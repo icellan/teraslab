@@ -483,10 +483,7 @@ impl ShardedIndex {
     pub fn try_stats(&self) -> Option<IndexStats> {
         let mut guards = Vec::with_capacity(self.shards.len());
         for shard in &self.shards {
-            match shard.try_read() {
-                Some(g) => guards.push(g),
-                None => return None,
-            }
+            guards.push(shard.try_read()?);
         }
 
         let mut total_entries = 0usize;

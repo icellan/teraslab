@@ -6251,7 +6251,7 @@ fn send_migration_complete(
                 .unwrap_or("(non-utf8)");
                 format!(" (code={code}: {msg})")
             } else {
-                format!(" (payload: {:?})", &response.payload)
+                format!(" (payload: {:?})", response.payload)
             }
         };
         return Err(format!(
