@@ -100,6 +100,17 @@ pub enum RedoError {
     #[error("corrupted entry at offset {offset}")]
     Corrupted { offset: u64 },
 
+    /// P1-18: a CRC-failing / truncated entry (or a non-zero mid-block pad) was
+    /// found in a NON-ACTIVE ring segment — corruption in the MIDDLE of the redo
+    /// history, not the tolerable torn tail of the active segment. Continuing
+    /// would replay a history with a HOLE (later segments' higher sequences pass
+    /// the monotonic check), silently serving a state that never existed, so
+    /// recovery fails closed here instead.
+    #[error(
+        "corruption in non-active ring segment {seg} at offset {offset}: redo history has a hole — failing closed"
+    )]
+    CorruptRingSegment { seg: u32, offset: usize },
+
     /// Redo entry sequence numbers must be contiguous within a log epoch.
     #[error(
         "redo sequence out of order at offset {offset}: previous={previous}, current={current}"
@@ -3082,7 +3093,12 @@ impl RedoLog {
     /// segments, since sequences increase in ring order. Returns the entries,
     /// the alignment-rounded tail offset within the segment, and the updated
     /// running max sequence.
-    fn scan_segment(&self, seg: u32, mut prev_seq: u64) -> Result<(Vec<RedoEntry>, u64, u64)> {
+    fn scan_segment(
+        &self,
+        seg: u32,
+        mut prev_seq: u64,
+        is_active: bool,
+    ) -> Result<(Vec<RedoEntry>, u64, u64)> {
         let r = self.ring.as_ref().expect("ring log");
         let align = self.device.alignment();
         let align_u64 = align as u64;
@@ -3112,7 +3128,15 @@ impl RedoLog {
                     }
                     let lw = u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap());
                     if lw != 0 {
-                        // Truncated / CRC-failing entry → end of segment.
+                        // Truncated / CRC-failing length-bearing entry. In the
+                        // ACTIVE segment this is the tolerable torn tail (a crash
+                        // mid-append). In a NON-ACTIVE (fully written) segment it
+                        // is corruption in the MIDDLE of history — P1-18: fail
+                        // closed rather than silently replaying later segments
+                        // past the hole.
+                        if !is_active {
+                            return Err(RedoError::CorruptRingSegment { seg, offset: pos });
+                        }
                         break;
                     }
                     // length=0. Aligned boundary → true end of data.
@@ -3124,6 +3148,10 @@ impl RedoLog {
                     let pad_end = ((pos as u64).next_multiple_of(align_u64) as usize).min(seg_size);
                     if buf[pos..pad_end].iter().all(|b| *b == 0) {
                         pos = pad_end;
+                    } else if !is_active {
+                        // Non-zero mid-block pad in a non-active segment → the
+                        // same mid-history corruption (P1-18): fail closed.
+                        return Err(RedoError::CorruptRingSegment { seg, offset: pos });
                     } else {
                         break;
                     }
@@ -3155,7 +3183,7 @@ impl RedoLog {
         let mut active_tail = 0u64;
         let mut seg = oldest;
         for _ in 0..live {
-            let (entries, tail, new_prev) = self.scan_segment(seg, prev_seq)?;
+            let (entries, tail, new_prev) = self.scan_segment(seg, prev_seq, seg == active)?;
             if let Some(last) = entries.last() {
                 seg_max[seg as usize] = last.sequence;
             }
@@ -9368,7 +9396,9 @@ mod tests {
         blk[..bytes.len()].copy_from_slice(&bytes);
         dev.pwrite_all_at(&blk, 4096).unwrap(); // entries region base = segment 0
 
-        let (entries, tail, prev) = log.scan_segment(0, 0).unwrap();
+        // Active segment: stale-lower-sequence remnant is a legitimate end, not
+        // corruption (unaffected by the P1-18 non-active fail-closed).
+        let (entries, tail, prev) = log.scan_segment(0, 0, true).unwrap();
         let seqs: Vec<u64> = entries.iter().map(|e| e.sequence).collect();
         assert_eq!(
             seqs,
@@ -9381,6 +9411,60 @@ mod tests {
             (new_end as u64).next_multiple_of(4096),
             "tail is aligned past the new content, not the stale remnant"
         );
+    }
+
+    /// P1-18: a CRC-failing / truncated entry in a NON-ACTIVE ring segment is
+    /// corruption in the MIDDLE of the redo history — recovery must fail closed,
+    /// not treat it as end-of-segment and silently replay later segments past
+    /// the hole. The SAME bytes in the ACTIVE segment are a tolerable torn tail.
+    #[test]
+    fn scan_segment_fails_closed_on_corruption_in_a_non_active_segment() {
+        let (dev, log) = make_ring(4096, 3);
+        // Two valid entries, then a length-bearing entry whose CRC is corrupted
+        // (a bit-flip mid-stream, not a clean zeroed tail).
+        let mut bytes = Vec::new();
+        for seq in [100u64, 101] {
+            bytes.extend_from_slice(
+                &RedoEntry {
+                    sequence: seq,
+                    op: freeze(1),
+                }
+                .serialize(),
+            );
+        }
+        let mut corrupt = RedoEntry {
+            sequence: 102,
+            op: freeze(2),
+        }
+        .serialize();
+        // Flip the trailing CRC byte: length word stays non-zero, CRC fails.
+        let last = corrupt.len() - 1;
+        corrupt[last] ^= 0xFF;
+        bytes.extend_from_slice(&corrupt);
+        let mut blk = AlignedBuf::new(4096, 4096);
+        blk[..bytes.len()].copy_from_slice(&bytes);
+        dev.pwrite_all_at(&blk, 4096).unwrap(); // segment 0
+
+        // Non-active segment → mid-history corruption must FAIL CLOSED.
+        let err = log
+            .scan_segment(0, 0, false)
+            .expect_err("corruption in a non-active segment must fail recovery closed");
+        assert!(
+            matches!(err, RedoError::CorruptRingSegment { seg: 0, .. }),
+            "expected CorruptRingSegment, got {err:?}",
+        );
+
+        // Active segment → the same bytes are a tolerable torn tail: recover the
+        // clean prefix and drop the corrupt entry.
+        let (entries, _tail, prev) = log
+            .scan_segment(0, 0, true)
+            .expect("active segment tolerates a torn tail");
+        assert_eq!(
+            entries.iter().map(|e| e.sequence).collect::<Vec<_>>(),
+            vec![100, 101],
+            "active segment recovers the clean prefix",
+        );
+        assert_eq!(prev, 101);
     }
 
     /// Phase 4: buffered-but-unflushed entries (a crash before fsync) are NOT
