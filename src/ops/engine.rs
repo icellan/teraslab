@@ -3803,8 +3803,51 @@ impl Engine {
                         &metadata,
                     )
                 };
-            } else {
-                self.write_metadata_fast(device_id, record_offset, &metadata)?;
+            } else if let Err(meta_err) =
+                self.write_metadata_fast(device_id, record_offset, &metadata)
+            {
+                // P0-11: on the owned-spend path the slot flip (SPENT→UNSPENT)
+                // is ALREADY durable (line ~3735) but its decremented counter is
+                // not. Left torn, a durable UNSPENT slot coexists with the
+                // unchanged all-spent counter, and the sweep — which reads the
+                // device counter, not the RAM all-spent bit — deletes a record
+                // holding a live restored UTXO (data loss). No crash occurs, so
+                // recovery's counter recompute never runs. Restore the invariant
+                // by reverting the slot to its prior SPENT state.
+                if caller_owns_spend {
+                    if let Err(revert_err) =
+                        self.write_slot_fast(device_id, record_offset, req.offset, &slot)
+                    {
+                        // The device cannot even take the revert: fail-stop so a
+                        // restart's counter recompute (recovery B-4) heals the
+                        // split before any sweep can delete the record.
+                        self.poison_all_redo_logs();
+                        return Err(SpendError::StorageError {
+                            detail: format!(
+                                "unspend metadata write failed ({meta_err}) and slot \
+                                 revert failed ({revert_err}); poisoned node to force \
+                                 recovery of offset {}",
+                                req.offset
+                            ),
+                        });
+                    }
+                    // Slot reverted → the device is consistent again (SPENT slot
+                    // + unchanged counter). Restore the RAM all-spent bit to its
+                    // pre-unspend value: the device counter (its write failed) is
+                    // `metadata.spent_utxos + 1`, so the record is all-spent again
+                    // iff that equals utxo_count.
+                    if entry.mined_slot != crate::index::mined_index::NO_MINED_SLOT {
+                        let was_all_spent = { metadata.spent_utxos }.wrapping_add(1) == utxo_count;
+                        self.mined_index().set_all_spent(
+                            &req.tx_key,
+                            entry.mined_slot,
+                            was_all_spent,
+                        );
+                    }
+                }
+                // A pure DAH-only no-op persist (`!caller_owns_spend`) flipped no
+                // slot, so nothing is torn — just surface the error.
+                return Err(meta_err);
             }
 
             // followup-1 dual-write: this branch is the ONLY path on which the
@@ -12748,6 +12791,159 @@ mod tests {
         assert!(
             !slot1.is_spent(),
             "slot 1 must remain UNSPENT on partial-write failure"
+        );
+    }
+
+    /// A device that fails `pwrite` at exactly ONE offset (the armed record's
+    /// metadata header), letting every other write — including the UTXO-slot
+    /// write in a different block — succeed. Reports `None` from `as_raw_ptr`
+    /// so record I/O routes through the fallible O_DIRECT pwrite path.
+    struct MetaWriteFailingDevice {
+        inner: Arc<dyn BlockDevice>,
+        fail_offset: Arc<AtomicU64>,
+    }
+    impl MetaWriteFailingDevice {
+        fn new(inner: Arc<dyn BlockDevice>) -> (Arc<Self>, Arc<AtomicU64>) {
+            // u64::MAX == disarmed (never matches a real record offset).
+            let fail_offset = Arc::new(AtomicU64::new(u64::MAX));
+            (
+                Arc::new(Self {
+                    inner,
+                    fail_offset: fail_offset.clone(),
+                }),
+                fail_offset,
+            )
+        }
+    }
+    impl BlockDevice for MetaWriteFailingDevice {
+        fn alignment(&self) -> usize {
+            self.inner.alignment()
+        }
+        fn size(&self) -> u64 {
+            self.inner.size()
+        }
+        fn pread(&self, buf: &mut [u8], offset: u64) -> crate::device::Result<usize> {
+            self.inner.pread(buf, offset)
+        }
+        fn pwrite(&self, buf: &[u8], offset: u64) -> crate::device::Result<usize> {
+            if offset == self.fail_offset.load(Ordering::SeqCst) {
+                return Err(DeviceError::Io(std::io::Error::other(
+                    "simulated metadata pwrite failure (P0-11)",
+                )));
+            }
+            self.inner.pwrite(buf, offset)
+        }
+        fn sync(&self) -> crate::device::Result<()> {
+            self.inner.sync()
+        }
+        fn as_raw_ptr(&self) -> Option<*mut u8> {
+            None
+        }
+    }
+
+    /// P0-11: unspend flips the slot SPENT→UNSPENT and persists it BEFORE the
+    /// decremented `spent_utxos` counter. If the metadata write fails, a durable
+    /// UNSPENT slot must NEVER be left coexisting with an all-spent counter —
+    /// otherwise the sweep (which reads the stale device counter) deletes a
+    /// record that holds a live restored UTXO. The fix reverts the slot to its
+    /// prior SPENT state on a metadata-write failure, restoring the invariant.
+    #[test]
+    fn unspend_metadata_write_failure_reverts_slot_not_leaving_live_utxo_all_spent() {
+        let inner: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let (dev_failing, fail_offset) = MetaWriteFailingDevice::new(inner);
+        let dev: Arc<dyn BlockDevice> = dev_failing;
+        let mut alloc = SlotAllocator::new(dev.clone()).unwrap();
+        let mut index = Index::new(100).unwrap();
+
+        // Record with 64 slots, ALL spent (all-spent counter == utxo_count). The
+        // target slot (63) lives well past the metadata block, so its slot write
+        // never touches the armed metadata offset.
+        let utxo_count = 64u32;
+        let target = 63u32;
+        let mut txid = [0u8; 32];
+        txid[0..8].copy_from_slice(&99u64.to_le_bytes());
+        let key = TxKey { txid };
+
+        let record_size = TxMetadata::record_size_for(utxo_count);
+        let offset = alloc.allocate(record_size).unwrap();
+
+        let mut spending_data = [0u8; 36];
+        spending_data[0] = 0xC3;
+        spending_data[32..36].copy_from_slice(&7u32.to_le_bytes());
+        let target_hash = {
+            let mut h = [0u8; 32];
+            h[0] = (target & 0xFF) as u8;
+            h[1] = ((target >> 8) & 0xFF) as u8;
+            h
+        };
+
+        let mut meta = TxMetadata::new(utxo_count);
+        meta.tx_id = txid;
+        meta.spent_utxos = utxo_count; // all-spent
+        let slots: Vec<UtxoSlot> = (0..utxo_count)
+            .map(|i| {
+                let mut hash = [0u8; 32];
+                hash[0] = (i & 0xFF) as u8;
+                hash[1] = ((i >> 8) & 0xFF) as u8;
+                UtxoSlot::new_spent(hash, spending_data)
+            })
+            .collect();
+        io::write_full_record(&*dev, offset, &meta, &slots).unwrap();
+
+        index
+            .register(
+                key,
+                TxIndexEntry {
+                    device_id: 0,
+                    record_offset: offset,
+                    mined_slot: crate::index::mined_index::NO_MINED_SLOT,
+                },
+            )
+            .unwrap();
+
+        let engine = Arc::new(Engine::new(
+            dev,
+            index,
+            alloc,
+            StripedLocks::new(1024),
+            DahIndex::new(),
+        ));
+
+        // Arm the metadata-header write to fail (the slot write, in a later
+        // block, still succeeds).
+        fail_offset.store(offset, Ordering::SeqCst);
+
+        let req = UnspendRequest {
+            tx_key: key,
+            offset: target,
+            utxo_hash: target_hash,
+            spending_data,
+            current_block_height: 1000,
+            block_height_retention: 288,
+        };
+        let result = engine.unspend(&req);
+        assert!(
+            result.is_err(),
+            "unspend must surface the metadata write failure, got {result:?}"
+        );
+
+        // Disarm and inspect the durable state: the invariant is that a live
+        // (UNSPENT) slot must NOT coexist with the all-spent counter. The fix
+        // reverts the slot, so it is back to SPENT and the counter is unchanged.
+        fail_offset.store(u64::MAX, Ordering::SeqCst);
+        let slot = engine.read_slot(&key, target).unwrap();
+        assert!(
+            slot.is_spent(),
+            "after a failed unspend metadata write the slot must be reverted to \
+             SPENT — a durable UNSPENT slot with an all-spent counter would let \
+             the sweep delete a record holding a live UTXO"
+        );
+        let meta_after = engine.read_metadata(&key).unwrap();
+        assert_eq!(
+            { meta_after.spent_utxos },
+            utxo_count,
+            "the all-spent counter must be unchanged (metadata write never landed)"
         );
     }
 
