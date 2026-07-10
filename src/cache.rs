@@ -568,6 +568,22 @@ impl CacheState {
                     // device bytes (loaded outside the lock) so untouched bytes
                     // are preserved.
                     Some(d) => d.to_vec(),
+                    // P1-24 (defensive): `preload` is `None` because the block
+                    // was RESIDENT at the residency check, so a partial
+                    // write-back skipped the preload — but it was evicted before
+                    // this re-lock (a concurrent insert's `evict_if_full`). For a
+                    // partial write-back, zero-filling here would DROP the
+                    // untouched bytes (corruption), so reload the device bytes
+                    // instead. Unreachable while the engine issues only
+                    // whole-block aligned writes (`!whole_block` never holds for
+                    // engine writes; see the `pwrite_all_at` note above); this
+                    // guards against silent corruption if that ever changes. The
+                    // brief load-under-lock only fires on this rare eviction race.
+                    None if self.writeback && !whole_block => {
+                        self.load_from_inner(block_idx)?.to_vec()
+                    }
+                    // Whole-block write (the whole block is overwritten) or a
+                    // read-through miss: zero-fill is correct — no untouched bytes.
                     None => vec![0u8; self.block_len(block_idx * bs)],
                 };
                 data[in_block..in_block + n].copy_from_slice(&buf[in_buf..in_buf + n]);
