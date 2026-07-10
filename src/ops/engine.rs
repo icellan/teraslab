@@ -7727,8 +7727,16 @@ impl Engine {
         // replay case). `update_*_index` is a no-op when old == new, and a
         // record is in the DAH index XOR the preserve index, so at most one of
         // these performs a real removal.
-        if device_dah != 0 {
-            self.update_dah_index(&req.tx_key, device_dah, 0)?;
+        // P1-1: post-Task-16d, `set_mined` plants the DAH ONLY in the `dah_index`
+        // secondary, leaving the device footer at 0. Gating removal on the footer
+        // alone therefore leaks an immortal dead-key entry — and those low-height
+        // entries fill the bounded sweep window and wedge all DAH deletion. Remove
+        // when EITHER the footer OR the live secondary height is non-zero.
+        // (`update_dah_index`'s `remove` is by-key; `old_height` is only a
+        // non-zero gate, so any non-zero value drives the removal.)
+        let live_dah = self.dah_index().get_height(&req.tx_key).unwrap_or(0);
+        if device_dah != 0 || live_dah != 0 {
+            self.update_dah_index(&req.tx_key, device_dah.max(live_dah), 0)?;
         }
         if device_preserve != 0 {
             self.update_preserve_index(&req.tx_key, device_preserve, 0)?;
@@ -12677,6 +12685,44 @@ mod tests {
         assert!(
             h2.engine.lookup(&h2.key).is_none(),
             "healthy node must delete the due record",
+        );
+    }
+
+    /// P1-1: post-Task-16d, `set_mined` plants the DAH only in the `dah_index`
+    /// secondary (the device footer `delete_at_height` stays 0). `delete_inner`
+    /// gated the secondary removal on the device footer alone, so deleting such
+    /// a record LEAKED an immortal dead-key `dah_index` entry — and those
+    /// low-height entries permanently fill the bounded sweep window and wedge
+    /// all DAH deletion. The removal must also consult the live secondary height.
+    #[test]
+    fn delete_removes_a_ram_planted_dah_index_entry_no_leak() {
+        // Device footer delete_at_height stays 0 (not customized) — the DAH is
+        // planted ONLY in the secondary index, mirroring set_mined post-16d.
+        let h = TestHarness::new(1, TxFlags::empty());
+        h.engine.dah_index().insert(500, h.key, None).unwrap();
+        assert_eq!(
+            h.engine.dah_index().get_height(&h.key),
+            Some(500),
+            "precondition: a RAM-planted DAH entry exists",
+        );
+        assert_eq!(
+            { h.engine.read_metadata(&h.key).unwrap().delete_at_height },
+            0,
+            "precondition: the device footer DAH is 0 (set_mined wrote nothing)",
+        );
+
+        // Unconditional client delete (due_guard = None).
+        h.engine
+            .delete(&DeleteRequest {
+                tx_key: h.key,
+                due_guard: None,
+            })
+            .expect("delete succeeds");
+
+        assert_eq!(
+            h.engine.dah_index().get_height(&h.key),
+            None,
+            "the RAM-planted DAH secondary entry must be removed on delete (no immortal leak)",
         );
     }
 
