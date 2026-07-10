@@ -8658,7 +8658,11 @@ fn decorate_get_item(
         // If we're master but don't have the data and inbound migration
         // is still pending, return a retry signal immediately instead of
         // parking a request thread behind migration progress.
-        if is_master && engine.read_metadata(&key).is_err() && cluster.has_pending_inbound(&key) {
+        // P1-9: order the cheap in-RAM checks BEFORE the device footer read so
+        // the common (no-migration) path short-circuits without reading — the
+        // authoritative read happens once, below. Only a genuinely pending
+        // inbound migration pays the guard read (and then returns here).
+        if is_master && cluster.has_pending_inbound(&key) && engine.read_metadata(&key).is_err() {
             let shard = crate::cluster::shards::ShardTable::shard_for_key(&key);
             tracing::debug!(shard, "dispatch: read still waiting for inbound migration");
             return WireGetResult {
@@ -9609,7 +9613,9 @@ fn decorate_get_spend_item(
                 // return a retryable MIGRATION_IN_PROGRESS instead of
                 // letting `get_spend` below report ERR_TX_NOT_FOUND
                 // (terminal) for a tx that is present-but-not-yet-migrated.
-                if engine.read_metadata(&key).is_err() && cluster.has_pending_inbound(&key) {
+                // P1-9: cheap in-RAM check first so the common path skips the
+                // guard read; the authoritative read happens once in `get_spend`.
+                if cluster.has_pending_inbound(&key) && engine.read_metadata(&key).is_err() {
                     let shard = crate::cluster::shards::ShardTable::shard_for_key(&key);
                     tracing::debug!(
                         shard,
