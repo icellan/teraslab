@@ -8697,6 +8697,36 @@ impl Engine {
                         }
                     }
                 }
+                crate::redo::RedoOp::MarkOnLongestChain {
+                    tx_key,
+                    on_longest_chain,
+                    current_block_height,
+                    ..
+                } => {
+                    // A longest-chain transition mutates mined-state at the
+                    // live op via `set_longest_chain` (bucket-only), but is
+                    // written only to the device footer on the crash path —
+                    // which the MinedIndex reader never consults. Snapshot
+                    // restore takes `unmined_since` from the `.mined`
+                    // checkpoint, so an above-fence transition is lost unless
+                    // replayed here. Resolve the slot exactly as the
+                    // `SetMinedBatch` arm does (in-tail slot first, else the
+                    // primary index's live pointer), skip if unknown, and
+                    // mirror the live op's `set_longest_chain` call.
+                    let slot = tail_slots.get(tx_key).copied().or_else(|| {
+                        self.index
+                            .lookup(tx_key)
+                            .map(|e| e.mined_slot)
+                            .filter(|&s| s != crate::index::mined_index::NO_MINED_SLOT)
+                    });
+                    let Some(slot) = slot else { continue };
+                    self.mined_index.set_longest_chain(
+                        tx_key,
+                        slot,
+                        *on_longest_chain,
+                        *current_block_height,
+                    );
+                }
                 _ => {}
             }
         }
@@ -18630,6 +18660,189 @@ mod tests {
         assert_eq!(
             unmined_since, 1000,
             "the live slot must carry the tx's unmined-since height"
+        );
+    }
+
+    /// P0 recovery hole: `replay_mined_index_redo_tail_above` must replay a
+    /// post-checkpoint `RedoOp::MarkOnLongestChain` into the authoritative
+    /// in-RAM `ShardedMinedIndex` — mirroring the live op
+    /// [`Engine::mark_on_longest_chain`], which journals the WAL entry then
+    /// calls `set_longest_chain`. It is the ONLY recovery pass that restores
+    /// mined-state (the device-scan rebuild was removed), and the `.mined`
+    /// snapshot restores `unmined_since` from the checkpoint — so a
+    /// longest-chain transition that landed in the redo tail ABOVE the
+    /// snapshot fence is silently lost unless this pass replays it. Without
+    /// the arm, an acked reorg-unmined record reads back on-longest-chain
+    /// (the sweeper then deletes a record the op chose to retain) and the
+    /// inverse acked re-mine stays stuck unmined — acked-state loss.
+    ///
+    /// Seeds a MINED record via a `.mined`-style snapshot restore, then
+    /// replays a single above-fence `MarkOnLongestChain` and asserts the
+    /// MinedIndex `unmined_since` moved to match the op. Both directions:
+    /// on→off (unmined_since 0 -> H) and off→on (unmined_since H -> 0).
+    ///
+    /// RED before the fix (the entry falls into the match's `_ => {}` arm, so
+    /// `unmined_since` stays at the snapshot value); GREEN after.
+    #[test]
+    fn mark_on_longest_chain_redo_tail_replays_into_mined_index() {
+        use crate::index::mined_index::{MinedByKeyEntry, NO_MINED_SLOT};
+        use crate::record::BlockEntry;
+        use crate::redo::{RedoLog, RedoOp};
+
+        // Seed a MINED record into a fresh engine's MinedIndex exactly as a
+        // `.mined` checkpoint restore would (block present, `unmined_since`
+        // taken verbatim from the snapshot entry), then replay a single
+        // above-fence `MarkOnLongestChain` and return the slot's resulting
+        // `(block_count, unmined_since)`.
+        let replay_mark = |n: u8,
+                           snapshot_unmined_since: u32,
+                           mark_on_longest_chain: bool,
+                           mark_height: u32|
+         -> (usize, u32) {
+            let dev: Arc<dyn BlockDevice> =
+                Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+
+            // A real on-device record — only its footer/locator matter; this
+            // throwaway engine's own index/MinedIndex are discarded.
+            let (device_id, offset, key) = {
+                let alloc = SlotAllocator::new(dev.clone()).unwrap();
+                let index = Index::new(1000).unwrap();
+                let temp_engine = Engine::new(
+                    dev.clone(),
+                    index,
+                    alloc,
+                    StripedLocks::new(1024),
+                    DahIndex::new(),
+                );
+                let (_, req) = make_create_req(n, 1);
+                let key = req.tx_key();
+                temp_engine.create(&req).expect("create succeeds");
+                let entry = temp_engine.lookup(&key).expect("entry registered");
+                temp_engine.allocator().lock().persist().unwrap();
+                (entry.device_id, entry.record_offset, key)
+            };
+
+            // Fresh engine sharing the device; primary index carries the key
+            // with the NO_MINED_SLOT sentinel — the recovery precondition
+            // (primary index fully replayed, MinedIndex still empty) before
+            // `recover_mined_index` restores the snapshot.
+            let fresh_index = ShardedIndex::from_single(Index::new(1000).unwrap().into());
+            fresh_index
+                .register(
+                    key,
+                    TxIndexEntry {
+                        device_id,
+                        record_offset: offset,
+                        mined_slot: NO_MINED_SLOT,
+                    },
+                )
+                .expect("register key");
+            let alloc2 = SlotAllocator::recover(dev.clone()).expect("allocator recovers");
+            let engine2 = Engine::new_with_sharded_index(
+                dev.clone(),
+                fresh_index,
+                alloc2,
+                StripedLocks::new(1024),
+                DahIndex::new(),
+            );
+
+            // `.mined` checkpoint: the record was captured MINED (one block),
+            // with `unmined_since` taken verbatim from the snapshot.
+            let entries = vec![MinedByKeyEntry {
+                txid: key.txid,
+                block_entries: vec![BlockEntry {
+                    block_id: 7,
+                    block_height: 800_000,
+                    subtree_idx: 3,
+                }],
+                unmined_since: snapshot_unmined_since,
+                all_spent: false,
+            }];
+            let restored_slots = engine2
+                .restore_mined_index_from_snapshot_entries(&entries)
+                .expect("snapshot restore succeeds");
+
+            // Precondition: the restore alone produced a live, mined slot at
+            // the snapshot's `unmined_since`.
+            let restored = engine2.lookup(&key).expect("entry present after restore");
+            assert_ne!(
+                restored.mined_slot, NO_MINED_SLOT,
+                "snapshot restore must produce a live mined slot"
+            );
+            let (pre_blocks, pre_unmined) = engine2
+                .mined_index()
+                .read_block_entries(&key, restored.mined_slot)
+                .expect("restored slot must be readable");
+            assert_eq!(
+                pre_blocks.len(),
+                1,
+                "precondition: the restored record is mined (one block)"
+            );
+            assert_eq!(
+                pre_unmined, snapshot_unmined_since,
+                "precondition: the restored slot carries the snapshot's unmined_since"
+            );
+
+            // A `MarkOnLongestChain` redo entry appended AFTER the checkpoint
+            // (sequence 1, strictly above the snapshot fence 0) — the exact
+            // op `Engine::mark_on_longest_chain` journals WAL-first on a reorg
+            // longest-chain transition.
+            let redo_dev: Arc<dyn BlockDevice> =
+                Arc::new(MemoryDevice::new(256 * 1024, 4096).unwrap());
+            let redo = Arc::new(parking_lot::Mutex::new(
+                RedoLog::open(redo_dev, 0, 256 * 1024).unwrap(),
+            ));
+            redo.lock()
+                .append_and_flush(RedoOp::MarkOnLongestChain {
+                    tx_key: key,
+                    on_longest_chain: mark_on_longest_chain,
+                    current_block_height: mark_height,
+                    block_height_retention: 100,
+                    generation: 1,
+                })
+                .expect("append MarkOnLongestChain");
+
+            engine2
+                .replay_mined_index_redo_tail_above(std::slice::from_ref(&redo), 0, restored_slots)
+                .expect("redo-tail replay succeeds");
+
+            let after = engine2
+                .lookup(&key)
+                .expect("entry still present after replay");
+            let (blocks, unmined) = engine2
+                .mined_index()
+                .read_block_entries(&key, after.mined_slot)
+                .expect("slot readable after replay");
+            (blocks.len(), unmined)
+        };
+
+        // Direction 1 (on -> off): snapshot captured the record on the
+        // longest chain (unmined_since 0); the post-checkpoint reorg marked it
+        // OFF at height 900_000. Recovery must land unmined_since == 900_000,
+        // NOT the stale 0.
+        let (blocks_off, unmined_off) = replay_mark(61, 0, false, 900_000);
+        assert_eq!(
+            unmined_off, 900_000,
+            "MarkOnLongestChain(false) must replay: the reorg-unmined record must NOT \
+             read back on the longest chain (pre-fix it stayed 0 — acked-state loss)"
+        );
+        assert_eq!(
+            blocks_off, 1,
+            "the longest-chain transition must not disturb the mined block entries"
+        );
+
+        // Direction 2 (off -> on): snapshot captured the record off the
+        // longest chain (unmined_since 850_000); the post-checkpoint op
+        // re-mined it onto the chain. Recovery must land unmined_since == 0.
+        let (blocks_on, unmined_on) = replay_mark(62, 850_000, true, 900_000);
+        assert_eq!(
+            unmined_on, 0,
+            "MarkOnLongestChain(true) must replay: the re-mined record must read back \
+             on the longest chain (pre-fix it stayed 850_000 — stuck unmined)"
+        );
+        assert_eq!(
+            blocks_on, 1,
+            "the longest-chain transition must not disturb the mined block entries"
         );
     }
 
