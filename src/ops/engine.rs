@@ -1121,6 +1121,22 @@ impl Engine {
         }
     }
 
+    /// The highest current redo sequence across all attached store logs (0 when
+    /// none are attached). P1-23: the checkpoint loop compares this against the
+    /// sequence at the last completed checkpoint to tell "the redo advanced
+    /// since the last checkpoint" (there is un-fsynced data) from "idle", so the
+    /// time-based trigger only fires when a create/relocate/spend actually landed.
+    pub fn current_redo_sequence(&self) -> u64 {
+        match self.redo_logs.get() {
+            Some(logs) if !logs.is_empty() => logs
+                .iter()
+                .map(|l| l.lock().current_sequence())
+                .max()
+                .unwrap_or(0),
+            _ => 0,
+        }
+    }
+
     /// Compact EVERY attached redo log's prefix through `fence`, reclaiming the
     /// covered bytes. The compaction fence is a GLOBAL sequence, so it applies
     /// uniformly to each store's log (each log's entries carry global
