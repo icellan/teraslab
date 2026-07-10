@@ -9584,9 +9584,30 @@ impl Engine {
         {
             return 0;
         }
+        // Snapshot every live index entry's offset, bucketed by owning store, so
+        // each store's reclaim can cross-check its fully-dead candidates against the
+        // AUTHORITATIVE live set and never free a segment that still holds a live
+        // record (P0: a crash-recovered reused segment can carry stale `used ==
+        // dead` accounting while owning a live post-checkpoint record). Snapshotted
+        // lock-free (one index pass) BEFORE taking any allocator lock — the same
+        // pattern `defrag_compact` and `recover_allocator_frontiers` use — so the
+        // hot allocation path is not stalled behind a full index scan. The tiny
+        // snapshot→lock window is covered by the allocator's `dead >= used`
+        // co-condition on reclaim.
+        let n = self.stores.len();
+        let mut live_offsets: Vec<Vec<u64>> = vec![Vec::new(); n];
+        self.index.for_each(|_key, e| {
+            let s = e.device_id as usize;
+            if s < n {
+                live_offsets[s].push(e.record_offset);
+            }
+        });
         let mut total = 0;
-        for store in &self.stores {
-            total += store.allocator.lock().reclaim_fully_dead_segments();
+        for (s, store) in self.stores.iter().enumerate() {
+            total += store
+                .allocator
+                .lock()
+                .reclaim_fully_dead_segments(&live_offsets[s]);
         }
         total
     }
@@ -14883,6 +14904,98 @@ mod tests {
         assert_eq!(engine.read_slot(&key, 0).unwrap().hash, [0x5C; 32]);
         // seg0 is now fully dead and reclaims.
         assert_eq!(engine.defrag_reclaim_fully_dead(), 1);
+    }
+
+    /// P0 (engine path): the reclaim fast path snapshots the LIVE index and must
+    /// refuse to free a segment that still owns a live index entry, even when the
+    /// allocator's `used`/`dead` accounting claims the segment is fully dead. This
+    /// is the crash-recovery hazard: a reused segment carries stale `used == dead`
+    /// while holding a live post-checkpoint record whose bytes recovery never
+    /// re-added to `used`. Without the cross-check the segment is reset+freed and a
+    /// later allocate re-hands out the live record's offset, overwriting acked data.
+    #[test]
+    fn defrag_reclaim_never_frees_a_segment_with_a_live_indexed_record() {
+        let dev: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let seg_size = 2 * 4096; // 2-block segments
+        let seg = crate::segment_allocator::SegmentAllocator::new(dev.clone(), seg_size).unwrap();
+        let engine = Engine::new(
+            dev.clone(),
+            Index::new(64).unwrap(),
+            seg,
+            StripedLocks::new(64),
+            DahIndex::new(),
+        );
+        let record_size = TxMetadata::record_size_for(1);
+
+        // seg0 block0 = live indexed record R; block1 = filler (fills seg0).
+        let r_off = engine
+            .allocator_for(0)
+            .lock()
+            .allocate(record_size)
+            .unwrap();
+        let filler = engine
+            .allocator_for(0)
+            .lock()
+            .allocate(record_size)
+            .unwrap();
+        let mut txid = [0u8; 32];
+        txid[0] = 0xA7;
+        let key = TxKey { txid };
+        let mut meta = TxMetadata::new(1);
+        meta.tx_id = txid;
+        let slots = vec![UtxoSlot::new_unspent([0xA7; 32])];
+        io::write_full_record(&*dev, r_off, &meta, &slots).unwrap();
+        engine
+            .register(
+                key,
+                TxIndexEntry {
+                    device_id: 0,
+                    record_offset: r_off,
+                    mined_slot: crate::index::mined_index::NO_MINED_SLOT,
+                },
+            )
+            .unwrap();
+
+        // Advance past seg0 (seal it) so it is NOT the open segment.
+        let _ = engine
+            .allocator_for(0)
+            .lock()
+            .allocate(record_size)
+            .unwrap();
+        assert_eq!(
+            engine
+                .allocator_for(0)
+                .lock()
+                .segment_stats()
+                .unwrap()
+                .open_segment,
+            1,
+            "seg0 must be sealed (open segment advanced to seg1)"
+        );
+
+        // Dead-mark BOTH blocks of seg0 (including R's): the allocator now reads
+        // `used == dead` for seg0 while R is STILL LIVE in the index — the exact
+        // fully-dead-accounting-but-live-record state the reclaim must survive.
+        for off in [r_off, filler] {
+            engine
+                .allocator_for(0)
+                .lock()
+                .free(off, record_size)
+                .unwrap();
+        }
+
+        // The reclaim snapshots the index, finds R live in seg0, and refuses to
+        // free it. Pre-fix (trusting `used == dead`) this returned 1 and freed seg0.
+        assert_eq!(
+            engine.defrag_reclaim_fully_dead(),
+            0,
+            "reclaim freed a segment whose live record R is still in the index"
+        );
+        // R's index entry is untouched and still resolves to its original offset,
+        // and the record is still readable there.
+        assert_eq!(engine.lookup(&key).unwrap().record_offset, r_off);
+        assert_eq!(engine.read_slot(&key, 0).unwrap().hash, [0xA7; 32]);
     }
 
     /// Compaction is a no-op when nothing is dead enough (self-gating).

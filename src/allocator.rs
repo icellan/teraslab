@@ -2156,7 +2156,13 @@ pub trait RecordAllocator: Send {
     /// the reclaimed state is re-derivable on recovery
     /// ([`Self::reconcile_recovered_free_list`]), so it needs no journaling — the
     /// checkpoint persists it in the header on its next pass.
-    fn reclaim_fully_dead_segments(&mut self) -> usize {
+    ///
+    /// `live_offsets` is the record offset of every live index entry on this store;
+    /// the segment allocator cross-checks it so a segment holding a live record is
+    /// NEVER reclaimed even under stale post-crash accounting (see the override).
+    /// Default 0 (in-place allocator has no segments): the list is ignored.
+    fn reclaim_fully_dead_segments(&mut self, live_offsets: &[u64]) -> usize {
+        let _ = live_offsets;
         0
     }
 
@@ -2309,8 +2315,8 @@ impl RecordAllocator for BoxedAllocator {
     fn reserve_recovered_live_region(&mut self, offset: u64, size: u64) -> bool {
         (**self).reserve_recovered_live_region(offset, size)
     }
-    fn reclaim_fully_dead_segments(&mut self) -> usize {
-        (**self).reclaim_fully_dead_segments()
+    fn reclaim_fully_dead_segments(&mut self, live_offsets: &[u64]) -> usize {
+        (**self).reclaim_fully_dead_segments(live_offsets)
     }
     fn defrag_victim_ranges(&self, min_dead_frac: f64, max: usize) -> Vec<(u64, u64)> {
         (**self).defrag_victim_ranges(min_dead_frac, max)
