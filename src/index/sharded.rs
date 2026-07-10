@@ -551,6 +551,33 @@ impl ShardedIndex {
         }
     }
 
+    /// Process the index ONE SHARD AT A TIME, bounding peak memory to a single
+    /// shard's worth of extracted values instead of the whole store.
+    ///
+    /// For each in-process index shard: under that shard's read lock, `map`
+    /// extracts a lightweight per-entry value from every entry into a batch; the
+    /// lock is then RELEASED and `process` is invoked with that shard's batch.
+    /// This keeps the primary shard lock off the caller's per-entry work (device
+    /// reads, secondary-index writes) — the lock discipline
+    /// [`crate::ops::Engine::reconcile_secondaries_from_mined_index`] requires —
+    /// while never materializing more than one shard's locators at once (the
+    /// whole-store `Vec` was an OOM hazard at the multi-billion-record design
+    /// point). `process` errors short-circuit the remaining shards.
+    pub fn try_for_each_shard<T, E>(
+        &self,
+        mut map: impl FnMut(TxKey, &TxIndexEntry) -> T,
+        mut process: impl FnMut(Vec<T>) -> Result<(), E>,
+    ) -> Result<(), E> {
+        for shard in &self.shards {
+            let batch: Vec<T> = {
+                let guard = shard.read();
+                guard.iter().map(|(key, entry)| map(key, &entry)).collect()
+            };
+            process(batch)?;
+        }
+        Ok(())
+    }
+
     /// Collect all registered keys into a `Vec`.
     ///
     /// Equivalent to calling `for_each` and collecting only the keys.
@@ -1782,6 +1809,62 @@ mod tests {
                 .unwrap_or_else(|| panic!("for_each missed key {txid:?}"));
             assert_eq!(got, entry, "entry mismatch for key {txid:?}");
         }
+    }
+
+    /// P1-2: `try_for_each_shard` must visit every registered entry exactly once
+    /// (across all shard batches), deliver them in per-shard batches (never one
+    /// giant Vec — the whole-store materialization was the OOM hazard), and
+    /// short-circuit the remaining shards when `process` returns `Err`.
+    #[test]
+    fn try_for_each_shard_batches_per_shard_and_short_circuits() {
+        use std::collections::HashSet;
+
+        const SHARDS: usize = 8;
+        let sharded = ShardedIndex::new_in_memory(500, SHARDS).unwrap();
+        for i in 0..200u64 {
+            sharded.register(make_key(i), make_entry(i * 16)).unwrap();
+        }
+
+        // Happy path: every entry visited exactly once, and no single batch holds
+        // the whole store (each batch is one shard's slice).
+        let mut visited: HashSet<u64> = HashSet::new();
+        let mut batches = 0usize;
+        let mut max_batch = 0usize;
+        sharded
+            .try_for_each_shard(
+                |_k, e| e.record_offset,
+                |batch: Vec<u64>| -> Result<(), ()> {
+                    batches += 1;
+                    max_batch = max_batch.max(batch.len());
+                    for off in batch {
+                        assert!(visited.insert(off), "offset {off} visited twice");
+                    }
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert_eq!(visited.len(), 200, "every registered entry visited once");
+        assert_eq!(batches, SHARDS, "one batch per index shard");
+        assert!(
+            max_batch < 200,
+            "no batch may hold the whole store ({max_batch} of 200) — that is the OOM the fix removes",
+        );
+
+        // Error short-circuits: `process` fails on the first batch → the call
+        // returns Err and stops (fewer than SHARDS batches processed).
+        let mut seen = 0usize;
+        let res: Result<(), &str> = sharded.try_for_each_shard(
+            |_k, _e| (),
+            |_batch| {
+                seen += 1;
+                Err("stop")
+            },
+        );
+        assert_eq!(res, Err("stop"));
+        assert_eq!(
+            seen, 1,
+            "process error must short-circuit the remaining shards"
+        );
     }
 
     // -----------------------------------------------------------------------

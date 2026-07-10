@@ -9186,31 +9186,32 @@ impl Engine {
         current_block_height: u32,
         block_height_retention: u32,
     ) -> Result<(), SpendError> {
-        // Snapshot only the live records' LOCATORS while holding the primary
-        // shard read lock, then release it before the per-record device +
-        // MinedIndex reads and secondary-index writes (so no secondary lock
-        // nests under the primary lock).
-        //
-        // The enumeration KEY is deliberately NOT captured: on the default
-        // `Memory`/`FileBacked` backend `for_each` yields the stored 12-byte
-        // txid prefix zero-padded to 32 bytes (see `hashtable::STORED_TXID_LEN`
-        // / `Bucket::stored_key`), NOT the record's true txid. Using it would
-        // fail the footer tx_id check for any realistic SHA256 txid (nonzero
-        // beyond byte 12) and mis-shard every MinedIndex read (`shard_for`
-        // routes on `txid[16..24]`, zeroed by truncation). The authoritative
-        // full txid is resolved from each record's device footer below.
-        let mut locators: Vec<(u8, u64, u32)> = Vec::with_capacity(self.index.len());
-        self.index.for_each(|_key, entry| {
-            locators.push((entry.device_id, entry.record_offset, entry.mined_slot));
-        });
-
         self.dah_index
             .clear()
             .map_err(|e| SpendError::StorageError {
                 detail: format!("mined-index reconcile: clearing DAH index failed: {e}"),
             })?;
 
-        for (device_id, record_offset, mined_slot) in locators {
+        // P1-2: iterate ONE INDEX SHARD AT A TIME so peak memory is bounded to a
+        // single shard's locators, not the whole store — the old whole-store
+        // `Vec::with_capacity(self.index.len())` was an OOM/boot hazard at the
+        // multi-billion-record design point (~tens of GiB on top of the index).
+        // Each shard's locators are collected under that shard's read lock, which
+        // is RELEASED before the batch's per-record device + MinedIndex reads and
+        // secondary-index writes (so no secondary lock nests under the primary).
+        //
+        // The enumeration KEY is deliberately NOT captured: on the default
+        // `Memory`/`FileBacked` backend the iterator yields the stored 12-byte
+        // txid prefix zero-padded to 32 bytes (see `hashtable::STORED_TXID_LEN`
+        // / `Bucket::stored_key`), NOT the record's true txid. Using it would
+        // fail the footer tx_id check for any realistic SHA256 txid (nonzero
+        // beyond byte 12) and mis-shard every MinedIndex read (`shard_for`
+        // routes on `txid[16..24]`, zeroed by truncation). The authoritative
+        // full txid is resolved from each record's device footer below.
+        self.index.try_for_each_shard(
+            |_key, entry| (entry.device_id, entry.record_offset, entry.mined_slot),
+            |locators: Vec<(u8, u64, u32)>| -> Result<(), SpendError> {
+                for (device_id, record_offset, mined_slot) in locators {
             // Read the footer ONCE and derive the AUTHORITATIVE full txid from
             // it (`meta.tx_id`). A single unreadable footer (torn / relocated
             // mid-scan) must SKIP this record, never brick the boot — same warn
@@ -9354,9 +9355,11 @@ impl Engine {
                         detail: format!("mined-index reconcile: DAH insert failed: {e}"),
                     }
                 })?;
-            }
-        }
-        Ok(())
+                    }
+                }
+                Ok(())
+            },
+        )
     }
 
     /// Read on-device metadata for a transaction.
