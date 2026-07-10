@@ -9001,24 +9001,40 @@ impl Engine {
     /// since the last checkpoint (absent from the primary index, hence not
     /// visited) are not left orphaned.
     ///
+    /// A record whose device footer is unreadable (torn / relocated mid-scan)
+    /// is SKIPPED with a warning + an [`Self::enumeration_unreadable`] metric
+    /// bump — a single unreadable footer must never brick the boot — mirroring
+    /// [`Self::resolve_full_keys`].
+    ///
     /// # Errors
     ///
-    /// Returns [`SpendError::StorageError`] on a device metadata read failure, a
-    /// primary/MinedIndex desync (a live `mined_slot` absent from the MinedIndex),
-    /// or a secondary-index clear/insert failure; [`SpendError::DahOverflow`] if
-    /// `current_block_height + block_height_retention` overflows `u32`.
+    /// Returns [`SpendError::StorageError`] on a primary/MinedIndex desync (a
+    /// live `mined_slot` absent from the MinedIndex) or a secondary-index
+    /// clear/insert failure; [`SpendError::DahOverflow`] if
+    /// `current_block_height + block_height_retention` overflows `u32`. An
+    /// individual record's footer read failure does NOT error — it is skipped
+    /// (see above).
     pub fn reconcile_secondaries_from_mined_index(
         &self,
         current_block_height: u32,
         block_height_retention: u32,
     ) -> Result<(), SpendError> {
-        // Snapshot the live records while holding only the primary shard read
-        // lock, then release it before the per-record device + MinedIndex reads
-        // and secondary-index writes (so no secondary lock nests under the
-        // primary lock).
-        let mut records: Vec<(TxKey, u8, u64, u32)> = Vec::with_capacity(self.index.len());
-        self.index.for_each(|key, entry| {
-            records.push((key, entry.device_id, entry.record_offset, entry.mined_slot));
+        // Snapshot only the live records' LOCATORS while holding the primary
+        // shard read lock, then release it before the per-record device +
+        // MinedIndex reads and secondary-index writes (so no secondary lock
+        // nests under the primary lock).
+        //
+        // The enumeration KEY is deliberately NOT captured: on the default
+        // `Memory`/`FileBacked` backend `for_each` yields the stored 12-byte
+        // txid prefix zero-padded to 32 bytes (see `hashtable::STORED_TXID_LEN`
+        // / `Bucket::stored_key`), NOT the record's true txid. Using it would
+        // fail the footer tx_id check for any realistic SHA256 txid (nonzero
+        // beyond byte 12) and mis-shard every MinedIndex read (`shard_for`
+        // routes on `txid[16..24]`, zeroed by truncation). The authoritative
+        // full txid is resolved from each record's device footer below.
+        let mut locators: Vec<(u8, u64, u32)> = Vec::with_capacity(self.index.len());
+        self.index.for_each(|_key, entry| {
+            locators.push((entry.device_id, entry.record_offset, entry.mined_slot));
         });
 
         self.dah_index
@@ -9027,8 +9043,34 @@ impl Engine {
                 detail: format!("mined-index reconcile: clearing DAH index failed: {e}"),
             })?;
 
-        for (key, device_id, record_offset, mined_slot) in records {
-            let meta = self.read_metadata_for_key(device_id, &key, record_offset)?;
+        for (device_id, record_offset, mined_slot) in locators {
+            // Read the footer ONCE and derive the AUTHORITATIVE full txid from
+            // it (`meta.tx_id`). A single unreadable footer (torn / relocated
+            // mid-scan) must SKIP this record, never brick the boot — same warn
+            // + `enumeration_unreadable` metric as `resolve_full_keys`. This
+            // replaces the old truncated-key `read_metadata_for_key`: the key is
+            // now derived FROM the footer, so its `meta.tx_id != key.txid`
+            // identity check is redundant (see debug_assert below).
+            let meta = match self.read_metadata_fast(device_id, record_offset) {
+                Ok(m) => m,
+                Err(e) => {
+                    self.enumeration_unreadable
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    tracing::warn!(
+                        target: "teraslab::engine",
+                        device_id,
+                        offset = record_offset,
+                        err = %e,
+                        "mined-index reconcile: record footer unreadable; skipping record",
+                    );
+                    continue;
+                }
+            };
+            let key = TxKey::from_bytes(meta.tx_id);
+            debug_assert_eq!(
+                meta.tx_id, key.txid,
+                "reconcile key is derived from the footer tx_id",
+            );
 
             // Authoritative mined-state from the MinedIndex, never the device.
             let (entries, unmined_since) = if mined_slot == crate::index::mined_index::NO_MINED_SLOT
@@ -10821,6 +10863,135 @@ mod tests {
             !unmined_keys.contains(&r1),
             "R1 (on longest chain) must not be in the unmined index",
         );
+    }
+
+    /// P0 (slim-index brick): `reconcile_secondaries_from_mined_index` runs on
+    /// EVERY boot (`bin/server.rs`, which FATAL-exits if it returns Err). On the
+    /// DEFAULT `Memory`/`FileBacked` backend, `Index::for_each` yields the stored
+    /// 12-byte txid prefix zero-padded to 32 bytes — NOT the record's true txid
+    /// (see `hashtable::STORED_TXID_LEN` / `Bucket::stored_key`). A realistic
+    /// SHA256 txid carries entropy in `[12..32]`, so the pre-fix reconcile — which
+    /// fed that truncated key straight into `read_metadata_for_key` — hit
+    /// `meta.tx_id != key.txid` → `TxNotFound`, propagated the `?`, and bricked
+    /// the boot for every default-config node.
+    ///
+    /// This seeds ONE record whose txid has entropy across all 32 bytes (so both
+    /// the footer tx_id identity check AND the MinedIndex `shard_for` routing on
+    /// `txid[16..24]` would misfire on the truncated key) and asserts reconcile
+    /// now resolves the AUTHORITATIVE full txid from the device footer: it returns
+    /// Ok, registers the DAH under the FULL key (never the truncated prefix), and
+    /// the record's mined-state is reachable via that full key. The sibling
+    /// reconcile tests use near-zero txids where the slim prefix happens to equal
+    /// the full tx_id, so they never exercised this path.
+    #[test]
+    fn reconcile_resolves_full_txid_from_device_footer_on_slim_index() {
+        const RETENTION: u32 = 288;
+        const RECOVERY_HEIGHT: u32 = 2000;
+
+        let dev: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let mut alloc = SlotAllocator::new(dev.clone()).unwrap();
+        let mut index = Index::new(64).unwrap();
+
+        // A realistic SHA256-shaped txid: nonzero bytes throughout, in particular
+        // across [12..32] (defeats the truncated-key footer tx_id check) and
+        // [16..24] (the bytes `ShardedMinedIndex::shard_for` routes on, zeroed by
+        // truncation → wrong shard).
+        let txid: [u8; 32] = [
+            0x3a, 0x7b, 0xf2, 0x9c, 0x11, 0x84, 0x6d, 0x0e, 0xa5, 0xc3, 0x58, 0x92, 0xd7, 0x4f,
+            0x1b, 0xe0, 0x66, 0x39, 0xac, 0x02, 0x7e, 0xd1, 0x5c, 0x88, 0x4a, 0x9f, 0x30, 0xb7,
+            0x21, 0xe8, 0x6c, 0x05,
+        ];
+        let key = TxKey { txid };
+        // The exact truncated key the slim primary index round-trips through
+        // `for_each` (12-byte prefix, [12..32] zeroed) — the key the pre-fix
+        // reconcile wrongly used.
+        let truncated_key = {
+            let mut t = [0u8; 32];
+            t[0..12].copy_from_slice(&txid[0..12]);
+            TxKey { txid: t }
+        };
+        assert_ne!(
+            key.txid, truncated_key.txid,
+            "test precondition: the txid must carry entropy beyond byte 12",
+        );
+
+        // Write an all-spent, on-longest-chain, 1-UTXO record with NO device DAH
+        // (the setMined-planted case: the live DAH is re-derived by the eval).
+        let mut meta = TxMetadata::new(1);
+        meta.tx_id = txid;
+        meta.spent_utxos = 1; // all-spent
+        meta.unmined_since = 0; // on the longest chain
+        meta.delete_at_height = 0; // setMined-planted → re-derived below
+        let record_size = TxMetadata::record_size_for(1);
+        let offset = alloc.allocate(record_size).unwrap();
+        let slot0 = UtxoSlot::new_spent([0x11; 32], [0xAB; 36]);
+        io::write_full_record(&*dev, offset, &meta, &[slot0]).unwrap();
+        index
+            .register(
+                key,
+                TxIndexEntry {
+                    device_id: 0,
+                    record_offset: offset,
+                    mined_slot: crate::index::mined_index::NO_MINED_SLOT,
+                },
+            )
+            .unwrap();
+
+        let engine = Engine::new(
+            dev.clone(),
+            index,
+            alloc,
+            StripedLocks::new(64),
+            DahIndex::new(),
+        );
+
+        // Seed the record's MinedIndex slot with one mined block (has_blocks),
+        // keyed by the FULL txid — exactly what the live create/setMined path
+        // does — then re-point the primary entry at the slot.
+        let slot = seed_mined_index_for_test(&engine, &key, &meta, &[(0x99, 1000, 0)]);
+        let e = engine.index.lookup(&key).unwrap();
+        engine
+            .index
+            .register(
+                key,
+                TxIndexEntry {
+                    device_id: 0,
+                    record_offset: e.record_offset,
+                    mined_slot: slot,
+                },
+            )
+            .unwrap();
+
+        // Pre-fix: Err(TxNotFound) (the truncated key fails the footer tx_id
+        // identity check) → the server FATAL-exits and bricks the boot. Post-fix:
+        // resolves the full txid from the footer and succeeds.
+        engine
+            .reconcile_secondaries_from_mined_index(RECOVERY_HEIGHT, RETENTION)
+            .expect("reconcile must not brick boot on a realistic slim-index txid");
+
+        // The DAH is registered under the AUTHORITATIVE full txid, re-derived to
+        // current_height + retention (device DAH was stale-0).
+        assert_eq!(
+            engine.dah_index().get_height(&key),
+            Some(RECOVERY_HEIGHT + RETENTION),
+            "DAH must be registered under the FULL txid, re-derived from the eval",
+        );
+        // And NEVER under the truncated slim-index prefix key.
+        assert_eq!(
+            engine.dah_index().get_height(&truncated_key),
+            None,
+            "DAH must not be keyed by the truncated slim-index prefix",
+        );
+        // Mined-state is reachable via the full key (correct MinedIndex shard).
+        let (entries, unmined_since) = engine
+            .mined_index()
+            .read_block_entries(&key, slot)
+            .expect("mined-state must be reachable via the full txid");
+        assert_eq!(unmined_since, 0, "record is on the longest chain");
+        assert_eq!(entries.len(), 1, "the one seeded mined block is present");
+        let be = entries[0];
+        assert_eq!({ be.block_id }, 0x99, "the seeded block_id round-trips");
     }
 
     // -----------------------------------------------------------------------
