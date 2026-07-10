@@ -4,7 +4,9 @@
 //! every file checksum, and the device geometry against the target config, then
 //! — holding the single-instance flock so a live server cannot be clobbered —
 //! writes each store's device image ranges back at their recorded offsets,
-//! installs the fabricated per-store redo files, copies the index snapshot and
+//! installs the fabricated per-store redo files, copies the primary index
+//! snapshot and its authoritative `.mined` MinedIndex companion (post-Task-16d
+//! mined-state lives only in RAM + this snapshot + the fenced redo tail) and
 //! the durable-height file, and restores the blob tree. It does NOT boot an
 //! engine: the node's normal startup (snapshot load + redo tail replay) does the
 //! recovery, because a backup is exactly a crash-legal image plus its redo tail.
@@ -103,7 +105,20 @@ pub fn restore(backup_dir: &Path, config: &ServerConfig) -> Result<(), BackupErr
     // 8. Index snapshot.
     let snap_src = backup_dir.join(&manifest.index_snapshot_file);
     let snap_bytes = std::fs::read(&snap_src).map_err(BackupError::Io)?;
-    write_and_fsync(&config.resolved_index_snapshot_path(), &snap_bytes)?;
+    let primary_snapshot_path = config.resolved_index_snapshot_path();
+    write_and_fsync(&primary_snapshot_path, &snap_bytes)?;
+
+    // 8a. Authoritative MinedIndex snapshot — installed as the `.mined` sibling
+    //     of the primary snapshot at the EXACT path boot derives (see
+    //     `checkpoint::mined_index_snapshot_path`). Post-Task-16d mined-state
+    //     lives only in RAM + this snapshot + the fenced redo tail, so without
+    //     it a restored node's `recover_mined_index` FATALs (present primary
+    //     snapshot, absent `.mined`) and acknowledged mined-state is lost. Its
+    //     bytes were already integrity-checked by `verify_checksums` at step 2.
+    let mined_snap_src = backup_dir.join(&manifest.mined_index_snapshot_file);
+    let mined_snap_bytes = std::fs::read(&mined_snap_src).map_err(BackupError::Io)?;
+    let mined_snapshot_path = crate::checkpoint::mined_index_snapshot_path(&primary_snapshot_path);
+    write_and_fsync(&mined_snapshot_path, &mined_snap_bytes)?;
 
     // 9. Durable node height.
     let height_bytes = crate::ops::engine::encode_durable_height(manifest.last_durable_height);

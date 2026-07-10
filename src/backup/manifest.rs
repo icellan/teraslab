@@ -12,7 +12,17 @@ use serde::{Deserialize, Serialize};
 
 /// Current manifest schema version. Restore refuses a manifest it does not
 /// recognise.
-pub const MANIFEST_VERSION: u32 = 1;
+///
+/// Bumped 1 -> 2 (P0 durability fix): the manifest now also records the
+/// authoritative in-RAM MinedIndex snapshot (`mined_index_snapshot_file` +
+/// `mined_index_sha256`). Post-Task-16d `set_mined` performs zero device
+/// writes, so mined-state lives ONLY in RAM + its `.mined` snapshot; a backup
+/// that captured only the primary index left every restore unbootable (a
+/// present primary snapshot with an absent `.mined` companion is FATAL at
+/// boot). The two new fields carry `#[serde(default)]` so an older (v1)
+/// manifest still DESERIALIZES and is then rejected with a clear
+/// [`ManifestError::UnsupportedVersion`] rather than an opaque parse error.
+pub const MANIFEST_VERSION: u32 = 2;
 
 /// The manifest filename inside a backup directory.
 pub const MANIFEST_FILE: &str = "MANIFEST.json";
@@ -109,6 +119,20 @@ pub struct Manifest {
     pub index_snapshot_file: String,
     /// SHA-256 of the index snapshot file bytes.
     pub index_snapshot_sha256: String,
+    /// The authoritative in-RAM MinedIndex snapshot file (relative to the
+    /// backup dir), TXID-keyed and fence-stamped with [`Manifest::fence`] —
+    /// the same value fencing the fabricated redo tail, so restore replays
+    /// the tail strictly above it. Restore installs this as the
+    /// [`crate::checkpoint::mined_index_snapshot_path`] companion of the
+    /// primary snapshot; without it, a restored node's boot-time
+    /// `recover_mined_index` FATALs (present primary snapshot, absent
+    /// `.mined`) and acknowledged mined-state is lost. `#[serde(default)]`
+    /// so a v1 manifest still parses and is rejected on the version check.
+    #[serde(default)]
+    pub mined_index_snapshot_file: String,
+    /// SHA-256 of the MinedIndex snapshot file bytes.
+    #[serde(default)]
+    pub mined_index_sha256: String,
     /// External blobs (empty when the store has no EXTERNAL records).
     pub blobs: Vec<BlobEntry>,
 }
@@ -200,6 +224,12 @@ impl Manifest {
     pub fn verify_checksums(&self, dir: &Path) -> Result<(), ManifestError> {
         // Index snapshot.
         verify_file(dir, &self.index_snapshot_file, &self.index_snapshot_sha256)?;
+        // Authoritative MinedIndex snapshot (companion of the primary snapshot).
+        verify_file(
+            dir,
+            &self.mined_index_snapshot_file,
+            &self.mined_index_sha256,
+        )?;
         // Per-store image + redo.
         for store in &self.stores {
             verify_file(dir, &store.image_file, &store.image_sha256)?;
@@ -284,6 +314,8 @@ mod tests {
             }],
             index_snapshot_file: "teraslab-index.snap".into(),
             index_snapshot_sha256: sha256_hex(b"snap"),
+            mined_index_snapshot_file: "teraslab-index.snap.mined".into(),
+            mined_index_sha256: sha256_hex(b"mined"),
             blobs: vec![],
         }
     }
@@ -313,11 +345,48 @@ mod tests {
     }
 
     #[test]
+    fn read_rejects_v1_manifest_gracefully() {
+        // A v1 manifest (no `.mined` fields) must still DESERIALIZE thanks to
+        // `#[serde(default)]`, then be rejected with a clear UnsupportedVersion
+        // rather than an opaque parse error — the graceful older-manifest path.
+        let dir = TempDir::new().unwrap();
+        let v1_json = r#"{
+            "manifest_version": 1,
+            "teraslab_version": "0.6.0",
+            "fence": 0,
+            "tail_end": 0,
+            "last_durable_height": 0,
+            "seg_header_version": 2,
+            "redo_header_version": 2,
+            "geometry": {
+                "device_count": 1,
+                "device_size": 67108864,
+                "alignment": 4096,
+                "device_split": 1,
+                "store_count": 1
+            },
+            "stores": [],
+            "index_snapshot_file": "teraslab-index.snap",
+            "index_snapshot_sha256": "00",
+            "blobs": []
+        }"#;
+        std::fs::write(dir.path().join(MANIFEST_FILE), v1_json).unwrap();
+        match Manifest::read(dir.path()) {
+            Err(ManifestError::UnsupportedVersion { found, supported }) => {
+                assert_eq!(found, 1);
+                assert_eq!(supported, MANIFEST_VERSION);
+            }
+            other => panic!("expected UnsupportedVersion for a v1 manifest, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn verify_checksums_detects_mismatch() {
         let dir = TempDir::new().unwrap();
         let m = sample();
         // Write the referenced files with the EXPECTED content...
         std::fs::write(dir.path().join("teraslab-index.snap"), b"snap").unwrap();
+        std::fs::write(dir.path().join("teraslab-index.snap.mined"), b"mined").unwrap();
         std::fs::write(dir.path().join("redo.0"), b"redo").unwrap();
         std::fs::write(dir.path().join("store.0.img"), [0u8; 4096]).unwrap();
         m.write(dir.path()).unwrap();

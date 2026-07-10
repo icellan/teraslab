@@ -29,6 +29,7 @@ use teraslab::index::{DahIndex, Index, ShardedIndex, TxKey};
 use teraslab::locks::StripedLocks;
 use teraslab::ops::create::CreateRequest;
 use teraslab::ops::engine::Engine;
+use teraslab::ops::set_mined::SetMinedRequest;
 use teraslab::redo::RedoLog;
 use teraslab::segment_allocator::SegmentAllocator;
 
@@ -217,6 +218,198 @@ fn backup_then_restore_round_trips_device_and_records() {
         "empty backup tail must replay nothing, got {} entries",
         entries.len()
     );
+}
+
+#[test]
+fn backup_restore_recovers_mined_state() {
+    // P0 regression: online backup must snapshot the authoritative in-RAM
+    // MinedIndex so a restored node can recover acknowledged mined-state.
+    //
+    // Post-Task-16d `set_mined` performs ZERO device writes and (via the direct
+    // path) writes no redo — mined-state lives ONLY in the in-RAM MinedIndex and
+    // its `.mined` checkpoint snapshot. If the backup captures the primary index
+    // snapshot but not the `.mined` companion, restore lays down a primary
+    // snapshot with NO `.mined` sibling. Boot's `recover_mined_index` then sees
+    // `checkpoint_ever_taken == true` (primary snapshot present) with an absent
+    // `.mined` and FATALs — every restore is unbootable, and the acknowledged
+    // mined-state is gone. This test drives the REAL boot recovery over the
+    // restored artifacts and asserts the mined record comes back MINED.
+
+    // --- Source: segment engine over a file device; write records, mine one.
+    let src_dir = TempDir::new().unwrap();
+    let config = source_config(src_dir.path());
+    let dev_path = config.device_paths[0].clone();
+
+    let dev: Arc<dyn BlockDevice> =
+        Arc::new(DirectDevice::open(&dev_path, DEVICE_SIZE, ALIGN).unwrap());
+    let seg = SegmentAllocator::new(dev.clone(), SEG).unwrap();
+    let engine = Engine::new(
+        dev.clone(),
+        Index::new(256).unwrap(),
+        seg,
+        StripedLocks::new(256),
+        DahIndex::new(),
+    );
+
+    let mut txids = Vec::new();
+    for i in 1..=4u64 {
+        txids.push(write_record(&engine, i));
+    }
+    // Mine record #1 on the longest chain. This mutates ONLY the in-RAM
+    // MinedIndex (no device write, no redo) — the exact state the backup must
+    // capture via the `.mined` snapshot.
+    let mined_key = TxKey { txid: txids[0] };
+    const MINED_BLOCK_ID: u32 = 7;
+    const MINED_BLOCK_HEIGHT: u32 = 100;
+    const MINED_SUBTREE_IDX: u32 = 3;
+    engine
+        .set_mined(&SetMinedRequest {
+            tx_key: mined_key,
+            block_id: MINED_BLOCK_ID,
+            block_height: MINED_BLOCK_HEIGHT,
+            subtree_idx: MINED_SUBTREE_IDX,
+            current_block_height: 1000,
+            block_height_retention: 288,
+            on_longest_chain: true,
+            unset_mined: false,
+        })
+        .expect("set_mined should succeed");
+    // Sanity: the source really holds the mined-state only in RAM.
+    let (src_blocks, src_unmined) = engine
+        .mined_block_entries(&mined_key)
+        .expect("source mined-state present");
+    assert_eq!(
+        src_unmined, 0,
+        "source record is mined on the longest chain"
+    );
+    assert_eq!(
+        src_blocks.iter().map(|b| b.block_id).collect::<Vec<_>>(),
+        vec![MINED_BLOCK_ID],
+        "source record carries the mined block",
+    );
+
+    engine.persist_allocator().unwrap();
+    dev.sync().unwrap();
+
+    // --- Online backup.
+    let backup_root = TempDir::new().unwrap();
+    let target = backup_root.path().join("bk");
+    let params = BackupParams {
+        throttle_bytes_per_sec: 0,
+        min_headroom_segments: 1,
+        abort_headroom_segments: 0,
+        ..BackupParams::default()
+    };
+    let cancel = AtomicBool::new(false);
+    let progress = Mutex::new(BackupProgress::default());
+    let blob_pause = AtomicBool::new(false);
+    run_backup(
+        &engine,
+        &blob_pause,
+        &config,
+        &params,
+        &target,
+        &cancel,
+        &progress,
+    )
+    .expect("backup should succeed");
+
+    drop(engine);
+    drop(dev);
+
+    // --- Restore into a FRESH set of files.
+    let restore_dir = TempDir::new().unwrap();
+    let mut rconfig = config.clone();
+    rconfig.device_paths = vec![restore_dir.path().join("data.dat")];
+    rconfig.redo_log_path = Some(restore_dir.path().join("data.dat.redo"));
+    rconfig.index_snapshot_path = restore_dir.path().join("data.dat.snap");
+
+    restore(&target, &rconfig).expect("restore should succeed");
+
+    // Manifest checksums must still verify (covers the new `.mined` file).
+    Manifest::read(&target)
+        .unwrap()
+        .verify_checksums(&target)
+        .expect("backup checksums verify");
+
+    // --- Reconstruct the store exactly as boot does, then run the REAL
+    //     mined-index recovery over the restored primary + `.mined` snapshots
+    //     and the restored fabricated redo tail.
+    let rdev: Arc<dyn BlockDevice> =
+        Arc::new(DirectDevice::open(&rconfig.device_paths[0], DEVICE_SIZE, ALIGN).unwrap());
+    let ralloc = SegmentAllocator::recover(rdev.clone()).expect("recover allocator from header");
+    let (rindex, rdah, _flags) =
+        ShardedIndex::restore_all(&rconfig.resolved_index_snapshot_path(), 1)
+            .expect("restore index snapshot");
+    let rengine =
+        Engine::new_with_sharded_index(rdev.clone(), rindex, ralloc, StripedLocks::new(256), rdah);
+
+    let redo_dev: Arc<dyn BlockDevice> = Arc::new(
+        DirectDevice::open(
+            &rconfig.resolved_redo_log_path(),
+            config.redo_log_size,
+            ALIGN,
+        )
+        .unwrap(),
+    );
+    let rlog = Arc::new(Mutex::new(
+        RedoLog::open(redo_dev, 0, config.redo_log_size).unwrap(),
+    ));
+
+    let primary_snapshot_path = rconfig.resolved_index_snapshot_path();
+    let mined_snapshot_path =
+        teraslab::checkpoint::mined_index_snapshot_path(&primary_snapshot_path);
+    let used_snapshot = rengine
+        .recover_mined_index(
+            &primary_snapshot_path,
+            &mined_snapshot_path,
+            std::slice::from_ref(&rlog),
+        )
+        .expect(
+            "mined-index recovery must succeed after restore: the backup must install a \
+             `.mined` companion so a present primary snapshot is not FATAL",
+        );
+    assert!(
+        used_snapshot,
+        "restore installs a checkpoint-style primary snapshot, so recovery must take the \
+         snapshot+redo-tail path (true), not the fresh-boot full replay",
+    );
+
+    // --- The record must come back MINED with the exact block tuple.
+    let (blocks, unmined_since) = rengine
+        .mined_block_entries(&mined_key)
+        .expect("mined record must be recoverable after restore");
+    assert_eq!(
+        unmined_since, 0,
+        "recovered record must be mined on the longest chain (unmined_since == 0)",
+    );
+    assert_eq!(
+        blocks.len(),
+        1,
+        "recovered record carries exactly one block"
+    );
+    let block_ids: Vec<u32> = blocks.iter().map(|b| b.block_id).collect();
+    let block_heights: Vec<u32> = blocks.iter().map(|b| b.block_height).collect();
+    let subtree_idxs: Vec<u32> = blocks.iter().map(|b| b.subtree_idx).collect();
+    assert_eq!(block_ids, vec![MINED_BLOCK_ID], "recovered block_id");
+    assert_eq!(
+        block_heights,
+        vec![MINED_BLOCK_HEIGHT],
+        "recovered block_height"
+    );
+    assert_eq!(
+        subtree_idxs,
+        vec![MINED_SUBTREE_IDX],
+        "recovered subtree_idx"
+    );
+
+    // The other records restore as UNMINED (present, no block entries).
+    for txid in &txids[1..] {
+        let (b, _u) = rengine
+            .mined_block_entries(&TxKey { txid: *txid })
+            .expect("non-mined record must still be present after restore");
+        assert!(b.is_empty(), "un-mined record must carry no block entries");
+    }
 }
 
 #[test]

@@ -265,11 +265,29 @@ fn run_backup_impl(
         p.fence = Some(fence);
     }
 
-    // 4. Backup-owned index snapshot.
+    // 4. Backup-owned index snapshot: the primary/DAH index AND the
+    //    authoritative in-RAM MinedIndex. Post-Task-16d `set_mined` writes zero
+    //    device bytes and (via its batch WAL) only a redo record, so mined-state
+    //    lives ONLY in RAM + this `.mined` snapshot + the fenced redo tail. The
+    //    `.mined` is fence-stamped with the SAME `fence` sampled under the
+    //    visibility guard at step 3 (and stamped on the fabricated redo region
+    //    below), so restore replays the tail STRICTLY ABOVE it — exactly the
+    //    contract `checkpoint::perform_checkpoint_inner` uses when it stamps
+    //    `snapshot_fence_sequence` into both its `.mined` and its redo fence.
+    //    Both snapshots are taken live (fuzzy) at this same point; a mutation
+    //    captured by the fuzzy scan but landing above the fence is folded into
+    //    `.mined` AND replayed from the teed tail — `recover_mined_index`'s
+    //    idempotent above-fence replay reconciles the overlap.
     set_state(progress, BackupState::Snapshotting);
+    let index_snapshot_path = target_dir.join("teraslab-index.snap");
     engine
-        .snapshot_index(&target_dir.join("teraslab-index.snap"))
+        .snapshot_index(&index_snapshot_path)
         .map_err(|e| BackupError::Index(e.to_string()))?;
+    let mined_index_snapshot_path =
+        crate::checkpoint::mined_index_snapshot_path(&index_snapshot_path);
+    engine
+        .snapshot_mined_index_by_key(&mined_index_snapshot_path, fence)
+        .map_err(BackupError::Io)?;
 
     // 5. Copy sealed + growing segments — STREAMED straight to each store's
     //    image file so the whole live-data set is never held in RAM (only one
@@ -497,6 +515,17 @@ fn run_backup_impl(
             std::fs::read(target_dir.join(&index_snapshot_file)).map_err(BackupError::Io)?;
         sha256_hex(&bytes)
     };
+    // The MinedIndex snapshot lives beside the primary snapshot under the same
+    // `.mined` sibling convention restore/boot derive it by.
+    let mined_index_snapshot_file = mined_index_snapshot_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("teraslab-index.snap.mined")
+        .to_string();
+    let mined_index_sha256 = {
+        let bytes = std::fs::read(&mined_index_snapshot_path).map_err(BackupError::Io)?;
+        sha256_hex(&bytes)
+    };
     let manifest = Manifest {
         manifest_version: MANIFEST_VERSION,
         teraslab_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -515,6 +544,8 @@ fn run_backup_impl(
         stores,
         index_snapshot_file,
         index_snapshot_sha256,
+        mined_index_snapshot_file,
+        mined_index_sha256,
         blobs,
     };
     manifest.write(target_dir)?;
