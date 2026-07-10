@@ -7574,6 +7574,20 @@ impl Engine {
     /// 4. Return the region to the allocator (after the primary-index removal,
     ///    so no `lookup(key)` can reach the post-free offset — F-G2-001).
     fn delete_inner(&self, req: &DeleteRequest) -> Result<(), SpendError> {
+        // P0-11 follow-up: a write-unhealthy (poisoned) node must not PRUNE. The
+        // internal DAH sweep journals no redo, so poisoning the redo log does not
+        // by itself fence it; refuse the guarded sweep delete (`due_guard` set)
+        // while unhealthy so a torn record left by `unspend`'s failed-revert
+        // fallback cannot be swept before a restart's recovery recomputes the
+        // counter and heals it. Explicit client deletes (`due_guard == None`) are
+        // not this data-loss vector and are left unchanged.
+        if req.due_guard.is_some() && !self.write_healthy() {
+            return Err(SpendError::StorageError {
+                detail:
+                    "node write-unhealthy (redo log poisoned); sweep-delete refused (fail-closed)"
+                        .to_string(),
+            });
+        }
         let _guard = self.locks.lock(&req.tx_key);
 
         // G-4: a backend read error must not collapse to "absent".
@@ -12594,6 +12608,75 @@ mod tests {
         assert!(
             !h.engine.is_due_for_sweep(&h.key, 1500),
             "device fields say due, but the MinedIndex says unmined → must be retained",
+        );
+    }
+
+    /// P0-11 follow-up: a poisoned (write-unhealthy) node must NOT prune/sweep.
+    /// The internal DAH sweep journals no redo, so poisoning the redo log alone
+    /// does not fence it; without an explicit gate a poisoned node (e.g. after
+    /// `unspend`'s failed-revert fallback) could still sweep a torn record before
+    /// a restart's recovery heals it. The gate refuses the guarded
+    /// (`due_guard == Some`) delete while the node is write-unhealthy.
+    #[test]
+    fn poisoned_node_refuses_sweep_delete() {
+        // A genuinely due-for-sweep record: all-spent + mined + on-longest-chain
+        // + a DAH entry at/under the sweep height.
+        let h = TestHarness::with_metadata(1, TxFlags::empty(), |m| {
+            m.spent_utxos = 1; // all-spent
+        });
+        h.add_mined_block(9, 1000, 0); // mined, on longest chain (unmined_since == 0)
+        h.engine.dah_index().insert(1000, h.key, None).unwrap();
+        let sweep_height = 2000;
+        assert!(
+            h.engine.is_due_for_sweep(&h.key, sweep_height),
+            "precondition: the record must be genuinely due for sweep",
+        );
+
+        // Attach a redo log and poison it → the node is write-unhealthy.
+        let log_dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
+        let log = Arc::new(parking_lot::Mutex::new(
+            crate::redo::RedoLog::open(log_dev, 0, 1024 * 1024).unwrap(),
+        ));
+        h.engine.set_redo_logs(vec![log.clone()]);
+        assert!(h.engine.write_healthy(), "healthy before poison");
+        log.lock().poison();
+        assert!(!h.engine.write_healthy(), "poisoned → unhealthy");
+
+        // The guarded sweep-delete must be refused and the record retained — a
+        // poisoned node must not destroy a record whose counter/slot split may be
+        // mid-heal.
+        let del = h.engine.prune_delete(&DeleteRequest {
+            tx_key: h.key,
+            due_guard: Some(sweep_height),
+        });
+        assert!(
+            matches!(del, Err(SpendError::StorageError { .. })),
+            "poisoned sweep-delete must be refused, got {del:?}",
+        );
+        assert!(
+            h.engine.lookup(&h.key).is_some(),
+            "the record must survive a sweep attempt on a poisoned node",
+        );
+
+        // Control: a healthy node (no redo log attached → write-healthy) still
+        // sweeps the same genuinely-due record, proving the gate is the
+        // differentiator, not the due-ness check.
+        let h2 = TestHarness::with_metadata(1, TxFlags::empty(), |m| {
+            m.spent_utxos = 1;
+        });
+        h2.add_mined_block(9, 1000, 0);
+        h2.engine.dah_index().insert(1000, h2.key, None).unwrap();
+        assert!(h2.engine.write_healthy(), "no redo log → write-healthy");
+        assert!(h2.engine.is_due_for_sweep(&h2.key, sweep_height));
+        h2.engine
+            .prune_delete(&DeleteRequest {
+                tx_key: h2.key,
+                due_guard: Some(sweep_height),
+            })
+            .expect("healthy node sweeps the due record");
+        assert!(
+            h2.engine.lookup(&h2.key).is_none(),
+            "healthy node must delete the due record",
         );
     }
 
