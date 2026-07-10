@@ -2155,11 +2155,6 @@ fn main() {
         device,
         cluster,
         otlp_provider,
-        // F-G10-003: hold the redo log so we can flush it on shutdown
-        // before `device.sync()`. Defense-in-depth: per-op fsync is the
-        // primary durability guarantee; this just ensures any tail buffer
-        // is on disk before we tear down.
-        redo_log: redo_log.clone(),
         // F-G10-022: take ownership of background-thread join handles so
         // `run()` can join them after the shutdown flag is set but before
         // `device.sync()`. Pre-fix these were `_`-prefixed bindings that
@@ -2207,9 +2202,6 @@ struct ServerWithShutdown {
     /// OTLP provider, present when `[observability].otlp_endpoint` was
     /// configured. Flushed with a 5 s timeout on graceful shutdown.
     otlp_provider: Option<teraslab::observability::OtelTracerProvider>,
-    /// Redo log handle, held so `run()` can flush it on shutdown ahead of
-    /// `device.sync()`. See F-G10-003.
-    redo_log: Option<Arc<Mutex<RedoLog>>>,
     /// Join handle for the redo-log checkpoint thread. See F-G10-022.
     checkpoint_handle: Mutex<Option<std::thread::JoinHandle<()>>>,
     /// Join handle for the periodic blob-GC sweep thread. See F-G10-022.
@@ -2292,15 +2284,18 @@ impl ServerWithShutdown {
             Err(e) => tracing::warn!(err = %e, "replication intent tracker flush failed"),
         }
 
-        // F-G10-003: flush the redo log before syncing the data device.
-        // Per-op fsync in the hot path is the primary durability guarantee;
-        // this just makes sure the tail buffer (if any) is on disk before
-        // the next-restart redo scan reads it.
-        if let Some(ref log) = self.redo_log {
-            match log.lock().flush() {
-                Ok(()) => tracing::info!("redo log flushed"),
-                Err(e) => tracing::warn!(err = %e, "redo log flush failed"),
-            }
+        // F-G10-003 / P1-22: flush EVERY store's redo log before syncing the
+        // data device — not just store 0. This runs post-drain (after
+        // `self.inner.run()` returned and the background flusher joined above),
+        // so any buffered mutation acked during the connection-drain window is
+        // captured here. `self.redo_log` is only store 0's handle
+        // (server.rs:1190-1195); flushing it alone silently dropped drain-window
+        // acks routed to stores 1..N on a clean shutdown, contradicting the
+        // "graceful stop loses nothing" contract. `flush_all_redo` fsyncs every
+        // per-store committer.
+        match self.engine.flush_all_redo() {
+            Ok(()) => tracing::info!("all redo logs flushed"),
+            Err(e) => tracing::warn!(err = %e, "redo log flush failed"),
         }
 
         // Sync device
