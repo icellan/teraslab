@@ -3818,9 +3818,17 @@ impl Engine {
                     if let Err(revert_err) =
                         self.write_slot_fast(device_id, record_offset, req.offset, &slot)
                     {
-                        // The device cannot even take the revert: fail-stop so a
-                        // restart's counter recompute (recovery B-4) heals the
-                        // split before any sweep can delete the record.
+                        // The device cannot even take the revert (device fully
+                        // dead). Fail-stop: poisoning fails the node's liveness
+                        // probe so the orchestrator restarts it, and recovery's
+                        // B-4 counter recompute then heals the split. NOTE: poison
+                        // does NOT synchronously fence the internal DAH sweep
+                        // (deletes journal no redo, so a poisoned log does not
+                        // reject them), so in this doubly-degenerate case a sweep
+                        // RPC could still fire before the probe reacts; adding a
+                        // write-health gate on the delete/sweep path is tracked
+                        // as a follow-up. Strictly better than the pre-fix silent
+                        // torn state regardless.
                         self.poison_all_redo_logs();
                         return Err(SpendError::StorageError {
                             detail: format!(
