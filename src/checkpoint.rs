@@ -2211,12 +2211,15 @@ mod tests {
         assert_eq!(unmined2_after, 0, "tx2 is now mined on the longest chain");
     }
 
-    /// Task 16d: the device-scan fallback is GONE. When a checkpoint HAS run
-    /// (a primary-index snapshot exists) but the `.mined` section is absent,
-    /// recovery must NOT silently rebuild from the device (which is stale
-    /// for any post-16d setMined) — it must fail closed.
+    /// Task 16d + P1-21: the device-scan fallback is GONE. When a checkpoint
+    /// has RECLAIMED a redo prefix (redo fence > 0) but the `.mined` section is
+    /// absent, the redo tail is INCOMPLETE (the reclaimed prefix's mined-state
+    /// lived only in the missing snapshot), so recovery must fail closed — NOT
+    /// silently rebuild from the (post-16d stale) device. (A primary snapshot
+    /// alone with an UNFENCED redo — e.g. a graceful shutdown — is instead
+    /// recoverable via full replay; see the sibling `..._full_replays...` test.)
     #[test]
-    fn recovery_without_mined_snapshot_is_fatal_when_checkpoint_exists() {
+    fn recovery_without_mined_snapshot_is_fatal_when_redo_prefix_reclaimed() {
         use crate::ops::set_mined::SetMinedRequest;
 
         let dir = tempfile::tempdir().unwrap();
@@ -2273,21 +2276,28 @@ mod tests {
         );
 
         let redo_dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(64 * 1024, 4096).unwrap());
-        let redo = RedoLog::open(redo_dev, 0, 64 * 1024).unwrap();
+        let redo = Arc::new(Mutex::new(RedoLog::open(redo_dev, 0, 64 * 1024).unwrap()));
+        // P1-21: simulate a checkpoint having RECLAIMED a redo prefix (fence > 0).
+        // With the reclaimed prefix gone AND the `.mined` snapshot that held its
+        // mined-state absent, the tail is incomplete → recovery must fail closed.
+        redo.lock().set_fence(1).unwrap();
 
         let mut alloc2: crate::allocator::BoxedAllocator =
             Box::new(SlotAllocator::recover(dev.clone()).expect("allocator header durable"));
         let (restored_index, dah2, _flags) = crate::index::ShardedIndex::restore_all(&snap_path, 1)
             .expect("primary snapshot must restore");
         let mut dah_b = crate::index::DahBackend::from(dah2);
-        crate::recovery::recover_all_with_allocator(
-            &*dev,
-            &redo,
-            &restored_index,
-            &mut dah_b,
-            Some(&mut alloc2),
-        )
-        .expect("primary/device recovery must succeed");
+        {
+            let guard = redo.lock();
+            crate::recovery::recover_all_with_allocator(
+                &*dev,
+                &guard,
+                &restored_index,
+                &mut dah_b,
+                Some(&mut alloc2),
+            )
+            .expect("primary/device recovery must succeed");
+        }
 
         let engine2 = Engine::new_with_sharded_index(
             dev.clone(),
@@ -2298,14 +2308,144 @@ mod tests {
         );
 
         let err = engine2
-            .recover_mined_index(&snap_path, &mined_snap_path, &[])
+            .recover_mined_index(&snap_path, &mined_snap_path, std::slice::from_ref(&redo))
             .expect_err(
-                "an existing primary checkpoint with a missing `.mined` section must be FATAL, \
-                 not silently device-rebuilt",
+                "a reclaimed redo prefix (fence > 0) with a missing `.mined` section must be \
+                 FATAL, not silently device-rebuilt",
             );
         assert!(
             matches!(err, SpendError::StorageError { .. }),
             "expected StorageError, got {err:?}"
+        );
+    }
+
+    /// P1-21: a graceful shutdown writes the primary-index snapshot but NOT the
+    /// `.mined` sibling (only a checkpoint writes that). On a node that never
+    /// checkpointed, the redo fence is still 0, so the ENTIRE mined-state is in
+    /// the redo tail and a full replay reconstructs it. Recovery must therefore
+    /// full-replay (not the FATAL branch) even though the primary snapshot
+    /// exists. The old `!primary_snapshot.exists()` gate wrongly bricked boot.
+    #[test]
+    fn recovery_without_mined_snapshot_full_replays_when_redo_unfenced() {
+        use crate::ops::set_mined::SetMinedRequest;
+
+        let dir = tempfile::tempdir().unwrap();
+        let snap_path = dir.path().join("graceful-shutdown.snap");
+        let mined_snap_path = mined_index_snapshot_path(&snap_path);
+
+        let dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(8 * 1024 * 1024, 4096).unwrap());
+        let alloc = SlotAllocator::new(dev.clone()).unwrap();
+        let index = Index::new(128).unwrap();
+        let engine = Engine::new(
+            dev.clone(),
+            index,
+            alloc,
+            StripedLocks::new(16),
+            DahIndex::new(),
+        );
+
+        // UNFENCED redo (fence 0) carrying the full mined-state history, exactly
+        // as a never-checkpointed node's redo does. Journalled WAL-first,
+        // mirroring dispatch (set_mined_inner writes no redo itself).
+        let redo_dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(64 * 1024, 4096).unwrap());
+        let redo = Arc::new(Mutex::new(RedoLog::open(redo_dev, 0, 64 * 1024).unwrap()));
+
+        let key = crate::index::TxKey { txid: [21u8; 32] };
+        let hash = [[0xEEu8; 32]];
+        engine
+            .create(&mined_test_create_req(key.txid, &hash))
+            .unwrap();
+        let entry = engine.lookup(&key).expect("create registers the entry");
+        redo.lock()
+            .append_and_flush(RedoOp::CreateV2 {
+                tx_key: key,
+                device_id: entry.device_id,
+                record_offset: entry.record_offset,
+                utxo_count: 1,
+                is_conflicting: false,
+                parent_txids: Vec::new(),
+            })
+            .unwrap();
+        engine
+            .set_mined(&SetMinedRequest {
+                tx_key: key,
+                block_id: 77,
+                block_height: 9,
+                subtree_idx: 0,
+                current_block_height: 9,
+                block_height_retention: 100_000,
+                on_longest_chain: true,
+                unset_mined: false,
+            })
+            .unwrap();
+        redo.lock()
+            .append_and_flush(RedoOp::SetMinedBatch {
+                block_id: 77,
+                block_height: 9,
+                subtree_idx: 0,
+                on_longest_chain: true,
+                current_block_height: 9,
+                block_height_retention: 100_000,
+                unset: false,
+                txids: vec![key],
+            })
+            .unwrap();
+
+        // Graceful shutdown: write the primary snapshot (NO `.mined` sibling).
+        engine
+            .snapshot_index(&snap_path)
+            .expect("primary snapshot must succeed");
+        engine
+            .persist_allocator()
+            .expect("allocator header must persist");
+        assert!(
+            snap_path.exists(),
+            "graceful shutdown wrote the primary snapshot"
+        );
+        assert!(
+            !mined_snap_path.exists(),
+            "graceful shutdown wrote NO .mined snapshot",
+        );
+        assert_eq!(
+            redo.lock().recovery_fence(),
+            0,
+            "never-checkpointed node: the redo fence is still 0",
+        );
+
+        // Restart: reconstruct the primary index, then recover the mined index.
+        let recovered_alloc = SlotAllocator::recover(dev.clone()).unwrap();
+        let (restored_index, dah2, _flags) = crate::index::ShardedIndex::restore_all(&snap_path, 1)
+            .expect("primary snapshot must restore");
+        let engine2 = Engine::new_with_sharded_index(
+            dev.clone(),
+            restored_index,
+            recovered_alloc,
+            StripedLocks::new(16),
+            crate::index::DahBackend::from(dah2),
+        );
+
+        let used_snapshot = engine2
+            .recover_mined_index(&snap_path, &mined_snap_path, std::slice::from_ref(&redo))
+            .expect("unfenced redo → full replay reconstructs mined-state, NOT fatal");
+        assert!(
+            !used_snapshot,
+            "no .mined snapshot → recovery reports the full-replay path",
+        );
+
+        let e = engine2.lookup(&key).expect("tx must still be indexed");
+        assert_ne!(
+            e.mined_slot,
+            crate::index::mined_index::NO_MINED_SLOT,
+            "full replay must allocate a mined_slot via the CreateV2 entry",
+        );
+        let (blocks, unmined_since) = engine2
+            .mined_index()
+            .read_block_entries(&key, e.mined_slot)
+            .expect("mined slot must carry the replayed block entry");
+        assert_eq!(unmined_since, 0, "replayed as on the longest chain");
+        assert!(
+            blocks.iter().any(|b| b.block_id == 77),
+            "the SetMinedBatch block (77) must be reconstructed by the full replay",
         );
     }
 

@@ -8994,17 +8994,32 @@ impl Engine {
         mined_snapshot_path: &std::path::Path,
         redo_logs: &[Arc<parking_lot::Mutex<crate::redo::RedoLog>>],
     ) -> Result<bool, SpendError> {
-        let checkpoint_ever_taken = primary_snapshot_path.exists();
+        let primary_snapshot_exists = primary_snapshot_path.exists();
+        // P1-21: the redo fence — the highest sequence whose prefix has been
+        // reclaimed. `0` means NOTHING was reclaimed, so a full redo-tail replay
+        // from genesis is provably COMPLETE. `primary_snapshot_path.exists()` is
+        // NOT a reliable "a checkpoint ran" proxy: a graceful shutdown writes the
+        // primary snapshot WITHOUT the `.mined` sibling (only the checkpoint
+        // writes that), so on a node that never checkpointed the old
+        // `!checkpoint_ever_taken` gate tripped the FATAL branch and refused to
+        // boot. Gate the full-replay path on the fence, not the primary snapshot.
+        let redo_fence = redo_logs
+            .iter()
+            .map(|l| l.lock().recovery_fence())
+            .max()
+            .unwrap_or(0);
 
         let bytes = match std::fs::read(mined_snapshot_path) {
             Ok(b) => b,
             Err(e) => {
-                if !checkpoint_ever_taken {
+                if redo_fence == 0 {
                     tracing::info!(
                         path = %mined_snapshot_path.display(),
                         err = %e,
-                        "mined-index recovery: fresh boot (no checkpoint has ever run); \
-                         reconstructing the MinedIndex via full redo-tail replay from genesis",
+                        primary_snapshot_exists,
+                        "mined-index recovery: no redo prefix has been reclaimed (fence 0); \
+                         reconstructing the MinedIndex via full redo-tail replay from genesis \
+                         (fresh boot or a graceful shutdown that wrote no .mined snapshot)",
                     );
                     self.mined_index.clear();
                     self.replay_mined_index_redo_tail(redo_logs)?;
@@ -9013,16 +9028,17 @@ impl Engine {
                 tracing::error!(
                     path = %mined_snapshot_path.display(),
                     err = %e,
-                    "FATAL: mined-index snapshot section absent despite an existing \
-                     primary-index checkpoint — the device-scan fallback was removed (Task \
-                     16d); recovery cannot safely reconstruct mined-state",
+                    redo_fence,
+                    "FATAL: mined-index snapshot section absent and a redo prefix has been \
+                     reclaimed (fence > 0), so the redo tail is incomplete — recovery cannot \
+                     safely reconstruct mined-state (Task 16d removed the device-scan fallback)",
                 );
                 return Err(SpendError::StorageError {
                     detail: format!(
-                        "mined-index recovery: snapshot section absent at {} despite an \
-                         existing primary-index checkpoint at {}: {e}",
+                        "mined-index recovery: snapshot section absent at {} with redo fence {} \
+                         (a reclaimed prefix makes the tail incomplete): {e}",
                         mined_snapshot_path.display(),
-                        primary_snapshot_path.display()
+                        redo_fence,
                     ),
                 });
             }

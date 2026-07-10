@@ -4496,6 +4496,17 @@ impl RedoLog {
         }
     }
 
+    /// The durable recovery fence: the highest sequence whose redo prefix has
+    /// been reclaimed (`checkpoint_seq`). `0` means NOTHING has been reclaimed,
+    /// so the entire log from genesis is still present and a full redo-tail
+    /// replay is provably complete. Set from the header at open and advanced by
+    /// [`Self::checkpoint_reclaim`]. Used by mined-index recovery (P1-21) to
+    /// tell "never fenced → full replay is safe" from "fenced → the reclaimed
+    /// prefix is gone, so a missing snapshot is fatal".
+    pub fn recovery_fence(&self) -> u64 {
+        self.checkpoint_seq
+    }
+
     /// The sequence number of the earliest available entry in the log.
     ///
     /// Returns `Ok(Some(seq))` if the log contains at least one entry,
