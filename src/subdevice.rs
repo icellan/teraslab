@@ -47,6 +47,35 @@ struct BarrierState {
     /// if it succeeded. Followers report the outcome of the barrier they
     /// coalesced onto via this field (the error object itself is not `Clone`).
     last_err: Option<String>,
+    /// Highest [`epoch`](Self::epoch) whose sync FAILED. Monotonic: only ever
+    /// raised, when a sync returns `Err`. A later successful sync clears
+    /// [`last_err`](Self::last_err) but NOT this, so a follower whose qualifying
+    /// generation failed can never be masked by a subsequent success (P0-10).
+    last_failed_epoch: u64,
+}
+
+impl BarrierState {
+    /// Outcome to report to a follower that has reached its `target` generation
+    /// (i.e. `epoch >= target`).
+    ///
+    /// Returns `Err` iff some generation at or after `target` failed
+    /// (`last_failed_epoch >= target`) — the follower's write may not have
+    /// reached stable storage. A failed qualifying generation is reported even
+    /// after a later successful sync cleared [`last_err`](Self::last_err),
+    /// because that later success cannot be trusted to have re-flushed pages a
+    /// failed fsync may have already dropped. Reporting is conservative in the
+    /// safe direction: a strictly-later failure (covering only writes that
+    /// arrived after this follower's sync) still trips it, never the reverse.
+    fn follower_outcome(&self, target: u64) -> Result<()> {
+        if self.last_failed_epoch >= target {
+            return Err(coalesced_barrier_error(
+                self.last_err
+                    .as_deref()
+                    .unwrap_or("qualifying sync generation failed"),
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl PhysicalBarrier {
@@ -58,6 +87,7 @@ impl PhysicalBarrier {
                 epoch: 0,
                 leader_busy: false,
                 last_err: None,
+                last_failed_epoch: 0,
             }),
             cond: Condvar::new(),
         })
@@ -90,13 +120,11 @@ impl PhysicalBarrier {
         let target = st.epoch + if st.leader_busy { 2 } else { 1 };
         loop {
             if st.epoch >= target {
-                // A qualifying sync completed. `last_err` reflects the latest
-                // completed sync: if it succeeded, everything pending (incl.
-                // ours) was flushed; if it failed, report failure conservatively.
-                return match &st.last_err {
-                    None => Ok(()),
-                    Some(msg) => Err(coalesced_barrier_error(msg)),
-                };
+                // A qualifying sync completed. Report from `last_failed_epoch`,
+                // NOT the volatile `last_err`: a failure at or after our target
+                // must surface even if a later success has since cleared
+                // `last_err`, or we would ack durability we never achieved.
+                return st.follower_outcome(target);
             }
             if !st.leader_busy {
                 // Become the leader for the next generation.
@@ -106,6 +134,11 @@ impl PhysicalBarrier {
                 let mut st2 = self.state.lock();
                 st2.epoch += 1;
                 st2.last_err = res.as_ref().err().map(|e| e.to_string());
+                if res.is_err() {
+                    // Remember the failed generation so a later success cannot
+                    // mask it for a follower still coalesced onto this one.
+                    st2.last_failed_epoch = st2.epoch;
+                }
                 st2.leader_busy = false;
                 self.cond.notify_all();
                 // The sync we just ran is, by construction, the qualifying one
@@ -708,5 +741,82 @@ mod tests {
             results.iter().all(|&is_err| is_err),
             "a caller saw success on a failing device"
         );
+    }
+
+    // REGRESSION (P0-10): a follower whose qualifying sync generation FAILED
+    // must observe failure even after a LATER successful sync has cleared
+    // `last_err`. The masking window is a lock-starved follower that reads the
+    // barrier state only after a subsequent generation succeeded; a live-thread
+    // repro is impractical (parking_lot's eventual fairness bounds starvation),
+    // but the durability hole is real, so we pin the invariant at the exact
+    // decision point the barrier uses to report a follower's outcome.
+    //
+    // The buggy logic reported purely from `last_err`, so the masked state
+    // (`last_err == None`, `last_failed_epoch == 2`) returned Ok — silently
+    // acking durability for a write that was never flushed. The fix consults
+    // `last_failed_epoch`, so a failed generation can never be masked.
+    #[test]
+    fn follower_outcome_reports_a_failed_qualifying_generation_even_after_a_later_success() {
+        // State after: gen 2 FAILED, then gen 3 SUCCEEDED (cleared last_err).
+        let masked = BarrierState {
+            epoch: 3,
+            leader_busy: false,
+            last_err: None,
+            last_failed_epoch: 2,
+        };
+        // A follower whose qualifying generation is 2 (or earlier, ≤ 2) coalesced
+        // onto the failed sync — it MUST see failure despite last_err == None.
+        assert!(
+            masked.follower_outcome(2).is_err(),
+            "gen-2 follower must observe the gen-2 sync failure (was masked by gen-3 success)"
+        );
+        assert!(
+            masked.follower_outcome(1).is_err(),
+            "gen-1 follower is also covered by the ≤2 failure"
+        );
+        // A follower that arrived AFTER the failure healed (qualifying gen 3+)
+        // depends only on the successful generations — it is durable → Ok.
+        assert!(
+            masked.follower_outcome(3).is_ok(),
+            "gen-3 follower's own qualifying sync succeeded"
+        );
+        assert!(
+            masked.follower_outcome(4).is_ok(),
+            "post-heal follower is durable"
+        );
+    }
+
+    // Conservative reporting: a follower is failed by ANY generation at or after
+    // its target. A strictly-later failure (`last_failed_epoch` > target) still
+    // trips it — the safe direction, and it only fires while the device is
+    // actively failing syncs. A clean device (no failures) reports Ok.
+    #[test]
+    fn follower_outcome_is_conservative_at_or_after_target() {
+        let failing = BarrierState {
+            epoch: 5,
+            leader_busy: false,
+            last_err: Some("gen-5 stalled".to_string()),
+            last_failed_epoch: 5,
+        };
+        // Both the gen-5 follower and an earlier gen-3 follower report failure
+        // while the device is failing syncs (conservative, never masks).
+        assert!(
+            failing.follower_outcome(5).is_err(),
+            "gen-5 follower doomed by gen-5"
+        );
+        assert!(
+            failing.follower_outcome(3).is_err(),
+            "gen-3 follower conservatively failed while device is failing (never masked)"
+        );
+
+        // A device that has never failed a sync reports Ok for every follower.
+        let clean = BarrierState {
+            epoch: 9,
+            leader_busy: false,
+            last_err: None,
+            last_failed_epoch: 0,
+        };
+        assert!(clean.follower_outcome(1).is_ok());
+        assert!(clean.follower_outcome(9).is_ok());
     }
 }
