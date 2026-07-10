@@ -1664,14 +1664,16 @@ mod tests {
              is the barrier still held across the snapshot?"
         );
         // Liveness floor: the reader made real forward progress DURING the
-        // checkpoint (a stop-the-world run completes ~1-2 acquisitions — the
-        // one before it blocks on the barrier). The threshold is deliberately
-        // low (not the raw throughput) so a starved CI runner that gives the
-        // reader little CPU cannot flake it, while still catching the
-        // stop-the-world case (~1-2 << 50). The `max_us` bound above is the
-        // primary proof; this guards against the reader never running at all.
+        // checkpoint (a stop-the-world run completes ~1-2 acquisitions — the one
+        // before it blocks on the barrier). The `max_us` bound above is the
+        // PRIMARY, scheduling-robust proof of non-blocking; this is only a weak
+        // "the reader thread actually ran more than a stalled one would" floor.
+        // The threshold is deliberately just above the stop-the-world count so a
+        // severely CPU-starved CI runner (observed as low as ~13 acquisitions on
+        // a contended 2-core macos runner) cannot flake it, while still catching
+        // the stop-the-world case (~1-2 < 5).
         assert!(
-            reads >= 50,
+            reads >= 5,
             "reader made almost no progress during checkpoint: only {reads} guard \
              acquisitions across {ckpt_us}us — stop-the-world, or the reader was never scheduled?"
         );
