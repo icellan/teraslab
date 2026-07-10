@@ -1,0 +1,8 @@
+# Pin the Rust toolchain so CI and local builds use the SAME compiler + clippy.
+# A floating `stable` let a new release (1.96 -> 1.97) silently red CI when
+# clippy 1.97 added lints against pre-existing code. Bump this deliberately when
+# adopting a newer Rust (and re-run `cargo clippy --all-targets -- -D warnings`
+# on both feature sets first). Verified green on 1.97.0.
+[toolchain]
+channel = "1.97.0"
+components = ["rustfmt", "clippy"]
