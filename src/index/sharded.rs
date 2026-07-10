@@ -559,7 +559,7 @@ impl ShardedIndex {
     /// lock is then RELEASED and `process` is invoked with that shard's batch.
     /// This keeps the primary shard lock off the caller's per-entry work (device
     /// reads, secondary-index writes) — the lock discipline
-    /// [`crate::ops::Engine::reconcile_secondaries_from_mined_index`] requires —
+    /// [`crate::ops::engine::Engine::reconcile_secondaries_from_mined_index`] requires —
     /// while never materializing more than one shard's locators at once (the
     /// whole-store `Vec` was an OOM hazard at the multi-billion-record design
     /// point). `process` errors short-circuit the remaining shards.
