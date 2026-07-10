@@ -8212,12 +8212,20 @@ impl Engine {
     /// attribute the third tx's blocks/`all_spent` to this entry's key.
     /// Closed the same way [`Self::read_metadata_for_key`] closes its
     /// identity race: after resolving the authoritative key from the
-    /// footer, a FRESH `self.index.lookup` re-resolves `mined_slot`, and
-    /// the pair is trusted only if that fresh entry still points at the
-    /// SAME `(device_id, record_offset)` this iteration captured and
-    /// carries a live (non-sentinel) `mined_slot`. Otherwise the record has
-    /// moved or gone since pass one and is simply omitted — the same
-    /// fallback coverage as an unreadable footer.
+    /// footer, a FRESH `self.index.lookup` re-resolves `mined_slot` — that
+    /// fresh slot is THIS key's current slot, so it can never be the stale,
+    /// now-reassigned one. The pair is kept whenever the fresh entry carries
+    /// a live (non-sentinel) `mined_slot`; a genuinely deleted / slot-less
+    /// key is omitted, the same fallback coverage as an unreadable footer.
+    /// The captured `(device_id, record_offset)` is deliberately NOT
+    /// re-required to match: the segment storage engine relocates a record
+    /// on spend (the DEFAULT), so a still-live record routinely has a fresh
+    /// entry at a DIFFERENT offset than pass one captured — requiring the
+    /// offset to match dropped every such relocated-but-live record from the
+    /// snapshot (silent mined-state loss, since the checkpoint then fences +
+    /// reclaims the redo holding its `SetMinedBatch`). See
+    /// [`Self::resolve_mined_index_pairs`] for the reused-offset dedup that
+    /// relaxation then requires.
     ///
     /// Written as a SEPARATE file (tempfile + fsync + rename + parent-dir
     /// fsync, mirroring [`ShardedIndex::snapshot_all_concurrent`]) so a
@@ -8304,25 +8312,51 @@ impl Engine {
                 }
             };
             let key = TxKey::from_bytes(meta.tx_id);
-            // Re-resolve against the CURRENT index instead of trusting the
-            // slot captured in the first pass (see the TOCTOU doc above).
+            // Re-resolve against the CURRENT index instead of trusting the slot
+            // captured in the first pass (see the TOCTOU doc above). The fresh
+            // lookup — not the captured `(device_id, offset)` — is authoritative:
+            // it already closes the reused-slot TOCTOU (the fresh `mined_slot` is
+            // the current one for THIS key). The pass-1 `(device_id, offset)` is
+            // deliberately NOT re-required to match: the segment storage engine
+            // relocates a record on spend (the DEFAULT), so a record that is
+            // still live under a live `mined_slot` routinely has a fresh entry at
+            // a DIFFERENT offset than pass 1 captured. Requiring the offset to
+            // match dropped every such relocated-but-live record from `.mined` —
+            // silent data loss, since the checkpoint then fences + reclaims the
+            // redo holding its SetMinedBatch (P0). Keep it whenever it is live
+            // with a valid fresh slot; only a genuinely deleted / slot-less key
+            // hits the `_` arm and is omitted (same as an unreadable footer).
             match self.index.lookup(&key) {
-                Some(fresh)
-                    if fresh.device_id == device_id
-                        && fresh.record_offset == offset
-                        && fresh.mined_slot != crate::index::mined_index::NO_MINED_SLOT =>
-                {
+                Some(fresh) if fresh.mined_slot != crate::index::mined_index::NO_MINED_SLOT => {
                     pairs.push((key, fresh.mined_slot));
                 }
                 _ => {
-                    // Moved (relocated/deleted+recreated) or freed since pass
-                    // one — expected under churn, not an error; omitted the
-                    // same as an unreadable footer.
+                    // Deleted or slot-less since pass one — expected under
+                    // churn, not an error; omitted the same as an unreadable
+                    // footer.
                     skipped += 1;
                 }
             }
         }
-        (pairs, skipped)
+        // Dedup by key (last-write-wins), preserving first-seen order for
+        // determinism. Now that the offset-equality guard is relaxed, a stale
+        // captured offset whose footer still resolves to a key that was ALSO
+        // captured from its fresh offset (a reused-offset TOCTOU) would push the
+        // same key twice. Both copies resolve — via the fresh lookup — to the
+        // SAME current slot, so collapsing to one keeps `.mined` free of
+        // duplicate txid sections.
+        let mut seen: std::collections::HashMap<TxKey, usize> =
+            std::collections::HashMap::with_capacity(pairs.len());
+        let mut deduped: Vec<(TxKey, u32)> = Vec::with_capacity(pairs.len());
+        for (key, slot) in pairs {
+            if let Some(&idx) = seen.get(&key) {
+                deduped[idx].1 = slot;
+            } else {
+                seen.insert(key, deduped.len());
+                deduped.push((key, slot));
+            }
+        }
+        (deduped, skipped)
     }
 
     /// Rebuild the in-memory [`ShardedMinedIndex`] FRESH from a checkpoint's
@@ -9033,19 +9067,19 @@ impl Engine {
     /// since the last checkpoint (absent from the primary index, hence not
     /// visited) are not left orphaned.
     ///
-    /// A record whose device footer is unreadable (torn / relocated mid-scan)
-    /// is SKIPPED with a warning + an [`Self::enumeration_unreadable`] metric
-    /// bump — a single unreadable footer must never brick the boot — mirroring
-    /// [`Self::resolve_full_keys`].
+    /// A record whose device footer is unreadable (torn / relocated mid-scan),
+    /// OR whose live `mined_slot` is absent from the MinedIndex (a
+    /// dangling/desynced slot), is SKIPPED with a warning + an
+    /// [`Self::enumeration_unreadable`] metric bump — a single such record must
+    /// never brick the boot — mirroring [`Self::resolve_full_keys`].
     ///
     /// # Errors
     ///
-    /// Returns [`SpendError::StorageError`] on a primary/MinedIndex desync (a
-    /// live `mined_slot` absent from the MinedIndex) or a secondary-index
-    /// clear/insert failure; [`SpendError::DahOverflow`] if
+    /// Returns [`SpendError::StorageError`] on a secondary-index clear/insert
+    /// failure, or [`SpendError::DahOverflow`] if
     /// `current_block_height + block_height_retention` overflows `u32`. An
-    /// individual record's footer read failure does NOT error — it is skipped
-    /// (see above).
+    /// individual record's footer read failure, or a dangling `mined_slot`,
+    /// does NOT error — it is skipped (see above).
     pub fn reconcile_secondaries_from_mined_index(
         &self,
         current_block_height: u32,
@@ -9109,13 +9143,31 @@ impl Engine {
             {
                 (Vec::new(), 0)
             } else {
-                self.mined_index
-                    .read_block_entries(&key, mined_slot)
-                    .ok_or(SpendError::StorageError {
-                        detail: "mined-index reconcile: mined_slot present in primary index \
-                                     but absent from MinedIndex"
-                            .to_string(),
-                    })?
+                match self.mined_index.read_block_entries(&key, mined_slot) {
+                    Some(v) => v,
+                    None => {
+                        // The primary carries a live `mined_slot` but the
+                        // MinedIndex has no such live slot for this key (a
+                        // dangling/desynced slot — e.g. a record dropped from a
+                        // stale `.mined` snapshot, which Part A now prevents).
+                        // This runs on EVERY boot and `bin/server.rs` FATAL-exits
+                        // on Err, so bricking here would turn ONE lost record into
+                        // an unbootable node. Degrade LOUDLY instead: skip THIS
+                        // record (its mined-state is unrecoverable regardless) and
+                        // keep reconciling the rest.
+                        self.enumeration_unreadable
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        tracing::warn!(
+                            target: "teraslab::engine",
+                            key = ?key,
+                            mined_slot,
+                            "mined-index reconcile: mined_slot present in primary index but \
+                             absent from MinedIndex (dangling slot); skipping this record's \
+                             secondary reconciliation rather than bricking the boot",
+                        );
+                        continue;
+                    }
+                }
             };
             let has_blocks = !entries.is_empty();
 
@@ -11047,6 +11099,137 @@ mod tests {
         assert_eq!(entries.len(), 1, "the one seeded mined block is present");
         let be = entries[0];
         assert_eq!({ be.block_id }, 0x99, "the seeded block_id round-trips");
+    }
+
+    /// P0 (Part B — dangling reconcile slot bricks boot): a primary entry whose
+    /// `mined_slot` is present but ABSENT from the MinedIndex (a lost/dangling
+    /// slot — e.g. the relocated-record loss Part A prevents, or any other
+    /// primary/MinedIndex desync) must NOT brick the boot.
+    /// `reconcile_secondaries_from_mined_index` runs on EVERY boot and
+    /// `bin/server.rs` FATAL-exits if it returns Err, so the pre-fix
+    /// `.ok_or(StorageError)?` on a single dangling slot turned ONE lost record
+    /// into an unbootable node on every boot attempt. The fix degrades a dangling
+    /// slot to a LOUD warn + `enumeration_unreadable` bump + `continue`, so one
+    /// lost record can never brick boot AND the OTHER records still reconcile.
+    #[test]
+    fn reconcile_degrades_dangling_mined_slot_instead_of_bricking() {
+        use crate::index::mined_index::NO_MINED_SLOT;
+        const RETENTION: u32 = 288;
+        const RECOVERY_HEIGHT: u32 = 2000;
+
+        let dev: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let mut alloc = SlotAllocator::new(dev.clone()).unwrap();
+        let mut index = Index::new(64).unwrap();
+
+        // A healthy record (live mined_slot, must still reconcile) and a broken
+        // one (dangling mined_slot, must be skipped) — both with realistic,
+        // full-entropy txids and readable device footers.
+        let ok_txid: [u8; 32] = [
+            0x3a, 0x7b, 0xf2, 0x9c, 0x11, 0x84, 0x6d, 0x0e, 0xa5, 0xc3, 0x58, 0x92, 0xd7, 0x4f,
+            0x1b, 0xe0, 0x66, 0x39, 0xac, 0x02, 0x7e, 0xd1, 0x5c, 0x88, 0x4a, 0x9f, 0x30, 0xb7,
+            0x21, 0xe8, 0x6c, 0x05,
+        ];
+        let bad_txid: [u8; 32] = [
+            0x5c, 0x9f, 0x21, 0xe8, 0x6c, 0x05, 0x4a, 0x30, 0xb7, 0x88, 0xd1, 0x7e, 0x02, 0xac,
+            0x39, 0x66, 0xe0, 0x1b, 0x4f, 0xd7, 0x92, 0x58, 0xc3, 0xa5, 0x0e, 0x6d, 0x84, 0x11,
+            0x9c, 0xf2, 0x7b, 0x3a,
+        ];
+        let ok_key = TxKey { txid: ok_txid };
+        let bad_key = TxKey { txid: bad_txid };
+
+        let make_record = |txid: [u8; 32], alloc: &mut SlotAllocator| -> (TxMetadata, u64) {
+            let mut meta = TxMetadata::new(1);
+            meta.tx_id = txid;
+            meta.spent_utxos = 1; // all-spent
+            meta.unmined_since = 0; // on the longest chain
+            meta.delete_at_height = 0; // setMined-planted → re-derived by the eval
+            let record_size = TxMetadata::record_size_for(1);
+            let offset = alloc.allocate(record_size).unwrap();
+            let slot0 = UtxoSlot::new_spent([txid[0]; 32], [0xAB; 36]);
+            io::write_full_record(&*dev, offset, &meta, &[slot0]).unwrap();
+            (meta, offset)
+        };
+        let (ok_meta, ok_off) = make_record(ok_txid, &mut alloc);
+        let (_bad_meta, bad_off) = make_record(bad_txid, &mut alloc);
+
+        // Slot 4242 is never allocated in the MinedIndex → dangling.
+        const DANGLING_SLOT: u32 = 4242;
+        index
+            .register(
+                ok_key,
+                TxIndexEntry {
+                    device_id: 0,
+                    record_offset: ok_off,
+                    mined_slot: NO_MINED_SLOT,
+                },
+            )
+            .unwrap();
+        index
+            .register(
+                bad_key,
+                TxIndexEntry {
+                    device_id: 0,
+                    record_offset: bad_off,
+                    mined_slot: DANGLING_SLOT,
+                },
+            )
+            .unwrap();
+
+        let engine = Engine::new(
+            dev.clone(),
+            index,
+            alloc,
+            StripedLocks::new(64),
+            DahIndex::new(),
+        );
+
+        // Give the healthy record a real MinedIndex slot and re-point its primary.
+        let ok_slot = seed_mined_index_for_test(&engine, &ok_key, &ok_meta, &[(0x99, 1000, 0)]);
+        engine
+            .index
+            .register(
+                ok_key,
+                TxIndexEntry {
+                    device_id: 0,
+                    record_offset: ok_off,
+                    mined_slot: ok_slot,
+                },
+            )
+            .unwrap();
+
+        // Precondition: the dangling slot really is absent from the MinedIndex.
+        assert!(
+            engine
+                .mined_index()
+                .read_block_entries(&bad_key, DANGLING_SLOT)
+                .is_none(),
+            "test precondition: the broken record's mined_slot must be absent from the MinedIndex",
+        );
+
+        let before = engine.enumeration_unreadable();
+        // Pre-fix: the dangling slot's `.ok_or(StorageError)?` propagates → Err →
+        // FATAL boot brick. Post-fix: warn + metric + continue → Ok.
+        engine
+            .reconcile_secondaries_from_mined_index(RECOVERY_HEIGHT, RETENTION)
+            .expect("a dangling mined_slot must degrade, never brick the boot");
+        assert_eq!(
+            engine.enumeration_unreadable(),
+            before + 1,
+            "the dangling-slot skip must bump the observable enumeration_unreadable metric",
+        );
+        // The dangling record was skipped (no DAH registered)...
+        assert_eq!(
+            engine.dah_index().get_height(&bad_key),
+            None,
+            "the skipped dangling record must not register a DAH",
+        );
+        // ...but the HEALTHY sibling was still fully reconciled.
+        assert_eq!(
+            engine.dah_index().get_height(&ok_key),
+            Some(RECOVERY_HEIGHT + RETENTION),
+            "the healthy record's DAH must still be reconciled despite the sibling skip",
+        );
     }
 
     /// P0 (premature-sweep): `reconcile_secondaries_from_mined_index` re-derives
@@ -19342,6 +19525,133 @@ mod tests {
             block_ids,
             vec![77],
             "the snapshot must carry F's OWN block data, never D's (the aliasing bug)"
+        );
+    }
+
+    /// P0 (Part A — relocated-record loss): `resolve_mined_index_pairs` (pass 2
+    /// of the `.mined` checkpoint snapshot) must KEEP a record that RELOCATED
+    /// between pass 1 (locator capture) and pass 2 (re-resolve). The segment
+    /// storage engine relocates a record on spend (the DEFAULT), so the record's
+    /// fresh primary entry sits at a DIFFERENT `(device_id, record_offset)` than
+    /// pass 1 captured — while still carrying a live `mined_slot`. The pre-fix
+    /// guard required the fresh entry to still match the CAPTURED
+    /// `(device_id, offset)`, so a relocated-but-live record FALSE-armed the `_`
+    /// arm and was SILENTLY OMITTED from `.mined` — data loss: the checkpoint
+    /// then fences + reclaims the redo holding that record's SetMinedBatch, so
+    /// its acked mined-state has no durable copy (boot brick / silent loss).
+    ///
+    /// The fresh `self.index.lookup` already closes the TOCTOU (the fresh slot
+    /// IS authoritative — see the `snapshot_by_key_...` sibling test), so the fix
+    /// drops the offset-equality requirement and keeps the record whenever it is
+    /// live with a valid fresh slot. Also asserts the reused-offset dedup: a
+    /// stale captured offset whose footer still resolves to a key ALSO captured
+    /// from its fresh offset must collapse to a SINGLE pair, never a duplicate.
+    #[test]
+    fn resolve_mined_index_pairs_keeps_relocated_live_record() {
+        use crate::index::mined_index::NO_MINED_SLOT;
+
+        let dev: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let mut alloc = SlotAllocator::new(dev.clone()).unwrap();
+        let mut index = Index::new(64).unwrap();
+
+        // Realistic SHA256-shaped txid (entropy throughout, [16..24] nonzero).
+        let txid: [u8; 32] = [
+            0x9c, 0x14, 0x2b, 0xe7, 0x50, 0x81, 0x3d, 0xa2, 0x66, 0xf0, 0x1a, 0x4c, 0xb9, 0x27,
+            0xde, 0x03, 0x77, 0xc1, 0x88, 0x0e, 0xa4, 0x5f, 0x30, 0x9b, 0x21, 0xe8, 0x6c, 0x05,
+            0x4a, 0x9f, 0xd7, 0x1b,
+        ];
+        let key = TxKey { txid };
+
+        let mut meta = TxMetadata::new(1);
+        meta.tx_id = txid;
+        meta.spent_utxos = 1; // all-spent
+        meta.unmined_since = 0; // on the longest chain
+        meta.delete_at_height = 0;
+        let record_size = TxMetadata::record_size_for(1);
+        let off_old = alloc.allocate(record_size).unwrap();
+        let slot0 = UtxoSlot::new_spent([0x11; 32], [0xAB; 36]);
+        io::write_full_record(&*dev, off_old, &meta, &[slot0]).unwrap();
+        index
+            .register(
+                key,
+                TxIndexEntry {
+                    device_id: 0,
+                    record_offset: off_old,
+                    mined_slot: NO_MINED_SLOT,
+                },
+            )
+            .unwrap();
+
+        let engine = Engine::new(
+            dev.clone(),
+            index,
+            alloc,
+            StripedLocks::new(64),
+            DahIndex::new(),
+        );
+
+        // Give the record a live MinedIndex slot and point the primary at it.
+        let mined_slot = seed_mined_index_for_test(&engine, &key, &meta, &[(0x99, 1000, 0)]);
+        engine
+            .index
+            .register(
+                key,
+                TxIndexEntry {
+                    device_id: 0,
+                    record_offset: off_old,
+                    mined_slot,
+                },
+            )
+            .unwrap();
+
+        // Pass 1 captured the record at its OLD offset.
+        let captured = vec![(0u8, off_old, mined_slot)];
+
+        // RELOCATE (segment-engine relocate-on-spend): write a fresh copy at a
+        // NEW offset and re-point the primary there, keeping the SAME live
+        // `mined_slot`. The OLD offset's footer stays readable (pass 2 reads it).
+        let off_new = engine.allocator().lock().allocate(record_size).unwrap();
+        assert_ne!(
+            off_new, off_old,
+            "relocation must land at a distinct offset"
+        );
+        io::write_full_record(&*dev, off_new, &meta, &[slot0]).unwrap();
+        engine
+            .index
+            .register(
+                key,
+                TxIndexEntry {
+                    device_id: 0,
+                    record_offset: off_new,
+                    mined_slot,
+                },
+            )
+            .unwrap();
+
+        // Pass 2 driven with the STALE pass-1 locator. Pre-fix: the fresh entry's
+        // offset (off_new) != captured (off_old) → `_` arm → SKIPPED (data loss).
+        // Post-fix: the fresh lookup is authoritative → KEPT with the fresh slot.
+        let (pairs, skipped) = engine.resolve_mined_index_pairs(captured);
+        let found = pairs
+            .iter()
+            .find(|(k, _)| *k == key)
+            .expect("a relocated-but-live record must be KEPT in the mined snapshot, not omitted");
+        assert_eq!(
+            found.1, mined_slot,
+            "the relocated record must be paired with its FRESH (authoritative) slot",
+        );
+        assert_eq!(skipped, 0, "a live relocated record is not a skip");
+
+        // Reused-offset dedup: both the stale OLD offset and the current NEW
+        // offset carry this key's footer, so both locators resolve (via the fresh
+        // lookup) to the SAME current entry. They must collapse to ONE pair.
+        let (deduped, _) = engine
+            .resolve_mined_index_pairs(vec![(0, off_old, mined_slot), (0, off_new, mined_slot)]);
+        assert_eq!(
+            deduped.iter().filter(|(k, _)| *k == key).count(),
+            1,
+            "a key captured twice (stale + fresh offset) must dedup to a single pair",
         );
     }
 
