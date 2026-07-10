@@ -507,6 +507,22 @@ impl SegmentAllocator {
         seg_end.saturating_sub(self.cursor)
     }
 
+    /// The highest segment index with `used > 0`, or `open_segment` when every
+    /// segment is empty (a fresh allocator). Mirrors
+    /// [`SegmentBackupView::highest_used`]. Under defrag reuse the layout is
+    /// NON-monotonic — a reclaimed low segment can be reused as `open_segment`
+    /// while higher segments still hold live records — so this is the true
+    /// append frontier: [`Self::advance_to_next_segment`] must advance PAST it,
+    /// never blindly to `open_segment + 1`, or it would reopen a segment that
+    /// still owns live acked records and hand out their offsets.
+    fn highest_used(&self) -> u32 {
+        self.segments
+            .iter()
+            .rposition(|s| s.used > 0)
+            .map(|i| i as u32)
+            .unwrap_or(self.open_segment)
+    }
+
     /// Seal the open segment and open the next one. Returns `false` when there
     /// is no further segment (device full).
     ///
@@ -534,10 +550,25 @@ impl SegmentAllocator {
             self.cursor = self.segment_start(reused);
             return true;
         }
-        let next = self.open_segment + 1;
+        // Advance to the FRONTIER — one past the highest USED segment — never a
+        // blind `open_segment + 1`. Under defrag reuse `open_segment` can be a
+        // reclaimed LOW segment while a HIGHER segment still holds live acked
+        // records; `open_segment + 1` would reopen that live segment and hand
+        // out its offsets, overwriting acked data. `max(open, highest_used) + 1`
+        // is a virgin segment by construction (nothing above `highest_used` is
+        // used). This also covers the pinned (backup) path, which reaches here
+        // deterministically because the reuse branch above is skipped while
+        // pinned. Any virgin GAP below `highest_used` is already on the free
+        // list and would have been popped by the reuse branch before we fall
+        // through here, so skipping past it strands nothing.
+        let next = self.open_segment.max(self.highest_used()).saturating_add(1);
         if next >= self.segment_count {
             return false;
         }
+        debug_assert!(
+            self.segments[next as usize].used == 0,
+            "advance_to_next_segment must open a virgin segment (used==0)"
+        );
         self.open_segment = next;
         self.cursor = self.segment_start(next);
         true
@@ -1538,6 +1569,86 @@ mod tests {
         );
         assert_eq!(o4, DATA_REGION_OFFSET, "reused seg0 starts at its base");
         assert_eq!(a.free_segment_count(), 0);
+    }
+
+    #[test]
+    fn advance_never_hands_out_offsets_over_a_live_segment() {
+        // P0: the fallthrough advance must open the FRONTIER (past the highest
+        // used segment), never a blind `open_segment + 1`. Drive the allocator
+        // into the non-monotonic state where `open_segment` is a REUSED LOW
+        // segment (0), the free list is empty, and a HIGHER segment (1) still
+        // holds live acked records. A blind `open_segment + 1` would then reopen
+        // segment 1 and hand out its live records' offsets → overwrite acked data.
+        let seg = 2 * ALIGN as u64;
+        let mut a = alloc(64, seg);
+
+        let o0 = a.allocate(4096).unwrap(); // seg0 b0
+        let o1 = a.allocate(4096).unwrap(); // seg0 b1 (fills seg0)
+        let o2 = a.allocate(4096).unwrap(); // seg1 b0  — LIVE (never freed)
+        let _o3 = a.allocate(4096).unwrap(); // seg1 b1 (fills seg1) — LIVE
+        let _o4 = a.allocate(4096).unwrap(); // seg2 b0  — LIVE
+        let _o5 = a.allocate(4096).unwrap(); // seg2 b1 (fills seg2) — LIVE
+        assert_eq!(a.open_segment(), 2);
+
+        // Reclaim the fully-dead seg0, then reuse it: the next advance pops seg0
+        // off the free list, so `open_segment` becomes the reused LOW segment 0
+        // and the free list drains empty. seg1 above it still holds live o2/_o3.
+        a.free(o0, 4096).unwrap();
+        a.free(o1, 4096).unwrap();
+        assert_eq!(a.reclaim_fully_dead_segments(), vec![0]);
+        let o6 = a.allocate(4096).unwrap(); // advance REUSES seg0 -> seg0 b0
+        assert_eq!(a.open_segment(), 0, "advance reused the reclaimed low seg0");
+        assert_eq!(a.free_segment_count(), 0, "free list drained");
+        assert_eq!(o6, DATA_REGION_OFFSET);
+
+        // Snapshot every segment that holds a live record BEFORE the fallthrough
+        // advance. o2 lives at segment_start(1); this set must exclude whatever
+        // segment the next allocation lands in.
+        let live_before: Vec<u32> = (0..a.segment_count())
+            .filter(|&i| a.segment_live(i) > 0)
+            .collect();
+        assert!(
+            live_before.contains(&1),
+            "seg1 must still hold the live records o2/_o3 ({live_before:?})"
+        );
+
+        // Fill the reused seg0, then force the fallthrough advance (free list is
+        // empty). The returned offset must NOT land in a segment holding a live
+        // record — it must open a virgin segment past the frontier.
+        let _o7 = a.allocate(4096).unwrap(); // seg0 b1 (fills reused seg0)
+        let o8 = a.allocate(4096).unwrap();
+
+        let landed = a
+            .segment_of(o8)
+            .expect("allocated offset must fall inside the data region");
+        assert!(
+            !live_before.contains(&landed),
+            "allocate handed out offset {o8} in segment {landed}, which held live \
+             records {live_before:?} — this overwrites acked data (o2 == {o2})"
+        );
+        // The frontier is one past the highest used segment (seg2), i.e. seg3.
+        assert_eq!(a.open_segment(), 3, "advanced to the virgin frontier");
+        assert_eq!(o8, a.data_region_start() + 3 * seg, "opened virgin seg3");
+        assert!(o8 != o2, "must not reissue the live record's offset");
+    }
+
+    #[test]
+    fn fresh_allocator_advances_monotonically_without_reuse() {
+        // With no reclaimed segments the frontier == open_segment, so the
+        // frontier advance must still walk 0 -> 1 -> 2 exactly: highest_used
+        // returns open_segment on an all-empty allocator.
+        let seg = 2 * ALIGN as u64;
+        let mut a = alloc(64, seg);
+        let _ = a.allocate(4096).unwrap(); // seg0 b0
+        let _ = a.allocate(4096).unwrap(); // seg0 b1 (full)
+        assert_eq!(a.open_segment(), 0);
+        let o2 = a.allocate(4096).unwrap(); // -> seg1
+        assert_eq!(a.open_segment(), 1, "0 -> 1");
+        assert_eq!(o2, a.data_region_start() + seg);
+        let _ = a.allocate(4096).unwrap(); // seg1 b1 (full)
+        let o4 = a.allocate(4096).unwrap(); // -> seg2
+        assert_eq!(a.open_segment(), 2, "1 -> 2");
+        assert_eq!(o4, a.data_region_start() + 2 * seg);
     }
 
     #[test]
