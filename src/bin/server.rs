@@ -1421,13 +1421,28 @@ fn main() {
     // the device mined-state fields are stale, so this is the ONLY correct
     // source: it EXCLUDES a reorg-unmined record's stale DAH (no premature
     // delete of a retained record on crash recovery) and re-derives a
-    // setMined-planted DAH the device never recorded. `recovery_height_floor` is
-    // the highest block height the replayed redo proved this node has seen — the
-    // conservative "current height" for re-deriving any device-stale DAH.
-    if let Err(e) = engine.reconcile_secondaries_from_mined_index(
-        recovery_height_floor,
-        config.block_height_retention,
-    ) {
+    // setMined-planted DAH the device never recorded.
+    //
+    // P0 (premature-sweep): the "current height" for re-deriving a device-stale
+    // DAH must be the node's real chain height, NOT the bare
+    // `recovery_height_floor`. That floor is the max height in the REPLAYED REDO
+    // TAIL only, and is 0 for a height-free tail — routine, since
+    // Create/Relocate/Delete/V1-spend carry no height and a clean restart (or a
+    // crash right after a checkpoint) replays no height-bearing entry. Passing 0
+    // here would re-derive every setMined-planted DAH as `0 + retention`, already
+    // past at real chain height → the acked record is swept a full retention
+    // window early and a later reorg-unspend returns TxNotFound. Fold the durable
+    // `.height` file (a pure atomic + CRC read, no side effects) into the floor
+    // BEFORE reconcile via `reconcile_height_floor` = `max(persisted, tail)`;
+    // `persisted_height` / `height_path` are reused below for the engine-side
+    // last-durable-height restore, keeping the two floors identical.
+    let height_path = config.resolved_last_durable_height_path();
+    let persisted_height = teraslab::ops::engine::read_durable_height_file(&height_path);
+    let reconcile_floor =
+        teraslab::ops::engine::reconcile_height_floor(persisted_height, recovery_height_floor);
+    if let Err(e) = engine
+        .reconcile_secondaries_from_mined_index(reconcile_floor, config.block_height_retention)
+    {
         tracing::error!(
             err = %e,
             "FATAL: failed to rebuild the DAH secondary index from the \
@@ -1512,8 +1527,10 @@ fn main() {
     //     reporting 0 (which would freeze the cluster GC horizon and force
     //     unnecessary full resyncs — design §4 height subsystem).
     // Persistence keeps the value monotone across restarts.
-    let height_path = config.resolved_last_durable_height_path();
-    let persisted_height = teraslab::ops::engine::read_durable_height_file(&height_path);
+    //
+    // `height_path` + `persisted_height` were read above (folded into the
+    // boot-reconcile floor); reuse them here for the engine-side height restore
+    // so the restored height and the reconcile floor stay identical.
     let record_floor = recovery_height_floor;
     engine.set_last_durable_height_path(height_path.clone());
     let restored_height = engine.restore_last_durable_height(persisted_height, record_floor);

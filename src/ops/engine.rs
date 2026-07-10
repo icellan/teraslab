@@ -1511,7 +1511,9 @@ impl Engine {
     /// Because the result is a `fetch_max`, calling this is itself monotone
     /// and idempotent. Returns the value the height was set to.
     pub fn restore_last_durable_height(&self, persisted: Option<u32>, record_floor: u32) -> u32 {
-        let restored = persisted.unwrap_or(0).max(record_floor);
+        // Shared with the boot-time reconcile floor so the restored height and
+        // the reconcile's `current_block_height` can never diverge (P0).
+        let restored = reconcile_height_floor(persisted, record_floor);
         self.last_durable_height
             .fetch_max(restored, std::sync::atomic::Ordering::Relaxed);
         self.last_durable_height()
@@ -10250,6 +10252,29 @@ pub fn read_durable_height_file(path: &std::path::Path) -> Option<u32> {
     decode_durable_height(&bytes)
 }
 
+/// Compute the block-height floor that seeds the boot-time DAH reconcile
+/// ([`Engine::reconcile_secondaries_from_mined_index`]) and the node's restored
+/// last-durable height. The floor is `max(persisted, tail_floor)`:
+///
+/// - `persisted` — the height read from the durable `.height` file
+///   ([`read_durable_height_file`]); `None` when the file is missing or corrupt
+///   (it then contributes nothing).
+/// - `tail_floor` — the max block height proved by the replayed redo tail. This
+///   is `0` for a height-free tail, which is ROUTINE: Create/Relocate/Delete and
+///   V1 spends carry no height, and a clean restart (or a crash right after a
+///   checkpoint) replays no height-bearing entry.
+///
+/// Folding `persisted` BEFORE the reconcile is load-bearing. A height-free tail
+/// alone yields `0`; the reconcile would then re-derive every setMined-planted
+/// DAH (device footer stale-0) as `0 + retention`, which at real chain height is
+/// already past → the acked record is swept up to a full retention window early
+/// and a later reorg-unspend returns `TxNotFound` (P0). This helper is kept
+/// identical to [`Engine::restore_last_durable_height`]'s own `max` so the
+/// reconcile floor and the restored last-durable height can never diverge.
+pub fn reconcile_height_floor(persisted: Option<u32>, tail_floor: u32) -> u32 {
+    persisted.unwrap_or(0).max(tail_floor)
+}
+
 /// fsync the parent directory of `path` so the rename of the durable-height
 /// file survives a crash. Mirrors the per-module helper used elsewhere
 /// (e.g. `replication::durable`); a no-op on non-unix where directory fsync
@@ -11022,6 +11047,111 @@ mod tests {
         assert_eq!(entries.len(), 1, "the one seeded mined block is present");
         let be = entries[0];
         assert_eq!({ be.block_id }, 0x99, "the seeded block_id round-trips");
+    }
+
+    /// P0 (premature-sweep): `reconcile_secondaries_from_mined_index` re-derives
+    /// a setMined-planted DAH (device footer `delete_at_height == 0`; all-spent,
+    /// mined, on the longest chain) as `current_block_height + retention`. The
+    /// server-boot ordering fix folds the persisted durable height into that
+    /// `current_block_height` (`reconcile_height_floor` + `bin/server.rs`), so at
+    /// real chain height the re-derived DAH lands a full retention window in the
+    /// FUTURE — the record is retained. The pre-fix code passed the bare
+    /// `recovery_height_floor`, which is 0 for a height-free redo tail, so the
+    /// DAH was re-derived at `0 + retention`, already FAR past the real chain
+    /// height → the acked record was swept a full retention window early (a later
+    /// reorg-unspend then returns TxNotFound — the exact loss this pass exists to
+    /// prevent). This proves the reconcile output tracks the floor: floor
+    /// 800_000 → DAH 800_288 (future, retained), floor 0 → DAH 288 (past →
+    /// premature).
+    #[test]
+    fn reconcile_at_persisted_height_avoids_premature_setmined_dah() {
+        const RETENTION: u32 = 288;
+        const CHAIN_HEIGHT: u32 = 800_000;
+
+        // Build one all-spent, mined, on-longest-chain record whose device DAH
+        // is stale-0 (the setMined-planted case the device never recorded),
+        // keyed by a realistic SHA256-shaped txid (entropy beyond byte 12, so the
+        // reconcile must resolve the full txid from the device footer), reconcile
+        // it at `floor`, and return the DAH height the reconcile registered.
+        let reconcile_dah_at = |floor: u32| -> Option<u32> {
+            let dev: Arc<dyn BlockDevice> =
+                Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+            let mut alloc = SlotAllocator::new(dev.clone()).unwrap();
+            let mut index = Index::new(64).unwrap();
+
+            let txid: [u8; 32] = [
+                0x9c, 0x1e, 0x77, 0xb4, 0x02, 0xf5, 0x6a, 0xd8, 0x33, 0x91, 0x4c, 0x0b, 0xe7, 0x28,
+                0x5d, 0xa0, 0x14, 0x8f, 0x62, 0xc9, 0x3b, 0x70, 0xd6, 0x11, 0xae, 0x59, 0x84, 0x2d,
+                0xf0, 0x63, 0x97, 0x08,
+            ];
+            let key = TxKey { txid };
+
+            let mut meta = TxMetadata::new(1);
+            meta.tx_id = txid;
+            meta.spent_utxos = 1; // all-spent
+            meta.unmined_since = 0; // on the longest chain
+            meta.delete_at_height = 0; // setMined-planted → re-derived by the eval
+            let record_size = TxMetadata::record_size_for(1);
+            let offset = alloc.allocate(record_size).unwrap();
+            let slot0 = UtxoSlot::new_spent([0x22; 32], [0xAB; 36]);
+            io::write_full_record(&*dev, offset, &meta, &[slot0]).unwrap();
+            index
+                .register(
+                    key,
+                    TxIndexEntry {
+                        device_id: 0,
+                        record_offset: offset,
+                        mined_slot: crate::index::mined_index::NO_MINED_SLOT,
+                    },
+                )
+                .unwrap();
+
+            let engine = Engine::new(
+                dev.clone(),
+                index,
+                alloc,
+                StripedLocks::new(64),
+                DahIndex::new(),
+            );
+
+            let slot = seed_mined_index_for_test(&engine, &key, &meta, &[(0x99, 1000, 0)]);
+            let e = engine.index.lookup(&key).unwrap();
+            engine
+                .index
+                .register(
+                    key,
+                    TxIndexEntry {
+                        device_id: 0,
+                        record_offset: e.record_offset,
+                        mined_slot: slot,
+                    },
+                )
+                .unwrap();
+
+            engine
+                .reconcile_secondaries_from_mined_index(floor, RETENTION)
+                .expect("reconcile must succeed");
+            engine.dah_index().get_height(&key)
+        };
+
+        // At the correct (persisted) chain height the DAH is a full retention
+        // window in the FUTURE — the record is retained, not due for sweep.
+        assert_eq!(
+            reconcile_dah_at(CHAIN_HEIGHT),
+            Some(CHAIN_HEIGHT + RETENTION),
+            "reconcile at the real chain height plants the DAH at chain_height + retention",
+        );
+
+        // The pre-fix hazard: a bare-0 floor (height-free redo tail, persisted
+        // height NOT folded in) re-derives the DAH at `0 + retention` == 288,
+        // already FAR past the real chain height → premature sweep.
+        let premature = reconcile_dah_at(0).expect("reconcile at floor 0 still plants a DAH");
+        assert_eq!(premature, RETENTION, "floor 0 re-derives the premature DAH");
+        assert!(
+            premature < CHAIN_HEIGHT,
+            "the pre-fix DAH ({premature}) is already past the chain height ({CHAIN_HEIGHT}) — \
+             the record would be swept a full retention window early",
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -26059,6 +26189,53 @@ mod tests {
         let e = create_engine();
         e.observe_block_height(900);
         assert_eq!(e.restore_last_durable_height(Some(100), 50), 900);
+    }
+
+    /// P0 (premature-sweep ordering): `reconcile_height_floor` folds the
+    /// persisted durable `.height` value into the boot-reconcile floor as
+    /// `max(persisted, tail_floor)` — identical to
+    /// [`Engine::restore_last_durable_height`]'s own `max`, so the reconcile
+    /// floor and the restored last-durable height can never diverge.
+    ///
+    /// The regression the server-boot ordering fix guards: a height-free redo
+    /// tail (a clean restart, or a crash right after a checkpoint) leaves the
+    /// replayed `tail_floor == 0`. Passing that bare 0 as
+    /// `reconcile_secondaries_from_mined_index`'s `current_block_height`
+    /// re-derives every setMined-planted DAH (device footer stale-0) as
+    /// `0 + retention`, already far past at real chain height → the acked record
+    /// is swept a full retention window early. Folding the persisted height
+    /// restores the real chain height BEFORE reconcile runs.
+    #[test]
+    fn reconcile_height_floor_folds_persisted_before_tail() {
+        // Height-free tail + no persisted file → 0 (the pre-fix hazard input).
+        assert_eq!(reconcile_height_floor(None, 0), 0);
+        // Height-free tail + persisted real chain height → the persisted height:
+        // the fold that eliminates the premature-sweep P0.
+        assert_eq!(reconcile_height_floor(Some(800_000), 0), 800_000);
+        // Tail floor above persisted → tail wins (record-derived safety net).
+        assert_eq!(reconcile_height_floor(Some(100), 800_000), 800_000);
+        // Persisted above tail floor → persisted wins.
+        assert_eq!(reconcile_height_floor(Some(800_000), 288), 800_000);
+        // No persisted value, nonzero tail → tail alone.
+        assert_eq!(reconcile_height_floor(None, 321), 321);
+
+        // It agrees with `restore_last_durable_height` for every combination
+        // (a fresh engine starts at 0, so its `fetch_max` returns the same
+        // value), so the two floors are provably consistent.
+        for (p, t) in [
+            (None, 0u32),
+            (Some(800_000), 0),
+            (Some(100), 500),
+            (None, 321),
+            (Some(800_000), 288),
+        ] {
+            let e = create_engine();
+            assert_eq!(
+                reconcile_height_floor(p, t),
+                e.restore_last_durable_height(p, t),
+                "reconcile floor must equal the restored last-durable height for ({p:?}, {t})",
+            );
+        }
     }
 
     #[test]
