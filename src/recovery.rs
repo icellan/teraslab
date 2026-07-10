@@ -1776,6 +1776,22 @@ fn replay_spend(
             if slot.status == UTXO_SPENT && slot.spending_data == *spending_data {
                 return ReplayResult::Skipped;
             }
+            // F-A1: the live `engine.spend` rejects a hash mismatch
+            // (ERR_UTXO_HASH_MISMATCH) BEFORE mutating (`ops/engine.rs`: `if
+            // slot.hash != item.utxo_hash`). Recovery must be symmetric: a V3
+            // redo entry whose `utxo_hash` no longer matches the on-disk slot
+            // identity is replaying a spend the master reported as an error —
+            // e.g. the slot was since unspent, frozen, and court-order
+            // reassigned to a new hash — so skip it rather than re-marking the
+            // slot SPENT with the slot's CURRENT hash and the entry's
+            // fabricated spending data. Mirrors the `replay_unspend`/
+            // `replay_freeze`/`ReassignV2` identity guards. V1/V2 entries carry
+            // no hash (`utxo_hash == None`) and keep their prior behavior.
+            if let Some(expected_hash) = utxo_hash
+                && slot.hash != *expected_hash
+            {
+                return ReplayResult::Skipped;
+            }
             slot.hash
         }
         None => match utxo_hash {
@@ -4137,6 +4153,119 @@ mod tests {
         assert_eq!(post_slot.spending_data, stored_spending_data);
         let post_meta = io::read_metadata(&*h.data_dev, ie.record_offset).unwrap();
         assert_eq!({ post_meta.spent_utxos }, 1);
+    }
+
+    #[test]
+    fn replay_spend_skips_stale_v3_entry_after_reassign_to_new_hash() {
+        // P0 (F-A1 parity for SpendV3): a court-order reassign moved slot 0 to a
+        // NEW utxo_hash (B). A post-checkpoint tail replays, in log order, an
+        // earlier spend of the ORIGINAL identity (A), its unspend, a freeze, and
+        // the reassign (A -> B) — all four already landed on-device before the
+        // crash, so the live final state is UNSPENT(B). On from-scratch replay
+        // the stale SpendV3(A) entry MUST be skipped because slot.hash (B) !=
+        // entry.utxo_hash (A), exactly as the live `engine.spend` rejects it
+        // (`ops/engine.rs`: `if slot.hash != item.utxo_hash` -> UtxoHashMismatch).
+        //
+        // Pre-fix `replay_spend` had no identity guard: it saw UNSPENT(B), failed
+        // the idempotency check, and re-marked the slot SPENT using the slot's
+        // CURRENT hash B plus the entry's fabricated spending data S1. The
+        // unspend/freeze/reassign replays then all SKIP (their guards see hash
+        // B != A, or status != FROZEN), leaving the recovered state durably
+        // SPENT(B, S1): the reassigned UTXO permanently marked spent, funds
+        // unspendable. Consensus-critical.
+        let mut h = RecoveryTestHarness::new();
+        let key = h.create_record(0xC0, 1);
+        let ie = h.index.lookup(&key).unwrap();
+
+        let hash_a = [0xAA; 32];
+        let hash_b = [0xBB; 32];
+        let s1 = [0x11; 36];
+        assert_ne!(hash_a, hash_b);
+
+        // On-device truth = the live FINAL state after the whole tail already
+        // applied pre-crash: slot 0 UNSPENT with the reassigned hash B, counter 0.
+        let live_final = UtxoSlot::new_unspent(hash_b);
+        io::write_utxo_slot(&*h.data_dev, ie.record_offset, 0, &live_final).unwrap();
+        let mut meta = io::read_metadata(&*h.data_dev, ie.record_offset).unwrap();
+        meta.spent_utxos = 0;
+        io::write_metadata(&*h.data_dev, ie.record_offset, &meta).unwrap();
+
+        // Redo tail in LOG ORDER: SpendV3(A, S1) -> UnspendV2(A) -> FreezeV2(A)
+        // -> ReassignV2(A -> B). All four were applied before the crash.
+        let mut redo = h.redo_log();
+        redo.append_and_flush(RedoOp::SpendV2 {
+            tx_key: key,
+            offset: 0,
+            spending_data: s1,
+            new_spent_count: 1,
+            current_block_height: 1000,
+            block_height_retention: 288,
+            target_generation: 1,
+            updated_at: 10,
+            utxo_hash: Some(hash_a),
+        })
+        .unwrap();
+        redo.append_and_flush(RedoOp::UnspendV2 {
+            tx_key: key,
+            offset: 0,
+            spending_data: s1,
+            new_spent_count: 0,
+            current_block_height: 1000,
+            block_height_retention: 288,
+            target_generation: 2,
+            updated_at: 20,
+            utxo_hash: Some(hash_a),
+        })
+        .unwrap();
+        redo.append_and_flush(RedoOp::FreezeV2 {
+            tx_key: key,
+            offset: 0,
+            utxo_hash: hash_a,
+        })
+        .unwrap();
+        redo.append_and_flush(RedoOp::ReassignV2 {
+            tx_key: key,
+            offset: 0,
+            new_hash: hash_b,
+            block_height: 1000,
+            spendable_after: 100,
+            prior_utxo_hash: hash_a,
+        })
+        .unwrap();
+
+        let stats = recover(&*h.data_dev, &redo, &h.index).unwrap();
+
+        // Every entry in the tail is stale against the reassigned identity, so
+        // NONE may be applied: the spend skips on the new hash guard, the unspend
+        // skips (slot already UNSPENT), the freeze skips (hash B != A), and the
+        // reassign skips (idempotent — slot already UNSPENT(B)).
+        assert_eq!(
+            stats.entries_replayed, 0,
+            "no tail entry may mutate the reassigned slot",
+        );
+        assert_eq!(stats.entries_skipped, 4, "all four tail entries must skip");
+
+        // Recovered slot MUST stay the reassigned UNSPENT(B) — the stale spend of
+        // identity A was skipped, NOT re-applied against hash B.
+        let post = io::read_utxo_slot(&*h.data_dev, ie.record_offset, 0).unwrap();
+        assert_eq!(
+            post.status, UTXO_UNSPENT,
+            "reassigned UTXO must not be resurrected as SPENT",
+        );
+        assert_eq!(
+            post.hash, hash_b,
+            "slot identity must remain the reassigned hash B",
+        );
+        assert_ne!(
+            post.spending_data, s1,
+            "no fabricated spending data from the stale spend may be stamped",
+        );
+        let post_meta = io::read_metadata(&*h.data_dev, ie.record_offset).unwrap();
+        assert_eq!(
+            { post_meta.spent_utxos },
+            0,
+            "counter must reflect zero spent slots",
+        );
     }
 
     #[test]
