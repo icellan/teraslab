@@ -1171,10 +1171,22 @@ impl Engine {
     ) -> std::result::Result<(), crate::redo::RedoError> {
         // Layout-dispatched per log (`checkpoint_reclaim`): a ring frees covered
         // segments (pointer advance); a linear log compacts the prefix.
-        match self.redo_logs.get() {
-            Some(logs) if !logs.is_empty() => {
-                for log in logs {
-                    log.lock().checkpoint_reclaim(fence)?;
+        //
+        // P0 (redo header-clobber): the reclaim rewrites the single redo header
+        // block, which a group-commit flush's Phase-2 pwrite also writes — but the
+        // flush releases the log lock before that slow pwrite, so a stale
+        // snapshotted flush header could land AFTER this advance and revert
+        // `oldest_seg` (→ recovery scans a reclaimed segment and drops acked
+        // entries). Route through each store's group-commit coordinator and hold
+        // its `flush_guard` across the header write so an in-flight Phase-2 flush
+        // and this reclaim can never interleave. The coordinators are 1:1 and in
+        // lockstep with `redo_logs` (`committer.log()` IS the same `Arc<Mutex>`),
+        // both built together in `set_redo_logs`.
+        match self.redo_committers.get() {
+            Some(committers) if !committers.is_empty() => {
+                for committer in committers {
+                    committer
+                        .under_flush_guard(|| committer.log().lock().checkpoint_reclaim(fence))?;
                 }
             }
             _ => {}
@@ -1207,15 +1219,43 @@ impl Engine {
         // Layout-dispatched per log (`checkpoint_fence`): a ring writes the
         // header fence (no log append); a linear log appends a RecoveryProgress
         // marker.
-        match self.redo_logs.get() {
-            Some(logs) if !logs.is_empty() => {
-                for log in logs {
-                    log.lock().checkpoint_fence(through_sequence)?;
+        //
+        // P0 (redo header-clobber): `checkpoint_fence` persists the advanced fence
+        // in the single redo header block that a group-commit flush's Phase-2
+        // pwrite also writes (with the log lock released). Hold each store's
+        // `flush_guard` across the header write so a stale in-flight flush header
+        // can never land after — and revert — this fence. See
+        // [`Self::compact_all_redo_through`] for the full rationale; the
+        // coordinators are 1:1 with `redo_logs`.
+        match self.redo_committers.get() {
+            Some(committers) if !committers.is_empty() => {
+                for committer in committers {
+                    committer.under_flush_guard(|| {
+                        committer.log().lock().checkpoint_fence(through_sequence)
+                    })?;
                 }
             }
             _ => {}
         }
         Ok(())
+    }
+
+    /// Run `f` while holding store 0's group-commit `flush_guard` when a committer
+    /// is attached, else run `f` directly.
+    ///
+    /// P0 (redo header-clobber): lets the single-handle checkpoint fallback (the
+    /// `checkpoint.rs` path taken only when NO per-store logs are attached —
+    /// tests) serialize its header write with any in-flight Phase-2 flush exactly
+    /// as [`Self::compact_all_redo_through`] / [`Self::mark_recovery_progress_all`]
+    /// do for the multi-store path. In the no-committer configuration there is no
+    /// background flusher (`flush_all_redo` iterates the — empty — committers), so
+    /// running `f` directly is race-free; the wrapper keeps the invariant explicit
+    /// and correct should a committer ever back that path.
+    pub fn under_redo_flush_guard_store0<R>(&self, f: impl FnOnce() -> R) -> R {
+        match self.redo_committers.get().and_then(|c| c.first()) {
+            Some(committer) => committer.under_flush_guard(f),
+            None => f(),
+        }
     }
 
     /// Append a single replica-applied redo op to the log owning its store,
@@ -14657,6 +14697,195 @@ mod tests {
                     if *tx_key == key && *record_offset == new_offset
             )),
             "standalone relocate must journal a thin Relocate"
+        );
+    }
+
+    /// P0 (redo header-clobber → acked data loss): a checkpoint's fence/reclaim
+    /// header write must NOT be reverted by an in-flight group-commit flush whose
+    /// Phase-2 header pwrite was snapshotted BEFORE the fence advanced.
+    ///
+    /// Both the flush's Phase-2 (`RedoLog::commit_flush`) and the checkpoint's
+    /// fence/reclaim rewrite the SAME single redo header block, which carries no
+    /// generation/epoch — the last pwrite wins. A group-commit flush RELEASES the
+    /// log lock before its slow O_DIRECT header pwrite, so the checkpoint (holding
+    /// only the log lock) can advance `checkpoint_seq`/`oldest_seg` and write the
+    /// new header in between — and then the flush's STALE snapshotted header lands
+    /// LAST, reverting the fence. On the next crash, ring recovery scans from the
+    /// reverted (already-reclaimed) `oldest_seg` and drops durably-acked entries.
+    ///
+    /// Deterministic reproduction: a device parks the FIRST header pwrite (offset
+    /// == `log_offset`) once armed. A background `flush_all_redo` parks there
+    /// holding the committer's `flush_guard` with the log lock already released
+    /// (Phase-2). The checkpoint's `mark_recovery_progress_all` +
+    /// `compact_all_redo_through` then run. Pre-fix the checkpoint takes only the
+    /// log lock (free), writes the advanced header, and is clobbered when the
+    /// parked stale header is released → the durable fence regresses to 0.
+    /// Post-fix the checkpoint blocks on `flush_guard` until the flush fully
+    /// completes, so its advanced header is written LAST and survives.
+    #[test]
+    fn checkpoint_fence_survives_inflight_flush_header_pwrite() {
+        use crate::redo::{RedoLog, RedoOp};
+        use std::sync::atomic::AtomicU32;
+        use std::time::Duration;
+
+        /// Parks the FIRST pwrite targeting the header block once armed; every
+        /// other write/read/sync passes through. Counts header writes that
+        /// actually landed so the driver never has to guess from a wall clock.
+        struct HeaderParkDev {
+            inner: MemoryDevice,
+            header_offset: u64,
+            armed: AtomicBool,        // false during setup so the fill flush passes
+            parked_once: AtomicBool,  // only the FIRST armed header write parks
+            in_park: AtomicBool,      // true while the flush's header write is parked
+            release: AtomicBool,      // set true to let the parked write land
+            header_writes: AtomicU32, // header writes that actually LANDED
+        }
+        impl BlockDevice for HeaderParkDev {
+            fn pread(&self, b: &mut [u8], o: u64) -> crate::device::Result<usize> {
+                self.inner.pread(b, o)
+            }
+            fn pwrite(&self, b: &[u8], o: u64) -> crate::device::Result<usize> {
+                if o == self.header_offset
+                    && self.armed.load(Ordering::SeqCst)
+                    && !self.parked_once.swap(true, Ordering::SeqCst)
+                {
+                    self.in_park.store(true, Ordering::SeqCst);
+                    while !self.release.load(Ordering::SeqCst) {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    self.in_park.store(false, Ordering::SeqCst);
+                }
+                let n = self.inner.pwrite(b, o)?;
+                if o == self.header_offset {
+                    self.header_writes.fetch_add(1, Ordering::SeqCst);
+                }
+                Ok(n)
+            }
+            fn alignment(&self) -> usize {
+                self.inner.alignment()
+            }
+            fn size(&self) -> u64 {
+                self.inner.size()
+            }
+            fn sync(&self) -> crate::device::Result<()> {
+                self.inner.sync()
+            }
+            fn sync_data(&self) -> crate::device::Result<()> {
+                self.inner.sync_data()
+            }
+        }
+
+        let segment_size = 4096u64;
+        let count = 4u64;
+        let total = 4096 + segment_size * count;
+        let dev = Arc::new(HeaderParkDev {
+            inner: MemoryDevice::new(total, 4096).unwrap(),
+            header_offset: 0,
+            armed: AtomicBool::new(false),
+            parked_once: AtomicBool::new(false),
+            in_park: AtomicBool::new(false),
+            release: AtomicBool::new(false),
+            header_writes: AtomicU32::new(0),
+        });
+        let ring_dev: Arc<dyn BlockDevice> = dev.clone();
+        let log = Arc::new(parking_lot::Mutex::new(
+            RedoLog::format_ring(ring_dev.clone(), 0, total, segment_size).unwrap(),
+        ));
+
+        // Minimal engine — only the redo path is exercised here.
+        let data: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
+        let alloc = SlotAllocator::new(data.clone()).unwrap();
+        let index = Index::new(128).unwrap();
+        let engine = Arc::new(Engine::new(
+            data,
+            index,
+            alloc,
+            StripedLocks::new(64),
+            DahIndex::new(),
+        ));
+        engine.set_redo_logs(vec![log.clone()]);
+        engine.set_buffered_durability(true);
+
+        let freeze = |n: u8| RedoOp::Freeze {
+            tx_key: crate::index::TxKey { txid: [n; 32] },
+            offset: 0,
+        };
+
+        // Fill several segments and flush durably (NOT armed → passes). The fence
+        // below covers all of these, so reclaim must free the older segments.
+        {
+            let mut l = log.lock();
+            for i in 0..200u32 {
+                l.append(freeze((i % 251) as u8)).unwrap();
+            }
+            l.flush().unwrap();
+            assert!(l.is_segment_ring(), "ring layout");
+        }
+        let fence = log.lock().current_sequence().saturating_sub(1);
+        assert!(fence > 0, "fence must be a real sequence: {fence}");
+
+        // One MORE buffered append: this is what the in-flight flush carries, and
+        // its stale header snapshot (checkpoint_seq 0, oldest_seg 0) is the clobber.
+        log.lock().append(freeze(0xAB)).unwrap();
+
+        // Arm: the next header pwrite (the flush's Phase-2) parks.
+        dev.armed.store(true, Ordering::SeqCst);
+
+        // T1: background flush parks at its header pwrite holding the committer's
+        // flush_guard, log lock already released (Phase-2).
+        let eng1 = engine.clone();
+        let t1 = std::thread::spawn(move || eng1.flush_all_redo());
+        let mut waited = 0;
+        while !dev.in_park.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(1));
+            waited += 1;
+            assert!(waited < 5000, "flush never reached its header pwrite");
+        }
+
+        // T2: the checkpoint fence + reclaim (the production per-store path).
+        let eng2 = engine.clone();
+        let done = Arc::new(AtomicBool::new(false));
+        let done2 = done.clone();
+        let t2 = std::thread::spawn(move || {
+            eng2.mark_recovery_progress_all(fence).unwrap();
+            eng2.compact_all_redo_through(fence).unwrap();
+            done2.store(true, Ordering::SeqCst);
+        });
+
+        // Wait until EITHER the checkpoint finished (pre-fix: not blocked, lands its
+        // header while the flush is parked) OR a bounded timeout (post-fix: blocked
+        // on flush_guard). The RESULT asserted below is deterministic either way —
+        // this only sequences the pre-fix clobber before release.
+        let mut w = 0;
+        while !done.load(Ordering::SeqCst) && w < 400 {
+            std::thread::sleep(Duration::from_millis(1));
+            w += 1;
+        }
+
+        // Release the parked stale header pwrite. Pre-fix it lands LAST, clobbering
+        // the checkpoint's header; post-fix the (blocked) checkpoint runs after the
+        // flush and writes the advanced header LAST.
+        dev.release.store(true, Ordering::SeqCst);
+        t1.join().unwrap().expect("flush ok");
+        t2.join().unwrap();
+
+        // Read the DURABLE header via a fresh reopen and assert the fence did NOT
+        // regress: recovery must see the checkpoint's advanced fence, and only the
+        // single post-fence entry remains to replay.
+        dev.armed.store(false, Ordering::SeqCst); // no parking during reopen
+        let reopened = RedoLog::open(ring_dev, 0, total).unwrap();
+        let (entries, durable_fence) = reopened.recover_with_fence().unwrap();
+        assert_eq!(
+            durable_fence, fence,
+            "durable checkpoint fence regressed: a stale in-flight flush header \
+             clobbered the checkpoint's advance (got {durable_fence}, want {fence})"
+        );
+        assert_eq!(
+            entries.len(),
+            1,
+            "only the single post-fence entry should replay; a regressed fence \
+             replays the whole reclaimed prefix (got {} entries)",
+            entries.len()
         );
     }
 

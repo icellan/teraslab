@@ -926,9 +926,14 @@ where
             .mark_recovery_progress_all(snapshot_fence_sequence)
             .map_err(|e| format!("redo checkpoint fence: {e}"))?;
     } else {
-        redo_log
-            .lock()
-            .checkpoint_fence(snapshot_fence_sequence)
+        // P0 (redo header-clobber): serialize the header write with any in-flight
+        // group-commit Phase-2 flush via store 0's `flush_guard` (a no-op passthrough
+        // when no committer backs this single handle — the only case this fallback
+        // runs), mirroring the multi-store path.
+        engine
+            .under_redo_flush_guard_store0(|| {
+                redo_log.lock().checkpoint_fence(snapshot_fence_sequence)
+            })
             .map_err(|e| format!("redo checkpoint fence: {e}"))?;
     }
 
@@ -950,9 +955,12 @@ where
                 .compact_all_redo_through(snapshot_fence_sequence)
                 .map_err(|e| format!("redo compact: {e}"))?;
         } else {
-            redo_log
-                .lock()
-                .checkpoint_reclaim(snapshot_fence_sequence)
+            // P0 (redo header-clobber): serialize with any in-flight Phase-2 flush
+            // via store 0's `flush_guard`, as above.
+            engine
+                .under_redo_flush_guard_store0(|| {
+                    redo_log.lock().checkpoint_reclaim(snapshot_fence_sequence)
+                })
                 .map_err(|e| format!("redo compact: {e}"))?;
         }
         true

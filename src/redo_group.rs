@@ -208,6 +208,30 @@ impl GroupCommit {
         &self.log
     }
 
+    /// Run `f` while holding this coordinator's `flush_guard`, serializing it
+    /// with any in-flight Phase-2 flush ([`Self::flush`] / [`Self::flush_no_sync`]).
+    ///
+    /// The checkpoint's fence/reclaim ([`RedoLog::checkpoint_fence`] /
+    /// [`RedoLog::checkpoint_reclaim`]) rewrite the SAME single header block that a
+    /// flush's Phase-2 pwrite ([`RedoLog::commit_flush`]) writes, but under only
+    /// the log lock — which a flush RELEASES before its slow O_DIRECT header
+    /// pwrite. The header carries no generation/epoch, so the last pwrite wins:
+    /// without this guard a flush can snapshot a pre-fence header under the log
+    /// lock, the checkpoint can then advance the fence + write the new header, and
+    /// the flush's stale Phase-2 header lands LAST — reverting `checkpoint_seq` /
+    /// `oldest_seg` and losing durably-acked entries on the next crash. Wrapping
+    /// the checkpoint header write here forces the two to serialize on
+    /// `flush_guard`; whichever runs second observes the other's committed header.
+    ///
+    /// Lock order (MUST match [`Self::flush`] / [`Self::flush_no_sync`]):
+    /// `flush_guard` FIRST, then the caller takes the log lock inside `f`. No code
+    /// path takes the log lock and THEN `flush_guard`, so there is no inversion
+    /// and no deadlock.
+    pub fn under_flush_guard<R>(&self, f: impl FnOnce() -> R) -> R {
+        let _fg = self.flush_guard.lock();
+        f()
+    }
+
     /// Durably append `ops` to the log, coalescing the fsync with any concurrent
     /// commits. Returns this submission's own `(first, last)` sequence range
     /// (or `Ok(None)` for empty `ops`). Returns `Err` if the log was poisoned,
@@ -1064,6 +1088,116 @@ mod tests {
         assert!(
             gc.commit(vec![delete_op(2)]).is_err(),
             "log poisoned after flush failure"
+        );
+    }
+
+    /// P0 (redo header-clobber): `under_flush_guard` must actually take
+    /// `flush_guard`, so a checkpoint's fence/reclaim header write serializes with
+    /// an in-flight flush's Phase-2 header pwrite (both rewrite the single,
+    /// epoch-less header block — the last pwrite wins). Prove it directly: while a
+    /// flush is parked mid-fsync HOLDING `flush_guard` (log lock already released),
+    /// an `under_flush_guard` call on another thread MUST block until the flush
+    /// releases the guard. Before this serialization the checkpoint took only the
+    /// log lock — which the flush had already dropped — so it would NOT block and
+    /// its header write could be clobbered by the flush's trailing stale pwrite.
+    #[test]
+    fn under_flush_guard_blocks_while_a_flush_holds_it() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        struct BlockingSyncDev {
+            inner: MemoryDevice,
+            armed: AtomicBool,   // false during open() so the header sync passes
+            in_sync: AtomicBool, // true while a sync is parked
+            release: AtomicBool, // set true to let a parked sync return
+        }
+        impl BlockingSyncDev {
+            fn park(&self) {
+                if self.armed.load(Ordering::SeqCst) {
+                    self.in_sync.store(true, Ordering::SeqCst);
+                    while !self.release.load(Ordering::SeqCst) {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    self.in_sync.store(false, Ordering::SeqCst);
+                }
+            }
+        }
+        impl BlockDevice for BlockingSyncDev {
+            fn pread(&self, b: &mut [u8], o: u64) -> DevResult<usize> {
+                self.inner.pread(b, o)
+            }
+            fn pwrite(&self, b: &[u8], o: u64) -> DevResult<usize> {
+                self.inner.pwrite(b, o)
+            }
+            fn alignment(&self) -> usize {
+                self.inner.alignment()
+            }
+            fn size(&self) -> u64 {
+                self.inner.size()
+            }
+            fn sync(&self) -> DevResult<()> {
+                self.park();
+                self.inner.sync()
+            }
+            fn sync_data(&self) -> DevResult<()> {
+                self.park();
+                self.inner.sync_data()
+            }
+        }
+
+        let dev = Arc::new(BlockingSyncDev {
+            inner: MemoryDevice::new(1024 * 1024, 4096).unwrap(),
+            armed: AtomicBool::new(false),
+            in_sync: AtomicBool::new(false),
+            release: AtomicBool::new(false),
+        });
+        let log = Arc::new(Mutex::new(
+            RedoLog::open(dev.clone() as Arc<dyn BlockDevice>, 0, 1024 * 1024).unwrap(),
+        ));
+        let gc = GroupCommit::new(log);
+        gc.set_buffered(true);
+        gc.commit(vec![delete_op(1)]).expect("buffered append");
+        dev.armed.store(true, Ordering::SeqCst);
+
+        // T1: flush parks in the fsync holding `flush_guard` (log lock released).
+        let gc1 = gc.clone();
+        let t1 = std::thread::spawn(move || gc1.flush());
+        let mut waited = 0;
+        while !dev.in_sync.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(1));
+            waited += 1;
+            assert!(waited < 5000, "flush never reached the parked fsync");
+        }
+
+        // T2: `under_flush_guard` must NOT run its closure while T1 holds the guard.
+        let ran = Arc::new(AtomicBool::new(false));
+        let ran2 = ran.clone();
+        let gc2 = gc.clone();
+        let (tx, rx) = mpsc::channel();
+        let t2 = std::thread::spawn(move || {
+            gc2.under_flush_guard(|| ran2.store(true, Ordering::SeqCst));
+            let _ = tx.send(());
+        });
+
+        // Still blocked: the parked flush holds `flush_guard`.
+        assert!(
+            rx.recv_timeout(Duration::from_millis(200)).is_err(),
+            "under_flush_guard ran while a flush held flush_guard — not serialized"
+        );
+        assert!(
+            !ran.load(Ordering::SeqCst),
+            "the guarded closure ran despite an in-flight flush holding the guard"
+        );
+
+        // Release the flush; T2's guarded closure now runs.
+        dev.release.store(true, Ordering::SeqCst);
+        t1.join().unwrap().expect("flush ok");
+        rx.recv_timeout(Duration::from_secs(5))
+            .expect("under_flush_guard never ran even after the flush released the guard");
+        t2.join().unwrap();
+        assert!(
+            ran.load(Ordering::SeqCst),
+            "the guarded closure must run once the flush releases flush_guard"
         );
     }
 }
