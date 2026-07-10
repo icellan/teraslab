@@ -7192,15 +7192,18 @@ impl Engine {
             // `read_metadata_direct` and `write_metadata_direct` take the
             // per-offset `io_locks()` read/write side, so the RMW is
             // torn-read-safe against concurrent direct accessors.
-            let (generation, prior_locked, old_dah, new_dah) = unsafe {
+            // P1-4: the authoritative DAH lives in the `dah_index` secondary
+            // post-16d — the device footer `delete_at_height` is 0 for a
+            // set_mined-planted DAH. Baseline the eviction off the secondary, NOT
+            // the frozen footer, so locking actually evicts the DAH (else the
+            // sweep deletes an explicitly-locked record) and compensation
+            // restores the true prior height.
+            let authoritative_dah = self.dah_index().get_height(&req.tx_key).unwrap_or(0);
+            let (generation, prior_locked) = unsafe {
                 let mut meta = io::read_metadata_direct(self.device_ptr_for(device_id), ro)
                     .map_err(|e| SpendError::StorageError {
                         detail: format!("{e}"),
                     })?;
-                // `old_dah` is what the DAH secondary index currently
-                // reflects: the on-device DAH (0 when preserved, since
-                // preservation clears it).
-                let old_dah = { meta.delete_at_height };
                 let prior_locked = meta.flags.contains(TxFlags::LOCKED);
                 if req.value {
                     meta.flags.insert(TxFlags::LOCKED);
@@ -7211,31 +7214,32 @@ impl Engine {
                 let generation = { meta.generation }.wrapping_add(1);
                 meta.generation = generation;
                 meta.updated_at = updated_at;
-                let new_dah = { meta.delete_at_height };
                 io::write_metadata_direct(self.device_ptr_for(device_id), ro, &meta);
-                (generation, prior_locked, old_dah, new_dah)
+                (generation, prior_locked)
             };
 
-            // Update DAH secondary index (two-phase durable)
-            self.update_dah_index(&req.tx_key, old_dah, new_dah)?;
+            // Update DAH secondary index (two-phase durable): locking evicts the
+            // authoritative DAH; unlocking leaves it untouched (old == new).
+            let new_dah = if req.value { 0 } else { authoritative_dah };
+            self.update_dah_index(&req.tx_key, authoritative_dah, new_dah)?;
 
             return Ok(SetLockedResponse {
                 generation,
                 prior_locked,
-                prior_delete_at_height: old_dah,
+                prior_delete_at_height: authoritative_dah,
             });
         }
 
         // Slow path: no direct pointer
         let mut meta = self.read_metadata_fast(device_id, ro)?;
-        let old_dah = { meta.delete_at_height };
+        // P1-4: baseline the DAH eviction off the authoritative secondary index,
+        // not the device footer (0 for a set_mined-planted DAH).
+        let authoritative_dah = self.dah_index().get_height(&req.tx_key).unwrap_or(0);
         let prior_locked = meta.flags.contains(TxFlags::LOCKED);
 
         if req.value {
             meta.flags |= TxFlags::LOCKED;
-            if old_dah != 0 {
-                meta.delete_at_height = 0;
-            }
+            meta.delete_at_height = 0; // Locking clears deleteAtHeight
         } else {
             meta.flags -= meta.flags & TxFlags::LOCKED;
         }
@@ -7245,13 +7249,13 @@ impl Engine {
 
         self.write_metadata_fast(device_id, ro, &meta)?;
 
-        let new_dah = { meta.delete_at_height };
-        self.update_dah_index(&req.tx_key, old_dah, new_dah)?;
+        let new_dah = if req.value { 0 } else { authoritative_dah };
+        self.update_dah_index(&req.tx_key, authoritative_dah, new_dah)?;
 
         Ok(SetLockedResponse {
             generation: { meta.generation },
             prior_locked,
-            prior_delete_at_height: old_dah,
+            prior_delete_at_height: authoritative_dah,
         })
     }
 
@@ -7392,6 +7396,12 @@ impl Engine {
         current_block_height: u32,
     ) -> bool {
         if { meta.preserve_until } != 0 {
+            return false;
+        }
+        // P1-4: an explicitly LOCKED record must never be swept, even if a DAH
+        // was (re-)planted on it after locking (locking itself evicts the DAH,
+        // but this closes the re-plant window as defense in depth).
+        if meta.flags.contains(TxFlags::LOCKED) {
             return false;
         }
         // Authoritative due-height: the live DAH secondary index, NOT the
@@ -12723,6 +12733,56 @@ mod tests {
             h.engine.dah_index().get_height(&h.key),
             None,
             "the RAM-planted DAH secondary entry must be removed on delete (no immortal leak)",
+        );
+    }
+
+    /// P1-4: `set_locked` baselined the evicted DAH off the device footer, which
+    /// is 0 for a set_mined-planted (RAM-only) DAH — so locking never evicted it
+    /// and the sweep could delete an explicitly-locked record. Locking must
+    /// evict the authoritative (`dah_index`) DAH and return it for compensation;
+    /// and `record_due_for_sweep` must never mark a LOCKED record due.
+    #[test]
+    fn locking_evicts_ram_planted_dah_and_locked_record_is_never_swept() {
+        // A due-for-sweep record with a RAM-planted DAH (device footer stays 0).
+        let h = TestHarness::with_metadata(1, TxFlags::empty(), |m| {
+            m.spent_utxos = 1;
+        });
+        h.add_mined_block(9, 1000, 0);
+        h.engine.dah_index().insert(1000, h.key, None).unwrap();
+        assert!(
+            h.engine.is_due_for_sweep(&h.key, 2000),
+            "precondition: due for sweep before lock",
+        );
+
+        // Lock → the RAM-planted DAH is evicted and returned for compensation.
+        let resp = h
+            .engine
+            .set_locked_with_before_image(&SetLockedRequest {
+                tx_key: h.key,
+                value: true,
+            })
+            .unwrap();
+        assert!(!resp.prior_locked, "was not previously locked");
+        assert_eq!(
+            resp.prior_delete_at_height, 1000,
+            "the prior RAM-planted DAH must be returned for exact compensation",
+        );
+        assert_eq!(
+            h.engine.dah_index().get_height(&h.key),
+            None,
+            "locking must evict the RAM-planted DAH from the secondary index",
+        );
+        assert!(
+            !h.engine.is_due_for_sweep(&h.key, 2000),
+            "no DAH after lock → not due for sweep",
+        );
+
+        // Defense-in-depth: even if a DAH is (re-)planted on the locked record,
+        // the sweep must never delete an explicitly-locked record.
+        h.engine.dah_index().insert(1000, h.key, None).unwrap();
+        assert!(
+            !h.engine.is_due_for_sweep(&h.key, 2000),
+            "a LOCKED record must never be due for sweep",
         );
     }
 
