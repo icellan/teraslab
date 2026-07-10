@@ -3715,21 +3715,33 @@ impl RedoLog {
             return Ok(None);
         }
 
-        // Measure each entry's on-disk size with a placeholder sequence. The
-        // serialized length is sequence-independent (the sequence is a fixed
-        // 8-byte field), so this equals the committed size exactly — and
-        // measuring before drawing keeps a `LogFull` from burning a sequence.
+        // Measure each entry's on-disk size ARITHMETICALLY (P1-14) rather than
+        // cloning + serializing + CRC-ing a throwaway `RedoEntry` per op. The
+        // serialized length is sequence-independent and exactly
+        // `ENTRY_HEADER_SIZE + ENTRY_OVERHEAD + op.serialized_data_len()` (the
+        // same formula `serialized_len` / `would_fit` use), so this is a pure
+        // integer computation — no heap alloc, memcpy, or CRC just to size the
+        // batch. Measuring before drawing keeps a `LogFull` from burning a
+        // sequence.
         let lens: Vec<u64> = ops
             .iter()
-            .map(|op| {
+            .map(|op| (ENTRY_HEADER_SIZE + ENTRY_OVERHEAD + op.serialized_data_len()) as u64)
+            .collect();
+        // Drift guard: the arithmetic size must equal the real serialized length
+        // (debug-only; release trusts the formula, which is the single source of
+        // truth for `would_fit`/`ring_batch_fits`).
+        debug_assert!(
+            ops.iter().zip(&lens).all(|(op, &len)| {
                 RedoEntry {
                     sequence: 0,
                     op: op.clone(),
                 }
                 .serialize()
                 .len() as u64
-            })
-            .collect();
+                    == len
+            }),
+            "append_atomic arithmetic size drifted from the serialized length",
+        );
 
         // Pre-check that the WHOLE batch fits before drawing any sequence or
         // buffering any byte — so a `LogFull` leaves no half-appended residue
