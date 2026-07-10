@@ -53,7 +53,6 @@ fn make_clustered_seg_engine_sized(seg_blocks: u64) -> Arc<Engine> {
     let log = RedoLog::open(log_dev, 0, 16 * 1024 * 1024).unwrap();
     engine.set_redo_logs(vec![Arc::new(parking_lot::Mutex::new(log))]);
     engine.set_buffered_durability(true);
-    engine.set_clustered(true);
     Arc::new(engine)
 }
 

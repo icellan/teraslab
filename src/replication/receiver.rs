@@ -2645,9 +2645,9 @@ mod tests {
         let log = crate::redo::RedoLog::open(log_dev, 0, 4 * 1024 * 1024).unwrap();
         engine.set_redo_logs(vec![Arc::new(parking_lot::Mutex::new(log))]);
         // Match the shape a clustered segment node actually boots (config forces
-        // buffered durability for segment).
+        // buffered durability for segment). The engine no longer carries a
+        // clustered/standalone flag — the segment spend redo is uniform (SpendV2).
         engine.set_buffered_durability(true);
-        engine.set_clustered(true);
         Arc::new(engine)
     }
 

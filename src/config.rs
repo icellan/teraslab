@@ -1910,11 +1910,17 @@ impl ServerConfig {
         // quorum before ack, plus failover + rejoin-resync healing a crashed
         // master's un-flushed tail. The former blanket refusal is therefore removed.
         //
-        // STANDALONE segment requires BUFFERED redo durability. Its spend journals
-        // a thin `Relocate` (a buffered append that reads the record back from the
-        // new, still-buffered offset on replay), so under strict durability an acked
-        // spend whose buffered data write is lost on crash would be silently
-        // reverted — refuse it.
+        // STANDALONE segment requires BUFFERED redo durability. The spend path is
+        // now redo-self-sufficient (it emits the convertible per-vout `SpendV2`,
+        // replayed IN PLACE against the durable pre-spend record — the thin
+        // `Relocate` that made strict unsafe is gone, per the P0 double-spend fix),
+        // but enabling STRICT durability for a standalone node is a SEPARATE, larger
+        // guarantee: it needs every mutation's redo to reconstruct acked state from
+        // the WAL alone with the buffered data write entirely lost. That whole-chain
+        // "Option A" (incl. the fat image-carrying `RedoOp::Create`) has only been
+        // designed and validated for CLUSTERED nodes (see below); a standalone node
+        // therefore stays on the buffered default until it is validated end to end.
+        // Refuse strict for standalone segment.
         //
         // CLUSTERED segment MAY use strict durability — this is the "true Option A"
         // (fsync-before-ack / commit-to-device). Its authoritative spend redo is the
@@ -1934,10 +1940,11 @@ impl ServerConfig {
             return Err(
                 "storage.engine = \"segment\" requires buffered redo durability on a \
                  STANDALONE node: set redo_buffered = true (or redo_buffered_io = true). \
-                 The log-structured spend's thin Relocate reads the record back from a \
-                 buffered offset on replay, which strict durability does not make safe. \
-                 (A CLUSTERED segment node MAY use strict durability — its SpendV2 redo \
-                 is self-sufficient and fsync'd before ack.)"
+                 The spend redo is now self-sufficient (SpendV2), but strict durability \
+                 for a standalone segment node requires whole-chain redo self-sufficiency \
+                 across every mutation, which has only been validated for CLUSTERED \
+                 nodes. (A CLUSTERED segment node MAY use strict durability — its SpendV2 \
+                 redo is self-sufficient and fsync'd before ack.)"
                     .to_string(),
             );
         }
@@ -3123,9 +3130,10 @@ backend = ""
 
     #[test]
     fn segment_engine_rejected_under_strict_durability() {
-        // Standalone but STRICT durability → segment engine must be refused: its
-        // spend journals the Relocate after the data write (not WAL-first), so
-        // crash safety needs the buffered checkpoint barrier.
+        // Standalone but STRICT durability → segment engine must be refused. The
+        // spend redo is now self-sufficient (SpendV2), but whole-chain strict
+        // "Option A" durability for a standalone segment node is only validated for
+        // clustered nodes, so a standalone node stays on the buffered default.
         let mut cfg = ServerConfig::default();
         cfg.storage.engine = StorageEngine::Segment;
         cfg.redo_buffered = false;

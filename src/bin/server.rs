@@ -1462,12 +1462,12 @@ fn main() {
     // migration suppression read via `engine.redo_log()`).
     if let Some(ref logs) = redo_logs_arc {
         engine.set_redo_logs(logs.clone());
-        // Declare clustered/replicated mode so a segment spend's authoritative redo
-        // becomes the convertible per-vout SpendV2 (the relocate move journals
-        // nothing); standalone nodes keep the thin index-only Relocate + checkpoint
-        // durability (specs/SEGMENT_CLUSTERING_DESIGN.md). Must follow set_redo_logs.
+        // As of the P0 double-spend fix the segment spend redo is uniform across node
+        // roles: EVERY segment spend — standalone and clustered — emits the
+        // convertible per-vout SpendV2 and the relocate move journals nothing, so the
+        // engine no longer needs a clustered/standalone flag
+        // (specs/SEGMENT_CLUSTERING_DESIGN.md).
         let clustered = config.is_clustered() || config.replication_factor > 1;
-        engine.set_clustered(clustered);
         // Surface the segment-on-cluster path explicitly: `Segment` is the default
         // engine (and an empty `[storage] engine` parses to it), so a clustered
         // node with the engine unset now boots the clustered-segment path where a
