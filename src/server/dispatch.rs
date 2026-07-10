@@ -6705,14 +6705,27 @@ fn handle_create_batch(
         } else {
             Vec::new()
         };
-        // Phase 1 log-structured lever: under BUFFERED redo durability the data
-        // device write and the redo entry are flushed on the same cadence, so the
-        // redo need not embed the record bytes — recovery reads them back from the
-        // device (replay_create_v2). This drops the create double-write (bytes
-        // written to both device and WAL). Under STRICT durability the data write
-        // is not fsynced before ack, so the WAL embed is the only durable copy —
-        // keep emitting RedoOp::Create. The device write happens either way
-        // (record_bytes is moved into ValidCreate below for the coalesced write).
+        // Phase 1 log-structured lever: under BUFFERED redo durability the redo
+        // need not embed the record bytes — recovery reads them back from the
+        // device (replay_create_v2), dropping the create double-write (bytes
+        // written to both device and WAL).
+        //
+        // P1-7: the data-device write is NOT flushed on the same cadence as the
+        // redo entry (the earlier claim here was wrong). The background flusher
+        // fsyncs only the REDO device; the DATA devices are fsynced by the
+        // checkpoint barrier (`sync_all_store_devices`, checkpoint step 3). So a
+        // durable CreateV2 entry's replay source (its record bytes) is lost on
+        // power failure if the crash lands before the next data-device fsync.
+        // That window is now BOUNDED by the checkpoint interval
+        // (`CheckpointConfig::max_checkpoint_interval`, default 60s — P1-23's
+        // time-based trigger), NOT "one flush interval". Follow-up (tighter,
+        // self-sufficient): emit a byte-embedding create when the record's store
+        // device differs from its redo log's device, mirroring the SpendV2 model.
+        //
+        // Under STRICT durability the data write is not fsynced before ack, so
+        // the WAL embed is the only durable copy — keep emitting RedoOp::Create.
+        // The device write happens either way (record_bytes is moved into
+        // ValidCreate below for the coalesced write).
         if create_redo_buffered {
             redo_ops.push(RedoOp::CreateV2 {
                 tx_key: key,
