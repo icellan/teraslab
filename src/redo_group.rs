@@ -35,10 +35,13 @@ use crate::redo::{RedoLog, RedoOp};
 /// append/flush path's return type so callers are unchanged.
 pub type CommitOutcome = Result<Option<(u64, u64)>, String>;
 
-/// One queued commit request.
+/// One queued commit request. The ops are pre-encoded (serialize + CRC-ready
+/// wire bytes) at submission time, OUTSIDE the log lock, so the leader's
+/// `flush_batch` does only the O(1) finalize (sequence patch + CRC + memcpy)
+/// under the log mutex — the same encode-once discipline buffered mode uses.
 struct Submission {
     id: u64,
-    ops: Vec<RedoOp>,
+    pre: Vec<crate::redo::PreEncoded>,
 }
 
 struct Inner {
@@ -281,11 +284,20 @@ impl GroupCommit {
             };
         }
 
+        // E7 / FU#9: encode + allocate the wire bytes for every op OUTSIDE both
+        // the coordinator lock and the log lock, exactly as the buffered path
+        // does. The leader's `flush_batch` then writes these pre-encoded bytes
+        // under the log mutex without re-serializing, so the per-store redo
+        // mutex is no longer the serialize-bound write-concurrency cap.
+        let pre: Vec<crate::redo::PreEncoded> = ops
+            .into_iter()
+            .map(crate::redo::RedoEntry::pre_encode)
+            .collect();
         let my_id = {
             let mut inner = self.inner.lock();
             let my_id = inner.next_id;
             inner.next_id += 1;
-            inner.pending.push_back(Submission { id: my_id, ops });
+            inner.pending.push_back(Submission { id: my_id, pre });
 
             if inner.flushing {
                 // Follower: a leader is already flushing and will absorb this
@@ -312,7 +324,7 @@ impl GroupCommit {
             let batch: Vec<Submission> = { self.inner.lock().pending.drain(..).collect() };
 
             if !batch.is_empty() {
-                let outcomes = self.flush_batch(&batch);
+                let outcomes = self.flush_batch(batch);
                 let mut inner = self.inner.lock();
                 for (id, outcome) in outcomes {
                     if id == my_id {
@@ -341,23 +353,28 @@ impl GroupCommit {
     /// Append every submission's ops to the log and flush once. Returns the
     /// per-submission outcome.
     ///
-    /// Each submission is appended **atomically** ([`RedoLog::append_atomic`]):
-    /// it either fits entirely or is rejected whole, leaving nothing buffered.
-    /// A rejected submission gets a transient `LogFull` error and is skipped —
-    /// the log is **not** poisoned, because `LogFull` is reclaimed by the
-    /// checkpoint and poisoning would wedge the node ("restart required") on a
-    /// momentarily full log. Submissions that fit are made durable by the single
-    /// flush; a small submission can still make progress in the same round that
-    /// a large one is deferred. The only fatal append error is an
-    /// already-poisoned log, which fails that submission. A flush I/O fault
-    /// poisons (inside `flush`) and fails every appended submission.
-    fn flush_batch(&self, batch: &[Submission]) -> Vec<(u64, CommitOutcome)> {
+    /// Each submission is appended **atomically**
+    /// ([`RedoLog::append_preencoded_atomic`], writing the bytes pre-encoded at
+    /// submission time — no serialize under the log lock): it either fits
+    /// entirely or is rejected whole, leaving nothing buffered. A rejected
+    /// submission gets a transient `LogFull` error and is skipped — the log is
+    /// **not** poisoned, because `LogFull` is reclaimed by the checkpoint and
+    /// poisoning would wedge the node ("restart required") on a momentarily full
+    /// log. Submissions that fit are made durable by the single flush; a small
+    /// submission can still make progress in the same round that a large one is
+    /// deferred. The only fatal append error is an already-poisoned log, which
+    /// fails that submission. A flush I/O fault poisons (inside `flush`) and
+    /// fails every appended submission.
+    ///
+    /// Takes the batch by value so each submission's pre-encoded bytes move
+    /// straight into the append with no copy.
+    fn flush_batch(&self, batch: Vec<Submission>) -> Vec<(u64, CommitOutcome)> {
         let mut guard = self.log.lock();
 
         let mut outcomes: Vec<(u64, CommitOutcome)> = Vec::with_capacity(batch.len());
         let mut any_appended = false;
         for sub in batch {
-            match guard.append_atomic(&sub.ops) {
+            match guard.append_preencoded_atomic(sub.pre) {
                 Ok(range) => {
                     if range.is_some() {
                         any_appended = true;
@@ -365,8 +382,9 @@ impl GroupCommit {
                     outcomes.push((sub.id, Ok(range)));
                 }
                 Err(e @ crate::redo::RedoError::LogFull { .. }) => {
-                    // Transient: retryable backpressure, no poison. `append_atomic`
-                    // buffered nothing for this submission.
+                    // Transient: retryable backpressure, no poison.
+                    // `append_preencoded_atomic` buffered nothing for this
+                    // submission.
                     outcomes.push((sub.id, Err(format!("{e}"))));
                 }
                 Err(e) => {
@@ -667,6 +685,40 @@ mod tests {
             .expect("range");
         assert_eq!(range.1 - range.0, 2, "3 ops -> span of 3 sequences");
         assert_eq!(gc.log().lock().recover().unwrap().len(), 3);
+    }
+
+    /// FU#9: the strict (non-buffered) group-commit path pre-encodes each op at
+    /// submission time and the leader writes those bytes under the log lock via
+    /// `append_preencoded_atomic` — the same encode-once path buffered mode
+    /// already uses, moving the serialize/CRC/alloc out of the log-lock critical
+    /// section. The refactor must be byte-for-byte identical to the previous
+    /// in-lock `append_atomic`: every op a strict commit accepts must replay
+    /// from the device to the exact op submitted, at sequences spanning the
+    /// returned range. A wiring slip (unpatched sequence placeholder, double
+    /// encode, wrong op bytes) surfaces here as a CRC failure or op mismatch.
+    #[test]
+    fn strict_commit_preencodes_and_replays_identically() {
+        let dev = CountingDev::new();
+        let gc = GroupCommit::new(open_log(dev.clone()));
+        // buffered stays false — exercise the strict leader / flush_batch path.
+        let ops = vec![delete_op(7), delete_op(19), delete_op(200)];
+        let range = gc.commit(ops.clone()).unwrap().expect("range");
+        assert_eq!(range.1 - range.0, 2, "3 ops -> 3 contiguous sequences");
+
+        let entries = gc.log().lock().recover().unwrap();
+        assert_eq!(entries.len(), 3, "all three ops durable");
+        for (i, expected) in ops.iter().enumerate() {
+            assert_eq!(
+                entries[i].sequence,
+                range.0 + i as u64,
+                "op {i} replayed at the wrong sequence",
+            );
+            assert_eq!(
+                &entries[i].op, expected,
+                "op {i} did not round-trip byte-identically through the \
+                 pre-encoded strict path",
+            );
+        }
     }
 
     #[test]
