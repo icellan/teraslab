@@ -1082,6 +1082,15 @@ fn main() {
     // into the last-durable-height floor below so a lost/corrupt `.height` file
     // cannot regress the node to height 0. Independent of `tombstones_enabled`.
     let mut recovery_height_floor: u32 = 0;
+    // FU#7 Option B: carry the redo-touched key set + the clean-secondary
+    // predicate OUT of the recovery block so the DAH reconcile (further below,
+    // after `recover_mined_index`) can drive the O(redo) Touched-scope pass.
+    let mut recovery_touched_keys: std::collections::HashSet<teraslab::index::TxKey> =
+        std::collections::HashSet::new();
+    // `true` iff the redb backend loaded BOTH secondaries cleanly (== the
+    // `!full_secondary_rebuild` condition). A necessary (not sufficient)
+    // precondition for the Touched-scope fast boot.
+    let mut clean_secondaries_for_fast_boot = false;
     if let Some(ref mut redo) = redo_logs {
         // B-7: only the redb backend has crash-durable secondaries that
         // already reflect committed state; when it loaded both cleanly,
@@ -1093,6 +1102,7 @@ fn main() {
         // pre-B-7 behavior exactly, so no correctness regression.
         let full_secondary_rebuild =
             !(config.index.backend == IndexBackendMode::Redb && secondary_status.dah_ok);
+        clean_secondaries_for_fast_boot = !full_secondary_rebuild;
         match teraslab::recovery::recover_all_multi_store(
             &store_devices,
             &mut store_allocators,
@@ -1109,9 +1119,10 @@ fn main() {
             // AFTER `engine.recover_mined_index`.
             true,
         ) {
-            Ok((stats, pending, deleted)) => {
+            Ok((stats, pending, deleted, touched)) => {
                 pending_conflicting_children = pending;
                 pending_deleted_children = deleted;
+                recovery_touched_keys = touched;
                 recovery_height_floor = stats.max_observed_block_height;
                 tracing::info!(
                     replayed = stats.entries_replayed,
@@ -1440,9 +1451,37 @@ fn main() {
     let persisted_height = teraslab::ops::engine::read_durable_height_file(&height_path);
     let reconcile_floor =
         teraslab::ops::engine::reconcile_height_floor(persisted_height, recovery_height_floor);
-    if let Err(e) = engine
-        .reconcile_secondaries_from_mined_index(reconcile_floor, config.block_height_retention)
-    {
+    // FU#7 Option B: pick the DAH-reconcile scope. The O(redo) Touched fast path
+    // is eligible ONLY when ALL of:
+    //   * `fast_boot_touched_secondaries` is enabled (default off), AND
+    //   * the redb backend loaded BOTH secondaries cleanly (== the
+    //     `!full_secondary_rebuild` predicate captured during recovery), AND
+    //   * the restored `.mined` snapshot was v3 (persisted the DE/LSA cache).
+    // Any miss falls back to the Full whole-store self-healing rebuild — the
+    // unchanged, always-correct path (a first-boot v2 snapshot takes it once,
+    // then the next checkpoint writes v3). The v3 FORMAT is always written, so
+    // enabling the flag later needs no migration.
+    let fast_boot_eligible = config.index.fast_boot_touched_secondaries
+        && clean_secondaries_for_fast_boot
+        && engine.mined_snapshot_restored_v3();
+    let reconcile_scope = if fast_boot_eligible {
+        teraslab::ops::engine::DahReconcileScope::Touched(&recovery_touched_keys)
+    } else {
+        teraslab::ops::engine::DahReconcileScope::Full
+    };
+    tracing::info!(
+        fast_boot_eligible,
+        touched_keys = recovery_touched_keys.len(),
+        clean_secondaries = clean_secondaries_for_fast_boot,
+        snapshot_v3 = engine.mined_snapshot_restored_v3(),
+        flag = config.index.fast_boot_touched_secondaries,
+        "FU#7 Option B: selecting DAH reconcile scope (Touched = O(redo), Full = O(store))",
+    );
+    if let Err(e) = engine.reconcile_secondaries_scoped(
+        reconcile_scope,
+        reconcile_floor,
+        config.block_height_retention,
+    ) {
         tracing::error!(
             err = %e,
             "FATAL: failed to rebuild the DAH secondary index from the \
