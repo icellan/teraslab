@@ -130,6 +130,12 @@ type connPool struct {
 
 	totalConns atomic.Int64 // global live connection count; hard ceiling = MaxConns
 
+	// negotiatedVersion caches this node's OP_HELLO protocol version (0 = not yet
+	// negotiated). Used by per-node capability gates (e.g. FU#5 query pagination)
+	// so a cluster fan-out decides each node's behaviour from THAT node's version,
+	// never one client-global verdict applied to every node in the fan-out.
+	negotiatedVersion atomic.Uint32
+
 	closed  atomic.Bool
 	closeCh chan struct{}
 	closeWg sync.WaitGroup

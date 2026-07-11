@@ -1,6 +1,7 @@
 package teraslab
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"sync"
@@ -454,19 +455,28 @@ func (c *Client) getSpendBatchClusterOnce(ctx context.Context, items []GetSpendI
 //
 // Each node caps its response independently, so every node is paged to
 // completion (FU#5 resume cursor) before moving to the next. The cursor is
-// per-node — it resumes within that node's own sorted candidate set. Pagination
-// is gated on the negotiated server version (>=3); against an older server the
-// client makes a single call per node and, if any node truncated, returns the
-// partial union with ErrQueryTruncated rather than looping forever.
+// per-node — it resumes within that node's own sorted candidate set.
+//
+// Pagination is gated PER NODE (never one client-global verdict applied to every
+// node): each node's protocol version is negotiated on its own pool, and a node
+// below version 3 is queried once and surfaced as incomplete rather than paged.
+// During a rolling upgrade nodes disagree, so a per-client gate could send a
+// resume cursor to a still-v2 node that ignores it and loop forever. Two layers
+// prevent that: the per-node gate (skips paging a known pre-v3 node) and, load-
+// bearing, a non-advancing-cursor guard that stops paging any node whose next
+// page does not advance past the cursor just sent. If any node's result is left
+// partial (pre-v3 node, or the guard tripped), the deduplicated union is returned
+// with ErrQueryTruncated — the other nodes' full contributions are preserved.
 func (c *Client) queryNodesUnion(ctx context.Context, opCode uint16, encode func(buf []byte, cursor *TxID) []byte, decode func([]byte) ([]TxID, bool, error)) ([]TxID, error) {
 	pools := c.cluster.allPools()
 	if len(pools) == 0 {
 		return nil, fmt.Errorf("no pools available")
 	}
-	supportsPaging := c.NegotiatedVersion() >= 3
 	seen := make(map[TxID]struct{})
 	var union []TxID
+	incomplete := false
 	for _, pool := range pools {
+		nodeSupportsPaging := c.nodeSupportsPaging(ctx, pool)
 		var cursor *TxID
 		for {
 			conn, err := pool.get(ctx)
@@ -504,17 +514,84 @@ func (c *Client) queryNodesUnion(ctx context.Context, opCode uint16, encode func
 			if !truncated {
 				break
 			}
-			if !supportsPaging {
-				return union, ErrQueryTruncated
+			if !nodeSupportsPaging {
+				// This node cannot resume from a cursor: keep its partial page and
+				// move on rather than looping. The union is flagged incomplete.
+				incomplete = true
+				break
 			}
 			if len(txids) == 0 {
 				return union, fmt.Errorf("query paging: truncated response with empty page")
 			}
 			last := txids[len(txids)-1]
+			// Non-advancing-cursor guard (load-bearing). The server sorts ascending
+			// by txid and a conforming v3 server returns only txids strictly greater
+			// than the sent cursor, so the new page's last txid MUST exceed it. If it
+			// does not, the server ignored the cursor (a still-v2 node the per-node
+			// gate misjudged, or any non-paging node) and paging would loop forever.
+			// Stop, keep the partial page, and flag the union incomplete. The very
+			// first page has a nil cursor, so the guard only applies from the second
+			// round-trip on.
+			if cursor != nil && bytes.Compare(last[:], cursor[:]) <= 0 {
+				incomplete = true
+				break
+			}
 			cursor = &last
 		}
 	}
+	if incomplete {
+		return union, ErrQueryTruncated
+	}
 	return union, nil
+}
+
+// nodeSupportsPaging reports whether the node behind pool speaks protocol version
+// >= 3 (the FU#5 resume cursor). The version is negotiated once per pool via
+// OP_HELLO and cached on the pool, so a cluster fan-out gates EACH node on its OWN
+// version rather than one client-global verdict. When the per-node handshake
+// cannot be completed (transient transport failure) it falls back to the client-
+// global negotiated version; the non-advancing-cursor guard in queryNodesUnion
+// keeps that fallback safe. A cached verdict never over-pages: if a node was
+// upgraded v2->v3 after the cache filled, it is merely queried once and surfaced
+// as incomplete (safe) until the pool reconnects.
+func (c *Client) nodeSupportsPaging(ctx context.Context, pool *connPool) bool {
+	v := pool.negotiatedVersion.Load()
+	if v == 0 {
+		if nv, ok := c.helloPool(ctx, pool); ok {
+			pool.negotiatedVersion.Store(uint32(nv))
+			v = uint32(nv)
+		} else {
+			// Inconclusive handshake: fall back to the client-global verdict rather
+			// than caching a wrong one. The guard protects correctness regardless.
+			v = uint32(c.NegotiatedVersion())
+		}
+	}
+	return v >= 3
+}
+
+// helloPool performs the OP_HELLO handshake against a specific pool and returns
+// the node's protocol version. ok is false only when the handshake could not be
+// completed (dial or transport failure), so the caller can fall back instead of
+// caching a wrong verdict; a genuine pre-handshake node replies with an error
+// status, which is a definitive version 1 (ok == true).
+func (c *Client) helloPool(ctx context.Context, pool *connPool) (version uint16, ok bool) {
+	conn, err := pool.get(ctx)
+	if err != nil {
+		return 0, false
+	}
+	resp, err := conn.roundTrip(ctx, OpHello, 0, nil)
+	if err != nil {
+		return 0, false
+	}
+	defer recyclePayload(resp.Payload)
+	switch {
+	case resp.Status == StatusError:
+		return 1, true
+	case resp.Status != StatusOK || len(resp.Payload) < 2:
+		return 0, false
+	default:
+		return getU16(resp.Payload[0:2]), true
+	}
 }
 
 // decodeGetFrame decodes a GetBatch response frame, recycling its payload.
