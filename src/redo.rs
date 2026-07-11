@@ -3931,8 +3931,8 @@ impl RedoLog {
         Ok(())
     }
 
-    /// Whether appending ALL of `ops` would fit in the current forward
-    /// headroom (no mutation, no sequence drawn).
+    /// Whether appending ALL of `ops` as one atomic batch would fit right now
+    /// (no mutation, no sequence drawn).
     ///
     /// The per-store routed write ([`crate::ops::engine::Engine::append_redo_ops_routed`])
     /// calls this BEFORE appending a batch so an oversized batch is rejected
@@ -3944,15 +3944,32 @@ impl RedoLog {
     /// a `pub(crate)` helper), not by serializing — so a hot create batch with
     /// fat `record_bytes` is not cloned/serialized/CRC'd here just to read its
     /// length (N2).
+    ///
+    /// Uses the SAME capacity rule as [`Self::append_atomic`] /
+    /// [`Self::append_preencoded_atomic`], so a `true` here guarantees the
+    /// matching atomic append will not itself trip `LogFull` (absent concurrent
+    /// space consumption): the segment-roll simulation ([`Self::ring_batch_fits`])
+    /// for a ring log, and the fence-reserved [`Self::append_capacity`] for a
+    /// linear log. (The looser `entries_region_size` bound this once used could
+    /// pass a batch the atomic append then rejected — a false pre-flight.)
     pub fn would_fit(&self, ops: &[&RedoOp]) -> bool {
         if self.poisoned {
             return false;
         }
-        let mut needed = self.write_pos + self.buffer.len() as u64;
-        for op in ops {
-            needed += (ENTRY_HEADER_SIZE + ENTRY_OVERHEAD + op.serialized_data_len()) as u64;
+        // Per-entry on-disk length by arithmetic (the exact size the atomic
+        // append would buffer, proven byte-exact by the `serialized_len` drift
+        // assertion), so a fat `record_bytes` create batch is not cloned here.
+        let lens: Vec<u64> = ops
+            .iter()
+            .map(|op| (ENTRY_HEADER_SIZE + ENTRY_OVERHEAD + op.serialized_data_len()) as u64)
+            .collect();
+        if self.is_ring() {
+            self.ring_batch_fits(&lens).is_ok()
+        } else {
+            let total: u64 = lens.iter().sum();
+            let used = self.write_pos + self.buffer.len() as u64;
+            used + total <= self.append_capacity()
         }
-        needed <= self.entries_region_size()
     }
 
     /// Flush the buffer to device, making all appended entries durable.

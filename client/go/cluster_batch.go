@@ -119,7 +119,9 @@ func resolveItemRedirects[T any](
 		_, subErr := sendItemMutationClusterOnce(ctx, c, opCode, sub, txidOf, sizeHint, encode)
 
 		combined := append([]BatchItemError(nil), otherErrs...)
+		degraded := pe.Degraded
 		if subPe, ok := subErr.(*PartialError); ok {
+			degraded = degraded || subPe.Degraded
 			combined = append(combined, remapBatchErrors(subPe.Errors, redirectIdx)...)
 		} else if subErr != nil {
 			return nil, subErr
@@ -128,7 +130,7 @@ func resolveItemRedirects[T any](
 		if len(combined) == 0 {
 			return &BatchResult{}, nil
 		}
-		res, err = nil, &PartialError{Errors: combined}
+		res, err = nil, &PartialError{Errors: combined, Degraded: degraded}
 	}
 	return res, err
 }
@@ -166,7 +168,7 @@ func sendItemMutationClusterOnce[T any](
 		for _, g := range groups {
 			err := send(g)
 			if pe, ok := err.(*PartialError); ok {
-				return nil, &PartialError{Errors: remapBatchErrors(pe.Errors, g.originalIdx)}
+				return nil, &PartialError{Errors: remapBatchErrors(pe.Errors, g.originalIdx), Degraded: pe.Degraded}
 			}
 			if err != nil {
 				return nil, err
@@ -195,9 +197,11 @@ func sendItemMutationClusterOnce[T any](
 	wg.Wait()
 
 	var allErrors []BatchItemError
+	degraded := false
 	for _, r := range results {
 		if r.err != nil {
 			if pe, ok := r.err.(*PartialError); ok {
+				degraded = degraded || pe.Degraded
 				allErrors = append(allErrors, remapBatchErrors(pe.Errors, r.idxMap)...)
 				continue
 			}
@@ -205,7 +209,7 @@ func sendItemMutationClusterOnce[T any](
 		}
 	}
 	if len(allErrors) > 0 {
-		return nil, &PartialError{Errors: allErrors}
+		return nil, &PartialError{Errors: allErrors, Degraded: degraded}
 	}
 	return &BatchResult{}, nil
 }
@@ -280,12 +284,14 @@ func (c *Client) setMinedBatchClusterOnce(ctx context.Context, params SetMinedBa
 
 	merged := &SpendBatchResponse{}
 	var allErrors []BatchItemError
+	degraded := false
 	for _, r := range results {
 		if r.err != nil {
 			pe, ok := r.err.(*PartialError)
 			if !ok {
 				return nil, r.err
 			}
+			degraded = degraded || pe.Degraded
 			for i := range pe.Successes {
 				if int(pe.Successes[i].ItemIndex) < len(r.idxMap) {
 					pe.Successes[i].ItemIndex = uint32(r.idxMap[pe.Successes[i].ItemIndex])
@@ -306,7 +312,7 @@ func (c *Client) setMinedBatchClusterOnce(ctx context.Context, params SetMinedBa
 	}
 	merged.Errors = allErrors
 	if len(allErrors) > 0 {
-		return merged, &PartialError{Successes: merged.Successes, Errors: allErrors}
+		return merged, &PartialError{Successes: merged.Successes, Errors: allErrors, Degraded: degraded}
 	}
 	return merged, nil
 }

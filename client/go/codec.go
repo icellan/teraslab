@@ -510,6 +510,39 @@ func decodePartialWithSignals(data []byte) ([]BatchItemSuccess, []BatchItemError
 	return successes, errors, nil
 }
 
+// sparseErrorsEncodedLen returns the byte length of the section that
+// decodeSparseErrors consumes for errs — used to locate the optional
+// PartialDurabilityDegraded trailer that may follow it.
+func sparseErrorsEncodedLen(errs []BatchItemError) int {
+	n := 4
+	for i := range errs {
+		n += 8 + len(errs[i].Data)
+	}
+	return n
+}
+
+// partialWithSignalsEncodedLen returns the byte length of the two-section body
+// that decodePartialWithSignals consumes — used to locate the optional
+// PartialDurabilityDegraded trailer that may follow it.
+func partialWithSignalsEncodedLen(successes []BatchItemSuccess, errs []BatchItemError) int {
+	n := 4
+	for i := range successes {
+		n += 6 + len(successes[i].BlockIDs)*4
+	}
+	n += 4
+	for i := range errs {
+		n += 8 + len(errs[i].Data)
+	}
+	return n
+}
+
+// hasDegradedTrailer reports whether data carries the reserved
+// PartialDurabilityDegraded trailer byte immediately after a section of length
+// consumed. An absent trailer (older servers) reports false.
+func hasDegradedTrailer(data []byte, consumed int) bool {
+	return consumed < len(data) && data[consumed] == PartialDurabilityDegraded
+}
+
 // decodeErrorPayload decodes a global error response payload.
 func decodeErrorPayload(data []byte) (uint16, string, error) {
 	if len(data) < 4 {

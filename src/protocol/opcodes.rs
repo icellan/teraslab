@@ -446,6 +446,21 @@ pub const ERR_NOT_DUE: u16 = 36;
 /// completed handoff.
 pub const ERR_MIGRATION_TARGET_NOT_READY: u16 = 37;
 
+/// P1-13 — the server could not serve a response because the assembled
+/// frame would exceed [`MAX_FRAME_SIZE`]. Emitted per-item on the GET
+/// read-back path (`handle_get_batch`) when a single record's data (dense
+/// UTXO slots, up to 4 MiB of inline cold data, or an EXTERNAL blob read
+/// back whole) — or the running sum of a batch — would push the response
+/// past the 16 MiB wire limit that every conforming reader enforces. Also
+/// used as the last-line response when `write_response` intercepts an
+/// over-budget frame instead of emitting a length prefix that would wrap.
+///
+/// Actionable client-side: re-request the offending record on its own, or
+/// with a narrower field mask (e.g. drop `COLD_DATA`). A genuinely oversized
+/// EXTERNAL blob (>16 MiB) is not currently serveable in one frame — a
+/// streaming read path is a documented follow-up.
+pub const ERR_RESPONSE_TOO_LARGE: u16 = 38;
+
 /// P3.10 / F-G5-017 — wire protocol revision.
 ///
 /// `1` is the historical implicit version: legacy clients and servers do

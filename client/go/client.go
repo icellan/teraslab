@@ -331,7 +331,10 @@ func handleMutationResponse(resp responseFrame) (*BatchResult, error) {
 		if err != nil {
 			return nil, fmt.Errorf("decode partial errors: %w", err)
 		}
-		return nil, &PartialError{Errors: errs}
+		// The reserved trailer tells us whether the items that DID apply were
+		// only replicated below quorum (degraded durability).
+		degraded := hasDegradedTrailer(resp.Payload, sparseErrorsEncodedLen(errs))
+		return nil, &PartialError{Errors: errs, Degraded: degraded}
 	default:
 		return nil, fmt.Errorf("unknown status: %d", resp.Status)
 	}
@@ -342,7 +345,9 @@ func handleSignalResponse(resp responseFrame) (*SpendBatchResponse, error) {
 	switch resp.Status {
 	case StatusOK, StatusDegradedDurability:
 		// StatusDegradedDurability is a successful-but-weak ack; decode any
-		// signal payload exactly as StatusOK.
+		// signal payload exactly as StatusOK. On this path the degraded signal
+		// rides in the status byte, not a payload trailer.
+		statusDegraded := resp.Status == StatusDegradedDurability
 		if len(resp.Payload) > 0 {
 			successes, errs, err := decodePartialWithSignals(resp.Payload)
 			if err != nil {
@@ -350,7 +355,7 @@ func handleSignalResponse(resp responseFrame) (*SpendBatchResponse, error) {
 			}
 			result := &SpendBatchResponse{Successes: successes, Errors: errs}
 			if len(errs) > 0 {
-				return result, &PartialError{Successes: successes, Errors: errs}
+				return result, &PartialError{Successes: successes, Errors: errs, Degraded: statusDegraded}
 			}
 			return result, nil
 		}
@@ -370,17 +375,23 @@ func handleSignalResponse(resp responseFrame) (*SpendBatchResponse, error) {
 		}
 		return nil, &RedirectError{Addr: addr}
 	case StatusPartialError:
-		// Try signal format first (successes + errors), fall back to sparse errors only
+		// Try signal format first (successes + errors), fall back to sparse
+		// errors only. Either layout may carry the reserved degraded-durability
+		// trailer, located just past the section the successful decoder consumed.
 		successes, errs, err := decodePartialWithSignals(resp.Payload)
+		degraded := false
 		if err != nil {
-			// Server may send sparse errors without success section
+			// Server may send sparse errors without success section (spend).
 			errs, err = decodeSparseErrors(resp.Payload)
 			if err != nil {
 				return nil, fmt.Errorf("decode partial: %w", err)
 			}
+			degraded = hasDegradedTrailer(resp.Payload, sparseErrorsEncodedLen(errs))
+		} else {
+			degraded = hasDegradedTrailer(resp.Payload, partialWithSignalsEncodedLen(successes, errs))
 		}
 		result := &SpendBatchResponse{Successes: successes, Errors: errs}
-		return result, &PartialError{Successes: successes, Errors: errs}
+		return result, &PartialError{Successes: successes, Errors: errs, Degraded: degraded}
 	default:
 		return nil, fmt.Errorf("unknown status: %d", resp.Status)
 	}
@@ -510,10 +521,12 @@ func (c *Client) resolveSignalRedirects(ctx context.Context, res *SpendBatchResp
 		// merged result; genuine (non-redirect) errors are preserved.
 		merged := &SpendBatchResponse{Successes: append([]BatchItemSuccess(nil), pe.Successes...)}
 		combinedErrs := append([]BatchItemError(nil), otherErrs...)
+		degraded := pe.Degraded
 		if subRes != nil {
 			merged.Successes = append(merged.Successes, remapBatchSuccesses(subRes.Successes, redirectIdx)...)
 		}
 		if subPe, ok := subErr.(*PartialError); ok {
+			degraded = degraded || subPe.Degraded
 			combinedErrs = append(combinedErrs, remapBatchErrors(subPe.Errors, redirectIdx)...)
 		} else if subErr != nil {
 			return nil, subErr
@@ -523,7 +536,7 @@ func (c *Client) resolveSignalRedirects(ctx context.Context, res *SpendBatchResp
 		if len(combinedErrs) == 0 {
 			return merged, nil
 		}
-		res, err = merged, &PartialError{Successes: merged.Successes, Errors: combinedErrs}
+		res, err = merged, &PartialError{Successes: merged.Successes, Errors: combinedErrs, Degraded: degraded}
 	}
 	return res, err
 }
@@ -597,9 +610,11 @@ func (c *Client) spendBatchClusterOnce(ctx context.Context, params SpendBatchPar
 
 	merged := &SpendBatchResponse{}
 	var allErrors []BatchItemError
+	degraded := false
 	for _, r := range results {
 		if r.err != nil {
 			if pe, ok := r.err.(*PartialError); ok {
+				degraded = degraded || pe.Degraded
 				for i := range pe.Successes {
 					if int(pe.Successes[i].ItemIndex) < len(r.group.originalIdx) {
 						pe.Successes[i].ItemIndex = uint32(r.group.originalIdx[pe.Successes[i].ItemIndex])
@@ -627,7 +642,7 @@ func (c *Client) spendBatchClusterOnce(ctx context.Context, params SpendBatchPar
 	}
 	merged.Errors = allErrors
 	if len(allErrors) > 0 {
-		return merged, &PartialError{Successes: merged.Successes, Errors: allErrors}
+		return merged, &PartialError{Successes: merged.Successes, Errors: allErrors, Degraded: degraded}
 	}
 	return merged, nil
 }
@@ -751,7 +766,9 @@ func (c *Client) resolveTxIDRedirects(ctx context.Context, opCode uint16, txids 
 		_, subErr := c.sendTxIDBatchClusterOnce(ctx, opCode, sub, encodePayload)
 
 		combined := append([]BatchItemError(nil), otherErrs...)
+		degraded := pe.Degraded
 		if subPe, ok := subErr.(*PartialError); ok {
+			degraded = degraded || subPe.Degraded
 			combined = append(combined, remapBatchErrors(subPe.Errors, redirectIdx)...)
 		} else if subErr != nil {
 			return nil, subErr
@@ -760,7 +777,7 @@ func (c *Client) resolveTxIDRedirects(ctx context.Context, opCode uint16, txids 
 		if len(combined) == 0 {
 			return &BatchResult{}, nil
 		}
-		res, err = nil, &PartialError{Errors: combined}
+		res, err = nil, &PartialError{Errors: combined, Degraded: degraded}
 	}
 	return res, err
 }
@@ -836,9 +853,11 @@ func (c *Client) sendTxIDBatchClusterOnce(ctx context.Context, opCode uint16, tx
 	wg.Wait()
 
 	var allErrors []BatchItemError
+	degraded := false
 	for _, r := range results {
 		if r.err != nil {
 			if pe, ok := r.err.(*PartialError); ok {
+				degraded = degraded || pe.Degraded
 				allErrors = append(allErrors, remapBatchErrors(pe.Errors, r.idxMap)...)
 				continue
 			}
@@ -846,7 +865,7 @@ func (c *Client) sendTxIDBatchClusterOnce(ctx context.Context, opCode uint16, tx
 		}
 	}
 	if len(allErrors) > 0 {
-		return nil, &PartialError{Errors: allErrors}
+		return nil, &PartialError{Errors: allErrors, Degraded: degraded}
 	}
 	return &BatchResult{}, nil
 }

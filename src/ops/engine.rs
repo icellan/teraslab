@@ -1025,6 +1025,65 @@ impl Engine {
             .filter(|&s| !per_store[s].is_empty())
             .collect();
 
+        // P1-5 pre-flight: when a batch touches more than one store, reject the
+        // WHOLE batch CLEANLY (retryable `LogFull`) BEFORE any store appends if
+        // ANY touched store's slice would not fit its redo log. Without this a
+        // multi-store batch can have one store commit durably while a sibling
+        // hits the deliberately-transient `LogFull`; the poison-on-partial guard
+        // below would then fence the ENTIRE node ("restart required") for what is
+        // merely retryable backpressure the next checkpoint reclaims. Rejecting
+        // up front keeps a transient `LogFull` from ever coexisting with a
+        // durable sibling store. (A single-store commit is already all-or-nothing
+        // via `append_atomic`, so its full log already fails cleanly without a
+        // poison — hence the `touched.len() > 1` gate.)
+        //
+        // Atomicity / lock ordering: every touched log is locked in ASCENDING
+        // log-index order and ALL the locks are held across the fit checks (a
+        // consistent cross-store snapshot). This ordered multi-lock acquisition
+        // is deadlock-free because it is the ONLY site that ever holds more than
+        // one redo-log lock at once — every other path (checkpoint reclaim,
+        // background flush, the committer append) locks a single log — so no
+        // lock-order cycle can form. The locks are released before the commit
+        // fan-out below (the committers re-lock each log internally); the narrow
+        // check-to-commit window a concurrent writer could still exploit is
+        // backstopped by the poison-on-partial guard, which stays the correct
+        // fail-safe for a genuine partial (durable sibling + real fault).
+        if touched.len() > 1
+            && let Some(logs) = self.redo_logs.get()
+            && !logs.is_empty()
+        {
+            // Group each touched store's slice by the log that will actually
+            // receive it (device -> log clamps an out-of-range store index to the
+            // last log), so a shared log is fit-checked against EVERY op it will
+            // get and is never locked twice (which would self-deadlock). BTreeMap
+            // iterates in ascending key order -> the required ascending lock order.
+            let mut per_log: std::collections::BTreeMap<usize, Vec<&crate::redo::RedoOp>> =
+                std::collections::BTreeMap::new();
+            for &store in &touched {
+                let log_idx = store.min(logs.len() - 1);
+                per_log
+                    .entry(log_idx)
+                    .or_default()
+                    .extend_from_slice(&per_store[store]);
+            }
+            let mut held = Vec::with_capacity(per_log.len());
+            for (&log_idx, log_ops) in &per_log {
+                let guard = logs[log_idx].lock();
+                if !guard.would_fit(log_ops) {
+                    // Clean, RETRYABLE rejection: a `LOG_FULL_MESSAGE_PREFIX`
+                    // message the caller classifies as transient backpressure
+                    // (retry + in-memory reservation rollback), NOT a poison.
+                    // `held` and `guard` drop here, releasing every lock taken.
+                    return Err(format!(
+                        "{}: redo store {log_idx} lacks room for this batch",
+                        crate::redo::LOG_FULL_MESSAGE_PREFIX
+                    ));
+                }
+                held.push(guard);
+            }
+            drop(held);
+        }
+
         // Collect each touched store's (min, max) sequence contribution.
         let ranges: Vec<Result<Option<(u64, u64)>, String>> = match touched.split_first() {
             None => return Ok((0, 0)),
@@ -3139,7 +3198,11 @@ impl Engine {
             // mined-state fresh from the authoritative MinedIndex (Task
             // 16a) — a record with at least one live block entry stays
             // spendable even if the on-device bit is still set.
-            let (mined_entries, _) = self.mined_block_entries(&req.tx_key)?;
+            //
+            // P1-10: `mined_slot` was captured from this record's entry above
+            // under the caller-held stripe lock, so pass it straight through
+            // rather than re-resolving the key via the primary index.
+            let (mined_entries, _) = self.mined_block_entries_at(&req.tx_key, mined_slot)?;
             if mined_entries.is_empty() {
                 return Err(SpendError::Locked);
             }
@@ -3161,8 +3224,8 @@ impl Engine {
         if req.spends.is_empty() {
             // Task 16d: block_ids come from the MinedIndex, not the device —
             // `metadata.block_entries_inline` is no longer kept current by
-            // setMined.
-            let (mined_entries, _) = self.mined_block_entries(&req.tx_key)?;
+            // setMined. P1-10: use the already-resolved `mined_slot`.
+            let (mined_entries, _) = self.mined_block_entries_at(&req.tx_key, mined_slot)?;
             let block_ids: Vec<u32> = mined_entries.into_iter().map(|e| e.block_id).collect();
             return Ok(PreparedSpend {
                 tx_key: req.tx_key,
@@ -3345,7 +3408,8 @@ impl Engine {
         }
 
         // Task 16d: block_ids come from the MinedIndex, not the device.
-        let (mined_entries, _) = self.mined_block_entries(&req.tx_key)?;
+        // P1-10: use the already-resolved `mined_slot` (stripe lock held).
+        let (mined_entries, _) = self.mined_block_entries_at(&req.tx_key, mined_slot)?;
         let block_ids: Vec<u32> = mined_entries.into_iter().map(|e| e.block_id).collect();
 
         Ok(PreparedSpend {
@@ -3407,7 +3471,8 @@ impl Engine {
             // Task 16c: see the identical reroute in `prepare_spend_multi`
             // — LOCKED is now an immutable create-time marker, so a record
             // is locked-for-spend only while unmined per the MinedIndex.
-            let (mined_entries, _) = self.mined_block_entries(&req.tx_key)?;
+            // P1-10: `entry` was resolved above under this stripe lock.
+            let (mined_entries, _) = self.mined_block_entries_at(&req.tx_key, entry.mined_slot)?;
             if mined_entries.is_empty() {
                 return Err(SpendError::Locked);
             }
@@ -3503,8 +3568,9 @@ impl Engine {
                         }
                     }
                     // Task 16d: block_ids come from the MinedIndex, not the
-                    // device.
-                    let (mined_entries, _) = self.mined_block_entries(&req.tx_key)?;
+                    // device. P1-10: reuse `entry.mined_slot` (stripe lock held).
+                    let (mined_entries, _) =
+                        self.mined_block_entries_at(&req.tx_key, entry.mined_slot)?;
                     let block_ids: Vec<u32> =
                         mined_entries.into_iter().map(|e| e.block_id).collect();
                     return Ok(SpendResponse {
@@ -3561,8 +3627,10 @@ impl Engine {
         // 7. Evaluate deleteAtHeight. `spend` never touches block entries or
         // `unmined_since`, so has_blocks/unmined_since are read fresh from
         // the authoritative MinedIndex (Task 16a) rather than the device
-        // metadata's `block_entry_count`/`unmined_since` fields.
-        let (mined_entries, mined_unmined_since) = self.mined_block_entries(&req.tx_key)?;
+        // metadata's `block_entry_count`/`unmined_since` fields. P1-10: reuse
+        // the `entry.mined_slot` already resolved under this stripe lock.
+        let (mined_entries, mined_unmined_since) =
+            self.mined_block_entries_at(&req.tx_key, entry.mined_slot)?;
         // followup-2 task 3: source `was_all_spent` from the cache-authoritative
         // LSA, not the (now-vestigial) device footer.
         metadata.flags.set(
@@ -3775,7 +3843,9 @@ impl Engine {
         //    the authoritative MinedIndex (Task 16a) rather than the device
         //    metadata's `block_entry_count`/`unmined_since` fields.
         let old_dah = { metadata.delete_at_height };
-        let (mined_entries, mined_unmined_since) = self.mined_block_entries(&req.tx_key)?;
+        // P1-10: reuse the `entry.mined_slot` resolved above under this stripe lock.
+        let (mined_entries, mined_unmined_since) =
+            self.mined_block_entries_at(&req.tx_key, entry.mined_slot)?;
         // followup-2 task 3: source `was_all_spent` from the cache-authoritative
         // LSA, not the (now-vestigial) device footer.
         metadata.flags.set(
@@ -4014,84 +4084,95 @@ impl Engine {
             })?
             .ok_or(SpendError::TxNotFound)?;
 
-        // 2. Apply the mined-state transition to the MinedIndex — the SOLE
-        //    write this op performs (Task 9's dual-write call; the device
-        //    half of that dual-write is what Task 16d removes).
-        if entry.mined_slot == crate::index::mined_index::NO_MINED_SLOT {
+        // 2-3. Apply the mined-state transition to the MinedIndex — the SOLE
+        //    write this op performs (Task 9's dual-write; the device half is
+        //    what Task 16d removes) — and read the post-mutation mined-state
+        //    back, BOTH under a SINGLE MinedIndex shard-lock acquisition. P1-12:
+        //    `apply_mined_transition` folds what were up to six separate
+        //    shard-lock round-trips (two `mined_block_entries`, apply,
+        //    `read_de_flags`, `is_all_spent`) plus two redundant primary-index
+        //    probes into one, using the `entry.mined_slot` already resolved
+        //    under the stripe lock. The read-back is the authoritative source
+        //    (Task 10) for the DAH eval and the response's block_ids — not a
+        //    device read.
+        let (block_entries, new_unmined, de_flags, all_spent) = if entry.mined_slot
+            == crate::index::mined_index::NO_MINED_SLOT
+        {
             // Should not happen for a live record — `create` always
             // allocates a mined_slot (Task 7). Tolerated defensively (the
             // pre-16d dual-write branch was gated the same way): there is no
             // device fallback left to fall into, so the mined-state
             // transition this call intended is simply lost. Surfaced loudly
-            // since it indicates an index invariant violation elsewhere.
+            // since it indicates an index invariant violation elsewhere. The
+            // RAM DAH eval below then runs against the empty/default state,
+            // exactly as the prior per-accessor path did for this slot.
             tracing::error!(
                 tx_key = ?tx_key.txid,
                 "set_mined_inner: live record has no mined_slot allocated; mined-state \
                  transition for this call cannot be recorded anywhere (post-16d there is no \
                  device fallback)",
             );
-        } else if req.unset_mined {
-            self.mined_index().apply_unset(
-                tx_key,
-                entry.mined_slot,
-                req.block_id,
-                req.current_block_height,
-            );
+            (Vec::new(), 0u32, 0u8, false)
         } else {
-            // BUG-2 guard, preserved: the pre-16d device counter was a `u8`,
-            // so a 256th DISTINCT block_id would wrap `255 -> 0` rather than
-            // erroring. The MinedIndex's overflow `Vec<BlockEntry>` has no
-            // such physical width constraint, but the cap is a deliberate
-            // bound against unbounded per-tx memory growth (a client
-            // repeatedly setMined-ing the same tx into new block_ids), not
-            // merely a storage-format artifact — so it is kept here rather
-            // than dropped. Idempotent re-application of an ALREADY-recorded
-            // block_id must still succeed even at capacity (mirrors the old
-            // `exists` short-circuit), so only a genuinely new distinct
-            // block_id is checked against the cap.
-            let (existing_before, _) = self.mined_block_entries(tx_key)?;
-            let already_present = existing_before.iter().any(|e| e.block_id == req.block_id);
-            if !already_present && existing_before.len() >= u8::MAX as usize {
-                return Err(SpendError::BlockEntriesFull {
-                    cap: u8::MAX as usize,
-                });
+            let transition = if req.unset_mined {
+                crate::index::mined_index::MinedTransition::Unset {
+                    block_id: req.block_id,
+                    current_height: req.current_block_height,
+                }
+            } else {
+                // BUG-2 guard, preserved: the pre-16d device counter was a
+                // `u8`, so a 256th DISTINCT block_id would wrap `255 -> 0`
+                // rather than erroring. The MinedIndex's overflow
+                // `Vec<BlockEntry>` has no such physical width constraint,
+                // but the cap is a deliberate bound against unbounded per-tx
+                // memory growth (a client repeatedly setMined-ing the same
+                // tx into new block_ids), not merely a storage-format
+                // artifact — so it is kept. It is now enforced INSIDE
+                // `apply_mined_transition` before it mutates (returning
+                // `BlockEntriesFull`), and an idempotent re-application of an
+                // already-recorded block_id still succeeds at capacity.
+                crate::index::mined_index::MinedTransition::Set {
+                    block_id: req.block_id,
+                    block_height: req.block_height,
+                    subtree_idx: req.subtree_idx,
+                    on_longest_chain: req.on_longest_chain,
+                }
+            };
+            match self
+                .mined_index()
+                .apply_mined_transition(tx_key, entry.mined_slot, transition)
+            {
+                crate::index::mined_index::MinedTransitionOutcome::Applied(state) => (
+                    state.block_entries,
+                    state.unmined_since,
+                    state.de_flags,
+                    state.all_spent,
+                ),
+                crate::index::mined_index::MinedTransitionOutcome::BlockEntriesFull => {
+                    return Err(SpendError::BlockEntriesFull {
+                        cap: u8::MAX as usize,
+                    });
+                }
+                crate::index::mined_index::MinedTransitionOutcome::SlotAbsent => {
+                    return Err(SpendError::StorageError {
+                        detail: "mined_slot present in primary index but absent from MinedIndex"
+                            .to_string(),
+                    });
+                }
             }
-            self.mined_index().apply_set_mined(
-                tx_key,
-                entry.mined_slot,
-                req.block_id,
-                req.block_height,
-                req.subtree_idx,
-                req.on_longest_chain,
-            );
-        }
-
-        // 3. Read the post-mutation mined-state back from the MinedIndex —
-        //    the authoritative source (Task 10) — for the DAH eval and the
-        //    response's block_ids. Not a device read.
-        let (block_entries, new_unmined) = self.mined_block_entries(tx_key)?;
+        };
         let has_blocks = !block_entries.is_empty();
 
         // 4. DAH evaluation sourced ENTIRELY from RAM (followup-2 — no device
         //    read). The four DAH-relevant flags + preserve come from the
-        //    MinedEntry DE-flag cache, `all_spent` from the cached
-        //    MINED_ALL_SPENT bit, `old_dah` from the authoritative DAH
-        //    secondary index, and has_blocks/unmined_since from the MinedIndex.
-        //    `read_de_flags`/`is_all_spent` return `None` only for a slot that
-        //    is absent or reallocated (the defensive NO_MINED_SLOT branch above,
-        //    or an ABA race the stripe lock precludes); defaulting to
-        //    empty/false there degrades to "no DAH change", never a wrong
-        //    delete.
-        let de_flags = self
-            .mined_index()
-            .read_de_flags(tx_key, entry.mined_slot)
-            .unwrap_or(0);
+        //    MinedEntry DE-flag cache (`de_flags`), `all_spent` from the cached
+        //    MINED_ALL_SPENT bit, has_blocks/unmined_since from the block-entry
+        //    read-back above — all captured in the single acquisition (P1-12),
+        //    which for an absent/ABA slot returns `SlotAbsent` above rather than
+        //    silently defaulting. `old_dah` comes from the authoritative DAH
+        //    secondary index.
         let tx_flags = crate::index::mined_index::tx_flags_from_de_flags(de_flags);
         let has_preserve = de_flags & crate::index::mined_index::MINED_PRESERVED != 0;
-        let all_spent = self
-            .mined_index()
-            .is_all_spent(tx_key, entry.mined_slot)
-            .unwrap_or(false);
         // Authoritative existing DAH: the live secondary-index height, not the
         // (now-frozen) device footer. Sourcing it here also closes the former
         // back-to-back-setMined staleness gap (each call now baselines
@@ -4215,8 +4296,9 @@ impl Engine {
         // never touches block entries, so has_blocks is read fresh from the
         // MinedIndex (Task 16a); `unmined_since` is the value already
         // computed above (in hand — this op is the one mutating it), not a
-        // MinedIndex re-read of the pre-mutation state.
-        let (mined_entries, _) = self.mined_block_entries(&req.tx_key)?;
+        // MinedIndex re-read of the pre-mutation state. P1-10: reuse the
+        // `entry.mined_slot` resolved above under this stripe lock.
+        let (mined_entries, _) = self.mined_block_entries_at(&req.tx_key, entry.mined_slot)?;
         // followup-2 task 3: source `was_all_spent` from the cache-authoritative
         // LSA, not the (now-vestigial) device footer.
         metadata.flags.set(
@@ -5580,7 +5662,9 @@ impl Engine {
         // `all_spent` is always false and only the "clear" / "all-spent
         // transition" branches (neither of which reads has_blocks/
         // on_longest_chain) are reachable.
-        let (mined_entries, mined_unmined_since) = self.mined_block_entries(parent_key)?;
+        // P1-10: reuse the `entry.mined_slot` resolved above under this stripe lock.
+        let (mined_entries, mined_unmined_since) =
+            self.mined_block_entries_at(parent_key, entry.mined_slot)?;
         let old_dah = { meta.delete_at_height };
         // followup-2 task 3: source `was_all_spent` from the cache-authoritative
         // LSA, not the (now-vestigial) device footer.
@@ -5897,8 +5981,9 @@ impl Engine {
             // (Task 16c) — LOCKED is now an immutable create-time marker, so a
             // record is locked-for-reassign only while unmined per the
             // MinedIndex. `reassign` has no `ignore_locked` escape hatch, so
-            // this is the sole gate.
-            let (mined_entries, _) = self.mined_block_entries(&req.tx_key)?;
+            // this is the sole gate. P1-10: reuse the `entry.mined_slot`
+            // resolved above under this stripe lock.
+            let (mined_entries, _) = self.mined_block_entries_at(&req.tx_key, entry.mined_slot)?;
             if mined_entries.is_empty() {
                 return Err(SpendError::Locked);
             }
@@ -6450,6 +6535,42 @@ impl Engine {
             })
     }
 
+    /// Slot-taking twin of [`Self::mined_block_entries`] for callers that have
+    /// already resolved the key's [`crate::index::TxIndexEntry`] under the
+    /// record's stripe lock.
+    ///
+    /// Identical behavior to [`Self::mined_block_entries`] EXCEPT it skips the
+    /// primary-index `lookup_checked` re-resolution — the caller passes the
+    /// `mined_slot` it already holds. This is semantics-preserving ONLY when
+    /// `mined_slot` is the entry's current slot for `key` and the stripe lock
+    /// is held (so the entry cannot be concurrently deleted/reassigned); every
+    /// hot-path caller (spend / unspend / setMined / mark-on-longest-chain /
+    /// prune / reassign / set-conflicting) satisfies both, removing a redundant
+    /// shard-`RwLock` read + Robin Hood probe per op.
+    ///
+    /// # Errors
+    ///
+    /// - [`SpendError::StorageError`] if `mined_slot` is live (not
+    ///   `NO_MINED_SLOT`) but the MinedIndex reports the slot as absent (an
+    ///   index/MinedIndex desync, not a normal miss). Unlike
+    ///   [`Self::mined_block_entries`] this never returns
+    ///   [`SpendError::TxNotFound`] — existence is the caller's held entry.
+    pub fn mined_block_entries_at(
+        &self,
+        key: &TxKey,
+        mined_slot: u32,
+    ) -> Result<(Vec<BlockEntry>, u32), SpendError> {
+        if mined_slot == crate::index::mined_index::NO_MINED_SLOT {
+            return Ok((vec![], 0));
+        }
+        self.mined_index
+            .read_block_entries(key, mined_slot)
+            .ok_or_else(|| SpendError::StorageError {
+                detail: "mined_slot present in primary index but absent from MinedIndex"
+                    .to_string(),
+            })
+    }
+
     fn append_conflicting_child_best_effort(
         &self,
         parent_key: &TxKey,
@@ -6936,7 +7057,9 @@ impl Engine {
         // so has_blocks/unmined_since for both branches below are read fresh
         // from the authoritative MinedIndex (Task 16a) rather than the
         // device metadata's `block_entry_count`/`unmined_since` fields.
-        let (mined_entries, mined_unmined_since) = self.mined_block_entries(&req.tx_key)?;
+        // P1-10: reuse the `entry.mined_slot` resolved above under this stripe lock.
+        let (mined_entries, mined_unmined_since) =
+            self.mined_block_entries_at(&req.tx_key, entry.mined_slot)?;
         let has_blocks = !mined_entries.is_empty();
 
         // Fast path: read the authoritative on-device metadata once and
@@ -7881,7 +8004,9 @@ impl Engine {
         // reorg-unmined via `set_mined` carries stale device mined-state, and
         // planting a DAH on it here (when it is actually unmined / retained)
         // would seed the very orphan the sweep gate now rejects.
-        let (mined_entries, mined_unmined_since) = self.mined_block_entries(key)?;
+        // P1-10: reuse the `entry.mined_slot` resolved above under this stripe lock.
+        let (mined_entries, mined_unmined_since) =
+            self.mined_block_entries_at(key, entry.mined_slot)?;
         let eligible =
             Self::sweep_eligible_with_mined(&meta, !mined_entries.is_empty(), mined_unmined_since);
 
@@ -10066,8 +10191,11 @@ impl PreparedSpend {
         // Batch spend never touches block entries or `unmined_since`, so
         // has_blocks/unmined_since are read fresh from the authoritative
         // MinedIndex (Task 16a) rather than the device metadata's
-        // `block_entry_count`/`unmined_since` fields.
-        let (mined_entries, mined_unmined_since) = engine.mined_block_entries(&tx_key)?;
+        // `block_entry_count`/`unmined_since` fields. P1-10: reuse the
+        // `mined_slot` carried on the PreparedSpend (resolved in
+        // `prepare_spend_multi` under the caller-held stripe lock).
+        let (mined_entries, mined_unmined_since) =
+            engine.mined_block_entries_at(&tx_key, mined_slot)?;
         // followup-2 task 3: source `was_all_spent` from the cache-authoritative
         // LSA, not the (now-vestigial) device footer.
         metadata.flags.set(
@@ -11258,6 +11386,69 @@ mod tests {
         assert_eq!(entries.len(), 1, "the one seeded mined block is present");
         let be = entries[0];
         assert_eq!({ be.block_id }, 0x99, "the seeded block_id round-trips");
+    }
+
+    /// P1-10: `mined_block_entries_at(key, slot)` is the slot-taking twin of
+    /// `mined_block_entries(key)`. It must return byte-identical results for a
+    /// record with a live mined slot (block entries + `unmined_since`) and the
+    /// same empty `(vec![], 0)` for `NO_MINED_SLOT`, WITHOUT the redundant
+    /// primary-index re-resolution the full variant performs.
+    #[test]
+    fn mined_block_entries_at_matches_full_variant() {
+        use crate::index::mined_index::NO_MINED_SLOT;
+
+        // Record on the longest chain (unmined_since == 0) with two mined blocks.
+        let h = TestHarness::new(3, TxFlags::empty());
+        h.add_mined_block(0x1234_5678, 800_000, 2);
+        h.add_mined_block(0x9abc_def0, 800_050, 0);
+
+        let slot = h
+            .engine
+            .lookup(&h.key)
+            .expect("record registered")
+            .mined_slot;
+        assert_ne!(
+            slot, NO_MINED_SLOT,
+            "precondition: the seeded record has a live mined slot"
+        );
+
+        // Live-slot case: the slot variant equals the full variant exactly,
+        // including block entries AND unmined_since.
+        let full = h
+            .engine
+            .mined_block_entries(&h.key)
+            .expect("full-variant read succeeds");
+        let at = h
+            .engine
+            .mined_block_entries_at(&h.key, slot)
+            .expect("slot-variant read succeeds");
+        assert_eq!(
+            full, at,
+            "slot variant must return identical (block entries, unmined_since)"
+        );
+
+        // Non-vacuous: the shared result actually carries the seeded blocks in
+        // insertion order, on the longest chain.
+        let block_ids: Vec<u32> = full.0.iter().copied().map(|e| e.block_id).collect();
+        assert_eq!(
+            block_ids,
+            vec![0x1234_5678, 0x9abc_def0],
+            "both variants surface the seeded block_ids in insertion order"
+        );
+        assert_eq!(
+            full.1, 0,
+            "on-longest-chain record reports unmined_since == 0"
+        );
+
+        // NO_MINED_SLOT short-circuit: empty result, identical to what the full
+        // variant returns for a never-mined entry — no MinedIndex probe at all.
+        assert_eq!(
+            h.engine
+                .mined_block_entries_at(&h.key, NO_MINED_SLOT)
+                .expect("NO_MINED_SLOT read succeeds"),
+            (Vec::new(), 0),
+            "NO_MINED_SLOT must yield the empty (vec![], 0) result"
+        );
     }
 
     /// P0 (Part B — dangling reconcile slot bricks boot): a primary entry whose
@@ -12511,6 +12702,143 @@ mod tests {
             Some(1288),
             "all-spent + mined + on-chain must set DAH = current(1000) + retention(288)",
         );
+    }
+
+    /// P1-12: `set_mined_inner` folds its six MinedIndex shard-lock
+    /// acquisitions (two `mined_block_entries`, `apply_set_mined`,
+    /// `read_de_flags`, `is_all_spent`, `set_de_flag`) into the consolidated
+    /// `apply_mined_transition`. This pins the observable outcome — response
+    /// signal + block_ids, the authoritative MinedIndex mined-state read-back,
+    /// and the DAH index — across the four key scenarios so the consolidation
+    /// can never silently change semantics.
+    #[test]
+    fn set_mined_inner_observable_outcome_unchanged_across_scenarios() {
+        // Scenario 1: mined on the longest chain, partially spent → no DAH,
+        // unmined cleared, no signal.
+        {
+            let h = TestHarness::new(2, TxFlags::empty());
+            let resp = h
+                .engine
+                .set_mined(&SetMinedRequest {
+                    tx_key: h.key,
+                    block_id: 7,
+                    block_height: 900,
+                    subtree_idx: 0,
+                    current_block_height: 1000,
+                    block_height_retention: 288,
+                    on_longest_chain: true,
+                    unset_mined: false,
+                })
+                .expect("mined on longest chain");
+            assert_eq!(resp.block_ids, vec![7]);
+            assert_eq!(resp.signal, Signal::None);
+            let (entries, unmined) = h.engine.mined_block_entries(&h.key).unwrap();
+            assert_eq!(entries.len(), 1, "one block recorded");
+            assert_eq!(unmined, 0, "on_longest_chain clears unmined_since");
+            assert!(
+                !h.engine.dah_index().range_query(u32::MAX).contains(&h.key),
+                "partially spent → no DAH",
+            );
+        }
+
+        // Scenario 2: unset_mined removes the sole block → record goes unmined
+        // as of current height, DAH stays absent, no signal.
+        {
+            let h = TestHarness::new(2, TxFlags::empty());
+            h.engine
+                .set_mined(&SetMinedRequest {
+                    tx_key: h.key,
+                    block_id: 7,
+                    block_height: 900,
+                    subtree_idx: 0,
+                    current_block_height: 1000,
+                    block_height_retention: 288,
+                    on_longest_chain: true,
+                    unset_mined: false,
+                })
+                .expect("mine");
+            let resp = h
+                .engine
+                .set_mined(&SetMinedRequest {
+                    tx_key: h.key,
+                    block_id: 7,
+                    block_height: 900,
+                    subtree_idx: 0,
+                    current_block_height: 1000,
+                    block_height_retention: 288,
+                    on_longest_chain: true,
+                    unset_mined: true,
+                })
+                .expect("unset");
+            assert!(resp.block_ids.is_empty(), "unset removed the sole block");
+            assert_eq!(resp.signal, Signal::None);
+            let (entries, unmined) = h.engine.mined_block_entries(&h.key).unwrap();
+            assert!(entries.is_empty(), "no blocks after unset");
+            assert_eq!(unmined, 1000, "unset with no blocks left re-marks unmined");
+            assert!(!h.engine.dah_index().range_query(u32::MAX).contains(&h.key));
+        }
+
+        // Scenario 3: an all-spent record mined on-chain → DAH = current +
+        // retention. Non-external, so the signal is None.
+        {
+            let h = TestHarness::new(2, TxFlags::empty());
+            h.engine.spend(&h.spend_req(0)).unwrap();
+            h.engine.spend(&h.spend_req(1)).unwrap();
+            let resp = h
+                .engine
+                .set_mined(&SetMinedRequest {
+                    tx_key: h.key,
+                    block_id: 8,
+                    block_height: 900,
+                    subtree_idx: 0,
+                    current_block_height: 1000,
+                    block_height_retention: 288,
+                    on_longest_chain: true,
+                    unset_mined: false,
+                })
+                .expect("mine all-spent");
+            assert_eq!(resp.block_ids, vec![8]);
+            assert_eq!(
+                resp.signal,
+                Signal::None,
+                "non-external all-spent emits no signal"
+            );
+            assert_eq!(
+                h.engine.dah_index().get_height(&h.key),
+                Some(1288),
+                "all-spent + mined + on-chain sets DAH = 1000 + 288",
+            );
+        }
+
+        // Scenario 4: a conflicting external record mined on-chain → DAH set
+        // via the conflicting branch, and (being external) signals DAHSet.
+        {
+            let h = TestHarness::new(2, TxFlags::CONFLICTING | TxFlags::EXTERNAL);
+            let resp = h
+                .engine
+                .set_mined(&SetMinedRequest {
+                    tx_key: h.key,
+                    block_id: 9,
+                    block_height: 900,
+                    subtree_idx: 0,
+                    current_block_height: 1000,
+                    block_height_retention: 288,
+                    on_longest_chain: true,
+                    unset_mined: false,
+                })
+                .expect("mine conflicting external");
+            assert_eq!(resp.block_ids, vec![9]);
+            assert_eq!(
+                resp.signal,
+                Signal::DeleteAtHeightSet,
+                "conflicting external with no prior DAH signals DAHSet",
+            );
+            assert_eq!(
+                h.engine.dah_index().get_height(&h.key),
+                Some(1288),
+                "conflicting record with existing_dah==0 arms a DAH",
+            );
+        }
     }
 
     /// followup-2 end-to-end: a setMined that drives an all-spent record to a
@@ -21254,6 +21582,111 @@ mod tests {
             fresh.recover().unwrap().len(),
             2,
             "only the fitting batch is durable; no residue from the rejected batch"
+        );
+    }
+
+    /// P1-5: a multi-store batch whose slice for ONE store would overflow that
+    /// store's redo log must be rejected as a WHOLE — cleanly and RETRYABLY (a
+    /// transient `LogFull`), BEFORE any store appends — so a durable sibling can
+    /// never coexist with a transient full store and trip the poison-on-partial
+    /// fence. Pre-fix, store 0 committed durably while store 1 hit `LogFull`,
+    /// poisoning BOTH logs and wedging the node ("restart required") for what is
+    /// merely retryable backpressure the next checkpoint reclaims.
+    #[test]
+    fn append_redo_ops_routed_preflight_rejects_oversized_slice_without_poison() {
+        use crate::redo::{RedoLog, RedoOp};
+        use std::sync::atomic::AtomicU64;
+
+        let engine = create_two_store_engine();
+
+        // Store 0: a roomy log (its one-op slice fits). Store 1: a TINY log so
+        // the batch's store-1 slice cannot fit — the deterministic stand-in for
+        // a sibling store momentarily full during a checkpoint drain.
+        let rdev0: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
+        let rdev1: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(8192, 4096).unwrap());
+        let mut log0 = RedoLog::open(rdev0.clone(), 0, 1024 * 1024).unwrap();
+        let mut log1 = RedoLog::open(rdev1.clone(), 0, 8192).unwrap();
+        let shared = Arc::new(AtomicU64::new(RedoLog::shared_sequence_floor(&[
+            &log0, &log1,
+        ])));
+        log0.attach_shared_sequence(shared.clone());
+        log1.attach_shared_sequence(shared.clone());
+        let log0_arc = Arc::new(parking_lot::Mutex::new(log0));
+        let log1_arc = Arc::new(parking_lot::Mutex::new(log1));
+        engine.set_redo_logs(vec![log0_arc.clone(), log1_arc.clone()]);
+
+        // One op for store 0 (fits) + a slice for store 1 that overflows its
+        // tiny log. Ordered store-0-first so the PRE-FIX head (calling thread)
+        // makes store 0 durable before store 1's `LogFull` is even seen —
+        // exactly the partial-commit hazard.
+        let mut ops = vec![RedoOp::AllocateRegion {
+            device_id: 0,
+            offset: 0,
+            size: 4096,
+        }];
+        ops.extend((0..2000u64).map(|i| RedoOp::AllocateRegion {
+            device_id: 1,
+            offset: i * 4096,
+            size: 4096,
+        }));
+
+        let err = engine
+            .append_redo_ops_routed(&ops)
+            .expect_err("a batch that overflows one store's log must be rejected");
+        // RETRYABLE: classified as transient `LogFull`, NOT the poison/fence
+        // error the pre-fix path returned.
+        assert!(
+            err.contains(crate::redo::LOG_FULL_MESSAGE_PREFIX),
+            "expected a retryable LogFull-classified rejection, got: {err}"
+        );
+        assert!(
+            !err.contains("partial cross-store"),
+            "must be a clean pre-flight rejection, NOT the poison/fence error: {err}"
+        );
+
+        // NO partial durable residue: the rejected batch appended nothing on
+        // EITHER store — reopening each device recovers zero entries (only the
+        // header written at open exists).
+        assert_eq!(
+            RedoLog::open(rdev0, 0, 1024 * 1024)
+                .unwrap()
+                .recover()
+                .unwrap()
+                .len(),
+            0,
+            "store 0 must hold NO residue from the rejected batch"
+        );
+        assert_eq!(
+            RedoLog::open(rdev1, 0, 8192)
+                .unwrap()
+                .recover()
+                .unwrap()
+                .len(),
+            0,
+            "store 1 must hold NO residue from the rejected batch"
+        );
+
+        // NEITHER log is poisoned — the node stays write-healthy: a fitting write
+        // to EITHER store still succeeds and both draw from the shared counter.
+        let s0 = log0_arc
+            .lock()
+            .append(RedoOp::AllocateRegion {
+                device_id: 0,
+                offset: 8192,
+                size: 4096,
+            })
+            .expect("store 0 must NOT be poisoned by a clean pre-flight rejection");
+        let s1 = log1_arc
+            .lock()
+            .append(RedoOp::AllocateRegion {
+                device_id: 1,
+                offset: 0,
+                size: 4096,
+            })
+            .expect("store 1 must NOT be poisoned by a clean pre-flight rejection");
+        assert_ne!(
+            s0, s1,
+            "both logs stay live and draw distinct shared sequences"
         );
     }
 

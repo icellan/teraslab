@@ -87,6 +87,18 @@ const (
 	StatusDegradedDurability uint8 = 5
 )
 
+// PartialDurabilityDegraded is the reserved trailer byte appended after the
+// sparse-error / partial-with-signals section of a StatusPartialError payload
+// when the items that DID apply were only replicated under degraded
+// (below-quorum, best-effort) durability. It carries the same meaning as
+// StatusDegradedDurability on a fully-successful batch: a single status byte
+// cannot express both "partial error" and "degraded" at once, so on the partial
+// path the degraded signal rides as this one-byte trailer. It is present only in
+// the degraded case, so non-degraded partial responses are byte-identical to the
+// pre-trailer wire format and older decoders (which stop after the declared
+// section) ignore it.
+const PartialDurabilityDegraded uint8 = 1
+
 // Error codes shared across all batch operations. Mirrors
 // src/protocol/opcodes.rs (ERR_* constants).
 const (

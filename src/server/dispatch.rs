@@ -8,7 +8,7 @@
 //! - Redo log entries are appended for crash recovery.
 //! - Replication ops are sent to replica nodes (if in cluster mode with RF > 1).
 
-use crate::cluster::coordinator::RunningCluster;
+use crate::cluster::coordinator::{MasterSnapshot, RunningCluster};
 use crate::cluster::shards::{NodeId, ShardHandoff, ShardTable};
 use crate::index::TxKey;
 use crate::ops::create::*;
@@ -4920,7 +4920,51 @@ fn check_shard_ownership(
 ) -> Option<BatchItemError> {
     let cluster = cluster?;
     let key = TxKey { txid: *txid };
-    match cluster.is_master(&key) {
+    let mastership = cluster.is_master(&key);
+    resolve_shard_ownership(cluster, &key, item_index, mastership, allow_if_migrating)
+}
+
+/// Batch-scoped variant of [`check_shard_ownership`] that resolves shard
+/// mastership from a per-batch [`MasterSnapshot`] (captured once via
+/// [`RunningCluster::master_snapshot`]) instead of re-acquiring the shard
+/// table + address locks for every item. Pass `snapshot = None` to fall back
+/// to the per-item [`RunningCluster::is_master`] lookup (a non-clustered node,
+/// where `cluster` is also `None`, or a caller that did not capture one).
+///
+/// Only the master-identity lookup is hoisted; the per-key migration gates
+/// (pending inbound, write-fence) and redirect routing in
+/// [`resolve_shard_ownership`] stay per item, so every item still gets its own
+/// correct redirect / migration / transition decision.
+fn check_shard_ownership_snap(
+    txid: &[u8; 32],
+    item_index: u32,
+    cluster: Option<&RunningCluster>,
+    snapshot: Option<&MasterSnapshot>,
+    allow_if_migrating: bool,
+) -> Option<BatchItemError> {
+    let cluster = cluster?;
+    let key = TxKey { txid: *txid };
+    let mastership = match snapshot {
+        Some(snap) => cluster.is_master_snapshot(snap, &key),
+        None => cluster.is_master(&key),
+    };
+    resolve_shard_ownership(cluster, &key, item_index, mastership, allow_if_migrating)
+}
+
+/// Resolve a shard-ownership decision from an already-computed
+/// [`MasterQueryResult`](crate::cluster::coordinator::MasterQueryResult),
+/// applying the per-key migration gates and building the redirect error.
+/// Shared by [`check_shard_ownership`] and [`check_shard_ownership_snap`] so
+/// the two entry points differ ONLY in how the master identity is looked up
+/// (per-item lock vs. batch snapshot) — the per-item gates below are identical.
+fn resolve_shard_ownership(
+    cluster: &RunningCluster,
+    key: &TxKey,
+    item_index: u32,
+    mastership: crate::cluster::coordinator::MasterQueryResult,
+    allow_if_migrating: bool,
+) -> Option<BatchItemError> {
+    match mastership {
         crate::cluster::coordinator::MasterQueryResult::Yes => {
             // If we're the new master but still waiting for inbound migration
             // data, reject mutations so clients retry after migration completes.
@@ -4929,8 +4973,8 @@ fn check_shard_ownership(
             // immediately (via the same path below when `allow_if_migrating`
             // is false), or is served locally during *outbound* migration
             // (the `MasterQueryResult::No` arm) where the data is still present.
-            if !allow_if_migrating && cluster.has_pending_inbound(&key) {
-                let shard = crate::cluster::shards::ShardTable::shard_for_key(&key);
+            if !allow_if_migrating && cluster.has_pending_inbound(key) {
+                let shard = crate::cluster::shards::ShardTable::shard_for_key(key);
                 tracing::debug!(
                     shard,
                     "dispatch: write rejected — pending inbound migration"
@@ -4940,8 +4984,8 @@ fn check_shard_ownership(
                     error_code: ERR_MIGRATION_IN_PROGRESS,
                     error_data: Vec::new(),
                 })
-            } else if !allow_if_migrating && cluster.is_shard_write_fenced(&key) {
-                let shard = crate::cluster::shards::ShardTable::shard_for_key(&key);
+            } else if !allow_if_migrating && cluster.is_shard_write_fenced(key) {
+                let shard = crate::cluster::shards::ShardTable::shard_for_key(key);
                 tracing::debug!(
                     shard,
                     "dispatch: write rejected — write-fenced (delta streaming)"
@@ -4973,7 +5017,7 @@ fn check_shard_ownership(
         crate::cluster::coordinator::MasterQueryResult::No => {
             // During outbound migration, reads can still be served locally
             // because the data hasn't been removed yet.
-            if allow_if_migrating && cluster.is_migrating_outbound(&key) {
+            if allow_if_migrating && cluster.is_migrating_outbound(key) {
                 return None;
             }
             // Determine the target node address for the redirect.
@@ -4990,7 +5034,7 @@ fn check_shard_ownership(
             // PartialError surfaced to the caller. That is a graceful
             // failure (no silent corruption); the legacy client just
             // does not benefit from version-based loop detection.
-            let route = cluster.route(&key);
+            let route = cluster.route(key);
             let error_data = match route {
                 crate::cluster::shards::RouteDecision::RedirectTo {
                     node,
@@ -5009,7 +5053,7 @@ fn check_shard_ownership(
                     // retries once membership converges, rather than chasing a
                     // blank target.
                     None => {
-                        let shard = crate::cluster::shards::ShardTable::shard_for_key(&key);
+                        let shard = crate::cluster::shards::ShardTable::shard_for_key(key);
                         tracing::debug!(
                             shard,
                             node = ?node,
@@ -5182,13 +5226,23 @@ fn handle_spend_batch(
     // redo flush (Phase 3) and the serial apply (Phase 4) still run afterwards
     // with all stripe locks held, so WAL-first ordering and per-txid atomicity
     // are unchanged.
+    // P1-3: hoist the shard-master lookup to ONE lock acquisition per batch —
+    // captured before the fan-out and shared (by shared ref) across the
+    // read-pool workers that validate groups concurrently.
+    let master_snap = cluster.map(|c| c.master_snapshot());
     let validate_group = |txid: &[u8; 32], group: &[(usize, &WireSpendItem)]| -> GroupOut {
         let mut out = GroupOut {
             errors: Vec::new(),
             redo_ops: Vec::new(),
             staged: None,
         };
-        if let Some(redirect_err) = check_shard_ownership(txid, group[0].0 as u32, cluster, false) {
+        if let Some(redirect_err) = check_shard_ownership_snap(
+            txid,
+            group[0].0 as u32,
+            cluster,
+            master_snap.as_ref(),
+            false,
+        ) {
             for &(i, _) in group {
                 out.errors.push(BatchItemError {
                     item_index: i as u32,
@@ -5553,25 +5607,12 @@ fn handle_spend_batch(
         }
     };
 
-    if errors.is_empty() {
-        let status = if repl_outcome.is_degraded() {
-            STATUS_DEGRADED_DURABILITY
-        } else {
-            STATUS_OK
-        };
-        ResponseFrame {
-            request_id: req.request_id,
-            status,
-            payload: vec![],
-        }
-    } else {
-        errors.sort_by_key(|e| e.item_index);
-        ResponseFrame {
-            request_id: req.request_id,
-            status: STATUS_PARTIAL_ERROR,
-            payload: encode_sparse_errors(&errors),
-        }
-    }
+    // Same status/degraded-trailer precedence as every other batch mutation:
+    // clean → STATUS_OK / STATUS_DEGRADED_DURABILITY, per-item errors →
+    // STATUS_PARTIAL_ERROR with the degraded signal appended as a payload
+    // trailer when replication was below-quorum (never silently dropped).
+    errors.sort_by_key(|e| e.item_index);
+    batch_response_with_outcome(req.request_id, &errors, repl_outcome)
 }
 
 // ---------------------------------------------------------------------------
@@ -5646,8 +5687,12 @@ fn handle_unspend_batch(
     // slots so over-decrement on a re-played idempotent redo is
     // harmless because replay skips before touching metadata.
     let mut running_spent: std::collections::HashMap<TxKey, u32> = std::collections::HashMap::new();
+    // P1-3: hoist the shard-master lookup to ONE lock acquisition per batch.
+    let master_snap = cluster.map(|c| c.master_snapshot());
     for (i, item) in items.iter().enumerate() {
-        if let Some(redirect_err) = check_shard_ownership(&item.txid, i as u32, cluster, false) {
+        if let Some(redirect_err) =
+            check_shard_ownership_snap(&item.txid, i as u32, cluster, master_snap.as_ref(), false)
+        {
             errors.push(redirect_err);
             continue;
         }
@@ -5823,8 +5868,12 @@ fn handle_set_mined_batch(
         key: TxKey,
     }
     let mut valid_items: Vec<ValidSetMined> = Vec::new();
+    // P1-3: hoist the shard-master lookup to ONE lock acquisition per batch.
+    let master_snap = cluster.map(|c| c.master_snapshot());
     for (i, txid) in txids.iter().enumerate() {
-        if let Some(redirect_err) = check_shard_ownership(txid, i as u32, cluster, false) {
+        if let Some(redirect_err) =
+            check_shard_ownership_snap(txid, i as u32, cluster, master_snap.as_ref(), false)
+        {
             errors.push(redirect_err);
             continue;
         }
@@ -6123,23 +6172,35 @@ fn handle_set_mined_batch(
 ///   locally; the client must still learn the block IDs).
 /// - When any item failed, the status is `STATUS_PARTIAL_ERROR` and the
 ///   payload carries both the per-item successes and the sparse error section.
+///   A degraded replication outcome for the items that applied is not dropped:
+///   it is appended as the [`PARTIAL_DURABILITY_DEGRADED`] trailer (see
+///   [`with_degraded_trailer`]), mirroring the status-byte signal the
+///   all-success path uses.
 fn set_mined_response_with_signals(
     request_id: u64,
     successes: &[BatchItemSuccess],
     errors: &[BatchItemError],
     outcome: ReplicationOutcome,
 ) -> ResponseFrame {
-    let status = if !errors.is_empty() {
-        STATUS_PARTIAL_ERROR
+    let payload = encode_partial_with_signals(successes, errors);
+    if !errors.is_empty() {
+        ResponseFrame {
+            request_id,
+            status: STATUS_PARTIAL_ERROR,
+            payload: with_degraded_trailer(payload, outcome),
+        }
     } else if outcome.is_degraded() {
-        STATUS_DEGRADED_DURABILITY
+        ResponseFrame {
+            request_id,
+            status: STATUS_DEGRADED_DURABILITY,
+            payload,
+        }
     } else {
-        STATUS_OK
-    };
-    ResponseFrame {
-        request_id,
-        status,
-        payload: encode_partial_with_signals(successes, errors),
+        ResponseFrame {
+            request_id,
+            status: STATUS_OK,
+            payload,
+        }
     }
 }
 
@@ -6448,8 +6509,12 @@ fn handle_create_batch(
         std::hash::BuildHasherDefault<crate::server::fast_hash::FastTxHasher>,
     > = std::collections::HashSet::default();
 
+    // P1-3: hoist the shard-master lookup to ONE lock acquisition per batch.
+    let master_snap = cluster.map(|c| c.master_snapshot());
     for (i, item) in items.iter().enumerate() {
-        if let Some(redirect_err) = check_shard_ownership(&item.txid, i as u32, cluster, false) {
+        if let Some(redirect_err) =
+            check_shard_ownership_snap(&item.txid, i as u32, cluster, master_snap.as_ref(), false)
+        {
             errors.push(redirect_err);
             continue;
         }
@@ -7257,8 +7322,12 @@ fn handle_freeze_batch(
         item: &'a WireSlotItem,
     }
     let mut valid_items: Vec<ValidFreeze> = Vec::new();
+    // P1-3: hoist the shard-master lookup to ONE lock acquisition per batch.
+    let master_snap = cluster.map(|c| c.master_snapshot());
     for (i, item) in items.iter().enumerate() {
-        if let Some(redirect_err) = check_shard_ownership(&item.txid, i as u32, cluster, false) {
+        if let Some(redirect_err) =
+            check_shard_ownership_snap(&item.txid, i as u32, cluster, master_snap.as_ref(), false)
+        {
             errors.push(redirect_err);
             continue;
         }
@@ -7379,8 +7448,12 @@ fn handle_unfreeze_batch(
         item: &'a WireSlotItem,
     }
     let mut valid_items: Vec<ValidUnfreeze> = Vec::new();
+    // P1-3: hoist the shard-master lookup to ONE lock acquisition per batch.
+    let master_snap = cluster.map(|c| c.master_snapshot());
     for (i, item) in items.iter().enumerate() {
-        if let Some(redirect_err) = check_shard_ownership(&item.txid, i as u32, cluster, false) {
+        if let Some(redirect_err) =
+            check_shard_ownership_snap(&item.txid, i as u32, cluster, master_snap.as_ref(), false)
+        {
             errors.push(redirect_err);
             continue;
         }
@@ -7500,8 +7573,12 @@ fn handle_reassign_batch(
         item: &'a WireReassignItem,
     }
     let mut valid_items: Vec<ValidReassign> = Vec::new();
+    // P1-3: hoist the shard-master lookup to ONE lock acquisition per batch.
+    let master_snap = cluster.map(|c| c.master_snapshot());
     for (i, item) in items.iter().enumerate() {
-        if let Some(redirect_err) = check_shard_ownership(&item.txid, i as u32, cluster, false) {
+        if let Some(redirect_err) =
+            check_shard_ownership_snap(&item.txid, i as u32, cluster, master_snap.as_ref(), false)
+        {
             errors.push(redirect_err);
             continue;
         }
@@ -7666,8 +7743,12 @@ fn handle_set_conflicting_batch(
         key: TxKey,
     }
     let mut valid_items: Vec<ValidSetConflicting> = Vec::new();
+    // P1-3: hoist the shard-master lookup to ONE lock acquisition per batch.
+    let master_snap = cluster.map(|c| c.master_snapshot());
     for (i, txid) in txids.iter().enumerate() {
-        if let Some(redirect_err) = check_shard_ownership(txid, i as u32, cluster, false) {
+        if let Some(redirect_err) =
+            check_shard_ownership_snap(txid, i as u32, cluster, master_snap.as_ref(), false)
+        {
             errors.push(redirect_err);
             continue;
         }
@@ -7803,8 +7884,12 @@ fn handle_remove_conflicting_child_batch(
         child: [u8; 32],
     }
     let mut valid_items: Vec<ValidRemove> = Vec::new();
+    // P1-3: hoist the shard-master lookup to ONE lock acquisition per batch.
+    let master_snap = cluster.map(|c| c.master_snapshot());
     for (i, (parent, child)) in pairs.iter().enumerate() {
-        if let Some(redirect_err) = check_shard_ownership(parent, i as u32, cluster, false) {
+        if let Some(redirect_err) =
+            check_shard_ownership_snap(parent, i as u32, cluster, master_snap.as_ref(), false)
+        {
             errors.push(redirect_err);
             continue;
         }
@@ -7915,8 +8000,12 @@ fn handle_set_locked_batch(
         key: TxKey,
     }
     let mut valid_items: Vec<ValidSetLocked> = Vec::new();
+    // P1-3: hoist the shard-master lookup to ONE lock acquisition per batch.
+    let master_snap = cluster.map(|c| c.master_snapshot());
     for (i, txid) in txids.iter().enumerate() {
-        if let Some(redirect_err) = check_shard_ownership(txid, i as u32, cluster, false) {
+        if let Some(redirect_err) =
+            check_shard_ownership_snap(txid, i as u32, cluster, master_snap.as_ref(), false)
+        {
             errors.push(redirect_err);
             continue;
         }
@@ -8045,8 +8134,12 @@ fn handle_preserve_until_batch(
         key: TxKey,
     }
     let mut valid_items: Vec<ValidPreserve> = Vec::new();
+    // P1-3: hoist the shard-master lookup to ONE lock acquisition per batch.
+    let master_snap = cluster.map(|c| c.master_snapshot());
     for (i, txid) in txids.iter().enumerate() {
-        if let Some(redirect_err) = check_shard_ownership(txid, i as u32, cluster, false) {
+        if let Some(redirect_err) =
+            check_shard_ownership_snap(txid, i as u32, cluster, master_snap.as_ref(), false)
+        {
             errors.push(redirect_err);
             continue;
         }
@@ -8191,8 +8284,13 @@ fn handle_delete_batch(
     //   2. mark every parent slot this child spent as PRUNED (UTXO correctness),
     //   3. remove the record locally (`engine.prune_delete`: RAM-index
     //      unregister + header zero via the write-back cache + region free).
+    // P1-3: hoist the shard-master lookup to ONE lock acquisition per batch,
+    // shared by both the per-child check below and the per-parent re-check.
+    let master_snap = cluster.map(|c| c.master_snapshot());
     'items: for (i, txid) in txids.iter().enumerate() {
-        if let Some(redirect_err) = check_shard_ownership(txid, i as u32, cluster, false) {
+        if let Some(redirect_err) =
+            check_shard_ownership_snap(txid, i as u32, cluster, master_snap.as_ref(), false)
+        {
             errors.push(redirect_err);
             continue;
         }
@@ -8255,7 +8353,13 @@ fn handle_delete_batch(
             }
         };
         for parent_txid in parent_txids {
-            if let Some(route_err) = check_shard_ownership(&parent_txid, i as u32, cluster, false) {
+            if let Some(route_err) = check_shard_ownership_snap(
+                &parent_txid,
+                i as u32,
+                cluster,
+                master_snap.as_ref(),
+                false,
+            ) {
                 errors.push(BatchItemError {
                     item_index: i as u32,
                     error_code: ERR_INVARIANT_VIOLATION,
@@ -8389,8 +8493,12 @@ fn handle_mark_longest_chain_batch(
         key: TxKey,
     }
     let mut valid_items: Vec<ValidMark> = Vec::new();
+    // P1-3: hoist the shard-master lookup to ONE lock acquisition per batch.
+    let master_snap = cluster.map(|c| c.master_snapshot());
     for (i, txid) in txids.iter().enumerate() {
-        if let Some(redirect_err) = check_shard_ownership(txid, i as u32, cluster, false) {
+        if let Some(redirect_err) =
+            check_shard_ownership_snap(txid, i as u32, cluster, master_snap.as_ref(), false)
+        {
             errors.push(redirect_err);
             continue;
         }
@@ -8579,6 +8687,11 @@ fn decorate_get_item(
     field_mask: FieldMask,
     local_read: bool,
     cluster: Option<&RunningCluster>,
+    // P1-3: batch-scoped shard-master snapshot captured once by the caller.
+    // The GET fan-out is the worst case for the per-item lock — every read-pool
+    // worker RMWs the same two reader-count cache lines. `None` falls back to
+    // the per-item `is_master` lookup (serial path / no snapshot captured).
+    master_snap: Option<&MasterSnapshot>,
 ) -> WireGetResult {
     let key = TxKey { txid: *txid };
 
@@ -8586,7 +8699,10 @@ fn decorate_get_item(
     // available locally (handles the migration window where shard tables
     // may be inconsistent across nodes).
     if !local_read && let Some(cluster) = cluster {
-        let mastership = cluster.is_master(&key);
+        let mastership = match master_snap {
+            Some(snap) => cluster.is_master_snapshot(snap, &key),
+            None => cluster.is_master(&key),
+        };
         let is_migrating_out = cluster.is_migrating_outbound(&key);
 
         // Distinguish three cases explicitly:
@@ -9044,25 +9160,72 @@ fn handle_get_batch(
 
     let local_read = req.flags & FLAG_LOCAL_READ != 0;
 
-    let results: Vec<WireGetResult> = match (txids.len() >= READ_FANOUT_THRESHOLD)
+    // P1-3: hoist the shard-master lookup to ONE lock acquisition for the whole
+    // GET batch. Skipped entirely for local reads (ownership is not consulted)
+    // and non-clustered nodes. The owned snapshot is `Sync`, so the fan-out
+    // workers share it by reference instead of each re-locking the shard table.
+    let master_snap = (!local_read)
+        .then(|| cluster.map(|c| c.master_snapshot()))
+        .flatten();
+
+    // P1-13: `mut` so the response-size budget below can downgrade over-budget
+    // items to ERR_RESPONSE_TOO_LARGE.
+    let mut results: Vec<WireGetResult> = match (txids.len() >= READ_FANOUT_THRESHOLD)
         .then(read_pool)
         .flatten()
     {
         Some(pool) => {
             use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
+            let master_snap = master_snap.as_ref();
             pool.install(|| {
                 txids
                     .par_iter()
                     .with_min_len(FANOUT_MIN_LEN)
-                    .map(|txid| decorate_get_item(txid, engine, field_mask, local_read, cluster))
+                    .map(|txid| {
+                        decorate_get_item(
+                            txid,
+                            engine,
+                            field_mask,
+                            local_read,
+                            cluster,
+                            master_snap,
+                        )
+                    })
                     .collect()
             })
         }
         None => txids
             .iter()
-            .map(|txid| decorate_get_item(txid, engine, field_mask, local_read, cluster))
+            .map(|txid| {
+                decorate_get_item(
+                    txid,
+                    engine,
+                    field_mask,
+                    local_read,
+                    cluster,
+                    master_snap.as_ref(),
+                )
+            })
             .collect(),
     };
+
+    // P1-13: enforce the MAX_FRAME_SIZE budget on the assembled response
+    // BEFORE counting outcomes and encoding. Fanned-out decoration cannot
+    // bound the CUMULATIVE size (each item is built on its own thread with no
+    // view of the others), so the running-total check runs serially here. Any
+    // item whose data would push the response past the wire-frame limit is
+    // downgraded to ERR_RESPONSE_TOO_LARGE so the batch stays readable instead
+    // of producing a frame every conforming reader rejects (which would fail
+    // ALL pipelined requests on the connection). The downgraded items fall
+    // into the `other_failed` bucket in the classification below.
+    let downgraded = enforce_get_response_budget(&mut results);
+    if downgraded > 0 {
+        tracing::warn!(
+            downgraded,
+            total = results.len(),
+            "get batch response exceeded MAX_FRAME_SIZE; downgraded oversized item(s) to ERR_RESPONSE_TOO_LARGE"
+        );
+    }
 
     // Track per-item outcomes: STATUS_OK => succeeded, ERR_TX_NOT_FOUND =>
     // not_found, anything else => failed.
@@ -9124,6 +9287,37 @@ fn handle_get_batch(
 // Pruner operations
 // ---------------------------------------------------------------------------
 
+/// Maximum number of 32-byte txids a single diagnostic-query response
+/// (`OP_QUERY_OLD_UNMINED` / `OP_QUERY_CONFLICTING`) may carry.
+///
+/// Chosen so the encoded [`ResponseFrame`] never exceeds [`MAX_FRAME_SIZE`]:
+/// `9` bytes of frame overhead (`request_id` + `status`) + the `4`-byte count
+/// prefix + `32 * N` txids + the `1`-byte truncated trailer. Past this bound
+/// the server returns a truncated prefix with the trailer flag set rather than
+/// emitting an oversized frame that every conforming reader rejects — these
+/// queries are diagnostic snapshots (pruner feeder / conflict sweep), so a
+/// capped prefix plus a "there is more" signal is strictly better than an
+/// un-decodable frame that tears down the connection.
+const MAX_QUERY_RESPONSE_TXIDS: usize = (MAX_FRAME_SIZE as usize - 9 - 4 - 1) / 32;
+
+/// Encode a diagnostic-query txid list into a response payload:
+/// `[count:u32 LE][txid:32]*count[truncated:u8]`.
+///
+/// The trailing `truncated` byte is `1` when the result was capped at
+/// [`MAX_QUERY_RESPONSE_TXIDS`] (more matches existed than were returned) and
+/// `0` when the list is complete. Placing the flag as a trailer keeps the
+/// layout backward-reasonable: a reader that stops after `count` txids simply
+/// ignores the extra byte, while a truncation-aware reader learns to re-query.
+fn encode_query_txid_response(keys: &[TxKey], truncated: bool) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(4 + keys.len() * 32 + 1);
+    payload.extend_from_slice(&(keys.len() as u32).to_le_bytes());
+    for key in keys {
+        payload.extend_from_slice(&key.txid);
+    }
+    payload.push(u8::from(truncated));
+    payload
+}
+
 /// Return the current unmined-txid snapshot at the instant the query runs,
 /// sourced from the authoritative [`ShardedMinedIndex`](crate::index::mined_index::ShardedMinedIndex)'s
 /// height buckets (Task 16b) rather than the separate unmined secondary
@@ -9144,6 +9338,20 @@ fn handle_query_old_unmined(
     engine: &Engine,
     cluster: Option<&RunningCluster>,
 ) -> ResponseFrame {
+    handle_query_old_unmined_capped(req, engine, cluster, MAX_QUERY_RESPONSE_TXIDS)
+}
+
+/// Cap-parameterized core of [`handle_query_old_unmined`]. The public handler
+/// passes [`MAX_QUERY_RESPONSE_TXIDS`]; tests inject a small cap to exercise the
+/// truncation path without materializing 16 MiB of txids. The result is capped
+/// at `max_txids` *qualifying* keys (post master/`preserve_until` filtering);
+/// when a further qualifying candidate exists the response is flagged truncated.
+fn handle_query_old_unmined_capped(
+    req: &RequestFrame,
+    engine: &Engine,
+    cluster: Option<&RunningCluster>,
+    max_txids: usize,
+) -> ResponseFrame {
     // Payload: [cutoff_height:4]
     if req.payload.len() < 4 {
         return error_response(req.request_id, ERR_PAYLOAD_MALFORMED, "malformed query");
@@ -9152,7 +9360,8 @@ fn handle_query_old_unmined(
         return error_response(req.request_id, ERR_PAYLOAD_MALFORMED, "malformed query");
     };
     let candidates = engine.mined_index().collect_unmined_keys_below(cutoff);
-    let mut keys = Vec::with_capacity(candidates.len());
+    let mut keys = Vec::with_capacity(candidates.len().min(max_txids));
+    let mut truncated = false;
     for key in candidates {
         // F-G5-003: skip keys this node does not master. Single-node mode
         // (no cluster) keeps the prior behaviour.
@@ -9163,7 +9372,16 @@ fn handle_query_old_unmined(
             }
         }
         match engine.read_metadata(&key) {
-            Ok(meta) if { meta.preserve_until } == 0 => keys.push(key),
+            Ok(meta) if { meta.preserve_until } == 0 => {
+                // P1-15: bound the response to one frame. Stop at the cap and
+                // signal truncation so the caller knows to re-query rather than
+                // shipping a >MAX_FRAME_SIZE frame every reader rejects.
+                if keys.len() >= max_txids {
+                    truncated = true;
+                    break;
+                }
+                keys.push(key);
+            }
             Ok(_) => {}
             Err(e) => {
                 tracing::warn!(
@@ -9175,16 +9393,10 @@ fn handle_query_old_unmined(
         }
     }
 
-    let mut payload = Vec::with_capacity(4 + keys.len() * 32);
-    payload.extend_from_slice(&(keys.len() as u32).to_le_bytes());
-    for key in &keys {
-        payload.extend_from_slice(&key.txid);
-    }
-
     ResponseFrame {
         request_id: req.request_id,
         status: STATUS_OK,
-        payload,
+        payload: encode_query_txid_response(&keys, truncated),
     }
 }
 
@@ -9199,8 +9411,21 @@ fn handle_query_conflicting(
     engine: &Engine,
     cluster: Option<&RunningCluster>,
 ) -> ResponseFrame {
+    handle_query_conflicting_capped(req, engine, cluster, MAX_QUERY_RESPONSE_TXIDS)
+}
+
+/// Cap-parameterized core of [`handle_query_conflicting`]. See
+/// [`handle_query_old_unmined_capped`] for the truncation contract; the public
+/// handler passes [`MAX_QUERY_RESPONSE_TXIDS`].
+fn handle_query_conflicting_capped(
+    req: &RequestFrame,
+    engine: &Engine,
+    cluster: Option<&RunningCluster>,
+    max_txids: usize,
+) -> ResponseFrame {
     let candidates: Vec<TxKey> = engine.conflicting_index().iter().collect();
-    let mut keys = Vec::with_capacity(candidates.len());
+    let mut keys = Vec::with_capacity(candidates.len().min(max_txids));
+    let mut truncated = false;
     for key in candidates {
         // F-G5-003: skip keys this node does not master. Single-node mode
         // (no cluster) keeps the prior behaviour.
@@ -9210,13 +9435,12 @@ fn handle_query_conflicting(
                 _ => continue,
             }
         }
+        // P1-15: bound the response to one frame; flag truncation past the cap.
+        if keys.len() >= max_txids {
+            truncated = true;
+            break;
+        }
         keys.push(key);
-    }
-
-    let mut payload = Vec::with_capacity(4 + keys.len() * 32);
-    payload.extend_from_slice(&(keys.len() as u32).to_le_bytes());
-    for key in &keys {
-        payload.extend_from_slice(&key.txid);
     }
 
     if let Some(m) = DISPATCH_METRICS.get() {
@@ -9231,7 +9455,7 @@ fn handle_query_conflicting(
     ResponseFrame {
         request_id: req.request_id,
         status: STATUS_OK,
-        payload,
+        payload: encode_query_txid_response(&keys, truncated),
     }
 }
 
@@ -9266,8 +9490,12 @@ fn handle_preserve_transactions(
         key: TxKey,
     }
     let mut valid_items: Vec<ValidPreserveTx> = Vec::new();
+    // P1-3: hoist the shard-master lookup to ONE lock acquisition per batch.
+    let master_snap = cluster.map(|c| c.master_snapshot());
     for (i, txid) in txids.iter().enumerate() {
-        if let Some(redirect_err) = check_shard_ownership(txid, i as u32, cluster, false) {
+        if let Some(redirect_err) =
+            check_shard_ownership_snap(txid, i as u32, cluster, master_snap.as_ref(), false)
+        {
             errors.push(redirect_err);
             continue;
         }
@@ -9444,13 +9672,18 @@ fn handle_process_expired(
     // Bounded to `max_batch` per call (lowest-`preserve_until` first) so a
     // large catch-up backlog can't peg a core in one request; the pruner fires
     // on every persisted block, so the remainder drains on subsequent calls.
+    // P1-3: hoist the shard-master lookup to ONE lock acquisition per pruner
+    // pass, shared by both the preservation-expiry and DAH-due ownership loops.
+    let master_snap = cluster.map(|c| c.master_snapshot());
     if block_height_retention != 0 {
         let expired_candidates = engine
             .preserve_index()
             .range_query_limited(current_height, max_batch as usize);
         for key in &expired_candidates {
             // Ownership: only the master schedules expiry for its records.
-            if check_shard_ownership(&key.txid, 0, cluster, false).is_some() {
+            if check_shard_ownership_snap(&key.txid, 0, cluster, master_snap.as_ref(), false)
+                .is_some()
+            {
                 continue;
             }
             match engine.expire_preservation_set_dah(key, current_height, block_height_retention) {
@@ -9508,8 +9741,10 @@ fn handle_process_expired(
     let mut owned_due: Vec<[u8; 32]> = Vec::new();
     for key in &candidates {
         // Ownership: skip if not master or not yet ready to write
-        // (pending inbound migration / fenced).
-        if check_shard_ownership(&key.txid, 0, cluster, false).is_some() {
+        // (pending inbound migration / fenced). P1-3: reuse the per-pass
+        // master snapshot captured above.
+        if check_shard_ownership_snap(&key.txid, 0, cluster, master_snap.as_ref(), false).is_some()
+        {
             continue;
         }
         if engine.is_due_for_sweep(key, current_height) {
@@ -10052,16 +10287,35 @@ fn codec_error_response(request_id: u64, op_label: &str, err: CodecError) -> Res
     )
 }
 
+/// Append the reserved [`PARTIAL_DURABILITY_DEGRADED`] trailer to a
+/// `STATUS_PARTIAL_ERROR` payload when replication was degraded.
+///
+/// The all-success degraded path signals below-quorum durability in the status
+/// byte (`STATUS_DEGRADED_DURABILITY`), but a `STATUS_PARTIAL_ERROR` response
+/// needs its status byte to carry the per-item diagnostics. So the degraded
+/// signal for the items that DID apply rides as this one-byte payload trailer
+/// instead — present only when degraded, so non-degraded partial responses are
+/// byte-identical to the pre-trailer wire format and older clients (which stop
+/// decoding after the declared section) ignore it.
+fn with_degraded_trailer(mut payload: Vec<u8>, outcome: ReplicationOutcome) -> Vec<u8> {
+    if outcome.is_degraded() {
+        payload.push(PARTIAL_DURABILITY_DEGRADED);
+    }
+    payload
+}
+
 /// Build a per-batch response frame, promoting clean responses to
 /// `STATUS_DEGRADED_DURABILITY` when replication returned
 /// [`ReplicationOutcome::Degraded`] (best-effort mode, zero replica ACKs).
 ///
-/// When there *are* per-item errors we still return `STATUS_PARTIAL_ERROR`:
-/// the partial-error path already conveys that not every item succeeded,
-/// and overwriting it with the degraded-durability status would erase the
-/// per-item diagnostic detail the client needs. The degraded-durability
-/// metric has already been incremented inside `replicate_all_ops`, so the
-/// server-side telemetry is unaffected.
+/// When there *are* per-item errors we return `STATUS_PARTIAL_ERROR` so the
+/// status byte can carry the per-item diagnostics — but a degraded outcome is
+/// no longer discarded: the items that DID apply are only single-node durable,
+/// so the same below-quorum signal the all-success path carries in its status
+/// byte is appended to the partial payload as the [`PARTIAL_DURABILITY_DEGRADED`]
+/// trailer (see [`with_degraded_trailer`]). A client that surfaces degraded
+/// durability on the full-success path therefore surfaces it on the partial
+/// path too, instead of mistaking the applied items for quorum-durable writes.
 ///
 /// Callers in non-cluster paths can pass [`ReplicationOutcome::Full`]
 /// (or [`ReplicationOutcome::NotApplicable`]) to get plain `STATUS_OK`.
@@ -10085,7 +10339,7 @@ fn batch_response_with_outcome(
         ResponseFrame {
             request_id,
             status: STATUS_PARTIAL_ERROR,
-            payload: encode_sparse_errors(errors),
+            payload: with_degraded_trailer(encode_sparse_errors(errors), outcome),
         }
     }
 }
@@ -11890,6 +12144,177 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // 1b'. handle_query_old_unmined / handle_query_conflicting — the response
+    // is bounded to one frame (P1-15). The wire layout gained a trailing
+    // `truncated` flag byte so a capped result is self-describing.
+    // -----------------------------------------------------------------------
+
+    /// The real per-response cap keeps the encoded frame at or below
+    /// `MAX_FRAME_SIZE`: the `9`-byte `ResponseFrame` overhead, the `4`-byte
+    /// count, `32 * cap` txids and the `1`-byte truncated trailer must all fit.
+    /// This is the invariant the pre-P1-15 handler violated (no cap at all →
+    /// >16 MiB frame past ~524k matches, rejected by every conforming reader).
+    #[test]
+    fn query_response_cap_fits_one_frame() {
+        let max_payload = 4 + MAX_QUERY_RESPONSE_TXIDS * 32 + 1;
+        let total_length = 8 + 1 + max_payload; // request_id + status + payload
+        assert!(
+            total_length <= MAX_FRAME_SIZE as usize,
+            "capped query response frame ({total_length} B) must fit MAX_FRAME_SIZE ({} B)",
+            MAX_FRAME_SIZE
+        );
+        // And it must be the LARGEST cap that still fits — one more txid overflows.
+        let over = 8 + 1 + 4 + (MAX_QUERY_RESPONSE_TXIDS + 1) * 32 + 1;
+        assert!(
+            over > MAX_FRAME_SIZE as usize,
+            "cap is not maximal: {MAX_QUERY_RESPONSE_TXIDS} txids leaves frame room to spare"
+        );
+    }
+
+    /// A non-truncated old-unmined response carries a trailing `truncated = 0`
+    /// flag byte. Pre-P1-15 the payload was exactly `4 + 32*count` with no
+    /// trailer, so this asserts the new self-describing wire layout.
+    #[test]
+    fn query_old_unmined_appends_untruncated_trailer() {
+        let h = DispatchTestHarness::new();
+        let txid_a = DispatchTestHarness::make_txid(1);
+        let txid_b = DispatchTestHarness::make_txid(2);
+        assert_eq!(h.create_tx_at_height(txid_a, 1, 100).status, STATUS_OK);
+        assert_eq!(h.create_tx_at_height(txid_b, 1, 150).status, STATUS_OK);
+
+        let resp = h.request(OP_QUERY_OLD_UNMINED, 200u32.to_le_bytes().to_vec());
+        assert_eq!(resp.status, STATUS_OK);
+        let count = u32::from_le_bytes(resp.payload[0..4].try_into().unwrap()) as usize;
+        assert_eq!(count, 2);
+        assert_eq!(
+            resp.payload.len(),
+            4 + count * 32 + 1,
+            "response must carry a 1-byte truncated trailer after the txids"
+        );
+        assert_eq!(
+            resp.payload[resp.payload.len() - 1],
+            0,
+            "complete result must flag truncated = 0"
+        );
+    }
+
+    /// With an injected small cap and more qualifying matches than the cap,
+    /// `handle_query_old_unmined_capped` returns exactly `cap` txids, flags
+    /// `truncated = 1`, keeps the frame bounded, and the returned txids are a
+    /// correct prefix of the full (uncapped) match order.
+    #[test]
+    fn query_old_unmined_truncates_and_flags_over_cap() {
+        let h = DispatchTestHarness::new();
+        // Six distinct unmined txs, all below the cutoff.
+        for n in 1..=6u8 {
+            let txid = DispatchTestHarness::make_txid(n);
+            assert_eq!(h.create_tx_at_height(txid, 1, 100).status, STATUS_OK);
+        }
+        let req = RequestFrame {
+            request_id: 1,
+            op_code: OP_QUERY_OLD_UNMINED,
+            flags: 0,
+            payload: 200u32.to_le_bytes().to_vec().into(),
+        };
+
+        // Uncapped (cap larger than the match set): full ordered result, no truncation.
+        let full = handle_query_old_unmined_capped(&req, &h.engine, None, 1000);
+        assert_eq!(full.status, STATUS_OK);
+        let full_count = u32::from_le_bytes(full.payload[0..4].try_into().unwrap()) as usize;
+        assert_eq!(full_count, 6);
+        assert_eq!(
+            full.payload[full.payload.len() - 1],
+            0,
+            "full result not truncated"
+        );
+        let full_txids: Vec<[u8; 32]> = (0..full_count)
+            .map(|i| {
+                full.payload[4 + i * 32..4 + i * 32 + 32]
+                    .try_into()
+                    .unwrap()
+            })
+            .collect();
+
+        // Capped at 3: exactly 3 txids, truncated flag set, bounded frame.
+        let cap = 3usize;
+        let capped = handle_query_old_unmined_capped(&req, &h.engine, None, cap);
+        assert_eq!(capped.status, STATUS_OK);
+        let capped_count = u32::from_le_bytes(capped.payload[0..4].try_into().unwrap()) as usize;
+        assert_eq!(capped_count, cap, "response capped at the injected limit");
+        assert_eq!(
+            capped.payload.len(),
+            4 + cap * 32 + 1,
+            "capped payload = count + cap txids + trailer"
+        );
+        assert_eq!(
+            capped.payload[capped.payload.len() - 1],
+            1,
+            "over-cap result must flag truncated = 1"
+        );
+        // Frame stays under MAX_FRAME_SIZE.
+        let frame_len = capped.encode().len() as u32;
+        assert!(
+            frame_len <= MAX_FRAME_SIZE,
+            "capped frame must fit MAX_FRAME_SIZE"
+        );
+
+        // Returned txids are a correct prefix of the full match order.
+        let capped_txids: Vec<[u8; 32]> = (0..capped_count)
+            .map(|i| {
+                capped.payload[4 + i * 32..4 + i * 32 + 32]
+                    .try_into()
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(
+            capped_txids,
+            full_txids[..cap].to_vec(),
+            "capped txids must be the leading prefix of the uncapped result"
+        );
+    }
+
+    /// The conflicting query is likewise bounded and self-describing.
+    #[test]
+    fn query_conflicting_truncates_and_flags_over_cap() {
+        let h = DispatchTestHarness::new();
+        for n in 1..=5u8 {
+            let txid = DispatchTestHarness::make_txid(n);
+            assert_eq!(h.create_tx(txid, 1).status, STATUS_OK);
+            h.engine
+                .set_conflicting(&crate::ops::remaining::SetConflictingRequest {
+                    tx_key: TxKey { txid },
+                    value: true,
+                    current_block_height: 1000,
+                    block_height_retention: 288,
+                })
+                .unwrap();
+        }
+        let req = RequestFrame {
+            request_id: 1,
+            op_code: OP_QUERY_CONFLICTING,
+            flags: 0,
+            payload: Vec::new().into(),
+        };
+
+        let full = handle_query_conflicting_capped(&req, &h.engine, None, 1000);
+        let full_count = u32::from_le_bytes(full.payload[0..4].try_into().unwrap()) as usize;
+        assert_eq!(full_count, 5);
+        assert_eq!(full.payload[full.payload.len() - 1], 0);
+
+        let cap = 2usize;
+        let capped = handle_query_conflicting_capped(&req, &h.engine, None, cap);
+        let capped_count = u32::from_le_bytes(capped.payload[0..4].try_into().unwrap()) as usize;
+        assert_eq!(capped_count, cap);
+        assert_eq!(capped.payload.len(), 4 + cap * 32 + 1);
+        assert_eq!(
+            capped.payload[capped.payload.len() - 1],
+            1,
+            "over-cap conflicting result must flag truncated = 1"
+        );
+        assert!(capped.encode().len() as u32 <= MAX_FRAME_SIZE);
+    }
+
+    // -----------------------------------------------------------------------
     // 1c. handle_preserve_transactions — preserves records
     // -----------------------------------------------------------------------
 
@@ -12969,6 +13394,99 @@ mod tests {
         let utxo_count = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
         assert_eq!(utxo_count, 3, "utxo_count should be 3");
         let _ = pos; // silence unused warning
+    }
+
+    /// P1-13 (end-to-end): a GET batch whose assembled COLD_DATA response
+    /// would exceed MAX_FRAME_SIZE must NOT ship an oversized frame (which
+    /// every conforming reader rejects, killing the connection and every
+    /// pipelined request on it). `handle_get_batch` budgets the response:
+    /// the item(s) that overflow come back as ERR_RESPONSE_TOO_LARGE while
+    /// the records that fit still return their full cold blob, and the
+    /// emitted frame is guaranteed within the wire limit.
+    #[test]
+    fn get_batch_over_max_frame_size_downgrades_offending_items() {
+        // Five records of ~3.4 MiB inline cold data each ≈ 17 MiB of blob:
+        // a COLD_DATA GET of all five would assemble past the 16 MiB limit.
+        // A 256 MiB device gives ample room for the records themselves.
+        let dev: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(256 * 1024 * 1024, 4096).unwrap());
+        let h = DispatchTestHarness::with_device(dev);
+        // A well-formed inline cold blob (inputs section only) that
+        // `read_cold_data` returns whole. ~3.4 MiB each.
+        let cold_data =
+            crate::ops::engine::build_cold_data(Some(&vec![0xCD; 3_400_000]), None, None);
+        let cold_len = cold_data.len();
+
+        let mut txids = Vec::new();
+        for i in 0..5u8 {
+            let txid = DispatchTestHarness::make_txid(100 + i);
+            let item = WireCreateItem {
+                txid,
+                tx_version: 1,
+                locktime: 0,
+                fee: 500,
+                size_in_bytes: 250,
+                extended_size: 250,
+                is_coinbase: false,
+                spending_height: 0,
+                created_at: 1_700_000_000_000,
+                flags: 0,
+                utxo_hashes: vec![[i; 32]],
+                cold_data: cold_data.clone(),
+                block_height: 0,
+                mined_block_id: None,
+                mined_block_height: None,
+                mined_subtree_idx: None,
+                parent_txids: vec![],
+            };
+            assert_eq!(
+                h.request(OP_CREATE_BATCH, encode_create_batch(&[item]))
+                    .status,
+                STATUS_OK,
+                "create of record {i} with {cold_len}-byte cold data must succeed"
+            );
+            txids.push(txid);
+        }
+
+        let resp = h.request(OP_GET_BATCH, encode_get_batch(FieldMask::COLD_DATA, &txids));
+        assert_eq!(resp.status, STATUS_OK);
+
+        // The emitted frame MUST fit the wire budget: total_length =
+        // request_id(8) + status(1) + payload.
+        let inner_len = 8 + 1 + resp.payload.len();
+        assert!(
+            inner_len <= MAX_FRAME_SIZE as usize,
+            "assembled GET response must not exceed MAX_FRAME_SIZE (got {inner_len})"
+        );
+
+        let results = decode_get_response(&resp.payload).unwrap();
+        assert_eq!(results.len(), 5, "every requested item is represented");
+
+        // At least one item overflowed and was downgraded (empty payload).
+        let downgraded = results
+            .iter()
+            .filter(|r| r.status == ERR_RESPONSE_TOO_LARGE as u8)
+            .count();
+        assert!(
+            downgraded >= 1,
+            "at least one item must be downgraded to ERR_RESPONSE_TOO_LARGE"
+        );
+        for r in &results {
+            if r.status == ERR_RESPONSE_TOO_LARGE as u8 {
+                assert!(r.data.is_empty(), "downgraded item drops its cold blob");
+            }
+        }
+
+        // The records that fit still return their FULL cold blob (status OK).
+        // GET payload for a COLD_DATA-only mask is [cold_len:4][cold_bytes].
+        let served_full = results
+            .iter()
+            .filter(|r| r.status == 0 && r.data.len() == 4 + cold_len)
+            .count();
+        assert!(
+            served_full >= 1,
+            "at least one in-budget record must return its full cold data"
+        );
     }
 
     #[test]
@@ -17162,19 +17680,74 @@ mod tests {
     }
 
     #[test]
-    fn partial_errors_override_degraded_status() {
-        // If the batch had per-item errors, we must return STATUS_PARTIAL_ERROR
-        // so the client sees the per-item diagnostics, not a blanket status
-        // byte that hides them. The degraded-durability escalation is still
-        // visible via server metrics.
+    fn partial_errors_keep_status_byte_and_carry_degraded_trailer() {
+        // P1-8: per-item errors own the status byte (STATUS_PARTIAL_ERROR) so the
+        // client still sees the per-item diagnostics — but a degraded outcome for
+        // the items that DID apply is no longer discarded. It rides as the
+        // reserved payload trailer, so the client decodes BOTH partial AND
+        // degraded (mirroring the status-byte signal of the all-success path).
         let errors = vec![BatchItemError {
             item_index: 0,
             error_code: ERR_TX_NOT_FOUND,
             error_data: vec![],
         }];
+
+        // Degraded partial: status still PARTIAL_ERROR, trailer surfaces degraded.
         let resp = batch_response_with_outcome(1, &errors, ReplicationOutcome::Degraded);
         assert_eq!(resp.status, STATUS_PARTIAL_ERROR);
-        assert_ne!(resp.status, STATUS_DEGRADED_DURABILITY);
+        let (decoded, degraded) = decode_sparse_errors_with_durability(&resp.payload)
+            .expect("degraded partial payload decodes");
+        assert_eq!(decoded, errors, "per-item diagnostics still present");
+        assert!(
+            degraded,
+            "degraded durability signal survives the partial case"
+        );
+
+        // Non-degraded partial: byte-identical to the pre-trailer wire format.
+        let resp_full = batch_response_with_outcome(1, &errors, ReplicationOutcome::Full);
+        assert_eq!(resp_full.status, STATUS_PARTIAL_ERROR);
+        assert_eq!(
+            resp_full.payload,
+            encode_sparse_errors(&errors),
+            "a full-durability partial response carries no trailer"
+        );
+        let (_, degraded) = decode_sparse_errors_with_durability(&resp_full.payload)
+            .expect("full partial payload decodes");
+        assert!(!degraded);
+    }
+
+    #[test]
+    fn set_mined_partial_error_carries_degraded_trailer() {
+        // P1-8 for the set-mined signal layout: a partial response whose applied
+        // items were only replicated below quorum must decode as partial + degraded.
+        let successes = vec![BatchItemSuccess {
+            item_index: 0,
+            signal: 1,
+            block_ids: vec![7],
+        }];
+        let errors = vec![BatchItemError {
+            item_index: 1,
+            error_code: ERR_CONFLICTING,
+            error_data: vec![],
+        }];
+
+        let resp =
+            set_mined_response_with_signals(9, &successes, &errors, ReplicationOutcome::Degraded);
+        assert_eq!(resp.status, STATUS_PARTIAL_ERROR);
+        let (ds, de, degraded) = decode_partial_with_signals_with_durability(&resp.payload)
+            .expect("degraded set-mined partial decodes");
+        assert_eq!(ds, successes);
+        assert_eq!(de, errors);
+        assert!(degraded, "set-mined partial surfaces degraded durability");
+
+        // Full durability: no trailer, byte-identical to the legacy encoding.
+        let resp_full =
+            set_mined_response_with_signals(9, &successes, &errors, ReplicationOutcome::Full);
+        assert_eq!(resp_full.status, STATUS_PARTIAL_ERROR);
+        assert_eq!(
+            resp_full.payload,
+            encode_partial_with_signals(&successes, &errors)
+        );
     }
 
     // -----------------------------------------------------------------------

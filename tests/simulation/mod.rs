@@ -8,12 +8,16 @@
 //! Every mutation is WAL-first (mirroring `server/dispatch.rs`): the
 //! redo entry is appended + fsynced to a redo device that survives the
 //! crash, and `recover()` rebuilds the engine via
-//! `recovery::recover_all_with_allocator` — the same pipeline
-//! production startup uses. The in-memory reference model is NEVER
-//! re-synced from engine state (or vice versa) after a crash, so the
-//! final verification is a true differential check: a redo entry lost,
-//! double-applied, or replayed non-idempotently shows up as a
-//! `utxo_count`/`spent_utxos` mismatch.
+//! `recovery::recover_all_with_allocator` AND the fresh-boot mined-index
+//! redo-tail replay (`Engine::replay_mined_index_redo_tail`) — the same
+//! two-stage pipeline production startup uses (the in-RAM MinedIndex
+//! boots empty and is reconstructed from the redo tail, see
+//! `bin/server.rs`'s `recover_mined_index`). The in-memory reference
+//! model is NEVER re-synced from engine state (or vice versa) after a
+//! crash, so the final verification is a true differential check: a redo
+//! entry lost, double-applied, or replayed non-idempotently shows up as a
+//! `utxo_count`/`spent_utxos` mismatch, and a dropped/mis-fenced durable
+//! `SetMinedBatch` intent shows up as a mined-block-id mismatch.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -293,8 +297,12 @@ impl SimulatedNode {
 
     /// Recover from a crash through the REAL production pipeline:
     /// reopen the surviving redo log, rebuild fresh index/allocator/
-    /// secondaries, and replay via `recover_all_with_allocator` —
-    /// exactly what `teraslab-server` startup does.
+    /// secondaries, replay via `recover_all_with_allocator`, and then
+    /// reconstruct the in-RAM MinedIndex via a fresh-boot redo-tail
+    /// replay — exactly what `teraslab-server` startup does (the sim
+    /// never checkpoints, so mined-index recovery is always the
+    /// no-snapshot full-replay-from-genesis branch of
+    /// `Engine::recover_mined_index`).
     pub fn recover(&mut self) {
         // Recovery must observe the true device bytes.
         let was_enabled = self.flaky.set_enabled(false);
@@ -331,6 +339,21 @@ impl SimulatedNode {
             dah,
         ));
         engine.set_redo_log(redo_arc.clone());
+
+        // The MinedIndex lives only in RAM and boots empty on every restart,
+        // so `recover_all_with_allocator` above leaves every recovered primary
+        // entry's `mined_slot` at the NO_MINED_SLOT sentinel. Production
+        // startup runs `Engine::recover_mined_index` right after building the
+        // engine (src/bin/server.rs); with no checkpoint ever taken here that
+        // reduces to a full redo-tail replay from genesis, which re-points
+        // each entry's `mined_slot` and re-applies every durable
+        // `SetMinedBatch` intent (`Create` + companion `SetMinedBatch` are
+        // both in the replayed redo). Without this step every crash would
+        // silently wipe all acked mined-state and the differential check below
+        // could never see it.
+        engine
+            .replay_mined_index_redo_tail(std::slice::from_ref(&redo_arc))
+            .expect("mined-index redo-tail replay must not error");
 
         self.redo = Some(redo_arc);
         self.engine = Some(engine);
@@ -420,8 +443,12 @@ impl Simulation {
             .flaky()
             .configure(config.io_error_probability, config.seed ^ 0xF1A4_DEAD_BEEF);
 
-        // Reference model: txid -> (utxo_count, spent_count, utxo_hashes)
-        type ReferenceMap = HashMap<[u8; 32], (u32, u32, Vec<[u8; 32]>)>;
+        // Reference model:
+        //   txid -> (utxo_count, spent_count, utxo_hashes, mined_block_ids)
+        // `mined_block_ids` accumulates the block_id of every durably-acked
+        // `SetMinedBatch` driven against the txid, in application order — the
+        // expected contents of the recovered MinedIndex's block-entry list.
+        type ReferenceMap = HashMap<[u8; 32], (u32, u32, Vec<[u8; 32]>, Vec<u32>)>;
         let mut reference: ReferenceMap = HashMap::new();
 
         let mut next_tx: u32 = 0;
@@ -516,7 +543,7 @@ impl Simulation {
                 }
                 match engine.create_at_offset(&req, record_offset) {
                     Ok(_) => {
-                        reference.insert(tx_id, (utxo_count, 0, utxo_hashes));
+                        reference.insert(tx_id, (utxo_count, 0, utxo_hashes, Vec::new()));
                         result.operations_completed += 1;
                     }
                     Err(_) => {
@@ -524,7 +551,7 @@ impl Simulation {
                         // error): the create IS committed. Recovery must
                         // materialize it from the redo entry.
                         result.io_errors_injected += 1;
-                        reference.insert(tx_id, (utxo_count, 0, utxo_hashes));
+                        reference.insert(tx_id, (utxo_count, 0, utxo_hashes, Vec::new()));
                         result.operations_completed += 1;
                         self.crash_and_recover(&mut result);
                     }
@@ -534,14 +561,14 @@ impl Simulation {
                 // validate under lock → redo fsync → apply)
                 let txids: Vec<[u8; 32]> = reference
                     .iter()
-                    .filter(|(_, (count, spent, _))| *spent < *count)
+                    .filter(|(_, (count, spent, _, _))| *spent < *count)
                     .map(|(id, _)| *id)
                     .collect();
                 let Some(&txid) = txids.get(self.rng.next_u32() as usize % txids.len().max(1))
                 else {
                     continue;
                 };
-                let Some((count, spent, hashes)) = reference.get(&txid) else {
+                let Some((count, spent, hashes, _)) = reference.get(&txid) else {
                     continue;
                 };
                 let offset = *spent;
@@ -651,13 +678,23 @@ impl Simulation {
                 {
                     continue;
                 }
+                // The SetMinedBatch redo entry above is now durable, so the
+                // mined block is committed regardless of whether the live
+                // apply lands — record the expected block_id in BOTH arms
+                // (a distinct, monotonically-increasing block_id per op, so
+                // no dedup collides and the recovered block-entry list is the
+                // exact ordered set of these ids).
                 match engine.set_mined(&req) {
-                    Ok(_) => result.operations_completed += 1,
+                    Ok(_) => {
+                        reference.get_mut(&txid).unwrap().3.push(block_id);
+                        result.operations_completed += 1;
+                    }
                     Err(_) => {
-                        // WAL durable; replay applies (or skips, for
-                        // entries past the inline block-entry cap —
-                        // either way state converges).
+                        // WAL durable, live apply lost: the mined-state IS
+                        // committed. Recovery's redo-tail replay must
+                        // re-apply it from the SetMinedBatch entry.
                         result.io_errors_injected += 1;
+                        reference.get_mut(&txid).unwrap().3.push(block_id);
                         result.operations_completed += 1;
                         self.crash_and_recover(&mut result);
                     }
@@ -672,12 +709,25 @@ impl Simulation {
                     let key = TxKey { txid };
                     match engine.read_metadata(&key) {
                         Ok(meta) => {
-                            let (expected_count, _, _) = &reference[&txid];
+                            let (expected_count, _, _, expected_block_ids) = &reference[&txid];
                             if { meta.utxo_count } != *expected_count {
                                 result.inconsistencies_found.push(format!(
                                     "op {}: utxo_count mismatch for tx {:?}",
                                     op_idx, txid
                                 ));
+                                result.data_loss_detected = true;
+                            }
+                            // Mined-state probe: a crash that dropped this
+                            // record's SetMinedBatch intent shows up here as a
+                            // recovered block-id set that no longer matches the
+                            // acked one.
+                            if let Some(msg) = mined_state_inconsistency(
+                                &engine,
+                                &key,
+                                expected_block_ids,
+                                &format!("op {op_idx}"),
+                            ) {
+                                result.inconsistencies_found.push(msg);
                                 result.data_loss_detected = true;
                             }
                             result.operations_completed += 1;
@@ -701,7 +751,7 @@ impl Simulation {
         self.nodes[0].flaky().set_enabled(false);
         if self.nodes[0].is_up() {
             let engine = self.nodes[0].engine().unwrap();
-            for (txid, (expected_count, expected_spent, _)) in &reference {
+            for (txid, (expected_count, expected_spent, _, expected_block_ids)) in &reference {
                 let key = TxKey { txid: *txid };
                 match engine.read_metadata(&key) {
                     Ok(meta) => {
@@ -723,6 +773,16 @@ impl Simulation {
                             ));
                             result.data_loss_detected = true;
                         }
+                        // Mined-state must survive recovery too: the recovered
+                        // MinedIndex's block-entry set must equal every acked
+                        // SetMinedBatch block_id for this record. A dropped
+                        // durable intent is data loss here.
+                        if let Some(msg) =
+                            mined_state_inconsistency(engine, &key, expected_block_ids, "final")
+                        {
+                            result.inconsistencies_found.push(msg);
+                            result.data_loss_detected = true;
+                        }
                     }
                     Err(_) => {
                         result
@@ -735,6 +795,43 @@ impl Simulation {
         }
 
         result
+    }
+}
+
+/// Differential check for recovered mined-state: the engine's live
+/// MinedIndex block-entry set for `key` must equal the reference model's
+/// `expected_block_ids` (the block_id of every durably-acked
+/// `SetMinedBatch` driven against the txid). Both sides are compared as
+/// sorted multisets, so a lost, extra, or corrupted block entry is
+/// detected regardless of replay ordering.
+///
+/// Returns `Some(message)` describing the divergence (which the caller
+/// records as data loss) or `None` when the recovered mined-state matches.
+fn mined_state_inconsistency(
+    engine: &Engine,
+    key: &TxKey,
+    expected_block_ids: &[u32],
+    context: &str,
+) -> Option<String> {
+    match engine.mined_block_entries(key) {
+        Ok((entries, _unmined_since)) => {
+            let mut got: Vec<u32> = entries.iter().map(|e| e.block_id).collect();
+            got.sort_unstable();
+            let mut expected: Vec<u32> = expected_block_ids.to_vec();
+            expected.sort_unstable();
+            if got != expected {
+                Some(format!(
+                    "{context}: mined block_ids mismatch for tx {:?}: expected {:?}, got {:?}",
+                    key.txid, expected, got
+                ))
+            } else {
+                None
+            }
+        }
+        Err(e) => Some(format!(
+            "{context}: mined_block_entries failed for tx {:?}: {e:?}",
+            key.txid
+        )),
     }
 }
 

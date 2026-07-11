@@ -344,6 +344,206 @@ impl MinedShard {
         }
     }
 
+    /// Locked body of [`ShardedMinedIndex::apply_set_mined`] — operates on an
+    /// already-locked shard so the consolidated setMined path
+    /// ([`ShardedMinedIndex::apply_mined_transition`]) can apply the transition
+    /// and read it back under a SINGLE shard-lock acquisition. The public
+    /// method is a thin lock-then-delegate wrapper; the semantics live here.
+    fn apply_set_mined_locked(
+        &mut self,
+        slot: u32,
+        block_id: u32,
+        block_height: u32,
+        subtree_idx: u32,
+        on_longest_chain: bool,
+        key: &TxKey,
+    ) -> MinedApplyResult {
+        debug_assert!(block_id != 0, "block_id 0 is the no-block sentinel");
+
+        let Some(inline_block_id) = self.get(slot).map(|e| e.block_id) else {
+            // Slot absent (freed or never allocated): nothing to apply.
+            return MinedApplyResult {
+                changed: false,
+                new_unmined_since: 0,
+            };
+        };
+
+        // Dedup: this block_id is already recorded, inline or in overflow.
+        let already_inline = inline_block_id != 0 && inline_block_id == block_id;
+        let already_overflow = self
+            .overflow
+            .get(&slot)
+            .is_some_and(|v| v.iter().any(|be| be.block_id == block_id));
+        if already_inline || already_overflow {
+            // The block tuple itself is a no-op, but the on_longest_chain ->
+            // unmined_since/bucket transition must still apply — mirrors the
+            // device slow-path add (`set_mined_inner`'s "Update
+            // unmined_since" step runs unconditionally on
+            // `req.on_longest_chain`, not only when `!exists`), so a
+            // duplicate setMined with on_longest_chain=true still ensures
+            // unmined_since==0.
+            let old_unmined = self.get(slot).map(|e| e.unmined_since).unwrap_or(0);
+            let new_unmined_since = if on_longest_chain { 0 } else { old_unmined };
+            if on_longest_chain && let Some(e) = self.get_mut(slot) {
+                e.unmined_since = 0;
+            }
+            if old_unmined != new_unmined_since {
+                self.set_unmined(slot, old_unmined, new_unmined_since, key);
+            }
+            return MinedApplyResult {
+                changed: false,
+                new_unmined_since,
+            };
+        }
+
+        if inline_block_id == 0 {
+            if let Some(e) = self.get_mut(slot) {
+                e.block_id = block_id;
+                e.block_height = block_height;
+                e.subtree_idx = subtree_idx;
+            }
+        } else {
+            self.overflow.entry(slot).or_default().push(BlockEntry {
+                block_id,
+                block_height,
+                subtree_idx,
+            });
+            if let Some(e) = self.get_mut(slot) {
+                e.flags |= MINED_HAS_OVERFLOW;
+            }
+        }
+
+        let old_unmined = self.get(slot).map(|e| e.unmined_since).unwrap_or(0);
+        let new_unmined_since = if on_longest_chain { 0 } else { old_unmined };
+        if on_longest_chain && let Some(e) = self.get_mut(slot) {
+            e.unmined_since = 0;
+        }
+        if old_unmined != new_unmined_since {
+            self.set_unmined(slot, old_unmined, new_unmined_since, key);
+        }
+
+        MinedApplyResult {
+            changed: true,
+            new_unmined_since,
+        }
+    }
+
+    /// Locked body of [`ShardedMinedIndex::apply_unset`] — see
+    /// [`Self::apply_set_mined_locked`] for why the mutation logic lives on the
+    /// already-locked shard rather than the public wrapper.
+    fn apply_unset_locked(&mut self, slot: u32, block_id: u32, current_height: u32, key: &TxKey) {
+        debug_assert!(block_id != 0, "block_id 0 is the no-block sentinel");
+        let Some(inline_block_id) = self.get(slot).map(|e| e.block_id) else {
+            return;
+        };
+
+        if inline_block_id == block_id {
+            // Removing the inline tuple: backfill from overflow if present.
+            let replacement = self
+                .overflow
+                .get_mut(&slot)
+                .filter(|v| !v.is_empty())
+                .map(|v| v.remove(0));
+            let overflow_now_empty = self.overflow.get(&slot).is_none_or(|v| v.is_empty());
+            if overflow_now_empty {
+                self.overflow.remove(&slot);
+            }
+
+            if let Some(e) = self.get_mut(slot) {
+                match replacement {
+                    Some(be) => {
+                        e.block_id = be.block_id;
+                        e.block_height = be.block_height;
+                        e.subtree_idx = be.subtree_idx;
+                        if overflow_now_empty {
+                            e.flags &= !MINED_HAS_OVERFLOW;
+                        }
+                    }
+                    None => {
+                        e.block_id = 0;
+                        e.block_height = 0;
+                        e.subtree_idx = 0;
+                    }
+                }
+            }
+        } else if let Some(v) = self.overflow.get_mut(&slot) {
+            if let Some(pos) = v.iter().position(|be| be.block_id == block_id) {
+                v.swap_remove(pos);
+            }
+            if v.is_empty() {
+                self.overflow.remove(&slot);
+                if let Some(e) = self.get_mut(slot) {
+                    e.flags &= !MINED_HAS_OVERFLOW;
+                }
+            }
+        } else {
+            // block_id not recorded for this slot at all; nothing to do.
+            return;
+        }
+
+        let has_blocks =
+            self.get(slot).is_some_and(|e| e.block_id != 0) || self.overflow.contains_key(&slot);
+        if !has_blocks {
+            let old_unmined = self.get(slot).map(|e| e.unmined_since).unwrap_or(0);
+            if let Some(e) = self.get_mut(slot) {
+                e.unmined_since = current_height;
+            }
+            self.set_unmined(slot, old_unmined, current_height, key);
+        }
+    }
+
+    /// Read the slot's full mined-state snapshot (block entries + the three
+    /// cached scalars the RAM DAH eval needs) with the shard already locked.
+    /// Returns `None` if the slot is absent or its `key_fp` no longer matches
+    /// `fp` — the same ABA guard [`ShardedMinedIndex::read_block_entries`] /
+    /// [`ShardedMinedIndex::read_de_flags`] / [`ShardedMinedIndex::is_all_spent`]
+    /// apply, now enforced once for all four reads.
+    fn read_mined_state_locked(
+        &self,
+        slot: u32,
+        fp: u32,
+    ) -> Option<(Vec<BlockEntry>, u32, u8, bool)> {
+        let entry = self.get(slot)?;
+        if entry.key_fp != fp {
+            return None;
+        }
+        let mut block_entries = Vec::new();
+        if entry.block_id != 0 {
+            block_entries.push(BlockEntry {
+                block_id: entry.block_id,
+                block_height: entry.block_height,
+                subtree_idx: entry.subtree_idx,
+            });
+        }
+        let unmined_since = entry.unmined_since;
+        let de_flags = entry.flags & MINED_DE_FLAG_MASK;
+        let all_spent = entry.flags & MINED_ALL_SPENT != 0;
+        if let Some(overflow) = self.overflow.get(&slot) {
+            block_entries.extend_from_slice(overflow);
+        }
+        Some((block_entries, unmined_since, de_flags, all_spent))
+    }
+
+    /// The number of distinct block tuples recorded for `slot` (inline + every
+    /// overflow entry) — the value [`ShardedMinedIndex::read_block_entries`]'s
+    /// returned `Vec` length would have, without materializing it. Used by the
+    /// consolidated setMined path to enforce the block-entry cap in place.
+    fn block_entry_count(&self, slot: u32) -> usize {
+        let inline = self.get(slot).is_some_and(|e| e.block_id != 0) as usize;
+        let overflow = self.overflow.get(&slot).map_or(0, |v| v.len());
+        inline + overflow
+    }
+
+    /// Whether `block_id` is already recorded for `slot`, inline or in overflow.
+    fn has_block_id(&self, slot: u32, block_id: u32) -> bool {
+        self.get(slot)
+            .is_some_and(|e| e.block_id != 0 && e.block_id == block_id)
+            || self
+                .overflow
+                .get(&slot)
+                .is_some_and(|v| v.iter().any(|be| be.block_id == block_id))
+    }
+
     /// Collect the shard-local slots (deterministic order) of unmined
     /// entries in buckets with height `< height`. Does not resolve txids —
     /// see [`Self::unmined_keys_below`] for that.
@@ -763,75 +963,15 @@ impl ShardedMinedIndex {
         subtree_idx: u32,
         on_longest_chain: bool,
     ) -> MinedApplyResult {
-        debug_assert!(block_id != 0, "block_id 0 is the no-block sentinel");
         let mut sh = self.shards[self.shard_for(key)].lock();
-
-        let Some(inline_block_id) = sh.get(slot).map(|e| e.block_id) else {
-            // Slot absent (freed or never allocated): nothing to apply.
-            return MinedApplyResult {
-                changed: false,
-                new_unmined_since: 0,
-            };
-        };
-
-        // Dedup: this block_id is already recorded, inline or in overflow.
-        let already_inline = inline_block_id != 0 && inline_block_id == block_id;
-        let already_overflow = sh
-            .overflow
-            .get(&slot)
-            .is_some_and(|v| v.iter().any(|be| be.block_id == block_id));
-        if already_inline || already_overflow {
-            // The block tuple itself is a no-op, but the on_longest_chain ->
-            // unmined_since/bucket transition must still apply — mirrors the
-            // device slow-path add (`set_mined_inner`'s "Update
-            // unmined_since" step runs unconditionally on
-            // `req.on_longest_chain`, not only when `!exists`), so a
-            // duplicate setMined with on_longest_chain=true still ensures
-            // unmined_since==0.
-            let old_unmined = sh.get(slot).map(|e| e.unmined_since).unwrap_or(0);
-            let new_unmined_since = if on_longest_chain { 0 } else { old_unmined };
-            if on_longest_chain && let Some(e) = sh.get_mut(slot) {
-                e.unmined_since = 0;
-            }
-            if old_unmined != new_unmined_since {
-                sh.set_unmined(slot, old_unmined, new_unmined_since, key);
-            }
-            return MinedApplyResult {
-                changed: false,
-                new_unmined_since,
-            };
-        }
-
-        if inline_block_id == 0 {
-            if let Some(e) = sh.get_mut(slot) {
-                e.block_id = block_id;
-                e.block_height = block_height;
-                e.subtree_idx = subtree_idx;
-            }
-        } else {
-            sh.overflow.entry(slot).or_default().push(BlockEntry {
-                block_id,
-                block_height,
-                subtree_idx,
-            });
-            if let Some(e) = sh.get_mut(slot) {
-                e.flags |= MINED_HAS_OVERFLOW;
-            }
-        }
-
-        let old_unmined = sh.get(slot).map(|e| e.unmined_since).unwrap_or(0);
-        let new_unmined_since = if on_longest_chain { 0 } else { old_unmined };
-        if on_longest_chain && let Some(e) = sh.get_mut(slot) {
-            e.unmined_since = 0;
-        }
-        if old_unmined != new_unmined_since {
-            sh.set_unmined(slot, old_unmined, new_unmined_since, key);
-        }
-
-        MinedApplyResult {
-            changed: true,
-            new_unmined_since,
-        }
+        sh.apply_set_mined_locked(
+            slot,
+            block_id,
+            block_height,
+            subtree_idx,
+            on_longest_chain,
+            key,
+        )
     }
 
     /// Remove a block tuple previously recorded by [`Self::apply_set_mined`].
@@ -849,64 +989,96 @@ impl ShardedMinedIndex {
     /// matching assert doc; `0` can never have been a real recorded block
     /// tuple, so unsetting it would be a caller bug, not a legitimate no-op.
     pub fn apply_unset(&self, key: &TxKey, slot: u32, block_id: u32, current_height: u32) {
-        debug_assert!(block_id != 0, "block_id 0 is the no-block sentinel");
         let mut sh = self.shards[self.shard_for(key)].lock();
-        let Some(inline_block_id) = sh.get(slot).map(|e| e.block_id) else {
-            return;
-        };
+        sh.apply_unset_locked(slot, block_id, current_height, key);
+    }
 
-        if inline_block_id == block_id {
-            // Removing the inline tuple: backfill from overflow if present.
-            let replacement = sh
-                .overflow
-                .get_mut(&slot)
-                .filter(|v| !v.is_empty())
-                .map(|v| v.remove(0));
-            let overflow_now_empty = sh.overflow.get(&slot).is_none_or(|v| v.is_empty());
-            if overflow_now_empty {
-                sh.overflow.remove(&slot);
-            }
+    /// Apply a set/unset-mined transition to `slot` and read back the full
+    /// post-transition mined-state — all under a SINGLE shard-lock acquisition.
+    ///
+    /// This is the consolidated hot-path primitive behind
+    /// `Engine::set_mined_inner` (the zero-device-I/O setMined path). The caller
+    /// already holds the record's stripe lock and its `mined_slot`, so this
+    /// folds what were up to six separate shard-lock round-trips — two
+    /// [`Self::read_block_entries`], [`Self::apply_set_mined`] /
+    /// [`Self::apply_unset`], [`Self::read_de_flags`], [`Self::is_all_spent`] —
+    /// into one, preserving their exact semantics.
+    ///
+    /// On the set path the block-entry cap ([`u8::MAX`] distinct block_ids) is
+    /// enforced BEFORE applying: a genuinely-new distinct block_id that would
+    /// exceed it yields [`MinedTransitionOutcome::BlockEntriesFull`] with
+    /// nothing mutated (an idempotent re-application of an already-recorded
+    /// block_id still applies at capacity). The unset path has no cap.
+    ///
+    /// Returns [`MinedTransitionOutcome::SlotAbsent`] if the slot is absent or
+    /// its stamped `key_fp` no longer matches `key` (the ABA the stripe lock
+    /// normally precludes) — mirroring [`Self::read_block_entries`] returning
+    /// `None`, which the caller maps to a hard error.
+    pub fn apply_mined_transition(
+        &self,
+        key: &TxKey,
+        slot: u32,
+        transition: MinedTransition,
+    ) -> MinedTransitionOutcome {
+        let fp = key_fp(key);
+        let mut sh = self.shards[self.shard_for(key)].lock();
 
-            if let Some(e) = sh.get_mut(slot) {
-                match replacement {
-                    Some(be) => {
-                        e.block_id = be.block_id;
-                        e.block_height = be.block_height;
-                        e.subtree_idx = be.subtree_idx;
-                        if overflow_now_empty {
-                            e.flags &= !MINED_HAS_OVERFLOW;
-                        }
-                    }
-                    None => {
-                        e.block_id = 0;
-                        e.block_height = 0;
-                        e.subtree_idx = 0;
-                    }
-                }
-            }
-        } else if let Some(v) = sh.overflow.get_mut(&slot) {
-            if let Some(pos) = v.iter().position(|be| be.block_id == block_id) {
-                v.swap_remove(pos);
-            }
-            if v.is_empty() {
-                sh.overflow.remove(&slot);
-                if let Some(e) = sh.get_mut(slot) {
-                    e.flags &= !MINED_HAS_OVERFLOW;
-                }
-            }
-        } else {
-            // block_id not recorded for this slot at all; nothing to do.
-            return;
+        // Slot/key guard mirrors read_block_entries / read_de_flags /
+        // is_all_spent: an absent or ABA-reallocated slot reads as absent, which
+        // the caller maps to a hard error rather than a silent no-op.
+        match sh.get(slot) {
+            Some(e) if e.key_fp == fp => {}
+            _ => return MinedTransitionOutcome::SlotAbsent,
         }
 
-        let has_blocks =
-            sh.get(slot).is_some_and(|e| e.block_id != 0) || sh.overflow.contains_key(&slot);
-        if !has_blocks {
-            let old_unmined = sh.get(slot).map(|e| e.unmined_since).unwrap_or(0);
-            if let Some(e) = sh.get_mut(slot) {
-                e.unmined_since = current_height;
+        match transition {
+            MinedTransition::Set {
+                block_id,
+                block_height,
+                subtree_idx,
+                on_longest_chain,
+            } => {
+                // BUG-2 cap guard, applied before mutating (mirrors
+                // set_mined_inner's pre-apply cap check): only a genuinely-new
+                // distinct block_id is checked, so an idempotent re-application
+                // still succeeds at capacity.
+                if !sh.has_block_id(slot, block_id)
+                    && sh.block_entry_count(slot) >= u8::MAX as usize
+                {
+                    return MinedTransitionOutcome::BlockEntriesFull;
+                }
+                sh.apply_set_mined_locked(
+                    slot,
+                    block_id,
+                    block_height,
+                    subtree_idx,
+                    on_longest_chain,
+                    key,
+                );
             }
-            sh.set_unmined(slot, old_unmined, current_height, key);
+            MinedTransition::Unset {
+                block_id,
+                current_height,
+            } => {
+                sh.apply_unset_locked(slot, block_id, current_height, key);
+            }
+        }
+
+        // Read the full post-transition snapshot under the same lock. The guard
+        // above pinned the slot present with a matching key_fp; neither a set
+        // (never frees the slot) nor an unset (only ever clears the block tuple,
+        // the entry stays live) can drop it, so this is Some in practice — a
+        // defensive SlotAbsent covers the impossible case rather than panicking.
+        match sh.read_mined_state_locked(slot, fp) {
+            Some((block_entries, unmined_since, de_flags, all_spent)) => {
+                MinedTransitionOutcome::Applied(MinedTransitionState {
+                    block_entries,
+                    unmined_since,
+                    de_flags,
+                    all_spent,
+                })
+            }
+            None => MinedTransitionOutcome::SlotAbsent,
         }
     }
 
@@ -1257,6 +1429,60 @@ pub struct MinedApplyResult {
     pub changed: bool,
     /// The entry's `unmined_since` after this call.
     pub new_unmined_since: u32,
+}
+
+/// The set-or-unset mutation for [`ShardedMinedIndex::apply_mined_transition`].
+#[derive(Debug, Clone, Copy)]
+pub enum MinedTransition {
+    /// Record the tx as mined in `block_id` — mirrors
+    /// [`ShardedMinedIndex::apply_set_mined`].
+    Set {
+        /// Block ID to record.
+        block_id: u32,
+        /// Block height for the recorded tuple.
+        block_height: u32,
+        /// Subtree index for the recorded tuple.
+        subtree_idx: u32,
+        /// Whether the block is on the longest chain (clears `unmined_since`).
+        on_longest_chain: bool,
+    },
+    /// Remove a previously-recorded `block_id` — mirrors
+    /// [`ShardedMinedIndex::apply_unset`].
+    Unset {
+        /// Block ID to remove.
+        block_id: u32,
+        /// Height to re-mark the tx unmined at if it ends up with no blocks.
+        current_height: u32,
+    },
+}
+
+/// The post-transition mined-state read-back returned by
+/// [`ShardedMinedIndex::apply_mined_transition`] — everything
+/// `Engine::set_mined_inner`'s RAM DAH eval needs, captured under the same
+/// shard-lock that applied the transition.
+#[derive(Debug, Clone)]
+pub struct MinedTransitionState {
+    /// The complete block-entry set (inline tuple first, then overflow).
+    pub block_entries: Vec<BlockEntry>,
+    /// The slot's `unmined_since` after the transition.
+    pub unmined_since: u32,
+    /// The slot's cached DAH-eval flag bits ([`MINED_DE_FLAG_MASK`]).
+    pub de_flags: u8,
+    /// The slot's cached [`MINED_ALL_SPENT`] bit.
+    pub all_spent: bool,
+}
+
+/// Outcome of [`ShardedMinedIndex::apply_mined_transition`].
+#[derive(Debug, Clone)]
+pub enum MinedTransitionOutcome {
+    /// Transition applied; carries the post-transition read-back.
+    Applied(MinedTransitionState),
+    /// Set path only: a genuinely-new distinct block_id would exceed the
+    /// block-entry cap ([`u8::MAX`] distinct block_ids); nothing was applied.
+    BlockEntriesFull,
+    /// The slot is absent or its `key_fp` no longer matches the key; nothing
+    /// was applied.
+    SlotAbsent,
 }
 
 #[cfg(test)]
@@ -2574,5 +2800,213 @@ mod tests {
         let key = TxKey { txid: [89u8; 32] };
         let slot = idx.alloc_created(&key, 5);
         idx.apply_unset(&key, slot, 0, 20);
+    }
+
+    /// P1-12: the consolidated `apply_mined_transition` (SET path) must return
+    /// exactly what the pre-consolidation accessor sequence produced —
+    /// `apply_set_mined` followed by `read_block_entries` / `read_de_flags` /
+    /// `is_all_spent` — and leave identical shard state. Two identically-seeded
+    /// indexes given the same key resolve to the same shard+slot, so any
+    /// divergence in routing, mutation, or read-back would fail here.
+    #[test]
+    fn apply_mined_transition_set_matches_individual_accessors() {
+        use crate::index::TxKey;
+
+        let seed = 0x0BAD_F00D_C0FF_EE00;
+        let key = TxKey { txid: [7u8; 32] };
+
+        // Reference: seed non-trivial cached state, apply the transition, then
+        // read it back the OLD way (four separate shard-lock acquisitions).
+        let reference = ShardedMinedIndex::new_with_seed(16, seed);
+        let ref_slot = reference.alloc_created(&key, 100);
+        reference.set_de_flag(&key, ref_slot, MINED_CONFLICTING, true);
+        reference.set_all_spent(&key, ref_slot, true);
+        let apply = reference.apply_set_mined(&key, ref_slot, 500, 20, 3, true);
+        let (ref_entries, ref_unmined) = reference
+            .read_block_entries(&key, ref_slot)
+            .expect("reference slot readable");
+        let ref_de = reference.read_de_flags(&key, ref_slot).expect("de flags");
+        let ref_all_spent = reference.is_all_spent(&key, ref_slot).expect("all_spent");
+
+        // Consolidated: identical seed+key ⇒ identical shard+slot.
+        let consolidated = ShardedMinedIndex::new_with_seed(16, seed);
+        let slot = consolidated.alloc_created(&key, 100);
+        assert_eq!(
+            slot, ref_slot,
+            "identical seed+key must reuse the same slot"
+        );
+        consolidated.set_de_flag(&key, slot, MINED_CONFLICTING, true);
+        consolidated.set_all_spent(&key, slot, true);
+        let outcome = consolidated.apply_mined_transition(
+            &key,
+            slot,
+            MinedTransition::Set {
+                block_id: 500,
+                block_height: 20,
+                subtree_idx: 3,
+                on_longest_chain: true,
+            },
+        );
+        let MinedTransitionOutcome::Applied(state) = outcome else {
+            panic!("set of a live slot must apply, got {outcome:?}");
+        };
+
+        assert_eq!(state.block_entries, ref_entries, "block_entries diverged");
+        assert_eq!(state.unmined_since, ref_unmined, "unmined_since diverged");
+        assert_eq!(state.de_flags, ref_de, "de_flags diverged");
+        assert_eq!(state.all_spent, ref_all_spent, "all_spent diverged");
+
+        // Not a vacuous match: the block was really recorded, on_longest_chain
+        // cleared unmined_since, and the pre-seeded cache bits survived.
+        assert!(
+            apply.changed,
+            "reference apply must have recorded a new block"
+        );
+        assert_eq!(state.block_entries.len(), 1);
+        assert_eq!({ state.block_entries[0].block_id }, 500);
+        assert_eq!(
+            state.unmined_since, 0,
+            "on_longest_chain clears unmined_since"
+        );
+        assert_eq!(state.de_flags, MINED_CONFLICTING);
+        assert!(state.all_spent);
+    }
+
+    /// P1-12: same equivalence proof for the UNSET path — removing the inline
+    /// block backfills from overflow, and the read-back tuple matches the old
+    /// `apply_unset` + `read_block_entries` / `read_de_flags` / `is_all_spent`.
+    #[test]
+    fn apply_mined_transition_unset_matches_individual_accessors() {
+        use crate::index::TxKey;
+
+        let seed = 0x1234_5678_9ABC_DEF0;
+        let key = TxKey { txid: [9u8; 32] };
+
+        let reference = ShardedMinedIndex::new_with_seed(16, seed);
+        let ref_slot = reference.alloc_created(&key, 100);
+        reference.apply_set_mined(&key, ref_slot, 500, 20, 3, true);
+        reference.apply_set_mined(&key, ref_slot, 600, 25, 4, true);
+        reference.set_de_flag(&key, ref_slot, MINED_PRESERVED, true);
+        reference.apply_unset(&key, ref_slot, 500, 777);
+        let (ref_entries, ref_unmined) = reference
+            .read_block_entries(&key, ref_slot)
+            .expect("reference slot readable");
+        let ref_de = reference.read_de_flags(&key, ref_slot).expect("de flags");
+        let ref_all_spent = reference.is_all_spent(&key, ref_slot).expect("all_spent");
+
+        let consolidated = ShardedMinedIndex::new_with_seed(16, seed);
+        let slot = consolidated.alloc_created(&key, 100);
+        consolidated.apply_set_mined(&key, slot, 500, 20, 3, true);
+        consolidated.apply_set_mined(&key, slot, 600, 25, 4, true);
+        consolidated.set_de_flag(&key, slot, MINED_PRESERVED, true);
+        let outcome = consolidated.apply_mined_transition(
+            &key,
+            slot,
+            MinedTransition::Unset {
+                block_id: 500,
+                current_height: 777,
+            },
+        );
+        let MinedTransitionOutcome::Applied(state) = outcome else {
+            panic!("unset of a live slot must apply, got {outcome:?}");
+        };
+
+        assert_eq!(state.block_entries, ref_entries, "block_entries diverged");
+        assert_eq!(state.unmined_since, ref_unmined, "unmined_since diverged");
+        assert_eq!(state.de_flags, ref_de, "de_flags diverged");
+        assert_eq!(state.all_spent, ref_all_spent, "all_spent diverged");
+
+        // Removing the inline 500 backfills 600 from overflow; one block left,
+        // record stays mined (unmined_since untouched at 0).
+        assert_eq!(state.block_entries.len(), 1);
+        assert_eq!({ state.block_entries[0].block_id }, 600);
+        assert_eq!(state.unmined_since, 0);
+        assert_eq!(state.de_flags, MINED_PRESERVED);
+    }
+
+    /// P1-12: the block-entry cap (255 distinct block_ids) is enforced BEFORE
+    /// mutating on the set path, and a genuinely-new distinct block_id that
+    /// would exceed it yields `BlockEntriesFull` with the entry set unchanged —
+    /// while an idempotent re-application of an already-recorded block_id still
+    /// applies at capacity (mirrors `Engine::set_mined_inner`'s guard).
+    #[test]
+    fn apply_mined_transition_reports_block_entries_full() {
+        use crate::index::TxKey;
+
+        let idx = ShardedMinedIndex::new(16);
+        let key = TxKey { txid: [3u8; 32] };
+        let slot = idx.alloc_created(&key, 100);
+
+        for block_id in 1..=(u8::MAX as u32) {
+            idx.apply_set_mined(&key, slot, block_id, 10, 0, true);
+        }
+        let (before, _) = idx.read_block_entries(&key, slot).unwrap();
+        assert_eq!(before.len(), u8::MAX as usize, "filled to the cap");
+
+        // A new distinct block_id is rejected; nothing is mutated.
+        let outcome = idx.apply_mined_transition(
+            &key,
+            slot,
+            MinedTransition::Set {
+                block_id: 256,
+                block_height: 10,
+                subtree_idx: 0,
+                on_longest_chain: true,
+            },
+        );
+        assert!(
+            matches!(outcome, MinedTransitionOutcome::BlockEntriesFull),
+            "a new distinct block_id past the cap must be rejected, got {outcome:?}"
+        );
+        let (after, _) = idx.read_block_entries(&key, slot).unwrap();
+        assert_eq!(
+            after.len(),
+            u8::MAX as usize,
+            "a rejected set must not grow the entry set"
+        );
+
+        // An already-recorded block_id still applies (idempotent no-op) at cap.
+        let outcome = idx.apply_mined_transition(
+            &key,
+            slot,
+            MinedTransition::Set {
+                block_id: 1,
+                block_height: 10,
+                subtree_idx: 0,
+                on_longest_chain: true,
+            },
+        );
+        let MinedTransitionOutcome::Applied(state) = outcome else {
+            panic!("idempotent re-set at capacity must apply, got {outcome:?}");
+        };
+        assert_eq!(state.block_entries.len(), u8::MAX as usize);
+    }
+
+    /// P1-12: a freed (or ABA-reallocated) slot reports `SlotAbsent` — the
+    /// same signal `read_block_entries` gives via `None`, which the engine
+    /// maps to a hard error — and nothing is mutated.
+    #[test]
+    fn apply_mined_transition_reports_slot_absent_for_freed_slot() {
+        use crate::index::TxKey;
+
+        let idx = ShardedMinedIndex::new(16);
+        let key = TxKey { txid: [5u8; 32] };
+        let slot = idx.alloc_created(&key, 100);
+        idx.free(&key, slot);
+
+        let outcome = idx.apply_mined_transition(
+            &key,
+            slot,
+            MinedTransition::Set {
+                block_id: 7,
+                block_height: 10,
+                subtree_idx: 0,
+                on_longest_chain: true,
+            },
+        );
+        assert!(
+            matches!(outcome, MinedTransitionOutcome::SlotAbsent),
+            "a freed slot must report absent, got {outcome:?}"
+        );
     }
 }

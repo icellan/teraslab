@@ -1213,6 +1213,61 @@ pub struct WireGetResult {
     pub data: Vec<u8>,
 }
 
+/// Enforce the [`MAX_FRAME_SIZE`](crate::protocol::opcodes::MAX_FRAME_SIZE)
+/// budget on an assembled GET-batch response, IN PLACE.
+///
+/// [`try_encode_get_response`] only rejects lengths that overflow a `u32`
+/// (~4 GiB); a legitimate batch can sum past the 16 MiB wire-frame limit
+/// long before that — UTXO slots at ~69 B each, up to 4 MiB of inline cold
+/// data per item, or an EXTERNAL blob read back whole. Emitting such a frame
+/// makes every conforming reader reject the length prefix and tear down the
+/// connection, failing all pipelined in-flight requests; retries hit the
+/// same wall deterministically.
+///
+/// This walks `items` in order, charging each item's on-wire cost
+/// (`status(1) + data_len(4) + data`) against a running total seeded with
+/// the fixed response overhead (`request_id(8) + status(1)` frame body plus
+/// the `item_count(4)` payload header). The first item whose inclusion would
+/// exceed the budget — and every later item that still would not fit
+/// alongside the ones already admitted — is replaced in place with a
+/// zero-length [`ERR_RESPONSE_TOO_LARGE`](crate::protocol::opcodes::ERR_RESPONSE_TOO_LARGE)
+/// result. The rest of the batch is served unchanged, so the client still
+/// gets every record that fits and can re-request the offending one on its
+/// own (or with a narrower field mask). Because a downgraded item costs only
+/// its 5-byte header, dropping a large item frees room for smaller ones that
+/// follow.
+///
+/// Returns the number of items downgraded (for logging / metrics). A batch
+/// already within budget is left byte-identical and returns `0`.
+pub fn enforce_get_response_budget(items: &mut [WireGetResult]) -> usize {
+    use crate::protocol::opcodes::{ERR_RESPONSE_TOO_LARGE, MAX_FRAME_SIZE};
+
+    // Fixed frame overhead that does not scale with item data:
+    //   response body: request_id(8) + status(1)
+    //   GET payload header: item_count(4)
+    const FIXED_OVERHEAD: usize = 8 + 1 + 4;
+    // Per-item fixed cost on the wire: status(1) + data_len(4).
+    const ITEM_OVERHEAD: usize = 5;
+
+    let max = MAX_FRAME_SIZE as usize;
+    let mut used = FIXED_OVERHEAD;
+    let mut downgraded = 0usize;
+    for item in items.iter_mut() {
+        let cost = ITEM_OVERHEAD.saturating_add(item.data.len());
+        if used.saturating_add(cost) > max {
+            *item = WireGetResult {
+                status: ERR_RESPONSE_TOO_LARGE as u8,
+                data: Vec::new(),
+            };
+            used = used.saturating_add(ITEM_OVERHEAD);
+            downgraded += 1;
+        } else {
+            used = used.saturating_add(cost);
+        }
+    }
+    downgraded
+}
+
 /// Encode GetBatch response items, rejecting lengths that cannot be represented
 /// by the wire format.
 pub fn try_encode_get_response(items: &[WireGetResult]) -> Result<Vec<u8>, CodecError> {
@@ -1462,6 +1517,69 @@ pub fn decode_partial_with_signals(
     data: &[u8],
 ) -> Option<(Vec<BatchItemSuccess>, Vec<BatchItemError>)> {
     decode_partial_with_signals_checked(data, MAX_DECODE_BATCH).ok()
+}
+
+// ---------------------------------------------------------------------------
+// Degraded-durability trailer for STATUS_PARTIAL_ERROR responses
+// ---------------------------------------------------------------------------
+
+/// Reserved trailer byte appended to a `STATUS_PARTIAL_ERROR` payload (after the
+/// [`encode_sparse_errors`] / [`encode_partial_with_signals`] section) when the
+/// items that *did* apply were only replicated under degraded (below-quorum,
+/// best-effort) durability.
+///
+/// The all-success degraded path already carries this signal in the status byte
+/// (`STATUS_DEGRADED_DURABILITY`); a single status byte cannot express both
+/// "partial error" and "degraded" at once, so on the partial path the same
+/// signal rides as this one-byte trailer instead. It is present ONLY in the
+/// degraded case, so a non-degraded partial response is byte-identical to the
+/// pre-trailer wire format, and every existing decoder ignores the extra byte
+/// (they stop after the declared section), so older clients are unaffected.
+pub const PARTIAL_DURABILITY_DEGRADED: u8 = 1;
+
+/// Byte length of the section produced by [`encode_sparse_errors`] for `errors`.
+/// Used to locate the optional [`PARTIAL_DURABILITY_DEGRADED`] trailer after a
+/// successful decode.
+pub fn sparse_errors_encoded_len(errors: &[BatchItemError]) -> usize {
+    4 + errors.iter().map(|e| 8 + e.error_data.len()).sum::<usize>()
+}
+
+/// Byte length of the section produced by [`encode_partial_with_signals`] for
+/// `successes` and `errors`. Used to locate the optional
+/// [`PARTIAL_DURABILITY_DEGRADED`] trailer after a successful decode.
+pub fn partial_with_signals_encoded_len(
+    successes: &[BatchItemSuccess],
+    errors: &[BatchItemError],
+) -> usize {
+    let success_len: usize = successes.iter().map(|s| 6 + s.block_ids.len() * 4).sum();
+    let error_len: usize = errors.iter().map(|e| 8 + e.error_data.len()).sum();
+    4 + success_len + 4 + error_len
+}
+
+/// Decode a sparse-error partial payload together with its optional
+/// degraded-durability trailer. Returns the per-item errors and `true` iff the
+/// applied items were only replicated under degraded durability (see
+/// [`PARTIAL_DURABILITY_DEGRADED`]). An absent trailer decodes as `false`, so
+/// this is wire-compatible with servers that never emit the trailer.
+pub fn decode_sparse_errors_with_durability(data: &[u8]) -> Option<(Vec<BatchItemError>, bool)> {
+    let errors = decode_sparse_errors(data)?;
+    let consumed = sparse_errors_encoded_len(&errors);
+    let degraded = matches!(data.get(consumed), Some(&PARTIAL_DURABILITY_DEGRADED));
+    Some((errors, degraded))
+}
+
+/// Decode a spend/set-mined partial payload (two-section signal layout) together
+/// with its optional degraded-durability trailer. Returns the per-item
+/// successes, per-item errors, and `true` iff the applied items were only
+/// replicated under degraded durability (see [`PARTIAL_DURABILITY_DEGRADED`]).
+#[allow(clippy::type_complexity)]
+pub fn decode_partial_with_signals_with_durability(
+    data: &[u8],
+) -> Option<(Vec<BatchItemSuccess>, Vec<BatchItemError>, bool)> {
+    let (successes, errors) = decode_partial_with_signals(data)?;
+    let consumed = partial_with_signals_encoded_len(&successes, &errors);
+    let degraded = matches!(data.get(consumed), Some(&PARTIAL_DURABILITY_DEGRADED));
+    Some((successes, errors, degraded))
 }
 
 // ---------------------------------------------------------------------------
@@ -2972,6 +3090,8 @@ mod tests {
         assert_eq!(ERR_NOT_CLUSTERED, 32);
         assert_eq!(ERR_INVARIANT_VIOLATION, 33);
         assert_eq!(ERR_STREAM_INVARIANT, 34);
+        // P1-13: response-too-large guard on the GET read-back path.
+        assert_eq!(ERR_RESPONSE_TOO_LARGE, 38);
         // ERR_INTERNAL stays at 255 — sentinel for genuinely unclassified
         // failures so old clients matching on 255 still receive a value.
         assert_eq!(ERR_INTERNAL, 255);
@@ -3257,6 +3377,125 @@ mod tests {
         );
     }
 
+    // P1-13: the response frame `total_length` the wire enforces is
+    //   request_id(8) + status(1) + get_payload
+    // where `get_payload` is what `try_encode_get_response` returns. This
+    // helper reconstructs that value from an encoded GET payload.
+    fn get_response_frame_inner_len(payload: &[u8]) -> usize {
+        8 + 1 + payload.len()
+    }
+
+    // P1-13: a batch already within the wire budget is left byte-identical and
+    // the function reports zero downgrades.
+    #[test]
+    fn enforce_get_response_budget_leaves_in_budget_batch_untouched() {
+        let mut items: Vec<WireGetResult> = (0..10)
+            .map(|i| WireGetResult {
+                status: 0,
+                data: vec![i as u8; 1024],
+            })
+            .collect();
+        let before = items.clone();
+        let downgraded = enforce_get_response_budget(&mut items);
+        assert_eq!(downgraded, 0, "small batch must not be downgraded");
+        assert_eq!(items, before, "in-budget batch must be byte-identical");
+        let payload = try_encode_get_response(&items).unwrap();
+        assert!(get_response_frame_inner_len(&payload) <= MAX_FRAME_SIZE as usize);
+    }
+
+    // P1-13 (Part 1, core): several large items whose data sums past
+    // MAX_FRAME_SIZE. The overflowing item(s) are downgraded in place to a
+    // zero-length ERR_RESPONSE_TOO_LARGE result; the items that fit are kept
+    // intact; and the RE-ENCODED response is guaranteed to fit the wire frame.
+    #[test]
+    fn enforce_get_response_budget_downgrades_overflowing_items() {
+        // Three 6 MiB items = 18 MiB > 16 MiB: the first two fit, the third
+        // overflows the budget and must be downgraded.
+        let big = 6 * 1024 * 1024usize;
+        let mut items: Vec<WireGetResult> = (0..3)
+            .map(|i| WireGetResult {
+                status: 0,
+                data: vec![i as u8 + 1; big],
+            })
+            .collect();
+        let originals = items.clone();
+
+        let downgraded = enforce_get_response_budget(&mut items);
+        assert_eq!(downgraded, 1, "exactly the overflowing item is downgraded");
+
+        // The items that fit are untouched.
+        assert_eq!(items[0], originals[0]);
+        assert_eq!(items[1], originals[1]);
+        // The offending item carries the typed code and NO data.
+        assert_eq!(items[2].status, ERR_RESPONSE_TOO_LARGE as u8);
+        assert!(items[2].data.is_empty(), "downgraded item drops its blob");
+
+        // The load-bearing invariant: the assembled frame now fits the wire
+        // budget, so no conforming reader rejects it.
+        let payload = try_encode_get_response(&items).unwrap();
+        let inner_len = get_response_frame_inner_len(&payload);
+        assert!(
+            inner_len <= MAX_FRAME_SIZE as usize,
+            "budgeted response must fit MAX_FRAME_SIZE (got {inner_len})"
+        );
+        // And it still decodes cleanly, preserving item order/count.
+        let decoded = decode_get_response(&payload).unwrap();
+        assert_eq!(decoded.len(), 3);
+        assert_eq!(decoded[2].status, ERR_RESPONSE_TOO_LARGE as u8);
+    }
+
+    // P1-13 (deferred-streaming behavior): a SINGLE item that alone exceeds
+    // MAX_FRAME_SIZE (e.g. a >16 MiB EXTERNAL blob read back whole) cannot be
+    // served in one frame, so it is downgraded to ERR_RESPONSE_TOO_LARGE —
+    // strictly better than emitting a corrupt/oversized frame. A streaming
+    // read path is a documented follow-up.
+    #[test]
+    fn enforce_get_response_budget_downgrades_single_oversized_item() {
+        let mut items = vec![WireGetResult {
+            status: 0,
+            data: vec![0xAB; MAX_FRAME_SIZE as usize],
+        }];
+        let downgraded = enforce_get_response_budget(&mut items);
+        assert_eq!(downgraded, 1);
+        assert_eq!(items[0].status, ERR_RESPONSE_TOO_LARGE as u8);
+        assert!(items[0].data.is_empty());
+        let payload = try_encode_get_response(&items).unwrap();
+        assert!(get_response_frame_inner_len(&payload) <= MAX_FRAME_SIZE as usize);
+    }
+
+    // Dropping a large item frees room for smaller items that follow it, so a
+    // small trailing item is still served rather than needlessly dropped.
+    #[test]
+    fn enforce_get_response_budget_keeps_small_items_after_a_dropped_big_one() {
+        let mut items = vec![
+            WireGetResult {
+                status: 0,
+                // Alone within budget, but leaves < 6 MiB of headroom.
+                data: vec![1u8; 12 * 1024 * 1024],
+            },
+            WireGetResult {
+                status: 0,
+                // 6 MiB would overflow alongside the first item → dropped.
+                data: vec![2u8; 6 * 1024 * 1024],
+            },
+            WireGetResult {
+                status: 0,
+                // Tiny — fits in the headroom left after the big item.
+                data: vec![3u8; 16],
+            },
+        ];
+        let downgraded = enforce_get_response_budget(&mut items);
+        assert_eq!(downgraded, 1, "only the middle item overflows");
+        assert_eq!(items[0].data.len(), 12 * 1024 * 1024, "first item kept");
+        assert_eq!(
+            items[1].status, ERR_RESPONSE_TOO_LARGE as u8,
+            "middle dropped"
+        );
+        assert_eq!(items[2].data, vec![3u8; 16], "small trailing item kept");
+        let payload = try_encode_get_response(&items).unwrap();
+        assert!(get_response_frame_inner_len(&payload) <= MAX_FRAME_SIZE as usize);
+    }
+
     #[test]
     fn encode_sparse_errors_capacity_sufficient() {
         let errors: Vec<BatchItemError> = (0..100)
@@ -3272,6 +3511,88 @@ mod tests {
             "sparse_errors had insufficient capacity: cap={} len={}",
             encoded.capacity(),
             encoded.len()
+        );
+    }
+
+    /// P1-8: a `STATUS_PARTIAL_ERROR` sparse payload carrying the reserved
+    /// degraded-durability trailer must decode as BOTH the per-item errors AND
+    /// the degraded flag. `sparse_errors_encoded_len` locates the trailer, and a
+    /// non-degraded payload (no trailer) must decode as `degraded == false`.
+    #[test]
+    fn sparse_errors_degraded_trailer_round_trips() {
+        let errors = vec![
+            BatchItemError {
+                item_index: 3,
+                error_code: ERR_ALREADY_SPENT,
+                error_data: vec![0xAB; 36],
+            },
+            BatchItemError {
+                item_index: 7,
+                error_code: ERR_TX_NOT_FOUND,
+                error_data: vec![],
+            },
+        ];
+
+        // Non-degraded: byte-identical to the pre-trailer format, degraded=false.
+        let plain = encode_sparse_errors(&errors);
+        let (decoded, degraded) =
+            decode_sparse_errors_with_durability(&plain).expect("plain payload decodes");
+        assert_eq!(decoded, errors, "errors survive without a trailer");
+        assert!(!degraded, "no trailer means not degraded");
+
+        // Degraded: same section plus a single trailer byte.
+        let mut degraded_payload = encode_sparse_errors(&errors);
+        degraded_payload.push(PARTIAL_DURABILITY_DEGRADED);
+        assert_eq!(
+            degraded_payload.len(),
+            sparse_errors_encoded_len(&errors) + 1,
+            "trailer sits exactly after the encoded section"
+        );
+        let (decoded, degraded) = decode_sparse_errors_with_durability(&degraded_payload)
+            .expect("degraded payload decodes");
+        assert_eq!(decoded, errors, "errors survive alongside the trailer");
+        assert!(degraded, "trailer byte surfaces the degraded signal");
+
+        // A pre-trailer decoder ignores the extra byte (older-client compat).
+        let legacy = decode_sparse_errors(&degraded_payload).expect("legacy decode");
+        assert_eq!(legacy, errors, "trailing byte is invisible to old decoders");
+    }
+
+    /// P1-8: the spend/set-mined two-section signal payload must round-trip the
+    /// degraded trailer alongside both successes and errors.
+    #[test]
+    fn partial_with_signals_degraded_trailer_round_trips() {
+        let successes = vec![BatchItemSuccess {
+            item_index: 0,
+            signal: 2,
+            block_ids: vec![10, 20],
+        }];
+        let errors = vec![BatchItemError {
+            item_index: 1,
+            error_code: ERR_CONFLICTING,
+            error_data: vec![],
+        }];
+
+        let plain = encode_partial_with_signals(&successes, &errors);
+        let (ds, de, degraded) =
+            decode_partial_with_signals_with_durability(&plain).expect("plain decodes");
+        assert_eq!(ds, successes);
+        assert_eq!(de, errors);
+        assert!(!degraded);
+
+        let mut degraded_payload = encode_partial_with_signals(&successes, &errors);
+        degraded_payload.push(PARTIAL_DURABILITY_DEGRADED);
+        assert_eq!(
+            degraded_payload.len(),
+            partial_with_signals_encoded_len(&successes, &errors) + 1
+        );
+        let (ds, de, degraded) = decode_partial_with_signals_with_durability(&degraded_payload)
+            .expect("degraded decodes");
+        assert_eq!(ds, successes);
+        assert_eq!(de, errors);
+        assert!(
+            degraded,
+            "trailer byte surfaces degraded on the signal layout"
         );
     }
 

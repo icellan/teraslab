@@ -8031,6 +8031,48 @@ pub struct RunningCluster {
     _event_handle: std::thread::JoinHandle<()>,
 }
 
+/// A batch-scoped snapshot of every shard's authoritative master identity.
+///
+/// [`RunningCluster::is_master`] resolves a key's master through
+/// [`RunningCluster::authoritative_master_for_shard`], which takes the two
+/// process-global RwLocks (`shard_table` + `node_addrs`). Called once per
+/// batch item — across an N-item batch and every dispatch thread — that is
+/// `2N` reader-lock acquire/release RMWs on two shared cache lines where `2`
+/// suffice: the shard table and address map cannot change mid-batch without a
+/// topology commit, which the per-item `topology_epoch` / `committed_term`
+/// checks retained in [`RunningCluster::is_master_snapshot`] still detect.
+/// Capturing every shard's master ONCE lets a batch answer per-item ownership
+/// from a lock-free array, mirroring the existing `inbound_atomic` /
+/// `migrating_bitmap` shadows already on this hot path.
+///
+/// The snapshot is owned (it borrows no lock guard), so it is `Send + Sync`
+/// and can be shared by reference across the read-pool fan-out that serves
+/// large GET / spend batches — and it holds the two locks only for the brief
+/// capture, never across the batch's device I/O, so it does not stall
+/// topology writers.
+pub struct MasterSnapshot {
+    /// Per-shard authoritative master, indexed by shard id (`0..NUM_SHARDS`).
+    /// Every entry is `NodeId(0)` when the local shard table lags the
+    /// committed topology term — the same sentinel
+    /// [`RunningCluster::authoritative_master_for_shard`] returns, so the
+    /// dispatcher redirects with `NodeId(0)` and the client refetches its
+    /// partition map.
+    masters: Vec<NodeId>,
+}
+
+impl MasterSnapshot {
+    /// The authoritative master captured for `key`'s shard.
+    ///
+    /// `shard_for_key` is a pure function returning a shard in
+    /// `0..NUM_SHARDS`, and `masters` always has exactly `NUM_SHARDS` entries,
+    /// so the index is in bounds by construction — the same invariant the
+    /// shard table's own `assignments[shard]` accesses rely on.
+    #[inline]
+    fn master_for_key(&self, key: &TxKey) -> NodeId {
+        self.masters[ShardTable::shard_for_key(key) as usize]
+    }
+}
+
 impl RunningCluster {
     fn preferred_master_for_shard(
         table: &ShardTable,
@@ -8118,6 +8160,66 @@ impl RunningCluster {
         // actually pending, and M1.2 makes it fresh by syncing immediately
         // after `start_outbound`, which is the correct fix for the lag the
         // audit flagged.
+        if self.inbound_atomic.test(shard) && auth_master == self.self_id {
+            return MasterQueryResult::Transitioning {
+                last_known_term: committed,
+            };
+        }
+        if auth_master == self.self_id {
+            MasterQueryResult::Yes
+        } else {
+            MasterQueryResult::No
+        }
+    }
+
+    /// Capture a batch-scoped [`MasterSnapshot`] of every shard's
+    /// authoritative master under a SINGLE acquisition of the `shard_table`
+    /// and `node_addrs` locks, so a batch can answer per-item ownership via
+    /// [`Self::is_master_snapshot`] without re-locking for each item.
+    ///
+    /// Each shard resolves exactly as [`Self::authoritative_master_for_shard`]
+    /// would: `NodeId(0)` for every shard when the local table lags the
+    /// committed term, otherwise the per-shard preferred master. Take one per
+    /// batch immediately before the per-item ownership loop.
+    pub fn master_snapshot(&self) -> MasterSnapshot {
+        let table = self.shard_table.read();
+        let committed = self.topology_authority.committed_term();
+        if table.version < committed {
+            // Stale local table: `authoritative_master_for_shard` returns the
+            // `NodeId(0)` sentinel for every shard — match that exactly.
+            return MasterSnapshot {
+                masters: vec![NodeId(0); NUM_SHARDS],
+            };
+        }
+        let addrs = self.node_addrs.read();
+        let masters = (0..NUM_SHARDS as u16)
+            .map(|shard| Self::preferred_master_for_shard(&table, &addrs, shard))
+            .collect();
+        MasterSnapshot { masters }
+    }
+
+    /// Like [`Self::is_master`], but resolves the key's shard master from a
+    /// batch-scoped [`MasterSnapshot`] instead of re-acquiring the
+    /// `shard_table` + `node_addrs` locks per call.
+    ///
+    /// Only the master-IDENTITY lookup is hoisted. The transitioning gate
+    /// (local `topology_epoch` ahead of the committed term) and the
+    /// subset-master gate (pending inbound migration) still run per call —
+    /// both read lock-free atomics, exactly as [`Self::is_master`] does — so a
+    /// topology change that lands mid-batch is still surfaced per item. The
+    /// result is therefore identical to [`Self::is_master`] for a `snap`
+    /// captured in the same steady state; the snapshot removes only the
+    /// redundant locking, never a per-item decision.
+    pub fn is_master_snapshot(&self, snap: &MasterSnapshot, key: &TxKey) -> MasterQueryResult {
+        let committed = self.topology_authority.committed_term();
+        let observed = self.topology_epoch.load(Ordering::Acquire);
+        if observed > committed {
+            return MasterQueryResult::Transitioning {
+                last_known_term: committed,
+            };
+        }
+        let shard = ShardTable::shard_for_key(key);
+        let auth_master = snap.master_for_key(key);
         if self.inbound_atomic.test(shard) && auth_master == self.self_id {
             return MasterQueryResult::Transitioning {
                 last_known_term: committed,
@@ -15065,6 +15167,177 @@ mod tests {
             other => panic!(
                 "expected MasterQueryResult::Transitioning {{ last_known_term: 5 }}, got {other:?}"
             ),
+        }
+    }
+
+    // ── Batch-scoped MasterSnapshot: hoisted lookup, per-item correctness ──
+
+    /// The batch-scoped `MasterSnapshot` must yield the SAME per-key
+    /// ownership decision as the per-item `is_master` for EVERY shard — one
+    /// hoisted lock lookup, but no loss of per-item correctness. Built on a
+    /// two-node cluster so shards split across a local (`Yes`) and a remote
+    /// (`No`) master; the `saw_yes && saw_no` guards make the test meaningful
+    /// — a hoist that wrongly collapsed to one master-for-all-shards would
+    /// diverge from `is_master` on the mixed shards and fail here.
+    #[test]
+    fn master_snapshot_matches_per_item_is_master_across_all_shards() {
+        let members = vec![NodeId(1), NodeId(2)];
+        let table = ShardTable::compute_with_epoch(&members, 2, 5, 1);
+        let cluster = new_test_running_cluster(
+            NodeId(1),
+            table,
+            &[
+                (NodeId(1), "127.0.0.1:4831".parse().unwrap()),
+                (NodeId(2), "127.0.0.1:4832".parse().unwrap()),
+            ],
+            &members,
+            &[],
+            &[],
+            &[],
+            2,
+        );
+
+        let snap = cluster.master_snapshot();
+
+        let mut saw_yes = false;
+        let mut saw_no = false;
+        for shard in 0..NUM_SHARDS as u16 {
+            let key = key_for_shard(shard);
+            let per_item = cluster.is_master(&key);
+            let hoisted = cluster.is_master_snapshot(&snap, &key);
+            assert_eq!(
+                hoisted, per_item,
+                "snapshot ownership for shard {shard} diverged from per-item is_master",
+            );
+            match per_item {
+                MasterQueryResult::Yes => saw_yes = true,
+                MasterQueryResult::No => saw_no = true,
+                MasterQueryResult::Transitioning { .. } => {}
+            }
+        }
+        assert!(saw_yes, "test cluster must own at least one shard (Yes)");
+        assert!(
+            saw_no,
+            "test cluster must have at least one remote shard (No)"
+        );
+    }
+
+    /// The snapshot hoists ONLY the master-identity lookup; the transitioning
+    /// gate (local `topology_epoch` ahead of the committed term) still fires
+    /// per call, so a topology proposal observed AFTER the snapshot was taken
+    /// is still surfaced as `Transitioning` — matching the per-item path.
+    #[test]
+    fn master_snapshot_still_reports_transitioning_per_item() {
+        let members = vec![NodeId(1)];
+        let table = ShardTable::compute_with_epoch(&members, 1, 5, 1);
+        let cluster = new_test_running_cluster(
+            NodeId(1),
+            table,
+            &[(NodeId(1), "127.0.0.1:4841".parse().unwrap())],
+            &members,
+            &[],
+            &[],
+            &[],
+            1,
+        );
+        // Snapshot captured BEFORE the epoch bump.
+        let snap = cluster.master_snapshot();
+        // A membership change is proposed/observed but not yet committed.
+        cluster.topology_epoch.store(6, Ordering::Release);
+
+        let key = key_for_shard(0);
+        match cluster.is_master_snapshot(&snap, &key) {
+            MasterQueryResult::Transitioning { last_known_term } => {
+                assert_eq!(
+                    last_known_term, 5,
+                    "Transitioning must still report the last quorum-committed term",
+                );
+            }
+            other => panic!("expected Transitioning through the snapshot path, got {other:?}"),
+        }
+        assert_eq!(
+            cluster.is_master_snapshot(&snap, &key),
+            cluster.is_master(&key),
+            "snapshot path must match per-item is_master under a transitioning epoch",
+        );
+    }
+
+    /// The subset-master gate (pending inbound migration) also stays per-item:
+    /// a shard this node authoritatively masters but is still receiving
+    /// inbound migration data for must read `Transitioning` through the
+    /// snapshot path too, matching `is_master`.
+    #[test]
+    fn master_snapshot_still_fences_pending_inbound_per_item() {
+        let members = vec![NodeId(1)];
+        let table = ShardTable::compute_with_epoch(&members, 1, 5, 1);
+        let inbound_shard = 0u16;
+        let cluster = new_test_running_cluster(
+            NodeId(1),
+            table,
+            &[(NodeId(1), "127.0.0.1:4851".parse().unwrap())],
+            &members,
+            &[inbound_shard],
+            &[],
+            &[],
+            1,
+        );
+        let snap = cluster.master_snapshot();
+        let key = key_for_shard(inbound_shard);
+        assert_eq!(
+            cluster.is_master_snapshot(&snap, &key),
+            cluster.is_master(&key),
+            "snapshot path must match per-item is_master for a pending-inbound shard",
+        );
+        match cluster.is_master_snapshot(&snap, &key) {
+            MasterQueryResult::Transitioning { .. } => {}
+            other => panic!("expected Transitioning for pending-inbound shard, got {other:?}"),
+        }
+    }
+
+    /// A local shard table that lags the committed topology term must resolve
+    /// every shard's master to the `NodeId(0)` sentinel through the snapshot,
+    /// exactly as `authoritative_master_for_shard` does — so the dispatcher
+    /// redirects with `NodeId(0)` (client refetches its map) rather than
+    /// trusting a stale local view. Here that surfaces as `No` for every
+    /// shard (self is NodeId(1), never NodeId(0)), matching `is_master`.
+    #[test]
+    fn master_snapshot_stale_table_resolves_sentinel_like_is_master() {
+        let members = vec![NodeId(1)];
+        let table = ShardTable::compute_with_epoch(&members, 1, 5, 1);
+        let cluster = new_test_running_cluster(
+            NodeId(1),
+            table,
+            &[(NodeId(1), "127.0.0.1:4861".parse().unwrap())],
+            &members,
+            &[],
+            &[],
+            &[],
+            1,
+        );
+        // Force the committed term AHEAD of the local shard table's version
+        // (version 5): a freshly-rejoined node whose table trails the quorum.
+        let committed = cluster.shard_table.read().version + 1;
+        cluster
+            .topology_authority
+            .committed_term_shared()
+            .store(committed, Ordering::Relaxed);
+        // Keep topology_epoch at the committed term so the transitioning gate
+        // does not pre-empt the stale-table path we are exercising.
+        cluster.topology_epoch.store(committed, Ordering::Release);
+
+        let snap = cluster.master_snapshot();
+        for shard in [0u16, 1, 1234, (NUM_SHARDS - 1) as u16] {
+            let key = key_for_shard(shard);
+            assert_eq!(
+                cluster.is_master_snapshot(&snap, &key),
+                cluster.is_master(&key),
+                "stale-table snapshot must match per-item is_master for shard {shard}",
+            );
+            assert_eq!(
+                cluster.is_master_snapshot(&snap, &key),
+                MasterQueryResult::No,
+                "stale-table shard {shard} must resolve to No via the NodeId(0) sentinel",
+            );
         }
     }
 
