@@ -98,10 +98,19 @@ struct Block {
     /// never corrupted.
     data: Arc<[u8]>,
     /// `true` in write-back mode when the block holds writes not yet flushed to
-    /// the inner device.
+    /// the inner device. Also selects which intrusive recency list this block is
+    /// threaded on (dirty blocks on the dirty list, clean blocks on the clean
+    /// list — see [`Shard`]), so the two lists always partition the resident set.
     dirty: bool,
-    /// Monotonic per-shard tick of last access, for LRU eviction.
-    last_used: u64,
+    /// Intrusive doubly-linked LRU links: the block-index of the previous / next
+    /// block on this block's current recency list (`None` at a list end). Which
+    /// list is selected by `dirty`. Maintained O(1) on every access, insert,
+    /// eviction and flush so prefer-clean victim selection is O(1) under the
+    /// shard lock (replacing the former O(all-resident-blocks) `min_by_key`
+    /// scan). The list head is the LRU eviction victim; the tail is
+    /// most-recently-used.
+    lru_prev: Option<u64>,
+    lru_next: Option<u64>,
 }
 
 /// One lock-striped partition of the cache.
@@ -114,15 +123,142 @@ struct Shard {
     /// [`Arc::ptr_eq`] to detect a concurrent re-dirty. Maintaining it lets the
     /// flush path iterate O(dirty) instead of O(all cached blocks) per tick.
     dirty: std::collections::HashSet<u64>,
-    tick: u64,
     /// Max blocks this shard may hold (>= 1).
     cap: usize,
+    /// Head (LRU victim) and tail (most-recently-used) of the intrusive
+    /// recency list threading every CLEAN resident block (`Block::dirty ==
+    /// false`). Both `None` iff the shard holds no clean block.
+    clean_head: Option<u64>,
+    clean_tail: Option<u64>,
+    /// Head (LRU victim) and tail (most-recently-used) of the intrusive recency
+    /// list threading every DIRTY resident block (`Block::dirty == true`). This
+    /// mirrors the `dirty` worklist's membership (both hold exactly the dirty
+    /// indices) but carries recency order for eviction. Both `None` iff the
+    /// shard holds no dirty block.
+    dirty_head: Option<u64>,
+    dirty_tail: Option<u64>,
 }
 
 impl Shard {
-    fn bump(&mut self) -> u64 {
-        self.tick = self.tick.wrapping_add(1);
-        self.tick
+    /// Mutable handle to the head pointer of the list selected by `dirty`.
+    fn list_head(&mut self, dirty: bool) -> &mut Option<u64> {
+        if dirty {
+            &mut self.dirty_head
+        } else {
+            &mut self.clean_head
+        }
+    }
+
+    /// Mutable handle to the tail pointer of the list selected by `dirty`.
+    fn list_tail(&mut self, dirty: bool) -> &mut Option<u64> {
+        if dirty {
+            &mut self.dirty_tail
+        } else {
+            &mut self.clean_tail
+        }
+    }
+
+    /// Unlink block `idx` from whichever recency list its current `dirty` flag
+    /// selects, patching its neighbours and the list head/tail. Leaves the block
+    /// resident with `None` links; a no-op if the block is absent. O(1).
+    ///
+    /// Callers that flip `Block::dirty` (clean<->dirty transitions) MUST unlink
+    /// BEFORE flipping the flag, so the block is removed from the list it is
+    /// actually on.
+    fn lru_unlink(&mut self, idx: u64) {
+        let (prev, next, dirty) = match self.blocks.get_mut(&idx) {
+            Some(b) => (b.lru_prev.take(), b.lru_next.take(), b.dirty),
+            None => return,
+        };
+        match prev {
+            Some(p) => {
+                if let Some(pb) = self.blocks.get_mut(&p) {
+                    pb.lru_next = next;
+                }
+            }
+            // `idx` was the head.
+            None => *self.list_head(dirty) = next,
+        }
+        match next {
+            Some(nx) => {
+                if let Some(nb) = self.blocks.get_mut(&nx) {
+                    nb.lru_prev = prev;
+                }
+            }
+            // `idx` was the tail.
+            None => *self.list_tail(dirty) = prev,
+        }
+    }
+
+    /// Append block `idx` at the MRU (tail) end of the list its current `dirty`
+    /// flag selects. The block must be resident and already unlinked (`None`
+    /// links). A no-op if the block is absent. O(1).
+    fn lru_push_back(&mut self, idx: u64) {
+        let dirty = match self.blocks.get(&idx) {
+            Some(b) => b.dirty,
+            None => return,
+        };
+        let old_tail = *self.list_tail(dirty);
+        if let Some(b) = self.blocks.get_mut(&idx) {
+            b.lru_prev = old_tail;
+            b.lru_next = None;
+        }
+        match old_tail {
+            Some(t) => {
+                if let Some(tb) = self.blocks.get_mut(&t) {
+                    tb.lru_next = Some(idx);
+                }
+            }
+            // List was empty; `idx` is now the head too.
+            None => *self.list_head(dirty) = Some(idx),
+        }
+        *self.list_tail(dirty) = Some(idx);
+    }
+
+    /// Record an access to resident block `idx` by moving it to the MRU (tail) of
+    /// its current list. A no-op if the block is absent or already the tail
+    /// (the common repeated-access case), so a hot block costs one lookup. O(1).
+    fn lru_touch(&mut self, idx: u64) {
+        if self.blocks.get(&idx).is_none_or(|b| b.lru_next.is_none()) {
+            return;
+        }
+        self.lru_unlink(idx);
+        self.lru_push_back(idx);
+    }
+
+    /// Record a WRITE access to resident block `idx`: move it to the MRU of its
+    /// list and, in write-back mode, transition a clean block onto the dirty list
+    /// and worklist. Idempotent for an already-dirty block. O(1). The caller has
+    /// already applied the byte mutation to `Block::data`.
+    fn touch_on_write(&mut self, idx: u64, writeback: bool) {
+        let was_clean = matches!(self.blocks.get(&idx), Some(b) if !b.dirty);
+        if writeback && was_clean {
+            // Clean -> dirty: unlink from the clean list (flag still false), flip,
+            // join the worklist, relink at the dirty MRU.
+            self.lru_unlink(idx);
+            if let Some(b) = self.blocks.get_mut(&idx) {
+                b.dirty = true;
+            }
+            self.dirty.insert(idx);
+            self.lru_push_back(idx);
+        } else {
+            // No list change (already dirty, or write-through): bump recency only.
+            self.lru_touch(idx);
+        }
+    }
+
+    /// Transition resident block `idx` from dirty to clean after a successful
+    /// flush: unlink from the dirty list, clear its flag and worklist entry, and
+    /// relink at the clean MRU. The caller has already confirmed (via
+    /// [`Arc::ptr_eq`]) the block was not re-dirtied since the flushed snapshot.
+    /// O(1).
+    fn mark_clean(&mut self, idx: u64) {
+        self.lru_unlink(idx);
+        if let Some(b) = self.blocks.get_mut(&idx) {
+            b.dirty = false;
+        }
+        self.dirty.remove(&idx);
+        self.lru_push_back(idx);
     }
 }
 
@@ -206,8 +342,11 @@ impl CachingDevice {
                 Mutex::new(Shard {
                     blocks: std::collections::HashMap::new(),
                     dirty: std::collections::HashSet::new(),
-                    tick: 0,
                     cap: per_shard_cap,
+                    clean_head: None,
+                    clean_tail: None,
+                    dirty_head: None,
+                    dirty_tail: None,
                 })
             })
             .collect::<Vec<_>>()
@@ -365,35 +504,35 @@ impl CacheState {
     /// tail source profiled in bench/results/20260629-local-profile). Eviction is
     /// a pure performance heuristic, so preferring clean over strictly-oldest is
     /// always safe.
+    ///
+    /// Victim selection is O(1): the LRU clean / LRU dirty block is the head of
+    /// the shard's respective intrusive recency list, so this no longer scans the
+    /// whole per-shard map (the former `min_by_key` cost, which a permanently-full
+    /// steady-state cache paid on every insert under the shard lock).
     fn evict_if_full(&self, shard: &mut Shard) -> Result<()> {
         while shard.blocks.len() >= shard.cap {
-            // Fast path: drop the LRU CLEAN block — no flush, no device I/O.
-            let clean_victim = shard
-                .blocks
-                .iter()
-                .filter(|(_, b)| !b.dirty)
-                .min_by_key(|(_, b)| b.last_used)
-                .map(|(idx, _)| *idx);
-            if let Some(idx) = clean_victim {
-                // Clean block: not in the dirty worklist, nothing to flush.
+            // Fast path: drop the LRU CLEAN block (clean-list head) — no flush,
+            // no device I/O. A clean block is not in the dirty worklist.
+            if let Some(idx) = shard.clean_head {
+                shard.lru_unlink(idx);
                 shard.blocks.remove(&idx);
                 continue;
             }
-            // Every resident block is dirty — flush the LRU dirty victim under
-            // the lock. Remove first; if the flush fails, re-insert so we don't
-            // lose the dirty bytes (the caller surfaces the error). Keep the
-            // dirty set in lockstep.
-            let victim = shard
-                .blocks
-                .iter()
-                .min_by_key(|(_, b)| b.last_used)
-                .map(|(idx, _)| *idx);
-            let Some(idx) = victim else { break };
-            let block = shard.blocks.remove(&idx).expect("victim present");
+            // Every resident block is dirty — flush the LRU dirty victim
+            // (dirty-list head) under the lock. Unlink + remove first; if the
+            // flush fails, restore the victim (bytes, dirty flag, worklist and
+            // list membership) so nothing is lost and the caller surfaces the
+            // error.
+            let Some(idx) = shard.dirty_head else { break };
+            shard.lru_unlink(idx);
+            let Some(block) = shard.blocks.remove(&idx) else {
+                break;
+            };
             shard.dirty.remove(&idx);
             if let Err(e) = self.flush_block(idx, &block.data) {
-                shard.dirty.insert(idx);
                 shard.blocks.insert(idx, block);
+                shard.dirty.insert(idx);
+                shard.lru_push_back(idx);
                 return Err(e);
             }
         }
@@ -433,10 +572,12 @@ impl CacheState {
             // Fast path: hit.
             {
                 let mut shard = self.shard_of(block_idx).lock();
-                let t = shard.bump();
-                if let Some(b) = shard.blocks.get_mut(&block_idx) {
-                    b.last_used = t;
-                    buf[in_buf..in_buf + n].copy_from_slice(&b.data[in_block..in_block + n]);
+                if shard.blocks.contains_key(&block_idx) {
+                    // Bump recency (move to the MRU end), then copy the bytes out.
+                    shard.lru_touch(block_idx);
+                    if let Some(b) = shard.blocks.get(&block_idx) {
+                        buf[in_buf..in_buf + n].copy_from_slice(&b.data[in_block..in_block + n]);
+                    }
                     continue;
                 }
             }
@@ -447,20 +588,25 @@ impl CacheState {
             let mut shard = self.shard_of(block_idx).lock();
             if !shard.blocks.contains_key(&block_idx) {
                 self.evict_if_full(&mut shard)?;
-                let t = shard.bump();
                 shard.blocks.insert(
                     block_idx,
                     Block {
                         data,
                         dirty: false,
-                        last_used: t,
+                        lru_prev: None,
+                        lru_next: None,
                     },
                 );
+                // A fresh read-through block joins the clean list at the MRU end.
+                shard.lru_push_back(block_idx);
+            } else {
+                // A block appeared during the unlocked load; it is now accessed,
+                // so bump its recency (it may be a dirty write we must not lose).
+                shard.lru_touch(block_idx);
             }
-            let t = shard.bump();
-            let b = shard.blocks.get_mut(&block_idx).expect("just inserted");
-            b.last_used = t;
-            buf[in_buf..in_buf + n].copy_from_slice(&b.data[in_block..in_block + n]);
+            if let Some(b) = shard.blocks.get(&block_idx) {
+                buf[in_buf..in_buf + n].copy_from_slice(&b.data[in_block..in_block + n]);
+            }
         }
         Ok(buf.len())
     }
@@ -545,7 +691,6 @@ impl CacheState {
                 None
             };
             let mut shard = self.shard_of(block_idx).lock();
-            let t = shard.bump();
             if let Some(b) = shard.blocks.get_mut(&block_idx) {
                 // Copy-on-write: `make_mut` mutates in place when this block is
                 // uniquely owned, but clones into a fresh buffer if a flusher is
@@ -553,14 +698,10 @@ impl CacheState {
                 // concurrent with an in-flight flush never corrupts the snapshot.
                 Arc::make_mut(&mut b.data)[in_block..in_block + n]
                     .copy_from_slice(&buf[in_buf..in_buf + n]);
-                b.last_used = t;
-                if self.writeback {
-                    b.dirty = true;
-                    // Keep the dirty worklist in lockstep with `Block::dirty`.
-                    // (`b`'s borrow of `shard.blocks` ends here; `shard.dirty`
-                    // is a disjoint field so this is a fresh borrow.)
-                    shard.dirty.insert(block_idx);
-                }
+                // Bump recency to MRU and, in write-back, transition a clean block
+                // onto the dirty list + worklist. (`b`'s borrow of `shard.blocks`
+                // ended above; `touch_on_write` re-borrows the shard.)
+                shard.touch_on_write(block_idx, self.writeback);
             } else {
                 self.evict_if_full(&mut shard)?;
                 let mut data: Vec<u8> = match preload {
@@ -587,16 +728,19 @@ impl CacheState {
                     None => vec![0u8; self.block_len(block_idx * bs)],
                 };
                 data[in_block..in_block + n].copy_from_slice(&buf[in_buf..in_buf + n]);
-                let t = shard.bump();
                 shard.blocks.insert(
                     block_idx,
                     Block {
                         data: Arc::from(data),
                         dirty: self.writeback,
-                        last_used: t,
+                        lru_prev: None,
+                        lru_next: None,
                     },
                 );
-                // Inserting a dirty block (write-back) adds it to the worklist.
+                // Link the new block at the MRU end of its list (dirty vs clean
+                // per its flag); a dirty (write-back) block also joins the
+                // worklist so `flush_all_dirty` finds it.
+                shard.lru_push_back(block_idx);
                 if self.writeback {
                     shard.dirty.insert(block_idx);
                 }
@@ -748,13 +892,16 @@ impl CacheState {
 
         // Clear the dirty bit per block under its shard lock, only if the cached
         // Arc is still the exact snapshot we just flushed (CoW re-dirty check).
+        // `mark_clean` also moves the block from the dirty list onto the clean
+        // list so the intrusive LRU structure stays consistent.
         for (idx, data) in &run.blocks {
             let mut shard = self.shard_of(*idx).lock();
-            if let Some(b) = shard.blocks.get_mut(idx)
-                && Arc::ptr_eq(&b.data, data)
-            {
-                b.dirty = false;
-                shard.dirty.remove(idx);
+            let still_snapshot = shard
+                .blocks
+                .get(idx)
+                .is_some_and(|b| Arc::ptr_eq(&b.data, data));
+            if still_snapshot {
+                shard.mark_clean(*idx);
             }
         }
         Ok(())
@@ -943,8 +1090,11 @@ mod tests {
             shards: vec![Mutex::new(Shard {
                 blocks: std::collections::HashMap::new(),
                 dirty: std::collections::HashSet::new(),
-                tick: 0,
                 cap,
+                clean_head: None,
+                clean_tail: None,
+                dirty_head: None,
+                dirty_tail: None,
             })]
             .into_boxed_slice(),
             shard_count: 1,
@@ -952,19 +1102,25 @@ mod tests {
         }
     }
 
-    fn put_block(shard: &mut Shard, idx: u64, byte: u8, dirty: bool, last_used: u64) {
+    /// Insert a block directly into a shard, linking it at the MRU end of its
+    /// recency list (dirty vs clean per `dirty`). Successive calls establish LRU
+    /// order by call order: the first-inserted block is the LRU (eviction)
+    /// candidate within its list.
+    fn put_block(shard: &mut Shard, idx: u64, byte: u8, dirty: bool) {
         let data: Arc<[u8]> = vec![byte; BS].into();
         shard.blocks.insert(
             idx,
             Block {
                 data,
                 dirty,
-                last_used,
+                lru_prev: None,
+                lru_next: None,
             },
         );
         if dirty {
             shard.dirty.insert(idx);
         }
+        shard.lru_push_back(idx);
     }
 
     #[test]
@@ -975,8 +1131,8 @@ mod tests {
         let dev = CountingDev::new(64 * BS, BS);
         let state = one_shard_state(dev.clone(), 2, true);
         let mut shard = state.shards[0].lock();
-        put_block(&mut shard, 0, 0xAA, true, 1); // dirty, oldest
-        put_block(&mut shard, 1, 0xBB, false, 2); // clean, newer
+        put_block(&mut shard, 0, 0xAA, true); // dirty, oldest
+        put_block(&mut shard, 1, 0xBB, false); // clean, newer
         state.evict_if_full(&mut shard).unwrap();
         assert!(
             shard.blocks.contains_key(&0),
@@ -1004,8 +1160,8 @@ mod tests {
         let dev = CountingDev::new(64 * BS, BS);
         let state = one_shard_state(dev.clone(), 2, true);
         let mut shard = state.shards[0].lock();
-        put_block(&mut shard, 0, 0xAA, true, 1); // dirty, oldest
-        put_block(&mut shard, 1, 0xBB, true, 2); // dirty, newer
+        put_block(&mut shard, 0, 0xAA, true); // dirty, oldest
+        put_block(&mut shard, 1, 0xBB, true); // dirty, newer
         state.evict_if_full(&mut shard).unwrap();
         assert!(
             !shard.blocks.contains_key(&0),
@@ -1968,6 +2124,284 @@ mod tests {
             dev.writes.load(Ordering::Relaxed),
             writes_before,
             "write-through sync flushes nothing via the index"
+        );
+    }
+
+    // ---- P1-11: O(1) prefer-clean LRU eviction structure ----
+    //
+    // These tests pin the EXACT eviction policy that must survive the switch
+    // from the O(n) `min_by_key` scan to the O(1) intrusive-LRU structure:
+    //   (a) the prefer-clean victim is the least-recently-used CLEAN block;
+    //   (b) with no clean block, the fallback evicts+flushes the LRU DIRTY block;
+    //   (c) a recently-used block survives while an older peer is evicted;
+    //   (d) the O(1) structure stays internally consistent across every op.
+
+    #[test]
+    fn evict_targets_the_lru_clean_block_after_a_touch_reorders_it() {
+        // (a)+(c): cap=3 single shard. Read blocks 0,1,2 (0 oldest). Re-read
+        // block 0 so it becomes the MRU clean block and block 1 becomes the LRU
+        // clean block. A 4th read forces one eviction: the victim MUST be the LRU
+        // clean block (now 1) — NOT the originally-oldest block 0, which the
+        // touch rescued — and no device write is needed for a clean eviction.
+        let dev = CountingDev::new(64 * BS, BS);
+        for i in 0..4u64 {
+            dev.inner
+                .pwrite(&ab(0x10 + i as u8, BS), i * BS as u64)
+                .unwrap();
+        }
+        let state = one_shard_state(dev.clone(), 3, true);
+        let mut b = AlignedBuf::new(BS, BS);
+        state.pread(&mut b[..], 0).unwrap(); // block 0 (oldest)
+        state.pread(&mut b[..], BS as u64).unwrap(); // block 1
+        state.pread(&mut b[..], 2 * BS as u64).unwrap(); // block 2 (MRU)
+        // Touch block 0 → it is now MRU clean; block 1 is now the LRU clean block.
+        state.pread(&mut b[..], 0).unwrap();
+        // 4th distinct block forces exactly one eviction.
+        state.pread(&mut b[..], 3 * BS as u64).unwrap();
+
+        let shard = state.shards[0].lock();
+        assert!(
+            shard.blocks.contains_key(&0),
+            "recently-touched block 0 must survive eviction"
+        );
+        assert!(
+            !shard.blocks.contains_key(&1),
+            "the LRU clean block (1) must be the eviction victim"
+        );
+        assert!(shard.blocks.contains_key(&2), "block 2 retained");
+        assert!(shard.blocks.contains_key(&3), "freshly inserted block 3");
+        drop(shard);
+        assert_eq!(
+            dev.writes.load(Ordering::Relaxed),
+            0,
+            "evicting a clean block issues no device write"
+        );
+    }
+
+    #[test]
+    fn evict_flushes_the_lru_dirty_victim_after_a_rewrite_reorders_it() {
+        // (b): cap=3, every resident block dirty. Write 0,1,2 (0 oldest), then
+        // re-write block 0 so it becomes the MRU dirty block and block 1 becomes
+        // the LRU dirty victim. A 4th write triggers the all-dirty fallback, which
+        // MUST flush+evict the LRU dirty block (1), exactly once, preserving its
+        // bytes on the device, and drop it from the dirty worklist.
+        let dev = CountingDev::new(64 * BS, BS);
+        let state = one_shard_state(dev.clone(), 3, true);
+        state.pwrite(&ab(0xA0, BS), 0).unwrap(); // dirty 0 (oldest)
+        state.pwrite(&ab(0xA1, BS), BS as u64).unwrap(); // dirty 1
+        state.pwrite(&ab(0xA2, BS), 2 * BS as u64).unwrap(); // dirty 2 (MRU)
+        // Re-write block 0 → 0 becomes MRU dirty; block 1 is now the LRU victim.
+        state.pwrite(&ab(0xB0, BS), 0).unwrap();
+        // These are all write-back, so nothing has reached the device yet.
+        assert_eq!(
+            dev.writes.load(Ordering::Relaxed),
+            0,
+            "write-back defers I/O"
+        );
+
+        // 4th distinct block → all-dirty fallback flushes the LRU dirty victim.
+        state.pwrite(&ab(0xA3, BS), 3 * BS as u64).unwrap();
+        assert_eq!(
+            dev.writes.load(Ordering::Relaxed),
+            1,
+            "exactly one device write to flush the single dirty victim"
+        );
+        assert_eq!(
+            read_inner(&dev, BS as u64, BS),
+            vec![0xA1; BS],
+            "the evicted LRU dirty victim (block 1) was flushed with its bytes"
+        );
+        let shard = state.shards[0].lock();
+        assert!(
+            !shard.blocks.contains_key(&1),
+            "the LRU dirty victim (1) is evicted"
+        );
+        assert!(
+            shard.blocks.contains_key(&0),
+            "the re-written block 0 survives (it was moved to MRU)"
+        );
+        assert!(shard.blocks.contains_key(&2), "block 2 retained");
+        assert!(shard.blocks.contains_key(&3), "freshly inserted block 3");
+        assert!(
+            !shard.dirty.contains(&1),
+            "the flushed victim left the dirty worklist"
+        );
+    }
+
+    #[test]
+    fn recently_used_block_survives_a_sweep_of_evictions() {
+        // (c): cap=2 single shard, all clean. Keep re-reading block 0 (the hot
+        // block) while a stream of distinct cold blocks flows through. The hot
+        // block must NEVER be evicted; each cold insert evicts the previous cold
+        // block instead.
+        let dev = CountingDev::new(64 * BS, BS);
+        for i in 0..8u64 {
+            dev.inner
+                .pwrite(&ab(0x20 + i as u8, BS), i * BS as u64)
+                .unwrap();
+        }
+        let state = one_shard_state(dev.clone(), 2, true);
+        let mut b = AlignedBuf::new(BS, BS);
+        state.pread(&mut b[..], 0).unwrap(); // hot block resident
+        for cold in 1..8u64 {
+            // Touch the hot block first so it is MRU, then bring in a cold block
+            // (cap=2 → one eviction): the victim must be the previous cold block,
+            // never the hot block.
+            state.pread(&mut b[..], 0).unwrap();
+            state.pread(&mut b[..], cold * BS as u64).unwrap();
+            let shard = state.shards[0].lock();
+            assert!(
+                shard.blocks.contains_key(&0),
+                "hot block 0 must survive cold-block churn (evicting cold {cold})"
+            );
+            if cold > 1 {
+                assert!(
+                    !shard.blocks.contains_key(&(cold - 1)),
+                    "the previous cold block {} was the victim",
+                    cold - 1
+                );
+            }
+        }
+        assert_eq!(
+            dev.writes.load(Ordering::Relaxed),
+            0,
+            "clean churn needs no device writes"
+        );
+        // The hot block still serves its correct bytes.
+        assert_eq!(read_cache_via_state(&state, 0), vec![0x20; BS]);
+    }
+
+    /// Read one block through a bare `CacheState` (test-only helper).
+    fn read_cache_via_state(state: &CacheState, off: u64) -> Vec<u8> {
+        let mut b = AlignedBuf::new(BS, BS);
+        state.pread(&mut b[..], off).unwrap();
+        b[..].to_vec()
+    }
+
+    /// Assert the full O(1)-eviction-structure invariant for one shard:
+    ///   * the `dirty` worklist set holds EXACTLY the indices whose block is
+    ///     dirty (the pre-existing lockstep invariant);
+    ///   * each recency list (clean, dirty) is a well-formed doubly-linked list
+    ///     (head/tail agree, `prev`/`next` links are mutually consistent, no
+    ///     cycles), every node carries the flag matching its list, and every
+    ///     resident block appears on EXACTLY one list (the two lists partition
+    ///     the resident set).
+    fn assert_shard_consistent(shard: &Shard) {
+        // dirty set <-> Block.dirty.
+        for idx in shard.dirty.iter() {
+            assert!(
+                shard.blocks.get(idx).map(|b| b.dirty).unwrap_or(false),
+                "dirty-set index {idx} is not a resident dirty block"
+            );
+        }
+        for (idx, b) in shard.blocks.iter() {
+            if b.dirty {
+                assert!(
+                    shard.dirty.contains(idx),
+                    "dirty block {idx} missing from the worklist"
+                );
+            }
+        }
+
+        // Walk both lists; collect the union and check integrity.
+        let mut seen = std::collections::HashSet::new();
+        for &(head, tail, want_dirty) in &[
+            (shard.clean_head, shard.clean_tail, false),
+            (shard.dirty_head, shard.dirty_tail, true),
+        ] {
+            if head.is_none() {
+                assert!(tail.is_none(), "list head None but tail set");
+            }
+            let mut cur = head;
+            let mut prev: Option<u64> = None;
+            let mut last: Option<u64> = None;
+            while let Some(idx) = cur {
+                let b = shard
+                    .blocks
+                    .get(&idx)
+                    .unwrap_or_else(|| panic!("list node {idx} not resident"));
+                assert_eq!(
+                    b.dirty, want_dirty,
+                    "block {idx} threaded on the wrong list"
+                );
+                assert_eq!(b.lru_prev, prev, "block {idx} prev-link mismatch");
+                assert!(
+                    seen.insert(idx),
+                    "block {idx} appears in a recency list twice (cycle/overlap)"
+                );
+                prev = Some(idx);
+                last = Some(idx);
+                cur = b.lru_next;
+            }
+            assert_eq!(last, tail, "list tail pointer disagrees with the walk");
+        }
+        assert_eq!(
+            seen.len(),
+            shard.blocks.len(),
+            "every resident block must be linked into exactly one recency list"
+        );
+    }
+
+    #[test]
+    fn lru_structure_stays_consistent_across_insert_get_write_evict_flush() {
+        // (d): drive the shard through every mutating op — write-back inserts
+        // (dirty), read-through inserts (clean), hits (touch), evictions (cap=4),
+        // a clean->dirty transition, and a flush (dirty->clean) — asserting the
+        // intrusive-list + worklist invariant after each phase. A regression in
+        // any link update (unlink/push_back/touch/mark_clean) trips the checker.
+        let dev = CountingDev::new(256 * BS, BS);
+        for i in 0..16u64 {
+            dev.inner
+                .pwrite(&ab(0x40 + (i & 0x0f) as u8, BS), i * BS as u64)
+                .unwrap();
+        }
+        let state = one_shard_state(dev.clone(), 4, true);
+        let mut buf = AlignedBuf::new(BS, BS);
+
+        // Phase 1: three write-back inserts → three dirty blocks.
+        for i in 0..3u64 {
+            state
+                .pwrite(&ab(0xC0 + i as u8, BS), i * BS as u64)
+                .unwrap();
+        }
+        assert_shard_consistent(&state.shards[0].lock());
+
+        // Phase 2: read-through inserts of new offsets → evictions kick in
+        // (cap=4), mixing clean and dirty on the two lists.
+        for i in 5..10u64 {
+            state.pread(&mut buf[..], i * BS as u64).unwrap();
+        }
+        assert_shard_consistent(&state.shards[0].lock());
+
+        // Phase 3: repeated hits on a resident block (touch/no-op MRU path).
+        let resident: u64 = {
+            let s = state.shards[0].lock();
+            *s.blocks.keys().next().expect("some block resident")
+        };
+        for _ in 0..3 {
+            state.pread(&mut buf[..], resident * BS as u64).unwrap();
+        }
+        assert_shard_consistent(&state.shards[0].lock());
+
+        // Phase 4: write a resident (or fresh) offset → clean->dirty transition
+        // and/or a dirty insert, then flush everything (dirty->clean).
+        state.pwrite(&ab(0xEE, BS), resident * BS as u64).unwrap();
+        assert_shard_consistent(&state.shards[0].lock());
+        state.sync().unwrap();
+        assert_shard_consistent(&state.shards[0].lock());
+
+        // After a full flush no block is dirty: the dirty list and worklist are
+        // both empty, everything lives on the clean list.
+        let s = state.shards[0].lock();
+        assert!(s.dirty.is_empty(), "sync cleared the worklist");
+        assert!(
+            s.dirty_head.is_none() && s.dirty_tail.is_none(),
+            "the dirty recency list is empty after a full flush"
+        );
+        assert_eq!(
+            s.blocks.len(),
+            s.cap,
+            "the shard is full at cap with only clean blocks"
         );
     }
 }
