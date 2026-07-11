@@ -15426,6 +15426,63 @@ mod tests {
         );
     }
 
+    /// The stale-table gate is deliberately CONSERVATIVE: once `committed_term`
+    /// advances past the snapshot's captured `version`, `is_master_snapshot`
+    /// returns `No` even if the live table has since caught up to the new term
+    /// AND this node retained mastership — the case where a live `is_master`
+    /// now answers `Yes`. This intentional divergence is the price of lock-free
+    /// per-item resolution: a batch snapshot froze the PRE-commit assignment and
+    /// cannot know whether the reassignment moved the shard, so it must not
+    /// serve from the frozen masters (that is exactly the hazard the gate
+    /// closes). The cost is a bounded, self-healing redirect during active
+    /// reconfiguration — the mutation path re-resolves locally via `route()`,
+    /// and the GET path emits a redirect the client absorbs by refetching its
+    /// partition map and retrying. This test pins that divergence so a future
+    /// change cannot "optimize" it away by trusting a stale snapshot.
+    #[test]
+    fn stale_snapshot_stays_conservative_even_after_table_catches_up() {
+        let members = vec![NodeId(1)];
+        let table = ShardTable::compute_with_epoch(&members, 1, 5, 1);
+        let cluster = new_test_running_cluster(
+            NodeId(1),
+            table,
+            &[(NodeId(1), "127.0.0.1:4881".parse().unwrap())],
+            &members,
+            &[],
+            &[],
+            &[],
+            1,
+        );
+
+        // Snapshot captured at version 5.
+        let snap = cluster.master_snapshot();
+        let key = key_for_shard(0);
+
+        // A commit lands AND the live table is fully installed at the new term
+        // 6, with this single-node cluster still mastering every shard.
+        *cluster.shard_table.write() = ShardTable::compute_with_epoch(&members, 1, 6, 1);
+        cluster
+            .topology_authority
+            .committed_term_shared()
+            .store(6, Ordering::Relaxed);
+        cluster.topology_epoch.store(6, Ordering::Release);
+
+        // Live is_master re-reads the fresh table → this node still owns it → Yes.
+        assert_eq!(
+            cluster.is_master(&key),
+            MasterQueryResult::Yes,
+            "precondition: the live table caught up and self retained mastership",
+        );
+        // The snapshot froze version 5 < committed 6, so it stays conservative:
+        // No (→ redirect), NOT the stale-frozen Yes.
+        assert_eq!(
+            cluster.is_master_snapshot(&snap, &key),
+            MasterQueryResult::No,
+            "a snapshot whose captured version trails the committed term must \
+             redirect conservatively, never trust its frozen masters",
+        );
+    }
+
     // ── Phase B fixup: cluster_key sourced from quorum-committed term ──
 
     /// `local_cluster_key()` MUST return the quorum-committed term, NOT the
