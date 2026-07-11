@@ -1025,6 +1025,65 @@ impl Engine {
             .filter(|&s| !per_store[s].is_empty())
             .collect();
 
+        // P1-5 pre-flight: when a batch touches more than one store, reject the
+        // WHOLE batch CLEANLY (retryable `LogFull`) BEFORE any store appends if
+        // ANY touched store's slice would not fit its redo log. Without this a
+        // multi-store batch can have one store commit durably while a sibling
+        // hits the deliberately-transient `LogFull`; the poison-on-partial guard
+        // below would then fence the ENTIRE node ("restart required") for what is
+        // merely retryable backpressure the next checkpoint reclaims. Rejecting
+        // up front keeps a transient `LogFull` from ever coexisting with a
+        // durable sibling store. (A single-store commit is already all-or-nothing
+        // via `append_atomic`, so its full log already fails cleanly without a
+        // poison — hence the `touched.len() > 1` gate.)
+        //
+        // Atomicity / lock ordering: every touched log is locked in ASCENDING
+        // log-index order and ALL the locks are held across the fit checks (a
+        // consistent cross-store snapshot). This ordered multi-lock acquisition
+        // is deadlock-free because it is the ONLY site that ever holds more than
+        // one redo-log lock at once — every other path (checkpoint reclaim,
+        // background flush, the committer append) locks a single log — so no
+        // lock-order cycle can form. The locks are released before the commit
+        // fan-out below (the committers re-lock each log internally); the narrow
+        // check-to-commit window a concurrent writer could still exploit is
+        // backstopped by the poison-on-partial guard, which stays the correct
+        // fail-safe for a genuine partial (durable sibling + real fault).
+        if touched.len() > 1
+            && let Some(logs) = self.redo_logs.get()
+            && !logs.is_empty()
+        {
+            // Group each touched store's slice by the log that will actually
+            // receive it (device -> log clamps an out-of-range store index to the
+            // last log), so a shared log is fit-checked against EVERY op it will
+            // get and is never locked twice (which would self-deadlock). BTreeMap
+            // iterates in ascending key order -> the required ascending lock order.
+            let mut per_log: std::collections::BTreeMap<usize, Vec<&crate::redo::RedoOp>> =
+                std::collections::BTreeMap::new();
+            for &store in &touched {
+                let log_idx = store.min(logs.len() - 1);
+                per_log
+                    .entry(log_idx)
+                    .or_default()
+                    .extend_from_slice(&per_store[store]);
+            }
+            let mut held = Vec::with_capacity(per_log.len());
+            for (&log_idx, log_ops) in &per_log {
+                let guard = logs[log_idx].lock();
+                if !guard.would_fit(log_ops) {
+                    // Clean, RETRYABLE rejection: a `LOG_FULL_MESSAGE_PREFIX`
+                    // message the caller classifies as transient backpressure
+                    // (retry + in-memory reservation rollback), NOT a poison.
+                    // `held` and `guard` drop here, releasing every lock taken.
+                    return Err(format!(
+                        "{}: redo store {log_idx} lacks room for this batch",
+                        crate::redo::LOG_FULL_MESSAGE_PREFIX
+                    ));
+                }
+                held.push(guard);
+            }
+            drop(held);
+        }
+
         // Collect each touched store's (min, max) sequence contribution.
         let ranges: Vec<Result<Option<(u64, u64)>, String>> = match touched.split_first() {
             None => return Ok((0, 0)),
@@ -21254,6 +21313,111 @@ mod tests {
             fresh.recover().unwrap().len(),
             2,
             "only the fitting batch is durable; no residue from the rejected batch"
+        );
+    }
+
+    /// P1-5: a multi-store batch whose slice for ONE store would overflow that
+    /// store's redo log must be rejected as a WHOLE — cleanly and RETRYABLY (a
+    /// transient `LogFull`), BEFORE any store appends — so a durable sibling can
+    /// never coexist with a transient full store and trip the poison-on-partial
+    /// fence. Pre-fix, store 0 committed durably while store 1 hit `LogFull`,
+    /// poisoning BOTH logs and wedging the node ("restart required") for what is
+    /// merely retryable backpressure the next checkpoint reclaims.
+    #[test]
+    fn append_redo_ops_routed_preflight_rejects_oversized_slice_without_poison() {
+        use crate::redo::{RedoLog, RedoOp};
+        use std::sync::atomic::AtomicU64;
+
+        let engine = create_two_store_engine();
+
+        // Store 0: a roomy log (its one-op slice fits). Store 1: a TINY log so
+        // the batch's store-1 slice cannot fit — the deterministic stand-in for
+        // a sibling store momentarily full during a checkpoint drain.
+        let rdev0: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
+        let rdev1: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(8192, 4096).unwrap());
+        let mut log0 = RedoLog::open(rdev0.clone(), 0, 1024 * 1024).unwrap();
+        let mut log1 = RedoLog::open(rdev1.clone(), 0, 8192).unwrap();
+        let shared = Arc::new(AtomicU64::new(RedoLog::shared_sequence_floor(&[
+            &log0, &log1,
+        ])));
+        log0.attach_shared_sequence(shared.clone());
+        log1.attach_shared_sequence(shared.clone());
+        let log0_arc = Arc::new(parking_lot::Mutex::new(log0));
+        let log1_arc = Arc::new(parking_lot::Mutex::new(log1));
+        engine.set_redo_logs(vec![log0_arc.clone(), log1_arc.clone()]);
+
+        // One op for store 0 (fits) + a slice for store 1 that overflows its
+        // tiny log. Ordered store-0-first so the PRE-FIX head (calling thread)
+        // makes store 0 durable before store 1's `LogFull` is even seen —
+        // exactly the partial-commit hazard.
+        let mut ops = vec![RedoOp::AllocateRegion {
+            device_id: 0,
+            offset: 0,
+            size: 4096,
+        }];
+        ops.extend((0..2000u64).map(|i| RedoOp::AllocateRegion {
+            device_id: 1,
+            offset: i * 4096,
+            size: 4096,
+        }));
+
+        let err = engine
+            .append_redo_ops_routed(&ops)
+            .expect_err("a batch that overflows one store's log must be rejected");
+        // RETRYABLE: classified as transient `LogFull`, NOT the poison/fence
+        // error the pre-fix path returned.
+        assert!(
+            err.contains(crate::redo::LOG_FULL_MESSAGE_PREFIX),
+            "expected a retryable LogFull-classified rejection, got: {err}"
+        );
+        assert!(
+            !err.contains("partial cross-store"),
+            "must be a clean pre-flight rejection, NOT the poison/fence error: {err}"
+        );
+
+        // NO partial durable residue: the rejected batch appended nothing on
+        // EITHER store — reopening each device recovers zero entries (only the
+        // header written at open exists).
+        assert_eq!(
+            RedoLog::open(rdev0, 0, 1024 * 1024)
+                .unwrap()
+                .recover()
+                .unwrap()
+                .len(),
+            0,
+            "store 0 must hold NO residue from the rejected batch"
+        );
+        assert_eq!(
+            RedoLog::open(rdev1, 0, 8192)
+                .unwrap()
+                .recover()
+                .unwrap()
+                .len(),
+            0,
+            "store 1 must hold NO residue from the rejected batch"
+        );
+
+        // NEITHER log is poisoned — the node stays write-healthy: a fitting write
+        // to EITHER store still succeeds and both draw from the shared counter.
+        let s0 = log0_arc
+            .lock()
+            .append(RedoOp::AllocateRegion {
+                device_id: 0,
+                offset: 8192,
+                size: 4096,
+            })
+            .expect("store 0 must NOT be poisoned by a clean pre-flight rejection");
+        let s1 = log1_arc
+            .lock()
+            .append(RedoOp::AllocateRegion {
+                device_id: 1,
+                offset: 0,
+                size: 4096,
+            })
+            .expect("store 1 must NOT be poisoned by a clean pre-flight rejection");
+        assert_ne!(
+            s0, s1,
+            "both logs stay live and draw distinct shared sequences"
         );
     }
 
