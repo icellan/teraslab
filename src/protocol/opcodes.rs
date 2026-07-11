@@ -216,6 +216,34 @@ pub const ADMIN_CLUSTER_HEALTH_PAYLOAD_SIZE: usize = 1 + 8 + 8;
 pub const OP_STREAM_CHUNK: u16 = 200;
 pub const OP_STREAM_END: u16 = 201;
 
+/// FU#4 — streaming READ of an over-budget EXTERNAL cold-data blob.
+///
+/// A single record whose EXTERNAL cold-data blob exceeds [`MAX_FRAME_SIZE`]
+/// (16 MiB) cannot be served whole by `OP_GET_BATCH` — that path downgrades
+/// the offending item to [`ERR_RESPONSE_TOO_LARGE`] (code 38). A NEW client
+/// that sees code 38 for an item re-requests the blob with this opcode, which
+/// the server streams across many response frames sharing the request's
+/// `request_id`.
+///
+/// Request payload (fixed 42 bytes):
+/// ```text
+///   txid:   [u8; 32]              // the record whose blob to stream
+///   field:  u16 LE                // field selector (bit index into FieldMask;
+///                                  //   see STREAM_READ_FIELD_COLD_DATA)
+///   offset: u64 LE                // resume point (0 = whole blob)
+/// ```
+///
+/// Response: zero or more [`STATUS_STREAM_CHUNK`] frames followed by exactly
+/// one [`STATUS_STREAM_END`] frame (or a single [`STATUS_ERROR`] /
+/// [`STATUS_REDIRECT`] frame that terminates the stream). Every frame carries
+/// the originating request's `request_id`. This is OPT-IN: an old client never
+/// sends it and keeps receiving code 38 from plain GET.
+///
+/// First cut: EXTERNAL COLD_DATA blobs only. Dense on-device UTXO_SLOTS are a
+/// torn-read hazard across a multi-frame stream (mutable under concurrent
+/// spends) and are deliberately DEFERRED to a follow-up.
+pub const OP_STREAM_READ: u16 = 202;
+
 // Replication (inter-node)
 pub const OP_REPLICA_BATCH: u16 = 240;
 pub const OP_REPLICA_ACK: u16 = 241;
@@ -524,6 +552,30 @@ pub const STATUS_PARTIAL_ERROR: u8 = 4;
 /// zero replica ACKs out of one or more targets — see `replicate_all_ops`
 /// in `server/dispatch.rs`).
 pub const STATUS_DEGRADED_DURABILITY: u8 = 5;
+
+/// FU#4 — a streaming-read chunk frame (one of many) for an in-flight
+/// [`OP_STREAM_READ`]. The [`ResponseFrame`](crate::protocol::frame::ResponseFrame)
+/// carries no op_code, only `status`, so this distinct status tells the client
+/// "more of this blob follows". Payload (symmetric to the streaming-WRITE
+/// [`encode_stream_chunk`](crate::protocol::codec::encode_stream_chunk), minus
+/// the txid which is implied by the shared `request_id`):
+/// ```text
+///   offset: u64 LE   // absolute byte offset of this chunk within the blob
+///   len:    u32 LE   // number of data bytes that follow
+///   data:   [u8; len]
+/// ```
+/// Each chunk frame is kept well below [`MAX_FRAME_SIZE`].
+pub const STATUS_STREAM_CHUNK: u8 = 6;
+
+/// FU#4 — the terminal frame of an [`OP_STREAM_READ`] stream. Exactly one is
+/// emitted after the last [`STATUS_STREAM_CHUNK`]. Payload (symmetric to
+/// [`encode_stream_end`](crate::protocol::codec::encode_stream_end), carrying
+/// the whole-blob digest so the client can verify the reassembled bytes):
+/// ```text
+///   total_size:   u64 LE     // total blob size in bytes
+///   content_hash: [u8; 32]   // SHA-256 of the whole blob
+/// ```
+pub const STATUS_STREAM_END: u8 = 7;
 
 // ---------------------------------------------------------------------------
 // CREATE-wire flag bits (the `flags` byte on a `CreateItem` / OP_CREATE_BATCH)
