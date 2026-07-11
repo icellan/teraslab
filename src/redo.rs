@@ -4562,6 +4562,17 @@ impl RedoLog {
         !self.buffer.is_empty()
     }
 
+    /// Whether this log has been poisoned by an earlier flush/append failure.
+    /// A poisoned log rejects every further `append`/`flush` with
+    /// [`RedoError::Poisoned`] until a process restart + recovery. Read under
+    /// the caller's log lock; the lock-free mirror is
+    /// [`RedoAtomics::is_poisoned`]. FU#6a's atomic admission checks this so a
+    /// genuinely poisoned log is treated as a fatal fault, not misclassified as
+    /// retryable backpressure (`would_fit` returns `false` for BOTH).
+    pub fn is_poisoned(&self) -> bool {
+        self.poisoned
+    }
+
     /// Current write position (bytes; for a ring log, the absolute offset within
     /// the entries region of the active segment's cursor + buffered tail).
     pub fn write_position(&self) -> u64 {

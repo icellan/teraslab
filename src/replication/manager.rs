@@ -604,6 +604,15 @@ impl ReplicationManager {
                                     "sequence-gap NAK: replica expects {expected_sequence}"
                                 ),
                             },
+                            // FU#6a: a retryable redo-backpressure NAK — nothing
+                            // applied or journaled on the replica. This broadcast
+                            // path has no dense-stream retry loop, so surface it
+                            // as a (retryable) replica error for the caller's
+                            // higher-level replication bookkeeping to re-drive.
+                            Ok(ReplicaAck::Busy { first_sequence }) => BatchOutcome::ReplicaErr {
+                                sequence: first_sequence,
+                                message: "redo busy (backpressure) NAK".to_string(),
+                            },
                             Err(e) => BatchOutcome::TransportErr(e),
                         },
                         Err(e) => BatchOutcome::TransportErr(e),

@@ -1005,6 +1005,25 @@ pub enum ReplicaAck {
         /// The `first_sequence` the offending batch carried.
         received_first_sequence: u64,
     },
+    /// FU#6a retryable-backpressure NAK: the batch's mutations were applied
+    /// in memory but its redo entries could not be admitted because a touched
+    /// redo log is momentarily full (a transient `RedoError::LogFull` the next
+    /// checkpoint reclaims). NOTHING was journaled, the receiver's watermark
+    /// did NOT advance, and no log was poisoned — the master should re-send the
+    /// IDENTICAL, unrelabeled batch after a short backoff (the mutations
+    /// re-apply idempotently). This replaces the pre-fix behavior where a
+    /// transient full redo poisoned the whole node.
+    ///
+    /// Wire note: this is an additive ack tag (3), carried in the same
+    /// `STATUS_ERROR` envelope as [`Self::Error`]/[`Self::Gap`]. A pre-upgrade
+    /// master decodes it as [`ProtocolError::UnknownOp`] and treats the batch
+    /// as a terminal error — safe (never a false ACK), mirroring how the `Gap`
+    /// tag was introduced (one-version compat, fail closed). `first_sequence`
+    /// is echoed for logging only; the master resends the same labeled batch.
+    Busy {
+        /// The offending batch's `first_sequence`, echoed for the master's log.
+        first_sequence: u64,
+    },
 }
 
 /// Sent by a replica to request catchup from the master.
@@ -1204,6 +1223,10 @@ impl ReplicaAck {
                 buf.extend_from_slice(&expected_sequence.to_le_bytes());
                 buf.extend_from_slice(&received_first_sequence.to_le_bytes());
             }
+            ReplicaAck::Busy { first_sequence } => {
+                buf.push(3);
+                buf.extend_from_slice(&first_sequence.to_le_bytes());
+            }
         }
         buf
     }
@@ -1234,6 +1257,12 @@ impl ReplicaAck {
                 Ok(ReplicaAck::Gap {
                     expected_sequence: u64::from_le_bytes(data[1..9].try_into().unwrap()),
                     received_first_sequence: u64::from_le_bytes(data[9..17].try_into().unwrap()),
+                })
+            }
+            3 => {
+                need(data, 9)?;
+                Ok(ReplicaAck::Busy {
+                    first_sequence: u64::from_le_bytes(data[1..9].try_into().unwrap()),
                 })
             }
             _ => Err(ProtocolError::UnknownOp(data[0])),
@@ -2013,6 +2042,29 @@ mod tests {
             ProtocolError::BufferTooShort { need, have } => {
                 assert_eq!(need, 17);
                 assert_eq!(have, 16);
+            }
+            other => panic!("expected BufferTooShort, got {other:?}"),
+        }
+    }
+
+    /// FU#6a: the retryable `Busy` NAK (ack tag 3) round-trips its
+    /// echoed `first_sequence`, occupies exactly `tag(1) + first_sequence(8)`
+    /// bytes, and a truncated frame fails to decode rather than mis-decoding.
+    #[test]
+    fn replica_ack_busy_round_trips() {
+        let ack = ReplicaAck::Busy { first_sequence: 77 };
+        let bytes = ack.serialize();
+        assert_eq!(bytes.len(), 9, "tag(1) + first_sequence(8)");
+        assert_eq!(bytes[0], 3, "Busy NAK uses ack tag 3");
+        let decoded = ReplicaAck::deserialize(&bytes).unwrap();
+        assert_eq!(decoded, ack);
+
+        // Truncated Busy frames must error, not mis-decode.
+        let err = ReplicaAck::deserialize(&bytes[..8]).unwrap_err();
+        match err {
+            ProtocolError::BufferTooShort { need, have } => {
+                assert_eq!(need, 9);
+                assert_eq!(have, 8);
             }
             other => panic!("expected BufferTooShort, got {other:?}"),
         }

@@ -976,11 +976,56 @@ pub fn handle_replica_batch_with_tracker(
     // `LogFull` → poison path rather than hanging.
     crate::server::dispatch::redo_backpressure_gate(engine);
 
+    // FU#6a: COLLECT each op's post-apply redo entries (with their owning
+    // store) instead of appending them inline. The mutations still happen
+    // per-op in the loop (mutate-first, journal-second is preserved); only the
+    // journaling is deferred to the ONE atomic admission after the loop.
+    let mut redo_entries: Vec<(crate::redo::RedoOp, u8)> = Vec::new();
     for (seq, op) in (start_seq..).zip(batch.ops.iter().skip(skip_count)) {
-        if let Err(msg) = apply_op_journal(engine, op, journal, is_migration) {
+        if let Err(msg) =
+            apply_op_journal_inner(engine, op, journal, is_migration, &mut redo_entries)
+        {
             let ack = ReplicaAck::Error {
                 failed_sequence: seq,
                 message: msg,
+            };
+            return ResponseFrame {
+                request_id: request.request_id,
+                status: STATUS_ERROR,
+                payload: ack.serialize(),
+            };
+        }
+    }
+
+    // FU#6a: admit the whole batch's collected redo entries in ONE atomic,
+    // all-or-nothing step across every touched store's log, BEFORE the data
+    // fsync + redo flush below. Collect-then-atomic structurally eliminates the
+    // mid-batch buffered residue that forced the old per-op path to
+    // `poison_all_redo_logs` on a transient `LogFull` (fencing the whole node).
+    match engine.append_replica_redo_batch_atomic(&redo_entries, batch.first_sequence) {
+        Ok(()) => {}
+        Err(crate::ops::engine::ReplicaRedoAdmitError::LogFull { first_sequence }) => {
+            // Retryable transient backpressure: NOTHING was journaled, the
+            // watermark does NOT advance (we return before the tracker update),
+            // and no log was poisoned. NAK `Busy` in the `STATUS_ERROR`
+            // envelope so a pre-upgrade master fails closed while a new master
+            // re-sends the IDENTICAL batch after a short backoff; the mutations
+            // (already applied in memory) re-apply idempotently. Skip the data
+            // fsync too, so a Busy leaves nothing durable.
+            let ack = ReplicaAck::Busy { first_sequence };
+            return ResponseFrame {
+                request_id: request.request_id,
+                status: STATUS_ERROR,
+                payload: ack.serialize(),
+            };
+        }
+        Err(crate::ops::engine::ReplicaRedoAdmitError::Fatal(detail)) => {
+            // A genuine fault — every redo log was poisoned inside the
+            // admission. Fail the batch closed exactly as the pre-FU#6a per-op
+            // path did on a real append failure.
+            let ack = ReplicaAck::Error {
+                failed_sequence: through,
+                message: format!("replica redo admission (fail-closed): {detail}"),
             };
             return ResponseFrame {
                 request_id: request.request_id,
@@ -1402,11 +1447,39 @@ pub fn apply_op(engine: &Engine, op: &ReplicaOp) -> std::result::Result<(), Stri
 ///
 /// Non-migration replica batches keep the original strict behaviour on both
 /// paths.
+///
+/// Single-op convenience: this appends the collected post-apply redo entries
+/// INLINE per-op (the historical behavior — including the fail-closed
+/// poison-on-error of [`Engine::append_replica_redo_entry_to_store`]). The
+/// batch apply path in [`handle_replica_batch_with_tracker`] instead COLLECTS
+/// via [`apply_op_journal_inner`] and admits every batch's entries in one
+/// atomic step ([`Engine::append_replica_redo_batch_atomic`], FU#6a). No flush
+/// here — the caller flushes (see [`flush_replica_redo_log`]).
 pub fn apply_op_journal(
     engine: &Engine,
     op: &ReplicaOp,
     journal: bool,
     is_migration: bool,
+) -> std::result::Result<(), String> {
+    let mut collected: Vec<(crate::redo::RedoOp, u8)> = Vec::new();
+    apply_op_journal_inner(engine, op, journal, is_migration, &mut collected)?;
+    for (redo_op, device_id) in &collected {
+        engine.append_replica_redo_entry_to_store(redo_op, *device_id)?;
+    }
+    Ok(())
+}
+
+/// Apply `op`'s mutation, then COLLECT its post-apply redo entries — each paired
+/// with its owning store `device_id` — into `redo_out`, WITHOUT appending or
+/// flushing. The mutation still happens per-op (mutate-first, journal-second is
+/// preserved); only the journaling is deferred so a whole batch's entries can be
+/// admitted atomically. See [`apply_op_journal`] for parameter semantics.
+fn apply_op_journal_inner(
+    engine: &Engine,
+    op: &ReplicaOp,
+    journal: bool,
+    is_migration: bool,
+    redo_out: &mut Vec<(crate::redo::RedoOp, u8)>,
 ) -> std::result::Result<(), String> {
     // When journalling is disabled (migration-baseline apply), suppress the
     // HEAVY engine-internal redo writes for the duration of the apply below —
@@ -2012,33 +2085,50 @@ pub fn apply_op_journal(
             // R-053: idempotency-by-generation. The pre-apply guard at
             // the top of `apply_op` already rejects strictly-stale ops under
             // wrapping generation ordering. For MarkLongestChain we also need
-            // to skip the equal-generation case: re-applying the same
-            // `MarkLongestChain` would otherwise bump generation again on the
-            // engine and write a stale `unmined_since`/DAH pair into the
-            // secondary indexes, even though the post-apply generation sync
-            // at the bottom of `apply_op` would immediately overwrite it back
-            // to `master_generation`. The visible effect would be a DAH index
-            // churn on every replay. Treating local at-or-ahead as a no-op
-            // makes the op fully idempotent on the replica.
-            if let Ok(meta) = engine.read_metadata(tx_key) {
-                let local_gen = { meta.generation };
-                if generation_at_or_ahead(local_gen, *master_generation) {
-                    return Ok(());
+            // to skip RE-APPLYING the mutation in the equal-generation case:
+            // re-running the same `MarkLongestChain` would otherwise bump
+            // generation again on the engine and write a stale
+            // `unmined_since`/DAH pair into the secondary indexes, even though
+            // the post-apply generation sync at the bottom of `apply_op` would
+            // immediately overwrite it back to `master_generation`. The visible
+            // effect would be a DAH index churn on every replay.
+            let already_at_or_ahead = engine
+                .read_metadata(tx_key)
+                .map(|meta| generation_at_or_ahead(meta.generation, *master_generation))
+                .unwrap_or(false);
+            if already_at_or_ahead {
+                // FU#6a Critical: skip re-applying the mutation (R-053 no-churn)
+                // but do NOT early-return. Falling through keeps the post-apply
+                // generation sync (idempotent — sets `master_generation` again)
+                // AND, critically, the deferred `build_post_apply_redo_op`
+                // collection at the bottom of `apply_op_journal_inner` running.
+                //
+                // A `Busy` resend of an equal-generation `MarkLongestChain` MUST
+                // re-journal the recovery-load-bearing `MarkOnLongestChain` redo
+                // entry that delivery 1 applied in RAM but DISCARDED on the Busy
+                // NAK (collect-then-atomic buffers nothing on `LogFull`). An
+                // arm-level `return Ok(())` here bypassed that redo collection:
+                // the resend would then ACK `Ok` and fsync the already-advanced
+                // generation-`G` metadata durable while journaling no
+                // `MarkOnLongestChain` entry — and the MinedIndex reader never
+                // consults the device footer, so a crash after that ACK loses the
+                // acked longest-chain transition (only the redo tail rebuilds it).
+                Ok(())
+            } else {
+                let req = crate::ops::mark_longest_chain::MarkOnLongestChainRequest {
+                    tx_key: *tx_key,
+                    on_longest_chain: *on_longest_chain,
+                    current_block_height: *current_block_height,
+                    block_height_retention: *block_height_retention,
+                };
+                match engine.mark_on_longest_chain(&req) {
+                    Ok(_) => Ok(()),
+                    Err(crate::ops::error::SpendError::TxNotFound) => {
+                        record_apply_skipped_missing_tx("mark_longest_chain", tx_key);
+                        Ok(())
+                    }
+                    Err(e) => Err(format!("mark_longest_chain: {e}")),
                 }
-            }
-            let req = crate::ops::mark_longest_chain::MarkOnLongestChainRequest {
-                tx_key: *tx_key,
-                on_longest_chain: *on_longest_chain,
-                current_block_height: *current_block_height,
-                block_height_retention: *block_height_retention,
-            };
-            match engine.mark_on_longest_chain(&req) {
-                Ok(_) => Ok(()),
-                Err(crate::ops::error::SpendError::TxNotFound) => {
-                    record_apply_skipped_missing_tx("mark_longest_chain", tx_key);
-                    Ok(())
-                }
-                Err(e) => Err(format!("mark_longest_chain: {e}")),
             }
         }
     }?;
@@ -2136,21 +2226,19 @@ pub fn apply_op_journal(
             match pre_delete_device_id {
                 // Route the Delete redo to the record's own store log (see the
                 // capture above) so it shares the log of the record's Create.
-                Some(device_id) => {
-                    engine.append_replica_redo_entry_to_store(&redo_op, device_id)?
-                }
-                None => write_replica_redo_entry(engine, &redo_op)?,
+                Some(device_id) => redo_out.push((redo_op, device_id)),
+                None => collect_routed_redo_entry(engine, redo_op, redo_out),
             }
         }
         // Companion mined-state redo for an already-mined replicated create.
-        // Journaled AFTER the `ReplicaCreate` above (higher sequence) and into
-        // the same batch flush, so a crash cannot make the create durable
-        // without its mining. See `create_companion_set_mined_ops`. The record
-        // is already applied+indexed at this point, so `write_replica_redo_entry`
-        // routes each companion to the same store log the ReplicaCreate landed
-        // in (both resolve the key's `device_id` from the primary index).
+        // Collected AFTER the `ReplicaCreate` above (higher sequence) and admitted
+        // into the same batch, so a crash cannot make the create durable without
+        // its mining. See `create_companion_set_mined_ops`. The record is already
+        // applied+indexed at this point, so `collect_routed_redo_entry` routes
+        // each companion to the same store log the ReplicaCreate landed in (both
+        // resolve the key's `device_id` from the primary index).
         for companion in create_companion_set_mined_ops(op) {
-            write_replica_redo_entry(engine, &companion)?;
+            collect_routed_redo_entry(engine, companion, redo_out);
         }
     }
 
@@ -2531,37 +2619,26 @@ fn build_post_apply_redo_op(
     }
 }
 
-/// Append + flush a redo entry on the replica's local engine log.
+/// COLLECT a routed redo entry into `redo_out` as `(RedoOp, device_id)` — the
+/// same store routing the per-op [`Engine::append_replica_redo_entry`] applies,
+/// but deferred so the batch's entries can be admitted atomically
+/// ([`Engine::append_replica_redo_batch_atomic`], FU#6a).
 ///
-/// Returns `Err(message)` when the engine has a redo log attached AND
-/// the append/flush fails — caller propagates to fail the batch ACK so
-/// the master retries instead of advancing its durable high-water mark.
-/// Append a redo entry for a single op WITHOUT flushing.
-///
-/// Called inside the per-op apply loop in
-/// `handle_replica_batch_with_tracker`. The batch-level flush happens
-/// once after the apply loop completes — see [`flush_replica_redo_log`].
-/// Batching the flush eliminates the per-op fsync that was a major perf
-/// regression on slow filesystems (Docker named volumes): a 200-op
-/// batch went from ~2 s (200 × 10 ms) to a single fsync.
-fn write_replica_redo_entry(
+/// Task 14: a `SetMinedBatch` built from a wire `ReplicaOp::SetMinedBatch`
+/// groups txids by CLUSTER SHARD (the wire op's own grouping criterion), which
+/// is independent of this node's per-key LOCAL store assignment (`device_id`) —
+/// two same-shard txids can easily live in different local stores.
+/// `Engine::redo_store_for_op`'s `SetMinedBatch` routing resolves the store from
+/// just the batch's FIRST txid, an invariant the MASTER upholds by grouping its
+/// own redo per store before ever constructing a `SetMinedBatch`
+/// (`handle_set_mined_batch`'s `txids_by_store`). Mirror that grouping here so
+/// each split group's txids genuinely share one store and routing cannot
+/// silently pin a cross-store txid's entry into the wrong store's log.
+fn collect_routed_redo_entry(
     engine: &Engine,
-    op: &crate::redo::RedoOp,
-) -> std::result::Result<(), String> {
-    // Per-store redo: route the entry to the log owning the op's store. The
-    // batch-level flush makes them durable. No-op when no log is attached.
-    //
-    // Task 14: a `SetMinedBatch` built from a wire `ReplicaOp::SetMinedBatch`
-    // groups txids by CLUSTER SHARD (the wire op's own grouping criterion),
-    // which is independent of this node's per-key LOCAL store assignment
-    // (`device_id`) — two same-shard txids can easily live in different
-    // local stores. `Engine::redo_store_for_op`'s `SetMinedBatch` routing
-    // resolves the store from just the batch's FIRST txid, an invariant the
-    // MASTER upholds by grouping its own redo per store before ever
-    // constructing a `SetMinedBatch` (`handle_set_mined_batch`'s
-    // `txids_by_store`). Mirror that grouping here before journaling, so
-    // each split group's txids genuinely share one store and routing cannot
-    // silently pin a cross-store txid's entry into the wrong store's log.
+    op: crate::redo::RedoOp,
+    redo_out: &mut Vec<(crate::redo::RedoOp, u8)>,
+) {
     if let crate::redo::RedoOp::SetMinedBatch {
         block_id,
         block_height,
@@ -2571,7 +2648,7 @@ fn write_replica_redo_entry(
         block_height_retention,
         unset,
         txids,
-    } = op
+    } = &op
         && txids.len() > 1
     {
         let mut by_store: std::collections::HashMap<u8, Vec<TxKey>> =
@@ -2580,7 +2657,7 @@ fn write_replica_redo_entry(
             let store = engine.lookup(tx_key).map(|e| e.device_id).unwrap_or(0);
             by_store.entry(store).or_default().push(*tx_key);
         }
-        for store_txids in by_store.into_values() {
+        for (store, store_txids) in by_store {
             let split_op = crate::redo::RedoOp::SetMinedBatch {
                 block_id: *block_id,
                 block_height: *block_height,
@@ -2591,19 +2668,23 @@ fn write_replica_redo_entry(
                 unset: *unset,
                 txids: store_txids,
             };
-            engine.append_replica_redo_entry(&split_op)?;
+            // Each split group's txids all resolve to `store`; that is exactly
+            // what `redo_store_for_op` would return for `split_op`.
+            redo_out.push((split_op, store));
         }
-        return Ok(());
+        return;
     }
-    engine.append_replica_redo_entry(op)
+    let device_id = engine.redo_store_for_op(&op);
+    redo_out.push((op, device_id));
 }
 
 /// Flush the replica redo log to durable storage.
 ///
-/// Called once per batch from `handle_replica_batch_with_tracker` after
-/// every op has been applied + appended via [`write_replica_redo_entry`]
-/// and after the data device fsync. The "apply, fsync data, then flush
-/// redo log, then ACK" discipline is preserved at the batch level.
+/// Called once per batch from `handle_replica_batch_with_tracker` after every
+/// op has been applied and the batch's redo entries admitted atomically (FU#6a,
+/// [`Engine::append_replica_redo_batch_atomic`]) and after the data device
+/// fsync. The "apply, fsync data, then flush redo log, then ACK" discipline is
+/// preserved at the batch level.
 fn flush_replica_redo_log(engine: &Engine) -> std::result::Result<(), String> {
     // Per-store redo: flush every touched store's log (one fsync per store).
     engine.flush_all_redo_logs()
@@ -6042,6 +6123,526 @@ mod tests {
         }
     }
 
+    /// Fill `log` with fat Create entries until it is full, returning how many
+    /// were durably written. No armed drain / no reclaimer — the log stays full,
+    /// so a subsequent apply's redo genuinely cannot be admitted.
+    fn fill_redo_log_to_full(log: &Arc<parking_lot::Mutex<crate::redo::RedoLog>>) -> usize {
+        use crate::redo::{RedoError, RedoOp};
+        let mut filler = 0u32;
+        let mut count = 0usize;
+        loop {
+            let mut txid = [0u8; 32];
+            txid[0..4].copy_from_slice(&filler.to_le_bytes());
+            let op = RedoOp::Create {
+                tx_key: TxKey { txid },
+                device_id: 0,
+                record_offset: 4096,
+                utxo_count: 1,
+                is_conflicting: false,
+                record_bytes: vec![0xCD; 2048].into(),
+                parent_txids: Vec::new(),
+            };
+            match log.lock().append_and_flush(op) {
+                Ok(_) => count += 1,
+                Err(RedoError::LogFull { .. }) => break,
+                Err(e) => panic!("unexpected error pre-filling redo: {e}"),
+            }
+            filler += 1;
+            assert!(count < 100_000, "redo pre-fill runaway");
+        }
+        count
+    }
+
+    fn busy_create_batch(first_sequence: u64, n: u8) -> ReplicaBatch {
+        let ops: Vec<ReplicaOp> = (0..n)
+            .map(|i| ReplicaOp::Create {
+                tx_key: key(100 + i),
+                metadata_bytes: vec![0u8; 64],
+                utxo_hashes: vec![[0xAA; 32]; 2],
+                cold_data: None,
+                is_external: false,
+            })
+            .collect();
+        ReplicaBatch {
+            first_sequence,
+            ops,
+            trace_ctx: None,
+            source_node_id: None,
+            cluster_key: 0,
+        }
+    }
+
+    /// FU#6a: a replica whose redo is genuinely full (no armed drain to free it)
+    /// must NAK the batch `Busy` — NOT poison the node. The collect-then-atomic
+    /// admission buffers nothing, leaves the log un-poisoned and residue-free,
+    /// and does NOT advance the tracker watermark. Pre-fix, the per-op inline
+    /// append hit `LogFull` on the first op and `poison_all_redo_logs`'d, fencing
+    /// the whole node until restart and returning `ReplicaAck::Error`.
+    #[test]
+    fn replica_apply_logfull_naks_busy_without_fencing() {
+        use crate::redo::{RedoError, RedoLog, RedoOp};
+        use std::sync::atomic::AtomicU64;
+
+        let dev: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let alloc = SlotAllocator::new(dev.clone()).unwrap();
+        let index = Index::new(10_000).unwrap();
+        let engine = Arc::new(Engine::new(
+            dev,
+            index,
+            alloc,
+            StripedLocks::new(1024),
+            DahIndex::new(),
+        ));
+        let log_dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(64 * 1024, 4096).unwrap());
+        let log_dev_reopen = log_dev.clone();
+        let log = Arc::new(parking_lot::Mutex::new(
+            RedoLog::open(log_dev, 0, 64 * 1024).unwrap(),
+        ));
+        engine.set_redo_logs(vec![log.clone()]);
+
+        // Fill the log to full with an UNARMED coordinator — the backpressure
+        // gate is a pure no-op, so the apply reaches the admission and finds no
+        // room (the historical "LogFull → poison" trigger).
+        let prefill_count = fill_redo_log_to_full(&log);
+        assert!(
+            prefill_count > 0,
+            "the pre-fill must write at least one entry"
+        );
+
+        let batch = busy_create_batch(10, 3);
+        let tracker = ReplicaAppliedTracker::in_memory();
+        let stream_key = "peer-busy:5000";
+        tracker.set(stream_key, 9); // first_sequence=10 is next-expected
+        let last_applied = Arc::new(AtomicU64::new(0));
+
+        let resp = handle_replica_batch_with_tracker(
+            &batch_request(&batch, 1),
+            &engine,
+            &last_applied,
+            Some(&tracker),
+            stream_key,
+            0,
+        );
+
+        // (a) Busy NAK: STATUS_ERROR envelope, ack tag 3, echoing first_sequence.
+        assert_eq!(
+            resp.status, STATUS_ERROR,
+            "a full replica redo must NAK, not ACK"
+        );
+        let ack = ReplicaAck::deserialize(&resp.payload).unwrap();
+        assert_eq!(
+            ack,
+            ReplicaAck::Busy { first_sequence: 10 },
+            "a transient full redo must NAK Busy, echoing the batch first_sequence",
+        );
+
+        // (b) The tracker watermark did NOT advance.
+        assert_eq!(
+            tracker.get(stream_key),
+            9,
+            "Busy must not advance the per-stream watermark",
+        );
+        assert_eq!(
+            last_applied.load(Ordering::Relaxed),
+            0,
+            "Busy must not advance last_applied",
+        );
+
+        // (c) The log was NOT poisoned and holds no buffered residue.
+        assert!(
+            !log.lock().is_poisoned(),
+            "a transient full log must NOT be poisoned (that is the bug FU#6a fixes)",
+        );
+        assert!(
+            !log.lock().has_pending(),
+            "the NAK'd batch must leave no buffered residue",
+        );
+
+        // (d) Reopening + recover shows NO residue from the NAK'd batch: only the
+        // pre-fill entries are durable, none for the batch's keys.
+        let recovered = RedoLog::open(log_dev_reopen, 0, 64 * 1024)
+            .unwrap()
+            .recover()
+            .unwrap();
+        assert_eq!(
+            recovered.len(),
+            prefill_count,
+            "the NAK'd batch must have added no durable redo entry",
+        );
+
+        // (e) The log still accepts writes after space is freed (proof it was
+        // never poisoned) — the probe+flush the brief asks for.
+        log.lock().reset().expect("reset reclaims the region");
+        let probe = RedoOp::Create {
+            tx_key: TxKey { txid: [0xEE; 32] },
+            device_id: 0,
+            record_offset: 4096,
+            utxo_count: 1,
+            is_conflicting: false,
+            record_bytes: vec![0x11; 128].into(),
+            parent_txids: Vec::new(),
+        };
+        match log.lock().append_and_flush(probe) {
+            Ok(_) => {}
+            Err(RedoError::Poisoned) => {
+                panic!("redo was poisoned — the replica was fenced (FU#6a regression)")
+            }
+            Err(e) => panic!("unexpected redo error after Busy NAK: {e}"),
+        }
+    }
+
+    /// FU#6a: after a `Busy` NAK the master re-sends the IDENTICAL batch; once
+    /// space is freed the resend applies cleanly — every record present, the
+    /// watermark advances, and the redo is recoverable. The mutations re-apply
+    /// idempotently (the first delivery already placed them in memory).
+    #[test]
+    fn replica_busy_nak_batch_reapplies_on_resend() {
+        use crate::redo::{RedoLog, RedoOp};
+        use std::sync::atomic::AtomicU64;
+
+        let dev: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let alloc = SlotAllocator::new(dev.clone()).unwrap();
+        let index = Index::new(10_000).unwrap();
+        let engine = Arc::new(Engine::new(
+            dev,
+            index,
+            alloc,
+            StripedLocks::new(1024),
+            DahIndex::new(),
+        ));
+        let log_dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(64 * 1024, 4096).unwrap());
+        let log_dev_reopen = log_dev.clone();
+        let log = Arc::new(parking_lot::Mutex::new(
+            RedoLog::open(log_dev, 0, 64 * 1024).unwrap(),
+        ));
+        engine.set_redo_logs(vec![log.clone()]);
+
+        fill_redo_log_to_full(&log);
+
+        let tracker = ReplicaAppliedTracker::in_memory();
+        let stream_key = "peer-busy:5100";
+        tracker.set(stream_key, 9);
+        let last_applied = Arc::new(AtomicU64::new(0));
+
+        // First delivery: redo full → Busy.
+        let batch = busy_create_batch(10, 3);
+        let resp = handle_replica_batch_with_tracker(
+            &batch_request(&batch, 1),
+            &engine,
+            &last_applied,
+            Some(&tracker),
+            stream_key,
+            0,
+        );
+        assert_eq!(resp.status, STATUS_ERROR, "first delivery must NAK Busy");
+        assert_eq!(
+            ReplicaAck::deserialize(&resp.payload).unwrap(),
+            ReplicaAck::Busy { first_sequence: 10 },
+        );
+        assert_eq!(tracker.get(stream_key), 9, "watermark unchanged after Busy");
+
+        // The checkpoint drain frees the redo (simulated by reset).
+        log.lock().reset().expect("reset reclaims the region");
+
+        // Resend the IDENTICAL batch: now it applies.
+        let resend = busy_create_batch(10, 3);
+        let resp2 = handle_replica_batch_with_tracker(
+            &batch_request(&resend, 2),
+            &engine,
+            &last_applied,
+            Some(&tracker),
+            stream_key,
+            0,
+        );
+        assert_eq!(
+            resp2.status, STATUS_OK,
+            "the resend must apply once the redo has room",
+        );
+        assert_eq!(
+            ReplicaAck::deserialize(&resp2.payload).unwrap(),
+            ReplicaAck::Ok {
+                through_sequence: 12
+            },
+            "the resend acks through the batch's last sequence",
+        );
+
+        // (a) Every record from the batch is present.
+        for i in 0..3u8 {
+            assert!(
+                engine.lookup(&key(100 + i)).is_some(),
+                "record {i} must exist after the resend applies",
+            );
+        }
+        // (b) The watermark advanced to the batch's last sequence (10 + 3 - 1).
+        assert_eq!(
+            tracker.get(stream_key),
+            12,
+            "the resend advances the watermark to the batch's last sequence",
+        );
+
+        // (c) The redo is recoverable: reopening shows the batch's 3 ReplicaCreate
+        // entries (nothing else survives the reset).
+        let recovered = RedoLog::open(log_dev_reopen, 0, 64 * 1024)
+            .unwrap()
+            .recover()
+            .unwrap();
+        let creates = recovered
+            .iter()
+            .filter(|e| matches!(e.op, RedoOp::ReplicaCreate { .. }))
+            .count();
+        assert_eq!(
+            creates, 3,
+            "all three resent creates must be durable in the replica redo",
+        );
+    }
+
+    /// FU#6a Critical (silent acked-state loss): a `Busy`-NAK'd
+    /// `MarkLongestChain` whose delivery-1 mutation already advanced the
+    /// record's generation to `master_generation` (applied in RAM, not yet
+    /// fsynced) MUST still re-journal its `MarkOnLongestChain` redo entry on the
+    /// resend.
+    ///
+    /// Pre-fix the `MarkLongestChain` apply arm early-returned `Ok(())` on the
+    /// equal-generation idempotence check, which on the resend bypassed BOTH the
+    /// post-apply generation sync AND the redo collection at the bottom of
+    /// `apply_op_journal_inner`. The generation sync is an immediately-effective
+    /// per-op mutation but redo journaling is deferred and DISCARDED on a `Busy`:
+    ///   1. Delivery 1 (redo full): `local_gen < G` so the arm applies the
+    ///      mutation → generation syncs to `G` in RAM → the `MarkOnLongestChain`
+    ///      redo is collected → atomic admission returns `LogFull` → `Busy`.
+    ///      Nothing journaled, no data fsync, watermark unchanged.
+    ///   2. Resend (redo drained): `local_gen == G` → the equal-gen check fires.
+    ///      Pre-fix it early-returned, so NO redo was collected → admission `Ok`
+    ///      → `sync_all_store_devices` fsyncs delivery-1's generation-`G`
+    ///      metadata DURABLE → watermark advances → ACK `Ok`.
+    ///
+    /// The MinedIndex reader never consults the device footer and the redo tail
+    /// is the ONLY pass that reconstructs a longest-chain transition, so a
+    /// replica crash after that ACK would recover the record ON the longest
+    /// chain — silently losing an acked off-chain transition the master chose to
+    /// retain. The fix skips re-applying the mutation (R-053 no-churn) but falls
+    /// through so the redo entry is still collected on the resend.
+    #[test]
+    fn busy_resend_of_equal_gen_mark_longest_chain_still_journals_redo() {
+        use crate::redo::{RedoLog, RedoOp};
+        use std::sync::atomic::AtomicU64;
+
+        let dev: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let alloc = SlotAllocator::new(dev.clone()).unwrap();
+        let index = Index::new(10_000).unwrap();
+        let engine = Arc::new(Engine::new(
+            dev,
+            index,
+            alloc,
+            StripedLocks::new(1024),
+            DahIndex::new(),
+        ));
+        let log_dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(64 * 1024, 4096).unwrap());
+        let log_dev_reopen = log_dev.clone();
+        let log = Arc::new(parking_lot::Mutex::new(
+            RedoLog::open(log_dev, 0, 64 * 1024).unwrap(),
+        ));
+        engine.set_redo_logs(vec![log.clone()]);
+
+        // Seed a record at a known generation < G, on the longest chain.
+        let k = key(140);
+        create_record(&engine, k, 1);
+        let base_gen = { engine.read_metadata(&k).unwrap().generation };
+        let g = base_gen + 1;
+
+        // Build a single-op off-chain MarkLongestChain batch at generation G.
+        let mark_off = |first_sequence: u64| ReplicaBatch {
+            first_sequence,
+            ops: vec![ReplicaOp::MarkLongestChain {
+                tx_key: k,
+                on_longest_chain: false,
+                current_block_height: 800_000,
+                block_height_retention: 288,
+                master_generation: g,
+            }],
+            trace_ctx: None,
+            source_node_id: None,
+            cluster_key: 0,
+        };
+
+        // Fill the redo so the batch's atomic admission returns LogFull.
+        fill_redo_log_to_full(&log);
+
+        let tracker = ReplicaAppliedTracker::in_memory();
+        let stream_key = "peer-busy:5200";
+        tracker.set(stream_key, 9); // first_sequence=10 is next-expected
+        let last_applied = Arc::new(AtomicU64::new(0));
+
+        // Delivery 1: redo full → Busy. The mutation still applies in RAM
+        // (gen -> G, unmined_since set) but nothing is journaled, no data is
+        // fsynced, and the watermark does not advance.
+        let batch = mark_off(10);
+        let resp = handle_replica_batch_with_tracker(
+            &batch_request(&batch, 1),
+            &engine,
+            &last_applied,
+            Some(&tracker),
+            stream_key,
+            0,
+        );
+        assert_eq!(resp.status, STATUS_ERROR, "first delivery must NAK Busy");
+        assert_eq!(
+            ReplicaAck::deserialize(&resp.payload).unwrap(),
+            ReplicaAck::Busy { first_sequence: 10 },
+        );
+        assert_eq!(
+            tracker.get(stream_key),
+            9,
+            "Busy must not advance the watermark",
+        );
+
+        // Precondition for the hazard: delivery 1's mutation IS live in RAM even
+        // though NOTHING was journaled — the generation is now exactly G and the
+        // off-chain transition is applied.
+        let mid = engine.read_metadata(&k).unwrap();
+        assert_eq!(
+            { mid.generation },
+            g,
+            "delivery-1 mutation applied in RAM despite the Busy NAK (gen advanced to G)",
+        );
+        assert_eq!(
+            { mid.unmined_since },
+            800_000,
+            "delivery-1 off-chain mark applied in RAM despite the Busy NAK",
+        );
+
+        // Free the redo and resend the IDENTICAL batch. `local_gen == G` now, so
+        // the MarkLongestChain equal-generation skip fires.
+        log.lock().reset().expect("reset reclaims the region");
+        let resend = mark_off(10);
+        let resp2 = handle_replica_batch_with_tracker(
+            &batch_request(&resend, 2),
+            &engine,
+            &last_applied,
+            Some(&tracker),
+            stream_key,
+            0,
+        );
+        assert_eq!(
+            resp2.status, STATUS_OK,
+            "the resend must ACK once the redo has room",
+        );
+        assert_eq!(
+            ReplicaAck::deserialize(&resp2.payload).unwrap(),
+            ReplicaAck::Ok {
+                through_sequence: 10
+            },
+        );
+        assert_eq!(
+            tracker.get(stream_key),
+            10,
+            "the resend advances the watermark to the batch's last sequence",
+        );
+
+        // KEY ASSERTION (load-bearing): the resend MUST have journaled a
+        // MarkOnLongestChain redo entry for `k`. The generation-G metadata is now
+        // fsynced durable; if the redo tail has NO MarkOnLongestChain entry, a
+        // crash-recovery MinedIndex rebuild (redo-tail-only — the footer is never
+        // consulted) recovers the record ON the longest chain, silently losing
+        // the acked off-chain transition. Pre-fix this entry is ABSENT (the
+        // equal-gen early-return skipped redo collection).
+        let recovered = RedoLog::open(log_dev_reopen, 0, 64 * 1024)
+            .unwrap()
+            .recover()
+            .unwrap();
+        let mark_entries: Vec<_> = recovered
+            .iter()
+            .filter(|e| {
+                matches!(
+                    &e.op,
+                    RedoOp::MarkOnLongestChain { tx_key, on_longest_chain, .. }
+                        if *tx_key == k && !*on_longest_chain
+                )
+            })
+            .collect();
+        assert_eq!(
+            mark_entries.len(),
+            1,
+            "the Busy-resend of an equal-generation MarkLongestChain MUST re-journal \
+             its recovery-load-bearing MarkOnLongestChain redo entry; without it the \
+             durable generation advances past a transition no redo tail can rebuild",
+        );
+    }
+
+    /// R-053 (FU#6a fix): the equal-generation `MarkLongestChain` skip must NOT
+    /// re-run the underlying mutation. The Critical fix stops the arm from
+    /// early-returning (so the deferred redo is still collected) but keeps the
+    /// mutation itself skipped, preserving R-053's no-DAH/generation-churn
+    /// intent. Deterministic probe: stamp a sentinel `updated_at` that the real
+    /// `mark_on_longest_chain` would overwrite with `now_millis()` (a much
+    /// smaller value), apply an equal-generation `MarkLongestChain`, and assert
+    /// `updated_at` is unchanged — proof the mutation did not run. The idempotent
+    /// generation sync that DOES run on the skip path preserves `updated_at`.
+    #[test]
+    fn equal_generation_mark_longest_chain_skip_does_not_reapply_mutation() {
+        let engine = make_engine();
+        let k = key(141);
+        create_record(&engine, k, 1);
+
+        // Drive it off-chain at generation G once (the real mutation runs here).
+        let base_gen = { engine.read_metadata(&k).unwrap().generation };
+        let g = base_gen + 1;
+        apply_op(
+            &engine,
+            &ReplicaOp::MarkLongestChain {
+                tx_key: k,
+                on_longest_chain: false,
+                current_block_height: 800_000,
+                block_height_retention: 288,
+                master_generation: g,
+            },
+        )
+        .unwrap();
+
+        // Stamp a sentinel `updated_at` the mutation would overwrite with a
+        // (much smaller) `now_millis()`.
+        const SENTINEL: u64 = u64::MAX;
+        {
+            let entry = engine.lookup(&k).unwrap();
+            let mut meta = engine.read_metadata(&k).unwrap();
+            meta.updated_at = SENTINEL;
+            crate::io::write_metadata(engine.device(), entry.record_offset, &meta).unwrap();
+        }
+
+        // Equal-generation replay: the skip must NOT re-run mark_on_longest_chain.
+        apply_op(
+            &engine,
+            &ReplicaOp::MarkLongestChain {
+                tx_key: k,
+                on_longest_chain: false,
+                current_block_height: 800_000,
+                block_height_retention: 288,
+                master_generation: g,
+            },
+        )
+        .unwrap();
+
+        let post = engine.read_metadata(&k).unwrap();
+        assert_eq!(
+            { post.updated_at },
+            SENTINEL,
+            "equal-gen skip must NOT re-run mark_on_longest_chain (R-053 no-churn)",
+        );
+        assert_eq!(
+            { post.generation },
+            g,
+            "equal-gen skip must not bump the generation",
+        );
+        assert_eq!(
+            { post.unmined_since },
+            800_000,
+            "equal-gen skip must not churn unmined_since",
+        );
+    }
+
     /// `replica_restart_remembers_last_applied_seq`: after persisting
     /// state and reopening the tracker from disk, the same batch is
     /// treated as a duplicate and skipped.
@@ -7409,9 +8010,9 @@ mod tests {
                     "error message must include diagnostic detail"
                 );
             }
-            ReplicaAck::Ok { .. } | ReplicaAck::Gap { .. } => {
+            ReplicaAck::Ok { .. } | ReplicaAck::Gap { .. } | ReplicaAck::Busy { .. } => {
                 panic!(
-                    "R-035: replica must NOT ACK Ok (or NAK Gap) when an on-device \
+                    "R-035: replica must NOT ACK Ok (or NAK Gap/Busy) when an on-device \
                      metadata write failed"
                 )
             }
