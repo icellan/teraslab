@@ -228,24 +228,42 @@ impl Harness {
             PrimaryBackend::rebuild_secondary(&*self.data_dev as &dyn BlockDevice, &alloc).unwrap();
         let mut dah = DahBackend::from(dah_idx);
 
-        let redo = RedoLog::open(self.redo_dev.clone() as Arc<dyn BlockDevice>, 0, REDO_SIZE)
-            .expect("reopen redo after crash");
+        // Reopen the redo behind an `Arc<Mutex<_>>` so the SAME handle drives
+        // BOTH recovery passes production startup runs: the device-level replay
+        // (`recover_all_with_allocator`, which takes `&RedoLog`) AND the
+        // MinedIndex reconstruction (`replay_mined_index_redo_tail`, which takes
+        // `&[Arc<Mutex<RedoLog>>]`). Post-Task-16d `set_mined` writes ZERO device
+        // bytes, so the mined-state lives only in RAM + the redo tail — without
+        // this second pass the recovered engine's MinedIndex is empty.
+        let redo = Arc::new(Mutex::new(
+            RedoLog::open(self.redo_dev.clone() as Arc<dyn BlockDevice>, 0, REDO_SIZE)
+                .expect("reopen redo after crash"),
+        ));
         recover_all_with_allocator(
             &*self.data_dev as &dyn BlockDevice,
-            &redo,
+            &redo.lock(),
             &index,
             &mut dah,
             Some(&mut alloc),
         )
         .expect("recovery must not fail");
 
-        Arc::new(Engine::new_with_sharded_index(
+        let engine = Arc::new(Engine::new_with_sharded_index(
             self.data_dev.clone() as Arc<dyn BlockDevice>,
             index,
             alloc,
             StripedLocks::new(64),
             dah,
-        ))
+        ));
+        // Mirror `bin/server.rs` startup's post-16d step: after the engine is
+        // built, replay the durable redo tail into the in-RAM MinedIndex (the
+        // fresh-boot full-replay path — this harness has no checkpoint/`.mined`
+        // snapshot). A durable `CreateV2` in the tail allocates + re-points each
+        // record's `mined_slot`; a durable `SetMinedBatch` then plants its block.
+        engine
+            .replay_mined_index_redo_tail(std::slice::from_ref(&redo))
+            .expect("mined-index redo-tail replay must not fail");
+        engine
     }
 }
 
@@ -595,8 +613,18 @@ fn sweep_unspend_wrong_hash_leaves_slot_spent() {
     }
 }
 
-/// SetMined: WAL-first `SetMined` + `engine.set_mined`. Recovery is consistent
-/// and the record's slots stay unspent (set_mined is not a spend).
+/// SetMined: WAL-first `SetMinedBatch` + `engine.set_mined`. Post-Task-16d
+/// `set_mined` writes ZERO device bytes, so the recovered mined-state lives
+/// SOLELY in the MinedIndex the harness `recover()` reconstructs from the redo
+/// tail — the device bytes are byte-identical to the seeded (unmined) state in
+/// every window. This sweep therefore asserts the RECOVERED mined-state
+/// directly: a durable `SetMinedBatch` must replant the exact block tuple
+/// (block_id / height / subtree) into the MinedIndex and mark the tx on the
+/// longest chain, while a `SetMinedBatch` whose intent was lost before its
+/// fsync (`BeforeRedoFsync`) must plant NO block. Slots stay unspent either way
+/// (set_mined is not a spend). Without the block assertion this test is
+/// vacuous: a `replay_mined_index_redo_tail` regression that drops durable
+/// SetMinedBatch intents would still pass the consistency + spent-count checks.
 #[test]
 fn sweep_set_mined() {
     for crash in CRASH_WINDOWS {
@@ -604,6 +632,33 @@ fn sweep_set_mined() {
         h.seed_record(3, 2);
         let k = key(3);
         let block_id = 0x1234_5678u32;
+        // Distinct, non-coincidental values so the recovered block entry must
+        // round-trip the journaled fields (not merely match a shared constant):
+        // the mined height differs from the chain tip and the subtree is nonzero.
+        let mined_height = 1_500u32;
+        let subtree_idx = 7u32;
+
+        // Journal a `CreateV2` for the seeded record and make it durable so it
+        // survives EVERY crash window. Dispatch writes this WAL-first on create;
+        // `seed_record`'s direct `engine.create` does not, and the mined-index
+        // redo-tail replay needs it to allocate + re-point the record's
+        // `mined_slot` before the companion `SetMinedBatch` can plant a block
+        // (mirrors the reference recovery tests in `src/checkpoint.rs`). The
+        // device-level replay skips this entry idempotently (the record is
+        // already rebuilt from the device scan), so only the mined path uses it.
+        let entry = h.engine.lookup(&k).expect("seeded record indexed");
+        h.redo_log
+            .lock()
+            .append_and_flush(RedoOp::CreateV2 {
+                tx_key: k,
+                device_id: entry.device_id,
+                record_offset: entry.record_offset,
+                utxo_count: 2,
+                is_conflicting: false,
+                parent_txids: Vec::new(),
+            })
+            .unwrap();
+        h.make_durable();
 
         let rec = drive(
             &h,
@@ -612,8 +667,8 @@ fn sweep_set_mined() {
                 redo.lock()
                     .append_and_flush(RedoOp::SetMinedBatch {
                         block_id,
-                        block_height: CURRENT_HEIGHT,
-                        subtree_idx: 0,
+                        block_height: mined_height,
+                        subtree_idx,
                         on_longest_chain: true,
                         current_block_height: CURRENT_HEIGHT,
                         block_height_retention: RETENTION,
@@ -627,8 +682,8 @@ fn sweep_set_mined() {
                     .set_mined(&SetMinedRequest {
                         tx_key: k,
                         block_id,
-                        block_height: CURRENT_HEIGHT,
-                        subtree_idx: 0,
+                        block_height: mined_height,
+                        subtree_idx,
                         current_block_height: CURRENT_HEIGHT,
                         block_height_retention: RETENTION,
                         on_longest_chain: true,
@@ -638,6 +693,7 @@ fn sweep_set_mined() {
             },
         );
 
+        // set_mined is not a spend: the record stays fully unspent everywhere.
         assert_record_consistent(&rec, &k);
         let meta = rec.read_metadata(&k).unwrap();
         assert_eq!(
@@ -645,6 +701,42 @@ fn sweep_set_mined() {
             0,
             "set_mined leaves slots unspent ({crash:?})"
         );
+
+        // The load-bearing assertion: the recovered MinedIndex must carry the
+        // block EXACTLY when the SetMinedBatch intent became durable, and must
+        // NOT when it was lost before its fsync. This is what lets the sweep
+        // detect a mined-state recovery regression.
+        let (blocks, unmined_since) = rec
+            .mined_block_entries(&k)
+            .expect("mined-state must be readable after recovery");
+        if crash.intent_durable() {
+            assert_eq!(
+                unmined_since, 0,
+                "a durable on-longest-chain set_mined must replay unmined_since=0 ({crash:?})",
+            );
+            let b = blocks
+                .iter()
+                .find(|b| { b.block_id } == block_id)
+                .unwrap_or_else(|| {
+                    panic!("durable set_mined must replant block {block_id:#x} ({crash:?})")
+                });
+            assert_eq!(
+                { b.block_height },
+                mined_height,
+                "replayed block height must match the journaled intent ({crash:?})",
+            );
+            assert_eq!(
+                { b.subtree_idx },
+                subtree_idx,
+                "replayed subtree index must match the journaled intent ({crash:?})",
+            );
+        } else {
+            assert!(
+                blocks.iter().all(|b| { b.block_id } != block_id),
+                "a set_mined whose intent never fsynced must NOT plant a block after \
+                 recovery ({crash:?})",
+            );
+        }
     }
 }
 
