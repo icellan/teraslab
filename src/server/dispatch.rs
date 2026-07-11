@@ -4283,13 +4283,13 @@ pub fn drop_replica_connection(addr: SocketAddr) {
 /// so concurrent sends to the SAME replica are serialized (correct: TCP
 /// is ordered) while different replicas proceed in parallel.
 fn exchange_replica_batch(
-    slot_guard: &mut PerAddrSlot,
+    connection: &mut Option<TcpReplicaTransport>,
     addr: SocketAddr,
     batch: &ReplicaBatch,
     ack_timeout: Duration,
     auth_secret: Option<&[u8]>,
 ) -> std::result::Result<ReplicaAck, String> {
-    let mut transport = match slot_guard.connection.take() {
+    let mut transport = match connection.take() {
         Some(t) if t.is_connected() && t.auth_secret_matches(auth_secret) => t,
         _ => TcpReplicaTransport::connect_with_auth(
             &addr.to_string(),
@@ -4317,7 +4317,7 @@ fn exchange_replica_batch(
 
     match transport.recv_ack(ack_timeout) {
         Ok(ack) => {
-            slot_guard.connection = Some(transport);
+            *connection = Some(transport);
             Ok(ack)
         }
         Err(e) => Err(format!("recv_ack: {e}")),
@@ -4383,14 +4383,61 @@ pub fn send_replica_ops_to(
     let slot = repl_slot_for(addr);
     // Lock only this address's slot. Other addresses are uncontended.
     let mut slot_guard = slot.lock();
+    // Disjoint field borrows: the `exchange` closure drives the pooled
+    // connection while the loop owns the stream cursor / last-acked fields.
+    let PerAddrSlot {
+        connection,
+        last_acked,
+        next_sequence,
+    } = &mut *slot_guard;
+    send_replica_ops_loop(
+        addr,
+        ops,
+        cluster_key,
+        source_node_id,
+        redo_high,
+        next_sequence,
+        last_acked,
+        |batch| exchange_replica_batch(connection, addr, batch, ack_timeout, auth_secret),
+    )
+}
 
+/// FU#6a: max resends for a `Busy` (retryable redo-backpressure) NAK, with a
+/// short backoff between tries. The total Busy wait
+/// (`MAX_BUSY_RETRIES * BUSY_RETRY_BACKOFF`) is deliberately kept WELL under the
+/// per-target ACK timeout so a genuinely stuck replica (wedged drain) still
+/// trips the caller's replication-failure path within budget instead of
+/// blocking the send indefinitely.
+const MAX_BUSY_RETRIES: usize = 4;
+const BUSY_RETRY_BACKOFF: Duration = Duration::from_millis(20);
+
+/// Core of [`send_replica_ops_to`], parameterized by the ack `exchange` so the
+/// classify / cursor / retry logic is unit-testable with a transport double.
+///
+/// `next_sequence` and `last_acked` are the slot's cursor fields, mutated in
+/// place (burned on a terminal failure, advanced on success). `exchange` sends
+/// one labeled batch and returns the decoded [`ReplicaAck`]. See
+/// [`send_replica_ops_to`] for the full behavior contract; the `Busy` arm added
+/// here re-sends the IDENTICAL batch (no burn, no relabel, no renegotiation
+/// attempt consumed) under its own bounded budget, then falls back to the
+/// `Error` behavior on exhaustion.
+#[allow(clippy::too_many_arguments)]
+fn send_replica_ops_loop(
+    addr: SocketAddr,
+    ops: &[ReplicaOp],
+    cluster_key: u64,
+    source_node_id: u64,
+    redo_high: u64,
+    next_sequence: &mut Option<u64>,
+    last_acked: &mut u64,
+    mut exchange: impl FnMut(&ReplicaBatch) -> std::result::Result<ReplicaAck, String>,
+) -> std::result::Result<(), String> {
     // Sync the stream cursor on first contact: adopt the replica's
-    // authoritative applied watermark. Initializing from any master-side
-    // persisted value instead could label NEW ops at positions the
-    // replica already covers, which the receiver would dedup-skip and
-    // ACK — silent drop. The probe makes that impossible by
-    // construction.
-    let mut next = match slot_guard.next_sequence {
+    // authoritative applied watermark via an empty-batch probe. Initializing
+    // from any master-side persisted value instead could label NEW ops at
+    // positions the replica already covers, which the receiver would dedup-skip
+    // and ACK — silent drop. The probe makes that impossible by construction.
+    let mut next = match *next_sequence {
         Some(n) => n,
         None => {
             let probe = ReplicaBatch {
@@ -4400,10 +4447,10 @@ pub fn send_replica_ops_to(
                 source_node_id: Some(source_node_id),
                 cluster_key,
             };
-            match exchange_replica_batch(&mut slot_guard, addr, &probe, ack_timeout, auth_secret)? {
+            match exchange(&probe)? {
                 ReplicaAck::Ok { through_sequence } => {
                     let n = through_sequence + 1;
-                    slot_guard.next_sequence = Some(n);
+                    *next_sequence = Some(n);
                     n
                 }
                 other => {
@@ -4413,7 +4460,13 @@ pub fn send_replica_ops_to(
         }
     };
 
-    for attempt in 0..MAX_SEQUENCE_RENEGOTIATIONS {
+    // Two independent budgets: sequence renegotiation (Gap / duplicate-skip
+    // resync) and Busy backpressure resends. Busy never consumes a
+    // renegotiation attempt (it relabels nothing), so both are bounded and the
+    // loop always terminates.
+    let mut reneg_attempts = 0usize;
+    let mut busy_retries = 0usize;
+    loop {
         let batch = ReplicaBatch {
             first_sequence: next,
             ops: ops.to_vec(),
@@ -4423,26 +4476,24 @@ pub fn send_replica_ops_to(
         };
         let last = batch.last_sequence();
 
-        let ack =
-            match exchange_replica_batch(&mut slot_guard, addr, &batch, ack_timeout, auth_secret) {
-                Ok(ack) => ack,
-                Err(e) => {
-                    // Burn the assigned positions: the frame may have been
-                    // applied with the ACK lost in flight. Reusing the
-                    // positions for different content could be dedup-skipped
-                    // by the receiver; a hole heals via Gap/relabel instead.
-                    slot_guard.next_sequence = Some(last + 1);
-                    return Err(e);
-                }
-            };
+        let ack = match exchange(&batch) {
+            Ok(ack) => ack,
+            Err(e) => {
+                // Burn the assigned positions: the frame may have been applied
+                // with the ACK lost in flight. Reusing the positions for
+                // different content could be dedup-skipped by the receiver; a
+                // hole heals via Gap/relabel instead.
+                *next_sequence = Some(last + 1);
+                return Err(e);
+            }
+        };
 
         match ack {
             ReplicaAck::Ok { through_sequence } if through_sequence == last => {
-                slot_guard.next_sequence = Some(last + 1);
-                slot_guard.last_acked = through_sequence;
-                // Persist the redo-log coverage for crash-safe catch-up
-                // and lag monitoring (real redo space, not the stream
-                // labels — see AckTracker docs).
+                *next_sequence = Some(last + 1);
+                *last_acked = through_sequence;
+                // Persist the redo-log coverage for crash-safe catch-up and lag
+                // monitoring (real redo space, not the stream labels).
                 if redo_high > 0
                     && let Some(tracker) = ACK_TRACKER.get()
                 {
@@ -4453,56 +4504,81 @@ pub fn send_replica_ops_to(
             ReplicaAck::Ok { through_sequence } => {
                 // Duplicate-skip against a watermark ahead of our cursor:
                 // nothing from THIS batch was applied. Adopt and retry.
+                reneg_attempts += 1;
+                if reneg_attempts >= MAX_SEQUENCE_RENEGOTIATIONS {
+                    return Err(format!(
+                        "replication to {addr}: sequence renegotiation did not converge after \
+                         {MAX_SEQUENCE_RENEGOTIATIONS} attempts",
+                    ));
+                }
                 tracing::warn!(
                     %addr,
-                    attempt,
+                    attempt = reneg_attempts,
                     sent_first = next,
                     sent_last = last,
                     replica_through = through_sequence,
                     "replication: cursor behind replica watermark; resyncing and relabeling",
                 );
-                slot_guard.next_sequence = Some(through_sequence + 1);
+                *next_sequence = Some(through_sequence + 1);
                 next = through_sequence + 1;
             }
             ReplicaAck::Gap {
                 expected_sequence, ..
             } => {
-                // Benign hole left by burned positions; relabel down to
-                // the replica's next-expected sequence and retry.
+                // Benign hole left by burned positions; relabel down to the
+                // replica's next-expected sequence and retry.
+                reneg_attempts += 1;
+                if reneg_attempts >= MAX_SEQUENCE_RENEGOTIATIONS {
+                    return Err(format!(
+                        "replication to {addr}: sequence renegotiation did not converge after \
+                         {MAX_SEQUENCE_RENEGOTIATIONS} attempts",
+                    ));
+                }
                 tracing::warn!(
                     %addr,
-                    attempt,
+                    attempt = reneg_attempts,
                     sent_first = next,
                     expected_sequence,
                     "replication: replica NAKed sequence gap; relabeling and re-sending",
                 );
-                slot_guard.next_sequence = Some(expected_sequence);
+                *next_sequence = Some(expected_sequence);
                 next = expected_sequence;
             }
-            ReplicaAck::Error { message, .. } => {
-                // Burn the positions — the replica may have applied a
-                // prefix before failing.
-                slot_guard.next_sequence = Some(last + 1);
-                return Err(format!("replica error: {message}"));
-            }
             ReplicaAck::Busy { first_sequence } => {
-                // FU#6a: retryable redo-backpressure NAK. Nothing was applied
-                // or journaled and the replica's watermark is unchanged, so the
+                // FU#6a: retryable redo-backpressure NAK. Nothing was applied or
+                // journaled and the replica's watermark is unchanged, so the
                 // IDENTICAL labeled batch is correct to resend — do NOT burn or
-                // relabel. The full bounded-retry-with-backoff handling lives in
-                // the refactored send loop below; this fallback (treat an
-                // unexpected Busy as a terminal error, burning the positions)
-                // matches the Busy-exhaustion behavior.
-                slot_guard.next_sequence = Some(last + 1);
-                return Err(format!("replica redo busy at seq {first_sequence}"));
+                // relabel, and do NOT consume a renegotiation attempt. Resend
+                // the SAME batch under a bounded budget with a short backoff.
+                if busy_retries >= MAX_BUSY_RETRIES {
+                    // Exhaustion: the replica's redo is genuinely stuck (drain
+                    // wedged). Fall back to the Error behavior — burn the
+                    // positions and fail so the caller's replication-failure
+                    // path fires.
+                    *next_sequence = Some(last + 1);
+                    return Err(format!(
+                        "replica redo busy: still full after {MAX_BUSY_RETRIES} retries \
+                         (first_sequence {first_sequence})",
+                    ));
+                }
+                busy_retries += 1;
+                tracing::warn!(
+                    %addr,
+                    busy_retries,
+                    first_sequence,
+                    "replication: replica NAKed redo-busy (backpressure); backing off and re-sending",
+                );
+                std::thread::sleep(BUSY_RETRY_BACKOFF);
+                // `next` unchanged — the resend carries the identical label.
+            }
+            ReplicaAck::Error { message, .. } => {
+                // Burn the positions — the replica may have applied a prefix
+                // before failing.
+                *next_sequence = Some(last + 1);
+                return Err(format!("replica error: {message}"));
             }
         }
     }
-
-    Err(format!(
-        "replication to {addr}: sequence renegotiation did not converge after \
-         {MAX_SEQUENCE_RENEGOTIATIONS} attempts",
-    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -10881,6 +10957,123 @@ mod tests {
         let index = Index::new(10000).unwrap();
         let locks = StripedLocks::new(1024);
         Engine::new(dev, index, alloc, locks, DahIndex::new())
+    }
+
+    /// FU#6a: a `Busy` NAK must be RESENT — identically labeled, with NO burn,
+    /// NO relabel, and NO renegotiation attempt consumed — under its own bounded
+    /// budget. A transport double that NAKs `Busy` once then ACKs `Ok` proves
+    /// the resend succeeds and the cursor advances exactly as a first-try `Ok`.
+    #[test]
+    fn send_replica_ops_to_retries_on_busy_then_succeeds() {
+        let addr: SocketAddr = "127.0.0.1:9001".parse().unwrap();
+        let ops = vec![ReplicaOp::Spend {
+            tx_key: crate::index::TxKey { txid: [7u8; 32] },
+            offset: 0,
+            spending_data: [0u8; 36],
+            current_block_height: 0,
+            block_height_retention: 0,
+            master_generation: 0,
+        }];
+        // Cursor already synced (Some) so no probe is sent.
+        let mut next_sequence = Some(5u64);
+        let mut last_acked = 0u64;
+
+        let mut calls = 0usize;
+        let mut labels: Vec<u64> = Vec::new();
+        let res = send_replica_ops_loop(
+            addr,
+            &ops,
+            0, // cluster_key
+            1, // source_node_id
+            0, // redo_high (skip the ACK_TRACKER side effect)
+            &mut next_sequence,
+            &mut last_acked,
+            |batch: &ReplicaBatch| {
+                calls += 1;
+                labels.push(batch.first_sequence);
+                if calls == 1 {
+                    Ok(ReplicaAck::Busy {
+                        first_sequence: batch.first_sequence,
+                    })
+                } else {
+                    Ok(ReplicaAck::Ok {
+                        through_sequence: batch.last_sequence(),
+                    })
+                }
+            },
+        );
+
+        assert!(res.is_ok(), "Busy-then-Ok must ultimately succeed: {res:?}");
+        assert_eq!(calls, 2, "exactly one Busy resend then the successful send");
+        // No burn, no relabel: BOTH sends carried the SAME label (5).
+        assert_eq!(
+            labels,
+            vec![5, 5],
+            "Busy must resend the identical label, never relabel/burn",
+        );
+        // Success advances the cursor to last+1 (batch of 1 at label 5 -> 6).
+        assert_eq!(
+            next_sequence,
+            Some(6),
+            "success advances the cursor past the batch",
+        );
+        assert_eq!(last_acked, 5, "last_acked records the through_sequence");
+    }
+
+    /// FU#6a: an always-`Busy` replica (drain wedged) must NOT loop forever — the
+    /// Busy budget is bounded, and on exhaustion the send falls back to the
+    /// `Error` behavior: burn the positions and return `Err` so the caller's
+    /// replication-failure path fires within budget.
+    #[test]
+    fn send_replica_ops_to_busy_exhaustion_burns_and_fails() {
+        let addr: SocketAddr = "127.0.0.1:9002".parse().unwrap();
+        let ops = vec![ReplicaOp::Spend {
+            tx_key: crate::index::TxKey { txid: [8u8; 32] },
+            offset: 0,
+            spending_data: [0u8; 36],
+            current_block_height: 0,
+            block_height_retention: 0,
+            master_generation: 0,
+        }];
+        let mut next_sequence = Some(5u64);
+        let mut last_acked = 0u64;
+
+        let mut calls = 0usize;
+        let res = send_replica_ops_loop(
+            addr,
+            &ops,
+            0,
+            1,
+            0,
+            &mut next_sequence,
+            &mut last_acked,
+            |batch: &ReplicaBatch| {
+                calls += 1;
+                Ok(ReplicaAck::Busy {
+                    first_sequence: batch.first_sequence,
+                })
+            },
+        );
+
+        let err = res.expect_err("an always-Busy replica must fail, not loop forever");
+        assert!(
+            err.contains("busy"),
+            "the exhaustion error must name the redo-busy cause, got: {err}",
+        );
+        // Bounded: the initial send plus MAX_BUSY_RETRIES resends, then it fails.
+        assert_eq!(
+            calls,
+            MAX_BUSY_RETRIES + 1,
+            "Busy resends are bounded by the budget",
+        );
+        // Positions burned: the cursor advanced past the batch (last=5 -> 6),
+        // exactly as the Error arm burns, so the position is never reused.
+        assert_eq!(
+            next_sequence,
+            Some(6),
+            "Busy exhaustion burns the batch's positions",
+        );
+        assert_eq!(last_acked, 0, "a failed send never records a through_sequence");
     }
 
     #[test]
