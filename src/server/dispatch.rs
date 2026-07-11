@@ -9287,6 +9287,37 @@ fn handle_get_batch(
 // Pruner operations
 // ---------------------------------------------------------------------------
 
+/// Maximum number of 32-byte txids a single diagnostic-query response
+/// (`OP_QUERY_OLD_UNMINED` / `OP_QUERY_CONFLICTING`) may carry.
+///
+/// Chosen so the encoded [`ResponseFrame`] never exceeds [`MAX_FRAME_SIZE`]:
+/// `9` bytes of frame overhead (`request_id` + `status`) + the `4`-byte count
+/// prefix + `32 * N` txids + the `1`-byte truncated trailer. Past this bound
+/// the server returns a truncated prefix with the trailer flag set rather than
+/// emitting an oversized frame that every conforming reader rejects — these
+/// queries are diagnostic snapshots (pruner feeder / conflict sweep), so a
+/// capped prefix plus a "there is more" signal is strictly better than an
+/// un-decodable frame that tears down the connection.
+const MAX_QUERY_RESPONSE_TXIDS: usize = (MAX_FRAME_SIZE as usize - 9 - 4 - 1) / 32;
+
+/// Encode a diagnostic-query txid list into a response payload:
+/// `[count:u32 LE][txid:32]*count[truncated:u8]`.
+///
+/// The trailing `truncated` byte is `1` when the result was capped at
+/// [`MAX_QUERY_RESPONSE_TXIDS`] (more matches existed than were returned) and
+/// `0` when the list is complete. Placing the flag as a trailer keeps the
+/// layout backward-reasonable: a reader that stops after `count` txids simply
+/// ignores the extra byte, while a truncation-aware reader learns to re-query.
+fn encode_query_txid_response(keys: &[TxKey], truncated: bool) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(4 + keys.len() * 32 + 1);
+    payload.extend_from_slice(&(keys.len() as u32).to_le_bytes());
+    for key in keys {
+        payload.extend_from_slice(&key.txid);
+    }
+    payload.push(u8::from(truncated));
+    payload
+}
+
 /// Return the current unmined-txid snapshot at the instant the query runs,
 /// sourced from the authoritative [`ShardedMinedIndex`](crate::index::mined_index::ShardedMinedIndex)'s
 /// height buckets (Task 16b) rather than the separate unmined secondary
@@ -9307,6 +9338,20 @@ fn handle_query_old_unmined(
     engine: &Engine,
     cluster: Option<&RunningCluster>,
 ) -> ResponseFrame {
+    handle_query_old_unmined_capped(req, engine, cluster, MAX_QUERY_RESPONSE_TXIDS)
+}
+
+/// Cap-parameterized core of [`handle_query_old_unmined`]. The public handler
+/// passes [`MAX_QUERY_RESPONSE_TXIDS`]; tests inject a small cap to exercise the
+/// truncation path without materializing 16 MiB of txids. The result is capped
+/// at `max_txids` *qualifying* keys (post master/`preserve_until` filtering);
+/// when a further qualifying candidate exists the response is flagged truncated.
+fn handle_query_old_unmined_capped(
+    req: &RequestFrame,
+    engine: &Engine,
+    cluster: Option<&RunningCluster>,
+    max_txids: usize,
+) -> ResponseFrame {
     // Payload: [cutoff_height:4]
     if req.payload.len() < 4 {
         return error_response(req.request_id, ERR_PAYLOAD_MALFORMED, "malformed query");
@@ -9315,7 +9360,8 @@ fn handle_query_old_unmined(
         return error_response(req.request_id, ERR_PAYLOAD_MALFORMED, "malformed query");
     };
     let candidates = engine.mined_index().collect_unmined_keys_below(cutoff);
-    let mut keys = Vec::with_capacity(candidates.len());
+    let mut keys = Vec::with_capacity(candidates.len().min(max_txids));
+    let mut truncated = false;
     for key in candidates {
         // F-G5-003: skip keys this node does not master. Single-node mode
         // (no cluster) keeps the prior behaviour.
@@ -9326,7 +9372,16 @@ fn handle_query_old_unmined(
             }
         }
         match engine.read_metadata(&key) {
-            Ok(meta) if { meta.preserve_until } == 0 => keys.push(key),
+            Ok(meta) if { meta.preserve_until } == 0 => {
+                // P1-15: bound the response to one frame. Stop at the cap and
+                // signal truncation so the caller knows to re-query rather than
+                // shipping a >MAX_FRAME_SIZE frame every reader rejects.
+                if keys.len() >= max_txids {
+                    truncated = true;
+                    break;
+                }
+                keys.push(key);
+            }
             Ok(_) => {}
             Err(e) => {
                 tracing::warn!(
@@ -9338,16 +9393,10 @@ fn handle_query_old_unmined(
         }
     }
 
-    let mut payload = Vec::with_capacity(4 + keys.len() * 32);
-    payload.extend_from_slice(&(keys.len() as u32).to_le_bytes());
-    for key in &keys {
-        payload.extend_from_slice(&key.txid);
-    }
-
     ResponseFrame {
         request_id: req.request_id,
         status: STATUS_OK,
-        payload,
+        payload: encode_query_txid_response(&keys, truncated),
     }
 }
 
@@ -9362,8 +9411,21 @@ fn handle_query_conflicting(
     engine: &Engine,
     cluster: Option<&RunningCluster>,
 ) -> ResponseFrame {
+    handle_query_conflicting_capped(req, engine, cluster, MAX_QUERY_RESPONSE_TXIDS)
+}
+
+/// Cap-parameterized core of [`handle_query_conflicting`]. See
+/// [`handle_query_old_unmined_capped`] for the truncation contract; the public
+/// handler passes [`MAX_QUERY_RESPONSE_TXIDS`].
+fn handle_query_conflicting_capped(
+    req: &RequestFrame,
+    engine: &Engine,
+    cluster: Option<&RunningCluster>,
+    max_txids: usize,
+) -> ResponseFrame {
     let candidates: Vec<TxKey> = engine.conflicting_index().iter().collect();
-    let mut keys = Vec::with_capacity(candidates.len());
+    let mut keys = Vec::with_capacity(candidates.len().min(max_txids));
+    let mut truncated = false;
     for key in candidates {
         // F-G5-003: skip keys this node does not master. Single-node mode
         // (no cluster) keeps the prior behaviour.
@@ -9373,13 +9435,12 @@ fn handle_query_conflicting(
                 _ => continue,
             }
         }
+        // P1-15: bound the response to one frame; flag truncation past the cap.
+        if keys.len() >= max_txids {
+            truncated = true;
+            break;
+        }
         keys.push(key);
-    }
-
-    let mut payload = Vec::with_capacity(4 + keys.len() * 32);
-    payload.extend_from_slice(&(keys.len() as u32).to_le_bytes());
-    for key in &keys {
-        payload.extend_from_slice(&key.txid);
     }
 
     if let Some(m) = DISPATCH_METRICS.get() {
@@ -9394,7 +9455,7 @@ fn handle_query_conflicting(
     ResponseFrame {
         request_id: req.request_id,
         status: STATUS_OK,
-        payload,
+        payload: encode_query_txid_response(&keys, truncated),
     }
 }
 
@@ -12080,6 +12141,177 @@ mod tests {
             count, 0,
             "preserved unmined tx must not be returned to the pruner"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // 1b'. handle_query_old_unmined / handle_query_conflicting — the response
+    // is bounded to one frame (P1-15). The wire layout gained a trailing
+    // `truncated` flag byte so a capped result is self-describing.
+    // -----------------------------------------------------------------------
+
+    /// The real per-response cap keeps the encoded frame at or below
+    /// `MAX_FRAME_SIZE`: the `9`-byte `ResponseFrame` overhead, the `4`-byte
+    /// count, `32 * cap` txids and the `1`-byte truncated trailer must all fit.
+    /// This is the invariant the pre-P1-15 handler violated (no cap at all →
+    /// >16 MiB frame past ~524k matches, rejected by every conforming reader).
+    #[test]
+    fn query_response_cap_fits_one_frame() {
+        let max_payload = 4 + MAX_QUERY_RESPONSE_TXIDS * 32 + 1;
+        let total_length = 8 + 1 + max_payload; // request_id + status + payload
+        assert!(
+            total_length <= MAX_FRAME_SIZE as usize,
+            "capped query response frame ({total_length} B) must fit MAX_FRAME_SIZE ({} B)",
+            MAX_FRAME_SIZE
+        );
+        // And it must be the LARGEST cap that still fits — one more txid overflows.
+        let over = 8 + 1 + 4 + (MAX_QUERY_RESPONSE_TXIDS + 1) * 32 + 1;
+        assert!(
+            over > MAX_FRAME_SIZE as usize,
+            "cap is not maximal: {MAX_QUERY_RESPONSE_TXIDS} txids leaves frame room to spare"
+        );
+    }
+
+    /// A non-truncated old-unmined response carries a trailing `truncated = 0`
+    /// flag byte. Pre-P1-15 the payload was exactly `4 + 32*count` with no
+    /// trailer, so this asserts the new self-describing wire layout.
+    #[test]
+    fn query_old_unmined_appends_untruncated_trailer() {
+        let h = DispatchTestHarness::new();
+        let txid_a = DispatchTestHarness::make_txid(1);
+        let txid_b = DispatchTestHarness::make_txid(2);
+        assert_eq!(h.create_tx_at_height(txid_a, 1, 100).status, STATUS_OK);
+        assert_eq!(h.create_tx_at_height(txid_b, 1, 150).status, STATUS_OK);
+
+        let resp = h.request(OP_QUERY_OLD_UNMINED, 200u32.to_le_bytes().to_vec());
+        assert_eq!(resp.status, STATUS_OK);
+        let count = u32::from_le_bytes(resp.payload[0..4].try_into().unwrap()) as usize;
+        assert_eq!(count, 2);
+        assert_eq!(
+            resp.payload.len(),
+            4 + count * 32 + 1,
+            "response must carry a 1-byte truncated trailer after the txids"
+        );
+        assert_eq!(
+            resp.payload[resp.payload.len() - 1],
+            0,
+            "complete result must flag truncated = 0"
+        );
+    }
+
+    /// With an injected small cap and more qualifying matches than the cap,
+    /// `handle_query_old_unmined_capped` returns exactly `cap` txids, flags
+    /// `truncated = 1`, keeps the frame bounded, and the returned txids are a
+    /// correct prefix of the full (uncapped) match order.
+    #[test]
+    fn query_old_unmined_truncates_and_flags_over_cap() {
+        let h = DispatchTestHarness::new();
+        // Six distinct unmined txs, all below the cutoff.
+        for n in 1..=6u8 {
+            let txid = DispatchTestHarness::make_txid(n);
+            assert_eq!(h.create_tx_at_height(txid, 1, 100).status, STATUS_OK);
+        }
+        let req = RequestFrame {
+            request_id: 1,
+            op_code: OP_QUERY_OLD_UNMINED,
+            flags: 0,
+            payload: 200u32.to_le_bytes().to_vec().into(),
+        };
+
+        // Uncapped (cap larger than the match set): full ordered result, no truncation.
+        let full = handle_query_old_unmined_capped(&req, &h.engine, None, 1000);
+        assert_eq!(full.status, STATUS_OK);
+        let full_count = u32::from_le_bytes(full.payload[0..4].try_into().unwrap()) as usize;
+        assert_eq!(full_count, 6);
+        assert_eq!(
+            full.payload[full.payload.len() - 1],
+            0,
+            "full result not truncated"
+        );
+        let full_txids: Vec<[u8; 32]> = (0..full_count)
+            .map(|i| {
+                full.payload[4 + i * 32..4 + i * 32 + 32]
+                    .try_into()
+                    .unwrap()
+            })
+            .collect();
+
+        // Capped at 3: exactly 3 txids, truncated flag set, bounded frame.
+        let cap = 3usize;
+        let capped = handle_query_old_unmined_capped(&req, &h.engine, None, cap);
+        assert_eq!(capped.status, STATUS_OK);
+        let capped_count = u32::from_le_bytes(capped.payload[0..4].try_into().unwrap()) as usize;
+        assert_eq!(capped_count, cap, "response capped at the injected limit");
+        assert_eq!(
+            capped.payload.len(),
+            4 + cap * 32 + 1,
+            "capped payload = count + cap txids + trailer"
+        );
+        assert_eq!(
+            capped.payload[capped.payload.len() - 1],
+            1,
+            "over-cap result must flag truncated = 1"
+        );
+        // Frame stays under MAX_FRAME_SIZE.
+        let frame_len = capped.encode().len() as u32;
+        assert!(
+            frame_len <= MAX_FRAME_SIZE,
+            "capped frame must fit MAX_FRAME_SIZE"
+        );
+
+        // Returned txids are a correct prefix of the full match order.
+        let capped_txids: Vec<[u8; 32]> = (0..capped_count)
+            .map(|i| {
+                capped.payload[4 + i * 32..4 + i * 32 + 32]
+                    .try_into()
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(
+            capped_txids,
+            full_txids[..cap].to_vec(),
+            "capped txids must be the leading prefix of the uncapped result"
+        );
+    }
+
+    /// The conflicting query is likewise bounded and self-describing.
+    #[test]
+    fn query_conflicting_truncates_and_flags_over_cap() {
+        let h = DispatchTestHarness::new();
+        for n in 1..=5u8 {
+            let txid = DispatchTestHarness::make_txid(n);
+            assert_eq!(h.create_tx(txid, 1).status, STATUS_OK);
+            h.engine
+                .set_conflicting(&crate::ops::remaining::SetConflictingRequest {
+                    tx_key: TxKey { txid },
+                    value: true,
+                    current_block_height: 1000,
+                    block_height_retention: 288,
+                })
+                .unwrap();
+        }
+        let req = RequestFrame {
+            request_id: 1,
+            op_code: OP_QUERY_CONFLICTING,
+            flags: 0,
+            payload: Vec::new().into(),
+        };
+
+        let full = handle_query_conflicting_capped(&req, &h.engine, None, 1000);
+        let full_count = u32::from_le_bytes(full.payload[0..4].try_into().unwrap()) as usize;
+        assert_eq!(full_count, 5);
+        assert_eq!(full.payload[full.payload.len() - 1], 0);
+
+        let cap = 2usize;
+        let capped = handle_query_conflicting_capped(&req, &h.engine, None, cap);
+        let capped_count = u32::from_le_bytes(capped.payload[0..4].try_into().unwrap()) as usize;
+        assert_eq!(capped_count, cap);
+        assert_eq!(capped.payload.len(), 4 + cap * 32 + 1);
+        assert_eq!(
+            capped.payload[capped.payload.len() - 1],
+            1,
+            "over-cap conflicting result must flag truncated = 1"
+        );
+        assert!(capped.encode().len() as u32 <= MAX_FRAME_SIZE);
     }
 
     // -----------------------------------------------------------------------
