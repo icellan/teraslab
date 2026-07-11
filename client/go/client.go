@@ -2,7 +2,9 @@ package teraslab
 
 import (
 	"context"
+	"crypto/sha256"
 	"fmt"
+	"net"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -1071,6 +1073,133 @@ func (c *Client) uploadBlob(ctx context.Context, txid TxID, data []byte) error {
 	recyclePayload(resp.Payload)
 
 	return nil
+}
+
+// StreamReadColdData reads an over-budget EXTERNAL cold-data blob (FU#4).
+//
+// A record whose EXTERNAL cold-data blob exceeds the 16 MiB single-frame wire
+// limit cannot be served whole by GetBatch — that path downgrades the offending
+// item to ErrCodeResponseTooLarge (38). On seeing code 38 for an item, re-request
+// the blob with this method, which sends OpStreamRead and reassembles the many
+// StatusStreamChunk response frames into the full payload, then verifies the
+// reassembled length and SHA-256 against the terminal StatusStreamEnd trailer.
+//
+// It opens a DEDICATED connection for the transfer so the multi-frame
+// server-push burst does not interfere with the pipelined request/response pool
+// (whose read loop delivers exactly one frame per request).
+//
+// Errors: a *ServerError (e.g. ErrCodeBlobNotFound / ErrCodeStorageIO) if the
+// blob is missing or unreadable server-side; a *RedirectError if this node is
+// not the record's master; a plain error on a malformed burst, non-contiguous
+// chunk offsets, digest mismatch, or I/O failure.
+func (c *Client) StreamReadColdData(ctx context.Context, txid TxID) ([]byte, error) {
+	addr, dialTimeout, err := c.streamReadTarget(txid)
+	if err != nil {
+		return nil, err
+	}
+	d := net.Dialer{Timeout: dialTimeout}
+	conn, err := d.DialContext(ctx, "tcp", addr)
+	if err != nil {
+		return nil, fmt.Errorf("stream-read dial %s: %w", addr, err)
+	}
+	defer conn.Close()
+	if tcp, ok := conn.(*net.TCPConn); ok {
+		_ = tcp.SetNoDelay(true)
+	}
+	return runStreamRead(ctx, conn, txid, 0)
+}
+
+// streamReadTarget resolves the address (and its dial timeout) to dial for a
+// stream read of txid: the single-node pool, or the txid's shard master pool in
+// cluster mode.
+func (c *Client) streamReadTarget(txid TxID) (string, time.Duration, error) {
+	if c.pool != nil {
+		return c.pool.addr, c.pool.config.DialTimeout, nil
+	}
+	if c.cluster != nil {
+		pool, err := c.cluster.poolForTxID(txid)
+		if err != nil {
+			return "", 0, err
+		}
+		return pool.addr, pool.config.DialTimeout, nil
+	}
+	return "", 0, fmt.Errorf("no pool available")
+}
+
+// runStreamRead drives an OpStreamRead over conn (a dedicated connection):
+// write the request, reassemble the StatusStreamChunk burst in offset order,
+// and verify the result against the terminal StatusStreamEnd trailer. offset is
+// the resume point (0 = whole blob); the full SHA-256 is only verifiable when
+// offset == 0.
+func runStreamRead(ctx context.Context, conn net.Conn, txid TxID, offset uint64) ([]byte, error) {
+	if dl, ok := ctx.Deadline(); ok {
+		_ = conn.SetDeadline(dl)
+	}
+
+	payload := encodeStreamReadRequest(nil, txid, StreamReadFieldColdData, offset)
+	f := &requestFrame{RequestID: 1, OpCode: OpStreamRead, Flags: 0, Payload: payload}
+	if _, err := writeRequest(conn, f, nil); err != nil {
+		return nil, fmt.Errorf("stream-read write: %w", err)
+	}
+
+	var data []byte
+	nextOffset := offset
+	var buf []byte
+	for {
+		resp, newBuf, err := readResponse(conn, buf)
+		buf = newBuf
+		if err != nil {
+			return nil, fmt.Errorf("stream-read read: %w", err)
+		}
+		switch resp.Status {
+		case StatusStreamChunk:
+			off, chunk, ok := decodeStreamReadChunk(resp.Payload)
+			if !ok {
+				recyclePayload(resp.Payload)
+				return nil, fmt.Errorf("malformed stream chunk")
+			}
+			if off != nextOffset {
+				recyclePayload(resp.Payload)
+				return nil, fmt.Errorf("stream chunk offset %d != expected %d", off, nextOffset)
+			}
+			data = append(data, chunk...)
+			nextOffset += uint64(len(chunk))
+			recyclePayload(resp.Payload)
+		case StatusStreamEnd:
+			total, hash, ok := decodeStreamReadEnd(resp.Payload)
+			recyclePayload(resp.Payload)
+			if !ok {
+				return nil, fmt.Errorf("malformed stream end")
+			}
+			if total < offset {
+				return nil, fmt.Errorf("stream end total_size %d < resume offset %d", total, offset)
+			}
+			if expected := total - offset; uint64(len(data)) != expected {
+				return nil, fmt.Errorf("stream reassembled %d bytes, trailer expects %d", len(data), expected)
+			}
+			if offset == 0 {
+				if got := sha256.Sum256(data); got != hash {
+					return nil, fmt.Errorf("stream content-hash mismatch after reassembly")
+				}
+			}
+			return data, nil
+		case StatusError:
+			code, msg, decErr := decodeErrorPayload(resp.Payload)
+			recyclePayload(resp.Payload)
+			if decErr != nil {
+				return nil, fmt.Errorf("stream error: undecodable payload")
+			}
+			return nil, &ServerError{Code: code, Message: msg}
+		case StatusRedirect:
+			addr, _ := decodeRedirect(resp.Payload)
+			recyclePayload(resp.Payload)
+			return nil, &RedirectError{Addr: addr}
+		default:
+			st := resp.Status
+			recyclePayload(resp.Payload)
+			return nil, fmt.Errorf("unexpected status %d in stream-read burst", st)
+		}
+	}
 }
 
 // FreezeBatch freezes specific UTXO slots. In cluster mode it fans out by shard

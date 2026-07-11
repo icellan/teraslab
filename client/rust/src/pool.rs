@@ -114,6 +114,26 @@ impl ConnPool {
         }
     }
 
+    /// The target server address this pool dials.
+    ///
+    /// Used by the FU#4 streaming-read path, which opens a dedicated
+    /// (non-pooled) connection so a multi-frame server-push burst does not
+    /// perturb the pipelined read loop.
+    pub fn addr(&self) -> &str {
+        &self.addr
+    }
+
+    /// The dial timeout configured for this pool (used when opening the
+    /// dedicated streaming-read connection).
+    pub fn dial_timeout(&self) -> std::time::Duration {
+        self.config.dial_timeout
+    }
+
+    /// The per-request round-trip timeout configured for this pool.
+    pub fn request_timeout(&self) -> std::time::Duration {
+        self.config.request_timeout
+    }
+
     /// Get a healthy connection from the pool, creating one if needed.
     ///
     /// Uses round-robin to distribute requests across connections.

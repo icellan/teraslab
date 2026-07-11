@@ -388,6 +388,62 @@ func encodeStreamEnd(buf []byte, txid TxID, totalSize uint64) []byte {
 	return buf
 }
 
+// streamReadRequestSize is the fixed OP_STREAM_READ request payload width.
+const streamReadRequestSize = 32 + 2 + 8
+
+// encodeStreamReadRequest encodes an OP_STREAM_READ request payload (FU#4).
+// Format: [txid:32][field:u16 LE][offset:u64 LE].
+func encodeStreamReadRequest(buf []byte, txid TxID, field uint16, offset uint64) []byte {
+	buf = append(buf, txid[:]...)
+	buf = appendU16(buf, field)
+	buf = appendU64(buf, offset)
+	return buf
+}
+
+// encodeStreamReadChunk encodes a STATUS_STREAM_CHUNK response payload (read
+// direction). Format: [offset:u64 LE][len:u32 LE][data]. The txid is implied by
+// the shared request_id, so — unlike encodeStreamChunk — it is omitted.
+func encodeStreamReadChunk(buf []byte, offset uint64, data []byte) []byte {
+	buf = appendU64(buf, offset)
+	buf = appendU32(buf, uint32(len(data)))
+	buf = append(buf, data...)
+	return buf
+}
+
+// decodeStreamReadChunk decodes a STATUS_STREAM_CHUNK response payload,
+// returning the absolute offset and a slice into payload holding the data.
+// The returned data slice aliases payload; copy it if it must outlive payload.
+func decodeStreamReadChunk(payload []byte) (offset uint64, data []byte, ok bool) {
+	if len(payload) < 12 {
+		return 0, nil, false
+	}
+	offset = getU64(payload[0:8])
+	dataLen := int(getU32(payload[8:12]))
+	if len(payload) < 12+dataLen {
+		return 0, nil, false
+	}
+	return offset, payload[12 : 12+dataLen], true
+}
+
+// encodeStreamReadEnd encodes a STATUS_STREAM_END response payload (read
+// direction). Format: [total_size:u64 LE][content_hash:32].
+func encodeStreamReadEnd(buf []byte, totalSize uint64, contentHash [32]byte) []byte {
+	buf = appendU64(buf, totalSize)
+	buf = append(buf, contentHash[:]...)
+	return buf
+}
+
+// decodeStreamReadEnd decodes a STATUS_STREAM_END response payload, returning
+// the total blob size and its whole-blob SHA-256 content hash.
+func decodeStreamReadEnd(payload []byte) (totalSize uint64, contentHash [32]byte, ok bool) {
+	if len(payload) != 40 {
+		return 0, [32]byte{}, false
+	}
+	totalSize = getU64(payload[0:8])
+	copy(contentHash[:], payload[8:40])
+	return totalSize, contentHash, true
+}
+
 // encodeColdData encodes a CreateItem's TxData into the cold_data wire format.
 // Format: [inputs_len:4][inputs][outputs_len:4][outputs][inpoints_len:4][inpoints]
 // Returns nil if the TxData has no content.

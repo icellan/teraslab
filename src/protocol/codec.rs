@@ -2069,6 +2069,142 @@ pub fn decode_stream_end(payload: &[u8]) -> Option<StreamEnd> {
 }
 
 // ---------------------------------------------------------------------------
+// Streaming read (OP_STREAM_READ = 202)  — FU#4
+// ---------------------------------------------------------------------------
+
+/// Field selector for [`OP_STREAM_READ`](crate::protocol::opcodes::OP_STREAM_READ):
+/// the FieldMask *bit index* naming the record field to stream.
+///
+/// Encoded as the bit index (not the raw [`FieldMask`] value) so it fits the
+/// request's `u16` field — the raw `FieldMask::COLD_DATA` value (`1 << 20`)
+/// exceeds 16 bits. This cut supports only cold data; the static assertion
+/// below pins the mapping so it can never drift from [`FieldMask::COLD_DATA`].
+///
+/// Dense `UTXO_SLOTS` streaming is deferred (torn-read hazard under concurrent
+/// spends), so a request naming any other field is rejected by the server.
+pub const STREAM_READ_FIELD_COLD_DATA: u16 = 20;
+
+// Compile-time guard: the bit-index selector must name exactly COLD_DATA.
+const _: () = assert!(1u32 << STREAM_READ_FIELD_COLD_DATA == FieldMask::COLD_DATA);
+
+/// Encoded width of an [`OP_STREAM_READ`](crate::protocol::opcodes::OP_STREAM_READ)
+/// request payload.
+pub const STREAM_READ_REQUEST_SIZE: usize = 32 + 2 + 8;
+
+/// Encode an `OP_STREAM_READ` request payload.
+///
+/// Format: `[txid:32][field:u16 LE][offset:u64 LE]`. `field` is a
+/// [`FieldMask`] bit index (see [`STREAM_READ_FIELD_COLD_DATA`]); `offset` is a
+/// resume point (`0` = whole blob).
+pub fn encode_stream_read_request(txid: &[u8; 32], field: u16, offset: u64) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(STREAM_READ_REQUEST_SIZE);
+    buf.extend_from_slice(txid);
+    put_u16(&mut buf, field);
+    buf.extend_from_slice(&offset.to_le_bytes());
+    buf
+}
+
+/// Decoded `OP_STREAM_READ` request fields.
+pub struct StreamReadRequest {
+    pub txid: [u8; 32],
+    pub field: u16,
+    pub offset: u64,
+}
+
+/// Decode an `OP_STREAM_READ` request payload.
+///
+/// Returns `None` if the payload is not exactly [`STREAM_READ_REQUEST_SIZE`]
+/// bytes.
+pub fn decode_stream_read_request(payload: &[u8]) -> Option<StreamReadRequest> {
+    if payload.len() != STREAM_READ_REQUEST_SIZE {
+        return None;
+    }
+    let mut txid = [0u8; 32];
+    txid.copy_from_slice(&payload[0..32]);
+    let field = get_u16(payload, 32);
+    let offset = u64::from_le_bytes(payload[34..42].try_into().ok()?);
+    Some(StreamReadRequest {
+        txid,
+        field,
+        offset,
+    })
+}
+
+/// Encode a [`STATUS_STREAM_CHUNK`](crate::protocol::opcodes::STATUS_STREAM_CHUNK)
+/// response payload (read direction).
+///
+/// Format: `[offset:u64 LE][len:u32 LE][data]`. The txid is implied by the
+/// shared `request_id`, so — unlike the streaming-WRITE
+/// [`encode_stream_chunk`] — it is omitted.
+pub fn encode_stream_read_chunk(offset: u64, data: &[u8]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(8 + 4 + data.len());
+    buf.extend_from_slice(&offset.to_le_bytes());
+    put_u32(&mut buf, data.len() as u32);
+    buf.extend_from_slice(data);
+    buf
+}
+
+/// Decoded read-direction stream chunk fields.
+pub struct StreamReadChunk<'a> {
+    pub offset: u64,
+    pub data: &'a [u8],
+}
+
+/// Decode a [`STATUS_STREAM_CHUNK`](crate::protocol::opcodes::STATUS_STREAM_CHUNK)
+/// response payload (read direction).
+///
+/// Returns `None` if the payload is too short or the declared length exceeds
+/// the available bytes.
+pub fn decode_stream_read_chunk(payload: &[u8]) -> Option<StreamReadChunk<'_>> {
+    if payload.len() < 12 {
+        return None;
+    }
+    let offset = u64::from_le_bytes(payload[0..8].try_into().ok()?);
+    let len = get_u32(payload, 8) as usize;
+    if payload.len() < 12 + len {
+        return None;
+    }
+    Some(StreamReadChunk {
+        offset,
+        data: &payload[12..12 + len],
+    })
+}
+
+/// Encode a [`STATUS_STREAM_END`](crate::protocol::opcodes::STATUS_STREAM_END)
+/// response payload (read direction).
+///
+/// Format: `[total_size:u64 LE][content_hash:32]`.
+pub fn encode_stream_read_end(total_size: u64, content_hash: &[u8; 32]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(8 + 32);
+    buf.extend_from_slice(&total_size.to_le_bytes());
+    buf.extend_from_slice(content_hash);
+    buf
+}
+
+/// Decoded read-direction stream end fields.
+pub struct StreamReadEnd {
+    pub total_size: u64,
+    pub content_hash: [u8; 32],
+}
+
+/// Decode a [`STATUS_STREAM_END`](crate::protocol::opcodes::STATUS_STREAM_END)
+/// response payload (read direction).
+///
+/// Returns `None` if the payload is not exactly 40 bytes.
+pub fn decode_stream_read_end(payload: &[u8]) -> Option<StreamReadEnd> {
+    if payload.len() != 40 {
+        return None;
+    }
+    let total_size = u64::from_le_bytes(payload[0..8].try_into().ok()?);
+    let mut content_hash = [0u8; 32];
+    content_hash.copy_from_slice(&payload[8..40]);
+    Some(StreamReadEnd {
+        total_size,
+        content_hash,
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -4052,5 +4188,97 @@ mod tests {
         let too_big = poisoned_spend_payload(MAX_DECODE_BATCH + 1);
         let err = decode_spend_batch_checked(&too_big, MAX_DECODE_BATCH).unwrap_err();
         assert!(matches!(err, CodecError::BatchTooLarge { .. }));
+    }
+
+    // -----------------------------------------------------------------------
+    // FU#4 — streaming read (OP_STREAM_READ) codec round-trips
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn stream_read_request_round_trips() {
+        let txid = [0x7Au8; 32];
+        let buf = encode_stream_read_request(&txid, STREAM_READ_FIELD_COLD_DATA, 4096);
+        assert_eq!(buf.len(), STREAM_READ_REQUEST_SIZE);
+        let decoded = decode_stream_read_request(&buf).expect("well-formed request decodes");
+        assert_eq!(decoded.txid, txid);
+        assert_eq!(decoded.field, STREAM_READ_FIELD_COLD_DATA);
+        assert_eq!(decoded.offset, 4096);
+    }
+
+    #[test]
+    fn stream_read_request_rejects_wrong_length() {
+        let txid = [1u8; 32];
+        let mut buf = encode_stream_read_request(&txid, STREAM_READ_FIELD_COLD_DATA, 0);
+        buf.push(0); // one byte too many
+        assert!(decode_stream_read_request(&buf).is_none());
+        buf.truncate(STREAM_READ_REQUEST_SIZE - 2);
+        assert!(decode_stream_read_request(&buf).is_none());
+    }
+
+    #[test]
+    fn stream_read_chunk_payload_round_trips() {
+        let data: Vec<u8> = (0..300u32).map(|i| (i % 251) as u8).collect();
+        let buf = encode_stream_read_chunk(1 << 20, &data);
+        // [offset:8][len:4][data]
+        assert_eq!(buf.len(), 8 + 4 + data.len());
+        let decoded = decode_stream_read_chunk(&buf).expect("chunk decodes");
+        assert_eq!(decoded.offset, 1 << 20);
+        assert_eq!(decoded.data, &data[..]);
+    }
+
+    #[test]
+    fn stream_read_chunk_rejects_truncated_data() {
+        let data = vec![0xEE; 64];
+        let mut buf = encode_stream_read_chunk(0, &data);
+        buf.truncate(buf.len() - 1); // drop the last data byte; len says 64
+        assert!(decode_stream_read_chunk(&buf).is_none());
+        // A payload shorter than the fixed header is rejected too.
+        assert!(decode_stream_read_chunk(&[0u8; 11]).is_none());
+    }
+
+    #[test]
+    fn stream_read_end_payload_round_trips() {
+        let hash = [0x5Cu8; 32];
+        let buf = encode_stream_read_end(1_048_577, &hash);
+        assert_eq!(buf.len(), 40);
+        let decoded = decode_stream_read_end(&buf).expect("end decodes");
+        assert_eq!(decoded.total_size, 1_048_577);
+        assert_eq!(decoded.content_hash, hash);
+    }
+
+    #[test]
+    fn stream_read_end_rejects_wrong_length() {
+        let hash = [0u8; 32];
+        let mut buf = encode_stream_read_end(0, &hash);
+        buf.pop();
+        assert!(decode_stream_read_end(&buf).is_none());
+    }
+
+    #[test]
+    fn stream_read_statuses_are_distinct_from_existing_statuses() {
+        // The new streaming-read statuses must not collide with any status a
+        // one-response-per-request client already understands (0..=5).
+        let existing = [
+            STATUS_OK,
+            STATUS_ERROR,
+            STATUS_NOT_FOUND,
+            STATUS_REDIRECT,
+            STATUS_PARTIAL_ERROR,
+            STATUS_DEGRADED_DURABILITY,
+        ];
+        assert!(!existing.contains(&STATUS_STREAM_CHUNK));
+        assert!(!existing.contains(&STATUS_STREAM_END));
+        assert_ne!(STATUS_STREAM_CHUNK, STATUS_STREAM_END);
+        assert_eq!(STATUS_STREAM_CHUNK, 6);
+        assert_eq!(STATUS_STREAM_END, 7);
+    }
+
+    #[test]
+    fn stream_read_field_selector_names_cold_data_not_slots() {
+        // The bit-index selector must resolve to COLD_DATA and never to the
+        // deferred UTXO_SLOTS field.
+        assert_eq!(1u32 << STREAM_READ_FIELD_COLD_DATA, FieldMask::COLD_DATA);
+        assert_ne!(1u32 << STREAM_READ_FIELD_COLD_DATA, FieldMask::UTXO_SLOTS);
+        assert_eq!(OP_STREAM_READ, 202);
     }
 }

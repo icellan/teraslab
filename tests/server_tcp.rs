@@ -3066,6 +3066,256 @@ fn backend_create_spend_unspend(mode: &IndexBackendMode) {
     guard.server.shutdown();
 }
 
+// ---------------------------------------------------------------------------
+// FU#4 — streaming read (OP_STREAM_READ) end-to-end over TCP
+// ---------------------------------------------------------------------------
+
+/// Start a server whose blob store is wired to BOTH the engine (so GET's
+/// `read_cold_data` resolves EXTERNAL blobs) and the server dispatch (so
+/// CREATE + OP_STREAM_READ resolve them). Returns the shared blob-store handle
+/// so a test can pre-seed a payload directly.
+fn start_test_server_with_engine_blob_store() -> (Arc<Server>, u16, Arc<dyn BlobStore>) {
+    let dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+    let alloc = SlotAllocator::new(dev.clone()).unwrap();
+    let index = Index::new(10_000).unwrap();
+    let store: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
+    let mut engine = Engine::new(dev, index, alloc, StripedLocks::new(1024), DahIndex::new());
+    engine.set_blob_store(store.clone());
+    let engine = Arc::new(engine);
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+
+    let config = ServerConfig {
+        listen_addr: format!("127.0.0.1:{port}"),
+        max_connections: 10,
+        max_batch_size: 8192,
+        ..Default::default()
+    };
+    let server = Arc::new(Server::new(engine, config).with_blob_store(store.clone()));
+    let server_clone = server.clone();
+    std::thread::spawn(move || {
+        server_clone.run().unwrap();
+    });
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    (server, port, store)
+}
+
+/// Create an EXTERNAL record over TCP referencing a pre-uploaded blob keyed by
+/// `txid`. The blob must already exist in the server's store.
+fn create_external_record(stream: &mut TcpStream, txid: [u8; 32], req_id: u64) -> ResponseFrame {
+    let item = WireCreateItem {
+        txid,
+        tx_version: 2,
+        locktime: 0,
+        fee: 1000,
+        size_in_bytes: 250,
+        extended_size: 0,
+        is_coinbase: false,
+        spending_height: 0,
+        created_at: 1_700_000_000_000,
+        flags: FLAG_EXTERNAL_BLOB,
+        utxo_hashes: vec![[0xAB; 32]],
+        cold_data: vec![],
+        block_height: 0,
+        mined_block_id: None,
+        mined_block_height: None,
+        mined_subtree_idx: None,
+        parent_txids: vec![],
+    };
+    create_records(stream, &[item], req_id)
+}
+
+/// Send OP_STREAM_READ and read the multi-frame burst, reassembling the chunk
+/// payloads and returning `(data, total_size, content_hash)` from the terminal
+/// STATUS_STREAM_END frame. Panics on a malformed burst, a non-terminal error
+/// status, or a missing END.
+fn stream_read_over_tcp(
+    stream: &mut TcpStream,
+    txid: [u8; 32],
+    field: u16,
+    offset: u64,
+    req_id: u64,
+) -> (Vec<u8>, u64, [u8; 32]) {
+    let payload = encode_stream_read_request(&txid, field, offset);
+    let req = RequestFrame {
+        request_id: req_id,
+        op_code: OP_STREAM_READ,
+        flags: 0,
+        payload: payload.into(),
+    };
+    stream.write_all(&req.encode()).unwrap();
+
+    let mut data = Vec::new();
+    let mut next_offset = offset;
+    loop {
+        let frame = read_response_or_panic(stream);
+        assert_eq!(
+            frame.request_id, req_id,
+            "every stream frame shares request_id"
+        );
+        match frame.status {
+            s if s == STATUS_STREAM_CHUNK => {
+                let chunk = decode_stream_read_chunk(&frame.payload).expect("chunk payload");
+                assert_eq!(
+                    chunk.offset, next_offset,
+                    "chunk offsets contiguous from resume"
+                );
+                next_offset += chunk.data.len() as u64;
+                data.extend_from_slice(chunk.data);
+            }
+            s if s == STATUS_STREAM_END => {
+                let end = decode_stream_read_end(&frame.payload).expect("end payload");
+                return (data, end.total_size, end.content_hash);
+            }
+            other => panic!("unexpected non-terminal status {other} in stream burst"),
+        }
+    }
+}
+
+/// A record whose EXTERNAL cold-data blob is > MAX_FRAME_SIZE (16 MiB) can be
+/// served across many STATUS_STREAM_CHUNK frames plus a STATUS_STREAM_END whose
+/// trailer digest matches the reassembled bytes.
+#[test]
+fn stream_read_external_blob_over_16mib_round_trips() {
+    let (server, port, store) = start_test_server_with_engine_blob_store();
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{port}")).unwrap();
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(30)))
+        .unwrap();
+
+    let txid = test_txid(9001);
+    // ~17 MiB: comfortably over the 16 MiB single-frame budget.
+    let blob: Vec<u8> = (0..(17 * 1024 * 1024 + 777))
+        .map(|i| (i % 251) as u8)
+        .collect();
+    let digest = store.put(&txid, &blob).unwrap();
+
+    let resp = create_external_record(&mut stream, txid, 1);
+    assert_eq!(resp.status, STATUS_OK, "external create must succeed");
+
+    let (data, total, hash) =
+        stream_read_over_tcp(&mut stream, txid, STREAM_READ_FIELD_COLD_DATA, 0, 2);
+    assert_eq!(data.len(), blob.len(), "reassembled length matches blob");
+    assert_eq!(
+        data, blob,
+        "reassembled bytes are byte-identical to the blob"
+    );
+    assert_eq!(total, digest.length, "END total_size matches blob length");
+    assert_eq!(hash, digest.sha256, "END content_hash matches blob digest");
+
+    server.shutdown();
+}
+
+/// Backward compat: a plain OP_GET_BATCH for the SAME > 16 MiB external record
+/// still downgrades the offending item to per-item ERR_RESPONSE_TOO_LARGE — the
+/// streaming path is strictly opt-in via the distinct opcode.
+#[test]
+fn get_batch_external_over_max_frame_still_returns_too_large() {
+    let (server, port, store) = start_test_server_with_engine_blob_store();
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{port}")).unwrap();
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(30)))
+        .unwrap();
+
+    let txid = test_txid(9002);
+    let blob: Vec<u8> = (0..(17 * 1024 * 1024 + 5))
+        .map(|i| (i % 251) as u8)
+        .collect();
+    store.put(&txid, &blob).unwrap();
+    assert_eq!(
+        create_external_record(&mut stream, txid, 1).status,
+        STATUS_OK
+    );
+
+    let resp = send_request(
+        &mut stream,
+        &RequestFrame {
+            request_id: 2,
+            op_code: OP_GET_BATCH,
+            flags: 0,
+            payload: encode_get_batch(FieldMask::COLD_DATA, &[txid]).into(),
+        },
+    );
+    assert_eq!(
+        resp.status, STATUS_OK,
+        "batch envelope is OK; item downgraded"
+    );
+    let results = decode_get_response(&resp.payload).unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(
+        results[0].status, ERR_RESPONSE_TOO_LARGE as u8,
+        "over-budget external item stays code 38 on plain GET (opt-in stream only)"
+    );
+    assert!(
+        results[0].data.is_empty(),
+        "downgraded item drops its cold blob"
+    );
+
+    server.shutdown();
+}
+
+/// Mid-stream error (blob missing) is reported as a single STATUS_ERROR frame
+/// carrying ERR_BLOB_NOT_FOUND, and the connection SURVIVES — the next request
+/// on the same connection succeeds.
+#[test]
+fn stream_read_missing_blob_errors_and_connection_survives() {
+    let (server, port, store) = start_test_server_with_engine_blob_store();
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{port}")).unwrap();
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(30)))
+        .unwrap();
+
+    let txid = test_txid(9003);
+    let blob: Vec<u8> = vec![0x42; 32 * 1024];
+    store.put(&txid, &blob).unwrap();
+    assert_eq!(
+        create_external_record(&mut stream, txid, 1).status,
+        STATUS_OK
+    );
+
+    // Remove the blob out from under the record, then stream-read it.
+    store.delete(&txid).unwrap();
+
+    let req = RequestFrame {
+        request_id: 2,
+        op_code: OP_STREAM_READ,
+        flags: 0,
+        payload: encode_stream_read_request(&txid, STREAM_READ_FIELD_COLD_DATA, 0).into(),
+    };
+    stream.write_all(&req.encode()).unwrap();
+    let frame = read_response_or_panic(&mut stream);
+    assert_eq!(frame.request_id, 2);
+    assert_eq!(
+        frame.status, STATUS_ERROR,
+        "missing blob → single terminal STATUS_ERROR frame"
+    );
+    let (code, _msg) = decode_error_payload(&frame.payload).unwrap();
+    assert_eq!(
+        code, ERR_BLOB_NOT_FOUND,
+        "missing external blob → ERR_BLOB_NOT_FOUND"
+    );
+
+    // The connection survived: a follow-up request works.
+    let ping = send_request(
+        &mut stream,
+        &RequestFrame {
+            request_id: 3,
+            op_code: OP_PING,
+            flags: 0,
+            payload: vec![].into(),
+        },
+    );
+    assert_eq!(ping.request_id, 3);
+    assert_eq!(
+        ping.status, STATUS_OK,
+        "connection survives a mid-stream error"
+    );
+
+    server.shutdown();
+}
+
 /// Generate, for each index backend, a `#[test]` per shared body so the core
 /// TCP wire paths run on Memory, redb, and file-backed servers.
 macro_rules! backend_matrix {

@@ -62,7 +62,18 @@ const ProtocolVersion uint16 = 3
 const (
 	OpStreamChunk uint16 = 200
 	OpStreamEnd   uint16 = 201
+	// OpStreamRead (FU#4) opt-in streaming READ of an over-budget EXTERNAL
+	// cold-data blob. Request payload: [txid:32][field:u16 LE][offset:u64 LE].
+	// Response: many StatusStreamChunk frames + one StatusStreamEnd, all sharing
+	// the request_id. Mirrors src/protocol/opcodes.rs OP_STREAM_READ.
+	OpStreamRead uint16 = 202
 )
+
+// StreamReadFieldColdData is the OpStreamRead field selector for EXTERNAL cold
+// data: the FieldMask bit index (fits the request's u16; the raw FieldColdData
+// value 1<<20 does not). Dense UTXO_SLOTS streaming is deferred, so it is the
+// only value this cut accepts. Mirrors codec::STREAM_READ_FIELD_COLD_DATA.
+const StreamReadFieldColdData uint16 = 20
 
 // Blob upload thresholds.
 const (
@@ -87,6 +98,12 @@ const (
 	// fully met). The data is committed locally; callers should treat it as a
 	// successful-but-weak ack, not an error.
 	StatusDegradedDurability uint8 = 5
+	// StatusStreamChunk (FU#4) is one of many chunk frames for an in-flight
+	// OpStreamRead. Payload: [offset:u64 LE][len:u32 LE][data].
+	StatusStreamChunk uint8 = 6
+	// StatusStreamEnd (FU#4) is the terminal frame of an OpStreamRead stream.
+	// Payload: [total_size:u64 LE][content_hash:32].
+	StatusStreamEnd uint8 = 7
 )
 
 // PartialDurabilityDegraded is the reserved trailer byte appended after the

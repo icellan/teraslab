@@ -10398,6 +10398,346 @@ fn handle_stream_end(
 }
 
 // ---------------------------------------------------------------------------
+// Streaming read (OP_STREAM_READ = 202) — FU#4
+// ---------------------------------------------------------------------------
+
+/// Target size for a single [`STATUS_STREAM_CHUNK`] frame's data section.
+///
+/// [`BlobStore::stream_to`] hands the adapter fixed-size (64 KiB) slabs; the
+/// framer coalesces them up to this target before emitting a frame, trading a
+/// handful of larger frames for fewer socket writes while staying two orders of
+/// magnitude below [`MAX_FRAME_SIZE`] (so a frame's length prefix can never
+/// wrap and desync the reader).
+const STREAM_READ_CHUNK_TARGET: usize = 256 * 1024;
+
+/// Handle an `OP_STREAM_READ`: server-push an over-budget EXTERNAL cold-data
+/// blob to the client across many [`STATUS_STREAM_CHUNK`] frames followed by a
+/// terminal [`STATUS_STREAM_END`] frame, all sharing the request's
+/// `request_id`.
+///
+/// Unlike [`handle_request`], this writes frames DIRECTLY to `out` (the
+/// connection's socket writer) because a single [`ResponseFrame`] return value
+/// cannot express a multi-frame burst. The connection loop runs it inline on
+/// the serial path (excluded from pipelining) so the whole burst lands without
+/// another response interleaving on the socket.
+///
+/// # Errors
+///
+/// Returns `Err` ONLY when writing to the socket fails (the connection is dead
+/// — the caller drops it). Every *protocol* failure (remote shard, unsupported
+/// field, missing/corrupt blob) is emitted as a single terminal
+/// [`STATUS_REDIRECT`] / [`STATUS_ERROR`] frame and returns `Ok(())` — the
+/// connection survives and the next request on it works.
+pub(crate) fn handle_stream_read(
+    request: &RequestFrame,
+    engine: &Engine,
+    out: &mut dyn std::io::Write,
+    blob_store: Option<&dyn BlobStore>,
+    cluster: Option<&RunningCluster>,
+) -> std::io::Result<()> {
+    let request_id = request.request_id;
+
+    let req = match decode_stream_read_request(&request.payload) {
+        Some(r) => r,
+        None => {
+            return write_frame(
+                out,
+                error_response(
+                    request_id,
+                    ERR_PAYLOAD_MALFORMED,
+                    "malformed stream-read request",
+                ),
+            );
+        }
+    };
+
+    // Cluster: if this node is not the master for the record's shard, return
+    // the normal redirect (same as GET) as a single response — do NOT stream.
+    if let Some(err) = check_shard_ownership(&req.txid, 0, cluster, false) {
+        let frame = if err.error_code == ERR_REDIRECT {
+            ResponseFrame {
+                request_id,
+                status: STATUS_REDIRECT,
+                payload: err.error_data,
+            }
+        } else {
+            error_response(request_id, err.error_code, "shard not owned")
+        };
+        return write_frame(out, frame);
+    }
+
+    // Field selector. This cut streams only EXTERNAL COLD_DATA. Dense
+    // UTXO_SLOTS is a torn-read hazard under concurrent spends and is DEFERRED:
+    // fall back to ERR_RESPONSE_TOO_LARGE (the same code plain GET emits) so the
+    // client learns the field is still not streamable.
+    if req.field != STREAM_READ_FIELD_COLD_DATA {
+        let (code, msg): (u16, &str) = if req.field == FieldMask::UTXO_SLOTS.trailing_zeros() as u16
+        {
+            (
+                ERR_RESPONSE_TOO_LARGE,
+                "UTXO_SLOTS streaming is not supported (deferred)",
+            )
+        } else {
+            (ERR_PAYLOAD_MALFORMED, "unsupported stream-read field")
+        };
+        return write_frame(out, error_response(request_id, code, msg));
+    }
+
+    let key = TxKey { txid: req.txid };
+
+    // Resolve the record and confirm it carries an EXTERNAL blob. A record with
+    // inline cold data (capped at 4 MiB) is always serveable whole via GET, so
+    // it is never streamed; a non-existent record has no blob either.
+    let external = match engine.lookup(&key) {
+        Some(_) => match engine.read_metadata(&key) {
+            Ok(m) => m.flags.contains(crate::record::TxFlags::EXTERNAL),
+            Err(SpendError::TxNotFound) => false,
+            Err(e) => {
+                return write_frame(
+                    out,
+                    error_response(
+                        request_id,
+                        ERR_STORAGE_IO,
+                        &format!("stream-read metadata read failed: {e}"),
+                    ),
+                );
+            }
+        },
+        None => {
+            return write_frame(
+                out,
+                error_response(request_id, ERR_TX_NOT_FOUND, "no such record"),
+            );
+        }
+    };
+    if !external {
+        return write_frame(
+            out,
+            error_response(
+                request_id,
+                ERR_BLOB_NOT_FOUND,
+                "record has no external cold-data blob to stream",
+            ),
+        );
+    }
+
+    let blob_store = match blob_store {
+        Some(bs) => bs,
+        None => {
+            return write_frame(
+                out,
+                error_response(request_id, ERR_INTERNAL, "blobstore not configured"),
+            );
+        }
+    };
+
+    stream_blob_to(request_id, &req.txid, req.offset, blob_store, out)
+}
+
+/// Stream the EXTERNAL blob keyed by `txid` to `out` as a burst of
+/// [`STATUS_STREAM_CHUNK`] frames plus a terminal [`STATUS_STREAM_END`].
+///
+/// Memory-bounded by construction: it fetches the digest sidecar once (for the
+/// END trailer + an early "not found" check) and then relies on
+/// [`BlobStore::stream_to`], a single-hash-pass primitive that verifies the
+/// whole payload before emitting a byte and never retains the blob in memory.
+/// It deliberately does NOT loop over [`BlobStore::get_range`] / [`BlobStore::get`],
+/// which re-read and re-digest the ENTIRE payload on every call (O(N²) I/O for
+/// a chunked read).
+///
+/// `offset` is a resume point: bytes before it are hashed (integrity is still
+/// verified over the whole blob) but not re-sent; chunk frames begin at
+/// `offset` and carry absolute offsets so the client can splice them onto a
+/// prefix it already holds.
+///
+/// # Errors
+///
+/// Returns `Err` only on a socket-write failure. A missing / corrupt blob is
+/// emitted as a single terminal [`STATUS_ERROR`] frame (returning `Ok`) —
+/// [`BlobStore::stream_to`] verifies the full digest BEFORE emitting any chunk,
+/// so such failures never leave a half-streamed frame on the wire.
+pub(crate) fn stream_blob_to(
+    request_id: u64,
+    txid: &[u8; 32],
+    offset: u64,
+    blob_store: &dyn BlobStore,
+    out: &mut dyn std::io::Write,
+) -> std::io::Result<()> {
+    // Digest sidecar → END trailer (total_size + content_hash) and an early
+    // not-found signal, without reading the payload.
+    let digest = match blob_store.digest(txid) {
+        Ok(Some(d)) => d,
+        Ok(None) => {
+            return write_frame(
+                out,
+                error_response(request_id, ERR_BLOB_NOT_FOUND, "external blob not found"),
+            );
+        }
+        Err(e) => {
+            return write_frame(
+                out,
+                error_response(
+                    request_id,
+                    ERR_STORAGE_IO,
+                    &format!("blob digest read: {e}"),
+                ),
+            );
+        }
+    };
+
+    let mut framer = ChunkFramer::new(request_id, offset, out);
+    let stream_result = blob_store.stream_to(txid, &mut framer);
+    // Surface a socket-write failure that happened *inside* the framer before
+    // interpreting the blob-level result: on a dead socket we must drop the
+    // connection, not try to emit another frame.
+    if let Some(err) = framer.take_socket_error() {
+        return Err(err);
+    }
+    match stream_result {
+        Ok(streamed) => {
+            debug_assert_eq!(streamed, digest.length);
+            // Flush any bytes still buffered below the frame target.
+            framer.flush_final()?;
+            if let Some(err) = framer.take_socket_error() {
+                return Err(err);
+            }
+            write_frame(
+                out,
+                ResponseFrame {
+                    request_id,
+                    status: STATUS_STREAM_END,
+                    payload: encode_stream_read_end(digest.length, &digest.sha256),
+                },
+            )
+        }
+        // A blob-read/verify failure. stream_to hashes the whole payload before
+        // emitting any chunk, so (absent a rare pass-2 device fault) no chunk
+        // frame has been written; terminate the stream with a single error
+        // frame. The connection survives.
+        Err(e) => {
+            let code = match e {
+                crate::storage::blobstore::BlobError::NotFound { .. } => ERR_BLOB_NOT_FOUND,
+                _ => ERR_STORAGE_IO,
+            };
+            write_frame(
+                out,
+                error_response(request_id, code, &format!("stream blob: {e}")),
+            )
+        }
+    }
+}
+
+/// A [`std::io::Write`] adapter that coalesces the fixed-size slabs
+/// [`BlobStore::stream_to`] writes into [`STATUS_STREAM_CHUNK`] response frames
+/// (up to [`STREAM_READ_CHUNK_TARGET`] data bytes each) and writes them to the
+/// socket. It also honours a resume `skip` offset by dropping bytes below it
+/// while still advancing the absolute position (so integrity hashing over the
+/// whole payload — done in `stream_to`'s pass 1 — is unaffected).
+///
+/// Socket-write failures are recorded (not silently swallowed) so the caller
+/// can distinguish a dead connection from a blob-read fault: the failure is
+/// returned as an `io::Error` from `write` (which `stream_to` surfaces) AND
+/// stashed in `socket_error` for the caller to re-check.
+struct ChunkFramer<'a> {
+    request_id: u64,
+    /// Resume offset: bytes with absolute position `< skip` are not emitted.
+    skip: u64,
+    /// Absolute offset of the next incoming byte (advances across all writes,
+    /// including skipped bytes).
+    abs_pos: u64,
+    /// Absolute offset of `buf[0]` (== the offset stamped on the next frame).
+    buf_start: u64,
+    /// Post-skip bytes not yet emitted as a frame.
+    buf: Vec<u8>,
+    out: &'a mut dyn std::io::Write,
+    socket_error: Option<std::io::Error>,
+}
+
+impl<'a> ChunkFramer<'a> {
+    fn new(request_id: u64, skip: u64, out: &'a mut dyn std::io::Write) -> Self {
+        Self {
+            request_id,
+            skip,
+            abs_pos: 0,
+            buf_start: skip,
+            buf: Vec::with_capacity(STREAM_READ_CHUNK_TARGET),
+            out,
+            socket_error: None,
+        }
+    }
+
+    fn take_socket_error(&mut self) -> Option<std::io::Error> {
+        self.socket_error.take()
+    }
+
+    /// Emit one frame carrying the first `len` buffered bytes.
+    fn emit(&mut self, len: usize) -> std::io::Result<()> {
+        let frame = ResponseFrame {
+            request_id: self.request_id,
+            status: STATUS_STREAM_CHUNK,
+            payload: encode_stream_read_chunk(self.buf_start, &self.buf[..len]),
+        };
+        match write_frame(self.out, frame) {
+            Ok(()) => {
+                self.buf.drain(..len);
+                self.buf_start += len as u64;
+                Ok(())
+            }
+            Err(e) => {
+                let kind = e.kind();
+                self.socket_error = Some(e);
+                Err(std::io::Error::from(kind))
+            }
+        }
+    }
+
+    /// Flush any remaining buffered bytes as a final (possibly under-target)
+    /// chunk frame. Called after `stream_to` returns Ok.
+    fn flush_final(&mut self) -> std::io::Result<()> {
+        if !self.buf.is_empty() {
+            let len = self.buf.len();
+            self.emit(len)?;
+        }
+        Ok(())
+    }
+}
+
+impl std::io::Write for ChunkFramer<'_> {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        let n = data.len();
+        let mut data = data;
+        // Drop the prefix below the resume offset (advancing abs_pos).
+        if self.abs_pos < self.skip {
+            let drop = ((self.skip - self.abs_pos) as usize).min(data.len());
+            self.abs_pos += drop as u64;
+            data = &data[drop..];
+        }
+        if !data.is_empty() {
+            if self.buf.is_empty() {
+                self.buf_start = self.abs_pos;
+            }
+            self.buf.extend_from_slice(data);
+            self.abs_pos += data.len() as u64;
+            while self.buf.len() >= STREAM_READ_CHUNK_TARGET {
+                self.emit(STREAM_READ_CHUNK_TARGET)?;
+            }
+        }
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.out.flush()
+    }
+}
+
+/// Encode a single response frame and write it to `out`. Uses
+/// [`ResponseFrame::encode`], which never emits a wrapped length prefix; the
+/// small control frames and the bounded chunk frames here are always in budget.
+fn write_frame(out: &mut dyn std::io::Write, frame: ResponseFrame) -> std::io::Result<()> {
+    out.write_all(&frame.encode())
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
@@ -14888,6 +15228,151 @@ mod tests {
             blob_digest.length
         );
         assert_ne!(&data[1..33], &txid);
+    }
+
+    /// FU#4 memory-bound guard: a chunked stream-read MUST use the
+    /// single-hash-pass `stream_to` primitive, NOT N `get`/`get_range` calls
+    /// (each of which re-reads and re-digests the ENTIRE payload — O(N²) I/O).
+    #[test]
+    fn stream_read_uses_stream_to_not_get_range() {
+        use crate::storage::blobstore::{
+            BlobDigest, BlobError, BlobStore, BlobStreamWriter, MemoryBlobStore,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        /// BlobStore double that counts which read primitive the handler uses,
+        /// delegating the actual work to an inner in-memory store.
+        struct SpyBlobStore {
+            inner: MemoryBlobStore,
+            stream_to_calls: AtomicUsize,
+            get_calls: AtomicUsize,
+            get_range_calls: AtomicUsize,
+            digest_calls: AtomicUsize,
+        }
+        impl SpyBlobStore {
+            fn new() -> Self {
+                Self {
+                    inner: MemoryBlobStore::new(),
+                    stream_to_calls: AtomicUsize::new(0),
+                    get_calls: AtomicUsize::new(0),
+                    get_range_calls: AtomicUsize::new(0),
+                    digest_calls: AtomicUsize::new(0),
+                }
+            }
+        }
+        type BlobResult<T> = std::result::Result<T, BlobError>;
+        impl BlobStore for SpyBlobStore {
+            fn put(&self, key: &[u8; 32], data: &[u8]) -> BlobResult<BlobDigest> {
+                self.inner.put(key, data)
+            }
+            fn get(&self, key: &[u8; 32]) -> BlobResult<Option<Vec<u8>>> {
+                self.get_calls.fetch_add(1, Ordering::Relaxed);
+                self.inner.get(key)
+            }
+            fn get_range(
+                &self,
+                key: &[u8; 32],
+                offset: u64,
+                length: u64,
+            ) -> BlobResult<Option<Vec<u8>>> {
+                self.get_range_calls.fetch_add(1, Ordering::Relaxed);
+                self.inner.get_range(key, offset, length)
+            }
+            fn delete(&self, key: &[u8; 32]) -> BlobResult<()> {
+                self.inner.delete(key)
+            }
+            fn exists(&self, key: &[u8; 32]) -> BlobResult<bool> {
+                self.inner.exists(key)
+            }
+            fn digest(&self, key: &[u8; 32]) -> BlobResult<Option<BlobDigest>> {
+                self.digest_calls.fetch_add(1, Ordering::Relaxed);
+                self.inner.digest(key)
+            }
+            fn stream_to(
+                &self,
+                key: &[u8; 32],
+                writer: &mut dyn std::io::Write,
+            ) -> BlobResult<u64> {
+                self.stream_to_calls.fetch_add(1, Ordering::Relaxed);
+                self.inner.stream_to(key, writer)
+            }
+            fn begin_stream(&self, key: &[u8; 32]) -> BlobResult<Box<dyn BlobStreamWriter>> {
+                self.inner.begin_stream(key)
+            }
+            fn list(&self) -> BlobResult<Vec<[u8; 32]>> {
+                self.inner.list()
+            }
+        }
+
+        let spy = SpyBlobStore::new();
+        let txid = DispatchTestHarness::make_txid(77);
+        // A blob spanning several chunk-target frames so a get_range-per-chunk
+        // implementation would light up the get_range counter many times.
+        let blob: Vec<u8> = (0..(STREAM_READ_CHUNK_TARGET * 3 + 123))
+            .map(|i| (i % 256) as u8)
+            .collect();
+        let digest = spy.put(&txid, &blob).unwrap();
+
+        let mut out: Vec<u8> = Vec::new();
+        stream_blob_to(9, &txid, 0, &spy, &mut out).expect("stream to in-memory sink");
+
+        // The single biggest trap: exactly one hashing pass, zero re-reads.
+        assert_eq!(
+            spy.stream_to_calls.load(Ordering::Relaxed),
+            1,
+            "must use stream_to exactly once"
+        );
+        assert_eq!(
+            spy.get_range_calls.load(Ordering::Relaxed),
+            0,
+            "must NOT re-read via get_range (O(N^2) trap)"
+        );
+        assert_eq!(
+            spy.get_calls.load(Ordering::Relaxed),
+            0,
+            "must NOT re-read the whole blob via get per chunk"
+        );
+        assert_eq!(
+            spy.digest_calls.load(Ordering::Relaxed),
+            1,
+            "digest sidecar read once for the END trailer"
+        );
+
+        // And the emitted frames reassemble to the original blob with a
+        // matching END trailer.
+        let (reassembled, end) = decode_stream_frames(&out, 9);
+        assert_eq!(reassembled, blob, "reassembled bytes match the source blob");
+        assert_eq!(end.total_size, digest.length);
+        assert_eq!(end.content_hash, digest.sha256);
+    }
+
+    /// Decode a burst of framed stream-read responses (all sharing
+    /// `expect_request_id`) into (reassembled data, END trailer). Panics on any
+    /// malformed frame, wrong request_id, or missing/duplicate END.
+    fn decode_stream_frames(bytes: &[u8], expect_request_id: u64) -> (Vec<u8>, StreamReadEnd) {
+        let mut pos = 0;
+        let mut data = Vec::new();
+        let mut end: Option<StreamReadEnd> = None;
+        let mut next_offset = 0u64;
+        while pos < bytes.len() {
+            let (frame, consumed) = ResponseFrame::decode(&bytes[pos..]).expect("decode frame");
+            pos += consumed;
+            assert_eq!(frame.request_id, expect_request_id, "shared request_id");
+            assert!(end.is_none(), "no frame may follow STATUS_STREAM_END");
+            match frame.status {
+                s if s == STATUS_STREAM_CHUNK => {
+                    let chunk = decode_stream_read_chunk(&frame.payload).expect("chunk payload");
+                    assert_eq!(chunk.offset, next_offset, "chunk offsets are contiguous");
+                    next_offset += chunk.data.len() as u64;
+                    data.extend_from_slice(chunk.data);
+                }
+                s if s == STATUS_STREAM_END => {
+                    end = Some(decode_stream_read_end(&frame.payload).expect("end payload"));
+                }
+                other => panic!("unexpected status {other} in stream burst"),
+            }
+        }
+        (data, end.expect("stream must end with STATUS_STREAM_END"))
     }
 
     #[test]
