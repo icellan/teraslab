@@ -11073,7 +11073,10 @@ mod tests {
             Some(6),
             "Busy exhaustion burns the batch's positions",
         );
-        assert_eq!(last_acked, 0, "a failed send never records a through_sequence");
+        assert_eq!(
+            last_acked, 0,
+            "a failed send never records a through_sequence"
+        );
     }
 
     #[test]

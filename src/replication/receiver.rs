@@ -982,7 +982,8 @@ pub fn handle_replica_batch_with_tracker(
     // journaling is deferred to the ONE atomic admission after the loop.
     let mut redo_entries: Vec<(crate::redo::RedoOp, u8)> = Vec::new();
     for (seq, op) in (start_seq..).zip(batch.ops.iter().skip(skip_count)) {
-        if let Err(msg) = apply_op_journal_inner(engine, op, journal, is_migration, &mut redo_entries)
+        if let Err(msg) =
+            apply_op_journal_inner(engine, op, journal, is_migration, &mut redo_entries)
         {
             let ack = ReplicaAck::Error {
                 failed_sequence: seq,
@@ -6187,7 +6188,10 @@ mod tests {
         // gate is a pure no-op, so the apply reaches the admission and finds no
         // room (the historical "LogFull → poison" trigger).
         let prefill_count = fill_redo_log_to_full(&log);
-        assert!(prefill_count > 0, "the pre-fill must write at least one entry");
+        assert!(
+            prefill_count > 0,
+            "the pre-fill must write at least one entry"
+        );
 
         let batch = busy_create_batch(10, 3);
         let tracker = ReplicaAppliedTracker::in_memory();

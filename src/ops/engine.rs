@@ -137,7 +137,9 @@ pub enum ReplicaRedoAdmitError {
     /// Retryable transient backpressure — buffer NOTHING, poison NOTHING.
     /// `first_sequence` echoes the offending batch's first sequence for the
     /// receiver's `ReplicaAck::Busy` (logging only).
-    #[error("replica redo admission: a touched log is momentarily full (retryable), first_sequence {first_sequence}")]
+    #[error(
+        "replica redo admission: a touched log is momentarily full (retryable), first_sequence {first_sequence}"
+    )]
     LogFull {
         /// The offending batch's first sequence, echoed for logging.
         first_sequence: u64,
@@ -22168,7 +22170,10 @@ mod tests {
             .expect_err("an oversized store-1 slice must reject the whole batch");
         match err {
             crate::ops::engine::ReplicaRedoAdmitError::LogFull { first_sequence } => {
-                assert_eq!(first_sequence, 42, "LogFull echoes the batch first_sequence");
+                assert_eq!(
+                    first_sequence, 42,
+                    "LogFull echoes the batch first_sequence"
+                );
             }
             other => panic!("expected a retryable LogFull, got: {other:?}"),
         }
@@ -22244,7 +22249,9 @@ mod tests {
         assert!(log0_arc.lock().has_pending(), "store 0 buffered its op");
         assert!(log1_arc.lock().has_pending(), "store 1 buffered its op");
 
-        engine.flush_all_redo_logs().expect("flush every touched store");
+        engine
+            .flush_all_redo_logs()
+            .expect("flush every touched store");
 
         // Reopen each store's log and recover: both entries are durable.
         let recovered0 = RedoLog::open(rdev0, 0, 64 * 1024)
