@@ -2087,7 +2087,8 @@ pub const STREAM_READ_FIELD_COLD_DATA: u16 = 20;
 // Compile-time guard: the bit-index selector must name exactly COLD_DATA.
 const _: () = assert!(1u32 << STREAM_READ_FIELD_COLD_DATA == FieldMask::COLD_DATA);
 
-/// Encoded width of an [`OP_STREAM_READ`] request payload.
+/// Encoded width of an [`OP_STREAM_READ`](crate::protocol::opcodes::OP_STREAM_READ)
+/// request payload.
 pub const STREAM_READ_REQUEST_SIZE: usize = 32 + 2 + 8;
 
 /// Encode an `OP_STREAM_READ` request payload.
