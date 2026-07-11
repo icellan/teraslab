@@ -1628,33 +1628,50 @@ impl Drop for HashTable {
             if let Backing::FileBacked { fd, path } = &self.backing {
                 // SAFETY: in `Drop` we hold exclusive ownership of the table,
                 // and the guard above ensures `self.ptr`/`self.mmap_len`
-                // describe the live mapping. `msync` flushes it durably;
-                // `dealloc_mmap_buckets` then `munmap`s exactly that
-                // `(ptr, len)` pair once (the table is being destroyed, so it
-                // is never accessed again); `close` releases the `fd` that
-                // `FileBacked` has kept open. Ordering is msync → munmap →
-                // close so the flush completes before the mapping is torn
-                // down.
-                unsafe { libc::msync(self.ptr.cast(), self.mmap_len, libc::MS_SYNC) };
+                // describe the live mapping. `msync` flushes dirty pages and
+                // `fsync` flushes the file, durably; `dealloc_mmap_buckets`
+                // then `munmap`s exactly that `(ptr, len)` pair once (the table
+                // is being destroyed, so it is never accessed again); `close`
+                // releases the `fd`. Ordering is msync → fsync → munmap → close
+                // so both flushes complete (while the fd is still open) before
+                // the mapping is torn down.
+                //
+                // P1-20: CHECK both flush results. The old code discarded the
+                // `msync` return and stamped the clean-shutdown sentinel
+                // unconditionally, so a FAILED durability flush was recorded as
+                // "clean" — bypassing the G-01 fail-closed reopen and letting the
+                // next boot read possibly-torn bucket bytes as valid. Mirror
+                // `sync_file_backed` (msync + fsync) and stamp the sentinel ONLY
+                // when both succeed.
+                let msync_rc =
+                    unsafe { libc::msync(self.ptr.cast(), self.mmap_len, libc::MS_SYNC) };
+                let fsync_rc = unsafe { libc::fsync(*fd) };
+                let flush_ok = msync_rc == 0 && fsync_rc == 0;
                 unsafe { dealloc_mmap_buckets(self.ptr, self.mmap_len) };
                 unsafe { libc::close(*fd) };
-                // F-G3-016: after the msync above durably flushes the
-                // bucket bytes, write the clean-shutdown sentinel so the
-                // next reopen can distinguish "clean close" from
-                // "crash mid-write". Best-effort — if creating the file
-                // fails (e.g. parent dir gone, EROFS) the next reopen
-                // will emit a warn, which is the correct outcome.
+                // F-G3-016 / P1-20: write the clean-shutdown sentinel only when
+                // the flush was durable AND this table still owns its path.
                 //
-                // G-2: skip the sentinel when this table is defunct — a
-                // table displaced by a resize no longer owns its path (the
-                // resized copy renamed a fresh file over it and now owns
-                // it). Writing the sentinel here would falsely mark a
-                // still-mutating index "cleanly shut down", so a later
-                // crash would be accepted as clean and torn buckets read
-                // as valid. Only the live table writes the sentinel.
-                if !self.defunct {
+                // G-2: skip the sentinel when this table is defunct — a table
+                // displaced by a resize no longer owns its path (the resized
+                // copy renamed a fresh file over it and now owns it). Writing
+                // the sentinel here would falsely mark a still-mutating index
+                // "cleanly shut down", so a later crash would be accepted as
+                // clean and torn buckets read as valid. Only the live table
+                // whose flush succeeded writes the sentinel.
+                if should_stamp_clean_shutdown(flush_ok, self.defunct) {
                     let sentinel = sentinel_path_for(path);
                     let _ = std::fs::File::create(&sentinel);
+                } else if !self.defunct {
+                    tracing::error!(
+                        target: "teraslab::index",
+                        path = %path.display(),
+                        msync_rc,
+                        fsync_rc,
+                        "file-backed index flush FAILED on shutdown; skipping the \
+                         clean-shutdown sentinel so the next reopen fail-closes to a \
+                         device-scan rebuild (G-01)",
+                    );
                 }
             } else {
                 // SAFETY: anonymous backing — in `Drop` we own the table
@@ -1665,6 +1682,17 @@ impl Drop for HashTable {
             }
         }
     }
+}
+
+/// Whether [`HashTable`]'s `Drop` should stamp the clean-shutdown sentinel.
+///
+/// P1-20: only when the final durability flush SUCCEEDED (`flush_ok`) AND this
+/// table still owns its path (`!defunct`). A failed flush must leave the
+/// sentinel ABSENT so the next reopen fail-closes to the G-01 device-scan
+/// rebuild instead of trusting possibly-torn bucket bytes; a defunct table
+/// (displaced by a resize) must never stamp regardless.
+fn should_stamp_clean_shutdown(flush_ok: bool, defunct: bool) -> bool {
+    flush_ok && !defunct
 }
 
 /// Build the sidecar sentinel path for a file-backed table at `path`.
@@ -2729,6 +2757,22 @@ mod tests {
     /// clean-shutdown sentinel on disk while the live table keeps mutating.
     /// Before the fix, the old table's `Drop` wrote `<path>.shutdown_clean`
     /// mid-run, so a later crash was accepted as clean.
+    /// P1-20: the clean-shutdown sentinel must be stamped ONLY when the final
+    /// durability flush succeeded AND the table still owns its path. The old
+    /// Drop discarded the msync result and stamped whenever `!defunct`, so a
+    /// FAILED flush (`flush_ok == false`) was recorded as clean — bypassing the
+    /// G-01 fail-closed reopen. The gating decision now consults both.
+    #[test]
+    fn clean_shutdown_sentinel_gated_on_flush_success_and_liveness() {
+        // Clean flush + live table → stamp (the only stamping case).
+        assert!(should_stamp_clean_shutdown(true, false));
+        // FAILED flush → do NOT stamp, so the next reopen fail-closes (the fix).
+        assert!(!should_stamp_clean_shutdown(false, false));
+        // Defunct table (displaced by resize) → never stamp, flush notwithstanding.
+        assert!(!should_stamp_clean_shutdown(true, true));
+        assert!(!should_stamp_clean_shutdown(false, true));
+    }
+
     #[test]
     fn resize_does_not_write_sentinel_while_table_is_live() {
         let dir = tempfile::tempdir().unwrap();

@@ -5246,27 +5246,29 @@ fn handle_spend_batch(
             prepared.transitions().iter().map(|(off, _)| *off).collect();
 
         // Segment (log-structured) store: the spend RELOCATES the record in
-        // `PreparedSpend::apply_locked`. For a CLUSTERED segment store the
-        // authoritative redo is the per-vout `SpendV2` we emit here, WAL-first in
-        // Phase 3, EXACTLY like the in-place engine — the relocate move itself
-        // journals nothing. `SpendV2` is the only redo op the replication machinery
-        // can convert to a `ReplicaOp` (`redo_entry_to_replica_op`), and it is what
-        // the durable replication-intent tracker (`write_replicated_redo_ops`), the
-        // startup / lag catch-up, and the migration delta all read. Without it, a
-        // segment spend applied locally but not yet shipped (crash between apply and
-        // Phase-5 replicate) could never be re-driven — leaving master SPENT /
-        // replica UNSPENT permanently (double-spend on failover). It is also
-        // self-sufficient for LOCAL recovery: on replay it re-applies the spend in
-        // place against the durable, append-only pre-spend record (idempotent;
-        // recomputes the spent counter from the slots), so no physical relocate redo
-        // is needed.
+        // `PreparedSpend::apply_locked`, baking the spent slot into the new image.
+        // The authoritative redo for that spend is the per-vout `SpendV2` we emit
+        // here, WAL-first in Phase 3, EXACTLY like the in-place engine — the relocate
+        // move itself journals nothing (`relocate_record`). This holds for BOTH
+        // STANDALONE and CLUSTERED segment stores:
+        //   * Local recovery (both): `SpendV2` is self-sufficient — on replay it
+        //     re-applies the spend IN PLACE against the durable, append-only
+        //     pre-spend record (idempotent; recomputes the spent counter from the
+        //     slots), so recovery never depends on the still-buffered relocated
+        //     bytes. This is the P0 double-spend fix: a STANDALONE segment spend
+        //     used to journal only a THIN `Relocate` pointing at the new (buffered,
+        //     checkpoint-durable) offset — a power-loss before the checkpoint left
+        //     `replay_relocate` reading torn bytes, `Skip`ping, and reverting the
+        //     acked spend to UNSPENT (double-spend). SpendV2 removes that dependence.
+        //   * Replication (clustered only): `SpendV2` is the only redo op the
+        //     replication machinery converts to a `ReplicaOp` (`redo_entry_to_replica_op`)
+        //     and what the durable replication-intent tracker, startup / lag
+        //     catch-up, and migration delta all read. (Standalone has no replicas;
+        //     the `ReplicaOp` below is only shipped when replication is active.)
         //
-        // STANDALONE segment (not clustered) emits NEITHER `SpendV2` nor a replica
-        // op — it has no replicas and relies solely on the thin `Relocate` its
-        // `relocate_record` journals for recovery (the shipped v0.8.0 behaviour,
-        // unchanged).
-        let log_structured = engine.store_is_log_structured(prepared.device_id);
-        let emit_spend_v2 = !log_structured || engine.clustered();
+        // So SpendV2 is emitted for EVERY durable spend transition (in-place +
+        // segment, standalone + clustered) — it is unconditionally the spend redo.
+        let emit_spend_v2 = true;
 
         let mut key_repl_ops: Vec<ReplicaOp> = Vec::new();
         let mut running_count = pre_spent_count;
@@ -6703,14 +6705,27 @@ fn handle_create_batch(
         } else {
             Vec::new()
         };
-        // Phase 1 log-structured lever: under BUFFERED redo durability the data
-        // device write and the redo entry are flushed on the same cadence, so the
-        // redo need not embed the record bytes — recovery reads them back from the
-        // device (replay_create_v2). This drops the create double-write (bytes
-        // written to both device and WAL). Under STRICT durability the data write
-        // is not fsynced before ack, so the WAL embed is the only durable copy —
-        // keep emitting RedoOp::Create. The device write happens either way
-        // (record_bytes is moved into ValidCreate below for the coalesced write).
+        // Phase 1 log-structured lever: under BUFFERED redo durability the redo
+        // need not embed the record bytes — recovery reads them back from the
+        // device (replay_create_v2), dropping the create double-write (bytes
+        // written to both device and WAL).
+        //
+        // P1-7: the data-device write is NOT flushed on the same cadence as the
+        // redo entry (the earlier claim here was wrong). The background flusher
+        // fsyncs only the REDO device; the DATA devices are fsynced by the
+        // checkpoint barrier (`sync_all_store_devices`, checkpoint step 3). So a
+        // durable CreateV2 entry's replay source (its record bytes) is lost on
+        // power failure if the crash lands before the next data-device fsync.
+        // That window is now BOUNDED by the checkpoint interval
+        // (`CheckpointConfig::max_checkpoint_interval`, default 60s — P1-23's
+        // time-based trigger), NOT "one flush interval". Follow-up (tighter,
+        // self-sufficient): emit a byte-embedding create when the record's store
+        // device differs from its redo log's device, mirroring the SpendV2 model.
+        //
+        // Under STRICT durability the data write is not fsynced before ack, so
+        // the WAL embed is the only durable copy — keep emitting RedoOp::Create.
+        // The device write happens either way (record_bytes is moved into
+        // ValidCreate below for the coalesced write).
         if create_redo_buffered {
             redo_ops.push(RedoOp::CreateV2 {
                 tx_key: key,
@@ -8656,7 +8671,11 @@ fn decorate_get_item(
         // If we're master but don't have the data and inbound migration
         // is still pending, return a retry signal immediately instead of
         // parking a request thread behind migration progress.
-        if is_master && engine.read_metadata(&key).is_err() && cluster.has_pending_inbound(&key) {
+        // P1-9: order the cheap in-RAM checks BEFORE the device footer read so
+        // the common (no-migration) path short-circuits without reading — the
+        // authoritative read happens once, below. Only a genuinely pending
+        // inbound migration pays the guard read (and then returns here).
+        if is_master && cluster.has_pending_inbound(&key) && engine.read_metadata(&key).is_err() {
             let shard = crate::cluster::shards::ShardTable::shard_for_key(&key);
             tracing::debug!(shard, "dispatch: read still waiting for inbound migration");
             return WireGetResult {
@@ -9607,7 +9626,9 @@ fn decorate_get_spend_item(
                 // return a retryable MIGRATION_IN_PROGRESS instead of
                 // letting `get_spend` below report ERR_TX_NOT_FOUND
                 // (terminal) for a tx that is present-but-not-yet-migrated.
-                if engine.read_metadata(&key).is_err() && cluster.has_pending_inbound(&key) {
+                // P1-9: cheap in-RAM check first so the common path skips the
+                // guard read; the authoritative read happens once in `get_spend`.
+                if cluster.has_pending_inbound(&key) && engine.read_metadata(&key).is_err() {
                     let shard = crate::cluster::shards::ShardTable::shard_for_key(&key);
                     tracing::debug!(
                         shard,
@@ -21883,6 +21904,195 @@ mod tests {
         assert_eq!(after.2 - before.2, 0, "no idempotent items");
         assert_eq!(after.3 - before.3, 1, "items_failed += 1 (hash mismatch)");
         assert_eq!(after.4 - before.4, 1, "one batch processed");
+    }
+
+    /// P0 (consensus-critical double-spend): a STANDALONE segment spend must be
+    /// recoverable from the durable REDO ALONE. An acked spend RELOCATES the record
+    /// and bakes the spent slot into the new image; under buffered durability those
+    /// relocated bytes sit in the drive's volatile cache until the next CHECKPOINT
+    /// fsyncs them, while the background flusher makes the redo durable first. A
+    /// power-loss in that window must NOT revert the acked spend to UNSPENT (a
+    /// double-spend).
+    ///
+    /// Before the fix a standalone segment spend journaled only a THIN
+    /// `RedoOp::Relocate` pointing at the new (still-buffered) offset. On recovery
+    /// `replay_relocate` read those lost bytes, found them torn, and `Skipped` —
+    /// keeping the index on the intact PRE-spend record, so the slot read UNSPENT
+    /// again and the acked spend was silently undone. The fix makes the standalone
+    /// segment spend emit the self-sufficient per-vout `RedoOp::SpendV2` (like
+    /// clustered) and stops journaling the thin Relocate, so recovery replays the
+    /// spend IN PLACE against the durable, append-only pre-spend record — no
+    /// dependence on the lost relocated bytes. Mirrors the clustered recovery test
+    /// `clustered_segment_spendv2_reconstructs_spend_in_place`.
+    #[test]
+    fn standalone_segment_spend_recoverable_from_redo_alone_after_powerloss() {
+        let _mg = metrics_test_lock();
+
+        // STANDALONE segment engine + one redo log — the SAME Arc wired to both the
+        // engine's internal redo path (`set_redo_logs`, used by `relocate_record`)
+        // and the dispatch redo_log param, exactly as production does (server.rs).
+        // Buffered durability = the bug's config.
+        let dev: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let seg =
+            crate::segment_allocator::SegmentAllocator::new(dev.clone(), 8 * 1024 * 1024).unwrap();
+        let engine = Engine::new(
+            dev.clone(),
+            Index::new(1024).unwrap(),
+            seg,
+            StripedLocks::new(64),
+            DahIndex::new(),
+        );
+        assert!(
+            engine.store_is_log_structured(0),
+            "segment (log-structured)"
+        );
+
+        let redo_size: u64 = 8 * 1024 * 1024;
+        let redo_dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(redo_size, 4096).unwrap());
+        let log = Arc::new(Mutex::new(
+            RedoLog::open(redo_dev.clone(), 0, redo_size).unwrap(),
+        ));
+        engine.set_redo_logs(vec![log.clone()]);
+        engine.set_buffered_durability(true);
+
+        // Durable, checkpoint-covered PRE-spend record at offset X: 4 UTXOs, all
+        // UNSPENT. `write_full_record` stamps valid metadata + slot CRCs.
+        let utxo_count = 4u32;
+        let mut txid = [0u8; 32];
+        txid[0] = 0x9A;
+        let key = TxKey { txid };
+        let mut slot1_hash = [0u8; 32];
+        slot1_hash[0] = 0x11;
+        slot1_hash[1] = 0x22; // the hash the spend of vout 1 will match
+        let slots: Vec<crate::record::UtxoSlot> = (0..utxo_count)
+            .map(|i| {
+                if i == 1 {
+                    crate::record::UtxoSlot::new_unspent(slot1_hash)
+                } else {
+                    let mut h = [0u8; 32];
+                    h[0] = (i as u8) + 1;
+                    crate::record::UtxoSlot::new_unspent(h)
+                }
+            })
+            .collect();
+        let mut meta = crate::record::TxMetadata::new(utxo_count);
+        meta.tx_id = txid;
+        let rec_size = crate::record::TxMetadata::record_size_for(utxo_count);
+        let x = engine.allocator_for(0).lock().allocate(rec_size).unwrap();
+        crate::io::write_full_record(&*dev, x, &meta, &slots).unwrap();
+        engine
+            .register(
+                key,
+                crate::index::TxIndexEntry {
+                    device_id: 0,
+                    record_offset: x,
+                    mined_slot: crate::index::mined_index::NO_MINED_SLOT,
+                },
+            )
+            .unwrap();
+
+        // Drive a REAL spend of vout 1 through the dispatch path — this exercises the
+        // `emit_spend_v2` decision AND `relocate_record`. It relocates X -> Y
+        // (buffered) and journals the spend's redo.
+        let params = SpendBatchParams {
+            ignore_conflicting: true,
+            ignore_locked: true,
+            current_block_height: 1000,
+            block_height_retention: 0,
+        };
+        let spending_data = [0x5Cu8; 36];
+        let items = vec![WireSpendItem {
+            txid,
+            vout: 1,
+            utxo_hash: slot1_hash,
+            spending_data,
+        }];
+        let req = RequestFrame {
+            request_id: 1,
+            op_code: OP_SPEND_BATCH,
+            flags: 0,
+            payload: encode_spend_batch(&params, &items).into(),
+        };
+        let mut conn_state = crate::server::ConnectionState::new();
+        let resp = handle_request(
+            &req,
+            &engine,
+            8192,
+            None,
+            Some(&*log),
+            &mut conn_state,
+            None,
+        );
+        assert_eq!(resp.status, STATUS_OK, "single valid spend must be acked");
+
+        // The live spend relocated the record off X.
+        let y = engine.lookup(&key).unwrap().record_offset;
+        assert_ne!(y, x, "segment spend relocates the record");
+
+        // Make the REDO durable — the fsync the buffered ack path skipped.
+        log.lock().flush().unwrap();
+
+        // The emitted spend redo must be the self-sufficient SpendV2, NOT the thin
+        // Relocate: the spend is recoverable from the redo alone.
+        let entries = {
+            let l = RedoLog::open(redo_dev.clone(), 0, redo_size).unwrap();
+            l.recover().unwrap()
+        };
+        let has_spend_v2 = entries.iter().any(|e| {
+            matches!(&e.op, RedoOp::SpendV2 { tx_key, offset, .. } if *tx_key == key && *offset == 1)
+        });
+        let has_relocate = entries
+            .iter()
+            .any(|e| matches!(&e.op, RedoOp::Relocate { tx_key, .. } if *tx_key == key));
+        assert!(
+            has_spend_v2,
+            "standalone segment spend must journal a self-sufficient SpendV2",
+        );
+        assert!(
+            !has_relocate,
+            "standalone segment spend must NOT journal a thin Relocate for the spend",
+        );
+
+        // POWER LOSS: the buffered data-device write at Y is lost (never fsynced),
+        // while the durable pre-spend record at X survives (append-only never
+        // overwrote it) and the index reloads from the pre-spend checkpoint snapshot
+        // (index -> X). Model this with a FRESH device holding ONLY the pre-spend
+        // record at X (Y absent) and a fresh index pointed at X — the same
+        // redo-is-the-only-truth setup as the strict clustered recovery test.
+        let recov_dev: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        crate::io::write_full_record(&*recov_dev, x, &meta, &slots).unwrap();
+        let recov_index = crate::index::ShardedIndex::from_single(Index::new(1024).unwrap().into());
+        recov_index
+            .register(
+                key,
+                crate::index::TxIndexEntry {
+                    device_id: 0,
+                    record_offset: x,
+                    mined_slot: crate::index::mined_index::NO_MINED_SLOT,
+                },
+            )
+            .unwrap();
+        let rec_log = RedoLog::open(redo_dev.clone(), 0, redo_size).unwrap();
+        let stats = crate::recovery::recover(&*recov_dev, &rec_log, &recov_index).unwrap();
+        assert_eq!(stats.entries_failed, 0, "no fatal replay failures");
+
+        // The acked spend SURVIVED power-loss: the record stays indexed at the
+        // durable pre-spend offset X and is reconstructed SPENT there — NOT reverted
+        // to UNSPENT (which would be a double-spend).
+        let ie = recov_index.lookup(&key).expect("record still indexed");
+        assert_eq!(ie.record_offset, x, "SpendV2 replays in place at X");
+        let m = crate::io::read_metadata(&*recov_dev, x).unwrap();
+        assert_eq!(
+            { m.spent_utxos },
+            1,
+            "acked spend survived power-loss (recovered from redo alone), NOT reverted to UNSPENT",
+        );
+        let s = crate::io::read_all_utxo_slots(&*recov_dev, x, utxo_count).unwrap();
+        assert_eq!(s[1].status, crate::record::UTXO_SPENT, "vout 1 SPENT");
+        assert_eq!(s[1].spending_data, spending_data, "spending data preserved");
+        assert_eq!(s[0].status, crate::record::UTXO_UNSPENT, "vout 0 untouched");
     }
 
     #[test]

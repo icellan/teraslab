@@ -1421,13 +1421,28 @@ fn main() {
     // the device mined-state fields are stale, so this is the ONLY correct
     // source: it EXCLUDES a reorg-unmined record's stale DAH (no premature
     // delete of a retained record on crash recovery) and re-derives a
-    // setMined-planted DAH the device never recorded. `recovery_height_floor` is
-    // the highest block height the replayed redo proved this node has seen — the
-    // conservative "current height" for re-deriving any device-stale DAH.
-    if let Err(e) = engine.reconcile_secondaries_from_mined_index(
-        recovery_height_floor,
-        config.block_height_retention,
-    ) {
+    // setMined-planted DAH the device never recorded.
+    //
+    // P0 (premature-sweep): the "current height" for re-deriving a device-stale
+    // DAH must be the node's real chain height, NOT the bare
+    // `recovery_height_floor`. That floor is the max height in the REPLAYED REDO
+    // TAIL only, and is 0 for a height-free tail — routine, since
+    // Create/Relocate/Delete/V1-spend carry no height and a clean restart (or a
+    // crash right after a checkpoint) replays no height-bearing entry. Passing 0
+    // here would re-derive every setMined-planted DAH as `0 + retention`, already
+    // past at real chain height → the acked record is swept a full retention
+    // window early and a later reorg-unspend returns TxNotFound. Fold the durable
+    // `.height` file (a pure atomic + CRC read, no side effects) into the floor
+    // BEFORE reconcile via `reconcile_height_floor` = `max(persisted, tail)`;
+    // `persisted_height` / `height_path` are reused below for the engine-side
+    // last-durable-height restore, keeping the two floors identical.
+    let height_path = config.resolved_last_durable_height_path();
+    let persisted_height = teraslab::ops::engine::read_durable_height_file(&height_path);
+    let reconcile_floor =
+        teraslab::ops::engine::reconcile_height_floor(persisted_height, recovery_height_floor);
+    if let Err(e) = engine
+        .reconcile_secondaries_from_mined_index(reconcile_floor, config.block_height_retention)
+    {
         tracing::error!(
             err = %e,
             "FATAL: failed to rebuild the DAH secondary index from the \
@@ -1447,12 +1462,12 @@ fn main() {
     // migration suppression read via `engine.redo_log()`).
     if let Some(ref logs) = redo_logs_arc {
         engine.set_redo_logs(logs.clone());
-        // Declare clustered/replicated mode so a segment spend's authoritative redo
-        // becomes the convertible per-vout SpendV2 (the relocate move journals
-        // nothing); standalone nodes keep the thin index-only Relocate + checkpoint
-        // durability (specs/SEGMENT_CLUSTERING_DESIGN.md). Must follow set_redo_logs.
+        // As of the P0 double-spend fix the segment spend redo is uniform across node
+        // roles: EVERY segment spend — standalone and clustered — emits the
+        // convertible per-vout SpendV2 and the relocate move journals nothing, so the
+        // engine no longer needs a clustered/standalone flag
+        // (specs/SEGMENT_CLUSTERING_DESIGN.md).
         let clustered = config.is_clustered() || config.replication_factor > 1;
-        engine.set_clustered(clustered);
         // Surface the segment-on-cluster path explicitly: `Segment` is the default
         // engine (and an empty `[storage] engine` parses to it), so a clustered
         // node with the engine unset now boots the clustered-segment path where a
@@ -1512,8 +1527,10 @@ fn main() {
     //     reporting 0 (which would freeze the cluster GC horizon and force
     //     unnecessary full resyncs — design §4 height subsystem).
     // Persistence keeps the value monotone across restarts.
-    let height_path = config.resolved_last_durable_height_path();
-    let persisted_height = teraslab::ops::engine::read_durable_height_file(&height_path);
+    //
+    // `height_path` + `persisted_height` were read above (folded into the
+    // boot-reconcile floor); reuse them here for the engine-side height restore
+    // so the restored height and the reconcile floor stay identical.
     let record_floor = recovery_height_floor;
     engine.set_last_durable_height_path(height_path.clone());
     let restored_height = engine.restore_last_durable_height(persisted_height, record_floor);
@@ -2138,11 +2155,6 @@ fn main() {
         device,
         cluster,
         otlp_provider,
-        // F-G10-003: hold the redo log so we can flush it on shutdown
-        // before `device.sync()`. Defense-in-depth: per-op fsync is the
-        // primary durability guarantee; this just ensures any tail buffer
-        // is on disk before we tear down.
-        redo_log: redo_log.clone(),
         // F-G10-022: take ownership of background-thread join handles so
         // `run()` can join them after the shutdown flag is set but before
         // `device.sync()`. Pre-fix these were `_`-prefixed bindings that
@@ -2190,9 +2202,6 @@ struct ServerWithShutdown {
     /// OTLP provider, present when `[observability].otlp_endpoint` was
     /// configured. Flushed with a 5 s timeout on graceful shutdown.
     otlp_provider: Option<teraslab::observability::OtelTracerProvider>,
-    /// Redo log handle, held so `run()` can flush it on shutdown ahead of
-    /// `device.sync()`. See F-G10-003.
-    redo_log: Option<Arc<Mutex<RedoLog>>>,
     /// Join handle for the redo-log checkpoint thread. See F-G10-022.
     checkpoint_handle: Mutex<Option<std::thread::JoinHandle<()>>>,
     /// Join handle for the periodic blob-GC sweep thread. See F-G10-022.
@@ -2275,15 +2284,18 @@ impl ServerWithShutdown {
             Err(e) => tracing::warn!(err = %e, "replication intent tracker flush failed"),
         }
 
-        // F-G10-003: flush the redo log before syncing the data device.
-        // Per-op fsync in the hot path is the primary durability guarantee;
-        // this just makes sure the tail buffer (if any) is on disk before
-        // the next-restart redo scan reads it.
-        if let Some(ref log) = self.redo_log {
-            match log.lock().flush() {
-                Ok(()) => tracing::info!("redo log flushed"),
-                Err(e) => tracing::warn!(err = %e, "redo log flush failed"),
-            }
+        // F-G10-003 / P1-22: flush EVERY store's redo log before syncing the
+        // data device — not just store 0. This runs post-drain (after
+        // `self.inner.run()` returned and the background flusher joined above),
+        // so any buffered mutation acked during the connection-drain window is
+        // captured here. `self.redo_log` is only store 0's handle
+        // (server.rs:1190-1195); flushing it alone silently dropped drain-window
+        // acks routed to stores 1..N on a clean shutdown, contradicting the
+        // "graceful stop loses nothing" contract. `flush_all_redo` fsyncs every
+        // per-store committer.
+        match self.engine.flush_all_redo() {
+            Ok(()) => tracing::info!("all redo logs flushed"),
+            Err(e) => tracing::warn!(err = %e, "redo log flush failed"),
         }
 
         // Sync device

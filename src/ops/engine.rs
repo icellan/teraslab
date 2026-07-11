@@ -223,20 +223,6 @@ pub struct Engine {
     /// instead of fsyncing per key on the ack path. Set in
     /// [`Self::set_buffered_durability`]; defaults to strict (`false`).
     redo_buffered: std::sync::atomic::AtomicBool,
-    /// Whether this node participates in a cluster / replication group
-    /// (`config.is_clustered() || replication_factor > 1`). Set once at boot via
-    /// [`Self::set_clustered`]; defaults to `false` (standalone).
-    ///
-    /// Governs the segment engine's spend redo. When `false` (standalone), a spend
-    /// relocate journals a THIN index-only [`crate::redo::RedoOp::Relocate`] for
-    /// recovery. When `true` (clustered), the relocate journals NOTHING — the
-    /// authoritative redo is the convertible per-vout [`crate::redo::RedoOp::SpendV2`]
-    /// emitted WAL-first by the caller (dispatch on the master,
-    /// `build_post_apply_redo_op` on the replica): it is replication-convertible AND
-    /// self-sufficient for local recovery (it replays the spend in place against the
-    /// durable, append-only pre-spend record). See
-    /// `specs/SEGMENT_CLUSTERING_DESIGN.md`.
-    clustered: std::sync::atomic::AtomicBool,
     /// One shared redo backpressure coordinator across all per-store logs,
     /// built and injected in [`Self::set_redo_logs`]. The dispatch gate
     /// ([`crate::redo::RedoBackpressure::wait_for_capacity`]) and the
@@ -532,7 +518,6 @@ impl Engine {
             redo_logs: std::sync::OnceLock::new(),
             redo_committers: std::sync::OnceLock::new(),
             redo_buffered: std::sync::atomic::AtomicBool::new(false),
-            clustered: std::sync::atomic::AtomicBool::new(false),
             redo_backpressure: std::sync::OnceLock::new(),
             redo_atomics: std::sync::OnceLock::new(),
             last_durable_height: std::sync::atomic::AtomicU32::new(0),
@@ -674,22 +659,6 @@ impl Engine {
     pub(crate) fn redo_buffered(&self) -> bool {
         self.redo_buffered
             .load(std::sync::atomic::Ordering::Acquire)
-    }
-
-    /// Declare whether this node runs clustered / replicated. Call once at boot
-    /// (after [`Self::set_redo_logs`]) with `config.is_clustered() ||
-    /// replication_factor > 1`. Switches the segment engine's spend redo to the
-    /// convertible [`crate::redo::RedoOp::SpendV2`] model (relocate journals
-    /// nothing) — see [`Self::clustered`] field docs and [`Self::relocate_record`].
-    pub fn set_clustered(&self, clustered: bool) {
-        self.clustered
-            .store(clustered, std::sync::atomic::Ordering::Release);
-    }
-
-    /// Whether this node runs clustered / replicated (governs the segment
-    /// relocate durability model — see [`Self::set_clustered`]).
-    pub(crate) fn clustered(&self) -> bool {
-        self.clustered.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Force every per-store redo log durable (fsync). Used by the background
@@ -1152,6 +1121,22 @@ impl Engine {
         }
     }
 
+    /// The highest current redo sequence across all attached store logs (0 when
+    /// none are attached). P1-23: the checkpoint loop compares this against the
+    /// sequence at the last completed checkpoint to tell "the redo advanced
+    /// since the last checkpoint" (there is un-fsynced data) from "idle", so the
+    /// time-based trigger only fires when a create/relocate/spend actually landed.
+    pub fn current_redo_sequence(&self) -> u64 {
+        match self.redo_logs.get() {
+            Some(logs) if !logs.is_empty() => logs
+                .iter()
+                .map(|l| l.lock().current_sequence())
+                .max()
+                .unwrap_or(0),
+            _ => 0,
+        }
+    }
+
     /// Compact EVERY attached redo log's prefix through `fence`, reclaiming the
     /// covered bytes. The compaction fence is a GLOBAL sequence, so it applies
     /// uniformly to each store's log (each log's entries carry global
@@ -1171,10 +1156,22 @@ impl Engine {
     ) -> std::result::Result<(), crate::redo::RedoError> {
         // Layout-dispatched per log (`checkpoint_reclaim`): a ring frees covered
         // segments (pointer advance); a linear log compacts the prefix.
-        match self.redo_logs.get() {
-            Some(logs) if !logs.is_empty() => {
-                for log in logs {
-                    log.lock().checkpoint_reclaim(fence)?;
+        //
+        // P0 (redo header-clobber): the reclaim rewrites the single redo header
+        // block, which a group-commit flush's Phase-2 pwrite also writes — but the
+        // flush releases the log lock before that slow pwrite, so a stale
+        // snapshotted flush header could land AFTER this advance and revert
+        // `oldest_seg` (→ recovery scans a reclaimed segment and drops acked
+        // entries). Route through each store's group-commit coordinator and hold
+        // its `flush_guard` across the header write so an in-flight Phase-2 flush
+        // and this reclaim can never interleave. The coordinators are 1:1 and in
+        // lockstep with `redo_logs` (`committer.log()` IS the same `Arc<Mutex>`),
+        // both built together in `set_redo_logs`.
+        match self.redo_committers.get() {
+            Some(committers) if !committers.is_empty() => {
+                for committer in committers {
+                    committer
+                        .under_flush_guard(|| committer.log().lock().checkpoint_reclaim(fence))?;
                 }
             }
             _ => {}
@@ -1207,15 +1204,43 @@ impl Engine {
         // Layout-dispatched per log (`checkpoint_fence`): a ring writes the
         // header fence (no log append); a linear log appends a RecoveryProgress
         // marker.
-        match self.redo_logs.get() {
-            Some(logs) if !logs.is_empty() => {
-                for log in logs {
-                    log.lock().checkpoint_fence(through_sequence)?;
+        //
+        // P0 (redo header-clobber): `checkpoint_fence` persists the advanced fence
+        // in the single redo header block that a group-commit flush's Phase-2
+        // pwrite also writes (with the log lock released). Hold each store's
+        // `flush_guard` across the header write so a stale in-flight flush header
+        // can never land after — and revert — this fence. See
+        // [`Self::compact_all_redo_through`] for the full rationale; the
+        // coordinators are 1:1 with `redo_logs`.
+        match self.redo_committers.get() {
+            Some(committers) if !committers.is_empty() => {
+                for committer in committers {
+                    committer.under_flush_guard(|| {
+                        committer.log().lock().checkpoint_fence(through_sequence)
+                    })?;
                 }
             }
             _ => {}
         }
         Ok(())
+    }
+
+    /// Run `f` while holding store 0's group-commit `flush_guard` when a committer
+    /// is attached, else run `f` directly.
+    ///
+    /// P0 (redo header-clobber): lets the single-handle checkpoint fallback (the
+    /// `checkpoint.rs` path taken only when NO per-store logs are attached —
+    /// tests) serialize its header write with any in-flight Phase-2 flush exactly
+    /// as [`Self::compact_all_redo_through`] / [`Self::mark_recovery_progress_all`]
+    /// do for the multi-store path. In the no-committer configuration there is no
+    /// background flusher (`flush_all_redo` iterates the — empty — committers), so
+    /// running `f` directly is race-free; the wrapper keeps the invariant explicit
+    /// and correct should a committer ever back that path.
+    pub fn under_redo_flush_guard_store0<R>(&self, f: impl FnOnce() -> R) -> R {
+        match self.redo_committers.get().and_then(|c| c.first()) {
+            Some(committer) => committer.under_flush_guard(f),
+            None => f(),
+        }
     }
 
     /// Append a single replica-applied redo op to the log owning its store,
@@ -1511,7 +1536,9 @@ impl Engine {
     /// Because the result is a `fetch_max`, calling this is itself monotone
     /// and idempotent. Returns the value the height was set to.
     pub fn restore_last_durable_height(&self, persisted: Option<u32>, record_floor: u32) -> u32 {
-        let restored = persisted.unwrap_or(0).max(record_floor);
+        // Shared with the boot-time reconcile floor so the restored height and
+        // the reconcile's `current_block_height` can never diverge (P0).
+        let restored = reconcile_height_floor(persisted, record_floor);
         self.last_durable_height
             .fetch_max(restored, std::sync::atomic::Ordering::Relaxed);
         self.last_durable_height()
@@ -3562,16 +3589,15 @@ impl Engine {
         if log_structured {
             // Segment (log-structured) engine: RELOCATE — append the full record
             // (spent slot + updated metadata baked in) at a fresh append-cursor
-            // offset, re-point the index, and (STANDALONE only) journal a thin
-            // `Relocate`, dead-marking the old extent. This mirrors the batch spend
-            // path (`PreparedSpend::apply_locked`) and reuses the same packed-safe
-            // primitive, so the SOLE production caller of this single-spend entry
-            // point — the replica apply path (`receiver.rs::apply_op` →
-            // `ReplicaOp::Spend`) — physically mirrors the master. `relocate_record`
-            // re-points the index in full (identically to recovery), so NO
-            // `sync_index_cache` follows. On a CLUSTERED node the relocate journals
-            // nothing; the replica's `build_post_apply_redo_op` emits the
-            // authoritative, convertible `SpendV2` after this.
+            // offset, re-point the index, and dead-mark the old extent. This mirrors
+            // the batch spend path (`PreparedSpend::apply_locked`) and reuses the same
+            // packed-safe primitive, so the SOLE production caller of this
+            // single-spend entry point — the replica apply path
+            // (`receiver.rs::apply_op` → `ReplicaOp::Spend`) — physically mirrors the
+            // master. `relocate_record` re-points the index in full (identically to
+            // recovery), so NO `sync_index_cache` follows, and journals NO relocate
+            // redo; the replica's `build_post_apply_redo_op` emits the authoritative,
+            // convertible, self-sufficient `SpendV2` after this.
             self.relocate_record(device_id, &req.tx_key, &metadata, &[(req.offset, new_slot)])?;
         } else {
             // In-place RMW. R-004: propagate the write error rather than
@@ -3793,8 +3819,59 @@ impl Engine {
                         &metadata,
                     )
                 };
-            } else {
-                self.write_metadata_fast(device_id, record_offset, &metadata)?;
+            } else if let Err(meta_err) =
+                self.write_metadata_fast(device_id, record_offset, &metadata)
+            {
+                // P0-11: on the owned-spend path the slot flip (SPENT→UNSPENT)
+                // is ALREADY durable (line ~3735) but its decremented counter is
+                // not. Left torn, a durable UNSPENT slot coexists with the
+                // unchanged all-spent counter, and the sweep — which reads the
+                // device counter, not the RAM all-spent bit — deletes a record
+                // holding a live restored UTXO (data loss). No crash occurs, so
+                // recovery's counter recompute never runs. Restore the invariant
+                // by reverting the slot to its prior SPENT state.
+                if caller_owns_spend {
+                    if let Err(revert_err) =
+                        self.write_slot_fast(device_id, record_offset, req.offset, &slot)
+                    {
+                        // The device cannot even take the revert (device fully
+                        // dead). Fail-stop: poisoning fails the node's liveness
+                        // probe so the orchestrator restarts it, and recovery's
+                        // B-4 counter recompute then heals the split. NOTE: poison
+                        // does NOT synchronously fence the internal DAH sweep
+                        // (deletes journal no redo, so a poisoned log does not
+                        // reject them), so in this doubly-degenerate case a sweep
+                        // RPC could still fire before the probe reacts; adding a
+                        // write-health gate on the delete/sweep path is tracked
+                        // as a follow-up. Strictly better than the pre-fix silent
+                        // torn state regardless.
+                        self.poison_all_redo_logs();
+                        return Err(SpendError::StorageError {
+                            detail: format!(
+                                "unspend metadata write failed ({meta_err}) and slot \
+                                 revert failed ({revert_err}); poisoned node to force \
+                                 recovery of offset {}",
+                                req.offset
+                            ),
+                        });
+                    }
+                    // Slot reverted → the device is consistent again (SPENT slot
+                    // + unchanged counter). Restore the RAM all-spent bit to its
+                    // pre-unspend value: the device counter (its write failed) is
+                    // `metadata.spent_utxos + 1`, so the record is all-spent again
+                    // iff that equals utxo_count.
+                    if entry.mined_slot != crate::index::mined_index::NO_MINED_SLOT {
+                        let was_all_spent = { metadata.spent_utxos }.wrapping_add(1) == utxo_count;
+                        self.mined_index().set_all_spent(
+                            &req.tx_key,
+                            entry.mined_slot,
+                            was_all_spent,
+                        );
+                    }
+                }
+                // A pure DAH-only no-op persist (`!caller_owns_spend`) flipped no
+                // slot, so nothing is torn — just surface the error.
+                return Err(meta_err);
             }
 
             // followup-1 dual-write: this branch is the ONLY path on which the
@@ -4988,8 +5065,10 @@ impl Engine {
     }
 
     /// Relocate `tx_key`'s record to a freshly-appended segment offset, baking in
-    /// `metadata` + `slot_mutations`, re-pointing the index, journaling a
-    /// [`RedoOp::Relocate`], and dead-marking the old extent. Returns the new
+    /// `metadata` + `slot_mutations`, re-pointing the index, and dead-marking the
+    /// old extent. Journals NO redo — the spend's self-sufficient per-vout
+    /// [`RedoOp::SpendV2`] is the authoritative recovery form (segment, standalone
+    /// and clustered alike); a defrag move is checkpoint-covered. Returns the new
     /// device offset. The LOG-STRUCTURED (segment) engine's spend primitive — it
     /// converts an in-place RMW (scattered write at the record's home offset) into
     /// a sequential append at the allocator cursor.
@@ -5003,23 +5082,26 @@ impl Engine {
     ///   and append-only never overwrites the old extent before defrag.
     /// - Durability is BUFFERED (the image write and dead-mark become durable at
     ///   the checkpoint barrier, which fsyncs the data device before reclaiming any
-    ///   redo prefix). The REDO that makes a spend crash-safe is journaled by the
-    ///   CALLER, not here, and differs by [`Self::clustered`]:
-    ///   - STANDALONE (`clustered() == false`): this fn appends a thin index-only
-    ///     `Relocate` (recovery reads the record back from `new_offset`); a crash
-    ///     before the barrier loses image + redo + dead-mark together and leaves
-    ///     the pre-relocation record intact — the contract `replay_relocate`
-    ///     enforces.
-    ///   - CLUSTERED (`clustered() == true`): this fn journals NOTHING. The spend's
-    ///     convertible per-vout `RedoOp::SpendV2` — emitted WAL-first by the
-    ///     dispatch spend path and by the replica's post-apply journalling — is the
-    ///     authoritative redo: replication-convertible AND self-sufficient for
-    ///     local recovery (it replays the spend IN PLACE against the durable,
-    ///     append-only pre-spend record). See `specs/SEGMENT_CLUSTERING_DESIGN.md`.
+    ///   redo prefix). This fn journals NO relocate redo for EITHER node role; the
+    ///   crash-safety of its two callers is provided elsewhere:
+    ///   - SPEND (dispatch / replica post-apply): the caller emits the convertible
+    ///     per-vout `RedoOp::SpendV2` WAL-first. It is replication-convertible AND
+    ///     self-sufficient for local recovery — on replay it re-applies the spend
+    ///     IN PLACE against the durable, append-only pre-spend record (not the
+    ///     still-buffered `new_offset`). A thin `Relocate` here would be redundant
+    ///     and, worse, would CONFLICT: it re-points recovery to `new_offset`'s
+    ///     buffered bytes, which a power-loss before the checkpoint loses — the P0
+    ///     double-spend the SpendV2 model fixes. This holds for STANDALONE and
+    ///     CLUSTERED alike.
+    ///   - DEFRAG/COMPACTION (`defrag_compact`, empty `slot_mutations`): a
+    ///     space-only move, checkpoint-covered and revert-safe with no redo. A
+    ///     crash before the next checkpoint reverts to the intact old extent
+    ///     (append-only never reused it); the record's logical state is unchanged
+    ///     either way. `replay_relocate` is retained only to replay legacy on-disk
+    ///     `Relocate` entries. See `specs/SEGMENT_CLUSTERING_DESIGN.md`.
     ///
     /// # Ordering (consensus-critical)
-    /// allocate → write new image (buffered) → [STANDALONE: journal thin
-    /// `Relocate`] → repoint index → free old.
+    /// allocate → write new image (buffered) → repoint index → free old.
     /// A lock-free reader that grabbed the old offset before the repoint still
     /// reads valid bytes: the old extent stays intact (append-only never reuses a
     /// freed offset until defrag), and the index swap is atomic. The repoint
@@ -5146,36 +5228,41 @@ impl Engine {
             }
         })?;
 
-        // 5. Journal the relocation for recovery — STANDALONE only.
+        // 5. Journal the relocation for recovery — NOTHING (both node roles).
         //
-        // STANDALONE segment relies on the thin index-only `Relocate` (recovery
-        // reads the record back from `new_offset`), made durable together with the
-        // data at the checkpoint barrier.
+        // This primitive journals NO relocate redo. Its two callers are each
+        // covered without one:
         //
-        // CLUSTERED segment journals NOTHING here: the spend's convertible per-vout
-        // `RedoOp::SpendV2` — emitted WAL-first by the dispatch spend path
-        // (`handle_spend_batch`) and by the replica's post-apply journalling
-        // (`build_post_apply_redo_op`) — is the authoritative redo. It is
-        // replication-convertible AND self-sufficient for local recovery: on replay
-        // it re-applies the spend IN PLACE against the durable, append-only
-        // pre-spend record (append-only never overwrites the old extent until
-        // defrag), so a physical relocate redo would be redundant. A fat
-        // image-carrying redo would also be a redo-amplification and oversized-entry
-        // hazard. See `specs/SEGMENT_CLUSTERING_DESIGN.md`.
-        if !self.clustered()
-            && let Some(log) = self.redo_log_for_device(device_id)
-        {
-            log.lock()
-                .append(crate::redo::RedoOp::Relocate {
-                    tx_key: *tx_key,
-                    device_id,
-                    record_offset: new_offset,
-                    utxo_count,
-                })
-                .map_err(|e| SpendError::StorageError {
-                    detail: format!("relocate: journal Relocate: {e}"),
-                })?;
-        }
+        //   * SPEND (dispatch `handle_spend_batch` / replica post-apply): the
+        //     convertible per-vout `RedoOp::SpendV2` — emitted WAL-first by the
+        //     caller (`build_post_apply_redo_op` on the replica) — is the
+        //     authoritative redo. It is replication-convertible AND self-sufficient
+        //     for LOCAL recovery: on replay it re-applies the spend IN PLACE against
+        //     the durable, append-only pre-spend record (append-only never
+        //     overwrites the old extent until defrag), so a physical relocate redo
+        //     would be redundant AND would CONFLICT (the thin `Relocate` re-points
+        //     to `new_offset`, whose bytes are still buffered, while `SpendV2`
+        //     applies at the old offset). This is the P0 double-spend fix — a
+        //     STANDALONE spend used to journal a thin `Relocate`; on a power-loss
+        //     before the checkpoint fsynced `new_offset`, `replay_relocate` read the
+        //     torn bytes, `Skip`ped, and reverted the acked spend to UNSPENT.
+        //
+        //   * DEFRAG/COMPACTION (`defrag_compact`, empty `slot_mutations`): a
+        //     space-only move with no logical change. It is checkpoint-covered and
+        //     revert-safe WITHOUT a redo: the checkpoint fsyncs the data device and
+        //     snapshots the index (→ `new_offset`) together before reclaiming any
+        //     redo prefix, so a crash AFTER the checkpoint recovers at `new_offset`;
+        //     a crash BEFORE it reloads the pre-defrag index snapshot (→ old offset)
+        //     and replays no relocate, keeping the record at the still-intact old
+        //     extent (append-only never reused it). Reverting a defrag is harmless —
+        //     the record's logical state is unchanged either way. This is exactly
+        //     the model the CLUSTERED path already relied on (its relocate journaled
+        //     nothing too); it is equally sound for STANDALONE.
+        //
+        // A fat image-carrying redo would additionally be a redo-amplification and
+        // oversized-entry hazard. `replay_relocate` is retained only for backward
+        // compatibility with existing on-disk logs that still carry `Relocate`
+        // entries. See `specs/SEGMENT_CLUSTERING_DESIGN.md`.
 
         // 6. Re-point the index to the new offset, rebuilding ALL cached fields
         // from `metadata` so the live entry equals what `replay_relocate` would
@@ -7121,15 +7208,18 @@ impl Engine {
             // `read_metadata_direct` and `write_metadata_direct` take the
             // per-offset `io_locks()` read/write side, so the RMW is
             // torn-read-safe against concurrent direct accessors.
-            let (generation, prior_locked, old_dah, new_dah) = unsafe {
+            // P1-4: the authoritative DAH lives in the `dah_index` secondary
+            // post-16d — the device footer `delete_at_height` is 0 for a
+            // set_mined-planted DAH. Baseline the eviction off the secondary, NOT
+            // the frozen footer, so locking actually evicts the DAH (else the
+            // sweep deletes an explicitly-locked record) and compensation
+            // restores the true prior height.
+            let authoritative_dah = self.dah_index().get_height(&req.tx_key).unwrap_or(0);
+            let (generation, prior_locked) = unsafe {
                 let mut meta = io::read_metadata_direct(self.device_ptr_for(device_id), ro)
                     .map_err(|e| SpendError::StorageError {
                         detail: format!("{e}"),
                     })?;
-                // `old_dah` is what the DAH secondary index currently
-                // reflects: the on-device DAH (0 when preserved, since
-                // preservation clears it).
-                let old_dah = { meta.delete_at_height };
                 let prior_locked = meta.flags.contains(TxFlags::LOCKED);
                 if req.value {
                     meta.flags.insert(TxFlags::LOCKED);
@@ -7140,31 +7230,32 @@ impl Engine {
                 let generation = { meta.generation }.wrapping_add(1);
                 meta.generation = generation;
                 meta.updated_at = updated_at;
-                let new_dah = { meta.delete_at_height };
                 io::write_metadata_direct(self.device_ptr_for(device_id), ro, &meta);
-                (generation, prior_locked, old_dah, new_dah)
+                (generation, prior_locked)
             };
 
-            // Update DAH secondary index (two-phase durable)
-            self.update_dah_index(&req.tx_key, old_dah, new_dah)?;
+            // Update DAH secondary index (two-phase durable): locking evicts the
+            // authoritative DAH; unlocking leaves it untouched (old == new).
+            let new_dah = if req.value { 0 } else { authoritative_dah };
+            self.update_dah_index(&req.tx_key, authoritative_dah, new_dah)?;
 
             return Ok(SetLockedResponse {
                 generation,
                 prior_locked,
-                prior_delete_at_height: old_dah,
+                prior_delete_at_height: authoritative_dah,
             });
         }
 
         // Slow path: no direct pointer
         let mut meta = self.read_metadata_fast(device_id, ro)?;
-        let old_dah = { meta.delete_at_height };
+        // P1-4: baseline the DAH eviction off the authoritative secondary index,
+        // not the device footer (0 for a set_mined-planted DAH).
+        let authoritative_dah = self.dah_index().get_height(&req.tx_key).unwrap_or(0);
         let prior_locked = meta.flags.contains(TxFlags::LOCKED);
 
         if req.value {
             meta.flags |= TxFlags::LOCKED;
-            if old_dah != 0 {
-                meta.delete_at_height = 0;
-            }
+            meta.delete_at_height = 0; // Locking clears deleteAtHeight
         } else {
             meta.flags -= meta.flags & TxFlags::LOCKED;
         }
@@ -7174,13 +7265,13 @@ impl Engine {
 
         self.write_metadata_fast(device_id, ro, &meta)?;
 
-        let new_dah = { meta.delete_at_height };
-        self.update_dah_index(&req.tx_key, old_dah, new_dah)?;
+        let new_dah = if req.value { 0 } else { authoritative_dah };
+        self.update_dah_index(&req.tx_key, authoritative_dah, new_dah)?;
 
         Ok(SetLockedResponse {
             generation: { meta.generation },
             prior_locked,
-            prior_delete_at_height: old_dah,
+            prior_delete_at_height: authoritative_dah,
         })
     }
 
@@ -7321,6 +7412,12 @@ impl Engine {
         current_block_height: u32,
     ) -> bool {
         if { meta.preserve_until } != 0 {
+            return false;
+        }
+        // P1-4: an explicitly LOCKED record must never be swept, even if a DAH
+        // was (re-)planted on it after locking (locking itself evicts the DAH,
+        // but this closes the re-plant window as defense in depth).
+        if meta.flags.contains(TxFlags::LOCKED) {
             return false;
         }
         // Authoritative due-height: the live DAH secondary index, NOT the
@@ -7503,6 +7600,20 @@ impl Engine {
     /// 4. Return the region to the allocator (after the primary-index removal,
     ///    so no `lookup(key)` can reach the post-free offset — F-G2-001).
     fn delete_inner(&self, req: &DeleteRequest) -> Result<(), SpendError> {
+        // P0-11 follow-up: a write-unhealthy (poisoned) node must not PRUNE. The
+        // internal DAH sweep journals no redo, so poisoning the redo log does not
+        // by itself fence it; refuse the guarded sweep delete (`due_guard` set)
+        // while unhealthy so a torn record left by `unspend`'s failed-revert
+        // fallback cannot be swept before a restart's recovery recomputes the
+        // counter and heals it. Explicit client deletes (`due_guard == None`) are
+        // not this data-loss vector and are left unchanged.
+        if req.due_guard.is_some() && !self.write_healthy() {
+            return Err(SpendError::StorageError {
+                detail:
+                    "node write-unhealthy (redo log poisoned); sweep-delete refused (fail-closed)"
+                        .to_string(),
+            });
+        }
         let _guard = self.locks.lock(&req.tx_key);
 
         // G-4: a backend read error must not collapse to "absent".
@@ -7642,8 +7753,16 @@ impl Engine {
         // replay case). `update_*_index` is a no-op when old == new, and a
         // record is in the DAH index XOR the preserve index, so at most one of
         // these performs a real removal.
-        if device_dah != 0 {
-            self.update_dah_index(&req.tx_key, device_dah, 0)?;
+        // P1-1: post-Task-16d, `set_mined` plants the DAH ONLY in the `dah_index`
+        // secondary, leaving the device footer at 0. Gating removal on the footer
+        // alone therefore leaks an immortal dead-key entry — and those low-height
+        // entries fill the bounded sweep window and wedge all DAH deletion. Remove
+        // when EITHER the footer OR the live secondary height is non-zero.
+        // (`update_dah_index`'s `remove` is by-key; `old_height` is only a
+        // non-zero gate, so any non-zero value drives the removal.)
+        let live_dah = self.dah_index().get_height(&req.tx_key).unwrap_or(0);
+        if device_dah != 0 || live_dah != 0 {
+            self.update_dah_index(&req.tx_key, device_dah.max(live_dah), 0)?;
         }
         if device_preserve != 0 {
             self.update_preserve_index(&req.tx_key, device_preserve, 0)?;
@@ -8210,12 +8329,20 @@ impl Engine {
     /// attribute the third tx's blocks/`all_spent` to this entry's key.
     /// Closed the same way [`Self::read_metadata_for_key`] closes its
     /// identity race: after resolving the authoritative key from the
-    /// footer, a FRESH `self.index.lookup` re-resolves `mined_slot`, and
-    /// the pair is trusted only if that fresh entry still points at the
-    /// SAME `(device_id, record_offset)` this iteration captured and
-    /// carries a live (non-sentinel) `mined_slot`. Otherwise the record has
-    /// moved or gone since pass one and is simply omitted — the same
-    /// fallback coverage as an unreadable footer.
+    /// footer, a FRESH `self.index.lookup` re-resolves `mined_slot` — that
+    /// fresh slot is THIS key's current slot, so it can never be the stale,
+    /// now-reassigned one. The pair is kept whenever the fresh entry carries
+    /// a live (non-sentinel) `mined_slot`; a genuinely deleted / slot-less
+    /// key is omitted, the same fallback coverage as an unreadable footer.
+    /// The captured `(device_id, record_offset)` is deliberately NOT
+    /// re-required to match: the segment storage engine relocates a record
+    /// on spend (the DEFAULT), so a still-live record routinely has a fresh
+    /// entry at a DIFFERENT offset than pass one captured — requiring the
+    /// offset to match dropped every such relocated-but-live record from the
+    /// snapshot (silent mined-state loss, since the checkpoint then fences +
+    /// reclaims the redo holding its `SetMinedBatch`). See
+    /// [`Self::resolve_mined_index_pairs`] for the reused-offset dedup that
+    /// relaxation then requires.
     ///
     /// Written as a SEPARATE file (tempfile + fsync + rename + parent-dir
     /// fsync, mirroring [`ShardedIndex::snapshot_all_concurrent`]) so a
@@ -8302,25 +8429,51 @@ impl Engine {
                 }
             };
             let key = TxKey::from_bytes(meta.tx_id);
-            // Re-resolve against the CURRENT index instead of trusting the
-            // slot captured in the first pass (see the TOCTOU doc above).
+            // Re-resolve against the CURRENT index instead of trusting the slot
+            // captured in the first pass (see the TOCTOU doc above). The fresh
+            // lookup — not the captured `(device_id, offset)` — is authoritative:
+            // it already closes the reused-slot TOCTOU (the fresh `mined_slot` is
+            // the current one for THIS key). The pass-1 `(device_id, offset)` is
+            // deliberately NOT re-required to match: the segment storage engine
+            // relocates a record on spend (the DEFAULT), so a record that is
+            // still live under a live `mined_slot` routinely has a fresh entry at
+            // a DIFFERENT offset than pass 1 captured. Requiring the offset to
+            // match dropped every such relocated-but-live record from `.mined` —
+            // silent data loss, since the checkpoint then fences + reclaims the
+            // redo holding its SetMinedBatch (P0). Keep it whenever it is live
+            // with a valid fresh slot; only a genuinely deleted / slot-less key
+            // hits the `_` arm and is omitted (same as an unreadable footer).
             match self.index.lookup(&key) {
-                Some(fresh)
-                    if fresh.device_id == device_id
-                        && fresh.record_offset == offset
-                        && fresh.mined_slot != crate::index::mined_index::NO_MINED_SLOT =>
-                {
+                Some(fresh) if fresh.mined_slot != crate::index::mined_index::NO_MINED_SLOT => {
                     pairs.push((key, fresh.mined_slot));
                 }
                 _ => {
-                    // Moved (relocated/deleted+recreated) or freed since pass
-                    // one — expected under churn, not an error; omitted the
-                    // same as an unreadable footer.
+                    // Deleted or slot-less since pass one — expected under
+                    // churn, not an error; omitted the same as an unreadable
+                    // footer.
                     skipped += 1;
                 }
             }
         }
-        (pairs, skipped)
+        // Dedup by key (last-write-wins), preserving first-seen order for
+        // determinism. Now that the offset-equality guard is relaxed, a stale
+        // captured offset whose footer still resolves to a key that was ALSO
+        // captured from its fresh offset (a reused-offset TOCTOU) would push the
+        // same key twice. Both copies resolve — via the fresh lookup — to the
+        // SAME current slot, so collapsing to one keeps `.mined` free of
+        // duplicate txid sections.
+        let mut seen: std::collections::HashMap<TxKey, usize> =
+            std::collections::HashMap::with_capacity(pairs.len());
+        let mut deduped: Vec<(TxKey, u32)> = Vec::with_capacity(pairs.len());
+        for (key, slot) in pairs {
+            if let Some(&idx) = seen.get(&key) {
+                deduped[idx].1 = slot;
+            } else {
+                seen.insert(key, deduped.len());
+                deduped.push((key, slot));
+            }
+        }
+        (deduped, skipped)
     }
 
     /// Rebuild the in-memory [`ShardedMinedIndex`] FRESH from a checkpoint's
@@ -8697,6 +8850,36 @@ impl Engine {
                         }
                     }
                 }
+                crate::redo::RedoOp::MarkOnLongestChain {
+                    tx_key,
+                    on_longest_chain,
+                    current_block_height,
+                    ..
+                } => {
+                    // A longest-chain transition mutates mined-state at the
+                    // live op via `set_longest_chain` (bucket-only), but is
+                    // written only to the device footer on the crash path —
+                    // which the MinedIndex reader never consults. Snapshot
+                    // restore takes `unmined_since` from the `.mined`
+                    // checkpoint, so an above-fence transition is lost unless
+                    // replayed here. Resolve the slot exactly as the
+                    // `SetMinedBatch` arm does (in-tail slot first, else the
+                    // primary index's live pointer), skip if unknown, and
+                    // mirror the live op's `set_longest_chain` call.
+                    let slot = tail_slots.get(tx_key).copied().or_else(|| {
+                        self.index
+                            .lookup(tx_key)
+                            .map(|e| e.mined_slot)
+                            .filter(|&s| s != crate::index::mined_index::NO_MINED_SLOT)
+                    });
+                    let Some(slot) = slot else { continue };
+                    self.mined_index.set_longest_chain(
+                        tx_key,
+                        slot,
+                        *on_longest_chain,
+                        *current_block_height,
+                    );
+                }
                 _ => {}
             }
         }
@@ -8827,17 +9010,32 @@ impl Engine {
         mined_snapshot_path: &std::path::Path,
         redo_logs: &[Arc<parking_lot::Mutex<crate::redo::RedoLog>>],
     ) -> Result<bool, SpendError> {
-        let checkpoint_ever_taken = primary_snapshot_path.exists();
+        let primary_snapshot_exists = primary_snapshot_path.exists();
+        // P1-21: the redo fence — the highest sequence whose prefix has been
+        // reclaimed. `0` means NOTHING was reclaimed, so a full redo-tail replay
+        // from genesis is provably COMPLETE. `primary_snapshot_path.exists()` is
+        // NOT a reliable "a checkpoint ran" proxy: a graceful shutdown writes the
+        // primary snapshot WITHOUT the `.mined` sibling (only the checkpoint
+        // writes that), so on a node that never checkpointed the old
+        // `!checkpoint_ever_taken` gate tripped the FATAL branch and refused to
+        // boot. Gate the full-replay path on the fence, not the primary snapshot.
+        let redo_fence = redo_logs
+            .iter()
+            .map(|l| l.lock().recovery_fence())
+            .max()
+            .unwrap_or(0);
 
         let bytes = match std::fs::read(mined_snapshot_path) {
             Ok(b) => b,
             Err(e) => {
-                if !checkpoint_ever_taken {
+                if redo_fence == 0 {
                     tracing::info!(
                         path = %mined_snapshot_path.display(),
                         err = %e,
-                        "mined-index recovery: fresh boot (no checkpoint has ever run); \
-                         reconstructing the MinedIndex via full redo-tail replay from genesis",
+                        primary_snapshot_exists,
+                        "mined-index recovery: no redo prefix has been reclaimed (fence 0); \
+                         reconstructing the MinedIndex via full redo-tail replay from genesis \
+                         (fresh boot or a graceful shutdown that wrote no .mined snapshot)",
                     );
                     self.mined_index.clear();
                     self.replay_mined_index_redo_tail(redo_logs)?;
@@ -8846,16 +9044,17 @@ impl Engine {
                 tracing::error!(
                     path = %mined_snapshot_path.display(),
                     err = %e,
-                    "FATAL: mined-index snapshot section absent despite an existing \
-                     primary-index checkpoint — the device-scan fallback was removed (Task \
-                     16d); recovery cannot safely reconstruct mined-state",
+                    redo_fence,
+                    "FATAL: mined-index snapshot section absent and a redo prefix has been \
+                     reclaimed (fence > 0), so the redo tail is incomplete — recovery cannot \
+                     safely reconstruct mined-state (Task 16d removed the device-scan fallback)",
                 );
                 return Err(SpendError::StorageError {
                     detail: format!(
-                        "mined-index recovery: snapshot section absent at {} despite an \
-                         existing primary-index checkpoint at {}: {e}",
+                        "mined-index recovery: snapshot section absent at {} with redo fence {} \
+                         (a reclaimed prefix makes the tail incomplete): {e}",
                         mined_snapshot_path.display(),
-                        primary_snapshot_path.display()
+                        redo_fence,
                     ),
                 });
             }
@@ -9001,47 +9200,108 @@ impl Engine {
     /// since the last checkpoint (absent from the primary index, hence not
     /// visited) are not left orphaned.
     ///
+    /// A record whose device footer is unreadable (torn / relocated mid-scan),
+    /// OR whose live `mined_slot` is absent from the MinedIndex (a
+    /// dangling/desynced slot), is SKIPPED with a warning + an
+    /// [`Self::enumeration_unreadable`] metric bump — a single such record must
+    /// never brick the boot — mirroring [`Self::resolve_full_keys`].
+    ///
     /// # Errors
     ///
-    /// Returns [`SpendError::StorageError`] on a device metadata read failure, a
-    /// primary/MinedIndex desync (a live `mined_slot` absent from the MinedIndex),
-    /// or a secondary-index clear/insert failure; [`SpendError::DahOverflow`] if
-    /// `current_block_height + block_height_retention` overflows `u32`.
+    /// Returns [`SpendError::StorageError`] on a secondary-index clear/insert
+    /// failure, or [`SpendError::DahOverflow`] if
+    /// `current_block_height + block_height_retention` overflows `u32`. An
+    /// individual record's footer read failure, or a dangling `mined_slot`,
+    /// does NOT error — it is skipped (see above).
     pub fn reconcile_secondaries_from_mined_index(
         &self,
         current_block_height: u32,
         block_height_retention: u32,
     ) -> Result<(), SpendError> {
-        // Snapshot the live records while holding only the primary shard read
-        // lock, then release it before the per-record device + MinedIndex reads
-        // and secondary-index writes (so no secondary lock nests under the
-        // primary lock).
-        let mut records: Vec<(TxKey, u8, u64, u32)> = Vec::with_capacity(self.index.len());
-        self.index.for_each(|key, entry| {
-            records.push((key, entry.device_id, entry.record_offset, entry.mined_slot));
-        });
-
         self.dah_index
             .clear()
             .map_err(|e| SpendError::StorageError {
                 detail: format!("mined-index reconcile: clearing DAH index failed: {e}"),
             })?;
 
-        for (key, device_id, record_offset, mined_slot) in records {
-            let meta = self.read_metadata_for_key(device_id, &key, record_offset)?;
+        // P1-2: iterate ONE INDEX SHARD AT A TIME so peak memory is bounded to a
+        // single shard's locators, not the whole store — the old whole-store
+        // `Vec::with_capacity(self.index.len())` was an OOM/boot hazard at the
+        // multi-billion-record design point (~tens of GiB on top of the index).
+        // Each shard's locators are collected under that shard's read lock, which
+        // is RELEASED before the batch's per-record device + MinedIndex reads and
+        // secondary-index writes (so no secondary lock nests under the primary).
+        //
+        // The enumeration KEY is deliberately NOT captured: on the default
+        // `Memory`/`FileBacked` backend the iterator yields the stored 12-byte
+        // txid prefix zero-padded to 32 bytes (see `hashtable::STORED_TXID_LEN`
+        // / `Bucket::stored_key`), NOT the record's true txid. Using it would
+        // fail the footer tx_id check for any realistic SHA256 txid (nonzero
+        // beyond byte 12) and mis-shard every MinedIndex read (`shard_for`
+        // routes on `txid[16..24]`, zeroed by truncation). The authoritative
+        // full txid is resolved from each record's device footer below.
+        self.index.try_for_each_shard(
+            |_key, entry| (entry.device_id, entry.record_offset, entry.mined_slot),
+            |locators: Vec<(u8, u64, u32)>| -> Result<(), SpendError> {
+                for (device_id, record_offset, mined_slot) in locators {
+            // Read the footer ONCE and derive the AUTHORITATIVE full txid from
+            // it (`meta.tx_id`). A single unreadable footer (torn / relocated
+            // mid-scan) must SKIP this record, never brick the boot — same warn
+            // + `enumeration_unreadable` metric as `resolve_full_keys`. This
+            // replaces the old truncated-key `read_metadata_for_key`: the key is
+            // now derived FROM the footer, so its `meta.tx_id != key.txid`
+            // identity check is redundant (see debug_assert below).
+            let meta = match self.read_metadata_fast(device_id, record_offset) {
+                Ok(m) => m,
+                Err(e) => {
+                    self.enumeration_unreadable
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    tracing::warn!(
+                        target: "teraslab::engine",
+                        device_id,
+                        offset = record_offset,
+                        err = %e,
+                        "mined-index reconcile: record footer unreadable; skipping record",
+                    );
+                    continue;
+                }
+            };
+            let key = TxKey::from_bytes(meta.tx_id);
+            debug_assert_eq!(
+                meta.tx_id, key.txid,
+                "reconcile key is derived from the footer tx_id",
+            );
 
             // Authoritative mined-state from the MinedIndex, never the device.
             let (entries, unmined_since) = if mined_slot == crate::index::mined_index::NO_MINED_SLOT
             {
                 (Vec::new(), 0)
             } else {
-                self.mined_index
-                    .read_block_entries(&key, mined_slot)
-                    .ok_or(SpendError::StorageError {
-                        detail: "mined-index reconcile: mined_slot present in primary index \
-                                     but absent from MinedIndex"
-                            .to_string(),
-                    })?
+                match self.mined_index.read_block_entries(&key, mined_slot) {
+                    Some(v) => v,
+                    None => {
+                        // The primary carries a live `mined_slot` but the
+                        // MinedIndex has no such live slot for this key (a
+                        // dangling/desynced slot — e.g. a record dropped from a
+                        // stale `.mined` snapshot, which Part A now prevents).
+                        // This runs on EVERY boot and `bin/server.rs` FATAL-exits
+                        // on Err, so bricking here would turn ONE lost record into
+                        // an unbootable node. Degrade LOUDLY instead: skip THIS
+                        // record (its mined-state is unrecoverable regardless) and
+                        // keep reconciling the rest.
+                        self.enumeration_unreadable
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        tracing::warn!(
+                            target: "teraslab::engine",
+                            key = ?key,
+                            mined_slot,
+                            "mined-index reconcile: mined_slot present in primary index but \
+                             absent from MinedIndex (dangling slot); skipping this record's \
+                             secondary reconciliation rather than bricking the boot",
+                        );
+                        continue;
+                    }
+                }
             };
             let has_blocks = !entries.is_empty();
 
@@ -9127,9 +9387,11 @@ impl Engine {
                         detail: format!("mined-index reconcile: DAH insert failed: {e}"),
                     }
                 })?;
-            }
-        }
-        Ok(())
+                    }
+                }
+                Ok(())
+            },
+        )
     }
 
     /// Read on-device metadata for a transaction.
@@ -9458,9 +9720,30 @@ impl Engine {
         {
             return 0;
         }
+        // Snapshot every live index entry's offset, bucketed by owning store, so
+        // each store's reclaim can cross-check its fully-dead candidates against the
+        // AUTHORITATIVE live set and never free a segment that still holds a live
+        // record (P0: a crash-recovered reused segment can carry stale `used ==
+        // dead` accounting while owning a live post-checkpoint record). Snapshotted
+        // lock-free (one index pass) BEFORE taking any allocator lock — the same
+        // pattern `defrag_compact` and `recover_allocator_frontiers` use — so the
+        // hot allocation path is not stalled behind a full index scan. The tiny
+        // snapshot→lock window is covered by the allocator's `dead >= used`
+        // co-condition on reclaim.
+        let n = self.stores.len();
+        let mut live_offsets: Vec<Vec<u64>> = vec![Vec::new(); n];
+        self.index.for_each(|_key, e| {
+            let s = e.device_id as usize;
+            if s < n {
+                live_offsets[s].push(e.record_offset);
+            }
+        });
         let mut total = 0;
-        for store in &self.stores {
-            total += store.allocator.lock().reclaim_fully_dead_segments();
+        for (s, store) in self.stores.iter().enumerate() {
+            total += store
+                .allocator
+                .lock()
+                .reclaim_fully_dead_segments(&live_offsets[s]);
         }
         total
     }
@@ -9475,8 +9758,10 @@ impl Engine {
     /// Each live record is moved VERBATIM to the append cursor via
     /// [`Self::relocate_record`] under its stripe lock — the same primitive and
     /// atomicity a spend uses, with empty slot mutations and its current metadata,
-    /// so it re-points the index, journals a buffered `Relocate`, and frees the old
-    /// extent. Best-effort + rate-limited: caller bounds `max_segments` (and thus
+    /// so it re-points the index and frees the old extent (journaling no redo — a
+    /// defrag move is checkpoint-covered and revert-safe: a crash before the next
+    /// checkpoint reverts to the intact old extent, harmless for a space move).
+    /// Best-effort + rate-limited: caller bounds `max_segments` (and thus
     /// the copy amplification); a per-record error is logged and skipped, never
     /// aborting the sweep.
     ///
@@ -9813,12 +10098,12 @@ impl PreparedSpend {
             // `relocate_record` sets the index entry in full (identically to
             // recovery), so NO subsequent `sync_index_cache` is needed (or wanted —
             // it would update the old key's cached fields without moving the
-            // offset). The spend's redo differs by node role: STANDALONE journals a
-            // thin buffered `Relocate` inside `relocate_record` (crash safety = the
-            // checkpoint barrier, which is why segment requires BUFFERED durability);
-            // CLUSTERED journals nothing here — the WAL-first `SpendV2` emitted in
-            // dispatch Phase 3 (already fsync-ordered before this apply) is the
-            // authoritative, convertible redo.
+            // offset). `relocate_record` journals NO relocate redo (both node roles):
+            // the WAL-first `SpendV2` emitted in dispatch Phase 3 (already
+            // fsync-ordered before this apply) is the authoritative, self-sufficient
+            // redo — on replay it re-applies the spend IN PLACE against the durable,
+            // append-only pre-spend record, so recovery never depends on the still-
+            // buffered relocated bytes (the P0 double-spend fix).
             engine.relocate_record(device_id, &tx_key, &metadata, &valid_spends)?;
         } else {
             // In-place RMW: targeted spend footer when direct, full otherwise.
@@ -10176,6 +10461,29 @@ pub fn decode_durable_height(bytes: &[u8]) -> Option<u32> {
 pub fn read_durable_height_file(path: &std::path::Path) -> Option<u32> {
     let bytes = std::fs::read(path).ok()?;
     decode_durable_height(&bytes)
+}
+
+/// Compute the block-height floor that seeds the boot-time DAH reconcile
+/// ([`Engine::reconcile_secondaries_from_mined_index`]) and the node's restored
+/// last-durable height. The floor is `max(persisted, tail_floor)`:
+///
+/// - `persisted` — the height read from the durable `.height` file
+///   ([`read_durable_height_file`]); `None` when the file is missing or corrupt
+///   (it then contributes nothing).
+/// - `tail_floor` — the max block height proved by the replayed redo tail. This
+///   is `0` for a height-free tail, which is ROUTINE: Create/Relocate/Delete and
+///   V1 spends carry no height, and a clean restart (or a crash right after a
+///   checkpoint) replays no height-bearing entry.
+///
+/// Folding `persisted` BEFORE the reconcile is load-bearing. A height-free tail
+/// alone yields `0`; the reconcile would then re-derive every setMined-planted
+/// DAH (device footer stale-0) as `0 + retention`, which at real chain height is
+/// already past → the acked record is swept up to a full retention window early
+/// and a later reorg-unspend returns `TxNotFound` (P0). This helper is kept
+/// identical to [`Engine::restore_last_durable_height`]'s own `max` so the
+/// reconcile floor and the restored last-durable height can never diverge.
+pub fn reconcile_height_floor(persisted: Option<u32>, tail_floor: u32) -> u32 {
+    persisted.unwrap_or(0).max(tail_floor)
 }
 
 /// fsync the parent directory of `path` so the rename of the durable-height
@@ -10820,6 +11128,371 @@ mod tests {
         assert!(
             !unmined_keys.contains(&r1),
             "R1 (on longest chain) must not be in the unmined index",
+        );
+    }
+
+    /// P0 (slim-index brick): `reconcile_secondaries_from_mined_index` runs on
+    /// EVERY boot (`bin/server.rs`, which FATAL-exits if it returns Err). On the
+    /// DEFAULT `Memory`/`FileBacked` backend, `Index::for_each` yields the stored
+    /// 12-byte txid prefix zero-padded to 32 bytes — NOT the record's true txid
+    /// (see `hashtable::STORED_TXID_LEN` / `Bucket::stored_key`). A realistic
+    /// SHA256 txid carries entropy in `[12..32]`, so the pre-fix reconcile — which
+    /// fed that truncated key straight into `read_metadata_for_key` — hit
+    /// `meta.tx_id != key.txid` → `TxNotFound`, propagated the `?`, and bricked
+    /// the boot for every default-config node.
+    ///
+    /// This seeds ONE record whose txid has entropy across all 32 bytes (so both
+    /// the footer tx_id identity check AND the MinedIndex `shard_for` routing on
+    /// `txid[16..24]` would misfire on the truncated key) and asserts reconcile
+    /// now resolves the AUTHORITATIVE full txid from the device footer: it returns
+    /// Ok, registers the DAH under the FULL key (never the truncated prefix), and
+    /// the record's mined-state is reachable via that full key. The sibling
+    /// reconcile tests use near-zero txids where the slim prefix happens to equal
+    /// the full tx_id, so they never exercised this path.
+    #[test]
+    fn reconcile_resolves_full_txid_from_device_footer_on_slim_index() {
+        const RETENTION: u32 = 288;
+        const RECOVERY_HEIGHT: u32 = 2000;
+
+        let dev: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let mut alloc = SlotAllocator::new(dev.clone()).unwrap();
+        let mut index = Index::new(64).unwrap();
+
+        // A realistic SHA256-shaped txid: nonzero bytes throughout, in particular
+        // across [12..32] (defeats the truncated-key footer tx_id check) and
+        // [16..24] (the bytes `ShardedMinedIndex::shard_for` routes on, zeroed by
+        // truncation → wrong shard).
+        let txid: [u8; 32] = [
+            0x3a, 0x7b, 0xf2, 0x9c, 0x11, 0x84, 0x6d, 0x0e, 0xa5, 0xc3, 0x58, 0x92, 0xd7, 0x4f,
+            0x1b, 0xe0, 0x66, 0x39, 0xac, 0x02, 0x7e, 0xd1, 0x5c, 0x88, 0x4a, 0x9f, 0x30, 0xb7,
+            0x21, 0xe8, 0x6c, 0x05,
+        ];
+        let key = TxKey { txid };
+        // The exact truncated key the slim primary index round-trips through
+        // `for_each` (12-byte prefix, [12..32] zeroed) — the key the pre-fix
+        // reconcile wrongly used.
+        let truncated_key = {
+            let mut t = [0u8; 32];
+            t[0..12].copy_from_slice(&txid[0..12]);
+            TxKey { txid: t }
+        };
+        assert_ne!(
+            key.txid, truncated_key.txid,
+            "test precondition: the txid must carry entropy beyond byte 12",
+        );
+
+        // Write an all-spent, on-longest-chain, 1-UTXO record with NO device DAH
+        // (the setMined-planted case: the live DAH is re-derived by the eval).
+        let mut meta = TxMetadata::new(1);
+        meta.tx_id = txid;
+        meta.spent_utxos = 1; // all-spent
+        meta.unmined_since = 0; // on the longest chain
+        meta.delete_at_height = 0; // setMined-planted → re-derived below
+        let record_size = TxMetadata::record_size_for(1);
+        let offset = alloc.allocate(record_size).unwrap();
+        let slot0 = UtxoSlot::new_spent([0x11; 32], [0xAB; 36]);
+        io::write_full_record(&*dev, offset, &meta, &[slot0]).unwrap();
+        index
+            .register(
+                key,
+                TxIndexEntry {
+                    device_id: 0,
+                    record_offset: offset,
+                    mined_slot: crate::index::mined_index::NO_MINED_SLOT,
+                },
+            )
+            .unwrap();
+
+        let engine = Engine::new(
+            dev.clone(),
+            index,
+            alloc,
+            StripedLocks::new(64),
+            DahIndex::new(),
+        );
+
+        // Seed the record's MinedIndex slot with one mined block (has_blocks),
+        // keyed by the FULL txid — exactly what the live create/setMined path
+        // does — then re-point the primary entry at the slot.
+        let slot = seed_mined_index_for_test(&engine, &key, &meta, &[(0x99, 1000, 0)]);
+        let e = engine.index.lookup(&key).unwrap();
+        engine
+            .index
+            .register(
+                key,
+                TxIndexEntry {
+                    device_id: 0,
+                    record_offset: e.record_offset,
+                    mined_slot: slot,
+                },
+            )
+            .unwrap();
+
+        // Pre-fix: Err(TxNotFound) (the truncated key fails the footer tx_id
+        // identity check) → the server FATAL-exits and bricks the boot. Post-fix:
+        // resolves the full txid from the footer and succeeds.
+        engine
+            .reconcile_secondaries_from_mined_index(RECOVERY_HEIGHT, RETENTION)
+            .expect("reconcile must not brick boot on a realistic slim-index txid");
+
+        // The DAH is registered under the AUTHORITATIVE full txid, re-derived to
+        // current_height + retention (device DAH was stale-0).
+        assert_eq!(
+            engine.dah_index().get_height(&key),
+            Some(RECOVERY_HEIGHT + RETENTION),
+            "DAH must be registered under the FULL txid, re-derived from the eval",
+        );
+        // And NEVER under the truncated slim-index prefix key.
+        assert_eq!(
+            engine.dah_index().get_height(&truncated_key),
+            None,
+            "DAH must not be keyed by the truncated slim-index prefix",
+        );
+        // Mined-state is reachable via the full key (correct MinedIndex shard).
+        let (entries, unmined_since) = engine
+            .mined_index()
+            .read_block_entries(&key, slot)
+            .expect("mined-state must be reachable via the full txid");
+        assert_eq!(unmined_since, 0, "record is on the longest chain");
+        assert_eq!(entries.len(), 1, "the one seeded mined block is present");
+        let be = entries[0];
+        assert_eq!({ be.block_id }, 0x99, "the seeded block_id round-trips");
+    }
+
+    /// P0 (Part B — dangling reconcile slot bricks boot): a primary entry whose
+    /// `mined_slot` is present but ABSENT from the MinedIndex (a lost/dangling
+    /// slot — e.g. the relocated-record loss Part A prevents, or any other
+    /// primary/MinedIndex desync) must NOT brick the boot.
+    /// `reconcile_secondaries_from_mined_index` runs on EVERY boot and
+    /// `bin/server.rs` FATAL-exits if it returns Err, so the pre-fix
+    /// `.ok_or(StorageError)?` on a single dangling slot turned ONE lost record
+    /// into an unbootable node on every boot attempt. The fix degrades a dangling
+    /// slot to a LOUD warn + `enumeration_unreadable` bump + `continue`, so one
+    /// lost record can never brick boot AND the OTHER records still reconcile.
+    #[test]
+    fn reconcile_degrades_dangling_mined_slot_instead_of_bricking() {
+        use crate::index::mined_index::NO_MINED_SLOT;
+        const RETENTION: u32 = 288;
+        const RECOVERY_HEIGHT: u32 = 2000;
+
+        let dev: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let mut alloc = SlotAllocator::new(dev.clone()).unwrap();
+        let mut index = Index::new(64).unwrap();
+
+        // A healthy record (live mined_slot, must still reconcile) and a broken
+        // one (dangling mined_slot, must be skipped) — both with realistic,
+        // full-entropy txids and readable device footers.
+        let ok_txid: [u8; 32] = [
+            0x3a, 0x7b, 0xf2, 0x9c, 0x11, 0x84, 0x6d, 0x0e, 0xa5, 0xc3, 0x58, 0x92, 0xd7, 0x4f,
+            0x1b, 0xe0, 0x66, 0x39, 0xac, 0x02, 0x7e, 0xd1, 0x5c, 0x88, 0x4a, 0x9f, 0x30, 0xb7,
+            0x21, 0xe8, 0x6c, 0x05,
+        ];
+        let bad_txid: [u8; 32] = [
+            0x5c, 0x9f, 0x21, 0xe8, 0x6c, 0x05, 0x4a, 0x30, 0xb7, 0x88, 0xd1, 0x7e, 0x02, 0xac,
+            0x39, 0x66, 0xe0, 0x1b, 0x4f, 0xd7, 0x92, 0x58, 0xc3, 0xa5, 0x0e, 0x6d, 0x84, 0x11,
+            0x9c, 0xf2, 0x7b, 0x3a,
+        ];
+        let ok_key = TxKey { txid: ok_txid };
+        let bad_key = TxKey { txid: bad_txid };
+
+        let make_record = |txid: [u8; 32], alloc: &mut SlotAllocator| -> (TxMetadata, u64) {
+            let mut meta = TxMetadata::new(1);
+            meta.tx_id = txid;
+            meta.spent_utxos = 1; // all-spent
+            meta.unmined_since = 0; // on the longest chain
+            meta.delete_at_height = 0; // setMined-planted → re-derived by the eval
+            let record_size = TxMetadata::record_size_for(1);
+            let offset = alloc.allocate(record_size).unwrap();
+            let slot0 = UtxoSlot::new_spent([txid[0]; 32], [0xAB; 36]);
+            io::write_full_record(&*dev, offset, &meta, &[slot0]).unwrap();
+            (meta, offset)
+        };
+        let (ok_meta, ok_off) = make_record(ok_txid, &mut alloc);
+        let (_bad_meta, bad_off) = make_record(bad_txid, &mut alloc);
+
+        // Slot 4242 is never allocated in the MinedIndex → dangling.
+        const DANGLING_SLOT: u32 = 4242;
+        index
+            .register(
+                ok_key,
+                TxIndexEntry {
+                    device_id: 0,
+                    record_offset: ok_off,
+                    mined_slot: NO_MINED_SLOT,
+                },
+            )
+            .unwrap();
+        index
+            .register(
+                bad_key,
+                TxIndexEntry {
+                    device_id: 0,
+                    record_offset: bad_off,
+                    mined_slot: DANGLING_SLOT,
+                },
+            )
+            .unwrap();
+
+        let engine = Engine::new(
+            dev.clone(),
+            index,
+            alloc,
+            StripedLocks::new(64),
+            DahIndex::new(),
+        );
+
+        // Give the healthy record a real MinedIndex slot and re-point its primary.
+        let ok_slot = seed_mined_index_for_test(&engine, &ok_key, &ok_meta, &[(0x99, 1000, 0)]);
+        engine
+            .index
+            .register(
+                ok_key,
+                TxIndexEntry {
+                    device_id: 0,
+                    record_offset: ok_off,
+                    mined_slot: ok_slot,
+                },
+            )
+            .unwrap();
+
+        // Precondition: the dangling slot really is absent from the MinedIndex.
+        assert!(
+            engine
+                .mined_index()
+                .read_block_entries(&bad_key, DANGLING_SLOT)
+                .is_none(),
+            "test precondition: the broken record's mined_slot must be absent from the MinedIndex",
+        );
+
+        let before = engine.enumeration_unreadable();
+        // Pre-fix: the dangling slot's `.ok_or(StorageError)?` propagates → Err →
+        // FATAL boot brick. Post-fix: warn + metric + continue → Ok.
+        engine
+            .reconcile_secondaries_from_mined_index(RECOVERY_HEIGHT, RETENTION)
+            .expect("a dangling mined_slot must degrade, never brick the boot");
+        assert_eq!(
+            engine.enumeration_unreadable(),
+            before + 1,
+            "the dangling-slot skip must bump the observable enumeration_unreadable metric",
+        );
+        // The dangling record was skipped (no DAH registered)...
+        assert_eq!(
+            engine.dah_index().get_height(&bad_key),
+            None,
+            "the skipped dangling record must not register a DAH",
+        );
+        // ...but the HEALTHY sibling was still fully reconciled.
+        assert_eq!(
+            engine.dah_index().get_height(&ok_key),
+            Some(RECOVERY_HEIGHT + RETENTION),
+            "the healthy record's DAH must still be reconciled despite the sibling skip",
+        );
+    }
+
+    /// P0 (premature-sweep): `reconcile_secondaries_from_mined_index` re-derives
+    /// a setMined-planted DAH (device footer `delete_at_height == 0`; all-spent,
+    /// mined, on the longest chain) as `current_block_height + retention`. The
+    /// server-boot ordering fix folds the persisted durable height into that
+    /// `current_block_height` (`reconcile_height_floor` + `bin/server.rs`), so at
+    /// real chain height the re-derived DAH lands a full retention window in the
+    /// FUTURE — the record is retained. The pre-fix code passed the bare
+    /// `recovery_height_floor`, which is 0 for a height-free redo tail, so the
+    /// DAH was re-derived at `0 + retention`, already FAR past the real chain
+    /// height → the acked record was swept a full retention window early (a later
+    /// reorg-unspend then returns TxNotFound — the exact loss this pass exists to
+    /// prevent). This proves the reconcile output tracks the floor: floor
+    /// 800_000 → DAH 800_288 (future, retained), floor 0 → DAH 288 (past →
+    /// premature).
+    #[test]
+    fn reconcile_at_persisted_height_avoids_premature_setmined_dah() {
+        const RETENTION: u32 = 288;
+        const CHAIN_HEIGHT: u32 = 800_000;
+
+        // Build one all-spent, mined, on-longest-chain record whose device DAH
+        // is stale-0 (the setMined-planted case the device never recorded),
+        // keyed by a realistic SHA256-shaped txid (entropy beyond byte 12, so the
+        // reconcile must resolve the full txid from the device footer), reconcile
+        // it at `floor`, and return the DAH height the reconcile registered.
+        let reconcile_dah_at = |floor: u32| -> Option<u32> {
+            let dev: Arc<dyn BlockDevice> =
+                Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+            let mut alloc = SlotAllocator::new(dev.clone()).unwrap();
+            let mut index = Index::new(64).unwrap();
+
+            let txid: [u8; 32] = [
+                0x9c, 0x1e, 0x77, 0xb4, 0x02, 0xf5, 0x6a, 0xd8, 0x33, 0x91, 0x4c, 0x0b, 0xe7, 0x28,
+                0x5d, 0xa0, 0x14, 0x8f, 0x62, 0xc9, 0x3b, 0x70, 0xd6, 0x11, 0xae, 0x59, 0x84, 0x2d,
+                0xf0, 0x63, 0x97, 0x08,
+            ];
+            let key = TxKey { txid };
+
+            let mut meta = TxMetadata::new(1);
+            meta.tx_id = txid;
+            meta.spent_utxos = 1; // all-spent
+            meta.unmined_since = 0; // on the longest chain
+            meta.delete_at_height = 0; // setMined-planted → re-derived by the eval
+            let record_size = TxMetadata::record_size_for(1);
+            let offset = alloc.allocate(record_size).unwrap();
+            let slot0 = UtxoSlot::new_spent([0x22; 32], [0xAB; 36]);
+            io::write_full_record(&*dev, offset, &meta, &[slot0]).unwrap();
+            index
+                .register(
+                    key,
+                    TxIndexEntry {
+                        device_id: 0,
+                        record_offset: offset,
+                        mined_slot: crate::index::mined_index::NO_MINED_SLOT,
+                    },
+                )
+                .unwrap();
+
+            let engine = Engine::new(
+                dev.clone(),
+                index,
+                alloc,
+                StripedLocks::new(64),
+                DahIndex::new(),
+            );
+
+            let slot = seed_mined_index_for_test(&engine, &key, &meta, &[(0x99, 1000, 0)]);
+            let e = engine.index.lookup(&key).unwrap();
+            engine
+                .index
+                .register(
+                    key,
+                    TxIndexEntry {
+                        device_id: 0,
+                        record_offset: e.record_offset,
+                        mined_slot: slot,
+                    },
+                )
+                .unwrap();
+
+            engine
+                .reconcile_secondaries_from_mined_index(floor, RETENTION)
+                .expect("reconcile must succeed");
+            engine.dah_index().get_height(&key)
+        };
+
+        // At the correct (persisted) chain height the DAH is a full retention
+        // window in the FUTURE — the record is retained, not due for sweep.
+        assert_eq!(
+            reconcile_dah_at(CHAIN_HEIGHT),
+            Some(CHAIN_HEIGHT + RETENTION),
+            "reconcile at the real chain height plants the DAH at chain_height + retention",
+        );
+
+        // The pre-fix hazard: a bare-0 floor (height-free redo tail, persisted
+        // height NOT folded in) re-derives the DAH at `0 + retention` == 288,
+        // already FAR past the real chain height → premature sweep.
+        let premature = reconcile_dah_at(0).expect("reconcile at floor 0 still plants a DAH");
+        assert_eq!(premature, RETENTION, "floor 0 re-derives the premature DAH");
+        assert!(
+            premature < CHAIN_HEIGHT,
+            "the pre-fix DAH ({premature}) is already past the chain height ({CHAIN_HEIGHT}) — \
+             the record would be swept a full retention window early",
         );
     }
 
@@ -11991,6 +12664,163 @@ mod tests {
         );
     }
 
+    /// P0-11 follow-up: a poisoned (write-unhealthy) node must NOT prune/sweep.
+    /// The internal DAH sweep journals no redo, so poisoning the redo log alone
+    /// does not fence it; without an explicit gate a poisoned node (e.g. after
+    /// `unspend`'s failed-revert fallback) could still sweep a torn record before
+    /// a restart's recovery heals it. The gate refuses the guarded
+    /// (`due_guard == Some`) delete while the node is write-unhealthy.
+    #[test]
+    fn poisoned_node_refuses_sweep_delete() {
+        // A genuinely due-for-sweep record: all-spent + mined + on-longest-chain
+        // + a DAH entry at/under the sweep height.
+        let h = TestHarness::with_metadata(1, TxFlags::empty(), |m| {
+            m.spent_utxos = 1; // all-spent
+        });
+        h.add_mined_block(9, 1000, 0); // mined, on longest chain (unmined_since == 0)
+        h.engine.dah_index().insert(1000, h.key, None).unwrap();
+        let sweep_height = 2000;
+        assert!(
+            h.engine.is_due_for_sweep(&h.key, sweep_height),
+            "precondition: the record must be genuinely due for sweep",
+        );
+
+        // Attach a redo log and poison it → the node is write-unhealthy.
+        let log_dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
+        let log = Arc::new(parking_lot::Mutex::new(
+            crate::redo::RedoLog::open(log_dev, 0, 1024 * 1024).unwrap(),
+        ));
+        h.engine.set_redo_logs(vec![log.clone()]);
+        assert!(h.engine.write_healthy(), "healthy before poison");
+        log.lock().poison();
+        assert!(!h.engine.write_healthy(), "poisoned → unhealthy");
+
+        // The guarded sweep-delete must be refused and the record retained — a
+        // poisoned node must not destroy a record whose counter/slot split may be
+        // mid-heal.
+        let del = h.engine.prune_delete(&DeleteRequest {
+            tx_key: h.key,
+            due_guard: Some(sweep_height),
+        });
+        assert!(
+            matches!(del, Err(SpendError::StorageError { .. })),
+            "poisoned sweep-delete must be refused, got {del:?}",
+        );
+        assert!(
+            h.engine.lookup(&h.key).is_some(),
+            "the record must survive a sweep attempt on a poisoned node",
+        );
+
+        // Control: a healthy node (no redo log attached → write-healthy) still
+        // sweeps the same genuinely-due record, proving the gate is the
+        // differentiator, not the due-ness check.
+        let h2 = TestHarness::with_metadata(1, TxFlags::empty(), |m| {
+            m.spent_utxos = 1;
+        });
+        h2.add_mined_block(9, 1000, 0);
+        h2.engine.dah_index().insert(1000, h2.key, None).unwrap();
+        assert!(h2.engine.write_healthy(), "no redo log → write-healthy");
+        assert!(h2.engine.is_due_for_sweep(&h2.key, sweep_height));
+        h2.engine
+            .prune_delete(&DeleteRequest {
+                tx_key: h2.key,
+                due_guard: Some(sweep_height),
+            })
+            .expect("healthy node sweeps the due record");
+        assert!(
+            h2.engine.lookup(&h2.key).is_none(),
+            "healthy node must delete the due record",
+        );
+    }
+
+    /// P1-1: post-Task-16d, `set_mined` plants the DAH only in the `dah_index`
+    /// secondary (the device footer `delete_at_height` stays 0). `delete_inner`
+    /// gated the secondary removal on the device footer alone, so deleting such
+    /// a record LEAKED an immortal dead-key `dah_index` entry — and those
+    /// low-height entries permanently fill the bounded sweep window and wedge
+    /// all DAH deletion. The removal must also consult the live secondary height.
+    #[test]
+    fn delete_removes_a_ram_planted_dah_index_entry_no_leak() {
+        // Device footer delete_at_height stays 0 (not customized) — the DAH is
+        // planted ONLY in the secondary index, mirroring set_mined post-16d.
+        let h = TestHarness::new(1, TxFlags::empty());
+        h.engine.dah_index().insert(500, h.key, None).unwrap();
+        assert_eq!(
+            h.engine.dah_index().get_height(&h.key),
+            Some(500),
+            "precondition: a RAM-planted DAH entry exists",
+        );
+        assert_eq!(
+            { h.engine.read_metadata(&h.key).unwrap().delete_at_height },
+            0,
+            "precondition: the device footer DAH is 0 (set_mined wrote nothing)",
+        );
+
+        // Unconditional client delete (due_guard = None).
+        h.engine
+            .delete(&DeleteRequest {
+                tx_key: h.key,
+                due_guard: None,
+            })
+            .expect("delete succeeds");
+
+        assert_eq!(
+            h.engine.dah_index().get_height(&h.key),
+            None,
+            "the RAM-planted DAH secondary entry must be removed on delete (no immortal leak)",
+        );
+    }
+
+    /// P1-4: `set_locked` baselined the evicted DAH off the device footer, which
+    /// is 0 for a set_mined-planted (RAM-only) DAH — so locking never evicted it
+    /// and the sweep could delete an explicitly-locked record. Locking must
+    /// evict the authoritative (`dah_index`) DAH and return it for compensation;
+    /// and `record_due_for_sweep` must never mark a LOCKED record due.
+    #[test]
+    fn locking_evicts_ram_planted_dah_and_locked_record_is_never_swept() {
+        // A due-for-sweep record with a RAM-planted DAH (device footer stays 0).
+        let h = TestHarness::with_metadata(1, TxFlags::empty(), |m| {
+            m.spent_utxos = 1;
+        });
+        h.add_mined_block(9, 1000, 0);
+        h.engine.dah_index().insert(1000, h.key, None).unwrap();
+        assert!(
+            h.engine.is_due_for_sweep(&h.key, 2000),
+            "precondition: due for sweep before lock",
+        );
+
+        // Lock → the RAM-planted DAH is evicted and returned for compensation.
+        let resp = h
+            .engine
+            .set_locked_with_before_image(&SetLockedRequest {
+                tx_key: h.key,
+                value: true,
+            })
+            .unwrap();
+        assert!(!resp.prior_locked, "was not previously locked");
+        assert_eq!(
+            resp.prior_delete_at_height, 1000,
+            "the prior RAM-planted DAH must be returned for exact compensation",
+        );
+        assert_eq!(
+            h.engine.dah_index().get_height(&h.key),
+            None,
+            "locking must evict the RAM-planted DAH from the secondary index",
+        );
+        assert!(
+            !h.engine.is_due_for_sweep(&h.key, 2000),
+            "no DAH after lock → not due for sweep",
+        );
+
+        // Defense-in-depth: even if a DAH is (re-)planted on the locked record,
+        // the sweep must never delete an explicitly-locked record.
+        h.engine.dah_index().insert(1000, h.key, None).unwrap();
+        assert!(
+            !h.engine.is_due_for_sweep(&h.key, 2000),
+            "a LOCKED record must never be due for sweep",
+        );
+    }
+
     /// Build an engine whose underlying device fails pwrites once a
     /// kill-switch flag is set. Used by the R-004 regression tests.
     /// The flag is off when the seed record is written; tests flip it
@@ -12193,6 +13023,159 @@ mod tests {
         assert!(
             !slot1.is_spent(),
             "slot 1 must remain UNSPENT on partial-write failure"
+        );
+    }
+
+    /// A device that fails `pwrite` at exactly ONE offset (the armed record's
+    /// metadata header), letting every other write — including the UTXO-slot
+    /// write in a different block — succeed. Reports `None` from `as_raw_ptr`
+    /// so record I/O routes through the fallible O_DIRECT pwrite path.
+    struct MetaWriteFailingDevice {
+        inner: Arc<dyn BlockDevice>,
+        fail_offset: Arc<AtomicU64>,
+    }
+    impl MetaWriteFailingDevice {
+        fn new(inner: Arc<dyn BlockDevice>) -> (Arc<Self>, Arc<AtomicU64>) {
+            // u64::MAX == disarmed (never matches a real record offset).
+            let fail_offset = Arc::new(AtomicU64::new(u64::MAX));
+            (
+                Arc::new(Self {
+                    inner,
+                    fail_offset: fail_offset.clone(),
+                }),
+                fail_offset,
+            )
+        }
+    }
+    impl BlockDevice for MetaWriteFailingDevice {
+        fn alignment(&self) -> usize {
+            self.inner.alignment()
+        }
+        fn size(&self) -> u64 {
+            self.inner.size()
+        }
+        fn pread(&self, buf: &mut [u8], offset: u64) -> crate::device::Result<usize> {
+            self.inner.pread(buf, offset)
+        }
+        fn pwrite(&self, buf: &[u8], offset: u64) -> crate::device::Result<usize> {
+            if offset == self.fail_offset.load(Ordering::SeqCst) {
+                return Err(DeviceError::Io(std::io::Error::other(
+                    "simulated metadata pwrite failure (P0-11)",
+                )));
+            }
+            self.inner.pwrite(buf, offset)
+        }
+        fn sync(&self) -> crate::device::Result<()> {
+            self.inner.sync()
+        }
+        fn as_raw_ptr(&self) -> Option<*mut u8> {
+            None
+        }
+    }
+
+    /// P0-11: unspend flips the slot SPENT→UNSPENT and persists it BEFORE the
+    /// decremented `spent_utxos` counter. If the metadata write fails, a durable
+    /// UNSPENT slot must NEVER be left coexisting with an all-spent counter —
+    /// otherwise the sweep (which reads the stale device counter) deletes a
+    /// record that holds a live restored UTXO. The fix reverts the slot to its
+    /// prior SPENT state on a metadata-write failure, restoring the invariant.
+    #[test]
+    fn unspend_metadata_write_failure_reverts_slot_not_leaving_live_utxo_all_spent() {
+        let inner: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let (dev_failing, fail_offset) = MetaWriteFailingDevice::new(inner);
+        let dev: Arc<dyn BlockDevice> = dev_failing;
+        let mut alloc = SlotAllocator::new(dev.clone()).unwrap();
+        let mut index = Index::new(100).unwrap();
+
+        // Record with 64 slots, ALL spent (all-spent counter == utxo_count). The
+        // target slot (63) lives well past the metadata block, so its slot write
+        // never touches the armed metadata offset.
+        let utxo_count = 64u32;
+        let target = 63u32;
+        let mut txid = [0u8; 32];
+        txid[0..8].copy_from_slice(&99u64.to_le_bytes());
+        let key = TxKey { txid };
+
+        let record_size = TxMetadata::record_size_for(utxo_count);
+        let offset = alloc.allocate(record_size).unwrap();
+
+        let mut spending_data = [0u8; 36];
+        spending_data[0] = 0xC3;
+        spending_data[32..36].copy_from_slice(&7u32.to_le_bytes());
+        let target_hash = {
+            let mut h = [0u8; 32];
+            h[0] = (target & 0xFF) as u8;
+            h[1] = ((target >> 8) & 0xFF) as u8;
+            h
+        };
+
+        let mut meta = TxMetadata::new(utxo_count);
+        meta.tx_id = txid;
+        meta.spent_utxos = utxo_count; // all-spent
+        let slots: Vec<UtxoSlot> = (0..utxo_count)
+            .map(|i| {
+                let mut hash = [0u8; 32];
+                hash[0] = (i & 0xFF) as u8;
+                hash[1] = ((i >> 8) & 0xFF) as u8;
+                UtxoSlot::new_spent(hash, spending_data)
+            })
+            .collect();
+        io::write_full_record(&*dev, offset, &meta, &slots).unwrap();
+
+        index
+            .register(
+                key,
+                TxIndexEntry {
+                    device_id: 0,
+                    record_offset: offset,
+                    mined_slot: crate::index::mined_index::NO_MINED_SLOT,
+                },
+            )
+            .unwrap();
+
+        let engine = Arc::new(Engine::new(
+            dev,
+            index,
+            alloc,
+            StripedLocks::new(1024),
+            DahIndex::new(),
+        ));
+
+        // Arm the metadata-header write to fail (the slot write, in a later
+        // block, still succeeds).
+        fail_offset.store(offset, Ordering::SeqCst);
+
+        let req = UnspendRequest {
+            tx_key: key,
+            offset: target,
+            utxo_hash: target_hash,
+            spending_data,
+            current_block_height: 1000,
+            block_height_retention: 288,
+        };
+        let result = engine.unspend(&req);
+        assert!(
+            result.is_err(),
+            "unspend must surface the metadata write failure, got {result:?}"
+        );
+
+        // Disarm and inspect the durable state: the invariant is that a live
+        // (UNSPENT) slot must NOT coexist with the all-spent counter. The fix
+        // reverts the slot, so it is back to SPENT and the counter is unchanged.
+        fail_offset.store(u64::MAX, Ordering::SeqCst);
+        let slot = engine.read_slot(&key, target).unwrap();
+        assert!(
+            slot.is_spent(),
+            "after a failed unspend metadata write the slot must be reverted to \
+             SPENT — a durable UNSPENT slot with an all-spent counter would let \
+             the sweep delete a record holding a live UTXO"
+        );
+        let meta_after = engine.read_metadata(&key).unwrap();
+        assert_eq!(
+            { meta_after.spent_utxos },
+            utxo_count,
+            "the all-spent counter must be unchanged (metadata write never landed)"
         );
     }
 
@@ -13963,49 +14946,52 @@ mod tests {
     }
 
     #[test]
-    fn relocate_record_journals_relocate_intent() {
+    fn relocate_record_journals_nothing_for_segment() {
         use crate::redo::{RedoLog, RedoOp};
 
-        let (engine, _dev, key, meta, _slots, _old) = seg_engine_with_record();
+        // P0 double-spend fix: `relocate_record` journals NO relocate redo for the
+        // segment engine (STANDALONE included, not just clustered). The spend's
+        // self-sufficient SpendV2 (emitted by the caller) is the authoritative spend
+        // redo, and defrag relocates are checkpoint-covered + revert-safe. A thin
+        // `Relocate` would re-point recovery to the still-buffered new offset and
+        // could revert an acked spend on a power-loss before the checkpoint.
+        let (engine, _dev, key, meta, _slots, old) = seg_engine_with_record();
 
         let log_dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
         let log = RedoLog::open(log_dev.clone(), 0, 1024 * 1024).unwrap();
         engine.set_redo_log(Arc::new(parking_lot::Mutex::new(log)));
 
+        // The relocate still MOVES the record on the device and re-points the index.
         let new_offset = engine.relocate_record(0, &key, &meta, &[]).unwrap();
+        assert_ne!(new_offset, old, "the record physically moved");
+        assert_eq!(engine.lookup(&key).unwrap().record_offset, new_offset);
 
-        // Buffered append: flush so a fresh reopen can recover it.
+        // Buffered append: flush so a fresh reopen would surface any journaled entry.
         engine.redo_log().unwrap().lock().flush().unwrap();
 
         let log2 = RedoLog::open(log_dev, 0, 1024 * 1024).unwrap();
         let entries = log2.recover().unwrap();
         assert!(
-            entries.iter().any(|e| matches!(
-                &e.op,
-                RedoOp::Relocate { tx_key, device_id, record_offset, utxo_count }
-                    if *tx_key == key
-                        && *device_id == 0
-                        && *record_offset == new_offset
-                        && *utxo_count == 4
-            )),
-            "a Relocate intent for the new offset must be journaled"
+            !entries
+                .iter()
+                .any(|e| matches!(&e.op, RedoOp::Relocate { tx_key, .. } if *tx_key == key)),
+            "segment relocate must journal NO Relocate redo (SpendV2 / checkpoint cover it)"
         );
     }
 
     #[test]
-    fn clustered_relocate_journals_nothing_spendv2_is_the_redo() {
+    fn segment_relocate_with_spend_mutation_journals_nothing() {
         use crate::redo::{RedoLog, RedoOp};
 
         let (engine, dev, key, meta, slots, _old) = seg_engine_with_record();
 
-        // Attach a redo log and declare clustered. A clustered relocate must
-        // journal NOTHING itself — the spend's convertible per-vout SpendV2
-        // (emitted by the dispatch / replica caller) is the authoritative redo, so
-        // `relocate_record` writes no relocate redo at all.
+        // A segment relocate that bakes in a spend mutation must journal NOTHING
+        // itself — the spend's convertible per-vout SpendV2 (emitted by the dispatch
+        // / replica caller) is the authoritative redo, so `relocate_record` writes no
+        // relocate redo at all. This is the unified model (standalone == clustered).
         let log_dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
         let log = RedoLog::open(log_dev.clone(), 0, 1024 * 1024).unwrap();
         engine.set_redo_logs(vec![Arc::new(parking_lot::Mutex::new(log))]);
-        engine.set_clustered(true);
 
         let mut new_meta = meta;
         new_meta.spent_utxos = 1;
@@ -14035,7 +15021,7 @@ mod tests {
                 &e.op,
                 RedoOp::Relocate { tx_key, .. } if *tx_key == key
             )),
-            "clustered relocate must journal no relocate redo — SpendV2 is the redo"
+            "segment relocate must journal no relocate redo — SpendV2 is the redo"
         );
     }
 
@@ -14098,30 +15084,200 @@ mod tests {
         assert_eq!({ m2.spent_utxos }, 2);
     }
 
+    // (Removed `standalone_relocate_still_journals_thin_relocate`: the STANDALONE
+    // vs CLUSTERED gating of the thin `Relocate` no longer exists — both journal
+    // nothing now. The primitive contract is covered by
+    // `relocate_record_journals_nothing_for_segment` (standalone) and
+    // `clustered_relocate_journals_nothing_spendv2_is_the_redo` (clustered), and the
+    // end-to-end spend recovery by
+    // `server::dispatch::tests::standalone_segment_spend_recoverable_from_redo_alone_after_powerloss`.)
+
+    /// P0 (redo header-clobber → acked data loss): a checkpoint's fence/reclaim
+    /// header write must NOT be reverted by an in-flight group-commit flush whose
+    /// Phase-2 header pwrite was snapshotted BEFORE the fence advanced.
+    ///
+    /// Both the flush's Phase-2 (`RedoLog::commit_flush`) and the checkpoint's
+    /// fence/reclaim rewrite the SAME single redo header block, which carries no
+    /// generation/epoch — the last pwrite wins. A group-commit flush RELEASES the
+    /// log lock before its slow O_DIRECT header pwrite, so the checkpoint (holding
+    /// only the log lock) can advance `checkpoint_seq`/`oldest_seg` and write the
+    /// new header in between — and then the flush's STALE snapshotted header lands
+    /// LAST, reverting the fence. On the next crash, ring recovery scans from the
+    /// reverted (already-reclaimed) `oldest_seg` and drops durably-acked entries.
+    ///
+    /// Deterministic reproduction: a device parks the FIRST header pwrite (offset
+    /// == `log_offset`) once armed. A background `flush_all_redo` parks there
+    /// holding the committer's `flush_guard` with the log lock already released
+    /// (Phase-2). The checkpoint's `mark_recovery_progress_all` +
+    /// `compact_all_redo_through` then run. Pre-fix the checkpoint takes only the
+    /// log lock (free), writes the advanced header, and is clobbered when the
+    /// parked stale header is released → the durable fence regresses to 0.
+    /// Post-fix the checkpoint blocks on `flush_guard` until the flush fully
+    /// completes, so its advanced header is written LAST and survives.
     #[test]
-    fn standalone_relocate_still_journals_thin_relocate() {
+    fn checkpoint_fence_survives_inflight_flush_header_pwrite() {
         use crate::redo::{RedoLog, RedoOp};
+        use std::sync::atomic::AtomicU32;
+        use std::time::Duration;
 
-        // Same setup as the clustered test but WITHOUT set_clustered — must keep
-        // the thin index-only Relocate (no image), proving the branch is gated.
-        let (engine, _dev, key, meta, _slots, _old) = seg_engine_with_record();
-        let log_dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
-        let log = RedoLog::open(log_dev.clone(), 0, 1024 * 1024).unwrap();
-        engine.set_redo_logs(vec![Arc::new(parking_lot::Mutex::new(log))]);
-        assert!(!engine.clustered(), "default must be standalone");
+        /// Parks the FIRST pwrite targeting the header block once armed; every
+        /// other write/read/sync passes through. Counts header writes that
+        /// actually landed so the driver never has to guess from a wall clock.
+        struct HeaderParkDev {
+            inner: MemoryDevice,
+            header_offset: u64,
+            armed: AtomicBool,        // false during setup so the fill flush passes
+            parked_once: AtomicBool,  // only the FIRST armed header write parks
+            in_park: AtomicBool,      // true while the flush's header write is parked
+            release: AtomicBool,      // set true to let the parked write land
+            header_writes: AtomicU32, // header writes that actually LANDED
+        }
+        impl BlockDevice for HeaderParkDev {
+            fn pread(&self, b: &mut [u8], o: u64) -> crate::device::Result<usize> {
+                self.inner.pread(b, o)
+            }
+            fn pwrite(&self, b: &[u8], o: u64) -> crate::device::Result<usize> {
+                if o == self.header_offset
+                    && self.armed.load(Ordering::SeqCst)
+                    && !self.parked_once.swap(true, Ordering::SeqCst)
+                {
+                    self.in_park.store(true, Ordering::SeqCst);
+                    while !self.release.load(Ordering::SeqCst) {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    self.in_park.store(false, Ordering::SeqCst);
+                }
+                let n = self.inner.pwrite(b, o)?;
+                if o == self.header_offset {
+                    self.header_writes.fetch_add(1, Ordering::SeqCst);
+                }
+                Ok(n)
+            }
+            fn alignment(&self) -> usize {
+                self.inner.alignment()
+            }
+            fn size(&self) -> u64 {
+                self.inner.size()
+            }
+            fn sync(&self) -> crate::device::Result<()> {
+                self.inner.sync()
+            }
+            fn sync_data(&self) -> crate::device::Result<()> {
+                self.inner.sync_data()
+            }
+        }
 
-        let new_offset = engine.relocate_record(0, &key, &meta, &[]).unwrap();
-        engine.flush_all_redo().unwrap();
+        let segment_size = 4096u64;
+        let count = 4u64;
+        let total = 4096 + segment_size * count;
+        let dev = Arc::new(HeaderParkDev {
+            inner: MemoryDevice::new(total, 4096).unwrap(),
+            header_offset: 0,
+            armed: AtomicBool::new(false),
+            parked_once: AtomicBool::new(false),
+            in_park: AtomicBool::new(false),
+            release: AtomicBool::new(false),
+            header_writes: AtomicU32::new(0),
+        });
+        let ring_dev: Arc<dyn BlockDevice> = dev.clone();
+        let log = Arc::new(parking_lot::Mutex::new(
+            RedoLog::format_ring(ring_dev.clone(), 0, total, segment_size).unwrap(),
+        ));
 
-        let log2 = RedoLog::open(log_dev, 0, 1024 * 1024).unwrap();
-        let entries = log2.recover().unwrap();
-        assert!(
-            entries.iter().any(|e| matches!(
-                &e.op,
-                RedoOp::Relocate { tx_key, record_offset, .. }
-                    if *tx_key == key && *record_offset == new_offset
-            )),
-            "standalone relocate must journal a thin Relocate"
+        // Minimal engine — only the redo path is exercised here.
+        let data: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
+        let alloc = SlotAllocator::new(data.clone()).unwrap();
+        let index = Index::new(128).unwrap();
+        let engine = Arc::new(Engine::new(
+            data,
+            index,
+            alloc,
+            StripedLocks::new(64),
+            DahIndex::new(),
+        ));
+        engine.set_redo_logs(vec![log.clone()]);
+        engine.set_buffered_durability(true);
+
+        let freeze = |n: u8| RedoOp::Freeze {
+            tx_key: crate::index::TxKey { txid: [n; 32] },
+            offset: 0,
+        };
+
+        // Fill several segments and flush durably (NOT armed → passes). The fence
+        // below covers all of these, so reclaim must free the older segments.
+        {
+            let mut l = log.lock();
+            for i in 0..200u32 {
+                l.append(freeze((i % 251) as u8)).unwrap();
+            }
+            l.flush().unwrap();
+            assert!(l.is_segment_ring(), "ring layout");
+        }
+        let fence = log.lock().current_sequence().saturating_sub(1);
+        assert!(fence > 0, "fence must be a real sequence: {fence}");
+
+        // One MORE buffered append: this is what the in-flight flush carries, and
+        // its stale header snapshot (checkpoint_seq 0, oldest_seg 0) is the clobber.
+        log.lock().append(freeze(0xAB)).unwrap();
+
+        // Arm: the next header pwrite (the flush's Phase-2) parks.
+        dev.armed.store(true, Ordering::SeqCst);
+
+        // T1: background flush parks at its header pwrite holding the committer's
+        // flush_guard, log lock already released (Phase-2).
+        let eng1 = engine.clone();
+        let t1 = std::thread::spawn(move || eng1.flush_all_redo());
+        let mut waited = 0;
+        while !dev.in_park.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(1));
+            waited += 1;
+            assert!(waited < 5000, "flush never reached its header pwrite");
+        }
+
+        // T2: the checkpoint fence + reclaim (the production per-store path).
+        let eng2 = engine.clone();
+        let done = Arc::new(AtomicBool::new(false));
+        let done2 = done.clone();
+        let t2 = std::thread::spawn(move || {
+            eng2.mark_recovery_progress_all(fence).unwrap();
+            eng2.compact_all_redo_through(fence).unwrap();
+            done2.store(true, Ordering::SeqCst);
+        });
+
+        // Wait until EITHER the checkpoint finished (pre-fix: not blocked, lands its
+        // header while the flush is parked) OR a bounded timeout (post-fix: blocked
+        // on flush_guard). The RESULT asserted below is deterministic either way —
+        // this only sequences the pre-fix clobber before release.
+        let mut w = 0;
+        while !done.load(Ordering::SeqCst) && w < 400 {
+            std::thread::sleep(Duration::from_millis(1));
+            w += 1;
+        }
+
+        // Release the parked stale header pwrite. Pre-fix it lands LAST, clobbering
+        // the checkpoint's header; post-fix the (blocked) checkpoint runs after the
+        // flush and writes the advanced header LAST.
+        dev.release.store(true, Ordering::SeqCst);
+        t1.join().unwrap().expect("flush ok");
+        t2.join().unwrap();
+
+        // Read the DURABLE header via a fresh reopen and assert the fence did NOT
+        // regress: recovery must see the checkpoint's advanced fence, and only the
+        // single post-fence entry remains to replay.
+        dev.armed.store(false, Ordering::SeqCst); // no parking during reopen
+        let reopened = RedoLog::open(ring_dev, 0, total).unwrap();
+        let (entries, durable_fence) = reopened.recover_with_fence().unwrap();
+        assert_eq!(
+            durable_fence, fence,
+            "durable checkpoint fence regressed: a stale in-flight flush header \
+             clobbered the checkpoint's advance (got {durable_fence}, want {fence})"
+        );
+        assert_eq!(
+            entries.len(),
+            1,
+            "only the single post-fence entry should replay; a regressed fence \
+             replays the whole reclaimed prefix (got {} entries)",
+            entries.len()
         );
     }
 
@@ -14369,6 +15525,98 @@ mod tests {
         assert_eq!(engine.read_slot(&key, 0).unwrap().hash, [0x5C; 32]);
         // seg0 is now fully dead and reclaims.
         assert_eq!(engine.defrag_reclaim_fully_dead(), 1);
+    }
+
+    /// P0 (engine path): the reclaim fast path snapshots the LIVE index and must
+    /// refuse to free a segment that still owns a live index entry, even when the
+    /// allocator's `used`/`dead` accounting claims the segment is fully dead. This
+    /// is the crash-recovery hazard: a reused segment carries stale `used == dead`
+    /// while holding a live post-checkpoint record whose bytes recovery never
+    /// re-added to `used`. Without the cross-check the segment is reset+freed and a
+    /// later allocate re-hands out the live record's offset, overwriting acked data.
+    #[test]
+    fn defrag_reclaim_never_frees_a_segment_with_a_live_indexed_record() {
+        let dev: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let seg_size = 2 * 4096; // 2-block segments
+        let seg = crate::segment_allocator::SegmentAllocator::new(dev.clone(), seg_size).unwrap();
+        let engine = Engine::new(
+            dev.clone(),
+            Index::new(64).unwrap(),
+            seg,
+            StripedLocks::new(64),
+            DahIndex::new(),
+        );
+        let record_size = TxMetadata::record_size_for(1);
+
+        // seg0 block0 = live indexed record R; block1 = filler (fills seg0).
+        let r_off = engine
+            .allocator_for(0)
+            .lock()
+            .allocate(record_size)
+            .unwrap();
+        let filler = engine
+            .allocator_for(0)
+            .lock()
+            .allocate(record_size)
+            .unwrap();
+        let mut txid = [0u8; 32];
+        txid[0] = 0xA7;
+        let key = TxKey { txid };
+        let mut meta = TxMetadata::new(1);
+        meta.tx_id = txid;
+        let slots = vec![UtxoSlot::new_unspent([0xA7; 32])];
+        io::write_full_record(&*dev, r_off, &meta, &slots).unwrap();
+        engine
+            .register(
+                key,
+                TxIndexEntry {
+                    device_id: 0,
+                    record_offset: r_off,
+                    mined_slot: crate::index::mined_index::NO_MINED_SLOT,
+                },
+            )
+            .unwrap();
+
+        // Advance past seg0 (seal it) so it is NOT the open segment.
+        let _ = engine
+            .allocator_for(0)
+            .lock()
+            .allocate(record_size)
+            .unwrap();
+        assert_eq!(
+            engine
+                .allocator_for(0)
+                .lock()
+                .segment_stats()
+                .unwrap()
+                .open_segment,
+            1,
+            "seg0 must be sealed (open segment advanced to seg1)"
+        );
+
+        // Dead-mark BOTH blocks of seg0 (including R's): the allocator now reads
+        // `used == dead` for seg0 while R is STILL LIVE in the index — the exact
+        // fully-dead-accounting-but-live-record state the reclaim must survive.
+        for off in [r_off, filler] {
+            engine
+                .allocator_for(0)
+                .lock()
+                .free(off, record_size)
+                .unwrap();
+        }
+
+        // The reclaim snapshots the index, finds R live in seg0, and refuses to
+        // free it. Pre-fix (trusting `used == dead`) this returned 1 and freed seg0.
+        assert_eq!(
+            engine.defrag_reclaim_fully_dead(),
+            0,
+            "reclaim freed a segment whose live record R is still in the index"
+        );
+        // R's index entry is untouched and still resolves to its original offset,
+        // and the record is still readable there.
+        assert_eq!(engine.lookup(&key).unwrap().record_offset, r_off);
+        assert_eq!(engine.read_slot(&key, 0).unwrap().hash, [0xA7; 32]);
     }
 
     /// Compaction is a no-op when nothing is dead enough (self-gating).
@@ -18462,6 +19710,189 @@ mod tests {
         );
     }
 
+    /// P0 recovery hole: `replay_mined_index_redo_tail_above` must replay a
+    /// post-checkpoint `RedoOp::MarkOnLongestChain` into the authoritative
+    /// in-RAM `ShardedMinedIndex` — mirroring the live op
+    /// [`Engine::mark_on_longest_chain`], which journals the WAL entry then
+    /// calls `set_longest_chain`. It is the ONLY recovery pass that restores
+    /// mined-state (the device-scan rebuild was removed), and the `.mined`
+    /// snapshot restores `unmined_since` from the checkpoint — so a
+    /// longest-chain transition that landed in the redo tail ABOVE the
+    /// snapshot fence is silently lost unless this pass replays it. Without
+    /// the arm, an acked reorg-unmined record reads back on-longest-chain
+    /// (the sweeper then deletes a record the op chose to retain) and the
+    /// inverse acked re-mine stays stuck unmined — acked-state loss.
+    ///
+    /// Seeds a MINED record via a `.mined`-style snapshot restore, then
+    /// replays a single above-fence `MarkOnLongestChain` and asserts the
+    /// MinedIndex `unmined_since` moved to match the op. Both directions:
+    /// on→off (unmined_since 0 -> H) and off→on (unmined_since H -> 0).
+    ///
+    /// RED before the fix (the entry falls into the match's `_ => {}` arm, so
+    /// `unmined_since` stays at the snapshot value); GREEN after.
+    #[test]
+    fn mark_on_longest_chain_redo_tail_replays_into_mined_index() {
+        use crate::index::mined_index::{MinedByKeyEntry, NO_MINED_SLOT};
+        use crate::record::BlockEntry;
+        use crate::redo::{RedoLog, RedoOp};
+
+        // Seed a MINED record into a fresh engine's MinedIndex exactly as a
+        // `.mined` checkpoint restore would (block present, `unmined_since`
+        // taken verbatim from the snapshot entry), then replay a single
+        // above-fence `MarkOnLongestChain` and return the slot's resulting
+        // `(block_count, unmined_since)`.
+        let replay_mark = |n: u8,
+                           snapshot_unmined_since: u32,
+                           mark_on_longest_chain: bool,
+                           mark_height: u32|
+         -> (usize, u32) {
+            let dev: Arc<dyn BlockDevice> =
+                Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+
+            // A real on-device record — only its footer/locator matter; this
+            // throwaway engine's own index/MinedIndex are discarded.
+            let (device_id, offset, key) = {
+                let alloc = SlotAllocator::new(dev.clone()).unwrap();
+                let index = Index::new(1000).unwrap();
+                let temp_engine = Engine::new(
+                    dev.clone(),
+                    index,
+                    alloc,
+                    StripedLocks::new(1024),
+                    DahIndex::new(),
+                );
+                let (_, req) = make_create_req(n, 1);
+                let key = req.tx_key();
+                temp_engine.create(&req).expect("create succeeds");
+                let entry = temp_engine.lookup(&key).expect("entry registered");
+                temp_engine.allocator().lock().persist().unwrap();
+                (entry.device_id, entry.record_offset, key)
+            };
+
+            // Fresh engine sharing the device; primary index carries the key
+            // with the NO_MINED_SLOT sentinel — the recovery precondition
+            // (primary index fully replayed, MinedIndex still empty) before
+            // `recover_mined_index` restores the snapshot.
+            let fresh_index = ShardedIndex::from_single(Index::new(1000).unwrap().into());
+            fresh_index
+                .register(
+                    key,
+                    TxIndexEntry {
+                        device_id,
+                        record_offset: offset,
+                        mined_slot: NO_MINED_SLOT,
+                    },
+                )
+                .expect("register key");
+            let alloc2 = SlotAllocator::recover(dev.clone()).expect("allocator recovers");
+            let engine2 = Engine::new_with_sharded_index(
+                dev.clone(),
+                fresh_index,
+                alloc2,
+                StripedLocks::new(1024),
+                DahIndex::new(),
+            );
+
+            // `.mined` checkpoint: the record was captured MINED (one block),
+            // with `unmined_since` taken verbatim from the snapshot.
+            let entries = vec![MinedByKeyEntry {
+                txid: key.txid,
+                block_entries: vec![BlockEntry {
+                    block_id: 7,
+                    block_height: 800_000,
+                    subtree_idx: 3,
+                }],
+                unmined_since: snapshot_unmined_since,
+                all_spent: false,
+            }];
+            let restored_slots = engine2
+                .restore_mined_index_from_snapshot_entries(&entries)
+                .expect("snapshot restore succeeds");
+
+            // Precondition: the restore alone produced a live, mined slot at
+            // the snapshot's `unmined_since`.
+            let restored = engine2.lookup(&key).expect("entry present after restore");
+            assert_ne!(
+                restored.mined_slot, NO_MINED_SLOT,
+                "snapshot restore must produce a live mined slot"
+            );
+            let (pre_blocks, pre_unmined) = engine2
+                .mined_index()
+                .read_block_entries(&key, restored.mined_slot)
+                .expect("restored slot must be readable");
+            assert_eq!(
+                pre_blocks.len(),
+                1,
+                "precondition: the restored record is mined (one block)"
+            );
+            assert_eq!(
+                pre_unmined, snapshot_unmined_since,
+                "precondition: the restored slot carries the snapshot's unmined_since"
+            );
+
+            // A `MarkOnLongestChain` redo entry appended AFTER the checkpoint
+            // (sequence 1, strictly above the snapshot fence 0) — the exact
+            // op `Engine::mark_on_longest_chain` journals WAL-first on a reorg
+            // longest-chain transition.
+            let redo_dev: Arc<dyn BlockDevice> =
+                Arc::new(MemoryDevice::new(256 * 1024, 4096).unwrap());
+            let redo = Arc::new(parking_lot::Mutex::new(
+                RedoLog::open(redo_dev, 0, 256 * 1024).unwrap(),
+            ));
+            redo.lock()
+                .append_and_flush(RedoOp::MarkOnLongestChain {
+                    tx_key: key,
+                    on_longest_chain: mark_on_longest_chain,
+                    current_block_height: mark_height,
+                    block_height_retention: 100,
+                    generation: 1,
+                })
+                .expect("append MarkOnLongestChain");
+
+            engine2
+                .replay_mined_index_redo_tail_above(std::slice::from_ref(&redo), 0, restored_slots)
+                .expect("redo-tail replay succeeds");
+
+            let after = engine2
+                .lookup(&key)
+                .expect("entry still present after replay");
+            let (blocks, unmined) = engine2
+                .mined_index()
+                .read_block_entries(&key, after.mined_slot)
+                .expect("slot readable after replay");
+            (blocks.len(), unmined)
+        };
+
+        // Direction 1 (on -> off): snapshot captured the record on the
+        // longest chain (unmined_since 0); the post-checkpoint reorg marked it
+        // OFF at height 900_000. Recovery must land unmined_since == 900_000,
+        // NOT the stale 0.
+        let (blocks_off, unmined_off) = replay_mark(61, 0, false, 900_000);
+        assert_eq!(
+            unmined_off, 900_000,
+            "MarkOnLongestChain(false) must replay: the reorg-unmined record must NOT \
+             read back on the longest chain (pre-fix it stayed 0 — acked-state loss)"
+        );
+        assert_eq!(
+            blocks_off, 1,
+            "the longest-chain transition must not disturb the mined block entries"
+        );
+
+        // Direction 2 (off -> on): snapshot captured the record off the
+        // longest chain (unmined_since 850_000); the post-checkpoint op
+        // re-mined it onto the chain. Recovery must land unmined_since == 0.
+        let (blocks_on, unmined_on) = replay_mark(62, 850_000, true, 900_000);
+        assert_eq!(
+            unmined_on, 0,
+            "MarkOnLongestChain(true) must replay: the re-mined record must read back \
+             on the longest chain (pre-fix it stayed 850_000 — stuck unmined)"
+        );
+        assert_eq!(
+            blocks_on, 1,
+            "the longest-chain transition must not disturb the mined block entries"
+        );
+    }
+
     /// Task 16a: `evaluate_delete_at_height`'s `has_blocks`/`unmined_since`
     /// inputs are now sourced from the `ShardedMinedIndex`, not from
     /// `metadata.block_entry_count`/`metadata.unmined_since`. Proves the
@@ -18828,6 +20259,133 @@ mod tests {
             block_ids,
             vec![77],
             "the snapshot must carry F's OWN block data, never D's (the aliasing bug)"
+        );
+    }
+
+    /// P0 (Part A — relocated-record loss): `resolve_mined_index_pairs` (pass 2
+    /// of the `.mined` checkpoint snapshot) must KEEP a record that RELOCATED
+    /// between pass 1 (locator capture) and pass 2 (re-resolve). The segment
+    /// storage engine relocates a record on spend (the DEFAULT), so the record's
+    /// fresh primary entry sits at a DIFFERENT `(device_id, record_offset)` than
+    /// pass 1 captured — while still carrying a live `mined_slot`. The pre-fix
+    /// guard required the fresh entry to still match the CAPTURED
+    /// `(device_id, offset)`, so a relocated-but-live record FALSE-armed the `_`
+    /// arm and was SILENTLY OMITTED from `.mined` — data loss: the checkpoint
+    /// then fences + reclaims the redo holding that record's SetMinedBatch, so
+    /// its acked mined-state has no durable copy (boot brick / silent loss).
+    ///
+    /// The fresh `self.index.lookup` already closes the TOCTOU (the fresh slot
+    /// IS authoritative — see the `snapshot_by_key_...` sibling test), so the fix
+    /// drops the offset-equality requirement and keeps the record whenever it is
+    /// live with a valid fresh slot. Also asserts the reused-offset dedup: a
+    /// stale captured offset whose footer still resolves to a key ALSO captured
+    /// from its fresh offset must collapse to a SINGLE pair, never a duplicate.
+    #[test]
+    fn resolve_mined_index_pairs_keeps_relocated_live_record() {
+        use crate::index::mined_index::NO_MINED_SLOT;
+
+        let dev: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let mut alloc = SlotAllocator::new(dev.clone()).unwrap();
+        let mut index = Index::new(64).unwrap();
+
+        // Realistic SHA256-shaped txid (entropy throughout, [16..24] nonzero).
+        let txid: [u8; 32] = [
+            0x9c, 0x14, 0x2b, 0xe7, 0x50, 0x81, 0x3d, 0xa2, 0x66, 0xf0, 0x1a, 0x4c, 0xb9, 0x27,
+            0xde, 0x03, 0x77, 0xc1, 0x88, 0x0e, 0xa4, 0x5f, 0x30, 0x9b, 0x21, 0xe8, 0x6c, 0x05,
+            0x4a, 0x9f, 0xd7, 0x1b,
+        ];
+        let key = TxKey { txid };
+
+        let mut meta = TxMetadata::new(1);
+        meta.tx_id = txid;
+        meta.spent_utxos = 1; // all-spent
+        meta.unmined_since = 0; // on the longest chain
+        meta.delete_at_height = 0;
+        let record_size = TxMetadata::record_size_for(1);
+        let off_old = alloc.allocate(record_size).unwrap();
+        let slot0 = UtxoSlot::new_spent([0x11; 32], [0xAB; 36]);
+        io::write_full_record(&*dev, off_old, &meta, &[slot0]).unwrap();
+        index
+            .register(
+                key,
+                TxIndexEntry {
+                    device_id: 0,
+                    record_offset: off_old,
+                    mined_slot: NO_MINED_SLOT,
+                },
+            )
+            .unwrap();
+
+        let engine = Engine::new(
+            dev.clone(),
+            index,
+            alloc,
+            StripedLocks::new(64),
+            DahIndex::new(),
+        );
+
+        // Give the record a live MinedIndex slot and point the primary at it.
+        let mined_slot = seed_mined_index_for_test(&engine, &key, &meta, &[(0x99, 1000, 0)]);
+        engine
+            .index
+            .register(
+                key,
+                TxIndexEntry {
+                    device_id: 0,
+                    record_offset: off_old,
+                    mined_slot,
+                },
+            )
+            .unwrap();
+
+        // Pass 1 captured the record at its OLD offset.
+        let captured = vec![(0u8, off_old, mined_slot)];
+
+        // RELOCATE (segment-engine relocate-on-spend): write a fresh copy at a
+        // NEW offset and re-point the primary there, keeping the SAME live
+        // `mined_slot`. The OLD offset's footer stays readable (pass 2 reads it).
+        let off_new = engine.allocator().lock().allocate(record_size).unwrap();
+        assert_ne!(
+            off_new, off_old,
+            "relocation must land at a distinct offset"
+        );
+        io::write_full_record(&*dev, off_new, &meta, &[slot0]).unwrap();
+        engine
+            .index
+            .register(
+                key,
+                TxIndexEntry {
+                    device_id: 0,
+                    record_offset: off_new,
+                    mined_slot,
+                },
+            )
+            .unwrap();
+
+        // Pass 2 driven with the STALE pass-1 locator. Pre-fix: the fresh entry's
+        // offset (off_new) != captured (off_old) → `_` arm → SKIPPED (data loss).
+        // Post-fix: the fresh lookup is authoritative → KEPT with the fresh slot.
+        let (pairs, skipped) = engine.resolve_mined_index_pairs(captured);
+        let found = pairs
+            .iter()
+            .find(|(k, _)| *k == key)
+            .expect("a relocated-but-live record must be KEPT in the mined snapshot, not omitted");
+        assert_eq!(
+            found.1, mined_slot,
+            "the relocated record must be paired with its FRESH (authoritative) slot",
+        );
+        assert_eq!(skipped, 0, "a live relocated record is not a skip");
+
+        // Reused-offset dedup: both the stale OLD offset and the current NEW
+        // offset carry this key's footer, so both locators resolve (via the fresh
+        // lookup) to the SAME current entry. They must collapse to ONE pair.
+        let (deduped, _) = engine
+            .resolve_mined_index_pairs(vec![(0, off_old, mined_slot), (0, off_new, mined_slot)]);
+        assert_eq!(
+            deduped.iter().filter(|(k, _)| *k == key).count(),
+            1,
+            "a key captured twice (stale + fresh offset) must dedup to a single pair",
         );
     }
 
@@ -25675,6 +27233,53 @@ mod tests {
         let e = create_engine();
         e.observe_block_height(900);
         assert_eq!(e.restore_last_durable_height(Some(100), 50), 900);
+    }
+
+    /// P0 (premature-sweep ordering): `reconcile_height_floor` folds the
+    /// persisted durable `.height` value into the boot-reconcile floor as
+    /// `max(persisted, tail_floor)` — identical to
+    /// [`Engine::restore_last_durable_height`]'s own `max`, so the reconcile
+    /// floor and the restored last-durable height can never diverge.
+    ///
+    /// The regression the server-boot ordering fix guards: a height-free redo
+    /// tail (a clean restart, or a crash right after a checkpoint) leaves the
+    /// replayed `tail_floor == 0`. Passing that bare 0 as
+    /// `reconcile_secondaries_from_mined_index`'s `current_block_height`
+    /// re-derives every setMined-planted DAH (device footer stale-0) as
+    /// `0 + retention`, already far past at real chain height → the acked record
+    /// is swept a full retention window early. Folding the persisted height
+    /// restores the real chain height BEFORE reconcile runs.
+    #[test]
+    fn reconcile_height_floor_folds_persisted_before_tail() {
+        // Height-free tail + no persisted file → 0 (the pre-fix hazard input).
+        assert_eq!(reconcile_height_floor(None, 0), 0);
+        // Height-free tail + persisted real chain height → the persisted height:
+        // the fold that eliminates the premature-sweep P0.
+        assert_eq!(reconcile_height_floor(Some(800_000), 0), 800_000);
+        // Tail floor above persisted → tail wins (record-derived safety net).
+        assert_eq!(reconcile_height_floor(Some(100), 800_000), 800_000);
+        // Persisted above tail floor → persisted wins.
+        assert_eq!(reconcile_height_floor(Some(800_000), 288), 800_000);
+        // No persisted value, nonzero tail → tail alone.
+        assert_eq!(reconcile_height_floor(None, 321), 321);
+
+        // It agrees with `restore_last_durable_height` for every combination
+        // (a fresh engine starts at 0, so its `fetch_max` returns the same
+        // value), so the two floors are provably consistent.
+        for (p, t) in [
+            (None, 0u32),
+            (Some(800_000), 0),
+            (Some(100), 500),
+            (None, 321),
+            (Some(800_000), 288),
+        ] {
+            let e = create_engine();
+            assert_eq!(
+                reconcile_height_floor(p, t),
+                e.restore_last_durable_height(p, t),
+                "reconcile floor must equal the restored last-durable height for ({p:?}, {t})",
+            );
+        }
     }
 
     #[test]

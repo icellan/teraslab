@@ -507,6 +507,22 @@ impl SegmentAllocator {
         seg_end.saturating_sub(self.cursor)
     }
 
+    /// The highest segment index with `used > 0`, or `open_segment` when every
+    /// segment is empty (a fresh allocator). Mirrors
+    /// [`SegmentBackupView::highest_used`]. Under defrag reuse the layout is
+    /// NON-monotonic — a reclaimed low segment can be reused as `open_segment`
+    /// while higher segments still hold live records — so this is the true
+    /// append frontier: [`Self::advance_to_next_segment`] must advance PAST it,
+    /// never blindly to `open_segment + 1`, or it would reopen a segment that
+    /// still owns live acked records and hand out their offsets.
+    fn highest_used(&self) -> u32 {
+        self.segments
+            .iter()
+            .rposition(|s| s.used > 0)
+            .map(|i| i as u32)
+            .unwrap_or(self.open_segment)
+    }
+
     /// Seal the open segment and open the next one. Returns `false` when there
     /// is no further segment (device full).
     ///
@@ -534,10 +550,25 @@ impl SegmentAllocator {
             self.cursor = self.segment_start(reused);
             return true;
         }
-        let next = self.open_segment + 1;
+        // Advance to the FRONTIER — one past the highest USED segment — never a
+        // blind `open_segment + 1`. Under defrag reuse `open_segment` can be a
+        // reclaimed LOW segment while a HIGHER segment still holds live acked
+        // records; `open_segment + 1` would reopen that live segment and hand
+        // out its offsets, overwriting acked data. `max(open, highest_used) + 1`
+        // is a virgin segment by construction (nothing above `highest_used` is
+        // used). This also covers the pinned (backup) path, which reaches here
+        // deterministically because the reuse branch above is skipped while
+        // pinned. Any virgin GAP below `highest_used` is already on the free
+        // list and would have been popped by the reuse branch before we fall
+        // through here, so skipping past it strands nothing.
+        let next = self.open_segment.max(self.highest_used()).saturating_add(1);
         if next >= self.segment_count {
             return false;
         }
+        debug_assert!(
+            self.segments[next as usize].used == 0,
+            "advance_to_next_segment must open a virgin segment (used==0)"
+        );
         self.open_segment = next;
         self.cursor = self.segment_start(next);
         true
@@ -563,7 +594,20 @@ impl SegmentAllocator {
     /// records out first — which is the next increment ([`Self::defrag_victims`]
     /// selects them). The open segment is never reclaimed (the cursor is inside
     /// it). Already-free segments are skipped (idempotent).
-    pub fn reclaim_fully_dead_segments(&mut self) -> Vec<u32> {
+    ///
+    /// `live_offsets` is the record offset of EVERY live index entry on this store
+    /// (the engine snapshots the index before calling). It is the AUTHORITATIVE
+    /// signal of which segments still hold acked data: a segment referenced by any
+    /// live offset is never reclaimed, even if its `used`/`dead` accounting claims
+    /// it is fully dead. This closes a P0 data-overwrite bug — after crash recovery
+    /// a REUSED segment can carry stale `used == dead > 0` from the checkpoint
+    /// header (its pre-reuse fully-dead state) while now holding a live
+    /// post-checkpoint record whose bytes recovery never re-added to `used`
+    /// ([`crate::recovery::recover_allocator_frontiers`] restores only the frontier
+    /// and free list, never `used`). Trusting `used == dead` there would reset+free
+    /// the segment and let a later allocate hand out the live record's offset,
+    /// overwriting acked UTXO data while the index still points at it.
+    pub fn reclaim_fully_dead_segments(&mut self, live_offsets: &[u64]) -> Vec<u32> {
         // A backup pin freezes reclaim entirely: leave every segment's
         // accounting intact and the reuse free list untouched so the copy sees a
         // stable used-segment set. (Checkpoints also skip the engine-level
@@ -572,14 +616,34 @@ impl SegmentAllocator {
         if self.pinned {
             return Vec::new();
         }
+        // Ground truth: which segments still own a live index entry.
+        let mut has_live = vec![false; self.segment_count as usize];
+        for &off in live_offsets {
+            if let Some(s) = self.segment_of(off) {
+                has_live[s as usize] = true;
+            }
+        }
         let mut reclaimed = Vec::new();
         for idx in 0..self.segment_count {
             if idx == self.open_segment {
                 continue;
             }
             let s = &self.segments[idx as usize];
-            // used == 0 means never-written OR already-reclaimed: nothing to do.
-            if s.used == 0 || s.used != s.dead {
+            // Reclaim ONLY a written segment (`used > 0`) whose every byte is dead
+            // (`dead >= used`) AND that holds no live index entry (`!has_live`):
+            //   - `used == 0` skips never-written / already-reclaimed segments.
+            //   - `!has_live` is the P0 guard: a segment holding a live record is
+            //     NEVER freed, even if stale accounting claims `used == dead`.
+            //   - `dead >= used` closes the fuzzy-checkpoint window. `live_offsets`
+            //     is snapshotted lock-free just before this call, so a segment that
+            //     a concurrent create reused+sealed IN that window can be missed by
+            //     `has_live`; such a segment still holds an un-dead-marked live
+            //     record (`dead == 0 < used`), so this excludes it. `>=` (not `==`)
+            //     means a recovered segment whose stale `used` under-counts its dead
+            //     bytes still drains once its live record dies and bumps `dead` past
+            //     `used` — so there is NO capacity leak (contrast the reclaim-
+            //     ineligible-flag option, which could strand such a segment forever).
+            if s.used == 0 || s.dead < s.used || has_live[idx as usize] {
                 continue;
             }
             self.segments[idx as usize] = SegmentMeta::default();
@@ -842,12 +906,27 @@ impl SegmentAllocator {
                 has_live[s as usize] = true;
             }
         }
+        // Scan up to the reuse FRONTIER — `max(open_segment, highest_used)` — not
+        // just `0..open_segment` (F2). Under a defrag-reclaimed non-monotonic layout
+        // `open_segment` can be a REUSED low segment while HIGHER segments still hold
+        // records (and count toward `highest_used`). A used segment ABOVE
+        // `open_segment` that holds no live record is a defrag hole; the old
+        // `0..open_segment` scan dropped it from the free list AND
+        // `advance_to_next_segment` jumps past it (to `max(open, highest_used) + 1`),
+        // so its capacity was permanently stranded. Every non-open segment at or
+        // below the frontier with no live record is safe to reclaim
+        // (`set_cursor_at_least` guarantees no live record sits strictly above
+        // `open_segment`). Segments ABOVE the frontier are the never-written virgin
+        // tail the frontier grows into on demand — leaving them off the free list
+        // avoids flooding it with the whole tail.
+        let frontier = self.open_segment.max(self.highest_used());
         self.free_segments.clear();
-        for idx in 0..self.open_segment {
-            if !has_live[idx as usize] {
-                self.segments[idx as usize] = SegmentMeta::default();
-                self.free_segments.push_back(idx);
+        for idx in 0..=frontier {
+            if idx == self.open_segment || has_live[idx as usize] {
+                continue;
             }
+            self.segments[idx as usize] = SegmentMeta::default();
+            self.free_segments.push_back(idx);
         }
     }
 
@@ -1355,8 +1434,8 @@ impl RecordAllocator for SegmentAllocator {
     fn reconcile_recovered_free_list(&mut self, live_offsets: &[u64]) {
         SegmentAllocator::reconcile_recovered_free_list(self, live_offsets);
     }
-    fn reclaim_fully_dead_segments(&mut self) -> usize {
-        SegmentAllocator::reclaim_fully_dead_segments(self).len()
+    fn reclaim_fully_dead_segments(&mut self, live_offsets: &[u64]) -> usize {
+        SegmentAllocator::reclaim_fully_dead_segments(self, live_offsets).len()
     }
     fn defrag_victim_ranges(&self, min_dead_frac: f64, max: usize) -> Vec<(u64, u64)> {
         SegmentAllocator::defrag_victim_ranges(self, min_dead_frac, max)
@@ -1523,7 +1602,7 @@ mod tests {
         // Dead-mark all of seg0.
         a.free(o0, 4096).unwrap();
         a.free(o1, 4096).unwrap();
-        assert_eq!(a.reclaim_fully_dead_segments(), vec![0]);
+        assert_eq!(a.reclaim_fully_dead_segments(&[]), vec![0]);
         assert_eq!(a.free_segment_count(), 1);
         // seg0's accounting was reset.
         assert_eq!(a.segment_live(0), 0);
@@ -1541,6 +1620,86 @@ mod tests {
     }
 
     #[test]
+    fn advance_never_hands_out_offsets_over_a_live_segment() {
+        // P0: the fallthrough advance must open the FRONTIER (past the highest
+        // used segment), never a blind `open_segment + 1`. Drive the allocator
+        // into the non-monotonic state where `open_segment` is a REUSED LOW
+        // segment (0), the free list is empty, and a HIGHER segment (1) still
+        // holds live acked records. A blind `open_segment + 1` would then reopen
+        // segment 1 and hand out its live records' offsets → overwrite acked data.
+        let seg = 2 * ALIGN as u64;
+        let mut a = alloc(64, seg);
+
+        let o0 = a.allocate(4096).unwrap(); // seg0 b0
+        let o1 = a.allocate(4096).unwrap(); // seg0 b1 (fills seg0)
+        let o2 = a.allocate(4096).unwrap(); // seg1 b0  — LIVE (never freed)
+        let _o3 = a.allocate(4096).unwrap(); // seg1 b1 (fills seg1) — LIVE
+        let _o4 = a.allocate(4096).unwrap(); // seg2 b0  — LIVE
+        let _o5 = a.allocate(4096).unwrap(); // seg2 b1 (fills seg2) — LIVE
+        assert_eq!(a.open_segment(), 2);
+
+        // Reclaim the fully-dead seg0, then reuse it: the next advance pops seg0
+        // off the free list, so `open_segment` becomes the reused LOW segment 0
+        // and the free list drains empty. seg1 above it still holds live o2/_o3.
+        a.free(o0, 4096).unwrap();
+        a.free(o1, 4096).unwrap();
+        assert_eq!(a.reclaim_fully_dead_segments(&[]), vec![0]);
+        let o6 = a.allocate(4096).unwrap(); // advance REUSES seg0 -> seg0 b0
+        assert_eq!(a.open_segment(), 0, "advance reused the reclaimed low seg0");
+        assert_eq!(a.free_segment_count(), 0, "free list drained");
+        assert_eq!(o6, DATA_REGION_OFFSET);
+
+        // Snapshot every segment that holds a live record BEFORE the fallthrough
+        // advance. o2 lives at segment_start(1); this set must exclude whatever
+        // segment the next allocation lands in.
+        let live_before: Vec<u32> = (0..a.segment_count())
+            .filter(|&i| a.segment_live(i) > 0)
+            .collect();
+        assert!(
+            live_before.contains(&1),
+            "seg1 must still hold the live records o2/_o3 ({live_before:?})"
+        );
+
+        // Fill the reused seg0, then force the fallthrough advance (free list is
+        // empty). The returned offset must NOT land in a segment holding a live
+        // record — it must open a virgin segment past the frontier.
+        let _o7 = a.allocate(4096).unwrap(); // seg0 b1 (fills reused seg0)
+        let o8 = a.allocate(4096).unwrap();
+
+        let landed = a
+            .segment_of(o8)
+            .expect("allocated offset must fall inside the data region");
+        assert!(
+            !live_before.contains(&landed),
+            "allocate handed out offset {o8} in segment {landed}, which held live \
+             records {live_before:?} — this overwrites acked data (o2 == {o2})"
+        );
+        // The frontier is one past the highest used segment (seg2), i.e. seg3.
+        assert_eq!(a.open_segment(), 3, "advanced to the virgin frontier");
+        assert_eq!(o8, a.data_region_start() + 3 * seg, "opened virgin seg3");
+        assert!(o8 != o2, "must not reissue the live record's offset");
+    }
+
+    #[test]
+    fn fresh_allocator_advances_monotonically_without_reuse() {
+        // With no reclaimed segments the frontier == open_segment, so the
+        // frontier advance must still walk 0 -> 1 -> 2 exactly: highest_used
+        // returns open_segment on an all-empty allocator.
+        let seg = 2 * ALIGN as u64;
+        let mut a = alloc(64, seg);
+        let _ = a.allocate(4096).unwrap(); // seg0 b0
+        let _ = a.allocate(4096).unwrap(); // seg0 b1 (full)
+        assert_eq!(a.open_segment(), 0);
+        let o2 = a.allocate(4096).unwrap(); // -> seg1
+        assert_eq!(a.open_segment(), 1, "0 -> 1");
+        assert_eq!(o2, a.data_region_start() + seg);
+        let _ = a.allocate(4096).unwrap(); // seg1 b1 (full)
+        let o4 = a.allocate(4096).unwrap(); // -> seg2
+        assert_eq!(a.open_segment(), 2, "1 -> 2");
+        assert_eq!(o4, a.data_region_start() + 2 * seg);
+    }
+
+    #[test]
     fn pinned_advance_skips_free_list_pop_and_advances_high_water() {
         // Same setup as the reuse test, but pin the lifecycle before the second
         // fill: the reclaimed seg0 must NOT be reused — allocation grows into
@@ -1552,7 +1711,7 @@ mod tests {
         let _o2 = a.allocate(4096).unwrap(); // -> seg1 b0
         a.free(o0, 4096).unwrap();
         a.free(o1, 4096).unwrap();
-        assert_eq!(a.reclaim_fully_dead_segments(), vec![0]);
+        assert_eq!(a.reclaim_fully_dead_segments(&[]), vec![0]);
         assert_eq!(a.free_segment_count(), 1);
 
         a.set_lifecycle_pinned(true);
@@ -1585,7 +1744,7 @@ mod tests {
 
         a.set_lifecycle_pinned(true);
         assert!(
-            a.reclaim_fully_dead_segments().is_empty(),
+            a.reclaim_fully_dead_segments(&[]).is_empty(),
             "pinned reclaim must return nothing"
         );
         assert_eq!(a.free_segment_count(), 0, "free list must stay empty");
@@ -1605,10 +1764,10 @@ mod tests {
         a.free(o1, 4096).unwrap();
 
         a.set_lifecycle_pinned(true);
-        assert!(a.reclaim_fully_dead_segments().is_empty());
+        assert!(a.reclaim_fully_dead_segments(&[]).is_empty());
         a.set_lifecycle_pinned(false);
 
-        assert_eq!(a.reclaim_fully_dead_segments(), vec![0]);
+        assert_eq!(a.reclaim_fully_dead_segments(&[]), vec![0]);
         assert_eq!(a.free_segment_count(), 1);
         let _o3 = a.allocate(4096).unwrap(); // fills seg1
         let o4 = a.allocate(4096).unwrap();
@@ -1666,13 +1825,13 @@ mod tests {
 
         a.free(b0, 4096).unwrap(); // seg1 partially dead (1/2)
         // Nothing fully dead yet: seg0 all-live, seg1 partial, seg2 open.
-        assert!(a.reclaim_fully_dead_segments().is_empty());
+        assert!(a.reclaim_fully_dead_segments(&[]).is_empty());
 
         // Now fully dead-mark seg0.
         a.free(a0, 4096).unwrap();
         a.free(a1, 4096).unwrap();
         // seg0 reclaims; seg1 (partial) and seg2 (open) do NOT.
-        assert_eq!(a.reclaim_fully_dead_segments(), vec![0]);
+        assert_eq!(a.reclaim_fully_dead_segments(&[]), vec![0]);
         assert_eq!(a.free_segment_count(), 1);
     }
 
@@ -1830,7 +1989,7 @@ mod tests {
         assert_eq!(a.open_segment(), 2);
         a.free(o0, 4096).unwrap();
         a.free(o1, 4096).unwrap();
-        assert_eq!(a.reclaim_fully_dead_segments(), vec![0]);
+        assert_eq!(a.reclaim_fully_dead_segments(&[]), vec![0]);
         assert_eq!(a.free_segment_count(), 1);
         let before = a.stats();
         a.persist().unwrap();
@@ -1888,6 +2047,115 @@ mod tests {
             "reconciled free seg0 reused after recovery"
         );
         assert_eq!(o, DATA_REGION_OFFSET);
+    }
+
+    #[test]
+    fn reclaim_never_frees_a_segment_holding_a_live_record_with_stale_accounting() {
+        // P0 (data overwrite): after a crash a REUSED segment K can carry stale
+        // `used == dead > 0` from the checkpoint header (its pre-reuse fully-dead
+        // state) while now holding a live post-checkpoint record R whose bytes
+        // recovery never re-added to `used`. Reclaim must cross-check the live index
+        // and REFUSE to free K — otherwise K is reset+freed, reused, and a later
+        // allocate hands out R's offset, overwriting acked data.
+        let seg = 2 * ALIGN as u64; // 2 blocks/segment
+        let mut a = alloc(64, seg);
+        let _o0 = a.allocate(4096).unwrap(); // seg0 b0
+        let _o1 = a.allocate(4096).unwrap(); // seg0 b1 (fills seg0)
+        let r = a.allocate(4096).unwrap(); // seg1 b0 == LIVE record R in K = seg1
+        let _r1 = a.allocate(4096).unwrap(); // seg1 b1 (fills seg1)
+        let top = a.allocate(4096).unwrap(); // seg2 b0 (highest live; the open seg)
+        let k = 1u32;
+        assert_eq!(a.segment_of(r), Some(k));
+        assert_eq!(a.open_segment(), 2);
+
+        // Forge the post-recovery accounting for K: `used == dead == seg` (fully
+        // dead per the stale checkpoint header) even though R physically lives in K
+        // and its bytes were never re-added to `used`. K is not the open segment, so
+        // the pre-fix `used == dead` gate would reclaim it here.
+        a.segments[k as usize] = SegmentMeta {
+            used: seg,
+            dead: seg,
+        };
+
+        // The authoritative live set for this store: R (in K) and top (in the open
+        // seg2). Reclaim MUST NOT free K.
+        let reclaimed = a.reclaim_fully_dead_segments(&[r, top]);
+        assert!(
+            !reclaimed.contains(&k),
+            "reclaim freed segment {k} which still holds the live record R at {r}: {reclaimed:?}"
+        );
+        assert_eq!(
+            a.free_segment_count(),
+            0,
+            "K must not be placed on the reuse free list while it holds a live record"
+        );
+
+        // Prove R's offset can never be re-handed out: fill the open seg2, then the
+        // next advance must open a VIRGIN segment past the frontier, never K.
+        let _fill = a.allocate(4096).unwrap(); // seg2 b1 (fills seg2)
+        let next = a.allocate(4096).unwrap();
+        assert_ne!(
+            a.segment_of(next),
+            Some(k),
+            "allocate handed out an offset in K — would overwrite live R at {r}"
+        );
+        assert_ne!(next, r, "reissued the live record R's offset {r}");
+        // Frontier = one past the highest used segment (seg2) → seg3 (virgin).
+        assert_eq!(
+            a.open_segment(),
+            3,
+            "advanced to the virgin frontier, not K"
+        );
+    }
+
+    #[test]
+    fn reconcile_frees_a_used_hole_above_the_open_segment() {
+        // F2 (post-crash capacity leak): a used segment holding no live record that
+        // sits ABOVE `open_segment` (a defrag-reclaimed non-monotonic layout leaves
+        // `open_segment` low while higher segments stay used) was dropped by the old
+        // `0..open_segment` reconcile scan AND skipped by the frontier advance, so it
+        // was permanently stranded. Reconcile must return it to the reuse free list.
+        let seg = 2 * ALIGN as u64;
+        let mut a = alloc(64, seg);
+        let o0 = a.allocate(4096).unwrap(); // seg0 b0
+        let o1 = a.allocate(4096).unwrap(); // seg0 b1 (fills seg0)
+        let o2 = a.allocate(4096).unwrap(); // seg1 b0 (kept LIVE)
+        let _o3 = a.allocate(4096).unwrap(); // seg1 b1 (fills seg1)
+        let o4 = a.allocate(4096).unwrap(); // seg2 b0
+        let _o5 = a.allocate(4096).unwrap(); // seg2 b1 (fills seg2)
+        assert_eq!(a.open_segment(), 2);
+        assert_eq!(a.segment_of(o4), Some(2));
+
+        // Drive `open_segment` DOWN below the used seg2: dead-mark all of seg0,
+        // reclaim it, then reuse it — the advance pops seg0 so `open_segment == 0`.
+        a.free(o0, 4096).unwrap();
+        a.free(o1, 4096).unwrap();
+        assert_eq!(a.reclaim_fully_dead_segments(&[o2, _o3, o4, _o5]), vec![0]);
+        let o6 = a.allocate(4096).unwrap(); // advance reuses seg0
+        assert_eq!(a.open_segment(), 0, "reused the reclaimed low seg0");
+        assert_eq!(o6, DATA_REGION_OFFSET);
+
+        // Recovery-style reconcile: seg1 keeps its live record o2, the open seg0
+        // keeps o6, and seg2's records (o4/o5) have relocated away — so seg2 is a
+        // USED hole sitting ABOVE the open segment.
+        a.reconcile_recovered_free_list(&[o2, o6]);
+        assert_eq!(a.segment_live(2), 0, "seg2 reset to empty");
+        assert_eq!(
+            a.free_segment_count(),
+            1,
+            "the used hole seg2 (above open_segment) must rejoin the free list"
+        );
+
+        // Non-vacuous: the freed hole is reused before growth. Fill the open seg0,
+        // then the next advance must REUSE seg2, not grow into a virgin segment.
+        let _o7 = a.allocate(4096).unwrap(); // fills seg0
+        let o8 = a.allocate(4096).unwrap();
+        assert_eq!(
+            a.open_segment(),
+            2,
+            "reused the reconciled hole seg2 instead of growing past it"
+        );
+        assert_eq!(o8, a.data_region_start() + 2 * seg);
     }
 
     #[test]

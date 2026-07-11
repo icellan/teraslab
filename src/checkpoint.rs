@@ -174,6 +174,16 @@ pub struct CheckpointConfig {
     pub emergency_high_water: f64,
     /// How often the task wakes to sample usage. Default: 1 second.
     pub poll_interval: Duration,
+    /// P1-23: maximum wall-clock time between COMPLETED checkpoints while the
+    /// redo has advanced (i.e. any create/relocate/spend appended since the last
+    /// checkpoint). The checkpoint's data-device fsync (step 3) is the ONLY
+    /// fsync of the data devices under the default buffered durability mode, so
+    /// a usage-only trigger leaves a lightly-loaded node's data unfsynced —
+    /// unboundedly widening the crash-loss window of the segment-relocate and
+    /// index-only CreateV2 paths. This fires a (fuzzy) checkpoint after the
+    /// interval elapses so that window is bounded. `None` disables the
+    /// time-based trigger (usage-only). Default: 60 seconds.
+    pub max_checkpoint_interval: Option<Duration>,
     /// Initial back-off after a failed checkpoint. Doubles each
     /// successive failure up to `max_backoff`. Reset to 0 on a
     /// successful checkpoint. Default: 1 second.
@@ -200,6 +210,7 @@ impl CheckpointConfig {
             low_water: 0.25,
             emergency_high_water: 0.90,
             poll_interval: Duration::from_secs(1),
+            max_checkpoint_interval: Some(Duration::from_secs(60)),
             initial_backoff: Duration::from_secs(1),
             max_backoff: Duration::from_secs(60),
             snapshot_path,
@@ -382,6 +393,13 @@ fn run_checkpoint_loop(
     // once the workload slows and the refill again outlasts a fuzzy.
     let mut last_ckpt_completed: Option<std::time::Instant> = None;
     let mut last_fuzzy_duration = Duration::ZERO;
+    // P1-23: time-based checkpoint trigger state. `loop_start` is the reference
+    // for the interval BEFORE the first checkpoint; `last_ckpt_sequence` is the
+    // redo sequence at the last completed checkpoint (baselined to the current
+    // sequence so pre-existing/recovered redo does not spuriously trigger — only
+    // NEW post-start appends do).
+    let loop_start = std::time::Instant::now();
+    let mut last_ckpt_sequence = engine.current_redo_sequence();
     // S-P2c: when the previous checkpoint reclaimed NOTHING (e.g. the reset
     // guard is holding the redo prefix for a lagging replica), a blocking
     // checkpoint would hold the exclusive visibility barrier across an O(index)
@@ -427,6 +445,21 @@ fn run_checkpoint_loop(
         // and cannot keep pace with the burst that starved the writer).
         let starved = backpressure.blocked_appenders() > 0;
 
+        // P1-23: also checkpoint when the max interval has elapsed with un-fsynced
+        // redo (data devices are fsynced only by the checkpoint barrier under
+        // buffered durability, so a usage-only trigger leaves a lightly-loaded
+        // node's creates/relocates unbounded on crash). Fires a FUZZY checkpoint
+        // (low usage → the `blocking` decision below stays false).
+        let time_since_ckpt = last_ckpt_completed
+            .map(|t| t.elapsed())
+            .unwrap_or_else(|| loop_start.elapsed());
+        let time_triggered = time_checkpoint_due(
+            engine.current_redo_sequence(),
+            last_ckpt_sequence,
+            time_since_ckpt,
+            config.max_checkpoint_interval,
+        );
+
         // Threshold-driven, no hysteresis latch. Single-flight is inherent
         // because `perform_checkpoint_*` runs synchronously in this loop, and
         // the blocking emergency path guarantees the log is drained before it
@@ -435,7 +468,7 @@ fn run_checkpoint_loop(
         // usage above low_water and never re-armed, so checkpoints stopped and
         // the redo grew to 100% / `LogFull` under sustained writes — the
         // regression this loop fixes.)
-        if usage < config.high_water && !starved {
+        if usage < config.high_water && !starved && !time_triggered {
             escalate_blocking = false;
             continue;
         }
@@ -505,6 +538,10 @@ fn run_checkpoint_loop(
             Ok(stats) => {
                 backoff = Duration::ZERO;
                 last_usage = stats.usage_after;
+                // P1-23: the data devices were just fsynced by this checkpoint,
+                // so reset the time-trigger baseline to the current redo sequence
+                // (only redo appended AFTER this point re-arms the time trigger).
+                last_ckpt_sequence = engine.current_redo_sequence();
                 // If a fuzzy checkpoint could not drain below high_water (its
                 // snapshot-window appends stayed resident), force the next one
                 // to block so the log is actually reclaimed.
@@ -604,6 +641,28 @@ fn fuzzy_would_be_overtaken(
         Some(refill) => last_fuzzy_duration > Duration::ZERO && refill < last_fuzzy_duration,
         None => false,
     }
+}
+
+/// P1-23: whether the TIME-based checkpoint trigger should fire this tick.
+///
+/// Fires only when there is un-fsynced data to flush — the redo advanced since
+/// the last completed checkpoint (`current_seq > last_ckpt_seq`) — AND the
+/// configured `interval` has elapsed since that checkpoint (or, before the first
+/// checkpoint, since the loop started, which the caller passes as `elapsed`).
+/// `interval == None` disables the trigger (usage-only behaviour). This bounds
+/// the crash-loss window of the buffered segment-relocate / CreateV2 paths whose
+/// only data-device fsync is the checkpoint barrier, WITHOUT checkpointing an
+/// idle node (no new redo → no fire).
+fn time_checkpoint_due(
+    current_seq: u64,
+    last_ckpt_seq: u64,
+    elapsed: Duration,
+    interval: Option<Duration>,
+) -> bool {
+    let Some(interval) = interval else {
+        return false;
+    };
+    current_seq > last_ckpt_seq && elapsed >= interval
 }
 
 /// Decide how the checkpoint task should react to a failed checkpoint.
@@ -926,9 +985,14 @@ where
             .mark_recovery_progress_all(snapshot_fence_sequence)
             .map_err(|e| format!("redo checkpoint fence: {e}"))?;
     } else {
-        redo_log
-            .lock()
-            .checkpoint_fence(snapshot_fence_sequence)
+        // P0 (redo header-clobber): serialize the header write with any in-flight
+        // group-commit Phase-2 flush via store 0's `flush_guard` (a no-op passthrough
+        // when no committer backs this single handle — the only case this fallback
+        // runs), mirroring the multi-store path.
+        engine
+            .under_redo_flush_guard_store0(|| {
+                redo_log.lock().checkpoint_fence(snapshot_fence_sequence)
+            })
             .map_err(|e| format!("redo checkpoint fence: {e}"))?;
     }
 
@@ -950,9 +1014,12 @@ where
                 .compact_all_redo_through(snapshot_fence_sequence)
                 .map_err(|e| format!("redo compact: {e}"))?;
         } else {
-            redo_log
-                .lock()
-                .checkpoint_reclaim(snapshot_fence_sequence)
+            // P0 (redo header-clobber): serialize with any in-flight Phase-2 flush
+            // via store 0's `flush_guard`, as above.
+            engine
+                .under_redo_flush_guard_store0(|| {
+                    redo_log.lock().checkpoint_reclaim(snapshot_fence_sequence)
+                })
                 .map_err(|e| format!("redo compact: {e}"))?;
         }
         true
@@ -1219,6 +1286,34 @@ mod tests {
     }
 
     /// Lever 6d: pick a blocking checkpoint when the log refills faster than a
+    /// P1-23: the time-based checkpoint trigger fires only when the redo
+    /// advanced since the last checkpoint AND the interval elapsed, and never
+    /// when disabled (`None`) or on an idle node (no new redo).
+    #[test]
+    fn time_checkpoint_due_requires_new_redo_and_elapsed_interval() {
+        let iv = Some(Duration::from_secs(60));
+        // Idle: no new redo since the last checkpoint → never fires, even after
+        // a long wall-clock gap.
+        assert!(!time_checkpoint_due(
+            100,
+            100,
+            Duration::from_secs(3600),
+            iv
+        ));
+        // New redo appended, but the interval has not elapsed yet → wait.
+        assert!(!time_checkpoint_due(101, 100, Duration::from_secs(30), iv));
+        // New redo AND the interval elapsed → fire (bound the crash-loss window).
+        assert!(time_checkpoint_due(101, 100, Duration::from_secs(60), iv));
+        assert!(time_checkpoint_due(200, 100, Duration::from_secs(120), iv));
+        // Disabled → never fires, regardless of redo/elapsed.
+        assert!(!time_checkpoint_due(
+            200,
+            100,
+            Duration::from_secs(3600),
+            None
+        ));
+    }
+
     /// fuzzy checkpoint runs (a fuzzy would be overtaken), but stay fuzzy under
     /// light load and before any fuzzy duration is known.
     #[test]
@@ -1569,14 +1664,16 @@ mod tests {
              is the barrier still held across the snapshot?"
         );
         // Liveness floor: the reader made real forward progress DURING the
-        // checkpoint (a stop-the-world run completes ~1-2 acquisitions — the
-        // one before it blocks on the barrier). The threshold is deliberately
-        // low (not the raw throughput) so a starved CI runner that gives the
-        // reader little CPU cannot flake it, while still catching the
-        // stop-the-world case (~1-2 << 50). The `max_us` bound above is the
-        // primary proof; this guards against the reader never running at all.
+        // checkpoint (a stop-the-world run completes ~1-2 acquisitions — the one
+        // before it blocks on the barrier). The `max_us` bound above is the
+        // PRIMARY, scheduling-robust proof of non-blocking; this is only a weak
+        // "the reader thread actually ran more than a stalled one would" floor.
+        // The threshold is deliberately just above the stop-the-world count so a
+        // severely CPU-starved CI runner (observed as low as ~13 acquisitions on
+        // a contended 2-core macos runner) cannot flake it, while still catching
+        // the stop-the-world case (~1-2 < 5).
         assert!(
-            reads >= 50,
+            reads >= 5,
             "reader made almost no progress during checkpoint: only {reads} guard \
              acquisitions across {ckpt_us}us — stop-the-world, or the reader was never scheduled?"
         );
@@ -2203,12 +2300,15 @@ mod tests {
         assert_eq!(unmined2_after, 0, "tx2 is now mined on the longest chain");
     }
 
-    /// Task 16d: the device-scan fallback is GONE. When a checkpoint HAS run
-    /// (a primary-index snapshot exists) but the `.mined` section is absent,
-    /// recovery must NOT silently rebuild from the device (which is stale
-    /// for any post-16d setMined) — it must fail closed.
+    /// Task 16d + P1-21: the device-scan fallback is GONE. When a checkpoint
+    /// has RECLAIMED a redo prefix (redo fence > 0) but the `.mined` section is
+    /// absent, the redo tail is INCOMPLETE (the reclaimed prefix's mined-state
+    /// lived only in the missing snapshot), so recovery must fail closed — NOT
+    /// silently rebuild from the (post-16d stale) device. (A primary snapshot
+    /// alone with an UNFENCED redo — e.g. a graceful shutdown — is instead
+    /// recoverable via full replay; see the sibling `..._full_replays...` test.)
     #[test]
-    fn recovery_without_mined_snapshot_is_fatal_when_checkpoint_exists() {
+    fn recovery_without_mined_snapshot_is_fatal_when_redo_prefix_reclaimed() {
         use crate::ops::set_mined::SetMinedRequest;
 
         let dir = tempfile::tempdir().unwrap();
@@ -2265,21 +2365,28 @@ mod tests {
         );
 
         let redo_dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(64 * 1024, 4096).unwrap());
-        let redo = RedoLog::open(redo_dev, 0, 64 * 1024).unwrap();
+        let redo = Arc::new(Mutex::new(RedoLog::open(redo_dev, 0, 64 * 1024).unwrap()));
+        // P1-21: simulate a checkpoint having RECLAIMED a redo prefix (fence > 0).
+        // With the reclaimed prefix gone AND the `.mined` snapshot that held its
+        // mined-state absent, the tail is incomplete → recovery must fail closed.
+        redo.lock().set_fence(1).unwrap();
 
         let mut alloc2: crate::allocator::BoxedAllocator =
             Box::new(SlotAllocator::recover(dev.clone()).expect("allocator header durable"));
         let (restored_index, dah2, _flags) = crate::index::ShardedIndex::restore_all(&snap_path, 1)
             .expect("primary snapshot must restore");
         let mut dah_b = crate::index::DahBackend::from(dah2);
-        crate::recovery::recover_all_with_allocator(
-            &*dev,
-            &redo,
-            &restored_index,
-            &mut dah_b,
-            Some(&mut alloc2),
-        )
-        .expect("primary/device recovery must succeed");
+        {
+            let guard = redo.lock();
+            crate::recovery::recover_all_with_allocator(
+                &*dev,
+                &guard,
+                &restored_index,
+                &mut dah_b,
+                Some(&mut alloc2),
+            )
+            .expect("primary/device recovery must succeed");
+        }
 
         let engine2 = Engine::new_with_sharded_index(
             dev.clone(),
@@ -2290,14 +2397,144 @@ mod tests {
         );
 
         let err = engine2
-            .recover_mined_index(&snap_path, &mined_snap_path, &[])
+            .recover_mined_index(&snap_path, &mined_snap_path, std::slice::from_ref(&redo))
             .expect_err(
-                "an existing primary checkpoint with a missing `.mined` section must be FATAL, \
-                 not silently device-rebuilt",
+                "a reclaimed redo prefix (fence > 0) with a missing `.mined` section must be \
+                 FATAL, not silently device-rebuilt",
             );
         assert!(
             matches!(err, SpendError::StorageError { .. }),
             "expected StorageError, got {err:?}"
+        );
+    }
+
+    /// P1-21: a graceful shutdown writes the primary-index snapshot but NOT the
+    /// `.mined` sibling (only a checkpoint writes that). On a node that never
+    /// checkpointed, the redo fence is still 0, so the ENTIRE mined-state is in
+    /// the redo tail and a full replay reconstructs it. Recovery must therefore
+    /// full-replay (not the FATAL branch) even though the primary snapshot
+    /// exists. The old `!primary_snapshot.exists()` gate wrongly bricked boot.
+    #[test]
+    fn recovery_without_mined_snapshot_full_replays_when_redo_unfenced() {
+        use crate::ops::set_mined::SetMinedRequest;
+
+        let dir = tempfile::tempdir().unwrap();
+        let snap_path = dir.path().join("graceful-shutdown.snap");
+        let mined_snap_path = mined_index_snapshot_path(&snap_path);
+
+        let dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(8 * 1024 * 1024, 4096).unwrap());
+        let alloc = SlotAllocator::new(dev.clone()).unwrap();
+        let index = Index::new(128).unwrap();
+        let engine = Engine::new(
+            dev.clone(),
+            index,
+            alloc,
+            StripedLocks::new(16),
+            DahIndex::new(),
+        );
+
+        // UNFENCED redo (fence 0) carrying the full mined-state history, exactly
+        // as a never-checkpointed node's redo does. Journalled WAL-first,
+        // mirroring dispatch (set_mined_inner writes no redo itself).
+        let redo_dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(64 * 1024, 4096).unwrap());
+        let redo = Arc::new(Mutex::new(RedoLog::open(redo_dev, 0, 64 * 1024).unwrap()));
+
+        let key = crate::index::TxKey { txid: [21u8; 32] };
+        let hash = [[0xEEu8; 32]];
+        engine
+            .create(&mined_test_create_req(key.txid, &hash))
+            .unwrap();
+        let entry = engine.lookup(&key).expect("create registers the entry");
+        redo.lock()
+            .append_and_flush(RedoOp::CreateV2 {
+                tx_key: key,
+                device_id: entry.device_id,
+                record_offset: entry.record_offset,
+                utxo_count: 1,
+                is_conflicting: false,
+                parent_txids: Vec::new(),
+            })
+            .unwrap();
+        engine
+            .set_mined(&SetMinedRequest {
+                tx_key: key,
+                block_id: 77,
+                block_height: 9,
+                subtree_idx: 0,
+                current_block_height: 9,
+                block_height_retention: 100_000,
+                on_longest_chain: true,
+                unset_mined: false,
+            })
+            .unwrap();
+        redo.lock()
+            .append_and_flush(RedoOp::SetMinedBatch {
+                block_id: 77,
+                block_height: 9,
+                subtree_idx: 0,
+                on_longest_chain: true,
+                current_block_height: 9,
+                block_height_retention: 100_000,
+                unset: false,
+                txids: vec![key],
+            })
+            .unwrap();
+
+        // Graceful shutdown: write the primary snapshot (NO `.mined` sibling).
+        engine
+            .snapshot_index(&snap_path)
+            .expect("primary snapshot must succeed");
+        engine
+            .persist_allocator()
+            .expect("allocator header must persist");
+        assert!(
+            snap_path.exists(),
+            "graceful shutdown wrote the primary snapshot"
+        );
+        assert!(
+            !mined_snap_path.exists(),
+            "graceful shutdown wrote NO .mined snapshot",
+        );
+        assert_eq!(
+            redo.lock().recovery_fence(),
+            0,
+            "never-checkpointed node: the redo fence is still 0",
+        );
+
+        // Restart: reconstruct the primary index, then recover the mined index.
+        let recovered_alloc = SlotAllocator::recover(dev.clone()).unwrap();
+        let (restored_index, dah2, _flags) = crate::index::ShardedIndex::restore_all(&snap_path, 1)
+            .expect("primary snapshot must restore");
+        let engine2 = Engine::new_with_sharded_index(
+            dev.clone(),
+            restored_index,
+            recovered_alloc,
+            StripedLocks::new(16),
+            crate::index::DahBackend::from(dah2),
+        );
+
+        let used_snapshot = engine2
+            .recover_mined_index(&snap_path, &mined_snap_path, std::slice::from_ref(&redo))
+            .expect("unfenced redo → full replay reconstructs mined-state, NOT fatal");
+        assert!(
+            !used_snapshot,
+            "no .mined snapshot → recovery reports the full-replay path",
+        );
+
+        let e = engine2.lookup(&key).expect("tx must still be indexed");
+        assert_ne!(
+            e.mined_slot,
+            crate::index::mined_index::NO_MINED_SLOT,
+            "full replay must allocate a mined_slot via the CreateV2 entry",
+        );
+        let (blocks, unmined_since) = engine2
+            .mined_index()
+            .read_block_entries(&key, e.mined_slot)
+            .expect("mined slot must carry the replayed block entry");
+        assert_eq!(unmined_since, 0, "replayed as on the longest chain");
+        assert!(
+            blocks.iter().any(|b| b.block_id == 77),
+            "the SetMinedBatch block (77) must be reconstructed by the full replay",
         );
     }
 
@@ -3514,6 +3751,7 @@ mod tests {
             low_water: 0.25,
             emergency_high_water: 0.90,
             poll_interval: Duration::from_millis(10),
+            max_checkpoint_interval: None,
             initial_backoff: Duration::from_millis(100),
             max_backoff: Duration::from_millis(400),
             snapshot_path: PathBuf::from("/dev/null"),
@@ -3609,6 +3847,7 @@ mod tests {
             low_water: 0.20,
             emergency_high_water: 0.90,
             poll_interval: Duration::from_millis(10),
+            max_checkpoint_interval: None,
             initial_backoff: Duration::from_millis(10),
             max_backoff: Duration::from_millis(40),
             snapshot_path: snap_path.clone(),
@@ -3671,6 +3910,7 @@ mod tests {
             low_water: 0.10,
             emergency_high_water: 0.98,
             poll_interval: Duration::from_millis(10),
+            max_checkpoint_interval: None,
             initial_backoff: Duration::from_millis(10),
             max_backoff: Duration::from_millis(40),
             snapshot_path: snap_path.clone(),
@@ -3727,6 +3967,7 @@ mod tests {
             low_water: 0.20,
             emergency_high_water: 0.90,
             poll_interval: Duration::from_millis(5),
+            max_checkpoint_interval: None,
             initial_backoff: Duration::from_millis(5),
             max_backoff: Duration::from_millis(40),
             snapshot_path: dir.path().join("sustained.snap"),
@@ -3869,6 +4110,7 @@ mod tests {
             low_water: 0.20,
             emergency_high_water: 0.75,
             poll_interval: Duration::from_millis(5),
+            max_checkpoint_interval: None,
             initial_backoff: Duration::from_millis(5),
             max_backoff: Duration::from_millis(40),
             snapshot_path: dir.path().join("soak.snap"),
@@ -3945,6 +4187,7 @@ mod tests {
             low_water: 0.10,
             emergency_high_water: 0.90,
             poll_interval: Duration::from_millis(2),
+            max_checkpoint_interval: None,
             initial_backoff: Duration::from_millis(2),
             max_backoff: Duration::from_millis(10),
             snapshot_path: snap_path.clone(),
@@ -4006,6 +4249,7 @@ mod tests {
             low_water: 0.10,
             emergency_high_water: 0.99,
             poll_interval: Duration::from_millis(50),
+            max_checkpoint_interval: None,
             initial_backoff: Duration::from_millis(10),
             max_backoff: Duration::from_millis(40),
             snapshot_path: dir.path().join("shutdown.snap"),

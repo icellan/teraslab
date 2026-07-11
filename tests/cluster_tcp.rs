@@ -159,7 +159,7 @@ fn create_node_full(
 
 /// Like [`create_node_full`] but selects the storage engine. `segment == true`
 /// builds a clustered log-structured node (redo log attached, buffered
-/// durability, `set_clustered`) — the shape a clustered segment node runs.
+/// durability) — the shape a clustered segment node runs.
 #[allow(clippy::too_many_arguments)]
 fn create_node_full_engine(
     node_id: u64,
@@ -197,7 +197,6 @@ fn create_node_full_engine(
         let log = RedoLog::open(log_dev, 0, 16 * 1024 * 1024).unwrap();
         engine.set_redo_logs(vec![Arc::new(parking_lot::Mutex::new(log))]);
         engine.set_buffered_durability(true);
-        engine.set_clustered(true);
         Arc::new(engine)
     } else {
         let alloc = SlotAllocator::new(dev.clone()).unwrap();
