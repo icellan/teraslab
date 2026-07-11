@@ -5607,25 +5607,12 @@ fn handle_spend_batch(
         }
     };
 
-    if errors.is_empty() {
-        let status = if repl_outcome.is_degraded() {
-            STATUS_DEGRADED_DURABILITY
-        } else {
-            STATUS_OK
-        };
-        ResponseFrame {
-            request_id: req.request_id,
-            status,
-            payload: vec![],
-        }
-    } else {
-        errors.sort_by_key(|e| e.item_index);
-        ResponseFrame {
-            request_id: req.request_id,
-            status: STATUS_PARTIAL_ERROR,
-            payload: encode_sparse_errors(&errors),
-        }
-    }
+    // Same status/degraded-trailer precedence as every other batch mutation:
+    // clean → STATUS_OK / STATUS_DEGRADED_DURABILITY, per-item errors →
+    // STATUS_PARTIAL_ERROR with the degraded signal appended as a payload
+    // trailer when replication was below-quorum (never silently dropped).
+    errors.sort_by_key(|e| e.item_index);
+    batch_response_with_outcome(req.request_id, &errors, repl_outcome)
 }
 
 // ---------------------------------------------------------------------------
@@ -6185,23 +6172,35 @@ fn handle_set_mined_batch(
 ///   locally; the client must still learn the block IDs).
 /// - When any item failed, the status is `STATUS_PARTIAL_ERROR` and the
 ///   payload carries both the per-item successes and the sparse error section.
+///   A degraded replication outcome for the items that applied is not dropped:
+///   it is appended as the [`PARTIAL_DURABILITY_DEGRADED`] trailer (see
+///   [`with_degraded_trailer`]), mirroring the status-byte signal the
+///   all-success path uses.
 fn set_mined_response_with_signals(
     request_id: u64,
     successes: &[BatchItemSuccess],
     errors: &[BatchItemError],
     outcome: ReplicationOutcome,
 ) -> ResponseFrame {
-    let status = if !errors.is_empty() {
-        STATUS_PARTIAL_ERROR
+    let payload = encode_partial_with_signals(successes, errors);
+    if !errors.is_empty() {
+        ResponseFrame {
+            request_id,
+            status: STATUS_PARTIAL_ERROR,
+            payload: with_degraded_trailer(payload, outcome),
+        }
     } else if outcome.is_degraded() {
-        STATUS_DEGRADED_DURABILITY
+        ResponseFrame {
+            request_id,
+            status: STATUS_DEGRADED_DURABILITY,
+            payload,
+        }
     } else {
-        STATUS_OK
-    };
-    ResponseFrame {
-        request_id,
-        status,
-        payload: encode_partial_with_signals(successes, errors),
+        ResponseFrame {
+            request_id,
+            status: STATUS_OK,
+            payload,
+        }
     }
 }
 
@@ -10207,16 +10206,35 @@ fn codec_error_response(request_id: u64, op_label: &str, err: CodecError) -> Res
     )
 }
 
+/// Append the reserved [`PARTIAL_DURABILITY_DEGRADED`] trailer to a
+/// `STATUS_PARTIAL_ERROR` payload when replication was degraded.
+///
+/// The all-success degraded path signals below-quorum durability in the status
+/// byte (`STATUS_DEGRADED_DURABILITY`), but a `STATUS_PARTIAL_ERROR` response
+/// needs its status byte to carry the per-item diagnostics. So the degraded
+/// signal for the items that DID apply rides as this one-byte payload trailer
+/// instead — present only when degraded, so non-degraded partial responses are
+/// byte-identical to the pre-trailer wire format and older clients (which stop
+/// decoding after the declared section) ignore it.
+fn with_degraded_trailer(mut payload: Vec<u8>, outcome: ReplicationOutcome) -> Vec<u8> {
+    if outcome.is_degraded() {
+        payload.push(PARTIAL_DURABILITY_DEGRADED);
+    }
+    payload
+}
+
 /// Build a per-batch response frame, promoting clean responses to
 /// `STATUS_DEGRADED_DURABILITY` when replication returned
 /// [`ReplicationOutcome::Degraded`] (best-effort mode, zero replica ACKs).
 ///
-/// When there *are* per-item errors we still return `STATUS_PARTIAL_ERROR`:
-/// the partial-error path already conveys that not every item succeeded,
-/// and overwriting it with the degraded-durability status would erase the
-/// per-item diagnostic detail the client needs. The degraded-durability
-/// metric has already been incremented inside `replicate_all_ops`, so the
-/// server-side telemetry is unaffected.
+/// When there *are* per-item errors we return `STATUS_PARTIAL_ERROR` so the
+/// status byte can carry the per-item diagnostics — but a degraded outcome is
+/// no longer discarded: the items that DID apply are only single-node durable,
+/// so the same below-quorum signal the all-success path carries in its status
+/// byte is appended to the partial payload as the [`PARTIAL_DURABILITY_DEGRADED`]
+/// trailer (see [`with_degraded_trailer`]). A client that surfaces degraded
+/// durability on the full-success path therefore surfaces it on the partial
+/// path too, instead of mistaking the applied items for quorum-durable writes.
 ///
 /// Callers in non-cluster paths can pass [`ReplicationOutcome::Full`]
 /// (or [`ReplicationOutcome::NotApplicable`]) to get plain `STATUS_OK`.
@@ -10240,7 +10258,7 @@ fn batch_response_with_outcome(
         ResponseFrame {
             request_id,
             status: STATUS_PARTIAL_ERROR,
-            payload: encode_sparse_errors(errors),
+            payload: with_degraded_trailer(encode_sparse_errors(errors), outcome),
         }
     }
 }
@@ -17317,19 +17335,74 @@ mod tests {
     }
 
     #[test]
-    fn partial_errors_override_degraded_status() {
-        // If the batch had per-item errors, we must return STATUS_PARTIAL_ERROR
-        // so the client sees the per-item diagnostics, not a blanket status
-        // byte that hides them. The degraded-durability escalation is still
-        // visible via server metrics.
+    fn partial_errors_keep_status_byte_and_carry_degraded_trailer() {
+        // P1-8: per-item errors own the status byte (STATUS_PARTIAL_ERROR) so the
+        // client still sees the per-item diagnostics — but a degraded outcome for
+        // the items that DID apply is no longer discarded. It rides as the
+        // reserved payload trailer, so the client decodes BOTH partial AND
+        // degraded (mirroring the status-byte signal of the all-success path).
         let errors = vec![BatchItemError {
             item_index: 0,
             error_code: ERR_TX_NOT_FOUND,
             error_data: vec![],
         }];
+
+        // Degraded partial: status still PARTIAL_ERROR, trailer surfaces degraded.
         let resp = batch_response_with_outcome(1, &errors, ReplicationOutcome::Degraded);
         assert_eq!(resp.status, STATUS_PARTIAL_ERROR);
-        assert_ne!(resp.status, STATUS_DEGRADED_DURABILITY);
+        let (decoded, degraded) = decode_sparse_errors_with_durability(&resp.payload)
+            .expect("degraded partial payload decodes");
+        assert_eq!(decoded, errors, "per-item diagnostics still present");
+        assert!(
+            degraded,
+            "degraded durability signal survives the partial case"
+        );
+
+        // Non-degraded partial: byte-identical to the pre-trailer wire format.
+        let resp_full = batch_response_with_outcome(1, &errors, ReplicationOutcome::Full);
+        assert_eq!(resp_full.status, STATUS_PARTIAL_ERROR);
+        assert_eq!(
+            resp_full.payload,
+            encode_sparse_errors(&errors),
+            "a full-durability partial response carries no trailer"
+        );
+        let (_, degraded) = decode_sparse_errors_with_durability(&resp_full.payload)
+            .expect("full partial payload decodes");
+        assert!(!degraded);
+    }
+
+    #[test]
+    fn set_mined_partial_error_carries_degraded_trailer() {
+        // P1-8 for the set-mined signal layout: a partial response whose applied
+        // items were only replicated below quorum must decode as partial + degraded.
+        let successes = vec![BatchItemSuccess {
+            item_index: 0,
+            signal: 1,
+            block_ids: vec![7],
+        }];
+        let errors = vec![BatchItemError {
+            item_index: 1,
+            error_code: ERR_CONFLICTING,
+            error_data: vec![],
+        }];
+
+        let resp =
+            set_mined_response_with_signals(9, &successes, &errors, ReplicationOutcome::Degraded);
+        assert_eq!(resp.status, STATUS_PARTIAL_ERROR);
+        let (ds, de, degraded) = decode_partial_with_signals_with_durability(&resp.payload)
+            .expect("degraded set-mined partial decodes");
+        assert_eq!(ds, successes);
+        assert_eq!(de, errors);
+        assert!(degraded, "set-mined partial surfaces degraded durability");
+
+        // Full durability: no trailer, byte-identical to the legacy encoding.
+        let resp_full =
+            set_mined_response_with_signals(9, &successes, &errors, ReplicationOutcome::Full);
+        assert_eq!(resp_full.status, STATUS_PARTIAL_ERROR);
+        assert_eq!(
+            resp_full.payload,
+            encode_partial_with_signals(&successes, &errors)
+        );
     }
 
     // -----------------------------------------------------------------------

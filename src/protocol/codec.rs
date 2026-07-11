@@ -1465,6 +1465,69 @@ pub fn decode_partial_with_signals(
 }
 
 // ---------------------------------------------------------------------------
+// Degraded-durability trailer for STATUS_PARTIAL_ERROR responses
+// ---------------------------------------------------------------------------
+
+/// Reserved trailer byte appended to a `STATUS_PARTIAL_ERROR` payload (after the
+/// [`encode_sparse_errors`] / [`encode_partial_with_signals`] section) when the
+/// items that *did* apply were only replicated under degraded (below-quorum,
+/// best-effort) durability.
+///
+/// The all-success degraded path already carries this signal in the status byte
+/// (`STATUS_DEGRADED_DURABILITY`); a single status byte cannot express both
+/// "partial error" and "degraded" at once, so on the partial path the same
+/// signal rides as this one-byte trailer instead. It is present ONLY in the
+/// degraded case, so a non-degraded partial response is byte-identical to the
+/// pre-trailer wire format, and every existing decoder ignores the extra byte
+/// (they stop after the declared section), so older clients are unaffected.
+pub const PARTIAL_DURABILITY_DEGRADED: u8 = 1;
+
+/// Byte length of the section produced by [`encode_sparse_errors`] for `errors`.
+/// Used to locate the optional [`PARTIAL_DURABILITY_DEGRADED`] trailer after a
+/// successful decode.
+pub fn sparse_errors_encoded_len(errors: &[BatchItemError]) -> usize {
+    4 + errors.iter().map(|e| 8 + e.error_data.len()).sum::<usize>()
+}
+
+/// Byte length of the section produced by [`encode_partial_with_signals`] for
+/// `successes` and `errors`. Used to locate the optional
+/// [`PARTIAL_DURABILITY_DEGRADED`] trailer after a successful decode.
+pub fn partial_with_signals_encoded_len(
+    successes: &[BatchItemSuccess],
+    errors: &[BatchItemError],
+) -> usize {
+    let success_len: usize = successes.iter().map(|s| 6 + s.block_ids.len() * 4).sum();
+    let error_len: usize = errors.iter().map(|e| 8 + e.error_data.len()).sum();
+    4 + success_len + 4 + error_len
+}
+
+/// Decode a sparse-error partial payload together with its optional
+/// degraded-durability trailer. Returns the per-item errors and `true` iff the
+/// applied items were only replicated under degraded durability (see
+/// [`PARTIAL_DURABILITY_DEGRADED`]). An absent trailer decodes as `false`, so
+/// this is wire-compatible with servers that never emit the trailer.
+pub fn decode_sparse_errors_with_durability(data: &[u8]) -> Option<(Vec<BatchItemError>, bool)> {
+    let errors = decode_sparse_errors(data)?;
+    let consumed = sparse_errors_encoded_len(&errors);
+    let degraded = matches!(data.get(consumed), Some(&PARTIAL_DURABILITY_DEGRADED));
+    Some((errors, degraded))
+}
+
+/// Decode a spend/set-mined partial payload (two-section signal layout) together
+/// with its optional degraded-durability trailer. Returns the per-item
+/// successes, per-item errors, and `true` iff the applied items were only
+/// replicated under degraded durability (see [`PARTIAL_DURABILITY_DEGRADED`]).
+#[allow(clippy::type_complexity)]
+pub fn decode_partial_with_signals_with_durability(
+    data: &[u8],
+) -> Option<(Vec<BatchItemSuccess>, Vec<BatchItemError>, bool)> {
+    let (successes, errors) = decode_partial_with_signals(data)?;
+    let consumed = partial_with_signals_encoded_len(&successes, &errors);
+    let degraded = matches!(data.get(consumed), Some(&PARTIAL_DURABILITY_DEGRADED));
+    Some((successes, errors, degraded))
+}
+
+// ---------------------------------------------------------------------------
 // Error response
 // ---------------------------------------------------------------------------
 
@@ -3272,6 +3335,88 @@ mod tests {
             "sparse_errors had insufficient capacity: cap={} len={}",
             encoded.capacity(),
             encoded.len()
+        );
+    }
+
+    /// P1-8: a `STATUS_PARTIAL_ERROR` sparse payload carrying the reserved
+    /// degraded-durability trailer must decode as BOTH the per-item errors AND
+    /// the degraded flag. `sparse_errors_encoded_len` locates the trailer, and a
+    /// non-degraded payload (no trailer) must decode as `degraded == false`.
+    #[test]
+    fn sparse_errors_degraded_trailer_round_trips() {
+        let errors = vec![
+            BatchItemError {
+                item_index: 3,
+                error_code: ERR_ALREADY_SPENT,
+                error_data: vec![0xAB; 36],
+            },
+            BatchItemError {
+                item_index: 7,
+                error_code: ERR_TX_NOT_FOUND,
+                error_data: vec![],
+            },
+        ];
+
+        // Non-degraded: byte-identical to the pre-trailer format, degraded=false.
+        let plain = encode_sparse_errors(&errors);
+        let (decoded, degraded) =
+            decode_sparse_errors_with_durability(&plain).expect("plain payload decodes");
+        assert_eq!(decoded, errors, "errors survive without a trailer");
+        assert!(!degraded, "no trailer means not degraded");
+
+        // Degraded: same section plus a single trailer byte.
+        let mut degraded_payload = encode_sparse_errors(&errors);
+        degraded_payload.push(PARTIAL_DURABILITY_DEGRADED);
+        assert_eq!(
+            degraded_payload.len(),
+            sparse_errors_encoded_len(&errors) + 1,
+            "trailer sits exactly after the encoded section"
+        );
+        let (decoded, degraded) = decode_sparse_errors_with_durability(&degraded_payload)
+            .expect("degraded payload decodes");
+        assert_eq!(decoded, errors, "errors survive alongside the trailer");
+        assert!(degraded, "trailer byte surfaces the degraded signal");
+
+        // A pre-trailer decoder ignores the extra byte (older-client compat).
+        let legacy = decode_sparse_errors(&degraded_payload).expect("legacy decode");
+        assert_eq!(legacy, errors, "trailing byte is invisible to old decoders");
+    }
+
+    /// P1-8: the spend/set-mined two-section signal payload must round-trip the
+    /// degraded trailer alongside both successes and errors.
+    #[test]
+    fn partial_with_signals_degraded_trailer_round_trips() {
+        let successes = vec![BatchItemSuccess {
+            item_index: 0,
+            signal: 2,
+            block_ids: vec![10, 20],
+        }];
+        let errors = vec![BatchItemError {
+            item_index: 1,
+            error_code: ERR_CONFLICTING,
+            error_data: vec![],
+        }];
+
+        let plain = encode_partial_with_signals(&successes, &errors);
+        let (ds, de, degraded) =
+            decode_partial_with_signals_with_durability(&plain).expect("plain decodes");
+        assert_eq!(ds, successes);
+        assert_eq!(de, errors);
+        assert!(!degraded);
+
+        let mut degraded_payload = encode_partial_with_signals(&successes, &errors);
+        degraded_payload.push(PARTIAL_DURABILITY_DEGRADED);
+        assert_eq!(
+            degraded_payload.len(),
+            partial_with_signals_encoded_len(&successes, &errors) + 1
+        );
+        let (ds, de, degraded) = decode_partial_with_signals_with_durability(&degraded_payload)
+            .expect("degraded decodes");
+        assert_eq!(ds, successes);
+        assert_eq!(de, errors);
+        assert!(
+            degraded,
+            "trailer byte surfaces degraded on the signal layout"
         );
     }
 

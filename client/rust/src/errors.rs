@@ -65,6 +65,13 @@ pub struct PartialError {
     /// Per-item failures. Item indices refer to the original request batch
     /// (already remapped from sub-batch indices in cluster mode).
     pub errors: Vec<BatchItemError>,
+    /// Whether the items that DID apply were only replicated under degraded
+    /// (below-quorum, best-effort) durability. Carries the same meaning as
+    /// receiving `STATUS_DEGRADED_DURABILITY` on a fully-successful batch: the
+    /// applied writes are single-node durable and may be lost if the master
+    /// crashes before catch-up streaming. Callers that require quorum durability
+    /// must treat a `true` here as a durability failure for the applied items.
+    pub degraded: bool,
 }
 
 impl std::fmt::Display for PartialError {
@@ -74,7 +81,11 @@ impl std::fmt::Display for PartialError {
             "partial error: {} of {} items failed",
             self.errors.len(),
             self.successes.len() + self.errors.len()
-        )
+        )?;
+        if self.degraded {
+            write!(f, " (applied items degraded-durability)")?;
+        }
+        Ok(())
     }
 }
 

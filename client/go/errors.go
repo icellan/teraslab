@@ -26,11 +26,23 @@ type PartialError struct {
 	// Errors contains per-item failures. Item indices refer to the original
 	// request batch (not sub-batch indices in cluster mode).
 	Errors []BatchItemError
+	// Degraded reports whether the items that DID apply were only replicated
+	// under degraded (below-quorum, best-effort) durability. It carries the
+	// same meaning as receiving StatusDegradedDurability on a fully-successful
+	// batch: the applied writes are single-node durable and may be lost if the
+	// master crashes before catch-up streaming. Callers that require quorum
+	// durability must treat a true value as a durability failure for the
+	// applied items.
+	Degraded bool
 }
 
 func (e *PartialError) Error() string {
-	return fmt.Sprintf("partial error: %d of %d items failed",
+	s := fmt.Sprintf("partial error: %d of %d items failed",
 		len(e.Errors), len(e.Successes)+len(e.Errors))
+	if e.Degraded {
+		s += " (applied items degraded-durability)"
+	}
+	return s
 }
 
 // ServerError is a global server error (response status = 1).

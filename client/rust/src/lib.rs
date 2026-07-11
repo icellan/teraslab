@@ -319,7 +319,9 @@ impl Client {
                 Err(ClientError::Redirect(addr))
             }
             STATUS_PARTIAL_ERROR => {
-                let errs = decode_sparse_errors(&resp.payload)?;
+                // The reserved trailer tells us whether the items that DID apply
+                // were only replicated below quorum (degraded durability).
+                let (errs, degraded) = decode_sparse_errors(&resp.payload)?;
                 // A PARTIAL_ERROR that decodes to zero per-item errors means
                 // nothing actually failed — treat it as success rather than
                 // surfacing an empty `Partial` (which callers must otherwise
@@ -330,6 +332,7 @@ impl Client {
                     Err(ClientError::Partial(PartialError {
                         successes: Vec::new(),
                         errors: errs,
+                        degraded,
                     }))
                 }
             }
@@ -361,12 +364,16 @@ impl Client {
             // (the server still carries the per-item signals / block IDs) and
             // surface success. Matches the Go client (`handleSignalResponse`).
             STATUS_OK | STATUS_DEGRADED_DURABILITY => {
+                // On this path the degraded signal (if any) rides in the status
+                // byte, not a payload trailer.
+                let status_degraded = resp.status == STATUS_DEGRADED_DURABILITY;
                 if !resp.payload.is_empty() {
-                    let (successes, errs) = decode_partial_with_signals(&resp.payload)?;
+                    let (successes, errs, _trailer) = decode_partial_with_signals(&resp.payload)?;
                     if !errs.is_empty() {
                         return Err(ClientError::Partial(PartialError {
                             successes,
                             errors: errs,
+                            degraded: status_degraded,
                         }));
                     }
                     Ok(SpendBatchResponse {
@@ -402,15 +409,23 @@ impl Client {
                 Err(ClientError::Redirect(addr))
             }
             STATUS_PARTIAL_ERROR => {
-                // The server encodes setMined/spend PARTIAL_ERROR responses
-                // with `encode_partial_with_signals` — a two-section layout
-                // (per-item successes with signals+block_ids, then per-item
-                // errors), NOT the plain sparse-error layout. Decoding with
-                // the wrong (sparse) codec reads the leading success_count as
-                // an error_count and can yield an EMPTY error list even when
-                // every item failed, silently masquerading as success (B5).
-                // Decode with the matching signal codec.
-                let (mut successes, errs) = decode_partial_with_signals(&resp.payload)?;
+                // set_mined encodes the two-section signal layout (per-item
+                // successes with signals+block_ids, then per-item errors);
+                // spend encodes the plain sparse-error layout. Decoding sparse
+                // with the signal codec reads the leading success_count as an
+                // error_count and can yield an EMPTY error list even when every
+                // item failed, silently masquerading as success (B5). Try the
+                // signal codec first, then fall back to sparse — matching the Go
+                // client's `handleSignalResponse`. Either layout carries the
+                // reserved degraded-durability trailer, surfaced on the Partial.
+                let (mut successes, errs, degraded) =
+                    match decode_partial_with_signals(&resp.payload) {
+                        Ok((successes, errs, degraded)) => (successes, errs, degraded),
+                        Err(_) => {
+                            let (errs, degraded) = decode_sparse_errors(&resp.payload)?;
+                            (Vec::new(), errs, degraded)
+                        }
+                    };
                 // Reconstruct any implicit successes: indices in
                 // `0..item_count` that appear in neither the successes nor the
                 // errors section still succeeded (the server may omit
@@ -432,6 +447,7 @@ impl Client {
                 Err(ClientError::Partial(PartialError {
                     successes,
                     errors: errs,
+                    degraded,
                 }))
             }
             other => Err(ClientError::Protocol(format!("unknown status: {}", other))),
@@ -607,6 +623,9 @@ impl Client {
         };
         let mut redirected_indices: Vec<usize> = Vec::new();
         let mut got_no_quorum = false;
+        // Any sub-batch whose applied items were only replicated below quorum
+        // taints the merged response as degraded-durability.
+        let mut merged_degraded = false;
 
         // Fan out one sub-batch per target node.
         let mut handles = Vec::with_capacity(groups.len());
@@ -634,6 +653,7 @@ impl Client {
                     merged.successes.extend(r.successes);
                 }
                 Err(ClientError::Partial(pe)) => {
+                    merged_degraded |= pe.degraded;
                     for mut s in pe.successes {
                         if (s.item_index as usize) < idx_map.len() {
                             s.item_index = idx_map[s.item_index as usize] as u32;
@@ -681,6 +701,7 @@ impl Client {
             return Err(ClientError::Partial(PartialError {
                 successes: merged.successes,
                 errors: merged.errors,
+                degraded: merged_degraded,
             }));
         }
 
@@ -899,6 +920,9 @@ impl Client {
         // the first txid).
         let mut got_no_quorum = false;
         let mut redirected_indices: Vec<usize> = Vec::new();
+        // Any sub-batch whose applied items were only replicated below quorum
+        // taints the merged response as degraded-durability.
+        let mut merged_degraded = false;
 
         for handle in handles {
             let (result, idx_map) = handle
@@ -910,6 +934,7 @@ impl Client {
                     // All items succeeded for this sub-batch.
                 }
                 Err(ClientError::Partial(pe)) => {
+                    merged_degraded |= pe.degraded;
                     // Separate redirect errors from real errors.
                     // Redirect errors mean the shard table is stale — refresh
                     // routing and retry those items on the correct node.
@@ -950,6 +975,7 @@ impl Client {
             return Err(ClientError::Partial(PartialError {
                 successes: Vec::new(),
                 errors: all_errors,
+                degraded: merged_degraded,
             }));
         }
 
@@ -1259,6 +1285,9 @@ impl Client {
             errors: Vec::new(),
         };
         let mut all_errors: Vec<BatchItemError> = Vec::new();
+        // Any sub-batch whose applied items were only replicated below quorum
+        // taints the merged response as degraded-durability.
+        let mut merged_degraded = false;
 
         for handle in handles {
             let (result, idx_map) = handle
@@ -1275,6 +1304,7 @@ impl Client {
                     }
                 }
                 Err(ClientError::Partial(pe)) => {
+                    merged_degraded |= pe.degraded;
                     // Separate redirect errors from real errors before
                     // copying implicit successes over, so items that are
                     // about to be retried do not appear in `merged.successes`
@@ -1322,6 +1352,7 @@ impl Client {
                                         }
                                     }
                                     Err(ClientError::Partial(retry_pe)) => {
+                                        merged_degraded |= retry_pe.degraded;
                                         for mut s in retry_pe.successes {
                                             s.item_index = orig_idx as u32;
                                             merged.successes.push(s);
@@ -1352,6 +1383,7 @@ impl Client {
             return Err(ClientError::Partial(PartialError {
                 successes: merged.successes,
                 errors: all_errors,
+                degraded: merged_degraded,
             }));
         }
 
@@ -1620,6 +1652,9 @@ impl Client {
         let mut all_errors: Vec<BatchItemError> = Vec::new();
         let mut got_no_quorum = false;
         let mut had_connection_error = false;
+        // Any sub-batch whose applied items were only replicated below quorum
+        // taints the merged response as degraded-durability.
+        let mut merged_degraded = false;
         for handle in handles {
             let join_result = handle
                 .await
@@ -1628,6 +1663,7 @@ impl Client {
                 Ok((result, idx_map)) => match result {
                     Ok(_) => {}
                     Err(ClientError::Partial(pe)) => {
+                        merged_degraded |= pe.degraded;
                         all_errors.extend(remap_batch_errors(pe.errors, &idx_map));
                     }
                     Err(ClientError::Server { code, ref message })
@@ -1663,6 +1699,7 @@ impl Client {
             return Err(ClientError::Partial(PartialError {
                 successes: Vec::new(),
                 errors: all_errors,
+                degraded: merged_degraded,
             }));
         }
         Ok(BatchResult { errors: Vec::new() })
@@ -1698,6 +1735,9 @@ impl Client {
         let mut all_errors: Vec<BatchItemError> = Vec::new();
         let mut got_no_quorum = false;
         let mut had_connection_error = false;
+        // Any sub-batch whose applied items were only replicated below quorum
+        // taints the merged response as degraded-durability.
+        let mut merged_degraded = false;
 
         for handle in handles {
             let join_result = handle
@@ -1707,6 +1747,7 @@ impl Client {
                 Ok((result, idx_map)) => match result {
                     Ok(_) => {}
                     Err(ClientError::Partial(pe)) => {
+                        merged_degraded |= pe.degraded;
                         all_errors.extend(remap_batch_errors(pe.errors, &idx_map));
                     }
                     Err(ClientError::Server { code, ref message })
@@ -1743,6 +1784,7 @@ impl Client {
             return Err(ClientError::Partial(PartialError {
                 successes: Vec::new(),
                 errors: all_errors,
+                degraded: merged_degraded,
             }));
         }
 
@@ -2740,26 +2782,32 @@ fn decode_redirect(data: &[u8]) -> Result<String, ClientError> {
         .ok_or_else(|| ClientError::Protocol("malformed redirect payload".to_string()))
 }
 
-/// Decode a sparse error list from a PartialError response.
-fn decode_sparse_errors(data: &[u8]) -> Result<Vec<BatchItemError>, ClientError> {
-    let wire_errors = codec::decode_sparse_errors(data)
+/// Decode a sparse error list from a PartialError response, plus the reserved
+/// degraded-durability trailer (`true` iff the applied items were only
+/// replicated below quorum). See [`codec::PARTIAL_DURABILITY_DEGRADED`].
+fn decode_sparse_errors(data: &[u8]) -> Result<(Vec<BatchItemError>, bool), ClientError> {
+    let (wire_errors, degraded) = codec::decode_sparse_errors_with_durability(data)
         .ok_or_else(|| ClientError::Protocol("malformed sparse errors".to_string()))?;
-    Ok(wire_errors
+    let errors = wire_errors
         .into_iter()
         .map(|e| BatchItemError {
             item_index: e.item_index,
             code: e.error_code,
             data: e.error_data,
         })
-        .collect())
+        .collect();
+    Ok((errors, degraded))
 }
 
-/// Decode a partial response with success signals and errors.
+/// Decode a partial response with success signals and errors, plus the reserved
+/// degraded-durability trailer (`true` iff the applied items were only
+/// replicated below quorum). See [`codec::PARTIAL_DURABILITY_DEGRADED`].
 fn decode_partial_with_signals(
     data: &[u8],
-) -> Result<(Vec<BatchItemSuccess>, Vec<BatchItemError>), ClientError> {
-    let (wire_successes, wire_errors) = codec::decode_partial_with_signals(data)
-        .ok_or_else(|| ClientError::Protocol("malformed partial signals".to_string()))?;
+) -> Result<(Vec<BatchItemSuccess>, Vec<BatchItemError>, bool), ClientError> {
+    let (wire_successes, wire_errors, degraded) =
+        codec::decode_partial_with_signals_with_durability(data)
+            .ok_or_else(|| ClientError::Protocol("malformed partial signals".to_string()))?;
     let successes = wire_successes
         .into_iter()
         .map(|s| BatchItemSuccess {
@@ -2776,7 +2824,7 @@ fn decode_partial_with_signals(
             data: e.error_data,
         })
         .collect();
-    Ok((successes, errors))
+    Ok((successes, errors, degraded))
 }
 
 /// Decode a GetBatch response payload.
@@ -3966,7 +4014,7 @@ mod tests {
 
     use teraslab::protocol::codec::{
         BatchItemError as WireBatchItemError, BatchItemSuccess as WireBatchItemSuccess,
-        encode_partial_with_signals, encode_sparse_errors,
+        PARTIAL_DURABILITY_DEGRADED, encode_partial_with_signals, encode_sparse_errors,
     };
     use teraslab::protocol::frame::ResponseFrame;
     use teraslab::protocol::opcodes::STATUS_DEGRADED_DURABILITY;
@@ -4104,7 +4152,112 @@ mod tests {
                 assert_eq!(pe.errors.len(), 1);
                 assert_eq!(pe.errors[0].code, ERR_TX_NOT_FOUND);
                 assert_eq!(pe.errors[0].item_index, 2);
+                assert!(
+                    !pe.degraded,
+                    "no trailer means the applied items were quorum-durable"
+                );
             }
+            other => panic!("expected Partial, got {other:?}"),
+        }
+    }
+
+    /// P1-8: a mutation PARTIAL_ERROR whose applied items were only replicated
+    /// below quorum carries the reserved degraded-durability trailer. The client
+    /// must surface BOTH the per-item errors AND `PartialError::degraded` — a
+    /// pre-fix server dropped the degraded signal entirely on the partial path.
+    #[test]
+    fn mutation_handler_partial_error_surfaces_degraded_trailer() {
+        let errors = vec![WireBatchItemError {
+            item_index: 0,
+            error_code: ERR_ALREADY_EXISTS,
+            error_data: vec![],
+        }];
+        // Server-authentic degraded partial: sparse errors + one trailer byte.
+        let mut payload = encode_sparse_errors(&errors);
+        payload.push(PARTIAL_DURABILITY_DEGRADED);
+        let resp = frame(STATUS_PARTIAL_ERROR, payload);
+
+        match Client::handle_mutation_response(&resp) {
+            Err(ClientError::Partial(pe)) => {
+                assert_eq!(pe.errors.len(), 1);
+                assert_eq!(pe.errors[0].code, ERR_ALREADY_EXISTS);
+                assert!(
+                    pe.degraded,
+                    "the applied items were degraded-durable; the client must surface it"
+                );
+            }
+            other => panic!("expected Partial, got {other:?}"),
+        }
+    }
+
+    /// P1-8 (spend-batch path): spend PARTIAL_ERROR uses the sparse layout, which
+    /// the signal handler decodes via its sparse fallback. A degraded spend batch
+    /// (some items failed, the rest applied below quorum) must surface BOTH the
+    /// partial errors AND the degraded flag.
+    #[test]
+    fn signal_handler_spend_partial_error_surfaces_degraded_trailer() {
+        let errors = vec![WireBatchItemError {
+            item_index: 1,
+            error_code: ERR_ALREADY_SPENT,
+            error_data: vec![0x11; 36],
+        }];
+        // Server-authentic degraded spend partial (sparse layout + trailer), as
+        // built by `batch_response_with_outcome` for OP_SPEND_BATCH.
+        let mut payload = encode_sparse_errors(&errors);
+        payload.push(PARTIAL_DURABILITY_DEGRADED);
+        let resp = frame(STATUS_PARTIAL_ERROR, payload);
+
+        match Client::handle_signal_response(&resp, 3) {
+            Err(ClientError::Partial(pe)) => {
+                assert_eq!(pe.errors.len(), 1, "the failed item must surface");
+                assert_eq!(pe.errors[0].code, ERR_ALREADY_SPENT);
+                assert_eq!(pe.errors[0].item_index, 1);
+                assert!(
+                    pe.degraded,
+                    "spend batch applied its other items below quorum; degraded must survive"
+                );
+            }
+            other => panic!("expected Partial, got {other:?}"),
+        }
+    }
+
+    /// P1-8 (set-mined path): set_mined PARTIAL_ERROR uses the two-section signal
+    /// layout; the degraded trailer must round-trip alongside the successes and
+    /// errors.
+    #[test]
+    fn signal_handler_setmined_partial_error_surfaces_degraded_trailer() {
+        let successes = vec![WireBatchItemSuccess {
+            item_index: 0,
+            signal: 2,
+            block_ids: vec![900],
+        }];
+        let errors = vec![WireBatchItemError {
+            item_index: 1,
+            error_code: ERR_CONFLICTING,
+            error_data: vec![],
+        }];
+        let mut payload = encode_partial_with_signals(&successes, &errors);
+        payload.push(PARTIAL_DURABILITY_DEGRADED);
+        let resp = frame(STATUS_PARTIAL_ERROR, payload);
+
+        match Client::handle_signal_response(&resp, 2) {
+            Err(ClientError::Partial(pe)) => {
+                assert_eq!(pe.errors.len(), 1);
+                assert_eq!(pe.errors[0].code, ERR_CONFLICTING);
+                assert_eq!(pe.successes.len(), 1, "the applied item's signal survives");
+                assert_eq!(pe.successes[0].block_ids, vec![900]);
+                assert!(pe.degraded, "set-mined degraded durability must surface");
+            }
+            other => panic!("expected Partial, got {other:?}"),
+        }
+
+        // Control: same payload without the trailer decodes as not degraded.
+        let plain = frame(
+            STATUS_PARTIAL_ERROR,
+            encode_partial_with_signals(&successes, &errors),
+        );
+        match Client::handle_signal_response(&plain, 2) {
+            Err(ClientError::Partial(pe)) => assert!(!pe.degraded),
             other => panic!("expected Partial, got {other:?}"),
         }
     }
