@@ -183,6 +183,8 @@ func ErrorCodeString(code uint16) string {
 		return "NOT_DUE"
 	case ErrCodeMigrationTargetNotReady:
 		return "MIGRATION_TARGET_NOT_READY"
+	case ErrCodeResponseTooLarge:
+		return "RESPONSE_TOO_LARGE"
 	case ErrCodeInternal:
 		return "INTERNAL"
 	default:

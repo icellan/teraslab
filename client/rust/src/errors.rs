@@ -123,6 +123,36 @@ pub fn error_code_string(code: u16) -> &'static str {
         ERR_NOT_CLUSTERED => "NOT_CLUSTERED",
         ERR_INVARIANT_VIOLATION => "INVARIANT_VIOLATION",
         ERR_STREAM_INVARIANT => "STREAM_INVARIANT",
+        ERR_DELETED_CHILDREN => "DELETED_CHILDREN",
+        ERR_NOT_DUE => "NOT_DUE",
+        ERR_MIGRATION_TARGET_NOT_READY => "MIGRATION_TARGET_NOT_READY",
+        ERR_RESPONSE_TOO_LARGE => "RESPONSE_TOO_LARGE",
         _ => "UNKNOWN",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::error_code_string;
+    use teraslab::protocol::opcodes::*;
+
+    /// Every typed server error code must map to its name, not the `UNKNOWN`
+    /// fallback. This guards the tail of the code space (35..=38) that the map
+    /// previously dropped — most importantly `ERR_RESPONSE_TOO_LARGE` (38),
+    /// which the GET frame-budget path now emits.
+    #[test]
+    fn maps_full_error_code_tail_including_response_too_large() {
+        assert_eq!(error_code_string(ERR_DELETED_CHILDREN), "DELETED_CHILDREN");
+        assert_eq!(error_code_string(ERR_NOT_DUE), "NOT_DUE");
+        assert_eq!(
+            error_code_string(ERR_MIGRATION_TARGET_NOT_READY),
+            "MIGRATION_TARGET_NOT_READY"
+        );
+        assert_eq!(
+            error_code_string(ERR_RESPONSE_TOO_LARGE),
+            "RESPONSE_TOO_LARGE"
+        );
+        // A genuinely unknown code still falls back.
+        assert_eq!(error_code_string(9999), "UNKNOWN");
     }
 }

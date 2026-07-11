@@ -118,7 +118,7 @@ const (
 	ErrCodeFrozenUntil      uint16 = 13
 	ErrCodeRedirect         uint16 = 14
 
-	// Cluster / streaming / operational error codes (15-37).
+	// Cluster / streaming / operational error codes (15-38).
 	ErrCodeNoQuorum                uint16 = 15
 	ErrCodeStreamNotFound          uint16 = 16
 	ErrCodeBlobNotFound            uint16 = 17
@@ -142,6 +142,7 @@ const (
 	ErrCodeDeletedChildren         uint16 = 35
 	ErrCodeNotDue                  uint16 = 36
 	ErrCodeMigrationTargetNotReady uint16 = 37
+	ErrCodeResponseTooLarge        uint16 = 38
 
 	ErrCodeInternal uint16 = 255
 )
