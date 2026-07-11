@@ -221,6 +221,50 @@ impl From<crate::record::RecordError> for DeviceError {
 /// Result type for device operations.
 pub type Result<T> = std::result::Result<T, DeviceError>;
 
+/// A sound identity for the PHYSICAL storage device backing a
+/// [`BlockDevice`]'s writes.
+///
+/// Two devices share a physical device — meaning an `fsync`/`fdatasync` issued
+/// against one ALSO makes durable a prior write to the other — iff their
+/// [`BlockDevice::physical_device_id`]s are both `Some` and EQUAL. This is the
+/// hinge FU#8 uses to decide whether a buffered create's cheap metadata-only
+/// `CreateV2` redo (whose replay reads the record back from the data device) is
+/// safe: it is safe only when the redo log's device shares a physical device
+/// with the record's data device, so the redo flush's device-level barrier also
+/// flushes the O_DIRECT data write.
+///
+/// The variants are deliberately kept in distinct identity spaces (a
+/// filesystem device number, a raw-block-device number, and an in-memory
+/// instance id never compare equal across kinds) so a coincidental numeric
+/// collision between, say, an `st_dev` and an in-memory counter can never be
+/// mistaken for co-location.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PhysicalDeviceId {
+    /// A regular file: the containing filesystem's device number (`st_dev`).
+    ///
+    /// Two regular files with the same `st_dev` live on one filesystem, hence
+    /// one underlying block device, so an `fsync` of either issues a
+    /// device-wide cache flush that covers the other's prior writes. This is
+    /// the identity of the DEFAULT single-disk deployment, where the data file
+    /// and its sibling `.redo` file share one filesystem.
+    Filesystem(u64),
+    /// A raw block device (`S_IFBLK`): the block device number (`st_rdev`).
+    ///
+    /// Distinct from [`Self::Filesystem`] because two raw block devices both
+    /// report the devtmpfs `st_dev` yet may be different physical disks — only
+    /// `st_rdev` distinguishes them. Two partitions of one disk carry
+    /// different `st_rdev`s (so they classify as NOT co-located, the safe
+    /// direction: a redundant embedded-bytes create, never a lost one).
+    Block(u64),
+    /// An in-memory device: a process-unique instance id.
+    ///
+    /// Used by [`MemoryDevice`] (tests + the in-memory backend). Two distinct
+    /// `MemoryDevice`s never compare equal; sub-devices carved from ONE
+    /// `MemoryDevice` share its id (they delegate through it), modelling the
+    /// co-located `device_split` topology.
+    Memory(u64),
+}
+
 // ---------------------------------------------------------------------------
 // BlockDevice trait
 // ---------------------------------------------------------------------------
@@ -308,6 +352,27 @@ pub trait BlockDevice: Send + Sync {
     /// device (`S_IFBLK`), or `false` for regular files and in-memory devices.
     fn is_block_device(&self) -> bool {
         false
+    }
+
+    /// A sound identity for the PHYSICAL device backing this device's writes,
+    /// or `None` when it cannot be soundly determined.
+    ///
+    /// See [`PhysicalDeviceId`]: two devices are co-located (an fsync of one
+    /// flushes a prior write to the other) iff this returns `Some(x)` for both
+    /// and the ids are equal. Callers MUST treat `None` — and any mismatch — as
+    /// "NOT provably co-located" (the durability-safe default: prefer a
+    /// redundant self-sufficient write over a possible loss window).
+    ///
+    /// The default is `None`. Only devices that can PROVE a shared physical
+    /// device override it: leaf devices with an OS identity ([`DirectDevice`],
+    /// [`MemoryDevice`]) and pass-through carvings that delegate to their
+    /// physical device ([`crate::subdevice::SubDevice`]). Wrappers that can
+    /// hold a write in volatile memory NOT flushed by the underlying device's
+    /// fsync — a write-back [`crate::cache::CachingDevice`] or the streaming
+    /// write buffer — deliberately KEEP the `None` default, so a store behind
+    /// one is treated as not co-located (a self-sufficient create is emitted).
+    fn physical_device_id(&self) -> Option<PhysicalDeviceId> {
+        None
     }
 
     /// Read exactly `buf.len()` bytes starting at `offset`, looping until the
@@ -557,7 +622,16 @@ pub struct MemoryDevice {
     /// [`as_raw_ptr`](BlockDevice::as_raw_ptr) path, because that
     /// pointer aliases the live allocation.
     durable_shadow: Option<parking_lot::Mutex<Box<[u8]>>>,
+    /// Process-unique instance id backing [`BlockDevice::physical_device_id`].
+    /// Assigned once at construction from a monotonic counter, so two distinct
+    /// `MemoryDevice`s never share an id and sub-devices carved from one (which
+    /// delegate through it) always do.
+    phys_id: u64,
 }
+
+/// Monotonic source of per-instance [`MemoryDevice`] physical ids. Starts at 1
+/// so a `0` sentinel is never a live id.
+static NEXT_MEMORY_DEVICE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 // SAFETY (C-6): MemoryDevice owns the heap allocation pointed to by `raw_ptr`
 // exclusively (the Box was consumed via `into_raw` and the pointer is
@@ -610,6 +684,7 @@ impl MemoryDevice {
             len: size,
             alignment,
             durable_shadow: None,
+            phys_id: NEXT_MEMORY_DEVICE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         })
     }
 
@@ -795,6 +870,10 @@ impl BlockDevice for MemoryDevice {
     fn as_raw_ptr(&self) -> Option<*mut u8> {
         Some(self.raw_ptr)
     }
+
+    fn physical_device_id(&self) -> Option<PhysicalDeviceId> {
+        Some(PhysicalDeviceId::Memory(self.phys_id))
+    }
 }
 
 /// Test-only wrapper that injects read failures behind any [`BlockDevice`].
@@ -877,6 +956,11 @@ pub struct DirectDevice {
     size: u64,
     alignment: usize,
     is_block: bool,
+    /// Physical-device identity captured at open (FU#8 co-location):
+    /// `Filesystem(st_dev)` for a regular file, `Block(st_rdev)` for a raw
+    /// block device, or `None` on non-unix targets. See
+    /// [`BlockDevice::physical_device_id`].
+    phys_id: Option<PhysicalDeviceId>,
 }
 
 impl DirectDevice {
@@ -971,9 +1055,10 @@ impl DirectDevice {
 
         let file = opts.open(path)?;
 
-        // Detect whether the path refers to a block device or a regular file.
+        // Detect whether the path refers to a block device or a regular file,
+        // and capture the physical-device identity used for FU#8 co-location.
         #[cfg(unix)]
-        let is_block = {
+        let (is_block, phys_id) = {
             use std::os::unix::io::AsRawFd;
             let fd = file.as_raw_fd();
             // Safety: fd is valid; stat_buf is fully written by fstat before
@@ -983,10 +1068,28 @@ impl DirectDevice {
             if rc != 0 {
                 return Err(DeviceError::Io(std::io::Error::last_os_error()));
             }
-            (stat_buf.st_mode & libc::S_IFMT) == libc::S_IFBLK
+            let is_block = (stat_buf.st_mode & libc::S_IFMT) == libc::S_IFBLK;
+            // A raw block device is keyed by its block-device number (st_rdev):
+            // two raw block devices both report the devtmpfs `st_dev`, so only
+            // `st_rdev` distinguishes different physical disks. A regular file
+            // is keyed by its containing filesystem's device number (st_dev):
+            // any two files on one filesystem share it, and an fsync of either
+            // issues a device-wide cache flush that covers the other's writes.
+            // `dev_t` is `u64` on Linux but `i32` on macOS, so the widening cast
+            // is platform-necessary — silence the Linux-only lint.
+            let phys_id = if is_block {
+                #[allow(clippy::unnecessary_cast)]
+                let rdev = stat_buf.st_rdev as u64;
+                PhysicalDeviceId::Block(rdev)
+            } else {
+                #[allow(clippy::unnecessary_cast)]
+                let dev = stat_buf.st_dev as u64;
+                PhysicalDeviceId::Filesystem(dev)
+            };
+            (is_block, Some(phys_id))
         };
         #[cfg(not(unix))]
-        let is_block = false;
+        let (is_block, phys_id): (bool, Option<PhysicalDeviceId>) = (false, None);
 
         let actual_size = if is_block {
             // Query the true device capacity from the kernel; never call
@@ -1099,6 +1202,7 @@ impl DirectDevice {
             size: actual_size,
             alignment,
             is_block,
+            phys_id,
         })
     }
 
@@ -1243,6 +1347,10 @@ impl BlockDevice for DirectDevice {
 
     fn is_block_device(&self) -> bool {
         self.is_block
+    }
+
+    fn physical_device_id(&self) -> Option<PhysicalDeviceId> {
+        self.phys_id
     }
 }
 
@@ -1461,6 +1569,88 @@ mod tests {
         let path = dir.path().join("test.dat");
         let dev = DirectDevice::open(&path, 4096, 4096).unwrap();
         dev.sync().unwrap();
+    }
+
+    /// FU#8: two DirectDevices backed by DIFFERENT files on the SAME filesystem
+    /// (the DEFAULT single-disk deployment: `data.dat` + its sibling
+    /// `data.dat.redo`) report the SAME `Filesystem(st_dev)` physical identity —
+    /// so a create routed to that store is classified co-located and keeps the
+    /// cheap CreateV2 (no write-amp regression). This is the load-bearing case
+    /// the barrier/Arc-pointer identity would miss (distinct fds, no shared
+    /// barrier), which is why co-location is keyed on the OS device number.
+    #[test]
+    fn direct_device_same_fs_shares_physical_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = DirectDevice::open(&dir.path().join("data.dat"), 65536, 4096).unwrap();
+        let redo = DirectDevice::open(&dir.path().join("data.dat.redo"), 65536, 4096).unwrap();
+        let data_id = data.physical_device_id();
+        let redo_id = redo.physical_device_id();
+        assert!(
+            matches!(data_id, Some(PhysicalDeviceId::Filesystem(_))),
+            "a regular file must key on its filesystem device number"
+        );
+        assert_eq!(
+            data_id, redo_id,
+            "two files on one filesystem share a physical id (co-located)"
+        );
+    }
+
+    /// FU#8: two independent `MemoryDevice`s NEVER share a physical id (they
+    /// model separate physical devices — a dedicated separate redo device),
+    /// while cloning the SAME device Arc preserves identity.
+    #[test]
+    fn memory_devices_have_distinct_physical_ids() {
+        let a = MemoryDevice::new(65536, 4096).unwrap();
+        let b = MemoryDevice::new(65536, 4096).unwrap();
+        let ida = a.physical_device_id();
+        assert!(matches!(ida, Some(PhysicalDeviceId::Memory(_))));
+        assert_ne!(
+            ida,
+            b.physical_device_id(),
+            "distinct MemoryDevices are distinct physical devices"
+        );
+        // A volatile device is still a distinct instance with its own id.
+        let v = MemoryDevice::new_volatile(65536, 4096).unwrap();
+        assert!(matches!(
+            v.physical_device_id(),
+            Some(PhysicalDeviceId::Memory(_))
+        ));
+        assert_ne!(v.physical_device_id(), ida);
+    }
+
+    /// FU#8: the default `BlockDevice::physical_device_id` is `None` (unknown →
+    /// treated as NOT co-located), and distinct in-kind identities never
+    /// compare equal across kinds.
+    #[test]
+    fn physical_id_variants_are_disjoint_and_default_is_none() {
+        assert_ne!(
+            PhysicalDeviceId::Filesystem(7),
+            PhysicalDeviceId::Block(7),
+            "a filesystem id and a block id with the same number are different devices"
+        );
+        assert_ne!(PhysicalDeviceId::Filesystem(7), PhysicalDeviceId::Memory(7));
+        assert_ne!(PhysicalDeviceId::Block(7), PhysicalDeviceId::Memory(7));
+
+        // A device with no proof of physical identity declines (safe default).
+        struct Opaque;
+        impl BlockDevice for Opaque {
+            fn pread(&self, _b: &mut [u8], _o: u64) -> Result<usize> {
+                Ok(0)
+            }
+            fn pwrite(&self, _b: &[u8], _o: u64) -> Result<usize> {
+                Ok(0)
+            }
+            fn alignment(&self) -> usize {
+                4096
+            }
+            fn size(&self) -> u64 {
+                0
+            }
+            fn sync(&self) -> Result<()> {
+                Ok(())
+            }
+        }
+        assert_eq!(Opaque.physical_device_id(), None);
     }
 
     #[test]
