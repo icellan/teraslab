@@ -25,13 +25,27 @@ pub const OP_GET_BATCH: u16 = 20;
 pub const OP_GET_SPEND_BATCH: u16 = 21;
 
 // Pruner
+/// Return txids unmined since before a cutoff height (pruner feeder).
+///
+/// Request payload: `[cutoff_height:4 LE][cursor:32?]`. The optional trailing
+/// 32-byte `cursor` (FU#5, PROTOCOL_VERSION 3) is a resume point: the handler
+/// sorts the full candidate set by txid and returns only qualifying txids
+/// strictly greater than `cursor`. Absent (4-byte payload) ⇒ resume from the
+/// start. Response (`STATUS_OK`): `[count:u32 LE][txid:32]*count[truncated:u8]`;
+/// `truncated=1` means a further qualifying txid exists past the frame cap and
+/// the caller should re-query with the last returned txid as the new cursor.
 pub const OP_QUERY_OLD_UNMINED: u16 = 30;
 pub const OP_PRESERVE_TRANSACTIONS: u16 = 31;
 pub const OP_PROCESS_EXPIRED_PRESERVATIONS: u16 = 32;
 /// Return all txids currently carrying the CONFLICTING flag (bit 0x02).
 ///
-/// Request payload: empty. Response (`STATUS_OK`): `[count:u32 LE][txid:32]*count`.
-/// Backs Teranode's `GetConflictingTxIterator`.
+/// Request payload: `[cursor:32?]`. The optional 32-byte `cursor` (FU#5,
+/// PROTOCOL_VERSION 3) is a resume point: the handler sorts the conflicting
+/// set by txid and returns only txids strictly greater than `cursor`. Absent
+/// (empty payload) ⇒ resume from the start. Response (`STATUS_OK`):
+/// `[count:u32 LE][txid:32]*count[truncated:u8]`; `truncated=1` means a further
+/// txid exists past the frame cap and the caller should re-query with the last
+/// returned txid as the new cursor. Backs Teranode's `GetConflictingTxIterator`.
 pub const OP_QUERY_CONFLICTING: u16 = 33;
 
 // Cluster / admin
@@ -474,7 +488,16 @@ pub const ERR_RESPONSE_TOO_LARGE: u16 = 38;
 /// unknown opcodes) must be updated to match on the new codes; new
 /// clients must continue to accept `ERR_INTERNAL` as a fallback for
 /// genuinely unclassified failures.
-pub const PROTOCOL_VERSION: u16 = 2;
+///
+/// Bumped to `3` (FU#5) for query-response pagination. `OP_QUERY_OLD_UNMINED`
+/// and `OP_QUERY_CONFLICTING` now accept an optional trailing 32-byte resume
+/// cursor on the REQUEST and, when the result is capped, set the response's
+/// `truncated` trailer so the caller re-queries with the last returned txid as
+/// the cursor. A `>= 3` server honours the cursor; a `< 3` server ignores it
+/// and always returns page 1, so a paging client MUST gate its resume loop on
+/// the negotiated version (`>= 3`) to avoid looping forever against an older
+/// server. The response wire format is unchanged, so old clients keep working.
+pub const PROTOCOL_VERSION: u16 = 3;
 
 pub const ERR_INTERNAL: u16 = 255;
 

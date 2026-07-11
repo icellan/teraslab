@@ -53,8 +53,10 @@ const (
 )
 
 // ProtocolVersion is the wire protocol version this client implements.
-// Matches src/protocol/opcodes.rs PROTOCOL_VERSION.
-const ProtocolVersion uint16 = 2
+// Matches src/protocol/opcodes.rs PROTOCOL_VERSION. Version 3 (FU#5) adds the
+// optional resume cursor on OP_QUERY_OLD_UNMINED / OP_QUERY_CONFLICTING; the
+// paging loop gates on the negotiated server version being >= 3.
+const ProtocolVersion uint16 = 3
 
 // Streaming blob upload opcodes.
 const (

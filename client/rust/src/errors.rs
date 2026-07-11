@@ -51,6 +51,17 @@ pub enum ClientError {
     /// The connection pool has been closed.
     #[error("pool closed")]
     PoolClosed,
+
+    /// FU#5 — a query response was flagged truncated but the negotiated server
+    /// protocol version is below 3, so the server has no resume cursor and the
+    /// client cannot page to completion. `partial` holds the valid-but-PARTIAL
+    /// first page: callers must not treat it as the complete set. Against a
+    /// version-3+ server the client pages internally and this is never returned.
+    #[error("query result truncated: server (protocol < 3) has no resume cursor; {} txids returned are partial", .partial.len())]
+    QueryTruncated {
+        /// The partial first page of txids returned before truncation.
+        partial: Vec<crate::types::TxID>,
+    },
 }
 
 /// Partial error containing per-item successes and failures from a batch operation.

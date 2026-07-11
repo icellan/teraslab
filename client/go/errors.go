@@ -1,6 +1,20 @@
 package teraslab
 
-import "fmt"
+import (
+	"errors"
+	"fmt"
+)
+
+// ErrQueryTruncated is returned by QueryOldUnmined / QueryConflicting when the
+// server flagged the result truncated but the negotiated protocol version is
+// below 3 (FU#5) — i.e. the server has no resume cursor, so the client cannot
+// page to completion. The returned txid slice is a valid but PARTIAL first
+// page: callers must not treat it as the complete set. Against a version-3+
+// server the client pages internally and this error is never returned.
+//
+// It is a sentinel, matchable with errors.Is; the returned slice is non-nil so
+// callers that want the partial page can still use it.
+var ErrQueryTruncated = errors.New("query result truncated: server (protocol < 3) has no resume cursor; returned page is partial")
 
 // BatchItemError represents a per-item failure in a batch response.
 type BatchItemError struct {

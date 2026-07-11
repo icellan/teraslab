@@ -827,12 +827,28 @@ func TestPartitionMapDecodeConsumesIsAlive(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestQueryOldUnminedEncode(t *testing.T) {
-	encoded := encodeQueryOldUnmined(nil, 5000)
+	// No cursor (page 1): the historical 4-byte payload an older server accepts.
+	encoded := encodeQueryOldUnmined(nil, 5000, nil)
 	if len(encoded) != 4 {
 		t.Fatalf("encoded length = %d, want 4", len(encoded))
 	}
 	if getU32(encoded) != 5000 {
 		t.Errorf("cutoff = %d, want 5000", getU32(encoded))
+	}
+
+	// With a cursor (page 2+): 4-byte cutoff + 32-byte cursor = 36 bytes.
+	cur := testTxID(42)
+	withCursor := encodeQueryOldUnmined(nil, 5000, &cur)
+	if len(withCursor) != 36 {
+		t.Fatalf("with-cursor encoded length = %d, want 36", len(withCursor))
+	}
+	if getU32(withCursor[0:4]) != 5000 {
+		t.Errorf("cutoff = %d, want 5000", getU32(withCursor[0:4]))
+	}
+	var gotCur TxID
+	copy(gotCur[:], withCursor[4:36])
+	if gotCur != cur {
+		t.Error("cursor round-trip mismatch")
 	}
 }
 
@@ -843,10 +859,14 @@ func TestQueryOldUnminedResponseDecode(t *testing.T) {
 	buf = append(buf, t1[:]...)
 	buf = append(buf, t2[:]...)
 	buf = append(buf, t3[:]...)
+	buf = append(buf, 0) // truncated = 0
 
-	txids, err := decodeQueryOldUnminedResponse(buf)
+	txids, truncated, err := decodeQueryOldUnminedResponse(buf)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if truncated {
+		t.Error("truncated flag should be false")
 	}
 	if len(txids) != 3 {
 		t.Fatalf("got %d txids, want 3", len(txids))
@@ -856,10 +876,63 @@ func TestQueryOldUnminedResponseDecode(t *testing.T) {
 	}
 }
 
+// A response whose trailer byte is 1 must decode truncated = true so the client
+// knows to page. Guards the FU#5 trailer-reading fix (the pre-fix Go decoder
+// dropped the trailer, silently returning a partial set).
+func TestQueryResponseDecodeTruncatedFlag(t *testing.T) {
+	t1, t2 := testTxID(1), testTxID(2)
+	var buf []byte
+	buf = appendU32(buf, 2)
+	buf = append(buf, t1[:]...)
+	buf = append(buf, t2[:]...)
+	buf = append(buf, 1) // truncated = 1
+
+	for _, tc := range []struct {
+		name   string
+		decode func([]byte) ([]TxID, bool, error)
+	}{
+		{"old_unmined", decodeQueryOldUnminedResponse},
+		{"conflicting", decodeQueryConflictingResponse},
+	} {
+		txids, truncated, err := tc.decode(buf)
+		if err != nil {
+			t.Fatalf("%s: %v", tc.name, err)
+		}
+		if !truncated {
+			t.Errorf("%s: truncated flag must be true", tc.name)
+		}
+		if len(txids) != 2 || txids[0] != t1 || txids[1] != t2 {
+			t.Errorf("%s: txid mismatch", tc.name)
+		}
+	}
+
+	// Defensive: a response with no trailer byte at all (exactly count txids)
+	// decodes as not truncated rather than erroring.
+	var noTrailer []byte
+	noTrailer = appendU32(noTrailer, 1)
+	noTrailer = append(noTrailer, t1[:]...)
+	txids, truncated, err := decodeQueryOldUnminedResponse(noTrailer)
+	if err != nil || truncated || len(txids) != 1 {
+		t.Fatalf("no-trailer decode: txids=%d truncated=%v err=%v", len(txids), truncated, err)
+	}
+}
+
 func TestQueryConflictingEncode(t *testing.T) {
-	encoded := encodeQueryConflicting(nil)
+	// No cursor: empty payload.
+	encoded := encodeQueryConflicting(nil, nil)
 	if len(encoded) != 0 {
 		t.Fatalf("encoded length = %d, want 0 (empty payload)", len(encoded))
+	}
+	// With cursor: bare 32-byte cursor.
+	cur := testTxID(7)
+	withCursor := encodeQueryConflicting(nil, &cur)
+	if len(withCursor) != 32 {
+		t.Fatalf("with-cursor encoded length = %d, want 32", len(withCursor))
+	}
+	var gotCur TxID
+	copy(gotCur[:], withCursor[0:32])
+	if gotCur != cur {
+		t.Error("conflicting cursor round-trip mismatch")
 	}
 }
 
@@ -870,10 +943,14 @@ func TestQueryConflictingResponseDecode(t *testing.T) {
 	buf = append(buf, t1[:]...)
 	buf = append(buf, t2[:]...)
 	buf = append(buf, t3[:]...)
+	buf = append(buf, 0) // truncated = 0
 
-	txids, err := decodeQueryConflictingResponse(buf)
+	txids, truncated, err := decodeQueryConflictingResponse(buf)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if truncated {
+		t.Error("truncated flag should be false")
 	}
 	if len(txids) != 3 {
 		t.Fatalf("got %d txids, want 3", len(txids))

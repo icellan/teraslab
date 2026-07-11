@@ -9435,25 +9435,56 @@ fn handle_query_old_unmined(
 /// Cap-parameterized core of [`handle_query_old_unmined`]. The public handler
 /// passes [`MAX_QUERY_RESPONSE_TXIDS`]; tests inject a small cap to exercise the
 /// truncation path without materializing 16 MiB of txids. The result is capped
-/// at `max_txids` *qualifying* keys (post master/`preserve_until` filtering);
-/// when a further qualifying candidate exists the response is flagged truncated.
+/// at `max_txids` *qualifying* keys (post cursor/master/`preserve_until`
+/// filtering); when a further qualifying candidate exists the response is
+/// flagged truncated.
+///
+/// FU#5 pagination: the request payload is `[cutoff_height:4][cursor:32?]`. The
+/// candidate set from [`collect_unmined_keys_below`](crate::index::mined_index::ShardedMinedIndex::collect_unmined_keys_below)
+/// walks a `HashMap` per shard (hash order), so it has no stable order across
+/// calls. To page soundly we impose a total order by sorting the full
+/// candidate set by txid, then skip every candidate with `txid <= cursor`.
+/// Because txid is a stable key independent of set membership, resuming with a
+/// strictly-greater cursor can never re-return a prior txid (no duplicates)
+/// and never permanently hides one that stays in range (no skips beyond the
+/// pre-existing non-snapshot anomalies documented above). The cursor is
+/// IMPLICIT on the wire: the client re-sends the last returned txid, so the
+/// response layout is unchanged.
 fn handle_query_old_unmined_capped(
     req: &RequestFrame,
     engine: &Engine,
     cluster: Option<&RunningCluster>,
     max_txids: usize,
 ) -> ResponseFrame {
-    // Payload: [cutoff_height:4]
-    if req.payload.len() < 4 {
-        return error_response(req.request_id, ERR_PAYLOAD_MALFORMED, "malformed query");
-    }
+    // Payload: [cutoff_height:4][cursor:32?]. Exactly 4 bytes = no cursor
+    // (old client / page 1); exactly 36 bytes = a 32-byte resume cursor. Any
+    // other length is malformed.
     let Some(cutoff) = le_u32_at(&req.payload, 0) else {
         return error_response(req.request_id, ERR_PAYLOAD_MALFORMED, "malformed query");
     };
-    let candidates = engine.mined_index().collect_unmined_keys_below(cutoff);
+    let cursor = match req.payload.len() {
+        4 => None,
+        36 => {
+            let mut c = [0u8; 32];
+            c.copy_from_slice(&req.payload[4..36]);
+            Some(c)
+        }
+        _ => {
+            return error_response(req.request_id, ERR_PAYLOAD_MALFORMED, "malformed query");
+        }
+    };
+    let mut candidates = engine.mined_index().collect_unmined_keys_below(cutoff);
+    // Total order for sound paging (see fn doc): sort by txid so the cursor
+    // resume (`> cursor`) is stable regardless of underlying hash order.
+    candidates.sort_unstable_by_key(|k| k.txid);
     let mut keys = Vec::with_capacity(candidates.len().min(max_txids));
     let mut truncated = false;
     for key in candidates {
+        // FU#5: resume strictly after the cursor. A txid == cursor was the last
+        // one returned on the prior page, so it is excluded here.
+        if cursor.is_some_and(|cur| key.txid <= cur) {
+            continue;
+        }
         // F-G5-003: skip keys this node does not master. Single-node mode
         // (no cluster) keeps the prior behaviour.
         if let Some(c) = cluster {
@@ -9506,18 +9537,43 @@ fn handle_query_conflicting(
 }
 
 /// Cap-parameterized core of [`handle_query_conflicting`]. See
-/// [`handle_query_old_unmined_capped`] for the truncation contract; the public
-/// handler passes [`MAX_QUERY_RESPONSE_TXIDS`].
+/// [`handle_query_old_unmined_capped`] for the truncation and FU#5 pagination
+/// contract; the public handler passes [`MAX_QUERY_RESPONSE_TXIDS`].
+///
+/// The request payload is `[cursor:32?]`: an empty payload resumes from the
+/// start, a 32-byte payload resumes strictly after that txid. The source
+/// [`ConflictingIndex`](crate::index::conflicting_index) is a `HashSet`
+/// (unordered), so the same sort-by-txid total order used by the unmined query
+/// is applied here before the cursor skip and cap.
 fn handle_query_conflicting_capped(
     req: &RequestFrame,
     engine: &Engine,
     cluster: Option<&RunningCluster>,
     max_txids: usize,
 ) -> ResponseFrame {
-    let candidates: Vec<TxKey> = engine.conflicting_index().iter().collect();
+    // Payload: [cursor:32?]. Empty = no cursor (page 1); 32 bytes = resume
+    // cursor. Any other length is malformed.
+    let cursor = match req.payload.len() {
+        0 => None,
+        32 => {
+            let mut c = [0u8; 32];
+            c.copy_from_slice(&req.payload[0..32]);
+            Some(c)
+        }
+        _ => {
+            return error_response(req.request_id, ERR_PAYLOAD_MALFORMED, "malformed query");
+        }
+    };
+    let mut candidates: Vec<TxKey> = engine.conflicting_index().iter().collect();
+    // Total order for sound paging (see handle_query_old_unmined_capped doc).
+    candidates.sort_unstable_by_key(|k| k.txid);
     let mut keys = Vec::with_capacity(candidates.len().min(max_txids));
     let mut truncated = false;
     for key in candidates {
+        // FU#5: resume strictly after the cursor.
+        if cursor.is_some_and(|cur| key.txid <= cur) {
+            continue;
+        }
         // F-G5-003: skip keys this node does not master. Single-node mode
         // (no cluster) keeps the prior behaviour.
         if let Some(c) = cluster {
@@ -12807,6 +12863,291 @@ mod tests {
             "over-cap conflicting result must flag truncated = 1"
         );
         assert!(capped.encode().len() as u32 <= MAX_FRAME_SIZE);
+    }
+
+    // -----------------------------------------------------------------------
+    // 1b''. FU#5 — query-response pagination via an implicit txid cursor.
+    // The response wire format is UNCHANGED (`[count][txid]*[truncated]`); the
+    // cursor rides on the REQUEST (`OP_QUERY_OLD_UNMINED` gains a trailing
+    // 32-byte cursor, `OP_QUERY_CONFLICTING` becomes a bare optional cursor).
+    // The handler sorts the full candidate set by txid, skips `txid <= cursor`,
+    // then applies the existing filters and cap. Sorting imposes a stable total
+    // order over the otherwise-unordered hash sources so paging never skips or
+    // duplicates a txid across pages.
+    // -----------------------------------------------------------------------
+
+    /// Build an `OP_QUERY_OLD_UNMINED` request payload: `[cutoff:4][cursor:32?]`.
+    fn old_unmined_req(cutoff: u32, cursor: Option<[u8; 32]>) -> RequestFrame {
+        let mut payload = cutoff.to_le_bytes().to_vec();
+        if let Some(c) = cursor {
+            payload.extend_from_slice(&c);
+        }
+        RequestFrame {
+            request_id: 1,
+            op_code: OP_QUERY_OLD_UNMINED,
+            flags: 0,
+            payload: payload.into(),
+        }
+    }
+
+    /// Build an `OP_QUERY_CONFLICTING` request payload: `[cursor:32?]`.
+    fn conflicting_req(cursor: Option<[u8; 32]>) -> RequestFrame {
+        let payload = cursor.map(|c| c.to_vec()).unwrap_or_default();
+        RequestFrame {
+            request_id: 1,
+            op_code: OP_QUERY_CONFLICTING,
+            flags: 0,
+            payload: payload.into(),
+        }
+    }
+
+    /// Parse a query txid response into `(txids, truncated)`.
+    fn parse_query_response(payload: &[u8]) -> (Vec<[u8; 32]>, bool) {
+        let count = u32::from_le_bytes(payload[0..4].try_into().unwrap()) as usize;
+        let mut txids = Vec::with_capacity(count);
+        for i in 0..count {
+            let start = 4 + i * 32;
+            txids.push(payload[start..start + 32].try_into().unwrap());
+        }
+        let truncated = payload[4 + count * 32] == 1;
+        (txids, truncated)
+    }
+
+    /// Paging over the unmined query with an injected small cap must yield
+    /// txid-sorted, pairwise-disjoint pages whose union is the full candidate
+    /// set — no skips, no duplicates. The cursor is the last txid of the prior
+    /// page (client holds `txids[len-1]`), resumed with `> cursor`.
+    #[test]
+    fn query_old_unmined_pages_are_txid_sorted_and_disjoint() {
+        let h = DispatchTestHarness::new();
+        // Seven distinct unmined txs below the cutoff — > 2× the injected cap.
+        let mut full: Vec<[u8; 32]> = Vec::new();
+        for n in 1..=7u8 {
+            let txid = DispatchTestHarness::make_txid(n);
+            assert_eq!(h.create_tx_at_height(txid, 1, 100).status, STATUS_OK);
+            full.push(txid);
+        }
+        full.sort_unstable();
+
+        let cap = 3usize;
+        let mut pages: Vec<Vec<[u8; 32]>> = Vec::new();
+        let mut cursor: Option<[u8; 32]> = None;
+        loop {
+            let req = old_unmined_req(200, cursor);
+            let resp = handle_query_old_unmined_capped(&req, &h.engine, None, cap);
+            assert_eq!(resp.status, STATUS_OK);
+            let (txids, truncated) = parse_query_response(&resp.payload);
+            // Each page is sorted strictly ascending.
+            for w in txids.windows(2) {
+                assert!(w[0] < w[1], "page not strictly ascending: {w:?}");
+            }
+            // Cross-page disjointness: this page's first txid must exceed the
+            // last txid of the previous page.
+            if let (Some(prev), Some(&first)) = (pages.last().and_then(|p| p.last()), txids.first())
+            {
+                assert!(
+                    first > *prev,
+                    "page-2 first txid must be > page-1 last txid (cursor resume is strict >)"
+                );
+            }
+            if truncated {
+                assert_eq!(txids.len(), cap, "a truncated page is exactly full");
+            }
+            let last = txids.last().copied();
+            pages.push(txids);
+            if !truncated {
+                break;
+            }
+            cursor = last;
+            assert!(cursor.is_some(), "a truncated page must carry a cursor");
+        }
+
+        // Union == full set, in order, zero duplicates.
+        let union: Vec<[u8; 32]> = pages.into_iter().flatten().collect();
+        assert_eq!(
+            union.len(),
+            full.len(),
+            "union size must equal the full set"
+        );
+        assert_eq!(
+            union, full,
+            "union (in page order) must equal the sorted set"
+        );
+        let mut dedup = union.clone();
+        dedup.dedup();
+        assert_eq!(dedup.len(), union.len(), "no txid may appear on two pages");
+    }
+
+    /// Same disjoint-paging guarantee for the conflicting query, whose source
+    /// (`ConflictingIndex`) is an unordered `HashSet`.
+    #[test]
+    fn query_conflicting_pages_are_txid_sorted_and_disjoint() {
+        let h = DispatchTestHarness::new();
+        let mut full: Vec<[u8; 32]> = Vec::new();
+        for n in 1..=5u8 {
+            let txid = DispatchTestHarness::make_txid(n);
+            assert_eq!(h.create_tx(txid, 1).status, STATUS_OK);
+            h.engine
+                .set_conflicting(&crate::ops::remaining::SetConflictingRequest {
+                    tx_key: TxKey { txid },
+                    value: true,
+                    current_block_height: 1000,
+                    block_height_retention: 288,
+                })
+                .unwrap();
+            full.push(txid);
+        }
+        full.sort_unstable();
+
+        let cap = 2usize;
+        let mut pages: Vec<Vec<[u8; 32]>> = Vec::new();
+        let mut cursor: Option<[u8; 32]> = None;
+        loop {
+            let req = conflicting_req(cursor);
+            let resp = handle_query_conflicting_capped(&req, &h.engine, None, cap);
+            assert_eq!(resp.status, STATUS_OK);
+            let (txids, truncated) = parse_query_response(&resp.payload);
+            for w in txids.windows(2) {
+                assert!(w[0] < w[1], "page not strictly ascending: {w:?}");
+            }
+            if let (Some(prev), Some(&first)) = (pages.last().and_then(|p| p.last()), txids.first())
+            {
+                assert!(first > *prev, "conflicting page resume must be strict >");
+            }
+            let last = txids.last().copied();
+            pages.push(txids);
+            if !truncated {
+                break;
+            }
+            cursor = last;
+        }
+
+        let union: Vec<[u8; 32]> = pages.into_iter().flatten().collect();
+        assert_eq!(union, full, "conflicting union must equal the sorted set");
+        let mut dedup = union.clone();
+        dedup.dedup();
+        assert_eq!(dedup.len(), union.len(), "no conflicting txid may repeat");
+    }
+
+    /// The cursor is EXCLUSIVE: a candidate whose txid equals the cursor is
+    /// skipped, and the first returned txid is the next-greater one.
+    #[test]
+    fn query_old_unmined_cursor_skips_at_and_below() {
+        let h = DispatchTestHarness::new();
+        let t1 = DispatchTestHarness::make_txid(1);
+        let t2 = DispatchTestHarness::make_txid(2);
+        let t3 = DispatchTestHarness::make_txid(3);
+        for t in [t1, t2, t3] {
+            assert_eq!(h.create_tx_at_height(t, 1, 100).status, STATUS_OK);
+        }
+        // Sanity: make_txid orders by first byte, so t1 < t2 < t3.
+        assert!(t1 < t2 && t2 < t3);
+
+        // cursor = t2 → t1 (below) and t2 (equal) are excluded; t3 is first.
+        let resp =
+            handle_query_old_unmined_capped(&old_unmined_req(200, Some(t2)), &h.engine, None, 100);
+        let (txids, truncated) = parse_query_response(&resp.payload);
+        assert_eq!(
+            txids,
+            vec![t3],
+            "cursor==t2 excludes t1 and t2, yields only t3"
+        );
+        assert!(!truncated);
+
+        // cursor = t1 → only t1 excluded; t2 then t3.
+        let resp2 =
+            handle_query_old_unmined_capped(&old_unmined_req(200, Some(t1)), &h.engine, None, 100);
+        let (txids2, _) = parse_query_response(&resp2.payload);
+        assert_eq!(txids2, vec![t2, t3]);
+    }
+
+    /// Conflicting-query cursor is likewise exclusive.
+    #[test]
+    fn query_conflicting_cursor_skips_at_and_below() {
+        let h = DispatchTestHarness::new();
+        let t1 = DispatchTestHarness::make_txid(1);
+        let t2 = DispatchTestHarness::make_txid(2);
+        let t3 = DispatchTestHarness::make_txid(3);
+        for t in [t1, t2, t3] {
+            assert_eq!(h.create_tx(t, 1).status, STATUS_OK);
+            h.engine
+                .set_conflicting(&crate::ops::remaining::SetConflictingRequest {
+                    tx_key: TxKey { txid: t },
+                    value: true,
+                    current_block_height: 1000,
+                    block_height_retention: 288,
+                })
+                .unwrap();
+        }
+        let resp =
+            handle_query_conflicting_capped(&conflicting_req(Some(t2)), &h.engine, None, 100);
+        let (txids, _) = parse_query_response(&resp.payload);
+        assert_eq!(txids, vec![t3]);
+    }
+
+    /// Back-compat: an old-length request payload (4 bytes for old-unmined, 0
+    /// bytes for conflicting) carries no cursor and pages from the start; a
+    /// with-cursor payload (36 / 32 bytes) parses and filters. A zero cursor is
+    /// below every real txid, so it too returns from the start.
+    #[test]
+    fn query_request_cursor_parse_back_compat() {
+        let h = DispatchTestHarness::new();
+        let t1 = DispatchTestHarness::make_txid(1);
+        let t2 = DispatchTestHarness::make_txid(2);
+        assert_eq!(h.create_tx_at_height(t1, 1, 100).status, STATUS_OK);
+        assert_eq!(h.create_tx_at_height(t2, 1, 100).status, STATUS_OK);
+
+        // Cursorless (4-byte) old-unmined payload → full set from the start.
+        let cursorless =
+            handle_query_old_unmined_capped(&old_unmined_req(200, None), &h.engine, None, 100);
+        let (a, _) = parse_query_response(&cursorless.payload);
+        assert_eq!(
+            a,
+            vec![t1, t2],
+            "cursorless payload starts from the beginning"
+        );
+
+        // With a zero cursor (36-byte payload) → still from the start.
+        let zero = handle_query_old_unmined_capped(
+            &old_unmined_req(200, Some([0u8; 32])),
+            &h.engine,
+            None,
+            100,
+        );
+        let (b, _) = parse_query_response(&zero.payload);
+        assert_eq!(
+            b,
+            vec![t1, t2],
+            "zero cursor is below every txid → from start"
+        );
+
+        // A malformed (non-{4,36}) old-unmined payload is rejected.
+        let bad = RequestFrame {
+            request_id: 1,
+            op_code: OP_QUERY_OLD_UNMINED,
+            flags: 0,
+            payload: vec![0u8; 10].into(),
+        };
+        let bad_resp = handle_query_old_unmined_capped(&bad, &h.engine, None, 100);
+        assert_eq!(bad_resp.status, STATUS_ERROR);
+        let (code, _) = decode_error_payload(&bad_resp.payload).unwrap();
+        assert_eq!(code, ERR_PAYLOAD_MALFORMED);
+
+        // Conflicting: empty payload (no cursor) parses; a malformed non-{0,32}
+        // payload is rejected.
+        let conf_empty =
+            handle_query_conflicting_capped(&conflicting_req(None), &h.engine, None, 100);
+        assert_eq!(conf_empty.status, STATUS_OK);
+        let conf_bad = RequestFrame {
+            request_id: 1,
+            op_code: OP_QUERY_CONFLICTING,
+            flags: 0,
+            payload: vec![0u8; 5].into(),
+        };
+        let conf_bad_resp = handle_query_conflicting_capped(&conf_bad, &h.engine, None, 100);
+        assert_eq!(conf_bad_resp.status, STATUS_ERROR);
+        let (conf_code, _) = decode_error_payload(&conf_bad_resp.payload).unwrap();
+        assert_eq!(conf_code, ERR_PAYLOAD_MALFORMED);
     }
 
     // -----------------------------------------------------------------------

@@ -61,6 +61,7 @@ pub use teraslab::protocol::opcodes::{
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::{Duration, Instant};
 
 use teraslab::protocol::codec;
@@ -182,6 +183,11 @@ pub struct Client {
     /// Cold-data size above which `create_batch` externalises via blob upload.
     /// Taken from `ClientConfig::blob_upload_threshold` (default 1 MiB).
     blob_upload_threshold: usize,
+    /// Wire protocol version negotiated with the server via `OP_HELLO`, or `0`
+    /// when not yet negotiated. Populated lazily on the first query that needs
+    /// the capability gate (FU#5 pagination). `1` records a server that predates
+    /// the handshake. See [`Client::ensure_server_version`].
+    negotiated_version: AtomicU16,
     /// Kept alive for the cluster refresh task.
     _refresh_task: Option<tokio::task::JoinHandle<()>>,
 }
@@ -222,6 +228,7 @@ impl Client {
                 pool: None,
                 cluster_secret: cfg.cluster_secret,
                 blob_upload_threshold,
+                negotiated_version: AtomicU16::new(0),
                 _refresh_task: Some(refresh_task),
             })
         } else if let Some(addr) = cfg.addr {
@@ -231,6 +238,7 @@ impl Client {
                 pool: Some(pool),
                 cluster_secret: cfg.cluster_secret,
                 blob_upload_threshold,
+                negotiated_version: AtomicU16::new(0),
                 _refresh_task: None,
             })
         } else {
@@ -2382,24 +2390,161 @@ impl Client {
 
     /// Query transactions that have been unmined since before `cutoff_height`.
     ///
+    /// A single response is capped at one 16 MiB frame. Against a version-3+
+    /// server (FU#5) the remainder is paged transparently via a resume cursor
+    /// and the complete set is returned. Against an older server a single
+    /// best-effort call is made and, if the result was capped, the partial page
+    /// is returned as [`ClientError::QueryTruncated`] rather than being silently
+    /// dropped.
+    ///
     /// # Errors
     ///
-    /// Returns [`ClientError::Server`] on error.
+    /// Returns [`ClientError::Server`] on a server error,
+    /// [`ClientError::QueryTruncated`] when a pre-v3 server truncated the
+    /// result, or [`ClientError::Protocol`] on a malformed response.
     pub async fn query_old_unmined(&self, cutoff_height: u32) -> Result<Vec<TxID>, ClientError> {
-        let payload = cutoff_height.to_le_bytes().to_vec();
+        self.page_query(
+            OP_QUERY_OLD_UNMINED,
+            move |cursor: Option<&TxID>| {
+                let mut payload = cutoff_height.to_le_bytes().to_vec();
+                if let Some(c) = cursor {
+                    payload.extend_from_slice(c);
+                }
+                payload
+            },
+            decode_query_old_unmined_response,
+        )
+        .await
+    }
+
+    /// Query all transactions currently flagged CONFLICTING.
+    ///
+    /// The request carries no parameters beyond the optional FU#5 resume cursor.
+    /// Pagination and the capability gate behave exactly as
+    /// [`Client::query_old_unmined`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError::Server`] on a server error,
+    /// [`ClientError::QueryTruncated`] when a pre-v3 server truncated the
+    /// result, or [`ClientError::Protocol`] on a malformed response.
+    pub async fn query_conflicting(&self) -> Result<Vec<TxID>, ClientError> {
+        self.page_query(
+            OP_QUERY_CONFLICTING,
+            |cursor: Option<&TxID>| {
+                let mut payload = Vec::new();
+                if let Some(c) = cursor {
+                    payload.extend_from_slice(c);
+                }
+                payload
+            },
+            decode_query_conflicting_response,
+        )
+        .await
+    }
+
+    /// Run a diagnostic txid-list query, transparently following the FU#5
+    /// truncated trailer to page the whole result when the negotiated server
+    /// version supports the resume cursor (`>= 3`).
+    ///
+    /// The capability gate is essential: a version-`< 3` server ignores the
+    /// cursor and returns page 1 forever, so a naive loop would never terminate.
+    /// Against such a server this makes exactly one call and, if the response was
+    /// truncated, returns [`ClientError::QueryTruncated`] with the partial page.
+    async fn page_query(
+        &self,
+        op_code: u16,
+        encode: impl Fn(Option<&TxID>) -> Vec<u8>,
+        decode: impl Fn(&[u8]) -> Result<(Vec<TxID>, bool), ClientError>,
+    ) -> Result<Vec<TxID>, ClientError> {
+        let supports_paging = self.ensure_server_version().await >= 3;
+        let mut all: Vec<TxID> = Vec::new();
+        let mut cursor: Option<TxID> = None;
+        loop {
+            let payload = encode(cursor.as_ref());
+            let conn = self.get_conn().await?;
+            let resp = conn.round_trip(op_code, 0, payload).await?;
+            if resp.status != STATUS_OK {
+                if resp.status == STATUS_ERROR {
+                    let (code, msg) = decode_error_payload(&resp.payload)?;
+                    return Err(ClientError::Server { code, message: msg });
+                }
+                return Err(ClientError::Protocol(format!(
+                    "unexpected status: {}",
+                    resp.status
+                )));
+            }
+            let (txids, truncated) = decode(&resp.payload)?;
+            all.extend_from_slice(&txids);
+            if !truncated {
+                return Ok(all);
+            }
+            if !supports_paging {
+                return Err(ClientError::QueryTruncated { partial: all });
+            }
+            match txids.last() {
+                Some(last) => cursor = Some(*last),
+                None => {
+                    // Defensive: a truncated-but-empty page would loop forever.
+                    // A conforming v3 server never emits this.
+                    return Err(ClientError::Protocol(
+                        "query paging: truncated response with empty page".to_string(),
+                    ));
+                }
+            }
+        }
+    }
+
+    /// The wire protocol version negotiated with the server via `OP_HELLO`, or
+    /// `0` if no query that needs it has run yet. `1` records a server that
+    /// predates the handshake.
+    pub fn negotiated_version(&self) -> u16 {
+        self.negotiated_version.load(Ordering::Relaxed)
+    }
+
+    /// Perform the `OP_HELLO` handshake and return the server's reported wire
+    /// protocol version.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError::Server`] if the server rejects the opcode (a
+    /// pre-handshake server), or [`ClientError::Protocol`] / connection errors
+    /// on transport failure or a short payload.
+    pub async fn hello(&self) -> Result<u16, ClientError> {
         let conn = self.get_conn().await?;
-        let resp = conn.round_trip(OP_QUERY_OLD_UNMINED, 0, payload).await?;
+        let resp = conn.round_trip(OP_HELLO, 0, Vec::new()).await?;
         if resp.status != STATUS_OK {
             if resp.status == STATUS_ERROR {
                 let (code, msg) = decode_error_payload(&resp.payload)?;
                 return Err(ClientError::Server { code, message: msg });
             }
             return Err(ClientError::Protocol(format!(
-                "unexpected status: {}",
+                "hello: unexpected status {}",
                 resp.status
             )));
         }
-        decode_query_old_unmined_response(&resp.payload)
+        if resp.payload.len() < 2 {
+            return Err(ClientError::Protocol(format!(
+                "hello: short payload ({} bytes)",
+                resp.payload.len()
+            )));
+        }
+        Ok(u16::from_le_bytes([resp.payload[0], resp.payload[1]]))
+    }
+
+    /// Return the negotiated server version, performing (and caching) the
+    /// `OP_HELLO` handshake on first call. A handshake failure — including an
+    /// older server that does not implement the opcode — records `1`, the safe
+    /// pre-handshake baseline, so the pagination gate degrades to a single call.
+    async fn ensure_server_version(&self) -> u16 {
+        let cached = self.negotiated_version.load(Ordering::Relaxed);
+        if cached != 0 {
+            return cached;
+        }
+        let v = self.hello().await.unwrap_or(1);
+        // A concurrent racer storing the same value is harmless.
+        self.negotiated_version.store(v, Ordering::Relaxed);
+        v
     }
 
     /// Preserve transactions until the given block height.
@@ -2855,19 +3000,25 @@ fn decode_get_spend_response(data: &[u8]) -> Result<Vec<GetSpendResult>, ClientE
         .collect())
 }
 
-/// Decode a QueryOldUnmined response payload.
-fn decode_query_old_unmined_response(data: &[u8]) -> Result<Vec<TxID>, ClientError> {
+/// Decode a diagnostic-query txid response payload:
+/// `[count:u32 LE][txid:32]*count[truncated:u8]`.
+///
+/// Returns the txids and whether the server flagged the result truncated
+/// (FU#5). A truncated result means a further qualifying txid exists past the
+/// frame cap and the caller should re-query with the last returned txid as the
+/// resume cursor. The trailing flag byte is optional for defensiveness: a
+/// response that stops exactly after the txids is treated as not truncated.
+fn decode_query_txid_response(data: &[u8], label: &str) -> Result<(Vec<TxID>, bool), ClientError> {
     if data.len() < 4 {
         return Err(ClientError::Protocol(format!(
-            "query old unmined: need 4 bytes, have {}",
+            "{label}: need 4 bytes, have {}",
             data.len()
         )));
     }
-    let count = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
-    if data.len() < 4 + count * 32 {
-        return Err(ClientError::Protocol(
-            "query old unmined: truncated".to_string(),
-        ));
+    let count = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
+    let end = 4 + count * 32;
+    if data.len() < end {
+        return Err(ClientError::Protocol(format!("{label}: truncated")));
     }
     let mut txids = Vec::with_capacity(count);
     let mut pos = 4;
@@ -2877,7 +3028,18 @@ fn decode_query_old_unmined_response(data: &[u8]) -> Result<Vec<TxID>, ClientErr
         txids.push(txid);
         pos += 32;
     }
-    Ok(txids)
+    let truncated = data.len() > end && data[end] == 1;
+    Ok((txids, truncated))
+}
+
+/// Decode a QueryOldUnmined response payload (see [`decode_query_txid_response`]).
+fn decode_query_old_unmined_response(data: &[u8]) -> Result<(Vec<TxID>, bool), ClientError> {
+    decode_query_txid_response(data, "query old unmined")
+}
+
+/// Decode a QueryConflicting response payload (see [`decode_query_txid_response`]).
+fn decode_query_conflicting_response(data: &[u8]) -> Result<(Vec<TxID>, bool), ClientError> {
+    decode_query_txid_response(data, "query conflicting")
 }
 
 /// Decode a ProcessExpiredPreservations response.
@@ -4432,5 +4594,251 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(cc.max_redirects, 5);
+    }
+
+    // -----------------------------------------------------------------------
+    // FU#5 — query-response pagination (trailer, cursor loop, capability gate).
+    // -----------------------------------------------------------------------
+
+    /// The txid-response decoder returns the trailing truncated flag, defends
+    /// against a missing trailer, and both named decoders share the behaviour.
+    #[test]
+    fn decode_query_txid_response_reads_trailer() {
+        let t1 = [0x11u8; 32];
+        let t2 = [0x22u8; 32];
+        let mut trunc = 2u32.to_le_bytes().to_vec();
+        trunc.extend_from_slice(&t1);
+        trunc.extend_from_slice(&t2);
+        trunc.push(1); // truncated = 1
+
+        let (txids, truncated) = decode_query_old_unmined_response(&trunc).unwrap();
+        assert_eq!(txids, vec![t1, t2]);
+        assert!(truncated, "trailer byte 1 must decode truncated = true");
+        // The conflicting decoder shares the same wire contract.
+        let (ctx, ctrunc) = decode_query_conflicting_response(&trunc).unwrap();
+        assert_eq!(ctx, vec![t1, t2]);
+        assert!(ctrunc);
+
+        // Explicit not-truncated trailer.
+        let mut zero = 1u32.to_le_bytes().to_vec();
+        zero.extend_from_slice(&t1);
+        zero.push(0);
+        let (z, ztr) = decode_query_old_unmined_response(&zero).unwrap();
+        assert_eq!(z, vec![t1]);
+        assert!(!ztr);
+
+        // Defensive: a response with no trailer byte decodes as not truncated.
+        let mut no_trailer = 1u32.to_le_bytes().to_vec();
+        no_trailer.extend_from_slice(&t1);
+        let (n, ntr) = decode_query_old_unmined_response(&no_trailer).unwrap();
+        assert_eq!(n, vec![t1]);
+        assert!(!ntr);
+    }
+
+    /// FU#5 in-process mock server: speaks the frame protocol and implements
+    /// cursor pagination for the two diagnostic queries, so the client's paging
+    /// loop and capability gate can be exercised without seeding >524k records
+    /// on a real server. `version` is what `OP_HELLO` reports; `honor_cursor =
+    /// false` simulates a pre-v3 server that ignores the cursor (always page 1).
+    struct PagingMock {
+        version: u16,
+        page_cap: usize,
+        full: Vec<TxID>,
+        honor_cursor: bool,
+    }
+
+    impl PagingMock {
+        fn new(version: u16, page_cap: usize, honor_cursor: bool, mut txids: Vec<TxID>) -> Self {
+            txids.sort_unstable();
+            Self {
+                version,
+                page_cap,
+                full: txids,
+                honor_cursor,
+            }
+        }
+
+        fn page_payload(&self, op_code: u16, req_payload: &[u8]) -> Vec<u8> {
+            let cursor: Option<TxID> = match op_code {
+                OP_QUERY_OLD_UNMINED if req_payload.len() == 36 => {
+                    let mut c = [0u8; 32];
+                    c.copy_from_slice(&req_payload[4..36]);
+                    Some(c)
+                }
+                OP_QUERY_CONFLICTING if req_payload.len() == 32 => {
+                    let mut c = [0u8; 32];
+                    c.copy_from_slice(&req_payload[0..32]);
+                    Some(c)
+                }
+                _ => None,
+            };
+            let mut qualifying: Vec<TxID> = self
+                .full
+                .iter()
+                .copied()
+                .filter(|t| !(self.honor_cursor && cursor.is_some_and(|cur| *t <= cur)))
+                .collect();
+            let mut truncated = 0u8;
+            if qualifying.len() > self.page_cap {
+                qualifying.truncate(self.page_cap);
+                truncated = 1;
+            }
+            let mut p = (qualifying.len() as u32).to_le_bytes().to_vec();
+            for t in &qualifying {
+                p.extend_from_slice(t);
+            }
+            p.push(truncated);
+            p
+        }
+    }
+
+    /// Bind the mock on an ephemeral port and return its address.
+    async fn spawn_paging_mock(mock: Arc<PagingMock>) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            loop {
+                let (mut sock, _) = match listener.accept().await {
+                    Ok(x) => x,
+                    Err(_) => return,
+                };
+                let mock = mock.clone();
+                tokio::spawn(async move {
+                    loop {
+                        let mut len_buf = [0u8; 4];
+                        if sock.read_exact(&mut len_buf).await.is_err() {
+                            return;
+                        }
+                        let total = u32::from_le_bytes(len_buf) as usize;
+                        if total < 12 {
+                            return;
+                        }
+                        let mut body = vec![0u8; total];
+                        if sock.read_exact(&mut body).await.is_err() {
+                            return;
+                        }
+                        let request_id = u64::from_le_bytes(body[0..8].try_into().unwrap());
+                        let op_code = u16::from_le_bytes([body[8], body[9]]);
+                        let payload = &body[12..];
+                        let resp_payload = match op_code {
+                            OP_HELLO => mock.version.to_le_bytes().to_vec(),
+                            OP_QUERY_OLD_UNMINED | OP_QUERY_CONFLICTING => {
+                                mock.page_payload(op_code, payload)
+                            }
+                            _ => Vec::new(),
+                        };
+                        // Response frame: [inner_len:4][request_id:8][status:1][payload].
+                        let inner_len = 8 + 1 + resp_payload.len();
+                        let mut out = (inner_len as u32).to_le_bytes().to_vec();
+                        out.extend_from_slice(&request_id.to_le_bytes());
+                        out.push(STATUS_OK);
+                        out.extend_from_slice(&resp_payload);
+                        if sock.write_all(&out).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        addr
+    }
+
+    fn seq_txids(n: u8) -> Vec<TxID> {
+        (1..=n)
+            .map(|i| {
+                let mut t = [0u8; 32];
+                t[0] = i;
+                t
+            })
+            .collect()
+    }
+
+    fn assert_same_set(got: &[TxID], want: &[TxID]) {
+        assert_eq!(got.len(), want.len(), "size mismatch: {got:?} vs {want:?}");
+        let mut seen = std::collections::HashMap::new();
+        for g in got {
+            *seen.entry(*g).or_insert(0usize) += 1;
+        }
+        for w in want {
+            assert_eq!(
+                seen.get(w).copied().unwrap_or(0),
+                1,
+                "missing/duplicate txid"
+            );
+        }
+    }
+
+    /// Against a v3 server the client pages a truncated result to completion and
+    /// returns the full deduplicated set (seed 7 > 2× the cap of 3).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn query_old_unmined_pages_to_completion_v3() {
+        let full = seq_txids(7);
+        let addr = spawn_paging_mock(Arc::new(PagingMock::new(3, 3, true, full.clone()))).await;
+        let client = Client::new(ClientConfig {
+            addr: Some(addr),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+        let got = client.query_old_unmined(1000).await.unwrap();
+        assert_same_set(&got, &full);
+        assert_eq!(
+            client.negotiated_version(),
+            3,
+            "hello must have negotiated v3"
+        );
+        client.close().await;
+    }
+
+    /// `query_conflicting` exists and pages to completion against a v3 server.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn query_conflicting_pages_to_completion_v3() {
+        let full = seq_txids(5);
+        let addr = spawn_paging_mock(Arc::new(PagingMock::new(3, 2, true, full.clone()))).await;
+        let client = Client::new(ClientConfig {
+            addr: Some(addr),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+        let got = client.query_conflicting().await.unwrap();
+        assert_same_set(&got, &full);
+        client.close().await;
+    }
+
+    /// Capability gate: against a server advertising protocol version 2 (which
+    /// ignores the cursor and returns page 1 forever), the client must NOT loop.
+    /// It makes a single bounded call and surfaces the truncation via
+    /// `ClientError::QueryTruncated` carrying the partial page.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn query_capability_gate_no_infinite_loop_v2() {
+        let full = seq_txids(7);
+        // version 2, honor_cursor = false: a faithful pre-FU#5 server.
+        let addr = spawn_paging_mock(Arc::new(PagingMock::new(2, 3, false, full))).await;
+        let client = Client::new(ClientConfig {
+            addr: Some(addr),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+        let res = tokio::time::timeout(Duration::from_secs(3), client.query_old_unmined(1000))
+            .await
+            .expect("must not loop forever against a pre-v3 server");
+        match res {
+            Err(ClientError::QueryTruncated { partial }) => {
+                assert_eq!(
+                    partial.len(),
+                    3,
+                    "one capped page must be surfaced as partial"
+                );
+            }
+            other => panic!("want ClientError::QueryTruncated, got {other:?}"),
+        }
+        assert_eq!(client.negotiated_version(), 2);
+        client.close().await;
     }
 }
