@@ -2085,33 +2085,50 @@ fn apply_op_journal_inner(
             // R-053: idempotency-by-generation. The pre-apply guard at
             // the top of `apply_op` already rejects strictly-stale ops under
             // wrapping generation ordering. For MarkLongestChain we also need
-            // to skip the equal-generation case: re-applying the same
-            // `MarkLongestChain` would otherwise bump generation again on the
-            // engine and write a stale `unmined_since`/DAH pair into the
-            // secondary indexes, even though the post-apply generation sync
-            // at the bottom of `apply_op` would immediately overwrite it back
-            // to `master_generation`. The visible effect would be a DAH index
-            // churn on every replay. Treating local at-or-ahead as a no-op
-            // makes the op fully idempotent on the replica.
-            if let Ok(meta) = engine.read_metadata(tx_key) {
-                let local_gen = { meta.generation };
-                if generation_at_or_ahead(local_gen, *master_generation) {
-                    return Ok(());
+            // to skip RE-APPLYING the mutation in the equal-generation case:
+            // re-running the same `MarkLongestChain` would otherwise bump
+            // generation again on the engine and write a stale
+            // `unmined_since`/DAH pair into the secondary indexes, even though
+            // the post-apply generation sync at the bottom of `apply_op` would
+            // immediately overwrite it back to `master_generation`. The visible
+            // effect would be a DAH index churn on every replay.
+            let already_at_or_ahead = engine
+                .read_metadata(tx_key)
+                .map(|meta| generation_at_or_ahead(meta.generation, *master_generation))
+                .unwrap_or(false);
+            if already_at_or_ahead {
+                // FU#6a Critical: skip re-applying the mutation (R-053 no-churn)
+                // but do NOT early-return. Falling through keeps the post-apply
+                // generation sync (idempotent — sets `master_generation` again)
+                // AND, critically, the deferred `build_post_apply_redo_op`
+                // collection at the bottom of `apply_op_journal_inner` running.
+                //
+                // A `Busy` resend of an equal-generation `MarkLongestChain` MUST
+                // re-journal the recovery-load-bearing `MarkOnLongestChain` redo
+                // entry that delivery 1 applied in RAM but DISCARDED on the Busy
+                // NAK (collect-then-atomic buffers nothing on `LogFull`). An
+                // arm-level `return Ok(())` here bypassed that redo collection:
+                // the resend would then ACK `Ok` and fsync the already-advanced
+                // generation-`G` metadata durable while journaling no
+                // `MarkOnLongestChain` entry — and the MinedIndex reader never
+                // consults the device footer, so a crash after that ACK loses the
+                // acked longest-chain transition (only the redo tail rebuilds it).
+                Ok(())
+            } else {
+                let req = crate::ops::mark_longest_chain::MarkOnLongestChainRequest {
+                    tx_key: *tx_key,
+                    on_longest_chain: *on_longest_chain,
+                    current_block_height: *current_block_height,
+                    block_height_retention: *block_height_retention,
+                };
+                match engine.mark_on_longest_chain(&req) {
+                    Ok(_) => Ok(()),
+                    Err(crate::ops::error::SpendError::TxNotFound) => {
+                        record_apply_skipped_missing_tx("mark_longest_chain", tx_key);
+                        Ok(())
+                    }
+                    Err(e) => Err(format!("mark_longest_chain: {e}")),
                 }
-            }
-            let req = crate::ops::mark_longest_chain::MarkOnLongestChainRequest {
-                tx_key: *tx_key,
-                on_longest_chain: *on_longest_chain,
-                current_block_height: *current_block_height,
-                block_height_retention: *block_height_retention,
-            };
-            match engine.mark_on_longest_chain(&req) {
-                Ok(_) => Ok(()),
-                Err(crate::ops::error::SpendError::TxNotFound) => {
-                    record_apply_skipped_missing_tx("mark_longest_chain", tx_key);
-                    Ok(())
-                }
-                Err(e) => Err(format!("mark_longest_chain: {e}")),
             }
         }
     }?;
@@ -6378,6 +6395,251 @@ mod tests {
         assert_eq!(
             creates, 3,
             "all three resent creates must be durable in the replica redo",
+        );
+    }
+
+    /// FU#6a Critical (silent acked-state loss): a `Busy`-NAK'd
+    /// `MarkLongestChain` whose delivery-1 mutation already advanced the
+    /// record's generation to `master_generation` (applied in RAM, not yet
+    /// fsynced) MUST still re-journal its `MarkOnLongestChain` redo entry on the
+    /// resend.
+    ///
+    /// Pre-fix the `MarkLongestChain` apply arm early-returned `Ok(())` on the
+    /// equal-generation idempotence check, which on the resend bypassed BOTH the
+    /// post-apply generation sync AND the redo collection at the bottom of
+    /// `apply_op_journal_inner`. The generation sync is an immediately-effective
+    /// per-op mutation but redo journaling is deferred and DISCARDED on a `Busy`:
+    ///   1. Delivery 1 (redo full): `local_gen < G` so the arm applies the
+    ///      mutation → generation syncs to `G` in RAM → the `MarkOnLongestChain`
+    ///      redo is collected → atomic admission returns `LogFull` → `Busy`.
+    ///      Nothing journaled, no data fsync, watermark unchanged.
+    ///   2. Resend (redo drained): `local_gen == G` → the equal-gen check fires.
+    ///      Pre-fix it early-returned, so NO redo was collected → admission `Ok`
+    ///      → `sync_all_store_devices` fsyncs delivery-1's generation-`G`
+    ///      metadata DURABLE → watermark advances → ACK `Ok`.
+    ///
+    /// The MinedIndex reader never consults the device footer and the redo tail
+    /// is the ONLY pass that reconstructs a longest-chain transition, so a
+    /// replica crash after that ACK would recover the record ON the longest
+    /// chain — silently losing an acked off-chain transition the master chose to
+    /// retain. The fix skips re-applying the mutation (R-053 no-churn) but falls
+    /// through so the redo entry is still collected on the resend.
+    #[test]
+    fn busy_resend_of_equal_gen_mark_longest_chain_still_journals_redo() {
+        use crate::redo::{RedoLog, RedoOp};
+        use std::sync::atomic::AtomicU64;
+
+        let dev: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let alloc = SlotAllocator::new(dev.clone()).unwrap();
+        let index = Index::new(10_000).unwrap();
+        let engine = Arc::new(Engine::new(
+            dev,
+            index,
+            alloc,
+            StripedLocks::new(1024),
+            DahIndex::new(),
+        ));
+        let log_dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(64 * 1024, 4096).unwrap());
+        let log_dev_reopen = log_dev.clone();
+        let log = Arc::new(parking_lot::Mutex::new(
+            RedoLog::open(log_dev, 0, 64 * 1024).unwrap(),
+        ));
+        engine.set_redo_logs(vec![log.clone()]);
+
+        // Seed a record at a known generation < G, on the longest chain.
+        let k = key(140);
+        create_record(&engine, k, 1);
+        let base_gen = { engine.read_metadata(&k).unwrap().generation };
+        let g = base_gen + 1;
+
+        // Build a single-op off-chain MarkLongestChain batch at generation G.
+        let mark_off = |first_sequence: u64| ReplicaBatch {
+            first_sequence,
+            ops: vec![ReplicaOp::MarkLongestChain {
+                tx_key: k,
+                on_longest_chain: false,
+                current_block_height: 800_000,
+                block_height_retention: 288,
+                master_generation: g,
+            }],
+            trace_ctx: None,
+            source_node_id: None,
+            cluster_key: 0,
+        };
+
+        // Fill the redo so the batch's atomic admission returns LogFull.
+        fill_redo_log_to_full(&log);
+
+        let tracker = ReplicaAppliedTracker::in_memory();
+        let stream_key = "peer-busy:5200";
+        tracker.set(stream_key, 9); // first_sequence=10 is next-expected
+        let last_applied = Arc::new(AtomicU64::new(0));
+
+        // Delivery 1: redo full → Busy. The mutation still applies in RAM
+        // (gen -> G, unmined_since set) but nothing is journaled, no data is
+        // fsynced, and the watermark does not advance.
+        let batch = mark_off(10);
+        let resp = handle_replica_batch_with_tracker(
+            &batch_request(&batch, 1),
+            &engine,
+            &last_applied,
+            Some(&tracker),
+            stream_key,
+            0,
+        );
+        assert_eq!(resp.status, STATUS_ERROR, "first delivery must NAK Busy");
+        assert_eq!(
+            ReplicaAck::deserialize(&resp.payload).unwrap(),
+            ReplicaAck::Busy { first_sequence: 10 },
+        );
+        assert_eq!(
+            tracker.get(stream_key),
+            9,
+            "Busy must not advance the watermark",
+        );
+
+        // Precondition for the hazard: delivery 1's mutation IS live in RAM even
+        // though NOTHING was journaled — the generation is now exactly G and the
+        // off-chain transition is applied.
+        let mid = engine.read_metadata(&k).unwrap();
+        assert_eq!(
+            { mid.generation },
+            g,
+            "delivery-1 mutation applied in RAM despite the Busy NAK (gen advanced to G)",
+        );
+        assert_eq!(
+            { mid.unmined_since },
+            800_000,
+            "delivery-1 off-chain mark applied in RAM despite the Busy NAK",
+        );
+
+        // Free the redo and resend the IDENTICAL batch. `local_gen == G` now, so
+        // the MarkLongestChain equal-generation skip fires.
+        log.lock().reset().expect("reset reclaims the region");
+        let resend = mark_off(10);
+        let resp2 = handle_replica_batch_with_tracker(
+            &batch_request(&resend, 2),
+            &engine,
+            &last_applied,
+            Some(&tracker),
+            stream_key,
+            0,
+        );
+        assert_eq!(
+            resp2.status, STATUS_OK,
+            "the resend must ACK once the redo has room",
+        );
+        assert_eq!(
+            ReplicaAck::deserialize(&resp2.payload).unwrap(),
+            ReplicaAck::Ok {
+                through_sequence: 10
+            },
+        );
+        assert_eq!(
+            tracker.get(stream_key),
+            10,
+            "the resend advances the watermark to the batch's last sequence",
+        );
+
+        // KEY ASSERTION (load-bearing): the resend MUST have journaled a
+        // MarkOnLongestChain redo entry for `k`. The generation-G metadata is now
+        // fsynced durable; if the redo tail has NO MarkOnLongestChain entry, a
+        // crash-recovery MinedIndex rebuild (redo-tail-only — the footer is never
+        // consulted) recovers the record ON the longest chain, silently losing
+        // the acked off-chain transition. Pre-fix this entry is ABSENT (the
+        // equal-gen early-return skipped redo collection).
+        let recovered = RedoLog::open(log_dev_reopen, 0, 64 * 1024)
+            .unwrap()
+            .recover()
+            .unwrap();
+        let mark_entries: Vec<_> = recovered
+            .iter()
+            .filter(|e| {
+                matches!(
+                    &e.op,
+                    RedoOp::MarkOnLongestChain { tx_key, on_longest_chain, .. }
+                        if *tx_key == k && !*on_longest_chain
+                )
+            })
+            .collect();
+        assert_eq!(
+            mark_entries.len(),
+            1,
+            "the Busy-resend of an equal-generation MarkLongestChain MUST re-journal \
+             its recovery-load-bearing MarkOnLongestChain redo entry; without it the \
+             durable generation advances past a transition no redo tail can rebuild",
+        );
+    }
+
+    /// R-053 (FU#6a fix): the equal-generation `MarkLongestChain` skip must NOT
+    /// re-run the underlying mutation. The Critical fix stops the arm from
+    /// early-returning (so the deferred redo is still collected) but keeps the
+    /// mutation itself skipped, preserving R-053's no-DAH/generation-churn
+    /// intent. Deterministic probe: stamp a sentinel `updated_at` that the real
+    /// `mark_on_longest_chain` would overwrite with `now_millis()` (a much
+    /// smaller value), apply an equal-generation `MarkLongestChain`, and assert
+    /// `updated_at` is unchanged — proof the mutation did not run. The idempotent
+    /// generation sync that DOES run on the skip path preserves `updated_at`.
+    #[test]
+    fn equal_generation_mark_longest_chain_skip_does_not_reapply_mutation() {
+        let engine = make_engine();
+        let k = key(141);
+        create_record(&engine, k, 1);
+
+        // Drive it off-chain at generation G once (the real mutation runs here).
+        let base_gen = { engine.read_metadata(&k).unwrap().generation };
+        let g = base_gen + 1;
+        apply_op(
+            &engine,
+            &ReplicaOp::MarkLongestChain {
+                tx_key: k,
+                on_longest_chain: false,
+                current_block_height: 800_000,
+                block_height_retention: 288,
+                master_generation: g,
+            },
+        )
+        .unwrap();
+
+        // Stamp a sentinel `updated_at` the mutation would overwrite with a
+        // (much smaller) `now_millis()`.
+        const SENTINEL: u64 = u64::MAX;
+        {
+            let entry = engine.lookup(&k).unwrap();
+            let mut meta = engine.read_metadata(&k).unwrap();
+            meta.updated_at = SENTINEL;
+            crate::io::write_metadata(engine.device(), entry.record_offset, &meta).unwrap();
+        }
+
+        // Equal-generation replay: the skip must NOT re-run mark_on_longest_chain.
+        apply_op(
+            &engine,
+            &ReplicaOp::MarkLongestChain {
+                tx_key: k,
+                on_longest_chain: false,
+                current_block_height: 800_000,
+                block_height_retention: 288,
+                master_generation: g,
+            },
+        )
+        .unwrap();
+
+        let post = engine.read_metadata(&k).unwrap();
+        assert_eq!(
+            { post.updated_at },
+            SENTINEL,
+            "equal-gen skip must NOT re-run mark_on_longest_chain (R-053 no-churn)",
+        );
+        assert_eq!(
+            { post.generation },
+            g,
+            "equal-gen skip must not bump the generation",
+        );
+        assert_eq!(
+            { post.unmined_since },
+            800_000,
+            "equal-gen skip must not churn unmined_since",
         );
     }
 
