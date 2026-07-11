@@ -8,7 +8,7 @@
 //! - Redo log entries are appended for crash recovery.
 //! - Replication ops are sent to replica nodes (if in cluster mode with RF > 1).
 
-use crate::cluster::coordinator::RunningCluster;
+use crate::cluster::coordinator::{MasterSnapshot, RunningCluster};
 use crate::cluster::shards::{NodeId, ShardHandoff, ShardTable};
 use crate::index::TxKey;
 use crate::ops::create::*;
@@ -4920,7 +4920,51 @@ fn check_shard_ownership(
 ) -> Option<BatchItemError> {
     let cluster = cluster?;
     let key = TxKey { txid: *txid };
-    match cluster.is_master(&key) {
+    let mastership = cluster.is_master(&key);
+    resolve_shard_ownership(cluster, &key, item_index, mastership, allow_if_migrating)
+}
+
+/// Batch-scoped variant of [`check_shard_ownership`] that resolves shard
+/// mastership from a per-batch [`MasterSnapshot`] (captured once via
+/// [`RunningCluster::master_snapshot`]) instead of re-acquiring the shard
+/// table + address locks for every item. Pass `snapshot = None` to fall back
+/// to the per-item [`RunningCluster::is_master`] lookup (a non-clustered node,
+/// where `cluster` is also `None`, or a caller that did not capture one).
+///
+/// Only the master-identity lookup is hoisted; the per-key migration gates
+/// (pending inbound, write-fence) and redirect routing in
+/// [`resolve_shard_ownership`] stay per item, so every item still gets its own
+/// correct redirect / migration / transition decision.
+fn check_shard_ownership_snap(
+    txid: &[u8; 32],
+    item_index: u32,
+    cluster: Option<&RunningCluster>,
+    snapshot: Option<&MasterSnapshot>,
+    allow_if_migrating: bool,
+) -> Option<BatchItemError> {
+    let cluster = cluster?;
+    let key = TxKey { txid: *txid };
+    let mastership = match snapshot {
+        Some(snap) => cluster.is_master_snapshot(snap, &key),
+        None => cluster.is_master(&key),
+    };
+    resolve_shard_ownership(cluster, &key, item_index, mastership, allow_if_migrating)
+}
+
+/// Resolve a shard-ownership decision from an already-computed
+/// [`MasterQueryResult`](crate::cluster::coordinator::MasterQueryResult),
+/// applying the per-key migration gates and building the redirect error.
+/// Shared by [`check_shard_ownership`] and [`check_shard_ownership_snap`] so
+/// the two entry points differ ONLY in how the master identity is looked up
+/// (per-item lock vs. batch snapshot) — the per-item gates below are identical.
+fn resolve_shard_ownership(
+    cluster: &RunningCluster,
+    key: &TxKey,
+    item_index: u32,
+    mastership: crate::cluster::coordinator::MasterQueryResult,
+    allow_if_migrating: bool,
+) -> Option<BatchItemError> {
+    match mastership {
         crate::cluster::coordinator::MasterQueryResult::Yes => {
             // If we're the new master but still waiting for inbound migration
             // data, reject mutations so clients retry after migration completes.
@@ -4929,8 +4973,8 @@ fn check_shard_ownership(
             // immediately (via the same path below when `allow_if_migrating`
             // is false), or is served locally during *outbound* migration
             // (the `MasterQueryResult::No` arm) where the data is still present.
-            if !allow_if_migrating && cluster.has_pending_inbound(&key) {
-                let shard = crate::cluster::shards::ShardTable::shard_for_key(&key);
+            if !allow_if_migrating && cluster.has_pending_inbound(key) {
+                let shard = crate::cluster::shards::ShardTable::shard_for_key(key);
                 tracing::debug!(
                     shard,
                     "dispatch: write rejected — pending inbound migration"
@@ -4940,8 +4984,8 @@ fn check_shard_ownership(
                     error_code: ERR_MIGRATION_IN_PROGRESS,
                     error_data: Vec::new(),
                 })
-            } else if !allow_if_migrating && cluster.is_shard_write_fenced(&key) {
-                let shard = crate::cluster::shards::ShardTable::shard_for_key(&key);
+            } else if !allow_if_migrating && cluster.is_shard_write_fenced(key) {
+                let shard = crate::cluster::shards::ShardTable::shard_for_key(key);
                 tracing::debug!(
                     shard,
                     "dispatch: write rejected — write-fenced (delta streaming)"
@@ -4973,7 +5017,7 @@ fn check_shard_ownership(
         crate::cluster::coordinator::MasterQueryResult::No => {
             // During outbound migration, reads can still be served locally
             // because the data hasn't been removed yet.
-            if allow_if_migrating && cluster.is_migrating_outbound(&key) {
+            if allow_if_migrating && cluster.is_migrating_outbound(key) {
                 return None;
             }
             // Determine the target node address for the redirect.
@@ -4990,7 +5034,7 @@ fn check_shard_ownership(
             // PartialError surfaced to the caller. That is a graceful
             // failure (no silent corruption); the legacy client just
             // does not benefit from version-based loop detection.
-            let route = cluster.route(&key);
+            let route = cluster.route(key);
             let error_data = match route {
                 crate::cluster::shards::RouteDecision::RedirectTo {
                     node,
@@ -5009,7 +5053,7 @@ fn check_shard_ownership(
                     // retries once membership converges, rather than chasing a
                     // blank target.
                     None => {
-                        let shard = crate::cluster::shards::ShardTable::shard_for_key(&key);
+                        let shard = crate::cluster::shards::ShardTable::shard_for_key(key);
                         tracing::debug!(
                             shard,
                             node = ?node,
@@ -5182,13 +5226,23 @@ fn handle_spend_batch(
     // redo flush (Phase 3) and the serial apply (Phase 4) still run afterwards
     // with all stripe locks held, so WAL-first ordering and per-txid atomicity
     // are unchanged.
+    // P1-3: hoist the shard-master lookup to ONE lock acquisition per batch —
+    // captured before the fan-out and shared (by shared ref) across the
+    // read-pool workers that validate groups concurrently.
+    let master_snap = cluster.map(|c| c.master_snapshot());
     let validate_group = |txid: &[u8; 32], group: &[(usize, &WireSpendItem)]| -> GroupOut {
         let mut out = GroupOut {
             errors: Vec::new(),
             redo_ops: Vec::new(),
             staged: None,
         };
-        if let Some(redirect_err) = check_shard_ownership(txid, group[0].0 as u32, cluster, false) {
+        if let Some(redirect_err) = check_shard_ownership_snap(
+            txid,
+            group[0].0 as u32,
+            cluster,
+            master_snap.as_ref(),
+            false,
+        ) {
             for &(i, _) in group {
                 out.errors.push(BatchItemError {
                     item_index: i as u32,
@@ -5646,8 +5700,12 @@ fn handle_unspend_batch(
     // slots so over-decrement on a re-played idempotent redo is
     // harmless because replay skips before touching metadata.
     let mut running_spent: std::collections::HashMap<TxKey, u32> = std::collections::HashMap::new();
+    // P1-3: hoist the shard-master lookup to ONE lock acquisition per batch.
+    let master_snap = cluster.map(|c| c.master_snapshot());
     for (i, item) in items.iter().enumerate() {
-        if let Some(redirect_err) = check_shard_ownership(&item.txid, i as u32, cluster, false) {
+        if let Some(redirect_err) =
+            check_shard_ownership_snap(&item.txid, i as u32, cluster, master_snap.as_ref(), false)
+        {
             errors.push(redirect_err);
             continue;
         }
@@ -5823,8 +5881,12 @@ fn handle_set_mined_batch(
         key: TxKey,
     }
     let mut valid_items: Vec<ValidSetMined> = Vec::new();
+    // P1-3: hoist the shard-master lookup to ONE lock acquisition per batch.
+    let master_snap = cluster.map(|c| c.master_snapshot());
     for (i, txid) in txids.iter().enumerate() {
-        if let Some(redirect_err) = check_shard_ownership(txid, i as u32, cluster, false) {
+        if let Some(redirect_err) =
+            check_shard_ownership_snap(txid, i as u32, cluster, master_snap.as_ref(), false)
+        {
             errors.push(redirect_err);
             continue;
         }
@@ -6448,8 +6510,12 @@ fn handle_create_batch(
         std::hash::BuildHasherDefault<crate::server::fast_hash::FastTxHasher>,
     > = std::collections::HashSet::default();
 
+    // P1-3: hoist the shard-master lookup to ONE lock acquisition per batch.
+    let master_snap = cluster.map(|c| c.master_snapshot());
     for (i, item) in items.iter().enumerate() {
-        if let Some(redirect_err) = check_shard_ownership(&item.txid, i as u32, cluster, false) {
+        if let Some(redirect_err) =
+            check_shard_ownership_snap(&item.txid, i as u32, cluster, master_snap.as_ref(), false)
+        {
             errors.push(redirect_err);
             continue;
         }
@@ -7257,8 +7323,12 @@ fn handle_freeze_batch(
         item: &'a WireSlotItem,
     }
     let mut valid_items: Vec<ValidFreeze> = Vec::new();
+    // P1-3: hoist the shard-master lookup to ONE lock acquisition per batch.
+    let master_snap = cluster.map(|c| c.master_snapshot());
     for (i, item) in items.iter().enumerate() {
-        if let Some(redirect_err) = check_shard_ownership(&item.txid, i as u32, cluster, false) {
+        if let Some(redirect_err) =
+            check_shard_ownership_snap(&item.txid, i as u32, cluster, master_snap.as_ref(), false)
+        {
             errors.push(redirect_err);
             continue;
         }
@@ -7379,8 +7449,12 @@ fn handle_unfreeze_batch(
         item: &'a WireSlotItem,
     }
     let mut valid_items: Vec<ValidUnfreeze> = Vec::new();
+    // P1-3: hoist the shard-master lookup to ONE lock acquisition per batch.
+    let master_snap = cluster.map(|c| c.master_snapshot());
     for (i, item) in items.iter().enumerate() {
-        if let Some(redirect_err) = check_shard_ownership(&item.txid, i as u32, cluster, false) {
+        if let Some(redirect_err) =
+            check_shard_ownership_snap(&item.txid, i as u32, cluster, master_snap.as_ref(), false)
+        {
             errors.push(redirect_err);
             continue;
         }
@@ -7500,8 +7574,12 @@ fn handle_reassign_batch(
         item: &'a WireReassignItem,
     }
     let mut valid_items: Vec<ValidReassign> = Vec::new();
+    // P1-3: hoist the shard-master lookup to ONE lock acquisition per batch.
+    let master_snap = cluster.map(|c| c.master_snapshot());
     for (i, item) in items.iter().enumerate() {
-        if let Some(redirect_err) = check_shard_ownership(&item.txid, i as u32, cluster, false) {
+        if let Some(redirect_err) =
+            check_shard_ownership_snap(&item.txid, i as u32, cluster, master_snap.as_ref(), false)
+        {
             errors.push(redirect_err);
             continue;
         }
@@ -7666,8 +7744,12 @@ fn handle_set_conflicting_batch(
         key: TxKey,
     }
     let mut valid_items: Vec<ValidSetConflicting> = Vec::new();
+    // P1-3: hoist the shard-master lookup to ONE lock acquisition per batch.
+    let master_snap = cluster.map(|c| c.master_snapshot());
     for (i, txid) in txids.iter().enumerate() {
-        if let Some(redirect_err) = check_shard_ownership(txid, i as u32, cluster, false) {
+        if let Some(redirect_err) =
+            check_shard_ownership_snap(txid, i as u32, cluster, master_snap.as_ref(), false)
+        {
             errors.push(redirect_err);
             continue;
         }
@@ -7803,8 +7885,12 @@ fn handle_remove_conflicting_child_batch(
         child: [u8; 32],
     }
     let mut valid_items: Vec<ValidRemove> = Vec::new();
+    // P1-3: hoist the shard-master lookup to ONE lock acquisition per batch.
+    let master_snap = cluster.map(|c| c.master_snapshot());
     for (i, (parent, child)) in pairs.iter().enumerate() {
-        if let Some(redirect_err) = check_shard_ownership(parent, i as u32, cluster, false) {
+        if let Some(redirect_err) =
+            check_shard_ownership_snap(parent, i as u32, cluster, master_snap.as_ref(), false)
+        {
             errors.push(redirect_err);
             continue;
         }
@@ -7915,8 +8001,12 @@ fn handle_set_locked_batch(
         key: TxKey,
     }
     let mut valid_items: Vec<ValidSetLocked> = Vec::new();
+    // P1-3: hoist the shard-master lookup to ONE lock acquisition per batch.
+    let master_snap = cluster.map(|c| c.master_snapshot());
     for (i, txid) in txids.iter().enumerate() {
-        if let Some(redirect_err) = check_shard_ownership(txid, i as u32, cluster, false) {
+        if let Some(redirect_err) =
+            check_shard_ownership_snap(txid, i as u32, cluster, master_snap.as_ref(), false)
+        {
             errors.push(redirect_err);
             continue;
         }
@@ -8045,8 +8135,12 @@ fn handle_preserve_until_batch(
         key: TxKey,
     }
     let mut valid_items: Vec<ValidPreserve> = Vec::new();
+    // P1-3: hoist the shard-master lookup to ONE lock acquisition per batch.
+    let master_snap = cluster.map(|c| c.master_snapshot());
     for (i, txid) in txids.iter().enumerate() {
-        if let Some(redirect_err) = check_shard_ownership(txid, i as u32, cluster, false) {
+        if let Some(redirect_err) =
+            check_shard_ownership_snap(txid, i as u32, cluster, master_snap.as_ref(), false)
+        {
             errors.push(redirect_err);
             continue;
         }
@@ -8191,8 +8285,13 @@ fn handle_delete_batch(
     //   2. mark every parent slot this child spent as PRUNED (UTXO correctness),
     //   3. remove the record locally (`engine.prune_delete`: RAM-index
     //      unregister + header zero via the write-back cache + region free).
+    // P1-3: hoist the shard-master lookup to ONE lock acquisition per batch,
+    // shared by both the per-child check below and the per-parent re-check.
+    let master_snap = cluster.map(|c| c.master_snapshot());
     'items: for (i, txid) in txids.iter().enumerate() {
-        if let Some(redirect_err) = check_shard_ownership(txid, i as u32, cluster, false) {
+        if let Some(redirect_err) =
+            check_shard_ownership_snap(txid, i as u32, cluster, master_snap.as_ref(), false)
+        {
             errors.push(redirect_err);
             continue;
         }
@@ -8255,7 +8354,13 @@ fn handle_delete_batch(
             }
         };
         for parent_txid in parent_txids {
-            if let Some(route_err) = check_shard_ownership(&parent_txid, i as u32, cluster, false) {
+            if let Some(route_err) = check_shard_ownership_snap(
+                &parent_txid,
+                i as u32,
+                cluster,
+                master_snap.as_ref(),
+                false,
+            ) {
                 errors.push(BatchItemError {
                     item_index: i as u32,
                     error_code: ERR_INVARIANT_VIOLATION,
@@ -8389,8 +8494,12 @@ fn handle_mark_longest_chain_batch(
         key: TxKey,
     }
     let mut valid_items: Vec<ValidMark> = Vec::new();
+    // P1-3: hoist the shard-master lookup to ONE lock acquisition per batch.
+    let master_snap = cluster.map(|c| c.master_snapshot());
     for (i, txid) in txids.iter().enumerate() {
-        if let Some(redirect_err) = check_shard_ownership(txid, i as u32, cluster, false) {
+        if let Some(redirect_err) =
+            check_shard_ownership_snap(txid, i as u32, cluster, master_snap.as_ref(), false)
+        {
             errors.push(redirect_err);
             continue;
         }
@@ -8579,6 +8688,11 @@ fn decorate_get_item(
     field_mask: FieldMask,
     local_read: bool,
     cluster: Option<&RunningCluster>,
+    // P1-3: batch-scoped shard-master snapshot captured once by the caller.
+    // The GET fan-out is the worst case for the per-item lock — every read-pool
+    // worker RMWs the same two reader-count cache lines. `None` falls back to
+    // the per-item `is_master` lookup (serial path / no snapshot captured).
+    master_snap: Option<&MasterSnapshot>,
 ) -> WireGetResult {
     let key = TxKey { txid: *txid };
 
@@ -8586,7 +8700,10 @@ fn decorate_get_item(
     // available locally (handles the migration window where shard tables
     // may be inconsistent across nodes).
     if !local_read && let Some(cluster) = cluster {
-        let mastership = cluster.is_master(&key);
+        let mastership = match master_snap {
+            Some(snap) => cluster.is_master_snapshot(snap, &key),
+            None => cluster.is_master(&key),
+        };
         let is_migrating_out = cluster.is_migrating_outbound(&key);
 
         // Distinguish three cases explicitly:
@@ -9044,23 +9161,50 @@ fn handle_get_batch(
 
     let local_read = req.flags & FLAG_LOCAL_READ != 0;
 
+    // P1-3: hoist the shard-master lookup to ONE lock acquisition for the whole
+    // GET batch. Skipped entirely for local reads (ownership is not consulted)
+    // and non-clustered nodes. The owned snapshot is `Sync`, so the fan-out
+    // workers share it by reference instead of each re-locking the shard table.
+    let master_snap = (!local_read)
+        .then(|| cluster.map(|c| c.master_snapshot()))
+        .flatten();
+
     let results: Vec<WireGetResult> = match (txids.len() >= READ_FANOUT_THRESHOLD)
         .then(read_pool)
         .flatten()
     {
         Some(pool) => {
             use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
+            let master_snap = master_snap.as_ref();
             pool.install(|| {
                 txids
                     .par_iter()
                     .with_min_len(FANOUT_MIN_LEN)
-                    .map(|txid| decorate_get_item(txid, engine, field_mask, local_read, cluster))
+                    .map(|txid| {
+                        decorate_get_item(
+                            txid,
+                            engine,
+                            field_mask,
+                            local_read,
+                            cluster,
+                            master_snap,
+                        )
+                    })
                     .collect()
             })
         }
         None => txids
             .iter()
-            .map(|txid| decorate_get_item(txid, engine, field_mask, local_read, cluster))
+            .map(|txid| {
+                decorate_get_item(
+                    txid,
+                    engine,
+                    field_mask,
+                    local_read,
+                    cluster,
+                    master_snap.as_ref(),
+                )
+            })
             .collect(),
     };
 
@@ -9266,8 +9410,12 @@ fn handle_preserve_transactions(
         key: TxKey,
     }
     let mut valid_items: Vec<ValidPreserveTx> = Vec::new();
+    // P1-3: hoist the shard-master lookup to ONE lock acquisition per batch.
+    let master_snap = cluster.map(|c| c.master_snapshot());
     for (i, txid) in txids.iter().enumerate() {
-        if let Some(redirect_err) = check_shard_ownership(txid, i as u32, cluster, false) {
+        if let Some(redirect_err) =
+            check_shard_ownership_snap(txid, i as u32, cluster, master_snap.as_ref(), false)
+        {
             errors.push(redirect_err);
             continue;
         }
@@ -9444,13 +9592,18 @@ fn handle_process_expired(
     // Bounded to `max_batch` per call (lowest-`preserve_until` first) so a
     // large catch-up backlog can't peg a core in one request; the pruner fires
     // on every persisted block, so the remainder drains on subsequent calls.
+    // P1-3: hoist the shard-master lookup to ONE lock acquisition per pruner
+    // pass, shared by both the preservation-expiry and DAH-due ownership loops.
+    let master_snap = cluster.map(|c| c.master_snapshot());
     if block_height_retention != 0 {
         let expired_candidates = engine
             .preserve_index()
             .range_query_limited(current_height, max_batch as usize);
         for key in &expired_candidates {
             // Ownership: only the master schedules expiry for its records.
-            if check_shard_ownership(&key.txid, 0, cluster, false).is_some() {
+            if check_shard_ownership_snap(&key.txid, 0, cluster, master_snap.as_ref(), false)
+                .is_some()
+            {
                 continue;
             }
             match engine.expire_preservation_set_dah(key, current_height, block_height_retention) {
@@ -9508,8 +9661,10 @@ fn handle_process_expired(
     let mut owned_due: Vec<[u8; 32]> = Vec::new();
     for key in &candidates {
         // Ownership: skip if not master or not yet ready to write
-        // (pending inbound migration / fenced).
-        if check_shard_ownership(&key.txid, 0, cluster, false).is_some() {
+        // (pending inbound migration / fenced). P1-3: reuse the per-pass
+        // master snapshot captured above.
+        if check_shard_ownership_snap(&key.txid, 0, cluster, master_snap.as_ref(), false).is_some()
+        {
             continue;
         }
         if engine.is_due_for_sweep(key, current_height) {
