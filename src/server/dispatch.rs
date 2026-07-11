@@ -4485,6 +4485,17 @@ pub fn send_replica_ops_to(
                 slot_guard.next_sequence = Some(last + 1);
                 return Err(format!("replica error: {message}"));
             }
+            ReplicaAck::Busy { first_sequence } => {
+                // FU#6a: retryable redo-backpressure NAK. Nothing was applied
+                // or journaled and the replica's watermark is unchanged, so the
+                // IDENTICAL labeled batch is correct to resend — do NOT burn or
+                // relabel. The full bounded-retry-with-backoff handling lives in
+                // the refactored send loop below; this fallback (treat an
+                // unexpected Busy as a terminal error, burning the positions)
+                // matches the Busy-exhaustion behavior.
+                slot_guard.next_sequence = Some(last + 1);
+                return Err(format!("replica redo busy at seq {first_sequence}"));
+            }
         }
     }
 

@@ -7409,9 +7409,9 @@ mod tests {
                     "error message must include diagnostic detail"
                 );
             }
-            ReplicaAck::Ok { .. } | ReplicaAck::Gap { .. } => {
+            ReplicaAck::Ok { .. } | ReplicaAck::Gap { .. } | ReplicaAck::Busy { .. } => {
                 panic!(
-                    "R-035: replica must NOT ACK Ok (or NAK Gap) when an on-device \
+                    "R-035: replica must NOT ACK Ok (or NAK Gap/Busy) when an on-device \
                      metadata write failed"
                 )
             }

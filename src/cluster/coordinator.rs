@@ -6155,6 +6155,14 @@ fn stream_shard_baseline(
                          (expected {expected_sequence}, sent {received_first_sequence})"
                     ));
                 }
+                Ok(ReplicaAck::Busy { first_sequence }) => {
+                    // FU#6a: the receiver's redo was momentarily full, so
+                    // nothing was applied or journaled — the whole migration
+                    // batch is safe to retry (no partial state to reconcile).
+                    return Err(format!(
+                        "migration batch: replica redo busy (backpressure) at seq {first_sequence}"
+                    ));
+                }
                 Err(e) => {
                     return Err(format!("migration batch: failed to parse replica ack: {e}"));
                 }
@@ -7143,6 +7151,13 @@ fn send_delta_ops(
                 return Err(format!(
                     "delta batch: unexpected sequence-gap NAK \
                      (expected {expected_sequence}, sent {received_first_sequence})"
+                ));
+            }
+            Ok(ReplicaAck::Busy { first_sequence }) => {
+                // FU#6a: the receiver's redo was momentarily full; nothing was
+                // applied or journaled, so the whole delta batch is retryable.
+                return Err(format!(
+                    "delta batch: replica redo busy (backpressure) at seq {first_sequence}"
                 ));
             }
             Err(e) => {
