@@ -8311,6 +8311,33 @@ impl Engine {
         self.update_preserve_index(key, preserve, 0)?;
         if new_dah != 0 {
             self.update_dah_index(key, 0, new_dah)?;
+        } else {
+            // FU#7 Option B superset-invariant fix: an INELIGIBLE expiry emits no
+            // DAH transition, so — unlike the eligible branch's
+            // `SecondaryDahUpdate` above — nothing otherwise keys this record into
+            // the redo tail. Journal a `PreserveUntil` CLEAR keyed to this record
+            // so recovery's `touched_keys` includes it and a fast-boot Touched
+            // reconcile device-reads the footer (now `preserve_until == 0`),
+            // overriding the stale `MINED_PRESERVED` a v3 snapshot restored.
+            // Without this, an all-spent/unmined (or reorg-unmined / REASSIGNED)
+            // expired record keeps a stale-SET PRESERVED bit on a Touched boot; a
+            // later setMined then early-returns on `has_preserve` and never plants
+            // a DAH — an immortal, never-swept record (#25 class). Replaying
+            // `PreserveUntil { block_height: 0 }` is a no-op skip against the
+            // already-cleared footer (idempotent) and never re-inserts a DAH or a
+            // preserve entry. Journaled through `journal_secondary_ops` so it
+            // honors strict-vs-buffered durability and LogFull-no-poison, exactly
+            // like the eligible branch's intent; a no-op when no redo log is
+            // attached (test / unconfigured paths), matching `update_dah_index`.
+            if let Some(log) = self.redo_log_for_key(key) {
+                self.journal_secondary_ops(
+                    &log,
+                    &[crate::redo::RedoOp::PreserveUntil {
+                        tx_key: *key,
+                        block_height: 0,
+                    }],
+                )?;
+            }
         }
 
         Ok(true)
@@ -13512,6 +13539,186 @@ mod tests {
             Some(500),
             "Touched(empty) must NOT clear the DAH — an untouched orphan is preserved, \
              which is exactly why the fast path is gated behind the default-off flag",
+        );
+    }
+
+    /// FU#7 Option B — Important durability fix (adversarial review): the
+    /// NON-ELIGIBLE branch of `expire_preservation_set_dah` (a due preservation
+    /// whose record is all-spent+unmined / reorg-unmined / REASSIGNED, so NO DAH
+    /// is scheduled) previously emitted no redo op keyed to the record. It thus
+    /// stayed OUT of recovery's `touched_keys`, so a fast-boot Touched reconcile
+    /// restored its DE-flag cache from the PRE-expiry v3 snapshot (stale
+    /// `MINED_PRESERVED` SET) and never device-reconciled it. A later setMined
+    /// then read the stale PRESERVED, `evaluate_dah_from_ram` early-returned, and
+    /// NO DAH was ever planted for an all-spent, mined, on-chain record — an
+    /// immortal, never-swept record (#25 class the eligibility gate exists to
+    /// avoid). The eligible branch is safe only because its `SecondaryDahUpdate`
+    /// already keys the record into the tail.
+    ///
+    /// The fix journals a `PreserveUntil { block_height: 0 }` clear keyed to the
+    /// record. This test drives the whole chain: build a non-eligible preserved
+    /// record, "checkpoint" (v3 snapshot captures PRESERVED) at a redo fence,
+    /// expire (non-eligible), then simulate the Touched boot — restore the stale
+    /// snapshot + reconcile ONLY the post-checkpoint touched tail — and assert
+    /// (1) the key is in the touched set, (2) its PRESERVED bit is
+    /// device-reconciled away, and (3) a later setMined plants a DAH (not
+    /// immortal). Before the fix the touched set omits the key, PRESERVED
+    /// survives, and no DAH is planted.
+    #[test]
+    fn nonelig_preserve_expiry_journals_key_so_touched_boot_reconciles_de_flags() {
+        use crate::index::mined_index::MINED_PRESERVED;
+        use crate::redo::{RedoLog, RedoOp};
+
+        let engine = create_engine();
+
+        // Attach a redo log so the engine journals (production always does; the
+        // fix's journal is a no-op without one, exactly like the eligible
+        // branch's `update_dah_index`).
+        let log_dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
+        let redo = Arc::new(parking_lot::Mutex::new(
+            RedoLog::open(log_dev.clone(), 0, 1024 * 1024).unwrap(),
+        ));
+        engine.set_redo_logs(vec![redo.clone()]);
+
+        // A 1-UTXO record spent to ALL-SPENT while UNMINED (no blocks), then
+        // preserved. all-spent + no-blocks ⇒ `sweep_eligible_with_mined` is
+        // false ⇒ the NON-ELIGIBLE expiry branch (`new_dah == 0`).
+        let (_h, req) = make_create_req(0xE7, 1);
+        let key = req.tx_key();
+        engine.create(&req).expect("create");
+        engine
+            .spend(&SpendRequest {
+                tx_key: key,
+                offset: 0,
+                utxo_hash: [0u8; 32], // make_create_req: utxo 0's hash is all-zero
+                spending_data: [0xAB; 36],
+                ignore_conflicting: false,
+                ignore_locked: false,
+                current_block_height: 900,
+                block_height_retention: 288,
+            })
+            .expect("spend to all-spent");
+        engine
+            .preserve_until(&PreserveUntilRequest {
+                tx_key: key,
+                block_height: 1000,
+            })
+            .expect("preserve");
+
+        let slot0 = engine.lookup(&key).unwrap().mined_slot;
+        assert!(
+            engine.mined_index().read_de_flags(&key, slot0).unwrap() & MINED_PRESERVED != 0,
+            "precondition: preserve set the PRESERVED DE bit",
+        );
+
+        // "Checkpoint": capture the v3 snapshot NOW (PRESERVED still set) and the
+        // fence = current redo max sequence. The expiry below lands STRICTLY
+        // above this fence, so it forms the post-checkpoint redo tail.
+        engine.flush_all_redo().unwrap();
+        let fence = redo
+            .lock()
+            .recover()
+            .unwrap()
+            .iter()
+            .map(|e| e.sequence)
+            .max()
+            .unwrap_or(0);
+        let mut snap_buf = Vec::new();
+        engine
+            .mined_index()
+            .serialize_by_key(fence, &[(key, slot0)], &mut snap_buf);
+        assert_eq!(snap_buf[0], 3, "checkpoint writes a v3 snapshot");
+        let (_f, snap_entries) =
+            crate::index::mined_index::ShardedMinedIndex::deserialize_by_key(&snap_buf)
+                .expect("v3 snapshot decodes");
+
+        // Expire the due, NON-ELIGIBLE preservation.
+        let expired = engine
+            .expire_preservation_set_dah(&key, 2000, 288)
+            .expect("expire");
+        assert!(expired, "the due preservation must be expired");
+        let post_meta = engine.read_metadata(&key).unwrap();
+        assert_eq!(
+            { post_meta.preserve_until },
+            0,
+            "expiry cleared preserve_until on the device footer",
+        );
+        assert_eq!(
+            { post_meta.delete_at_height },
+            0,
+            "NON-ELIGIBLE expiry plants no DAH",
+        );
+
+        // Build the post-checkpoint touched set exactly as recovery does: the
+        // union of keys over redo entries with sequence > fence.
+        engine.flush_all_redo().unwrap();
+        let mut touched: std::collections::HashSet<TxKey> = std::collections::HashSet::new();
+        for e in redo.lock().recover().unwrap() {
+            if e.sequence <= fence {
+                continue;
+            }
+            if let RedoOp::SetMinedBatch { txids, .. } = &e.op {
+                touched.extend(txids.iter().copied());
+            } else if let Some(k) = e.op.tx_key() {
+                touched.insert(*k);
+            }
+        }
+        // (1) THE fix: the non-eligible expiry keyed the record into the tail.
+        assert!(
+            touched.contains(&key),
+            "non-eligible preserve-expiry must journal a redo op keyed to the record so \
+             recovery's touched_keys includes it (else the fast-boot Touched reconcile \
+             never device-reconciles its stale PRESERVED DE bit)",
+        );
+
+        // Simulate the Touched-scope boot: restore the STALE v3 snapshot
+        // (PRESERVED set) into a fresh mined index, then reconcile ONLY the
+        // post-checkpoint touched tail.
+        engine
+            .restore_mined_index_from_snapshot_entries(&snap_entries)
+            .expect("restore v3 snapshot");
+        let slot1 = engine.lookup(&key).unwrap().mined_slot;
+        assert!(
+            engine.mined_index().read_de_flags(&key, slot1).unwrap() & MINED_PRESERVED != 0,
+            "precondition: the v3 snapshot restored the STALE PRESERVED bit",
+        );
+        engine
+            .reconcile_secondaries_scoped(DahReconcileScope::Touched(&touched), 2000, 288)
+            .expect("touched reconcile");
+
+        // (2) The touched reconcile device-read the footer (preserve_until == 0)
+        // and cleared the stale PRESERVED.
+        assert_eq!(
+            engine.mined_index().read_de_flags(&key, slot1).unwrap() & MINED_PRESERVED,
+            0,
+            "the Touched reconcile must clear the stale PRESERVED bit for the (now-touched) \
+             expired record, matching its device footer",
+        );
+
+        // (3) Downstream: the record is NOT immortal — a later setMined plants a
+        // DAH (with a stale PRESERVED, `evaluate_dah_from_ram` early-returns and
+        // never plants one).
+        assert!(
+            engine.dah_index().get_height(&key).is_none(),
+            "precondition: no DAH before the mine",
+        );
+        engine
+            .set_mined(&SetMinedRequest {
+                tx_key: key,
+                block_id: 77,
+                block_height: 1500,
+                subtree_idx: 0,
+                current_block_height: 2000,
+                block_height_retention: 288,
+                on_longest_chain: true,
+                unset_mined: false,
+            })
+            .expect("set_mined");
+        assert_eq!(
+            engine.dah_index().get_height(&key),
+            Some(2000 + 288),
+            "an all-spent, mined, on-chain, no-longer-preserved record MUST get a DAH \
+             scheduled (not an immortal, never-swept record)",
         );
     }
 
