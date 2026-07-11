@@ -506,6 +506,26 @@ pub struct IndexConfig {
     /// much greater than the number of concurrent writers for good read
     /// isolation; write-lock collision probability ≈ writers / N.
     pub index_shards: usize,
+
+    /// FU#7 Option B: make a clean-secondary boot's DE/LSA-cache reseed + DAH
+    /// rebuild O(redo) instead of O(store). Default `false`.
+    ///
+    /// When `true` AND the boot is eligible — the `redb` backend loaded BOTH
+    /// secondaries cleanly (`dah_ok`) AND the `.mined` checkpoint snapshot is
+    /// v3 (persists the DE/LSA cache) — recovery restores every untouched
+    /// record's DE/LSA cache straight from the snapshot (RAM, no device read)
+    /// and reconciles ONLY the redo-touched keys against the device. On any
+    /// ineligible boot (non-redb backend, an unclean secondary, or a first-boot
+    /// v2 snapshot) it silently falls back to the full whole-store rebuild —
+    /// which the next checkpoint makes eligible by writing a v3 snapshot.
+    ///
+    /// Default OFF because the full pass ALSO self-heals any DE/DAH drift for
+    /// the WHOLE store on every boot (it device-reads every record), whereas
+    /// the fast path only device-reads the redo-touched set and trusts the
+    /// persisted snapshot for the rest. The v3 snapshot FORMAT is written
+    /// unconditionally (additive durable data), so enabling this later needs no
+    /// migration — the next checkpoint already produced an eligible snapshot.
+    pub fast_boot_touched_secondaries: bool,
 }
 
 impl Default for IndexConfig {
@@ -517,6 +537,7 @@ impl Default for IndexConfig {
             redb_cache_size: 256 * 1024 * 1024, // 256 MiB
             file_backed_path: PathBuf::from("teraslab-index.dat"),
             index_shards: 256,
+            fast_boot_touched_secondaries: false,
         }
     }
 }

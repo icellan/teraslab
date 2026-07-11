@@ -49,6 +49,7 @@ fn build_engine_for_backend(mode: &IndexBackendMode, dir: &TempDir) -> Arc<Engin
         redb_cache_size: 16 * 1024 * 1024,
         file_backed_path: dir.path().join("primary.index"),
         index_shards: 16,
+        fast_boot_touched_secondaries: false,
     };
 
     let (primary, dah): (PrimaryBackend, DahBackend) = match mode {

@@ -364,6 +364,15 @@ pub struct Engine {
     /// Prometheus counter `teraslab_index_enumeration_unreadable_total`.
     /// Monotonic for the lifetime of the engine.
     enumeration_unreadable: std::sync::atomic::AtomicU64,
+    /// FU#7 Option B: `true` iff the last [`Self::recover_mined_index`] restored
+    /// from a v3 `.mined` checkpoint snapshot (one that persisted every entry's
+    /// DE/LSA cache). `false` after a fresh boot (no snapshot) OR a legacy v2
+    /// snapshot (first boot after upgrade). The server boot path reads it via
+    /// [`Self::mined_snapshot_restored_v3`] to decide whether the O(redo)
+    /// Touched-scope reconcile is eligible this boot. Purely advisory: the v3
+    /// FORMAT is always written, and an ineligible boot just does the full
+    /// whole-store rebuild.
+    mined_snapshot_restored_v3: std::sync::atomic::AtomicBool,
     /// Test-only fault injector: when set to `true`, the next call to
     /// [`Self::register_with_shard_count`] returns an error WITHOUT
     /// performing the backend `register` or incrementing `shard_counts`.
@@ -410,6 +419,32 @@ pub struct Engine {
 // `Send + Sync`.
 unsafe impl Send for Engine {}
 unsafe impl Sync for Engine {}
+
+/// Scope for [`Engine::reconcile_secondaries_scoped`] — the boot-time DE/LSA
+/// cache reseed + DAH secondary rebuild (FU#7 Option B).
+///
+/// Both variants run the IDENTICAL per-record logic
+/// ([`Engine::reconcile_one_record_secondary`]); they differ only in WHICH
+/// records they visit and whether the durable DAH is cleared first.
+#[derive(Debug, Clone, Copy)]
+pub enum DahReconcileScope<'a> {
+    /// Whole-store self-healing rebuild (the pre-FU#7 behavior, and still the
+    /// default). CLEARS the DAH secondary, then iterates EVERY live primary
+    /// record, device-reads each footer, reseeds its DE/LSA cache from the
+    /// device, and re-derives its DAH. O(store). Used when the fast path is
+    /// ineligible (flag off, non-redb backend, an unclean secondary, or a v2
+    /// `.mined` snapshot that did not persist the DE cache).
+    Full,
+    /// O(redo) fast path. Does NOT clear the durable (redb) DAH — it is already
+    /// crash-consistent from its clean load. The DE/LSA cache for records
+    /// OUTSIDE `touched` was already restored from the v3 `.mined` snapshot
+    /// (see [`Engine::restore_mined_index_from_snapshot_entries`]); this
+    /// reconciles ONLY the redo-touched keys against the device (the footer
+    /// read WINS for a touched record — the soundness invariant). A touched key
+    /// whose primary record is gone (deleted post-checkpoint) has its stale DAH
+    /// entry removed. Eligible iff `redb && dah_ok && snapshot_was_v3 && flag`.
+    Touched(&'a std::collections::HashSet<TxKey>),
+}
 
 impl Engine {
     fn external_ref_for_create(req: &CreateRequest) -> Result<Option<ExternalRef>, CreateError> {
@@ -579,6 +614,7 @@ impl Engine {
             cached_millis: std::sync::atomic::AtomicU64::new(sys_millis()),
             conflicting_children_dropped: std::sync::atomic::AtomicU64::new(0),
             enumeration_unreadable: std::sync::atomic::AtomicU64::new(0),
+            mined_snapshot_restored_v3: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             fail_next_register: std::sync::atomic::AtomicBool::new(false),
             lifecycle_pinned: std::sync::atomic::AtomicBool::new(false),
@@ -6858,6 +6894,19 @@ impl Engine {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// FU#7 Option B: whether the last [`Self::recover_mined_index`] restored
+    /// from a v3 `.mined` checkpoint snapshot (which persists every entry's
+    /// DE/LSA cache), enabling the O(redo) Touched-scope secondary reconcile.
+    ///
+    /// `false` after a fresh boot (no snapshot) or a legacy v2 snapshot (first
+    /// boot after upgrade) — the boot path then does the full whole-store
+    /// rebuild, and the next checkpoint writes a v3 snapshot. Read by
+    /// `bin/server.rs` between `recover_mined_index` and the DAH reconcile.
+    pub fn mined_snapshot_restored_v3(&self) -> bool {
+        self.mined_snapshot_restored_v3
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     // -----------------------------------------------------------------------
     // F-X-022 — Deleted children list (the reference UDF `addDeletedChildren` parity)
     //
@@ -8894,6 +8943,18 @@ impl Engine {
             if e.all_spent {
                 self.mined_index.set_all_spent(&key, slot, true);
             }
+            // FU#7 Option B: restore the persisted DE/LSA cache from a v3
+            // snapshot (composes over the ALL_SPENT/HAS_OVERFLOW bits
+            // apply_set_mined/set_all_spent just set — restore_de_flags only
+            // rewrites the MINED_DE_FLAG_MASK group). A v2 snapshot entry
+            // (de_flags == None) is left untouched here: the boot path detects
+            // the v2 snapshot (any None) and runs the whole-store device reseed
+            // (Full mode), which reseeds every record's DE/LSA from the device.
+            // So a None entry is NEVER left with a zeroed cache — the fresh
+            // slot's `flags: 0` is overwritten by the Full-mode device pass.
+            if let Some(de) = e.de_flags {
+                self.mined_index.restore_de_flags(&key, slot, de);
+            }
             let new_entry = TxIndexEntry {
                 device_id: existing.device_id,
                 record_offset: existing.record_offset,
@@ -9383,6 +9444,10 @@ impl Engine {
                          reconstructing the MinedIndex via full redo-tail replay from genesis \
                          (fresh boot or a graceful shutdown that wrote no .mined snapshot)",
                     );
+                    // No snapshot restored → not a v3 restore → the Touched-scope
+                    // fast boot is ineligible (there is no persisted DE cache).
+                    self.mined_snapshot_restored_v3
+                        .store(false, std::sync::atomic::Ordering::Relaxed);
                     self.mined_index.clear();
                     self.replay_mined_index_redo_tail(redo_logs)?;
                     return Ok(false);
@@ -9405,6 +9470,13 @@ impl Engine {
                 });
             }
         };
+        // FU#7 Option B: record whether this is a v3 snapshot (persists the
+        // DE/LSA cache) BEFORE decode — the version byte is `bytes[0]`. A v3
+        // snapshot makes the O(redo) Touched-scope reconcile eligible; a v2
+        // snapshot (first boot after upgrade) forces the full rebuild once.
+        // Store the decision only on the SUCCESS path (after decode + fence
+        // checks pass), so a FATAL abort leaves the flag at its default.
+        let snapshot_was_v3 = bytes.first() == Some(&3);
         let decoded = crate::index::mined_index::ShardedMinedIndex::deserialize_by_key(&bytes);
         let (snapshot_fence, entries) = match decoded {
             Ok(v) => v,
@@ -9502,9 +9574,15 @@ impl Engine {
         // snapshot-restored slot via the same in-tail dedup a
         // create-then-recreate cycle already uses, instead of orphaning it.
         self.replay_mined_index_redo_tail_above(redo_logs, snapshot_fence, restored_slots)?;
+        // FU#7 Option B: the restore succeeded — publish the v3-ness so the boot
+        // path can pick Touched vs Full scope. A v2 snapshot restores its
+        // block-state normally but carries no DE cache, so it is NOT v3-eligible.
+        self.mined_snapshot_restored_v3
+            .store(snapshot_was_v3, std::sync::atomic::Ordering::Relaxed);
         tracing::info!(
             entries = entries.len(),
             fence = snapshot_fence,
+            snapshot_was_v3,
             "mined-index recovery: restored from checkpoint snapshot + redo-tail replay",
         );
         Ok(true)
@@ -9564,180 +9642,282 @@ impl Engine {
         current_block_height: u32,
         block_height_retention: u32,
     ) -> Result<(), SpendError> {
-        self.dah_index
-            .clear()
-            .map_err(|e| SpendError::StorageError {
-                detail: format!("mined-index reconcile: clearing DAH index failed: {e}"),
-            })?;
+        self.reconcile_secondaries_scoped(
+            DahReconcileScope::Full,
+            current_block_height,
+            block_height_retention,
+        )
+    }
 
-        // P1-2: iterate ONE INDEX SHARD AT A TIME so peak memory is bounded to a
-        // single shard's locators, not the whole store — the old whole-store
-        // `Vec::with_capacity(self.index.len())` was an OOM/boot hazard at the
-        // multi-billion-record design point (~tens of GiB on top of the index).
-        // Each shard's locators are collected under that shard's read lock, which
-        // is RELEASED before the batch's per-record device + MinedIndex reads and
-        // secondary-index writes (so no secondary lock nests under the primary).
-        //
-        // The enumeration KEY is deliberately NOT captured: on the default
-        // `Memory`/`FileBacked` backend the iterator yields the stored 12-byte
-        // txid prefix zero-padded to 32 bytes (see `hashtable::STORED_TXID_LEN`
-        // / `Bucket::stored_key`), NOT the record's true txid. Using it would
-        // fail the footer tx_id check for any realistic SHA256 txid (nonzero
-        // beyond byte 12) and mis-shard every MinedIndex read (`shard_for`
-        // routes on `txid[16..24]`, zeroed by truncation). The authoritative
-        // full txid is resolved from each record's device footer below.
-        self.index.try_for_each_shard(
-            |_key, entry| (entry.device_id, entry.record_offset, entry.mined_slot),
-            |locators: Vec<(u8, u64, u32)>| -> Result<(), SpendError> {
-                for (device_id, record_offset, mined_slot) in locators {
-            // Read the footer ONCE and derive the AUTHORITATIVE full txid from
-            // it (`meta.tx_id`). A single unreadable footer (torn / relocated
-            // mid-scan) must SKIP this record, never brick the boot — same warn
-            // + `enumeration_unreadable` metric as `resolve_full_keys`. This
-            // replaces the old truncated-key `read_metadata_for_key`: the key is
-            // now derived FROM the footer, so its `meta.tx_id != key.txid`
-            // identity check is redundant (see debug_assert below).
-            let meta = match self.read_metadata_fast(device_id, record_offset) {
-                Ok(m) => m,
-                Err(e) => {
+    /// Boot-time DE/LSA cache reseed + DAH secondary rebuild, over the chosen
+    /// [`DahReconcileScope`] (FU#7 Option B).
+    ///
+    /// [`DahReconcileScope::Full`] is the unchanged whole-store self-heal
+    /// (clear the DAH, iterate every primary record, device-read each footer).
+    /// [`DahReconcileScope::Touched`] is the O(redo) fast path: the DE/LSA cache
+    /// for untouched records was already restored from the v3 `.mined` snapshot
+    /// ([`Self::restore_mined_index_from_snapshot_entries`]) and the durable
+    /// redb DAH is crash-consistent from its clean load, so only the
+    /// redo-touched keys need a device footer read.
+    ///
+    /// # Soundness invariant (do NOT weaken)
+    ///
+    /// Every op that mutates a record's DE-flags/LSA already emits a redo entry
+    /// keyed by that record, so `touched` is a guaranteed SUPERSET of every
+    /// record changed after the checkpoint. Therefore for a TOUCHED record the
+    /// device footer read WINS (overrides the snapshot-restored value), and for
+    /// an untouched record the persisted snapshot value is current and is left
+    /// as restored — WITHOUT a device read. This is the identical mechanism
+    /// already used for the `all_spent` bit (persisted in v2, restored without a
+    /// device read).
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::reconcile_secondaries_from_mined_index`]: a per-record
+    /// footer read failure or dangling `mined_slot` is skipped, never fatal; a
+    /// DAH clear/insert/remove failure or a DAH-height overflow is returned.
+    pub fn reconcile_secondaries_scoped(
+        &self,
+        scope: DahReconcileScope<'_>,
+        current_block_height: u32,
+        block_height_retention: u32,
+    ) -> Result<(), SpendError> {
+        match scope {
+            DahReconcileScope::Full => {
+                self.dah_index
+                    .clear()
+                    .map_err(|e| SpendError::StorageError {
+                        detail: format!("mined-index reconcile: clearing DAH index failed: {e}"),
+                    })?;
+
+                // P1-2: iterate ONE INDEX SHARD AT A TIME so peak memory is
+                // bounded to a single shard's locators, not the whole store —
+                // the old whole-store `Vec::with_capacity(self.index.len())` was
+                // an OOM/boot hazard at the multi-billion-record design point
+                // (~tens of GiB on top of the index). Each shard's locators are
+                // collected under that shard's read lock, which is RELEASED
+                // before the batch's per-record device + MinedIndex reads and
+                // secondary-index writes (so no secondary lock nests under the
+                // primary).
+                //
+                // The enumeration KEY is deliberately NOT captured: on the
+                // default `Memory`/`FileBacked` backend the iterator yields the
+                // stored 12-byte txid prefix zero-padded to 32 bytes (see
+                // `hashtable::STORED_TXID_LEN` / `Bucket::stored_key`), NOT the
+                // record's true txid. The authoritative full txid is resolved
+                // from each record's device footer inside the helper.
+                self.index.try_for_each_shard(
+                    |_key, entry| (entry.device_id, entry.record_offset, entry.mined_slot),
+                    |locators: Vec<(u8, u64, u32)>| -> Result<(), SpendError> {
+                        for (device_id, record_offset, mined_slot) in locators {
+                            // Full mode CLEARED the DAH, so an ineligible record
+                            // is simply not re-inserted — never removed.
+                            self.reconcile_one_record_secondary(
+                                device_id,
+                                record_offset,
+                                mined_slot,
+                                current_block_height,
+                                block_height_retention,
+                                false,
+                            )?;
+                        }
+                        Ok(())
+                    },
+                )
+            }
+            DahReconcileScope::Touched(touched) => {
+                // Do NOT clear the DAH: the durable redb DAH is crash-consistent
+                // from its clean load; only the redo-touched keys can be stale.
+                for key in touched {
+                    match self.index.lookup(key) {
+                        Some(entry) => {
+                            // Touched mode does not clear, so a now-ineligible
+                            // touched record must have any stale DAH entry
+                            // REMOVED (remove_stale = true).
+                            self.reconcile_one_record_secondary(
+                                entry.device_id,
+                                entry.record_offset,
+                                entry.mined_slot,
+                                current_block_height,
+                                block_height_retention,
+                                true,
+                            )?;
+                        }
+                        None => {
+                            // A touched key whose primary record is GONE (deleted
+                            // after the checkpoint): drop any stale durable DAH
+                            // entry the pre-crash redb commit may still hold.
+                            self.dah_index.remove(key, None).map_err(|e| {
+                                SpendError::StorageError {
+                                    detail: format!(
+                                        "mined-index reconcile (touched): DAH remove of \
+                                         deleted record failed: {e}"
+                                    ),
+                                }
+                            })?;
+                        }
+                    }
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Reconcile ONE record's DE/LSA cache + DAH secondary from its device
+    /// footer. Shared VERBATIM by [`DahReconcileScope::Full`] and
+    /// [`DahReconcileScope::Touched`] so the two paths can never produce a
+    /// divergent DE cache or DAH (FU#7 Option B guards this with a byte-for-byte
+    /// Full-vs-Touched parity test).
+    ///
+    /// `remove_stale`: Full mode CLEARED the DAH first, so an ineligible record
+    /// is simply not re-inserted (`false`). Touched mode does NOT clear the
+    /// durable redb DAH, so an ineligible touched record must have any stale
+    /// entry REMOVED (`true`).
+    ///
+    /// A footer read failure or a dangling `mined_slot` SKIPS the record (warn +
+    /// [`Self::enumeration_unreadable`] bump), never fatal — identical to the
+    /// pre-FU#7 whole-store loop.
+    ///
+    /// # Errors
+    ///
+    /// [`SpendError::StorageError`] on a DAH insert/remove failure, or
+    /// [`SpendError::DahOverflow`] if `current_block_height +
+    /// block_height_retention` overflows `u32`.
+    fn reconcile_one_record_secondary(
+        &self,
+        device_id: u8,
+        record_offset: u64,
+        mined_slot: u32,
+        current_block_height: u32,
+        block_height_retention: u32,
+        remove_stale: bool,
+    ) -> Result<(), SpendError> {
+        // Read the footer ONCE and derive the AUTHORITATIVE full txid from it
+        // (`meta.tx_id`). A single unreadable footer (torn / relocated mid-scan)
+        // must SKIP this record, never brick the boot — same warn +
+        // `enumeration_unreadable` metric as `resolve_full_keys`.
+        let meta = match self.read_metadata_fast(device_id, record_offset) {
+            Ok(m) => m,
+            Err(e) => {
+                self.enumeration_unreadable
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                tracing::warn!(
+                    target: "teraslab::engine",
+                    device_id,
+                    offset = record_offset,
+                    err = %e,
+                    "mined-index reconcile: record footer unreadable; skipping record",
+                );
+                return Ok(());
+            }
+        };
+        let key = TxKey::from_bytes(meta.tx_id);
+        debug_assert_eq!(
+            meta.tx_id, key.txid,
+            "reconcile key is derived from the footer tx_id",
+        );
+
+        // Authoritative mined-state from the MinedIndex, never the device.
+        let (entries, unmined_since) = if mined_slot == crate::index::mined_index::NO_MINED_SLOT {
+            (Vec::new(), 0)
+        } else {
+            match self.mined_index.read_block_entries(&key, mined_slot) {
+                Some(v) => v,
+                None => {
+                    // The primary carries a live `mined_slot` but the MinedIndex
+                    // has no such live slot for this key (a dangling/desynced
+                    // slot). This runs on EVERY boot and `bin/server.rs`
+                    // FATAL-exits on Err, so bricking here would turn ONE lost
+                    // record into an unbootable node. Degrade LOUDLY instead:
+                    // skip THIS record and keep reconciling the rest.
                     self.enumeration_unreadable
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     tracing::warn!(
                         target: "teraslab::engine",
-                        device_id,
-                        offset = record_offset,
-                        err = %e,
-                        "mined-index reconcile: record footer unreadable; skipping record",
+                        key = ?key,
+                        mined_slot,
+                        "mined-index reconcile: mined_slot present in primary index but \
+                         absent from MinedIndex (dangling slot); skipping this record's \
+                         secondary reconciliation rather than bricking the boot",
                     );
-                    continue;
+                    return Ok(());
                 }
-            };
-            let key = TxKey::from_bytes(meta.tx_id);
-            debug_assert_eq!(
-                meta.tx_id, key.txid,
-                "reconcile key is derived from the footer tx_id",
-            );
-
-            // Authoritative mined-state from the MinedIndex, never the device.
-            let (entries, unmined_since) = if mined_slot == crate::index::mined_index::NO_MINED_SLOT
-            {
-                (Vec::new(), 0)
-            } else {
-                match self.mined_index.read_block_entries(&key, mined_slot) {
-                    Some(v) => v,
-                    None => {
-                        // The primary carries a live `mined_slot` but the
-                        // MinedIndex has no such live slot for this key (a
-                        // dangling/desynced slot — e.g. a record dropped from a
-                        // stale `.mined` snapshot, which Part A now prevents).
-                        // This runs on EVERY boot and `bin/server.rs` FATAL-exits
-                        // on Err, so bricking here would turn ONE lost record into
-                        // an unbootable node. Degrade LOUDLY instead: skip THIS
-                        // record (its mined-state is unrecoverable regardless) and
-                        // keep reconciling the rest.
-                        self.enumeration_unreadable
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        tracing::warn!(
-                            target: "teraslab::engine",
-                            key = ?key,
-                            mined_slot,
-                            "mined-index reconcile: mined_slot present in primary index but \
-                             absent from MinedIndex (dangling slot); skipping this record's \
-                             secondary reconciliation rather than bricking the boot",
-                        );
-                        continue;
-                    }
-                }
-            };
-            let has_blocks = !entries.is_empty();
-
-            // followup-1 recovery reseed: the MinedIndex was rebuilt fresh by
-            // `recover_mined_index` (which ran just before this pass on every
-            // boot — see `bin/server.rs`), so its DE-flag cache is zeroed.
-            // Reseed the FOUR device-authoritative DE flags from the device
-            // footer (`meta.flags` + `preserve_until`) so setMined's
-            // cache-sourced DAH eval (Task 2) starts correct post-recovery.
-            // Records with no live mined slot hold no cache to seed.
-            //
-            // followup-2 task 3: LAST_SPENT_ALL is NOT reseeded from the device
-            // (it is cache-authoritative and the device copy can lag). Instead
-            // reconstruct it from AUTHORITATIVE state: a record's steady-state
-            // `LAST_SPENT_ALL` is its current effective all-spent status —
-            // `spent_utxos == utxo_count` with the LP-3 REASSIGNED exclusion.
-            // This is the fixpoint of `evaluate_delete_at_height`'s LSA
-            // transitions for a non-conflicting record (the all-spent SET branch
-            // AND the no-blocks all-spent transition both drive LSA to
-            // `effective_all_spent`, and the not-all-spent path drives it to
-            // false), so it is correct whether or not the record is
-            // mined/on-chain — the covered-all-spent and all-spent-not-mined
-            // cases both reconstruct to true. Conflicting/preserved records
-            // are the exception (handled below): they freeze LSA, and since
-            // setMined freezes it for them too, the device bit is authoritative
-            // for those records and is read back verbatim.
-            if mined_slot != crate::index::mined_index::NO_MINED_SLOT {
-                self.mined_index.reseed_de_flags(
-                    &key,
-                    mined_slot,
-                    crate::index::mined_index::device_de_flags(
-                        meta.flags,
-                        { meta.preserve_until } != 0,
-                    ),
-                );
-                // Conflicting/preserved records FREEZE LAST_SPENT_ALL: the
-                // CONFLICTING branch and the preserve early-return in
-                // `evaluate_delete_at_height` never recompute it, and setMined
-                // freezes it for them too (its RAM eval takes the same frozen
-                // branches), so the cache never diverges from the device for
-                // these records — the device `LAST_SPENT_ALL` bit is NOT
-                // vestigial here, it holds the exact frozen value. Reconstruct
-                // it verbatim from the device so the frozen value survives
-                // recovery. For every other record LAST_SPENT_ALL is
-                // cache-authoritative (setMined may have advanced it past the
-                // lagging device), so reconstruct from authoritative state.
-                let reconstructed_lsa =
-                    if meta.flags.contains(TxFlags::CONFLICTING) || { meta.preserve_until } != 0 {
-                        meta.flags.contains(TxFlags::LAST_SPENT_ALL)
-                    } else {
-                        let spent = { meta.spent_utxos };
-                        let count = { meta.utxo_count };
-                        spent == count && !meta.flags.contains(TxFlags::REASSIGNED)
-                    };
-                self.set_cache_lsa(&key, mined_slot, reconstructed_lsa);
             }
+        };
+        let has_blocks = !entries.is_empty();
 
-            let (_signal, patch) = evaluate_delete_at_height(
-                &meta,
-                has_blocks,
-                unmined_since,
-                current_block_height,
-                block_height_retention,
-            )?;
-            let device_dah = { meta.delete_at_height };
-            // `delete_eval`'s decision: the DAH the record SHOULD carry. Zero
-            // (or a clearing patch) means ineligible — retained, not swept.
-            let derived_dah = patch
-                .as_ref()
-                .map(|p| p.new_delete_at_height)
-                .unwrap_or(device_dah);
-            if derived_dah != 0 && { meta.preserve_until } == 0 {
-                // Prefer the exact device DAH when present; fall back to the
-                // re-derived value only when the device field is stale-0 (the
-                // setMined-planted case the device never recorded).
-                let dah_value = if device_dah != 0 {
-                    device_dah
+        // followup-1 recovery reseed: reseed the FOUR device-authoritative DE
+        // flags from the device footer (`meta.flags` + `preserve_until`). In
+        // Touched mode this is the device-authoritative override that WINS over
+        // any snapshot-restored value for a touched record (the soundness
+        // invariant). Records with no live mined slot hold no cache to seed.
+        //
+        // followup-2 task 3: LAST_SPENT_ALL is NOT reseeded from the device (it
+        // is cache-authoritative and the device copy can lag). Instead
+        // reconstruct it from AUTHORITATIVE state: a record's steady-state
+        // `LAST_SPENT_ALL` is its current effective all-spent status
+        // (`spent_utxos == utxo_count` with the LP-3 REASSIGNED exclusion).
+        // Conflicting/preserved records freeze LSA, so the device bit is
+        // authoritative for them and is read back verbatim.
+        if mined_slot != crate::index::mined_index::NO_MINED_SLOT {
+            self.mined_index.reseed_de_flags(
+                &key,
+                mined_slot,
+                crate::index::mined_index::device_de_flags(
+                    meta.flags,
+                    { meta.preserve_until } != 0,
+                ),
+            );
+            let reconstructed_lsa =
+                if meta.flags.contains(TxFlags::CONFLICTING) || { meta.preserve_until } != 0 {
+                    meta.flags.contains(TxFlags::LAST_SPENT_ALL)
                 } else {
-                    derived_dah
+                    let spent = { meta.spent_utxos };
+                    let count = { meta.utxo_count };
+                    spent == count && !meta.flags.contains(TxFlags::REASSIGNED)
                 };
-                self.dah_index.insert(dah_value, key, None).map_err(|e| {
-                    SpendError::StorageError {
-                        detail: format!("mined-index reconcile: DAH insert failed: {e}"),
-                    }
+            self.set_cache_lsa(&key, mined_slot, reconstructed_lsa);
+        }
+
+        let (_signal, patch) = evaluate_delete_at_height(
+            &meta,
+            has_blocks,
+            unmined_since,
+            current_block_height,
+            block_height_retention,
+        )?;
+        let device_dah = { meta.delete_at_height };
+        // `delete_eval`'s decision: the DAH the record SHOULD carry. Zero (or a
+        // clearing patch) means ineligible — retained, not swept.
+        let derived_dah = patch
+            .as_ref()
+            .map(|p| p.new_delete_at_height)
+            .unwrap_or(device_dah);
+        let eligible = derived_dah != 0 && { meta.preserve_until } == 0;
+        if eligible {
+            // Prefer the exact device DAH when present; fall back to the
+            // re-derived value only when the device field is stale-0 (the
+            // setMined-planted case the device never recorded).
+            let dah_value = if device_dah != 0 {
+                device_dah
+            } else {
+                derived_dah
+            };
+            self.dah_index
+                .insert(dah_value, key, None)
+                .map_err(|e| SpendError::StorageError {
+                    detail: format!("mined-index reconcile: DAH insert failed: {e}"),
                 })?;
-                    }
-                }
-                Ok(())
-            },
-        )
+        } else if remove_stale {
+            // Touched mode only: this record is no longer DAH-eligible, so drop
+            // any stale durable entry (Full mode already cleared the DAH).
+            self.dah_index
+                .remove(&key, None)
+                .map_err(|e| SpendError::StorageError {
+                    detail: format!("mined-index reconcile (touched): DAH remove failed: {e}"),
+                })?;
+        }
+        Ok(())
     }
 
     /// Read on-device metadata for a transaction.
@@ -12828,6 +13008,511 @@ mod tests {
                 key.txid[0],
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // FU#7 Option B: v3 `.mined` snapshot DE/LSA persistence + the Full/Touched
+    // reconcile split. Reuses the hand-written-device reconcile harness above.
+    // -----------------------------------------------------------------------
+
+    /// FU#7 Option B test #4: restoring from a v2 snapshot (`de_flags == None`)
+    /// must NEVER leave a zeroed DE cache. The boot path picks Full mode for any
+    /// v2 snapshot, and the Full whole-store reconcile reseeds every mined
+    /// record's DE cache from the device footer. Proven by asserting each
+    /// record's cache matches its device footer AFTER restore(None) + Full
+    /// reconcile — even though restore itself wrote nothing (a fresh slot starts
+    /// `flags: 0`, which the precondition confirms).
+    #[test]
+    fn v2_restore_then_full_reconcile_reseeds_de_cache_from_device() {
+        let dev: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let mut alloc = SlotAllocator::new(dev.clone()).unwrap();
+        let mut index = Index::new(64).unwrap();
+
+        let mut write_record =
+            |byte: u8, flags: TxFlags, preserve_until: u32| -> (TxKey, TxMetadata) {
+                let mut txid = [0u8; 32];
+                txid[0] = byte;
+                txid[1] = 0xD7;
+                let key = TxKey { txid };
+                let mut meta = TxMetadata::new(1);
+                meta.tx_id = txid;
+                meta.spent_utxos = 1; // all-spent
+                meta.unmined_since = 0;
+                meta.flags = flags;
+                meta.preserve_until = preserve_until;
+                let record_size = TxMetadata::record_size_for(1);
+                let offset = alloc.allocate(record_size).unwrap();
+                let uslot = UtxoSlot::new_spent([byte; 32], [0xAB; 36]);
+                io::write_full_record(&*dev, offset, &meta, &[uslot]).unwrap();
+                index
+                    .register(
+                        key,
+                        TxIndexEntry {
+                            device_id: 0,
+                            record_offset: offset,
+                            mined_slot: crate::index::mined_index::NO_MINED_SLOT,
+                        },
+                    )
+                    .unwrap();
+                (key, meta)
+            };
+
+        let records = vec![
+            write_record(0x01, TxFlags::EXTERNAL | TxFlags::CONFLICTING, 0),
+            write_record(0x02, TxFlags::REASSIGNED, 0),
+            write_record(0x03, TxFlags::empty(), 5000), // preserved
+            write_record(0x04, TxFlags::empty(), 0),    // plain, no DE flags
+        ];
+
+        let engine = Engine::new(
+            dev.clone(),
+            index,
+            alloc,
+            StripedLocks::new(64),
+            DahIndex::new(),
+        );
+
+        // Restore from a v2 snapshot: every entry carries `de_flags == None`.
+        let entries: Vec<_> = records
+            .iter()
+            .map(|(key, _meta)| crate::index::mined_index::MinedByKeyEntry {
+                txid: key.txid,
+                block_entries: vec![crate::record::BlockEntry {
+                    block_id: key.txid[0] as u32,
+                    block_height: 1000,
+                    subtree_idx: 0,
+                }],
+                unmined_since: 0,
+                all_spent: true,
+                de_flags: None,
+            })
+            .collect();
+        engine
+            .restore_mined_index_from_snapshot_entries(&entries)
+            .expect("v2 snapshot restore succeeds");
+
+        // Precondition: restore(None) left the DE cache ZEROED for a record that
+        // DOES carry device flags — the exact hazard the Full reconcile fixes.
+        let (k0, _) = &records[0];
+        let slot0 = engine.lookup(k0).unwrap().mined_slot;
+        assert_eq!(
+            engine.mined_index().read_de_flags(k0, slot0),
+            Some(0),
+            "a v2 restore must NOT write DE flags (cache starts zeroed)",
+        );
+
+        // Full reconcile — the fallback the boot path runs for any v2 snapshot.
+        engine
+            .reconcile_secondaries_from_mined_index(2000, 288)
+            .expect("full reconcile reseeds the DE cache from the device");
+
+        // Every mined record's device DE cache now matches its device footer:
+        // the fallback reseeded, it did not leave a zeroed cache.
+        for (key, _meta) in &records {
+            assert_de_cache_matches_device(&engine, key);
+        }
+    }
+
+    /// FU#7 Option B test #5 (point-6 regression guard): a DE-flag mutation
+    /// AFTER the checkpoint must be corrected by the TOUCHED-record device read.
+    /// The v3 snapshot carries a STALE DE value (as of the checkpoint); the
+    /// device footer carries the post-mutation value (a `set_conflicting`-style
+    /// op wrote CONFLICTING and emitted a redo entry, so the key is touched).
+    /// Touched reconcile must leave the cache at the DEVICE value, NOT the stale
+    /// snapshot value — the soundness invariant.
+    #[test]
+    fn touched_record_device_read_overrides_stale_snapshot_de() {
+        use crate::index::mined_index::{MINED_CONFLICTING, MINED_DE_DEVICE_MASK, MINED_EXTERNAL};
+
+        let dev: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let mut alloc = SlotAllocator::new(dev.clone()).unwrap();
+        let mut index = Index::new(64).unwrap();
+
+        let mut txid = [0u8; 32];
+        txid[0] = 0x55;
+        txid[1] = 0xD7;
+        let key = TxKey { txid };
+        // Device footer carries the POST-mutation flags (EXTERNAL | CONFLICTING).
+        let mut meta = TxMetadata::new(1);
+        meta.tx_id = txid;
+        meta.spent_utxos = 1;
+        meta.unmined_since = 0;
+        meta.flags = TxFlags::EXTERNAL | TxFlags::CONFLICTING;
+        let record_size = TxMetadata::record_size_for(1);
+        let offset = alloc.allocate(record_size).unwrap();
+        let uslot = UtxoSlot::new_spent([0x55; 32], [0xAB; 36]);
+        io::write_full_record(&*dev, offset, &meta, &[uslot]).unwrap();
+        index
+            .register(
+                key,
+                TxIndexEntry {
+                    device_id: 0,
+                    record_offset: offset,
+                    mined_slot: crate::index::mined_index::NO_MINED_SLOT,
+                },
+            )
+            .unwrap();
+
+        let engine = Engine::new(
+            dev.clone(),
+            index,
+            alloc,
+            StripedLocks::new(64),
+            DahIndex::new(),
+        );
+
+        // Restore a v3 snapshot with the STALE PRE-mutation DE value (EXTERNAL
+        // only, no CONFLICTING).
+        let entries = vec![crate::index::mined_index::MinedByKeyEntry {
+            txid: key.txid,
+            block_entries: vec![crate::record::BlockEntry {
+                block_id: 0x55,
+                block_height: 1000,
+                subtree_idx: 0,
+            }],
+            unmined_since: 0,
+            all_spent: true,
+            de_flags: Some(MINED_EXTERNAL),
+        }];
+        engine
+            .restore_mined_index_from_snapshot_entries(&entries)
+            .expect("v3 snapshot restore succeeds");
+        let slot = engine.lookup(&key).unwrap().mined_slot;
+        assert_eq!(
+            engine
+                .mined_index()
+                .read_de_flags(&key, slot)
+                .map(|f| f & MINED_DE_DEVICE_MASK),
+            Some(MINED_EXTERNAL),
+            "precondition: snapshot restored the STALE DE value (EXTERNAL, no CONFLICTING)",
+        );
+
+        // Touched reconcile with the key in the touched set → device read WINS.
+        let mut touched = std::collections::HashSet::new();
+        touched.insert(key);
+        engine
+            .reconcile_secondaries_scoped(DahReconcileScope::Touched(&touched), 2000, 288)
+            .expect("touched reconcile succeeds");
+
+        let got = engine.mined_index().read_de_flags(&key, slot).unwrap() & MINED_DE_DEVICE_MASK;
+        assert_eq!(
+            got,
+            MINED_EXTERNAL | MINED_CONFLICTING,
+            "for a TOUCHED record the device footer read must WIN over the stale snapshot value \
+             (device-authoritative), not stay at the snapshot's EXTERNAL-only value",
+        );
+    }
+
+    /// FU#7 Option B test #6: an UNTOUCHED record's DE/LSA is restored from the
+    /// v3 snapshot with NO device read. Proven two ways: (a) an
+    /// `RwCountingDevice` records ZERO reads across the Touched(empty) reconcile,
+    /// and (b) the cache retains the SNAPSHOT value V even though the device
+    /// footer would derive a DIFFERENT value W (a stray read would show W).
+    #[test]
+    fn untouched_record_restores_de_lsa_from_snapshot_without_device_read() {
+        use crate::index::mined_index::{
+            MINED_CONFLICTING, MINED_DE_FLAG_MASK, MINED_EXTERNAL, MINED_LAST_SPENT_ALL,
+        };
+
+        let inner: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let (dev, reads, _writes) = RwCountingDevice::new(inner);
+        let dev: Arc<dyn BlockDevice> = dev;
+        let mut alloc = SlotAllocator::new(dev.clone()).unwrap();
+        let mut index = Index::new(64).unwrap();
+
+        // Device footer derives DE = W (CONFLICTING) — DIFFERENT from snapshot V.
+        let mut txid = [0u8; 32];
+        txid[0] = 0x66;
+        txid[1] = 0xD7;
+        let key = TxKey { txid };
+        let mut meta = TxMetadata::new(1);
+        meta.tx_id = txid;
+        meta.spent_utxos = 1;
+        meta.unmined_since = 0;
+        meta.flags = TxFlags::CONFLICTING; // W
+        let record_size = TxMetadata::record_size_for(1);
+        let offset = alloc.allocate(record_size).unwrap();
+        let uslot = UtxoSlot::new_spent([0x66; 32], [0xAB; 36]);
+        io::write_full_record(&*dev, offset, &meta, &[uslot]).unwrap();
+        index
+            .register(
+                key,
+                TxIndexEntry {
+                    device_id: 0,
+                    record_offset: offset,
+                    mined_slot: crate::index::mined_index::NO_MINED_SLOT,
+                },
+            )
+            .unwrap();
+
+        let engine = Engine::new(
+            dev.clone(),
+            index,
+            alloc,
+            StripedLocks::new(64),
+            DahIndex::new(),
+        );
+
+        // Snapshot V = EXTERNAL | LAST_SPENT_ALL (differs from device W = CONFLICTING).
+        let v = MINED_EXTERNAL | MINED_LAST_SPENT_ALL;
+        let entries = vec![crate::index::mined_index::MinedByKeyEntry {
+            txid: key.txid,
+            block_entries: vec![crate::record::BlockEntry {
+                block_id: 0x66,
+                block_height: 1000,
+                subtree_idx: 0,
+            }],
+            unmined_since: 0,
+            all_spent: true,
+            de_flags: Some(v),
+        }];
+        engine
+            .restore_mined_index_from_snapshot_entries(&entries)
+            .expect("v3 snapshot restore succeeds");
+        let slot = engine.lookup(&key).unwrap().mined_slot;
+        assert_eq!(
+            engine.mined_index().read_de_flags(&key, slot),
+            Some(v & MINED_DE_FLAG_MASK),
+            "precondition: snapshot restored V (EXTERNAL | LAST_SPENT_ALL)",
+        );
+
+        // No touched keys → Touched(empty) reconcile is a no-op that reads
+        // NOTHING from the device.
+        let reads_before = reads.load(Ordering::SeqCst);
+        let touched = std::collections::HashSet::new();
+        engine
+            .reconcile_secondaries_scoped(DahReconcileScope::Touched(&touched), 2000, 288)
+            .expect("touched(empty) reconcile succeeds");
+        assert_eq!(
+            reads.load(Ordering::SeqCst),
+            reads_before,
+            "Touched(empty) reconcile must perform ZERO device reads for an untouched record",
+        );
+
+        // Cache still holds the SNAPSHOT value V (device W = CONFLICTING never read).
+        let got = engine.mined_index().read_de_flags(&key, slot).unwrap();
+        assert_eq!(
+            got,
+            v & MINED_DE_FLAG_MASK,
+            "untouched record must keep its snapshot DE/LSA (V), NOT the device value W",
+        );
+        assert!(
+            got & MINED_LAST_SPENT_ALL != 0,
+            "the cache-authoritative LSA bit must survive the snapshot restore",
+        );
+        assert_eq!(
+            got & MINED_CONFLICTING,
+            0,
+            "the device-only CONFLICTING bit must NOT appear (proving no device read happened)",
+        );
+    }
+
+    /// FU#7 Option B test #7: a clean-boot Touched pass yields an IDENTICAL DE
+    /// cache AND DAH to the whole-store Full device pass. State is built with
+    /// REAL ops (create / set_mined / spend) so the op-maintained cache is an
+    /// INDEPENDENT source from Full's device-derived reseed — making the DE
+    /// parity assertion non-circular. The v3 snapshot is serialized from the
+    /// op-maintained cache BEFORE Full runs.
+    #[test]
+    fn touched_boot_matches_full_pass_for_de_cache_and_dah() {
+        let engine = create_engine();
+
+        // rA: plain, mined on-chain, then fully spent → all-spent + DAH, LSA=true.
+        let (_ha, ra_req) = make_create_req(0xA0, 2);
+        let ra = ra_req.tx_key();
+        engine.create(&ra_req).expect("create rA");
+        engine
+            .set_mined(&SetMinedRequest {
+                tx_key: ra,
+                block_id: 11,
+                block_height: 900,
+                subtree_idx: 0,
+                current_block_height: 1000,
+                block_height_retention: 288,
+                on_longest_chain: true,
+                unset_mined: false,
+            })
+            .expect("set_mined rA");
+        for i in 0..2u32 {
+            let mut utxo_hash = [0u8; 32];
+            utxo_hash[0] = i as u8;
+            let mut spending_data = [0u8; 36];
+            spending_data[0] = 0xAB;
+            spending_data[32..36].copy_from_slice(&1u32.to_le_bytes());
+            engine
+                .spend(&SpendRequest {
+                    tx_key: ra,
+                    offset: i,
+                    utxo_hash,
+                    spending_data,
+                    ignore_conflicting: false,
+                    ignore_locked: false,
+                    current_block_height: 1000,
+                    block_height_retention: 288,
+                })
+                .expect("spend rA");
+        }
+
+        // rB: external, mined, NOT spent → DE=EXTERNAL, LSA=false, no DAH.
+        let (_hb, mut rb_req) = make_create_req(0xB0, 2);
+        rb_req.is_external = true;
+        rb_req.inputs = None;
+        rb_req.outputs = None;
+        rb_req.inpoints = None;
+        rb_req.external_ref = Some(test_external_ref(rb_req.tx_id));
+        let rb = rb_req.tx_key();
+        engine.create(&rb_req).expect("create rB");
+        engine
+            .set_mined(&SetMinedRequest {
+                tx_key: rb,
+                block_id: 22,
+                block_height: 900,
+                subtree_idx: 0,
+                current_block_height: 1000,
+                block_height_retention: 288,
+                on_longest_chain: true,
+                unset_mined: false,
+            })
+            .expect("set_mined rB");
+
+        // rC: plain, NOT mined, NOT spent → unmined, no DAH, DE=0.
+        let (_hc, rc_req) = make_create_req(0xC0, 1);
+        let rc = rc_req.tx_key();
+        engine.create(&rc_req).expect("create rC");
+
+        let keys = [ra, rb, rc];
+
+        // Snapshot the OP-MAINTAINED mined index to a v3 buffer (captures the DE
+        // cache as maintained by the ops above, BEFORE any reconcile).
+        let pairs: Vec<(TxKey, u32)> = keys
+            .iter()
+            .map(|k| (*k, engine.lookup(k).unwrap().mined_slot))
+            .collect();
+        let mut buf = Vec::new();
+        engine.mined_index().serialize_by_key(7, &pairs, &mut buf);
+        assert_eq!(buf[0], 3, "checkpoint must write a v3 snapshot");
+        let (_fence, snap_entries) =
+            crate::index::mined_index::ShardedMinedIndex::deserialize_by_key(&buf)
+                .expect("v3 snapshot decodes");
+
+        // Full pass: whole-store device reseed + DAH rebuild. Capture results.
+        engine
+            .reconcile_secondaries_from_mined_index(1000, 288)
+            .expect("full reconcile");
+        let de_full: Vec<Option<u8>> = keys
+            .iter()
+            .map(|k| {
+                engine
+                    .mined_index()
+                    .read_de_flags(k, engine.lookup(k).unwrap().mined_slot)
+            })
+            .collect();
+        let dah_full: Vec<Option<u32>> = keys
+            .iter()
+            .map(|k| engine.dah_index().get_height(k))
+            .collect();
+        // Non-vacuous: at least one record must be DAH-eligible (rA/rC all-spent).
+        assert!(
+            dah_full.iter().any(|d| d.is_some()),
+            "test setup must produce at least one DAH entry",
+        );
+
+        // Clean-boot Touched path: restore DE/LSA from the v3 snapshot (RAM, no
+        // device read for untouched records), then rebuild the DAH via a
+        // Touched pass over ALL keys from an EMPTY DAH (this exercises the SAME
+        // shared per-record helper Full uses, so the two must agree).
+        engine
+            .restore_mined_index_from_snapshot_entries(&snap_entries)
+            .expect("restore from v3 snapshot");
+        let de_touched: Vec<Option<u8>> = keys
+            .iter()
+            .map(|k| {
+                engine
+                    .mined_index()
+                    .read_de_flags(k, engine.lookup(k).unwrap().mined_slot)
+            })
+            .collect();
+        assert_eq!(
+            de_touched, de_full,
+            "snapshot-restored DE/LSA cache must EQUAL the Full device-reseeded cache \
+             (byte-for-byte, per key: {keys:?})",
+        );
+
+        engine
+            .dah_index()
+            .clear()
+            .expect("clear DAH for touched pass");
+        let touched: std::collections::HashSet<TxKey> = keys.iter().copied().collect();
+        engine
+            .reconcile_secondaries_scoped(DahReconcileScope::Touched(&touched), 1000, 288)
+            .expect("touched reconcile");
+        let dah_touched: Vec<Option<u32>> = keys
+            .iter()
+            .map(|k| engine.dah_index().get_height(k))
+            .collect();
+        assert_eq!(
+            dah_touched, dah_full,
+            "Touched-pass DAH must EQUAL the Full-pass DAH (per key: {keys:?})",
+        );
+    }
+
+    /// FU#7 Option B test #8: the flag defaults OFF, and the Full scope
+    /// (selected whenever the flag is off) still self-heals — it CLEARS a stale
+    /// DAH orphan a Touched pass would preserve. This is the exact behavioral
+    /// difference the default-off flag gates: Full is whole-store self-healing,
+    /// Touched trusts the durable secondary for untouched keys.
+    #[test]
+    fn flag_defaults_off_and_full_scope_clears_orphan_touched_preserves() {
+        // Default is OFF: an operator must opt in to the fast path.
+        assert!(
+            !crate::config::IndexConfig::default().fast_boot_touched_secondaries,
+            "fast_boot_touched_secondaries must default to false (full self-heal)",
+        );
+
+        let dev: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let alloc = SlotAllocator::new(dev.clone()).unwrap();
+        let index = Index::new(64).unwrap();
+        let engine = Engine::new(
+            dev.clone(),
+            index,
+            alloc,
+            StripedLocks::new(64),
+            DahIndex::new(),
+        );
+
+        // A stale DAH orphan for a key with NO live primary record (as a crashed
+        // node's durable redb DAH might still carry).
+        let orphan = TxKey { txid: [0x77; 32] };
+        engine.dah_index().insert(500, orphan, None).unwrap();
+        assert_eq!(engine.dah_index().get_height(&orphan), Some(500));
+
+        // Full scope CLEARS the whole DAH → the orphan is swept (self-heal).
+        engine
+            .reconcile_secondaries_scoped(DahReconcileScope::Full, 2000, 288)
+            .expect("full reconcile");
+        assert_eq!(
+            engine.dah_index().get_height(&orphan),
+            None,
+            "Full scope must CLEAR a stale orphan (whole-store self-heal — the flag-off path)",
+        );
+
+        // Re-seed the orphan; Touched(empty) does NOT clear → the orphan is
+        // PRESERVED (Touched trusts the durable secondary for untouched keys).
+        engine.dah_index().insert(500, orphan, None).unwrap();
+        let touched = std::collections::HashSet::new();
+        engine
+            .reconcile_secondaries_scoped(DahReconcileScope::Touched(&touched), 2000, 288)
+            .expect("touched reconcile");
+        assert_eq!(
+            engine.dah_index().get_height(&orphan),
+            Some(500),
+            "Touched(empty) must NOT clear the DAH — an untouched orphan is preserved, \
+             which is exactly why the fast path is gated behind the default-off flag",
+        );
     }
 
     /// followup-2 headline test: `set_mined_inner` performs ZERO device reads
@@ -19996,6 +20681,7 @@ mod tests {
             }],
             unmined_since: 0,
             all_spent: true,
+            de_flags: None,
         }];
 
         engine2
@@ -20090,6 +20776,7 @@ mod tests {
             block_entries: vec![],
             unmined_since: 555,
             all_spent: false,
+            de_flags: None,
         }];
 
         engine2
@@ -20187,6 +20874,7 @@ mod tests {
             block_entries: vec![],
             unmined_since: 1000,
             all_spent: false,
+            de_flags: None,
         }];
         let restored_slots = engine2
             .restore_mined_index_from_snapshot_entries(&entries)
@@ -20353,6 +21041,7 @@ mod tests {
                 }],
                 unmined_since: snapshot_unmined_since,
                 all_spent: false,
+                de_flags: None,
             }];
             let restored_slots = engine2
                 .restore_mined_index_from_snapshot_entries(&entries)
