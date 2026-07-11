@@ -1389,7 +1389,32 @@ fn write_response(
     auth_required: bool,
     cluster_secret: Option<&Arc<Vec<u8>>>,
 ) -> Result<(), String> {
-    let encoded = response.encode();
+    // P1-13 last-line defense: never write a frame whose length prefix would
+    // wrap (`inner_len as u32`) and desync the client's stream. Per-operation
+    // budgeting (e.g. `handle_get_batch`) already keeps responses in bounds,
+    // so this only fires for a handler that assembled an over-MAX_FRAME_SIZE
+    // frame without budgeting — reply with a typed ERR_RESPONSE_TOO_LARGE
+    // frame instead so the connection (and every other pipelined request on
+    // it) survives.
+    let encoded = match response.try_encode() {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            tracing::warn!(
+                request_id = response.request_id,
+                payload_len = response.payload.len(),
+                "response frame exceeds MAX_FRAME_SIZE; replacing with ERR_RESPONSE_TOO_LARGE"
+            );
+            ResponseFrame {
+                request_id: response.request_id,
+                status: STATUS_ERROR,
+                payload: encode_error_payload(
+                    ERR_RESPONSE_TOO_LARGE,
+                    "response frame exceeds maximum wire size",
+                ),
+            }
+            .encode()
+        }
+    };
     let bytes = if auth_required {
         crate::cluster::auth::sign_frame(
             cluster_secret

@@ -9168,7 +9168,9 @@ fn handle_get_batch(
         .then(|| cluster.map(|c| c.master_snapshot()))
         .flatten();
 
-    let results: Vec<WireGetResult> = match (txids.len() >= READ_FANOUT_THRESHOLD)
+    // P1-13: `mut` so the response-size budget below can downgrade over-budget
+    // items to ERR_RESPONSE_TOO_LARGE.
+    let mut results: Vec<WireGetResult> = match (txids.len() >= READ_FANOUT_THRESHOLD)
         .then(read_pool)
         .flatten()
     {
@@ -9206,6 +9208,24 @@ fn handle_get_batch(
             })
             .collect(),
     };
+
+    // P1-13: enforce the MAX_FRAME_SIZE budget on the assembled response
+    // BEFORE counting outcomes and encoding. Fanned-out decoration cannot
+    // bound the CUMULATIVE size (each item is built on its own thread with no
+    // view of the others), so the running-total check runs serially here. Any
+    // item whose data would push the response past the wire-frame limit is
+    // downgraded to ERR_RESPONSE_TOO_LARGE so the batch stays readable instead
+    // of producing a frame every conforming reader rejects (which would fail
+    // ALL pipelined requests on the connection). The downgraded items fall
+    // into the `other_failed` bucket in the classification below.
+    let downgraded = enforce_get_response_budget(&mut results);
+    if downgraded > 0 {
+        tracing::warn!(
+            downgraded,
+            total = results.len(),
+            "get batch response exceeded MAX_FRAME_SIZE; downgraded oversized item(s) to ERR_RESPONSE_TOO_LARGE"
+        );
+    }
 
     // Track per-item outcomes: STATUS_OK => succeeded, ERR_TX_NOT_FOUND =>
     // not_found, anything else => failed.
@@ -13142,6 +13162,99 @@ mod tests {
         let utxo_count = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
         assert_eq!(utxo_count, 3, "utxo_count should be 3");
         let _ = pos; // silence unused warning
+    }
+
+    /// P1-13 (end-to-end): a GET batch whose assembled COLD_DATA response
+    /// would exceed MAX_FRAME_SIZE must NOT ship an oversized frame (which
+    /// every conforming reader rejects, killing the connection and every
+    /// pipelined request on it). `handle_get_batch` budgets the response:
+    /// the item(s) that overflow come back as ERR_RESPONSE_TOO_LARGE while
+    /// the records that fit still return their full cold blob, and the
+    /// emitted frame is guaranteed within the wire limit.
+    #[test]
+    fn get_batch_over_max_frame_size_downgrades_offending_items() {
+        // Five records of ~3.4 MiB inline cold data each ≈ 17 MiB of blob:
+        // a COLD_DATA GET of all five would assemble past the 16 MiB limit.
+        // A 256 MiB device gives ample room for the records themselves.
+        let dev: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(256 * 1024 * 1024, 4096).unwrap());
+        let h = DispatchTestHarness::with_device(dev);
+        // A well-formed inline cold blob (inputs section only) that
+        // `read_cold_data` returns whole. ~3.4 MiB each.
+        let cold_data =
+            crate::ops::engine::build_cold_data(Some(&vec![0xCD; 3_400_000]), None, None);
+        let cold_len = cold_data.len();
+
+        let mut txids = Vec::new();
+        for i in 0..5u8 {
+            let txid = DispatchTestHarness::make_txid(100 + i);
+            let item = WireCreateItem {
+                txid,
+                tx_version: 1,
+                locktime: 0,
+                fee: 500,
+                size_in_bytes: 250,
+                extended_size: 250,
+                is_coinbase: false,
+                spending_height: 0,
+                created_at: 1_700_000_000_000,
+                flags: 0,
+                utxo_hashes: vec![[i; 32]],
+                cold_data: cold_data.clone(),
+                block_height: 0,
+                mined_block_id: None,
+                mined_block_height: None,
+                mined_subtree_idx: None,
+                parent_txids: vec![],
+            };
+            assert_eq!(
+                h.request(OP_CREATE_BATCH, encode_create_batch(&[item]))
+                    .status,
+                STATUS_OK,
+                "create of record {i} with {cold_len}-byte cold data must succeed"
+            );
+            txids.push(txid);
+        }
+
+        let resp = h.request(OP_GET_BATCH, encode_get_batch(FieldMask::COLD_DATA, &txids));
+        assert_eq!(resp.status, STATUS_OK);
+
+        // The emitted frame MUST fit the wire budget: total_length =
+        // request_id(8) + status(1) + payload.
+        let inner_len = 8 + 1 + resp.payload.len();
+        assert!(
+            inner_len <= MAX_FRAME_SIZE as usize,
+            "assembled GET response must not exceed MAX_FRAME_SIZE (got {inner_len})"
+        );
+
+        let results = decode_get_response(&resp.payload).unwrap();
+        assert_eq!(results.len(), 5, "every requested item is represented");
+
+        // At least one item overflowed and was downgraded (empty payload).
+        let downgraded = results
+            .iter()
+            .filter(|r| r.status == ERR_RESPONSE_TOO_LARGE as u8)
+            .count();
+        assert!(
+            downgraded >= 1,
+            "at least one item must be downgraded to ERR_RESPONSE_TOO_LARGE"
+        );
+        for r in &results {
+            if r.status == ERR_RESPONSE_TOO_LARGE as u8 {
+                assert!(r.data.is_empty(), "downgraded item drops its cold blob");
+            }
+        }
+
+        // The records that fit still return their FULL cold blob (status OK).
+        // GET payload for a COLD_DATA-only mask is [cold_len:4][cold_bytes].
+        let served_full = results
+            .iter()
+            .filter(|r| r.status == 0 && r.data.len() == 4 + cold_len)
+            .count();
+        assert!(
+            served_full >= 1,
+            "at least one in-budget record must return its full cold data"
+        );
     }
 
     #[test]

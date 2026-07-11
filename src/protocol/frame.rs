@@ -217,15 +217,76 @@ fn parse_request_header(data: &[u8]) -> Result<(u64, u16, u16, std::ops::Range<u
 }
 
 impl ResponseFrame {
+    /// The frame `total_length` (the value written into the 4-byte length
+    /// prefix and checked against [`MAX_FRAME_SIZE`] by every reader): the
+    /// bytes AFTER the prefix — `request_id(8) + status(1) + payload`.
+    fn inner_len(&self) -> usize {
+        8 + 1 + self.payload.len()
+    }
+
     /// Encode this frame to bytes.
+    ///
+    /// Never emits a frame whose `total_length` would exceed
+    /// [`MAX_FRAME_SIZE`]: the historical `inner_len as u32` cast silently
+    /// WRAPS once the body approaches 4 GiB, producing a length prefix that
+    /// disagrees with the bytes that follow and desyncs the reader's stream.
+    /// If the frame is over budget this substitutes a minimal, well-formed
+    /// error frame (see [`ResponseFrame::oversize_error_frame`]) rather than
+    /// a corrupt one. Callers that need to observe the overflow (the hot
+    /// response path in `server::write_response`) use [`ResponseFrame::try_encode`].
     pub fn encode(&self) -> Vec<u8> {
-        let inner_len = 8 + 1 + self.payload.len(); // request_id + status + payload
+        match self.try_encode() {
+            Ok(bytes) => bytes,
+            Err(_) => Self::oversize_error_frame(self.request_id),
+        }
+    }
+
+    /// Encode this frame, refusing to serialise a body larger than the wire
+    /// format's [`MAX_FRAME_SIZE`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FrameError::TooLarge`] when `request_id(8) + status(1) +
+    /// payload` exceeds [`MAX_FRAME_SIZE`], BEFORE the `u32` length cast —
+    /// so the overflow can never wrap into a corrupt length prefix. This is
+    /// the last-line defense behind the per-operation response budgeting
+    /// (e.g. `handle_get_batch`): a well-behaved handler never triggers it.
+    pub fn try_encode(&self) -> Result<Vec<u8>> {
+        let inner_len = self.inner_len();
+        if inner_len > MAX_FRAME_SIZE as usize {
+            return Err(FrameError::TooLarge {
+                // Saturating conversion: the true size may exceed `u32`, but
+                // the reported value is only diagnostic (the guard already
+                // fired). `unwrap_or` cannot panic.
+                size: u32::try_from(inner_len).unwrap_or(u32::MAX),
+                max: MAX_FRAME_SIZE,
+            });
+        }
         let total_length = inner_len as u32;
         let mut buf = Vec::with_capacity(4 + inner_len);
         buf.extend_from_slice(&total_length.to_le_bytes());
         buf.extend_from_slice(&self.request_id.to_le_bytes());
         buf.push(self.status);
         buf.extend_from_slice(&self.payload);
+        Ok(buf)
+    }
+
+    /// A minimal, always-in-budget response frame emitted when [`encode`]
+    /// is asked to serialise a body too large for the wire format. Carries
+    /// `STATUS_ERROR` with an empty payload — a valid frame the reader can
+    /// consume without desyncing the stream — and preserves `request_id` so
+    /// the client can still correlate the failure. The production write path
+    /// (`server::write_response`) intercepts the typed
+    /// [`crate::protocol::opcodes::ERR_RESPONSE_TOO_LARGE`] error before this
+    /// fallback is ever reached.
+    ///
+    /// [`encode`]: ResponseFrame::encode
+    fn oversize_error_frame(request_id: u64) -> Vec<u8> {
+        let inner_len = 8 + 1; // request_id + status, empty payload
+        let mut buf = Vec::with_capacity(4 + inner_len);
+        buf.extend_from_slice(&(inner_len as u32).to_le_bytes());
+        buf.extend_from_slice(&request_id.to_le_bytes());
+        buf.push(crate::protocol::opcodes::STATUS_ERROR);
         buf
     }
 
@@ -373,6 +434,102 @@ mod tests {
         let (decoded, consumed) = ResponseFrame::decode(&encoded).unwrap();
         assert_eq!(decoded, frame);
         assert_eq!(consumed, encoded.len());
+    }
+
+    // P1-13: `ResponseFrame::try_encode` MUST refuse a body larger than the
+    // wire format's MAX_FRAME_SIZE instead of letting `inner_len as u32` wrap
+    // into a length prefix that disagrees with the bytes that follow.
+    #[test]
+    fn response_frame_try_encode_refuses_oversize() {
+        // inner_len = request_id(8) + status(1) + payload. Make payload just
+        // large enough that inner_len exceeds MAX_FRAME_SIZE by one byte.
+        let payload_len = MAX_FRAME_SIZE as usize - 9 + 1;
+        let frame = ResponseFrame {
+            request_id: 7,
+            status: STATUS_OK,
+            payload: vec![0u8; payload_len],
+        };
+        let err = frame
+            .try_encode()
+            .expect_err("over-MAX_FRAME_SIZE frame must be refused");
+        match err {
+            FrameError::TooLarge { size, max } => {
+                assert_eq!(max, MAX_FRAME_SIZE);
+                assert!(
+                    size > MAX_FRAME_SIZE,
+                    "reported size {size} must exceed max {max}"
+                );
+            }
+            other => panic!("expected FrameError::TooLarge, got {other:?}"),
+        }
+    }
+
+    // The largest in-budget response (inner_len == MAX_FRAME_SIZE exactly)
+    // still encodes and round-trips byte-for-byte.
+    #[test]
+    fn response_frame_try_encode_accepts_max_budget() {
+        let payload_len = MAX_FRAME_SIZE as usize - 9; // inner_len == MAX
+        let frame = ResponseFrame {
+            request_id: 11,
+            status: STATUS_OK,
+            payload: vec![0x5A; payload_len],
+        };
+        let encoded = frame.try_encode().expect("exactly-at-budget frame encodes");
+        // Declared length prefix must equal the true body length (no wrap).
+        let declared = u32::from_le_bytes(encoded[0..4].try_into().unwrap());
+        assert_eq!(declared as usize, encoded.len() - 4);
+        assert_eq!(declared, MAX_FRAME_SIZE);
+        let (decoded, consumed) = ResponseFrame::decode(&encoded).unwrap();
+        assert_eq!(decoded, frame);
+        assert_eq!(consumed, encoded.len());
+    }
+
+    // P1-13: the infallible `encode()` convenience wrapper must NEVER emit a
+    // frame whose length prefix wraps. On an oversize frame it substitutes a
+    // minimal, well-formed error frame whose declared length matches its
+    // bytes — a reader can consume it without desyncing the stream. (On the
+    // pre-fix code the `inner_len as u32` cast wrapped, so `declared` was far
+    // smaller than the real body and this assertion failed.)
+    #[test]
+    fn response_frame_encode_never_emits_wrapped_length() {
+        let payload_len = MAX_FRAME_SIZE as usize + 1024; // comfortably over
+        let frame = ResponseFrame {
+            request_id: 0xDEAD_BEEF,
+            status: STATUS_OK,
+            payload: vec![0u8; payload_len],
+        };
+        let encoded = frame.encode();
+        let declared = u32::from_le_bytes(encoded[0..4].try_into().unwrap());
+        // The single load-bearing invariant: the declared length prefix must
+        // equal the actual number of bytes after it, and stay within budget.
+        assert_eq!(
+            declared as usize,
+            encoded.len() - 4,
+            "encode() must not emit a length prefix that disagrees with the body"
+        );
+        assert!(
+            declared <= MAX_FRAME_SIZE,
+            "fallback frame must fit the wire budget"
+        );
+        // The fallback frame decodes cleanly and preserves request_id.
+        let (decoded, consumed) = ResponseFrame::decode(&encoded).unwrap();
+        assert_eq!(consumed, encoded.len());
+        assert_eq!(decoded.request_id, 0xDEAD_BEEF);
+        assert_eq!(decoded.status, crate::protocol::opcodes::STATUS_ERROR);
+    }
+
+    // In-budget frames encode byte-identically through both entry points, so
+    // routing the production write path through `try_encode` is transparent.
+    #[test]
+    fn response_frame_try_encode_matches_encode_in_budget() {
+        for payload_len in [0usize, 1, 13, 4096, 1024 * 1024] {
+            let frame = ResponseFrame {
+                request_id: 0x1234 + payload_len as u64,
+                status: STATUS_OK,
+                payload: (0..payload_len).map(|i| (i % 251) as u8).collect(),
+            };
+            assert_eq!(frame.try_encode().unwrap(), frame.encode());
+        }
     }
 
     #[test]
