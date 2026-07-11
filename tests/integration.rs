@@ -1844,3 +1844,265 @@ fn snapshot_deletion_with_corrupt_header_primary_recovers_secondary_degrades() {
     );
     assert_eq!(outcome.dah.len(), 0, "degraded DAH fallback must be empty");
 }
+
+// ---------------------------------------------------------------------------
+// FU#7 Option B — on-disk fast-boot E2E (Touched vs Full parity)
+// ---------------------------------------------------------------------------
+
+/// Boot a fresh engine from the SHARED on-disk state (data device + persisted
+/// allocator + real `.mined` v3 snapshot FILE + redo WAL) and capture the
+/// resulting DE/LSA cache + DAH for `keys`. `fast_boot == true` picks the
+/// O(redo) `Touched` reconcile scope; `false` picks the whole-store `Full`
+/// scope. Both boots only READ the shared state, so the same bytes serve both.
+#[allow(clippy::type_complexity)]
+fn fast_boot_capture(
+    dev: &Arc<dyn BlockDevice>,
+    redo: &Arc<parking_lot::Mutex<teraslab::redo::RedoLog>>,
+    primary_snap: &std::path::Path,
+    mined_snap: &std::path::Path,
+    keys: &[TxKey],
+    touched: &std::collections::HashSet<TxKey>,
+    fast_boot: bool,
+) -> (Vec<Option<u8>>, Vec<Option<u32>>) {
+    use teraslab::index::ShardedIndex;
+    use teraslab::ops::engine::DahReconcileScope;
+
+    let alloc =
+        SlotAllocator::recover(dev.clone()).expect("allocator recovers from the persisted header");
+    let primary = PrimaryBackend::rebuild(&**dev, &alloc).expect("primary rebuilds from device");
+    let sharded = ShardedIndex::from_single(primary);
+    let engine = Engine::new_with_sharded_index(
+        dev.clone(),
+        sharded,
+        alloc,
+        StripedLocks::new(64),
+        DahIndex::new(),
+    );
+
+    // Real serialize→file→deserialize→restore of the v3 `.mined` snapshot plus
+    // the post-fence redo-tail replay — identical for both boots.
+    let used = engine
+        .recover_mined_index(primary_snap, mined_snap, std::slice::from_ref(redo))
+        .expect("mined-index recovery must succeed");
+    assert!(
+        used,
+        "must use the v3 snapshot + redo-tail path (not the fresh full-replay branch)",
+    );
+    assert!(
+        engine.mined_snapshot_restored_v3(),
+        "the restored snapshot must be flagged v3 (persists the DE/LSA cache)",
+    );
+
+    let scope = if fast_boot {
+        DahReconcileScope::Touched(touched)
+    } else {
+        DahReconcileScope::Full
+    };
+    engine
+        .reconcile_secondaries_scoped(scope, 2000, 288)
+        .expect("secondary reconcile must succeed");
+
+    let de = keys
+        .iter()
+        .map(|k| {
+            engine
+                .lookup(k)
+                .and_then(|e| engine.mined_index().read_de_flags(k, e.mined_slot))
+        })
+        .collect();
+    let dah = keys
+        .iter()
+        .map(|k| engine.dah_index().get_height(k))
+        .collect();
+    (de, dah)
+}
+
+/// FU#7 Option B — on-disk E2E for the Important durability fix: a Touched-mode
+/// fast boot and a Full-mode boot from the SAME on-disk state (data device +
+/// redo tail + a real `.mined` v3 snapshot FILE) must produce a BYTE-FOR-BYTE
+/// identical DE-flag cache AND DAH index — INCLUDING a preserved record whose
+/// window expired NON-ELIGIBLY in the post-checkpoint redo tail.
+///
+/// This exercises the real serialize→file→deserialize→restore→reconcile path
+/// (`snapshot_mined_index_by_key` → `recover_mined_index` →
+/// `reconcile_secondaries_scoped`) end-to-end, which the in-`engine.rs` unit
+/// tests only drive with hand-built state. Before the fix the non-eligible
+/// expiry journaled no redo op keyed to the record, so the Touched boot omitted
+/// it from `touched_keys`, kept the stale `MINED_PRESERVED` the v3 snapshot
+/// restored, and DIVERGED from Full (so this asserts the fix end-to-end).
+///
+/// Records:
+/// - `p`: all-spent + UNMINED + preserved → NON-ELIGIBLE expiry in the tail.
+/// - `m`: mined on-chain, spent to all-spent in the tail → DAH planted (touched).
+/// - `u`: mined on-chain, never touched post-checkpoint → trusted from snapshot.
+///
+/// No record carries a DAH at checkpoint time, so the fresh in-memory DAH
+/// faithfully models the crash-time durable (redb) DAH the Touched path trusts.
+#[test]
+fn e2e_touched_and_full_boot_agree_on_de_cache_and_dah_incl_expired_preserved() {
+    use teraslab::redo::{RedoLog, RedoOp};
+
+    let dir = TempDir::new().unwrap();
+    let primary_snap = dir.path().join("boot.snap");
+    let mined_snap = teraslab::checkpoint::mined_index_snapshot_path(&primary_snap);
+
+    let dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(16 * 1024 * 1024, 4096).unwrap());
+    let redo_dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
+    let redo = Arc::new(parking_lot::Mutex::new(
+        RedoLog::open(redo_dev.clone(), 0, 1024 * 1024).unwrap(),
+    ));
+
+    // Pre-checkpoint state on engine E0 (redo-log attached so it journals).
+    // E0 uses the REDB DAH backend — the durable two-phase DAH backend a real
+    // fast-boot node runs — so a spend that plants a DAH fsyncs a keyed
+    // `SecondaryDahUpdate` into the redo tail. (The in-memory backend
+    // deliberately IGNORES the redo log and rebuilds from the primary replay +
+    // device scan, so it would never key the record.) The BOOTS below rebuild
+    // the DAH from scratch, so they use a fresh in-memory backend: an empty
+    // crash-time DAH is faithful here because the ONLY DAH-bearing record (M) is
+    // touched and gets its DAH re-derived from the device by the Touched
+    // reconcile.
+    let alloc0 = SlotAllocator::new(dev.clone()).unwrap();
+    let index0 = Index::new(10_000).unwrap();
+    let dah0 = DahBackend::OnDisk(
+        RedbDahIndex::open(&dir.path().join("e0-dah.redb"), 16 * 1024 * 1024).unwrap(),
+    );
+    let engine0 = Arc::new(Engine::new(
+        dev.clone(),
+        index0,
+        alloc0,
+        StripedLocks::new(64),
+        dah0,
+    ));
+    engine0.set_redo_logs(vec![redo.clone()]);
+
+    // p: all-spent + UNMINED + preserved → NON-ELIGIBLE expiry (the fix's target).
+    let p = create_tx(&engine0, 1, 1);
+    spend_utxo(&engine0, p, 1, 0);
+    engine0
+        .preserve_until(&PreserveUntilRequest {
+            tx_key: p,
+            block_height: 1500,
+        })
+        .unwrap();
+    // m: mined on-chain, NOT yet spent (no DAH at checkpoint).
+    let m = create_tx(&engine0, 2, 1);
+    engine0
+        .set_mined(&SetMinedRequest {
+            tx_key: m,
+            block_id: 10,
+            block_height: 900,
+            subtree_idx: 0,
+            current_block_height: 1000,
+            block_height_retention: 288,
+            on_longest_chain: true,
+            unset_mined: false,
+        })
+        .unwrap();
+    // u: mined on-chain, NOT spent, NO post-checkpoint activity (untouched).
+    let u = create_tx(&engine0, 3, 1);
+    engine0
+        .set_mined(&SetMinedRequest {
+            tx_key: u,
+            block_id: 11,
+            block_height: 900,
+            subtree_idx: 0,
+            current_block_height: 1000,
+            block_height_retention: 288,
+            on_longest_chain: true,
+            unset_mined: false,
+        })
+        .unwrap();
+
+    let keys = [p, m, u];
+
+    // "Checkpoint": fence = current redo max seq, then write the REAL v3 `.mined`
+    // FILE + primary snapshot. The snapshot captures P's PRESERVED DE bit.
+    engine0.flush_all_redo().unwrap();
+    let fence = redo
+        .lock()
+        .recover()
+        .unwrap()
+        .iter()
+        .map(|e| e.sequence)
+        .max()
+        .unwrap_or(0);
+    engine0
+        .snapshot_mined_index_by_key(&mined_snap, fence)
+        .unwrap();
+    engine0.snapshot_index(&primary_snap).unwrap();
+
+    // Post-checkpoint redo TAIL (sequences > fence): P expires (non-eligible),
+    // M is spent to all-spent (DAH planted). U is left untouched.
+    let expired = engine0.expire_preservation_set_dah(&p, 2000, 288).unwrap();
+    assert!(expired, "P's due preservation must expire");
+    spend_utxo(&engine0, m, 2, 0);
+
+    // Persist the allocator so both boots can recover it, then flush the tail.
+    engine0.persist_allocator().unwrap();
+    engine0.flush_all_redo().unwrap();
+
+    // Build the post-checkpoint touched set exactly as recovery does.
+    let mut touched: std::collections::HashSet<TxKey> = std::collections::HashSet::new();
+    for e in redo.lock().recover().unwrap() {
+        if e.sequence <= fence {
+            continue;
+        }
+        if let RedoOp::SetMinedBatch { txids, .. } = &e.op {
+            touched.extend(txids.iter().copied());
+        } else if let Some(k) = e.op.tx_key() {
+            touched.insert(*k);
+        }
+    }
+    assert!(
+        touched.contains(&p),
+        "post-fix: the non-eligible expiry keys P into the post-checkpoint touched tail",
+    );
+    assert!(
+        touched.contains(&m),
+        "M's post-checkpoint spend keys it into the touched tail",
+    );
+    assert!(
+        !touched.contains(&u),
+        "U had no post-checkpoint activity, so it stays untouched (trusted from the snapshot)",
+    );
+
+    // Drop E0's in-memory engine; the device bytes, redo WAL, and `.mined` file
+    // survive — exactly the on-disk state a real restart boots from.
+    drop(engine0);
+
+    let (de_full, dah_full) = fast_boot_capture(
+        &dev,
+        &redo,
+        &primary_snap,
+        &mined_snap,
+        &keys,
+        &touched,
+        false,
+    );
+    let (de_touched, dah_touched) = fast_boot_capture(
+        &dev,
+        &redo,
+        &primary_snap,
+        &mined_snap,
+        &keys,
+        &touched,
+        true,
+    );
+
+    // Non-vacuous: the setup must produce a real DAH (M) so the equality below
+    // is meaningful, not a trivial all-None match.
+    assert!(
+        dah_full.iter().any(|d| d.is_some()),
+        "test setup must yield at least one DAH entry (M all-spent + mined on-chain)",
+    );
+    assert_eq!(
+        de_touched, de_full,
+        "Touched-boot DE/LSA cache must EQUAL the Full-boot cache byte-for-byte, INCLUDING \
+         the expired preserved record P (keys P,M,U = {keys:?})",
+    );
+    assert_eq!(
+        dah_touched, dah_full,
+        "Touched-boot DAH must EQUAL the Full-boot DAH (keys P,M,U = {keys:?})",
+    );
+}
