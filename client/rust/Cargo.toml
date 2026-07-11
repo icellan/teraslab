@@ -10,6 +10,7 @@ path = "src/bin/loadgen.rs"
 [dependencies]
 teraslab = { path = "../.." }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "time", "io-util", "sync"] }
+sha2 = "0.10"
 parking_lot = "0.12"
 thiserror = "2"
 clap = { version = "4", features = ["derive"] }

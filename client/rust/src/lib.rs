@@ -104,6 +104,143 @@ fn needs_external_upload(cold_len: usize, threshold: usize) -> bool {
     cold_len > threshold
 }
 
+/// Drive an `OP_STREAM_READ` over `stream` (a dedicated connection): write the
+/// request, reassemble the `STATUS_STREAM_CHUNK` burst, and verify the result
+/// against the terminal `STATUS_STREAM_END` trailer.
+///
+/// `offset` is the resume point (`0` = whole blob). The full SHA-256 digest is
+/// only verifiable when `offset == 0` (the reassembled bytes are the whole
+/// blob); for a resume the length is still checked against the trailer.
+async fn run_stream_read<S>(
+    mut stream: S,
+    txid: &[u8; 32],
+    offset: u64,
+    request_timeout: Duration,
+) -> Result<Vec<u8>, ClientError>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    use sha2::{Digest, Sha256};
+    use tokio::io::AsyncWriteExt;
+
+    let payload =
+        codec::encode_stream_read_request(txid, codec::STREAM_READ_FIELD_COLD_DATA, offset);
+    let frame = teraslab::protocol::frame::RequestFrame {
+        request_id: 1,
+        op_code: OP_STREAM_READ,
+        flags: 0,
+        payload: payload.into(),
+    };
+    stream
+        .write_all(&frame.encode())
+        .await
+        .map_err(|e| ClientError::Connection(format!("stream-read write: {e}")))?;
+
+    let mut data: Vec<u8> = Vec::new();
+    let mut next_offset = offset;
+    loop {
+        let resp = read_stream_frame(&mut stream, request_timeout).await?;
+        match resp.status {
+            s if s == STATUS_STREAM_CHUNK => {
+                let chunk = codec::decode_stream_read_chunk(&resp.payload)
+                    .ok_or_else(|| ClientError::Protocol("malformed stream chunk".to_string()))?;
+                if chunk.offset != next_offset {
+                    return Err(ClientError::Protocol(format!(
+                        "stream chunk offset {} != expected {}",
+                        chunk.offset, next_offset
+                    )));
+                }
+                next_offset += chunk.data.len() as u64;
+                data.extend_from_slice(chunk.data);
+            }
+            s if s == STATUS_STREAM_END => {
+                let end = codec::decode_stream_read_end(&resp.payload)
+                    .ok_or_else(|| ClientError::Protocol("malformed stream end".to_string()))?;
+                let expected_len = end.total_size.checked_sub(offset).ok_or_else(|| {
+                    ClientError::Protocol("stream end total_size < resume offset".to_string())
+                })?;
+                if data.len() as u64 != expected_len {
+                    return Err(ClientError::Protocol(format!(
+                        "stream reassembled {} bytes, trailer expects {}",
+                        data.len(),
+                        expected_len
+                    )));
+                }
+                if offset == 0 {
+                    let mut hasher = Sha256::new();
+                    hasher.update(&data);
+                    let digest: [u8; 32] = hasher.finalize().into();
+                    if digest != end.content_hash {
+                        return Err(ClientError::Protocol(
+                            "stream content-hash mismatch after reassembly".to_string(),
+                        ));
+                    }
+                }
+                return Ok(data);
+            }
+            s if s == STATUS_ERROR => {
+                let (code, message) = codec::decode_error_payload(&resp.payload)
+                    .unwrap_or((ERR_INTERNAL, "stream error".to_string()));
+                return Err(ClientError::Server { code, message });
+            }
+            s if s == STATUS_REDIRECT => {
+                let addr = codec::decode_redirect(&resp.payload).unwrap_or_default();
+                return Err(ClientError::Redirect(addr));
+            }
+            s if s == STATUS_NOT_FOUND => return Err(ClientError::NotFound),
+            other => {
+                return Err(ClientError::Protocol(format!(
+                    "unexpected status {other} in stream-read burst"
+                )));
+            }
+        }
+    }
+}
+
+/// Read one response frame from a streaming-read connection, bounded by
+/// `request_timeout`. Unlike the pooled read loop, this reads frames one at a
+/// time inline so a single request can consume many response frames.
+async fn read_stream_frame<S>(
+    stream: &mut S,
+    request_timeout: Duration,
+) -> Result<teraslab::protocol::frame::ResponseFrame, ClientError>
+where
+    S: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+    let read = async {
+        let mut len_buf = [0u8; 4];
+        stream.read_exact(&mut len_buf).await?;
+        let total = u32::from_le_bytes(len_buf);
+        if !(9..=MAX_FRAME_SIZE).contains(&total) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("stream frame length {total} out of range"),
+            ));
+        }
+        let mut body = vec![0u8; total as usize];
+        stream.read_exact(&mut body).await?;
+        Ok::<Vec<u8>, std::io::Error>(body)
+    };
+    let body = tokio::time::timeout(request_timeout, read)
+        .await
+        .map_err(|_| ClientError::Timeout)?
+        .map_err(|e| ClientError::Connection(format!("stream-read read: {e}")))?;
+    // `body` is at least 9 bytes (guarded above): request_id(8) + status(1).
+    let request_id = u64::from_le_bytes(
+        body[0..8]
+            .try_into()
+            .map_err(|_| ClientError::Protocol("short stream frame".to_string()))?,
+    );
+    let status = body[8];
+    let payload = body[9..].to_vec();
+    Ok(teraslab::protocol::frame::ResponseFrame {
+        request_id,
+        status,
+        payload,
+    })
+}
+
 use crate::cluster::Cluster;
 use crate::pool::ConnPool;
 
@@ -1854,6 +1991,55 @@ impl Client {
         }
 
         Ok(())
+    }
+
+    /// Stream-read an over-budget EXTERNAL cold-data blob (FU#4).
+    ///
+    /// A record whose EXTERNAL cold-data blob exceeds the 16 MiB single-frame
+    /// wire limit cannot be served whole by [`Self::get_batch`] — that path
+    /// downgrades the offending item to `ERR_RESPONSE_TOO_LARGE` (code 38). On
+    /// seeing code 38 for an item, re-request the blob with this method, which
+    /// sends `OP_STREAM_READ` and reassembles the many `STATUS_STREAM_CHUNK`
+    /// response frames into the full payload, then verifies the reassembled
+    /// length and SHA-256 against the terminal `STATUS_STREAM_END` trailer.
+    ///
+    /// This opens a DEDICATED connection for the transfer so the multi-frame
+    /// server-push burst does not interfere with the pipelined request/response
+    /// pool (whose read loop delivers exactly one frame per request).
+    ///
+    /// # Errors
+    ///
+    /// - [`ClientError::Server`] with `ERR_BLOB_NOT_FOUND` / `ERR_STORAGE_IO`
+    ///   if the blob is missing or unreadable server-side.
+    /// - [`ClientError::Redirect`] if this node is not the record's master
+    ///   (single-node callers should not see this).
+    /// - [`ClientError::Protocol`] if a frame is malformed, chunk offsets are
+    ///   non-contiguous, or the reassembled digest does not match the trailer.
+    /// - [`ClientError::Connection`] / [`ClientError::Timeout`] on I/O failure.
+    pub async fn stream_read_cold_data(&self, txid: &[u8; 32]) -> Result<Vec<u8>, ClientError> {
+        let (addr, dial_timeout, request_timeout) = if let Some(pool) = &self.pool {
+            (
+                pool.addr().to_string(),
+                pool.dial_timeout(),
+                pool.request_timeout(),
+            )
+        } else if let Some(cl) = &self.cluster {
+            let pool = cl.pool_for_txid(txid)?;
+            (
+                pool.addr().to_string(),
+                pool.dial_timeout(),
+                pool.request_timeout(),
+            )
+        } else {
+            return Err(ClientError::Connection("no pool available".to_string()));
+        };
+
+        let stream = tokio::time::timeout(dial_timeout, tokio::net::TcpStream::connect(&addr))
+            .await
+            .map_err(|_| ClientError::Connection(format!("stream-read dial timeout: {addr}")))?
+            .map_err(|e| ClientError::Connection(format!("stream-read dial {addr}: {e}")))?;
+        let _ = stream.set_nodelay(true);
+        run_stream_read(stream, txid, 0, request_timeout).await
     }
 
     /// Create new transaction records.
@@ -4840,5 +5026,142 @@ mod tests {
         }
         assert_eq!(client.negotiated_version(), 2);
         client.close().await;
+    }
+
+    // -----------------------------------------------------------------------
+    // FU#4 — streaming read reassembly + digest verification
+    // -----------------------------------------------------------------------
+
+    /// Server-side of a stream-read over an in-memory duplex: read (and drop)
+    /// the OP_STREAM_READ request, then emit `blob` as `chunk_size`-byte
+    /// STATUS_STREAM_CHUNK frames plus a terminal STATUS_STREAM_END whose
+    /// trailer digest is `end_hash` (usually the true SHA-256, but overridable
+    /// to exercise the client's integrity check).
+    async fn serve_stream_read<S>(
+        mut server: S,
+        blob: Vec<u8>,
+        chunk_size: usize,
+        end_hash: [u8; 32],
+    ) where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        use teraslab::protocol::frame::ResponseFrame;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // Read the request frame: [len:4][body:len].
+        let mut len_buf = [0u8; 4];
+        server.read_exact(&mut len_buf).await.unwrap();
+        let total = u32::from_le_bytes(len_buf) as usize;
+        let mut body = vec![0u8; total];
+        server.read_exact(&mut body).await.unwrap();
+        let request_id = u64::from_le_bytes(body[0..8].try_into().unwrap());
+
+        let mut offset = 0u64;
+        for chunk in blob.chunks(chunk_size.max(1)) {
+            let frame = ResponseFrame {
+                request_id,
+                status: STATUS_STREAM_CHUNK,
+                payload: codec::encode_stream_read_chunk(offset, chunk),
+            };
+            server.write_all(&frame.encode()).await.unwrap();
+            offset += chunk.len() as u64;
+        }
+        let end = ResponseFrame {
+            request_id,
+            status: STATUS_STREAM_END,
+            payload: codec::encode_stream_read_end(blob.len() as u64, &end_hash),
+        };
+        server.write_all(&end.encode()).await.unwrap();
+        server.flush().await.unwrap();
+    }
+
+    fn sha256(data: &[u8]) -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(data);
+        h.finalize().into()
+    }
+
+    #[tokio::test]
+    async fn stream_read_reassembles_over_16mib_and_verifies_digest() {
+        // ~17 MiB, larger than a single 16 MiB frame; the server chops it into
+        // many chunk frames the client must stitch back together in order.
+        let blob: Vec<u8> = (0..(17 * 1024 * 1024 + 321))
+            .map(|i| (i % 251) as u8)
+            .collect();
+        let hash = sha256(&blob);
+        let (client_side, server_side) = tokio::io::duplex(1 << 20);
+
+        let blob_for_server = blob.clone();
+        let server = tokio::spawn(async move {
+            serve_stream_read(server_side, blob_for_server, 200 * 1024, hash).await;
+        });
+
+        let txid = [0x11u8; 32];
+        let got = run_stream_read(client_side, &txid, 0, Duration::from_secs(30))
+            .await
+            .expect("stream read should reassemble and verify");
+        assert_eq!(got.len(), blob.len(), "reassembled length matches");
+        assert_eq!(got, blob, "reassembled bytes are byte-identical");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stream_read_rejects_digest_mismatch() {
+        let blob: Vec<u8> = (0..70_000u32).map(|i| (i % 256) as u8).collect();
+        // Advertise a WRONG content hash in the END trailer.
+        let bad_hash = [0xFFu8; 32];
+        let (client_side, server_side) = tokio::io::duplex(1 << 16);
+        let blob_for_server = blob.clone();
+        let server = tokio::spawn(async move {
+            serve_stream_read(server_side, blob_for_server, 16 * 1024, bad_hash).await;
+        });
+
+        let txid = [0x22u8; 32];
+        let err = run_stream_read(client_side, &txid, 0, Duration::from_secs(30))
+            .await
+            .expect_err("a mismatched trailer digest must be rejected");
+        match err {
+            ClientError::Protocol(msg) => assert!(
+                msg.contains("content-hash mismatch"),
+                "want content-hash mismatch, got: {msg}"
+            ),
+            other => panic!("want Protocol(content-hash mismatch), got {other:?}"),
+        }
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stream_read_surfaces_mid_stream_error_frame() {
+        use teraslab::protocol::frame::ResponseFrame;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (client_side, mut server_side) = tokio::io::duplex(4096);
+        let server = tokio::spawn(async move {
+            // Drain the request, then reply with a single terminal error frame.
+            let mut len_buf = [0u8; 4];
+            server_side.read_exact(&mut len_buf).await.unwrap();
+            let total = u32::from_le_bytes(len_buf) as usize;
+            let mut body = vec![0u8; total];
+            server_side.read_exact(&mut body).await.unwrap();
+            let request_id = u64::from_le_bytes(body[0..8].try_into().unwrap());
+            let frame = ResponseFrame {
+                request_id,
+                status: STATUS_ERROR,
+                payload: codec::encode_error_payload(ERR_BLOB_NOT_FOUND, "external blob not found"),
+            };
+            server_side.write_all(&frame.encode()).await.unwrap();
+            server_side.flush().await.unwrap();
+        });
+
+        let txid = [0x33u8; 32];
+        let err = run_stream_read(client_side, &txid, 0, Duration::from_secs(30))
+            .await
+            .expect_err("an error frame terminates the stream");
+        match err {
+            ClientError::Server { code, .. } => assert_eq!(code, ERR_BLOB_NOT_FOUND),
+            other => panic!("want Server{{BLOB_NOT_FOUND}}, got {other:?}"),
+        }
+        server.await.unwrap();
     }
 }
