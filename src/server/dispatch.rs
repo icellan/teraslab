@@ -9476,16 +9476,14 @@ fn handle_query_old_unmined_capped(
     let mut candidates = engine.mined_index().collect_unmined_keys_below(cutoff);
     // Total order for sound paging (see fn doc): sort by txid so the cursor
     // resume (`> cursor`) is stable regardless of underlying hash order.
-    candidates.sort_unstable_by(|a, b| a.txid.cmp(&b.txid));
+    candidates.sort_unstable_by_key(|k| k.txid);
     let mut keys = Vec::with_capacity(candidates.len().min(max_txids));
     let mut truncated = false;
     for key in candidates {
         // FU#5: resume strictly after the cursor. A txid == cursor was the last
         // one returned on the prior page, so it is excluded here.
-        if let Some(cur) = cursor {
-            if key.txid <= cur {
-                continue;
-            }
+        if cursor.is_some_and(|cur| key.txid <= cur) {
+            continue;
         }
         // F-G5-003: skip keys this node does not master. Single-node mode
         // (no cluster) keeps the prior behaviour.
@@ -9568,15 +9566,13 @@ fn handle_query_conflicting_capped(
     };
     let mut candidates: Vec<TxKey> = engine.conflicting_index().iter().collect();
     // Total order for sound paging (see handle_query_old_unmined_capped doc).
-    candidates.sort_unstable_by(|a, b| a.txid.cmp(&b.txid));
+    candidates.sort_unstable_by_key(|k| k.txid);
     let mut keys = Vec::with_capacity(candidates.len().min(max_txids));
     let mut truncated = false;
     for key in candidates {
         // FU#5: resume strictly after the cursor.
-        if let Some(cur) = cursor {
-            if key.txid <= cur {
-                continue;
-            }
+        if cursor.is_some_and(|cur| key.txid <= cur) {
+            continue;
         }
         // F-G5-003: skip keys this node does not master. Single-node mode
         // (no cluster) keeps the prior behaviour.
@@ -12968,8 +12964,15 @@ mod tests {
 
         // Union == full set, in order, zero duplicates.
         let union: Vec<[u8; 32]> = pages.into_iter().flatten().collect();
-        assert_eq!(union.len(), full.len(), "union size must equal the full set");
-        assert_eq!(union, full, "union (in page order) must equal the sorted set");
+        assert_eq!(
+            union.len(),
+            full.len(),
+            "union size must equal the full set"
+        );
+        assert_eq!(
+            union, full,
+            "union (in page order) must equal the sorted set"
+        );
         let mut dedup = union.clone();
         dedup.dedup();
         assert_eq!(dedup.len(), union.len(), "no txid may appear on two pages");
@@ -13041,13 +13044,19 @@ mod tests {
         assert!(t1 < t2 && t2 < t3);
 
         // cursor = t2 → t1 (below) and t2 (equal) are excluded; t3 is first.
-        let resp = handle_query_old_unmined_capped(&old_unmined_req(200, Some(t2)), &h.engine, None, 100);
+        let resp =
+            handle_query_old_unmined_capped(&old_unmined_req(200, Some(t2)), &h.engine, None, 100);
         let (txids, truncated) = parse_query_response(&resp.payload);
-        assert_eq!(txids, vec![t3], "cursor==t2 excludes t1 and t2, yields only t3");
+        assert_eq!(
+            txids,
+            vec![t3],
+            "cursor==t2 excludes t1 and t2, yields only t3"
+        );
         assert!(!truncated);
 
         // cursor = t1 → only t1 excluded; t2 then t3.
-        let resp2 = handle_query_old_unmined_capped(&old_unmined_req(200, Some(t1)), &h.engine, None, 100);
+        let resp2 =
+            handle_query_old_unmined_capped(&old_unmined_req(200, Some(t1)), &h.engine, None, 100);
         let (txids2, _) = parse_query_response(&resp2.payload);
         assert_eq!(txids2, vec![t2, t3]);
     }
@@ -13070,7 +13079,8 @@ mod tests {
                 })
                 .unwrap();
         }
-        let resp = handle_query_conflicting_capped(&conflicting_req(Some(t2)), &h.engine, None, 100);
+        let resp =
+            handle_query_conflicting_capped(&conflicting_req(Some(t2)), &h.engine, None, 100);
         let (txids, _) = parse_query_response(&resp.payload);
         assert_eq!(txids, vec![t3]);
     }
@@ -13088,9 +13098,14 @@ mod tests {
         assert_eq!(h.create_tx_at_height(t2, 1, 100).status, STATUS_OK);
 
         // Cursorless (4-byte) old-unmined payload → full set from the start.
-        let cursorless = handle_query_old_unmined_capped(&old_unmined_req(200, None), &h.engine, None, 100);
+        let cursorless =
+            handle_query_old_unmined_capped(&old_unmined_req(200, None), &h.engine, None, 100);
         let (a, _) = parse_query_response(&cursorless.payload);
-        assert_eq!(a, vec![t1, t2], "cursorless payload starts from the beginning");
+        assert_eq!(
+            a,
+            vec![t1, t2],
+            "cursorless payload starts from the beginning"
+        );
 
         // With a zero cursor (36-byte payload) → still from the start.
         let zero = handle_query_old_unmined_capped(
@@ -13100,7 +13115,11 @@ mod tests {
             100,
         );
         let (b, _) = parse_query_response(&zero.payload);
-        assert_eq!(b, vec![t1, t2], "zero cursor is below every txid → from start");
+        assert_eq!(
+            b,
+            vec![t1, t2],
+            "zero cursor is below every txid → from start"
+        );
 
         // A malformed (non-{4,36}) old-unmined payload is rejected.
         let bad = RequestFrame {
@@ -13116,7 +13135,8 @@ mod tests {
 
         // Conflicting: empty payload (no cursor) parses; a malformed non-{0,32}
         // payload is rejected.
-        let conf_empty = handle_query_conflicting_capped(&conflicting_req(None), &h.engine, None, 100);
+        let conf_empty =
+            handle_query_conflicting_capped(&conflicting_req(None), &h.engine, None, 100);
         assert_eq!(conf_empty.status, STATUS_OK);
         let conf_bad = RequestFrame {
             request_id: 1,
