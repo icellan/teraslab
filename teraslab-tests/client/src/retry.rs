@@ -145,6 +145,7 @@ mod tests {
                     data: vec![],
                 })
                 .collect(),
+            degraded: false,
         })
     }
 
