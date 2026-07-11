@@ -163,7 +163,18 @@ const MINED_SNAPSHOT_VERSION: u8 = 2;
 ///
 /// Bumped 1 -> 2 (Task 13 CRITICAL fix) to add the leading `fence` field —
 /// see [`ShardedMinedIndex::serialize_by_key`]'s format doc.
-const MINED_BYKEY_SNAPSHOT_VERSION: u8 = 2;
+///
+/// Bumped 2 -> 3 (FU#7 Option B) to persist each entry's cached DAH-eval
+/// flag group ([`MINED_DE_FLAG_MASK`] — the four device DE flags AND the
+/// cache-authoritative [`MINED_LAST_SPENT_ALL`]) as one extra byte after
+/// `all_spent`. This lets a clean-secondary boot restore the DE/LSA cache
+/// for records NOT in the redo-touched set straight from RAM, avoiding the
+/// per-record device footer read the old whole-store reconcile did. A v2
+/// snapshot decodes with `de_flags == None` (first boot after upgrade), which
+/// forces the full whole-store device reseed exactly once; the next
+/// checkpoint writes v3. See
+/// [`crate::ops::engine::Engine::reconcile_secondaries_from_mined_index`].
+const MINED_BYKEY_SNAPSHOT_VERSION: u8 = 3;
 
 /// One transaction's mined-state as persisted in the checkpoint's TXID-keyed
 /// MinedIndex snapshot section (see [`ShardedMinedIndex::serialize_by_key`]).
@@ -189,6 +200,17 @@ pub struct MinedByKeyEntry {
     pub unmined_since: u32,
     /// Whether every UTXO in this tx was spent ([`MINED_ALL_SPENT`]).
     pub all_spent: bool,
+    /// The record's cached DAH-eval flag group ([`MINED_DE_FLAG_MASK`] — the
+    /// four device DE flags plus the cache-authoritative
+    /// [`MINED_LAST_SPENT_ALL`]) as of the checkpoint, or `None` when decoded
+    /// from a pre-FU#7 v2 snapshot that did not persist it.
+    ///
+    /// FU#7 Option B: a v3 snapshot carries `Some(byte)`, letting recovery
+    /// restore the DE/LSA cache from RAM for records outside the redo-touched
+    /// set (no device read). `None` (v2) signals the fast path is ineligible
+    /// this boot — recovery falls back to the whole-store device reseed. See
+    /// [`crate::ops::engine::Engine::restore_mined_index_from_snapshot_entries`].
+    pub de_flags: Option<u8>,
 }
 
 /// Errors from [`ShardedMinedIndex::deserialize`].
@@ -1223,6 +1245,39 @@ impl ShardedMinedIndex {
         }
     }
 
+    /// Restore the FULL cached DE-flag group ([`MINED_DE_FLAG_MASK`] — the four
+    /// device DE bits AND the cache-authoritative [`MINED_LAST_SPENT_ALL`]) from
+    /// a value persisted in a v3 `.mined` checkpoint snapshot (FU#7 Option B),
+    /// leaving every other `flags` bit untouched — INCLUDING
+    /// [`MINED_ALL_SPENT`] / [`MINED_HAS_OVERFLOW`] (which `apply_set_mined` /
+    /// `set_all_spent` set on the same slot before this call composes over them).
+    ///
+    /// Unlike [`Self::reseed_de_flags`] — which DELIBERATELY excludes
+    /// `LAST_SPENT_ALL` because it reseeds from the possibly-lagging DEVICE
+    /// footer — this restores the LSA bit too: the snapshot byte was read from
+    /// the LIVE RAM cache via [`Self::read_de_flags`] at checkpoint time, so it
+    /// already holds the authoritative LSA. Restoring it is precisely what
+    /// avoids the per-record device footer read on the fast boot path.
+    ///
+    /// Used ONLY by `Engine::restore_mined_index_from_snapshot_entries` and only
+    /// for records NOT in the redo-touched set. For a TOUCHED record the device
+    /// footer read WINS and overrides this value (the touched set is a superset
+    /// of every record whose DE/LSA changed after the checkpoint — see
+    /// `Engine::reconcile_secondaries_from_mined_index`).
+    ///
+    /// Key_fp-verified like [`Self::set_de_flag`]; a no-op if the slot is absent
+    /// or the fingerprint mismatches.
+    pub fn restore_de_flags(&self, key: &TxKey, slot: u32, de_flags: u8) {
+        let fp = key_fp(key);
+        let mut sh = self.shards[self.shard_for(key)].lock();
+        if let Some(entry) = sh.get_mut(slot) {
+            if entry.key_fp != fp {
+                return;
+            }
+            entry.flags = (entry.flags & !MINED_DE_FLAG_MASK) | (de_flags & MINED_DE_FLAG_MASK);
+        }
+    }
+
     /// Serialize the entire index (the routing seed, plus every shard's
     /// entries, free list, and overflow map) into a versioned snapshot,
     /// appended to `out`.
@@ -1315,8 +1370,17 @@ impl ShardedMinedIndex {
     /// the redo log at the same checkpoint — see
     /// `Engine::snapshot_mined_index_by_key`), a 4-byte little-endian entry
     /// count, then for each entry: `txid(32)`, `unmined_since(4 LE)`,
-    /// `all_spent(1)`, `block_entries_len(4 LE)`, then that many
+    /// `all_spent(1)`, `de_flags(1)`, `block_entries_len(4 LE)`, then that many
     /// `(block_id(4 LE), block_height(4 LE), subtree_idx(4 LE))` tuples.
+    ///
+    /// The `de_flags` byte (added in version 3, FU#7 Option B) is the record's
+    /// cached DAH-eval flag group — [`Self::read_de_flags`], = `entry.flags &
+    /// MINED_DE_FLAG_MASK`, which already includes the cache-authoritative
+    /// [`MINED_LAST_SPENT_ALL`] bit, so LSA needs no separate field. The cache
+    /// is live in RAM (dual-written at every mutating op), so it is read here
+    /// verbatim; recovery restores it for records outside the redo-touched set
+    /// without a device read (see
+    /// `Engine::restore_mined_index_from_snapshot_entries`).
     ///
     /// The `fence` field (added in version 2, Task 13 CRITICAL fix) is
     /// defense-in-depth against a stale snapshot outliving a truncated redo
@@ -1341,11 +1405,18 @@ impl ShardedMinedIndex {
             let all_spent = self
                 .with_entry(&key, slot, |e| e.flags & MINED_ALL_SPENT != 0)
                 .unwrap_or(false);
+            // FU#7 Option B: persist the live DE-flag cache (device DE bits +
+            // the cache-authoritative LAST_SPENT_ALL). The slot is live here
+            // (read_block_entries just succeeded), so read_de_flags returns
+            // Some; unwrap_or(0) is defensive against a concurrent free
+            // between the two shard-lock acquisitions.
+            let de_flags = self.read_de_flags(&key, slot).unwrap_or(0);
             collected.push(MinedByKeyEntry {
                 txid: key.txid,
                 block_entries,
                 unmined_since,
                 all_spent,
+                de_flags: Some(de_flags),
             });
         }
 
@@ -1356,6 +1427,9 @@ impl ShardedMinedIndex {
             out.extend_from_slice(&e.txid);
             out.extend_from_slice(&e.unmined_since.to_le_bytes());
             out.push(e.all_spent as u8);
+            // Always v3: one DE-flag byte. `collected` is built above with
+            // `de_flags = Some(..)`, so this never writes a placeholder.
+            out.push(e.de_flags.unwrap_or(0) & MINED_DE_FLAG_MASK);
             out.extend_from_slice(&(e.block_entries.len() as u32).to_le_bytes());
             for be in &e.block_entries {
                 // `BlockEntry` is `#[repr(C, packed)]`; copy fields out to
@@ -1382,12 +1456,21 @@ impl ShardedMinedIndex {
     ) -> Result<(u64, Vec<MinedByKeyEntry>), MinedIndexError> {
         let mut cur = SnapshotCursor::new(bytes);
         let version = cur.read_u8().ok_or(MinedIndexError::Corrupt)?;
-        if version != MINED_BYKEY_SNAPSHOT_VERSION {
-            return Err(MinedIndexError::VersionMismatch(
-                version,
-                MINED_BYKEY_SNAPSHOT_VERSION,
-            ));
-        }
+        // FU#7 Option B: accept BOTH the current v3 (carries a per-entry
+        // `de_flags` byte) AND the previous v2 (no such byte; decodes with
+        // `de_flags == None`, forcing the whole-store device reseed one time).
+        // Any OTHER version still fails closed with VersionMismatch (a future
+        // format or a corrupt byte), unchanged.
+        let is_v3 = match version {
+            3 => true,
+            2 => false,
+            _ => {
+                return Err(MinedIndexError::VersionMismatch(
+                    version,
+                    MINED_BYKEY_SNAPSHOT_VERSION,
+                ));
+            }
+        };
         let fence = cur.read_u64().ok_or(MinedIndexError::Corrupt)?;
         let count = cur.read_u32().ok_or(MinedIndexError::Corrupt)? as usize;
         // Grow via `push`, not `Vec::with_capacity(count)`, so a
@@ -1399,6 +1482,12 @@ impl ShardedMinedIndex {
             let txid = cur.read_array32().ok_or(MinedIndexError::Corrupt)?;
             let unmined_since = cur.read_u32().ok_or(MinedIndexError::Corrupt)?;
             let all_spent = cur.read_u8().ok_or(MinedIndexError::Corrupt)? != 0;
+            // v3: one DE-flag byte follows `all_spent`. v2: absent → None.
+            let de_flags = if is_v3 {
+                Some(cur.read_u8().ok_or(MinedIndexError::Corrupt)? & MINED_DE_FLAG_MASK)
+            } else {
+                None
+            };
             let block_count = cur.read_u32().ok_or(MinedIndexError::Corrupt)? as usize;
             let mut block_entries = Vec::new();
             for _ in 0..block_count {
@@ -1416,6 +1505,7 @@ impl ShardedMinedIndex {
                 block_entries,
                 unmined_since,
                 all_spent,
+                de_flags,
             });
         }
         Ok((fence, out))
@@ -2560,6 +2650,11 @@ mod tests {
         assert!(entries.is_empty(), "no pairs -> no snapshot entries");
     }
 
+    /// FU#7 Option B: v3 is the current version, and v2 is now a VALID
+    /// (backward-compat) version, so the old "flip to original+1" no longer
+    /// exercises an unknown version. Assert that BOTH a FUTURE version (4) and
+    /// a legacy-unknown version (0) still fail closed with `VersionMismatch`,
+    /// while `want` reports the current `MINED_BYKEY_SNAPSHOT_VERSION` (3).
     #[test]
     fn deserialize_by_key_wrong_version_fails_closed() {
         let idx = ShardedMinedIndex::new(16);
@@ -2568,18 +2663,111 @@ mod tests {
 
         let mut buf = Vec::new();
         idx.serialize_by_key(42, &[(k, slot)], &mut buf);
-        let original_version = buf[0];
-        buf[0] = original_version.wrapping_add(1);
+        assert_eq!(
+            buf[0], MINED_BYKEY_SNAPSHOT_VERSION,
+            "serialize must stamp the current (v3) version",
+        );
 
-        let err = ShardedMinedIndex::deserialize_by_key(&buf)
-            .expect_err("a flipped version byte must fail closed");
-        match err {
-            MinedIndexError::VersionMismatch(got, want) => {
-                assert_eq!(got, original_version.wrapping_add(1));
-                assert_eq!(want, MINED_BYKEY_SNAPSHOT_VERSION);
+        for bad_version in [4u8, 0u8] {
+            let mut corrupt = buf.clone();
+            corrupt[0] = bad_version;
+            let err = ShardedMinedIndex::deserialize_by_key(&corrupt)
+                .expect_err("an unknown version byte must fail closed");
+            match err {
+                MinedIndexError::VersionMismatch(got, want) => {
+                    assert_eq!(got, bad_version);
+                    assert_eq!(want, MINED_BYKEY_SNAPSHOT_VERSION);
+                }
+                other => {
+                    panic!("expected VersionMismatch for version {bad_version}, got {other:?}")
+                }
             }
-            other => panic!("expected VersionMismatch, got {other:?}"),
         }
+    }
+
+    /// FU#7 Option B test #1: a v3 snapshot round-trips the full DE-flag group
+    /// — all four device DE bits AND the cache-authoritative
+    /// `MINED_LAST_SPENT_ALL` — through `serialize_by_key`/`deserialize_by_key`,
+    /// and stamps version byte 3.
+    #[test]
+    fn deserialize_by_key_v3_roundtrips_de_flags_and_lsa() {
+        let idx = ShardedMinedIndex::new(16);
+        let k = TxKey { txid: [30u8; 32] };
+        let slot = idx.alloc_created(&k, 0);
+        idx.apply_set_mined(&k, slot, 500, 20, 3, true);
+        // Set ALL five DE-mask bits (the four device flags + LSA) on the live
+        // cache. `restore_de_flags` writes the whole MINED_DE_FLAG_MASK group,
+        // so use it to plant every bit at once.
+        let all_de = MINED_EXTERNAL
+            | MINED_CONFLICTING
+            | MINED_LAST_SPENT_ALL
+            | MINED_REASSIGNED
+            | MINED_PRESERVED;
+        assert_eq!(all_de, MINED_DE_FLAG_MASK, "the five DE bits ARE the mask");
+        idx.restore_de_flags(&k, slot, all_de);
+        assert_eq!(
+            idx.read_de_flags(&k, slot),
+            Some(all_de),
+            "precondition: the live cache carries every DE bit",
+        );
+
+        let mut buf = Vec::new();
+        idx.serialize_by_key(9, &[(k, slot)], &mut buf);
+        assert_eq!(buf[0], 3, "serialize must stamp version 3");
+
+        let (fence, entries) =
+            ShardedMinedIndex::deserialize_by_key(&buf).expect("v3 snapshot must decode");
+        assert_eq!(fence, 9);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].de_flags,
+            Some(all_de),
+            "every DE bit (incl. LAST_SPENT_ALL) must round-trip in v3",
+        );
+    }
+
+    /// FU#7 Option B test #2: a hand-crafted v2 stream (version byte 2, NO
+    /// per-entry `de_flags` byte) decodes without error and yields
+    /// `de_flags == None` for every entry — the first-boot-after-upgrade path.
+    #[test]
+    fn deserialize_by_key_v2_stream_decodes_with_none_de_flags() {
+        let txid = [7u8; 32];
+        let mut buf = Vec::new();
+        buf.push(2u8); // version 2 (legacy)
+        buf.extend_from_slice(&123u64.to_le_bytes()); // fence
+        buf.extend_from_slice(&1u32.to_le_bytes()); // one entry
+        // entry: txid, unmined_since, all_spent, block_count(0) — NO de_flags byte.
+        buf.extend_from_slice(&txid);
+        buf.extend_from_slice(&0u32.to_le_bytes()); // unmined_since
+        buf.push(1u8); // all_spent = true
+        buf.extend_from_slice(&0u32.to_le_bytes()); // block_count = 0
+
+        let (fence, entries) =
+            ShardedMinedIndex::deserialize_by_key(&buf).expect("a v2 stream must still decode");
+        assert_eq!(fence, 123);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].txid, txid);
+        assert!(entries[0].all_spent);
+        assert_eq!(
+            entries[0].de_flags, None,
+            "a v2 entry carries no DE flags -> None (forces device reseed)",
+        );
+    }
+
+    /// FU#7 Option B test #3 (companion to the wrong-version guard): version 2
+    /// is explicitly ACCEPTED (backward compat), distinct from the rejected
+    /// unknown versions.
+    #[test]
+    fn deserialize_by_key_accepts_version_2() {
+        // Build a minimal well-formed v2 stream with zero entries.
+        let mut buf = Vec::new();
+        buf.push(2u8);
+        buf.extend_from_slice(&0u64.to_le_bytes()); // fence
+        buf.extend_from_slice(&0u32.to_le_bytes()); // zero entries
+        let (fence, entries) = ShardedMinedIndex::deserialize_by_key(&buf)
+            .expect("version 2 must be accepted for backward compatibility");
+        assert_eq!(fence, 0);
+        assert!(entries.is_empty());
     }
 
     #[test]

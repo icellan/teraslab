@@ -583,6 +583,17 @@ pub fn recover_all_with_allocator_collecting_pending_conflicts_progress(
     )
 }
 
+/// The success payload of [`recover_all_multi_store`]: `(stats,
+/// pending_conflicting_children, pending_deleted_children, touched_keys)`. Named
+/// so the 4-tuple stays under clippy's `type_complexity` bar (FU#7 Option B
+/// added the trailing `touched_keys` set).
+pub type MultiStoreRecoveryOutcome = (
+    RecoveryStats,
+    Vec<PendingAppendConflictingChild>,
+    Vec<PendingAppendDeletedChild>,
+    std::collections::HashSet<TxKey>,
+);
+
 /// Multi-store recovery: replay each store's OWN redo log against that store.
 ///
 /// Per-store redo: every store has its own redo log (its own backing region),
@@ -601,6 +612,14 @@ pub fn recover_all_with_allocator_collecting_pending_conflicts_progress(
 /// mined-state fields are no longer kept current by `set_mined`. When `false`
 /// the legacy device-metadata reconcile runs (correct for callers that do not
 /// recover a MinedIndex).
+///
+/// Returns [`MultiStoreRecoveryOutcome`] = `(stats,
+/// pending_conflicting_children, pending_deleted_children, touched_keys)`.
+/// `touched_keys` (FU#7 Option B) is the union of every key the redo logs
+/// touched — the input to the server boot path's O(redo) Touched-scope DAH
+/// reconcile. It is populated only when `!full_secondary_rebuild` (the
+/// fast-path-eligible case, i.e. redb with a clean DAH); otherwise it is empty
+/// and the caller uses the Full whole-store rebuild.
 #[allow(clippy::too_many_arguments)]
 pub fn recover_all_multi_store(
     devices: &[std::sync::Arc<dyn BlockDevice>],
@@ -610,14 +629,7 @@ pub fn recover_all_multi_store(
     dah: &mut DahBackend,
     full_secondary_rebuild: bool,
     defer_secondary_reconcile: bool,
-) -> Result<
-    (
-        RecoveryStats,
-        Vec<PendingAppendConflictingChild>,
-        Vec<PendingAppendDeletedChild>,
-    ),
-    RecoveryError,
-> {
+) -> Result<MultiStoreRecoveryOutcome, RecoveryError> {
     assert_eq!(
         devices.len(),
         allocators.len(),
@@ -794,7 +806,15 @@ pub fn recover_all_multi_store(
             reconcile_secondary_indexes_for_keys_multi(&dev_refs, index, dah, &touched_keys)?;
         }
     }
-    Ok((total, pending_cc, pending_dc))
+    // FU#7 Option B: return the redo-touched key set so the server boot path —
+    // which DEFERS the secondary reconcile (`defer_secondary_reconcile == true`)
+    // and instead rebuilds the DAH from the recovered MinedIndex — can drive its
+    // O(redo) Touched-scope reconcile. It is `empty` on any full-rebuild boot
+    // (`full_secondary_rebuild == true`), where the caller uses Full scope and
+    // ignores it. When `!defer_secondary_reconcile` it was already consumed by
+    // the in-line `reconcile_secondary_indexes_for_keys_multi` above; returning
+    // it as well is harmless (a clone-free move of a set no later code reads).
+    Ok((total, pending_cc, pending_dc, touched_keys))
 }
 
 // Each argument is a distinct recovery input (device, the two index
@@ -5167,7 +5187,7 @@ mod tests {
         let devices = [dev0.clone(), dev1.clone()];
         let mut allocators = [alloc0, alloc1];
         let mut redo_logs = [redo0, redo1];
-        let (stats, _, _) = recover_all_multi_store(
+        let (stats, _, _, _) = recover_all_multi_store(
             &devices,
             &mut allocators,
             &mut redo_logs,
@@ -5278,7 +5298,7 @@ mod tests {
         let devices = [dev0.clone(), dev1.clone()];
         let mut allocators = [alloc0, alloc1];
         let mut redo_logs = [redo0, redo1];
-        let (stats, _, _) = recover_all_multi_store(
+        let (stats, _, _, _) = recover_all_multi_store(
             &devices,
             &mut allocators,
             &mut redo_logs,
@@ -5393,7 +5413,7 @@ mod tests {
         let devices = [dev0.clone(), dev1.clone()];
         let mut allocators = [alloc0, alloc1];
         let mut redo_logs = [redo0, redo1];
-        let (stats, _, _) = recover_all_multi_store(
+        let (stats, _, _, _) = recover_all_multi_store(
             &devices,
             &mut allocators,
             &mut redo_logs,
@@ -5529,7 +5549,7 @@ mod tests {
             let devices = [dev0.clone(), dev1.clone()];
             let mut allocators = [alloc0, alloc1];
             let mut redo_logs = [redo0, redo1];
-            let (stats, _, _) = recover_all_multi_store(
+            let (stats, _, _, _) = recover_all_multi_store(
                 &devices,
                 &mut allocators,
                 &mut redo_logs,
@@ -5690,7 +5710,7 @@ mod tests {
         let devices = [dev0.clone(), dev1.clone()];
         let mut allocators = [alloc0, alloc1];
         let mut redo_logs = [redo0, redo1];
-        let (stats, _, _) = recover_all_multi_store(
+        let (stats, _, _, _) = recover_all_multi_store(
             &devices,
             &mut allocators,
             &mut redo_logs,
@@ -5811,7 +5831,7 @@ mod tests {
         }
 
         let mut dah = DahBackend::new_in_memory();
-        let (stats, _, _) = recover_all_multi_store(
+        let (stats, _, _, _) = recover_all_multi_store(
             &devices,
             &mut allocators,
             &mut redo_logs,
