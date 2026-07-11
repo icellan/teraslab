@@ -946,10 +946,15 @@ pub unsafe fn write_utxo_slot_direct(
     slot_index: u32,
     slot: &UtxoSlot,
 ) {
-    // F-X-007 (BC-02): record-level write guard.
-    let _w = io_locks().write(record_offset);
+    // F-X-007 (BC-02) + P1-6: hold the record-base stripe (the key the lock-free
+    // direct readers use) UNIONED with the covering physical-block stripe(s) of
+    // the slot bytes `[slot_offset, slot_offset + UTXO_SLOT_SIZE)`. For a record
+    // spanning more than one 4 KiB block the slot lives in a LATER block whose
+    // stripe the backup copier guards (`read_span_blocks`); the record-base
+    // stripe alone left them disjoint. See `slot_write_stripes`.
+    let slot_offset = record_offset + TxMetadata::utxo_slot_offset(slot_index);
+    let _w = lock_slot_write_stripes(record_offset, slot_offset, UTXO_SLOT_SIZE as u64);
     unsafe {
-        let slot_offset = record_offset + TxMetadata::utxo_slot_offset(slot_index);
         let dst = base_ptr.add(off_to_usize(slot_offset));
         // F-G1-003 / C-3: atomic chunked store from a local stack
         // buffer — see `write_metadata_direct`.
@@ -1043,16 +1048,21 @@ pub fn write_metadata(
     record_offset: u64,
     metadata: &TxMetadata,
 ) -> Result<()> {
-    // Hold the per-offset write guard across the (possibly multi-block, RMW)
-    // header write so a concurrent lock-free `read_metadata` for the same offset
-    // never observes a torn header — the write counterpart of the guard added to
-    // `read_metadata`.
-    let _w = io_locks().write(record_offset);
-
     let align = device.alignment();
     let aligned_base = record_offset / align as u64 * align as u64;
     let intra_offset = (record_offset - aligned_base) as usize;
     let total_size = align_up(intra_offset + METADATA_SIZE, align);
+
+    // Hold the record-base stripe across the (possibly multi-block, RMW) header
+    // write so a concurrent lock-free `read_metadata` for the same offset never
+    // observes a torn header — the write counterpart of the guard added to
+    // `read_metadata`. P1-6: a packed header that straddles a 4 KiB block
+    // boundary spills into a LATER block whose stripe the backup copier guards,
+    // so union in the covering-block stripe(s) of the header RMW span
+    // `[aligned_base, aligned_base + total_size)`; for a block-aligned record the
+    // header stays within its first block and this collapses (dedup) to exactly
+    // the record-base stripe — no behavior change. See `slot_write_stripes`.
+    let _w = lock_slot_write_stripes(record_offset, aligned_base, total_size as u64);
 
     let mut buf = AlignedBuf::new(total_size, align);
 
@@ -1371,6 +1381,83 @@ pub(crate) fn read_span_blocks(
     stripes.iter().map(|&s| locks.read_index(s)).collect()
 }
 
+/// Compute the sorted, deduplicated `io_locks` stripe indices a slot- or
+/// header-writer must hold exclusively for one record: the RECORD-BASE stripe
+/// (keyed by `record_offset`) UNIONED with the physical-block stripe(s) of the
+/// covering read-modify-write span `[covering_offset, covering_offset +
+/// covering_span)` actually written to the device.
+///
+/// # Why both are needed (P1-6)
+///
+/// Two independent guard populations must be excluded, and they key the
+/// `io_locks` table differently:
+///
+/// - The record-base readers — [`read_all_utxo_slots`],
+///   [`read_record_identity_and_slots`]/[`read_record_identity_and_slot`],
+///   [`read_metadata`], [`read_utxo_slot`] — take ONE guard keyed by
+///   `record_offset`, i.e. the stripe of the record's FIRST 4 KiB block,
+///   *regardless* of which page the slot lands on. Keeping this stripe is
+///   MANDATORY or those readers lose their torn-read exclusion.
+/// - The online-backup copier ([`read_span_blocks`], used by
+///   `backup::copier::copy_range`) guards each 4 KiB block it copies by *that
+///   block's own* stripe. For a record larger than one 4 KiB block
+///   (`utxo_count >= ~52`, or a packed header straddling a block boundary) the
+///   bytes actually RMW'd live in a LATER block, whose stripe differs from the
+///   record base. Holding only the record-base stripe leaves the copier and
+///   the writer on DISJOINT stripes, so the copier can `pread` a torn slot
+///   mid-write. Adding the covering-block stripe(s) makes the two guards
+///   overlap.
+///
+/// The union is **sorted and deduplicated**: the `RwLock` write side is NOT
+/// reentrant, so each unique stripe is acquired at most once, and the global
+/// sort order matches [`lock_span_blocks`] / [`read_span_blocks`] /
+/// `write_records_coalesced` so concurrent multi-stripe acquirers cannot
+/// deadlock (a thread only ever waits on a stripe with a higher index than
+/// every stripe it already holds).
+fn slot_write_stripes(record_offset: u64, covering_offset: u64, covering_span: u64) -> Vec<usize> {
+    let locks = io_locks();
+    const BLOCK: u64 = 4096;
+    // Record-base stripe — mandatory (record-base readers key by record_offset).
+    let mut stripes: Vec<usize> = vec![locks.stripe_index(record_offset)];
+    // Physical-block stripe(s) of the RMW'd span — one stripe per 4 KiB block,
+    // the same granularity the backup copier's `read_span_blocks` guards.
+    if covering_span != 0 {
+        let first_block = covering_offset - (covering_offset % BLOCK);
+        let last_byte = covering_offset + covering_span - 1;
+        let last_block = last_byte - (last_byte % BLOCK);
+        let mut block = first_block;
+        loop {
+            stripes.push(locks.stripe_index(block));
+            if block == last_block {
+                break;
+            }
+            block += BLOCK;
+        }
+    }
+    stripes.sort_unstable();
+    stripes.dedup();
+    stripes
+}
+
+/// Acquire the exclusive `io_locks` write guards for the stripe set returned by
+/// [`slot_write_stripes`], in sorted order, returned as a `Vec` of held guards.
+///
+/// The caller holds them across its entire read-modify-write so both the
+/// record-base readers and the per-block backup copier are excluded for the
+/// duration. See [`slot_write_stripes`] for the union rationale and the
+/// deadlock-freedom argument.
+fn lock_slot_write_stripes(
+    record_offset: u64,
+    covering_offset: u64,
+    covering_span: u64,
+) -> Vec<parking_lot::RwLockWriteGuard<'static, ()>> {
+    let locks = io_locks();
+    slot_write_stripes(record_offset, covering_offset, covering_span)
+        .into_iter()
+        .map(|s| locks.write_index(s))
+        .collect()
+}
+
 /// Write a single [`UtxoSlot`] at `slot_index` within the record at `record_offset`.
 ///
 /// Uses read-modify-write: reads the aligned block containing the slot,
@@ -1387,15 +1474,20 @@ pub fn write_utxo_slot(
     let intra_offset = (slot_offset - aligned_base) as usize;
     let total_size = align_up(intra_offset + UTXO_SLOT_SIZE, align);
 
-    // F-X-007 (BC-02): record-level write guard, keyed by the record base
-    // offset — the SAME key the lock-free readers (`read_all_utxo_slots`,
-    // `read_record_identity_and_slots`/`_and_slot`) take. This is the
-    // block-device spend slot-write path used on the production O_DIRECT
-    // device (where `device_ptr` is null, so `write_slot_fast` routes here
-    // instead of the guarded `write_utxo_slot_direct`). Without it the
-    // readers' coherent-snapshot guard excluded nothing on production and a
-    // concurrent spend could tear a slot read (g2 follow-up).
-    let _w = io_locks().write(record_offset);
+    // F-X-007 (BC-02) + P1-6: hold the record-base stripe (keyed by the record
+    // base offset — the SAME key the lock-free record-base readers
+    // `read_all_utxo_slots` / `read_record_identity_and_slots`/`_and_slot` take)
+    // UNIONED with the covering physical-block stripe(s) of the slot's RMW span
+    // `[aligned_base, aligned_base + total_size)`. This is the block-device
+    // spend slot-write path used on the production O_DIRECT device (where
+    // `device_ptr` is null, so `write_slot_fast` routes here instead of
+    // `write_utxo_slot_direct`). For a record spanning more than one 4 KiB block
+    // the slot lives in a LATER block whose stripe the online-backup copier
+    // guards (`read_span_blocks`); holding only the record-base stripe left the
+    // copier and this writer on disjoint stripes and the copier could `pread` a
+    // torn slot mid-write. See `slot_write_stripes` for the union + deadlock
+    // reasoning.
+    let _w = lock_slot_write_stripes(record_offset, aligned_base, total_size as u64);
 
     let mut buf = AlignedBuf::new(total_size, align);
     // Read-modify-write: one slot is always less than a 4096 block.
@@ -1711,6 +1803,109 @@ mod tests {
         rx.recv_timeout(Duration::from_secs(5))
             .expect("writer acquires once the read guards drop");
         handle.join().unwrap();
+    }
+
+    #[test]
+    fn write_utxo_slot_excludes_backup_copier_read_of_tail_block() {
+        // P1-6: a slot write into a LATER 4 KiB block of a large record must be
+        // mutually excluded from the online-backup copier's per-block read
+        // guard for that same block — otherwise the copier's `pread_nocache`
+        // can capture a torn slot mid-RMW. Before the fix the slot writer took
+        // ONLY the record-base stripe (keyed by `record_offset`), so a copier
+        // holding the tail block's own stripe (`read_span_blocks`) shared NO
+        // stripe with the writer and did not block it.
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let dev = test_device(); // 4096-byte alignment
+        let record_offset = 0u64;
+        // METADATA_SIZE=320, UTXO_SLOT_SIZE=73 → slot 52+ lives past 4096.
+        let num_slots = 60u32;
+        create_test_record(&*dev, record_offset, num_slots);
+
+        // A slot whose RMW span lands wholly inside block 1 [4096, 8192).
+        let slot_index = 55u32;
+        let slot_offset = record_offset + TxMetadata::utxo_slot_offset(slot_index);
+        assert!(
+            slot_offset >= 4096,
+            "test slot must live past the record-base block"
+        );
+
+        let locks = io_locks();
+        // The whole point of the bug: the tail block is a DIFFERENT stripe than
+        // the record base, so the old single-key guard excluded nothing here.
+        assert_ne!(
+            locks.stripe_index(record_offset),
+            locks.stripe_index(4096),
+            "test needs the tail block on a different stripe than the record base"
+        );
+
+        // The online-backup copier holds the tail block's READ stripe while it
+        // preads that chunk (see `backup::copier::copy_range`).
+        let copier_guard = read_span_blocks(4096, 4096);
+
+        let dev2 = dev.clone();
+        let (tx, rx) = mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let new_slot = UtxoSlot::new_unspent([0x77u8; 32]);
+            write_utxo_slot(&*dev2, record_offset, slot_index, &new_slot).unwrap();
+            tx.send(()).unwrap();
+        });
+
+        // The slot write MUST block while the copier holds the tail block's read
+        // guard. Before the fix it completed immediately (disjoint stripe), so
+        // this `is_err()` was false → RED.
+        assert!(
+            rx.recv_timeout(Duration::from_millis(300)).is_err(),
+            "slot write into the tail block must block while the backup copier \
+             holds that block's read guard (torn-read exclusion)"
+        );
+
+        drop(copier_guard);
+        rx.recv_timeout(Duration::from_secs(5))
+            .expect("slot write proceeds once the copier read guard drops");
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn slot_write_stripes_unions_record_base_and_covering_blocks() {
+        let locks = io_locks();
+
+        // Small record: the slot RMW span sits inside the record-base block, so
+        // the union collapses (dedup) to exactly the record-base stripe — the
+        // pre-fix single-key behavior for small records, unchanged.
+        let small = slot_write_stripes(0, 0, 4096);
+        assert_eq!(small, vec![locks.stripe_index(0)]);
+
+        // Large record: the slot lives in a LATER block, so the set carries BOTH
+        // the record-base stripe (the record-base readers' key) and the covering
+        // block's stripe (the backup copier's key), sorted + deduped.
+        let record_offset = 0u64;
+        let tail_block = 4096u64;
+        let got = slot_write_stripes(record_offset, tail_block, 4096);
+        assert!(
+            got.contains(&locks.stripe_index(record_offset)),
+            "must keep the record-base stripe for the record-base readers"
+        );
+        assert!(
+            got.contains(&locks.stripe_index(tail_block)),
+            "must add the covering block's stripe so the backup copier overlaps"
+        );
+        // Strictly ascending → sorted AND unique (no reentrant double-acquire).
+        assert!(
+            got.windows(2).all(|w| w[0] < w[1]),
+            "stripe set must be sorted and deduplicated: {got:?}"
+        );
+
+        // A packed header/slot straddling a 4 KiB boundary covers BOTH blocks.
+        let straddle = slot_write_stripes(0, 8192 - 10, 73);
+        assert!(straddle.contains(&locks.stripe_index(4096))); // block 1
+        assert!(straddle.contains(&locks.stripe_index(8192))); // block 2
+        assert!(straddle.contains(&locks.stripe_index(0))); // record base
+        assert!(straddle.windows(2).all(|w| w[0] < w[1]));
+
+        // Zero span → just the mandatory record-base stripe.
+        assert_eq!(slot_write_stripes(0, 0, 0), vec![locks.stripe_index(0)]);
     }
 
     /// Helper: create test metadata + slots and write them at `record_offset`.
