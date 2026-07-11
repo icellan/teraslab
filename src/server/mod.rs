@@ -1280,21 +1280,40 @@ fn handle_connection_inner(
             if pipelining {
                 inflight.drain();
             }
-            let response = dispatch::handle_request(
-                &request,
-                engine,
-                opts.max_batch_size,
-                opts.cluster,
-                opts.redo_log,
-                &mut conn_state,
-                opts.blob_store,
-            );
-            write_response(
-                &writer,
-                response,
-                auth_required,
-                opts.cluster_secret.as_ref(),
-            )?;
+            if !auth_required && request.op_code == OP_STREAM_READ {
+                // FU#4 streaming read: a server-push burst that cannot be
+                // expressed as one `ResponseFrame`. Hold the writer mutex for
+                // the whole burst so its chunk+end frames land contiguously
+                // (no other response interleaves), then run the handler with a
+                // direct `&mut Write` to the socket. A socket-write failure
+                // propagates out to drop the connection; all protocol failures
+                // are emitted inline as terminal frames (Ok).
+                let mut guard = writer.lock();
+                dispatch::handle_stream_read(
+                    &request,
+                    engine,
+                    &mut *guard,
+                    opts.blob_store,
+                    opts.cluster,
+                )
+                .map_err(|e| format!("stream read: {e}"))?;
+            } else {
+                let response = dispatch::handle_request(
+                    &request,
+                    engine,
+                    opts.max_batch_size,
+                    opts.cluster,
+                    opts.redo_log,
+                    &mut conn_state,
+                    opts.blob_store,
+                );
+                write_response(
+                    &writer,
+                    response,
+                    auth_required,
+                    opts.cluster_secret.as_ref(),
+                )?;
+            }
         }
         // The per-iteration read_buf reclaim happens at the TOP of the
         // loop (`prepare_read_buf`), not here: doing it there lets the
@@ -1377,7 +1396,11 @@ impl Drop for ConnDrainGuard {
 /// verification/signing (authenticated inter-node frames). Everything else is
 /// dispatched concurrently; these take a drain barrier and run inline.
 fn is_pipelineable(request: &RequestFrame, auth_required: bool) -> bool {
-    !auth_required && !matches!(request.op_code, OP_STREAM_CHUNK | OP_STREAM_END)
+    !auth_required
+        && !matches!(
+            request.op_code,
+            OP_STREAM_CHUNK | OP_STREAM_END | OP_STREAM_READ
+        )
 }
 
 /// Encode, optionally sign, and write one response under the shared writer
