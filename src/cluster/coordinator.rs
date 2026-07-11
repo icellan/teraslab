@@ -8058,6 +8058,15 @@ pub struct MasterSnapshot {
     /// dispatcher redirects with `NodeId(0)` and the client refetches its
     /// partition map.
     masters: Vec<NodeId>,
+    /// The `shard_table.version` these masters were captured at. A commit that
+    /// lands AFTER capture advances `committed_term` beyond this value while
+    /// the local table has not yet been installed; in that window the frozen
+    /// `masters` are stale and [`RunningCluster::is_master_snapshot`] must fall
+    /// back to the `NodeId(0)` sentinel, exactly as a live
+    /// [`RunningCluster::authoritative_master_for_shard`] does once
+    /// `table.version < committed_term`. See
+    /// `master_snapshot_goes_stale_when_commit_lands_after_capture`.
+    version: u64,
 }
 
 impl MasterSnapshot {
@@ -8184,18 +8193,20 @@ impl RunningCluster {
     pub fn master_snapshot(&self) -> MasterSnapshot {
         let table = self.shard_table.read();
         let committed = self.topology_authority.committed_term();
-        if table.version < committed {
+        let version = table.version;
+        if version < committed {
             // Stale local table: `authoritative_master_for_shard` returns the
             // `NodeId(0)` sentinel for every shard — match that exactly.
             return MasterSnapshot {
                 masters: vec![NodeId(0); NUM_SHARDS],
+                version,
             };
         }
         let addrs = self.node_addrs.read();
         let masters = (0..NUM_SHARDS as u16)
             .map(|shard| Self::preferred_master_for_shard(&table, &addrs, shard))
             .collect();
-        MasterSnapshot { masters }
+        MasterSnapshot { masters, version }
     }
 
     /// Like [`Self::is_master`], but resolves the key's shard master from a
@@ -8203,13 +8214,15 @@ impl RunningCluster {
     /// `shard_table` + `node_addrs` locks per call.
     ///
     /// Only the master-IDENTITY lookup is hoisted. The transitioning gate
-    /// (local `topology_epoch` ahead of the committed term) and the
-    /// subset-master gate (pending inbound migration) still run per call —
-    /// both read lock-free atomics, exactly as [`Self::is_master`] does — so a
-    /// topology change that lands mid-batch is still surfaced per item. The
-    /// result is therefore identical to [`Self::is_master`] for a `snap`
-    /// captured in the same steady state; the snapshot removes only the
-    /// redundant locking, never a per-item decision.
+    /// (local `topology_epoch` ahead of the committed term), the stale-table
+    /// gate (committed term advanced past the snapshot's captured
+    /// `shard_table.version`), and the subset-master gate (pending inbound
+    /// migration) all still run per call — each reads a lock-free atomic,
+    /// exactly as [`Self::is_master`] does — so a topology change that lands
+    /// mid-batch is still surfaced per item. The result is therefore identical
+    /// to [`Self::is_master`] for a `snap` captured in the same steady state;
+    /// the snapshot removes only the redundant locking, never a per-item
+    /// decision.
     pub fn is_master_snapshot(&self, snap: &MasterSnapshot, key: &TxKey) -> MasterQueryResult {
         let committed = self.topology_authority.committed_term();
         let observed = self.topology_epoch.load(Ordering::Acquire);
@@ -8217,6 +8230,16 @@ impl RunningCluster {
             return MasterQueryResult::Transitioning {
                 last_known_term: committed,
             };
+        }
+        // Stale-table gate: a quorum commit that landed AFTER this snapshot was
+        // captured advances `committed_term` past the `shard_table.version`
+        // the snapshot froze, while the new table has not yet been installed.
+        // In that window a live `authoritative_master_for_shard` returns the
+        // `NodeId(0)` sentinel (→ `No`/redirect); the frozen `masters` would
+        // otherwise answer from the pre-commit assignment. Mirror the sentinel
+        // exactly rather than trust the stale snapshot.
+        if committed > snap.version {
+            return MasterQueryResult::No;
         }
         let shard = ShardTable::shard_for_key(key);
         let auth_master = snap.master_for_key(key);
@@ -15339,6 +15362,125 @@ mod tests {
                 "stale-table shard {shard} must resolve to No via the NodeId(0) sentinel",
             );
         }
+    }
+
+    /// FU#1 regression: a batch snapshot must not answer from a pre-commit
+    /// assignment after a quorum commit lands mid-batch. The snapshot freezes
+    /// the `shard_table.version` it was captured at; once `committed_term`
+    /// advances beyond that version — the same condition under which a live
+    /// `authoritative_master_for_shard` returns the `NodeId(0)` sentinel — the
+    /// frozen masters are stale, so `is_master_snapshot` must resolve to `No`
+    /// (redirect / refetch), NOT trust a stale `self == Yes` assignment. This
+    /// window is distinct from `master_snapshot_stale_table_resolves_sentinel_*`
+    /// (table already stale AT capture): here the snapshot is captured while
+    /// current, then the commit lands under it.
+    #[test]
+    fn master_snapshot_goes_stale_when_commit_lands_after_capture() {
+        let members = vec![NodeId(1)];
+        let table = ShardTable::compute_with_epoch(&members, 1, 5, 1);
+        let cluster = new_test_running_cluster(
+            NodeId(1),
+            table,
+            &[(NodeId(1), "127.0.0.1:4871".parse().unwrap())],
+            &members,
+            &[],
+            &[],
+            &[],
+            1,
+        );
+
+        // Snapshot captured while the local table is CURRENT (version ==
+        // committed term == 5): this single-node cluster masters shard 0
+        // itself, so the fresh snapshot answers Yes.
+        let snap = cluster.master_snapshot();
+        let key = key_for_shard(0);
+        assert_eq!(
+            cluster.is_master_snapshot(&snap, &key),
+            MasterQueryResult::Yes,
+            "precondition: a snapshot captured while current owns shard 0",
+        );
+
+        // A quorum commit lands AFTER the snapshot: committed_term advances to
+        // 6 while the local shard table (still version 5) has not yet been
+        // installed. topology_epoch is kept AT the committed term so the
+        // transitioning gate (observed > committed) does NOT fire — isolating
+        // the stale-table window this fix closes.
+        cluster
+            .topology_authority
+            .committed_term_shared()
+            .store(6, Ordering::Relaxed);
+        cluster.topology_epoch.store(6, Ordering::Release);
+
+        // Live is_master now sees table.version (5) < committed (6) → the
+        // NodeId(0) sentinel → No. The snapshot path MUST agree.
+        assert_eq!(
+            cluster.is_master(&key),
+            MasterQueryResult::No,
+            "live is_master must redirect once the local table trails the commit",
+        );
+        assert_eq!(
+            cluster.is_master_snapshot(&snap, &key),
+            MasterQueryResult::No,
+            "a snapshot gone stale under a mid-batch commit must resolve to No \
+             (NodeId(0) sentinel), not a pre-commit Yes",
+        );
+    }
+
+    /// The stale-table gate is deliberately CONSERVATIVE: once `committed_term`
+    /// advances past the snapshot's captured `version`, `is_master_snapshot`
+    /// returns `No` even if the live table has since caught up to the new term
+    /// AND this node retained mastership — the case where a live `is_master`
+    /// now answers `Yes`. This intentional divergence is the price of lock-free
+    /// per-item resolution: a batch snapshot froze the PRE-commit assignment and
+    /// cannot know whether the reassignment moved the shard, so it must not
+    /// serve from the frozen masters (that is exactly the hazard the gate
+    /// closes). The cost is a bounded, self-healing redirect during active
+    /// reconfiguration — the mutation path re-resolves locally via `route()`,
+    /// and the GET path emits a redirect the client absorbs by refetching its
+    /// partition map and retrying. This test pins that divergence so a future
+    /// change cannot "optimize" it away by trusting a stale snapshot.
+    #[test]
+    fn stale_snapshot_stays_conservative_even_after_table_catches_up() {
+        let members = vec![NodeId(1)];
+        let table = ShardTable::compute_with_epoch(&members, 1, 5, 1);
+        let cluster = new_test_running_cluster(
+            NodeId(1),
+            table,
+            &[(NodeId(1), "127.0.0.1:4881".parse().unwrap())],
+            &members,
+            &[],
+            &[],
+            &[],
+            1,
+        );
+
+        // Snapshot captured at version 5.
+        let snap = cluster.master_snapshot();
+        let key = key_for_shard(0);
+
+        // A commit lands AND the live table is fully installed at the new term
+        // 6, with this single-node cluster still mastering every shard.
+        *cluster.shard_table.write() = ShardTable::compute_with_epoch(&members, 1, 6, 1);
+        cluster
+            .topology_authority
+            .committed_term_shared()
+            .store(6, Ordering::Relaxed);
+        cluster.topology_epoch.store(6, Ordering::Release);
+
+        // Live is_master re-reads the fresh table → this node still owns it → Yes.
+        assert_eq!(
+            cluster.is_master(&key),
+            MasterQueryResult::Yes,
+            "precondition: the live table caught up and self retained mastership",
+        );
+        // The snapshot froze version 5 < committed 6, so it stays conservative:
+        // No (→ redirect), NOT the stale-frozen Yes.
+        assert_eq!(
+            cluster.is_master_snapshot(&snap, &key),
+            MasterQueryResult::No,
+            "a snapshot whose captured version trails the committed term must \
+             redirect conservatively, never trust its frozen masters",
+        );
     }
 
     // ── Phase B fixup: cluster_key sourced from quorum-committed term ──

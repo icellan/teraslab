@@ -103,6 +103,7 @@ func TestErrorCodeStringAll(t *testing.T) {
 		{ErrCodeDeletedChildren, "DELETED_CHILDREN"},
 		{ErrCodeNotDue, "NOT_DUE"},
 		{ErrCodeMigrationTargetNotReady, "MIGRATION_TARGET_NOT_READY"},
+		{ErrCodeResponseTooLarge, "RESPONSE_TOO_LARGE"},
 		{ErrCodeInternal, "INTERNAL"},
 		{99, "UNKNOWN(99)"},
 	}
