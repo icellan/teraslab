@@ -4084,88 +4084,95 @@ impl Engine {
             })?
             .ok_or(SpendError::TxNotFound)?;
 
-        // 2. Apply the mined-state transition to the MinedIndex — the SOLE
-        //    write this op performs (Task 9's dual-write call; the device
-        //    half of that dual-write is what Task 16d removes).
-        if entry.mined_slot == crate::index::mined_index::NO_MINED_SLOT {
+        // 2-3. Apply the mined-state transition to the MinedIndex — the SOLE
+        //    write this op performs (Task 9's dual-write; the device half is
+        //    what Task 16d removes) — and read the post-mutation mined-state
+        //    back, BOTH under a SINGLE MinedIndex shard-lock acquisition. P1-12:
+        //    `apply_mined_transition` folds what were up to six separate
+        //    shard-lock round-trips (two `mined_block_entries`, apply,
+        //    `read_de_flags`, `is_all_spent`) plus two redundant primary-index
+        //    probes into one, using the `entry.mined_slot` already resolved
+        //    under the stripe lock. The read-back is the authoritative source
+        //    (Task 10) for the DAH eval and the response's block_ids — not a
+        //    device read.
+        let (block_entries, new_unmined, de_flags, all_spent) = if entry.mined_slot
+            == crate::index::mined_index::NO_MINED_SLOT
+        {
             // Should not happen for a live record — `create` always
             // allocates a mined_slot (Task 7). Tolerated defensively (the
             // pre-16d dual-write branch was gated the same way): there is no
             // device fallback left to fall into, so the mined-state
             // transition this call intended is simply lost. Surfaced loudly
-            // since it indicates an index invariant violation elsewhere.
+            // since it indicates an index invariant violation elsewhere. The
+            // RAM DAH eval below then runs against the empty/default state,
+            // exactly as the prior per-accessor path did for this slot.
             tracing::error!(
                 tx_key = ?tx_key.txid,
                 "set_mined_inner: live record has no mined_slot allocated; mined-state \
                  transition for this call cannot be recorded anywhere (post-16d there is no \
                  device fallback)",
             );
-        } else if req.unset_mined {
-            self.mined_index().apply_unset(
-                tx_key,
-                entry.mined_slot,
-                req.block_id,
-                req.current_block_height,
-            );
+            (Vec::new(), 0u32, 0u8, false)
         } else {
-            // BUG-2 guard, preserved: the pre-16d device counter was a `u8`,
-            // so a 256th DISTINCT block_id would wrap `255 -> 0` rather than
-            // erroring. The MinedIndex's overflow `Vec<BlockEntry>` has no
-            // such physical width constraint, but the cap is a deliberate
-            // bound against unbounded per-tx memory growth (a client
-            // repeatedly setMined-ing the same tx into new block_ids), not
-            // merely a storage-format artifact — so it is kept here rather
-            // than dropped. Idempotent re-application of an ALREADY-recorded
-            // block_id must still succeed even at capacity (mirrors the old
-            // `exists` short-circuit), so only a genuinely new distinct
-            // block_id is checked against the cap. P1-10: this branch is
-            // reached only when `entry.mined_slot != NO_MINED_SLOT`, and the
-            // stripe lock pins the entry — reuse the slot directly.
-            let (existing_before, _) = self.mined_block_entries_at(tx_key, entry.mined_slot)?;
-            let already_present = existing_before.iter().any(|e| e.block_id == req.block_id);
-            if !already_present && existing_before.len() >= u8::MAX as usize {
-                return Err(SpendError::BlockEntriesFull {
-                    cap: u8::MAX as usize,
-                });
+            let transition = if req.unset_mined {
+                crate::index::mined_index::MinedTransition::Unset {
+                    block_id: req.block_id,
+                    current_height: req.current_block_height,
+                }
+            } else {
+                // BUG-2 guard, preserved: the pre-16d device counter was a
+                // `u8`, so a 256th DISTINCT block_id would wrap `255 -> 0`
+                // rather than erroring. The MinedIndex's overflow
+                // `Vec<BlockEntry>` has no such physical width constraint,
+                // but the cap is a deliberate bound against unbounded per-tx
+                // memory growth (a client repeatedly setMined-ing the same
+                // tx into new block_ids), not merely a storage-format
+                // artifact — so it is kept. It is now enforced INSIDE
+                // `apply_mined_transition` before it mutates (returning
+                // `BlockEntriesFull`), and an idempotent re-application of an
+                // already-recorded block_id still succeeds at capacity.
+                crate::index::mined_index::MinedTransition::Set {
+                    block_id: req.block_id,
+                    block_height: req.block_height,
+                    subtree_idx: req.subtree_idx,
+                    on_longest_chain: req.on_longest_chain,
+                }
+            };
+            match self
+                .mined_index()
+                .apply_mined_transition(tx_key, entry.mined_slot, transition)
+            {
+                crate::index::mined_index::MinedTransitionOutcome::Applied(state) => (
+                    state.block_entries,
+                    state.unmined_since,
+                    state.de_flags,
+                    state.all_spent,
+                ),
+                crate::index::mined_index::MinedTransitionOutcome::BlockEntriesFull => {
+                    return Err(SpendError::BlockEntriesFull {
+                        cap: u8::MAX as usize,
+                    });
+                }
+                crate::index::mined_index::MinedTransitionOutcome::SlotAbsent => {
+                    return Err(SpendError::StorageError {
+                        detail: "mined_slot present in primary index but absent from MinedIndex"
+                            .to_string(),
+                    });
+                }
             }
-            self.mined_index().apply_set_mined(
-                tx_key,
-                entry.mined_slot,
-                req.block_id,
-                req.block_height,
-                req.subtree_idx,
-                req.on_longest_chain,
-            );
-        }
-
-        // 3. Read the post-mutation mined-state back from the MinedIndex —
-        //    the authoritative source (Task 10) — for the DAH eval and the
-        //    response's block_ids. Not a device read. P1-10: reuse the
-        //    entry slot (the NO_MINED_SLOT defensive branch above still yields
-        //    the same empty result the re-lookup would).
-        let (block_entries, new_unmined) = self.mined_block_entries_at(tx_key, entry.mined_slot)?;
+        };
         let has_blocks = !block_entries.is_empty();
 
         // 4. DAH evaluation sourced ENTIRELY from RAM (followup-2 — no device
         //    read). The four DAH-relevant flags + preserve come from the
-        //    MinedEntry DE-flag cache, `all_spent` from the cached
-        //    MINED_ALL_SPENT bit, `old_dah` from the authoritative DAH
-        //    secondary index, and has_blocks/unmined_since from the MinedIndex.
-        //    `read_de_flags`/`is_all_spent` return `None` only for a slot that
-        //    is absent or reallocated (the defensive NO_MINED_SLOT branch above,
-        //    or an ABA race the stripe lock precludes); defaulting to
-        //    empty/false there degrades to "no DAH change", never a wrong
-        //    delete.
-        let de_flags = self
-            .mined_index()
-            .read_de_flags(tx_key, entry.mined_slot)
-            .unwrap_or(0);
+        //    MinedEntry DE-flag cache (`de_flags`), `all_spent` from the cached
+        //    MINED_ALL_SPENT bit, has_blocks/unmined_since from the block-entry
+        //    read-back above — all captured in the single acquisition (P1-12),
+        //    which for an absent/ABA slot returns `SlotAbsent` above rather than
+        //    silently defaulting. `old_dah` comes from the authoritative DAH
+        //    secondary index.
         let tx_flags = crate::index::mined_index::tx_flags_from_de_flags(de_flags);
         let has_preserve = de_flags & crate::index::mined_index::MINED_PRESERVED != 0;
-        let all_spent = self
-            .mined_index()
-            .is_all_spent(tx_key, entry.mined_slot)
-            .unwrap_or(false);
         // Authoritative existing DAH: the live secondary-index height, not the
         // (now-frozen) device footer. Sourcing it here also closes the former
         // back-to-back-setMined staleness gap (each call now baselines
@@ -12695,6 +12702,143 @@ mod tests {
             Some(1288),
             "all-spent + mined + on-chain must set DAH = current(1000) + retention(288)",
         );
+    }
+
+    /// P1-12: `set_mined_inner` folds its six MinedIndex shard-lock
+    /// acquisitions (two `mined_block_entries`, `apply_set_mined`,
+    /// `read_de_flags`, `is_all_spent`, `set_de_flag`) into the consolidated
+    /// `apply_mined_transition`. This pins the observable outcome — response
+    /// signal + block_ids, the authoritative MinedIndex mined-state read-back,
+    /// and the DAH index — across the four key scenarios so the consolidation
+    /// can never silently change semantics.
+    #[test]
+    fn set_mined_inner_observable_outcome_unchanged_across_scenarios() {
+        // Scenario 1: mined on the longest chain, partially spent → no DAH,
+        // unmined cleared, no signal.
+        {
+            let h = TestHarness::new(2, TxFlags::empty());
+            let resp = h
+                .engine
+                .set_mined(&SetMinedRequest {
+                    tx_key: h.key,
+                    block_id: 7,
+                    block_height: 900,
+                    subtree_idx: 0,
+                    current_block_height: 1000,
+                    block_height_retention: 288,
+                    on_longest_chain: true,
+                    unset_mined: false,
+                })
+                .expect("mined on longest chain");
+            assert_eq!(resp.block_ids, vec![7]);
+            assert_eq!(resp.signal, Signal::None);
+            let (entries, unmined) = h.engine.mined_block_entries(&h.key).unwrap();
+            assert_eq!(entries.len(), 1, "one block recorded");
+            assert_eq!(unmined, 0, "on_longest_chain clears unmined_since");
+            assert!(
+                !h.engine.dah_index().range_query(u32::MAX).contains(&h.key),
+                "partially spent → no DAH",
+            );
+        }
+
+        // Scenario 2: unset_mined removes the sole block → record goes unmined
+        // as of current height, DAH stays absent, no signal.
+        {
+            let h = TestHarness::new(2, TxFlags::empty());
+            h.engine
+                .set_mined(&SetMinedRequest {
+                    tx_key: h.key,
+                    block_id: 7,
+                    block_height: 900,
+                    subtree_idx: 0,
+                    current_block_height: 1000,
+                    block_height_retention: 288,
+                    on_longest_chain: true,
+                    unset_mined: false,
+                })
+                .expect("mine");
+            let resp = h
+                .engine
+                .set_mined(&SetMinedRequest {
+                    tx_key: h.key,
+                    block_id: 7,
+                    block_height: 900,
+                    subtree_idx: 0,
+                    current_block_height: 1000,
+                    block_height_retention: 288,
+                    on_longest_chain: true,
+                    unset_mined: true,
+                })
+                .expect("unset");
+            assert!(resp.block_ids.is_empty(), "unset removed the sole block");
+            assert_eq!(resp.signal, Signal::None);
+            let (entries, unmined) = h.engine.mined_block_entries(&h.key).unwrap();
+            assert!(entries.is_empty(), "no blocks after unset");
+            assert_eq!(unmined, 1000, "unset with no blocks left re-marks unmined");
+            assert!(!h.engine.dah_index().range_query(u32::MAX).contains(&h.key));
+        }
+
+        // Scenario 3: an all-spent record mined on-chain → DAH = current +
+        // retention. Non-external, so the signal is None.
+        {
+            let h = TestHarness::new(2, TxFlags::empty());
+            h.engine.spend(&h.spend_req(0)).unwrap();
+            h.engine.spend(&h.spend_req(1)).unwrap();
+            let resp = h
+                .engine
+                .set_mined(&SetMinedRequest {
+                    tx_key: h.key,
+                    block_id: 8,
+                    block_height: 900,
+                    subtree_idx: 0,
+                    current_block_height: 1000,
+                    block_height_retention: 288,
+                    on_longest_chain: true,
+                    unset_mined: false,
+                })
+                .expect("mine all-spent");
+            assert_eq!(resp.block_ids, vec![8]);
+            assert_eq!(
+                resp.signal,
+                Signal::None,
+                "non-external all-spent emits no signal"
+            );
+            assert_eq!(
+                h.engine.dah_index().get_height(&h.key),
+                Some(1288),
+                "all-spent + mined + on-chain sets DAH = 1000 + 288",
+            );
+        }
+
+        // Scenario 4: a conflicting external record mined on-chain → DAH set
+        // via the conflicting branch, and (being external) signals DAHSet.
+        {
+            let h = TestHarness::new(2, TxFlags::CONFLICTING | TxFlags::EXTERNAL);
+            let resp = h
+                .engine
+                .set_mined(&SetMinedRequest {
+                    tx_key: h.key,
+                    block_id: 9,
+                    block_height: 900,
+                    subtree_idx: 0,
+                    current_block_height: 1000,
+                    block_height_retention: 288,
+                    on_longest_chain: true,
+                    unset_mined: false,
+                })
+                .expect("mine conflicting external");
+            assert_eq!(resp.block_ids, vec![9]);
+            assert_eq!(
+                resp.signal,
+                Signal::DeleteAtHeightSet,
+                "conflicting external with no prior DAH signals DAHSet",
+            );
+            assert_eq!(
+                h.engine.dah_index().get_height(&h.key),
+                Some(1288),
+                "conflicting record with existing_dah==0 arms a DAH",
+            );
+        }
     }
 
     /// followup-2 end-to-end: a setMined that drives an all-spent record to a
