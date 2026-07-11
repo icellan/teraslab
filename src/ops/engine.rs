@@ -268,6 +268,22 @@ pub struct Engine {
     /// burst). [`Self::write_healthy`] reads these. `None`/empty in test /
     /// no-WAL paths, which are treated as write-healthy.
     redo_atomics: std::sync::OnceLock<Vec<Arc<crate::redo::RedoAtomics>>>,
+    /// FU#8 per-store flag (index = `device_id`): `true` when a BUFFERED create
+    /// on that store MUST emit a self-sufficient byte-embedding `RedoOp::Create`
+    /// instead of the cheap metadata-only `CreateV2` — i.e. the store's DATA
+    /// device is NOT provably co-located with its redo log's device, so a redo
+    /// flush's fsync does not also make the record's data write durable and a
+    /// `CreateV2` whose data write is lost in the buffered window would be
+    /// unrecoverable.
+    ///
+    /// Computed ONCE in [`Self::set_redo_logs`] from the device topology
+    /// ([`crate::device::PhysicalDeviceId`]) so the create hot path reads it
+    /// lock-free. `None` until per-store redo logs are attached; the accessor
+    /// ([`Self::create_redo_is_self_sufficient`]) then treats "unset" as the
+    /// legacy single-handle / unconfigured test path (co-located → `CreateV2`).
+    /// A store whose co-location cannot be soundly proven is recorded as `true`
+    /// (self-sufficient required) — the durability-safe default.
+    create_self_sufficient_required: std::sync::OnceLock<Box<[bool]>>,
     /// Highest `current_block_height` this node has durably observed across
     /// every height-bearing op it applied (spend / set_mined /
     /// mark_longest_chain / unspend), monotonically maxed
@@ -552,6 +568,7 @@ impl Engine {
             redo_buffered: std::sync::atomic::AtomicBool::new(false),
             redo_backpressure: std::sync::OnceLock::new(),
             redo_atomics: std::sync::OnceLock::new(),
+            create_self_sufficient_required: std::sync::OnceLock::new(),
             last_durable_height: std::sync::atomic::AtomicU32::new(0),
             last_durable_height_path: std::sync::OnceLock::new(),
             last_checkpoint_compacted: std::sync::atomic::AtomicU64::new(0),
@@ -651,6 +668,35 @@ impl Engine {
                 l.lock().set_backpressure(bp.clone());
             }
             let _ = self.redo_backpressure.set(bp);
+
+            // FU#8: precompute, per store, whether a BUFFERED create must emit a
+            // self-sufficient byte-embedding `Create` (the store's DATA device
+            // is NOT provably co-located with its redo device) instead of the
+            // cheap metadata-only `CreateV2`. A store is co-located ONLY when
+            // its data device and its dedicated redo device report the SAME
+            // physical identity — then a redo flush's device-level fsync also
+            // makes the O_DIRECT data write durable, so `CreateV2`'s read-back
+            // replay is safe. Co-location is decided ONLY for the
+            // one-dedicated-redo-log-per-store shape; any other shape (a single
+            // representative handle covering several stores, or a
+            // count-mismatched vec) is treated as NOT co-located for EVERY store
+            // — the durability-safe default (a redundant embedded write, never a
+            // lost record). Read lock-free on the create hot path.
+            let store_count = self.store_count();
+            let required: Vec<bool> = if logs.len() == store_count {
+                (0..store_count)
+                    .map(|store| {
+                        let data_id = self.device_for(store as u8).physical_device_id();
+                        let redo_id = logs[store].lock().device_handle().physical_device_id();
+                        !matches!((data_id, redo_id), (Some(a), Some(b)) if a == b)
+                    })
+                    .collect()
+            } else {
+                vec![true; store_count]
+            };
+            let _ = self
+                .create_self_sufficient_required
+                .set(required.into_boxed_slice());
         }
         if self.redo_logs.set(logs).is_err() {
             tracing::warn!("engine per-store redo logs already attached; ignoring replacement");
@@ -848,6 +894,32 @@ impl Engine {
     /// `Option<&Mutex<RedoLog>>` instead.
     pub fn has_per_store_redo(&self) -> bool {
         self.redo_logs.get().is_some_and(|l| !l.is_empty())
+    }
+
+    /// FU#8: whether a BUFFERED create on store `device_id` must emit a
+    /// self-sufficient byte-embedding [`crate::redo::RedoOp::Create`] rather
+    /// than the cheap metadata-only [`crate::redo::RedoOp::CreateV2`].
+    ///
+    /// Returns `true` when the store's DATA device is NOT provably co-located
+    /// with its redo log's device — so a redo flush's fsync does NOT also make
+    /// the record's data-device write durable, and a `CreateV2` whose data
+    /// write is lost in the buffered flush window would be unrecoverable. In
+    /// that case the create must embed its bytes so recovery can rebuild the
+    /// record from the redo tail alone (`replay_create`).
+    ///
+    /// Reads the per-store flag precomputed in [`Self::set_redo_logs`] from the
+    /// device topology (lock-free). Returns `true` (require the safe
+    /// self-sufficient create) for an out-of-range `device_id`. Returns `false`
+    /// (co-located → `CreateV2`) only when NO per-store redo topology has been
+    /// attached — the legacy single-handle / unconfigured test path, where the
+    /// durability decision is not live (production always attaches per-store
+    /// logs at boot).
+    #[inline]
+    pub(crate) fn create_redo_is_self_sufficient(&self, device_id: u8) -> bool {
+        match self.create_self_sufficient_required.get() {
+            Some(flags) => flags.get(device_id as usize).copied().unwrap_or(true),
+            None => false,
+        }
     }
 
     /// The store (`device_id`) that owns a redo op for per-store routing.

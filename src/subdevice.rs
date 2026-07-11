@@ -282,6 +282,16 @@ impl BlockDevice for SubDevice {
     fn is_block_device(&self) -> bool {
         self.barrier.device().is_block_device()
     }
+
+    fn physical_device_id(&self) -> Option<crate::device::PhysicalDeviceId> {
+        // A sub-device's writes land on the shared physical device, and its
+        // `sync()` delegates to that device's barrier — so its physical
+        // identity IS the underlying device's. Two sub-devices carved from ONE
+        // physical device (a `device_split` store's data + redo) therefore
+        // report the SAME id and classify as co-located (FU#8): an fsync of
+        // either flushes the other's writes on the shared device.
+        self.barrier.device().physical_device_id()
+    }
 }
 
 /// Split a physical device into `k` equal-sized virtual sub-devices that share
@@ -532,6 +542,29 @@ mod tests {
         let subs = split_device(dev, 4).unwrap();
         let p2 = subs[2].as_raw_ptr().unwrap();
         assert_eq!(p2 as usize, base_ptr as usize + 4 * 4096);
+    }
+
+    /// FU#8: every sub-device carved from ONE physical device reports the SAME
+    /// physical id (delegated through the shared barrier), while sub-devices of
+    /// a DIFFERENT physical device differ — so a `device_split` store's data +
+    /// redo sub-devices classify as co-located.
+    #[test]
+    fn subdevices_of_one_physical_share_id() {
+        use crate::device::BlockDevice;
+        let phys = mem(8 * 4096);
+        let phys_id = phys.physical_device_id();
+        assert!(phys_id.is_some(), "backing MemoryDevice has an identity");
+        let subs = split_device(phys, 4).unwrap();
+        for s in &subs {
+            assert_eq!(
+                s.physical_device_id(),
+                phys_id,
+                "a sub-device inherits its physical device's identity"
+            );
+        }
+        // A sub-device of an unrelated physical device does NOT match.
+        let other_subs = split_device(mem(8 * 4096), 4).unwrap();
+        assert_ne!(other_subs[0].physical_device_id(), phys_id);
     }
 
     #[test]

@@ -6862,23 +6862,27 @@ fn handle_create_batch(
         // device (replay_create_v2), dropping the create double-write (bytes
         // written to both device and WAL).
         //
-        // P1-7: the data-device write is NOT flushed on the same cadence as the
-        // redo entry (the earlier claim here was wrong). The background flusher
-        // fsyncs only the REDO device; the DATA devices are fsynced by the
-        // checkpoint barrier (`sync_all_store_devices`, checkpoint step 3). So a
-        // durable CreateV2 entry's replay source (its record bytes) is lost on
-        // power failure if the crash lands before the next data-device fsync.
-        // That window is now BOUNDED by the checkpoint interval
-        // (`CheckpointConfig::max_checkpoint_interval`, default 60s — P1-23's
-        // time-based trigger), NOT "one flush interval". Follow-up (tighter,
-        // self-sufficient): emit a byte-embedding create when the record's store
-        // device differs from its redo log's device, mirroring the SpendV2 model.
+        // P1-7 / FU#8: the data-device write is NOT flushed on the same cadence
+        // as the redo entry. The background flusher fsyncs only the REDO device;
+        // the DATA devices are fsynced by the checkpoint barrier
+        // (`sync_all_store_devices`, checkpoint step 3). So a durable CreateV2
+        // entry's replay source (its record bytes) can be lost on power failure
+        // if the crash lands before the next data-device fsync — UNLESS the redo
+        // fsync ALSO flushes the data write, which holds exactly when the redo
+        // device and the record's data device share one physical device (a
+        // device-wide cache flush covers both). FU#8 emits the cheap
+        // metadata-only CreateV2 ONLY for such co-located stores; a store whose
+        // data device is on a DIFFERENT physical device from its redo log gets
+        // the self-sufficient byte-embedding Create instead, closing its
+        // power-loss window (recovery rebuilds the record from the redo tail via
+        // `replay_create`). `create_redo_is_self_sufficient` returns true when
+        // the byte-embedding Create is required (not provably co-located).
         //
         // Under STRICT durability the data write is not fsynced before ack, so
         // the WAL embed is the only durable copy — keep emitting RedoOp::Create.
         // The device write happens either way (record_bytes is moved into
         // ValidCreate below for the coalesced write).
-        if create_redo_buffered {
+        if create_redo_buffered && !engine.create_redo_is_self_sufficient(device_id) {
             redo_ops.push(RedoOp::CreateV2 {
                 tx_key: key,
                 device_id,
@@ -11969,6 +11973,289 @@ mod tests {
     #[test]
     fn already_mined_create_recovers_mining_from_companion_buffered() {
         already_mined_create_recovers_mining_from_companion(true);
+    }
+
+    /// FU#8 helper: build a minimal single-UTXO create item for `txid`.
+    #[cfg(test)]
+    fn fu8_create_item(txid: [u8; 32]) -> WireCreateItem {
+        let mut hsh = [0u8; 32];
+        hsh[0] = txid[0];
+        hsh[1] = 0xA5;
+        WireCreateItem {
+            txid,
+            tx_version: 1,
+            locktime: 0,
+            fee: 500,
+            size_in_bytes: 250,
+            extended_size: 250,
+            is_coinbase: false,
+            spending_height: 0,
+            created_at: 1_700_000_000_000,
+            flags: 0,
+            utxo_hashes: vec![hsh],
+            cold_data: vec![],
+            block_height: 900_000,
+            mined_block_id: None,
+            mined_block_height: None,
+            mined_subtree_idx: None,
+            parent_txids: vec![],
+        }
+    }
+
+    /// FU#8: drive a single create through the real batch-create emission path
+    /// with per-store redo attached (so co-location is computed) and BUFFERED
+    /// durability, then return the redo op emitted for the create.
+    #[cfg(test)]
+    fn fu8_drive_create(engine: &Engine, redo_log: &Arc<Mutex<RedoLog>>, txid: [u8; 32]) -> RedoOp {
+        let req = RequestFrame {
+            request_id: 1,
+            op_code: OP_CREATE_BATCH,
+            flags: 0,
+            payload: encode_create_batch(&[fu8_create_item(txid)]).into(),
+        };
+        let mut cs = crate::server::ConnectionState::new();
+        let resp = handle_request(&req, engine, 8192, None, Some(redo_log), &mut cs, None);
+        assert_eq!(resp.status, STATUS_OK, "create must succeed");
+        // Flush the redo so the entry is durable on the redo device; the DATA
+        // device write stays unsynced (buffered) — exactly the FU#8 window.
+        redo_log.lock().flush().unwrap();
+        let key = TxKey { txid };
+        let entries = redo_log.lock().recover().unwrap();
+        entries
+            .into_iter()
+            .find_map(|e| match &e.op {
+                RedoOp::Create { tx_key, .. } | RedoOp::CreateV2 { tx_key, .. }
+                    if *tx_key == key =>
+                {
+                    Some(e.op.clone())
+                }
+                _ => None,
+            })
+            .expect("create entry present in redo log")
+    }
+
+    /// FU#8 (RED→GREEN): a BUFFERED create on a store whose DATA device is NOT
+    /// co-located with its redo device MUST emit the self-sufficient
+    /// byte-embedding `RedoOp::Create` — NOT the metadata-only `CreateV2` — so
+    /// that when the un-flushed data-device write is lost to a power failure,
+    /// recovery reconstructs the record from the redo tail alone
+    /// (`replay_create` pwrites the embedded bytes back).
+    ///
+    /// Before the fix the buffered branch always emitted `CreateV2`; recovery's
+    /// `replay_create_v2` reads the (lost) bytes back, sees a mismatch, and
+    /// `Skipped`s the record — silent loss. This test fails RED on both the
+    /// emission assertion and the post-crash lookup.
+    #[test]
+    fn fu8_buffered_noncolocated_create_embeds_bytes_and_recovers_after_data_loss() {
+        let _g = metrics_test_lock();
+        // Non-co-located: the data device and the redo device are DISTINCT
+        // physical devices, so a redo fsync does NOT flush the data write.
+        let data_mem = Arc::new(MemoryDevice::new_volatile(64 * 1024 * 1024, 4096).unwrap());
+        let data_dev: Arc<dyn BlockDevice> = data_mem.clone();
+        let redo_dev: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(16 * 1024 * 1024, 4096).unwrap());
+        let alloc = SlotAllocator::new(data_dev.clone()).unwrap();
+        let index = Index::new(10_000).unwrap();
+        let engine = Engine::new(
+            data_dev.clone(),
+            index,
+            alloc,
+            StripedLocks::new(1024),
+            DahIndex::new(),
+        );
+        let redo_log = Arc::new(Mutex::new(
+            RedoLog::open(redo_dev.clone(), 0, 16 * 1024 * 1024).unwrap(),
+        ));
+        // Attach per-store redo → co-location computed from the device topology.
+        engine.set_redo_logs(vec![redo_log.clone()]);
+        engine.set_buffered_durability(true);
+
+        let txid = DispatchTestHarness::make_txid(0x51);
+        let key = TxKey { txid };
+        let op = fu8_drive_create(&engine, &redo_log, txid);
+
+        // (1) Emission: a non-co-located buffered create embeds the record bytes.
+        let (record_offset, utxo_count) = match &op {
+            RedoOp::Create {
+                record_offset,
+                utxo_count,
+                record_bytes,
+                ..
+            } => {
+                assert!(
+                    !record_bytes.is_empty(),
+                    "byte-embedding Create must carry the record bytes"
+                );
+                (*record_offset, *utxo_count)
+            }
+            RedoOp::CreateV2 { .. } => panic!(
+                "non-co-located buffered create emitted metadata-only CreateV2 (loss window); \
+                 expected byte-embedding RedoOp::Create"
+            ),
+            other => panic!("unexpected create op: {other:?}"),
+        };
+
+        // Persist the allocator so a fresh recovery could re-derive it if needed.
+        engine.allocator().lock().persist().unwrap();
+
+        // (2) Power failure: the un-synced data-device write is lost.
+        assert!(
+            data_mem.simulate_power_loss(),
+            "data device must be volatile so the un-synced write is dropped"
+        );
+
+        // (3) Recovery reconstructs the record FROM THE REDO TAIL alone.
+        let fresh = crate::index::ShardedIndex::from_single(Index::new(10_000).unwrap().into());
+        let rec_log = RedoLog::open(redo_dev.clone(), 0, 16 * 1024 * 1024).unwrap();
+        crate::recovery::recover(&*data_dev, &rec_log, &fresh).expect("recovery succeeds");
+        let ie = fresh
+            .lookup(&key)
+            .expect("record reconstructed from the redo tail after the data write was lost");
+        assert_eq!(ie.record_offset, record_offset);
+        let m = crate::io::read_metadata(&*data_dev, ie.record_offset).expect("metadata readable");
+        assert_eq!(
+            { m.tx_id },
+            txid,
+            "recovered record is the right transaction"
+        );
+        assert_eq!({ m.utxo_count }, utxo_count, "recovered utxo_count matches");
+    }
+
+    /// FU#8 guard: a BUFFERED create on a CO-LOCATED store (data + redo carved
+    /// from ONE physical device, sharing its fsync barrier) still emits the
+    /// cheap metadata-only `CreateV2` — NO write-amp regression — and recovers
+    /// normally (the data write is durable via the shared device fsync, so
+    /// `replay_create_v2` reads it back).
+    #[test]
+    fn fu8_buffered_colocated_create_stays_createv2_and_recovers() {
+        let _g = metrics_test_lock();
+        // Co-located: split ONE physical device into a data sub-device and a
+        // redo sub-device. Both share the physical device's fsync barrier, so a
+        // redo fsync flushes the data write too.
+        let phys: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let subs = crate::subdevice::split_device(phys, 2).unwrap();
+        let data_dev: Arc<dyn BlockDevice> = subs[0].clone();
+        let redo_dev: Arc<dyn BlockDevice> = subs[1].clone();
+        let alloc = SlotAllocator::new(data_dev.clone()).unwrap();
+        let index = Index::new(10_000).unwrap();
+        let engine = Engine::new(
+            data_dev.clone(),
+            index,
+            alloc,
+            StripedLocks::new(1024),
+            DahIndex::new(),
+        );
+        let redo_log = Arc::new(Mutex::new(
+            RedoLog::open(redo_dev.clone(), 0, 4 * 1024 * 1024).unwrap(),
+        ));
+        engine.set_redo_logs(vec![redo_log.clone()]);
+        engine.set_buffered_durability(true);
+
+        let txid = DispatchTestHarness::make_txid(0x52);
+        let key = TxKey { txid };
+        let op = fu8_drive_create(&engine, &redo_log, txid);
+
+        let (record_offset, utxo_count) = match &op {
+            RedoOp::CreateV2 {
+                record_offset,
+                utxo_count,
+                ..
+            } => (*record_offset, *utxo_count),
+            RedoOp::Create { .. } => panic!(
+                "co-located buffered create emitted byte-embedding Create (write-amp regression); \
+                 expected metadata-only RedoOp::CreateV2"
+            ),
+            other => panic!("unexpected create op: {other:?}"),
+        };
+
+        // No crash: recovery reads the record back from the (durable) device.
+        let fresh = crate::index::ShardedIndex::from_single(Index::new(10_000).unwrap().into());
+        let rec_log = RedoLog::open(redo_dev.clone(), 0, 4 * 1024 * 1024).unwrap();
+        crate::recovery::recover(&*data_dev, &rec_log, &fresh).expect("recovery succeeds");
+        let ie = fresh
+            .lookup(&key)
+            .expect("CreateV2 recovers the record by reading it back from the device");
+        assert_eq!(ie.record_offset, record_offset);
+        let m = crate::io::read_metadata(&*data_dev, ie.record_offset).expect("metadata readable");
+        assert_eq!({ m.tx_id }, txid);
+        assert_eq!({ m.utxo_count }, utxo_count);
+    }
+
+    /// FU#8 guard: STRICT durability is unchanged — the create always embeds
+    /// its record bytes (`RedoOp::Create`), regardless of device co-location,
+    /// because under strict durability the data write is not fsynced before ack
+    /// and the WAL embed is the only durable copy.
+    #[test]
+    fn fu8_strict_create_embeds_bytes_regardless_of_colocation() {
+        let _g = metrics_test_lock();
+        // Even on a CO-LOCATED topology, strict mode must embed the bytes.
+        let phys: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let subs = crate::subdevice::split_device(phys, 2).unwrap();
+        let data_dev: Arc<dyn BlockDevice> = subs[0].clone();
+        let redo_dev: Arc<dyn BlockDevice> = subs[1].clone();
+        let alloc = SlotAllocator::new(data_dev.clone()).unwrap();
+        let index = Index::new(10_000).unwrap();
+        let engine = Engine::new(
+            data_dev.clone(),
+            index,
+            alloc,
+            StripedLocks::new(1024),
+            DahIndex::new(),
+        );
+        let redo_log = Arc::new(Mutex::new(
+            RedoLog::open(redo_dev.clone(), 0, 4 * 1024 * 1024).unwrap(),
+        ));
+        engine.set_redo_logs(vec![redo_log.clone()]);
+        // STRICT: leave buffered durability off (the default).
+
+        let txid = DispatchTestHarness::make_txid(0x53);
+        let op = fu8_drive_create(&engine, &redo_log, txid);
+        assert!(
+            matches!(&op, RedoOp::Create { .. }),
+            "strict durability must always emit byte-embedding Create; got {op:?}"
+        );
+    }
+
+    /// FU#8 accessor semantics: safe default when no per-store redo is attached
+    /// (legacy single-handle path → co-located → CreateV2), and a
+    /// self-sufficient Create requirement once a redo on a DISTINCT physical
+    /// device is attached (non-co-located). Out-of-range store ids are safe.
+    #[test]
+    fn fu8_accessor_defaults_safe_and_reflects_topology() {
+        let _g = metrics_test_lock();
+        let data_dev: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(16 * 1024 * 1024, 4096).unwrap());
+        let alloc = SlotAllocator::new(data_dev.clone()).unwrap();
+        let engine = Engine::new(
+            data_dev.clone(),
+            Index::new(1000).unwrap(),
+            alloc,
+            StripedLocks::new(1024),
+            DahIndex::new(),
+        );
+        // No per-store redo attached yet: preserve the legacy CreateV2 default.
+        assert!(
+            !engine.create_redo_is_self_sufficient(0),
+            "unset topology must default to co-located (legacy CreateV2)"
+        );
+
+        // Attach a redo on a DISTINCT physical device → not co-located.
+        let redo_dev: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(4 * 1024 * 1024, 4096).unwrap());
+        let redo_log = Arc::new(Mutex::new(
+            RedoLog::open(redo_dev, 0, 4 * 1024 * 1024).unwrap(),
+        ));
+        engine.set_redo_logs(vec![redo_log]);
+        assert!(
+            engine.create_redo_is_self_sufficient(0),
+            "data + redo on different physical devices → require self-sufficient Create"
+        );
+        assert!(
+            engine.create_redo_is_self_sufficient(200),
+            "out-of-range store id is treated as not co-located (safe)"
+        );
     }
 
     /// FIX 1 (P2): the Phase-3 register loop is parallelized across scoped
