@@ -117,6 +117,36 @@ pub(crate) struct Store {
     log_structured: bool,
 }
 
+/// Outcome of the replica batch's collect-then-atomic redo admission
+/// ([`Engine::append_replica_redo_batch_atomic`], FU#6a).
+///
+/// The two variants tell the receiver whether the master should RETRY the
+/// identical batch or the node has to fail closed:
+///
+/// * [`Self::LogFull`] — a touched store's redo log is momentarily full (a
+///   transient [`crate::redo::RedoError::LogFull`] the next checkpoint
+///   reclaims). NOTHING was buffered and NO log was poisoned; the receiver
+///   NAKs [`crate::replication::protocol::ReplicaAck::Busy`] and the master
+///   re-sends the identical batch after a short backoff. Retryable.
+/// * [`Self::Fatal`] — a touched log is genuinely poisoned or an append that
+///   passed the pre-flight fit check still failed (a real I/O fault). Every
+///   redo log is poisoned and the node fails closed, exactly as the pre-FU#6a
+///   per-op path did on any append error.
+#[derive(Debug, thiserror::Error)]
+pub enum ReplicaRedoAdmitError {
+    /// Retryable transient backpressure — buffer NOTHING, poison NOTHING.
+    /// `first_sequence` echoes the offending batch's first sequence for the
+    /// receiver's `ReplicaAck::Busy` (logging only).
+    #[error("replica redo admission: a touched log is momentarily full (retryable), first_sequence {first_sequence}")]
+    LogFull {
+        /// The offending batch's first sequence, echoed for logging.
+        first_sequence: u64,
+    },
+    /// A genuine fault — every redo log has been poisoned; the node fails closed.
+    #[error("replica redo admission failed closed: {0}")]
+    Fatal(String),
+}
+
 pub struct Engine {
     /// Every store backing this engine, indexed by `device_id` (store 0 first).
     /// Each holds its own device + raw device pointer + allocator. Route by
@@ -832,7 +862,7 @@ impl Engine {
     /// `Create`/`AllocateRegion`/`FreeRegion` ops so a keyed op journaled in the
     /// SAME batch as the `Create` of its key routes to the SAME store as that
     /// create, preserving per-store-log purity for per-store recovery.
-    fn redo_store_for_op(&self, op: &crate::redo::RedoOp) -> u8 {
+    pub(crate) fn redo_store_for_op(&self, op: &crate::redo::RedoOp) -> u8 {
         use crate::redo::RedoOp;
         match op {
             RedoOp::Create { device_id, .. }
@@ -1366,6 +1396,123 @@ impl Engine {
                 "replica redo append failed; poisoned all store logs (fail-closed)"
             );
             return Err(format!("replica redo append: {e}"));
+        }
+        Ok(())
+    }
+
+    /// FU#6a: admit a whole replica batch's post-apply redo entries in ONE
+    /// atomic, all-or-nothing step across every touched store's log — the
+    /// collect-then-atomic replacement for the per-op inline
+    /// [`Self::append_replica_redo_entry_to_store`].
+    ///
+    /// `entries` are the `(RedoOp, device_id)` pairs the receiver COLLECTED
+    /// during its per-op apply loop (mutations already applied; nothing
+    /// journaled yet). This groups them by destination log, locks every touched
+    /// log in ascending index order, holds ALL the locks across a
+    /// [`crate::redo::RedoLog::would_fit`] pre-flight, and then:
+    ///
+    /// * ALL fit → appends each slice (buffered, NO flush) under the held locks
+    ///   and releases them; the caller's once-per-batch
+    ///   [`Self::flush_all_redo_logs`] makes them durable. Returns `Ok(())`.
+    /// * ANY does not fit (transient `LogFull`) → buffers NOTHING, poisons
+    ///   NOTHING, releases every lock, and returns
+    ///   [`ReplicaRedoAdmitError::LogFull`] so the receiver NAKs `Busy` and the
+    ///   master re-sends the identical batch.
+    /// * a touched log is already poisoned, or an append that passed the fit
+    ///   check still fails → poisons every log and returns
+    ///   [`ReplicaRedoAdmitError::Fatal`] (fail closed, unchanged behavior).
+    ///
+    /// By admitting the batch atomically, a mid-batch `LogFull` can never leave
+    /// earlier ops of the batch buffered-but-unflushed (the residue the pre-fix
+    /// per-op path had to poison to contain). No fsync ever happens under the
+    /// held log locks.
+    ///
+    /// Atomicity / lock ordering matches the primary preflight in
+    /// [`Self::append_redo_ops_routed`]: every touched log is locked once, in
+    /// ascending index order, which is deadlock-free because this is the only
+    /// replica site that holds more than one redo-log lock at a time.
+    ///
+    /// A no-op returning `Ok(())` when `entries` is empty or no per-store log is
+    /// attached (test / no-WAL paths), matching
+    /// [`Self::append_replica_redo_entry_to_store`]'s no-log behavior.
+    ///
+    /// # Errors
+    ///
+    /// [`ReplicaRedoAdmitError::LogFull`] (retryable; nothing buffered, nothing
+    /// poisoned) or [`ReplicaRedoAdmitError::Fatal`] (every log poisoned).
+    pub fn append_replica_redo_batch_atomic(
+        &self,
+        entries: &[(crate::redo::RedoOp, u8)],
+        first_sequence: u64,
+    ) -> std::result::Result<(), ReplicaRedoAdmitError> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let Some(logs) = self.redo_logs.get() else {
+            // No per-store logs attached (test / no-WAL paths): nothing to
+            // admit, exactly as the per-op path no-ops when no log is attached.
+            return Ok(());
+        };
+        if logs.is_empty() {
+            return Ok(());
+        }
+
+        // Group each entry's op by the log that will actually receive it
+        // (device -> log clamps an out-of-range store index to the last log),
+        // so a shared log is fit-checked against EVERY op it will get and is
+        // never locked twice. `BTreeMap` iterates ascending -> the required
+        // ascending lock order.
+        let mut per_log: BTreeMap<usize, Vec<&crate::redo::RedoOp>> = BTreeMap::new();
+        for (op, device_id) in entries {
+            let log_idx = (*device_id as usize).min(logs.len() - 1);
+            per_log.entry(log_idx).or_default().push(op);
+        }
+        let touched: Vec<(usize, Vec<&crate::redo::RedoOp>)> = per_log.into_iter().collect();
+
+        // Lock every touched log in ASCENDING index order and hold ALL the
+        // locks across the fit checks (a consistent cross-store snapshot).
+        let mut held = Vec::with_capacity(touched.len());
+        for (log_idx, log_ops) in &touched {
+            let guard = logs[*log_idx].lock();
+            // A poisoned log is a GENUINE fault, not backpressure. `would_fit`
+            // ALSO returns false when poisoned, so check poison FIRST to avoid
+            // misclassifying a poisoned log as a retryable `LogFull`.
+            if guard.is_poisoned() {
+                drop(guard);
+                drop(held);
+                self.poison_all_redo_logs();
+                return Err(ReplicaRedoAdmitError::Fatal(format!(
+                    "store {log_idx} redo log already poisoned"
+                )));
+            }
+            if !guard.would_fit(log_ops) {
+                // Retryable transient backpressure: buffer NOTHING, poison
+                // NOTHING; `guard` and `held` drop here, releasing every lock.
+                return Err(ReplicaRedoAdmitError::LogFull { first_sequence });
+            }
+            held.push(guard);
+        }
+
+        // Every touched log has room: append each slice (buffered, NO flush)
+        // under the still-held locks. `would_fit` proved the fit, so a per-op
+        // `LogFull` here is impossible; any other append error is a genuine
+        // fault -> poison every log + fail closed.
+        let mut append_err: Option<String> = None;
+        'admit: for (guard, (log_idx, log_ops)) in held.iter_mut().zip(touched.iter()) {
+            for op in log_ops {
+                if let Err(e) = guard.append((*op).clone()) {
+                    append_err = Some(format!("store {log_idx} append failed: {e}"));
+                    break 'admit;
+                }
+            }
+        }
+        // Release every lock BEFORE poisoning (parking_lot mutexes are not
+        // reentrant, and `poison_all_redo_logs` re-locks each log).
+        drop(held);
+        if let Some(detail) = append_err {
+            self.poison_all_redo_logs();
+            tracing::error!(detail = %detail, "replica redo admission append failed; poisoned all store logs (fail-closed)");
+            return Err(ReplicaRedoAdmitError::Fatal(detail));
         }
         Ok(())
     }
@@ -21972,6 +22119,144 @@ mod tests {
         );
         // A subsequent batch flush makes nothing durable: store 0 recovers empty.
         let _ = engine.flush_all_redo_logs();
+    }
+
+    /// FU#6a: the collect-then-atomic admission rejects a whole batch CLEANLY
+    /// when ANY touched store's slice does not fit — buffering nothing and
+    /// poisoning nothing (a transient `LogFull` is retryable backpressure, not
+    /// a fence). This is the exact contrast with the per-op
+    /// `append_replica_redo_entry_to_store`, which poisons on the first
+    /// overflowing append.
+    #[test]
+    fn append_replica_redo_batch_atomic_logfull_is_retryable_without_poison() {
+        use crate::redo::{RedoLog, RedoOp};
+        use std::sync::atomic::AtomicU64;
+
+        let engine = create_two_store_engine();
+        // Store 0: roomy. Store 1: tiny — a single fat op overflows it.
+        let rdev0: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(64 * 1024, 4096).unwrap());
+        let rdev1: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(8192, 4096).unwrap());
+        let mut log0 = RedoLog::open(rdev0, 0, 64 * 1024).unwrap();
+        let mut log1 = RedoLog::open(rdev1, 0, 8192).unwrap();
+        let shared = Arc::new(AtomicU64::new(RedoLog::shared_sequence_floor(&[
+            &log0, &log1,
+        ])));
+        log0.attach_shared_sequence(shared.clone());
+        log1.attach_shared_sequence(shared);
+        let log0_arc = Arc::new(parking_lot::Mutex::new(log0));
+        let log1_arc = Arc::new(parking_lot::Mutex::new(log1));
+        engine.set_redo_logs(vec![log0_arc.clone(), log1_arc.clone()]);
+
+        let small = RedoOp::AllocateRegion {
+            device_id: 0,
+            offset: 4096,
+            size: 4096,
+        };
+        let fat = RedoOp::Create {
+            tx_key: TxKey { txid: [9u8; 32] },
+            device_id: 1,
+            record_offset: 4096,
+            utxo_count: 1,
+            is_conflicting: false,
+            record_bytes: vec![0xEE; 8192].into(),
+            parent_txids: Vec::new(),
+        };
+
+        // Store 1's slice does not fit: the WHOLE batch is rejected atomically.
+        let err = engine
+            .append_replica_redo_batch_atomic(&[(small.clone(), 0), (fat, 1)], 42)
+            .expect_err("an oversized store-1 slice must reject the whole batch");
+        match err {
+            crate::ops::engine::ReplicaRedoAdmitError::LogFull { first_sequence } => {
+                assert_eq!(first_sequence, 42, "LogFull echoes the batch first_sequence");
+            }
+            other => panic!("expected a retryable LogFull, got: {other:?}"),
+        }
+
+        // Atomic all-or-nothing: store 0 buffered NOTHING despite fitting.
+        assert!(
+            !log0_arc.lock().has_pending(),
+            "store 0 must buffer nothing when the batch is rejected"
+        );
+        assert!(
+            !log1_arc.lock().has_pending(),
+            "store 1 must buffer nothing when the batch is rejected"
+        );
+        // Neither log was poisoned — a transient LogFull is retryable, not a fence.
+        assert!(
+            !log0_arc.lock().is_poisoned(),
+            "a transient LogFull must NOT poison store 0"
+        );
+        assert!(
+            !log1_arc.lock().is_poisoned(),
+            "a transient LogFull must NOT poison store 1"
+        );
+
+        // A subsequent fitting admission (just the small op) succeeds — proof
+        // the logs still accept writes (they were never poisoned).
+        engine
+            .append_replica_redo_batch_atomic(&[(small, 0)], 43)
+            .expect("a fitting admission must succeed after a rejected one");
+        assert!(
+            log0_arc.lock().has_pending(),
+            "the fitting op is buffered on store 0"
+        );
+        engine
+            .flush_all_redo_logs()
+            .expect("the buffered op flushes durable");
+    }
+
+    /// FU#6a: when every touched store's slice fits, the atomic admission
+    /// buffers each store's slice and the once-per-batch flush makes them
+    /// durable across ALL touched stores (multi-store atomicity).
+    #[test]
+    fn append_replica_redo_batch_atomic_admits_every_touched_store() {
+        use crate::redo::{RedoLog, RedoOp};
+        use std::sync::atomic::AtomicU64;
+
+        let engine = create_two_store_engine();
+        let rdev0: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(64 * 1024, 4096).unwrap());
+        let rdev1: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(64 * 1024, 4096).unwrap());
+        let mut log0 = RedoLog::open(rdev0.clone(), 0, 64 * 1024).unwrap();
+        let mut log1 = RedoLog::open(rdev1.clone(), 0, 64 * 1024).unwrap();
+        let shared = Arc::new(AtomicU64::new(RedoLog::shared_sequence_floor(&[
+            &log0, &log1,
+        ])));
+        log0.attach_shared_sequence(shared.clone());
+        log1.attach_shared_sequence(shared);
+        let log0_arc = Arc::new(parking_lot::Mutex::new(log0));
+        let log1_arc = Arc::new(parking_lot::Mutex::new(log1));
+        engine.set_redo_logs(vec![log0_arc.clone(), log1_arc.clone()]);
+
+        let op0 = RedoOp::AllocateRegion {
+            device_id: 0,
+            offset: 4096,
+            size: 4096,
+        };
+        let op1 = RedoOp::AllocateRegion {
+            device_id: 1,
+            offset: 8192,
+            size: 4096,
+        };
+        engine
+            .append_replica_redo_batch_atomic(&[(op0, 0), (op1, 1)], 7)
+            .expect("both slices fit -> admitted");
+        assert!(log0_arc.lock().has_pending(), "store 0 buffered its op");
+        assert!(log1_arc.lock().has_pending(), "store 1 buffered its op");
+
+        engine.flush_all_redo_logs().expect("flush every touched store");
+
+        // Reopen each store's log and recover: both entries are durable.
+        let recovered0 = RedoLog::open(rdev0, 0, 64 * 1024)
+            .unwrap()
+            .recover()
+            .unwrap();
+        let recovered1 = RedoLog::open(rdev1, 0, 64 * 1024)
+            .unwrap()
+            .recover()
+            .unwrap();
+        assert_eq!(recovered0.len(), 1, "store 0's admitted entry is durable");
+        assert_eq!(recovered1.len(), 1, "store 1's admitted entry is durable");
     }
 
     #[test]
