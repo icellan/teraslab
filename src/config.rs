@@ -525,6 +525,14 @@ pub struct IndexConfig {
     /// persisted snapshot for the rest. The v3 snapshot FORMAT is written
     /// unconditionally (additive durable data), so enabling this later needs no
     /// migration — the next checkpoint already produced an eligible snapshot.
+    ///
+    /// EXPERIMENTAL — two known safe-direction (over-retention, self-healing)
+    /// residuals should be closed before enabling in production: (1) a transient
+    /// redo `LogFull` during a non-eligible preservation expiry can briefly
+    /// re-expose a stale-`PRESERVED` window until the reclaiming checkpoint
+    /// writes a fresh snapshot; (2) the redb-DAH-trust path for untouched
+    /// records is proven by unit tests but not yet by an on-disk end-to-end
+    /// test. Neither risks data loss or a wrong delete.
     pub fast_boot_touched_secondaries: bool,
 }
 
