@@ -271,28 +271,50 @@ func getSpendBatchSize(n int) int { return 4 + n*68 }
 // Pruner operations
 // ---------------------------------------------------------------------------
 
-// encodeQueryOldUnmined appends a QueryOldUnmined request payload to buf.
-func encodeQueryOldUnmined(buf []byte, cutoffHeight uint32) []byte {
-	return appendU32(buf, cutoffHeight)
+// encodeQueryOldUnmined appends a QueryOldUnmined request payload to buf:
+// [cutoffHeight:4 LE][cursor:32?]. When cursor is non-nil, the 32-byte resume
+// cursor is appended (FU#5 pagination) so the server returns only qualifying
+// txids strictly greater than it. A nil cursor omits the trailing bytes,
+// yielding the historical 4-byte page-1 request an older server still accepts.
+func encodeQueryOldUnmined(buf []byte, cutoffHeight uint32, cursor *TxID) []byte {
+	buf = appendU32(buf, cutoffHeight)
+	return appendQueryCursor(buf, cursor)
 }
 
-// encodeQueryConflicting appends a QueryConflicting request payload to buf.
-// The request carries no parameters (CONFLICTING is a boolean flag with no
-// cutoff), so buf is returned unchanged. Wire layout must match the Rust
-// server's handle_query_conflicting (empty request payload).
-func encodeQueryConflicting(buf []byte) []byte {
+// encodeQueryConflicting appends a QueryConflicting request payload to buf:
+// [cursor:32?]. The request otherwise carries no parameters (CONFLICTING is a
+// boolean flag with no cutoff). A nil cursor yields the historical empty
+// payload; a non-nil cursor appends the 32-byte FU#5 resume cursor. Wire layout
+// must match the Rust server's handle_query_conflicting_capped.
+func encodeQueryConflicting(buf []byte, cursor *TxID) []byte {
+	return appendQueryCursor(buf, cursor)
+}
+
+// appendQueryCursor appends the 32-byte resume cursor when non-nil, leaving buf
+// unchanged otherwise. Absence of the cursor is how "page 1 / from the start"
+// is encoded (the server distinguishes it by payload length).
+func appendQueryCursor(buf []byte, cursor *TxID) []byte {
+	if cursor != nil {
+		buf = append(buf, cursor[:]...)
+	}
 	return buf
 }
 
-// decodeQueryConflictingResponse decodes a QueryConflicting response payload.
-// The format is identical to QueryOldUnmined: [count:u32 LE][txid:32]*count.
-func decodeQueryConflictingResponse(data []byte) ([]TxID, error) {
+// decodeQueryTxIDResponse decodes a diagnostic-query txid response payload:
+// [count:u32 LE][txid:32]*count[truncated:u8]. It returns the txids and whether
+// the server flagged the result truncated (FU#5): a truncated result means a
+// further qualifying txid exists past the frame cap and the caller should
+// re-query with the last returned txid as the resume cursor. The trailing flag
+// byte is optional for defensiveness — a response that stops exactly after the
+// txids is treated as not truncated.
+func decodeQueryTxIDResponse(data []byte, label string) ([]TxID, bool, error) {
 	if len(data) < 4 {
-		return nil, fmt.Errorf("query conflicting: need 4 bytes, have %d", len(data))
+		return nil, false, fmt.Errorf("%s: need 4 bytes, have %d", label, len(data))
 	}
 	count := int(getU32(data[0:4]))
-	if len(data) < 4+count*32 {
-		return nil, fmt.Errorf("query conflicting: truncated")
+	end := 4 + count*32
+	if len(data) < end {
+		return nil, false, fmt.Errorf("%s: truncated", label)
 	}
 	txids := make([]TxID, count)
 	pos := 4
@@ -300,7 +322,14 @@ func decodeQueryConflictingResponse(data []byte) ([]TxID, error) {
 		copy(txids[i][:], data[pos:pos+32])
 		pos += 32
 	}
-	return txids, nil
+	truncated := len(data) > end && data[end] == 1
+	return txids, truncated, nil
+}
+
+// decodeQueryConflictingResponse decodes a QueryConflicting response payload.
+// The format is identical to QueryOldUnmined.
+func decodeQueryConflictingResponse(data []byte) ([]TxID, bool, error) {
+	return decodeQueryTxIDResponse(data, "query conflicting")
 }
 
 // encodeRemoveConflictingChildBatch appends a RemoveConflictingChildBatch
@@ -729,22 +758,10 @@ func decodePartitionMap(data []byte) (*PartitionMap, error) {
 	return pm, nil
 }
 
-// decodeQueryOldUnminedResponse decodes a QueryOldUnmined response payload.
-func decodeQueryOldUnminedResponse(data []byte) ([]TxID, error) {
-	if len(data) < 4 {
-		return nil, fmt.Errorf("query old unmined: need 4 bytes, have %d", len(data))
-	}
-	count := int(getU32(data[0:4]))
-	if len(data) < 4+count*32 {
-		return nil, fmt.Errorf("query old unmined: truncated")
-	}
-	txids := make([]TxID, count)
-	pos := 4
-	for i := 0; i < count; i++ {
-		copy(txids[i][:], data[pos:pos+32])
-		pos += 32
-	}
-	return txids, nil
+// decodeQueryOldUnminedResponse decodes a QueryOldUnmined response payload,
+// returning the txids and the FU#5 truncated flag (see decodeQueryTxIDResponse).
+func decodeQueryOldUnminedResponse(data []byte) ([]TxID, bool, error) {
+	return decodeQueryTxIDResponse(data, "query old unmined")
 }
 
 // decodeProcessExpiredResponse decodes a ProcessExpiredPreservations response.

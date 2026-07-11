@@ -447,49 +447,71 @@ func (c *Client) getSpendBatchClusterOnce(ctx context.Context, items []GetSpendI
 	return merged, nil
 }
 
-// queryNodesUnion runs a parameterless txid-list query against every distinct
-// node and returns the deduplicated union of results. In cluster mode the
-// server filters each node's response to the shards it masters, so the union is
-// the cluster-wide answer. Used by QueryOldUnmined / QueryConflicting.
-func (c *Client) queryNodesUnion(ctx context.Context, opCode uint16, encode func(buf []byte) []byte, decode func([]byte) ([]TxID, error)) ([]TxID, error) {
+// queryNodesUnion runs a diagnostic txid-list query against every distinct node
+// and returns the deduplicated union of results. In cluster mode the server
+// filters each node's response to the shards it masters, so the union is the
+// cluster-wide answer. Used by QueryOldUnmined / QueryConflicting.
+//
+// Each node caps its response independently, so every node is paged to
+// completion (FU#5 resume cursor) before moving to the next. The cursor is
+// per-node — it resumes within that node's own sorted candidate set. Pagination
+// is gated on the negotiated server version (>=3); against an older server the
+// client makes a single call per node and, if any node truncated, returns the
+// partial union with ErrQueryTruncated rather than looping forever.
+func (c *Client) queryNodesUnion(ctx context.Context, opCode uint16, encode func(buf []byte, cursor *TxID) []byte, decode func([]byte) ([]TxID, bool, error)) ([]TxID, error) {
 	pools := c.cluster.allPools()
 	if len(pools) == 0 {
 		return nil, fmt.Errorf("no pools available")
 	}
+	supportsPaging := c.NegotiatedVersion() >= 3
 	seen := make(map[TxID]struct{})
 	var union []TxID
 	for _, pool := range pools {
-		conn, err := pool.get(ctx)
-		if err != nil {
-			return nil, err
-		}
-		buf := getBuf(16)
-		payload := encode(buf)
-		resp, err := conn.roundTrip(ctx, opCode, 0, payload)
-		putBuf(payload)
-		if err != nil {
-			return nil, err
-		}
-		if resp.Status != StatusOK {
-			if resp.Status == StatusError {
-				code, msg, _ := decodeErrorPayload(resp.Payload)
+		var cursor *TxID
+		for {
+			conn, err := pool.get(ctx)
+			if err != nil {
+				return nil, err
+			}
+			buf := getBuf(40)
+			payload := encode(buf, cursor)
+			resp, err := conn.roundTrip(ctx, opCode, 0, payload)
+			putBuf(payload)
+			if err != nil {
+				return nil, err
+			}
+			if resp.Status != StatusOK {
+				if resp.Status == StatusError {
+					code, msg, _ := decodeErrorPayload(resp.Payload)
+					recyclePayload(resp.Payload)
+					return nil, &ServerError{Code: code, Message: msg}
+				}
+				status := resp.Status
 				recyclePayload(resp.Payload)
-				return nil, &ServerError{Code: code, Message: msg}
+				return nil, fmt.Errorf("unexpected status: %d", status)
 			}
-			status := resp.Status
+			txids, truncated, err := decode(resp.Payload)
 			recyclePayload(resp.Payload)
-			return nil, fmt.Errorf("unexpected status: %d", status)
-		}
-		txids, err := decode(resp.Payload)
-		recyclePayload(resp.Payload)
-		if err != nil {
-			return nil, err
-		}
-		for _, t := range txids {
-			if _, ok := seen[t]; !ok {
-				seen[t] = struct{}{}
-				union = append(union, t)
+			if err != nil {
+				return nil, err
 			}
+			for _, t := range txids {
+				if _, ok := seen[t]; !ok {
+					seen[t] = struct{}{}
+					union = append(union, t)
+				}
+			}
+			if !truncated {
+				break
+			}
+			if !supportsPaging {
+				return union, ErrQueryTruncated
+			}
+			if len(txids) == 0 {
+				return union, fmt.Errorf("query paging: truncated response with empty page")
+			}
+			last := txids[len(txids)-1]
+			cursor = &last
 		}
 	}
 	return union, nil

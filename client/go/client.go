@@ -1236,64 +1236,101 @@ func (c *Client) GetSpendBatch(ctx context.Context, items []GetSpendItem) ([]Get
 // QueryOldUnmined queries transactions unmined since before cutoffHeight. In
 // cluster mode it fans the query out to every node and returns the
 // deduplicated union (each node answers for the shards it masters).
+//
+// A single query response is capped at one 16 MiB frame. Against a version-3+
+// server (FU#5) the client transparently pages the remainder via a resume
+// cursor and returns the complete set. Against an older server it makes a
+// single best-effort call and, if the result was capped, returns the partial
+// page wrapped with ErrQueryTruncated rather than silently dropping the tail.
 func (c *Client) QueryOldUnmined(ctx context.Context, cutoffHeight uint32) ([]TxID, error) {
 	if c.cluster != nil {
 		return c.queryNodesUnion(ctx, OpQueryOldUnmined,
-			func(buf []byte) []byte { return encodeQueryOldUnmined(buf, cutoffHeight) },
+			func(buf []byte, cursor *TxID) []byte {
+				return encodeQueryOldUnmined(buf, cutoffHeight, cursor)
+			},
 			decodeQueryOldUnminedResponse)
 	}
-	buf := getBuf(4)
-	payload := encodeQueryOldUnmined(buf, cutoffHeight)
-	conn, err := c.getConn(ctx)
-	if err != nil {
-		putBuf(payload)
-		return nil, err
-	}
-	resp, err := c.sendAndRecycle(ctx, conn, OpQueryOldUnmined, payload)
-	if err != nil {
-		return nil, err
-	}
-	defer recyclePayload(resp.Payload)
-	if resp.Status != StatusOK {
-		if resp.Status == StatusError {
-			code, msg, _ := decodeErrorPayload(resp.Payload)
-			return nil, &ServerError{Code: code, Message: msg}
-		}
-		return nil, fmt.Errorf("unexpected status: %d", resp.Status)
-	}
-	return decodeQueryOldUnminedResponse(resp.Payload)
+	return c.pageSingleNodeQuery(ctx, OpQueryOldUnmined,
+		func(buf []byte, cursor *TxID) []byte {
+			return encodeQueryOldUnmined(buf, cutoffHeight, cursor)
+		},
+		decodeQueryOldUnminedResponse)
 }
 
 // QueryConflicting queries all transactions currently flagged CONFLICTING.
 //
 // The request carries no parameters. In cluster mode it fans the query out to
 // every node and returns the deduplicated union (each node answers for the
-// shards it masters).
+// shards it masters). Pagination behaviour matches QueryOldUnmined.
 func (c *Client) QueryConflicting(ctx context.Context) ([]TxID, error) {
 	if c.cluster != nil {
 		return c.queryNodesUnion(ctx, OpQueryConflicting,
 			encodeQueryConflicting, decodeQueryConflictingResponse)
 	}
-	buf := getBuf(0)
-	payload := encodeQueryConflicting(buf)
-	conn, err := c.getConn(ctx)
-	if err != nil {
-		putBuf(payload)
-		return nil, err
-	}
-	resp, err := c.sendAndRecycle(ctx, conn, OpQueryConflicting, payload)
-	if err != nil {
-		return nil, err
-	}
-	defer recyclePayload(resp.Payload)
-	if resp.Status != StatusOK {
-		if resp.Status == StatusError {
-			code, msg, _ := decodeErrorPayload(resp.Payload)
-			return nil, &ServerError{Code: code, Message: msg}
+	return c.pageSingleNodeQuery(ctx, OpQueryConflicting,
+		encodeQueryConflicting, decodeQueryConflictingResponse)
+}
+
+// pageSingleNodeQuery runs a diagnostic txid-list query against the single-node
+// pool, transparently following the FU#5 truncated trailer to page the whole
+// result when the negotiated server version supports the resume cursor (>=3).
+//
+// The capability gate is essential: a version-<3 server ignores the cursor and
+// returns page 1 forever, so a naive loop would never terminate. Against such a
+// server the client makes exactly one call and, if truncated, returns the
+// partial page with ErrQueryTruncated (a visible signal — never a silent drop).
+func (c *Client) pageSingleNodeQuery(
+	ctx context.Context,
+	opCode uint16,
+	encode func(buf []byte, cursor *TxID) []byte,
+	decode func([]byte) ([]TxID, bool, error),
+) ([]TxID, error) {
+	supportsPaging := c.NegotiatedVersion() >= 3
+	var all []TxID
+	var cursor *TxID
+	for {
+		buf := getBuf(40)
+		payload := encode(buf, cursor)
+		conn, err := c.getConn(ctx)
+		if err != nil {
+			putBuf(payload)
+			return nil, err
 		}
-		return nil, fmt.Errorf("unexpected status: %d", resp.Status)
+		resp, err := c.sendAndRecycle(ctx, conn, opCode, payload)
+		if err != nil {
+			return nil, err
+		}
+		if resp.Status != StatusOK {
+			if resp.Status == StatusError {
+				code, msg, _ := decodeErrorPayload(resp.Payload)
+				recyclePayload(resp.Payload)
+				return nil, &ServerError{Code: code, Message: msg}
+			}
+			status := resp.Status
+			recyclePayload(resp.Payload)
+			return nil, fmt.Errorf("unexpected status: %d", status)
+		}
+		txids, truncated, derr := decode(resp.Payload)
+		recyclePayload(resp.Payload)
+		if derr != nil {
+			return nil, derr
+		}
+		all = append(all, txids...)
+		if !truncated {
+			return all, nil
+		}
+		if !supportsPaging {
+			return all, ErrQueryTruncated
+		}
+		if len(txids) == 0 {
+			// Defensive: a truncated-but-empty page would loop forever. A
+			// conforming v3 server never emits this (truncation implies a
+			// full page), so treat it as a protocol violation.
+			return all, fmt.Errorf("query paging: truncated response with empty page")
+		}
+		last := txids[len(txids)-1]
+		cursor = &last
 	}
-	return decodeQueryConflictingResponse(resp.Payload)
 }
 
 // RemoveConflictingChildBatch removes (parent, child) links from parents'
