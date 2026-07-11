@@ -242,11 +242,18 @@ pub type Result<T> = std::result::Result<T, DeviceError>;
 pub enum PhysicalDeviceId {
     /// A regular file: the containing filesystem's device number (`st_dev`).
     ///
-    /// Two regular files with the same `st_dev` live on one filesystem, hence
-    /// one underlying block device, so an `fsync` of either issues a
-    /// device-wide cache flush that covers the other's prior writes. This is
-    /// the identity of the DEFAULT single-disk deployment, where the data file
-    /// and its sibling `.redo` file share one filesystem.
+    /// Two regular files with the same `st_dev` live on one filesystem. On the
+    /// DEFAULT deployment — one filesystem over a SINGLE block device, with
+    /// O_DIRECT writes — an `fsync` of either issues a device-wide cache-flush
+    /// barrier that covers the other's prior writes; that is the co-location
+    /// guarantee this identity encodes. On an exotic multi-device COW
+    /// filesystem (e.g. ZFS/multi-device btrfs) one `st_dev` can span several
+    /// physical devices and the barrier may NOT cover the other file — there
+    /// the checkpoint's own unconditional data-device fsync remains the
+    /// durability backstop (bounding any window to the checkpoint interval,
+    /// i.e. the pre-FU#8 behavior), so this over-broad match never regresses
+    /// durability, only forgoes the tighter byte-embedding create. Page-cache
+    /// mode does NOT report this id (see `DirectDevice::open_inner`).
     Filesystem(u64),
     /// A raw block device (`S_IFBLK`): the block device number (`st_rdev`).
     ///
@@ -1073,8 +1080,14 @@ impl DirectDevice {
             // two raw block devices both report the devtmpfs `st_dev`, so only
             // `st_rdev` distinguishes different physical disks. A regular file
             // is keyed by its containing filesystem's device number (st_dev):
-            // any two files on one filesystem share it, and an fsync of either
-            // issues a device-wide cache flush that covers the other's writes.
+            // any two files on one *single-block-device* filesystem share it,
+            // and — because their writes are O_DIRECT (submitted to the device,
+            // not held in the OS page cache) — an fsync of either issues a
+            // device-wide cache-flush barrier that drains the shared drive
+            // write cache, covering the other's prior writes. (This is the
+            // physical-co-location guarantee; on an exotic multi-device COW
+            // filesystem the checkpoint barrier's own data-device fsync remains
+            // the durability backstop — see `create_redo_is_self_sufficient`.)
             // `dev_t` is `u64` on Linux but `i32` on macOS, so the widening cast
             // is platform-necessary — silence the Linux-only lint.
             let phys_id = if is_block {
@@ -1086,7 +1099,15 @@ impl DirectDevice {
                 let dev = stat_buf.st_dev as u64;
                 PhysicalDeviceId::Filesystem(dev)
             };
-            (is_block, Some(phys_id))
+            // In page-cache mode (`cached == true`) the co-location guarantee
+            // above does NOT hold: writes land in the OS page cache rather than
+            // being submitted to the device, so a device-wide fdatasync issued
+            // for a DIFFERENT fd on the same drive does not write them back.
+            // Suppress the physical id so a cached device is NEVER judged
+            // co-located and always takes the self-sufficient byte-embedding
+            // Create path. (The production data device is always O_DIRECT; this
+            // guards a future data device ever routed through `open_buffered`.)
+            (is_block, if cached { None } else { Some(phys_id) })
         };
         #[cfg(not(unix))]
         let (is_block, phys_id): (bool, Option<PhysicalDeviceId>) = (false, None);
@@ -1592,6 +1613,34 @@ mod tests {
         assert_eq!(
             data_id, redo_id,
             "two files on one filesystem share a physical id (co-located)"
+        );
+    }
+
+    /// FU#8 / M2: a page-cached DirectDevice (`open_buffered`) must NOT report a
+    /// physical id. Its writes land in the OS page cache, not the device, so a
+    /// redo device-wide fdatasync issued for a DIFFERENT fd on the same drive
+    /// would not write them back — trusting co-location there would reopen the
+    /// silent-loss window FU#8 closes. Suppressing the id forces such a device
+    /// onto the self-sufficient byte-embedding Create path (the safe default).
+    /// The O_DIRECT sibling on the same filesystem still reports an id, proving
+    /// the suppression is cache-mode-specific, not path-specific.
+    #[test]
+    fn buffered_direct_device_reports_no_physical_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let cached =
+            DirectDevice::open_buffered(&dir.path().join("data.dat"), 65536, 4096).unwrap();
+        assert_eq!(
+            cached.physical_device_id(),
+            None,
+            "a page-cached device must not claim a physical id (never co-located)"
+        );
+        let direct = DirectDevice::open(&dir.path().join("other.dat"), 65536, 4096).unwrap();
+        assert!(
+            matches!(
+                direct.physical_device_id(),
+                Some(PhysicalDeviceId::Filesystem(_))
+            ),
+            "an O_DIRECT regular-file device still reports its filesystem id"
         );
     }
 
