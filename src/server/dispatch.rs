@@ -3109,6 +3109,7 @@ where
                     // shard-matching) as the row's routing key.
                     for op in
                         crate::cluster::coordinator::redo_entry_to_replica_ops(entry, shard, engine)
+                            .map_err(|e| format!("intent-recovery convert: {e}"))?
                     {
                         let Some(op) = filter_set_mined_batch_to_owned(op, &owned_keys) else {
                             continue;
@@ -3135,6 +3136,7 @@ where
             let shard = ShardTable::shard_for_key(&tx_key);
             if let Some(op) =
                 crate::cluster::coordinator::redo_entry_to_replica_op(entry, shard, engine)
+                    .map_err(|e| format!("intent-recovery convert: {e}"))?
             {
                 debug_assert_eq!(
                     op.tx_key(),
@@ -4135,6 +4137,7 @@ where
         let shard = ShardTable::shard_for_key(&tx_key);
         if let Some(op) =
             crate::cluster::coordinator::redo_entry_to_replica_op(entry, shard, engine)
+                .map_err(|e| format!("compensation convert: {e}"))?
         {
             ops_by_key.push((tx_key, vec![op]));
         }

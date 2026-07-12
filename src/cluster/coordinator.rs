@@ -6122,10 +6122,42 @@ fn stream_shard_baseline(
             meta_buf.extend_from_slice(&meta.delete_at_height.to_le_bytes());
             meta_buf.extend_from_slice(&meta.preserve_until.to_le_bytes());
 
-            let cold_data = if meta.flags.contains(crate::record::TxFlags::EXTERNAL) {
-                engine
-                    .blob_store()
-                    .and_then(|bs| bs.get(&key.txid).ok().flatten())
+            // S3 (baseline path): an EXTERNAL record's cold blob MUST accompany
+            // its baseline create, else the joining/migration target gets a LIVE
+            // record with a dangling `ExternalRef` (permanent payload loss). The
+            // pre-fix `.and_then(|bs| bs.get(..).ok().flatten())` silently
+            // yielded `cold_data = None` on a missing/unreadable blob while still
+            // shipping `is_external = true`. Mirror the delta converter
+            // (`convert_migration_create`) and the dispatch write path
+            // (`create_repl_cold_data` / `SkipReplicationBlobMissing`): a missing
+            // blob, an unreadable blob, or no configured blob store all FAIL the
+            // baseline task so the source retries rather than shipping an
+            // incomplete record.
+            let is_external = meta.flags.contains(crate::record::TxFlags::EXTERNAL);
+            let cold_data = if is_external {
+                match engine.blob_store() {
+                    Some(bs) => match bs.get(&key.txid) {
+                        Ok(Some(blob)) => Some(blob),
+                        Ok(None) => {
+                            return Err(format!(
+                                "baseline external blob missing shard {} key {:?}",
+                                task.shard, key
+                            ));
+                        }
+                        Err(e) => {
+                            return Err(format!(
+                                "baseline external blob read shard {} key {:?}: {e}",
+                                task.shard, key
+                            ));
+                        }
+                    },
+                    None => {
+                        return Err(format!(
+                            "baseline external blob missing (no blob store) shard {} key {:?}",
+                            task.shard, key
+                        ));
+                    }
+                }
             } else {
                 None
             };
@@ -6135,7 +6167,7 @@ fn stream_shard_baseline(
                 metadata_bytes: meta_buf,
                 utxo_hashes,
                 cold_data,
-                is_external: meta.flags.contains(crate::record::TxFlags::EXTERNAL),
+                is_external,
             });
 
             // Replay spent/frozen slot state so the replica matches the master.
@@ -6633,13 +6665,96 @@ fn send_completion_only_handshakes(
     vec![HandshakeOutcome::Unconfirmed; tasks.len()]
 }
 
-/// Convert a redo log entry to a ReplicaOp if it belongs to the given shard.
+/// Failure converting a redo entry into a `ReplicaOp` because the source
+/// record's authoritative state could not be read back completely.
 ///
-/// Returns None for entries belonging to other shards, or for non-replicatable
-/// ops like Checkpoint and MarkOnLongestChain. Create and Delete ops are
-/// converted so that records created or deleted after the baseline snapshot
+/// Every variant is fail-closed: the caller MUST abort and retry the
+/// migration/recovery task rather than ship a partial or corrupt record to a
+/// replica or migration target, where it would be permanent data loss. This
+/// mirrors the dispatch-side live create path's blob-missing discipline (see
+/// `server::dispatch::create_repl_cold_data` / `SkipReplicationBlobMissing`).
+#[derive(Debug, thiserror::Error)]
+pub enum ReplicaConvertError {
+    /// A UTXO slot footer could not be read, so the record's real UTXO identity
+    /// is unknown. Shipping a zero hash (`[0u8; 32]`) would corrupt the target's
+    /// record identity.
+    #[error("read UTXO slot {offset} for {tx_key:?} failed: {detail}")]
+    SlotRead {
+        /// The record whose slot could not be read.
+        tx_key: TxKey,
+        /// The offset of the unreadable UTXO slot.
+        offset: u32,
+        /// Debug rendering of the underlying read error.
+        detail: String,
+    },
+    /// An EXTERNAL record's cold blob is absent (or no blob store is
+    /// configured), so shipping the create would leave the target with a live
+    /// record pointing at a dangling `ExternalRef` — permanent payload loss.
+    #[error("external blob missing for {tx_key:?}")]
+    ExternalBlobMissing {
+        /// The EXTERNAL record whose blob could not be found.
+        tx_key: TxKey,
+    },
+    /// An EXTERNAL record's cold blob could not be read back from the blob
+    /// store (an I/O error, distinct from a plain absent blob).
+    #[error("read external blob for {tx_key:?} failed: {detail}")]
+    ExternalBlobRead {
+        /// The EXTERNAL record whose blob read failed.
+        tx_key: TxKey,
+        /// Rendering of the underlying blob-store error.
+        detail: String,
+    },
+    /// The record's authoritative mined-state (its block set and the derived
+    /// `unmined_since`) could not be read from the MinedIndex, so the create
+    /// would ship an unknown/stale mined-state to the target.
+    #[error("read mined state for {tx_key:?} failed: {detail}")]
+    MinedStateRead {
+        /// The record whose mined-state read failed.
+        tx_key: TxKey,
+        /// Debug rendering of the underlying read error.
+        detail: String,
+    },
+}
+
+/// Convert a redo log entry to a `ReplicaOp` if it belongs to the given shard.
+///
+/// Returns `Ok(None)` for entries belonging to other shards or for
+/// non-replicatable ops (e.g. Checkpoint, MarkOnLongestChain). Create and Delete
+/// ops are converted so records created or deleted after the baseline snapshot
 /// are captured in the delta phase.
+///
+/// Create ops read the record's current on-store state (UTXO slots, mined-state
+/// and — for EXTERNAL records — the cold blob). If any of that state cannot be
+/// read back completely this returns `Err`, so the caller FAILS the
+/// migration/recovery task and retries rather than shipping a partial/corrupt
+/// record to the target (permanent data loss there).
+///
+/// # Errors
+///
+/// Returns [`ReplicaConvertError`] when a create entry's record state cannot be
+/// read completely (see [`convert_migration_create`]).
 pub fn redo_entry_to_replica_op(
+    entry: &crate::redo::RedoEntry,
+    shard: u16,
+    engine: &Engine,
+) -> std::result::Result<Option<crate::replication::protocol::ReplicaOp>, ReplicaConvertError> {
+    use crate::redo::RedoOp;
+    match &entry.op {
+        RedoOp::ReplicaCreate { tx_key, .. }
+        | RedoOp::Create { tx_key, .. }
+        | RedoOp::CreateV2 { tx_key, .. } => convert_migration_create(tx_key, shard, engine),
+        _ => Ok(convert_infallible_op(entry, shard, engine)),
+    }
+}
+
+/// Infallible arms of [`redo_entry_to_replica_op`].
+///
+/// Returns `None` for entries belonging to other shards or for non-replicatable
+/// ops. Create ops are handled by the fallible [`convert_migration_create`]
+/// (they may need to fail-closed on unreadable record state) and map to `None`
+/// here — the public [`redo_entry_to_replica_op`] wrapper intercepts them before
+/// this helper is ever called with one.
+fn convert_infallible_op(
     entry: &crate::redo::RedoEntry,
     shard: u16,
     engine: &Engine,
@@ -6909,68 +7024,14 @@ pub fn redo_entry_to_replica_op(
                 child_txid: *child_txid,
             })
         }
-        RedoOp::ReplicaCreate { tx_key, .. }
-        | RedoOp::Create { tx_key, .. }
-        | RedoOp::CreateV2 { tx_key, .. } => {
-            // A record created after the baseline snapshot must be sent as a
-            // delta, otherwise the target never receives it. We read the full
-            // current record state from the engine (metadata, UTXOs, cold data)
-            // and emit a ReplicaOp::Create. Any subsequent mutations (Spend,
-            // SetMined, etc.) within the delta range have their own redo
-            // entries which are already converted above, and applying them
-            // twice on the target is harmless (all ops are idempotent).
-            if ShardTable::shard_for_key(tx_key) != shard {
-                return None;
-            }
-            let meta = match engine.read_metadata(tx_key) {
-                Ok(m) => m,
-                Err(_) => return None, // record may have been deleted since
-            };
-
-            let utxo_count = meta.utxo_count;
-            let mut utxo_hashes = Vec::with_capacity(utxo_count as usize);
-            for v in 0..utxo_count {
-                match engine.read_slot(tx_key, v) {
-                    Ok(slot) => utxo_hashes.push(slot.hash),
-                    Err(_) => utxo_hashes.push([0u8; 32]),
-                }
-            }
-
-            // Serialize metadata in the same format as stream_shard_baseline.
-            let mut meta_buf = Vec::with_capacity(70);
-            meta_buf.extend_from_slice(&meta.tx_version.to_le_bytes());
-            meta_buf.extend_from_slice(&meta.locktime.to_le_bytes());
-            meta_buf.extend_from_slice(&meta.fee.to_le_bytes());
-            meta_buf.extend_from_slice(&meta.size_in_bytes.to_le_bytes());
-            meta_buf.extend_from_slice(&meta.extended_size.to_le_bytes());
-            let (is_coinbase, wire_flags) =
-                crate::replication::protocol::create_metadata_flag_bytes(meta.flags);
-            meta_buf.push(is_coinbase);
-            meta_buf.extend_from_slice(&meta.spending_height.to_le_bytes());
-            meta_buf.extend_from_slice(&meta.created_at.to_le_bytes());
-            meta_buf.push(wire_flags);
-            // Extended metadata for full failover state:
-            meta_buf.extend_from_slice(&meta.generation.to_le_bytes());
-            meta_buf.extend_from_slice(&meta.updated_at.to_le_bytes());
-            meta_buf.extend_from_slice(&meta.unmined_since.to_le_bytes());
-            meta_buf.extend_from_slice(&meta.delete_at_height.to_le_bytes());
-            meta_buf.extend_from_slice(&meta.preserve_until.to_le_bytes());
-
-            let cold_data = if meta.flags.contains(crate::record::TxFlags::EXTERNAL) {
-                engine
-                    .blob_store()
-                    .and_then(|bs| bs.get(&tx_key.txid).ok().flatten())
-            } else {
-                None
-            };
-
-            Some(ReplicaOp::Create {
-                tx_key: *tx_key,
-                metadata_bytes: meta_buf,
-                utxo_hashes,
-                cold_data,
-                is_external: meta.flags.contains(crate::record::TxFlags::EXTERNAL),
-            })
+        RedoOp::ReplicaCreate { .. } | RedoOp::Create { .. } | RedoOp::CreateV2 { .. } => {
+            // Create ops need fail-closed reads of the record's current state
+            // (UTXO slots, mined-state and — for EXTERNAL records — the cold
+            // blob); the fallible `convert_migration_create` builds them, and
+            // the public `redo_entry_to_replica_op` intercepts these variants
+            // before this helper runs. Reaching here would be a routing bug, so
+            // conservatively map to None.
+            None
         }
         RedoOp::Delete { tx_key, .. } => {
             // A delete after the baseline snapshot must be forwarded so the
@@ -7063,6 +7124,139 @@ pub fn redo_entry_to_replica_op(
     }
 }
 
+/// Build a migration/recovery `ReplicaOp::Create` for `tx_key` by reading the
+/// record's current on-store state.
+///
+/// A record created after the baseline snapshot must be sent as a delta,
+/// otherwise the target never receives it. This reads the full current record
+/// state from the engine (metadata, UTXO slots and — for EXTERNAL records — the
+/// cold blob) and emits a `ReplicaOp::Create`. Any subsequent mutations (Spend,
+/// SetMined, …) within the delta range have their own redo entries which are
+/// converted separately; applying them twice on the target is harmless (all ops
+/// are idempotent).
+///
+/// This is FAIL-CLOSED: if any part of the record's authoritative state cannot
+/// be read back, it returns `Err` rather than shipping a partial/corrupt record.
+/// The dispatch-side live create path applies the same discipline (see
+/// `server::dispatch::create_repl_cold_data` / `SkipReplicationBlobMissing`).
+///
+/// # Errors
+///
+/// - [`ReplicaConvertError::SlotRead`] when a UTXO slot footer cannot be read
+///   (shipping a zero hash would corrupt the target's record identity).
+fn convert_migration_create(
+    tx_key: &TxKey,
+    shard: u16,
+    engine: &Engine,
+) -> std::result::Result<Option<crate::replication::protocol::ReplicaOp>, ReplicaConvertError> {
+    use crate::replication::protocol::ReplicaOp;
+
+    if ShardTable::shard_for_key(tx_key) != shard {
+        return Ok(None);
+    }
+    let meta = match engine.read_metadata(tx_key) {
+        Ok(m) => m,
+        Err(_) => return Ok(None), // record may have been deleted since
+    };
+
+    // G6: the record's real UTXO identity comes from its on-device slot
+    // footers. A slot read that ERRORS must FAIL the task (fail-closed) — the
+    // pre-fix code substituted a zero hash (`[0u8; 32]`), shipping a corrupt
+    // identity to the migration target (permanent corruption there).
+    let utxo_count = meta.utxo_count;
+    let mut utxo_hashes = Vec::with_capacity(utxo_count as usize);
+    for v in 0..utxo_count {
+        match engine.read_slot(tx_key, v) {
+            Ok(slot) => utxo_hashes.push(slot.hash),
+            Err(e) => {
+                return Err(ReplicaConvertError::SlotRead {
+                    tx_key: *tx_key,
+                    offset: v,
+                    detail: format!("{e:?}"),
+                });
+            }
+        }
+    }
+
+    // S6: source `unmined_since` from the authoritative in-RAM MinedIndex, NOT
+    // the device footer. Post-16d, setMined/unset write mined-state ONLY to the
+    // MinedIndex; the device footer's `unmined_since` is stale for any tx
+    // mined-then-reorged after creation. Shipping the stale device value would
+    // seed the target's MinedIndex with the wrong (create-time) height and prune
+    // the still-unmined UTXO early. Mirror `stream_shard_baseline`'s discipline:
+    // a `TxNotFound` race falls back to the (about-to-be-deleted) footer, any
+    // other read error FAILS the task.
+    let unmined_since = match engine.mined_block_entries(tx_key) {
+        Ok((_, u)) => u,
+        Err(crate::ops::error::SpendError::TxNotFound) => meta.unmined_since,
+        Err(e) => {
+            return Err(ReplicaConvertError::MinedStateRead {
+                tx_key: *tx_key,
+                detail: format!("{e:?}"),
+            });
+        }
+    };
+
+    // Serialize metadata in the same format as stream_shard_baseline.
+    let mut meta_buf = Vec::with_capacity(70);
+    meta_buf.extend_from_slice(&meta.tx_version.to_le_bytes());
+    meta_buf.extend_from_slice(&meta.locktime.to_le_bytes());
+    meta_buf.extend_from_slice(&meta.fee.to_le_bytes());
+    meta_buf.extend_from_slice(&meta.size_in_bytes.to_le_bytes());
+    meta_buf.extend_from_slice(&meta.extended_size.to_le_bytes());
+    let (is_coinbase, wire_flags) =
+        crate::replication::protocol::create_metadata_flag_bytes(meta.flags);
+    meta_buf.push(is_coinbase);
+    meta_buf.extend_from_slice(&meta.spending_height.to_le_bytes());
+    meta_buf.extend_from_slice(&meta.created_at.to_le_bytes());
+    meta_buf.push(wire_flags);
+    // Extended metadata for full failover state:
+    meta_buf.extend_from_slice(&meta.generation.to_le_bytes());
+    meta_buf.extend_from_slice(&meta.updated_at.to_le_bytes());
+    // MinedIndex-sourced (see the `mined_block_entries` read above), NOT
+    // `meta.unmined_since` (stale device footer post-16d).
+    meta_buf.extend_from_slice(&unmined_since.to_le_bytes());
+    meta_buf.extend_from_slice(&meta.delete_at_height.to_le_bytes());
+    meta_buf.extend_from_slice(&meta.preserve_until.to_le_bytes());
+
+    // S3: an EXTERNAL record's cold blob MUST accompany its create, else the
+    // target gets a LIVE record with a dangling `ExternalRef` (permanent payload
+    // loss). The pre-fix `.and_then(|bs| bs.get(..).ok().flatten())` silently
+    // yielded `cold_data = None` on a missing/unreadable blob while still
+    // shipping `is_external = true`. Mirror the dispatch write path
+    // (`create_repl_cold_data` / `SkipReplicationBlobMissing`): a missing blob,
+    // an unreadable blob, or no configured blob store all FAIL the task so the
+    // source retries rather than handing off an incomplete record.
+    let is_external = meta.flags.contains(crate::record::TxFlags::EXTERNAL);
+    let cold_data = if is_external {
+        match engine.blob_store() {
+            Some(bs) => match bs.get(&tx_key.txid) {
+                Ok(Some(blob)) => Some(blob),
+                Ok(None) => {
+                    return Err(ReplicaConvertError::ExternalBlobMissing { tx_key: *tx_key });
+                }
+                Err(e) => {
+                    return Err(ReplicaConvertError::ExternalBlobRead {
+                        tx_key: *tx_key,
+                        detail: format!("{e}"),
+                    });
+                }
+            },
+            None => return Err(ReplicaConvertError::ExternalBlobMissing { tx_key: *tx_key }),
+        }
+    } else {
+        None
+    };
+
+    Ok(Some(ReplicaOp::Create {
+        tx_key: *tx_key,
+        metadata_bytes: meta_buf,
+        utxo_hashes,
+        cold_data,
+        is_external,
+    }))
+}
+
 /// Convert a redo log entry into EVERY `ReplicaOp` it represents for `shard`.
 ///
 /// CRITICAL FIX (Task 11): [`redo_entry_to_replica_op`] can only ever produce
@@ -7088,7 +7282,7 @@ pub fn redo_entry_to_replica_ops(
     entry: &crate::redo::RedoEntry,
     shard: u16,
     engine: &Engine,
-) -> Vec<crate::replication::protocol::ReplicaOp> {
+) -> std::result::Result<Vec<crate::replication::protocol::ReplicaOp>, ReplicaConvertError> {
     use crate::redo::RedoOp;
     use crate::replication::protocol::ReplicaOp;
 
@@ -7109,9 +7303,9 @@ pub fn redo_entry_to_replica_ops(
             .copied()
             .collect();
         if shard_txids.is_empty() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
-        return vec![ReplicaOp::SetMinedBatch {
+        return Ok(vec![ReplicaOp::SetMinedBatch {
             block_id: *block_id,
             block_height: *block_height,
             subtree_idx: *subtree_idx,
@@ -7120,11 +7314,11 @@ pub fn redo_entry_to_replica_ops(
             block_height_retention: *block_height_retention,
             unset: *unset,
             txids: shard_txids,
-        }];
+        }]);
     }
-    redo_entry_to_replica_op(entry, shard, engine)
+    Ok(redo_entry_to_replica_op(entry, shard, engine)?
         .into_iter()
-        .collect()
+        .collect())
 }
 
 fn collect_migration_delta_ops(
@@ -7150,11 +7344,17 @@ fn collect_migration_delta_ops(
     let first_entry_seq = entries.first().map(|e| e.sequence);
     crate::replication::durable::check_redo_truncation(first_entry_seq, snapshot_seq)?;
 
-    Ok(entries
-        .iter()
-        .filter(|e| e.sequence < fence_seq)
-        .flat_map(|e| redo_entry_to_replica_ops(e, shard, engine))
-        .collect())
+    let mut ops = Vec::new();
+    for e in entries.iter().filter(|e| e.sequence < fence_seq) {
+        // Fail-closed: a converter error (unreadable record state) fails the
+        // whole migration-delta task so the source retries rather than handing
+        // off an incomplete/corrupt record set to the target.
+        ops.extend(
+            redo_entry_to_replica_ops(e, shard, engine)
+                .map_err(|err| format!("convert redo entry seq {}: {err}", e.sequence))?,
+        );
+    }
+    Ok(ops)
 }
 
 /// Decide whether a shard's key SET may have changed between the baseline
@@ -10321,6 +10521,96 @@ mod tests {
             shipped_unmined, device_unmined,
             "regression guard: the stale device value must never be what ships"
         );
+    }
+
+    /// S3 (baseline path): `stream_shard_baseline` must FAIL when an EXTERNAL
+    /// record's blob is absent from the blob store, rather than emit a baseline
+    /// `ReplicaOp::Create` with `is_external = true` and `cold_data = None`. The
+    /// latter would create a live EXTERNAL record on the joining/migration
+    /// target whose `ExternalRef` dangles — permanent payload loss. This mirrors
+    /// the delta converter's S3 fix and the dispatch write path's
+    /// `SkipReplicationBlobMissing` discipline.
+    #[test]
+    fn migration_baseline_fails_closed_when_external_blob_missing() {
+        use std::io::{Read, Write};
+
+        let mut engine = test_engine();
+        // Blob store configured, but no blob ever uploaded for this record —
+        // the lost/GC'd/never-written case: `bs.get(txid)` -> `Ok(None)`.
+        let blob: std::sync::Arc<dyn crate::storage::blobstore::BlobStore> =
+            std::sync::Arc::new(crate::storage::blobstore::MemoryBlobStore::new());
+        engine.set_blob_store(blob);
+
+        let shard = 71u16;
+        let key = tx_key_for_shard(shard, 1);
+        create_external_record(&engine, key);
+        assert!(
+            engine.lookup(&key).is_some(),
+            "the EXTERNAL record must be registered (only its blob is missing)"
+        );
+
+        // Receiver: accept, and — should the (pre-fix) sender ship a batch — read
+        // it and ACK so the sender returns Ok (making the `Ok` arm below panic:
+        // a clean RED before the fix). Once fixed, the sender returns Err before
+        // writing anything; the receiver's read then hits EOF when the test drops
+        // the client stream, and the thread returns.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let receiver = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut header = [0u8; 4];
+            if stream.read_exact(&mut header).is_err() {
+                return;
+            }
+            let payload_len = u32::from_le_bytes(header) as usize;
+            let mut body = vec![0u8; payload_len];
+            if stream.read_exact(&mut body).is_err() {
+                return;
+            }
+            let mut frame_bytes = header.to_vec();
+            frame_bytes.extend_from_slice(&body);
+            let (request, _) = crate::protocol::frame::RequestFrame::decode(&frame_bytes).unwrap();
+            let response = crate::protocol::frame::ResponseFrame {
+                request_id: request.request_id,
+                status: crate::protocol::opcodes::STATUS_OK,
+                payload: crate::replication::protocol::ReplicaAck::Ok {
+                    through_sequence: 0,
+                }
+                .serialize(),
+            };
+            let _ = stream.write_all(&response.encode());
+        });
+
+        let mut stream = std::net::TcpStream::connect(addr).unwrap();
+        let task = MigrationTask {
+            shard,
+            from_node: NodeId(1),
+            to_node: NodeId(2),
+            is_master: true,
+        };
+        let result = stream_shard_baseline(
+            &task,
+            &[&key],
+            &engine,
+            &mut stream,
+            64,
+            /* cluster_key */ 0,
+            None,
+        );
+
+        match result {
+            Err(msg) => assert!(
+                msg.contains("external blob missing"),
+                "baseline must fail-closed with an external-blob-missing error, got: {msg}"
+            ),
+            Ok(_) => panic!(
+                "stream_shard_baseline must FAIL for an EXTERNAL record with a missing blob — \
+                 a dangling-ref (is_external=true, cold_data=None) create must never ship"
+            ),
+        }
+
+        drop(stream); // unblock the receiver if it is still waiting for a batch
+        let _ = receiver.join();
     }
 
     /// Task 15 (full convergence): replay a captured migration baseline batch
@@ -16676,7 +16966,7 @@ mod tests {
         };
 
         let three = make_entry(vec![k1, k2, k3]);
-        let ops = redo_entry_to_replica_ops(&three, shard, &engine);
+        let ops = redo_entry_to_replica_ops(&three, shard, &engine).unwrap();
         assert_eq!(
             ops.len(),
             1,
@@ -16711,20 +17001,25 @@ mod tests {
 
         // A 1-txid batch yields exactly 1 op (batch-of-one).
         let one = make_entry(vec![k1]);
-        let one_ops = redo_entry_to_replica_ops(&one, shard, &engine);
+        let one_ops = redo_entry_to_replica_ops(&one, shard, &engine).unwrap();
         assert_eq!(one_ops.len(), 1);
         assert_eq!(one_ops[0].tx_key(), Some(k1));
 
         // A 0-txid batch yields 0 ops.
         let empty = make_entry(vec![]);
-        assert_eq!(redo_entry_to_replica_ops(&empty, shard, &engine).len(), 0);
+        assert_eq!(
+            redo_entry_to_replica_ops(&empty, shard, &engine)
+                .unwrap()
+                .len(),
+            0
+        );
 
         // A txid whose shard does not match the requested shard is excluded,
         // mirroring every other op's shard-ownership filter — the foreign
         // txid must not appear in the coalesced batch's txids.
         let other_shard_key = tx_key_for_shard(shard + 1, 9);
         let mixed = make_entry(vec![k1, other_shard_key]);
-        let mixed_ops = redo_entry_to_replica_ops(&mixed, shard, &engine);
+        let mixed_ops = redo_entry_to_replica_ops(&mixed, shard, &engine).unwrap();
         assert_eq!(mixed_ops.len(), 1);
         match &mixed_ops[0] {
             ReplicaOp::SetMinedBatch { txids, .. } => {
@@ -16760,7 +17055,7 @@ mod tests {
             },
         };
 
-        let ops = redo_entry_to_replica_ops(&entry, shard, &engine);
+        let ops = redo_entry_to_replica_ops(&entry, shard, &engine).unwrap();
         assert_eq!(ops.len(), 1, "must coalesce into a single op, got {ops:?}");
         match &ops[0] {
             ReplicaOp::SetMinedBatch {
@@ -16773,5 +17068,320 @@ mod tests {
             }
             other => panic!("expected SetMinedBatch{{unset: true}}, got {other:?}"),
         }
+    }
+
+    /// Test device that mirrors an inner device but can be flipped to fail every
+    /// `pread`. It still exposes the inner device's raw pointer, so metadata
+    /// reads (zero-copy direct-pointer path) keep succeeding while UTXO slot
+    /// reads (which go through `pread`) fail — reproducing the exact state the
+    /// migration converter must fail-closed on (G6).
+    struct SlotReadFailingDevice {
+        inner: std::sync::Arc<dyn crate::device::BlockDevice>,
+        fail: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl crate::device::BlockDevice for SlotReadFailingDevice {
+        fn pread(&self, buf: &mut [u8], offset: u64) -> crate::device::Result<usize> {
+            if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(crate::device::DeviceError::Io(std::io::Error::other(
+                    "injected slot pread failure",
+                )));
+            }
+            self.inner.pread(buf, offset)
+        }
+        fn pwrite(&self, buf: &[u8], offset: u64) -> crate::device::Result<usize> {
+            self.inner.pwrite(buf, offset)
+        }
+        fn alignment(&self) -> usize {
+            self.inner.alignment()
+        }
+        fn size(&self) -> u64 {
+            self.inner.size()
+        }
+        fn sync(&self) -> crate::device::Result<()> {
+            self.inner.sync()
+        }
+        fn as_raw_ptr(&self) -> Option<*mut u8> {
+            // Expose the inner pointer so the engine's direct metadata-read path
+            // stays healthy; only `pread` (the slot-read path) is made to fail.
+            self.inner.as_raw_ptr()
+        }
+    }
+
+    fn slot_read_failing_engine() -> (Engine, std::sync::Arc<std::sync::atomic::AtomicBool>) {
+        let inner: std::sync::Arc<dyn crate::device::BlockDevice> =
+            std::sync::Arc::new(crate::device::MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let fail = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let dev: std::sync::Arc<dyn crate::device::BlockDevice> =
+            std::sync::Arc::new(SlotReadFailingDevice {
+                inner,
+                fail: fail.clone(),
+            });
+        let alloc = crate::allocator::SlotAllocator::new(dev.clone()).unwrap();
+        let engine = Engine::new(
+            dev,
+            crate::index::Index::new(1024).unwrap(),
+            alloc,
+            crate::locks::StripedLocks::new(64),
+            crate::index::DahIndex::new(),
+        );
+        (engine, fail)
+    }
+
+    /// G6: when a UTXO slot footer cannot be read, the migration converter must
+    /// FAIL the task (fail-closed) rather than substitute a zero hash
+    /// (`[0u8; 32]`) and ship a record with a corrupt/zero UTXO identity to the
+    /// migration target (permanent corruption there). The source retries; a
+    /// half-read record is never handed off.
+    #[test]
+    fn migration_convert_fails_closed_when_utxo_slot_read_errors() {
+        use crate::redo::{RedoEntry, RedoOp};
+        use crate::replication::protocol::ReplicaOp;
+        use std::sync::atomic::Ordering;
+
+        let (engine, fail) = slot_read_failing_engine();
+        let shard = 9u16;
+        let key = tx_key_for_shard(shard, 1);
+        create_test_record(&engine, key); // one UTXO with hash 0x44..
+
+        let entry = RedoEntry {
+            sequence: 1,
+            op: RedoOp::ReplicaCreate {
+                tx_key: key,
+                device_id: 0,
+                record_offset: 0,
+                utxo_count: 1,
+            },
+        };
+
+        // Baseline: with reads healthy the converter ships the record's REAL
+        // UTXO hash (0x44..), never a zero hash — proving the failure below is
+        // caused by the injected slot-read fault, not the fixture.
+        match redo_entry_to_replica_op(&entry, shard, &engine).unwrap() {
+            Some(ReplicaOp::Create { utxo_hashes, .. }) => {
+                assert_eq!(
+                    utxo_hashes,
+                    vec![[0x44u8; 32]],
+                    "healthy read must ship the real UTXO hash"
+                );
+            }
+            other => panic!("expected a Create op with healthy reads, got {other:?}"),
+        }
+
+        // Now make the slot read fail. The converter must return an error (fail
+        // the task), NOT an Ok(Create) carrying a zero hash.
+        fail.store(true, Ordering::SeqCst);
+        match redo_entry_to_replica_op(&entry, shard, &engine) {
+            Err(ReplicaConvertError::SlotRead { tx_key, offset, .. }) => {
+                assert_eq!(tx_key, key, "error must name the record whose slot failed");
+                assert_eq!(offset, 0, "the failing slot offset must be reported");
+            }
+            other => panic!(
+                "expected SlotRead error (fail-closed), got {other:?} — a zero-hash \
+                 Create must never be emitted on an unreadable slot"
+            ),
+        }
+
+        // The batch-level converter must propagate the same failure so the
+        // migration-delta collection fails the whole task rather than dropping
+        // the record.
+        match redo_entry_to_replica_ops(&entry, shard, &engine) {
+            Err(ReplicaConvertError::SlotRead { tx_key, .. }) => assert_eq!(tx_key, key),
+            other => panic!("expected SlotRead error from the batch converter, got {other:?}"),
+        }
+    }
+
+    fn external_ref_for(txid: [u8; 32]) -> crate::record::ExternalRef {
+        crate::record::ExternalRef {
+            store_type: 1,
+            content_hash: txid,
+            total_size: 250,
+            input_count: 0,
+            output_count: 0,
+            inputs_offset: 0,
+            outputs_offset: 0,
+        }
+    }
+
+    fn create_external_record(engine: &Engine, key: TxKey) {
+        let utxo_hashes = [[0x44u8; 32]];
+        engine
+            .create(&crate::ops::create::CreateRequest {
+                tx_id: key.txid,
+                tx_version: 1,
+                locktime: 0,
+                fee: 100,
+                size_in_bytes: 100,
+                extended_size: 0,
+                is_coinbase: false,
+                spending_height: 0,
+                utxo_hashes: &utxo_hashes,
+                inputs: None,
+                outputs: None,
+                inpoints: None,
+                is_external: true,
+                created_at: 1710000000000,
+                block_height: 0,
+                mined_block_infos: &[],
+                frozen: false,
+                conflicting: false,
+                locked: false,
+                external_ref: Some(external_ref_for(key.txid)),
+                parent_txids: &[],
+            })
+            .unwrap();
+    }
+
+    /// S3: converting an EXTERNAL create whose blob is absent from the blob
+    /// store must FAIL the task (fail-closed) rather than emit a live
+    /// `ReplicaOp::Create` with `is_external = true` and `cold_data = None`. The
+    /// latter would create a live EXTERNAL record on the migration target whose
+    /// `ExternalRef` dangles — permanent payload loss. Mirrors the dispatch
+    /// write path's `SkipReplicationBlobMissing` discipline.
+    #[test]
+    fn migration_convert_fails_closed_when_external_blob_missing() {
+        use crate::redo::{RedoEntry, RedoOp};
+
+        let mut engine = test_engine();
+        // Blob store configured, but no blob ever uploaded for this record —
+        // the lost/GC'd/never-written case: `bs.get(txid)` -> `Ok(None)`.
+        let blob: std::sync::Arc<dyn crate::storage::blobstore::BlobStore> =
+            std::sync::Arc::new(crate::storage::blobstore::MemoryBlobStore::new());
+        engine.set_blob_store(blob);
+
+        let shard = 12u16;
+        let key = tx_key_for_shard(shard, 1);
+        create_external_record(&engine, key);
+        assert!(
+            engine.lookup(&key).is_some(),
+            "the EXTERNAL record must be registered (only its blob is missing)"
+        );
+
+        let entry = RedoEntry {
+            sequence: 1,
+            op: RedoOp::ReplicaCreate {
+                tx_key: key,
+                device_id: 0,
+                record_offset: 0,
+                utxo_count: 1,
+            },
+        };
+
+        match redo_entry_to_replica_op(&entry, shard, &engine) {
+            Err(ReplicaConvertError::ExternalBlobMissing { tx_key }) => {
+                assert_eq!(tx_key, key, "error must name the blob-less EXTERNAL record");
+            }
+            other => panic!(
+                "expected ExternalBlobMissing (fail-closed), got {other:?} — a live \
+                 EXTERNAL Create with a dangling ExternalRef must never be emitted"
+            ),
+        }
+
+        // Batch converter must propagate the same failure.
+        match redo_entry_to_replica_ops(&entry, shard, &engine) {
+            Err(ReplicaConvertError::ExternalBlobMissing { tx_key }) => assert_eq!(tx_key, key),
+            other => panic!("expected ExternalBlobMissing from the batch converter, got {other:?}"),
+        }
+    }
+
+    /// S6: the delta converter's Create op must ship `unmined_since` sourced
+    /// from the authoritative in-RAM MinedIndex, NOT the (post-16d stale) device
+    /// footer.
+    ///
+    /// For a mined-then-fully-reorged tx the two DISAGREE: setMined/unset write
+    /// mined-state only to the MinedIndex, so the device footer keeps its
+    /// create-time `unmined_since` while the MinedIndex carries the reorg
+    /// height. Shipping the stale device value would seed the target's
+    /// MinedIndex with the wrong (create-time) height and prune the
+    /// still-unmined UTXO early. This mirrors the baseline path (Task 15) and
+    /// `stream_shard_baseline`.
+    #[test]
+    fn migration_convert_ships_unmined_since_from_mined_index_not_stale_footer() {
+        use crate::ops::set_mined::SetMinedRequest;
+        use crate::redo::{RedoEntry, RedoOp};
+        use crate::replication::protocol::ReplicaOp;
+
+        let engine = test_engine();
+        let shard = 83u16;
+        let key = tx_key_for_shard(shard, 1);
+        create_test_record(&engine, key);
+
+        // Mine on the longest chain, then reorg it FULLY out at height 700_000.
+        // The MinedIndex ends with no blocks and `unmined_since == 700_000`; the
+        // device footer keeps its stale create-time value, because setMined/unset
+        // write nothing to the device post-16d.
+        engine
+            .set_mined(&SetMinedRequest {
+                tx_key: key,
+                block_id: 500,
+                block_height: 650_000,
+                subtree_idx: 0,
+                current_block_height: 650_010,
+                block_height_retention: 288,
+                on_longest_chain: true,
+                unset_mined: false,
+            })
+            .unwrap();
+        engine
+            .set_mined(&SetMinedRequest {
+                tx_key: key,
+                block_id: 500,
+                block_height: 650_000,
+                subtree_idx: 0,
+                current_block_height: 700_000,
+                block_height_retention: 288,
+                on_longest_chain: false,
+                unset_mined: true,
+            })
+            .unwrap();
+
+        // Precondition: device footer and MinedIndex genuinely disagree.
+        let device_unmined = { engine.read_metadata(&key).unwrap().unmined_since };
+        let (mined_blocks, mined_unmined) = engine.mined_block_entries(&key).unwrap();
+        assert!(
+            mined_blocks.is_empty(),
+            "tx was fully reorged out — no blocks remain"
+        );
+        assert_eq!(
+            mined_unmined, 700_000,
+            "MinedIndex holds the reorg height as unmined_since"
+        );
+        assert_ne!(
+            device_unmined, mined_unmined,
+            "test premise: the device footer's unmined_since ({device_unmined}) must be STALE \
+             relative to the MinedIndex ({mined_unmined})"
+        );
+
+        let entry = RedoEntry {
+            sequence: 1,
+            op: RedoOp::ReplicaCreate {
+                tx_key: key,
+                device_id: 0,
+                record_offset: 0,
+                utxo_count: 1,
+            },
+        };
+        let op = redo_entry_to_replica_op(&entry, shard, &engine)
+            .unwrap()
+            .expect("converter must ship a Create for the delta record");
+
+        // Parse the shipped Create op's `unmined_since` (metadata bytes 58..62,
+        // same layout as stream_shard_baseline).
+        let shipped_unmined = match op {
+            ReplicaOp::Create { metadata_bytes, .. } => {
+                u32::from_le_bytes(metadata_bytes[58..62].try_into().unwrap())
+            }
+            other => panic!("expected a Create op, got {other:?}"),
+        };
+
+        assert_eq!(
+            shipped_unmined, mined_unmined,
+            "the converter must ship the MinedIndex's unmined_since (reorg height \
+             {mined_unmined}), NOT the stale device footer value ({device_unmined})"
+        );
+        assert_ne!(
+            shipped_unmined, device_unmined,
+            "regression guard: the stale device value must never be what ships"
+        );
     }
 }
