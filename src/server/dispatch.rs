@@ -3800,6 +3800,7 @@ fn compensate_replication_failure(
                     spending_data,
                     current_block_height,
                     block_height_retention,
+                    master_generation,
                     ..
                 } => {
                     // Reverse unspend → re-spend the slot with its exact
@@ -3821,11 +3822,24 @@ fn compensate_replication_failure(
                         if let Ok(v) = engine.validate_spend_multi(&req) {
                             let _ = v.apply(engine);
                         }
-                        comp_redo.push(RedoOp::Spend {
+                        // C27-residual: emit the hash-guarded SpendV2 (carrying
+                        // the slot's utxo_hash) for symmetry with the live spend
+                        // path, which emits SpendV2-with-hash. The legacy
+                        // hash-less `RedoOp::Spend` replays with utxo_hash=None
+                        // and so lacks the V3 identity guard — recovery would
+                        // re-mark the slot SPENT even if it had since been
+                        // reassigned to a new hash. With the hash present,
+                        // `replay_spend` skips a stale re-spend instead.
+                        comp_redo.push(RedoOp::SpendV2 {
                             tx_key: *key,
                             offset: *offset,
                             spending_data: *spending_data,
                             new_spent_count: 0,
+                            current_block_height: *current_block_height,
+                            block_height_retention: *block_height_retention,
+                            target_generation: *master_generation,
+                            updated_at: engine.now_millis(),
+                            utxo_hash: Some(slot.hash),
                         });
                     }
                 }
@@ -27794,6 +27808,61 @@ mod tests {
         assert!(
             err.contains("slot read failed"),
             "the error must name the read failure, got: {err}",
+        );
+    }
+
+    #[test]
+    fn c27_unspend_compensation_emits_spend_v2_with_hash() {
+        // C27-residual: reversing an unspend (re-spend) must journal the
+        // hash-guarded SpendV2 for symmetry with the live spend path. The
+        // legacy hash-less `RedoOp::Spend` replays with utxo_hash=None and so
+        // lacks the V3 identity guard — recovery would re-mark a slot SPENT
+        // even after it was reassigned to a new hash.
+        let h = CompensationCrashHarness::new();
+        let (key, _spending_data) = h.seed_record_and_spend([0xC7; 32]);
+        let slot_hash = h.engine.read_slot(&key, 0).expect("slot exists").hash;
+
+        let repl_ops = vec![(
+            key,
+            vec![ReplicaOp::Unspend {
+                tx_key: key,
+                offset: 0,
+                spending_data: [0u8; 36],
+                current_block_height: 1000,
+                block_height_retention: 288,
+                master_generation: 4,
+            }],
+        )];
+        let before_images = vec![(key, vec![BeforeImage::None])];
+
+        let comp_range =
+            compensate_replication_failure(&h.engine, &repl_ops, &before_images, Some(&h.redo_log))
+                .expect("compensation completes")
+                .expect("reverse-unspend must emit a compensating re-spend redo entry");
+
+        let entries = h
+            .redo_log
+            .lock()
+            .read_from_sequence(comp_range.0)
+            .expect("read comp redo");
+        let comp: Vec<_> = entries
+            .into_iter()
+            .filter(|e| e.sequence >= comp_range.0 && e.sequence <= comp_range.1)
+            .collect();
+
+        let found_v2 = comp.iter().any(|e| {
+            matches!(&e.op,
+                RedoOp::SpendV2 { tx_key, offset: 0, utxo_hash: Some(hh), .. }
+                    if *tx_key == key && *hh == slot_hash)
+        });
+        assert!(
+            found_v2,
+            "reverse-unspend must journal SpendV2 carrying the utxo_hash, got: {:?}",
+            comp.iter().map(|e| &e.op).collect::<Vec<_>>(),
+        );
+        assert!(
+            !comp.iter().any(|e| matches!(&e.op, RedoOp::Spend { .. })),
+            "must NOT re-emit the legacy hash-less RedoOp::Spend",
         );
     }
 
