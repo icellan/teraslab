@@ -3726,14 +3726,16 @@ fn compensate_replication_failure(
     redo_log: Option<&Mutex<RedoLog>>,
 ) -> std::result::Result<Option<(u64, u64)>, String> {
     let mut comp_redo: Vec<RedoOp> = Vec::new();
-    // DC-1: a slot-restore `write_utxo_slot` that fails must NOT be
-    // swallowed. We record the first such failure and surface it once the
+    // DC-1: a slot-restore `write_utxo_slot` that fails — OR a slot READ
+    // that a compensation arm needs and cannot complete (C16/G8) — must NOT
+    // be swallowed. We record the first such failure and surface it once the
     // compensating redo entries are durable, so the redo log still drives a
-    // correct replay on restart while the caller learns the in-memory/device
-    // restore did not complete cleanly (the op must not report a clean
-    // rollback). Mirrors the R-004/R-035 "propagate the write error rather
-    // than log-and-continue" discipline already applied to engine slot
-    // writes and receiver metadata writes.
+    // correct replay on restart while the caller learns the compensation did
+    // not complete cleanly (the op must not report a clean rollback, and the
+    // pending intent must not be cleared over an unreversed slot). Mirrors
+    // the R-004/R-035 "propagate the error rather than log-and-continue"
+    // discipline already applied to engine slot writes and receiver metadata
+    // writes.
     let mut restore_write_err: Option<String> = None;
 
     let before_shape_ok = before_images_match_repl_ops(repl_ops, before_images);
@@ -3759,8 +3761,8 @@ fn compensate_replication_failure(
                     current_block_height,
                     block_height_retention,
                     ..
-                } => {
-                    if let Ok(slot) = engine.read_slot(key, *offset) {
+                } => match engine.read_slot(key, *offset) {
+                    Ok(slot) => {
                         let req = crate::ops::unspend::UnspendRequest {
                             tx_key: *key,
                             offset: *offset,
@@ -3777,7 +3779,22 @@ fn compensate_replication_failure(
                             new_spent_count: 0,
                         });
                     }
-                }
+                    Err(e) => {
+                        // C16/G8: DC-1 discipline for a READ failure. Pre-fix
+                        // this arm was `if let Ok(slot) = ...` — an Err was
+                        // silently skipped, so NO compensating unspend/redo was
+                        // emitted, the intent was cleared as a clean rollback,
+                        // and the slot was left SPENT: a silent divergence from
+                        // the replicas that never applied it. Record the failure
+                        // and surface it after the loop so the intent stays
+                        // PENDING and recovery re-ships the compensation instead
+                        // of clearing it on an unread slot.
+                        if restore_write_err.is_none() {
+                            restore_write_err =
+                                Some(format!("spend rollback slot read failed: {e}"));
+                        }
+                    }
+                },
                 ReplicaOp::Unspend {
                     offset,
                     spending_data,
@@ -27732,6 +27749,51 @@ mod tests {
         assert!(
             slot.is_unspent(),
             "durable comp Unspend ⇒ recovery lands the slot UNSPENT (compensated, single-valued)"
+        );
+    }
+
+    #[test]
+    fn c16_spend_compensation_read_failure_keeps_intent_pending() {
+        // C16/G8: when the Spend-compensation arm's `read_slot` FAILS, the arm
+        // must record the failure and the function must return Err — so the
+        // caller keeps the replication intent PENDING and recovery re-ships the
+        // compensation. Pre-fix the arm was `if let Ok(slot) = ...`, so an Err
+        // was silently skipped: no compensating unspend/redo was emitted, the
+        // function returned Ok (a clean rollback), and the intent would be
+        // cleared with the slot left SPENT — a silent divergence.
+        let h = CompensationCrashHarness::new();
+
+        // A key that was NEVER seeded → read_slot returns Err(TxNotFound),
+        // driving the compensation arm's read-failure path.
+        let mut txid = [0u8; 32];
+        txid[0] = 0xC1;
+        let key = TxKey { txid };
+        assert!(
+            h.engine.read_slot(&key, 0).is_err(),
+            "precondition: the unseeded key's slot read must fail",
+        );
+
+        let repl_ops = vec![(
+            key,
+            vec![ReplicaOp::Spend {
+                tx_key: key,
+                offset: 0,
+                spending_data: [0u8; 36],
+                current_block_height: 1000,
+                block_height_retention: 288,
+                master_generation: 0,
+            }],
+        )];
+        let before_images = vec![(key, vec![BeforeImage::None])];
+
+        let err =
+            compensate_replication_failure(&h.engine, &repl_ops, &before_images, Some(&h.redo_log))
+                .expect_err(
+                    "a spend-compensation read failure must return Err so the intent stays pending",
+                );
+        assert!(
+            err.contains("slot read failed"),
+            "the error must name the read failure, got: {err}",
         );
     }
 
