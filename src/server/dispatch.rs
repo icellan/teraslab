@@ -577,9 +577,17 @@ pub(crate) fn handle_request(
     // (topology proposals/votes/commits, replica batches, admin
     // health/diagnostics, ping) bypasses the check so a node can
     // become Alive in the first place.
+    //
+    // C22: gate on MULTI-NODE membership (`peak_cluster_size > 1`), NOT on
+    // the replication factor. An RF=1 multi-node node still owns every
+    // shard on its bootstrap `[self]` table before its first committed
+    // topology activates, so keying the gate on RF>1 let it serve mutations
+    // during that window and create dual authority for a shard. A genuine
+    // single-node bootstrap (`peak == 1`) stays exempt so it can serve
+    // immediately.
     if needs_cluster_readiness(request.op_code)
         && let Some(c) = cluster
-        && c.shard_table().read().replication_factor() > 1
+        && c.peak_cluster_size() > 1
         && !c.cluster_health().is_ready()
     {
         return error_response(
@@ -20387,6 +20395,71 @@ mod tests {
         assert_eq!(
             admin_resp.status, STATUS_OK,
             "OP_ADMIN_CLUSTER_HEALTH must bypass the readiness gate",
+        );
+    }
+
+    #[test]
+    fn c22_err_cluster_not_ready_gates_writes_for_rf1_multinode_joining() {
+        // C22: an RF=1 but MULTI-NODE Joining node must still reject mutations
+        // with ERR_CLUSTER_NOT_READY. It owns every shard on its bootstrap
+        // `[self]` table before its first committed topology activates, so
+        // serving here creates dual authority. Pre-fix the gate keyed on
+        // `replication_factor() > 1`, so an RF=1 node skipped the gate and
+        // served the mutation (RED).
+        let n1 = crate::cluster::shards::NodeId(1);
+        let n2 = crate::cluster::shards::NodeId(2);
+        // RF=1 (third arg), two members.
+        let table = crate::cluster::shards::ShardTable::compute_with_epoch(&[n1, n2], 1, 1, 1);
+        assert_eq!(table.replication_factor(), 1, "fixture must be RF=1");
+        // Empty `committed_members` ⇒ Joining. peak_size=2 ⇒ multi-node.
+        // Both nodes live so the quorum check (which runs AFTER this gate) is
+        // satisfied — proving it is the readiness gate, not NO_QUORUM, that
+        // rejects the write once the fix is in.
+        let cluster = crate::cluster::coordinator::new_test_running_cluster(
+            n1,
+            table,
+            &[
+                (n1, "127.0.0.1:9601".parse().unwrap()),
+                (n2, "127.0.0.1:9602".parse().unwrap()),
+            ],
+            &[], // no committed topology ⇒ Joining
+            &[],
+            &[],
+            &[],
+            2, // peak_size ⇒ peak_cluster_size() > 1
+        );
+        assert!(
+            cluster.peak_cluster_size() > 1,
+            "fixture must be multi-node"
+        );
+        assert!(
+            !cluster.cluster_health().is_ready(),
+            "fixture must be Joining"
+        );
+
+        let mut payload = vec![1u8, 0, 0, 0];
+        payload.extend_from_slice(&[0xabu8; 32]);
+        let req = RequestFrame {
+            request_id: 21,
+            op_code: OP_DELETE_BATCH,
+            flags: 0,
+            payload: payload.into(),
+        };
+        let mut conn_state = crate::server::ConnectionState::new();
+        let resp = handle_request(
+            &req,
+            &DispatchTestHarness::new().engine,
+            8192,
+            Some(&cluster),
+            None,
+            &mut conn_state,
+            None,
+        );
+        assert_eq!(resp.status, STATUS_ERROR);
+        let err = u16::from_le_bytes(resp.payload[..2].try_into().unwrap());
+        assert_eq!(
+            err, ERR_CLUSTER_NOT_READY,
+            "an RF=1 multi-node Joining node must reject mutations with ERR_CLUSTER_NOT_READY",
         );
     }
 
