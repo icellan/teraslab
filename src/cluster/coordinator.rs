@@ -4678,26 +4678,46 @@ fn compute_manifest_for_entries(entries: &[(TxKey, u32)]) -> [u8; 32] {
 
 /// Wait for in-flight client mutations to drain after raising a shard fence.
 ///
-/// Every mutating dispatch holds the EXCLUSIVE side of the engine's
-/// dispatch-visibility barrier from before its shard-fence check until
-/// after its engine apply + redo append (see
-/// `dispatch::acquire_dispatch_visibility_guard`). Acquiring — and
-/// immediately releasing — the SHARED side therefore blocks until every
-/// mutation that passed the fence check *before* the fence was raised has
-/// fully applied and journaled. Any mutation that begins after this
-/// returns runs its fence check against the already-set fence bit and is
-/// rejected with `ERR_MIGRATION_IN_PROGRESS`.
+/// The hot mutating dispatches (spend / set_mined / create) take the
+/// **SHARED** side of the engine's per-key visibility barrier —
+/// `engine.visibility().mutation(&keys)` = `global.read()` plus per-key stripe
+/// writes — held from their shard-fence check through their engine apply +
+/// redo append. A SHARED-vs-SHARED acquisition never blocks, so the pre-fix
+/// drain (which also took `global.read()`) returned IMMEDIATELY while such a
+/// mutation was still mid-apply: it could journal a redo seq *beyond* the
+/// captured `fence_seq`, so the migration delta/manifest cutoff missed it and
+/// the write was lost at handoff (C18).
+///
+/// This drain instead briefly takes the **EXCLUSIVE** side (`global.write()`,
+/// the same checkpoint-style guard reads use to exclude a checkpoint). A
+/// write lock cannot be granted until every in-flight SHARED holder has
+/// released, so on return every mutation that passed the fence check *before*
+/// the fence was raised has fully applied and journaled — its seq is strictly
+/// below any `fence_seq` captured afterwards. Any mutation beginning after
+/// this returns re-reads the already-set fence bit under its own guard and is
+/// rejected with `ERR_MIGRATION_IN_PROGRESS` (see the set_mined post-guard
+/// re-check, C19). The exclusive side is acquired and released *immediately*
+/// here — it is a barrier, NOT held across migration I/O — so the whole write
+/// path is stalled only for the instant it takes existing in-flight mutations
+/// to finish, not for the duration of the migration.
 ///
 /// Called between raising a shard fence and capturing `fence_seq` /
 /// re-reading shard keys, so that no mutation can apply after the
 /// migration delta/manifest cutoff while the shard is still fenced
 /// (the apply-after-fence-check TOCTOU).
 ///
-/// MUST NOT be called while holding the migration-manager mutex: mutating
-/// dispatches acquire that mutex (dual-write fan-out) while holding the
-/// exclusive barrier, so nesting the two would deadlock.
+/// LOCK ORDER (deadlock-critical): the barrier (`global.write()`) is always
+/// acquired here holding NO other lock, and released before this returns. A
+/// hot-path mutation takes `global.read()` BEFORE the migration-manager mutex
+/// (the dual-write fan-out mutex is taken only after the visibility guard is
+/// released, at replication time), so the order is uniformly
+/// `visibility → migration mutex`, never the reverse. Therefore this MUST NOT
+/// be called while holding the migration-manager mutex: doing so would let a
+/// mutation holding `global.read()` and waiting on that mutex sit under this
+/// barrier's `global.write()` wait, closing a cycle. Both call sites release
+/// the migration mutex before draining.
 fn drain_in_flight_mutations(engine: &Engine) {
-    drop(engine.acquire_dispatch_visibility_guard());
+    drop(engine.acquire_mutation_visibility_guard());
 }
 
 /// Maximum number of shards a migration worker fences together in one
@@ -15059,26 +15079,34 @@ mod tests {
         );
     }
 
-    /// The post-fence drain (`drain_in_flight_mutations`) must not return
-    /// while a mutating dispatch still holds the exclusive side of the
-    /// dispatch-visibility barrier — closing the TOCTOU where a write that
-    /// passed the fence check before the fence was raised applies its
-    /// mutation after `fence_seq` capture / manifest collection.
+    /// C18: the post-fence drain (`drain_in_flight_mutations`) must not return
+    /// while a HOT mutating dispatch still holds its per-key visibility guard.
+    ///
+    /// The hot path (spend / set_mined / create) takes
+    /// `engine.visibility().mutation(&keys)` — the SHARED side of the global
+    /// gate plus per-key stripe writes — from before its fence check through
+    /// its apply + redo append. The pre-fix drain also took the SHARED side, so
+    /// SHARED-vs-SHARED never blocked and the drain returned while the write was
+    /// still mid-apply; that write could journal a redo seq beyond the captured
+    /// `fence_seq` and be lost at handoff. Modelled here with the REAL hot-path
+    /// guard, so this fails against the old shared drain and passes against the
+    /// exclusive barrier.
     #[test]
     fn fence_drain_waits_for_in_flight_mutation() {
         let engine = Arc::new(test_engine());
+        let key = tx_key_for_shard(3, 1);
 
         let (acquired_tx, acquired_rx) = std::sync::mpsc::channel::<()>();
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
         let applied = Arc::new(AtomicBool::new(false));
 
-        // Simulated in-flight mutation: passed the fence check (i.e. holds
-        // the exclusive barrier), stalls, then applies and releases.
+        // Simulated in-flight hot mutation: passed the fence check while holding
+        // the SHARED per-key guard, stalls, then applies and releases.
         let writer = {
             let engine = engine.clone();
             let applied = applied.clone();
             std::thread::spawn(move || {
-                let guard = engine.acquire_mutation_visibility_guard();
+                let guard = engine.visibility().mutation(std::slice::from_ref(&key));
                 acquired_tx.send(()).unwrap();
                 release_rx.recv().unwrap();
                 // The "apply + redo append" happens strictly before the
@@ -15100,14 +15128,14 @@ mod tests {
             })
         };
 
-        // Bounded negative check: while the writer holds the exclusive
-        // barrier the drain must stay blocked.
+        // Bounded negative check: while the writer holds the SHARED per-key
+        // guard the drain (exclusive barrier) must stay blocked.
         let hold_deadline = std::time::Instant::now() + Duration::from_millis(200);
         while std::time::Instant::now() < hold_deadline {
             assert!(
                 !drain.is_finished(),
-                "drain returned while a mutation still held the exclusive \
-                 dispatch-visibility barrier",
+                "drain returned while a hot mutation still held its SHARED per-key \
+                 visibility guard — its redo append could land beyond fence_seq",
             );
             std::thread::sleep(Duration::from_millis(10));
         }
