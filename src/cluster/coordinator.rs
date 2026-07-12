@@ -2719,6 +2719,7 @@ impl ClusterCoordinator {
             topology_state_path,
             swim_incarnation: swim_incarnation_for_cluster,
             startup_reactivation_needed,
+            stale_suspect_shards: Arc::new(RwLock::new(std::collections::BTreeSet::new())),
             #[cfg(any(test, feature = "fault-injection"))]
             drop_commit_signals: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
@@ -8762,6 +8763,13 @@ pub struct RunningCluster {
     /// SWIM incarnation counter shared with the event loop for persistence.
     swim_incarnation: Arc<std::sync::atomic::AtomicU64>,
     startup_reactivation_needed: Arc<AtomicBool>,
+    /// Reverse-heal (finding C1): the shards this node currently suspects hold
+    /// a LOST ACKED TAIL. Populated by the boot detector (Tier-1 AckTracker
+    /// fast-path / Tier-2 manifest confirm). Phase 1 is detection-only — this
+    /// set is LOGGED + METERED (`stale_suspect_shards` gauge) but is NOT used
+    /// to fence reads/writes or trigger a pull. `BTreeSet` keeps it sorted +
+    /// deduplicated for the getter and the gauge count.
+    stale_suspect_shards: Arc<RwLock<std::collections::BTreeSet<u16>>>,
     /// Test-only: when set, [`RunningCluster::signal_topology_committed`]
     /// drops the signal instead of queuing it. Models the production race
     /// where a node's authority commits a new term (via the dispatch
@@ -8874,6 +8882,29 @@ impl RunningCluster {
     /// Get the current shard table.
     pub fn shard_table(&self) -> Arc<ShardTableLock<ShardTable>> {
         self.shard_table.clone()
+    }
+
+    /// Reverse-heal (finding C1): the shards this node currently suspects hold
+    /// a LOST ACKED TAIL, sorted ascending. Empty on a clean boot. Phase 1
+    /// exposes this for observability only — it does not gate serving.
+    pub fn stale_suspect_shards(&self) -> Vec<u16> {
+        self.stale_suspect_shards.read().iter().copied().collect()
+    }
+
+    /// Reverse-heal (finding C1): replace the set of suspected stale shards and
+    /// refresh the `stale_suspect_shards` gauge to its new cardinality.
+    ///
+    /// Called by the boot detector. Phase 1 is detection-only: this LOGS +
+    /// METERS the suspicion; it never fences or pulls. Passing an empty
+    /// iterator clears the suspicion (and drops the gauge to 0).
+    pub fn record_stale_suspect_shards(&self, shards: impl IntoIterator<Item = u16>) {
+        let set: std::collections::BTreeSet<u16> = shards.into_iter().collect();
+        let count = set.len();
+        *self.stale_suspect_shards.write() = set;
+        if let Some(m) = crate::metrics::migration_metrics() {
+            m.stale_suspect_shards
+                .store(count as u32, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 
     /// Determine whether this node is the master for the given key.
@@ -10540,6 +10571,7 @@ pub(crate) fn new_test_running_cluster(
         topology_state_path: None,
         swim_incarnation: Arc::new(std::sync::atomic::AtomicU64::new(1)),
         startup_reactivation_needed: Arc::new(AtomicBool::new(false)),
+        stale_suspect_shards: Arc::new(RwLock::new(std::collections::BTreeSet::new())),
         #[cfg(any(test, feature = "fault-injection"))]
         drop_commit_signals: Arc::new(AtomicBool::new(false)),
         #[cfg(test)]
@@ -16455,6 +16487,48 @@ mod tests {
             MasterQueryResult::Yes => {}
             other => panic!("expected MasterQueryResult::Yes, got {other:?}"),
         }
+    }
+
+    /// Reverse-heal Phase 1: the cluster handle exposes the suspected-stale
+    /// shard set (sorted + deduped) and refreshes the `stale_suspect_shards`
+    /// gauge to the set cardinality; an empty set clears both.
+    #[test]
+    fn stale_suspect_shards_handle_records_and_clears() {
+        use crate::metrics::{MigrationMetrics, init_migration_metrics, migration_metrics};
+        use std::sync::OnceLock;
+
+        static MIG: OnceLock<MigrationMetrics> = OnceLock::new();
+        init_migration_metrics(MIG.get_or_init(MigrationMetrics::new));
+
+        let cluster = single_node_cluster_for_master_query_tests();
+        assert!(
+            cluster.stale_suspect_shards().is_empty(),
+            "clean boot → no suspects",
+        );
+
+        // Duplicates + out of order → getter returns a sorted, deduped set.
+        cluster.record_stale_suspect_shards([7u16, 3, 7, 1]);
+        assert_eq!(cluster.stale_suspect_shards(), vec![1, 3, 7]);
+
+        // The gauge reflects the cardinality. A bounded retry wins against any
+        // parallel test mutating the process-global gauge.
+        let mm = migration_metrics().expect("metrics installed");
+        let mut saw_three = false;
+        for _ in 0..256 {
+            cluster.record_stale_suspect_shards([1u16, 3, 7]);
+            if mm.stale_suspect_shards.load(Ordering::Relaxed) == 3 {
+                saw_three = true;
+                break;
+            }
+        }
+        assert!(saw_three, "gauge must reflect the suspect-shard count");
+
+        // Clearing empties the set.
+        cluster.record_stale_suspect_shards(Vec::<u16>::new());
+        assert!(
+            cluster.stale_suspect_shards().is_empty(),
+            "clearing drops all suspects",
+        );
     }
 
     #[test]
