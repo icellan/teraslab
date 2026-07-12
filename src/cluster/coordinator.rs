@@ -1406,6 +1406,10 @@ impl ClusterCoordinator {
         replication: ReplicationRuntimeConfig,
     ) -> RunningCluster {
         let swim = self.swim.take().expect("swim already started");
+        // G1 — grab the shared SWIM membership handle BEFORE `start()` consumes
+        // the runner, so `alive_node_count` can exclude Suspect/Dead peers from
+        // the mutation-quorum count.
+        let swim_membership = swim.membership();
         let (swim_shutdown, swim_handle, event_rx) = swim.start();
 
         let shard_table = self.shard_table.clone();
@@ -2671,6 +2675,7 @@ impl ClusterCoordinator {
             shard_table: self.shard_table.clone(),
             migration: self.migration.clone(),
             node_addrs: self.node_addrs.clone(),
+            swim_membership,
             swim_shutdown,
             shutdown: self.shutdown.clone(),
             peak_size,
@@ -8335,6 +8340,17 @@ pub struct RunningCluster {
     shard_table: Arc<ShardTableLock<ShardTable>>,
     migration: Arc<Mutex<MigrationManager>>,
     node_addrs: Arc<RwLock<std::collections::HashMap<NodeId, SocketAddr>>>,
+    /// G1 — shared handle to the live SWIM membership state.
+    ///
+    /// `node_addrs` retains a `Suspect` peer until SWIM declares it `Dead`
+    /// (E-03), so it alone cannot distinguish a strictly-`Alive` peer from
+    /// one that is currently `Suspect` (partitioned but not yet reaped).
+    /// The mutation-quorum count ([`RunningCluster::alive_node_count`]) reads
+    /// this to exclude `Suspect`/`Dead` peers, so the minority side of a
+    /// partition cannot count a peer it can no longer reach toward "I still
+    /// have quorum" during the suspicion-timeout window (a dual-master write
+    /// window). Cloned from the `SwimRunner` before it is started.
+    swim_membership: Arc<Mutex<crate::cluster::membership::Membership>>,
     swim_shutdown: Arc<AtomicBool>,
     shutdown: Arc<AtomicBool>,
     /// Highest observed cluster size (for quorum calculations).
@@ -9139,12 +9155,49 @@ impl RunningCluster {
         .serialize()
     }
 
+    /// G1 — the peers SWIM currently considers strictly `Alive` (excludes
+    /// `Suspect` and `Dead`).
+    ///
+    /// Does NOT include `self`: production SWIM does not track the local node
+    /// in its `members` map (it is implicitly alive to itself), so callers
+    /// treat `self` as always alive. A `Suspect` peer is deliberately dropped
+    /// even though it is still in `node_addrs` (SWIM keeps a Suspect until the
+    /// suspicion timeout declares it Dead — E-03).
+    fn swim_alive_peers(&self) -> std::collections::HashSet<NodeId> {
+        use crate::cluster::membership::NodeState;
+        self.swim_membership
+            .lock()
+            .all_member_states()
+            .into_iter()
+            .filter(|(_, state, _, _)| *state == NodeState::Alive)
+            .map(|(id, _, _, _)| id)
+            .collect()
+    }
+
+    /// Test-only (G1) — drive a committed peer into the SWIM `Suspect` state
+    /// so `alive_node_count` drops it from the mutation-quorum count, modelling
+    /// the suspicion-timeout window of a network partition. The peer must have
+    /// been registered `Alive` first (the test constructor marks every
+    /// `live_node` peer Alive).
+    #[cfg(test)]
+    pub(crate) fn test_set_peer_suspect(&self, node: NodeId) {
+        // Incarnation 1 matches the value the test constructor used to mark the
+        // peer Alive, satisfying `mark_suspect`'s `incarnation >= current` gate.
+        self.swim_membership.lock().mark_suspect(node, 1);
+    }
+
     /// Number of alive nodes in the cluster.
     ///
     /// Uses the committed topology members when a topology has been
     /// committed (non-empty member list). Falls back to the SWIM-derived
     /// `node_addrs` length during initial single-node startup before any
     /// topology has been committed.
+    ///
+    /// G1 — a committed member only counts when it is BOTH in `node_addrs`
+    /// AND strictly `Alive` in the live SWIM view (`self` always counts). A
+    /// `Suspect` peer is excluded so the minority side of a partition cannot
+    /// count a peer it can no longer reach toward "I still have quorum" during
+    /// the suspicion-timeout window — closing a dual-master write window.
     pub fn alive_node_count(&self) -> usize {
         let committed = self.topology_authority.committed_members();
         let addrs = self.node_addrs.read();
@@ -9170,9 +9223,18 @@ impl RunningCluster {
             // 1 for self if self is in committed but not addrs (the
             // production case); skip the +1 when test harnesses have
             // explicitly put self in `node_addrs`.
+            //
+            // G1 — additionally require each counted PEER to be strictly
+            // `Alive` in the live SWIM view. `self` is exempt (always alive,
+            // and not tracked in SWIM `members`). A `Suspect` peer is still in
+            // `node_addrs` (E-03) but must NOT count toward "I still have
+            // quorum": otherwise the minority side of a partition keeps serving
+            // writes during the whole suspicion-timeout window (dual-master).
+            let alive_peers = self.swim_alive_peers();
             let peers = committed
                 .iter()
                 .filter(|node| addrs.contains_key(node))
+                .filter(|node| **node == self.self_id || alive_peers.contains(node))
                 .count();
             let self_committed = committed.contains(&self.self_id);
             let self_in_addrs = addrs.contains_key(&self.self_id);
@@ -10033,6 +10095,20 @@ pub(crate) fn new_test_running_cluster(
         node_addrs.insert(*node, *addr);
     }
 
+    // G1 — model the SWIM membership as all-`live_nodes`-Alive so the default
+    // test topology is a healthy converged cluster. Peers (everyone but self)
+    // are marked Alive; tests that need a partition flip a peer to Suspect via
+    // [`RunningCluster::test_set_peer_suspect`].
+    let swim_membership = {
+        let mut m = crate::cluster::membership::Membership::new(self_id, Duration::from_secs(1));
+        for (node, addr) in live_nodes {
+            if *node != self_id {
+                m.mark_alive(*node, *addr, 1, true);
+            }
+        }
+        Arc::new(Mutex::new(m))
+    };
+
     let (topology_commit_tx, _topology_commit_rx) = std::sync::mpsc::channel();
     let (resync_request_tx, _resync_request_rx) = std::sync::mpsc::channel();
     let (transfer_request_tx, _transfer_request_rx) = std::sync::mpsc::channel();
@@ -10046,6 +10122,7 @@ pub(crate) fn new_test_running_cluster(
         shard_table: Arc::new(ShardTableLock::new(table.clone())),
         migration,
         node_addrs: Arc::new(RwLock::new(node_addrs)),
+        swim_membership,
         swim_shutdown: Arc::new(AtomicBool::new(true)),
         shutdown: Arc::new(AtomicBool::new(true)),
         peak_size: Arc::new(std::sync::atomic::AtomicUsize::new(peak_size)),
@@ -15338,6 +15415,114 @@ mod tests {
             cluster.alive_node_count(),
             2,
             "self must count as alive even when SWIM omits it from node_addrs"
+        );
+    }
+
+    /// G1 (RED before fix) — mutation quorum must exclude Suspect peers.
+    ///
+    /// A 3-node cluster {1,2,3} partitions with node 1 isolated: SWIM marks
+    /// peers 2 and 3 Suspect, but they remain in `node_addrs` until the
+    /// suspicion timeout declares them Dead (E-03). Pre-fix `alive_node_count`
+    /// counted those addrs-known Suspect peers, so the isolated minority
+    /// reported 3 alive and (peak=3 ⇒ quorum 2) kept accepting writes — a
+    /// dual-master window versus the {2,3} majority. The count must drop the
+    /// Suspect peers to just `self`, failing the quorum gate on the minority.
+    #[test]
+    fn alive_quorum_excludes_suspect_peers_on_partition() {
+        let members = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let table = ShardTable::compute_with_epoch(&members, 2, 11, 1);
+        // Production shape: self (NodeId(1)) is NOT in node_addrs; peers are.
+        let cluster = new_test_running_cluster(
+            NodeId(1),
+            table,
+            &[
+                (NodeId(2), "127.0.0.1:4321".parse().unwrap()),
+                (NodeId(3), "127.0.0.1:4322".parse().unwrap()),
+            ],
+            &members,
+            &[],
+            &[],
+            &[],
+            3,
+        );
+        // Healthy baseline: all three count.
+        assert_eq!(cluster.alive_node_count(), 3, "all-Alive baseline");
+
+        // Node 1 is partitioned away from both peers.
+        cluster.test_set_peer_suspect(NodeId(2));
+        cluster.test_set_peer_suspect(NodeId(3));
+
+        let quorum_needed = cluster.peak_cluster_size() / 2 + 1;
+        assert_eq!(
+            cluster.alive_node_count(),
+            1,
+            "Suspect peers must not count toward quorum — only self remains alive"
+        );
+        assert!(
+            cluster.alive_node_count() < quorum_needed,
+            "isolated minority must fail the write-quorum gate (dual-master fence)"
+        );
+    }
+
+    /// G1 liveness guard — a healthy all-Alive cluster still reaches quorum.
+    ///
+    /// Same 3-node topology with NO Suspect peers: every committed member is
+    /// Alive, so the count stays at 3 ≥ quorum 2 and writes are served. The
+    /// partition fence must not brick a converged cluster.
+    #[test]
+    fn alive_quorum_healthy_cluster_still_serves() {
+        let members = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let table = ShardTable::compute_with_epoch(&members, 2, 13, 1);
+        let cluster = new_test_running_cluster(
+            NodeId(1),
+            table,
+            &[
+                (NodeId(2), "127.0.0.1:4331".parse().unwrap()),
+                (NodeId(3), "127.0.0.1:4332".parse().unwrap()),
+            ],
+            &members,
+            &[],
+            &[],
+            &[],
+            3,
+        );
+        let quorum_needed = cluster.peak_cluster_size() / 2 + 1;
+        assert_eq!(cluster.alive_node_count(), 3);
+        assert!(
+            cluster.alive_node_count() >= quorum_needed,
+            "healthy all-Alive cluster must still achieve write quorum"
+        );
+    }
+
+    /// G1 precision — the MAJORITY side of a partition keeps serving.
+    ///
+    /// Node 1 with peer 2 Alive and peer 3 Suspect (the reachable 2-node
+    /// majority side of a 3-node cluster) must still count 2 ≥ quorum 2 — the
+    /// fix drops only unreachable peers, it does not over-fence the surviving
+    /// majority.
+    #[test]
+    fn alive_quorum_majority_side_keeps_serving() {
+        let members = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let table = ShardTable::compute_with_epoch(&members, 2, 15, 1);
+        let cluster = new_test_running_cluster(
+            NodeId(1),
+            table,
+            &[
+                (NodeId(2), "127.0.0.1:4341".parse().unwrap()),
+                (NodeId(3), "127.0.0.1:4342".parse().unwrap()),
+            ],
+            &members,
+            &[],
+            &[],
+            &[],
+            3,
+        );
+        cluster.test_set_peer_suspect(NodeId(3));
+        let quorum_needed = cluster.peak_cluster_size() / 2 + 1;
+        assert_eq!(cluster.alive_node_count(), 2, "self + one Alive peer");
+        assert!(
+            cluster.alive_node_count() >= quorum_needed,
+            "majority side must keep serving"
         );
     }
 
