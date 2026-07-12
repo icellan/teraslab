@@ -450,6 +450,24 @@ pub struct PersistedTopologyState {
     pub committed_placement_version: u16,
 }
 
+/// G9 — result of [`TopologyAuthority::handle_commit_durable`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DurableCommitOutcome {
+    /// The commit passed every gate, its post-commit state was persisted
+    /// durably, and it was then applied. Carries the committed term; the
+    /// caller should activate the shard table for it.
+    Applied(u64),
+    /// The commit did not pass the acceptance gates (stale term, bad digest,
+    /// unsupported placement version, missing quorum proof, or split-brain
+    /// signature). Nothing was persisted or applied.
+    NotApplied,
+    /// The commit was valid but the durable persist failed. Fail-closed: the
+    /// term was NOT applied, so the node keeps serving its prior term rather
+    /// than one it could forget on reboot. The caller must surface a retryable
+    /// error and must NOT activate under the new term.
+    PersistFailed,
+}
+
 impl PersistedTopologyState {
     /// Serialize to bytes.
     ///
@@ -710,6 +728,23 @@ pub struct TopologyAuthority {
     /// take it too so a follower vote cannot interleave a proposer's
     /// self-vote.
     vote_decision: Mutex<()>,
+    /// Item 1 — serializes the whole commit gate→persist→apply sequence.
+    ///
+    /// `commit_passes_gates` reads `committed_term`, then (in the durable path)
+    /// a multi-ms persist fsync runs, then `apply_commit` mutates term/members/
+    /// placement. Without a critical section spanning all three, two commits T
+    /// and T+1 can both pass the gate at `committed_term = T-1` and interleave
+    /// so the LOWER term's late apply clobbers the higher one that already
+    /// applied and was ACKed — an ACK-then-forget authority split (the fsync in
+    /// the gap widened the race from µs to ms). Held across gate + persist +
+    /// apply in [`TopologyAuthority::handle_commit`] and
+    /// [`TopologyAuthority::handle_commit_durable`]. This is the OUTERMOST lock:
+    /// it is only ever acquired at the top of those two methods, before any of
+    /// the inner `committed_*` RwLocks / atomics, and the `persist` closure runs
+    /// pure file I/O that never touches the authority — so there is no lock-order
+    /// inversion. Commits are rare (topology changes only), so serializing the
+    /// fsync here is acceptable.
+    commit_apply: Mutex<()>,
     /// Pending proposal (if this node is the proposer).
     pending_proposal: Mutex<Option<PendingProposal>>,
     /// Timeout before a non-proposer becomes a fallback proposer.
@@ -744,6 +779,31 @@ pub struct TopologyAuthority {
     /// for atomic access; logically a `u16`). `1` until the cluster
     /// unanimously upgrades to HRW.
     committed_placement_version: AtomicU64,
+    /// C11 — highest quorum-committed term this node OBSERVED but could NOT
+    /// apply because its placement version exceeds this build's support (a
+    /// downgraded / misconfigured node). Raised (`fetch_max`) in
+    /// [`TopologyAuthority::handle_commit`]'s activation-gate refuse path, gated
+    /// on `has_quorum_voter_proof`. That gate is a STRUCTURAL correctness filter
+    /// (it stops a genuinely sub-quorum commit from arming the fence); it is NOT
+    /// forgery resistance — `voters` is a plaintext, self-declared, forgeable
+    /// wire field. Forgery is stopped upstream by the frame HMAC on
+    /// `OP_TOPOLOGY_COMMIT` (only in `cluster_secret` mode; see the arm site).
+    ///
+    /// When this exceeds `committed_term`, the node has proof the cluster
+    /// advanced to an authority it cannot serve; it must self-fence (stop
+    /// serving authoritative reads/writes) rather than keep serving under its
+    /// stale term, which would be a v1/v2 dual-authority split.
+    ///
+    /// The `is_self_fenced` auto-clear (fence lifts once `committed_term`
+    /// reaches this term) exists in code but is UNREACHABLE in the real arming
+    /// case: placement versions are monotonic cluster-wide, so once a majority
+    /// commits an unsupported placement, every later term carries a placement
+    /// this build STILL cannot apply → `committed_term` never catches up. The
+    /// fence is therefore effectively PERMANENT for a stale binary (the correct
+    /// fail-closed choice). Not persisted, so recovery is a BINARY UPGRADE +
+    /// REBOOT: reboot clears the atomic and gossip re-teaches the now-applicable
+    /// term.
+    unapplicable_committed_term: AtomicU64,
     /// W6 (INVARIANT ii) — highest placement version each peer is known to
     /// support, learned from the `voter_placement_support` field of every
     /// vote this node receives (the proposer is the primary consumer). Self
@@ -765,6 +825,7 @@ impl TopologyAuthority {
             committed_voter_ever_seen: Arc::new(RwLock::new(HashSet::new())),
             voted_term: AtomicU64::new(0),
             vote_decision: Mutex::new(()),
+            commit_apply: Mutex::new(()),
             pending_proposal: Mutex::new(None),
             propose_timeout,
             last_membership_change: Mutex::new(Instant::now()),
@@ -772,6 +833,7 @@ impl TopologyAuthority {
             last_commit_at_unix_ms: AtomicU64::new(0),
             peak_cluster_size: AtomicU64::new(1),
             committed_placement_version: AtomicU64::new(1),
+            unapplicable_committed_term: AtomicU64::new(0),
             peer_placement_support: RwLock::new({
                 let mut m = std::collections::HashMap::new();
                 m.insert(
@@ -991,6 +1053,35 @@ impl TopologyAuthority {
     /// Current committed term.
     pub fn committed_term(&self) -> u64 {
         self.committed_term.load(Ordering::Relaxed)
+    }
+
+    /// C11 — highest quorum-committed term this node observed but could not
+    /// apply (its placement version exceeds this build's support). `0` when
+    /// none has been observed. See [`TopologyAuthority::is_self_fenced`].
+    pub fn unapplicable_committed_term(&self) -> u64 {
+        self.unapplicable_committed_term.load(Ordering::Relaxed)
+    }
+
+    /// C11 — whether this node must self-fence: it has proof the cluster
+    /// quorum-committed a term GREATER than its own applied term that it
+    /// cannot apply. In that state the node's placement view is stale and it
+    /// must stop serving authority (return `Transitioning`/redirect) rather
+    /// than run a divergent v1/v2 authority alongside the upgraded majority.
+    ///
+    /// Fail-closed. The atomic-based auto-clear (fence lifts once
+    /// `committed_term` reaches the unapplicable term) exists, but in the real
+    /// arming case it is UNREACHABLE: placement versions are monotonic
+    /// cluster-wide, so once a majority commits a placement this build cannot
+    /// apply, every later term carries a placement it STILL cannot apply and
+    /// `committed_term` never catches up. So for a stale binary the fence is
+    /// effectively PERMANENT (the correct fail-closed choice), and it is GLOBAL
+    /// — it forces `Transitioning` for ALL keys, a sharp availability cliff for
+    /// a not-yet-upgraded straggler during a rolling upgrade. Recovery is a
+    /// BINARY UPGRADE + REBOOT: the atomic is not persisted, so a reboot clears
+    /// it and gossip re-teaches the now-applicable term.
+    pub fn is_self_fenced(&self) -> bool {
+        self.unapplicable_committed_term.load(Ordering::Relaxed)
+            > self.committed_term.load(Ordering::Relaxed)
     }
 
     /// Members of the committed term.
@@ -1366,12 +1457,42 @@ impl TopologyAuthority {
     /// Returns `Some(term)` if the commit is valid and was applied,
     /// meaning the caller should activate the shard table with the
     /// committed members.
+    ///
+    /// NOTE (G9): this advances the served `committed_term` in memory WITHOUT
+    /// persisting it. Callers that must not serve a term they could lose across
+    /// a crash use [`TopologyAuthority::handle_commit_durable`] instead; this
+    /// remains for tests and single-node paths where a crash cannot produce a
+    /// peer holding a term this node forgot.
     pub fn handle_commit(&self, commit: &TopologyCommit) -> Option<u64> {
+        // Item 1 — hold the commit critical section across gate + apply so a
+        // concurrent commit cannot interleave and regress the served term.
+        let _apply_guard = self.commit_apply.lock();
+        if !self.commit_passes_gates(commit) {
+            return None;
+        }
+        if self.apply_commit_locked(commit) {
+            Some(commit.term)
+        } else {
+            // Superseded under the lock (a higher term already applied). The
+            // gate above should have caught it, but the apply-time re-check is
+            // the authoritative guard — report "not applied".
+            None
+        }
+    }
+
+    /// Run every acceptance gate for an incoming commit WITHOUT applying it.
+    ///
+    /// Returns `true` when the commit is valid and should be applied. Shared by
+    /// [`TopologyAuthority::handle_commit`] and the durable variant so a commit
+    /// is validated identically whether or not the caller persists first. A
+    /// couple of gates carry side effects (the C11 self-fence arm, error logs);
+    /// those fire on rejection exactly as before.
+    fn commit_passes_gates(&self, commit: &TopologyCommit) -> bool {
         let committed = self.committed_term.load(Ordering::Relaxed);
 
         // Validate: term must be strictly higher.
         if commit.term <= committed {
-            return None;
+            return false;
         }
 
         // Validate digest. The digest is computed over
@@ -1384,7 +1505,7 @@ impl TopologyAuthority {
             commit.placement_version,
         );
         if commit.digest != expected_digest {
-            return None;
+            return false;
         }
 
         // W6 (INVARIANT ii) — activation gate. REFUSE to apply (and thus to
@@ -1403,11 +1524,35 @@ impl TopologyAuthority {
                 max_supported = crate::cluster::shards::MAX_SUPPORTED_PLACEMENT_VERSION,
                 "cluster: refusing topology commit — placement version exceeds this build's support",
             );
-            return None;
+            // C11 — the cluster quorum-committed a term this build cannot
+            // apply. Record it so the coordinator self-fences (stops serving
+            // authority) instead of continuing under the stale term, which
+            // would be a v1/v2 dual-authority split.
+            //
+            // Forgery resistance does NOT come from `has_quorum_voter_proof`:
+            // `voters` is a plaintext, self-declared wire field, trivially
+            // forgeable alongside the digest, so the proof is a purely
+            // STRUCTURAL correctness filter (it stops a genuinely sub-quorum
+            // commit from arming the fence, not an attacker). The real forgery
+            // resistance is the FRAME HMAC: `OP_TOPOLOGY_COMMIT` is an
+            // inter-node auth opcode, and `verify_signed_body_streaming` rejects
+            // a forged frame when `cluster_secret` is set — so a forged commit
+            // never reaches this code in an authenticated cluster. CAVEAT: in
+            // `cluster_secret`-less (trusted-overlay, fail-open) mode there is
+            // no HMAC, so a forged `OP_TOPOLOGY_COMMIT` with a fabricated voter
+            // list CAN arm a persistent global self-fence (inert-reject → brick
+            // amplification). That is within the trusted-overlay threat model
+            // (the overlay is assumed authenticated by other means), but
+            // operators running fail-open should know it.
+            if commit.has_quorum_voter_proof() {
+                self.unapplicable_committed_term
+                    .fetch_max(commit.term, Ordering::Relaxed);
+            }
+            return false;
         }
 
         if !commit.has_quorum_voter_proof() {
-            return None;
+            return false;
         }
 
         // E-2: mirror the propose/vote-side split-brain guard set on the
@@ -1437,19 +1582,43 @@ impl TopologyAuthority {
                 "cluster: refusing topology commit — split-brain heal signature \
                  (cluster_id mismatch, non-monotonic change, or unseen members).",
             );
-            return None;
+            return false;
         }
 
-        // Apply commit.
+        true
+    }
+
+    /// Apply a commit that has already passed every validation gate in
+    /// [`TopologyAuthority::handle_commit`]. Advances `committed_term` — the
+    /// value `is_master` serves — so callers that require durability first must
+    /// go through [`TopologyAuthority::handle_commit_durable`] (G9).
+    ///
+    /// PRECONDITION: the caller MUST hold [`Self::commit_apply`]. That lock is
+    /// what makes the term/members/placement mutation atomic w.r.t. a
+    /// concurrent commit; the apply-time re-check below relies on
+    /// `committed_term` not changing under it.
+    ///
+    /// Item 1 — re-checks `commit.term <= committed_term` at apply time and, if
+    /// superseded, abandons the apply ENTIRELY (mutates nothing — not the term,
+    /// not members, not placement). A bare `fetch_max` on `committed_term` alone
+    /// would still write this commit's members/placement, leaving the higher
+    /// term paired with a lower term's members. Returns `true` if the commit was
+    /// applied, `false` if it was abandoned as superseded.
+    fn apply_commit_locked(&self, commit: &TopologyCommit) -> bool {
+        // Item 1 — abandon a superseded lower term outright. Under
+        // `commit_apply` this load is stable for the rest of the function.
+        if commit.term <= self.committed_term.load(Ordering::Relaxed) {
+            return false;
+        }
         // E-01: a committed term with N members is direct evidence the
         // cluster reached size N — raise the peak so any later
         // SWIM-observed shrink is gated on the majority of this size.
         self.observe_peak_cluster_size(commit.members.len() as u64);
-        self.committed_term.store(commit.term, Ordering::Relaxed);
         // W6 — adopt the committed placement version. The coordinator reads
         // this when it (re)installs the shard table for `commit.term`, so the
         // first v2 commit triggers the planned full reshuffle via the normal
-        // activation/migration machinery.
+        // activation/migration machinery. Set BEFORE committed_term so a reader
+        // that observes the new term also sees the matching placement version.
         self.committed_placement_version
             .store(commit.placement_version.max(1) as u64, Ordering::Relaxed);
         *self.committed_members.write().unwrap() = commit.members.clone();
@@ -1467,6 +1636,10 @@ impl TopologyAuthority {
                 seen.insert(*m);
             }
         }
+        // Advance the served term LAST: `is_master` reads `committed_term`, so
+        // publishing it after the members/placement above keeps a concurrent
+        // reader from seeing the new term with a stale member view.
+        self.committed_term.store(commit.term, Ordering::Relaxed);
         // Phase I — stamp the wall-clock time so cluster_health can
         // report `last_topology_commit_age_ms`. Best-effort: a system
         // clock without UNIX_EPOCH access stays at the prior value.
@@ -1477,8 +1650,90 @@ impl TopologyAuthority {
 
         // Clear any pending proposal (superseded by this commit).
         *self.pending_proposal.lock() = None;
+        true
+    }
 
-        Some(commit.term)
+    /// G9 — the `PersistedTopologyState` this authority WOULD hold after
+    /// applying `commit`, computed WITHOUT mutating any state.
+    ///
+    /// Lets a caller persist the post-commit durable record BEFORE
+    /// `apply_commit_locked` advances the served `committed_term`
+    /// (see [`TopologyAuthority::handle_commit_durable`]). Mirrors exactly what
+    /// [`TopologyAuthority::persisted_state`] returns after apply:
+    /// term/members/voters/placement taken from the commit, peak raised to the
+    /// committed size, and the ever-seen set unioned with the commit's
+    /// members+voters. `voted_term` is left as-is (apply does not touch it).
+    pub fn persisted_state_for_commit(
+        &self,
+        commit: &TopologyCommit,
+        peak: u64,
+        incarnation: u64,
+    ) -> PersistedTopologyState {
+        let mut ever_seen: HashSet<NodeId> = self.committed_voter_ever_seen.read().unwrap().clone();
+        ever_seen.extend(commit.voters.iter().copied());
+        ever_seen.extend(commit.members.iter().copied());
+        PersistedTopologyState {
+            peak_cluster_size: peak
+                .max(self.peak_cluster_size())
+                .max(commit.members.len() as u64),
+            committed_term: commit.term,
+            committed_members: commit.members.clone(),
+            committed_voters: commit.voters.clone(),
+            voted_term: self.voted_term.load(Ordering::Relaxed),
+            incarnation,
+            committed_voter_ever_seen: ever_seen.into_iter().collect(),
+            committed_placement_version: commit.placement_version.max(1),
+        }
+    }
+
+    /// G9 — apply a commit only after its post-commit state is DURABLE.
+    ///
+    /// The committed term is what `is_master` serves, so a node must not
+    /// advertise authority under term T until T survives a crash. This mirrors
+    /// the H10 persist-before-vote discipline for the commit path: every
+    /// validation gate of [`TopologyAuthority::handle_commit`] runs first (so
+    /// an invalid or unsupported commit never persists and never applies), then
+    /// `persist` is invoked with the post-commit [`PersistedTopologyState`];
+    /// only if it returns `true` is the commit applied in memory.
+    ///
+    /// Fail-closed: on a persist failure the commit is NOT applied
+    /// ([`DurableCommitOutcome::PersistFailed`]) and the node stays on its
+    /// prior term rather than serve a term it could forget on reboot.
+    pub fn handle_commit_durable<F>(
+        &self,
+        commit: &TopologyCommit,
+        peak: u64,
+        incarnation: u64,
+        persist: F,
+    ) -> DurableCommitOutcome
+    where
+        F: FnOnce(&PersistedTopologyState) -> bool,
+    {
+        // Item 1 — hold the commit critical section across the ENTIRE
+        // gate→persist→apply sequence. Without it, a concurrent higher-term
+        // commit can apply+ACK during this call's multi-ms persist, and this
+        // call's later apply would clobber it (ACK-then-forget authority split).
+        // `commit_apply` is the outermost lock; the `persist` closure below runs
+        // pure file I/O that never re-enters the authority, so holding it across
+        // the fsync introduces no lock-order inversion (see the field docs).
+        let _apply_guard = self.commit_apply.lock();
+        if !self.commit_passes_gates(commit) {
+            return DurableCommitOutcome::NotApplied;
+        }
+        let state = self.persisted_state_for_commit(commit, peak, incarnation);
+        if !persist(&state) {
+            return DurableCommitOutcome::PersistFailed;
+        }
+        if self.apply_commit_locked(commit) {
+            DurableCommitOutcome::Applied(commit.term)
+        } else {
+            // Superseded under the lock. Cannot happen while the guard is held
+            // (the gate already required `commit.term > committed_term` and
+            // nothing else advances the term without this lock), but the
+            // apply-time re-check is the authoritative guard: report NotApplied
+            // rather than a phantom `Applied` for a term we did not install.
+            DurableCommitOutcome::NotApplied
+        }
     }
 
     /// Phase I — millis since UNIX epoch of the most recent observed
@@ -3753,6 +4008,463 @@ mod tests {
             0,
             "unsupported commit must not advance"
         );
+    }
+
+    /// C11 — refusing an unsupported, quorum-proven committed term sets the
+    /// self-fence flag so the coordinator stops serving stale authority.
+    #[test]
+    fn unapplicable_committed_term_arms_self_fence() {
+        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+        assert!(!auth.is_self_fenced(), "fresh authority is not fenced");
+        let too_high = crate::cluster::shards::MAX_SUPPORTED_PLACEMENT_VERSION + 1;
+        let mems = members(&[1, 2, 3]);
+        let commit = TopologyCommit {
+            term: 4,
+            proposer: NodeId(1),
+            members: mems.clone(),
+            cluster_id: ClusterId::UNSET,
+            placement_version: too_high,
+            digest: TopologyTerm::compute_digest(4, &ClusterId::UNSET, &mems, too_high),
+            voters: mems.clone(),
+        };
+        assert_eq!(auth.handle_commit(&commit), None);
+        assert_eq!(auth.unapplicable_committed_term(), 4);
+        assert!(
+            auth.is_self_fenced(),
+            "observing a quorum-committed term it cannot apply must self-fence"
+        );
+    }
+
+    /// C11 (forged-commit guard) — a refused unsupported commit WITHOUT a valid
+    /// quorum voter proof must NOT fence a healthy node (the digest is
+    /// forgeable; only a quorum-proven commit is proof the cluster advanced).
+    #[test]
+    fn unapplicable_committed_term_without_quorum_proof_does_not_fence() {
+        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+        let too_high = crate::cluster::shards::MAX_SUPPORTED_PLACEMENT_VERSION + 1;
+        let mems = members(&[1, 2, 3]);
+        let forged = TopologyCommit {
+            term: 4,
+            proposer: NodeId(1),
+            members: mems.clone(),
+            cluster_id: ClusterId::UNSET,
+            placement_version: too_high,
+            digest: TopologyTerm::compute_digest(4, &ClusterId::UNSET, &mems, too_high),
+            // No quorum: a single voter cannot prove a 3-member commit.
+            voters: members(&[1]),
+        };
+        assert_eq!(auth.handle_commit(&forged), None);
+        assert_eq!(
+            auth.unapplicable_committed_term(),
+            0,
+            "a commit lacking a quorum voter proof must not arm the fence"
+        );
+        assert!(!auth.is_self_fenced());
+    }
+
+    /// C11 liveness — a node that CAN apply the committed term adopts it and is
+    /// NOT self-fenced (don't over-fence a node that keeps up).
+    #[test]
+    fn applicable_committed_term_does_not_fence() {
+        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+        let mems = members(&[1, 2, 3]);
+        let commit = TopologyCommit {
+            term: 4,
+            proposer: NodeId(1),
+            members: mems.clone(),
+            cluster_id: ClusterId::UNSET,
+            placement_version: 1, // supported
+            digest: TopologyTerm::compute_digest(4, &ClusterId::UNSET, &mems, 1),
+            voters: mems.clone(),
+        };
+        assert_eq!(auth.handle_commit(&commit), Some(4));
+        assert_eq!(auth.committed_term(), 4);
+        assert!(
+            !auth.is_self_fenced(),
+            "a node that applied the committed term must keep serving"
+        );
+    }
+
+    /// C11 — the self-fence auto-clears once `committed_term` catches up to (or
+    /// past) the previously-unapplicable term, so a node that later commits a
+    /// term it CAN apply is not permanently bricked.
+    #[test]
+    fn self_fence_clears_when_committed_term_catches_up() {
+        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+        let mems = members(&[1, 2, 3]);
+        let too_high = crate::cluster::shards::MAX_SUPPORTED_PLACEMENT_VERSION + 1;
+        // Observe an unsupported term 4 → fenced (committed still 0).
+        let bad = TopologyCommit {
+            term: 4,
+            proposer: NodeId(1),
+            members: mems.clone(),
+            cluster_id: ClusterId::UNSET,
+            placement_version: too_high,
+            digest: TopologyTerm::compute_digest(4, &ClusterId::UNSET, &mems, too_high),
+            voters: mems.clone(),
+        };
+        assert_eq!(auth.handle_commit(&bad), None);
+        assert!(auth.is_self_fenced());
+
+        // A later supported commit at term 5 applies and clears the fence.
+        let good = TopologyCommit {
+            term: 5,
+            proposer: NodeId(1),
+            members: mems.clone(),
+            cluster_id: ClusterId::UNSET,
+            placement_version: 1,
+            digest: TopologyTerm::compute_digest(5, &ClusterId::UNSET, &mems, 1),
+            voters: mems.clone(),
+        };
+        assert_eq!(auth.handle_commit(&good), Some(5));
+        assert!(
+            !auth.is_self_fenced(),
+            "fence must clear once committed_term (5) passes the unapplicable term (4)"
+        );
+    }
+
+    /// G9 (RED before fix) — a commit whose durable persist FAILS must NOT
+    /// advance the served `committed_term`. Pre-fix ordering advanced the term
+    /// in memory first and only then persisted (best-effort), so a crash — or
+    /// here a failed persist — left the node serving/authorising under a term
+    /// it had no durable record of. `handle_commit_durable` must fail closed.
+    #[test]
+    fn handle_commit_durable_fails_closed_when_persist_fails() {
+        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+        let mems = members(&[1, 2, 3]);
+        let commit = TopologyCommit {
+            term: 4,
+            proposer: NodeId(1),
+            members: mems.clone(),
+            cluster_id: ClusterId::UNSET,
+            placement_version: 1,
+            digest: TopologyTerm::compute_digest(4, &ClusterId::UNSET, &mems, 1),
+            voters: mems.clone(),
+        };
+        // Persist reports failure.
+        let outcome = auth.handle_commit_durable(&commit, 3, 1, |_state| false);
+        assert_eq!(outcome, DurableCommitOutcome::PersistFailed);
+        assert_eq!(
+            auth.committed_term(),
+            0,
+            "committed_term must NOT advance when the durable persist fails"
+        );
+        assert!(
+            auth.committed_members().is_empty(),
+            "committed membership must not change on a failed persist"
+        );
+    }
+
+    /// G9 liveness + ordering — a successful persist applies the commit, and
+    /// the state handed to `persist` carries the NEW term while
+    /// `committed_term` is still the OLD one (persist strictly precedes the
+    /// served advance).
+    #[test]
+    fn handle_commit_durable_persists_before_serving() {
+        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+        let mems = members(&[1, 2, 3]);
+        let commit = TopologyCommit {
+            term: 4,
+            proposer: NodeId(1),
+            members: mems.clone(),
+            cluster_id: ClusterId::UNSET,
+            placement_version: 1,
+            digest: TopologyTerm::compute_digest(4, &ClusterId::UNSET, &mems, 1),
+            voters: mems.clone(),
+        };
+        let persisted_term = std::cell::Cell::new(u64::MAX);
+        let served_term_at_persist = std::cell::Cell::new(u64::MAX);
+        let outcome = auth.handle_commit_durable(&commit, 3, 1, |state| {
+            // The state being made durable carries the new committed term...
+            persisted_term.set(state.committed_term);
+            // ...while the SERVED committed_term has NOT yet advanced.
+            served_term_at_persist.set(auth.committed_term());
+            true
+        });
+        assert_eq!(outcome, DurableCommitOutcome::Applied(4));
+        assert_eq!(
+            persisted_term.get(),
+            4,
+            "the state persisted must carry the new committed term"
+        );
+        assert_eq!(
+            served_term_at_persist.get(),
+            0,
+            "committed_term must still be the OLD term while persisting (persist-before-serve)"
+        );
+        assert_eq!(
+            auth.committed_term(),
+            4,
+            "committed_term advances only after a successful persist"
+        );
+    }
+
+    /// G9 — an invalid/stale commit is neither persisted nor applied.
+    #[test]
+    fn handle_commit_durable_rejects_invalid_without_persisting() {
+        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+        let mems = members(&[1, 2, 3]);
+        // Bad digest → gate rejects before any persist.
+        let commit = TopologyCommit {
+            term: 4,
+            proposer: NodeId(1),
+            members: mems.clone(),
+            cluster_id: ClusterId::UNSET,
+            placement_version: 1,
+            digest: [0u8; 32],
+            voters: mems.clone(),
+        };
+        let persist_called = std::cell::Cell::new(false);
+        let outcome = auth.handle_commit_durable(&commit, 3, 1, |_state| {
+            persist_called.set(true);
+            true
+        });
+        assert_eq!(outcome, DurableCommitOutcome::NotApplied);
+        assert!(
+            !persist_called.get(),
+            "an invalid commit must not reach the persist step"
+        );
+        assert_eq!(auth.committed_term(), 0);
+    }
+
+    /// Item 1 (RED before fix) — `handle_commit_durable` must never let a
+    /// LOWER term regress `committed_term` after a HIGHER term has already
+    /// applied and been ACKed.
+    ///
+    /// G9 widened this from µs to ms: the gate reads `committed_term`, then the
+    /// multi-ms persist fsync runs, then (pre-fix) `apply_commit` stores
+    /// `commit.term` UNCONDITIONALLY. Two commits T and T+1 can both pass the
+    /// gate at `committed_term = T-1`; if the lower term's persist finishes
+    /// AFTER the higher term applies, the lower term's late apply clobbers the
+    /// higher one — the node ACKed T+1 but now serves/gates on T and would
+    /// reboot at T while peers hold T+1 (the exact authority split G9 exists to
+    /// prevent).
+    ///
+    /// This drives the interleave deterministically with ordering primitives
+    /// (no wall-clock assertions): the LOWER term (6) blocks inside its persist
+    /// closure until released; the HIGHER term (7) is spawned while 6 is parked.
+    /// Pre-fix, 7 is unsynchronized, overtakes, applies, and is ACKed; then 6's
+    /// late apply regresses `committed_term` to 6 AND the members to the 6-set.
+    /// Post-fix, 6 holds the commit critical section across its persist, so 7 is
+    /// serialized behind it (6 applies, then 7 applies) and the final durable
+    /// authority is term 7 with the 7-member set — never a regression.
+    ///
+    /// A bare `fetch_max` on `committed_term` alone would NOT pass: it would
+    /// leave term 7 paired with the lower term's member set. The members
+    /// assertion pins that the superseded apply mutates NOTHING.
+    #[test]
+    fn handle_commit_durable_lower_term_never_regresses_committed_term() {
+        use std::sync::mpsc;
+
+        // Baseline: commit term 5 with members {1,2,3,4} so BOTH later member
+        // sets are already "ever seen" (the split-brain fallback would else
+        // reject re-introducing node 4). `committed_term` starts at 5 = T-1.
+        let auth = Arc::new(TopologyAuthority::new(NodeId(1), Duration::from_secs(1)));
+        let base_members = members(&[1, 2, 3, 4]);
+        let baseline = TopologyCommit {
+            term: 5,
+            proposer: NodeId(1),
+            members: base_members.clone(),
+            cluster_id: ClusterId::UNSET,
+            placement_version: 1,
+            digest: TopologyTerm::compute_digest(5, &ClusterId::UNSET, &base_members, 1),
+            voters: base_members.clone(),
+        };
+        assert_eq!(auth.handle_commit(&baseline), Some(5));
+        assert_eq!(auth.committed_term(), 5);
+
+        // Lower term 6, DIFFERENT (subset) member set {1,2,3}.
+        let lo_members = members(&[1, 2, 3]);
+        let commit_lo = TopologyCommit {
+            term: 6,
+            proposer: NodeId(1),
+            members: lo_members.clone(),
+            cluster_id: ClusterId::UNSET,
+            placement_version: 1,
+            digest: TopologyTerm::compute_digest(6, &ClusterId::UNSET, &lo_members, 1),
+            voters: lo_members.clone(),
+        };
+        // Higher term 7, full member set {1,2,3,4}.
+        let hi_members = members(&[1, 2, 3, 4]);
+        let commit_hi = TopologyCommit {
+            term: 7,
+            proposer: NodeId(1),
+            members: hi_members.clone(),
+            cluster_id: ClusterId::UNSET,
+            placement_version: 1,
+            digest: TopologyTerm::compute_digest(7, &ClusterId::UNSET, &hi_members, 1),
+            voters: hi_members.clone(),
+        };
+
+        let (lo_in_persist_tx, lo_in_persist_rx) = mpsc::channel::<()>();
+        let (release_lo_tx, release_lo_rx) = mpsc::channel::<()>();
+        let (hi_done_tx, hi_done_rx) = mpsc::channel::<()>();
+
+        // Worker A — the LOWER term. Its persist closure announces that it has
+        // passed the gate and is now mid-persist, then BLOCKS until released.
+        let auth_a = auth.clone();
+        let a = std::thread::spawn(move || {
+            auth_a.handle_commit_durable(&commit_lo, 4, 1, move |_state| {
+                lo_in_persist_tx.send(()).expect("send lo_in_persist");
+                release_lo_rx.recv().expect("recv release_lo");
+                true
+            })
+        });
+
+        // Wait until the lower term has passed its gate and is parked in
+        // persist (committed_term still 5). Pre-fix no lock is held here;
+        // post-fix the commit critical section IS held — which is exactly what
+        // serializes the higher term behind it.
+        lo_in_persist_rx
+            .recv()
+            .expect("lower term must reach persist");
+
+        // Worker B — the HIGHER term. Its persist returns immediately.
+        let auth_b = auth.clone();
+        let b = std::thread::spawn(move || {
+            let out = auth_b.handle_commit_durable(&commit_hi, 4, 1, |_state| true);
+            hi_done_tx.send(()).expect("send hi_done");
+            out
+        });
+
+        // Pre-fix: B is unsynchronized, overtakes A, applies term 7, signals
+        // done (well within the fallback). Post-fix: B blocks acquiring the
+        // commit lock A holds, so it cannot finish until A is released — this
+        // `recv_timeout` is a pure LIVENESS fallback, not a timing assertion
+        // (the real assertions below are on committed state). Either way we then
+        // release A. The window is orders of magnitude larger than a lock-free
+        // apply, so pre-fix reproduction is deterministic.
+        let _hi_applied_before_release = hi_done_rx.recv_timeout(Duration::from_secs(1)).is_ok();
+        release_lo_tx.send(()).expect("release lower term");
+
+        let _outcome_a = a.join().expect("A joins");
+        let outcome_b = b.join().expect("B joins");
+
+        // The higher term must be the durable authority — never regressed to 6.
+        assert_eq!(
+            auth.committed_term(),
+            7,
+            "committed_term must NOT regress to the lower term after the higher \
+             term applied and was ACKed"
+        );
+        assert_eq!(
+            auth.committed_members(),
+            hi_members,
+            "members must be the higher term's set — a bare fetch_max on the term \
+             alone would leave term 7 paired with the lower term's members"
+        );
+        assert_eq!(
+            outcome_b,
+            DurableCommitOutcome::Applied(7),
+            "the higher term must report Applied",
+        );
+    }
+
+    /// Item 1 liveness guard — the commit critical section must NOT stall
+    /// normal forward progress: two DISTINCT sequential terms (T then T+1) both
+    /// apply and advance `committed_term` monotonically.
+    #[test]
+    fn handle_commit_durable_sequential_terms_both_apply() {
+        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+
+        let m1 = members(&[1, 2, 3, 4]);
+        let c1 = TopologyCommit {
+            term: 1,
+            proposer: NodeId(1),
+            members: m1.clone(),
+            cluster_id: ClusterId::UNSET,
+            placement_version: 1,
+            digest: TopologyTerm::compute_digest(1, &ClusterId::UNSET, &m1, 1),
+            voters: m1.clone(),
+        };
+        assert_eq!(
+            auth.handle_commit_durable(&c1, 4, 1, |_s| true),
+            DurableCommitOutcome::Applied(1),
+        );
+        assert_eq!(auth.committed_term(), 1);
+        assert_eq!(auth.committed_members(), m1);
+
+        // A higher term with a DIFFERENT (subset drain) member set also applies.
+        let m2 = members(&[1, 2, 3]);
+        let c2 = TopologyCommit {
+            term: 2,
+            proposer: NodeId(1),
+            members: m2.clone(),
+            cluster_id: ClusterId::UNSET,
+            placement_version: 1,
+            digest: TopologyTerm::compute_digest(2, &ClusterId::UNSET, &m2, 1),
+            voters: m2.clone(),
+        };
+        assert_eq!(
+            auth.handle_commit_durable(&c2, 4, 1, |_s| true),
+            DurableCommitOutcome::Applied(2),
+        );
+        assert_eq!(auth.committed_term(), 2);
+        assert_eq!(auth.committed_members(), m2);
+    }
+
+    /// G9 — `persisted_state_for_commit` mirrors exactly what
+    /// `persisted_state` reports after a real `handle_commit` apply, so the
+    /// pre-apply durable record is byte-identical to the post-apply one.
+    #[test]
+    fn persisted_state_for_commit_matches_post_apply_state() {
+        let mems = members(&[1, 2, 3]);
+        let commit = TopologyCommit {
+            term: 4,
+            proposer: NodeId(1),
+            members: mems.clone(),
+            cluster_id: ClusterId::UNSET,
+            placement_version: 1,
+            digest: TopologyTerm::compute_digest(4, &ClusterId::UNSET, &mems, 1),
+            voters: mems.clone(),
+        };
+
+        // Pre-apply projection.
+        let auth_a = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+        let projected = auth_a.persisted_state_for_commit(&commit, 3, 7);
+
+        // Real apply, then read the actual persisted state.
+        let auth_b = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+        assert_eq!(auth_b.handle_commit(&commit), Some(4));
+        let actual = auth_b.persisted_state(3, 7);
+
+        // Item 3 — destructure BOTH with every field bound explicitly (no `..`).
+        // A field added to `PersistedTopologyState` + `apply_commit_locked` but
+        // NOT to `persisted_state_for_commit` (or vice versa) then fails to
+        // compile here, forcing the projection to stay exhaustive.
+        let PersistedTopologyState {
+            peak_cluster_size: projected_peak,
+            committed_term: projected_term,
+            committed_members: projected_members,
+            committed_voters: projected_voters,
+            voted_term: projected_voted_term,
+            incarnation: projected_incarnation,
+            committed_voter_ever_seen: projected_ever_seen,
+            committed_placement_version: projected_placement,
+        } = projected;
+        let PersistedTopologyState {
+            peak_cluster_size: actual_peak,
+            committed_term: actual_term,
+            committed_members: actual_members,
+            committed_voters: actual_voters,
+            voted_term: actual_voted_term,
+            incarnation: actual_incarnation,
+            committed_voter_ever_seen: actual_ever_seen,
+            committed_placement_version: actual_placement,
+        } = actual;
+
+        assert_eq!(projected_term, actual_term);
+        assert_eq!(projected_members, actual_members);
+        assert_eq!(projected_voters, actual_voters);
+        assert_eq!(projected_peak, actual_peak);
+        assert_eq!(projected_placement, actual_placement);
+        assert_eq!(projected_voted_term, actual_voted_term);
+        assert_eq!(projected_incarnation, actual_incarnation);
+        let mut a: Vec<u64> = projected_ever_seen.iter().map(|n| n.0).collect();
+        let mut b: Vec<u64> = actual_ever_seen.iter().map(|n| n.0).collect();
+        a.sort_unstable();
+        b.sort_unstable();
+        assert_eq!(a, b, "ever-seen set must match post-apply");
     }
 
     #[test]

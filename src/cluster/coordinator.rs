@@ -1406,6 +1406,10 @@ impl ClusterCoordinator {
         replication: ReplicationRuntimeConfig,
     ) -> RunningCluster {
         let swim = self.swim.take().expect("swim already started");
+        // G1 — grab the shared SWIM membership handle BEFORE `start()` consumes
+        // the runner, so `alive_node_count` can exclude Suspect/Dead peers from
+        // the mutation-quorum count.
+        let swim_membership = swim.membership();
         let (swim_shutdown, swim_handle, event_rx) = swim.start();
 
         let shard_table = self.shard_table.clone();
@@ -2671,6 +2675,7 @@ impl ClusterCoordinator {
             shard_table: self.shard_table.clone(),
             migration: self.migration.clone(),
             node_addrs: self.node_addrs.clone(),
+            swim_membership,
             swim_shutdown,
             shutdown: self.shutdown.clone(),
             peak_size,
@@ -3076,35 +3081,50 @@ impl ClusterCoordinator {
                                 if commit.term <= local_term {
                                     continue;
                                 }
-                                if let Some(applied_term) =
-                                    topology_authority.handle_commit(&commit)
-                                {
-                                    tracing::info!(
-                                        term = applied_term,
-                                        %peer_addr,
-                                        members = remote_members.len(),
-                                        "cluster: catch-up: applied term from peer",
-                                    );
-                                    // POST-commit persist: the peer's term is
-                                    // already applied to the in-memory authority
-                                    // (handle_commit above) and cannot be rolled
-                                    // back, so this proceeds regardless. A failure
-                                    // is surfaced by `persist_topology_state`
-                                    // (ERROR + PERSIST_FAILURES); catch-up is
-                                    // idempotent and re-converges on restart.
-                                    if let Some(ref path) = *topology_state_path {
-                                        let peak = peak_size.load(Ordering::Relaxed) as u64;
-                                        let inc = swim_incarnation.load(Ordering::Relaxed);
-                                        let _ = persist_topology_state(
-                                            path,
-                                            &topology_authority.persisted_state(peak, inc),
+                                // G9 — adopt the peer's committed term only after
+                                // it is DURABLE. Ordering the persist after the
+                                // in-memory `handle_commit` left a crash window
+                                // that reverted this node to its prior term while
+                                // the peer held the newer one. Persist-before-serve
+                                // and fail closed: on a persist failure, do NOT
+                                // adopt the term — try the next peer / re-propose.
+                                let peak = peak_size.load(Ordering::Relaxed) as u64;
+                                let inc = swim_incarnation.load(Ordering::Relaxed);
+                                let path = topology_state_path.as_deref();
+                                match topology_authority.handle_commit_durable(
+                                    &commit,
+                                    peak,
+                                    inc,
+                                    |state| persist_topology_state_durable(path, state),
+                                ) {
+                                    crate::cluster::topology::DurableCommitOutcome::Applied(
+                                        applied_term,
+                                    ) => {
+                                        tracing::info!(
+                                            term = applied_term,
+                                            %peer_addr,
+                                            members = remote_members.len(),
+                                            "cluster: catch-up: adopted peer term (persisted first)",
                                         );
+                                        // Signal the event loop to activate.
+                                        let _ = topology_commit_tx
+                                            .send((remote_members.clone(), commit.term));
+                                        caught_up = true;
+                                        break;
                                     }
-                                    // Signal the event loop to activate the topology.
-                                    let _ = topology_commit_tx
-                                        .send((remote_members.clone(), commit.term));
-                                    caught_up = true;
-                                    break;
+                                    crate::cluster::topology::DurableCommitOutcome::PersistFailed => {
+                                        tracing::error!(
+                                            term = commit.term,
+                                            %peer_addr,
+                                            "cluster: catch-up: NOT adopting peer term — durable \
+                                             persist failed (G9); will retry via next peer / re-propose",
+                                        );
+                                        continue;
+                                    }
+                                    crate::cluster::topology::DurableCommitOutcome::NotApplied => {
+                                        // Raced / no longer acceptable — try next peer.
+                                        continue;
+                                    }
                                 }
                             }
                         }
@@ -4374,21 +4394,36 @@ fn try_run_topology_proposal(
         );
     }
 
-    // Apply commit locally.
-    topology_authority.handle_commit(&commit);
-    // POST-commit persist: the term is already committed in the in-memory
-    // authority and cannot be rolled back, so this proceeds regardless. A
-    // failure is surfaced by `persist_topology_state` (ERROR + PERSIST_FAILURES)
-    // and re-persisted by a later event / SWIM peak re-raise.
-    if let Some(path) = topology_state_path {
-        let peak = peak_size.load(Ordering::Relaxed) as u64;
-        let inc = swim_incarnation.load(Ordering::Relaxed);
-        let _ = persist_topology_state(path, &topology_authority.persisted_state(peak, inc));
+    // G9 — apply the commit locally only AFTER its committed term is durable.
+    // The proposer already broadcast the commit to peers; if its own persist
+    // fails it must NOT begin serving/activating under the new term (a crash
+    // would revert it to T-1 while peers hold T). Fail-closed: stay on the
+    // prior term and let a later TopologyStale catch-up re-drive activation.
+    let peak = peak_size.load(Ordering::Relaxed) as u64;
+    let inc = swim_incarnation.load(Ordering::Relaxed);
+    let path = topology_state_path.as_deref();
+    match topology_authority.handle_commit_durable(&commit, peak, inc, |state| {
+        persist_topology_state_durable(path, state)
+    }) {
+        crate::cluster::topology::DurableCommitOutcome::Applied(_) => {
+            // Signal the event loop to activate the shard table.
+            let _ = topology_commit_tx.send((commit.members.clone(), commit.term));
+            true
+        }
+        crate::cluster::topology::DurableCommitOutcome::PersistFailed => {
+            tracing::error!(
+                term = commit.term,
+                "cluster: proposer NOT activating committed term — durable persist \
+                 failed; staying on prior term (G9), will re-drive via catch-up",
+            );
+            false
+        }
+        crate::cluster::topology::DurableCommitOutcome::NotApplied => {
+            // Already superseded/duplicate (e.g. a concurrent higher commit
+            // advanced past this term). No local activation needed.
+            true
+        }
     }
-
-    // Signal the event loop to activate the shard table.
-    let _ = topology_commit_tx.send((commit.members.clone(), commit.term));
-    true
 }
 
 /// Send a request frame on an existing TCP stream and read the response.
@@ -4798,6 +4833,34 @@ const MIGRATION_PIPELINE_SUB_BATCH: usize = 32;
 ///
 /// This is orders of magnitude faster than per-shard connections:
 /// a 3-node cluster migrating 1300 shards uses 1 connection instead of 1300.
+///
+/// # C25 — why `topology_epoch` (not the quorum-committed `cluster_key`) here
+///
+/// `topology_epoch` is the LOCAL shard-table version this migration was
+/// planned at. It plays two roles, and the local version — not
+/// `committed_cluster_key` — is correct for BOTH:
+///
+///  1. **Local abort fence** (`migration_epoch_current`): a migration must be
+///     discarded the instant the LOCAL table advances past the epoch it was
+///     planned at, regardless of the quorum-committed term. Gating on
+///     `committed_cluster_key` would let a migration keep streaming under a
+///     shard plan the node has already replaced. See the `migration_epoch_current`
+///     doc for the full rationale.
+///  2. **Outbound `cluster_key`** stamped on the streamed baseline / redo delta
+///     batches and the `OP_MIGRATION_COMPLETE` handshake (via
+///     `stream_shard_baseline` / `send_completion_only_handshakes`).
+///
+/// These do not diverge in a way that mis-fences: `activate_topology` computes
+/// the table at `commit.term` AND stores `topology_epoch = commit.term`
+/// together, and every migration in this batch is spawned from that same
+/// activation — so `topology_epoch == committed_term == shard_table.version`
+/// at spawn time, which is exactly the `committed_cluster_key` the receiver
+/// gates inbound batches on. The only window where the per-node
+/// `topology_epoch` leads `committed_term` is a membership proposed/observed
+/// but not yet quorum-committed (the `is_master` `Transitioning` gate); NO
+/// migration is spawned in that window, so the stamped key always matches the
+/// activated, committed term. (Pinned by
+/// `activation_keeps_topology_epoch_equal_to_committed_term`.)
 #[allow(clippy::too_many_arguments)]
 fn run_migration_batch(
     tasks: Vec<MigrationTask>,
@@ -4807,6 +4870,9 @@ fn run_migration_batch(
     migration: &Arc<Mutex<MigrationManager>>,
     shard_table: &Arc<ShardTableLock<ShardTable>>,
     redo_log: &Option<Arc<ParkingMutex<RedoLog>>>,
+    // C25: the LOCAL table version this migration was planned at — the abort
+    // fence AND the outbound migration `cluster_key`. Equals `committed_term`
+    // at spawn (see the fn-level doc). Intentionally not `committed_cluster_key`.
     topology_epoch: u64,
     pool_size: usize,
     batch_size: usize,
@@ -7665,9 +7731,19 @@ fn persist_topology_state(
 /// and report whether the state is now durable.
 ///
 /// Returns `true` when there is nothing to persist (`path` is `None` — no state
-/// file configured, e.g. an ephemeral single-node test) or the persist
-/// succeeded. Returns `false` on a durable-write failure (already retried,
-/// ERROR-logged, and counted in [`PERSIST_FAILURES`] by [`persist_topology_state`]).
+/// file configured) or the persist succeeded. Returns `false` on a durable-write
+/// failure (already retried, ERROR-logged, and counted in [`PERSIST_FAILURES`]
+/// by [`persist_topology_state`]).
+///
+/// A `None` path is best-effort durable: production clustered nodes ALWAYS
+/// configure a `topology_state_path` and get real persist + G9 durability via
+/// the `Some(p)` branch below, so a `None` path is an ephemeral / single-node /
+/// test config with no cross-crash hazard. Guarding against a *misconfigured*
+/// clustered node started with no state path is a STARTUP config-validation
+/// concern (reject the config at boot), NOT a per-commit fail-close here: a
+/// per-commit NAK would brick legitimate diskless / in-memory clusters — under
+/// G9 (persist-before-apply) it NAKs every topology commit, so the cluster
+/// never converges. Residual: add that startup validation.
 ///
 /// PRE-broadcast callers (those about to self-vote or advertise a proposal)
 /// MUST NOT proceed when this returns `false`: a node must never advertise or
@@ -7684,6 +7760,11 @@ fn persist_topology_state_durable(
 ) -> bool {
     match path {
         Some(p) => persist_topology_state(p, state).is_ok(),
+        // Best-effort for a `None` (unconfigured) path — see the doc comment:
+        // production clustered nodes always configure a `topology_state_path`,
+        // so the misconfigured-clustered-no-path case is a STARTUP-validation
+        // residual, NOT a per-commit fail-close (a per-commit NAK bricks
+        // legitimate diskless / in-memory clusters under G9).
         None => true,
     }
 }
@@ -8335,6 +8416,17 @@ pub struct RunningCluster {
     shard_table: Arc<ShardTableLock<ShardTable>>,
     migration: Arc<Mutex<MigrationManager>>,
     node_addrs: Arc<RwLock<std::collections::HashMap<NodeId, SocketAddr>>>,
+    /// G1 — shared handle to the live SWIM membership state.
+    ///
+    /// `node_addrs` retains a `Suspect` peer until SWIM declares it `Dead`
+    /// (E-03), so it alone cannot distinguish a strictly-`Alive` peer from
+    /// one that is currently `Suspect` (partitioned but not yet reaped).
+    /// The mutation-quorum count ([`RunningCluster::alive_node_count`]) reads
+    /// this to exclude `Suspect`/`Dead` peers, so the minority side of a
+    /// partition cannot count a peer it can no longer reach toward "I still
+    /// have quorum" during the suspicion-timeout window (a dual-master write
+    /// window). Cloned from the `SwimRunner` before it is started.
+    swim_membership: Arc<Mutex<crate::cluster::membership::Membership>>,
     swim_shutdown: Arc<AtomicBool>,
     shutdown: Arc<AtomicBool>,
     /// Highest observed cluster size (for quorum calculations).
@@ -8564,6 +8656,22 @@ impl RunningCluster {
     /// map.
     pub fn is_master(&self, key: &TxKey) -> MasterQueryResult {
         let committed = self.topology_authority.committed_term();
+        // C11 — self-fence: the cluster quorum-committed a term this build
+        // cannot apply (placement version beyond support). Serving under our
+        // stale term now would run a divergent authority alongside the
+        // upgraded majority, so surface a retryable `Transitioning` for ALL
+        // keys instead of `Yes`. Fail-closed (unavailable beats dual-authority).
+        // The fence is GLOBAL (all keys) and, because placement is monotonic
+        // cluster-wide, effectively PERMANENT for a stale binary — the
+        // `committed_term` auto-clear is unreachable in the real arming case.
+        // Recovery is a binary upgrade + reboot (the fence is not persisted;
+        // reboot clears it and gossip re-teaches the applicable term). See
+        // `TopologyAuthority::is_self_fenced`.
+        if self.topology_authority.is_self_fenced() {
+            return MasterQueryResult::Transitioning {
+                last_known_term: committed,
+            };
+        }
         let observed = self.topology_epoch.load(Ordering::Acquire);
         if observed > committed {
             return MasterQueryResult::Transitioning {
@@ -8652,6 +8760,13 @@ impl RunningCluster {
     /// decision.
     pub fn is_master_snapshot(&self, snap: &MasterSnapshot, key: &TxKey) -> MasterQueryResult {
         let committed = self.topology_authority.committed_term();
+        // C11 — self-fence (see `is_master`): a committed term this build
+        // cannot apply forces `Transitioning` for every key.
+        if self.topology_authority.is_self_fenced() {
+            return MasterQueryResult::Transitioning {
+                last_known_term: committed,
+            };
+        }
         let observed = self.topology_epoch.load(Ordering::Acquire);
         if observed > committed {
             return MasterQueryResult::Transitioning {
@@ -9069,6 +9184,12 @@ impl RunningCluster {
             nodes.push((self.self_id, self.self_addr));
         }
         nodes.sort_by_key(|(node, _)| node.0);
+        // C21 — advertise each peer's REAL SWIM liveness instead of a
+        // hardcoded `1`. A Suspect/Dead-but-not-yet-forgotten peer must be
+        // advertised `is_alive=0` so clients (and the routing decode) see the
+        // true membership view. `self` is always alive; a peer absent from the
+        // strictly-Alive set (Suspect/Dead/unknown) is advertised dead.
+        let alive_peers = self.swim_alive_peers();
         buf.extend_from_slice(&(nodes.len() as u32).to_le_bytes());
         for (node_id, addr) in &nodes {
             buf.extend_from_slice(&node_id.0.to_le_bytes());
@@ -9076,7 +9197,8 @@ impl RunningCluster {
             let addr_bytes = addr_str.as_bytes();
             buf.extend_from_slice(&(addr_bytes.len() as u16).to_le_bytes());
             buf.extend_from_slice(addr_bytes);
-            buf.push(1); // is_alive — required by RoutingInfo::decode format
+            let is_alive = *node_id == self.self_id || alive_peers.contains(node_id);
+            buf.push(u8::from(is_alive)); // is_alive — required by RoutingInfo::decode format
         }
 
         // Shard assignments (4096 entries, each is just the master node_id).
@@ -9139,12 +9261,49 @@ impl RunningCluster {
         .serialize()
     }
 
+    /// G1 — the peers SWIM currently considers strictly `Alive` (excludes
+    /// `Suspect` and `Dead`).
+    ///
+    /// Does NOT include `self`: production SWIM does not track the local node
+    /// in its `members` map (it is implicitly alive to itself), so callers
+    /// treat `self` as always alive. A `Suspect` peer is deliberately dropped
+    /// even though it is still in `node_addrs` (SWIM keeps a Suspect until the
+    /// suspicion timeout declares it Dead — E-03).
+    fn swim_alive_peers(&self) -> std::collections::HashSet<NodeId> {
+        use crate::cluster::membership::NodeState;
+        self.swim_membership
+            .lock()
+            .all_member_states()
+            .into_iter()
+            .filter(|(_, state, _, _)| *state == NodeState::Alive)
+            .map(|(id, _, _, _)| id)
+            .collect()
+    }
+
+    /// Test-only (G1) — drive a committed peer into the SWIM `Suspect` state
+    /// so `alive_node_count` drops it from the mutation-quorum count, modelling
+    /// the suspicion-timeout window of a network partition. The peer must have
+    /// been registered `Alive` first (the test constructor marks every
+    /// `live_node` peer Alive).
+    #[cfg(test)]
+    pub(crate) fn test_set_peer_suspect(&self, node: NodeId) {
+        // Incarnation 1 matches the value the test constructor used to mark the
+        // peer Alive, satisfying `mark_suspect`'s `incarnation >= current` gate.
+        self.swim_membership.lock().mark_suspect(node, 1);
+    }
+
     /// Number of alive nodes in the cluster.
     ///
     /// Uses the committed topology members when a topology has been
     /// committed (non-empty member list). Falls back to the SWIM-derived
     /// `node_addrs` length during initial single-node startup before any
     /// topology has been committed.
+    ///
+    /// G1 — a committed member only counts when it is BOTH in `node_addrs`
+    /// AND strictly `Alive` in the live SWIM view (`self` always counts). A
+    /// `Suspect` peer is excluded so the minority side of a partition cannot
+    /// count a peer it can no longer reach toward "I still have quorum" during
+    /// the suspicion-timeout window — closing a dual-master write window.
     pub fn alive_node_count(&self) -> usize {
         let committed = self.topology_authority.committed_members();
         let addrs = self.node_addrs.read();
@@ -9170,9 +9329,30 @@ impl RunningCluster {
             // 1 for self if self is in committed but not addrs (the
             // production case); skip the +1 when test harnesses have
             // explicitly put self in `node_addrs`.
+            //
+            // G1 — additionally require each counted PEER to be strictly
+            // `Alive` in the live SWIM view. `self` is exempt (always alive,
+            // and not tracked in SWIM `members`). A `Suspect` peer is still in
+            // `node_addrs` (E-03) but must NOT count toward "I still have
+            // quorum": otherwise the minority side of a partition keeps serving
+            // writes during the whole suspicion-timeout window (dual-master).
+            //
+            // This exclusion is LOAD-BEARING AT EVERY CLUSTER SIZE and must NOT
+            // be gated on cluster size (e.g. `peak >= 3`). On a 2-node partition
+            // each side keeps the other in `node_addrs`; gating the exclusion on
+            // size would let BOTH sides count the (Suspect) peer, both reach
+            // quorum = 2, and both accept RF-quorum writes — sustained
+            // DUAL-WRITE, the exact split this closes. The cost of keeping it
+            // unconditional is that a small / even cluster briefly REFUSES
+            // writes during a SWIM-Suspect blip (it cannot confirm the peer is
+            // alive, so it cannot safely accept an RF-quorum write). That
+            // refusal is INTENDED fail-closed behaviour and SELF-HEALS: it
+            // resumes the instant SWIM refutes the suspicion or reaps the peer.
+            let alive_peers = self.swim_alive_peers();
             let peers = committed
                 .iter()
                 .filter(|node| addrs.contains_key(node))
+                .filter(|node| **node == self.self_id || alive_peers.contains(node))
                 .count();
             let self_committed = committed.contains(&self.self_id);
             let self_in_addrs = addrs.contains_key(&self.self_id);
@@ -9906,6 +10086,33 @@ impl RunningCluster {
         }
     }
 
+    /// G9 — apply a received commit only after its committed term is DURABLE.
+    ///
+    /// The committed term is the value `is_master` serves authority under, so a
+    /// node must not advertise term T until T survives a crash — otherwise a
+    /// crash between advancing and persisting reverts this node to T-1 while
+    /// peers hold T (it served/authorised under a term it will forget). This
+    /// persists the post-commit state BEFORE the in-memory advance, mirroring
+    /// the H10 persist-before-vote discipline, and fails closed on a persist
+    /// error (the term is not applied — the node keeps serving its prior term).
+    ///
+    /// The caller activates the shard table only on
+    /// [`crate::cluster::topology::DurableCommitOutcome::Applied`].
+    pub fn apply_committed_topology_durable(
+        &self,
+        commit: &crate::cluster::topology::TopologyCommit,
+    ) -> crate::cluster::topology::DurableCommitOutcome {
+        let peak = self.peak_size.load(Ordering::Relaxed) as u64;
+        let inc = self.swim_incarnation.load(Ordering::Relaxed);
+        let path = self.topology_state_path.as_deref();
+        self.topology_authority
+            .handle_commit_durable(commit, peak, inc, |state| {
+                // `None` path (no state file — ephemeral single-node test) is
+                // trivially durable; a real path must fsync successfully.
+                persist_topology_state_durable(path, state)
+            })
+    }
+
     /// Access the fenced-shards atomic bitmap directly.
     pub fn fenced_bitmap(&self) -> &Arc<crate::cluster::migration::AtomicShardBitmap> {
         &self.fenced_bitmap
@@ -10033,6 +10240,20 @@ pub(crate) fn new_test_running_cluster(
         node_addrs.insert(*node, *addr);
     }
 
+    // G1 — model the SWIM membership as all-`live_nodes`-Alive so the default
+    // test topology is a healthy converged cluster. Peers (everyone but self)
+    // are marked Alive; tests that need a partition flip a peer to Suspect via
+    // [`RunningCluster::test_set_peer_suspect`].
+    let swim_membership = {
+        let mut m = crate::cluster::membership::Membership::new(self_id, Duration::from_secs(1));
+        for (node, addr) in live_nodes {
+            if *node != self_id {
+                m.mark_alive(*node, *addr, 1, true);
+            }
+        }
+        Arc::new(Mutex::new(m))
+    };
+
     let (topology_commit_tx, _topology_commit_rx) = std::sync::mpsc::channel();
     let (resync_request_tx, _resync_request_rx) = std::sync::mpsc::channel();
     let (transfer_request_tx, _transfer_request_rx) = std::sync::mpsc::channel();
@@ -10046,6 +10267,7 @@ pub(crate) fn new_test_running_cluster(
         shard_table: Arc::new(ShardTableLock::new(table.clone())),
         migration,
         node_addrs: Arc::new(RwLock::new(node_addrs)),
+        swim_membership,
         swim_shutdown: Arc::new(AtomicBool::new(true)),
         shutdown: Arc::new(AtomicBool::new(true)),
         peak_size: Arc::new(std::sync::atomic::AtomicUsize::new(peak_size)),
@@ -15131,6 +15353,59 @@ mod tests {
         assert_eq!(cluster.node_addr(&NodeId(1)).unwrap().port(), 0);
     }
 
+    /// C21 (RED before fix) — advertised `is_alive` reflects real SWIM state.
+    ///
+    /// Pre-fix `encode_partition_map` hardcoded `is_alive = 1` for every node,
+    /// so a Suspect peer was advertised as alive. After the fix a Suspect peer
+    /// is advertised `is_alive = 0`, while `self` and strictly-Alive peers stay
+    /// `is_alive = 1`.
+    #[test]
+    fn partition_map_advertises_real_swim_liveness() {
+        let members = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let table = ShardTable::compute_with_epoch(&members, 2, 21, 1);
+        let cluster = new_test_running_cluster(
+            NodeId(1),
+            table,
+            &[
+                (NodeId(2), "127.0.0.1:4361".parse().unwrap()),
+                (NodeId(3), "127.0.0.1:4362".parse().unwrap()),
+            ],
+            &members,
+            &[],
+            &[],
+            &[],
+            3,
+        );
+
+        // Partition: node 2 goes Suspect (still in node_addrs — E-03).
+        cluster.test_set_peer_suspect(NodeId(2));
+
+        let routing = crate::cluster::routing::RoutingInfo::decode(&cluster.encode_partition_map())
+            .expect("partition map should decode");
+        let alive_of = |id: NodeId| {
+            routing
+                .nodes
+                .iter()
+                .find(|n| n.id == id)
+                .map(|n| n.is_alive)
+        };
+        assert_eq!(
+            alive_of(NodeId(2)),
+            Some(false),
+            "a Suspect peer must be advertised is_alive=0"
+        );
+        assert_eq!(
+            alive_of(NodeId(3)),
+            Some(true),
+            "an Alive peer must be advertised is_alive=1"
+        );
+        assert_eq!(
+            alive_of(NodeId(1)),
+            Some(true),
+            "self must be advertised is_alive=1"
+        );
+    }
+
     #[test]
     fn partition_map_committed_members_match_active_table_version() {
         let active_members = vec![NodeId(1), NodeId(3)];
@@ -15338,6 +15613,114 @@ mod tests {
             cluster.alive_node_count(),
             2,
             "self must count as alive even when SWIM omits it from node_addrs"
+        );
+    }
+
+    /// G1 (RED before fix) — mutation quorum must exclude Suspect peers.
+    ///
+    /// A 3-node cluster {1,2,3} partitions with node 1 isolated: SWIM marks
+    /// peers 2 and 3 Suspect, but they remain in `node_addrs` until the
+    /// suspicion timeout declares them Dead (E-03). Pre-fix `alive_node_count`
+    /// counted those addrs-known Suspect peers, so the isolated minority
+    /// reported 3 alive and (peak=3 ⇒ quorum 2) kept accepting writes — a
+    /// dual-master window versus the {2,3} majority. The count must drop the
+    /// Suspect peers to just `self`, failing the quorum gate on the minority.
+    #[test]
+    fn alive_quorum_excludes_suspect_peers_on_partition() {
+        let members = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let table = ShardTable::compute_with_epoch(&members, 2, 11, 1);
+        // Production shape: self (NodeId(1)) is NOT in node_addrs; peers are.
+        let cluster = new_test_running_cluster(
+            NodeId(1),
+            table,
+            &[
+                (NodeId(2), "127.0.0.1:4321".parse().unwrap()),
+                (NodeId(3), "127.0.0.1:4322".parse().unwrap()),
+            ],
+            &members,
+            &[],
+            &[],
+            &[],
+            3,
+        );
+        // Healthy baseline: all three count.
+        assert_eq!(cluster.alive_node_count(), 3, "all-Alive baseline");
+
+        // Node 1 is partitioned away from both peers.
+        cluster.test_set_peer_suspect(NodeId(2));
+        cluster.test_set_peer_suspect(NodeId(3));
+
+        let quorum_needed = cluster.peak_cluster_size() / 2 + 1;
+        assert_eq!(
+            cluster.alive_node_count(),
+            1,
+            "Suspect peers must not count toward quorum — only self remains alive"
+        );
+        assert!(
+            cluster.alive_node_count() < quorum_needed,
+            "isolated minority must fail the write-quorum gate (dual-master fence)"
+        );
+    }
+
+    /// G1 liveness guard — a healthy all-Alive cluster still reaches quorum.
+    ///
+    /// Same 3-node topology with NO Suspect peers: every committed member is
+    /// Alive, so the count stays at 3 ≥ quorum 2 and writes are served. The
+    /// partition fence must not brick a converged cluster.
+    #[test]
+    fn alive_quorum_healthy_cluster_still_serves() {
+        let members = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let table = ShardTable::compute_with_epoch(&members, 2, 13, 1);
+        let cluster = new_test_running_cluster(
+            NodeId(1),
+            table,
+            &[
+                (NodeId(2), "127.0.0.1:4331".parse().unwrap()),
+                (NodeId(3), "127.0.0.1:4332".parse().unwrap()),
+            ],
+            &members,
+            &[],
+            &[],
+            &[],
+            3,
+        );
+        let quorum_needed = cluster.peak_cluster_size() / 2 + 1;
+        assert_eq!(cluster.alive_node_count(), 3);
+        assert!(
+            cluster.alive_node_count() >= quorum_needed,
+            "healthy all-Alive cluster must still achieve write quorum"
+        );
+    }
+
+    /// G1 precision — the MAJORITY side of a partition keeps serving.
+    ///
+    /// Node 1 with peer 2 Alive and peer 3 Suspect (the reachable 2-node
+    /// majority side of a 3-node cluster) must still count 2 ≥ quorum 2 — the
+    /// fix drops only unreachable peers, it does not over-fence the surviving
+    /// majority.
+    #[test]
+    fn alive_quorum_majority_side_keeps_serving() {
+        let members = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let table = ShardTable::compute_with_epoch(&members, 2, 15, 1);
+        let cluster = new_test_running_cluster(
+            NodeId(1),
+            table,
+            &[
+                (NodeId(2), "127.0.0.1:4341".parse().unwrap()),
+                (NodeId(3), "127.0.0.1:4342".parse().unwrap()),
+            ],
+            &members,
+            &[],
+            &[],
+            &[],
+            3,
+        );
+        cluster.test_set_peer_suspect(NodeId(3));
+        let quorum_needed = cluster.peak_cluster_size() / 2 + 1;
+        assert_eq!(cluster.alive_node_count(), 2, "self + one Alive peer");
+        assert!(
+            cluster.alive_node_count() >= quorum_needed,
+            "majority side must keep serving"
         );
     }
 
@@ -15851,6 +16234,202 @@ mod tests {
             MasterQueryResult::No => {}
             other => panic!("expected MasterQueryResult::No, got {other:?}"),
         }
+    }
+
+    /// C11 (RED before fix) — a downgraded node that observes a quorum-committed
+    /// term it CANNOT apply must self-fence, not keep serving stale.
+    ///
+    /// self=1 is the master of `shard` under committed_term=5 and serves it
+    /// (`Yes`). It then observes a valid, quorum-proven commit at term 6 whose
+    /// placement version exceeds this build's support: `handle_commit` refuses
+    /// it (committed_term stays 5). Pre-fix `is_master` still answered `Yes` —
+    /// a v1 authority running alongside the upgraded v2 majority (dual
+    /// authority). Post-fix it must answer `Transitioning` for the shard.
+    #[test]
+    fn is_master_self_fences_on_unapplicable_committed_term() {
+        let members = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let table = ShardTable::compute_with_epoch(&members, 2, 5, 1);
+        let shard = (0..NUM_SHARDS as u16)
+            .find(|&s| table.target_assignment(s).master == NodeId(1))
+            .expect("some shard mastered by NodeId(1)");
+        let key = key_for_shard(shard);
+        let cluster = new_test_running_cluster(
+            NodeId(1),
+            table,
+            &[
+                (NodeId(1), "127.0.0.1:4851".parse().unwrap()),
+                (NodeId(2), "127.0.0.1:4852".parse().unwrap()),
+                (NodeId(3), "127.0.0.1:4853".parse().unwrap()),
+            ],
+            &members,
+            &[],
+            &[],
+            &[],
+            3,
+        );
+        // Liveness baseline: a healthy node serves its shard as master.
+        assert!(
+            matches!(cluster.is_master(&key), MasterQueryResult::Yes),
+            "baseline: node must serve its shard before any bad commit"
+        );
+
+        // Observe a quorum-committed term the build cannot apply.
+        let cid = cluster.topology_authority.cluster_id();
+        let too_high = crate::cluster::shards::MAX_SUPPORTED_PLACEMENT_VERSION + 1;
+        let bad = crate::cluster::topology::TopologyCommit {
+            term: 6,
+            proposer: NodeId(1),
+            members: members.clone(),
+            cluster_id: cid,
+            placement_version: too_high,
+            digest: crate::cluster::topology::TopologyTerm::compute_digest(
+                6, &cid, &members, too_high,
+            ),
+            voters: members.clone(),
+        };
+        assert_eq!(
+            cluster.topology_authority.handle_commit(&bad),
+            None,
+            "an unsupported committed term must be refused (not applied)"
+        );
+        assert_eq!(
+            cluster.topology_authority.committed_term(),
+            5,
+            "refused commit must not advance committed_term"
+        );
+
+        match cluster.is_master(&key) {
+            MasterQueryResult::Transitioning { last_known_term } => {
+                assert_eq!(last_known_term, 5);
+            }
+            other => panic!("expected self-fenced Transitioning, got {other:?}"),
+        }
+    }
+
+    /// G9 (RED before fix) — a received commit whose durable persist FAILS must
+    /// not begin serving authority under the new term. Pre-fix the dispatch
+    /// follower advanced `committed_term` in memory (which `is_master` serves)
+    /// and only then persisted; a crash there reverted the node to T-1 while
+    /// peers held T. `apply_committed_topology_durable` persists first and
+    /// fails closed: `committed_term` stays 5 and the node keeps serving the
+    /// last durable term, never the phantom term 6.
+    #[test]
+    fn durable_commit_fails_closed_and_keeps_serving_prior_term() {
+        // Point the topology state file UNDER a regular file so
+        // `create_dir_all(parent)` fails deterministically → persist fails.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let blocker = dir.path().join("blocker");
+        std::fs::write(&blocker, b"x").expect("write blocker file");
+        let bad_path = blocker.join("sub").join("topology.state");
+
+        let members = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let table = ShardTable::compute_with_epoch(&members, 2, 5, 1);
+        let shard = (0..NUM_SHARDS as u16)
+            .find(|&s| table.target_assignment(s).master == NodeId(1))
+            .expect("some shard mastered by NodeId(1)");
+        let key = key_for_shard(shard);
+        let cluster = new_test_running_cluster_with_topology_path(
+            NodeId(1),
+            table,
+            &[
+                (NodeId(1), "127.0.0.1:4861".parse().unwrap()),
+                (NodeId(2), "127.0.0.1:4862".parse().unwrap()),
+                (NodeId(3), "127.0.0.1:4863".parse().unwrap()),
+            ],
+            &members,
+            &[],
+            &[],
+            &[],
+            3,
+            Some(bad_path),
+        );
+        assert_eq!(cluster.topology_authority.committed_term(), 5);
+
+        // A perfectly valid commit for the next term — but the node cannot
+        // persist it.
+        let cid = cluster.topology_authority.cluster_id();
+        let commit = crate::cluster::topology::TopologyCommit {
+            term: 6,
+            proposer: NodeId(1),
+            members: members.clone(),
+            cluster_id: cid,
+            placement_version: 1,
+            digest: crate::cluster::topology::TopologyTerm::compute_digest(6, &cid, &members, 1),
+            voters: members.clone(),
+        };
+
+        let outcome = cluster.apply_committed_topology_durable(&commit);
+        assert_eq!(
+            outcome,
+            crate::cluster::topology::DurableCommitOutcome::PersistFailed,
+            "a failed persist must report PersistFailed"
+        );
+        assert_eq!(
+            cluster.topology_authority.committed_term(),
+            5,
+            "committed_term must not advance to a term that isn't durable"
+        );
+        // The node keeps serving under the last DURABLE term (5), not term 6.
+        assert!(
+            matches!(cluster.is_master(&key), MasterQueryResult::Yes),
+            "node must keep serving its shard under the durable term, not the phantom one"
+        );
+    }
+
+    /// G9 liveness — a received commit that persists successfully advances and
+    /// the node serves under the new durable term.
+    #[test]
+    fn durable_commit_applies_and_serves_after_successful_persist() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("topology.state");
+
+        // Committed at term 5 with members {1,2,3}; a later term 6 re-commit of
+        // the same set (e.g. a placement upgrade / re-proposal) must persist
+        // before it is served.
+        let members = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let table = ShardTable::compute_with_epoch(&members, 2, 5, 1);
+        let cluster = new_test_running_cluster_with_topology_path(
+            NodeId(1),
+            table,
+            &[
+                (NodeId(1), "127.0.0.1:4871".parse().unwrap()),
+                (NodeId(2), "127.0.0.1:4872".parse().unwrap()),
+                (NodeId(3), "127.0.0.1:4873".parse().unwrap()),
+            ],
+            &members,
+            &[],
+            &[],
+            &[],
+            3,
+            Some(path.clone()),
+        );
+        assert_eq!(cluster.topology_authority.committed_term(), 5);
+
+        let cid = cluster.topology_authority.cluster_id();
+        let commit = crate::cluster::topology::TopologyCommit {
+            term: 6,
+            proposer: NodeId(1),
+            members: members.clone(),
+            cluster_id: cid,
+            placement_version: 1,
+            digest: crate::cluster::topology::TopologyTerm::compute_digest(6, &cid, &members, 1),
+            voters: members.clone(),
+        };
+
+        let outcome = cluster.apply_committed_topology_durable(&commit);
+        assert_eq!(
+            outcome,
+            crate::cluster::topology::DurableCommitOutcome::Applied(6),
+            "a healthy persist path must apply the commit"
+        );
+        assert_eq!(cluster.topology_authority.committed_term(), 6);
+        // The durable record on disk carries the new term.
+        let loaded = load_topology_state(&path);
+        assert_eq!(
+            loaded.committed_term, 6,
+            "the committed term must be durable on disk"
+        );
+        assert_eq!(loaded.committed_members, members);
     }
 
     #[test]
@@ -16711,6 +17290,55 @@ mod tests {
             7,
             "cluster_key_handle() must back the same value (7) so manager \
              and receiver observe the committed term, not topology_epoch",
+        );
+    }
+
+    /// C25 pin — in a converged / activated topology the per-node
+    /// `topology_epoch`, the quorum-committed term, and the local shard-table
+    /// version all agree. This is the invariant that makes `topology_epoch` a
+    /// safe migration `cluster_key`: `activate_topology` sets all three to
+    /// `commit.term` together, so the key stamped on outbound migration traffic
+    /// (see `run_migration_batch`'s C25 doc) equals the `committed_term` the
+    /// receiver gates inbound batches on. The ONLY divergence
+    /// (`topology_epoch` leading `committed_term` — pinned by
+    /// `local_cluster_key_returns_committed_term_not_topology_epoch`) is a
+    /// proposed-but-not-committed membership, and NO migration is spawned in
+    /// that window.
+    #[test]
+    fn activation_keeps_topology_epoch_equal_to_committed_term() {
+        let members = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let table = ShardTable::compute_with_epoch(&members, 2, 7, 1);
+        let cluster = new_test_running_cluster(
+            NodeId(1),
+            table,
+            &[
+                (NodeId(1), "127.0.0.1:4881".parse().unwrap()),
+                (NodeId(2), "127.0.0.1:4882".parse().unwrap()),
+                (NodeId(3), "127.0.0.1:4883".parse().unwrap()),
+            ],
+            &members,
+            &[],
+            &[],
+            &[],
+            3,
+        );
+
+        let epoch = cluster.topology_epoch();
+        let committed = cluster.topology_authority.committed_term();
+        let table_ver = cluster.shard_table().read().version;
+        assert_eq!(epoch, 7, "activated epoch");
+        assert_eq!(
+            epoch, committed,
+            "migration cluster_key (topology_epoch) must equal the committed term"
+        );
+        assert_eq!(
+            epoch, table_ver,
+            "and the local shard-table version the migration is planned at"
+        );
+        assert_eq!(
+            cluster.local_cluster_key(),
+            committed,
+            "committed_cluster_key (the receiver's inbound gate) mirrors committed_term"
         );
     }
 
