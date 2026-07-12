@@ -782,16 +782,27 @@ pub struct TopologyAuthority {
     /// C11 — highest quorum-committed term this node OBSERVED but could NOT
     /// apply because its placement version exceeds this build's support (a
     /// downgraded / misconfigured node). Raised (`fetch_max`) in
-    /// [`TopologyAuthority::handle_commit`]'s activation-gate refuse path,
-    /// but ONLY for a commit carrying a valid quorum voter proof so a forged
-    /// or unverified message cannot fence a healthy node.
+    /// [`TopologyAuthority::handle_commit`]'s activation-gate refuse path, gated
+    /// on `has_quorum_voter_proof`. That gate is a STRUCTURAL correctness filter
+    /// (it stops a genuinely sub-quorum commit from arming the fence); it is NOT
+    /// forgery resistance — `voters` is a plaintext, self-declared, forgeable
+    /// wire field. Forgery is stopped upstream by the frame HMAC on
+    /// `OP_TOPOLOGY_COMMIT` (only in `cluster_secret` mode; see the arm site).
     ///
     /// When this exceeds `committed_term`, the node has proof the cluster
     /// advanced to an authority it cannot serve; it must self-fence (stop
     /// serving authoritative reads/writes) rather than keep serving under its
-    /// stale term, which would be a v1/v2 dual-authority split. Auto-clears
-    /// once `committed_term` catches up to or past it (a later commit this
-    /// build CAN apply). Not persisted — a reboot re-learns it from gossip.
+    /// stale term, which would be a v1/v2 dual-authority split.
+    ///
+    /// The `is_self_fenced` auto-clear (fence lifts once `committed_term`
+    /// reaches this term) exists in code but is UNREACHABLE in the real arming
+    /// case: placement versions are monotonic cluster-wide, so once a majority
+    /// commits an unsupported placement, every later term carries a placement
+    /// this build STILL cannot apply → `committed_term` never catches up. The
+    /// fence is therefore effectively PERMANENT for a stale binary (the correct
+    /// fail-closed choice). Not persisted, so recovery is a BINARY UPGRADE +
+    /// REBOOT: reboot clears the atomic and gossip re-teaches the now-applicable
+    /// term.
     unapplicable_committed_term: AtomicU64,
     /// W6 (INVARIANT ii) — highest placement version each peer is known to
     /// support, learned from the `voter_placement_support` field of every
@@ -1057,10 +1068,17 @@ impl TopologyAuthority {
     /// must stop serving authority (return `Transitioning`/redirect) rather
     /// than run a divergent v1/v2 authority alongside the upgraded majority.
     ///
-    /// Fail-closed but self-clearing: the fence lifts automatically once
-    /// `committed_term` catches up to or past the unapplicable term (a later
-    /// commit this build CAN apply), so a node that legitimately advances is
-    /// never permanently bricked.
+    /// Fail-closed. The atomic-based auto-clear (fence lifts once
+    /// `committed_term` reaches the unapplicable term) exists, but in the real
+    /// arming case it is UNREACHABLE: placement versions are monotonic
+    /// cluster-wide, so once a majority commits a placement this build cannot
+    /// apply, every later term carries a placement it STILL cannot apply and
+    /// `committed_term` never catches up. So for a stale binary the fence is
+    /// effectively PERMANENT (the correct fail-closed choice), and it is GLOBAL
+    /// — it forces `Transitioning` for ALL keys, a sharp availability cliff for
+    /// a not-yet-upgraded straggler during a rolling upgrade. Recovery is a
+    /// BINARY UPGRADE + REBOOT: the atomic is not persisted, so a reboot clears
+    /// it and gossip re-teaches the now-applicable term.
     pub fn is_self_fenced(&self) -> bool {
         self.unapplicable_committed_term.load(Ordering::Relaxed)
             > self.committed_term.load(Ordering::Relaxed)
@@ -1509,9 +1527,23 @@ impl TopologyAuthority {
             // C11 — the cluster quorum-committed a term this build cannot
             // apply. Record it so the coordinator self-fences (stops serving
             // authority) instead of continuing under the stale term, which
-            // would be a v1/v2 dual-authority split. Gate on a valid quorum
-            // voter proof: the digest alone is forgeable, so an unverified
-            // message must not be able to fence a healthy node.
+            // would be a v1/v2 dual-authority split.
+            //
+            // Forgery resistance does NOT come from `has_quorum_voter_proof`:
+            // `voters` is a plaintext, self-declared wire field, trivially
+            // forgeable alongside the digest, so the proof is a purely
+            // STRUCTURAL correctness filter (it stops a genuinely sub-quorum
+            // commit from arming the fence, not an attacker). The real forgery
+            // resistance is the FRAME HMAC: `OP_TOPOLOGY_COMMIT` is an
+            // inter-node auth opcode, and `verify_signed_body_streaming` rejects
+            // a forged frame when `cluster_secret` is set — so a forged commit
+            // never reaches this code in an authenticated cluster. CAVEAT: in
+            // `cluster_secret`-less (trusted-overlay, fail-open) mode there is
+            // no HMAC, so a forged `OP_TOPOLOGY_COMMIT` with a fabricated voter
+            // list CAN arm a persistent global self-fence (inert-reject → brick
+            // amplification). That is within the trusted-overlay threat model
+            // (the overlay is assumed authenticated by other means), but
+            // operators running fail-open should know it.
             if commit.has_quorum_voter_proof() {
                 self.unapplicable_committed_term
                     .fetch_max(commit.term, Ordering::Relaxed);
@@ -4396,26 +4428,40 @@ mod tests {
         assert_eq!(auth_b.handle_commit(&commit), Some(4));
         let actual = auth_b.persisted_state(3, 7);
 
-        assert_eq!(projected.committed_term, actual.committed_term);
-        assert_eq!(projected.committed_members, actual.committed_members);
-        assert_eq!(projected.committed_voters, actual.committed_voters);
-        assert_eq!(projected.peak_cluster_size, actual.peak_cluster_size);
-        assert_eq!(
-            projected.committed_placement_version,
-            actual.committed_placement_version
-        );
-        assert_eq!(projected.voted_term, actual.voted_term);
-        assert_eq!(projected.incarnation, actual.incarnation);
-        let mut a: Vec<u64> = projected
-            .committed_voter_ever_seen
-            .iter()
-            .map(|n| n.0)
-            .collect();
-        let mut b: Vec<u64> = actual
-            .committed_voter_ever_seen
-            .iter()
-            .map(|n| n.0)
-            .collect();
+        // Item 3 — destructure BOTH with every field bound explicitly (no `..`).
+        // A field added to `PersistedTopologyState` + `apply_commit_locked` but
+        // NOT to `persisted_state_for_commit` (or vice versa) then fails to
+        // compile here, forcing the projection to stay exhaustive.
+        let PersistedTopologyState {
+            peak_cluster_size: projected_peak,
+            committed_term: projected_term,
+            committed_members: projected_members,
+            committed_voters: projected_voters,
+            voted_term: projected_voted_term,
+            incarnation: projected_incarnation,
+            committed_voter_ever_seen: projected_ever_seen,
+            committed_placement_version: projected_placement,
+        } = projected;
+        let PersistedTopologyState {
+            peak_cluster_size: actual_peak,
+            committed_term: actual_term,
+            committed_members: actual_members,
+            committed_voters: actual_voters,
+            voted_term: actual_voted_term,
+            incarnation: actual_incarnation,
+            committed_voter_ever_seen: actual_ever_seen,
+            committed_placement_version: actual_placement,
+        } = actual;
+
+        assert_eq!(projected_term, actual_term);
+        assert_eq!(projected_members, actual_members);
+        assert_eq!(projected_voters, actual_voters);
+        assert_eq!(projected_peak, actual_peak);
+        assert_eq!(projected_placement, actual_placement);
+        assert_eq!(projected_voted_term, actual_voted_term);
+        assert_eq!(projected_incarnation, actual_incarnation);
+        let mut a: Vec<u64> = projected_ever_seen.iter().map(|n| n.0).collect();
+        let mut b: Vec<u64> = actual_ever_seen.iter().map(|n| n.0).collect();
         a.sort_unstable();
         b.sort_unstable();
         assert_eq!(a, b, "ever-seen set must match post-apply");

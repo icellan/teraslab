@@ -7730,10 +7730,15 @@ fn persist_topology_state(
 /// F-E1: persist topology state for a background (event-loop / proposer) site
 /// and report whether the state is now durable.
 ///
-/// Returns `true` when there is nothing to persist (`path` is `None` — no state
-/// file configured, e.g. an ephemeral single-node test) or the persist
-/// succeeded. Returns `false` on a durable-write failure (already retried,
-/// ERROR-logged, and counted in [`PERSIST_FAILURES`] by [`persist_topology_state`]).
+/// Returns `true` when the persist succeeded, or when `path` is `None` AND the
+/// state is genuinely single-node (no durability hazard — e.g. an ephemeral
+/// single-node test). Returns `false` on a durable-write failure (already
+/// retried, ERROR-logged, and counted in [`PERSIST_FAILURES`] by
+/// [`persist_topology_state`]), OR when `path` is `None` but the state is
+/// CLUSTERED (multi-node evidence): a clustered term with no configured state
+/// file cannot be made durable, so it is fail-closed here rather than silently
+/// treated as durable (Item 2 — that would reopen the G9 serve-before-persist
+/// window).
 ///
 /// PRE-broadcast callers (those about to self-vote or advertise a proposal)
 /// MUST NOT proceed when this returns `false`: a node must never advertise or
@@ -7750,7 +7755,17 @@ fn persist_topology_state_durable(
 ) -> bool {
     match path {
         Some(p) => persist_topology_state(p, state).is_ok(),
-        None => true,
+        // Item 2 — a `None` path is only trivially "durable" for a genuinely
+        // single-node / non-clustered state. A CLUSTERED state (multi-node
+        // evidence: peak or committed/voter set >= 2) with no configured state
+        // file CANNOT be made durable, so reporting it durable would silently
+        // revert to serve-before-persist and reopen the G9 ACK-then-forget
+        // window. Fail-closed there: the commit is NAKed / not applied. A truly
+        // single-node state (peak 1, <2 members) has no such hazard — a crash
+        // cannot leave a peer holding a term this node forgot — so the missing
+        // path stays legitimate (ephemeral single-node tests, non-clustered
+        // servers).
+        None => topology_multi_node_evidence_peak(state).is_none(),
     }
 }
 
@@ -8645,8 +8660,13 @@ impl RunningCluster {
         // cannot apply (placement version beyond support). Serving under our
         // stale term now would run a divergent authority alongside the
         // upgraded majority, so surface a retryable `Transitioning` for ALL
-        // keys instead of `Yes`. Fail-closed (unavailable beats dual-authority)
-        // and self-clearing once `committed_term` catches up.
+        // keys instead of `Yes`. Fail-closed (unavailable beats dual-authority).
+        // The fence is GLOBAL (all keys) and, because placement is monotonic
+        // cluster-wide, effectively PERMANENT for a stale binary — the
+        // `committed_term` auto-clear is unreachable in the real arming case.
+        // Recovery is a binary upgrade + reboot (the fence is not persisted;
+        // reboot clears it and gossip re-teaches the applicable term). See
+        // `TopologyAuthority::is_self_fenced`.
         if self.topology_authority.is_self_fenced() {
             return MasterQueryResult::Transitioning {
                 last_known_term: committed,
@@ -9316,6 +9336,18 @@ impl RunningCluster {
             // `node_addrs` (E-03) but must NOT count toward "I still have
             // quorum": otherwise the minority side of a partition keeps serving
             // writes during the whole suspicion-timeout window (dual-master).
+            //
+            // This exclusion is LOAD-BEARING AT EVERY CLUSTER SIZE and must NOT
+            // be gated on cluster size (e.g. `peak >= 3`). On a 2-node partition
+            // each side keeps the other in `node_addrs`; gating the exclusion on
+            // size would let BOTH sides count the (Suspect) peer, both reach
+            // quorum = 2, and both accept RF-quorum writes — sustained
+            // DUAL-WRITE, the exact split this closes. The cost of keeping it
+            // unconditional is that a small / even cluster briefly REFUSES
+            // writes during a SWIM-Suspect blip (it cannot confirm the peer is
+            // alive, so it cannot safely accept an RF-quorum write). That
+            // refusal is INTENDED fail-closed behaviour and SELF-HEALS: it
+            // resumes the instant SWIM refutes the suspicion or reaps the peer.
             let alive_peers = self.swim_alive_peers();
             let peers = committed
                 .iter()
@@ -10075,8 +10107,10 @@ impl RunningCluster {
         let path = self.topology_state_path.as_deref();
         self.topology_authority
             .handle_commit_durable(commit, peak, inc, |state| {
-                // `None` path (no state file — ephemeral single-node test) is
-                // trivially durable; a real path must fsync successfully.
+                // A real path must fsync successfully. A `None` path is durable
+                // only for a genuinely single-node state; a clustered term with
+                // no state file is fail-closed (Item 2, see
+                // `persist_topology_state_durable`).
                 persist_topology_state_durable(path, state)
             })
     }
@@ -16398,6 +16432,100 @@ mod tests {
             "the committed term must be durable on disk"
         );
         assert_eq!(loaded.committed_members, members);
+    }
+
+    /// Item 2 — a CLUSTERED node with NO configured `topology_state_path` must
+    /// NOT treat a commit as durable. `persist_topology_state_durable(None, ..)`
+    /// used to return `true` unconditionally, so a misconfigured clustered node
+    /// (multi-node topology, no state file) silently reverted to
+    /// serve-before-persist and reopened the G9 ACK-then-forget window. It must
+    /// fail-closed: the commit is NOT applied and `committed_term` does not
+    /// advance.
+    #[test]
+    fn clustered_commit_with_no_state_path_is_not_durable() {
+        let members = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let table = ShardTable::compute_with_epoch(&members, 2, 5, 1);
+        // `new_test_running_cluster` leaves `topology_state_path` = None.
+        let cluster = new_test_running_cluster(
+            NodeId(1),
+            table,
+            &[
+                (NodeId(1), "127.0.0.1:4881".parse().unwrap()),
+                (NodeId(2), "127.0.0.1:4882".parse().unwrap()),
+                (NodeId(3), "127.0.0.1:4883".parse().unwrap()),
+            ],
+            &members,
+            &[],
+            &[],
+            &[],
+            3,
+        );
+        assert!(cluster.topology_state_path.is_none());
+        assert_eq!(cluster.topology_authority.committed_term(), 5);
+
+        let cid = cluster.topology_authority.cluster_id();
+        let commit = crate::cluster::topology::TopologyCommit {
+            term: 6,
+            proposer: NodeId(1),
+            members: members.clone(),
+            cluster_id: cid,
+            placement_version: 1,
+            digest: crate::cluster::topology::TopologyTerm::compute_digest(6, &cid, &members, 1),
+            voters: members.clone(),
+        };
+
+        let outcome = cluster.apply_committed_topology_durable(&commit);
+        assert_eq!(
+            outcome,
+            crate::cluster::topology::DurableCommitOutcome::PersistFailed,
+            "a clustered commit with no state file must be fail-closed, not durable",
+        );
+        assert_eq!(
+            cluster.topology_authority.committed_term(),
+            5,
+            "committed_term must NOT advance for a non-durable clustered commit",
+        );
+    }
+
+    /// Item 2 (counter-case) — a genuinely SINGLE-NODE / non-clustered node with
+    /// no state path is legitimately durable (a crash cannot leave a peer
+    /// holding a term this node forgot), so its commit still applies. The Item 2
+    /// fail-closed must not break this path.
+    #[test]
+    fn single_node_commit_with_no_state_path_still_applies() {
+        let members = vec![NodeId(1)];
+        let table = ShardTable::compute_with_epoch(&members, 1, 5, 1);
+        let cluster = new_test_running_cluster(
+            NodeId(1),
+            table,
+            &[(NodeId(1), "127.0.0.1:4891".parse().unwrap())],
+            &members,
+            &[],
+            &[],
+            &[],
+            1,
+        );
+        assert!(cluster.topology_state_path.is_none());
+        assert_eq!(cluster.topology_authority.committed_term(), 5);
+
+        let cid = cluster.topology_authority.cluster_id();
+        let commit = crate::cluster::topology::TopologyCommit {
+            term: 6,
+            proposer: NodeId(1),
+            members: members.clone(),
+            cluster_id: cid,
+            placement_version: 1,
+            digest: crate::cluster::topology::TopologyTerm::compute_digest(6, &cid, &members, 1),
+            voters: members.clone(),
+        };
+
+        let outcome = cluster.apply_committed_topology_durable(&commit);
+        assert_eq!(
+            outcome,
+            crate::cluster::topology::DurableCommitOutcome::Applied(6),
+            "a single-node commit with no state file is legitimately durable",
+        );
+        assert_eq!(cluster.topology_authority.committed_term(), 6);
     }
 
     #[test]
