@@ -226,6 +226,13 @@ impl ShardedIndex {
         self.shards.len()
     }
 
+    /// The per-process (or persisted, for a restored index) shard seed. Exposed
+    /// so sibling per-key structures — e.g. the deletion-tombstone index — can
+    /// route a key to the SAME shard number via [`shard_for_key`].
+    pub fn seed(&self) -> u64 {
+        self.seed
+    }
+
     /// Compute which shard a key belongs to.
     ///
     /// Uses bytes `[8..12]` of the txid (disjoint from bucket `[0..8]` and

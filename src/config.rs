@@ -1098,6 +1098,25 @@ where
 /// could under-lock a shared block, so packing is refused above this.
 const PACKED_MAX_DEVICE_ALIGNMENT: usize = 4096;
 
+/// Reverse-heal configuration (`[reverse_heal]`) — the delete-safe reverse-pull
+/// subsystem. Everything here is OFF by default so single-node / RF=1
+/// deployments pay nothing (the derived `Default` — `tombstones = false`,
+/// `tombstone_retention_blocks = None` — is exactly the disabled state).
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+pub struct ReverseHealConfig {
+    /// Enable per-store generation-aware deletion tombstones (Phase 2a). When
+    /// off (default) no tombstone log is attached and the delete path records
+    /// nothing — a zero-cost no-op.
+    pub tombstones: bool,
+
+    /// Retention horizon for a tombstone, in blocks: a tombstone is GC'd once
+    /// `deletion_height + retention <= last_durable_height`. `None` (default)
+    /// reuses `block_height_retention` — the same replica-lag window spends
+    /// already use (design §E1).
+    pub tombstone_retention_blocks: Option<u32>,
+}
+
 /// TeraSlab server configuration.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
@@ -1590,6 +1609,10 @@ pub struct ServerConfig {
     /// default (`backup_dir` unset). See [`BackupConfig`].
     pub backup: BackupConfig,
 
+    /// Reverse-heal configuration (`[reverse_heal]`). Deletion tombstones are
+    /// disabled by default. See [`ReverseHealConfig`].
+    pub reverse_heal: ReverseHealConfig,
+
     /// Expected device identity (hex string). If set, the server refuses to
     /// start if the on-disk identity does not match. Use this to prevent
     /// accidentally pointing at the wrong device.
@@ -1685,6 +1708,7 @@ impl Default for ServerConfig {
             cache: CacheConfig::default(),
             storage: StorageConfig::default(),
             backup: BackupConfig::default(),
+            reverse_heal: ReverseHealConfig::default(),
             device_id: None,
             observability: ObservabilityConfig::default(),
         }
@@ -1862,6 +1886,26 @@ impl ServerConfig {
                 PathBuf::from(p)
             }
         }
+    }
+
+    /// Resolve the deletion-tombstone log path (reverse-heal Phase 2a) by
+    /// appending `.tombstones` to the resolved index snapshot path — co-located
+    /// with the other engine-derived durable artifacts the checkpoint writes
+    /// (index snapshot, allocator header, `.height`), and works for in-memory
+    /// device configurations used in tests.
+    pub fn resolved_tombstone_log_path(&self) -> PathBuf {
+        let mut p = self.resolved_index_snapshot_path().into_os_string();
+        p.push(".tombstones");
+        PathBuf::from(p)
+    }
+
+    /// The effective tombstone retention horizon in blocks: the explicit
+    /// `reverse_heal.tombstone_retention_blocks` override, else
+    /// `block_height_retention` (design §E1 safe default).
+    pub fn resolved_tombstone_retention_blocks(&self) -> u32 {
+        self.reverse_heal
+            .tombstone_retention_blocks
+            .unwrap_or(self.block_height_retention)
     }
 
     /// Resolve the cluster state file path. Uses `cluster_state_path` if set,
