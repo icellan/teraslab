@@ -381,6 +381,39 @@ pub fn ack_tracker_handle() -> Option<&'static crate::replication::durable::AckT
     ACK_TRACKER.get()
 }
 
+/// C3/G12: compute the reclaim / catch-up watermark across the EXPECTED
+/// replica set rather than only the replicas already PRESENT in the ACK
+/// tracker.
+///
+/// The redo-log reset guard (C3) and the startup catch-up pass (G12) must
+/// not treat an empty (or partial) ACK tracker as "every replica is caught
+/// up": a replica the topology expects but that has not yet ACKed anything
+/// still needs the whole redo prefix. Every expected replica missing from
+/// `acked` therefore contributes `0` (caught up to nothing), which pulls
+/// the minimum to `0` and blocks a reclaim until that replica proves it has
+/// the range.
+///
+/// Returns `floor` only when `expected` is empty — a genuine single-node /
+/// RF=1 deployment with no fan-out target, where nothing holds the reset
+/// back. Replicas that appear in `acked` but are NOT in `expected` (e.g. a
+/// node demoted out of the shard's replica set by a topology change) are
+/// ignored: they no longer need this master's redo, so they must not pin
+/// the log.
+pub fn min_acked_over_expected(
+    acked: &HashMap<SocketAddr, u64>,
+    expected: &[SocketAddr],
+    floor: u64,
+) -> u64 {
+    if expected.is_empty() {
+        return floor;
+    }
+    expected
+        .iter()
+        .map(|addr| acked.get(addr).copied().unwrap_or(0))
+        .min()
+        .unwrap_or(floor)
+}
+
 /// Initialize the persistent receiver-side applied tracker.
 ///
 /// Must be called once during clustered server startup before accepting
@@ -19690,6 +19723,50 @@ mod tests {
         assert!(
             tracker.pending().is_empty(),
             "stale pending intent should be cleared after redo reclamation"
+        );
+    }
+
+    #[test]
+    fn c3_reset_guard_blocks_reclaim_for_expected_but_unacked_replica() {
+        // C3: an EMPTY ack tracker with an EXPECTED replica must NOT permit a
+        // redo reset — the expected replica has acked nothing, so the whole
+        // prefix below `floor` is still needed. Pre-fix the reset guard took
+        // `all_acked().values().min().unwrap_or(floor)`, so an empty map
+        // defaulted straight to `floor` and let the reclaim proceed as if every
+        // replica were already caught up.
+        let expected: SocketAddr = "10.0.0.2:7000".parse().unwrap();
+        let floor: u64 = 42;
+
+        // Empty tracker (no ACKs yet) + one expected replica → min_acked 0,
+        // which is < floor, so the reset guard must refuse.
+        let empty: HashMap<SocketAddr, u64> = HashMap::new();
+        let min_acked = min_acked_over_expected(&empty, &[expected], floor);
+        assert_eq!(
+            min_acked, 0,
+            "an expected replica with no ACK entry must count as caught-up-to-nothing (0)"
+        );
+        assert!(
+            min_acked < floor,
+            "can_reset must be false: reclaiming would erase a prefix the expected replica needs"
+        );
+
+        // Once that replica ACKs at/above the floor the reset is permitted.
+        let mut acked = HashMap::new();
+        acked.insert(expected, floor + 5);
+        assert!(
+            min_acked_over_expected(&acked, &[expected], floor) >= floor,
+            "reclaim proceeds only after the expected replica acks at/above the floor"
+        );
+
+        // A replica present in the tracker but NOT expected (demoted out of the
+        // shard set) must not pin the log.
+        let stale: SocketAddr = "10.0.0.9:7000".parse().unwrap();
+        let mut acked_stale = HashMap::new();
+        acked_stale.insert(stale, 0);
+        assert_eq!(
+            min_acked_over_expected(&acked_stale, &[], floor),
+            floor,
+            "with no expected replica the reset is unconstrained even if the tracker holds a demoted node"
         );
     }
 
