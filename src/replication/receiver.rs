@@ -982,9 +982,19 @@ pub fn handle_replica_batch_with_tracker(
     // journaling is deferred to the ONE atomic admission after the loop.
     let mut redo_entries: Vec<(crate::redo::RedoOp, u8)> = Vec::new();
     for (seq, op) in (start_seq..).zip(batch.ops.iter().skip(skip_count)) {
-        if let Err(msg) =
-            apply_op_journal_inner(engine, op, journal, is_migration, &mut redo_entries)
-        {
+        // C15: only a steady-state, dense-sequence–tracked, non-migration batch
+        // NAKs on a record it is missing (a real divergence — the master
+        // committed a mutation against a record this replica never received).
+        // Migration baselines and out-of-band compensation (`!tracked`) keep the
+        // tolerant skip.
+        if let Err(msg) = apply_op_journal_inner(
+            engine,
+            op,
+            journal,
+            is_migration,
+            tracked,
+            &mut redo_entries,
+        ) {
             let ack = ReplicaAck::Error {
                 failed_sequence: seq,
                 message: msg,
@@ -1361,6 +1371,44 @@ fn record_apply_skipped_missing_tx(op_name: &'static str, tx_key: &TxKey) {
     );
 }
 
+/// Resolve a replica op whose target record is ABSENT on this replica (the
+/// pre-op slot read returned not-found).
+///
+/// The skip metric + warn are recorded either way, preserving the
+/// machine-readable divergence signal. The return then forks on
+/// `nak_on_missing`:
+///
+/// * `false` — migration-baseline applies, out-of-band compensation, and the
+///   single-op [`apply_op`] convenience keep the historical tolerant skip
+///   (`Ok(())`). A migration baseline legitimately streams a record another
+///   source owns, and compensation is in-process + idempotent, so an absent
+///   record there is not a divergence.
+/// * `true` — a steady-state, dense-sequence–tracked, non-migration replica
+///   batch treats the absence as a REAL divergence (C15): the master committed
+///   a mutation against a record this replica never received. Return `Err` so
+///   the batch NAKs (retryable, surfaced as [`ReplicaAck::Error`]); the caller
+///   returns before advancing the high-water mark, so the master re-ships /
+///   marks the replica Down and resyncs instead of the gap being silently
+///   masked to a metric while a false ACK advances the HWM.
+///
+/// SAFE DEFAULT: honesty over late-joiner liveness. A genuinely late-joining
+/// replica that legitimately lacks a record now NAKs until it is caught up via
+/// resync — the correct signal, not a silently-tolerated hole.
+fn missing_record_apply_outcome(
+    op_name: &'static str,
+    tx_key: &TxKey,
+    nak_on_missing: bool,
+) -> std::result::Result<(), String> {
+    record_apply_skipped_missing_tx(op_name, tx_key);
+    if nak_on_missing {
+        Err(format!(
+            "{op_name}: record absent on a steady-state replica batch — NAK (retryable) so the master re-ships/resyncs instead of masking the divergence"
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 /// Record a HARD divergence — the replica's local slot state contradicts
 /// what the master's mutation expected (e.g. master sent a Spend on what
 /// it observed as Unspent, but the replica's slot is Frozen, Pruned, or
@@ -1462,7 +1510,10 @@ pub fn apply_op_journal(
     is_migration: bool,
 ) -> std::result::Result<(), String> {
     let mut collected: Vec<(crate::redo::RedoOp, u8)> = Vec::new();
-    apply_op_journal_inner(engine, op, journal, is_migration, &mut collected)?;
+    // Single-op / migration-baseline applies preserve the historical tolerant
+    // skip on an absent record (`nak_on_missing = false`); the C15 NAK is scoped
+    // to steady-state tracked BATCHES, driven from the batch loop below.
+    apply_op_journal_inner(engine, op, journal, is_migration, false, &mut collected)?;
     for (redo_op, device_id) in &collected {
         engine.append_replica_redo_entry_to_store(redo_op, *device_id)?;
     }
@@ -1479,6 +1530,7 @@ fn apply_op_journal_inner(
     op: &ReplicaOp,
     journal: bool,
     is_migration: bool,
+    nak_on_missing: bool,
     redo_out: &mut Vec<(crate::redo::RedoOp, u8)>,
 ) -> std::result::Result<(), String> {
     // When journalling is disabled (migration-baseline apply), suppress the
@@ -1559,11 +1611,10 @@ fn apply_op_journal_inner(
             let hash = match engine.read_slot(tx_key, *offset) {
                 Ok(slot) => slot.hash,
                 Err(_) => {
-                    // TX or slot not found — skip gracefully but
-                    // surface the divergence via metrics + warn log
-                    // so operators can detect a missing Create.
-                    record_apply_skipped_missing_tx("spend", tx_key);
-                    return Ok(());
+                    // TX or slot not found. On a steady-state tracked batch this
+                    // is a real divergence (a missing Create) and NAKs; migration
+                    // / out-of-band / single-op applies tolerate it. See C15.
+                    return missing_record_apply_outcome("spend", tx_key, nak_on_missing);
                 }
             };
             let req = SpendRequest {
@@ -1637,8 +1688,7 @@ fn apply_op_journal_inner(
             let slot = match engine.read_slot(tx_key, *offset) {
                 Ok(slot) => slot,
                 Err(_) => {
-                    record_apply_skipped_missing_tx("unspend", tx_key);
-                    return Ok(());
+                    return missing_record_apply_outcome("unspend", tx_key, nak_on_missing);
                 }
             };
             let req = UnspendRequest {
@@ -1753,8 +1803,7 @@ fn apply_op_journal_inner(
             let hash = match engine.read_slot(tx_key, *offset) {
                 Ok(slot) => slot.hash,
                 Err(_) => {
-                    record_apply_skipped_missing_tx("freeze", tx_key);
-                    return Ok(());
+                    return missing_record_apply_outcome("freeze", tx_key, nak_on_missing);
                 }
             };
             let req = FreezeRequest {
@@ -1777,8 +1826,7 @@ fn apply_op_journal_inner(
             let hash = match engine.read_slot(tx_key, *offset) {
                 Ok(slot) => slot.hash,
                 Err(_) => {
-                    record_apply_skipped_missing_tx("unfreeze", tx_key);
-                    return Ok(());
+                    return missing_record_apply_outcome("unfreeze", tx_key, nak_on_missing);
                 }
             };
             let req = UnfreezeRequest {
@@ -1807,8 +1855,7 @@ fn apply_op_journal_inner(
             let old_hash = match engine.read_slot(tx_key, *offset) {
                 Ok(slot) => slot.hash,
                 Err(_) => {
-                    record_apply_skipped_missing_tx("reassign", tx_key);
-                    return Ok(());
+                    return missing_record_apply_outcome("reassign", tx_key, nak_on_missing);
                 }
             };
             // C28: stash the pre-apply hash for the post-apply `ReassignV2`
@@ -7912,6 +7959,86 @@ mod tests {
             after > before,
             "spend on missing TX must bump replica_apply_skipped_missing_tx \
              (was {before}, now {after})",
+        );
+    }
+
+    /// C15: a steady-state, dense-sequence–tracked, NON-migration replica batch
+    /// that mutates a record this replica is missing is a real divergence — the
+    /// master committed a mutation against a record we never received a Create
+    /// for. The receiver must NAK (retryable) WITHOUT advancing the high-water
+    /// mark so the master re-ships / marks us Down and resyncs, instead of
+    /// silently ACKing and masking the gap to a metric. The MIGRATION path must
+    /// keep tolerating an absent record (a baseline legitimately streams a
+    /// record another source owns).
+    #[test]
+    fn tracked_spend_on_missing_record_naks_without_advancing_hwm() {
+        // --- steady-state tracked batch: missing record => NAK, HWM frozen ---
+        let engine = make_engine();
+        let tracker = ReplicaAppliedTracker::in_memory();
+        let last_applied = Arc::new(AtomicU64::new(0));
+        let stream_key = "peer-c15:5000";
+        tracker.set(stream_key, 9); // first_sequence=10 is next-expected
+
+        // key(199) was never created on this replica.
+        let batch = make_spend_batch(10, key(199), 0..1, 7);
+        let resp = handle_replica_batch_with_tracker(
+            &batch_request(&batch, 1),
+            &engine,
+            &last_applied,
+            Some(&tracker),
+            stream_key,
+            0,
+        );
+
+        assert_eq!(
+            resp.status, STATUS_ERROR,
+            "a tracked spend for a missing record must NAK, not silently ACK",
+        );
+        match ReplicaAck::deserialize(&resp.payload).expect("ack decodes") {
+            ReplicaAck::Error {
+                failed_sequence,
+                message,
+            } => {
+                assert_eq!(
+                    failed_sequence, 10,
+                    "the NAK must point at the offending sequence",
+                );
+                assert!(
+                    message.contains("absent"),
+                    "the NAK message must name the missing-record divergence, got: {message}",
+                );
+            }
+            other => panic!("expected a retryable Error NAK, got {other:?}"),
+        }
+        assert_eq!(
+            tracker.get(stream_key),
+            9,
+            "a missing-record NAK must NOT advance the per-stream high-water mark",
+        );
+        assert_eq!(
+            last_applied.load(Ordering::Relaxed),
+            0,
+            "a missing-record NAK must NOT advance last_applied",
+        );
+
+        // --- migration batch: an absent record is still tolerated ---
+        let mig_engine = make_engine();
+        let mig_tracker = ReplicaAppliedTracker::in_memory();
+        let mig_last = Arc::new(AtomicU64::new(0));
+        let mig_batch = make_spend_batch(0, key(199), 0..1, 7);
+        let mut mig_req = batch_request(&mig_batch, 2);
+        mig_req.flags = FLAG_MIGRATION_BATCH;
+        let mig_resp = handle_replica_batch_with_tracker(
+            &mig_req,
+            &mig_engine,
+            &mig_last,
+            Some(&mig_tracker),
+            "peer-c15-mig:5000",
+            0,
+        );
+        assert_eq!(
+            mig_resp.status, STATUS_OK,
+            "a migration batch must still tolerate an absent record",
         );
     }
 
