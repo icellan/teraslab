@@ -8580,6 +8580,17 @@ impl RunningCluster {
     /// map.
     pub fn is_master(&self, key: &TxKey) -> MasterQueryResult {
         let committed = self.topology_authority.committed_term();
+        // C11 — self-fence: the cluster quorum-committed a term this build
+        // cannot apply (placement version beyond support). Serving under our
+        // stale term now would run a divergent authority alongside the
+        // upgraded majority, so surface a retryable `Transitioning` for ALL
+        // keys instead of `Yes`. Fail-closed (unavailable beats dual-authority)
+        // and self-clearing once `committed_term` catches up.
+        if self.topology_authority.is_self_fenced() {
+            return MasterQueryResult::Transitioning {
+                last_known_term: committed,
+            };
+        }
         let observed = self.topology_epoch.load(Ordering::Acquire);
         if observed > committed {
             return MasterQueryResult::Transitioning {
@@ -8668,6 +8679,13 @@ impl RunningCluster {
     /// decision.
     pub fn is_master_snapshot(&self, snap: &MasterSnapshot, key: &TxKey) -> MasterQueryResult {
         let committed = self.topology_authority.committed_term();
+        // C11 — self-fence (see `is_master`): a committed term this build
+        // cannot apply forces `Transitioning` for every key.
+        if self.topology_authority.is_self_fenced() {
+            return MasterQueryResult::Transitioning {
+                last_known_term: committed,
+            };
+        }
         let observed = self.topology_epoch.load(Ordering::Acquire);
         if observed > committed {
             return MasterQueryResult::Transitioning {
@@ -16095,6 +16113,76 @@ mod tests {
         match cluster.is_master(&key) {
             MasterQueryResult::No => {}
             other => panic!("expected MasterQueryResult::No, got {other:?}"),
+        }
+    }
+
+    /// C11 (RED before fix) — a downgraded node that observes a quorum-committed
+    /// term it CANNOT apply must self-fence, not keep serving stale.
+    ///
+    /// self=1 is the master of `shard` under committed_term=5 and serves it
+    /// (`Yes`). It then observes a valid, quorum-proven commit at term 6 whose
+    /// placement version exceeds this build's support: `handle_commit` refuses
+    /// it (committed_term stays 5). Pre-fix `is_master` still answered `Yes` —
+    /// a v1 authority running alongside the upgraded v2 majority (dual
+    /// authority). Post-fix it must answer `Transitioning` for the shard.
+    #[test]
+    fn is_master_self_fences_on_unapplicable_committed_term() {
+        let members = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let table = ShardTable::compute_with_epoch(&members, 2, 5, 1);
+        let shard = (0..NUM_SHARDS as u16)
+            .find(|&s| table.target_assignment(s).master == NodeId(1))
+            .expect("some shard mastered by NodeId(1)");
+        let key = key_for_shard(shard);
+        let cluster = new_test_running_cluster(
+            NodeId(1),
+            table,
+            &[
+                (NodeId(1), "127.0.0.1:4851".parse().unwrap()),
+                (NodeId(2), "127.0.0.1:4852".parse().unwrap()),
+                (NodeId(3), "127.0.0.1:4853".parse().unwrap()),
+            ],
+            &members,
+            &[],
+            &[],
+            &[],
+            3,
+        );
+        // Liveness baseline: a healthy node serves its shard as master.
+        assert!(
+            matches!(cluster.is_master(&key), MasterQueryResult::Yes),
+            "baseline: node must serve its shard before any bad commit"
+        );
+
+        // Observe a quorum-committed term the build cannot apply.
+        let cid = cluster.topology_authority.cluster_id();
+        let too_high = crate::cluster::shards::MAX_SUPPORTED_PLACEMENT_VERSION + 1;
+        let bad = crate::cluster::topology::TopologyCommit {
+            term: 6,
+            proposer: NodeId(1),
+            members: members.clone(),
+            cluster_id: cid,
+            placement_version: too_high,
+            digest: crate::cluster::topology::TopologyTerm::compute_digest(
+                6, &cid, &members, too_high,
+            ),
+            voters: members.clone(),
+        };
+        assert_eq!(
+            cluster.topology_authority.handle_commit(&bad),
+            None,
+            "an unsupported committed term must be refused (not applied)"
+        );
+        assert_eq!(
+            cluster.topology_authority.committed_term(),
+            5,
+            "refused commit must not advance committed_term"
+        );
+
+        match cluster.is_master(&key) {
+            MasterQueryResult::Transitioning { last_known_term } => {
+                assert_eq!(last_known_term, 5);
+            }
+            other => panic!("expected self-fenced Transitioning, got {other:?}"),
         }
     }
 

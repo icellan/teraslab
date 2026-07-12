@@ -744,6 +744,20 @@ pub struct TopologyAuthority {
     /// for atomic access; logically a `u16`). `1` until the cluster
     /// unanimously upgrades to HRW.
     committed_placement_version: AtomicU64,
+    /// C11 — highest quorum-committed term this node OBSERVED but could NOT
+    /// apply because its placement version exceeds this build's support (a
+    /// downgraded / misconfigured node). Raised (`fetch_max`) in
+    /// [`TopologyAuthority::handle_commit`]'s activation-gate refuse path,
+    /// but ONLY for a commit carrying a valid quorum voter proof so a forged
+    /// or unverified message cannot fence a healthy node.
+    ///
+    /// When this exceeds `committed_term`, the node has proof the cluster
+    /// advanced to an authority it cannot serve; it must self-fence (stop
+    /// serving authoritative reads/writes) rather than keep serving under its
+    /// stale term, which would be a v1/v2 dual-authority split. Auto-clears
+    /// once `committed_term` catches up to or past it (a later commit this
+    /// build CAN apply). Not persisted — a reboot re-learns it from gossip.
+    unapplicable_committed_term: AtomicU64,
     /// W6 (INVARIANT ii) — highest placement version each peer is known to
     /// support, learned from the `voter_placement_support` field of every
     /// vote this node receives (the proposer is the primary consumer). Self
@@ -772,6 +786,7 @@ impl TopologyAuthority {
             last_commit_at_unix_ms: AtomicU64::new(0),
             peak_cluster_size: AtomicU64::new(1),
             committed_placement_version: AtomicU64::new(1),
+            unapplicable_committed_term: AtomicU64::new(0),
             peer_placement_support: RwLock::new({
                 let mut m = std::collections::HashMap::new();
                 m.insert(
@@ -991,6 +1006,28 @@ impl TopologyAuthority {
     /// Current committed term.
     pub fn committed_term(&self) -> u64 {
         self.committed_term.load(Ordering::Relaxed)
+    }
+
+    /// C11 — highest quorum-committed term this node observed but could not
+    /// apply (its placement version exceeds this build's support). `0` when
+    /// none has been observed. See [`TopologyAuthority::is_self_fenced`].
+    pub fn unapplicable_committed_term(&self) -> u64 {
+        self.unapplicable_committed_term.load(Ordering::Relaxed)
+    }
+
+    /// C11 — whether this node must self-fence: it has proof the cluster
+    /// quorum-committed a term GREATER than its own applied term that it
+    /// cannot apply. In that state the node's placement view is stale and it
+    /// must stop serving authority (return `Transitioning`/redirect) rather
+    /// than run a divergent v1/v2 authority alongside the upgraded majority.
+    ///
+    /// Fail-closed but self-clearing: the fence lifts automatically once
+    /// `committed_term` catches up to or past the unapplicable term (a later
+    /// commit this build CAN apply), so a node that legitimately advances is
+    /// never permanently bricked.
+    pub fn is_self_fenced(&self) -> bool {
+        self.unapplicable_committed_term.load(Ordering::Relaxed)
+            > self.committed_term.load(Ordering::Relaxed)
     }
 
     /// Members of the committed term.
@@ -1403,6 +1440,16 @@ impl TopologyAuthority {
                 max_supported = crate::cluster::shards::MAX_SUPPORTED_PLACEMENT_VERSION,
                 "cluster: refusing topology commit — placement version exceeds this build's support",
             );
+            // C11 — the cluster quorum-committed a term this build cannot
+            // apply. Record it so the coordinator self-fences (stops serving
+            // authority) instead of continuing under the stale term, which
+            // would be a v1/v2 dual-authority split. Gate on a valid quorum
+            // voter proof: the digest alone is forgeable, so an unverified
+            // message must not be able to fence a healthy node.
+            if commit.has_quorum_voter_proof() {
+                self.unapplicable_committed_term
+                    .fetch_max(commit.term, Ordering::Relaxed);
+            }
             return None;
         }
 
@@ -3752,6 +3799,119 @@ mod tests {
             auth.committed_term(),
             0,
             "unsupported commit must not advance"
+        );
+    }
+
+    /// C11 — refusing an unsupported, quorum-proven committed term sets the
+    /// self-fence flag so the coordinator stops serving stale authority.
+    #[test]
+    fn unapplicable_committed_term_arms_self_fence() {
+        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+        assert!(!auth.is_self_fenced(), "fresh authority is not fenced");
+        let too_high = crate::cluster::shards::MAX_SUPPORTED_PLACEMENT_VERSION + 1;
+        let mems = members(&[1, 2, 3]);
+        let commit = TopologyCommit {
+            term: 4,
+            proposer: NodeId(1),
+            members: mems.clone(),
+            cluster_id: ClusterId::UNSET,
+            placement_version: too_high,
+            digest: TopologyTerm::compute_digest(4, &ClusterId::UNSET, &mems, too_high),
+            voters: mems.clone(),
+        };
+        assert_eq!(auth.handle_commit(&commit), None);
+        assert_eq!(auth.unapplicable_committed_term(), 4);
+        assert!(
+            auth.is_self_fenced(),
+            "observing a quorum-committed term it cannot apply must self-fence"
+        );
+    }
+
+    /// C11 (forged-commit guard) — a refused unsupported commit WITHOUT a valid
+    /// quorum voter proof must NOT fence a healthy node (the digest is
+    /// forgeable; only a quorum-proven commit is proof the cluster advanced).
+    #[test]
+    fn unapplicable_committed_term_without_quorum_proof_does_not_fence() {
+        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+        let too_high = crate::cluster::shards::MAX_SUPPORTED_PLACEMENT_VERSION + 1;
+        let mems = members(&[1, 2, 3]);
+        let forged = TopologyCommit {
+            term: 4,
+            proposer: NodeId(1),
+            members: mems.clone(),
+            cluster_id: ClusterId::UNSET,
+            placement_version: too_high,
+            digest: TopologyTerm::compute_digest(4, &ClusterId::UNSET, &mems, too_high),
+            // No quorum: a single voter cannot prove a 3-member commit.
+            voters: members(&[1]),
+        };
+        assert_eq!(auth.handle_commit(&forged), None);
+        assert_eq!(
+            auth.unapplicable_committed_term(),
+            0,
+            "a commit lacking a quorum voter proof must not arm the fence"
+        );
+        assert!(!auth.is_self_fenced());
+    }
+
+    /// C11 liveness — a node that CAN apply the committed term adopts it and is
+    /// NOT self-fenced (don't over-fence a node that keeps up).
+    #[test]
+    fn applicable_committed_term_does_not_fence() {
+        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+        let mems = members(&[1, 2, 3]);
+        let commit = TopologyCommit {
+            term: 4,
+            proposer: NodeId(1),
+            members: mems.clone(),
+            cluster_id: ClusterId::UNSET,
+            placement_version: 1, // supported
+            digest: TopologyTerm::compute_digest(4, &ClusterId::UNSET, &mems, 1),
+            voters: mems.clone(),
+        };
+        assert_eq!(auth.handle_commit(&commit), Some(4));
+        assert_eq!(auth.committed_term(), 4);
+        assert!(
+            !auth.is_self_fenced(),
+            "a node that applied the committed term must keep serving"
+        );
+    }
+
+    /// C11 — the self-fence auto-clears once `committed_term` catches up to (or
+    /// past) the previously-unapplicable term, so a node that later commits a
+    /// term it CAN apply is not permanently bricked.
+    #[test]
+    fn self_fence_clears_when_committed_term_catches_up() {
+        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+        let mems = members(&[1, 2, 3]);
+        let too_high = crate::cluster::shards::MAX_SUPPORTED_PLACEMENT_VERSION + 1;
+        // Observe an unsupported term 4 → fenced (committed still 0).
+        let bad = TopologyCommit {
+            term: 4,
+            proposer: NodeId(1),
+            members: mems.clone(),
+            cluster_id: ClusterId::UNSET,
+            placement_version: too_high,
+            digest: TopologyTerm::compute_digest(4, &ClusterId::UNSET, &mems, too_high),
+            voters: mems.clone(),
+        };
+        assert_eq!(auth.handle_commit(&bad), None);
+        assert!(auth.is_self_fenced());
+
+        // A later supported commit at term 5 applies and clears the fence.
+        let good = TopologyCommit {
+            term: 5,
+            proposer: NodeId(1),
+            members: mems.clone(),
+            cluster_id: ClusterId::UNSET,
+            placement_version: 1,
+            digest: TopologyTerm::compute_digest(5, &ClusterId::UNSET, &mems, 1),
+            voters: mems.clone(),
+        };
+        assert_eq!(auth.handle_commit(&good), Some(5));
+        assert!(
+            !auth.is_self_fenced(),
+            "fence must clear once committed_term (5) passes the unapplicable term (4)"
         );
     }
 
