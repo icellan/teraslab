@@ -1256,6 +1256,16 @@ pub struct MigrationMetrics {
     /// `/metrics`. A persistently non-zero value is the operator-visible signal
     /// that a shard needs a re-migration or manual intervention.
     pub migration_lost: AtomicU32,
+    /// Reverse-heal (finding C1): number of shards this node currently suspects
+    /// hold a LOST ACKED TAIL (gauge). Raised at boot when the persistent
+    /// AckTracker proves this node acked writes beyond its recovered
+    /// `shared_sequence_floor` (Tier-1), or when a quorum-current replica
+    /// demonstrably holds shard state this node lacks (Tier-2). Phase 1 is
+    /// detection-only: a non-zero value LOGS + METERS a suspected stale tail;
+    /// it does NOT fence or pull. A persistently non-zero value is the
+    /// operator-visible signal that a node booted with a gap versus its
+    /// replicas.
+    pub stale_suspect_shards: AtomicU32,
     /// Number of times a migration completion or failure was rejected because
     /// the bookkeeping task's `topology_epoch` did not match the live
     /// epoch on the coordinator.
@@ -1329,6 +1339,7 @@ impl MigrationMetrics {
             migration_phase_delta: AtomicU32::new(0),
             migration_phase_serving_new: AtomicU32::new(0),
             migration_lost: AtomicU32::new(0),
+            stale_suspect_shards: AtomicU32::new(0),
             topology_epoch_mismatch: PaddedCounter::new(),
             phantom_master_relinquished: PaddedCounter::new(),
         }
