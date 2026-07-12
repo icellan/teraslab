@@ -5970,6 +5970,40 @@ fn handle_set_mined_batch(
         });
     }
 
+    // C19: acquire the per-key visibility guard NOW — BEFORE the authoritative
+    // write-fence re-check below and before the redo/apply — so a migration's
+    // fence drain (which takes the EXCLUSIVE side of this same gate, C18) cannot
+    // capture `fence_seq` between our check and our redo append. Held across the
+    // redo append + apply, released before replication. Excludes a client read
+    // of THESE keys while set_mined applies, while disjoint batches run
+    // concurrently.
+    let visibility_keys: Vec<TxKey> = valid_items.iter().map(|v| v.key).collect();
+    let visibility_guard = engine.visibility().mutation(&visibility_keys);
+
+    // C19: re-validate the outbound write-fence UNDER the guard. The first-pass
+    // ownership check above ran WITHOUT the guard, so a shard fenced for
+    // outbound migration between that check and here would otherwise let our
+    // setMined redo land past `fence_seq` and be silently lost at handoff. Under
+    // the guard the drain's EXCLUSIVE barrier cannot be in progress, so a fence
+    // we do NOT see here is guaranteed to be captured with our seq below
+    // `fence_seq`; a fence we DO see means the migration owns the cutoff, so we
+    // reject cleanly with ERR_MIGRATION_IN_PROGRESS and the client retries
+    // against the new master. Either way the write is never lost.
+    if let Some(c) = cluster {
+        valid_items.retain(|v| {
+            if c.is_shard_write_fenced(&v.key) || c.has_pending_inbound(&v.key) {
+                errors.push(BatchItemError {
+                    item_index: v.idx as u32,
+                    error_code: ERR_MIGRATION_IN_PROGRESS,
+                    error_data: Vec::new(),
+                });
+                false
+            } else {
+                true
+            }
+        });
+    }
+
     // D5/§9: group the owned keys by their store (each key's primary-index
     // `device_id`, falling back to store 0 for a key not yet indexed — same
     // fallback `Engine::redo_store_for_op` uses) and build ONE
@@ -6001,12 +6035,6 @@ fn handle_set_mined_batch(
             txids,
         })
         .collect();
-
-    // Per-key visibility for the apply window (released before replication).
-    // Excludes a client read of THESE keys while set_mined applies, while
-    // set_mined batches on disjoint keys run concurrently.
-    let visibility_keys: Vec<TxKey> = valid_items.iter().map(|v| v.key).collect();
-    let visibility_guard = engine.visibility().mutation(&visibility_keys);
 
     // Phase 2: WAL-first — write redo before engine mutation.
     let redo_range = match write_replicated_redo_ops(engine, cluster, redo_log, &redo_ops) {
@@ -21008,6 +21036,92 @@ mod tests {
         );
 
         drop(guard);
+    }
+
+    /// C19: a set_mined that passes the first-pass ownership check BEFORE
+    /// acquiring its visibility guard must RE-CHECK the write-fence UNDER the
+    /// guard. If a shard is fenced for outbound migration while the set_mined is
+    /// blocked acquiring the guard, the re-check must reject it cleanly
+    /// (ERR_MIGRATION_IN_PROGRESS) rather than apply it — otherwise its redo
+    /// would land past `fence_seq` and be silently lost at handoff.
+    ///
+    /// Deterministic race: the main thread holds the per-key guard so the
+    /// set_mined thread (which has already passed the pre-guard ownership check
+    /// with the fence DOWN) blocks acquiring it. We raise the fence while
+    /// holding the guard, then release it; when set_mined finally acquires the
+    /// guard it must observe the now-raised fence. RED before the re-check (the
+    /// item applies), GREEN after (the item is rejected).
+    #[test]
+    fn set_mined_rechecks_write_fence_under_guard() {
+        let h = DispatchTestHarness::new();
+        let shard = 44u16;
+        let txid = txid_for_shard(shard, 7);
+        let key = TxKey { txid };
+        assert_eq!(
+            h.create_tx(txid, 1).status,
+            STATUS_OK,
+            "record must exist so an un-rejected set_mined would really apply",
+        );
+
+        let members = vec![crate::cluster::shards::NodeId(1)];
+        let table = crate::cluster::shards::ShardTable::compute_with_epoch(&members, 1, 12, 1);
+        let cluster = crate::cluster::coordinator::new_test_running_cluster(
+            crate::cluster::shards::NodeId(1),
+            table,
+            &[(
+                crate::cluster::shards::NodeId(1),
+                "127.0.0.1:4744".parse().unwrap(),
+            )],
+            &members,
+            &[], // no inbound — this node fully owns the shard at first-pass time
+            &[],
+            &[],
+            1,
+        );
+
+        let params = SetMinedBatchParams {
+            block_id: 77,
+            block_height: 900_000,
+            subtree_idx: 0,
+            on_longest_chain: true,
+            unset_mined: false,
+            current_block_height: 900_050,
+            block_height_retention: 288,
+        };
+        let payload = encode_set_mined_batch(&params, &[txid]);
+
+        // Hold the per-key guard so the set_mined thread blocks acquiring it
+        // AFTER passing its pre-guard ownership check (fence still down).
+        let guard = h.engine.visibility().mutation(std::slice::from_ref(&key));
+
+        let resp = std::thread::scope(|s| {
+            let handle = s.spawn(|| h.request_with_cluster(OP_SET_MINED_BATCH, payload, &cluster));
+            // Let the set_mined thread run its pre-guard check (passes) and
+            // block acquiring the guard.
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            // Raise the outbound fence AFTER that check, BEFORE releasing the
+            // guard — the exact race C19 closes.
+            cluster.test_fence_shard(shard);
+            drop(guard);
+            handle.join().unwrap()
+        });
+
+        assert_eq!(
+            resp.status, STATUS_PARTIAL_ERROR,
+            "a set_mined racing the fence must report the item as failed, not OK",
+        );
+        let (successes, errors) = decode_set_mined_response(&resp.payload);
+        assert!(
+            successes.is_empty(),
+            "C19: set_mined must NOT apply on a shard fenced while it was blocked \
+             acquiring its guard — the write would land past fence_seq and be lost",
+        );
+        assert_eq!(errors.len(), 1, "the single fenced item must be rejected");
+        assert_eq!(
+            errors[0].error_code, ERR_MIGRATION_IN_PROGRESS,
+            "the racing set_mined must be cleanly rejected with \
+             ERR_MIGRATION_IN_PROGRESS, never lost",
+        );
     }
 
     /// W2/P3 — torn-visibility property test. This is the test that

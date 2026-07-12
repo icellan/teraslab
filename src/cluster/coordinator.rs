@@ -915,6 +915,14 @@ fn old_master_available_for_handoff(
 // Phase D: exchange phase before migration
 // ---------------------------------------------------------------------------
 
+/// [`PartitionVersionEntry::flags`] bit 1 (subset/incomplete): the reporting
+/// node holds only a SUBSET of the shard — it is a subset master with a pending
+/// inbound migration still receiving data, so it does not fully own the shard
+/// even when its record count is non-zero. Kept in sync with the `0b10` literal
+/// set by the exchange responders (`build_self_partition_version_entries` and
+/// the `OP_PARTITION_VERSION_REPORT` dispatch handler).
+pub const PARTITION_FLAG_PENDING_INBOUND: u8 = 0b10;
+
 /// One node's view of a single shard's local data state.
 ///
 /// Reported by every alive peer during the post-commit exchange phase so the
@@ -925,15 +933,8 @@ fn old_master_available_for_handoff(
 /// - bit 0 (`0b01`): this node believes it is the master of `shard` in the
 ///   currently active shard table.
 /// - bit 1 (`0b10`): this node has a pending inbound migration for `shard`
-///   (i.e. is a subset master receiving data).
-/// [`PartitionVersionEntry::flags`] bit 1: this node holds only a SUBSET of the
-/// shard — it is a subset master with a pending inbound migration still
-/// receiving data. A holder with this bit set does not fully own the shard even
-/// when its record count is non-zero. Kept in sync with the `0b10` literal set
-/// by the exchange responders (`build_self_partition_version_entries` and the
-/// `OP_PARTITION_VERSION_REPORT` dispatch handler).
-pub const PARTITION_FLAG_PENDING_INBOUND: u8 = 0b10;
-
+///   (i.e. is a subset master receiving data). See
+///   [`PARTITION_FLAG_PENDING_INBOUND`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PartitionVersionEntry {
     /// Shard number (0..NUM_SHARDS).
@@ -10524,7 +10525,10 @@ mod tests {
         assert!(installed, "the routing projection must install");
 
         // The projection updated (new members installed)…
-        assert_eq!(*active_members.read(), vec![NodeId(1), NodeId(2), NodeId(3)]);
+        assert_eq!(
+            *active_members.read(),
+            vec![NodeId(1), NodeId(2), NodeId(3)]
+        );
         // …but the in-flight inbound migration MUST survive.
         assert!(
             migration.lock().has_pending_inbound(shard),
@@ -16592,8 +16596,7 @@ mod tests {
                 last_applied_seq: 42,
             }],
         );
-        let skipped =
-            build_plan_from_partition_view(&old_table, &new_table, &owns_view, NodeId(1));
+        let skipped = build_plan_from_partition_view(&old_table, &new_table, &owns_view, NodeId(1));
         assert!(
             !skipped.iter().any(|t| t.shard == shard),
             "a fully-owning new master must skip the migration (guards against a \
