@@ -9621,6 +9621,36 @@ impl RunningCluster {
     /// restored entries inform the coordinator which shards were
     /// mid-migration when the node crashed. The next topology activation
     /// will either resume or re-plan these migrations.
+    ///
+    /// # C5 — reconcile-don't-clobber (why force-fail + re-plan is safe)
+    ///
+    /// Each interrupted outbound task is `mark_failed` here so the next
+    /// topology activation RE-PLANS it as a FRESH task with a LIVE worker. It
+    /// is deliberately NOT kept "resumable": a migration worker self-aborts
+    /// once the epoch advances, and a task restored into the active list has
+    /// NO worker (its thread died with the crash), so preserving it would
+    /// strand the shard forever with no progress (see the epoch-worker note in
+    /// the activation path).
+    ///
+    /// Force-failing then re-shipping the baseline is reconcile-safe — it
+    /// cannot CLOBBER a write the target absorbed during the interrupted
+    /// migration — because the re-ship is idempotent-by-generation AT THE
+    /// RECEIVER: `apply_create_replica` (migration arm) SKIPS any incoming
+    /// record whose generation is older than the copy the target already holds
+    /// (see `migration_duplicate_create_older_generation_is_skipped_no_downgrade`),
+    /// so a newer write the target absorbed always wins over this source's
+    /// re-shipped baseline. The re-plan also takes a FRESH snapshot (a fresh
+    /// task starts in `Preparing` with `snapshot_sequence` reset), so no stale
+    /// delta is replayed over newer target state.
+    ///
+    /// Finally, this runs during startup BEFORE any client listener is
+    /// accepting traffic (see `server.rs`), so lifting the source's write
+    /// fence here serves nothing stale in the gap before re-activation.
+    ///
+    /// Known residual (follow-up, not addressed here): the generation guard
+    /// covers records the target still holds; it does NOT cover a record the
+    /// target authoritatively DELETED (a re-shipped create would resurrect it).
+    /// Closing that needs a record-level tombstone and is tracked separately.
     pub fn restore_outbound_state(&self) {
         if let Some(ref path) = self.outbound_state_path {
             let data = crate::cluster::migration::load_outbound_state(path);
@@ -15897,6 +15927,95 @@ mod tests {
                  authority; got {other:?}",
             ),
         }
+    }
+
+    /// C5 (SAFE DEFAULT: reconcile-don't-clobber) — restoring an interrupted
+    /// FENCED-phase outbound migration must recover in a way that cannot
+    /// clobber writes the target absorbed during the interrupted migration:
+    ///
+    ///  1. it schedules a FRESH re-plan (a live worker re-drives it) rather
+    ///     than leaving the task "resumable" with a dead worker (which would
+    ///     strand the shard);
+    ///  2. it fabricates NO committed-handoff evidence for the shard, so
+    ///     orphan cleanup will not delete the source's copy (no data loss) and
+    ///     the re-drive re-ships against the generation-idempotent receiver
+    ///     (the newer target write wins — see `restore_outbound_state` docs and
+    ///     `migration_duplicate_create_older_generation_is_skipped_no_downgrade`);
+    ///  3. it leaves no shard stranded as "migrating" without a task.
+    #[test]
+    fn restore_outbound_state_recovers_reconcile_safe() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("outbound.state");
+        let shard = 7u16;
+        let task = MigrationTask {
+            shard,
+            from_node: NodeId(1),
+            to_node: NodeId(2),
+            is_master: true,
+        };
+
+        // Persist a mid-flight FENCED-phase outbound migration exactly as a
+        // crash would leave it: baseline shipped, source writes fenced, the
+        // target potentially holding newer absorbed writes.
+        {
+            let mut mgr = MigrationManager::new();
+            mgr.start_outbound(
+                std::slice::from_ref(&task),
+                NodeId(1),
+                &std::collections::HashSet::new(),
+            );
+            mgr.mark_fenced(&task, 100);
+            assert!(mgr.is_shard_fenced(shard), "precondition: shard was fenced");
+            crate::cluster::migration::persist_outbound_state(&path, &mgr);
+        }
+
+        // Bring the node up and wire the persisted outbound-state path.
+        let members = vec![NodeId(1)];
+        let table = ShardTable::compute_with_epoch(&members, 1, 5, 1);
+        let mut cluster = new_test_running_cluster(
+            NodeId(1),
+            table,
+            &[
+                (NodeId(1), "127.0.0.1:4861".parse().unwrap()),
+                (NodeId(2), "127.0.0.1:4862".parse().unwrap()),
+            ],
+            &members,
+            &[],
+            &[],
+            &[],
+            1,
+        );
+        cluster.outbound_state_path = Some(path);
+
+        cluster.restore_outbound_state();
+
+        // (1) A fresh, live-worker re-drive is scheduled.
+        assert!(
+            cluster.startup_reactivation_needed.load(Ordering::Acquire),
+            "restore must schedule a re-plan so a FRESH worker re-drives the migration",
+        );
+        {
+            let mgr = cluster.migration.lock();
+            // The interrupted task is force-failed + cleaned, not stranded as a
+            // preserved task whose worker died with the crash.
+            assert_eq!(
+                mgr.active_count(),
+                0,
+                "the interrupted task must not be left resumable with a dead worker",
+            );
+            // (2) No committed-handoff evidence is fabricated: orphan cleanup
+            // must not be authorized to delete the source's last copy, and the
+            // re-drive reconciles against the generation-idempotent receiver.
+            assert!(
+                !mgr.has_committed_handoff(shard, 5),
+                "restore must not fabricate committed-handoff evidence",
+            );
+        }
+        // (3) The shard is not stranded as "migrating" without a task.
+        assert!(
+            !cluster.migrating_bitmap.test(shard),
+            "no shard should be left flagged migrating without an active task",
+        );
     }
 
     // ── Batch-scoped MasterSnapshot: hoisted lookup, per-item correctness ──
