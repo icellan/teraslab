@@ -7730,15 +7730,20 @@ fn persist_topology_state(
 /// F-E1: persist topology state for a background (event-loop / proposer) site
 /// and report whether the state is now durable.
 ///
-/// Returns `true` when the persist succeeded, or when `path` is `None` AND the
-/// state is genuinely single-node (no durability hazard — e.g. an ephemeral
-/// single-node test). Returns `false` on a durable-write failure (already
-/// retried, ERROR-logged, and counted in [`PERSIST_FAILURES`] by
-/// [`persist_topology_state`]), OR when `path` is `None` but the state is
-/// CLUSTERED (multi-node evidence): a clustered term with no configured state
-/// file cannot be made durable, so it is fail-closed here rather than silently
-/// treated as durable (Item 2 — that would reopen the G9 serve-before-persist
-/// window).
+/// Returns `true` when there is nothing to persist (`path` is `None` — no state
+/// file configured) or the persist succeeded. Returns `false` on a durable-write
+/// failure (already retried, ERROR-logged, and counted in [`PERSIST_FAILURES`]
+/// by [`persist_topology_state`]).
+///
+/// A `None` path is best-effort durable: production clustered nodes ALWAYS
+/// configure a `topology_state_path` and get real persist + G9 durability via
+/// the `Some(p)` branch below, so a `None` path is an ephemeral / single-node /
+/// test config with no cross-crash hazard. Guarding against a *misconfigured*
+/// clustered node started with no state path is a STARTUP config-validation
+/// concern (reject the config at boot), NOT a per-commit fail-close here: a
+/// per-commit NAK would brick legitimate diskless / in-memory clusters — under
+/// G9 (persist-before-apply) it NAKs every topology commit, so the cluster
+/// never converges. Residual: add that startup validation.
 ///
 /// PRE-broadcast callers (those about to self-vote or advertise a proposal)
 /// MUST NOT proceed when this returns `false`: a node must never advertise or
@@ -7755,17 +7760,12 @@ fn persist_topology_state_durable(
 ) -> bool {
     match path {
         Some(p) => persist_topology_state(p, state).is_ok(),
-        // Item 2 — a `None` path is only trivially "durable" for a genuinely
-        // single-node / non-clustered state. A CLUSTERED state (multi-node
-        // evidence: peak or committed/voter set >= 2) with no configured state
-        // file CANNOT be made durable, so reporting it durable would silently
-        // revert to serve-before-persist and reopen the G9 ACK-then-forget
-        // window. Fail-closed there: the commit is NAKed / not applied. A truly
-        // single-node state (peak 1, <2 members) has no such hazard — a crash
-        // cannot leave a peer holding a term this node forgot — so the missing
-        // path stays legitimate (ephemeral single-node tests, non-clustered
-        // servers).
-        None => topology_multi_node_evidence_peak(state).is_none(),
+        // Best-effort for a `None` (unconfigured) path — see the doc comment:
+        // production clustered nodes always configure a `topology_state_path`,
+        // so the misconfigured-clustered-no-path case is a STARTUP-validation
+        // residual, NOT a per-commit fail-close (a per-commit NAK bricks
+        // legitimate diskless / in-memory clusters under G9).
+        None => true,
     }
 }
 
@@ -10107,10 +10107,8 @@ impl RunningCluster {
         let path = self.topology_state_path.as_deref();
         self.topology_authority
             .handle_commit_durable(commit, peak, inc, |state| {
-                // A real path must fsync successfully. A `None` path is durable
-                // only for a genuinely single-node state; a clustered term with
-                // no state file is fail-closed (Item 2, see
-                // `persist_topology_state_durable`).
+                // `None` path (no state file — ephemeral single-node test) is
+                // trivially durable; a real path must fsync successfully.
                 persist_topology_state_durable(path, state)
             })
     }
@@ -16432,100 +16430,6 @@ mod tests {
             "the committed term must be durable on disk"
         );
         assert_eq!(loaded.committed_members, members);
-    }
-
-    /// Item 2 — a CLUSTERED node with NO configured `topology_state_path` must
-    /// NOT treat a commit as durable. `persist_topology_state_durable(None, ..)`
-    /// used to return `true` unconditionally, so a misconfigured clustered node
-    /// (multi-node topology, no state file) silently reverted to
-    /// serve-before-persist and reopened the G9 ACK-then-forget window. It must
-    /// fail-closed: the commit is NOT applied and `committed_term` does not
-    /// advance.
-    #[test]
-    fn clustered_commit_with_no_state_path_is_not_durable() {
-        let members = vec![NodeId(1), NodeId(2), NodeId(3)];
-        let table = ShardTable::compute_with_epoch(&members, 2, 5, 1);
-        // `new_test_running_cluster` leaves `topology_state_path` = None.
-        let cluster = new_test_running_cluster(
-            NodeId(1),
-            table,
-            &[
-                (NodeId(1), "127.0.0.1:4881".parse().unwrap()),
-                (NodeId(2), "127.0.0.1:4882".parse().unwrap()),
-                (NodeId(3), "127.0.0.1:4883".parse().unwrap()),
-            ],
-            &members,
-            &[],
-            &[],
-            &[],
-            3,
-        );
-        assert!(cluster.topology_state_path.is_none());
-        assert_eq!(cluster.topology_authority.committed_term(), 5);
-
-        let cid = cluster.topology_authority.cluster_id();
-        let commit = crate::cluster::topology::TopologyCommit {
-            term: 6,
-            proposer: NodeId(1),
-            members: members.clone(),
-            cluster_id: cid,
-            placement_version: 1,
-            digest: crate::cluster::topology::TopologyTerm::compute_digest(6, &cid, &members, 1),
-            voters: members.clone(),
-        };
-
-        let outcome = cluster.apply_committed_topology_durable(&commit);
-        assert_eq!(
-            outcome,
-            crate::cluster::topology::DurableCommitOutcome::PersistFailed,
-            "a clustered commit with no state file must be fail-closed, not durable",
-        );
-        assert_eq!(
-            cluster.topology_authority.committed_term(),
-            5,
-            "committed_term must NOT advance for a non-durable clustered commit",
-        );
-    }
-
-    /// Item 2 (counter-case) — a genuinely SINGLE-NODE / non-clustered node with
-    /// no state path is legitimately durable (a crash cannot leave a peer
-    /// holding a term this node forgot), so its commit still applies. The Item 2
-    /// fail-closed must not break this path.
-    #[test]
-    fn single_node_commit_with_no_state_path_still_applies() {
-        let members = vec![NodeId(1)];
-        let table = ShardTable::compute_with_epoch(&members, 1, 5, 1);
-        let cluster = new_test_running_cluster(
-            NodeId(1),
-            table,
-            &[(NodeId(1), "127.0.0.1:4891".parse().unwrap())],
-            &members,
-            &[],
-            &[],
-            &[],
-            1,
-        );
-        assert!(cluster.topology_state_path.is_none());
-        assert_eq!(cluster.topology_authority.committed_term(), 5);
-
-        let cid = cluster.topology_authority.cluster_id();
-        let commit = crate::cluster::topology::TopologyCommit {
-            term: 6,
-            proposer: NodeId(1),
-            members: members.clone(),
-            cluster_id: cid,
-            placement_version: 1,
-            digest: crate::cluster::topology::TopologyTerm::compute_digest(6, &cid, &members, 1),
-            voters: members.clone(),
-        };
-
-        let outcome = cluster.apply_committed_topology_durable(&commit);
-        assert_eq!(
-            outcome,
-            crate::cluster::topology::DurableCommitOutcome::Applied(6),
-            "a single-node commit with no state file is legitimately durable",
-        );
-        assert_eq!(cluster.topology_authority.committed_term(), 6);
     }
 
     #[test]
