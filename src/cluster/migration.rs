@@ -1433,13 +1433,30 @@ impl MigrationManager {
         Ok(())
     }
 
-    /// Clear all inbound migrations (used when the topology changes and
-    /// supersedes any in-flight migrations).
+    /// Clear inbound migrations superseded by a topology change.
+    ///
+    /// C17 (SAFE DEFAULT) — a topology supersede must NOT silently unfence a
+    /// shard this node received INCOMPLETELY and never proved complete (an
+    /// entry marked LOST by [`Self::mark_inbound_lost`]). "No pending inbound"
+    /// is not the same as "complete": dropping such a fence here would let
+    /// [`RunningCluster::is_master`] serve a partial shard as full authority
+    /// (the sibling of C8, at the supersede path instead of the GC path).
+    ///
+    /// LOST (unproven) entries are therefore RETAINED with their fence bit,
+    /// so the shard stays client-invisible until it is genuinely completed.
+    /// Ordinary in-flight (non-lost) inbound expectations are still dropped:
+    /// the supersede's fresh plan re-registers whatever the new topology needs
+    /// via [`Self::start_outbound`], and a re-acquiring migration clears the
+    /// lost mark of any preserved entry it supersedes.
     pub fn clear_inbound(&mut self) {
-        self.inbound_migrations.clear();
+        self.inbound_migrations.retain(|m| !m.completed && m.lost);
         self.inbound_bitmap.clear_all();
-        // BUG4 (b): no shard is pending after a full clear → drop the whole
-        // accumulator (no-op off-path).
+        for m in &self.inbound_migrations {
+            // Every surviving entry is an unproven LOST shard — keep it fenced.
+            self.inbound_bitmap.set(m.shard);
+        }
+        // BUG4 (b): no non-lost shard is pending after this clear → drop the
+        // whole accumulator (no-op off-path).
     }
 
     /// Remove pending inbound entries for the selected shards.
@@ -3512,6 +3529,37 @@ mod tests {
         // It is once again a reap candidate (fresh pending, not lost).
         let settled2 = mgr.pending_inbound_shards_excluding_recent_requests(Duration::from_secs(1));
         assert!(settled2.contains(&11));
+    }
+
+    /// C17 (sibling of C8) — a topology supersede (`clear_inbound`) must NOT
+    /// unfence a shard that was received incompletely and never proved
+    /// completeness. "Not-pending-inbound" is not "complete".
+    #[test]
+    fn clear_inbound_preserves_unproven_lost_fence() {
+        let mut mgr = MigrationManager::new();
+        // One ordinary in-flight (non-lost) inbound and one orphaned+lost one.
+        mgr.register_inbound_source(3, NodeId(2));
+        mgr.register_inbound_source(9, NodeId(4));
+        let settled: std::collections::HashSet<u16> = [9].into_iter().collect();
+        assert_eq!(mgr.mark_inbound_lost(&settled), 1);
+        assert!(mgr.is_shard_lost(9));
+
+        // A topology change supersedes the in-flight migration bookkeeping.
+        mgr.clear_inbound();
+
+        // SAFE DEFAULT: the UNPROVEN lost shard keeps its fence — it is never
+        // served as full authority just because the topology moved on.
+        assert!(
+            mgr.has_pending_inbound(9),
+            "clear_inbound must NOT unfence an unproven lost shard",
+        );
+        assert!(mgr.is_shard_lost(9), "the lost mark survives the supersede");
+        // The ordinary non-lost in-flight expectation is superseded as before;
+        // the fresh plan re-registers whatever the new topology needs.
+        assert!(
+            !mgr.has_pending_inbound(3),
+            "a non-lost in-flight inbound is still superseded by clear_inbound",
+        );
     }
 
     // -----------------------------------------------------------------------

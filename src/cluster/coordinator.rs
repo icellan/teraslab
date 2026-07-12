@@ -8542,6 +8542,17 @@ impl RunningCluster {
         // actually pending, and M1.2 makes it fresh by syncing immediately
         // after `start_outbound`, which is the correct fix for the lag the
         // audit flagged.
+        //
+        // C17 — this bit gates serving on PROVEN completeness, not merely "no
+        // pending inbound". A clear bit means the shard was proven complete
+        // (its completion handshake landed → `mark_inbound_complete` dropped
+        // the bit) or was never migrated at all. An INCOMPLETE shard that was
+        // never proven — an orphan the settled-inbound GC marked LOST (C8), or
+        // an unproven entry preserved across a topology supersede
+        // (`clear_inbound`, C17) — keeps this bit SET, so it stays
+        // `Transitioning` (client-invisible) and is never served as full
+        // authority. The two clearing paths that could drop the fence WITHOUT
+        // a completeness proof are precisely the ones C8/C17 close.
         if self.inbound_atomic.test(shard) && auth_master == self.self_id {
             return MasterQueryResult::Transitioning {
                 last_known_term: committed,
@@ -15837,6 +15848,53 @@ mod tests {
             MasterQueryResult::Transitioning { .. } => {}
             other => panic!(
                 "a lost/incomplete shard must NOT be served as full authority; got {other:?}",
+            ),
+        }
+    }
+
+    /// C17 (sibling of C8) — a topology supersede (`clear_inbound`) must not
+    /// let a shard this node received INCOMPLETELY (marked LOST) become
+    /// serveable as full authority. `is_master` gates on proven completeness,
+    /// so the preserved fence keeps the shard `Transitioning`. Before C17,
+    /// `clear_inbound` wiped the fence and `is_master` returned `Yes`.
+    #[test]
+    fn is_master_fences_lost_shard_across_topology_supersede() {
+        let members = vec![NodeId(1)];
+        let table = ShardTable::compute_with_epoch(&members, 1, 5, 1);
+        let cluster = new_test_running_cluster(
+            NodeId(1),
+            table,
+            &[(NodeId(1), "127.0.0.1:4851".parse().unwrap())],
+            &members,
+            &[],
+            &[],
+            &[],
+            1,
+        );
+        let shard = 0u16;
+        let key = key_for_shard(shard);
+
+        // Incomplete inbound, source dies, settled GC marks it lost, THEN a
+        // topology change supersedes the in-flight migration bookkeeping.
+        {
+            let mgr = &mut cluster.migration.lock();
+            mgr.register_inbound_source(shard, NodeId(2));
+            let settled =
+                mgr.pending_inbound_shards_excluding_recent_requests(Duration::from_secs(1));
+            assert_eq!(mgr.mark_inbound_lost(&settled), 1);
+            mgr.clear_inbound();
+            assert!(
+                mgr.is_shard_lost(shard),
+                "the lost mark and fence survive the supersede",
+            );
+        }
+        cluster.sync_migration_bitmaps();
+
+        match cluster.is_master(&key) {
+            MasterQueryResult::Transitioning { .. } => {}
+            other => panic!(
+                "a lost shard superseded by a topology change must NOT be served as full \
+                 authority; got {other:?}",
             ),
         }
     }
