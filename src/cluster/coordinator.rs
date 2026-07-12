@@ -6655,6 +6655,23 @@ pub enum ReplicaConvertError {
         /// Debug rendering of the underlying read error.
         detail: String,
     },
+    /// An EXTERNAL record's cold blob is absent (or no blob store is
+    /// configured), so shipping the create would leave the target with a live
+    /// record pointing at a dangling `ExternalRef` — permanent payload loss.
+    #[error("external blob missing for {tx_key:?}")]
+    ExternalBlobMissing {
+        /// The EXTERNAL record whose blob could not be found.
+        tx_key: TxKey,
+    },
+    /// An EXTERNAL record's cold blob could not be read back from the blob
+    /// store (an I/O error, distinct from a plain absent blob).
+    #[error("read external blob for {tx_key:?} failed: {detail}")]
+    ExternalBlobRead {
+        /// The EXTERNAL record whose blob read failed.
+        tx_key: TxKey,
+        /// Rendering of the underlying blob-store error.
+        detail: String,
+    },
 }
 
 /// Convert a redo log entry to a `ReplicaOp` if it belongs to the given shard.
@@ -7139,10 +7156,31 @@ fn convert_migration_create(
     meta_buf.extend_from_slice(&meta.delete_at_height.to_le_bytes());
     meta_buf.extend_from_slice(&meta.preserve_until.to_le_bytes());
 
-    let cold_data = if meta.flags.contains(crate::record::TxFlags::EXTERNAL) {
-        engine
-            .blob_store()
-            .and_then(|bs| bs.get(&tx_key.txid).ok().flatten())
+    // S3: an EXTERNAL record's cold blob MUST accompany its create, else the
+    // target gets a LIVE record with a dangling `ExternalRef` (permanent payload
+    // loss). The pre-fix `.and_then(|bs| bs.get(..).ok().flatten())` silently
+    // yielded `cold_data = None` on a missing/unreadable blob while still
+    // shipping `is_external = true`. Mirror the dispatch write path
+    // (`create_repl_cold_data` / `SkipReplicationBlobMissing`): a missing blob,
+    // an unreadable blob, or no configured blob store all FAIL the task so the
+    // source retries rather than handing off an incomplete record.
+    let is_external = meta.flags.contains(crate::record::TxFlags::EXTERNAL);
+    let cold_data = if is_external {
+        match engine.blob_store() {
+            Some(bs) => match bs.get(&tx_key.txid) {
+                Ok(Some(blob)) => Some(blob),
+                Ok(None) => {
+                    return Err(ReplicaConvertError::ExternalBlobMissing { tx_key: *tx_key });
+                }
+                Err(e) => {
+                    return Err(ReplicaConvertError::ExternalBlobRead {
+                        tx_key: *tx_key,
+                        detail: format!("{e}"),
+                    });
+                }
+            },
+            None => return Err(ReplicaConvertError::ExternalBlobMissing { tx_key: *tx_key }),
+        }
     } else {
         None
     };
@@ -7152,7 +7190,7 @@ fn convert_migration_create(
         metadata_bytes: meta_buf,
         utxo_hashes,
         cold_data,
-        is_external: meta.flags.contains(crate::record::TxFlags::EXTERNAL),
+        is_external,
     }))
 }
 
@@ -16997,6 +17035,99 @@ mod tests {
         match redo_entry_to_replica_ops(&entry, shard, &engine) {
             Err(ReplicaConvertError::SlotRead { tx_key, .. }) => assert_eq!(tx_key, key),
             other => panic!("expected SlotRead error from the batch converter, got {other:?}"),
+        }
+    }
+
+    fn external_ref_for(txid: [u8; 32]) -> crate::record::ExternalRef {
+        crate::record::ExternalRef {
+            store_type: 1,
+            content_hash: txid,
+            total_size: 250,
+            input_count: 0,
+            output_count: 0,
+            inputs_offset: 0,
+            outputs_offset: 0,
+        }
+    }
+
+    fn create_external_record(engine: &Engine, key: TxKey) {
+        let utxo_hashes = [[0x44u8; 32]];
+        engine
+            .create(&crate::ops::create::CreateRequest {
+                tx_id: key.txid,
+                tx_version: 1,
+                locktime: 0,
+                fee: 100,
+                size_in_bytes: 100,
+                extended_size: 0,
+                is_coinbase: false,
+                spending_height: 0,
+                utxo_hashes: &utxo_hashes,
+                inputs: None,
+                outputs: None,
+                inpoints: None,
+                is_external: true,
+                created_at: 1710000000000,
+                block_height: 0,
+                mined_block_infos: &[],
+                frozen: false,
+                conflicting: false,
+                locked: false,
+                external_ref: Some(external_ref_for(key.txid)),
+                parent_txids: &[],
+            })
+            .unwrap();
+    }
+
+    /// S3: converting an EXTERNAL create whose blob is absent from the blob
+    /// store must FAIL the task (fail-closed) rather than emit a live
+    /// `ReplicaOp::Create` with `is_external = true` and `cold_data = None`. The
+    /// latter would create a live EXTERNAL record on the migration target whose
+    /// `ExternalRef` dangles — permanent payload loss. Mirrors the dispatch
+    /// write path's `SkipReplicationBlobMissing` discipline.
+    #[test]
+    fn migration_convert_fails_closed_when_external_blob_missing() {
+        use crate::redo::{RedoEntry, RedoOp};
+
+        let mut engine = test_engine();
+        // Blob store configured, but no blob ever uploaded for this record —
+        // the lost/GC'd/never-written case: `bs.get(txid)` -> `Ok(None)`.
+        let blob: std::sync::Arc<dyn crate::storage::blobstore::BlobStore> =
+            std::sync::Arc::new(crate::storage::blobstore::MemoryBlobStore::new());
+        engine.set_blob_store(blob);
+
+        let shard = 12u16;
+        let key = tx_key_for_shard(shard, 1);
+        create_external_record(&engine, key);
+        assert!(
+            engine.lookup(&key).is_some(),
+            "the EXTERNAL record must be registered (only its blob is missing)"
+        );
+
+        let entry = RedoEntry {
+            sequence: 1,
+            op: RedoOp::ReplicaCreate {
+                tx_key: key,
+                device_id: 0,
+                record_offset: 0,
+                utxo_count: 1,
+            },
+        };
+
+        match redo_entry_to_replica_op(&entry, shard, &engine) {
+            Err(ReplicaConvertError::ExternalBlobMissing { tx_key }) => {
+                assert_eq!(tx_key, key, "error must name the blob-less EXTERNAL record");
+            }
+            other => panic!(
+                "expected ExternalBlobMissing (fail-closed), got {other:?} — a live \
+                 EXTERNAL Create with a dangling ExternalRef must never be emitted"
+            ),
+        }
+
+        // Batch converter must propagate the same failure.
+        match redo_entry_to_replica_ops(&entry, shard, &engine) {
+            Err(ReplicaConvertError::ExternalBlobMissing { tx_key }) => assert_eq!(tx_key, key),
+            other => panic!("expected ExternalBlobMissing from the batch converter, got {other:?}"),
         }
     }
 }
