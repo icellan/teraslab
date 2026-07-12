@@ -10453,7 +10453,17 @@ pub(crate) fn handle_stream_read(
 
     // Cluster: if this node is not the master for the record's shard, return
     // the normal redirect (same as GET) as a single response — do NOT stream.
-    if let Some(err) = check_shard_ownership(&req.txid, 0, cluster, false) {
+    //
+    // FU#4-A: `allow_if_migrating = true` — a READ served during an OUTBOUND
+    // migration of the shard, matching plain GET (`decorate_get_item`: serve
+    // locally when `is_master || is_migrating_outbound`). The source still holds
+    // the blob until migration completes (`run_orphan_cleanup` is gated on no
+    // active/failed migration), and stream-read is the fallback for exactly the
+    // over-budget blobs GET couldn't serve whole, so it must share GET's
+    // serve-during-outbound liveness. (The streaming-WRITE path —
+    // `handle_stream_chunk` / `handle_stream_end` — keeps `false`: those are
+    // mutations on the master.)
+    if let Some(err) = check_shard_ownership(&req.txid, 0, cluster, true) {
         let frame = if err.error_code == ERR_REDIRECT {
             ResponseFrame {
                 request_id,
@@ -15373,6 +15383,129 @@ mod tests {
             }
         }
         (data, end.expect("stream must end with STATUS_STREAM_END"))
+    }
+
+    /// FU#4-A: stream-read must SERVE an over-budget EXTERNAL blob locally during
+    /// an OUTBOUND migration of its shard, exactly like plain GET does — the
+    /// source still holds the blob until migration completes (`run_orphan_cleanup`
+    /// is gated on no active/failed migration). Stream-read is the fallback for
+    /// precisely the blobs GET couldn't serve whole, so it must share GET's
+    /// serve-during-outbound-migration liveness.
+    ///
+    /// Scenario: this node is NO LONGER master for the record's shard (topology
+    /// moved mastership to the target) but the shard is migrating OUTBOUND from
+    /// here (`is_master == No`, `is_migrating_outbound == true`). GET serves this
+    /// locally; before the fix stream-read passed `allow_if_migrating = false`
+    /// and REDIRECTED the (unfetchable) blob. RED asserts no redirect / a full
+    /// STREAM_CHUNK…STREAM_END burst; GREEN after `false → true`.
+    #[test]
+    fn stream_read_serves_during_outbound_migration_like_get() {
+        use crate::cluster::shards::{NodeId, ShardTable};
+        use crate::protocol::codec::{STREAM_READ_FIELD_COLD_DATA, encode_stream_read_request};
+        use crate::storage::blobstore::{BlobStore, MemoryBlobStore};
+
+        let mut h = DispatchTestHarness::new();
+        let txid = DispatchTestHarness::make_txid(88);
+        let payload = b"external cold-data blob served during an outbound shard migration".to_vec();
+
+        // EXTERNAL record on THIS node's engine + its blob in the store (the
+        // migration SOURCE still holds the data until migration completes).
+        let blob_store: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
+        h.engine.set_blob_store(blob_store.clone());
+        let digest = blob_store.put(&txid, &payload).unwrap();
+        let item = WireCreateItem {
+            txid,
+            tx_version: 1,
+            locktime: 0,
+            fee: 0,
+            size_in_bytes: payload.len() as u64,
+            extended_size: payload.len() as u64,
+            is_coinbase: false,
+            spending_height: 0,
+            created_at: 1700000000000,
+            flags: FLAG_EXTERNAL_BLOB,
+            utxo_hashes: vec![[0xAB; 32]],
+            cold_data: vec![], // streamed — blob already in the store
+            block_height: 0,
+            mined_block_id: None,
+            mined_block_height: None,
+            mined_subtree_idx: None,
+            parent_txids: vec![],
+        };
+        let resp =
+            h.request_with_blob_store(OP_CREATE_BATCH, encode_create_batch(&[item]), &*blob_store);
+        assert_eq!(resp.status, STATUS_OK, "external create must succeed");
+
+        // 2-node cluster: self is NOT master for the record's shard, but that
+        // shard is migrating OUTBOUND from here.
+        let shard = ShardTable::shard_for_key(&TxKey { txid });
+        let members = vec![NodeId(1), NodeId(2)];
+        let table = ShardTable::compute_with_epoch(&members, 2, 11, 1);
+        let master = table.target_assignment(shard).master;
+        let self_id = if master == NodeId(1) {
+            NodeId(2)
+        } else {
+            NodeId(1)
+        };
+        let cluster = crate::cluster::coordinator::new_test_running_cluster(
+            self_id,
+            table,
+            &[
+                (NodeId(1), "127.0.0.1:4471".parse().unwrap()),
+                (NodeId(2), "127.0.0.1:4472".parse().unwrap()),
+            ],
+            &members,
+            &[],      // inbound_shards
+            &[shard], // migrating_shards — OUTBOUND migration active for this shard
+            &[],      // fenced_shards
+            2,
+        );
+        // Preconditions: not master, but migrating outbound (the FU#4-A window).
+        let key = TxKey { txid };
+        assert!(
+            !matches!(
+                cluster.is_master(&key),
+                crate::cluster::coordinator::MasterQueryResult::Yes
+            ),
+            "precondition: self is NOT master for the shard",
+        );
+        assert!(
+            cluster.is_migrating_outbound(&key),
+            "precondition: the shard is migrating outbound from this node",
+        );
+
+        let req = RequestFrame {
+            request_id: 42,
+            op_code: OP_STREAM_READ,
+            flags: 0,
+            payload: encode_stream_read_request(&txid, STREAM_READ_FIELD_COLD_DATA, 0).into(),
+        };
+        let mut out: Vec<u8> = Vec::new();
+        handle_stream_read(
+            &req,
+            &h.engine,
+            &mut out,
+            Some(&*blob_store),
+            Some(&cluster),
+        )
+        .expect("stream-read must not fail at the socket layer");
+
+        // RED (allow_if_migrating == false): a single STATUS_REDIRECT frame.
+        // GREEN (== true): the full STREAM_CHUNK…STREAM_END burst.
+        let (first_frame, _consumed) =
+            ResponseFrame::decode(&out).expect("stream-read must emit at least one frame");
+        assert_ne!(
+            first_frame.status, STATUS_REDIRECT,
+            "stream-read must SERVE the blob during outbound migration (parity with GET), \
+             not redirect the unfetchable over-budget blob",
+        );
+        let (reassembled, end) = decode_stream_frames(&out, 42);
+        assert_eq!(
+            reassembled, payload,
+            "streamed bytes must reassemble to the external blob",
+        );
+        assert_eq!(end.total_size, digest.length, "END trailer total_size");
+        assert_eq!(end.content_hash, digest.sha256, "END trailer content_hash");
     }
 
     #[test]
