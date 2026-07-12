@@ -1736,12 +1736,15 @@ fn main() {
         // Restore migration state from a previous run so shards that were
         // mid-migration remain blocked (inbound) or tracked (outbound).
         //
-        // A corrupt/truncated inbound-fence file is fail-closed: it is the only
-        // record of which shards were still receiving data, so we abort startup
-        // rather than come up serving those (incomplete) shards as complete
-        // authority. Re-sync from the source node clears the condition.
+        // A corrupt/truncated/unreadable inbound-fence file is fail-closed: it
+        // is the only record of which shards were still receiving data, so we
+        // abort startup rather than come up serving those (incomplete) shards
+        // as complete authority. The node will NOT boot to receive a re-sync
+        // while the condition persists — an operator must remove (or repair)
+        // the corrupt fence file so the node restarts with no pending inbound
+        // state and the source node re-initiates the migration.
         if let Err(e) = running.restore_inbound_state() {
-            tracing::error!(err = %e, "cluster: inbound-fence state corrupt — refusing to start (incomplete shards would be served as complete)");
+            tracing::error!(err = %e, "cluster: inbound-fence state unrecoverable — refusing to start (incomplete shards would be served as complete); remove the corrupt inbound-state file to boot");
             std::process::exit(1);
         }
         running.restore_outbound_state();

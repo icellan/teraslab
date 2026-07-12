@@ -369,7 +369,10 @@ fn crash_mid_migration_no_loss_no_dup_no_dual_master() {
     // --- RESTART the new master through real recovery + inbound restore. ---
     let new_recovered = new.recover();
     let mut restored_mgr = MigrationManager::new();
-    restored_mgr.restore_inbound(&load_inbound_state(&inbound_path));
+    let inbound_bytes = load_inbound_state(&inbound_path).expect("load inbound state");
+    restored_mgr
+        .restore_inbound(&inbound_bytes)
+        .expect("restore inbound state");
 
     // INVARIANT 1: the restored inbound state still fences the shard, so the
     // new master refuses to serve as master for it.
@@ -731,7 +734,10 @@ fn receiver_crash_mid_baseline_recovers_flushed_via_redo_then_redrives() {
     // redo-tail replay). The FLUSHED half recovers with reconstructed slots.
     let new_recovered = new.recover();
     let mut restored_mgr = MigrationManager::new();
-    restored_mgr.restore_inbound(&load_inbound_state(&inbound_path));
+    let inbound_bytes = load_inbound_state(&inbound_path).expect("load inbound state");
+    restored_mgr
+        .restore_inbound(&inbound_bytes)
+        .expect("restore inbound state");
 
     // FENCE intact: the receiver still refuses to serve the shard.
     assert!(

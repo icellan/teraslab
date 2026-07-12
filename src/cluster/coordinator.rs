@@ -9317,7 +9317,10 @@ impl RunningCluster {
         &self,
     ) -> Result<(), crate::cluster::migration::InboundRestoreError> {
         if let Some(ref path) = self.inbound_state_path {
-            let data = crate::cluster::migration::load_inbound_state(path);
+            // I-2: a read error on an existing fence file (not "absent") is
+            // fail-closed — the `?` propagates it so the caller aborts startup
+            // rather than treat an unreadable fence set as no fences.
+            let data = crate::cluster::migration::load_inbound_state(path)?;
             if !data.is_empty() {
                 let mut mgr = self.migration.lock();
                 mgr.restore_inbound(&data)?;
@@ -11059,7 +11062,8 @@ mod tests {
             "batch completion from node2 must not clear node3's inbound task"
         );
 
-        let data = crate::cluster::migration::load_inbound_state(&path);
+        let data = crate::cluster::migration::load_inbound_state(&path)
+            .expect("load persisted inbound state");
         let mut restored = MigrationManager::new();
         restored
             .restore_inbound(&data)
