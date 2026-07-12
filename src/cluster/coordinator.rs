@@ -18449,13 +18449,14 @@ mod tests {
 
         let floor = 100u64;
 
-        // Tier-1 is stale-low: the tracker only persisted an ACK at seq 100
-        // (== floor) before the crash, missing later writes acked in the
-        // sub-second flush window. So Tier-1 reports NO lost tail.
+        // Tier-1 is stale-low: the tracker's last durable flush only captured
+        // an ACK at seq 99 (below the exclusive floor of 100), missing the
+        // later writes acked at/above the floor in the sub-second flush window
+        // before the crash. So Tier-1 (`acked >= floor`) reports NO lost tail.
         let dir = tempfile::tempdir().unwrap();
         let tracker = AckTracker::new(dir.path().join("ack.dat"));
         let replica_addr: std::net::SocketAddr = "127.0.0.1:6000".parse().unwrap();
-        tracker.record_ack(replica_addr, 100);
+        tracker.record_ack(replica_addr, 99);
         assert!(
             tracker.acked_beyond(floor).is_empty(),
             "Tier-1 is stale-low here and misses the gap",
