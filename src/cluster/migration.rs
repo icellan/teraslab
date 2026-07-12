@@ -1237,7 +1237,7 @@ impl MigrationManager {
     /// [`Self::clear_pending_inbound_for_shards`] when it reaps an orphaned
     /// inbound entry (a source that died mid-migration with no completion
     /// handshake). Clearing the fence there is unsafe: it would let a shard
-    /// this node holds only PARTIALLY answer [`RunningCluster::is_master`] as
+    /// this node holds only PARTIALLY answer `RunningCluster::is_master` as
     /// full authority and serve stale/incomplete reads and writes.
     ///
     /// The SAFE DEFAULT is fence-until-proven: only a NON-completed entry that
@@ -1439,7 +1439,7 @@ impl MigrationManager {
     /// shard this node received INCOMPLETELY and never proved complete (an
     /// entry marked LOST by [`Self::mark_inbound_lost`]). "No pending inbound"
     /// is not the same as "complete": dropping such a fence here would let
-    /// [`RunningCluster::is_master`] serve a partial shard as full authority
+    /// `RunningCluster::is_master` serve a partial shard as full authority
     /// (the sibling of C8, at the supersede path instead of the GC path).
     ///
     /// LOST (unproven) entries are therefore RETAINED with their fence bit,
