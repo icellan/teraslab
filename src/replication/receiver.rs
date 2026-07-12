@@ -755,19 +755,22 @@ pub fn handle_replica_batch_with_tracker(
         };
     }
 
-    // F-G7-005: tighten the cluster_key gate for migration batches.
-    // The dedup-bypass path (FLAG_MIGRATION_BATCH) skips the
-    // already-applied skip_count logic and unconditionally re-applies
-    // every op. A buggy or hostile sender that sets the flag bit and
-    // a `cluster_key = 0` wildcard could therefore replay arbitrary
-    // mutations through the dedup-bypass path. When the receiver is
-    // in steady-state clustered mode (`local_cluster_key != 0`) we
-    // require a non-zero `cluster_key` on migration batches so the
-    // sender's epoch is explicit; the wildcard remains accepted only
-    // for normal-replication batches (where the per-stream dedup
-    // tracker plus the generation guard absorb any replay damage).
+    // F-G7-005 + C24: close the `cluster_key == 0` V1-compat wildcard once the
+    // receiver is in steady-state clustered mode (`local_cluster_key != 0`), for
+    // BOTH migration and normal batches. The `!= 0` guard on the stale gate
+    // above short-circuits for a zero key, so a zero-key batch otherwise
+    // bypasses the epoch/cluster-key check entirely. A clustered node holds a
+    // quorum-committed term, so a zero-key sender is either a pre-clustering V1
+    // master that must not be replicating into the cluster, or a stale/misrouted
+    // batch — reject both under the strict-auth default. (Originally F-G7-005
+    // closed only the migration dedup-bypass path, where a flag+wildcard could
+    // replay arbitrary mutations; C24 extends the closure to normal batches,
+    // whose per-stream dedup tracker and generation guard curb but do not
+    // eliminate a misrouted zero-key replay.) The wildcard stays accepted only
+    // while the receiver has not yet observed a term (`local_cluster_key == 0`,
+    // the pre-quorum / post-restart / single-node / V1 window handled above).
     let is_migration_flag = request.flags & FLAG_MIGRATION_BATCH != 0;
-    if is_migration_flag && batch.cluster_key == 0 && local_cluster_key != 0 {
+    if batch.cluster_key == 0 && local_cluster_key != 0 {
         if let Some(m) = crate::metrics::replication_metrics() {
             m.replica_rejected_stale_cluster_key.inc();
         }
@@ -775,7 +778,8 @@ pub fn handle_replica_batch_with_tracker(
             local_cluster_key,
             first_sequence = batch.first_sequence,
             ops_len = batch.ops.len(),
-            "replica rejected migration batch: cluster_key wildcard not allowed in clustered mode"
+            is_migration = is_migration_flag,
+            "replica rejected batch: cluster_key wildcard not allowed in clustered mode"
         );
         let mut payload = Vec::with_capacity(6);
         payload.extend_from_slice(&ERR_STALE_EPOCH.to_le_bytes());
@@ -7760,10 +7764,15 @@ mod tests {
         assert_eq!(last_applied.load(Ordering::Relaxed), through);
     }
 
+    /// C24: a steady-state NORMAL (non-migration) batch stamped with the
+    /// `cluster_key == 0` V1-compat wildcard must be REJECTED once the receiver
+    /// is in clustered steady state (`local_cluster_key != 0`), matching the
+    /// migration path's wildcard closure. A clustered node holds a
+    /// quorum-committed term, so a zero-key sender is either a pre-clustering V1
+    /// master that must not be replicating into the cluster or a stale/misrouted
+    /// batch — either way the wildcard must not bypass the epoch gate.
     #[test]
-    fn unknown_cluster_key_batch_applied() {
-        // V1-compat: a `cluster_key == 0` batch (e.g. produced by an older
-        // master that did not emit the field) must apply unconditionally.
+    fn normal_batch_with_wildcard_cluster_key_rejected_in_clustered_mode() {
         let engine = make_engine();
         create_record(&engine, key(73), 3);
 
@@ -7773,8 +7782,8 @@ mod tests {
 
         // R-D1: seed the watermark so first_sequence=40 is next-expected.
         tracker.set(DEFAULT_STREAM_KEY, 39);
-        let batch = batch_with_cluster_key(40, key(73), 0..1, 1, /* unknown */ 0);
-        let through = batch.last_sequence();
+        let slot0_before = engine.read_slot(&key(73), 0).unwrap().status;
+        let batch = batch_with_cluster_key(40, key(73), 0..1, 1, /* wildcard */ 0);
         let req = batch_request(&batch, 1);
 
         let resp = handle_replica_batch_with_tracker(
@@ -7786,7 +7795,65 @@ mod tests {
             local_cluster_key,
         );
 
-        assert_eq!(resp.status, STATUS_OK);
+        assert_eq!(
+            resp.status, STATUS_ERROR,
+            "a normal wildcard-cluster_key batch must be rejected in clustered mode",
+        );
+        assert_eq!(
+            decode_error_code(&resp.payload),
+            ERR_STALE_EPOCH,
+            "rejection error_code must be ERR_STALE_EPOCH",
+        );
+        // Witnesses: engine untouched, watermark frozen.
+        assert_eq!(
+            engine.read_slot(&key(73), 0).unwrap().status,
+            slot0_before,
+            "rejected wildcard batch must not mutate slot status",
+        );
+        assert_eq!(
+            tracker.get(DEFAULT_STREAM_KEY),
+            39,
+            "rejected wildcard batch must not advance the high-water mark",
+        );
+        assert_eq!(
+            last_applied.load(Ordering::Relaxed),
+            0,
+            "rejected wildcard batch must not advance last_applied",
+        );
+    }
+
+    /// C24 boundary: the SAME normal wildcard (`cluster_key == 0`) batch must
+    /// still be ACCEPTED when `local_cluster_key == 0` — the receiver has not
+    /// observed a quorum-committed term yet (post-restart, pre-bootstrap, or a
+    /// single-node / V1 deployment), so there is no epoch to violate. The
+    /// wildcard reject only bites once the receiver is clustered.
+    #[test]
+    fn normal_batch_with_wildcard_cluster_key_accepted_when_local_zero() {
+        let engine = make_engine();
+        create_record(&engine, key(73), 3);
+
+        let last_applied = Arc::new(AtomicU64::new(0));
+        let tracker = ReplicaAppliedTracker::in_memory();
+
+        // R-D1: seed the watermark so first_sequence=40 is next-expected.
+        tracker.set(DEFAULT_STREAM_KEY, 39);
+        let batch = batch_with_cluster_key(40, key(73), 0..1, 1, /* wildcard */ 0);
+        let through = batch.last_sequence();
+        let req = batch_request(&batch, 1);
+
+        let resp = handle_replica_batch_with_tracker(
+            &req,
+            &engine,
+            &last_applied,
+            Some(&tracker),
+            DEFAULT_STREAM_KEY,
+            /* local_cluster_key */ 0,
+        );
+
+        assert_eq!(
+            resp.status, STATUS_OK,
+            "a normal wildcard batch must be accepted when local_cluster_key = 0",
+        );
         let ack = ReplicaAck::deserialize(&resp.payload).unwrap();
         assert_eq!(
             ack,
@@ -8046,7 +8113,11 @@ mod tests {
     fn replica_rejected_stale_cluster_key_metric_increments() {
         // The metric is process-wide via `replication_metrics()`. We make
         // sure it is initialized (idempotent) and snapshot the counter
-        // before/after to assert exactly one increment per reject.
+        // before/after to assert the reject path bumps it. The assertion is
+        // `>= before + 1` rather than exactly `+1` because the counter is
+        // shared across the whole test binary: other reject tests (e.g. the
+        // C24 normal-wildcard reject) run in parallel and legitimately bump the
+        // SAME counter inside our before/after window.
         let engine = make_engine();
         create_record(&engine, key(75), 2);
 
@@ -8079,10 +8150,10 @@ mod tests {
         assert_eq!(resp.status, STATUS_ERROR);
 
         let after = metrics.replica_rejected_stale_cluster_key.get();
-        assert_eq!(
-            after,
-            before + 1,
-            "replica_rejected_stale_cluster_key must increment exactly once per reject",
+        assert!(
+            after > before,
+            "replica_rejected_stale_cluster_key must increment on a reject \
+             (before={before}, after={after})",
         );
     }
 
