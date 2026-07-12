@@ -381,6 +381,82 @@ pub fn ack_tracker_handle() -> Option<&'static crate::replication::durable::AckT
     ACK_TRACKER.get()
 }
 
+/// C3/G12: compute the reclaim / catch-up watermark across the EXPECTED
+/// replica set rather than only the replicas already PRESENT in the ACK
+/// tracker.
+///
+/// The redo-log reset guard (C3) and the startup catch-up pass (G12) must
+/// not treat an empty (or partial) ACK tracker as "every replica is caught
+/// up": a replica the topology expects but that has not yet ACKed anything
+/// still needs the whole redo prefix. Every expected replica missing from
+/// `acked` therefore contributes `0` (caught up to nothing), which pulls
+/// the minimum to `0` and blocks a reclaim until that replica proves it has
+/// the range.
+///
+/// Returns `floor` only when `expected` is empty — a genuine single-node /
+/// RF=1 deployment with no fan-out target, where nothing holds the reset
+/// back. Replicas that appear in `acked` but are NOT in `expected` (e.g. a
+/// node demoted out of the shard's replica set by a topology change) are
+/// ignored: they no longer need this master's redo, so they must not pin
+/// the log.
+pub fn min_acked_over_expected(
+    acked: &HashMap<SocketAddr, u64>,
+    expected: &[SocketAddr],
+    floor: u64,
+) -> u64 {
+    if expected.is_empty() {
+        return floor;
+    }
+    expected
+        .iter()
+        .map(|addr| acked.get(addr).copied().unwrap_or(0))
+        .min()
+        .unwrap_or(floor)
+}
+
+/// G12: enumerate the replicas the startup catch-up pass must drive, over
+/// the UNION of the ACK tracker's known replicas and the topology's
+/// EXPECTED-replica set.
+///
+/// The startup pass previously iterated only `all_acked()` and early-returned
+/// when the tracker was empty, so a replica the master has never ACKed (no
+/// tracker entry — a fresh master, or one whose ACK file was discarded as
+/// corrupt) was silently skipped and never caught up. Seeding the expected
+/// replicas here gives every one of them a `from_seq` of `last_acked + 1`
+/// (defaulting to `0 + 1 = 1` when absent), so it is streamed the redo it is
+/// missing — or, if that prefix was already reclaimed, driven onto a
+/// full-shard resync by `run_one_catchup_pass`.
+///
+/// Returns `(addr, last_acked)` for every replica whose `last_acked` is
+/// strictly below `current_seq` (i.e. genuinely behind), de-duplicated,
+/// with expected replicas listed first. A replica already at/above
+/// `current_seq` is omitted (nothing to send).
+pub fn startup_catchup_targets(
+    acked: &HashMap<SocketAddr, u64>,
+    expected: &[SocketAddr],
+    current_seq: u64,
+) -> Vec<(SocketAddr, u64)> {
+    let mut seen: std::collections::BTreeSet<SocketAddr> = std::collections::BTreeSet::new();
+    let mut out: Vec<(SocketAddr, u64)> = Vec::new();
+    // Expected replicas first — including any with no tracker entry (last_acked
+    // defaults to 0), which is exactly the case the pre-fix loop dropped.
+    for addr in expected {
+        let last = acked.get(addr).copied().unwrap_or(0);
+        if last < current_seq && seen.insert(*addr) {
+            out.push((*addr, last));
+        }
+    }
+    // Plus any replica the tracker knows about that is not in the expected set
+    // (e.g. a still-behind node mid-topology-change) so we never regress the
+    // prior tracker-driven behavior.
+    for (addr, last) in acked {
+        if *last < current_seq && seen.insert(*addr) {
+            out.push((*addr, *last));
+        }
+    }
+    out
+}
+
 /// Initialize the persistent receiver-side applied tracker.
 ///
 /// Must be called once during clustered server startup before accepting
@@ -501,9 +577,17 @@ pub(crate) fn handle_request(
     // (topology proposals/votes/commits, replica batches, admin
     // health/diagnostics, ping) bypasses the check so a node can
     // become Alive in the first place.
+    //
+    // C22: gate on MULTI-NODE membership (`peak_cluster_size > 1`), NOT on
+    // the replication factor. An RF=1 multi-node node still owns every
+    // shard on its bootstrap `[self]` table before its first committed
+    // topology activates, so keying the gate on RF>1 let it serve mutations
+    // during that window and create dual authority for a shard. A genuine
+    // single-node bootstrap (`peak == 1`) stays exempt so it can serve
+    // immediately.
     if needs_cluster_readiness(request.op_code)
         && let Some(c) = cluster
-        && c.shard_table().read().replication_factor() > 1
+        && c.peak_cluster_size() > 1
         && !c.cluster_health().is_ready()
     {
         return error_response(
@@ -3059,21 +3143,54 @@ pub fn recover_pending_replication_intents(
         Some(t) => t,
         None => return Ok(()),
     };
-    recover_pending_replication_intents_from_tracker(tracker, redo_log, engine, |ops, range| {
-        // The intent range is already present in the durable tracker; this
-        // recovery path commits it explicitly after successful fan-out.
-        replicate_all_ops(Some(cluster), ops, range, &[]).map(|_| ())
-    })
+    let resync_handle = cluster.resync_sender_handle();
+    recover_pending_replication_intents_from_tracker(
+        tracker,
+        redo_log,
+        engine,
+        |ops, range| {
+            // The intent range is already present in the durable tracker; this
+            // recovery path commits it explicitly after successful fan-out.
+            replicate_all_ops(Some(cluster), ops, range, &[]).map(|_| ())
+        },
+        |keys| {
+            // C2: a reclaimed intent can no longer be incrementally replayed —
+            // post an explicit full-shard resync to every replica node of the
+            // reclaimed keys' shards so the divergent prefix is repaired even if
+            // the lag-monitor catch-up loop would otherwise skip a node whose
+            // ACK watermark already caught up.
+            let table = cluster.shard_table();
+            let table = table.read();
+            let mut per_node: std::collections::BTreeMap<NodeId, std::collections::BTreeSet<u16>> =
+                std::collections::BTreeMap::new();
+            for key in keys {
+                let shard = ShardTable::shard_for_key(key);
+                for replica in table.replicas_for_key(key) {
+                    per_node.entry(*replica).or_default().insert(shard);
+                }
+            }
+            for (node, shards) in per_node {
+                if !resync_handle.signal_for_node(node, shards.into_iter().collect()) {
+                    tracing::warn!(
+                        node_id = node.0,
+                        "intent-recovery: reclaimed-range resync could not be queued (coordinator stopped)",
+                    );
+                }
+            }
+        },
+    )
 }
 
-fn recover_pending_replication_intents_from_tracker<F>(
+fn recover_pending_replication_intents_from_tracker<F, R>(
     tracker: &crate::replication::durable::ReplicationIntentTracker,
     redo_log: Option<&Mutex<RedoLog>>,
     engine: &Engine,
     mut replicate: F,
+    mut resync: R,
 ) -> std::result::Result<(), String>
 where
     F: FnMut(&[(TxKey, Vec<ReplicaOp>)], (u64, u64)) -> std::result::Result<(), String>,
+    R: FnMut(&[TxKey]),
 {
     let pending = tracker.pending_with_keys();
     if pending.is_empty() {
@@ -3166,6 +3283,14 @@ where
                 current_sequence,
                 "pending replication intent refers to reclaimed redo range; clearing marker and requiring replica full resync/catch-up",
             );
+            // C2: the reclaimed range can no longer be incrementally replayed,
+            // so enqueue an EXPLICIT full resync for this intent's keys BEFORE
+            // clearing the marker. Pre-fix the marker was committed with no
+            // resync, leaving repair to depend entirely on the lag-monitor
+            // catch-up loop noticing the divergence later; a node that had
+            // fully caught up on its ACK watermark (so the loop skips it) would
+            // never be repaired for this reclaimed prefix.
+            resync(&intent_keys);
             tracker
                 .commit(range.first_sequence, range.last_sequence)
                 .map_err(|e| format!("replication intent commit: {e}"))?;
@@ -3601,14 +3726,16 @@ fn compensate_replication_failure(
     redo_log: Option<&Mutex<RedoLog>>,
 ) -> std::result::Result<Option<(u64, u64)>, String> {
     let mut comp_redo: Vec<RedoOp> = Vec::new();
-    // DC-1: a slot-restore `write_utxo_slot` that fails must NOT be
-    // swallowed. We record the first such failure and surface it once the
+    // DC-1: a slot-restore `write_utxo_slot` that fails — OR a slot READ
+    // that a compensation arm needs and cannot complete (C16/G8) — must NOT
+    // be swallowed. We record the first such failure and surface it once the
     // compensating redo entries are durable, so the redo log still drives a
-    // correct replay on restart while the caller learns the in-memory/device
-    // restore did not complete cleanly (the op must not report a clean
-    // rollback). Mirrors the R-004/R-035 "propagate the write error rather
-    // than log-and-continue" discipline already applied to engine slot
-    // writes and receiver metadata writes.
+    // correct replay on restart while the caller learns the compensation did
+    // not complete cleanly (the op must not report a clean rollback, and the
+    // pending intent must not be cleared over an unreversed slot). Mirrors
+    // the R-004/R-035 "propagate the error rather than log-and-continue"
+    // discipline already applied to engine slot writes and receiver metadata
+    // writes.
     let mut restore_write_err: Option<String> = None;
 
     let before_shape_ok = before_images_match_repl_ops(repl_ops, before_images);
@@ -3634,8 +3761,8 @@ fn compensate_replication_failure(
                     current_block_height,
                     block_height_retention,
                     ..
-                } => {
-                    if let Ok(slot) = engine.read_slot(key, *offset) {
+                } => match engine.read_slot(key, *offset) {
+                    Ok(slot) => {
                         let req = crate::ops::unspend::UnspendRequest {
                             tx_key: *key,
                             offset: *offset,
@@ -3652,12 +3779,28 @@ fn compensate_replication_failure(
                             new_spent_count: 0,
                         });
                     }
-                }
+                    Err(e) => {
+                        // C16/G8: DC-1 discipline for a READ failure. Pre-fix
+                        // this arm was `if let Ok(slot) = ...` — an Err was
+                        // silently skipped, so NO compensating unspend/redo was
+                        // emitted, the intent was cleared as a clean rollback,
+                        // and the slot was left SPENT: a silent divergence from
+                        // the replicas that never applied it. Record the failure
+                        // and surface it after the loop so the intent stays
+                        // PENDING and recovery re-ships the compensation instead
+                        // of clearing it on an unread slot.
+                        if restore_write_err.is_none() {
+                            restore_write_err =
+                                Some(format!("spend rollback slot read failed: {e}"));
+                        }
+                    }
+                },
                 ReplicaOp::Unspend {
                     offset,
                     spending_data,
                     current_block_height,
                     block_height_retention,
+                    master_generation,
                     ..
                 } => {
                     // Reverse unspend → re-spend the slot with its exact
@@ -3679,11 +3822,24 @@ fn compensate_replication_failure(
                         if let Ok(v) = engine.validate_spend_multi(&req) {
                             let _ = v.apply(engine);
                         }
-                        comp_redo.push(RedoOp::Spend {
+                        // C27-residual: emit the hash-guarded SpendV2 (carrying
+                        // the slot's utxo_hash) for symmetry with the live spend
+                        // path, which emits SpendV2-with-hash. The legacy
+                        // hash-less `RedoOp::Spend` replays with utxo_hash=None
+                        // and so lacks the V3 identity guard — recovery would
+                        // re-mark the slot SPENT even if it had since been
+                        // reassigned to a new hash. With the hash present,
+                        // `replay_spend` skips a stale re-spend instead.
+                        comp_redo.push(RedoOp::SpendV2 {
                             tx_key: *key,
                             offset: *offset,
                             spending_data: *spending_data,
                             new_spent_count: 0,
+                            current_block_height: *current_block_height,
+                            block_height_retention: *block_height_retention,
+                            target_generation: *master_generation,
+                            updated_at: engine.now_millis(),
+                            utxo_hash: Some(slot.hash),
                         });
                     }
                 }
@@ -19490,11 +19646,14 @@ mod tests {
         tracker.begin(7, 7, &[]).unwrap();
         let h = DispatchTestHarness::new();
 
-        let err =
-            recover_pending_replication_intents_from_tracker(&tracker, None, &h.engine, |_, _| {
-                panic!("replication must not run without redo")
-            })
-            .unwrap_err();
+        let err = recover_pending_replication_intents_from_tracker(
+            &tracker,
+            None,
+            &h.engine,
+            |_, _| panic!("replication must not run without redo"),
+            |_: &[TxKey]| {},
+        )
+        .unwrap_err();
 
         assert!(err.contains("requires redo log"), "err was: {err}");
         assert_eq!(tracker.pending().len(), 1);
@@ -19535,6 +19694,7 @@ mod tests {
                 observed_ops = ops.to_vec();
                 Ok(())
             },
+            |_: &[TxKey]| {},
         )
         .expect("pending intent recovery succeeds");
 
@@ -19680,6 +19840,7 @@ mod tests {
                 replicated = true;
                 Ok(())
             },
+            |_: &[TxKey]| {},
         )
         .expect("reclaimed redo range should clear stale intent instead of bricking startup");
 
@@ -19690,6 +19851,92 @@ mod tests {
         assert!(
             tracker.pending().is_empty(),
             "stale pending intent should be cleared after redo reclamation"
+        );
+    }
+
+    #[test]
+    fn c3_reset_guard_blocks_reclaim_for_expected_but_unacked_replica() {
+        // C3: an EMPTY ack tracker with an EXPECTED replica must NOT permit a
+        // redo reset — the expected replica has acked nothing, so the whole
+        // prefix below `floor` is still needed. Pre-fix the reset guard took
+        // `all_acked().values().min().unwrap_or(floor)`, so an empty map
+        // defaulted straight to `floor` and let the reclaim proceed as if every
+        // replica were already caught up.
+        let expected: SocketAddr = "10.0.0.2:7000".parse().unwrap();
+        let floor: u64 = 42;
+
+        // Empty tracker (no ACKs yet) + one expected replica → min_acked 0,
+        // which is < floor, so the reset guard must refuse.
+        let empty: HashMap<SocketAddr, u64> = HashMap::new();
+        let min_acked = min_acked_over_expected(&empty, &[expected], floor);
+        assert_eq!(
+            min_acked, 0,
+            "an expected replica with no ACK entry must count as caught-up-to-nothing (0)"
+        );
+        assert!(
+            min_acked < floor,
+            "can_reset must be false: reclaiming would erase a prefix the expected replica needs"
+        );
+
+        // Once that replica ACKs at/above the floor the reset is permitted.
+        let mut acked = HashMap::new();
+        acked.insert(expected, floor + 5);
+        assert!(
+            min_acked_over_expected(&acked, &[expected], floor) >= floor,
+            "reclaim proceeds only after the expected replica acks at/above the floor"
+        );
+
+        // A replica present in the tracker but NOT expected (demoted out of the
+        // shard set) must not pin the log.
+        let stale: SocketAddr = "10.0.0.9:7000".parse().unwrap();
+        let mut acked_stale = HashMap::new();
+        acked_stale.insert(stale, 0);
+        assert_eq!(
+            min_acked_over_expected(&acked_stale, &[], floor),
+            floor,
+            "with no expected replica the reset is unconstrained even if the tracker holds a demoted node"
+        );
+    }
+
+    #[test]
+    fn g12_startup_catchup_targets_expected_but_absent_replica() {
+        // G12: the startup catch-up pass must initiate catch-up for a replica
+        // the topology EXPECTS even when the ACK tracker has no entry for it.
+        // Pre-fix the pass iterated only `all_acked()` and early-returned on an
+        // empty tracker, so this replica was never caught up.
+        let expected: SocketAddr = "10.0.0.2:7000".parse().unwrap();
+        let current_seq: u64 = 100;
+
+        // Empty tracker, one expected replica → one target from seq 0 (→ from_seq 1).
+        let empty: HashMap<SocketAddr, u64> = HashMap::new();
+        let targets = startup_catchup_targets(&empty, &[expected], current_seq);
+        assert_eq!(
+            targets,
+            vec![(expected, 0u64)],
+            "an expected-but-absent replica must be scheduled for catch-up from sequence 0"
+        );
+
+        // A tracker replica NOT in the expected set that is still behind is also
+        // driven (no regression of the prior tracker-only behavior).
+        let other: SocketAddr = "10.0.0.9:7000".parse().unwrap();
+        let mut acked = HashMap::new();
+        acked.insert(other, 40u64);
+        let targets = startup_catchup_targets(&acked, &[expected], current_seq);
+        assert!(
+            targets.contains(&(expected, 0u64)),
+            "expected replica still scheduled"
+        );
+        assert!(
+            targets.contains(&(other, 40u64)),
+            "a still-behind tracker replica is not dropped"
+        );
+
+        // A replica already at/above current_seq is not re-driven.
+        let mut caught_up = HashMap::new();
+        caught_up.insert(expected, current_seq);
+        assert!(
+            startup_catchup_targets(&caught_up, &[expected], current_seq).is_empty(),
+            "a caught-up replica produces no catch-up target"
         );
     }
 
@@ -19761,6 +20008,7 @@ mod tests {
                 observed.extend_from_slice(ops);
                 Ok(())
             },
+            |_: &[TxKey]| {},
         )
         .expect("merged read must resolve a range spanning both store logs");
 
@@ -19848,6 +20096,7 @@ mod tests {
                 observed.extend_from_slice(ops);
                 Ok(())
             },
+            |_: &[TxKey]| {},
         )
         .expect("recovery of a satisfiable (non-reclaimed) range must succeed");
 
@@ -19995,6 +20244,7 @@ mod tests {
                 observed_ops.extend_from_slice(ops);
                 Ok(())
             },
+            |_: &[TxKey]| {},
         )
         .expect("pending intent recovery succeeds");
 
@@ -20069,6 +20319,8 @@ mod tests {
         }
 
         let mut replicated = false;
+        // C2: capture the explicit resync the reclaim branch must enqueue.
+        let mut resync_keys: Vec<TxKey> = Vec::new();
         recover_pending_replication_intents_from_tracker(
             &tracker,
             Some(&redo_log),
@@ -20077,12 +20329,21 @@ mod tests {
                 replicated = true;
                 Ok(())
             },
+            |keys: &[TxKey]| resync_keys.extend_from_slice(keys),
         )
         .expect("reclaimed keyed range should clear stale intent, not brick startup");
 
         assert!(
             !replicated,
             "a reclaimed range cannot be incrementally replayed even with a key set"
+        );
+        // C2: the reclaim branch must have enqueued an EXPLICIT resync for the
+        // intent's own key BEFORE clearing the marker — not deferred repair to
+        // the lag-monitor catch-up loop. Pre-fix `resync_keys` stayed empty.
+        assert_eq!(
+            resync_keys,
+            vec![tx_key],
+            "reclaimed intent must enqueue an explicit resync for its keys"
         );
         assert!(
             tracker.pending().is_empty(),
@@ -20165,6 +20426,71 @@ mod tests {
         assert_eq!(
             admin_resp.status, STATUS_OK,
             "OP_ADMIN_CLUSTER_HEALTH must bypass the readiness gate",
+        );
+    }
+
+    #[test]
+    fn c22_err_cluster_not_ready_gates_writes_for_rf1_multinode_joining() {
+        // C22: an RF=1 but MULTI-NODE Joining node must still reject mutations
+        // with ERR_CLUSTER_NOT_READY. It owns every shard on its bootstrap
+        // `[self]` table before its first committed topology activates, so
+        // serving here creates dual authority. Pre-fix the gate keyed on
+        // `replication_factor() > 1`, so an RF=1 node skipped the gate and
+        // served the mutation (RED).
+        let n1 = crate::cluster::shards::NodeId(1);
+        let n2 = crate::cluster::shards::NodeId(2);
+        // RF=1 (third arg), two members.
+        let table = crate::cluster::shards::ShardTable::compute_with_epoch(&[n1, n2], 1, 1, 1);
+        assert_eq!(table.replication_factor(), 1, "fixture must be RF=1");
+        // Empty `committed_members` ⇒ Joining. peak_size=2 ⇒ multi-node.
+        // Both nodes live so the quorum check (which runs AFTER this gate) is
+        // satisfied — proving it is the readiness gate, not NO_QUORUM, that
+        // rejects the write once the fix is in.
+        let cluster = crate::cluster::coordinator::new_test_running_cluster(
+            n1,
+            table,
+            &[
+                (n1, "127.0.0.1:9601".parse().unwrap()),
+                (n2, "127.0.0.1:9602".parse().unwrap()),
+            ],
+            &[], // no committed topology ⇒ Joining
+            &[],
+            &[],
+            &[],
+            2, // peak_size ⇒ peak_cluster_size() > 1
+        );
+        assert!(
+            cluster.peak_cluster_size() > 1,
+            "fixture must be multi-node"
+        );
+        assert!(
+            !cluster.cluster_health().is_ready(),
+            "fixture must be Joining"
+        );
+
+        let mut payload = vec![1u8, 0, 0, 0];
+        payload.extend_from_slice(&[0xabu8; 32]);
+        let req = RequestFrame {
+            request_id: 21,
+            op_code: OP_DELETE_BATCH,
+            flags: 0,
+            payload: payload.into(),
+        };
+        let mut conn_state = crate::server::ConnectionState::new();
+        let resp = handle_request(
+            &req,
+            &DispatchTestHarness::new().engine,
+            8192,
+            Some(&cluster),
+            None,
+            &mut conn_state,
+            None,
+        );
+        assert_eq!(resp.status, STATUS_ERROR);
+        let err = u16::from_le_bytes(resp.payload[..2].try_into().unwrap());
+        assert_eq!(
+            err, ERR_CLUSTER_NOT_READY,
+            "an RF=1 multi-node Joining node must reject mutations with ERR_CLUSTER_NOT_READY",
         );
     }
 
@@ -21166,6 +21492,7 @@ mod tests {
             Some(&redo_log),
             &h.engine,
             |ops, r| replicate_all_ops(Some(&cluster), ops, r, &[]).map(|_| ()),
+            |_: &[TxKey]| {},
         );
 
         result.expect(
@@ -27436,6 +27763,106 @@ mod tests {
         assert!(
             slot.is_unspent(),
             "durable comp Unspend ⇒ recovery lands the slot UNSPENT (compensated, single-valued)"
+        );
+    }
+
+    #[test]
+    fn c16_spend_compensation_read_failure_keeps_intent_pending() {
+        // C16/G8: when the Spend-compensation arm's `read_slot` FAILS, the arm
+        // must record the failure and the function must return Err — so the
+        // caller keeps the replication intent PENDING and recovery re-ships the
+        // compensation. Pre-fix the arm was `if let Ok(slot) = ...`, so an Err
+        // was silently skipped: no compensating unspend/redo was emitted, the
+        // function returned Ok (a clean rollback), and the intent would be
+        // cleared with the slot left SPENT — a silent divergence.
+        let h = CompensationCrashHarness::new();
+
+        // A key that was NEVER seeded → read_slot returns Err(TxNotFound),
+        // driving the compensation arm's read-failure path.
+        let mut txid = [0u8; 32];
+        txid[0] = 0xC1;
+        let key = TxKey { txid };
+        assert!(
+            h.engine.read_slot(&key, 0).is_err(),
+            "precondition: the unseeded key's slot read must fail",
+        );
+
+        let repl_ops = vec![(
+            key,
+            vec![ReplicaOp::Spend {
+                tx_key: key,
+                offset: 0,
+                spending_data: [0u8; 36],
+                current_block_height: 1000,
+                block_height_retention: 288,
+                master_generation: 0,
+            }],
+        )];
+        let before_images = vec![(key, vec![BeforeImage::None])];
+
+        let err =
+            compensate_replication_failure(&h.engine, &repl_ops, &before_images, Some(&h.redo_log))
+                .expect_err(
+                    "a spend-compensation read failure must return Err so the intent stays pending",
+                );
+        assert!(
+            err.contains("slot read failed"),
+            "the error must name the read failure, got: {err}",
+        );
+    }
+
+    #[test]
+    fn c27_unspend_compensation_emits_spend_v2_with_hash() {
+        // C27-residual: reversing an unspend (re-spend) must journal the
+        // hash-guarded SpendV2 for symmetry with the live spend path. The
+        // legacy hash-less `RedoOp::Spend` replays with utxo_hash=None and so
+        // lacks the V3 identity guard — recovery would re-mark a slot SPENT
+        // even after it was reassigned to a new hash.
+        let h = CompensationCrashHarness::new();
+        let (key, _spending_data) = h.seed_record_and_spend([0xC7; 32]);
+        let slot_hash = h.engine.read_slot(&key, 0).expect("slot exists").hash;
+
+        let repl_ops = vec![(
+            key,
+            vec![ReplicaOp::Unspend {
+                tx_key: key,
+                offset: 0,
+                spending_data: [0u8; 36],
+                current_block_height: 1000,
+                block_height_retention: 288,
+                master_generation: 4,
+            }],
+        )];
+        let before_images = vec![(key, vec![BeforeImage::None])];
+
+        let comp_range =
+            compensate_replication_failure(&h.engine, &repl_ops, &before_images, Some(&h.redo_log))
+                .expect("compensation completes")
+                .expect("reverse-unspend must emit a compensating re-spend redo entry");
+
+        let entries = h
+            .redo_log
+            .lock()
+            .read_from_sequence(comp_range.0)
+            .expect("read comp redo");
+        let comp: Vec<_> = entries
+            .into_iter()
+            .filter(|e| e.sequence >= comp_range.0 && e.sequence <= comp_range.1)
+            .collect();
+
+        let found_v2 = comp.iter().any(|e| {
+            matches!(&e.op,
+                RedoOp::SpendV2 { tx_key, offset: 0, utxo_hash: Some(hh), .. }
+                    if *tx_key == key && *hh == slot_hash)
+        });
+        assert!(
+            found_v2,
+            "reverse-unspend must journal SpendV2 carrying the utxo_hash, got: {:?}",
+            comp.iter().map(|e| &e.op).collect::<Vec<_>>(),
+        );
+        assert!(
+            !comp.iter().any(|e| matches!(&e.op, RedoOp::Spend { .. })),
+            "must NOT re-emit the legacy hash-less RedoOp::Spend",
         );
     }
 

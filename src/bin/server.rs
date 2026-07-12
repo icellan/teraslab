@@ -1877,6 +1877,11 @@ fn main() {
             // Stash for the runtime lag monitor (spawned after this block).
             catchup_ctx = Some(ctx.clone());
 
+            // G12: snapshot the topology's EXPECTED replica set so the startup
+            // pass catches up a replica the master has never ACKed (no tracker
+            // entry) rather than no-opping on an empty tracker.
+            let expected_replicas = running.expected_replica_addrs();
+
             std::thread::spawn(move || {
                 // Use the process-wide ACK tracker installed by
                 // `init_ack_tracker` above — constructing a second
@@ -1886,9 +1891,6 @@ fn main() {
                     None => return,
                 };
                 let all_acked = tracker.all_acked();
-                if all_acked.is_empty() {
-                    return; // No known replicas yet
-                }
 
                 let current_seq = ctx
                     .redo_log
@@ -1896,10 +1898,14 @@ fn main() {
                     .map(|rl| rl.lock().current_sequence())
                     .unwrap_or(0);
 
-                for (addr, last_acked) in &all_acked {
-                    if *last_acked >= current_seq {
-                        continue; // Already caught up
-                    }
+                // G12: drive the UNION of tracker-known and expected replicas.
+                // An expected-but-absent replica gets from_seq = 0 + 1 = 1.
+                let targets = teraslab::server::dispatch::startup_catchup_targets(
+                    &all_acked,
+                    &expected_replicas,
+                    current_seq,
+                );
+                for (addr, last_acked) in targets {
                     tracing::info!(
                         %addr,
                         lag = current_seq - last_acked,
@@ -1909,7 +1915,7 @@ fn main() {
                     run_one_catchup_pass(
                         &ctx,
                         tracker,
-                        *addr,
+                        addr,
                         last_acked + 1,
                         current_seq,
                         10_000, // max_ops_per_pass
@@ -2049,16 +2055,32 @@ fn main() {
         // validation (validate_sizes) already checked the ranges/ordering.
         cfg.defrag = config.storage.defrag.clone();
         if let Some(tracker) = teraslab::server::dispatch::ack_tracker_handle() {
+            let cluster_for_reset = cluster.clone();
             let reset_guard: std::sync::Arc<dyn Fn(u64) -> bool + Send + Sync + 'static> =
                 std::sync::Arc::new(move |floor_sequence| {
-                    let all = tracker.all_acked();
-                    let min_acked = all.values().copied().min().unwrap_or(floor_sequence);
+                    let acked = tracker.all_acked();
+                    // C3: seed the reclaim denominator from the topology's
+                    // EXPECTED replica set, not just the replicas already
+                    // present in the ACK tracker. An empty/partial tracker with
+                    // an expected-but-unacked replica yields min_acked = 0 and
+                    // blocks the reclaim, so we never erase a redo prefix a
+                    // replica still needs.
+                    let expected = cluster_for_reset
+                        .as_ref()
+                        .map(|c| c.expected_replica_addrs())
+                        .unwrap_or_default();
+                    let min_acked = teraslab::server::dispatch::min_acked_over_expected(
+                        &acked,
+                        &expected,
+                        floor_sequence,
+                    );
                     let can_reset = min_acked >= floor_sequence;
                     if !can_reset {
                         tracing::warn!(
                             floor_sequence,
                             min_acked,
-                            replicas = all.len(),
+                            expected_replicas = expected.len(),
+                            acked_replicas = acked.len(),
                             "checkpoint reset deferred until replicas catch up",
                         );
                     }

@@ -8137,6 +8137,21 @@ impl ResyncSenderHandle {
             .send(crate::replication::manager::ResyncRequest { node_id, shards })
             .is_ok()
     }
+
+    /// C2 — post a `ResyncRequest` directly for a known `NodeId`, without an
+    /// address round-trip. Used by pending-intent recovery, which already
+    /// knows the replica `NodeId`s of a reclaimed range's shards from the
+    /// shard table. `shards` empty means "every shard the named replica
+    /// should hold per the current shard table". Returns `true` on
+    /// successful queue, `false` when the receiver has been dropped.
+    pub fn signal_for_node(&self, node_id: NodeId, shards: Vec<u16>) -> bool {
+        self.tx
+            .send(crate::replication::manager::ResyncRequest {
+                node_id: node_id.0,
+                shards,
+            })
+            .is_ok()
+    }
 }
 
 /// Phase I — snapshot of this node's readiness for client traffic.
@@ -8886,6 +8901,46 @@ impl RunningCluster {
             .read()
             .iter()
             .find_map(|(id, a)| if a == addr { Some(*id) } else { None })
+    }
+
+    /// C3/G12: the socket addresses of every replica this node is expected
+    /// to keep in sync — the union, over all shards this node currently
+    /// masters, of the shards' replica `NodeId`s resolved through the
+    /// committed address map. `self` is excluded.
+    ///
+    /// The redo-log reset guard and the startup catch-up pass seed their
+    /// "who must have acked before we reclaim / who must be caught up"
+    /// denominator from this set, so an expected-but-absent replica blocks a
+    /// reclaim (C3) and still receives a catch-up pass (G12) even when the
+    /// ACK tracker has no entry for it yet.
+    ///
+    /// Uses the effective (currently-serving) assignment so a shard still in
+    /// handoff is attributed to its serving master. Replica `NodeId`s that do
+    /// not (yet) resolve to an address are omitted — the tracker is keyed by
+    /// address, so an unresolvable node could never have an ACK entry to
+    /// compare against, and including it would only risk pinning the log on a
+    /// node that has been permanently removed.
+    pub fn expected_replica_addrs(&self) -> Vec<SocketAddr> {
+        // Snapshot the address map first (and drop its lock) so we never hold
+        // it while iterating the shard table.
+        let addrs = self.node_addrs.read().clone();
+        let table = self.shard_table.read();
+        let mut out: std::collections::BTreeSet<SocketAddr> = std::collections::BTreeSet::new();
+        for shard in 0..NUM_SHARDS as u16 {
+            let assignment = table.assignment(shard);
+            if assignment.master != self.self_id {
+                continue;
+            }
+            for replica in &assignment.replicas {
+                if *replica == self.self_id {
+                    continue;
+                }
+                if let Some(addr) = addrs.get(replica) {
+                    out.insert(*addr);
+                }
+            }
+        }
+        out.into_iter().collect()
     }
 
     /// Is `ip` the address of a known cluster peer (or self)?
