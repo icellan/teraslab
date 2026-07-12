@@ -4745,58 +4745,42 @@ impl ShardRecency {
     }
 }
 
-/// Conservative "does THIS node hold a superset of `replica`'s shard manifest?"
-/// approximation from recency alone, for the Phase-1 detector where a full
-/// network manifest confirm is not run.
-///
-/// Returns `true` (this node is a superset ⇒ NOT stale vs `replica`) when this
-/// node's max generation is at-or-ahead of the replica's AND its record count
-/// is at least the replica's — the two signals a behind/subset replica always
-/// satisfies. It is deliberately conservative: it may return `false`
-/// (→ SUSPECT) on a divergence a full manifest confirm would clear, but it
-/// NEVER returns `true` for a replica strictly ahead in generation, so the
-/// "never heal FROM a behind node" invariant holds. The authoritative reverse
-/// `confirm_target_holds_superset` manifest exchange replaces it in the
-/// Phase-2 heal path.
-pub fn recency_indicates_superset(self_recency: ShardRecency, replica: ShardRecency) -> bool {
-    crate::record::generation_at_or_ahead(self_recency.max_generation, replica.max_generation)
-        && self_recency.count >= replica.count
-}
-
-/// Reverse-heal Tier-2 (finding C1): is a mastered shard stale on THIS node
-/// relative to its live replicas?
+/// Reverse-heal Tier-2 (finding C1): does a mastered shard on THIS node DIVERGE
+/// from any of its live replicas — making it a candidate for a Phase-2 manifest
+/// exchange?
 ///
 /// `self_recency` is this node's recency for the shard. `replica_recencies` is
-/// the recency each live replica of the shard reported (the caller filters to
-/// the shard's committed replica set). `self_holds_superset_of` is the
-/// containment probe: given a replica's recency it returns `true` iff this node
-/// holds a SUPERSET of that replica's shard manifest. In production it is
-/// backed by the reverse `confirm_target_holds_superset` manifest exchange; the
-/// Phase-1 detector passes the cheap [`recency_indicates_superset`]
-/// approximation.
+/// the recency each live (committed) replica of the shard reported (the caller
+/// filters to the shard's committed replica set). The shard is flagged SUSPECT
+/// iff ANY replica's manifest digest differs from this node's.
 ///
-/// # Safety invariant — "never heal FROM a behind node"
+/// # Phase-1 semantics — DIFFERENCE, not DIRECTION
 ///
-/// The result flags stale ONLY when some replica's digest differs from this
-/// node's AND this node does NOT hold a superset of that replica. A replica
-/// that is itself behind (a subset of this node) satisfies
-/// `self_holds_superset_of == true`, so a lower-generation / behind peer can
-/// NEVER make this node think it is stale — it takes a replica that
-/// demonstrably holds state this node lacks. A digest match short-circuits to
-/// "not stale" (identical shard state), so the probe runs only on a genuine
-/// divergence. An empty `replica_recencies` can never flag stale (nothing to
-/// heal from).
-pub fn is_shard_stale_vs_replicas<F>(
+/// A digest mismatch proves the two shard images are not identical, but NOT
+/// which side is ahead. A shard's `max_generation` is a max over independent
+/// per-record generation counters, so it is BLIND to divergence on any sub-max
+/// record, and `count` conflates "newer" with "different set" — the pre-fix
+/// `recency_indicates_superset` (`gen_at_or_ahead && count>=count`) suppressed a
+/// real stale flag in the normal spend-churn regime (steady spends keep the
+/// count flat and churn sub-max generations). The ONLY sound suppression at
+/// shard granularity is digest EQUALITY: identical images cannot hide a lost
+/// write. So Phase 1 flags SUSPECT on ANY digest mismatch and defers the
+/// DIRECTION question (who is actually ahead) to the Phase-2 per-record manifest
+/// exchange.
+///
+/// This deliberately OVER-flags on ordinary replication lag — a behind replica
+/// also trips it. That is safe: detection is log + meter only and never fences
+/// or pulls. The "never heal FROM a behind node" invariant is a Phase-2 HEALING
+/// property, enforced by the authoritative, generation-aware, tombstone-aware
+/// `confirm_target_holds_superset` manifest exchange — NOT a Phase-1 detection
+/// property. An empty `replica_recencies`, or all-matching digests, never flags.
+pub fn is_shard_stale_vs_replicas(
     self_recency: ShardRecency,
     replica_recencies: &[ShardRecency],
-    mut self_holds_superset_of: F,
-) -> bool
-where
-    F: FnMut(ShardRecency) -> bool,
-{
+) -> bool {
     replica_recencies
         .iter()
-        .any(|&replica| replica.digest != self_recency.digest && !self_holds_superset_of(replica))
+        .any(|replica| replica.digest != self_recency.digest)
 }
 
 /// Reverse-heal Tier-2 composition: the set of shards this node masters that
@@ -4804,14 +4788,15 @@ where
 ///
 /// For each shard `self_id` masters in `shard_table`, this reads self's recency
 /// and every committed replica's reported recency out of the partition view and
-/// runs [`is_shard_stale_vs_replicas`] with the Phase-1
-/// [`recency_indicates_superset`] predicate. Detection only — the returned
-/// shards are logged + metered by the caller; Phase 1 neither fences nor pulls.
+/// runs [`is_shard_stale_vs_replicas`], flagging the shard SUSPECT on ANY
+/// replica digest mismatch. Detection only — the returned shards are logged +
+/// metered by the caller; Phase 1 neither fences nor pulls.
 ///
-/// Note on quorum: Phase 1 flags SUSPECT from any single ahead replica (safe,
-/// since the superset predicate still forbids healing from a behind node).
-/// Quorum-corroboration of the heal *source* is a Phase-3 concern
-/// (`elect_master` recency) and does not gate a detection-only flag.
+/// Note on direction: a digest mismatch flags SUSPECT regardless of which side
+/// is ahead (Phase 1 cannot soundly tell — see [`is_shard_stale_vs_replicas`]).
+/// The over-flag on a behind replica is safe because detection never heals; the
+/// Phase-2 manifest exchange determines direction and enforces
+/// never-heal-from-behind and delete-safety before any pull.
 pub(crate) fn detect_stale_shards_from_view(
     self_id: NodeId,
     shard_table: &ShardTable,
@@ -4844,9 +4829,7 @@ pub(crate) fn detect_stale_shards_from_view(
             .filter(|r| **r != self_id)
             .filter_map(|r| recency_of(*r, shard))
             .collect();
-        if is_shard_stale_vs_replicas(self_recency, &replica_recencies, |replica| {
-            recency_indicates_superset(self_recency, replica)
-        }) {
+        if is_shard_stale_vs_replicas(self_recency, &replica_recencies) {
             stale.push(shard);
         }
     }
@@ -18463,8 +18446,7 @@ mod tests {
         );
 
         // Tier-2 is the backstop: a live replica reports a shard whose digest
-        // differs AND whose generation is strictly ahead of this node's, and
-        // this node does NOT hold a superset of it → stale detected.
+        // differs from this node's → SUSPECT, catching the gap Tier-1 missed.
         let self_recency = ShardRecency {
             count: 5,
             digest: 0xAAAA,
@@ -18475,78 +18457,100 @@ mod tests {
             digest: 0xBBBB,
             max_generation: 101,
         };
-        let stale = is_shard_stale_vs_replicas(self_recency, &[replica_recency], |r| {
-            recency_indicates_superset(self_recency, r)
-        });
+        let stale = is_shard_stale_vs_replicas(self_recency, &[replica_recency]);
         assert!(stale, "Tier-2 catches the gap Tier-1 missed");
     }
 
-    /// Reverse-heal Phase 1 safety invariant ("never heal FROM a behind
-    /// node"): a replica with a DIFFERENT digest but strictly BEHIND generation
-    /// must NOT make this node think it is stale, and a digest match
-    /// short-circuits to not-stale regardless of the probe.
+    /// Reverse-heal Phase 1 (P1-2, the case the pre-fix code MISSED): the
+    /// sub-max-divergence false negative. Self and a quorum-current replica
+    /// report the SAME `max_generation` and SAME live count, but DIFFERENT
+    /// digests — the replica applied a spend of a sub-max record this node lost.
+    /// This is the NORMAL UTXO spend-churn regime (steady spends keep the count
+    /// flat and churn sub-max generations). The old `recency_indicates_superset`
+    /// heuristic (`gen_at_or_ahead(10,10) && 2>=2` = true) suppressed the flag;
+    /// digest EQUALITY is the only sound suppression, so a divergent digest MUST
+    /// flag SUSPECT.
     #[test]
-    fn is_shard_stale_never_flags_from_a_behind_replica() {
+    fn tier2_flags_suspect_on_any_digest_mismatch_with_quorum_replica() {
         let self_recency = ShardRecency {
-            count: 10,
-            digest: 0x1111,
-            max_generation: 200,
+            count: 2,
+            digest: 0xA1A1,
+            max_generation: 10,
         };
-
-        let behind_replica = ShardRecency {
-            count: 8,
-            digest: 0x2222,
-            max_generation: 150,
-        };
-        assert!(
-            !is_shard_stale_vs_replicas(self_recency, &[behind_replica], |r| {
-                recency_indicates_superset(self_recency, r)
-            }),
-            "a behind replica's differing digest must not flag this node stale",
-        );
-
-        let same_state = ShardRecency {
-            count: 10,
-            digest: 0x1111,
-            max_generation: 200,
+        let replica_recency = ShardRecency {
+            count: 2,
+            digest: 0xB2B2,
+            max_generation: 10,
         };
         assert!(
-            !is_shard_stale_vs_replicas(self_recency, &[same_state], |_| false),
-            "a digest match short-circuits to not-stale regardless of the probe",
+            is_shard_stale_vs_replicas(self_recency, &[replica_recency]),
+            "same max_gen + count but divergent digest must flag SUSPECT",
         );
     }
 
-    /// Reverse-heal Phase 1 NEGATIVE: a node with no ahead replica (empty set,
-    /// or all replicas matching) does not fire the Tier-2 detector.
+    /// Reverse-heal Phase 1 (P1-3): a strictly-BEHIND replica whose digest
+    /// differs (e.g. self applied a delete the laggard has not) IS flagged
+    /// SUSPECT. Phase 1 cannot soundly tell direction at shard granularity, so
+    /// it flags any divergence — an intentional, SAFE over-flag: detection only
+    /// logs + meters, never heals. The Phase-2 per-record manifest exchange
+    /// determines DIRECTION and is generation-/tombstone-aware, so it enforces
+    /// never-heal-from-behind and prevents the delete-resurrection hazard the
+    /// pre-fix code's false "self is stale" verdict would have set up.
     #[test]
-    fn is_shard_stale_clean_when_no_replica_is_ahead() {
+    fn tier2_flags_suspect_even_from_a_behind_replica_delete_divergence() {
+        // Self applied a delete of B → {A gen5}; the laggard still has
+        // {A gen5, B gen3}. Digest differs, laggard is strictly behind.
+        let self_recency = ShardRecency {
+            count: 1,
+            digest: 0x1111,
+            max_generation: 5,
+        };
+        let behind_replica = ShardRecency {
+            count: 2,
+            digest: 0x2222,
+            max_generation: 5,
+        };
+        assert!(
+            is_shard_stale_vs_replicas(self_recency, &[behind_replica]),
+            "a behind replica's differing digest flags SUSPECT (safe over-flag; \
+             Phase-2 direction determination prevents the actual resurrection)",
+        );
+    }
+
+    /// Reverse-heal Phase 1 NEGATIVE: digest EQUALITY is the sound suppression.
+    /// An empty replica set, or replicas whose digests all match this node's,
+    /// never fires the Tier-2 detector — regardless of any max_gen/count skew.
+    #[test]
+    fn tier2_does_not_flag_when_digest_matches() {
         let self_recency = ShardRecency {
             count: 3,
             digest: 0xF00D,
             max_generation: 42,
         };
         assert!(
-            !is_shard_stale_vs_replicas(self_recency, &[], |_| false),
+            !is_shard_stale_vs_replicas(self_recency, &[]),
             "no replicas → detector does not fire",
         );
-        let identical = ShardRecency {
-            count: 3,
+        // Identical digest but DELIBERATELY skewed count/max_gen: equality of the
+        // digest alone must suppress, proving the fix no longer leans on the
+        // unsound (max_gen, count) direction signals.
+        let matching_digest = ShardRecency {
+            count: 99,
             digest: 0xF00D,
-            max_generation: 42,
+            max_generation: 7,
         };
         assert!(
-            !is_shard_stale_vs_replicas(self_recency, &[identical, identical], |r| {
-                recency_indicates_superset(self_recency, r)
-            }),
-            "identical replicas → detector does not fire",
+            !is_shard_stale_vs_replicas(self_recency, &[matching_digest, matching_digest]),
+            "matching digests → detector does not fire even with count/gen skew",
         );
     }
 
     /// Reverse-heal Phase 1 composition: `detect_stale_shards_from_view` flags
-    /// exactly the mastered shards whose replicas are ahead, leaving
-    /// unmastered and healthy shards alone.
+    /// exactly the mastered shards whose replicas report a DIVERGENT digest
+    /// (either direction), suppresses on digest EQUALITY, and never flags a
+    /// shard this node does not master.
     #[test]
-    fn detect_stale_shards_from_view_flags_only_ahead_mastered_shards() {
+    fn detect_stale_shards_from_view_flags_mastered_divergent_shards() {
         let members = [NodeId(1), NodeId(2), NodeId(3)];
         let table = ShardTable::compute_with_epoch(&members, 2, 1, 1);
 
@@ -18590,16 +18594,28 @@ mod tests {
         assert_eq!(
             stale,
             vec![shard],
-            "only the ahead-replica mastered shard is flagged"
+            "the divergent-digest mastered shard is flagged"
         );
 
-        // A node that masters this shard but whose replica is BEHIND is clean.
+        // A strictly-BEHIND replica whose digest STILL differs is ALSO flagged
+        // SUSPECT: Phase 1 cannot tell direction, so it over-flags safely (the
+        // Phase-2 exchange determines direction before any heal).
         view.get_mut(&replica).unwrap()[0].max_generation = 50;
         view.get_mut(&replica).unwrap()[0].last_applied_seq = 1;
+        let behind_divergent = detect_stale_shards_from_view(NodeId(1), &table, &view);
+        assert_eq!(
+            behind_divergent,
+            vec![shard],
+            "a behind replica with a divergent digest is flagged SUSPECT (safe over-flag)",
+        );
+
+        // Digest EQUALITY is the only sound suppression: matching digest → clean
+        // even though the replica's count/max_gen still skew.
+        view.get_mut(&replica).unwrap()[0].manifest_digest = 0xAAAA;
         let clean = detect_stale_shards_from_view(NodeId(1), &table, &view);
         assert!(
             clean.is_empty(),
-            "a behind replica must not flag the mastered shard stale",
+            "a replica whose digest matches must not flag the mastered shard stale",
         );
 
         // A non-master (NodeId(2) for a shard N1 masters) is never flagged.
