@@ -675,6 +675,14 @@ fn main() {
         tracing::error!(err = %e, "FATAL: invalid config");
         std::process::exit(1);
     }
+    // Durability-framed signpost for a best-effort replication posture at
+    // RF > 1. The same combination is a hard error in validate_cluster_safety
+    // below; emitting this first gives the operator the "why it is unsafe"
+    // context ahead of the fatal (and covers programmatic embedders that skip
+    // this validation chain).
+    if let Some(warning) = config.durability_warning() {
+        tracing::warn!(warning = %warning, "replication durability degraded");
+    }
     if let Err(e) = config.validate_cluster_safety() {
         tracing::error!(err = %e, "FATAL: unsafe cluster config");
         std::process::exit(1);

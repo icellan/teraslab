@@ -1912,6 +1912,58 @@ impl ServerConfig {
         self.replication_degraded_mode == "best_effort"
     }
 
+    /// A startup durability warning when the operator has opted into a
+    /// best-effort replication posture at a replication factor that implies
+    /// replicas (`RF > 1`), and `None` under the safe default.
+    ///
+    /// Either best-effort knob lets a mutation be acknowledged to the client
+    /// without a replica ACK, so an acked write can be lost if the master
+    /// crashes before replicas catch up:
+    ///
+    /// - `ack_policy = "best_effort"` — disables replica-ACK enforcement, so a
+    ///   write is acked with zero durable replicas.
+    /// - `replication_degraded_mode = "best_effort"` — on replica-ACK failure
+    ///   the client still receives success.
+    ///
+    /// The default (`ack_policy` other than `"best_effort"` AND
+    /// `replication_degraded_mode = "reject"`) returns `None`. `RF <= 1` also
+    /// returns `None`: with no replicas the best-effort knobs are a no-op.
+    ///
+    /// # Relationship to [`Self::validate_cluster_safety`]
+    ///
+    /// The very same `RF > 1` + best-effort combinations are ALSO a hard
+    /// startup error in [`Self::validate_cluster_safety`], so a CLI-launched
+    /// server never actually runs in this posture. This warning is the
+    /// durability-framed signpost emitted BEFORE that fatal (so an operator
+    /// sees *why* the config is unsafe, not just *that* it is rejected) and a
+    /// guard for programmatic embedders that construct a [`ServerConfig`] and
+    /// consult [`Self::resolved_ack_policy`] without running the cluster-safety
+    /// validation chain.
+    pub fn durability_warning(&self) -> Option<String> {
+        if self.replication_factor <= 1 {
+            return None;
+        }
+        let ack_best_effort = self.ack_policy == "best_effort";
+        let degraded_best_effort = self.replication_degraded_mode == "best_effort";
+        if !ack_best_effort && !degraded_best_effort {
+            return None;
+        }
+        let knob = match (ack_best_effort, degraded_best_effort) {
+            (true, true) => "ack_policy and replication_degraded_mode are both \"best_effort\"",
+            (true, false) => "ack_policy = \"best_effort\"",
+            (false, true) => "replication_degraded_mode = \"best_effort\"",
+            (false, false) => unreachable!("guarded above"),
+        };
+        Some(format!(
+            "{knob} with replication_factor = {rf} (> 1): acknowledged writes may be \
+             confirmed to the client WITHOUT a durable replica ACK and can be lost if the \
+             master crashes before replicas catch up. This is not replica-durable; use \
+             ack_policy = \"auto\"/\"write_all\"/\"write_majority\" with \
+             replication_degraded_mode = \"reject\" for single-node-failure durability.",
+            rf = self.replication_factor,
+        ))
+    }
+
     /// Validate cluster durability settings against the server safety contract.
     ///
     /// Rejects `replication_degraded_mode = "best_effort"` when the configured
@@ -2749,6 +2801,78 @@ backend = ""
         assert!(err.contains("ack_policy"), "error was: {err}");
         assert!(err.contains("best_effort"), "error was: {err}");
         assert!(err.contains("replication_factor = 3"), "error was: {err}");
+    }
+
+    #[test]
+    fn durability_warning_fires_for_best_effort_at_rf_gt_1() {
+        // ack_policy = best_effort at RF>1 → warning surfaces the 0-ACK risk.
+        let cfg = ServerConfig {
+            replication_factor: 3,
+            ack_policy: "best_effort".to_string(),
+            replication_degraded_mode: "reject".to_string(),
+            ..ServerConfig::default()
+        };
+        let warning = cfg
+            .durability_warning()
+            .expect("ack_policy=best_effort + RF=3 must warn");
+        assert!(warning.contains("ack_policy"), "warning was: {warning}");
+        assert!(
+            warning.contains("replication_factor = 3"),
+            "warning was: {warning}"
+        );
+        assert!(
+            warning.contains("not replica-durable"),
+            "warning must name the durability risk, was: {warning}"
+        );
+
+        // replication_degraded_mode = best_effort at RF>1 also warns.
+        let cfg = ServerConfig {
+            replication_factor: 2,
+            ack_policy: "auto".to_string(),
+            replication_degraded_mode: "best_effort".to_string(),
+            ..ServerConfig::default()
+        };
+        let warning = cfg
+            .durability_warning()
+            .expect("replication_degraded_mode=best_effort + RF=2 must warn");
+        assert!(
+            warning.contains("replication_degraded_mode"),
+            "warning was: {warning}"
+        );
+        assert!(
+            warning.contains("replication_factor = 2"),
+            "warning was: {warning}"
+        );
+    }
+
+    #[test]
+    fn durability_warning_silent_for_default_and_rf_1() {
+        // DEFAULT (reject + auto) at RF>1 is the safe posture — no warning.
+        let cfg = ServerConfig {
+            replication_factor: 3,
+            ..ServerConfig::default()
+        };
+        assert_eq!(cfg.ack_policy, "auto", "guard: default ack_policy");
+        assert_eq!(
+            cfg.replication_degraded_mode, "reject",
+            "guard: default degraded mode"
+        );
+        assert!(
+            cfg.durability_warning().is_none(),
+            "the default reject/auto posture must not warn"
+        );
+
+        // RF=1 best_effort is a no-op (no replicas) → no warning.
+        let cfg = ServerConfig {
+            replication_factor: 1,
+            ack_policy: "best_effort".to_string(),
+            replication_degraded_mode: "best_effort".to_string(),
+            ..ServerConfig::default()
+        };
+        assert!(
+            cfg.durability_warning().is_none(),
+            "RF=1 best_effort has no replicas to lose, so it must not warn"
+        );
     }
 
     #[test]
