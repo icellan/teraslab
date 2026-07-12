@@ -208,11 +208,13 @@ pub(crate) struct ConnectionState {
     pub(crate) stream_idle_timeout: Option<Duration>,
     /// C23: whether the current frame is authorized to honor `FLAG_LOCAL_READ`
     /// (which bypasses the shard-ownership/redirect check on GET). Set per frame
-    /// by the connection loop to `auth_required || cluster_secret.is_none()` —
-    /// true for HMAC-authenticated cluster peers and for trusted-overlay mode,
-    /// false for an arbitrary external client on an auth-enforcing node. Defaults
-    /// to `false` (external client / test double) so the flag is ignored unless
-    /// the connection loop explicitly grants it.
+    /// by the connection loop to `auth_required || cluster_secret.is_none()`.
+    /// Because GET is not an inter-node auth opcode, `auth_required` is always
+    /// false for the frames that read this flag, so it is effectively
+    /// `cluster_secret.is_none()`: honored only in trusted-overlay mode, disabled
+    /// for all clients on any `cluster_secret`-configured node. Defaults to
+    /// `false` (external client / test double) so the flag is ignored unless the
+    /// connection loop explicitly grants it.
     pub(crate) local_read_authorized: bool,
 }
 
@@ -1271,12 +1273,23 @@ fn handle_connection_inner(
         // ops and authenticated inter-node frames take a drain barrier and run
         // inline against `conn_state`, so their semantics are unchanged.
         // C23: a GET's FLAG_LOCAL_READ (bypass shard ownership + read locally)
-        // is honored only for a frame the transport authenticated as a cluster
-        // peer (`auth_required`) or on a trusted-overlay node (no
-        // `cluster_secret`, the fail-open default). An arbitrary external client
-        // on an auth-enforcing node must NOT be able to set the flag to read a
-        // shard it does not own, so its flag is ignored and it falls through to
+        // must NOT be settable by an arbitrary external client on an
+        // auth-enforcing node — that is exactly the shard-bypass this gate
+        // closes; the flag is ignored for such clients and they fall through to
         // the normal ownership/redirect path.
+        //
+        // NOTE on the effective rule: `auth_required` is
+        // `is_inter_node_auth_opcode(op) && cluster_secret.is_some()`, and GET
+        // (the ONLY opcode that reads FLAG_LOCAL_READ) is NOT an inter-node auth
+        // opcode — so for every GET frame `auth_required` is always false and
+        // this collapses to `cluster_secret.is_none()`. In practice
+        // FLAG_LOCAL_READ is therefore honored ONLY in trusted-overlay mode (no
+        // `cluster_secret`); on ANY `cluster_secret`-configured node it is
+        // disabled for all clients (a GET is never HMAC-authenticated as an
+        // inter-node frame). The `auth_required` disjunct is kept as the correct
+        // general rule, but re-enabling local reads for authenticated peers
+        // would require adding GET to the inter-node auth set — deliberately NOT
+        // done, since that would reopen the client-forced-local-read hole.
         let local_read_authorized = auth_required || opts.cluster_secret.is_none();
         if pipelining && is_pipelineable(&request, auth_required) {
             // Reserve a per-connection slot (backpressure to `depth`) then hand

@@ -2442,11 +2442,22 @@ pub(crate) fn build_replication_targets(
     let mut addr_nodes: HashMap<SocketAddr, NodeId> = HashMap::new();
     // C31: `dual_write_targets_for_shard` takes the migration lock and allocates
     // a Vec on every call. It was invoked once PER KEY in this loop — N lock
-    // acquisitions + N allocations for an N-key batch. The batch runs under the
-    // per-key visibility guard, so migration state cannot change mid-batch;
-    // memoize the lookup per DISTINCT shard so the migration lock is taken at
-    // most once per shard the batch touches (once total for a same-shard batch),
-    // with byte-identical per-key results.
+    // acquisitions + N allocations for an N-key batch. Memoize the lookup per
+    // DISTINCT shard so the migration lock is taken at most once per shard the
+    // batch touches (once total for a same-shard batch), with byte-identical
+    // per-key results.
+    //
+    // Safety of a per-shard memo (NOT the visibility guard — that locks records,
+    // not migration state): the quorum-bearing targets come from
+    // `table_guard.target_assignment(shard)` under the `table.read()` lock held
+    // for the whole loop below, so the shard assignment is frozen (a migration
+    // *completion* needs `table.write()` and cannot commit mid-loop). Only the
+    // dual-write EXTRAS are memoized, and dual-write is explicitly best-effort:
+    // a too-few memo is covered by the migration stream, a too-many memo is
+    // deduped against the frozen assignment and otherwise idempotently applied +
+    // orphan-cleaned. So even a migration-window flip between two keys of a
+    // same-shard batch stays within the pre-existing plan-vs-send tolerance and
+    // cannot mis-route a quorum-bearing write.
     let mut dual_write_by_shard: HashMap<u16, Vec<NodeId>> = HashMap::new();
 
     for (key, ops) in ops_by_key {
@@ -9632,9 +9643,11 @@ fn handle_get_batch(
     max_batch: u32,
     cluster: Option<&RunningCluster>,
     // C23: whether this frame is authorized to honor FLAG_LOCAL_READ. Computed
-    // once per frame in the connection loop: true for HMAC-authenticated cluster
-    // peers and for trusted-overlay mode (no `cluster_secret`); false for an
-    // arbitrary external client on an auth-enforcing node.
+    // once per frame in the connection loop as `auth_required ||
+    // cluster_secret.is_none()`. GET is not an inter-node auth opcode, so
+    // `auth_required` is always false here and this is effectively
+    // `cluster_secret.is_none()`: honored only in trusted-overlay mode, disabled
+    // for every client on an auth-enforcing (`cluster_secret`) node.
     local_read_authorized: bool,
 ) -> ResponseFrame {
     let (field_mask, txids) = match decode_get_batch_checked(&req.payload, max_batch) {
@@ -9651,9 +9664,10 @@ fn handle_get_batch(
     let _visibility_guard = engine.visibility().read(&vis_keys);
 
     // C23: FLAG_LOCAL_READ bypasses the shard-ownership/redirect check, so it is
-    // honored ONLY when the frame is authorized (authenticated cluster peer, or
-    // trusted-overlay mode). An arbitrary external client that sets the flag is
-    // ignored and falls through to the normal ownership/redirect path.
+    // honored ONLY when the frame is authorized. In practice (see
+    // `local_read_authorized`) that means trusted-overlay mode only; an external
+    // client on an auth-enforcing node is ignored and falls through to the
+    // normal ownership/redirect path.
     let local_read = local_read_authorized && (req.flags & FLAG_LOCAL_READ != 0);
 
     // P1-3: hoist the shard-master lookup to ONE lock acquisition for the whole
@@ -10523,8 +10537,9 @@ fn handle_get_spend_batch(
     let vis_keys: Vec<TxKey> = items.iter().map(|i| TxKey { txid: i.txid }).collect();
     let _visibility_guard = engine.visibility().read(&vis_keys);
 
-    // C23: honor FLAG_LOCAL_READ only for authorized (cluster-auth / trusted-
-    // overlay) callers; an external client's flag is ignored.
+    // C23: honor FLAG_LOCAL_READ only for authorized callers (in practice
+    // trusted-overlay mode only — see `handle_get_batch` / `local_read_authorized`);
+    // an external client's flag on an auth-enforcing node is ignored.
     let local_read = local_read_authorized && (req.flags & FLAG_LOCAL_READ != 0);
 
     let results: Vec<WireGetSpendResult> = match (items.len() >= READ_FANOUT_THRESHOLD)
@@ -18507,9 +18522,9 @@ mod tests {
 
     /// C23: `FLAG_LOCAL_READ` bypasses the shard-ownership/redirect check and
     /// reads the record locally. An arbitrary external client must NOT be able
-    /// to set it to read a shard this node does not own — only a caller the
-    /// transport authorized (authenticated cluster peer, or trusted-overlay
-    /// mode) may. This pins that gate at the GET handler: an unauthorized
+    /// to set it to read a shard this node does not own — only an authorized
+    /// caller (in production: trusted-overlay mode, i.e. no `cluster_secret`)
+    /// may. This pins that gate at the GET handler: an unauthorized
     /// caller's flag is ignored (→ REDIRECT), an authorized caller's is honored
     /// (→ local read).
     #[test]
