@@ -1708,9 +1708,18 @@ fn main() {
             .topology_epoch
             .store(initial_epoch, std::sync::atomic::Ordering::Relaxed);
         coordinator.topology_authority.restore(&topo_state);
-        if initial_epoch > 0 {
-            coordinator.shard_table.write().version = initial_epoch;
-        }
+        // C6 — reconstruct and install the committed topology's shard table so
+        // a restarting node masters ONLY the shards it actually owns. The
+        // bootstrap table is the single-member `[self]` table (self masters
+        // every shard); stamping its `version` to the committed term would make
+        // the stale-table gate treat it as CURRENT while it still claimed
+        // all-master — an all-master split-brain write window until reactivation
+        // converged. Installing the real committed assignment (from the
+        // membership restored just above) scopes the node correctly at boot,
+        // with no reliance on a later activation. When no committed membership
+        // is recoverable, the bootstrap table is left as-is and the stale-table
+        // gate withholds authority until the first activation.
+        coordinator.install_restored_shard_table();
         let running = coordinator.start(
             engine.clone(),
             Some(cluster_state_path),

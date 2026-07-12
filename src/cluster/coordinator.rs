@@ -1171,6 +1171,53 @@ pub struct ClusterCoordinator {
     topology_debounce: Duration,
 }
 
+/// C6 — reconstruct the shard table for a RESTORED committed topology at boot.
+///
+/// A restarting node's bootstrap shard table is the single-member `[self]`
+/// table, in which `self` masters every shard. Stamping that bare table's
+/// `version` to the committed term T — as the old boot path did — makes the
+/// FU#1 stale-table gate treat it as CURRENT (`version >= committed`) while it
+/// still claims all-master, so `master_snapshot` / `is_master` briefly answer
+/// `Yes` for EVERY shard: an all-master split-brain write window until a fresh
+/// activation converges.
+///
+/// This instead recomputes the REAL per-shard assignment for the committed
+/// topology (via [`ShardTable::compute_with_epoch`], the same pure function a
+/// normal activation installs), so the node masters ONLY the shards it actually
+/// owns — immediately, with no reliance on reactivation. The table carries
+/// `version == committed_term`, so the stale-table gate treats it as current
+/// AND its assignments are correct.
+///
+/// Returns:
+/// - `Some(table)` when a committed multi-/single-node topology is recoverable
+///   (`committed_term > 0` AND a non-empty `committed_members`). The caller
+///   installs it directly (no handoff: the node is restoring the steady-state
+///   view of a topology it already belonged to; its owned data is already on
+///   disk).
+/// - `None` when there is nothing to restore (a fresh node, or a legacy
+///   epoch-only persisted format that predates persisted membership:
+///   `committed_term == 0` or empty `committed_members`). The caller keeps the
+///   single-member bootstrap table (`version == 1`); for any committed term
+///   `> 1` the stale-table gate then WITHHOLDS authority (redirects to the
+///   `NodeId(0)` sentinel) until the first real activation installs membership —
+///   the split-brain-safe fallback (redirect, never all-master).
+pub(crate) fn restored_committed_shard_table(
+    committed_members: &[NodeId],
+    replication_factor: u8,
+    committed_term: u64,
+    placement_version: u16,
+) -> Option<ShardTable> {
+    if committed_term == 0 || committed_members.is_empty() {
+        return None;
+    }
+    Some(ShardTable::compute_with_epoch(
+        committed_members,
+        replication_factor,
+        committed_term,
+        placement_version.max(1),
+    ))
+}
+
 impl ClusterCoordinator {
     /// Create a new coordinator. Does NOT start the SWIM loop yet.
     ///
@@ -1252,6 +1299,36 @@ impl ClusterCoordinator {
             cluster_secret: config.cluster_secret.map(Arc::new),
             activation_hold: Arc::new(AtomicBool::new(false)),
             topology_debounce: config.topology_debounce,
+        }
+    }
+
+    /// C6 — install the RESTORED committed shard table over the bootstrap
+    /// `[self]` table on boot.
+    ///
+    /// Call AFTER [`TopologyAuthority::restore`](crate::cluster::topology::TopologyAuthority::restore)
+    /// (which loads the persisted committed term, membership, and placement
+    /// version) and BEFORE [`start`](Self::start). Reconstructs the committed
+    /// topology's per-shard assignment from the restored authority so this node
+    /// masters ONLY its real shards, rather than stamping the bootstrap
+    /// `[self]` table's `version` to the committed term (which would leave the
+    /// node believing it masters every shard — an all-master split-brain write
+    /// window; see [`restored_committed_shard_table`]).
+    ///
+    /// When no committed topology is recoverable (fresh node, or a legacy
+    /// epoch-only persisted format), the bootstrap table is left untouched; for
+    /// any committed term `> 1` the stale-table gate then withholds authority
+    /// until the first activation installs membership.
+    pub fn install_restored_shard_table(&self) {
+        let committed_term = self.topology_authority.committed_term();
+        let members = self.topology_authority.committed_members();
+        let placement_version = self.topology_authority.committed_placement_version();
+        if let Some(table) = restored_committed_shard_table(
+            &members,
+            self.replication_factor,
+            committed_term,
+            placement_version,
+        ) {
+            *self.shard_table.write() = table;
         }
     }
 
@@ -15495,6 +15572,118 @@ mod tests {
             MasterQueryResult::No,
             "a snapshot whose captured version trails the committed term must \
              redirect conservatively, never trust its frozen masters",
+        );
+    }
+
+    // ── C6: multi-node restart must not claim all-master pre-activation ──
+
+    /// C6 (P0, split-brain hazard) — on a multi-node RESTART, the boot path
+    /// must NOT leave this node believing it masters every shard.
+    ///
+    /// A restarting node's bootstrap shard table is the single-member
+    /// `[self]` table (self masters every shard). The old boot path stamped
+    /// that bare table's `version` to the committed term T, which made the
+    /// stale-table gate (FU#1) treat it as CURRENT (`version >= committed`)
+    /// while it still claimed all-master — so `master_snapshot` / `is_master`
+    /// answered `Yes` for EVERY shard, an all-master split-brain write window
+    /// until reactivation converged.
+    ///
+    /// The fix reconstructs the REAL committed assignment from the persisted
+    /// membership ([`restored_committed_shard_table`]) so the node masters
+    /// ONLY the shards it actually owns, immediately and without waiting for a
+    /// fresh activation. This test asserts: for a committed 3-node topology in
+    /// which `self` owns only SOME shards, right after restore the node
+    /// answers `Yes` for exactly its own shards and `No` (redirect) for the
+    /// peers' — never `Yes` for a shard it does not own.
+    #[test]
+    fn multi_node_restart_does_not_all_master_before_activation() {
+        let committed_members = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let term = 5u64;
+        let rf = 2u8;
+        let pv = 1u16;
+
+        // Reference: the assignment every correct node derives for this term.
+        let reference = ShardTable::compute_with_epoch(&committed_members, rf, term, pv);
+        let self_owned = (0..NUM_SHARDS as u16)
+            .filter(|&s| reference.target_assignment(s).master == NodeId(1))
+            .count();
+        assert!(
+            self_owned > 0 && self_owned < NUM_SHARDS,
+            "committed topology must split shards across peers for this test to \
+             be meaningful (self owns {self_owned}/{NUM_SHARDS})",
+        );
+
+        // C6 boot: install the RESTORED committed table — not the `[self]`
+        // bootstrap table stamped to the committed term (the old bug).
+        let boot_table = restored_committed_shard_table(&committed_members, rf, term, pv)
+            .expect("multi-node committed membership yields a restored table");
+        assert_eq!(
+            boot_table.version, term,
+            "restored table must carry the committed term so it is not treated as stale",
+        );
+
+        let cluster = new_test_running_cluster(
+            NodeId(1),
+            boot_table,
+            &[
+                (NodeId(1), "127.0.0.1:4901".parse().unwrap()),
+                (NodeId(2), "127.0.0.1:4902".parse().unwrap()),
+                (NodeId(3), "127.0.0.1:4903".parse().unwrap()),
+            ],
+            &committed_members,
+            &[],
+            &[],
+            &[],
+            3,
+        );
+
+        // Immediately after restore (no fresh activation): per-shard ownership
+        // must exactly match the committed topology.
+        let snap = cluster.master_snapshot();
+        let mut saw_yes = false;
+        let mut saw_no = false;
+        for shard in 0..NUM_SHARDS as u16 {
+            let key = key_for_shard(shard);
+            let real_shard = ShardTable::shard_for_key(&key);
+            let owned_by_self = reference.target_assignment(real_shard).master == NodeId(1);
+            let per_item = cluster.is_master(&key);
+            let hoisted = cluster.is_master_snapshot(&snap, &key);
+            assert_eq!(
+                hoisted, per_item,
+                "snapshot ownership diverged from per-item is_master for shard {shard}",
+            );
+            match per_item {
+                MasterQueryResult::Yes => {
+                    assert!(
+                        owned_by_self,
+                        "shard {shard} answered is_master==Yes but self does NOT own it \
+                         in the committed topology — all-master split-brain window",
+                    );
+                    saw_yes = true;
+                }
+                MasterQueryResult::No => {
+                    assert!(
+                        !owned_by_self,
+                        "shard {shard} answered No but self OWNS it in the committed \
+                         topology — regression: node abandoned its own shard",
+                    );
+                    saw_no = true;
+                }
+                MasterQueryResult::Transitioning { last_known_term } => {
+                    panic!(
+                        "shard {shard} unexpectedly Transitioning (last_known_term \
+                         {last_known_term}) on a settled restore",
+                    );
+                }
+            }
+        }
+        assert!(
+            saw_yes,
+            "node must still master its OWN shards after restore (no over-correction)",
+        );
+        assert!(
+            saw_no,
+            "node must redirect shards owned by peers after restore (no all-master)",
         );
     }
 
