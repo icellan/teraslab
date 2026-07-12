@@ -1247,6 +1247,15 @@ pub struct MigrationMetrics {
     pub migration_phase_delta: AtomicU32,
     /// Shards that have completed handoff and are now serving on the new owner.
     pub migration_phase_serving_new: AtomicU32,
+    /// Number of shards currently marked LOST/UNAVAILABLE (gauge): received
+    /// incompletely with the source presumed dead and no completeness proof
+    /// (C8/C17). Such shards stay fenced and are never served as full
+    /// authority. Mirrors [`crate::cluster::migration::MigrationManager::lost_count`]
+    /// and is refreshed wherever the migration bitmaps are synced, so a shard
+    /// that stays lost across GC cycles remains continuously visible on
+    /// `/metrics`. A persistently non-zero value is the operator-visible signal
+    /// that a shard needs a re-migration or manual intervention.
+    pub migration_lost: AtomicU32,
     /// Number of times a migration completion or failure was rejected because
     /// the bookkeeping task's `topology_epoch` did not match the live
     /// epoch on the coordinator.
@@ -1319,6 +1328,7 @@ impl MigrationMetrics {
             migration_phase_copying: AtomicU32::new(0),
             migration_phase_delta: AtomicU32::new(0),
             migration_phase_serving_new: AtomicU32::new(0),
+            migration_lost: AtomicU32::new(0),
             topology_epoch_mismatch: PaddedCounter::new(),
             phantom_master_relinquished: PaddedCounter::new(),
         }

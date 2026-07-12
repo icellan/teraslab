@@ -100,6 +100,19 @@ fn sync_atomic_migration_bitmaps(
             migrating_bm.set(progress.shard);
         }
     }
+    // P2 — refresh the LOST/UNAVAILABLE-shard gauge from the manager on every
+    // bitmap sync (the GC window, topology activation, and periodic resync all
+    // funnel through here). It is a level, not a counter: `store` the current
+    // count so a shard that stays lost across GC cycles remains continuously
+    // visible on `/metrics`, and the gauge drops to 0 the moment the shard is
+    // completed or re-migrated. `lost_count()` is O(inbound entries), off the
+    // write hot path.
+    if let Some(m) = crate::metrics::migration_metrics() {
+        m.migration_lost.store(
+            mgr.lost_count() as u32,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
 }
 
 /// Decide whether a migration task scheduled at `topology_epoch` is still
@@ -1857,11 +1870,22 @@ impl ClusterCoordinator {
                             // the request re-fire interval, so a lost
                             // request is still reaped on the cycle after the
                             // next re-fire would have re-stamped it.
+                            //
+                            // C8 (SAFE DEFAULT: fence-until-proven) — a
+                            // genuinely orphaned inbound is INCOMPLETE (no
+                            // completion handshake was ever seen; a proven
+                            // entry is completed and removed by
+                            // `cleanup_completed` on the normal path). Clearing
+                            // its fence here would let this node serve a shard
+                            // it holds only PARTIALLY as full authority. Mark
+                            // it LOST instead: the shard stays fenced
+                            // (client-invisible / unavailable) until a future
+                            // migration completes it or an operator intervenes.
                             let settled_shards = mgr
                                 .pending_inbound_shards_excluding_recent_requests(
                                     TRANSFER_REQUEST_INTERVAL,
                                 );
-                            mgr.clear_pending_inbound_for_shards(&settled_shards)
+                            mgr.mark_inbound_lost(&settled_shards)
                         } else {
                             mgr.clear_stale_inbound(Duration::from_secs(30))
                         };
@@ -1876,9 +1900,10 @@ impl ClusterCoordinator {
                                 crate::cluster::migration::persist_inbound_state(path, &mgr);
                             }
                             if clear_settled_inbound {
-                                tracing::info!(
-                                    removed,
-                                    "cluster: cleared settled inbound migrations — no active migrations or handoffs remain",
+                                tracing::warn!(
+                                    lost = removed,
+                                    total_lost = mgr.lost_count(),
+                                    "cluster: marked orphaned INCOMPLETE inbound shards UNAVAILABLE (kept fenced, not served as authority) — source died mid-migration with no completion handshake; a future migration or operator must complete them",
                                 );
                             } else {
                                 tracing::info!(
@@ -3427,13 +3452,24 @@ impl ClusterCoordinator {
         if preserved_tasks.is_empty() {
             fenced_bm.clear_all();
             migrating_bm.clear_all();
-            inbound_bm.clear_all();
+            // C17 — `clear_inbound` (above) RETAINS unproven LOST inbound
+            // entries and keeps their `inbound_bitmap` fence bit set. Reload
+            // the hot-path atomic FROM the manager rather than `clear_all()`:
+            // a blind clear would drop the lost shard's fence and let
+            // `is_master` serve a partially received shard as full authority
+            // (the exact hole C17 closes) until the next periodic sync.
+            let mgr = migration.lock();
+            inbound_bm.load_from(mgr.inbound_bitmap());
+            drop(mgr);
         } else {
             // Reload fenced bitmap from the manager (preserves fences for active migrations).
             let mgr = migration.lock();
             fenced_bm.load_from(mgr.fenced_bitmap());
-            // Inbound was already cleared in the manager, so clear its atomic.
-            inbound_bm.clear_all();
+            // C17 — `clear_inbound` no longer wipes LOST/unproven inbound
+            // entries; it retains them with their fence bit. Reload the atomic
+            // from the manager (NOT `clear_all()`) so those preserved fences
+            // mirror into the hot path.
+            inbound_bm.load_from(mgr.inbound_bitmap());
             // Rebuild migrating bitmap from the active migration list.
             migrating_bm.clear_all();
             for p in mgr.active_migrations() {
@@ -3455,6 +3491,16 @@ impl ClusterCoordinator {
 
         if all_new_tasks.is_empty() {
             *shard_table.write() = new_table;
+            // C17 — no migration tasks to install, but the supersede's
+            // `clear_inbound` may have preserved LOST/unproven inbound fences
+            // in the manager. Mirror the manager's bitmaps into the hot-path
+            // atomics so NO install path leaves a stale-cleared `inbound_bm`
+            // that would let `is_master` serve a partially received shard as
+            // full authority (the non-empty branch below already re-syncs via
+            // `sync_atomic_migration_bitmaps` after `start_outbound`).
+            let mgr = migration.lock();
+            sync_atomic_migration_bitmaps(&mgr, fenced_bm, migrating_bm, inbound_bm);
+            drop(mgr);
         } else {
             let all_tasks = all_new_tasks;
 
@@ -8539,6 +8585,17 @@ impl RunningCluster {
         // actually pending, and M1.2 makes it fresh by syncing immediately
         // after `start_outbound`, which is the correct fix for the lag the
         // audit flagged.
+        //
+        // C17 — this bit gates serving on PROVEN completeness, not merely "no
+        // pending inbound". A clear bit means the shard was proven complete
+        // (its completion handshake landed → `mark_inbound_complete` dropped
+        // the bit) or was never migrated at all. An INCOMPLETE shard that was
+        // never proven — an orphan the settled-inbound GC marked LOST (C8), or
+        // an unproven entry preserved across a topology supersede
+        // (`clear_inbound`, C17) — keeps this bit SET, so it stays
+        // `Transitioning` (client-invisible) and is never served as full
+        // authority. The two clearing paths that could drop the fence WITHOUT
+        // a completeness proof are precisely the ones C8/C17 close.
         if self.inbound_atomic.test(shard) && auth_master == self.self_id {
             return MasterQueryResult::Transitioning {
                 last_known_term: committed,
@@ -9620,6 +9677,36 @@ impl RunningCluster {
     /// restored entries inform the coordinator which shards were
     /// mid-migration when the node crashed. The next topology activation
     /// will either resume or re-plan these migrations.
+    ///
+    /// # C5 — reconcile-don't-clobber (why force-fail + re-plan is safe)
+    ///
+    /// Each interrupted outbound task is `mark_failed` here so the next
+    /// topology activation RE-PLANS it as a FRESH task with a LIVE worker. It
+    /// is deliberately NOT kept "resumable": a migration worker self-aborts
+    /// once the epoch advances, and a task restored into the active list has
+    /// NO worker (its thread died with the crash), so preserving it would
+    /// strand the shard forever with no progress (see the epoch-worker note in
+    /// the activation path).
+    ///
+    /// Force-failing then re-shipping the baseline is reconcile-safe — it
+    /// cannot CLOBBER a write the target absorbed during the interrupted
+    /// migration — because the re-ship is idempotent-by-generation AT THE
+    /// RECEIVER: `apply_create_replica` (migration arm) SKIPS any incoming
+    /// record whose generation is older than the copy the target already holds
+    /// (see `migration_duplicate_create_older_generation_is_skipped_no_downgrade`),
+    /// so a newer write the target absorbed always wins over this source's
+    /// re-shipped baseline. The re-plan also takes a FRESH snapshot (a fresh
+    /// task starts in `Preparing` with `snapshot_sequence` reset), so no stale
+    /// delta is replayed over newer target state.
+    ///
+    /// Finally, this runs during startup BEFORE any client listener is
+    /// accepting traffic (see `server.rs`), so lifting the source's write
+    /// fence here serves nothing stale in the gap before re-activation.
+    ///
+    /// Known residual (follow-up, not addressed here): the generation guard
+    /// covers records the target still holds; it does NOT cover a record the
+    /// target authoritatively DELETED (a re-shipped create would resurrect it).
+    /// Closing that needs a record-level tombstone and is tracked separately.
     pub fn restore_outbound_state(&self) {
         if let Some(ref path) = self.outbound_state_path {
             let data = crate::cluster::migration::load_outbound_state(path);
@@ -15800,6 +15887,372 @@ mod tests {
                 "expected MasterQueryResult::Transitioning {{ last_known_term: 5 }}, got {other:?}"
             ),
         }
+    }
+
+    /// C8 — a shard this node is the authoritative master for, but which it
+    /// received only PARTIALLY (source died mid-migration, marked LOST by the
+    /// settled-inbound GC), must NOT answer `is_master == Yes`. An incomplete
+    /// shard is never served as full authority: it stays fenced
+    /// (`Transitioning`) until a future migration proves it complete or an
+    /// operator intervenes. Before C8 the GC cleared the fence here, so the
+    /// partial shard served reads/writes as full master.
+    #[test]
+    fn is_master_fences_lost_incomplete_inbound_shard() {
+        let members = vec![NodeId(1)];
+        let table = ShardTable::compute_with_epoch(&members, 1, 5, 1);
+        let cluster = new_test_running_cluster(
+            NodeId(1),
+            table,
+            &[(NodeId(1), "127.0.0.1:4841".parse().unwrap())],
+            &members,
+            &[],
+            &[],
+            &[],
+            1,
+        );
+        let shard = 0u16;
+        let key = key_for_shard(shard);
+
+        // Baseline: single node is the plain authority for shard 0 (no fence).
+        assert!(
+            matches!(cluster.is_master(&key), MasterQueryResult::Yes),
+            "precondition: node is the authority for shard 0",
+        );
+
+        // An incomplete inbound arrived, then its source died; the settled GC
+        // marks it lost (fence KEPT). Mirror that and refresh the hot-path
+        // shadow the way the event loop does after the GC.
+        {
+            let mgr = &mut cluster.migration.lock();
+            mgr.register_inbound_source(shard, NodeId(2));
+            let settled =
+                mgr.pending_inbound_shards_excluding_recent_requests(Duration::from_secs(1));
+            assert_eq!(mgr.mark_inbound_lost(&settled), 1);
+            assert!(mgr.is_shard_lost(shard));
+        }
+        cluster.sync_migration_bitmaps();
+
+        match cluster.is_master(&key) {
+            MasterQueryResult::Transitioning { .. } => {}
+            other => panic!(
+                "a lost/incomplete shard must NOT be served as full authority; got {other:?}",
+            ),
+        }
+    }
+
+    /// C17 (sibling of C8) — a topology supersede (`clear_inbound`) must not
+    /// let a shard this node received INCOMPLETELY (marked LOST) become
+    /// serveable as full authority. `is_master` gates on proven completeness,
+    /// so the preserved fence keeps the shard `Transitioning`. Before C17,
+    /// `clear_inbound` wiped the fence and `is_master` returned `Yes`.
+    #[test]
+    fn is_master_fences_lost_shard_across_topology_supersede() {
+        let members = vec![NodeId(1)];
+        let table = ShardTable::compute_with_epoch(&members, 1, 5, 1);
+        let cluster = new_test_running_cluster(
+            NodeId(1),
+            table,
+            &[(NodeId(1), "127.0.0.1:4851".parse().unwrap())],
+            &members,
+            &[],
+            &[],
+            &[],
+            1,
+        );
+        let shard = 0u16;
+        let key = key_for_shard(shard);
+
+        // Incomplete inbound, source dies, settled GC marks it lost, THEN a
+        // topology change supersedes the in-flight migration bookkeeping.
+        {
+            let mgr = &mut cluster.migration.lock();
+            mgr.register_inbound_source(shard, NodeId(2));
+            let settled =
+                mgr.pending_inbound_shards_excluding_recent_requests(Duration::from_secs(1));
+            assert_eq!(mgr.mark_inbound_lost(&settled), 1);
+            mgr.clear_inbound();
+            assert!(
+                mgr.is_shard_lost(shard),
+                "the lost mark and fence survive the supersede",
+            );
+        }
+        cluster.sync_migration_bitmaps();
+
+        match cluster.is_master(&key) {
+            MasterQueryResult::Transitioning { .. } => {}
+            other => panic!(
+                "a lost shard superseded by a topology change must NOT be served as full \
+                 authority; got {other:?}",
+            ),
+        }
+    }
+
+    /// C17 (P1) — the manager-level `clear_inbound` fix must be MIRRORED into
+    /// the hot-path `inbound_atomic` on the REAL production supersede path
+    /// (`activate_topology_with_view`), not only via a later
+    /// `sync_migration_bitmaps`. A topology supersede that preserves a LOST
+    /// (unproven) inbound shard must leave that shard fenced in the atomic the
+    /// write hot path reads, so `is_master` returns `Transitioning` (never
+    /// `Yes`) WITHOUT any follow-up sync. Before the fix the empty-task install
+    /// branch cleared `inbound_atomic` with no reload, leaking a partially
+    /// received shard as full authority for up to one event-loop tick.
+    #[test]
+    fn activate_topology_supersede_mirrors_lost_fence_into_inbound_atomic() {
+        // The supersede drives `sync_atomic_migration_bitmaps`, which (post P2)
+        // writes the shared `migration_lost` gauge; serialize against other
+        // metrics-touching tests and install a metrics sink.
+        let _guard = migration_metrics_test_guard();
+        let _metrics = install_test_migration_metrics();
+
+        let members = vec![NodeId(1)];
+        let epoch = 5u64;
+        let placement_version = 1u16;
+        let rf = 1u8;
+        let table = ShardTable::compute_with_epoch(&members, rf, epoch, placement_version);
+        let cluster = new_test_running_cluster(
+            NodeId(1),
+            table,
+            &[(NodeId(1), "127.0.0.1:4871".parse().unwrap())],
+            &members,
+            &[],
+            &[],
+            &[],
+            1,
+        );
+        let shard = 0u16;
+        let key = key_for_shard(shard);
+
+        // Engine holds data so the empty-engine single-node fast path is
+        // skipped and the real supersede logic (which hits the empty-task
+        // install branch) runs.
+        let engine = Arc::new(test_engine());
+        create_test_record(&engine, key_for_shard(1));
+        assert!(engine.index_len() > 0, "precondition: engine is non-empty");
+
+        // Incomplete inbound, source dies, settled-inbound GC marks the shard
+        // LOST and syncs the fence into the hot-path atomic — exactly the
+        // production state right before a topology supersede lands.
+        {
+            let mgr = &mut cluster.migration.lock();
+            mgr.register_inbound_source(shard, NodeId(2));
+            let settled =
+                mgr.pending_inbound_shards_excluding_recent_requests(Duration::from_secs(1));
+            assert_eq!(mgr.mark_inbound_lost(&settled), 1);
+            assert!(mgr.is_shard_lost(shard));
+        }
+        cluster.sync_migration_bitmaps();
+        assert!(
+            cluster.inbound_atomic.test(shard),
+            "precondition: the lost fence is present in the hot-path atomic before the supersede",
+        );
+
+        // Drive the REAL production supersede at the committed term, so the
+        // `is_master` epoch guard stays OPEN and the ONLY thing that can fence
+        // the shard is the inbound atomic.
+        let view: std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>> =
+            std::collections::HashMap::new();
+        ClusterCoordinator::activate_topology_with_view(
+            &members,
+            epoch,
+            placement_version,
+            NodeId(1),
+            rf,
+            &cluster.shard_table,
+            &cluster.migration,
+            &cluster.node_addrs,
+            &engine,
+            &None,
+            1,
+            1,
+            1,
+            &cluster.fenced_bitmap,
+            &cluster.migrating_bitmap,
+            &cluster.inbound_atomic,
+            &cluster.active_topology_members,
+            &view,
+            &cluster.migration_throttle,
+            &cluster.cluster_secret,
+        );
+
+        // The manager retained the unproven lost entry across the supersede (C17).
+        assert!(
+            cluster.migration.lock().is_shard_lost(shard),
+            "manager keeps the unproven lost entry across the supersede",
+        );
+        // ...and the hot-path atomic must STILL mirror it — WITHOUT a follow-up
+        // `sync_migration_bitmaps` (which reloads the atomic and would hide the
+        // bug this test targets).
+        assert!(
+            cluster.inbound_atomic.test(shard),
+            "supersede must not clear the lost shard's hot-path inbound fence",
+        );
+        match cluster.is_master(&key) {
+            MasterQueryResult::Transitioning { .. } => {}
+            other => panic!(
+                "a supersede that preserves a LOST inbound shard must NOT serve it as full \
+                 authority on the production `activate_topology_with_view` path; got {other:?}",
+            ),
+        }
+    }
+
+    /// C8/C17 (P2) — the `migration_lost` gauge must reflect the number of
+    /// shards currently marked LOST/UNAVAILABLE and stay current across syncs,
+    /// so a persistently-lost shard is continuously visible on `/metrics`. It
+    /// is a level (current count), not a monotonic counter, and drops back to
+    /// 0 once the shard is completed / re-migrated.
+    #[test]
+    fn migration_lost_gauge_tracks_lost_shards() {
+        let _guard = migration_metrics_test_guard();
+        let metrics = install_test_migration_metrics();
+
+        let members = vec![NodeId(1)];
+        let table = ShardTable::compute_with_epoch(&members, 1, 5, 1);
+        let cluster = new_test_running_cluster(
+            NodeId(1),
+            table,
+            &[(NodeId(1), "127.0.0.1:4881".parse().unwrap())],
+            &members,
+            &[],
+            &[],
+            &[],
+            1,
+        );
+        let shard = 3u16;
+
+        // No lost shards yet: a sync reports zero (the gauge is absolute — a
+        // store of the current count, so it is independent of any prior test's
+        // residue on the shared metrics sink).
+        cluster.sync_migration_bitmaps();
+        assert_eq!(
+            metrics.migration_lost.load(Ordering::Relaxed),
+            0,
+            "no lost shards → migration_lost gauge is 0",
+        );
+
+        // Incomplete inbound, source dies, settled-inbound GC marks it LOST.
+        {
+            let mgr = &mut cluster.migration.lock();
+            mgr.register_inbound_source(shard, NodeId(2));
+            let settled =
+                mgr.pending_inbound_shards_excluding_recent_requests(Duration::from_secs(1));
+            assert_eq!(mgr.mark_inbound_lost(&settled), 1);
+        }
+        cluster.sync_migration_bitmaps();
+        assert_eq!(
+            metrics.migration_lost.load(Ordering::Relaxed),
+            1,
+            "a shard marked LOST must raise the migration_lost gauge",
+        );
+
+        // A later sync while the shard is STILL lost keeps the gauge at 1 — the
+        // level does not decay while the shard remains unavailable. This is the
+        // observability the P2 warn-log gap left silent (the warn fires only on
+        // the cycle that marks NEW shards lost).
+        cluster.sync_migration_bitmaps();
+        assert_eq!(
+            metrics.migration_lost.load(Ordering::Relaxed),
+            1,
+            "a persistently-lost shard stays visible on the gauge across syncs",
+        );
+
+        // Completion (equivalently, a re-migration that clears the lost mark)
+        // drops the count; the gauge follows back to 0.
+        cluster.migration.lock().mark_inbound_complete(shard);
+        cluster.sync_migration_bitmaps();
+        assert_eq!(
+            metrics.migration_lost.load(Ordering::Relaxed),
+            0,
+            "completing the shard drops the migration_lost gauge back to 0",
+        );
+    }
+
+    /// C5 (SAFE DEFAULT: reconcile-don't-clobber) — restoring an interrupted
+    /// FENCED-phase outbound migration must recover in a way that cannot
+    /// clobber writes the target absorbed during the interrupted migration:
+    ///
+    ///  1. it schedules a FRESH re-plan (a live worker re-drives it) rather
+    ///     than leaving the task "resumable" with a dead worker (which would
+    ///     strand the shard);
+    ///  2. it fabricates NO committed-handoff evidence for the shard, so
+    ///     orphan cleanup will not delete the source's copy (no data loss) and
+    ///     the re-drive re-ships against the generation-idempotent receiver
+    ///     (the newer target write wins — see `restore_outbound_state` docs and
+    ///     `migration_duplicate_create_older_generation_is_skipped_no_downgrade`);
+    ///  3. it leaves no shard stranded as "migrating" without a task.
+    #[test]
+    fn restore_outbound_state_recovers_reconcile_safe() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("outbound.state");
+        let shard = 7u16;
+        let task = MigrationTask {
+            shard,
+            from_node: NodeId(1),
+            to_node: NodeId(2),
+            is_master: true,
+        };
+
+        // Persist a mid-flight FENCED-phase outbound migration exactly as a
+        // crash would leave it: baseline shipped, source writes fenced, the
+        // target potentially holding newer absorbed writes.
+        {
+            let mut mgr = MigrationManager::new();
+            mgr.start_outbound(
+                std::slice::from_ref(&task),
+                NodeId(1),
+                &std::collections::HashSet::new(),
+            );
+            mgr.mark_fenced(&task, 100);
+            assert!(mgr.is_shard_fenced(shard), "precondition: shard was fenced");
+            crate::cluster::migration::persist_outbound_state(&path, &mgr);
+        }
+
+        // Bring the node up and wire the persisted outbound-state path.
+        let members = vec![NodeId(1)];
+        let table = ShardTable::compute_with_epoch(&members, 1, 5, 1);
+        let mut cluster = new_test_running_cluster(
+            NodeId(1),
+            table,
+            &[
+                (NodeId(1), "127.0.0.1:4861".parse().unwrap()),
+                (NodeId(2), "127.0.0.1:4862".parse().unwrap()),
+            ],
+            &members,
+            &[],
+            &[],
+            &[],
+            1,
+        );
+        cluster.outbound_state_path = Some(path);
+
+        cluster.restore_outbound_state();
+
+        // (1) A fresh, live-worker re-drive is scheduled.
+        assert!(
+            cluster.startup_reactivation_needed.load(Ordering::Acquire),
+            "restore must schedule a re-plan so a FRESH worker re-drives the migration",
+        );
+        {
+            let mgr = cluster.migration.lock();
+            // The interrupted task is force-failed + cleaned, not stranded as a
+            // preserved task whose worker died with the crash.
+            assert_eq!(
+                mgr.active_count(),
+                0,
+                "the interrupted task must not be left resumable with a dead worker",
+            );
+            // (2) No committed-handoff evidence is fabricated: orphan cleanup
+            // must not be authorized to delete the source's last copy, and the
+            // re-drive reconciles against the generation-idempotent receiver.
+            assert!(
+                !mgr.has_committed_handoff(shard, 5),
+                "restore must not fabricate committed-handoff evidence",
+            );
+        }
+        // (3) The shard is not stranded as "migrating" without a task.
+        assert!(
+            !cluster.migrating_bitmap.test(shard),
+            "no shard should be left flagged migrating without an active task",
+        );
     }
 
     // ── Batch-scoped MasterSnapshot: hoisted lookup, per-item correctness ──
