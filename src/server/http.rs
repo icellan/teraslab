@@ -1301,6 +1301,11 @@ pub(crate) fn render_metrics_text(
         );
         prom_gauge(
             &mut out,
+            "teraslab_migration_lost",
+            mm.migration_lost.load(Ordering::Relaxed) as u64,
+        );
+        prom_gauge(
+            &mut out,
             "teraslab_migration_phase_preparing",
             mm.migration_phase_preparing.load(Ordering::Relaxed) as u64,
         );
@@ -2408,6 +2413,9 @@ fn migration_metrics_json(state: &HttpState) -> serde_json::Value {
     let active = mm
         .map(|m| m.migration_active.load(Ordering::Relaxed) as u64)
         .unwrap_or(0);
+    let lost = mm
+        .map(|m| m.migration_lost.load(Ordering::Relaxed) as u64)
+        .unwrap_or(0);
     let preparing = mm
         .map(|m| m.migration_phase_preparing.load(Ordering::Relaxed) as u64)
         .unwrap_or(0);
@@ -2449,6 +2457,7 @@ fn migration_metrics_json(state: &HttpState) -> serde_json::Value {
         "bytes_transferred": serde_json::Value::Object(bytes),
         "entries_applied_total": entries_applied,
         "active": active,
+        "lost": lost,
         "phase": {
             "preparing": preparing,
             "copying": copying,
@@ -4375,6 +4384,7 @@ mod tests {
             "teraslab_migration_bytes_transferred_total",
             "teraslab_migration_entries_applied_total",
             "teraslab_migration_active",
+            "teraslab_migration_lost",
             "teraslab_migration_phase_preparing",
             "teraslab_migration_phase_copying",
             "teraslab_migration_phase_delta",
@@ -4399,6 +4409,50 @@ mod tests {
                 "/metrics output missing {name}\n--- output ---\n{text}",
             );
         }
+    }
+
+    /// P2 — the `migration_lost` gauge must be RENDERED into the `/metrics`
+    /// text with the value stored on the shared `MigrationMetrics`, so a
+    /// persistently-lost shard is actually visible to an operator scraping
+    /// `/metrics` (not merely tracked internally).
+    ///
+    /// The metrics sink is a process-global shared with other tests that
+    /// mutate `migration_lost` (the coordinator's supersede / GC tests). A
+    /// distinctive sentinel plus a bounded re-render makes the value assertion
+    /// deterministic: our store "wins" within a few renders since no other
+    /// test stores in a tight loop, and the bound guarantees termination.
+    #[test]
+    fn metrics_text_renders_migration_lost_gauge_value() {
+        use crate::metrics::{MigrationMetrics, init_migration_metrics, migration_metrics};
+        use std::sync::OnceLock;
+
+        static MIG: OnceLock<MigrationMetrics> = OnceLock::new();
+        init_migration_metrics(MIG.get_or_init(MigrationMetrics::new));
+        let mm = migration_metrics().expect("migration metrics installed");
+
+        let m = ThreadMetrics::new();
+        let h = ThreadHistograms::new();
+
+        // A distinctive value no other migration test produces (they store 0/1).
+        const SENTINEL: u32 = 4242;
+        let expected = format!("teraslab_migration_lost {SENTINEL}");
+        let mut rendered_our_value = false;
+        for _ in 0..256 {
+            mm.migration_lost.store(SENTINEL, Ordering::Relaxed);
+            let text = render_metrics_text(&m, &h, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+            if text.contains(&expected) {
+                rendered_our_value = true;
+                break;
+            }
+        }
+        assert!(
+            rendered_our_value,
+            "/metrics text must render teraslab_migration_lost with the stored gauge value",
+        );
+
+        // Restore the shared gauge so a later value-sensitive test is not
+        // contaminated by this test's sentinel.
+        mm.migration_lost.store(0, Ordering::Relaxed);
     }
 
     /// Phase 5: `/admin/top` JSON must carry the new top-level
