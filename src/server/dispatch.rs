@@ -1950,30 +1950,38 @@ pub(crate) fn handle_request(
             match crate::cluster::topology::TopologyCommit::deserialize(&request.payload) {
                 Some(commit) => {
                     let members = commit.members.clone();
-                    if let Some(term) = cluster.topology_authority().handle_commit(&commit) {
-                        // Safety requirement (H10): persist the committed
-                        // `committed_term` / `committed_members` BEFORE
-                        // replying so the commit survives a crash. If
-                        // persist fails, refuse to ack; the proposer will
-                        // retry and we'll re-apply on the retry.
-                        if let Err(e) = cluster.persist_topology() {
+                    // G9 — persist the committed term BEFORE it is advanced in
+                    // memory (which is what `is_master` serves). Ordering the
+                    // fsync AFTER the in-memory advance left a crash window that
+                    // reverted this node to T-1 while peers held T — it served
+                    // authority under a term it would forget on reboot.
+                    // `apply_committed_topology_durable` persists first and
+                    // fails closed on a persist error.
+                    use crate::cluster::topology::DurableCommitOutcome;
+                    match cluster.apply_committed_topology_durable(&commit) {
+                        DurableCommitOutcome::Applied(term) => {
+                            tracing::info!(
+                                term = term,
+                                members = members.len(),
+                                "cluster: topology committed"
+                            );
+                            // Activate only after the commit is durable.
+                            cluster.signal_topology_committed(members, term);
+                        }
+                        DurableCommitOutcome::PersistFailed => {
+                            // Refuse to ack; the proposer retries and we
+                            // re-apply once durability is restored.
                             return error_response(
                                 request.request_id,
                                 ERR_TOPOLOGY_PERSIST_FAILED,
-                                &format!(
-                                    "topology commit term {term} applied in memory but persist failed: {e}",
-                                ),
+                                "topology commit refused — durable persist of committed term failed",
                             );
                         }
-                        tracing::info!(
-                            term = term,
-                            members = members.len(),
-                            "cluster: topology committed"
-                        );
-                        // Signal the coordinator event loop to activate the
-                        // shard table with the committed member list — only
-                        // after the commit is durable.
-                        cluster.signal_topology_committed(members, term);
+                        DurableCommitOutcome::NotApplied => {
+                            // Stale, duplicate, or unacceptable commit: no state
+                            // change (matches the prior `handle_commit` → None
+                            // branch). Ack OK so the proposer stops retrying.
+                        }
                     }
                     ResponseFrame {
                         request_id: request.request_id,

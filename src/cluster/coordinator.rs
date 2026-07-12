@@ -4379,21 +4379,36 @@ fn try_run_topology_proposal(
         );
     }
 
-    // Apply commit locally.
-    topology_authority.handle_commit(&commit);
-    // POST-commit persist: the term is already committed in the in-memory
-    // authority and cannot be rolled back, so this proceeds regardless. A
-    // failure is surfaced by `persist_topology_state` (ERROR + PERSIST_FAILURES)
-    // and re-persisted by a later event / SWIM peak re-raise.
-    if let Some(path) = topology_state_path {
-        let peak = peak_size.load(Ordering::Relaxed) as u64;
-        let inc = swim_incarnation.load(Ordering::Relaxed);
-        let _ = persist_topology_state(path, &topology_authority.persisted_state(peak, inc));
+    // G9 — apply the commit locally only AFTER its committed term is durable.
+    // The proposer already broadcast the commit to peers; if its own persist
+    // fails it must NOT begin serving/activating under the new term (a crash
+    // would revert it to T-1 while peers hold T). Fail-closed: stay on the
+    // prior term and let a later TopologyStale catch-up re-drive activation.
+    let peak = peak_size.load(Ordering::Relaxed) as u64;
+    let inc = swim_incarnation.load(Ordering::Relaxed);
+    let path = topology_state_path.as_deref();
+    match topology_authority.handle_commit_durable(&commit, peak, inc, |state| {
+        persist_topology_state_durable(path, state)
+    }) {
+        crate::cluster::topology::DurableCommitOutcome::Applied(_) => {
+            // Signal the event loop to activate the shard table.
+            let _ = topology_commit_tx.send((commit.members.clone(), commit.term));
+            true
+        }
+        crate::cluster::topology::DurableCommitOutcome::PersistFailed => {
+            tracing::error!(
+                term = commit.term,
+                "cluster: proposer NOT activating committed term — durable persist \
+                 failed; staying on prior term (G9), will re-drive via catch-up",
+            );
+            false
+        }
+        crate::cluster::topology::DurableCommitOutcome::NotApplied => {
+            // Already superseded/duplicate (e.g. a concurrent higher commit
+            // advanced past this term). No local activation needed.
+            true
+        }
     }
-
-    // Signal the event loop to activate the shard table.
-    let _ = topology_commit_tx.send((commit.members.clone(), commit.term));
-    true
 }
 
 /// Send a request frame on an existing TCP stream and read the response.
@@ -9991,6 +10006,33 @@ impl RunningCluster {
         } else {
             Ok(())
         }
+    }
+
+    /// G9 — apply a received commit only after its committed term is DURABLE.
+    ///
+    /// The committed term is the value `is_master` serves authority under, so a
+    /// node must not advertise term T until T survives a crash — otherwise a
+    /// crash between advancing and persisting reverts this node to T-1 while
+    /// peers hold T (it served/authorised under a term it will forget). This
+    /// persists the post-commit state BEFORE the in-memory advance, mirroring
+    /// the H10 persist-before-vote discipline, and fails closed on a persist
+    /// error (the term is not applied — the node keeps serving its prior term).
+    ///
+    /// The caller activates the shard table only on
+    /// [`crate::cluster::topology::DurableCommitOutcome::Applied`].
+    pub fn apply_committed_topology_durable(
+        &self,
+        commit: &crate::cluster::topology::TopologyCommit,
+    ) -> crate::cluster::topology::DurableCommitOutcome {
+        let peak = self.peak_size.load(Ordering::Relaxed) as u64;
+        let inc = self.swim_incarnation.load(Ordering::Relaxed);
+        let path = self.topology_state_path.as_deref();
+        self.topology_authority
+            .handle_commit_durable(commit, peak, inc, |state| {
+                // `None` path (no state file — ephemeral single-node test) is
+                // trivially durable; a real path must fsync successfully.
+                persist_topology_state_durable(path, state)
+            })
     }
 
     /// Access the fenced-shards atomic bitmap directly.
@@ -16184,6 +16226,132 @@ mod tests {
             }
             other => panic!("expected self-fenced Transitioning, got {other:?}"),
         }
+    }
+
+    /// G9 (RED before fix) — a received commit whose durable persist FAILS must
+    /// not begin serving authority under the new term. Pre-fix the dispatch
+    /// follower advanced `committed_term` in memory (which `is_master` serves)
+    /// and only then persisted; a crash there reverted the node to T-1 while
+    /// peers held T. `apply_committed_topology_durable` persists first and
+    /// fails closed: `committed_term` stays 5 and the node keeps serving the
+    /// last durable term, never the phantom term 6.
+    #[test]
+    fn durable_commit_fails_closed_and_keeps_serving_prior_term() {
+        // Point the topology state file UNDER a regular file so
+        // `create_dir_all(parent)` fails deterministically → persist fails.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let blocker = dir.path().join("blocker");
+        std::fs::write(&blocker, b"x").expect("write blocker file");
+        let bad_path = blocker.join("sub").join("topology.state");
+
+        let members = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let table = ShardTable::compute_with_epoch(&members, 2, 5, 1);
+        let shard = (0..NUM_SHARDS as u16)
+            .find(|&s| table.target_assignment(s).master == NodeId(1))
+            .expect("some shard mastered by NodeId(1)");
+        let key = key_for_shard(shard);
+        let cluster = new_test_running_cluster_with_topology_path(
+            NodeId(1),
+            table,
+            &[
+                (NodeId(1), "127.0.0.1:4861".parse().unwrap()),
+                (NodeId(2), "127.0.0.1:4862".parse().unwrap()),
+                (NodeId(3), "127.0.0.1:4863".parse().unwrap()),
+            ],
+            &members,
+            &[],
+            &[],
+            &[],
+            3,
+            Some(bad_path),
+        );
+        assert_eq!(cluster.topology_authority.committed_term(), 5);
+
+        // A perfectly valid commit for the next term — but the node cannot
+        // persist it.
+        let cid = cluster.topology_authority.cluster_id();
+        let commit = crate::cluster::topology::TopologyCommit {
+            term: 6,
+            proposer: NodeId(1),
+            members: members.clone(),
+            cluster_id: cid,
+            placement_version: 1,
+            digest: crate::cluster::topology::TopologyTerm::compute_digest(6, &cid, &members, 1),
+            voters: members.clone(),
+        };
+
+        let outcome = cluster.apply_committed_topology_durable(&commit);
+        assert_eq!(
+            outcome,
+            crate::cluster::topology::DurableCommitOutcome::PersistFailed,
+            "a failed persist must report PersistFailed"
+        );
+        assert_eq!(
+            cluster.topology_authority.committed_term(),
+            5,
+            "committed_term must not advance to a term that isn't durable"
+        );
+        // The node keeps serving under the last DURABLE term (5), not term 6.
+        assert!(
+            matches!(cluster.is_master(&key), MasterQueryResult::Yes),
+            "node must keep serving its shard under the durable term, not the phantom one"
+        );
+    }
+
+    /// G9 liveness — a received commit that persists successfully advances and
+    /// the node serves under the new durable term.
+    #[test]
+    fn durable_commit_applies_and_serves_after_successful_persist() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("topology.state");
+
+        // Committed at term 5 with members {1,2,3}; a later term 6 re-commit of
+        // the same set (e.g. a placement upgrade / re-proposal) must persist
+        // before it is served.
+        let members = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let table = ShardTable::compute_with_epoch(&members, 2, 5, 1);
+        let cluster = new_test_running_cluster_with_topology_path(
+            NodeId(1),
+            table,
+            &[
+                (NodeId(1), "127.0.0.1:4871".parse().unwrap()),
+                (NodeId(2), "127.0.0.1:4872".parse().unwrap()),
+                (NodeId(3), "127.0.0.1:4873".parse().unwrap()),
+            ],
+            &members,
+            &[],
+            &[],
+            &[],
+            3,
+            Some(path.clone()),
+        );
+        assert_eq!(cluster.topology_authority.committed_term(), 5);
+
+        let cid = cluster.topology_authority.cluster_id();
+        let commit = crate::cluster::topology::TopologyCommit {
+            term: 6,
+            proposer: NodeId(1),
+            members: members.clone(),
+            cluster_id: cid,
+            placement_version: 1,
+            digest: crate::cluster::topology::TopologyTerm::compute_digest(6, &cid, &members, 1),
+            voters: members.clone(),
+        };
+
+        let outcome = cluster.apply_committed_topology_durable(&commit);
+        assert_eq!(
+            outcome,
+            crate::cluster::topology::DurableCommitOutcome::Applied(6),
+            "a healthy persist path must apply the commit"
+        );
+        assert_eq!(cluster.topology_authority.committed_term(), 6);
+        // The durable record on disk carries the new term.
+        let loaded = load_topology_state(&path);
+        assert_eq!(
+            loaded.committed_term, 6,
+            "the committed term must be durable on disk"
+        );
+        assert_eq!(loaded.committed_members, members);
     }
 
     #[test]

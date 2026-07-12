@@ -450,6 +450,24 @@ pub struct PersistedTopologyState {
     pub committed_placement_version: u16,
 }
 
+/// G9 — result of [`TopologyAuthority::handle_commit_durable`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DurableCommitOutcome {
+    /// The commit passed every gate, its post-commit state was persisted
+    /// durably, and it was then applied. Carries the committed term; the
+    /// caller should activate the shard table for it.
+    Applied(u64),
+    /// The commit did not pass the acceptance gates (stale term, bad digest,
+    /// unsupported placement version, missing quorum proof, or split-brain
+    /// signature). Nothing was persisted or applied.
+    NotApplied,
+    /// The commit was valid but the durable persist failed. Fail-closed: the
+    /// term was NOT applied, so the node keeps serving its prior term rather
+    /// than one it could forget on reboot. The caller must surface a retryable
+    /// error and must NOT activate under the new term.
+    PersistFailed,
+}
+
 impl PersistedTopologyState {
     /// Serialize to bytes.
     ///
@@ -1403,12 +1421,33 @@ impl TopologyAuthority {
     /// Returns `Some(term)` if the commit is valid and was applied,
     /// meaning the caller should activate the shard table with the
     /// committed members.
+    ///
+    /// NOTE (G9): this advances the served `committed_term` in memory WITHOUT
+    /// persisting it. Callers that must not serve a term they could lose across
+    /// a crash use [`TopologyAuthority::handle_commit_durable`] instead; this
+    /// remains for tests and single-node paths where a crash cannot produce a
+    /// peer holding a term this node forgot.
     pub fn handle_commit(&self, commit: &TopologyCommit) -> Option<u64> {
+        if !self.commit_passes_gates(commit) {
+            return None;
+        }
+        self.apply_commit(commit);
+        Some(commit.term)
+    }
+
+    /// Run every acceptance gate for an incoming commit WITHOUT applying it.
+    ///
+    /// Returns `true` when the commit is valid and should be applied. Shared by
+    /// [`TopologyAuthority::handle_commit`] and the durable variant so a commit
+    /// is validated identically whether or not the caller persists first. A
+    /// couple of gates carry side effects (the C11 self-fence arm, error logs);
+    /// those fire on rejection exactly as before.
+    fn commit_passes_gates(&self, commit: &TopologyCommit) -> bool {
         let committed = self.committed_term.load(Ordering::Relaxed);
 
         // Validate: term must be strictly higher.
         if commit.term <= committed {
-            return None;
+            return false;
         }
 
         // Validate digest. The digest is computed over
@@ -1421,7 +1460,7 @@ impl TopologyAuthority {
             commit.placement_version,
         );
         if commit.digest != expected_digest {
-            return None;
+            return false;
         }
 
         // W6 (INVARIANT ii) — activation gate. REFUSE to apply (and thus to
@@ -1450,11 +1489,11 @@ impl TopologyAuthority {
                 self.unapplicable_committed_term
                     .fetch_max(commit.term, Ordering::Relaxed);
             }
-            return None;
+            return false;
         }
 
         if !commit.has_quorum_voter_proof() {
-            return None;
+            return false;
         }
 
         // E-2: mirror the propose/vote-side split-brain guard set on the
@@ -1484,19 +1523,27 @@ impl TopologyAuthority {
                 "cluster: refusing topology commit — split-brain heal signature \
                  (cluster_id mismatch, non-monotonic change, or unseen members).",
             );
-            return None;
+            return false;
         }
 
-        // Apply commit.
+        true
+    }
+
+    /// Apply a commit that has already passed every validation gate in
+    /// [`TopologyAuthority::handle_commit`]. Advances `committed_term` — the
+    /// value `is_master` serves — so callers that require durability first must
+    /// go through [`TopologyAuthority::handle_commit_durable`] (G9), never call
+    /// this directly.
+    fn apply_commit(&self, commit: &TopologyCommit) {
         // E-01: a committed term with N members is direct evidence the
         // cluster reached size N — raise the peak so any later
         // SWIM-observed shrink is gated on the majority of this size.
         self.observe_peak_cluster_size(commit.members.len() as u64);
-        self.committed_term.store(commit.term, Ordering::Relaxed);
         // W6 — adopt the committed placement version. The coordinator reads
         // this when it (re)installs the shard table for `commit.term`, so the
         // first v2 commit triggers the planned full reshuffle via the normal
-        // activation/migration machinery.
+        // activation/migration machinery. Set BEFORE committed_term so a reader
+        // that observes the new term also sees the matching placement version.
         self.committed_placement_version
             .store(commit.placement_version.max(1) as u64, Ordering::Relaxed);
         *self.committed_members.write().unwrap() = commit.members.clone();
@@ -1514,6 +1561,10 @@ impl TopologyAuthority {
                 seen.insert(*m);
             }
         }
+        // Advance the served term LAST: `is_master` reads `committed_term`, so
+        // publishing it after the members/placement above keeps a concurrent
+        // reader from seeing the new term with a stale member view.
+        self.committed_term.store(commit.term, Ordering::Relaxed);
         // Phase I — stamp the wall-clock time so cluster_health can
         // report `last_topology_commit_age_ms`. Best-effort: a system
         // clock without UNIX_EPOCH access stays at the prior value.
@@ -1524,8 +1575,73 @@ impl TopologyAuthority {
 
         // Clear any pending proposal (superseded by this commit).
         *self.pending_proposal.lock() = None;
+    }
 
-        Some(commit.term)
+    /// G9 — the `PersistedTopologyState` this authority WOULD hold after
+    /// applying `commit`, computed WITHOUT mutating any state.
+    ///
+    /// Lets a caller persist the post-commit durable record BEFORE
+    /// [`TopologyAuthority::apply_commit`] advances the served `committed_term`
+    /// (see [`TopologyAuthority::handle_commit_durable`]). Mirrors exactly what
+    /// [`TopologyAuthority::persisted_state`] returns after `apply_commit`:
+    /// term/members/voters/placement taken from the commit, peak raised to the
+    /// committed size, and the ever-seen set unioned with the commit's
+    /// members+voters. `voted_term` is left as-is (apply does not touch it).
+    pub fn persisted_state_for_commit(
+        &self,
+        commit: &TopologyCommit,
+        peak: u64,
+        incarnation: u64,
+    ) -> PersistedTopologyState {
+        let mut ever_seen: HashSet<NodeId> = self.committed_voter_ever_seen.read().unwrap().clone();
+        ever_seen.extend(commit.voters.iter().copied());
+        ever_seen.extend(commit.members.iter().copied());
+        PersistedTopologyState {
+            peak_cluster_size: peak
+                .max(self.peak_cluster_size())
+                .max(commit.members.len() as u64),
+            committed_term: commit.term,
+            committed_members: commit.members.clone(),
+            committed_voters: commit.voters.clone(),
+            voted_term: self.voted_term.load(Ordering::Relaxed),
+            incarnation,
+            committed_voter_ever_seen: ever_seen.into_iter().collect(),
+            committed_placement_version: commit.placement_version.max(1),
+        }
+    }
+
+    /// G9 — apply a commit only after its post-commit state is DURABLE.
+    ///
+    /// The committed term is what `is_master` serves, so a node must not
+    /// advertise authority under term T until T survives a crash. This mirrors
+    /// the H10 persist-before-vote discipline for the commit path: every
+    /// validation gate of [`TopologyAuthority::handle_commit`] runs first (so
+    /// an invalid or unsupported commit never persists and never applies), then
+    /// `persist` is invoked with the post-commit [`PersistedTopologyState`];
+    /// only if it returns `true` is the commit applied in memory.
+    ///
+    /// Fail-closed: on a persist failure the commit is NOT applied
+    /// ([`DurableCommitOutcome::PersistFailed`]) and the node stays on its
+    /// prior term rather than serve a term it could forget on reboot.
+    pub fn handle_commit_durable<F>(
+        &self,
+        commit: &TopologyCommit,
+        peak: u64,
+        incarnation: u64,
+        persist: F,
+    ) -> DurableCommitOutcome
+    where
+        F: FnOnce(&PersistedTopologyState) -> bool,
+    {
+        if !self.commit_passes_gates(commit) {
+            return DurableCommitOutcome::NotApplied;
+        }
+        let state = self.persisted_state_for_commit(commit, peak, incarnation);
+        if !persist(&state) {
+            return DurableCommitOutcome::PersistFailed;
+        }
+        self.apply_commit(commit);
+        DurableCommitOutcome::Applied(commit.term)
     }
 
     /// Phase I — millis since UNIX epoch of the most recent observed
@@ -3913,6 +4029,160 @@ mod tests {
             !auth.is_self_fenced(),
             "fence must clear once committed_term (5) passes the unapplicable term (4)"
         );
+    }
+
+    /// G9 (RED before fix) — a commit whose durable persist FAILS must NOT
+    /// advance the served `committed_term`. Pre-fix ordering advanced the term
+    /// in memory first and only then persisted (best-effort), so a crash — or
+    /// here a failed persist — left the node serving/authorising under a term
+    /// it had no durable record of. `handle_commit_durable` must fail closed.
+    #[test]
+    fn handle_commit_durable_fails_closed_when_persist_fails() {
+        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+        let mems = members(&[1, 2, 3]);
+        let commit = TopologyCommit {
+            term: 4,
+            proposer: NodeId(1),
+            members: mems.clone(),
+            cluster_id: ClusterId::UNSET,
+            placement_version: 1,
+            digest: TopologyTerm::compute_digest(4, &ClusterId::UNSET, &mems, 1),
+            voters: mems.clone(),
+        };
+        // Persist reports failure.
+        let outcome = auth.handle_commit_durable(&commit, 3, 1, |_state| false);
+        assert_eq!(outcome, DurableCommitOutcome::PersistFailed);
+        assert_eq!(
+            auth.committed_term(),
+            0,
+            "committed_term must NOT advance when the durable persist fails"
+        );
+        assert!(
+            auth.committed_members().is_empty(),
+            "committed membership must not change on a failed persist"
+        );
+    }
+
+    /// G9 liveness + ordering — a successful persist applies the commit, and
+    /// the state handed to `persist` carries the NEW term while
+    /// `committed_term` is still the OLD one (persist strictly precedes the
+    /// served advance).
+    #[test]
+    fn handle_commit_durable_persists_before_serving() {
+        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+        let mems = members(&[1, 2, 3]);
+        let commit = TopologyCommit {
+            term: 4,
+            proposer: NodeId(1),
+            members: mems.clone(),
+            cluster_id: ClusterId::UNSET,
+            placement_version: 1,
+            digest: TopologyTerm::compute_digest(4, &ClusterId::UNSET, &mems, 1),
+            voters: mems.clone(),
+        };
+        let persisted_term = std::cell::Cell::new(u64::MAX);
+        let served_term_at_persist = std::cell::Cell::new(u64::MAX);
+        let outcome = auth.handle_commit_durable(&commit, 3, 1, |state| {
+            // The state being made durable carries the new committed term...
+            persisted_term.set(state.committed_term);
+            // ...while the SERVED committed_term has NOT yet advanced.
+            served_term_at_persist.set(auth.committed_term());
+            true
+        });
+        assert_eq!(outcome, DurableCommitOutcome::Applied(4));
+        assert_eq!(
+            persisted_term.get(),
+            4,
+            "the state persisted must carry the new committed term"
+        );
+        assert_eq!(
+            served_term_at_persist.get(),
+            0,
+            "committed_term must still be the OLD term while persisting (persist-before-serve)"
+        );
+        assert_eq!(
+            auth.committed_term(),
+            4,
+            "committed_term advances only after a successful persist"
+        );
+    }
+
+    /// G9 — an invalid/stale commit is neither persisted nor applied.
+    #[test]
+    fn handle_commit_durable_rejects_invalid_without_persisting() {
+        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+        let mems = members(&[1, 2, 3]);
+        // Bad digest → gate rejects before any persist.
+        let commit = TopologyCommit {
+            term: 4,
+            proposer: NodeId(1),
+            members: mems.clone(),
+            cluster_id: ClusterId::UNSET,
+            placement_version: 1,
+            digest: [0u8; 32],
+            voters: mems.clone(),
+        };
+        let persist_called = std::cell::Cell::new(false);
+        let outcome = auth.handle_commit_durable(&commit, 3, 1, |_state| {
+            persist_called.set(true);
+            true
+        });
+        assert_eq!(outcome, DurableCommitOutcome::NotApplied);
+        assert!(
+            !persist_called.get(),
+            "an invalid commit must not reach the persist step"
+        );
+        assert_eq!(auth.committed_term(), 0);
+    }
+
+    /// G9 — `persisted_state_for_commit` mirrors exactly what
+    /// `persisted_state` reports after a real `handle_commit` apply, so the
+    /// pre-apply durable record is byte-identical to the post-apply one.
+    #[test]
+    fn persisted_state_for_commit_matches_post_apply_state() {
+        let mems = members(&[1, 2, 3]);
+        let commit = TopologyCommit {
+            term: 4,
+            proposer: NodeId(1),
+            members: mems.clone(),
+            cluster_id: ClusterId::UNSET,
+            placement_version: 1,
+            digest: TopologyTerm::compute_digest(4, &ClusterId::UNSET, &mems, 1),
+            voters: mems.clone(),
+        };
+
+        // Pre-apply projection.
+        let auth_a = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+        let projected = auth_a.persisted_state_for_commit(&commit, 3, 7);
+
+        // Real apply, then read the actual persisted state.
+        let auth_b = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+        assert_eq!(auth_b.handle_commit(&commit), Some(4));
+        let actual = auth_b.persisted_state(3, 7);
+
+        assert_eq!(projected.committed_term, actual.committed_term);
+        assert_eq!(projected.committed_members, actual.committed_members);
+        assert_eq!(projected.committed_voters, actual.committed_voters);
+        assert_eq!(projected.peak_cluster_size, actual.peak_cluster_size);
+        assert_eq!(
+            projected.committed_placement_version,
+            actual.committed_placement_version
+        );
+        assert_eq!(projected.voted_term, actual.voted_term);
+        assert_eq!(projected.incarnation, actual.incarnation);
+        let mut a: Vec<u64> = projected
+            .committed_voter_ever_seen
+            .iter()
+            .map(|n| n.0)
+            .collect();
+        let mut b: Vec<u64> = actual
+            .committed_voter_ever_seen
+            .iter()
+            .map(|n| n.0)
+            .collect();
+        a.sort_unstable();
+        b.sort_unstable();
+        assert_eq!(a, b, "ever-seen set must match post-apply");
     }
 
     #[test]
