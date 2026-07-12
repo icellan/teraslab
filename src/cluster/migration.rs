@@ -325,6 +325,33 @@ struct InboundMigration {
     /// (the requester re-derives and re-sends from `pending_inbound_entries`
     /// after restore), so this is process-local timing state only.
     transfer_requested_at: Option<std::time::Instant>,
+    /// C8 — set when the settled-inbound GC reaps this entry as an orphan
+    /// (its source died mid-migration and there is no completion handshake)
+    /// WITHOUT a completeness proof. A `lost` entry stays in
+    /// `inbound_migrations` with its `inbound_bitmap` fence bit SET, so the
+    /// shard is never served as full authority — it is marked UNAVAILABLE
+    /// (client-invisible) rather than cleared-to-Serving. The mark is
+    /// cleared only by a genuine completeness proof (`mark_inbound_complete*`,
+    /// which flips `completed` and thereby drops the `lost` predicate) or by
+    /// a fresh migration re-acquiring the shard (`add_inbound` /
+    /// `register_inbound_source`). Not serialized: a restart re-loads the
+    /// entry as plain-pending (still fenced); the GC re-marks it lost after
+    /// the next idle window — the fence is what matters and it survives.
+    lost: bool,
+}
+
+impl InboundMigration {
+    /// A freshly-registered, not-yet-received inbound entry (fence up, not
+    /// completed, no outstanding transfer request, not lost).
+    fn pending(shard: u16, from_node: NodeId) -> Self {
+        Self {
+            shard,
+            from_node,
+            completed: false,
+            transfer_requested_at: None,
+            lost: false,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -605,6 +632,18 @@ impl MigrationManager {
                 // record so a stale entry cannot later authorize deleting the
                 // data we are now receiving back (task #28).
                 self.committed_handoffs.remove(&task.shard);
+                // C8 — a fresh migration re-acquiring this shard SUPERSEDES any
+                // prior orphaned/lost attempt (possibly from a now-dead
+                // source): clear the `lost` mark on every existing entry for
+                // the shard so a stale entry cannot leave the re-received shard
+                // flagged unavailable once the fresh copy proves complete.
+                for m in self
+                    .inbound_migrations
+                    .iter_mut()
+                    .filter(|m| m.shard == task.shard)
+                {
+                    m.lost = false;
+                }
                 if let Some(existing) = self
                     .inbound_migrations
                     .iter_mut()
@@ -625,12 +664,8 @@ impl MigrationManager {
                         self.inbound_bitmap.set(task.shard);
                     }
                 } else {
-                    self.inbound_migrations.push(InboundMigration {
-                        shard: task.shard,
-                        from_node: task.from_node,
-                        completed: false,
-                        transfer_requested_at: None,
-                    });
+                    self.inbound_migrations
+                        .push(InboundMigration::pending(task.shard, task.from_node));
                     self.inbound_bitmap.set(task.shard);
                 }
             }
@@ -647,12 +682,8 @@ impl MigrationManager {
         if self.inbound_migrations.iter().any(|m| m.shard == shard) {
             return false;
         }
-        self.inbound_migrations.push(InboundMigration {
-            shard,
-            from_node: NodeId(0),
-            completed: false,
-            transfer_requested_at: None,
-        });
+        self.inbound_migrations
+            .push(InboundMigration::pending(shard, NodeId(0)));
         self.inbound_bitmap.set(shard);
         true
     }
@@ -677,19 +708,20 @@ impl MigrationManager {
     /// path treats the shard as still receiving until completion. Returns
     /// `true` if a new entry was added, `false` if one already existed.
     pub fn register_inbound_source(&mut self, shard: u16, from_node: NodeId) -> bool {
-        if self
+        if let Some(existing) = self
             .inbound_migrations
-            .iter()
-            .any(|m| m.shard == shard && m.from_node == from_node && !m.completed)
+            .iter_mut()
+            .find(|m| m.shard == shard && m.from_node == from_node && !m.completed)
         {
+            // C8 — re-seeding a re-push expectation for a shard previously
+            // marked lost revives it as an active (non-lost) pending entry so
+            // the incoming re-home completes it, rather than leaving it stuck
+            // as unavailable.
+            existing.lost = false;
             return false;
         }
-        self.inbound_migrations.push(InboundMigration {
-            shard,
-            from_node,
-            completed: false,
-            transfer_requested_at: None,
-        });
+        self.inbound_migrations
+            .push(InboundMigration::pending(shard, from_node));
         self.inbound_bitmap.set(shard);
         true
     }
@@ -946,10 +978,8 @@ impl MigrationManager {
             return;
         }
         self.inbound_migrations.push(InboundMigration {
-            shard,
-            from_node,
             completed: true,
-            transfer_requested_at: None,
+            ..InboundMigration::pending(shard, from_node)
         });
     }
 
@@ -1186,12 +1216,70 @@ impl MigrationManager {
         self.inbound_migrations
             .iter()
             .filter(|m| !m.completed)
+            // C8 — a shard already marked LOST is terminal for the reap
+            // fast-path: it stays fenced (unavailable) and must NOT be
+            // re-processed, otherwise the GC would spin re-marking it every
+            // cycle. It leaves this set only via a completeness proof or a
+            // fresh re-acquiring migration (both clear the `lost` predicate).
+            .filter(|m| !m.lost)
             .filter(|m| match m.transfer_requested_at {
                 Some(at) => now.duration_since(at) >= request_grace,
                 None => true,
             })
             .map(|m| m.shard)
             .collect()
+    }
+
+    /// C8 — mark the listed inbound shards as LOST (unavailable) rather than
+    /// clearing their write fence.
+    ///
+    /// The settled-inbound GC calls this INSTEAD of
+    /// [`Self::clear_pending_inbound_for_shards`] when it reaps an orphaned
+    /// inbound entry (a source that died mid-migration with no completion
+    /// handshake). Clearing the fence there is unsafe: it would let a shard
+    /// this node holds only PARTIALLY answer [`RunningCluster::is_master`] as
+    /// full authority and serve stale/incomplete reads and writes.
+    ///
+    /// The SAFE DEFAULT is fence-until-proven: only a NON-completed entry that
+    /// was NOT already lost is marked (proven-complete entries are cleared by
+    /// [`Self::cleanup_completed`] on the normal path and are never touched
+    /// here). The shard's `inbound_bitmap` fence bit is deliberately KEPT set,
+    /// so the shard stays client-invisible until a future migration completes
+    /// it or an operator intervenes. Returns the number of shards newly marked
+    /// lost.
+    pub fn mark_inbound_lost(&mut self, shards: &std::collections::HashSet<u16>) -> usize {
+        let mut marked = 0usize;
+        for m in &mut self.inbound_migrations {
+            if !m.completed && !m.lost && shards.contains(&m.shard) {
+                // Fence bit is intentionally left SET — do NOT clear it. A
+                // pending entry always holds its `inbound_bitmap` bit, so the
+                // shard stays fenced/unavailable.
+                m.lost = true;
+                marked += 1;
+            }
+        }
+        marked
+    }
+
+    /// C8 — whether `shard` currently has a pending inbound entry marked LOST
+    /// (unavailable): received incompletely, source presumed dead, no
+    /// completeness proof. Such a shard stays fenced and must never be served
+    /// as full authority. Derived from the entries (off the hot path); the
+    /// write hot path fences via the `inbound_bitmap` shadow, which a lost
+    /// entry keeps set.
+    pub fn is_shard_lost(&self, shard: u16) -> bool {
+        self.inbound_migrations
+            .iter()
+            .any(|m| m.shard == shard && !m.completed && m.lost)
+    }
+
+    /// C8 — number of shards currently marked LOST (unavailable). Diagnostic /
+    /// alerting hook.
+    pub fn lost_count(&self) -> usize {
+        self.inbound_migrations
+            .iter()
+            .filter(|m| !m.completed && m.lost)
+            .count()
     }
 
     /// W1.1 residual fix — number of pending inbound shards with an
@@ -1337,12 +1425,8 @@ impl MigrationManager {
                 .iter()
                 .any(|m| m.shard == shard && m.from_node == from_node)
             {
-                self.inbound_migrations.push(InboundMigration {
-                    shard,
-                    from_node,
-                    completed: false,
-                    transfer_requested_at: None,
-                });
+                self.inbound_migrations
+                    .push(InboundMigration::pending(shard, from_node));
                 self.inbound_bitmap.set(shard);
             }
         }
@@ -2724,19 +2808,11 @@ mod tests {
     #[test]
     fn clear_stale_inbound_preserves_pending_entries() {
         let mut mgr = MigrationManager::new();
-        mgr.inbound_migrations.push(InboundMigration {
-            shard: 10,
-            from_node: NodeId(1),
-            completed: false,
-            transfer_requested_at: None,
-        });
+        mgr.inbound_migrations
+            .push(InboundMigration::pending(10, NodeId(1)));
         mgr.inbound_bitmap.set(10);
-        mgr.inbound_migrations.push(InboundMigration {
-            shard: 20,
-            from_node: NodeId(0),
-            completed: false,
-            transfer_requested_at: None,
-        });
+        mgr.inbound_migrations
+            .push(InboundMigration::pending(20, NodeId(0)));
         mgr.inbound_bitmap.set(20);
 
         let removed = mgr.clear_stale_inbound(Duration::ZERO);
@@ -2756,19 +2832,11 @@ mod tests {
     fn settled_gc_skips_recently_requested_inbound() {
         let mut mgr = MigrationManager::new();
         // Two inbound entries: shard 10 from node 1, shard 20 from node 2.
-        mgr.inbound_migrations.push(InboundMigration {
-            shard: 10,
-            from_node: NodeId(1),
-            completed: false,
-            transfer_requested_at: None,
-        });
+        mgr.inbound_migrations
+            .push(InboundMigration::pending(10, NodeId(1)));
         mgr.inbound_bitmap.set(10);
-        mgr.inbound_migrations.push(InboundMigration {
-            shard: 20,
-            from_node: NodeId(2),
-            completed: false,
-            transfer_requested_at: None,
-        });
+        mgr.inbound_migrations
+            .push(InboundMigration::pending(20, NodeId(2)));
         mgr.inbound_bitmap.set(20);
 
         let grace = Duration::from_secs(10);
@@ -3332,6 +3400,118 @@ mod tests {
         assert!(mgr.has_pending_inbound(20));
         assert!(mgr.has_pending_inbound(30));
         assert_eq!(mgr.inbound_count(), 2);
+    }
+
+    // -----------------------------------------------------------------------
+    // C8 — settled-inbound orphan reap must NOT serve an INCOMPLETE shard as
+    // full authority. An orphaned incomplete inbound (source died, no
+    // completion handshake) is marked LOST and stays FENCED, never cleared.
+    // -----------------------------------------------------------------------
+
+    /// The core C8 property: reaping a genuinely orphaned but INCOMPLETE
+    /// inbound entry keeps the shard fenced (marks it lost/unavailable) rather
+    /// than clearing the fence — so the partial shard is never served as full
+    /// authority. Contrast `clear_pending_inbound_for_shards`, which drops the
+    /// fence (the unsafe pre-C8 reap).
+    #[test]
+    fn mark_inbound_lost_keeps_fence_for_incomplete_orphan() {
+        let mut mgr = MigrationManager::new();
+        // A source began pushing but died mid-migration: incomplete, no
+        // completion handshake seen.
+        mgr.register_inbound_source(7, NodeId(2));
+        assert!(mgr.has_pending_inbound(7), "shard fenced while receiving");
+        assert!(!mgr.is_shard_lost(7));
+
+        // Settled-inbound GC reap candidates: incomplete entries with no
+        // outstanding transfer request.
+        let settled = mgr.pending_inbound_shards_excluding_recent_requests(Duration::from_secs(1));
+        assert!(
+            settled.contains(&7),
+            "orphaned incomplete inbound is a reap candidate"
+        );
+
+        // SAFE DEFAULT: the reap marks the shard LOST but MUST NOT clear the
+        // fence — an incomplete shard is never served as full authority.
+        let marked = mgr.mark_inbound_lost(&settled);
+        assert_eq!(marked, 1, "the incomplete orphan is marked lost");
+        assert_eq!(mgr.lost_count(), 1);
+        assert!(mgr.is_shard_lost(7), "shard marked lost/unavailable");
+        assert!(
+            mgr.has_pending_inbound(7),
+            "fence MUST remain set after orphan-reap of an INCOMPLETE inbound",
+        );
+
+        // Idempotent: a lost shard leaves the reap candidate set, so a second
+        // GC pass is a no-op — no re-mark, no fence churn.
+        let settled2 = mgr.pending_inbound_shards_excluding_recent_requests(Duration::from_secs(1));
+        assert!(
+            !settled2.contains(&7),
+            "a lost shard is excluded from further reap candidates",
+        );
+        assert_eq!(mgr.mark_inbound_lost(&settled2), 0);
+        assert!(
+            mgr.has_pending_inbound(7),
+            "fence still held on the second pass"
+        );
+    }
+
+    /// A shard marked lost that LATER receives the completion handshake (source
+    /// recovered, or a re-home completed it) is PROVEN complete: the lost mark
+    /// and the fence both clear on the normal completion path.
+    #[test]
+    fn proven_complete_clears_lost_mark_and_fence() {
+        let mut mgr = MigrationManager::new();
+        mgr.register_inbound_source(9, NodeId(3));
+        let settled = mgr.pending_inbound_shards_excluding_recent_requests(Duration::from_secs(1));
+        assert_eq!(mgr.mark_inbound_lost(&settled), 1);
+        assert!(mgr.is_shard_lost(9));
+        assert!(mgr.has_pending_inbound(9));
+
+        // Completion handshake arrives → proven complete.
+        mgr.mark_inbound_complete(9);
+        assert!(
+            !mgr.is_shard_lost(9),
+            "completeness proof clears the lost mark"
+        );
+        assert!(
+            !mgr.has_pending_inbound(9),
+            "proven-complete shard is unfenced"
+        );
+        assert_eq!(mgr.lost_count(), 0);
+    }
+
+    /// A fresh migration re-acquiring a lost shard revives it as an active
+    /// (non-lost) pending entry so the incoming data can complete it — the
+    /// shard is being received again, not abandoned.
+    #[test]
+    fn re_acquiring_lost_shard_clears_lost_mark() {
+        let mut mgr = MigrationManager::new();
+        mgr.register_inbound_source(11, NodeId(4));
+        let settled = mgr.pending_inbound_shards_excluding_recent_requests(Duration::from_secs(1));
+        mgr.mark_inbound_lost(&settled);
+        assert!(mgr.is_shard_lost(11));
+
+        // A new topology term hands shard 11 back to this node as an inbound
+        // target from a fresh source.
+        let task = MigrationTask {
+            shard: 11,
+            from_node: NodeId(5),
+            to_node: NodeId(1),
+            is_master: true,
+        };
+        mgr.start_outbound(
+            std::slice::from_ref(&task),
+            NodeId(1),
+            &std::collections::HashSet::new(),
+        );
+        assert!(!mgr.is_shard_lost(11), "re-acquiring clears the lost mark");
+        assert!(
+            mgr.has_pending_inbound(11),
+            "still fenced — now actively receiving"
+        );
+        // It is once again a reap candidate (fresh pending, not lost).
+        let settled2 = mgr.pending_inbound_shards_excluding_recent_requests(Duration::from_secs(1));
+        assert!(settled2.contains(&11));
     }
 
     // -----------------------------------------------------------------------

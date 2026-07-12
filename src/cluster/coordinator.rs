@@ -1857,11 +1857,22 @@ impl ClusterCoordinator {
                             // the request re-fire interval, so a lost
                             // request is still reaped on the cycle after the
                             // next re-fire would have re-stamped it.
+                            //
+                            // C8 (SAFE DEFAULT: fence-until-proven) — a
+                            // genuinely orphaned inbound is INCOMPLETE (no
+                            // completion handshake was ever seen; a proven
+                            // entry is completed and removed by
+                            // `cleanup_completed` on the normal path). Clearing
+                            // its fence here would let this node serve a shard
+                            // it holds only PARTIALLY as full authority. Mark
+                            // it LOST instead: the shard stays fenced
+                            // (client-invisible / unavailable) until a future
+                            // migration completes it or an operator intervenes.
                             let settled_shards = mgr
                                 .pending_inbound_shards_excluding_recent_requests(
                                     TRANSFER_REQUEST_INTERVAL,
                                 );
-                            mgr.clear_pending_inbound_for_shards(&settled_shards)
+                            mgr.mark_inbound_lost(&settled_shards)
                         } else {
                             mgr.clear_stale_inbound(Duration::from_secs(30))
                         };
@@ -1876,9 +1887,10 @@ impl ClusterCoordinator {
                                 crate::cluster::migration::persist_inbound_state(path, &mgr);
                             }
                             if clear_settled_inbound {
-                                tracing::info!(
-                                    removed,
-                                    "cluster: cleared settled inbound migrations — no active migrations or handoffs remain",
+                                tracing::warn!(
+                                    lost = removed,
+                                    total_lost = mgr.lost_count(),
+                                    "cluster: marked orphaned INCOMPLETE inbound shards UNAVAILABLE (kept fenced, not served as authority) — source died mid-migration with no completion handshake; a future migration or operator must complete them",
                                 );
                             } else {
                                 tracing::info!(
@@ -15774,6 +15786,57 @@ mod tests {
             }
             other => panic!(
                 "expected MasterQueryResult::Transitioning {{ last_known_term: 5 }}, got {other:?}"
+            ),
+        }
+    }
+
+    /// C8 — a shard this node is the authoritative master for, but which it
+    /// received only PARTIALLY (source died mid-migration, marked LOST by the
+    /// settled-inbound GC), must NOT answer `is_master == Yes`. An incomplete
+    /// shard is never served as full authority: it stays fenced
+    /// (`Transitioning`) until a future migration proves it complete or an
+    /// operator intervenes. Before C8 the GC cleared the fence here, so the
+    /// partial shard served reads/writes as full master.
+    #[test]
+    fn is_master_fences_lost_incomplete_inbound_shard() {
+        let members = vec![NodeId(1)];
+        let table = ShardTable::compute_with_epoch(&members, 1, 5, 1);
+        let cluster = new_test_running_cluster(
+            NodeId(1),
+            table,
+            &[(NodeId(1), "127.0.0.1:4841".parse().unwrap())],
+            &members,
+            &[],
+            &[],
+            &[],
+            1,
+        );
+        let shard = 0u16;
+        let key = key_for_shard(shard);
+
+        // Baseline: single node is the plain authority for shard 0 (no fence).
+        assert!(
+            matches!(cluster.is_master(&key), MasterQueryResult::Yes),
+            "precondition: node is the authority for shard 0",
+        );
+
+        // An incomplete inbound arrived, then its source died; the settled GC
+        // marks it lost (fence KEPT). Mirror that and refresh the hot-path
+        // shadow the way the event loop does after the GC.
+        {
+            let mgr = &mut cluster.migration.lock();
+            mgr.register_inbound_source(shard, NodeId(2));
+            let settled =
+                mgr.pending_inbound_shards_excluding_recent_requests(Duration::from_secs(1));
+            assert_eq!(mgr.mark_inbound_lost(&settled), 1);
+            assert!(mgr.is_shard_lost(shard));
+        }
+        cluster.sync_migration_bitmaps();
+
+        match cluster.is_master(&key) {
+            MasterQueryResult::Transitioning { .. } => {}
+            other => panic!(
+                "a lost/incomplete shard must NOT be served as full authority; got {other:?}",
             ),
         }
     }
