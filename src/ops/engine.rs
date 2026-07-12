@@ -2769,6 +2769,61 @@ impl Engine {
         self.shard_counts[shard as usize].load(std::sync::atomic::Ordering::Acquire)
     }
 
+    /// Per-shard recency fingerprint for the reverse-heal detector (finding C1).
+    ///
+    /// Returns `(count, digest, max_generation)`:
+    ///
+    /// - `count` — number of live records read for the shard. A record whose
+    ///   footer is unreadable or that raced a concurrent deletion
+    ///   ([`SpendError::TxNotFound`](crate::ops::error::SpendError::TxNotFound))
+    ///   is skipped, so this can trail the O(1) [`Self::shard_record_count`] by
+    ///   the number of such records; it is a best-effort content count.
+    /// - `digest` — an order-independent 64-bit fingerprint of the shard's
+    ///   `(txid, generation)` set. It reuses the migration `ManifestHasher`
+    ///   fold primitive (its SHA-256 finalize, truncated to the low 8 bytes),
+    ///   so two nodes with byte-identical shard state produce identical digests
+    ///   and a single record whose generation diverges flips the digest. The
+    ///   truncation is safe because the digest is only a cheap *mismatch*
+    ///   pre-filter — an authoritative superset confirm arbitrates staleness.
+    /// - `max_generation` — the maximum record `generation` in the shard under
+    ///   WRAPPING-serial ordering (see
+    ///   [`crate::record::generation_target_ahead`]), or `0` when the shard
+    ///   holds no readable record. The wrapping compare assumes no record sits
+    ///   untouched for more than 2^31 mutations while a peer advances — safe
+    ///   for any realistic lost tail.
+    ///
+    /// Reuses the existing [`Self::keys_for_shard`] index scan plus the
+    /// per-record [`Self::read_metadata`] device read (the same primitives the
+    /// migration manifest collector uses); it introduces no new device scan.
+    /// Intended for boot-time / off-hot-path detection, one call per mastered
+    /// shard.
+    pub fn shard_recency(&self, shard: u16) -> (u64, u64, u32) {
+        let keys = self.keys_for_shard(shard);
+        let mut manifest = crate::cluster::coordinator::ManifestHasher::new();
+        let mut max_generation: u32 = 0;
+        let mut count: u64 = 0;
+        for key in &keys {
+            let generation = match self.read_metadata(key) {
+                Ok(meta) => meta.generation,
+                // Raced deletion or an unreadable footer: skip it. Such a record
+                // is still observable via `enumeration_unreadable`; excluding it
+                // here only shifts the fingerprint, never correctness.
+                Err(_) => continue,
+            };
+            manifest.fold(&key.txid, generation);
+            // Wrapping-serial max: keep whichever generation is "ahead".
+            if count == 0 || crate::record::generation_target_ahead(max_generation, generation) {
+                max_generation = generation;
+            }
+            count = count.saturating_add(1);
+        }
+        let full = manifest.finalize();
+        let digest = u64::from_le_bytes([
+            full[0], full[1], full[2], full[3], full[4], full[5], full[6], full[7],
+        ]);
+        (count, digest, max_generation)
+    }
+
     /// Populate `shard_counts` from the fully-built primary index.
     ///
     /// Called EXACTLY ONCE from `new_inner` while the engine is still
@@ -28748,6 +28803,63 @@ mod tests {
         let other_shard = if shard == 0 { 1 } else { 0 };
         let other_keys = h.engine.keys_for_shard(other_shard);
         assert!(other_keys.is_empty());
+    }
+
+    /// Reverse-heal Phase 1: `shard_recency` is a deterministic content
+    /// fingerprint — recomputing it over unchanged state yields identical
+    /// `(count, digest, max_generation)`, and an empty shard fingerprints
+    /// differently from a populated one.
+    #[test]
+    fn shard_recency_digest_identical_for_identical_state() {
+        let h = TestHarness::new(3, TxFlags::empty());
+        let shard = crate::cluster::shards::ShardTable::shard_for_key(&h.key);
+
+        let (count_a, digest_a, max_gen_a) = h.engine.shard_recency(shard);
+        let (count_b, digest_b, max_gen_b) = h.engine.shard_recency(shard);
+
+        assert_eq!(count_a, 1, "one record lives in the shard");
+        assert_eq!(count_a, count_b, "count is stable across recomputation");
+        assert_eq!(digest_a, digest_b, "digest is a deterministic fingerprint");
+        assert_eq!(max_gen_a, max_gen_b, "max_generation is stable");
+
+        // A shard with no records fingerprints to (0, digest_of_empty, 0), and
+        // that empty digest differs from the populated shard's.
+        let empty_shard = shard ^ 1;
+        let (empty_count, empty_digest, empty_gen) = h.engine.shard_recency(empty_shard);
+        assert_eq!(empty_count, 0, "sibling shard holds no records");
+        assert_eq!(empty_gen, 0, "empty shard has max_generation 0");
+        assert_ne!(
+            empty_digest, digest_a,
+            "empty and populated shards fingerprint differently",
+        );
+    }
+
+    /// Reverse-heal Phase 1: advancing only a record's generation (its shard
+    /// membership unchanged) must flip the digest and move `max_generation`,
+    /// so a peer that diverged on generation is detectable.
+    #[test]
+    fn shard_recency_differs_on_divergent_generation() {
+        let h = TestHarness::new(3, TxFlags::empty());
+        let shard = crate::cluster::shards::ShardTable::shard_for_key(&h.key);
+
+        let (count_before, digest_before, gen_before) = h.engine.shard_recency(shard);
+        assert_eq!(count_before, 1);
+
+        let bumped = gen_before.wrapping_add(7);
+        assert!(
+            h.engine
+                .set_record_generation(&h.key, bumped)
+                .expect("generation write"),
+            "record present → generation written",
+        );
+
+        let (count_after, digest_after, gen_after) = h.engine.shard_recency(shard);
+        assert_eq!(count_after, count_before, "record count is unchanged");
+        assert_eq!(gen_after, bumped, "max_generation reflects the new generation");
+        assert_ne!(
+            digest_after, digest_before,
+            "a divergent generation flips the shard fingerprint",
+        );
     }
 
     #[test]
