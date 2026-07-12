@@ -379,6 +379,13 @@ pub struct Engine {
     /// paths, in which case [`Self::persist_last_durable_height`] is a no-op
     /// and the height is recovered from the record-derived floor alone.
     last_durable_height_path: std::sync::OnceLock<std::path::PathBuf>,
+    /// Per-store deletion-tombstone log (reverse-heal Phase 2a), attached
+    /// post-construction via [`Self::set_tombstone_log`] (mirroring the redo /
+    /// last-durable-height attach pattern) ONLY when `reverse_heal.tombstones`
+    /// is enabled. Absent ⇒ the whole subsystem is a zero-cost no-op: deletes
+    /// record nothing and every query returns `false` (default OFF, so
+    /// single-node / RF=1 deployments pay nothing).
+    tombstone_log: std::sync::OnceLock<crate::ops::tombstone::TombstoneLog>,
     /// Segments the LAST checkpoint's defrag compaction pass relocated live
     /// records out of. Published by the checkpoint via
     /// [`Self::record_last_checkpoint_defrag`] and read by the `/status`
@@ -677,6 +684,7 @@ impl Engine {
             create_self_sufficient_required: std::sync::OnceLock::new(),
             last_durable_height: std::sync::atomic::AtomicU32::new(0),
             last_durable_height_path: std::sync::OnceLock::new(),
+            tombstone_log: std::sync::OnceLock::new(),
             last_checkpoint_compacted: std::sync::atomic::AtomicU64::new(0),
             last_checkpoint_reclaimed: std::sync::atomic::AtomicU64::new(0),
             blob_store: None,
@@ -2006,6 +2014,89 @@ impl Engine {
         std::fs::rename(&tmp_path, path)?;
         fsync_parent_dir(path)?;
         Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Reverse-heal Phase 2a: deletion tombstones.
+    //
+    // The attached [`crate::ops::tombstone::TombstoneLog`] gates the entire
+    // subsystem: absent (the default, `reverse_heal.tombstones` off) ⇒ deletes
+    // record nothing and every query is a `false` no-op. See the field doc on
+    // [`Self::tombstone_log`].
+    // -----------------------------------------------------------------------
+
+    /// Attach the per-store deletion-tombstone log (reverse-heal Phase 2a).
+    /// Called once at boot ONLY when `reverse_heal.tombstones` is enabled;
+    /// enabling deletion-tombstone recording, retention GC, and the
+    /// [`Self::tombstone_at_or_ahead`] heal-apply query. Idempotent-safe: a
+    /// second call is ignored (the first log wins).
+    pub fn set_tombstone_log(&self, log: crate::ops::tombstone::TombstoneLog) {
+        if self.tombstone_log.set(log).is_err() {
+            tracing::warn!(
+                target: "teraslab::engine",
+                "set_tombstone_log called twice; keeping the first log",
+            );
+        }
+    }
+
+    /// Whether deletion tombstones are enabled on this node (a log is attached).
+    pub fn tombstones_enabled(&self) -> bool {
+        self.tombstone_log.get().is_some()
+    }
+
+    /// The primary index's shard seed — so an attached tombstone log routes each
+    /// key to the SAME shard number as the primary index.
+    pub fn index_seed(&self) -> u64 {
+        self.index.seed()
+    }
+
+    /// O(1) heal-apply query (design §A, consumed by Phase 2c): does this node
+    /// hold a durable tombstone for `key` at a generation at-or-ahead of
+    /// `generation`? Always `false` when tombstones are disabled.
+    pub fn tombstone_at_or_ahead(&self, key: &TxKey, generation: u32) -> bool {
+        self.tombstone_log
+            .get()
+            .is_some_and(|log| log.at_or_ahead(key, generation))
+    }
+
+    /// The recorded `(generation, deletion_height)` for `key`'s tombstone, if
+    /// any. `None` when disabled or no tombstone exists.
+    pub fn tombstone_lookup(&self, key: &TxKey) -> Option<(u32, u32)> {
+        self.tombstone_log.get().and_then(|log| log.lookup(key))
+    }
+
+    /// Persist the tombstone log at a checkpoint (retention GC + durable write +
+    /// fsync). No-op when disabled.
+    ///
+    /// # Errors
+    /// Returns a [`std::io::Error`] on filesystem failure; the checkpoint treats
+    /// it like the last-durable-height persist — non-fatal, retried next round.
+    pub fn persist_tombstones(&self) -> std::io::Result<()> {
+        match self.tombstone_log.get() {
+            Some(log) => log.persist(self.last_durable_height()),
+            None => Ok(()),
+        }
+    }
+
+    /// GC the in-RAM tombstone index against the current last-durable height
+    /// (boot floor-GC / checkpoint pre-pass). Returns the number dropped, `0`
+    /// when disabled.
+    pub fn gc_tombstones(&self) -> usize {
+        self.tombstone_log
+            .get()
+            .map_or(0, |log| log.gc(self.last_durable_height()))
+    }
+
+    /// Boot reconcile (Invariant TS-1): drop any tombstone whose key came back
+    /// LIVE in the recovered primary index, so a delete reverted after its
+    /// append reached disk leaves no dangling tombstone over a live record.
+    /// Returns the number dropped, `0` when disabled. Runs AFTER recovery has
+    /// rebuilt + reconciled the primary index.
+    pub fn reconcile_tombstones_against_live_index(&self) -> usize {
+        let Some(log) = self.tombstone_log.get() else {
+            return 0;
+        };
+        log.reconcile_against_live(|key| matches!(self.index.lookup_checked(key), Ok(Some(_))))
     }
 
     /// Acquire the SHARED (read-side) dispatch visibility barrier — used
@@ -8214,7 +8305,7 @@ impl Engine {
         // recheck reads metadata the unguarded path reads anyway, so the cost
         // is one extra `TxFlags` test. Direct client deletes
         // (`due_guard == None`) skip this and stay unconditional (spec §3.18).
-        let (record_size, device_preserve, device_dah, device_conflicting) = {
+        let (record_size, device_preserve, device_dah, device_conflicting, frozen_generation) = {
             let meta =
                 self.read_metadata_for_key(entry.device_id, &req.tx_key, entry.record_offset)?;
             if let Some(current_height) = req.due_guard
@@ -8237,6 +8328,11 @@ impl Engine {
                 { meta.preserve_until },
                 { meta.delete_at_height },
                 meta.flags.contains(TxFlags::CONFLICTING),
+                // Reverse-heal Phase 2a: the record's FROZEN generation N —
+                // captured here (one extra packed-field copy under the stripe
+                // lock already held) so the tombstone below carries it. Pre-2a
+                // this was read into `meta` and discarded (design Q1/Q2).
+                { meta.generation },
             )
         };
 
@@ -8361,6 +8457,28 @@ impl Engine {
         // this is safe even for a slot that was somehow already freed.
         if entry.mined_slot != crate::index::mined_index::NO_MINED_SLOT {
             self.mined_index.free(&req.tx_key, entry.mined_slot);
+        }
+
+        // Reverse-heal Phase 2a: record the deletion tombstone. Reached ONLY
+        // after the KO-3 recheck passed (a NotDue/preserved delete returned
+        // `NotDue` early above, writing no tombstone — design §G/E3) and every
+        // destructive step succeeded. The record is an in-RAM insert + a
+        // RAM-buffered on-disk append that flushes on the SAME checkpoint
+        // barrier as the unregister + FreeRegion — no extra hot-path fsync, so
+        // the delete-latency floor is untouched, and a crash before checkpoint
+        // reverts BOTH the delete and the tombstone (Invariant TS-1). No-op when
+        // tombstones are disabled (no log attached).
+        if let Some(log) = self.tombstone_log.get() {
+            let cause = if req.due_guard.is_some() {
+                crate::ops::tombstone::TombstoneCause::Dah
+            } else {
+                crate::ops::tombstone::TombstoneCause::ClientDelete
+            };
+            // The delete's observed height: the DAH sweep's evaluated height
+            // when guarded, else the node's current durable-height tip. Both are
+            // in the same block-height space the retention GC compares against.
+            let deletion_height = req.due_guard.unwrap_or_else(|| self.last_durable_height());
+            log.record(&req.tx_key, frozen_generation, deletion_height, cause);
         }
 
         Ok(())
