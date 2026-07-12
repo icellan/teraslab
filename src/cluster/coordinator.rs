@@ -3376,6 +3376,32 @@ impl ClusterCoordinator {
         let new_replica_plan = ShardTable::replica_migration_plan(&old_table_snap, &new_table);
         drop(old_table_snap);
 
+        // Reverse-heal Phase 1 (finding C1): Tier-2 detection. The partition
+        // view already carries each node's per-shard generation digest, so this
+        // compares this node's newly-mastered shards against its replicas with
+        // no extra I/O and LOGS + METERS any shard a replica demonstrably holds
+        // a superset of. Detection-only: no fence, no pull. The superset
+        // predicate never flags from a behind peer ("never heal FROM a behind
+        // node"). Guarded on a non-empty view so a timed-out exchange does not
+        // clobber the coarse boot-time Tier-1 estimate with a spurious 0.
+        if !partition_view.is_empty() {
+            let stale_suspects = detect_stale_shards_from_view(self_id, &new_table, partition_view);
+            if !stale_suspects.is_empty() {
+                tracing::warn!(
+                    count = stale_suspects.len(),
+                    shards = ?stale_suspects,
+                    "reverse-heal: Tier-2 detected mastered shards a replica holds a \
+                     superset of (detection-only: no fence, no pull in this build)",
+                );
+            }
+            if let Some(m) = crate::metrics::migration_metrics() {
+                m.stale_suspect_shards.store(
+                    stale_suspects.len() as u32,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+            }
+        }
+
         let populated_shards: std::collections::HashSet<u16> = (0..NUM_SHARDS as u16)
             .filter(|&s| engine.shard_record_count(s) > 0)
             .collect();
@@ -8882,6 +8908,16 @@ impl RunningCluster {
     /// Get the current shard table.
     pub fn shard_table(&self) -> Arc<ShardTableLock<ShardTable>> {
         self.shard_table.clone()
+    }
+
+    /// Reverse-heal (finding C1): the shards this node is the committed TARGET
+    /// master of, per the active shard table. The boot detector's coarse Tier-1
+    /// fast-path scopes a lost-acked-tail suspicion to these shards.
+    pub fn mastered_shards(&self) -> Vec<u16> {
+        let table = self.shard_table.read();
+        (0..NUM_SHARDS as u16)
+            .filter(|&s| table.target_assignment(s).master == self.self_id)
+            .collect()
     }
 
     /// Reverse-heal (finding C1): the shards this node currently suspects hold
@@ -16529,6 +16565,21 @@ mod tests {
             cluster.stale_suspect_shards().is_empty(),
             "clearing drops all suspects",
         );
+    }
+
+    /// Reverse-heal Phase 1: a single-node cluster masters every shard, so the
+    /// coarse Tier-1 fast-path's `mastered_shards()` covers all of them.
+    #[test]
+    fn mastered_shards_covers_every_shard_for_single_node() {
+        let cluster = single_node_cluster_for_master_query_tests();
+        let mastered = cluster.mastered_shards();
+        assert_eq!(
+            mastered.len(),
+            NUM_SHARDS,
+            "the sole member masters every shard",
+        );
+        assert_eq!(mastered.first().copied(), Some(0));
+        assert_eq!(mastered.last().copied(), Some(NUM_SHARDS as u16 - 1));
     }
 
     #[test]
