@@ -2526,15 +2526,18 @@ fn build_post_apply_redo_op(
             // redo-tail recovery re-validates the prior identity and replays
             // idempotently. The prior hash was captured pre-apply; the current
             // slot already holds the NEW hash, so it cannot be re-derived here.
-            let prior_utxo_hash = match reassign_prior_hash {
-                Some(h) => h,
-                // Only reachable outside the apply path (no pre-capture). Fall
-                // back to the current slot; skip journaling if it is unreadable
-                // rather than emit a hash-less legacy `Reassign`.
-                None => match engine.read_slot(tx_key, *offset) {
-                    Ok(slot) => slot.hash,
-                    Err(_) => return Ok(None),
-                },
+            let Some(prior_utxo_hash) = reassign_prior_hash else {
+                // L-1: unreachable via the apply path (the reassign apply arm
+                // always captures the pre-apply hash). Fail SAFE: reading the
+                // post-apply slot would yield the NEW hash, and a `ReassignV2`
+                // carrying that as `prior_utxo_hash` makes recovery's identity
+                // guard SKIP the reassign — silently losing it. Journal nothing
+                // rather than a wrong-guard entry.
+                debug_assert!(
+                    false,
+                    "reassign redo built without a captured pre-apply prior hash"
+                );
+                return Ok(None);
             };
             Ok(Some(RedoOp::ReassignV2 {
                 tx_key: *tx_key,
