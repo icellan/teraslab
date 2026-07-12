@@ -2637,7 +2637,55 @@ fn replicate_all_ops(
     redo_seq_range: (u64, u64),
     intent_ranges: &[(u64, u64)],
 ) -> std::result::Result<ReplicationOutcome, String> {
-    replicate_all_ops_with_barrier(cluster, ops_by_key, redo_seq_range, intent_ranges, None)
+    // `engine` is `None`: the recovery / intent-re-replication / compensation
+    // callers of this wrapper have ALREADY made their redo durable (that is why
+    // they are replaying it), so the C-1 local-durable-before-ack step below is
+    // both unnecessary and inapplicable — there is no client blocked on a fresh
+    // ack. The live client mutation handlers call
+    // `replicate_all_ops_with_barrier` directly with `Some(engine)`.
+    replicate_all_ops_with_barrier(
+        cluster,
+        ops_by_key,
+        redo_seq_range,
+        intent_ranges,
+        None,
+        None,
+    )
+}
+
+/// C-1 / G3: make a just-applied mutation LOCALLY durable before its cluster
+/// ACK, so a `STATUS_OK` returned under active replication implies "locally
+/// durable AND quorum-replicated".
+///
+/// Forces, for the store set this batch touched:
+/// 1. the redo tail durable via [`Engine::flush_all_redo`] — the per-store
+///    group-commit coordinators' pwrite + `fsync`, the SAME path the checkpoint
+///    barrier uses, coalescing to one `fsync` per touched redo device; and
+/// 2. every store's data device durable via [`Engine::sync_all_store_devices`]
+///    (one `fsync` per data device).
+///
+/// This is called ONLY under buffered durability with active replication (see
+/// the caller's gate). Under strict durability the redo is already `fsync`ed per
+/// commit; single-node (RF = 1, no migration) keeps the buffered no-`fsync`-ack
+/// fast path untouched.
+///
+/// Why both: closing C-1's unflushed-redo-tail loss window needs (1); a
+/// co-located buffered [`RedoOp::CreateV2`](crate::redo::RedoOp::CreateV2) whose
+/// record bytes live only on the (not-yet-`fsync`ed) data device needs (2) so
+/// recovery's `replay_create_v2` read-back can never Skip-then-lose an acked
+/// create (G3).
+///
+/// # Errors
+///
+/// Returns the redo-flush or data-sync error message. The caller MUST fail the
+/// client request on error: the write is NOT locally durable, so acking it would
+/// break the durability contract this function exists to uphold.
+fn ensure_local_write_durable(engine: &Engine) -> std::result::Result<(), String> {
+    engine.flush_all_redo()?;
+    engine
+        .sync_all_store_devices()
+        .map_err(|e| format!("data device sync before ack: {e}"))?;
+    Ok(())
 }
 
 /// Replication fan-out with C-1 barrier handoff.
@@ -2659,12 +2707,23 @@ fn replicate_all_ops(
 /// D-6 (added): the ACK policy is evaluated **per key** against the
 /// replica set each key was actually sent to, not over the union of all
 /// fan-out addresses.
+///
+/// `engine` is `Some` for the live client mutation handlers and `None` for
+/// recovery / intent-re-replication / unit-test drivers. When present AND
+/// buffered durability is active AND this write is being replicated
+/// ([`replication_active`]), the master's local redo tail + data devices are
+/// forced durable BEFORE the ACK ([`ensure_local_write_durable`]) — the C-1 /
+/// G3 strict-fsync-before-ack contract — running CONCURRENTLY with the replica
+/// round-trip so the local `fsync` hides behind the network RTT. Single-node
+/// (RF = 1, no migration) and strict durability skip this and keep their fast
+/// paths.
 fn replicate_all_ops_with_barrier(
     cluster: Option<&RunningCluster>,
     ops_by_key: &[(TxKey, Vec<ReplicaOp>)],
     redo_seq_range: (u64, u64),
     intent_ranges: &[(u64, u64)],
     mut barrier: Option<MutationBarrier<'_>>,
+    engine: Option<&Engine>,
 ) -> std::result::Result<ReplicationOutcome, String> {
     let cluster = match cluster {
         Some(c) => c,
@@ -2762,47 +2821,91 @@ fn replicate_all_ops_with_barrier(
     // epoch so the receiver's gate can reject stale-cluster writes.
     let cluster_key = cluster.local_cluster_key();
     let auth_secret = cluster.cluster_secret().map(|s| s.to_vec());
+    // C-1 / G3 strict-fsync-before-ack: under active replication in buffered
+    // durability, force this write's local redo tail + data devices durable
+    // BEFORE the ACK is classified, CONCURRENTLY with the replica round-trip so
+    // the local fsync hides behind the network RTT. Both the fan-out AND the
+    // local durability must finish before the outcome is decided, so a
+    // `STATUS_OK` proves the write is durable locally AND on a replica quorum.
+    // The gate matches the master-side replication-intent gate exactly
+    // (`replication_active`): every intent this write recorded names a redo
+    // range that is now made durable here, so a crash in the intent window can
+    // no longer leave a local-only mutation whose redo tail was dropped. Strict
+    // durability (redo already fsynced per commit) and single-node (RF = 1, no
+    // migration) skip this and keep their fast paths.
+    let want_local_durable =
+        engine.is_some_and(|e| e.redo_buffered()) && replication_active(Some(cluster));
     // Preserve the (addr, result) association so we can apply per-set
     // ACK accounting (Phase E) after the parallel fan-out completes.
-    let results: Vec<(SocketAddr, std::result::Result<(), String>)> =
-        REPL_RUNTIME.block_on(async {
-            let mut handles = Vec::with_capacity(by_addr.len());
-            for (addr, ops) in by_addr {
-                let auth_secret = auth_secret.clone();
-                let ack_timeout = ack_timeouts.get(&addr).copied().unwrap_or(base_timeout);
-                handles.push(tokio::task::spawn_blocking(move || {
-                    if ops.is_empty() {
-                        return (addr, Ok(()));
-                    }
-                    // R-D1/D-3: per-replica dense stream labels are
-                    // assigned inside `send_replica_ops_to` under the
-                    // per-address slot mutex — NOT the master-global
-                    // redo range, which covers ops this address never
-                    // receives. The redo range's high end is recorded
-                    // against the ACK for catch-up/lag bookkeeping.
-                    let res = send_replica_ops_to(
-                        addr,
-                        &ops,
-                        ack_timeout,
-                        auth_secret.as_deref(),
-                        cluster_key,
-                        source_node_id,
-                        redo_seq_range.1,
-                    );
-                    (addr, res)
-                }));
+    #[allow(clippy::type_complexity)]
+    let (results, local_durable): (
+        Vec<(SocketAddr, std::result::Result<(), String>)>,
+        std::result::Result<(), String>,
+    ) = std::thread::scope(|scope| {
+        // Local redo + data fsync runs on its own scoped thread so it overlaps
+        // the network fan-out below; `None` when the gate is off (no local
+        // durability enforced — the fast path).
+        let durable_handle = match engine {
+            Some(e) if want_local_durable => {
+                Some(scope.spawn(move || ensure_local_write_durable(e)))
             }
-            let mut results = Vec::with_capacity(handles.len());
-            for handle in handles {
-                results.push(handle.await.unwrap_or_else(|_| {
-                    (
-                        SocketAddr::from(([0u8, 0, 0, 0], 0)),
-                        Err("task panicked".to_string()),
-                    )
-                }));
-            }
-            results
-        });
+            _ => None,
+        };
+        let results: Vec<(SocketAddr, std::result::Result<(), String>)> =
+            REPL_RUNTIME.block_on(async {
+                let mut handles = Vec::with_capacity(by_addr.len());
+                for (addr, ops) in by_addr {
+                    let auth_secret = auth_secret.clone();
+                    let ack_timeout = ack_timeouts.get(&addr).copied().unwrap_or(base_timeout);
+                    handles.push(tokio::task::spawn_blocking(move || {
+                        if ops.is_empty() {
+                            return (addr, Ok(()));
+                        }
+                        // R-D1/D-3: per-replica dense stream labels are
+                        // assigned inside `send_replica_ops_to` under the
+                        // per-address slot mutex — NOT the master-global
+                        // redo range, which covers ops this address never
+                        // receives. The redo range's high end is recorded
+                        // against the ACK for catch-up/lag bookkeeping.
+                        let res = send_replica_ops_to(
+                            addr,
+                            &ops,
+                            ack_timeout,
+                            auth_secret.as_deref(),
+                            cluster_key,
+                            source_node_id,
+                            redo_seq_range.1,
+                        );
+                        (addr, res)
+                    }));
+                }
+                let mut results = Vec::with_capacity(handles.len());
+                for handle in handles {
+                    results.push(handle.await.unwrap_or_else(|_| {
+                        (
+                            SocketAddr::from(([0u8, 0, 0, 0], 0)),
+                            Err("task panicked".to_string()),
+                        )
+                    }));
+                }
+                results
+            });
+        let local_durable = match durable_handle {
+            Some(h) => h
+                .join()
+                .unwrap_or_else(|_| Err("local durability worker panicked".to_string())),
+            None => Ok(()),
+        };
+        (results, local_durable)
+    });
+
+    // A failed local durability step means the write is NOT locally durable:
+    // fail the client request (the caller compensates / returns an error)
+    // rather than ACK a write a master crash could still silently drop. On a
+    // genuine fault the redo flush already poisoned the log (fail-closed).
+    if let Err(e) = local_durable {
+        return Err(format!("local durability before ack failed: {e}"));
+    }
 
     let mut last_error: Option<String> = None;
     let mut dual_write_acks: usize = 0;
@@ -5678,6 +5781,7 @@ fn handle_spend_batch(
         spend_redo_range,
         &spend_intent_ranges,
         barrier,
+        Some(engine),
     ) {
         Ok(o) => o,
         Err(e) => {
@@ -5903,6 +6007,7 @@ fn handle_unspend_batch(
         redo_range,
         &[redo_range],
         barrier,
+        Some(engine),
     ) {
         Ok(o) => o,
         Err(e) => {
@@ -6242,6 +6347,7 @@ fn handle_set_mined_batch(
         redo_range,
         &[redo_range],
         barrier,
+        Some(engine),
     ) {
         Ok(o) => o,
         Err(e) => {
@@ -7379,6 +7485,7 @@ fn handle_create_batch(
         redo_range,
         &[redo_range],
         barrier,
+        Some(engine),
     ) {
         Ok(o) => o,
         Err(e) => {
@@ -7509,6 +7616,7 @@ fn handle_freeze_batch(
         redo_range,
         &[redo_range],
         barrier,
+        Some(engine),
     ) {
         Ok(o) => o,
         Err(e) => {
@@ -7634,6 +7742,7 @@ fn handle_unfreeze_batch(
         redo_range,
         &[redo_range],
         barrier,
+        Some(engine),
     ) {
         Ok(o) => o,
         Err(e) => {
@@ -7787,6 +7896,7 @@ fn handle_reassign_batch(
         redo_range,
         &[redo_range],
         barrier,
+        Some(engine),
     ) {
         Ok(o) => o,
         Err(e) => {
@@ -7934,6 +8044,7 @@ fn handle_set_conflicting_batch(
         redo_range,
         &[redo_range],
         barrier,
+        Some(engine),
     ) {
         Ok(o) => o,
         Err(e) => {
@@ -8059,6 +8170,7 @@ fn handle_remove_conflicting_child_batch(
         redo_range,
         &[redo_range],
         barrier,
+        Some(engine),
     ) {
         Ok(o) => o,
         Err(e) => {
@@ -8189,6 +8301,7 @@ fn handle_set_locked_batch(
         redo_range,
         &[redo_range],
         barrier,
+        Some(engine),
     ) {
         Ok(o) => o,
         Err(e) => {
@@ -8319,6 +8432,7 @@ fn handle_preserve_until_batch(
         redo_range,
         &[redo_range],
         barrier,
+        Some(engine),
     ) {
         Ok(o) => o,
         Err(e) => {
@@ -8715,6 +8829,7 @@ fn handle_mark_longest_chain_batch(
         redo_range,
         &[redo_range],
         barrier,
+        Some(engine),
     ) {
         Ok(o) => o,
         Err(e) => {
@@ -9721,6 +9836,7 @@ fn handle_preserve_transactions(
         redo_range,
         &[redo_range],
         barrier,
+        Some(engine),
     ) {
         Ok(o) => o,
         Err(e) => {
@@ -21147,9 +21263,15 @@ mod tests {
 
         let start = std::time::Instant::now();
         *started.lock() = Some(start);
-        let outcome =
-            replicate_all_ops_with_barrier(Some(&cluster), &ops, (10, 10), &[], Some(barrier))
-                .expect("slow ACK still satisfies WriteMajority for the one key");
+        let outcome = replicate_all_ops_with_barrier(
+            Some(&cluster),
+            &ops,
+            (10, 10),
+            &[],
+            Some(barrier),
+            None,
+        )
+        .expect("slow ACK still satisfies WriteMajority for the one key");
         let elapsed = start.elapsed();
         assert_eq!(outcome, ReplicationOutcome::Full);
         assert!(
@@ -21257,6 +21379,312 @@ mod tests {
             errors[0].error_code, ERR_MIGRATION_IN_PROGRESS,
             "the racing set_mined must be cleanly rejected with \
              ERR_MIGRATION_IN_PROGRESS, never lost",
+        );
+    }
+
+    /// A data device that counts `sync()` calls and delegates the rest to an
+    /// in-memory device — lets a test assert the ack path fsynced (or did not).
+    struct SyncSpyDevice {
+        inner: MemoryDevice,
+        syncs: std::sync::atomic::AtomicU64,
+    }
+
+    impl BlockDevice for SyncSpyDevice {
+        fn pread(&self, b: &mut [u8], o: u64) -> crate::device::Result<usize> {
+            self.inner.pread(b, o)
+        }
+        fn pwrite(&self, b: &[u8], o: u64) -> crate::device::Result<usize> {
+            self.inner.pwrite(b, o)
+        }
+        fn alignment(&self) -> usize {
+            self.inner.alignment()
+        }
+        fn size(&self) -> u64 {
+            self.inner.size()
+        }
+        fn sync(&self) -> crate::device::Result<()> {
+            self.syncs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.sync()
+        }
+    }
+
+    /// Build a single-store engine whose DATA device counts fsyncs, with a
+    /// per-store redo log + group-commit committer in BUFFERED durability (the
+    /// default clustered config where a plain redo append does NOT fsync).
+    /// Returns the engine, the shared data-device sync counter, and the redo
+    /// log handle so a test can observe both the redo-flush and data-fsync
+    /// state after an ack.
+    fn buffered_engine_with_sync_spy() -> (Engine, Arc<SyncSpyDevice>, Arc<Mutex<RedoLog>>) {
+        let data = Arc::new(SyncSpyDevice {
+            inner: MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap(),
+            syncs: std::sync::atomic::AtomicU64::new(0),
+        });
+        let data_dev: Arc<dyn BlockDevice> = data.clone();
+        let alloc = SlotAllocator::new(data_dev.clone()).unwrap();
+        let engine = Engine::new(
+            data_dev,
+            Index::new(10_000).unwrap(),
+            alloc,
+            StripedLocks::new(64),
+            DahIndex::new(),
+        );
+        let redo_size: u64 = 8 * 1024 * 1024;
+        let redo_dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(redo_size, 4096).unwrap());
+        let log = Arc::new(Mutex::new(RedoLog::open(redo_dev, 0, redo_size).unwrap()));
+        engine.set_redo_logs(vec![log.clone()]);
+        engine.set_buffered_durability(true);
+        (engine, data, log)
+    }
+
+    #[test]
+    fn rf_gt_1_mutation_is_locally_fsync_durable_before_ack() {
+        use std::sync::atomic::Ordering;
+
+        // C-1 (+ G3) core: under the default config (buffered redo, RF>1) an
+        // acked mutation MUST be locally durable BEFORE STATUS_OK — the master
+        // must have fsynced its own redo tail AND data devices, so a master
+        // crash in the (pre-fix) unflushed window recovers the write instead of
+        // silently dropping an already-acked, quorum-replicated mutation.
+        let (engine, data, log) = buffered_engine_with_sync_spy();
+
+        let replica = spawn_replica_receiver(ReplicaBehaviour::Ack);
+        let (cluster, key) = two_node_rf2(replica, Some(AckPolicy::WriteMajority));
+
+        // Buffer this write's redo entry WITHOUT fsync — the ack-path skip C-1
+        // attacks. It is now pending on the device's write cache, not durable.
+        let (_first, last) = engine
+            .append_redo_ops_routed(&[RedoOp::Delete {
+                tx_key: key,
+                record_offset: 0,
+                record_size: 0,
+            }])
+            .unwrap();
+        assert!(last > 0, "the buffered append drew a real sequence");
+        assert!(
+            log.lock().has_pending(),
+            "precondition: the buffered redo entry is un-flushed before the ack",
+        );
+        let syncs_before = data.syncs.load(Ordering::SeqCst);
+
+        let ops = vec![(key, vec![ReplicaOp::Delete { tx_key: key }])];
+        let outcome = replicate_all_ops_with_barrier(
+            Some(&cluster),
+            &ops,
+            (last, last),
+            &[],
+            None,
+            Some(&engine),
+        )
+        .expect("an ACKing replica satisfies WriteMajority for RF=2");
+        assert_eq!(outcome, ReplicationOutcome::Full);
+
+        // By the time the outcome is Full (→ STATUS_OK) the local redo tail is
+        // fsync-durable (buffer drained) AND the data device has been fsynced.
+        assert!(
+            !log.lock().has_pending(),
+            "RF>1 buffered ack must flush the local redo tail before returning Full",
+        );
+        assert!(
+            data.syncs.load(Ordering::SeqCst) > syncs_before,
+            "RF>1 buffered ack must fsync the data device before returning Full",
+        );
+    }
+
+    #[test]
+    fn single_node_rf1_mutation_still_buffered_no_fsync_on_ack() {
+        use std::sync::atomic::Ordering;
+
+        // The RF=1 / single-node fast path must be UNREGRESSED: no replication
+        // is active, so the ack does NOT fsync the redo tail or the data device
+        // — the buffered no-fsync-on-ack contract that keeps single-node
+        // throughput high.
+        let (engine, data, log) = buffered_engine_with_sync_spy();
+
+        let n1 = crate::cluster::shards::NodeId(1);
+        let members = vec![n1];
+        let table = crate::cluster::shards::ShardTable::compute_with_epoch(&members, 1, 41, 1);
+        let cluster = crate::cluster::coordinator::new_test_running_cluster(
+            n1,
+            table,
+            &[(n1, "127.0.0.1:1".parse().unwrap())],
+            &members,
+            &[],
+            &[],
+            &[],
+            1,
+        );
+        assert_eq!(
+            cluster.shard_table().read().replication_factor(),
+            1,
+            "single-node cluster is RF=1",
+        );
+
+        let key = TxKey {
+            txid: DispatchTestHarness::make_txid(0x33),
+        };
+        let (_first, last) = engine
+            .append_redo_ops_routed(&[RedoOp::Delete {
+                tx_key: key,
+                record_offset: 0,
+                record_size: 0,
+            }])
+            .unwrap();
+        assert!(log.lock().has_pending());
+        let syncs_before = data.syncs.load(Ordering::SeqCst);
+
+        let ops = vec![(key, vec![ReplicaOp::Delete { tx_key: key }])];
+        let outcome = replicate_all_ops_with_barrier(
+            Some(&cluster),
+            &ops,
+            (last, last),
+            &[],
+            None,
+            Some(&engine),
+        )
+        .expect("RF=1 has no replica targets — replication is not applicable");
+        assert_eq!(
+            outcome,
+            ReplicationOutcome::NotApplicable,
+            "a single-node RF=1 write is not replicated",
+        );
+
+        assert!(
+            log.lock().has_pending(),
+            "single-node RF=1 ack must NOT flush the redo tail (buffered fast path preserved)",
+        );
+        assert_eq!(
+            data.syncs.load(Ordering::SeqCst),
+            syncs_before,
+            "single-node RF=1 ack must NOT fsync the data device",
+        );
+    }
+
+    #[test]
+    fn rf_gt_1_colocated_buffered_create_durable_before_ack_survives_crash() {
+        // G3: a co-located BUFFERED create emits the metadata-only `CreateV2`
+        // (its record bytes read back from the data device on replay). Pre-fix,
+        // the RF>1 ack neither fsynced the redo tail (the CreateV2 entry) nor the
+        // data device (the record bytes), so a master crash right after
+        // STATUS_OK dropped both → recovery's `replay_create_v2` read-back found
+        // nothing → the acked create vanished (key absent). Strict-fsync-before-
+        // ack fsyncs both, so the create survives the crash and recovers.
+        let _mg = metrics_test_lock();
+
+        // One VOLATILE device backs BOTH the store's data region (low offsets)
+        // and its redo log (a high offset region) — so the store is provably
+        // co-located with its redo (same physical device id): the exact
+        // condition under which a buffered create emits `CreateV2`. `sync()`
+        // snapshots the whole device; `simulate_power_loss()` reverts every
+        // write not yet synced.
+        let dev_size: u64 = 64 * 1024 * 1024;
+        let mem = Arc::new(MemoryDevice::new_volatile(dev_size, 4096).unwrap());
+        let dev: Arc<dyn BlockDevice> = mem.clone();
+        let alloc = SlotAllocator::new(dev.clone()).unwrap();
+        let engine = Engine::new(
+            dev.clone(),
+            Index::new(10_000).unwrap(),
+            alloc,
+            StripedLocks::new(64),
+            DahIndex::new(),
+        );
+
+        let redo_off: u64 = 40 * 1024 * 1024;
+        let redo_len: u64 = 8 * 1024 * 1024;
+        let log = Arc::new(Mutex::new(
+            RedoLog::open(dev.clone(), redo_off, redo_len).unwrap(),
+        ));
+        engine.set_redo_logs(vec![log.clone()]);
+        engine.set_buffered_durability(true);
+        assert!(
+            !engine.create_redo_is_self_sufficient(0),
+            "data + redo share one device → co-located → buffered create emits CreateV2",
+        );
+
+        let replica = spawn_replica_receiver(ReplicaBehaviour::Ack);
+        let (cluster, key) = two_node_rf2(replica, Some(AckPolicy::WriteMajority));
+
+        // Drive a REAL create of `key` (a shard n1 masters) through the dispatch
+        // handler under RF=2, wiring the same redo log the engine holds.
+        let item = WireCreateItem {
+            txid: key.txid,
+            tx_version: 1,
+            locktime: 0,
+            fee: 500,
+            size_in_bytes: 250,
+            extended_size: 250,
+            is_coinbase: false,
+            spending_height: 0,
+            created_at: 1_700_000_000_000,
+            flags: 0,
+            utxo_hashes: vec![[7u8; 32], [8u8; 32]],
+            cold_data: vec![],
+            block_height: 0,
+            mined_block_id: None,
+            mined_block_height: None,
+            mined_subtree_idx: None,
+            parent_txids: vec![],
+        };
+        let req = RequestFrame {
+            request_id: 1,
+            op_code: OP_CREATE_BATCH,
+            flags: 0,
+            payload: encode_create_batch(&[item]).into(),
+        };
+        let mut conn_state = crate::server::ConnectionState::new();
+        let resp = handle_request(
+            &req,
+            &engine,
+            8192,
+            Some(&cluster),
+            Some(&*log),
+            &mut conn_state,
+            None,
+        );
+        assert_eq!(resp.status, STATUS_OK, "RF=2 create must be acked");
+
+        // The emitted redo really is the metadata-only CreateV2 (the G3 shape)
+        // AND it is already durable on the device after the ack — a fresh reader
+        // of the redo region sees it (pre-fix it would still be an un-flushed
+        // buffer entry, invisible on the device).
+        let has_create_v2 = {
+            let l = RedoLog::open(dev.clone(), redo_off, redo_len).unwrap();
+            l.recover()
+                .unwrap()
+                .iter()
+                .any(|e| matches!(&e.op, RedoOp::CreateV2 { tx_key, .. } if *tx_key == key))
+        };
+        assert!(
+            has_create_v2,
+            "co-located buffered create must journal a durable CreateV2 before ack",
+        );
+
+        // CRASH right after STATUS_OK: revert every un-fsynced write. With the
+        // fix the ack already fsynced the redo tail (CreateV2) AND the data
+        // device (record bytes), so both survive.
+        assert!(mem.simulate_power_loss(), "device must be volatile");
+
+        // Reopen from the post-crash device and run recovery ≡ crash recovery.
+        let recov_index =
+            crate::index::ShardedIndex::from_single(Index::new(10_000).unwrap().into());
+        let rec_log = RedoLog::open(dev.clone(), redo_off, redo_len).unwrap();
+        let stats = crate::recovery::recover(&*dev, &rec_log, &recov_index).unwrap();
+        assert_eq!(stats.entries_failed, 0, "no fatal replay failures");
+
+        // The acked create SURVIVED the crash: recovery re-registered the key
+        // and its record bytes read back intact (G3 closed).
+        let ie = recov_index
+            .lookup(&key)
+            .expect("acked co-located create must survive the crash and recover (G3)");
+        let meta = crate::io::read_metadata(&*dev, ie.record_offset).unwrap();
+        assert_eq!(
+            { meta.tx_id },
+            key.txid,
+            "recovered record is the acked create"
+        );
+        assert_eq!(
+            { meta.utxo_count },
+            2,
+            "recovered record carries the created utxo count",
         );
     }
 
