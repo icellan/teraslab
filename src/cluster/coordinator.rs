@@ -5016,6 +5016,237 @@ fn compute_manifest_for_entries(entries: &[(TxKey, u32)]) -> [u8; 32] {
 }
 
 // ---------------------------------------------------------------------------
+// Reverse-heal Phase 2b — per-record manifest-diff DIRECTION
+// ---------------------------------------------------------------------------
+//
+// Phase 1 (finding C1) flags a mastered shard SUSPECT on ANY replica digest
+// mismatch — DIFFERENCE, not DIRECTION. Phase 2b resolves DIRECTION per record:
+// which records is this (restarted) ex-master actually BEHIND on, and FROM WHOM
+// may it heal. It reuses the exact-entry manifest the superset probe already
+// ships (`confirm_target_holds_superset`), extended into a tombstone-aware
+// ship-set diff so a laggard that merely MISSED a delete is never mistaken for a
+// node that is ahead (the resurrection bug, P1-3). Phase 2b decides WHAT to ship
+// and FROM WHOM only; the pull/apply that consumes the ship-set is Phase 2c.
+
+/// A heal-manifest entry's kind marker (reverse-heal Phase 2b wire, design §B):
+/// the ex-master's own per-record view carried in the tombstone-aware
+/// manifest-diff selected by [`FLAG_MIGRATION_MANIFEST_DIFF`]. Encoded as a
+/// single trailing byte per entry, so the diff frame is a PROTOCOL_VERSION-gated
+/// additive extension of the `txid || generation` exact-entry manifest the
+/// superset probe already carries — a legacy peer never sets the flag and never
+/// sees the marker.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum HealEntryKind {
+    /// The ex-master holds this key LIVE at the entry's generation.
+    Live = 0,
+    /// The ex-master DELETED this key; the entry's generation is the FROZEN
+    /// tombstone generation `N` (design §A). A source record at-or-behind `N`
+    /// must NEVER be pulled (P1-3 — no resurrection).
+    Tomb = 1,
+}
+
+/// Serialized size of one heal-manifest entry: `txid[32] || generation[4] ||
+/// kind[1]`.
+pub const HEAL_MANIFEST_ENTRY_SIZE: usize = 37;
+
+/// Encode one heal-manifest entry to its fixed 37-byte on-wire form
+/// (little-endian generation; the [`HealEntryKind`] as a trailing byte).
+pub fn encode_heal_manifest_entry(
+    key: &TxKey,
+    generation: u32,
+    kind: HealEntryKind,
+) -> [u8; HEAL_MANIFEST_ENTRY_SIZE] {
+    let mut buf = [0u8; HEAL_MANIFEST_ENTRY_SIZE];
+    buf[0..32].copy_from_slice(&key.txid);
+    buf[32..36].copy_from_slice(&generation.to_le_bytes());
+    buf[36] = kind as u8;
+    buf
+}
+
+/// Decode one 37-byte heal-manifest entry into `(key, generation, kind)`.
+///
+/// Returns `None` on a short slice or an unrecognized kind byte — a peer must
+/// reject a malformed diff, not guess a kind.
+pub fn decode_heal_manifest_entry(src: &[u8]) -> Option<(TxKey, u32, HealEntryKind)> {
+    if src.len() < HEAL_MANIFEST_ENTRY_SIZE {
+        return None;
+    }
+    let mut txid = [0u8; 32];
+    txid.copy_from_slice(&src[0..32]);
+    let generation = u32::from_le_bytes([src[32], src[33], src[34], src[35]]);
+    let kind = match src[36] {
+        0 => HealEntryKind::Live,
+        1 => HealEntryKind::Tomb,
+        _ => return None,
+    };
+    Some((TxKey { txid }, generation, kind))
+}
+
+/// One record the healing ex-master must PULL from the chosen source, carrying
+/// the generation the source holds (the generation the pulled image will bear).
+/// Phase 2b determines the set; Phase 2c performs the pull/apply.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ShipRecord {
+    /// The record to pull.
+    pub key: TxKey,
+    /// The generation the source holds for `key` — strictly ahead of (or
+    /// unknown to) the ex-master, so pulling it never downgrades local state.
+    pub source_generation: u32,
+}
+
+/// The per-record ship-set (reverse-heal Phase 2b, design §B): the records the
+/// ex-master is BEHIND on and must pull from the source to converge. A non-empty
+/// ship-set is exactly the DIRECTION signal "self is behind" — resolving the
+/// P1-2 sub-max regime that shard-`max_generation`/`count` recency is blind to.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ShipSet {
+    /// Records to pull, in source-manifest order.
+    pub records: Vec<ShipRecord>,
+}
+
+impl ShipSet {
+    /// DIRECTION: this node is behind on the shard iff the ship-set is
+    /// non-empty (never-heal-from-behind is a direction property — a source that
+    /// is at-or-behind the ex-master on every record produces an empty set).
+    pub fn is_self_behind(&self) -> bool {
+        !self.records.is_empty()
+    }
+}
+
+/// Compute the tombstone-aware per-record ship-set for one shard (reverse-heal
+/// Phase 2b, design §B). PURE over the two manifests plus the local tombstone
+/// index, so it is unit-testable without a live cluster.
+///
+/// - `dst_live` — the healing ex-master's own LIVE manifest for the shard
+///   (`collect_manifest_entries`).
+/// - `dst_tombstone_gen` — looks up the ex-master's FROZEN tombstone generation
+///   for a key (the in-RAM Phase-2a index, generation only —
+///   `Engine::tombstone_lookup` mapped to its generation), `None` when the key
+///   was never deleted.
+/// - `source_manifest` — the chosen source's LIVE `(txid, generation)` set.
+///
+/// A source record `k @ g_src` enters the ship-set iff the source strictly holds
+/// MORE than the ex-master on `k`:
+/// - ex-master LIVE at `g_dst`  → pull iff the source is strictly ahead
+///   (`generation_target_ahead(g_dst, g_src)` — the lost sub-max mutation, P1-2);
+/// - ex-master TOMB at `g_tomb` → pull iff the source holds a mutation strictly
+///   NEWER than the delete (`generation_target_ahead(g_tomb, g_src)`); a source
+///   at-or-behind the tombstone is never pulled (no resurrection, P1-3);
+/// - ex-master holds NEITHER    → pull (the record was lost entirely).
+///
+/// Every source record not admitted above is the complementary never-pull set
+/// (the ex-master already holds or tombstoned it at an at-or-ahead generation),
+/// so the ship-set never downgrades a record self is not behind on.
+///
+/// Argument-order note: `generation_target_ahead(local, target)` returns true
+/// when `target` is NEWER than `local` (see [`crate::record::generation_target_ahead`]).
+/// "Source strictly ahead" is therefore `generation_target_ahead(g_dst, g_src)`
+/// — matching the existing superset receiver's `target_generation <
+/// source_generation` reject (`dispatch.rs`). This is the exact complement of
+/// the never-pull `generation_at_or_ahead(g_dst, g_src)` leg.
+pub fn compute_heal_ship_set<F>(
+    dst_live: &[(TxKey, u32)],
+    dst_tombstone_gen: F,
+    source_manifest: &[(TxKey, u32)],
+) -> ShipSet
+where
+    F: Fn(&TxKey) -> Option<u32>,
+{
+    let mut dst_by_key: std::collections::HashMap<TxKey, u32> =
+        std::collections::HashMap::with_capacity(dst_live.len());
+    for (key, generation) in dst_live {
+        dst_by_key.insert(*key, *generation);
+    }
+
+    let mut records = Vec::new();
+    for (key, g_src) in source_manifest {
+        // A LIVE local record wins over any (stale) tombstone: if the key is
+        // genuinely present, the LIVE rule decides regardless of a dangling
+        // tombstone. Invariant TS-1 keeps these mutually exclusive in practice.
+        let ship = match dst_by_key.get(key) {
+            Some(&g_dst) => crate::record::generation_target_ahead(g_dst, *g_src),
+            None => match dst_tombstone_gen(key) {
+                Some(g_tomb) => crate::record::generation_target_ahead(g_tomb, *g_src),
+                None => true,
+            },
+        };
+        if ship {
+            records.push(ShipRecord {
+                key: *key,
+                source_generation: *g_src,
+            });
+        }
+    }
+    ShipSet { records }
+}
+
+/// Order two quorum-current heal-source candidates by recency (reverse-heal
+/// Phase 2b source selection): more-recent wins on higher `max_generation` under
+/// WRAPPING-serial ordering, then higher live count, then higher node id as a
+/// deterministic final tiebreak. Returns `true` iff `a` is strictly more recent
+/// than `b`.
+fn heal_source_more_recent(
+    a: ShardRecency,
+    a_node: NodeId,
+    b: ShardRecency,
+    b_node: NodeId,
+) -> bool {
+    if a.max_generation != b.max_generation {
+        return crate::record::generation_target_ahead(b.max_generation, a.max_generation);
+    }
+    if a.count != b.count {
+        return a.count > b.count;
+    }
+    a_node.0 > b_node.0
+}
+
+/// Select the heal SOURCE for one shard (reverse-heal Phase 2b, design §B): the
+/// argmax-recency, QUORUM-CURRENT committed replica. NEVER a behind /
+/// non-current node — the never-heal-from-behind invariant is a DIRECTION
+/// property (a behind source yields an empty ship-set), and a node that is not a
+/// committed replica or is still receiving inbound data is not a sound authority
+/// to heal from at all.
+///
+/// A candidate `node` (≠ `self_id`) is QUORUM-CURRENT iff it is in the shard's
+/// `committed_replicas` set AND it reported a [`PartitionVersionEntry`] for
+/// `shard` in `partition_view` AND that entry is NOT flagged
+/// [`PARTITION_FLAG_PENDING_INBOUND`] (a subset holder still migrating in is not
+/// current). Among the quorum-current candidates the highest-recency one wins; a
+/// fresher-looking node that fails the gate is never chosen. Returns `None` when
+/// no candidate qualifies (heal is not attempted).
+pub fn select_heal_source(
+    self_id: NodeId,
+    committed_replicas: &[NodeId],
+    partition_view: &std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>>,
+    shard: u16,
+) -> Option<NodeId> {
+    let mut best: Option<(NodeId, ShardRecency)> = None;
+    for &node in committed_replicas {
+        if node == self_id {
+            continue;
+        }
+        // Quorum-current gate: must have reported this shard and not be a subset
+        // holder still receiving inbound data.
+        let Some(entry) = partition_view
+            .get(&node)
+            .and_then(|entries| entries.iter().find(|e| e.shard == shard))
+        else {
+            continue;
+        };
+        if entry.flags & PARTITION_FLAG_PENDING_INBOUND != 0 {
+            continue;
+        }
+        let recency = ShardRecency::from_entry(entry);
+        best = match best {
+            Some((bn, br)) if !heal_source_more_recent(recency, node, br, bn) => Some((bn, br)),
+            _ => Some((node, recency)),
+        };
+    }
+    best.map(|(node, _)| node)
+}
+
+// ---------------------------------------------------------------------------
 // Batched migration
 // ---------------------------------------------------------------------------
 
@@ -14921,6 +15152,209 @@ mod tests {
         assert!(
             !tasks.iter().any(|t| t.shard == rolled_back_shard),
             "diverged shards are repaired via re-activation, not direct tasks"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Reverse-heal Phase 2b — per-record manifest-diff DIRECTION
+    // -----------------------------------------------------------------------
+
+    /// A distinct 32-byte txid for the manifest-diff tests.
+    fn hk(b: u8) -> TxKey {
+        let mut txid = [0u8; 32];
+        txid[0] = b;
+        txid[5] = 0xC3;
+        TxKey { txid }
+    }
+
+    /// P1-2: the source is ONE generation ahead on a record while the shard
+    /// record count is flat and `max_generation` unchanged (a steady sub-max
+    /// spend the ex-master lost). Per-record direction must still put that
+    /// record in the ship-set — the exact case shard-recency (count / max_gen)
+    /// is blind to.
+    #[test]
+    fn manifest_diff_ships_submax_lost_record() {
+        let k_lost = hk(1);
+        let k_same = hk(2);
+        // Ex-master LIVE view: k_lost@4 (behind), k_same@9 (matches source).
+        let dst_live = vec![(k_lost, 4u32), (k_same, 9u32)];
+        // Source LIVE view: k_lost@5 (one ahead), k_same@9.
+        let source = vec![(k_lost, 5u32), (k_same, 9u32)];
+        let ship = compute_heal_ship_set(&dst_live, |_| None, &source);
+        assert_eq!(
+            ship.records,
+            vec![ShipRecord {
+                key: k_lost,
+                source_generation: 5,
+            }],
+            "only the sub-max lost record ships; the equal-generation record does not",
+        );
+        assert!(ship.is_self_behind());
+    }
+
+    /// P1-3: the ex-master correctly DELETED `k` at generation N (tombstone
+    /// `k@N`); a laggard source still holds `k` at a generation <= N. Direction
+    /// must classify `k` as never-pull — it is NOT in the ship-set (no
+    /// resurrection).
+    #[test]
+    fn manifest_diff_excludes_tombstoned_record() {
+        let k_deleted = hk(7);
+        let n: u32 = 12;
+        // Ex-master holds NO live entry for k_deleted; it carries a tombstone@N.
+        let dst_live: Vec<(TxKey, u32)> = Vec::new();
+        let tombs: std::collections::HashMap<TxKey, u32> = [(k_deleted, n)].into_iter().collect();
+        // Source still holds k at N (equal) — a terminal fully-spent record
+        // admits no further mutation, so the source can never be strictly ahead
+        // of the delete.
+        let source = vec![(k_deleted, n)];
+        let ship = compute_heal_ship_set(&dst_live, |k| tombs.get(k).copied(), &source);
+        assert!(
+            ship.records.is_empty(),
+            "a record tombstoned at >= the source generation must never ship (P1-3)",
+        );
+        assert!(!ship.is_self_behind());
+
+        // A source strictly BEHIND the delete (N-1) is likewise never pulled.
+        let source_behind = vec![(k_deleted, n - 1)];
+        let ship2 = compute_heal_ship_set(&dst_live, |k| tombs.get(k).copied(), &source_behind);
+        assert!(ship2.records.is_empty());
+    }
+
+    /// The DIRECTION contract: `is_self_behind()` is true IFF the ship-set is
+    /// non-empty — across a deficit, a level, and an ahead manifest.
+    #[test]
+    fn manifest_diff_direction_self_behind_iff_shipset_nonempty() {
+        let k = hk(3);
+        // (a) source holds a record the ex-master lacks -> behind.
+        let behind = compute_heal_ship_set(&[], |_| None, &[(k, 1)]);
+        assert!(behind.is_self_behind());
+        assert_eq!(behind.records.len(), 1);
+        // (b) identical single record -> not behind.
+        let level = compute_heal_ship_set(&[(k, 1)], |_| None, &[(k, 1)]);
+        assert!(!level.is_self_behind());
+        assert!(level.records.is_empty());
+        // (c) ex-master strictly AHEAD -> not behind (never-pull, no downgrade).
+        let ahead = compute_heal_ship_set(&[(k, 5)], |_| None, &[(k, 3)]);
+        assert!(!ahead.is_self_behind());
+    }
+
+    /// A record the ex-master lost ENTIRELY (no live entry, no tombstone) but
+    /// the source still holds must ship — the record has to be recovered.
+    #[test]
+    fn manifest_diff_ships_record_source_has_that_exmaster_lost_entirely() {
+        let k = hk(9);
+        let ship = compute_heal_ship_set(&[], |_| None, &[(k, 2)]);
+        assert_eq!(
+            ship.records,
+            vec![ShipRecord {
+                key: k,
+                source_generation: 2,
+            }],
+        );
+    }
+
+    /// Identical manifests (same keys + generations, no tombstones) -> empty
+    /// ship-set, not self-behind.
+    #[test]
+    fn manifest_diff_empty_when_manifests_identical() {
+        let m = vec![(hk(1), 3u32), (hk(2), 7u32), (hk(3), 0u32)];
+        let ship = compute_heal_ship_set(&m, |_| None, &m);
+        assert!(ship.records.is_empty());
+        assert!(!ship.is_self_behind());
+    }
+
+    /// Source selection must reject a fresher-looking but NON-quorum-current
+    /// node: (a) a committed replica flagged PENDING_INBOUND (subset, still
+    /// receiving inbound data) and (b) a node absent from the committed replica
+    /// set — even with a strictly higher `max_generation` — are never chosen
+    /// over a lower-recency, current committed replica.
+    #[test]
+    fn source_selection_rejects_non_quorum_current() {
+        let self_id = NodeId(1);
+        let current = NodeId(2); // committed replica, current, max_gen 5
+        let pending = NodeId(3); // committed replica, PENDING_INBOUND, max_gen 100
+        let outsider = NodeId(4); // NOT a committed replica, current, max_gen 200
+        let shard = 0u16;
+        let committed_replicas = vec![self_id, current, pending];
+
+        let mk = |g: u32, flags: u8| PartitionVersionEntry {
+            shard,
+            flags,
+            replica_count: 1,
+            last_applied_seq: 10,
+            manifest_digest: g as u64,
+            max_generation: g,
+        };
+        let mut view: std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>> =
+            std::collections::HashMap::new();
+        view.insert(current, vec![mk(5, 0)]);
+        view.insert(pending, vec![mk(100, PARTITION_FLAG_PENDING_INBOUND)]);
+        view.insert(outsider, vec![mk(200, 0)]);
+
+        assert_eq!(
+            select_heal_source(self_id, &committed_replicas, &view, shard),
+            Some(current),
+            "must pick the lower-recency but quorum-current replica, never the \
+             fresher pending-inbound or non-member node",
+        );
+
+        // No quorum-current candidate at all -> None (heal is not attempted).
+        let only_pending = vec![self_id, pending];
+        assert_eq!(
+            select_heal_source(self_id, &only_pending, &view, shard),
+            None,
+        );
+    }
+
+    /// Among two quorum-current committed replicas, the higher-recency one wins.
+    #[test]
+    fn source_selection_picks_argmax_recency_among_current() {
+        let self_id = NodeId(1);
+        let lo = NodeId(2);
+        let hi = NodeId(3);
+        let shard = 4u16;
+        let committed = vec![self_id, lo, hi];
+        let mk = |g: u32| PartitionVersionEntry {
+            shard,
+            flags: 0,
+            replica_count: 1,
+            last_applied_seq: 1,
+            manifest_digest: 0,
+            max_generation: g,
+        };
+        let mut view: std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>> =
+            std::collections::HashMap::new();
+        view.insert(lo, vec![mk(7)]);
+        view.insert(hi, vec![mk(11)]);
+        assert_eq!(
+            select_heal_source(self_id, &committed, &view, shard),
+            Some(hi),
+        );
+    }
+
+    /// The heal-manifest entry wire marker round-trips LIVE and TOMB kinds; a
+    /// short slice or an unknown kind byte decodes to `None` (a peer rejects a
+    /// malformed diff rather than guessing).
+    #[test]
+    fn heal_manifest_entry_roundtrips_live_and_tomb() {
+        for (kind, g) in [(HealEntryKind::Live, 3u32), (HealEntryKind::Tomb, 12u32)] {
+            let key = hk(42);
+            let bytes = encode_heal_manifest_entry(&key, g, kind);
+            assert_eq!(bytes.len(), HEAL_MANIFEST_ENTRY_SIZE);
+            let (dk, dg, dkind) = decode_heal_manifest_entry(&bytes).expect("roundtrip decodes");
+            assert_eq!(dk, key);
+            assert_eq!(dg, g);
+            assert_eq!(dkind, kind);
+        }
+        assert!(
+            decode_heal_manifest_entry(&[0u8; 10]).is_none(),
+            "a short slice must not decode",
+        );
+        let mut bad = encode_heal_manifest_entry(&hk(1), 0, HealEntryKind::Live);
+        bad[36] = 0x7F; // unknown kind byte
+        assert!(
+            decode_heal_manifest_entry(&bad).is_none(),
+            "an unknown kind byte must not decode",
         );
     }
 
