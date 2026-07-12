@@ -949,6 +949,26 @@ fn partition_then_crash_then_on_disk_boot_recovers_consistently() {
         Duration::from_secs(30),
     )
     .expect("majority side {2,3} should re-commit a 2-node topology");
+    // The committed term advancing to the 2-node topology does not mean node2's
+    // LOCAL shard table has applied it yet — until it does, every shard still
+    // resolves to `NodeId(0)` and `is_master` answers `Transitioning`, never
+    // `Yes` (the same lag guarded for node1 after the initial 3-node commit).
+    // Wait until node2 actually masters a shard under the 2-node table before
+    // searching for a key it owns.
+    wait_until(
+        || {
+            (0..8192u32).any(|i| {
+                matches!(
+                    node2.cluster.is_master(&TxKey {
+                        txid: make_txid(600_000 + i)
+                    }),
+                    MasterQueryResult::Yes
+                )
+            })
+        },
+        Duration::from_secs(30),
+    )
+    .expect("node2 should master at least one shard once the 2-node table applies");
     // No dual-master DURING the partition: a majority-mastered key is not `Yes`
     // on the isolated node.
     let majority_key = find_key_mastered_by(&node2, 600_000);
