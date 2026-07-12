@@ -1917,6 +1917,267 @@ fn fast_boot_capture(
     (de, dah)
 }
 
+/// Like [`fast_boot_capture`] but boots against the SURVIVING on-disk redb DAH
+/// (reopened from a per-boot COPY of `dah_redb_src`) instead of a fresh
+/// in-memory DAH. Each boot gets its own copy so the two boots start from the
+/// IDENTICAL durable crash-time DAH and their reconciles never cross-contaminate
+/// (Full clears+rebuilds its copy; Touched trusts its copy). This is what
+/// exercises the durable-redb-DAH-trust path: a Touched boot keeps an UNTOUCHED
+/// record's durable redb DAH entry rather than re-deriving it.
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
+fn fast_boot_capture_ondisk_dah(
+    dev: &Arc<dyn BlockDevice>,
+    redo: &Arc<parking_lot::Mutex<teraslab::redo::RedoLog>>,
+    primary_snap: &std::path::Path,
+    mined_snap: &std::path::Path,
+    dah_redb_src: &std::path::Path,
+    dah_redb_work: &std::path::Path,
+    keys: &[TxKey],
+    touched: &std::collections::HashSet<TxKey>,
+    fast_boot: bool,
+) -> (Vec<Option<u8>>, Vec<Option<u32>>) {
+    use teraslab::index::ShardedIndex;
+    use teraslab::ops::engine::DahReconcileScope;
+
+    // Boot from a private COPY of the surviving durable redb so Full's
+    // clear+rebuild never leaks into the Touched boot's view.
+    std::fs::copy(dah_redb_src, dah_redb_work).expect("copy surviving redb DAH");
+
+    let alloc =
+        SlotAllocator::recover(dev.clone()).expect("allocator recovers from the persisted header");
+    let primary = PrimaryBackend::rebuild(&**dev, &alloc).expect("primary rebuilds from device");
+    let sharded = ShardedIndex::from_single(primary);
+    let dah = DahBackend::OnDisk(
+        RedbDahIndex::open(dah_redb_work, 16 * 1024 * 1024).expect("reopen surviving redb DAH"),
+    );
+    let engine =
+        Engine::new_with_sharded_index(dev.clone(), sharded, alloc, StripedLocks::new(64), dah);
+
+    let used = engine
+        .recover_mined_index(primary_snap, mined_snap, std::slice::from_ref(redo))
+        .expect("mined-index recovery must succeed");
+    assert!(
+        used,
+        "must use the v3 snapshot + redo-tail path (not the fresh full-replay branch)",
+    );
+    assert!(
+        engine.mined_snapshot_restored_v3(),
+        "the restored snapshot must be flagged v3 (persists the DE/LSA cache)",
+    );
+
+    let scope = if fast_boot {
+        DahReconcileScope::Touched(touched)
+    } else {
+        DahReconcileScope::Full
+    };
+    engine
+        .reconcile_secondaries_scoped(scope, 2000, 288)
+        .expect("secondary reconcile must succeed");
+
+    let de = keys
+        .iter()
+        .map(|k| {
+            engine
+                .lookup(k)
+                .and_then(|e| engine.mined_index().read_de_flags(k, e.mined_slot))
+        })
+        .collect();
+    let dah = keys
+        .iter()
+        .map(|k| engine.dah_index().get_height(k))
+        .collect();
+    (de, dah)
+}
+
+/// FU#7-C: the durable-redb-DAH-trust path, E2E. FU#7 Option B's Touched boot
+/// trusts the DURABLE redb DAH for UNTOUCHED records; the sibling
+/// `e2e_touched_and_full_boot_agree_on_de_cache_and_dah_incl_expired_preserved`
+/// rebuilds into a FRESH in-memory DAH where NO record carries a DAH at
+/// checkpoint time, so that trust is only ever UNIT-tested — never driven E2E
+/// against a real surviving on-disk redb.
+///
+/// Here record `d` gets a DURABLE redb DAH entry BEFORE the checkpoint and is
+/// left UNTOUCHED in the post-checkpoint redo tail. Both boots reopen the
+/// SURVIVING on-disk redb (a per-boot copy), NOT a fresh in-memory one. The
+/// Touched boot must KEEP `d`'s DAH — trusted from the durable redb, never
+/// reconciled (d is not in `touched_keys`, i.e. never device-read) — and agree
+/// with the Full boot (which clears + rebuilds the DAH from the device scan).
+///
+/// Records:
+/// - `d`: mined on-chain + spent to all-spent BEFORE the checkpoint → durable
+///   redb DAH at checkpoint; UNTOUCHED afterward (the trust target).
+/// - `t`: mined on-chain (no DAH at checkpoint), spent to all-spent in the tail
+///   → DAH planted, TOUCHED (makes the Touched reconcile non-trivial and proves
+///   `d` is excluded from a non-empty touched set).
+#[test]
+fn e2e_touched_boot_trusts_durable_redb_dah_for_untouched_record() {
+    use teraslab::redo::{RedoLog, RedoOp};
+
+    let dir = TempDir::new().unwrap();
+    let primary_snap = dir.path().join("boot.snap");
+    let mined_snap = teraslab::checkpoint::mined_index_snapshot_path(&primary_snap);
+    let dah_redb = dir.path().join("dah.redb");
+
+    let dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(16 * 1024 * 1024, 4096).unwrap());
+    let redo_dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
+    let redo = Arc::new(parking_lot::Mutex::new(
+        RedoLog::open(redo_dev.clone(), 0, 1024 * 1024).unwrap(),
+    ));
+
+    // E0 with the OnDisk redb DAH backend — the durable two-phase backend a real
+    // fast-boot node runs, so a spend that plants a DAH fsyncs a keyed
+    // `SecondaryDahUpdate` into the redo tail AND commits it to redb.
+    let alloc0 = SlotAllocator::new(dev.clone()).unwrap();
+    let index0 = Index::new(10_000).unwrap();
+    let dah0 = DahBackend::OnDisk(RedbDahIndex::open(&dah_redb, 16 * 1024 * 1024).unwrap());
+    let engine0 = Arc::new(Engine::new(
+        dev.clone(),
+        index0,
+        alloc0,
+        StripedLocks::new(64),
+        dah0,
+    ));
+    engine0.set_redo_logs(vec![redo.clone()]);
+
+    // d: mined on-chain, then spent to all-spent → DAH planted (durable in redb +
+    // footer) BEFORE the checkpoint. Left UNTOUCHED after the checkpoint.
+    let d = create_tx(&engine0, 1, 1);
+    engine0
+        .set_mined(&SetMinedRequest {
+            tx_key: d,
+            block_id: 10,
+            block_height: 900,
+            subtree_idx: 0,
+            current_block_height: 1000,
+            block_height_retention: 288,
+            on_longest_chain: true,
+            unset_mined: false,
+        })
+        .unwrap();
+    spend_utxo(&engine0, d, 1, 0); // all-spent + mined on-chain → DAH = 2000 + 288
+    assert_eq!(
+        engine0.dah_index().get_height(&d),
+        Some(2000 + 288),
+        "d must carry a DURABLE redb DAH at checkpoint time (the trust target)",
+    );
+
+    // t: mined on-chain, NOT spent (no DAH at checkpoint). Spent post-checkpoint
+    // so the touched set is non-empty and the Touched reconcile genuinely runs.
+    let t = create_tx(&engine0, 2, 1);
+    engine0
+        .set_mined(&SetMinedRequest {
+            tx_key: t,
+            block_id: 11,
+            block_height: 900,
+            subtree_idx: 0,
+            current_block_height: 1000,
+            block_height_retention: 288,
+            on_longest_chain: true,
+            unset_mined: false,
+        })
+        .unwrap();
+
+    let keys = [d, t];
+
+    // "Checkpoint": fence = current redo max seq, then write the REAL v3 `.mined`
+    // FILE + primary snapshot. d already carries a durable DAH here.
+    engine0.flush_all_redo().unwrap();
+    let fence = redo
+        .lock()
+        .recover()
+        .unwrap()
+        .iter()
+        .map(|e| e.sequence)
+        .max()
+        .unwrap_or(0);
+    engine0
+        .snapshot_mined_index_by_key(&mined_snap, fence)
+        .unwrap();
+    engine0.snapshot_index(&primary_snap).unwrap();
+
+    // Post-checkpoint redo TAIL (sequences > fence): t spent to all-spent (DAH
+    // planted, touched). d is left UNTOUCHED.
+    spend_utxo(&engine0, t, 2, 0);
+
+    engine0.persist_allocator().unwrap();
+    engine0.flush_all_redo().unwrap();
+    // Make the crash-time redb DAH durable so both boots reopen d's (and t's)
+    // entry from the surviving file.
+    engine0.dah_index().flush_durable().unwrap();
+
+    // Build the post-checkpoint touched set exactly as recovery does.
+    let mut touched: std::collections::HashSet<TxKey> = std::collections::HashSet::new();
+    for e in redo.lock().recover().unwrap() {
+        if e.sequence <= fence {
+            continue;
+        }
+        if let RedoOp::SetMinedBatch { txids, .. } = &e.op {
+            touched.extend(txids.iter().copied());
+        } else if let Some(k) = e.op.tx_key() {
+            touched.insert(*k);
+        }
+    }
+    assert!(
+        !touched.contains(&d),
+        "d had no post-checkpoint activity → UNTOUCHED (never device-read; trusted from durable redb)",
+    );
+    assert!(
+        touched.contains(&t),
+        "t's post-checkpoint spend keys it into the touched tail",
+    );
+
+    // Drop E0's engine (clean redb close); the device bytes, redo WAL, `.mined`
+    // file, and the durable redb DAH FILE survive — the on-disk state a real
+    // restart boots from.
+    drop(engine0);
+
+    let full_work = dir.path().join("dah-boot-full.redb");
+    let touched_work = dir.path().join("dah-boot-touched.redb");
+    let (de_full, dah_full) = fast_boot_capture_ondisk_dah(
+        &dev,
+        &redo,
+        &primary_snap,
+        &mined_snap,
+        &dah_redb,
+        &full_work,
+        &keys,
+        &touched,
+        false,
+    );
+    let (de_touched, dah_touched) = fast_boot_capture_ondisk_dah(
+        &dev,
+        &redo,
+        &primary_snap,
+        &mined_snap,
+        &dah_redb,
+        &touched_work,
+        &keys,
+        &touched,
+        true,
+    );
+
+    // The crux: d's DAH survives the Touched boot SOLELY from the durable redb
+    // (d is untouched → never reconciled), and equals the Full boot's re-derived
+    // value. A fresh-in-memory DAH boot (the sibling test) would show None here.
+    assert_eq!(
+        dah_touched[0],
+        Some(2000 + 288),
+        "d's durable redb DAH must be TRUSTED (present) after the Touched boot — the whole point",
+    );
+    assert_eq!(
+        dah_touched[0], dah_full[0],
+        "d's DAH must AGREE between the Touched and Full boots",
+    );
+    assert_eq!(
+        de_touched, de_full,
+        "Touched-boot DE/LSA cache must EQUAL the Full-boot cache (keys d,t = {keys:?})",
+    );
+    assert_eq!(
+        dah_touched, dah_full,
+        "Touched-boot DAH must EQUAL the Full-boot DAH (keys d,t = {keys:?})",
+    );
+}
+
 /// FU#7 Option B — on-disk E2E for the Important durability fix: a Touched-mode
 /// fast boot and a Full-mode boot from the SAME on-disk state (data device +
 /// redo tail + a real `.mined` v3 snapshot FILE) must produce a BYTE-FOR-BYTE
