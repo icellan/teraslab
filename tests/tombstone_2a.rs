@@ -453,6 +453,64 @@ fn tombstone_survives_crash_and_reload() {
     assert!(rec.tombstone_at_or_ahead(&k, frozen_gen));
 }
 
+/// P2-2 (Invariant TS-1 for re-created keys, E5 re-org mitigation). Re-creating
+/// a deleted txid must clear the stale tombstone from the prior delete IMMEDIATELY
+/// (online, not just at boot reconcile), and the durable log must not carry it
+/// either — otherwise a Phase 3/4 online heal would drop the resurrected live
+/// record. Drives the real create/delete/create path + a durable reload.
+#[test]
+fn create_after_delete_clears_tombstone() {
+    let h = Harness::new_with_tombstones();
+    let k = h.seed_record(11, 2);
+
+    // Delete k: a tombstone is recorded (in RAM + buffered append).
+    h.engine
+        .delete(&DeleteRequest {
+            tx_key: k,
+            due_guard: None,
+        })
+        .expect("delete must succeed");
+    assert!(
+        h.engine.tombstone_lookup(&k).is_some(),
+        "the delete must record a tombstone",
+    );
+    assert!(h.engine.tombstone_at_or_ahead(&k, u32::MAX));
+
+    // Re-create the SAME txid: the key is LIVE again, so its stale tombstone must
+    // be dropped from the in-RAM index at once (ONLINE — before any boot reconcile).
+    let hashes: Vec<[u8; 32]> = (0..2u32).map(|v| slot_hash(11, v)).collect();
+    h.engine
+        .create(&base_create_req(11, &hashes))
+        .expect("re-create of the deleted txid must succeed");
+    assert!(
+        h.engine.lookup(&k).is_some(),
+        "the re-created record must be live",
+    );
+    assert!(
+        !h.engine.tombstone_at_or_ahead(&k, u32::MAX),
+        "re-create must clear the stale tombstone (else an online heal drops the live record)",
+    );
+    assert!(
+        h.engine.tombstone_lookup(&k).is_none(),
+        "no tombstone may remain for the re-created key",
+    );
+
+    // The durable log must not carry it either: persist, then reload WITHOUT the
+    // boot reconcile (which would otherwise mask a stale durable tombstone).
+    h.make_durable();
+    let reloaded = TombstoneLog::load(
+        h.tombstone_path.clone(),
+        h.engine.index_seed(),
+        h.engine.index_shard_count(),
+        TEST_RETENTION,
+    )
+    .unwrap();
+    assert!(
+        reloaded.lookup(&k).is_none(),
+        "the compacted durable log must not re-append the cleared tombstone",
+    );
+}
+
 /// Checkpoint-time GC drops a tombstone once
 /// `deletion_height + RETENTION_BLOCKS <= last_durable_height`.
 #[test]

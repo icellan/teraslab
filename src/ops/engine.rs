@@ -2101,6 +2101,24 @@ impl Engine {
         log.reconcile_against_live(|key| matches!(self.index.lookup_checked(key), Ok(Some(_))))
     }
 
+    /// Drop any stale tombstone for a key that has just been (re)registered LIVE
+    /// by the create path (Invariant TS-1). A no-op — and zero-cost — when
+    /// tombstones are disabled or no tombstone exists for the key.
+    ///
+    /// Without this, a re-created key keeps the tombstone from its prior delete
+    /// during normal operation. It is harmless only while heals are boot-only
+    /// (boot `reconcile_against_live` drops it); the moment a Phase 3/4 ONLINE
+    /// heal runs, that stale tombstone would drop the resurrected live record —
+    /// a data-loss bug. Clearing it on create also mitigates the design's E5
+    /// re-org gap (a re-org re-create clears its tombstone so a later heal keeps
+    /// the record). Called OUTSIDE the primary-index shard write guard to avoid
+    /// nesting the index-shard lock with the tombstone-shard lock.
+    pub fn clear_tombstone_for_recreated_key(&self, key: &TxKey) {
+        if let Some(log) = self.tombstone_log.get() {
+            log.clear(key);
+        }
+    }
+
     /// Acquire the SHARED (read-side) dispatch visibility barrier — used
     /// by client READ ops so they run concurrently with each other while
     /// remaining mutually exclusive with mutations, replica-batch applies,
@@ -5116,6 +5134,12 @@ impl Engine {
             return Err(CreateError::DuplicateTxId);
         }
 
+        // Reverse-heal Phase 2a (Invariant TS-1): this key is now LIVE again, so
+        // drop any tombstone left over from a prior delete of the same txid — a
+        // re-created key must carry no tombstone or a later online heal would drop
+        // the resurrected record. No-op when tombstones are disabled.
+        self.clear_tombstone_for_recreated_key(&key);
+
         // Conflicting secondary index: this record carries the CONFLICTING
         // flag (set above), so track it for OP_QUERY_CONFLICTING.
         if req.conflicting {
@@ -5477,6 +5501,12 @@ impl Engine {
             self.mined_index.free(&key, mined_slot);
             return Err(CreateError::DuplicateTxId);
         }
+
+        // Reverse-heal Phase 2a (Invariant TS-1): re-registering this key LIVE
+        // must clear any stale tombstone from a prior delete of the same txid, so
+        // a later online heal cannot drop the resurrected record. No-op when
+        // tombstones are disabled.
+        self.clear_tombstone_for_recreated_key(&key);
 
         // Conflicting secondary index: this record carries the CONFLICTING
         // flag (set above), so track it for OP_QUERY_CONFLICTING.
