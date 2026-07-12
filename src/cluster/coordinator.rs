@@ -9085,6 +9085,12 @@ impl RunningCluster {
             nodes.push((self.self_id, self.self_addr));
         }
         nodes.sort_by_key(|(node, _)| node.0);
+        // C21 — advertise each peer's REAL SWIM liveness instead of a
+        // hardcoded `1`. A Suspect/Dead-but-not-yet-forgotten peer must be
+        // advertised `is_alive=0` so clients (and the routing decode) see the
+        // true membership view. `self` is always alive; a peer absent from the
+        // strictly-Alive set (Suspect/Dead/unknown) is advertised dead.
+        let alive_peers = self.swim_alive_peers();
         buf.extend_from_slice(&(nodes.len() as u32).to_le_bytes());
         for (node_id, addr) in &nodes {
             buf.extend_from_slice(&node_id.0.to_le_bytes());
@@ -9092,7 +9098,8 @@ impl RunningCluster {
             let addr_bytes = addr_str.as_bytes();
             buf.extend_from_slice(&(addr_bytes.len() as u16).to_le_bytes());
             buf.extend_from_slice(addr_bytes);
-            buf.push(1); // is_alive — required by RoutingInfo::decode format
+            let is_alive = *node_id == self.self_id || alive_peers.contains(node_id);
+            buf.push(u8::from(is_alive)); // is_alive — required by RoutingInfo::decode format
         }
 
         // Shard assignments (4096 entries, each is just the master node_id).
@@ -15206,6 +15213,59 @@ mod tests {
             "partition maps must advertise self even when SWIM node_addrs omits it",
         );
         assert_eq!(cluster.node_addr(&NodeId(1)).unwrap().port(), 0);
+    }
+
+    /// C21 (RED before fix) — advertised `is_alive` reflects real SWIM state.
+    ///
+    /// Pre-fix `encode_partition_map` hardcoded `is_alive = 1` for every node,
+    /// so a Suspect peer was advertised as alive. After the fix a Suspect peer
+    /// is advertised `is_alive = 0`, while `self` and strictly-Alive peers stay
+    /// `is_alive = 1`.
+    #[test]
+    fn partition_map_advertises_real_swim_liveness() {
+        let members = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let table = ShardTable::compute_with_epoch(&members, 2, 21, 1);
+        let cluster = new_test_running_cluster(
+            NodeId(1),
+            table,
+            &[
+                (NodeId(2), "127.0.0.1:4361".parse().unwrap()),
+                (NodeId(3), "127.0.0.1:4362".parse().unwrap()),
+            ],
+            &members,
+            &[],
+            &[],
+            &[],
+            3,
+        );
+
+        // Partition: node 2 goes Suspect (still in node_addrs — E-03).
+        cluster.test_set_peer_suspect(NodeId(2));
+
+        let routing = crate::cluster::routing::RoutingInfo::decode(&cluster.encode_partition_map())
+            .expect("partition map should decode");
+        let alive_of = |id: NodeId| {
+            routing
+                .nodes
+                .iter()
+                .find(|n| n.id == id)
+                .map(|n| n.is_alive)
+        };
+        assert_eq!(
+            alive_of(NodeId(2)),
+            Some(false),
+            "a Suspect peer must be advertised is_alive=0"
+        );
+        assert_eq!(
+            alive_of(NodeId(3)),
+            Some(true),
+            "an Alive peer must be advertised is_alive=1"
+        );
+        assert_eq!(
+            alive_of(NodeId(1)),
+            Some(true),
+            "self must be advertised is_alive=1"
+        );
     }
 
     #[test]
