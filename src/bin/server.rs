@@ -1609,6 +1609,45 @@ fn main() {
         "node last-durable height restored (height subsystem)",
     );
 
+    // Reverse-heal Phase 2a: attach the deletion-tombstone log ONLY when
+    // enabled (`reverse_heal.tombstones`). Runs AFTER the height restore so the
+    // boot floor-GC sees the restored last-durable height, and AFTER recovery
+    // has rebuilt + reconciled the primary index so the live-reconcile
+    // (Invariant TS-1) can drop any tombstone whose record came back live.
+    if config.reverse_heal.tombstones {
+        let tombstone_path = config.resolved_tombstone_log_path();
+        let retention = config.resolved_tombstone_retention_blocks();
+        match teraslab::ops::tombstone::TombstoneLog::load(
+            tombstone_path.clone(),
+            engine.index_seed(),
+            engine.index_shard_count(),
+            retention,
+        ) {
+            Ok(log) => {
+                engine.set_tombstone_log(log);
+                let dropped_live = engine.reconcile_tombstones_against_live_index();
+                let dropped_gc = engine.gc_tombstones();
+                tracing::info!(
+                    path = %tombstone_path.display(),
+                    retention_blocks = retention,
+                    dropped_live,
+                    dropped_gc,
+                    "deletion tombstones enabled (reverse-heal Phase 2a): log replayed",
+                );
+            }
+            Err(e) => {
+                tracing::error!(
+                    path = %tombstone_path.display(),
+                    err = %e,
+                    "failed to load deletion-tombstone log; refusing to start with a \
+                     corrupt tombstone set (a lost tombstone risks resurrecting a deleted \
+                     record on a future heal)",
+                );
+                std::process::exit(1);
+            }
+        }
+    }
+
     // 5. Start cluster if configured
     //
     // D-7/D-8: the catch-up handles built inside the cluster-start block are

@@ -933,6 +933,17 @@ where
         tracing::warn!(err = %e, "checkpoint: last-durable-height persist failed (non-fatal)");
     }
 
+    // 2c. Persist the deletion-tombstone log (reverse-heal Phase 2a): retention
+    //     GC + durable write + fsync. A no-op when tombstones are disabled (no
+    //     log attached). NON-FATAL like the height above: the deletes are
+    //     already durable via the index snapshot, and the tombstone set is
+    //     re-derived/retried at the next checkpoint, so a transient tombstone
+    //     write error must not block redo reclamation. The atomic write
+    //     self-fsyncs, so it does not depend on the step-3 device barrier.
+    if let Err(e) = engine.persist_tombstones() {
+        tracing::warn!(err = %e, "checkpoint: tombstone-log persist failed (non-fatal)");
+    }
+
     // 3. Durability barrier (B-1/G-1 audit fixes). Redo reclamation is
     //    only legal once every store the fenced entries cover is durable:
     //
