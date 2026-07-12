@@ -207,6 +207,40 @@ impl AckTracker {
         inner.last_acked.clone()
     }
 
+    /// Reverse-heal Tier-1 fast-path (finding C1): the replicas whose durably
+    /// persisted last-ACK sequence is at-or-beyond `floor`.
+    ///
+    /// `floor` is this node's recovered `shared_sequence_floor` = the master's
+    /// `next_sequence` = highest-durable redo sequence + 1. It is the EXCLUSIVE
+    /// next-to-assign sequence, so the highest sequence this node can still
+    /// prove it holds after recovery is `floor - 1`. The tracker stores the
+    /// INCLUSIVE `redo_high` each replica ACKed (the highest redo seq whose ops
+    /// that replica confirmed durable). Both live in this master's own global
+    /// redo-sequence space, so the comparison is valid.
+    ///
+    /// Because the ACK is inclusive and the floor is exclusive, a lost acked
+    /// tail exists iff `acked >= floor`: an ACK of exactly `floor` means the
+    /// master returned `STATUS_OK` for op `floor` yet recovered only through
+    /// `floor - 1` — the depth-1 lost tail that is the modal crash. Using `>`
+    /// here (pre-fix) missed that boundary and silently accepted the loss. A
+    /// NON-EMPTY result therefore means this node acked at least one write it
+    /// can no longer prove it holds — a lost acked tail. Empty means Tier-1
+    /// sees no gap.
+    ///
+    /// This is a *fast-path* filter, not the sole authority: the tracker
+    /// flushes on a <=1s / 100-ACK cadence, so it can be stale-low and MISS a
+    /// gap in the sub-second window. The per-shard generation-manifest confirm
+    /// (Tier-2) is the authoritative backstop.
+    pub fn acked_beyond(&self, floor: u64) -> Vec<(SocketAddr, u64)> {
+        let inner = self.inner.lock();
+        inner
+            .last_acked
+            .iter()
+            .filter(|&(_, &seq)| seq >= floor)
+            .map(|(addr, &seq)| (*addr, seq))
+            .collect()
+    }
+
     /// Force a flush of any dirty state to disk.
     pub fn flush(&self) {
         let mut inner = self.inner.lock();
@@ -1130,6 +1164,111 @@ mod tests {
         let tracker = AckTracker::new(path);
         assert_eq!(tracker.last_acked(&test_addr(5000)), 42);
         assert_eq!(tracker.last_acked(&test_addr(5001)), 99);
+    }
+
+    /// Reverse-heal Phase 1 Tier-1 (finding C1): a downstream replica's
+    /// durably-persisted ACK that survives recovery ABOVE the recovered
+    /// `shared_sequence_floor` proves this node acked a write it no longer
+    /// holds — the detector must fire. An ACK at or below the floor is covered
+    /// by the recovered log and must NOT fire.
+    #[test]
+    fn recovery_detects_lost_acked_tail_when_acktracker_ahead_of_fence() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ack.dat");
+
+        // A master durably ACKs a downstream replica through master-global
+        // sequence 100 (INCLUSIVE — 100 is the highest redo seq it told the
+        // client was durable), then "crashes".
+        {
+            let tracker = AckTracker::new(path.clone());
+            tracker.record_ack(test_addr(5000), 100);
+            tracker.flush();
+        }
+
+        // Recovery reloads the persisted tracker. `floor` is the recovered
+        // `shared_sequence_floor` = `next_sequence` = highest-durable + 1: the
+        // EXCLUSIVE next-to-assign sequence. Because the ACK is inclusive and
+        // the floor is exclusive, a lost acked tail exists iff `acked >= floor`.
+        let recovered = AckTracker::new(path);
+
+        // floor 50 well below the ACK → lost acked tail (fires).
+        let lost = recovered.acked_beyond(50);
+        assert_eq!(lost.len(), 1, "replica acked 100 >= floor 50 → lost tail");
+        assert_eq!(lost[0], (test_addr(5000), 100));
+
+        // floor == acked → the DEPTH-1 lost tail (the modal crash): the master
+        // acked 100 but recovered only through 99 (next_sequence = 100). It
+        // returned STATUS_OK for op 100 yet can no longer prove it holds it, so
+        // this MUST fire — inclusive ACK vs exclusive floor.
+        let depth_one = recovered.acked_beyond(100);
+        assert_eq!(
+            depth_one.len(),
+            1,
+            "acked == floor is a depth-1 lost acked tail, not covered",
+        );
+        assert_eq!(depth_one[0], (test_addr(5000), 100));
+
+        // floor == acked + 1 → op 100 was recovered (next_sequence = 101) →
+        // nothing lost. This is the no-loss case; it must NOT false-positive.
+        assert!(
+            recovered.acked_beyond(101).is_empty(),
+            "floor one past the ACK → op 100 durable, nothing lost",
+        );
+    }
+
+    /// Reverse-heal Tier-1 depth-1 regression (P1-1): the ACK stored is
+    /// INCLUSIVE (highest redo seq covered) while boot passes an EXCLUSIVE floor
+    /// (`shared_sequence_floor` = `next_sequence` = highest-durable + 1). The
+    /// modal crash loses exactly the last acked op: master acks seq N, crashes
+    /// before N is durable, recovers `next_sequence = N`, so `floor == acked ==
+    /// N`. Pre-fix `acked_beyond` used `seq > floor` and MISSED this (`N > N` is
+    /// false), silently accepting the loss of an op the client was told was
+    /// durable. The detector must fire at `acked == floor`.
+    #[test]
+    fn acked_beyond_flags_depth_one_lost_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let tracker = AckTracker::new(dir.path().join("ack.dat"));
+        let replica = test_addr(5100);
+
+        // Master acked op 100; recovery restored next_sequence = 100.
+        tracker.record_ack(replica, 100);
+        let floor = 100u64;
+
+        assert_eq!(
+            tracker.acked_beyond(floor),
+            vec![(replica, 100)],
+            "acked == exclusive floor (depth-1 lost tail) must fire",
+        );
+
+        // One deeper: op 100 was recovered (next_sequence = 101) → nothing lost.
+        assert!(
+            tracker.acked_beyond(101).is_empty(),
+            "acked strictly below the floor → covered, must not fire",
+        );
+    }
+
+    /// Reverse-heal Phase 1 NEGATIVE: a node whose every replica ACK is at or
+    /// below the recovered floor (and a fresh/empty tracker) must not fire the
+    /// Tier-1 detector — no false positive.
+    #[test]
+    fn recovery_no_lost_tail_does_not_fire_detector() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ack.dat");
+        let tracker = AckTracker::new(path);
+        tracker.record_ack(test_addr(5000), 40);
+        tracker.record_ack(test_addr(5001), 50);
+        // Exclusive floor 51: every replica ACK is strictly below it, so every
+        // acked op was recovered → the detector must not fire.
+        assert!(
+            tracker.acked_beyond(51).is_empty(),
+            "no replica acked at or beyond the floor → detector must not fire",
+        );
+
+        let empty = AckTracker::new(dir.path().join("empty.dat"));
+        assert!(
+            empty.acked_beyond(0).is_empty(),
+            "empty tracker never fires the detector",
+        );
     }
 
     #[test]

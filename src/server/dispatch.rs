@@ -11667,6 +11667,11 @@ fn handle_admin_cluster_health(
 /// and a non-zero record count is a safe proxy for "this node holds data for
 /// this shard". The migration-plan refinement only fires when the value is
 /// strictly greater than zero, so the proxy never causes a wrong skip.
+///
+/// Each entry also carries the reverse-heal recency signal (`manifest_digest`
+/// and `max_generation`, finding C1), computed by the shared
+/// `build_self_partition_version_entries` so the wire response is
+/// byte-identical to this node's in-process self-report.
 fn handle_partition_version_report(
     req: &RequestFrame,
     engine: &Engine,
@@ -11701,50 +11706,25 @@ fn handle_partition_version_report(
         );
     }
 
-    let entries: Vec<(u16, u8, u8, u64)> = match cluster {
-        Some(c) => {
-            let table = c.shard_table();
-            let table_guard = table.read();
-            let inbound_bm = c.inbound_bitmap();
-            (0..crate::cluster::shards::NUM_SHARDS as u16)
-                .filter_map(|shard| {
-                    let count = engine.shard_record_count(shard);
-                    let assignment = table_guard.target_assignment(shard);
-                    let is_master = assignment.master == c.self_id();
-                    let is_subset = inbound_bm.test(shard);
-                    let is_replica = assignment.replicas.contains(&c.self_id());
-                    // Only emit entries where this node has any role or any data —
-                    // shards we neither own nor hold are uninteresting to the
-                    // coordinator and would just bloat the response.
-                    if !is_master && !is_replica && !is_subset && count == 0 {
-                        return None;
-                    }
-                    let mut flags = 0u8;
-                    if is_master {
-                        flags |= 0b01;
-                    }
-                    if is_subset {
-                        flags |= 0b10;
-                    }
-                    let replica_count =
-                        u8::try_from(assignment.replicas.len().min(255)).unwrap_or(255);
-                    Some((shard, flags, replica_count, count))
-                })
-                .collect()
-        }
+    let entries: Vec<crate::cluster::coordinator::PartitionVersionEntry> = match cluster {
+        // Reuse the shared self-report builder so the wire response is
+        // byte-identical to the in-process partition-view entries — including
+        // the reverse-heal `manifest_digest` + `max_generation` recency signal
+        // (finding C1), computed in one filtered index scan off the hot path.
+        Some(c) => crate::cluster::coordinator::build_self_partition_version_entries(
+            c.self_id(),
+            engine,
+            &c.shard_table(),
+            c.inbound_bitmap(),
+        ),
         None => Vec::new(),
     };
 
-    let mut payload = Vec::with_capacity(20 + entries.len() * PARTITION_VERSION_ENTRY_SIZE);
-    payload.extend_from_slice(&self_id.to_le_bytes());
-    payload.extend_from_slice(&local_cluster_key.to_le_bytes());
-    payload.extend_from_slice(&(entries.len() as u32).to_le_bytes());
-    for (shard, flags, replica_count, last_applied_seq) in entries {
-        payload.extend_from_slice(&shard.to_le_bytes());
-        payload.push(flags);
-        payload.push(replica_count);
-        payload.extend_from_slice(&last_applied_seq.to_le_bytes());
-    }
+    let payload = crate::cluster::coordinator::encode_partition_version_response(
+        self_id,
+        local_cluster_key,
+        &entries,
+    );
 
     ResponseFrame {
         request_id: req.request_id,

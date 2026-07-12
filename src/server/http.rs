@@ -1306,6 +1306,11 @@ pub(crate) fn render_metrics_text(
         );
         prom_gauge(
             &mut out,
+            "teraslab_stale_suspect_shards",
+            mm.stale_suspect_shards.load(Ordering::Relaxed) as u64,
+        );
+        prom_gauge(
+            &mut out,
             "teraslab_migration_phase_preparing",
             mm.migration_phase_preparing.load(Ordering::Relaxed) as u64,
         );
@@ -2416,6 +2421,9 @@ fn migration_metrics_json(state: &HttpState) -> serde_json::Value {
     let lost = mm
         .map(|m| m.migration_lost.load(Ordering::Relaxed) as u64)
         .unwrap_or(0);
+    let stale_suspect_shards = mm
+        .map(|m| m.stale_suspect_shards.load(Ordering::Relaxed) as u64)
+        .unwrap_or(0);
     let preparing = mm
         .map(|m| m.migration_phase_preparing.load(Ordering::Relaxed) as u64)
         .unwrap_or(0);
@@ -2458,6 +2466,7 @@ fn migration_metrics_json(state: &HttpState) -> serde_json::Value {
         "entries_applied_total": entries_applied,
         "active": active,
         "lost": lost,
+        "stale_suspect_shards": stale_suspect_shards,
         "phase": {
             "preparing": preparing,
             "copying": copying,
@@ -4453,6 +4462,41 @@ mod tests {
         // Restore the shared gauge so a later value-sensitive test is not
         // contaminated by this test's sentinel.
         mm.migration_lost.store(0, Ordering::Relaxed);
+    }
+
+    /// Reverse-heal Phase 1: the `stale_suspect_shards` gauge must be RENDERED
+    /// into the `/metrics` text with the value stored on the shared
+    /// `MigrationMetrics`, so a node that booted with a suspected lost tail is
+    /// visible to an operator scraping `/metrics`.
+    #[test]
+    fn metrics_text_renders_stale_suspect_shards_gauge_value() {
+        use crate::metrics::{MigrationMetrics, init_migration_metrics, migration_metrics};
+        use std::sync::OnceLock;
+
+        static MIG: OnceLock<MigrationMetrics> = OnceLock::new();
+        init_migration_metrics(MIG.get_or_init(MigrationMetrics::new));
+        let mm = migration_metrics().expect("migration metrics installed");
+
+        let m = ThreadMetrics::new();
+        let h = ThreadHistograms::new();
+
+        const SENTINEL: u32 = 3737;
+        let expected = format!("teraslab_stale_suspect_shards {SENTINEL}");
+        let mut rendered_our_value = false;
+        for _ in 0..256 {
+            mm.stale_suspect_shards.store(SENTINEL, Ordering::Relaxed);
+            let text = render_metrics_text(&m, &h, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+            if text.contains(&expected) {
+                rendered_our_value = true;
+                break;
+            }
+        }
+        assert!(
+            rendered_our_value,
+            "/metrics text must render teraslab_stale_suspect_shards with the stored gauge value",
+        );
+
+        mm.stale_suspect_shards.store(0, Ordering::Relaxed);
     }
 
     /// Phase 5: `/admin/top` JSON must carry the new top-level

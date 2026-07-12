@@ -958,6 +958,20 @@ pub struct PartitionVersionEntry {
     pub replica_count: u8,
     /// Last replication sequence applied for this shard (0 if unknown).
     pub last_applied_seq: u64,
+    /// Reverse-heal recency signal (finding C1): an order-independent 64-bit
+    /// fingerprint of the shard's `(txid, generation)` set, produced by
+    /// `Engine::shard_recency`. Two nodes with byte-identical shard state
+    /// report the same digest; any diverging generation flips it. `0` from a
+    /// legacy (pre-Phase-1) peer that did not report a digest — the wire field
+    /// is additive, so an absent digest is indistinguishable from a genuine
+    /// empty-shard digest only by count, which is why detection treats a
+    /// digest mismatch as a mere pre-filter, not proof.
+    pub manifest_digest: u64,
+    /// Reverse-heal recency signal (finding C1): the maximum record
+    /// `generation` in the shard under WRAPPING-serial ordering (see
+    /// `crate::record::generation_target_ahead`), `0` when the shard holds no
+    /// record or when reported by a legacy peer.
+    pub max_generation: u32,
 }
 
 /// In-progress collection of `PartitionVersionEntry` reports from cluster
@@ -2705,6 +2719,7 @@ impl ClusterCoordinator {
             topology_state_path,
             swim_incarnation: swim_incarnation_for_cluster,
             startup_reactivation_needed,
+            stale_suspect_shards: Arc::new(RwLock::new(std::collections::BTreeSet::new())),
             #[cfg(any(test, feature = "fault-injection"))]
             drop_commit_signals: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
@@ -3360,6 +3375,32 @@ impl ClusterCoordinator {
             build_plan_from_partition_view(&old_table_snap, &new_table, partition_view, self_id);
         let new_replica_plan = ShardTable::replica_migration_plan(&old_table_snap, &new_table);
         drop(old_table_snap);
+
+        // Reverse-heal Phase 1 (finding C1): Tier-2 detection. The partition
+        // view already carries each node's per-shard generation digest, so this
+        // compares this node's newly-mastered shards against its replicas with
+        // no extra I/O and LOGS + METERS any shard a replica demonstrably holds
+        // a superset of. Detection-only: no fence, no pull. The superset
+        // predicate never flags from a behind peer ("never heal FROM a behind
+        // node"). Guarded on a non-empty view so a timed-out exchange does not
+        // clobber the coarse boot-time Tier-1 estimate with a spurious 0.
+        if !partition_view.is_empty() {
+            let stale_suspects = detect_stale_shards_from_view(self_id, &new_table, partition_view);
+            if !stale_suspects.is_empty() {
+                tracing::warn!(
+                    count = stale_suspects.len(),
+                    shards = ?stale_suspects,
+                    "reverse-heal: Tier-2 detected mastered shards a replica holds a \
+                     superset of (detection-only: no fence, no pull in this build)",
+                );
+            }
+            if let Some(m) = crate::metrics::migration_metrics() {
+                m.stale_suspect_shards.store(
+                    stale_suspects.len() as u32,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+            }
+        }
 
         let populated_shards: std::collections::HashSet<u16> = (0..NUM_SHARDS as u16)
             .filter(|&s| engine.shard_record_count(s) > 0)
@@ -4514,71 +4555,285 @@ fn send_topology_frame(
 /// the in-process self-report is byte-equivalent to what a peer would receive
 /// over the wire. Empty shards on which this node has no role are excluded
 /// to keep the view compact.
-fn build_self_partition_version_entries(
+pub(crate) fn build_self_partition_version_entries(
     self_id: NodeId,
     engine: &Engine,
     shard_table: &Arc<ShardTableLock<ShardTable>>,
     inbound_bm: &Arc<crate::cluster::migration::AtomicShardBitmap>,
 ) -> Vec<PartitionVersionEntry> {
-    let table = shard_table.read();
-    let mut out = Vec::with_capacity(NUM_SHARDS);
-    for shard in 0..NUM_SHARDS as u16 {
-        let count = engine.shard_record_count(shard);
-        let assignment = table.target_assignment(shard);
-        let is_master = assignment.master == self_id;
-        let is_subset = inbound_bm.test(shard);
-        let is_replica = assignment.replicas.contains(&self_id);
-        if !is_master && !is_replica && !is_subset && count == 0 {
-            continue;
-        }
-        let mut flags = 0u8;
-        if is_master {
-            flags |= 0b01;
-        }
-        if is_subset {
-            flags |= 0b10;
-        }
-        let replica_count = u8::try_from(assignment.replicas.len().min(255)).unwrap_or(255);
-        out.push(PartitionVersionEntry {
-            shard,
-            flags,
-            replica_count,
-            last_applied_seq: count,
-        });
+    // First pass: decide participation and per-shard record count from the
+    // O(1) shard counters, holding the shard-table read lock only briefly.
+    struct Pending {
+        shard: u16,
+        flags: u8,
+        replica_count: u8,
+        count: u64,
     }
-    out
+    let mut pending: Vec<Pending> = Vec::with_capacity(NUM_SHARDS);
+    let mut participating: std::collections::HashSet<u16> = std::collections::HashSet::new();
+    {
+        let table = shard_table.read();
+        for shard in 0..NUM_SHARDS as u16 {
+            let count = engine.shard_record_count(shard);
+            let assignment = table.target_assignment(shard);
+            let is_master = assignment.master == self_id;
+            let is_subset = inbound_bm.test(shard);
+            let is_replica = assignment.replicas.contains(&self_id);
+            if !is_master && !is_replica && !is_subset && count == 0 {
+                continue;
+            }
+            let mut flags = 0u8;
+            if is_master {
+                flags |= 0b01;
+            }
+            if is_subset {
+                flags |= 0b10;
+            }
+            let replica_count = u8::try_from(assignment.replicas.len().min(255)).unwrap_or(255);
+            participating.insert(shard);
+            pending.push(Pending {
+                shard,
+                flags,
+                replica_count,
+                count,
+            });
+        }
+    }
+
+    // Second pass: ONE filtered index scan resolves the participating shards'
+    // keys; fold each shard's `(txid, generation)` into the reverse-heal
+    // recency signal. Only participating shards are read, and the whole thing
+    // runs off the hot path (post-topology-commit exchange), not per client op.
+    let (keys_by_shard, _skipped) = engine.keys_by_shard_filtered(&participating);
+    let empty: Vec<TxKey> = Vec::new();
+    pending
+        .into_iter()
+        .map(|p| {
+            let keys = keys_by_shard.get(&p.shard).unwrap_or(&empty);
+            let (_scan_count, manifest_digest, max_generation) = engine.recency_for_keys(keys);
+            PartitionVersionEntry {
+                shard: p.shard,
+                flags: p.flags,
+                replica_count: p.replica_count,
+                last_applied_seq: p.count,
+                manifest_digest,
+                max_generation,
+            }
+        })
+        .collect()
+}
+
+/// Serialize an `OP_PARTITION_VERSION_REPORT` response payload from a list of
+/// [`PartitionVersionEntry`].
+///
+/// Wire layout matches the doc comment on
+/// [`OP_PARTITION_VERSION_REPORT`](crate::protocol::opcodes::OP_PARTITION_VERSION_REPORT):
+/// `node_id:u64 | cluster_key:u64 | entry_count:u32 | entries` where each entry
+/// is [`PARTITION_VERSION_ENTRY_SIZE`] bytes. Shared by the in-process
+/// self-report and the dispatch handler so both encode byte-identically,
+/// including the Phase-1 additive `manifest_digest` + `max_generation` tail.
+pub(crate) fn encode_partition_version_response(
+    self_id: u64,
+    cluster_key: u64,
+    entries: &[PartitionVersionEntry],
+) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(20 + entries.len() * PARTITION_VERSION_ENTRY_SIZE);
+    payload.extend_from_slice(&self_id.to_le_bytes());
+    payload.extend_from_slice(&cluster_key.to_le_bytes());
+    payload.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+    for e in entries {
+        payload.extend_from_slice(&e.shard.to_le_bytes());
+        payload.push(e.flags);
+        payload.push(e.replica_count);
+        payload.extend_from_slice(&e.last_applied_seq.to_le_bytes());
+        payload.extend_from_slice(&e.manifest_digest.to_le_bytes());
+        payload.extend_from_slice(&e.max_generation.to_le_bytes());
+    }
+    payload
 }
 
 /// Phase D: parse an `OP_PARTITION_VERSION_REPORT` response payload into a
 /// list of [`PartitionVersionEntry`].
 ///
-/// Returns `None` if the payload is truncated or `entry_count * 12` does not
-/// match the trailing bytes — callers treat this as "no data" so a malformed
-/// peer does not corrupt the partition view.
+/// The per-entry stride is ADDITIVE (Phase 1, finding C1): entries are either
+/// the legacy [`PARTITION_VERSION_ENTRY_SIZE_LEGACY`]-byte layout (a
+/// pre-Phase-1 peer that reports no digest) or the current
+/// [`PARTITION_VERSION_ENTRY_SIZE`]-byte layout that appends
+/// `manifest_digest:u64` + `max_generation:u32`. The stride is inferred from
+/// the body length, so a Phase-1 parser reads both; the new fields default to
+/// `0` for a legacy peer. Returns `None` if the payload is truncated or the
+/// trailing bytes match neither stride — callers treat this as "no data" so a
+/// malformed peer does not corrupt the partition view.
 fn parse_partition_version_response(payload: &[u8]) -> Option<Vec<PartitionVersionEntry>> {
     if payload.len() < 20 {
         return None;
     }
     let entry_count = u32::from_le_bytes(payload[16..20].try_into().ok()?) as usize;
-    let expected = 20 + entry_count * PARTITION_VERSION_ENTRY_SIZE;
-    if payload.len() != expected {
-        return None;
+    let body = payload.len() - 20;
+    if entry_count == 0 {
+        return if body == 0 { Some(Vec::new()) } else { None };
     }
+    // Prefer the current (wider) stride; fall back to the legacy stride.
+    let stride = if body == entry_count * PARTITION_VERSION_ENTRY_SIZE {
+        PARTITION_VERSION_ENTRY_SIZE
+    } else if body == entry_count * PARTITION_VERSION_ENTRY_SIZE_LEGACY {
+        PARTITION_VERSION_ENTRY_SIZE_LEGACY
+    } else {
+        return None;
+    };
     let mut entries = Vec::with_capacity(entry_count);
     for i in 0..entry_count {
-        let off = 20 + i * PARTITION_VERSION_ENTRY_SIZE;
+        let off = 20 + i * stride;
         let shard = u16::from_le_bytes(payload[off..off + 2].try_into().ok()?);
         let flags = payload[off + 2];
         let replica_count = payload[off + 3];
         let last_applied_seq = u64::from_le_bytes(payload[off + 4..off + 12].try_into().ok()?);
+        let (manifest_digest, max_generation) = if stride == PARTITION_VERSION_ENTRY_SIZE {
+            let digest = u64::from_le_bytes(payload[off + 12..off + 20].try_into().ok()?);
+            let max_gen = u32::from_le_bytes(payload[off + 20..off + 24].try_into().ok()?);
+            (digest, max_gen)
+        } else {
+            (0, 0)
+        };
         entries.push(PartitionVersionEntry {
             shard,
             flags,
             replica_count,
             last_applied_seq,
+            manifest_digest,
+            max_generation,
         });
     }
     Some(entries)
+}
+
+// ---------------------------------------------------------------------------
+// Reverse-heal Tier-2 detection (finding C1) — per-shard generation manifest
+// ---------------------------------------------------------------------------
+
+/// A shard's reverse-heal recency, as produced by `Engine::shard_recency` and
+/// carried in [`PartitionVersionEntry`]. Used by the Tier-2 detector to compare
+/// this node's shard state against a peer's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ShardRecency {
+    /// Live record count for the shard (best-effort; see `Engine::shard_recency`).
+    pub count: u64,
+    /// Order-independent 64-bit `(txid, generation)` fingerprint.
+    pub digest: u64,
+    /// Maximum record generation under WRAPPING-serial ordering (0 when empty).
+    pub max_generation: u32,
+}
+
+impl ShardRecency {
+    /// Build from the `Engine::shard_recency` tuple `(count, digest, max_gen)`.
+    pub fn from_engine(recency: (u64, u64, u32)) -> Self {
+        Self {
+            count: recency.0,
+            digest: recency.1,
+            max_generation: recency.2,
+        }
+    }
+
+    /// Read the recency a peer reported for a shard out of its
+    /// [`PartitionVersionEntry`] (`last_applied_seq` is the record-count proxy).
+    pub fn from_entry(entry: &PartitionVersionEntry) -> Self {
+        Self {
+            count: entry.last_applied_seq,
+            digest: entry.manifest_digest,
+            max_generation: entry.max_generation,
+        }
+    }
+}
+
+/// Reverse-heal Tier-2 (finding C1): does a mastered shard on THIS node DIVERGE
+/// from any of its live replicas — making it a candidate for a Phase-2 manifest
+/// exchange?
+///
+/// `self_recency` is this node's recency for the shard. `replica_recencies` is
+/// the recency each live (committed) replica of the shard reported (the caller
+/// filters to the shard's committed replica set). The shard is flagged SUSPECT
+/// iff ANY replica's manifest digest differs from this node's.
+///
+/// # Phase-1 semantics — DIFFERENCE, not DIRECTION
+///
+/// A digest mismatch proves the two shard images are not identical, but NOT
+/// which side is ahead. A shard's `max_generation` is a max over independent
+/// per-record generation counters, so it is BLIND to divergence on any sub-max
+/// record, and `count` conflates "newer" with "different set" — the pre-fix
+/// `recency_indicates_superset` (`gen_at_or_ahead && count>=count`) suppressed a
+/// real stale flag in the normal spend-churn regime (steady spends keep the
+/// count flat and churn sub-max generations). The ONLY sound suppression at
+/// shard granularity is digest EQUALITY: identical images cannot hide a lost
+/// write. So Phase 1 flags SUSPECT on ANY digest mismatch and defers the
+/// DIRECTION question (who is actually ahead) to the Phase-2 per-record manifest
+/// exchange.
+///
+/// This deliberately OVER-flags on ordinary replication lag — a behind replica
+/// also trips it. That is safe: detection is log + meter only and never fences
+/// or pulls. The "never heal FROM a behind node" invariant is a Phase-2 HEALING
+/// property, enforced by the authoritative, generation-aware, tombstone-aware
+/// `confirm_target_holds_superset` manifest exchange — NOT a Phase-1 detection
+/// property. An empty `replica_recencies`, or all-matching digests, never flags.
+pub fn is_shard_stale_vs_replicas(
+    self_recency: ShardRecency,
+    replica_recencies: &[ShardRecency],
+) -> bool {
+    replica_recencies
+        .iter()
+        .any(|replica| replica.digest != self_recency.digest)
+}
+
+/// Reverse-heal Tier-2 composition: the set of shards this node masters that
+/// look stale versus the peers in `partition_view` (finding C1).
+///
+/// For each shard `self_id` masters in `shard_table`, this reads self's recency
+/// and every committed replica's reported recency out of the partition view and
+/// runs [`is_shard_stale_vs_replicas`], flagging the shard SUSPECT on ANY
+/// replica digest mismatch. Detection only — the returned shards are logged +
+/// metered by the caller; Phase 1 neither fences nor pulls.
+///
+/// Note on direction: a digest mismatch flags SUSPECT regardless of which side
+/// is ahead (Phase 1 cannot soundly tell — see [`is_shard_stale_vs_replicas`]).
+/// The over-flag on a behind replica is safe because detection never heals; the
+/// Phase-2 manifest exchange determines direction and enforces
+/// never-heal-from-behind and delete-safety before any pull.
+pub(crate) fn detect_stale_shards_from_view(
+    self_id: NodeId,
+    shard_table: &ShardTable,
+    partition_view: &std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>>,
+) -> Vec<u16> {
+    // Index each node's reported entries by shard for O(1) lookup.
+    let recency_of = |node: NodeId, shard: u16| -> Option<ShardRecency> {
+        partition_view
+            .get(&node)?
+            .iter()
+            .find(|e| e.shard == shard)
+            .map(ShardRecency::from_entry)
+    };
+
+    let mut stale = Vec::new();
+    for shard in 0..NUM_SHARDS as u16 {
+        let assignment = shard_table.target_assignment(shard);
+        if assignment.master != self_id {
+            continue;
+        }
+        // Self's recency for the shard (absent ⇒ empty shard).
+        let self_recency = recency_of(self_id, shard).unwrap_or(ShardRecency {
+            count: 0,
+            digest: 0,
+            max_generation: 0,
+        });
+        let replica_recencies: Vec<ShardRecency> = assignment
+            .replicas
+            .iter()
+            .filter(|r| **r != self_id)
+            .filter_map(|r| recency_of(*r, shard))
+            .collect();
+        if is_shard_stale_vs_replicas(self_recency, &replica_recencies) {
+            stale.push(shard);
+        }
+    }
+    stale
 }
 
 // ---------------------------------------------------------------------------
@@ -8517,6 +8772,13 @@ pub struct RunningCluster {
     /// SWIM incarnation counter shared with the event loop for persistence.
     swim_incarnation: Arc<std::sync::atomic::AtomicU64>,
     startup_reactivation_needed: Arc<AtomicBool>,
+    /// Reverse-heal (finding C1): the shards this node currently suspects hold
+    /// a LOST ACKED TAIL. Populated by the boot detector (Tier-1 AckTracker
+    /// fast-path / Tier-2 manifest confirm). Phase 1 is detection-only — this
+    /// set is LOGGED + METERED (`stale_suspect_shards` gauge) but is NOT used
+    /// to fence reads/writes or trigger a pull. `BTreeSet` keeps it sorted +
+    /// deduplicated for the getter and the gauge count.
+    stale_suspect_shards: Arc<RwLock<std::collections::BTreeSet<u16>>>,
     /// Test-only: when set, [`RunningCluster::signal_topology_committed`]
     /// drops the signal instead of queuing it. Models the production race
     /// where a node's authority commits a new term (via the dispatch
@@ -8629,6 +8891,39 @@ impl RunningCluster {
     /// Get the current shard table.
     pub fn shard_table(&self) -> Arc<ShardTableLock<ShardTable>> {
         self.shard_table.clone()
+    }
+
+    /// Reverse-heal (finding C1): the shards this node is the committed TARGET
+    /// master of, per the active shard table. The boot detector's coarse Tier-1
+    /// fast-path scopes a lost-acked-tail suspicion to these shards.
+    pub fn mastered_shards(&self) -> Vec<u16> {
+        let table = self.shard_table.read();
+        (0..NUM_SHARDS as u16)
+            .filter(|&s| table.target_assignment(s).master == self.self_id)
+            .collect()
+    }
+
+    /// Reverse-heal (finding C1): the shards this node currently suspects hold
+    /// a LOST ACKED TAIL, sorted ascending. Empty on a clean boot. Phase 1
+    /// exposes this for observability only — it does not gate serving.
+    pub fn stale_suspect_shards(&self) -> Vec<u16> {
+        self.stale_suspect_shards.read().iter().copied().collect()
+    }
+
+    /// Reverse-heal (finding C1): replace the set of suspected stale shards and
+    /// refresh the `stale_suspect_shards` gauge to its new cardinality.
+    ///
+    /// Called by the boot detector. Phase 1 is detection-only: this LOGS +
+    /// METERS the suspicion; it never fences or pulls. Passing an empty
+    /// iterator clears the suspicion (and drops the gauge to 0).
+    pub fn record_stale_suspect_shards(&self, shards: impl IntoIterator<Item = u16>) {
+        let set: std::collections::BTreeSet<u16> = shards.into_iter().collect();
+        let count = set.len();
+        *self.stale_suspect_shards.write() = set;
+        if let Some(m) = crate::metrics::migration_metrics() {
+            m.stale_suspect_shards
+                .store(count as u32, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 
     /// Determine whether this node is the master for the given key.
@@ -10295,6 +10590,7 @@ pub(crate) fn new_test_running_cluster(
         topology_state_path: None,
         swim_incarnation: Arc::new(std::sync::atomic::AtomicU64::new(1)),
         startup_reactivation_needed: Arc::new(AtomicBool::new(false)),
+        stale_suspect_shards: Arc::new(RwLock::new(std::collections::BTreeSet::new())),
         #[cfg(any(test, feature = "fault-injection"))]
         drop_commit_signals: Arc::new(AtomicBool::new(false)),
         #[cfg(test)]
@@ -14362,6 +14658,8 @@ mod tests {
                     flags: 0,
                     replica_count: 1,
                     last_applied_seq: 5,
+                    manifest_digest: 0,
+                    max_generation: 0,
                 })
                 .collect(),
         );
@@ -14901,6 +15199,8 @@ mod tests {
                     flags: 0,
                     replica_count: 1,
                     last_applied_seq: 9,
+                    manifest_digest: 0,
+                    max_generation: 0,
                 })
                 .collect(),
         );
@@ -16206,6 +16506,63 @@ mod tests {
             MasterQueryResult::Yes => {}
             other => panic!("expected MasterQueryResult::Yes, got {other:?}"),
         }
+    }
+
+    /// Reverse-heal Phase 1: the cluster handle exposes the suspected-stale
+    /// shard set (sorted + deduped) and refreshes the `stale_suspect_shards`
+    /// gauge to the set cardinality; an empty set clears both.
+    #[test]
+    fn stale_suspect_shards_handle_records_and_clears() {
+        use crate::metrics::{MigrationMetrics, init_migration_metrics, migration_metrics};
+        use std::sync::OnceLock;
+
+        static MIG: OnceLock<MigrationMetrics> = OnceLock::new();
+        init_migration_metrics(MIG.get_or_init(MigrationMetrics::new));
+
+        let cluster = single_node_cluster_for_master_query_tests();
+        assert!(
+            cluster.stale_suspect_shards().is_empty(),
+            "clean boot → no suspects",
+        );
+
+        // Duplicates + out of order → getter returns a sorted, deduped set.
+        cluster.record_stale_suspect_shards([7u16, 3, 7, 1]);
+        assert_eq!(cluster.stale_suspect_shards(), vec![1, 3, 7]);
+
+        // The gauge reflects the cardinality. A bounded retry wins against any
+        // parallel test mutating the process-global gauge.
+        let mm = migration_metrics().expect("metrics installed");
+        let mut saw_three = false;
+        for _ in 0..256 {
+            cluster.record_stale_suspect_shards([1u16, 3, 7]);
+            if mm.stale_suspect_shards.load(Ordering::Relaxed) == 3 {
+                saw_three = true;
+                break;
+            }
+        }
+        assert!(saw_three, "gauge must reflect the suspect-shard count");
+
+        // Clearing empties the set.
+        cluster.record_stale_suspect_shards(Vec::<u16>::new());
+        assert!(
+            cluster.stale_suspect_shards().is_empty(),
+            "clearing drops all suspects",
+        );
+    }
+
+    /// Reverse-heal Phase 1: a single-node cluster masters every shard, so the
+    /// coarse Tier-1 fast-path's `mastered_shards()` covers all of them.
+    #[test]
+    fn mastered_shards_covers_every_shard_for_single_node() {
+        let cluster = single_node_cluster_for_master_query_tests();
+        let mastered = cluster.mastered_shards();
+        assert_eq!(
+            mastered.len(),
+            NUM_SHARDS,
+            "the sole member masters every shard",
+        );
+        assert_eq!(mastered.first().copied(), Some(0));
+        assert_eq!(mastered.last().copied(), Some(NUM_SHARDS as u16 - 1));
     }
 
     #[test]
@@ -17613,6 +17970,8 @@ mod tests {
                 flags: 0,
                 replica_count: 1,
                 last_applied_seq: 0,
+                manifest_digest: 0,
+                max_generation: 0,
             }],
         );
         view.insert(
@@ -17622,6 +17981,8 @@ mod tests {
                 flags: 0,
                 replica_count: 1,
                 last_applied_seq: 9_999,
+                manifest_digest: 0,
+                max_generation: 0,
             }],
         );
 
@@ -17678,6 +18039,8 @@ mod tests {
                 flags: 0,
                 replica_count: 1,
                 last_applied_seq: 9_999,
+                manifest_digest: 0,
+                max_generation: 0,
             }],
         );
         apply_master_election(
@@ -17966,12 +18329,16 @@ mod tests {
                 flags: 0b01,
                 replica_count: 1,
                 last_applied_seq: 100,
+                manifest_digest: 0,
+                max_generation: 0,
             },
             PartitionVersionEntry {
                 shard: 1,
                 flags: 0b00,
                 replica_count: 1,
                 last_applied_seq: 50,
+                manifest_digest: 0,
+                max_generation: 0,
             },
         ];
         let entries2 = vec![PartitionVersionEntry {
@@ -17979,12 +18346,284 @@ mod tests {
             flags: 0b00,
             replica_count: 1,
             last_applied_seq: 90,
+            manifest_digest: 0,
+            max_generation: 0,
         }];
         phase.record(NodeId(10), entries1.clone());
         phase.record(NodeId(20), entries2.clone());
         let view = phase.partition_view();
         assert_eq!(view.get(&NodeId(10)).unwrap(), &entries1);
         assert_eq!(view.get(&NodeId(20)).unwrap(), &entries2);
+    }
+
+    /// Reverse-heal Phase 1: the additive `manifest_digest` + `max_generation`
+    /// recency fields survive an `OP_PARTITION_VERSION_REPORT` wire round-trip.
+    #[test]
+    fn partition_version_entry_roundtrips_digest_and_max_gen() {
+        let entries = vec![
+            PartitionVersionEntry {
+                shard: 7,
+                flags: 0b01,
+                replica_count: 2,
+                last_applied_seq: 42,
+                manifest_digest: 0xDEAD_BEEF_CAFE_F00D,
+                max_generation: 9_999,
+            },
+            PartitionVersionEntry {
+                shard: 4095,
+                flags: 0b11,
+                replica_count: 255,
+                last_applied_seq: 0,
+                manifest_digest: 0,
+                max_generation: 0,
+            },
+        ];
+        let payload = encode_partition_version_response(123, 456, &entries);
+        let parsed =
+            parse_partition_version_response(&payload).expect("well-formed payload parses");
+        assert_eq!(
+            parsed, entries,
+            "digest + max_generation survive the wire round-trip",
+        );
+    }
+
+    /// Reverse-heal Phase 1: the parser is additive — a legacy (pre-Phase-1)
+    /// peer's 12-byte entries still parse, with the new recency fields
+    /// defaulting to 0, so a mixed-version cluster degrades gracefully instead
+    /// of dropping the whole report.
+    #[test]
+    fn partition_version_parser_tolerates_legacy_12byte_entries() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&7u64.to_le_bytes()); // node_id
+        payload.extend_from_slice(&9u64.to_le_bytes()); // cluster_key
+        payload.extend_from_slice(&1u32.to_le_bytes()); // entry_count
+        // one legacy 12-byte entry (no digest / max_generation)
+        payload.extend_from_slice(&3u16.to_le_bytes()); // shard
+        payload.push(0b01); // flags
+        payload.push(1); // replica_count
+        payload.extend_from_slice(&77u64.to_le_bytes()); // last_applied_seq
+        assert_eq!(
+            payload.len(),
+            20 + PARTITION_VERSION_ENTRY_SIZE_LEGACY,
+            "hand-built payload uses the legacy stride",
+        );
+
+        let parsed = parse_partition_version_response(&payload).expect("legacy payload parses");
+        assert_eq!(
+            parsed,
+            vec![PartitionVersionEntry {
+                shard: 3,
+                flags: 0b01,
+                replica_count: 1,
+                last_applied_seq: 77,
+                manifest_digest: 0,
+                max_generation: 0,
+            }],
+            "legacy entry parses with recency fields defaulted to 0",
+        );
+    }
+
+    /// Reverse-heal Phase 1: when Tier-1 (the AckTracker fast-path) is
+    /// stale-low and misses a sub-second gap, the Tier-2 manifest confirm is
+    /// the backstop that catches it.
+    #[test]
+    fn recovery_acktracker_stalelow_missed_gap_is_caught_by_manifest_confirm() {
+        use crate::replication::durable::AckTracker;
+
+        let floor = 100u64;
+
+        // Tier-1 is stale-low: the tracker's last durable flush only captured
+        // an ACK at seq 99 (below the exclusive floor of 100), missing the
+        // later writes acked at/above the floor in the sub-second flush window
+        // before the crash. So Tier-1 (`acked >= floor`) reports NO lost tail.
+        let dir = tempfile::tempdir().unwrap();
+        let tracker = AckTracker::new(dir.path().join("ack.dat"));
+        let replica_addr: std::net::SocketAddr = "127.0.0.1:6000".parse().unwrap();
+        tracker.record_ack(replica_addr, 99);
+        assert!(
+            tracker.acked_beyond(floor).is_empty(),
+            "Tier-1 is stale-low here and misses the gap",
+        );
+
+        // Tier-2 is the backstop: a live replica reports a shard whose digest
+        // differs from this node's → SUSPECT, catching the gap Tier-1 missed.
+        let self_recency = ShardRecency {
+            count: 5,
+            digest: 0xAAAA,
+            max_generation: 100,
+        };
+        let replica_recency = ShardRecency {
+            count: 6,
+            digest: 0xBBBB,
+            max_generation: 101,
+        };
+        let stale = is_shard_stale_vs_replicas(self_recency, &[replica_recency]);
+        assert!(stale, "Tier-2 catches the gap Tier-1 missed");
+    }
+
+    /// Reverse-heal Phase 1 (P1-2, the case the pre-fix code MISSED): the
+    /// sub-max-divergence false negative. Self and a quorum-current replica
+    /// report the SAME `max_generation` and SAME live count, but DIFFERENT
+    /// digests — the replica applied a spend of a sub-max record this node lost.
+    /// This is the NORMAL UTXO spend-churn regime (steady spends keep the count
+    /// flat and churn sub-max generations). The old `recency_indicates_superset`
+    /// heuristic (`gen_at_or_ahead(10,10) && 2>=2` = true) suppressed the flag;
+    /// digest EQUALITY is the only sound suppression, so a divergent digest MUST
+    /// flag SUSPECT.
+    #[test]
+    fn tier2_flags_suspect_on_any_digest_mismatch_with_quorum_replica() {
+        let self_recency = ShardRecency {
+            count: 2,
+            digest: 0xA1A1,
+            max_generation: 10,
+        };
+        let replica_recency = ShardRecency {
+            count: 2,
+            digest: 0xB2B2,
+            max_generation: 10,
+        };
+        assert!(
+            is_shard_stale_vs_replicas(self_recency, &[replica_recency]),
+            "same max_gen + count but divergent digest must flag SUSPECT",
+        );
+    }
+
+    /// Reverse-heal Phase 1 (P1-3): a strictly-BEHIND replica whose digest
+    /// differs (e.g. self applied a delete the laggard has not) IS flagged
+    /// SUSPECT. Phase 1 cannot soundly tell direction at shard granularity, so
+    /// it flags any divergence — an intentional, SAFE over-flag: detection only
+    /// logs + meters, never heals. The Phase-2 per-record manifest exchange
+    /// determines DIRECTION and is generation-/tombstone-aware, so it enforces
+    /// never-heal-from-behind and prevents the delete-resurrection hazard the
+    /// pre-fix code's false "self is stale" verdict would have set up.
+    #[test]
+    fn tier2_flags_suspect_even_from_a_behind_replica_delete_divergence() {
+        // Self applied a delete of B → {A gen5}; the laggard still has
+        // {A gen5, B gen3}. Digest differs, laggard is strictly behind.
+        let self_recency = ShardRecency {
+            count: 1,
+            digest: 0x1111,
+            max_generation: 5,
+        };
+        let behind_replica = ShardRecency {
+            count: 2,
+            digest: 0x2222,
+            max_generation: 5,
+        };
+        assert!(
+            is_shard_stale_vs_replicas(self_recency, &[behind_replica]),
+            "a behind replica's differing digest flags SUSPECT (safe over-flag; \
+             Phase-2 direction determination prevents the actual resurrection)",
+        );
+    }
+
+    /// Reverse-heal Phase 1 NEGATIVE: digest EQUALITY is the sound suppression.
+    /// An empty replica set, or replicas whose digests all match this node's,
+    /// never fires the Tier-2 detector — regardless of any max_gen/count skew.
+    #[test]
+    fn tier2_does_not_flag_when_digest_matches() {
+        let self_recency = ShardRecency {
+            count: 3,
+            digest: 0xF00D,
+            max_generation: 42,
+        };
+        assert!(
+            !is_shard_stale_vs_replicas(self_recency, &[]),
+            "no replicas → detector does not fire",
+        );
+        // Identical digest but DELIBERATELY skewed count/max_gen: equality of the
+        // digest alone must suppress, proving the fix no longer leans on the
+        // unsound (max_gen, count) direction signals.
+        let matching_digest = ShardRecency {
+            count: 99,
+            digest: 0xF00D,
+            max_generation: 7,
+        };
+        assert!(
+            !is_shard_stale_vs_replicas(self_recency, &[matching_digest, matching_digest]),
+            "matching digests → detector does not fire even with count/gen skew",
+        );
+    }
+
+    /// Reverse-heal Phase 1 composition: `detect_stale_shards_from_view` flags
+    /// exactly the mastered shards whose replicas report a DIVERGENT digest
+    /// (either direction), suppresses on digest EQUALITY, and never flags a
+    /// shard this node does not master.
+    #[test]
+    fn detect_stale_shards_from_view_flags_mastered_divergent_shards() {
+        let members = [NodeId(1), NodeId(2), NodeId(3)];
+        let table = ShardTable::compute_with_epoch(&members, 2, 1, 1);
+
+        // Pick a shard NodeId(1) masters that has at least one replica.
+        let shard = (0..NUM_SHARDS as u16)
+            .find(|&s| {
+                let a = table.target_assignment(s);
+                a.master == NodeId(1) && !a.replicas.is_empty()
+            })
+            .expect("N1 masters some shard with a replica");
+        let replica = table.target_assignment(shard).replicas[0];
+
+        let mut view: std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>> =
+            std::collections::HashMap::new();
+        // Self (master) reports an OLDER generation than the replica.
+        view.insert(
+            NodeId(1),
+            vec![PartitionVersionEntry {
+                shard,
+                flags: 0b01,
+                replica_count: 1,
+                last_applied_seq: 5,
+                manifest_digest: 0xAAAA,
+                max_generation: 100,
+            }],
+        );
+        // The replica reports a divergent digest AND a strictly-ahead generation.
+        view.insert(
+            replica,
+            vec![PartitionVersionEntry {
+                shard,
+                flags: 0,
+                replica_count: 1,
+                last_applied_seq: 6,
+                manifest_digest: 0xBBBB,
+                max_generation: 101,
+            }],
+        );
+
+        let stale = detect_stale_shards_from_view(NodeId(1), &table, &view);
+        assert_eq!(
+            stale,
+            vec![shard],
+            "the divergent-digest mastered shard is flagged"
+        );
+
+        // A strictly-BEHIND replica whose digest STILL differs is ALSO flagged
+        // SUSPECT: Phase 1 cannot tell direction, so it over-flags safely (the
+        // Phase-2 exchange determines direction before any heal).
+        view.get_mut(&replica).unwrap()[0].max_generation = 50;
+        view.get_mut(&replica).unwrap()[0].last_applied_seq = 1;
+        let behind_divergent = detect_stale_shards_from_view(NodeId(1), &table, &view);
+        assert_eq!(
+            behind_divergent,
+            vec![shard],
+            "a behind replica with a divergent digest is flagged SUSPECT (safe over-flag)",
+        );
+
+        // Digest EQUALITY is the only sound suppression: matching digest → clean
+        // even though the replica's count/max_gen still skew.
+        view.get_mut(&replica).unwrap()[0].manifest_digest = 0xAAAA;
+        let clean = detect_stale_shards_from_view(NodeId(1), &table, &view);
+        assert!(
+            clean.is_empty(),
+            "a replica whose digest matches must not flag the mastered shard stale",
+        );
+
+        // A non-master (NodeId(2) for a shard N1 masters) is never flagged.
+        let from_n2 = detect_stale_shards_from_view(NodeId(2), &table, &view);
+        assert!(
+            !from_n2.contains(&shard),
+            "detection only considers shards the node actually masters",
+        );
     }
 
     #[test]
@@ -18023,6 +18662,8 @@ mod tests {
                 flags: 0b01,
                 replica_count: 1,
                 last_applied_seq: 42,
+                manifest_digest: 0,
+                max_generation: 0,
             }],
         );
         let tasks =
@@ -18066,6 +18707,8 @@ mod tests {
                 flags: 0b01,
                 replica_count: 1,
                 last_applied_seq: 42,
+                manifest_digest: 0,
+                max_generation: 0,
             }],
         );
         let skipped = build_plan_from_partition_view(&old_table, &new_table, &owns_view, NodeId(1));
@@ -18084,6 +18727,8 @@ mod tests {
                 flags: 0b01 | PARTITION_FLAG_PENDING_INBOUND,
                 replica_count: 1,
                 last_applied_seq: 42,
+                manifest_digest: 0,
+                max_generation: 0,
             }],
         );
         let refined =

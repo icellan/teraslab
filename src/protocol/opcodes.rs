@@ -175,20 +175,35 @@ pub const KEY_DIAGNOSIS_ENCODED_SIZE: usize = 2 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 8;
 ///   node_id:     u64 LE   (8 bytes)
 ///   cluster_key: u64 LE   (8 bytes)
 ///   entry_count: u32 LE   (4 bytes)
-///   entries: PartitionVersionEntry * count    // entry_count entries, each 12 bytes
+///   entries: PartitionVersionEntry * count    // entry_count entries, each 24 bytes
 /// ```
 ///
-/// Each entry layout (12 bytes):
+/// Each entry layout (24 bytes):
 /// ```text
 ///   shard:            u16 LE   (2 bytes)
 ///   flags:            u8       (1 byte; bit0=is_master, bit1=is_subset)
 ///   replica_count:    u8       (1 byte)
 ///   last_applied_seq: u64 LE   (8 bytes)
+///   manifest_digest:  u64 LE   (8 bytes; reverse-heal recency fingerprint)
+///   max_generation:   u32 LE   (4 bytes; reverse-heal recency signal)
 /// ```
+///
+/// The trailing `manifest_digest` + `max_generation` are ADDITIVE (finding C1,
+/// reverse-heal Phase 1): the parser infers the per-entry stride from the body
+/// length, so a Phase-1 reader accepts both the 24-byte layout and a legacy
+/// peer's 12-byte ([`PARTITION_VERSION_ENTRY_SIZE_LEGACY`]) entries (new fields
+/// default to 0). No `PROTOCOL_VERSION` bump.
 pub const OP_PARTITION_VERSION_REPORT: u16 = 105;
 
-/// Encoded width of a single `PartitionVersionEntry` on the wire.
-pub const PARTITION_VERSION_ENTRY_SIZE: usize = 2 + 1 + 1 + 8;
+/// Encoded width of a single `PartitionVersionEntry` on the wire (current
+/// layout, including the reverse-heal `manifest_digest` + `max_generation`).
+pub const PARTITION_VERSION_ENTRY_SIZE: usize = 2 + 1 + 1 + 8 + 8 + 4;
+
+/// Legacy (pre-Phase-1) encoded width of a `PartitionVersionEntry`: shard,
+/// flags, replica_count, last_applied_seq only. Accepted by the parser for
+/// backward compatibility with peers that predate the reverse-heal recency
+/// fields.
+pub const PARTITION_VERSION_ENTRY_SIZE_LEGACY: usize = 2 + 1 + 1 + 8;
 
 /// Phase I — admin opcode returning a snapshot of this node's cluster
 /// readiness. Designed for client / test pre-flight checks so callers
