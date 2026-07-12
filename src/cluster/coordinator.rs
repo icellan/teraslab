@@ -6672,6 +6672,16 @@ pub enum ReplicaConvertError {
         /// Rendering of the underlying blob-store error.
         detail: String,
     },
+    /// The record's authoritative mined-state (its block set and the derived
+    /// `unmined_since`) could not be read from the MinedIndex, so the create
+    /// would ship an unknown/stale mined-state to the target.
+    #[error("read mined state for {tx_key:?} failed: {detail}")]
+    MinedStateRead {
+        /// The record whose mined-state read failed.
+        tx_key: TxKey,
+        /// Debug rendering of the underlying read error.
+        detail: String,
+    },
 }
 
 /// Convert a redo log entry to a `ReplicaOp` if it belongs to the given shard.
@@ -7136,6 +7146,25 @@ fn convert_migration_create(
         }
     }
 
+    // S6: source `unmined_since` from the authoritative in-RAM MinedIndex, NOT
+    // the device footer. Post-16d, setMined/unset write mined-state ONLY to the
+    // MinedIndex; the device footer's `unmined_since` is stale for any tx
+    // mined-then-reorged after creation. Shipping the stale device value would
+    // seed the target's MinedIndex with the wrong (create-time) height and prune
+    // the still-unmined UTXO early. Mirror `stream_shard_baseline`'s discipline:
+    // a `TxNotFound` race falls back to the (about-to-be-deleted) footer, any
+    // other read error FAILS the task.
+    let unmined_since = match engine.mined_block_entries(tx_key) {
+        Ok((_, u)) => u,
+        Err(crate::ops::error::SpendError::TxNotFound) => meta.unmined_since,
+        Err(e) => {
+            return Err(ReplicaConvertError::MinedStateRead {
+                tx_key: *tx_key,
+                detail: format!("{e:?}"),
+            });
+        }
+    };
+
     // Serialize metadata in the same format as stream_shard_baseline.
     let mut meta_buf = Vec::with_capacity(70);
     meta_buf.extend_from_slice(&meta.tx_version.to_le_bytes());
@@ -7152,7 +7181,9 @@ fn convert_migration_create(
     // Extended metadata for full failover state:
     meta_buf.extend_from_slice(&meta.generation.to_le_bytes());
     meta_buf.extend_from_slice(&meta.updated_at.to_le_bytes());
-    meta_buf.extend_from_slice(&meta.unmined_since.to_le_bytes());
+    // MinedIndex-sourced (see the `mined_block_entries` read above), NOT
+    // `meta.unmined_since` (stale device footer post-16d).
+    meta_buf.extend_from_slice(&unmined_since.to_le_bytes());
     meta_buf.extend_from_slice(&meta.delete_at_height.to_le_bytes());
     meta_buf.extend_from_slice(&meta.preserve_until.to_le_bytes());
 
@@ -17129,5 +17160,106 @@ mod tests {
             Err(ReplicaConvertError::ExternalBlobMissing { tx_key }) => assert_eq!(tx_key, key),
             other => panic!("expected ExternalBlobMissing from the batch converter, got {other:?}"),
         }
+    }
+
+    /// S6: the delta converter's Create op must ship `unmined_since` sourced
+    /// from the authoritative in-RAM MinedIndex, NOT the (post-16d stale) device
+    /// footer.
+    ///
+    /// For a mined-then-fully-reorged tx the two DISAGREE: setMined/unset write
+    /// mined-state only to the MinedIndex, so the device footer keeps its
+    /// create-time `unmined_since` while the MinedIndex carries the reorg
+    /// height. Shipping the stale device value would seed the target's
+    /// MinedIndex with the wrong (create-time) height and prune the
+    /// still-unmined UTXO early. This mirrors the baseline path (Task 15) and
+    /// `stream_shard_baseline`.
+    #[test]
+    fn migration_convert_ships_unmined_since_from_mined_index_not_stale_footer() {
+        use crate::ops::set_mined::SetMinedRequest;
+        use crate::redo::{RedoEntry, RedoOp};
+        use crate::replication::protocol::ReplicaOp;
+
+        let engine = test_engine();
+        let shard = 83u16;
+        let key = tx_key_for_shard(shard, 1);
+        create_test_record(&engine, key);
+
+        // Mine on the longest chain, then reorg it FULLY out at height 700_000.
+        // The MinedIndex ends with no blocks and `unmined_since == 700_000`; the
+        // device footer keeps its stale create-time value, because setMined/unset
+        // write nothing to the device post-16d.
+        engine
+            .set_mined(&SetMinedRequest {
+                tx_key: key,
+                block_id: 500,
+                block_height: 650_000,
+                subtree_idx: 0,
+                current_block_height: 650_010,
+                block_height_retention: 288,
+                on_longest_chain: true,
+                unset_mined: false,
+            })
+            .unwrap();
+        engine
+            .set_mined(&SetMinedRequest {
+                tx_key: key,
+                block_id: 500,
+                block_height: 650_000,
+                subtree_idx: 0,
+                current_block_height: 700_000,
+                block_height_retention: 288,
+                on_longest_chain: false,
+                unset_mined: true,
+            })
+            .unwrap();
+
+        // Precondition: device footer and MinedIndex genuinely disagree.
+        let device_unmined = { engine.read_metadata(&key).unwrap().unmined_since };
+        let (mined_blocks, mined_unmined) = engine.mined_block_entries(&key).unwrap();
+        assert!(
+            mined_blocks.is_empty(),
+            "tx was fully reorged out — no blocks remain"
+        );
+        assert_eq!(
+            mined_unmined, 700_000,
+            "MinedIndex holds the reorg height as unmined_since"
+        );
+        assert_ne!(
+            device_unmined, mined_unmined,
+            "test premise: the device footer's unmined_since ({device_unmined}) must be STALE \
+             relative to the MinedIndex ({mined_unmined})"
+        );
+
+        let entry = RedoEntry {
+            sequence: 1,
+            op: RedoOp::ReplicaCreate {
+                tx_key: key,
+                device_id: 0,
+                record_offset: 0,
+                utxo_count: 1,
+            },
+        };
+        let op = redo_entry_to_replica_op(&entry, shard, &engine)
+            .unwrap()
+            .expect("converter must ship a Create for the delta record");
+
+        // Parse the shipped Create op's `unmined_since` (metadata bytes 58..62,
+        // same layout as stream_shard_baseline).
+        let shipped_unmined = match op {
+            ReplicaOp::Create { metadata_bytes, .. } => {
+                u32::from_le_bytes(metadata_bytes[58..62].try_into().unwrap())
+            }
+            other => panic!("expected a Create op, got {other:?}"),
+        };
+
+        assert_eq!(
+            shipped_unmined, mined_unmined,
+            "the converter must ship the MinedIndex's unmined_since (reorg height \
+             {mined_unmined}), NOT the stale device footer value ({device_unmined})"
+        );
+        assert_ne!(
+            shipped_unmined, device_unmined,
+            "regression guard: the stale device value must never be what ships"
+        );
     }
 }
