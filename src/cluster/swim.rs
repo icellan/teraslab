@@ -408,6 +408,14 @@ pub struct SwimRunner {
     swim_peer_addrs: Arc<Mutex<HashMap<NodeId, SocketAddr>>>,
     shutdown: Arc<AtomicBool>,
     incarnation: u64,
+    /// Cross-thread mirror of [`Self::incarnation`], shared with the
+    /// coordinator so a refuted (bumped) incarnation is persisted alongside
+    /// topology state. Without this share the coordinator only ever saw the
+    /// *starting* incarnation, so a node that refuted self-suspicion would
+    /// reboot BELOW its peers' `max_seen` and be permanently exiled (S1).
+    /// Updated on every refute bump; the runner's own `incarnation` field
+    /// remains the in-thread source of truth.
+    incarnation_shared: Arc<std::sync::atomic::AtomicU64>,
     /// Currently pending direct probe (at most one at a time).
     pending_probe: Option<PendingProbe>,
     /// Index for round-robin peer selection.
@@ -453,6 +461,10 @@ impl SwimRunner {
             config.suspicion_timeout,
         )));
         let incarnation = config.persisted_incarnation + 1;
+        // Seed the shared mirror with the starting incarnation so the
+        // coordinator's persistence path observes it immediately (before the
+        // first refute).
+        let incarnation_shared = Arc::new(std::sync::atomic::AtomicU64::new(incarnation));
         Self {
             config,
             membership,
@@ -460,6 +472,7 @@ impl SwimRunner {
             swim_peer_addrs: Arc::new(Mutex::new(HashMap::new())),
             shutdown: Arc::new(AtomicBool::new(false)),
             incarnation,
+            incarnation_shared,
             pending_probe: None,
             probe_round_robin: 0,
             ping_req_forwarding: HashMap::new(),
@@ -472,6 +485,18 @@ impl SwimRunner {
     /// Get the current SWIM incarnation counter.
     pub fn incarnation(&self) -> u64 {
         self.incarnation
+    }
+
+    /// Shared handle to the live SWIM incarnation counter.
+    ///
+    /// The coordinator holds this same atomic and persists it alongside
+    /// topology state. Because the runner stores every refute bump into it
+    /// (see the self-suspicion refutation path in
+    /// [`Self::handle_message`]), a refuted incarnation survives a reboot —
+    /// the node restarts at `persisted + 1`, which is `>=` its peers'
+    /// `max_seen`, instead of being permanently exiled as stale (S1).
+    pub fn incarnation_shared(&self) -> Arc<std::sync::atomic::AtomicU64> {
+        self.incarnation_shared.clone()
     }
 
     /// Get a reference to the membership state.
@@ -917,6 +942,12 @@ impl SwimRunner {
                             // impossible, so staying at MAX (rather than wrapping)
                             // is the safe, non-regressing behaviour.
                             self.incarnation = inc.saturating_add(1);
+                            // S1: publish the bump to the shared atomic the
+                            // coordinator persists. Without this the refuted
+                            // value is lost on reboot and the node returns
+                            // below peers' max_seen — permanently exiled.
+                            self.incarnation_shared
+                                .store(self.incarnation, Ordering::Relaxed);
                             tracing::debug!(
                                 self_id = self.config.self_id.0,
                                 refuted_incarnation = inc,
@@ -1496,6 +1527,11 @@ impl SwimRunner {
     }
 
     #[cfg(test)]
+    fn test_shared_incarnation(&self) -> u64 {
+        self.incarnation_shared.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
     fn test_member_state(&self, id: NodeId) -> Option<crate::cluster::membership::NodeState> {
         self.membership.lock().member_info(&id).map(|i| i.state)
     }
@@ -1631,6 +1667,15 @@ mod tests {
     }
 
     fn test_runner_id(self_id: NodeId, bind: SocketAddr, self_addr: SocketAddr) -> SwimRunner {
+        test_runner_id_with_persisted(self_id, bind, self_addr, 0)
+    }
+
+    fn test_runner_id_with_persisted(
+        self_id: NodeId,
+        bind: SocketAddr,
+        self_addr: SocketAddr,
+        persisted_incarnation: u64,
+    ) -> SwimRunner {
         SwimRunner::new(SwimConfig {
             self_id,
             self_addr,
@@ -1640,7 +1685,7 @@ mod tests {
             probe_interval: Duration::from_millis(100),
             suspicion_timeout: Duration::from_secs(5),
             cluster_secret: None,
-            persisted_incarnation: 0,
+            persisted_incarnation,
             committed_term: Arc::new(AtomicU64::new(0)),
         })
     }
@@ -2012,6 +2057,62 @@ mod tests {
             parse_first_entry_incarnation(&updates),
             start_inc + 1,
             "refutation must ride the next gossip as Alive(self, bumped incarnation)",
+        );
+    }
+
+    /// S1: a refute bump must be written to the *shared* incarnation atomic
+    /// (the one the coordinator persists), not just the in-thread field.
+    /// Otherwise the bumped value is lost on reboot and the node returns
+    /// below its peers' `max_seen` — permanently exiled.
+    #[test]
+    fn refuted_incarnation_is_shared_and_survives_reboot() {
+        let self_addr: SocketAddr = "127.0.0.1:7160".parse().unwrap();
+        let node = test_runner_id(NodeId(1), self_addr, self_addr);
+        // Grab the atomic the coordinator would persist.
+        let shared = node.incarnation_shared();
+        let start_inc = node.test_incarnation();
+        assert_eq!(
+            shared.load(Ordering::Relaxed),
+            start_inc,
+            "shared atomic must start at the runner's starting incarnation",
+        );
+
+        // A peer suspects us at incarnation `start_inc + 5` (peers' max_seen).
+        let peers_max = start_inc + 5;
+        let peer_addr: SocketAddr = "10.0.0.2:5160".parse().unwrap();
+        let mut peer = test_runner_id(NodeId(2), peer_addr, "10.0.0.2:9060".parse().unwrap());
+        let mut node = node;
+        let msg = encode_gossip_about(
+            &mut peer,
+            NodeId(1),
+            1, // Suspect
+            peers_max,
+            &self_addr.to_string(),
+            &self_addr.to_string(),
+        );
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let _ = node.handle_message(&msg, peer_addr, &socket);
+
+        let bumped = node.test_incarnation();
+        assert_eq!(bumped, peers_max + 1, "refute must out-incarnate peers_max");
+        // The bug: the shared atomic (what gets persisted) is NEVER updated,
+        // so it lags the in-thread field.
+        assert_eq!(
+            node.test_shared_incarnation(),
+            bumped,
+            "refuted incarnation must be written to the shared/persisted atomic",
+        );
+
+        // Reboot: the persisted value seeds the next run, which starts at
+        // persisted + 1 — strictly above the peers' max_seen, so peers accept it.
+        let persisted = shared.load(Ordering::Relaxed);
+        let rebooted = test_runner_id_with_persisted(NodeId(1), self_addr, self_addr, persisted);
+        assert!(
+            rebooted.test_incarnation() > peers_max,
+            "rebooted node must return with an incarnation above peers' max_seen \
+             (got {}, peers_max {})",
+            rebooted.test_incarnation(),
+            peers_max,
         );
     }
 

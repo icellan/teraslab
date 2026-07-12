@@ -1289,7 +1289,11 @@ impl ClusterCoordinator {
             persisted_incarnation: config.persisted_incarnation,
             committed_term: topology_authority.committed_term_shared(),
         });
-        let swim_incarnation = Arc::new(std::sync::atomic::AtomicU64::new(swim.incarnation()));
+        // Share the runner's live incarnation atomic (NOT a fresh copy of its
+        // starting value) so refute bumps are visible to the persistence path
+        // and survive a reboot — otherwise the node reboots below its peers'
+        // max_seen and is permanently exiled (S1).
+        let swim_incarnation = swim.incarnation_shared();
 
         let mut addrs = std::collections::HashMap::new();
         addrs.insert(config.self_id, config.self_addr);
@@ -9500,12 +9504,26 @@ impl RunningCluster {
     /// that were mid-migration when the node crashed will remain blocked
     /// until the source node re-initiates migration or a topology change
     /// supersedes them.
-    pub fn restore_inbound_state(&self) {
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`InboundRestoreError`](crate::cluster::migration::InboundRestoreError)
+    /// if the persisted inbound-fence file is corrupt or truncated. This is
+    /// fail-closed: the file is the only record of which shards were still
+    /// fenced, so a corrupt file must abort startup rather than let the node
+    /// come up serving those shards as complete authority. The caller must NOT
+    /// proceed to accept client requests on an error.
+    pub fn restore_inbound_state(
+        &self,
+    ) -> Result<(), crate::cluster::migration::InboundRestoreError> {
         if let Some(ref path) = self.inbound_state_path {
-            let data = crate::cluster::migration::load_inbound_state(path);
+            // I-2: a read error on an existing fence file (not "absent") is
+            // fail-closed — the `?` propagates it so the caller aborts startup
+            // rather than treat an unreadable fence set as no fences.
+            let data = crate::cluster::migration::load_inbound_state(path)?;
             if !data.is_empty() {
                 let mut mgr = self.migration.lock();
-                mgr.restore_inbound(&data);
+                mgr.restore_inbound(&data)?;
                 self.inbound_atomic.load_from(mgr.inbound_bitmap());
                 let count = mgr.inbound_count();
                 if count > 0 {
@@ -9516,6 +9534,7 @@ impl RunningCluster {
                 }
             }
         }
+        Ok(())
     }
 
     /// Restore outbound migration state from a previous run.
@@ -11333,9 +11352,12 @@ mod tests {
             "batch completion from node2 must not clear node3's inbound task"
         );
 
-        let data = crate::cluster::migration::load_inbound_state(&path);
+        let data = crate::cluster::migration::load_inbound_state(&path)
+            .expect("load persisted inbound state");
         let mut restored = MigrationManager::new();
-        restored.restore_inbound(&data);
+        restored
+            .restore_inbound(&data)
+            .expect("persisted inbound state restores");
         assert!(!restored.has_pending_inbound(10));
         assert!(!restored.has_pending_inbound(11));
         assert!(restored.has_pending_inbound(12));

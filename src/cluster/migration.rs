@@ -1226,20 +1226,29 @@ impl MigrationManager {
 
     /// Serialize pending (non-completed) inbound migrations to bytes.
     ///
-    /// Format: `[count:4][shard:2 + from_node:8] × count`.
+    /// Format: `[count:4][shard:2 + from_node:8] × count][crc32:4]`.
+    /// The trailing CRC32 is computed over the count header and all entries.
     /// Only pending entries are persisted — completed ones are omitted.
+    ///
+    /// The CRC lets [`Self::restore_inbound`] fail closed on a corrupt or
+    /// truncated file rather than silently dropping write fences. This is a
+    /// one-time on-disk format break from the pre-CRC layout; an old file
+    /// (no trailing CRC) is rejected by `restore_inbound`, which is the safe
+    /// (still-fenced) outcome.
     pub fn serialize_inbound(&self) -> Vec<u8> {
         let pending: Vec<_> = self
             .inbound_migrations
             .iter()
             .filter(|m| !m.completed)
             .collect();
-        let mut buf = Vec::with_capacity(4 + pending.len() * 10);
+        let mut buf = Vec::with_capacity(4 + pending.len() * 10 + 4);
         buf.extend_from_slice(&(pending.len() as u32).to_le_bytes());
         for m in &pending {
             buf.extend_from_slice(&m.shard.to_le_bytes());
             buf.extend_from_slice(&m.from_node.0.to_le_bytes());
         }
+        let crc = crc32fast::hash(&buf);
+        buf.extend_from_slice(&crc.to_le_bytes());
         buf
     }
 
@@ -1248,16 +1257,75 @@ impl MigrationManager {
     /// Entries restored this way start as non-completed, so the node will
     /// refuse writes for these shards until migration completes or is
     /// explicitly cleared.
-    pub fn restore_inbound(&mut self, data: &[u8]) {
-        if data.len() < 4 {
-            return;
+    ///
+    /// # Fail-closed integrity
+    ///
+    /// The file is validated in full BEFORE any state is mutated: the declared
+    /// entry count must match the file length exactly, and the trailing CRC32
+    /// must match the checksum over the body. On any mismatch the manager is
+    /// left untouched and an [`InboundRestoreError`] is returned. A corrupt or
+    /// truncated fence file must never silently drop write fences — the caller
+    /// must treat the affected shards as still fenced (unavailable) rather than
+    /// serving them as complete authority. An OLD pre-CRC file has no trailing
+    /// CRC and so fails this check (the safe outcome).
+    ///
+    /// Empty `data` (an absent state file) is not corruption and is a no-op.
+    /// A bare 4-byte `[count=0]` file (the pre-CRC empty-state stub) is also
+    /// accepted as an empty state, so an upgraded node with nothing to fence
+    /// boots rather than bricking on the one-time format break.
+    ///
+    /// # Errors
+    ///
+    /// - [`InboundRestoreError::TooShort`] if `data` is non-empty but shorter
+    ///   than the 8-byte minimum (count header + CRC) and is not the 4-byte
+    ///   old empty-state stub.
+    /// - [`InboundRestoreError::LengthMismatch`] if the declared count does not
+    ///   match the file length (short read or trailing garbage).
+    /// - [`InboundRestoreError::ChecksumMismatch`] if the trailing CRC32 does
+    ///   not match the body.
+    pub fn restore_inbound(&mut self, data: &[u8]) -> Result<(), InboundRestoreError> {
+        // An absent file (empty bytes) carries no state — nothing to restore.
+        if data.is_empty() {
+            return Ok(());
         }
-        let count = u32::from_le_bytes(data[0..4].try_into().unwrap_or([0; 4])) as usize;
+        // I-1 back-compat: the pre-CRC format wrote a bare 4-byte `[count=0]`
+        // stub for the empty state (every completion that cleared the last
+        // pending inbound rewrote the file this way, and it is never deleted).
+        // It carries no fences and no CRC. Accept it as a valid empty state so
+        // an upgraded node with NOTHING to fence boots cleanly instead of
+        // crash-looping on a `TooShort` brick. A 4-byte file whose count is
+        // non-zero cannot be this stub (an old file with N>=1 entries is
+        // `4 + 10*N` bytes) — it is truncated/corrupt and still falls through to
+        // the fail-closed `TooShort` below.
+        if data.len() == 4 && u32::from_le_bytes(data[0..4].try_into().unwrap_or([0; 4])) == 0 {
+            return Ok(());
+        }
+        if data.len() < 8 {
+            return Err(InboundRestoreError::TooShort { len: data.len() });
+        }
+        let count = u32::from_le_bytes(data[0..4].try_into().unwrap_or([0; 4]));
+        // Exact-length check: [count:4] + count * [entry:10] + [crc:4]. This
+        // rejects both a truncated file (short read) and trailing garbage.
+        let expected = 4usize
+            .saturating_add((count as usize).saturating_mul(10))
+            .saturating_add(4);
+        if data.len() != expected {
+            return Err(InboundRestoreError::LengthMismatch {
+                count,
+                expected,
+                actual: data.len(),
+            });
+        }
+        let crc_off = data.len() - 4;
+        let stored = u32::from_le_bytes(data[crc_off..].try_into().unwrap_or([0; 4]));
+        let computed = crc32fast::hash(&data[..crc_off]);
+        if stored != computed {
+            return Err(InboundRestoreError::ChecksumMismatch { stored, computed });
+        }
+        // Validation passed — apply the entries. No error path remains, so the
+        // manager is never left partially mutated.
         let mut pos = 4;
         for _ in 0..count {
-            if pos + 10 > data.len() {
-                break;
-            }
             let shard = u16::from_le_bytes(data[pos..pos + 2].try_into().unwrap_or([0; 2]));
             let from_node = NodeId(u64::from_le_bytes(
                 data[pos + 2..pos + 10].try_into().unwrap_or([0; 8]),
@@ -1278,6 +1346,7 @@ impl MigrationManager {
                 self.inbound_bitmap.set(shard);
             }
         }
+        Ok(())
     }
 
     /// Clear all inbound migrations (used when the topology changes and
@@ -1434,6 +1503,44 @@ impl MigrationManager {
     }
 }
 
+/// Error returned by [`MigrationManager::restore_inbound`] when the persisted
+/// inbound-fence file fails its integrity checks.
+///
+/// Every variant is fail-closed: the manager's existing fences are left
+/// untouched, and the caller must treat the affected shards as still fenced
+/// (unavailable) rather than serving them as complete authority.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum InboundRestoreError {
+    /// The file is non-empty but too short to contain the 4-byte count header
+    /// plus the trailing 4-byte CRC32.
+    #[error("inbound-fence file too short: {len} bytes (need >= 8)")]
+    TooShort { len: usize },
+
+    /// The declared entry count does not match the file length — the file was
+    /// truncated (short read) or carries trailing garbage.
+    #[error(
+        "inbound-fence file length mismatch: got {actual} bytes, expected {expected} for count={count}"
+    )]
+    LengthMismatch {
+        count: u32,
+        expected: usize,
+        actual: usize,
+    },
+
+    /// The trailing CRC32 does not match the checksum computed over the body.
+    #[error(
+        "inbound-fence file checksum mismatch: stored={stored:#010x}, computed={computed:#010x}"
+    )]
+    ChecksumMismatch { stored: u32, computed: u32 },
+
+    /// The inbound-fence file exists but could not be read — an I/O error
+    /// distinct from "not found" (e.g. `EIO`/`EACCES`). Fail-closed: the file
+    /// may record shards still fenced, so the node must not come up ignoring it
+    /// (an absent file is instead reported as an empty state, not an error).
+    #[error("inbound-fence file read error: {detail}")]
+    ReadError { detail: String },
+}
+
 /// Persist inbound migration state to disk (atomic write via temp + rename).
 ///
 /// Best-effort: errors are logged but do not propagate. On restart the
@@ -1455,10 +1562,23 @@ pub fn persist_inbound_state(path: &std::path::Path, mgr: &MigrationManager) {
 
 /// Load inbound migration state from disk.
 ///
-/// Returns the raw bytes for `MigrationManager::restore_inbound()`.
-/// Returns an empty Vec if the file doesn't exist or is corrupted.
-pub fn load_inbound_state(path: &std::path::Path) -> Vec<u8> {
-    std::fs::read(path).unwrap_or_default()
+/// Returns the raw bytes for [`MigrationManager::restore_inbound`].
+///
+/// # Errors
+///
+/// I-2: an ABSENT file (`NotFound`) is a safe empty state and returns
+/// `Ok(vec![])`. Any OTHER I/O error (e.g. `EIO`/`EACCES` on an existing fence
+/// file) is fail-closed and returns [`InboundRestoreError::ReadError`] — the
+/// bytes cannot be trusted as "no fences", so the caller must not silently drop
+/// whatever fences the unreadable file recorded.
+pub fn load_inbound_state(path: &std::path::Path) -> Result<Vec<u8>, InboundRestoreError> {
+    match std::fs::read(path) {
+        Ok(data) => Ok(data),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(e) => Err(InboundRestoreError::ReadError {
+            detail: e.to_string(),
+        }),
+    }
 }
 
 /// Persist outbound migration state to disk (atomic write via temp + rename).
@@ -1779,7 +1899,9 @@ mod tests {
         // durable restart trigger).
         let bytes = mgr.serialize_inbound();
         let mut restored = MigrationManager::new();
-        restored.restore_inbound(&bytes);
+        restored
+            .restore_inbound(&bytes)
+            .expect("round-trip restores");
         assert_eq!(restored.pending_inbound_entries(), vec![(9, master)]);
     }
 
@@ -2037,7 +2159,9 @@ mod tests {
 
         let data = mgr.serialize_inbound();
         let mut restored = MigrationManager::new();
-        restored.restore_inbound(&data);
+        restored
+            .restore_inbound(&data)
+            .expect("round-trip restores");
 
         // Only shard 20 (pending) should be restored.
         assert!(!restored.has_pending_inbound(10));
@@ -2047,26 +2171,89 @@ mod tests {
 
     #[test]
     fn restore_inbound_empty_data() {
+        // An absent file (empty bytes) is not corruption — restore is a no-op.
         let mut mgr = MigrationManager::new();
-        mgr.restore_inbound(&[]);
+        mgr.restore_inbound(&[]).expect("empty is a valid no-op");
         assert_eq!(mgr.inbound_count(), 0);
 
-        mgr.restore_inbound(&[0, 0, 0, 0]); // count = 0
+        // A valid zero-entry state round-trips through the CRC format.
+        let empty_state = MigrationManager::new().serialize_inbound();
+        mgr.restore_inbound(&empty_state)
+            .expect("zero-entry state restores");
         assert_eq!(mgr.inbound_count(), 0);
     }
 
     #[test]
     fn restore_inbound_truncated_data() {
+        // G5: count=2 but only 1 entry's worth of data and no CRC. The old
+        // behavior silently restored a subset (dropping fences); the fix must
+        // FAIL-CLOSED so incomplete shards are never served as full authority.
         let mut mgr = MigrationManager::new();
-        // count=2 but only 1 entry's worth of data (10 bytes).
         let mut data = Vec::new();
         data.extend_from_slice(&2u32.to_le_bytes());
         data.extend_from_slice(&42u16.to_le_bytes());
         data.extend_from_slice(&7u64.to_le_bytes());
-        mgr.restore_inbound(&data);
-        // Should restore 1 entry, ignore the truncated second.
-        assert_eq!(mgr.inbound_count(), 1);
-        assert!(mgr.has_pending_inbound(42));
+        let err = mgr
+            .restore_inbound(&data)
+            .expect_err("truncated fence file must fail closed");
+        assert!(
+            matches!(err, InboundRestoreError::LengthMismatch { .. }),
+            "expected LengthMismatch, got {err:?}"
+        );
+        assert_eq!(mgr.inbound_count(), 0, "no fences may be restored");
+        assert!(!mgr.has_pending_inbound(42));
+    }
+
+    #[test]
+    fn restore_inbound_corrupt_fails_closed() {
+        // Build a valid persisted fence set with two pending inbound shards.
+        let mut src = MigrationManager::new();
+        src.mark_inbound_active(10);
+        src.mark_inbound_active(20);
+        let good = src.serialize_inbound();
+
+        // (1) A short read (dropped tail bytes) must fail closed on length,
+        //     not silently restore a subset of the fences.
+        let truncated = &good[..good.len() - 3];
+        let mut mgr = MigrationManager::new();
+        let err = mgr
+            .restore_inbound(truncated)
+            .expect_err("short read must fail closed");
+        assert!(
+            matches!(err, InboundRestoreError::LengthMismatch { .. }),
+            "expected LengthMismatch, got {err:?}"
+        );
+        assert_eq!(mgr.inbound_count(), 0);
+
+        // (2) A single corrupted byte in the body must fail the CRC.
+        let mut flipped = good.clone();
+        flipped[4] ^= 0xFF;
+        let mut mgr2 = MigrationManager::new();
+        let err2 = mgr2
+            .restore_inbound(&flipped)
+            .expect_err("corrupt body must fail closed");
+        assert!(
+            matches!(err2, InboundRestoreError::ChecksumMismatch { .. }),
+            "expected ChecksumMismatch, got {err2:?}"
+        );
+        assert_eq!(mgr2.inbound_count(), 0);
+
+        // (3) A prior fence must survive a failed restore (keep shards fenced
+        //     rather than dropping them).
+        let mut mgr3 = MigrationManager::new();
+        mgr3.mark_inbound_active(99);
+        assert!(mgr3.restore_inbound(&flipped).is_err());
+        assert!(
+            mgr3.has_pending_inbound(99),
+            "existing fence must survive a failed restore"
+        );
+
+        // (4) The valid round-trip still restores every fence.
+        let mut ok = MigrationManager::new();
+        ok.restore_inbound(&good).expect("valid fence set restores");
+        assert!(ok.has_pending_inbound(10));
+        assert!(ok.has_pending_inbound(20));
+        assert_eq!(ok.inbound_count(), 2);
     }
 
     #[test]
@@ -2078,8 +2265,47 @@ mod tests {
         let data = mgr.serialize_inbound();
 
         // Restore onto the same manager — should not duplicate.
-        mgr.restore_inbound(&data);
+        mgr.restore_inbound(&data).expect("round-trip restores");
         assert_eq!(mgr.inbound_count(), 1);
+    }
+
+    #[test]
+    fn restore_inbound_accepts_old_empty_stub() {
+        // I-1: the pre-CRC format wrote a bare 4-byte `[count=0]` stub for the
+        // empty state (every completion that cleared the last pending inbound).
+        // An upgraded node reading it has ZERO shards to fence — it must boot,
+        // NOT crash-loop on a `TooShort` brick.
+        let mut mgr = MigrationManager::new();
+        mgr.restore_inbound(&[0, 0, 0, 0])
+            .expect("old 4-byte empty stub must be accepted as empty state");
+        assert_eq!(mgr.inbound_count(), 0);
+
+        // But a 4-byte stub claiming entries it cannot contain is corrupt, not
+        // an old-empty file — it must still fail closed.
+        let mut mgr2 = MigrationManager::new();
+        let err = mgr2
+            .restore_inbound(&[5, 0, 0, 0])
+            .expect_err("4-byte file claiming 5 entries must fail closed");
+        assert!(
+            matches!(err, InboundRestoreError::TooShort { .. }),
+            "expected TooShort, got {err:?}"
+        );
+        assert_eq!(mgr2.inbound_count(), 0);
+    }
+
+    #[test]
+    fn load_inbound_state_read_error_fails_closed() {
+        // I-2: a real I/O error on an EXISTING fence path (here a directory,
+        // which `std::fs::read` cannot read) must NOT be silently treated as an
+        // absent (empty) file. Fences the file recorded as pending would be
+        // dropped otherwise — the exact fail-open G5 closes.
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let err = super::load_inbound_state(dir.path())
+            .expect_err("reading a directory must be a fail-closed read error");
+        assert!(
+            matches!(err, InboundRestoreError::ReadError { .. }),
+            "expected ReadError, got {err:?}"
+        );
     }
 
     #[test]
@@ -2093,9 +2319,11 @@ mod tests {
 
         super::persist_inbound_state(&path, &mgr);
 
-        let data = super::load_inbound_state(&path);
+        let data = super::load_inbound_state(&path).expect("load persisted state");
         let mut restored = MigrationManager::new();
-        restored.restore_inbound(&data);
+        restored
+            .restore_inbound(&data)
+            .expect("round-trip restores");
         assert!(restored.has_pending_inbound(100));
         assert!(restored.has_pending_inbound(200));
         assert_eq!(restored.inbound_count(), 2);
@@ -2103,7 +2331,9 @@ mod tests {
 
     #[test]
     fn load_inbound_state_missing_file() {
-        let data = super::load_inbound_state(std::path::Path::new("/nonexistent/path"));
+        // An absent file is a safe empty state, NOT a read error.
+        let data = super::load_inbound_state(std::path::Path::new("/nonexistent/path"))
+            .expect("absent file is an empty state, not an error");
         assert!(data.is_empty());
     }
 

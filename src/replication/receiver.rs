@@ -1538,6 +1538,14 @@ fn apply_op_journal_inner(
         _ => None,
     };
 
+    // C28: a reassign overwrites the slot's utxo_hash, so the prior identity
+    // the recovery guard must re-validate against is only available BEFORE the
+    // apply. Capture it in the reassign arm below and hand it to
+    // `build_post_apply_redo_op` so the journaled entry is the hash-guarded
+    // `ReassignV2` (idempotent replay) rather than the legacy hash-less
+    // `Reassign` (replays without the guard).
+    let mut reassign_prior_hash: Option<[u8; 32]> = None;
+
     match op {
         ReplicaOp::Spend {
             tx_key,
@@ -1803,6 +1811,9 @@ fn apply_op_journal_inner(
                     return Ok(());
                 }
             };
+            // C28: stash the pre-apply hash for the post-apply `ReassignV2`
+            // redo (the guard identity the slot will no longer carry).
+            reassign_prior_hash = Some(old_hash);
             let req = ReassignRequest {
                 tx_key: *tx_key,
                 offset: *offset,
@@ -2222,7 +2233,7 @@ fn apply_op_journal_inner(
     // already-mined baseline handed off but not yet checkpointed recovers
     // slotted + mined after a target crash instead of slot-less + unmined.
     if journal || is_migration {
-        if let Some(redo_op) = build_post_apply_redo_op(engine, op)? {
+        if let Some(redo_op) = build_post_apply_redo_op(engine, op, reassign_prior_hash)? {
             match pre_delete_device_id {
                 // Route the Delete redo to the record's own store log (see the
                 // capture above) so it shares the log of the record's Create.
@@ -2333,9 +2344,17 @@ fn create_companion_set_mined_ops(op: &ReplicaOp) -> Vec<crate::redo::RedoOp> {
 /// Returns `Ok(None)` when the op has no recoverable redo entry (e.g.
 /// the engine apply was a graceful skip because the record had already
 /// been deleted), or when no redo log is attached (test paths).
+/// Build the local redo entry a replica journals AFTER applying `op`.
+///
+/// `reassign_prior_hash` carries the reassign target slot's utxo_hash captured
+/// BEFORE the engine applied the reassign (see [`apply_op_journal_inner`]). A
+/// reassign overwrites the slot hash, so this pre-apply value is the identity
+/// the recovery guard must re-validate against; it is `None` for every other
+/// op (and for direct callers outside the apply path).
 fn build_post_apply_redo_op(
     engine: &Engine,
     op: &ReplicaOp,
+    reassign_prior_hash: Option<[u8; 32]>,
 ) -> std::result::Result<Option<crate::redo::RedoOp>, String> {
     use crate::redo::RedoOp;
     if engine.redo_log().is_none() {
@@ -2502,13 +2521,33 @@ fn build_post_apply_redo_op(
             block_height,
             spendable_after,
             ..
-        } => Ok(Some(RedoOp::Reassign {
-            tx_key: *tx_key,
-            offset: *offset,
-            new_hash: *new_hash,
-            block_height: *block_height,
-            spendable_after: *spendable_after,
-        })),
+        } => {
+            // C28: journal the hash-guarded `ReassignV2` so this replica's own
+            // redo-tail recovery re-validates the prior identity and replays
+            // idempotently. The prior hash was captured pre-apply; the current
+            // slot already holds the NEW hash, so it cannot be re-derived here.
+            let Some(prior_utxo_hash) = reassign_prior_hash else {
+                // L-1: unreachable via the apply path (the reassign apply arm
+                // always captures the pre-apply hash). Fail SAFE: reading the
+                // post-apply slot would yield the NEW hash, and a `ReassignV2`
+                // carrying that as `prior_utxo_hash` makes recovery's identity
+                // guard SKIP the reassign — silently losing it. Journal nothing
+                // rather than a wrong-guard entry.
+                debug_assert!(
+                    false,
+                    "reassign redo built without a captured pre-apply prior hash"
+                );
+                return Ok(None);
+            };
+            Ok(Some(RedoOp::ReassignV2 {
+                tx_key: *tx_key,
+                offset: *offset,
+                new_hash: *new_hash,
+                block_height: *block_height,
+                spendable_after: *spendable_after,
+                prior_utxo_hash,
+            }))
+        }
         ReplicaOp::SetConflicting {
             tx_key,
             value,
@@ -3420,7 +3459,7 @@ mod tests {
 
         // The post-apply redo is a SpendV2 for the spent vout (convertible +
         // self-sufficient), NOT a physical relocate op.
-        let post = build_post_apply_redo_op(&engine, &op).unwrap();
+        let post = build_post_apply_redo_op(&engine, &op, None).unwrap();
         match post {
             Some(crate::redo::RedoOp::SpendV2 { tx_key, offset, .. }) => {
                 assert_eq!(tx_key, k);
@@ -3437,7 +3476,7 @@ mod tests {
             Arc::new(MemoryDevice::new(4 * 1024 * 1024, 4096).unwrap());
         let log = crate::redo::RedoLog::open(log_dev, 0, 4 * 1024 * 1024).unwrap();
         inplace.set_redo_logs(vec![Arc::new(parking_lot::Mutex::new(log))]);
-        let post_inplace = build_post_apply_redo_op(&inplace, &op).unwrap();
+        let post_inplace = build_post_apply_redo_op(&inplace, &op, None).unwrap();
         assert!(
             matches!(post_inplace, Some(crate::redo::RedoOp::SpendV2 { .. })),
             "in-place replica Spend must emit a post-apply SpendV2, got {post_inplace:?}"
@@ -4597,6 +4636,92 @@ mod tests {
         let meta = engine.read_metadata(&k).unwrap();
         assert_eq!({ meta.reassignment_count }, 1);
         assert_eq!(engine.read_slot(&k, 0).unwrap().hash, new_hash);
+    }
+
+    /// C28: a replica applying a reassign must journal the hash-guarded
+    /// `ReassignV2` (carrying the PRE-apply prior hash), not the legacy
+    /// hash-less `Reassign`. Otherwise this replica's own redo-tail recovery
+    /// replays the reassign WITHOUT the identity guard — non-idempotent, and
+    /// it can misapply against a slot whose identity has since changed.
+    #[test]
+    fn replica_reassign_journals_hash_guarded_reassign_v2() {
+        let engine = make_engine();
+        let log_arc = attach_redo_log(&engine);
+        let k = key(63);
+        create_record(&engine, k, 2);
+
+        apply_op(
+            &engine,
+            &ReplicaOp::Freeze {
+                tx_key: k,
+                offset: 0,
+                master_generation: 0,
+            },
+        )
+        .unwrap();
+
+        // The prior hash the recovery guard must re-validate against is the
+        // slot's hash BEFORE the reassign is applied.
+        let prior_hash = engine.read_slot(&k, 0).unwrap().hash;
+        let new_hash = [0x5A; 32];
+
+        // Isolate the reassign's redo entries (drop the freeze's).
+        let pre_seq = log_arc.lock().current_sequence();
+        apply_op(
+            &engine,
+            &ReplicaOp::Reassign {
+                tx_key: k,
+                offset: 0,
+                new_hash,
+                block_height: 800_000,
+                spendable_after: 1_000,
+                master_generation: 1,
+            },
+        )
+        .unwrap();
+        flush_replica_redo_log(&engine).expect("redo log flush");
+
+        // Post-apply the slot carries the NEW hash — proving `prior_hash`
+        // could not have been read back after the apply.
+        assert_eq!(engine.read_slot(&k, 0).unwrap().hash, new_hash);
+
+        let entries = log_arc
+            .lock()
+            .read_from_sequence(pre_seq)
+            .expect("redo log replay");
+        let reassign_entry = entries
+            .iter()
+            .find(|e| {
+                matches!(
+                    e.op,
+                    crate::redo::RedoOp::ReassignV2 { .. } | crate::redo::RedoOp::Reassign { .. }
+                )
+            })
+            .expect("a reassign redo entry must be journaled");
+        match &reassign_entry.op {
+            crate::redo::RedoOp::ReassignV2 {
+                tx_key,
+                offset,
+                new_hash: entry_new,
+                prior_utxo_hash,
+                ..
+            } => {
+                assert_eq!(*tx_key, k);
+                assert_eq!(*offset, 0);
+                assert_eq!(*entry_new, new_hash);
+                assert_eq!(
+                    *prior_utxo_hash, prior_hash,
+                    "ReassignV2 must carry the PRE-apply prior hash for the recovery identity guard",
+                );
+            }
+            crate::redo::RedoOp::Reassign { .. } => {
+                panic!(
+                    "replica journaled legacy hash-less Reassign — recovery replays it \
+                     without the identity guard (C28)"
+                );
+            }
+            other => panic!("unexpected redo op: {other:?}"),
+        }
     }
 
     #[test]
