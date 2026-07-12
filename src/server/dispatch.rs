@@ -2872,6 +2872,21 @@ fn replicate_all_ops_with_barrier(
     // one) and a peer master↔master apply can acquire its own barrier
     // instead of deadlocking until the ack timeout. If replication later
     // fails, compensation is a separate durable mutation.
+    //
+    // G4 RESIDUAL (FOLLOW-UP): `barrier` here is the COARSE, engine-wide
+    // EXCLUSIVE visibility barrier used by the mutation handlers that have NOT
+    // been migrated to per-key visibility (unspend / freeze / unfreeze /
+    // reassign / set_conflicting / remove_conflicting_child / set_locked /
+    // preserve_until / mark_longest_chain). Releasing it before the replication
+    // round-trip leaves the SAME read-your-writes / monotonicity window the
+    // fine-grained spend/set_mined paths closed (a reader can observe a write
+    // that a replication failure then rolls back). It is NOT closed the same way
+    // here on purpose: holding this GLOBAL EXCLUSIVE barrier across the network
+    // RTT would serialize the whole engine on every replicated mutation and
+    // block checkpoints for the RTT. Closing it correctly requires first
+    // migrating these ops to per-key `mutation_stripes` visibility (like
+    // spend/set_mined), then holding only the per-key stripes to quorum — a
+    // separate, larger redesign tracked as follow-up.
     if let Some(b) = barrier.as_mut() {
         b.release();
     }
@@ -6285,11 +6300,21 @@ fn handle_set_mined_batch(
     // write-fence re-check below and before the redo/apply — so a migration's
     // fence drain (which takes the EXCLUSIVE side of this same gate, C18) cannot
     // capture `fence_seq` between our check and our redo append. Held across the
-    // redo append + apply, released before replication. Excludes a client read
-    // of THESE keys while set_mined applies, while disjoint batches run
-    // concurrently.
+    // redo append + apply. Excludes a client read of THESE keys while set_mined
+    // applies, while disjoint batches run concurrently.
+    //
+    // G4 (read-your-writes / monotonicity): acquire the two halves separately,
+    // mirroring `handle_spend_batch`. `global_vis` (checkpoint coordination —
+    // also what excludes the C19 fence drain) is held across the redo append +
+    // apply and released before the replication RTT so a checkpoint can run
+    // during it. `visibility_stripes` (per-key WRITE) is HELD across replication
+    // and any compensation, released only once the durable outcome is known — so
+    // a reader of these keys never observes a set_mined that a replication
+    // failure then rolls back. `global_read` before `mutation_stripes` preserves
+    // the global-before-stripes acquisition order.
     let visibility_keys: Vec<TxKey> = valid_items.iter().map(|v| v.key).collect();
-    let visibility_guard = engine.visibility().mutation(&visibility_keys);
+    let global_vis = engine.visibility().global_read();
+    let visibility_stripes = engine.visibility().mutation_stripes(&visibility_keys);
 
     // C19: re-validate the outbound write-fence UNDER the guard. The first-pass
     // ownership check above ran WITHOUT the guard, so a shard fenced for
@@ -6540,8 +6565,12 @@ fn handle_set_mined_batch(
         }
     }
 
-    // Release per-key visibility before replication (reads of these keys resume).
-    drop(visibility_guard);
+    // G4: release ONLY the global (checkpoint-coordination) side before the
+    // replication RTT so a checkpoint can run during it; the per-key
+    // `visibility_stripes` stay held across replication (and any compensation)
+    // below — a reader of these keys is excluded until the outcome is known, so
+    // it never observes a set_mined that a failure then rolls back.
+    drop(global_vis);
 
     // Phase 4: Replicate.
     let repl_outcome = match replicate_all_ops_with_barrier(
@@ -6556,6 +6585,8 @@ fn handle_set_mined_batch(
         Err(e) => {
             // Gap #8: rollback uses the captured pre-unset block-entry
             // fields so a crash mid-rollback can be replayed exactly.
+            // `visibility_stripes` is still held here, so no reader observes the
+            // rolled-back mined-state; it drops as the handler returns below.
             if let Some(resp) = compensate_replication_failure_or_error(
                 req.request_id,
                 cluster,
@@ -6570,6 +6601,10 @@ fn handle_set_mined_batch(
             return error_response(req.request_id, ERR_REPLICATION_FAILED, &e);
         }
     };
+
+    // G4: replication reached a durable outcome (Full / Degraded). Release the
+    // per-key visibility so readers observe the committed mined-state.
+    drop(visibility_stripes);
 
     // Final batch-level ticks: set_mined_succeeded counts a successful batch,
     // set_mined_attempted incremented at dispatch entry. Tick succeeded only
@@ -6829,6 +6864,18 @@ fn handle_create_batch(
     // the stripe hold to Phase 3 lets stripe-overlapping creates pipeline through
     // the I/O stages. Reads landing before Phase 3 correctly see "not found"
     // (the key is not yet in the index), preserving batch-atomic visibility.
+    //
+    // G4 RESIDUAL (FOLLOW-UP): unlike spend/set_mined, create does NOT hold a
+    // per-key `mutation_stripes` visibility guard — a created key becomes
+    // reader-visible by INDEX PRESENCE (register_create_at_offset in Phase 3
+    // under the engine stripe lock), not by a held visibility stripe. So the
+    // hold-to-quorum discipline applied to spend/set_mined does not transfer
+    // directly: closing create's read-your-writes window (a reader sees a
+    // created record that a replication failure then rolls back) needs the index
+    // registration / reader-visibility deferred to the replication outcome,
+    // which is a separate change from this per-key-stripe pattern. Tracked as
+    // follow-up. (Delete is unaffected — it is local GC prune, never replicated,
+    // so it has no replication-rollback window.)
     let vis_start = std::time::Instant::now();
     let _global_vis = engine.visibility().global_read();
     if let Some(h) = DISPATCH_HISTOGRAMS.get() {
@@ -21771,6 +21818,116 @@ mod tests {
                 .status,
             UTXO_UNSPENT,
             "compensation must have rolled the slot back to UNSPENT",
+        );
+    }
+
+    /// G4 (set_mined): the fine-grained per-key hold-to-quorum discipline
+    /// extends to set_mined. A reader concurrent with an RF>1 set_mined whose
+    /// replication FAILS must never observe the mined-state — it is excluded
+    /// until the outcome is known and the mined-state is rolled back, so it
+    /// observes only the pre-write UNMINED state. Mirrors the spend test.
+    #[test]
+    fn set_mined_holds_visibility_until_replication_outcome_reader_never_sees_rolled_back_mined() {
+        use std::sync::atomic::{AtomicU8, Ordering};
+
+        const SLOW_NAK_MS: u64 = 500;
+        let replica = spawn_replica_receiver(ReplicaBehaviour::SlowNak(SLOW_NAK_MS));
+        let (cluster, key) = two_node_rf2(replica, Some(AckPolicy::WriteMajority));
+
+        let h = RedoDispatchHarness::new();
+        assert_eq!(
+            h.create_tx(key.txid, 1).status,
+            STATUS_OK,
+            "seed create must succeed"
+        );
+        // Precondition: freshly-created record is UNMINED (no block entries).
+        let mined_now = |k: &TxKey| -> bool {
+            h.engine
+                .mined_block_entries(k)
+                .map(|(entries, _)| !entries.is_empty())
+                .unwrap_or(false)
+        };
+        assert!(!mined_now(&key), "precondition: seeded record is UNMINED");
+
+        let set_mined_params = SetMinedBatchParams {
+            block_id: 7,
+            block_height: 100,
+            subtree_idx: 0,
+            on_longest_chain: true,
+            unset_mined: false,
+            current_block_height: 100,
+            block_height_retention: 288,
+        };
+        let set_mined_payload = encode_set_mined_batch(&set_mined_params, &[key.txid]);
+
+        // Reader's observation: 0 = observed UNMINED, 1 = observed MINED,
+        // 0xFF = not recorded.
+        const UNSET: u8 = 0xFF;
+        const OBS_UNMINED: u8 = 0;
+        const OBS_MINED: u8 = 1;
+        let observed = AtomicU8::new(UNSET);
+
+        std::thread::scope(|s| {
+            // set_mined applies locally, blocks ~SLOW_NAK_MS in replication, then
+            // the NAK fails it and compensation rolls the mined-state back.
+            let set_mined_resp = s.spawn(|| {
+                let req = RequestFrame {
+                    request_id: 1,
+                    op_code: OP_SET_MINED_BATCH,
+                    flags: 0,
+                    payload: set_mined_payload.into(),
+                };
+                let mut cs = crate::server::ConnectionState::new();
+                handle_request(
+                    &req,
+                    &h.engine,
+                    8192,
+                    Some(&cluster),
+                    Some(&h.redo_log),
+                    &mut cs,
+                    None,
+                )
+            });
+
+            // Reader: wait (dirty read, bypassing visibility) until the mined
+            // state has applied locally, so replication is now in flight. Then
+            // take the read-visibility guard and record whether the record looks
+            // MINED. After the fix this guard BLOCKS until the replication
+            // outcome + rollback (→ UNMINED); before the fix it acquires
+            // immediately and exposes the soon-rolled-back MINED state.
+            s.spawn(|| {
+                loop {
+                    if mined_now(&key) {
+                        break;
+                    }
+                    std::thread::yield_now();
+                }
+                let _read_guard = h.engine.visibility().read(std::slice::from_ref(&key));
+                let obs = if mined_now(&key) {
+                    OBS_MINED
+                } else {
+                    OBS_UNMINED
+                };
+                observed.store(obs, Ordering::SeqCst);
+            });
+
+            let resp = set_mined_resp.join().expect("set_mined thread panicked");
+            assert_eq!(
+                resp.status, STATUS_ERROR,
+                "set_mined must fail: its sole replica NAKed (below WriteMajority)",
+            );
+        });
+
+        assert_eq!(
+            observed.load(Ordering::SeqCst),
+            OBS_UNMINED,
+            "reader observed a set_mined that replication failed and rolled back \
+             (read-your-writes / monotonicity violation)",
+        );
+        // The durable local state is the rolled-back UNMINED record.
+        assert!(
+            !mined_now(&key),
+            "compensation must have rolled the mined-state back to UNMINED",
         );
     }
 
