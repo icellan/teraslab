@@ -1262,13 +1262,16 @@ impl Engine {
         // validated, so this batch commits durably on one store and hits a
         // transient `LogFull` on another (a partial the poison-on-partial guard
         // would then spuriously fence the whole node for) — RESERVE each touched
-        // store's byte footprint under the held locks after every store fits. A
-        // concurrent batch's `would_fit` counts the reservation as consumed and
-        // cleanly (retryably) `LogFull`s instead of racing in. The reservation is
-        // released once the commit lands, on every path, by the RAII guard below;
-        // the poison-on-partial guard stays the fail-safe for a GENUINE partial
-        // (durable sibling + real I/O fault), which the reservation does not
-        // affect.
+        // store's forward-headroom need under the held locks after every store
+        // fits. The reserved amount (`batch_reservation_bytes`) is a SAFE
+        // OVER-ESTIMATE of the commit's true forward advance on that log (linear
+        // flush alignment; ring per-entry segment-roll waste), so a concurrent
+        // batch's `would_fit` counts it as consumed and can NEVER over-admit —
+        // it errs only toward an occasional early (retryable) `LogFull`, never a
+        // partial. The reservation is released once the commit lands, on every
+        // path, by the RAII guard below; the poison-on-partial guard stays the
+        // fail-safe for a GENUINE partial (durable sibling + real I/O fault),
+        // which the reservation does not affect.
         //
         // Declared here (outside the `if`) so its `Drop` releases on EVERY exit
         // path of the fan-out — the partial-poison `return`, any `?`, or a panic —
@@ -1310,13 +1313,18 @@ impl Engine {
                 }
                 held.push(guard);
             }
-            // Every touched store fits. Reserve each store's exact byte footprint
+            // Every touched store fits. Reserve each store's forward-headroom need
             // on its `RedoAtomics` while STILL holding the ascending locks, so the
             // reservation is published atomically with the fit-check snapshot a
-            // concurrent batch reads. `held` and `per_log` iterate in the same
-            // ascending log-index order, so the guard is paired with its ops.
+            // concurrent batch reads. `batch_reservation_bytes` is a SAFE
+            // OVER-ESTIMATE of the commit's TRUE forward advance on this specific
+            // log — layout- and alignment-aware (linear flush padding; ring
+            // per-entry segment-roll waste) — so a concurrent batch's `would_fit`
+            // can never over-admit into a partial-poison, erring only toward an
+            // occasional retryable `LogFull`. `held` and `per_log` iterate in the
+            // same ascending log-index order, so the guard is paired with its ops.
             for (guard, (_, log_ops)) in held.iter().zip(per_log.iter()) {
-                let bytes = crate::redo::RedoLog::batch_footprint(log_ops);
+                let bytes = guard.batch_reservation_bytes(log_ops);
                 let atomics = guard.atomics();
                 atomics.reserve(bytes);
                 _reservation.push(atomics, bytes);
@@ -22916,6 +22924,64 @@ mod tests {
         );
     }
 
+    /// Drive the check-to-commit window deterministically: batch A parks in the
+    /// pre-flight seam (fit-checked + reserved, log locks released, commit not yet
+    /// started), the main thread runs batch B against A's live reservation, then A
+    /// is released to commit. Returns `(A result, B result)`. The seam is
+    /// installed only on A's spawned thread, so B (on the caller's thread) never
+    /// parks.
+    #[allow(clippy::type_complexity)]
+    fn run_preflight_window_race(
+        engine: &Arc<Engine>,
+        batch_a: Vec<crate::redo::RedoOp>,
+        batch_b: Vec<crate::redo::RedoOp>,
+    ) -> (
+        std::result::Result<(u64, u64), String>,
+        std::result::Result<(u64, u64), String>,
+    ) {
+        use std::sync::{Condvar, Mutex};
+        let a_parked = Arc::new((Mutex::new(false), Condvar::new()));
+        let release_a = Arc::new((Mutex::new(false), Condvar::new()));
+        let a_parked_h = a_parked.clone();
+        let release_a_h = release_a.clone();
+        let engine_a = engine.clone();
+        let a_thread = std::thread::spawn(move || {
+            install_redo_preflight_seam(Box::new(move || {
+                {
+                    let (m, cv) = &*a_parked_h;
+                    *m.lock().unwrap() = true;
+                    cv.notify_all();
+                }
+                let (m, cv) = &*release_a_h;
+                let mut g = m.lock().unwrap();
+                while !*g {
+                    g = cv.wait(g).unwrap();
+                }
+            }));
+            let r = engine_a.append_redo_ops_routed(&batch_a);
+            clear_redo_preflight_seam();
+            r
+        });
+        // Wait until A is parked (reservation live, locks released).
+        {
+            let (m, cv) = &*a_parked;
+            let mut g = m.lock().unwrap();
+            while !*g {
+                g = cv.wait(g).unwrap();
+            }
+        }
+        // B runs against A's outstanding reservation.
+        let b_res = engine.append_redo_ops_routed(&batch_b);
+        // Release A; it commits.
+        {
+            let (m, cv) = &*release_a;
+            *m.lock().unwrap() = true;
+            cv.notify_all();
+        }
+        let a_res = a_thread.join().expect("A thread panicked");
+        (a_res, b_res)
+    }
+
     /// FU#6b (P1-5 residual): the CHECK-TO-COMMIT window. A multi-store batch's
     /// pre-flight validates that every touched store's slice fits, then releases
     /// the log locks before the commit fan-out re-locks them. Without a
@@ -22936,7 +23002,6 @@ mod tests {
     fn multistore_partial_logfull_window_does_not_poison() {
         use crate::redo::{RedoLog, RedoOp};
         use std::sync::atomic::AtomicU64;
-        use std::sync::{Condvar, Mutex};
 
         let engine = create_two_store_engine();
 
@@ -22992,52 +23057,12 @@ mod tests {
             }));
             ops
         };
-        let batch_a = make_batch();
-        let batch_b = make_batch();
 
-        // Coordination: A parks in the check-to-commit seam; the main thread runs
-        // B against A's live reservation, then releases A.
-        let a_parked = Arc::new((Mutex::new(false), Condvar::new()));
-        let release_a = Arc::new((Mutex::new(false), Condvar::new()));
+        let (a_res, b_res) = run_preflight_window_race(&engine, make_batch(), make_batch());
 
-        let a_parked_h = a_parked.clone();
-        let release_a_h = release_a.clone();
-        let engine_a = engine.clone();
-        let a_thread = std::thread::spawn(move || {
-            // Install the seam on A's thread only: signal "parked", then block
-            // until released — holding A in the window with its reservation live.
-            install_redo_preflight_seam(Box::new(move || {
-                {
-                    let (m, cv) = &*a_parked_h;
-                    *m.lock().unwrap() = true;
-                    cv.notify_all();
-                }
-                let (m, cv) = &*release_a_h;
-                let mut g = m.lock().unwrap();
-                while !*g {
-                    g = cv.wait(g).unwrap();
-                }
-            }));
-            let r = engine_a.append_redo_ops_routed(&batch_a);
-            clear_redo_preflight_seam();
-            r
-        });
-
-        // Wait until A is parked (reservation live, locks released).
-        {
-            let (m, cv) = &*a_parked;
-            let mut g = m.lock().unwrap();
-            while !*g {
-                g = cv.wait(g).unwrap();
-            }
-        }
-
-        // B runs while A is parked. With the reservation, B's `would_fit` sees
-        // A's outstanding store-1 reservation and cleanly, retryably `LogFull`s at
-        // pre-flight — it never enters the commit fan-out, so no partial, no poison.
-        let b_err = engine
-            .append_redo_ops_routed(&batch_b)
-            .expect_err("B must be rejected while A holds the reservation");
+        // B was rejected while A held the reservation — a clean RETRYABLE LogFull,
+        // never the partial-poison fatal.
+        let b_err = b_res.expect_err("B must be rejected while A holds the reservation");
         assert!(
             b_err.contains(crate::redo::LOG_FULL_MESSAGE_PREFIX),
             "B must get a RETRYABLE LogFull, got: {b_err}"
@@ -23047,16 +23072,8 @@ mod tests {
             "B must be a clean pre-flight rejection, not the poison/fence error: {b_err}"
         );
 
-        // Release A; it commits durably on both stores.
-        {
-            let (m, cv) = &*release_a;
-            *m.lock().unwrap() = true;
-            cv.notify_all();
-        }
-        let (first, last) = a_thread
-            .join()
-            .expect("A thread panicked")
-            .expect("A must commit durably (no partial, no poison)");
+        // A committed durably on both stores.
+        let (first, last) = a_res.expect("A must commit durably (no partial, no poison)");
         assert!(last >= first, "A returns a valid sequence range");
 
         // NEITHER log is poisoned — the node stays write-healthy.
@@ -23093,6 +23110,101 @@ mod tests {
             1,
             "A's single store-0 op must be durable and B's must be absent"
         );
+    }
+
+    /// FU#6b LINEAR alignment boundary: the reservation must cover the commit's
+    /// TRUE forward advance, which a flush rounds UP to the device alignment — so
+    /// reserving the raw footprint under-counts by up to `align - 1` bytes and a
+    /// concurrent batch can still over-admit into a partial-poison. This tunes
+    /// store 1 so a batch's raw store-1 footprint sits within one alignment block
+    /// of full: with the raw-footprint reservation B `would_fit`-passes (RED —
+    /// over-admit → partial), with the `align_up(footprint)` reservation B is
+    /// cleanly rejected and NEITHER store poisons (GREEN).
+    #[test]
+    fn multistore_reservation_covers_linear_flush_alignment() {
+        use crate::redo::{RedoLog, RedoOp};
+        use std::sync::atomic::AtomicU64;
+
+        let engine = create_two_store_engine();
+
+        // store 0: roomy. store 1: entries region 16384 B, pre-filled to write_pos
+        // 4096 B → headroom H = 12288 B (three 4 KiB blocks).
+        let rdev0: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
+        let rdev1: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(20480, 4096).unwrap());
+        let mut log0 = RedoLog::open(rdev0.clone(), 0, 1024 * 1024).unwrap();
+        let mut log1 = RedoLog::open(rdev1.clone(), 0, 20480).unwrap();
+        let shared = Arc::new(AtomicU64::new(RedoLog::shared_sequence_floor(&[
+            &log0, &log1,
+        ])));
+        log0.attach_shared_sequence(shared.clone());
+        log1.attach_shared_sequence(shared.clone());
+
+        // Pre-fill store 1 to write_pos 4096 (120 * 34 = 4080 B → flush pads to one
+        // block), leaving H = 12288 B.
+        for i in 0..120u64 {
+            log1.append(RedoOp::AllocateRegion {
+                device_id: 1,
+                offset: i * 4096,
+                size: 4096,
+            })
+            .unwrap();
+        }
+        log1.flush().unwrap();
+        assert_eq!(
+            log1.available_space(),
+            12288,
+            "pre-fill must leave exactly three blocks of store-1 headroom"
+        );
+
+        let log0_arc = Arc::new(parking_lot::Mutex::new(log0));
+        let log1_arc = Arc::new(parking_lot::Mutex::new(log1));
+        engine.set_redo_logs(vec![log0_arc.clone(), log1_arc.clone()]);
+
+        // Each batch's store-1 slice = 121 * 34 = 4114 B (raw footprint fA), whose
+        // flush advances write_pos by align_up(4114) = 8192 B. With H = 12288:
+        //   fA + fB = 8228 <= 12288  → the RAW-footprint reservation admits B
+        //   align_up(fA) + fB = 12306 > 12288 → the aligned reservation rejects B
+        // so this boundary manifests ONLY the flush-alignment under-count.
+        let make_batch = || {
+            let mut ops = vec![RedoOp::AllocateRegion {
+                device_id: 0,
+                offset: 0,
+                size: 4096,
+            }];
+            ops.extend((0..121u64).map(|i| RedoOp::AllocateRegion {
+                device_id: 1,
+                offset: i * 4096,
+                size: 4096,
+            }));
+            ops
+        };
+
+        let (a_res, b_res) = run_preflight_window_race(&engine, make_batch(), make_batch());
+
+        let b_err = b_res.expect_err(
+            "B must be rejected: the aligned reservation covers A's real flush advance",
+        );
+        assert!(
+            b_err.contains(crate::redo::LOG_FULL_MESSAGE_PREFIX),
+            "B must get a RETRYABLE LogFull, got: {b_err}"
+        );
+        assert!(
+            !b_err.contains("partial cross-store"),
+            "B must be a clean pre-flight rejection, not a partial poison: {b_err}"
+        );
+
+        let (first, last) = a_res.expect("A must commit durably (no partial, no poison)");
+        assert!(last >= first, "A returns a valid sequence range");
+        assert!(
+            !log0_arc.lock().is_poisoned(),
+            "store 0 must not be poisoned by the alignment boundary"
+        );
+        assert!(
+            !log1_arc.lock().is_poisoned(),
+            "store 1 must not be poisoned by the alignment boundary"
+        );
+        assert_eq!(log0_arc.lock().atomics().reserved(), 0);
+        assert_eq!(log1_arc.lock().atomics().reserved(), 0);
     }
 
     /// FU#6b: the RAII reservation guard must release on EVERY exit path so a
