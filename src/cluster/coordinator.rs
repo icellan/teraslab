@@ -855,20 +855,41 @@ fn install_active_routing_snapshot(
     *shard_table.write() = snapshot;
     *active_topology_members.write() = routing.committed_members.clone();
 
-    {
+    // C7: a routing/assignment projection update (shard_table +
+    // active_topology_members, installed above) must NOT destroy in-flight
+    // migration incompleteness. Resetting the manager here would drop the
+    // inbound entry + fence for a shard still receiving data, so `is_master`
+    // would flip from Transitioning to Yes and this node would serve — and
+    // persist — an INCOMPLETE shard as if fully owned. Only reset (and clear
+    // the bitmaps / rewrite the persisted state) when nothing is in flight;
+    // otherwise preserve the migration state and its bitmaps so the
+    // migration's own completion path clears them once the data is whole. A
+    // superseding activation that proves completeness clears them via that
+    // path, never via a bare routing snapshot.
+    let reset = {
         let mut mgr = migration.lock();
-        *mgr = MigrationManager::new();
-        if let Some(path) = inbound_state_path {
-            crate::cluster::migration::persist_inbound_state(path, &mgr);
+        let has_inflight = !mgr.pending_inbound_entries().is_empty()
+            || !mgr.active_migrations().is_empty()
+            || mgr.fenced_count() > 0;
+        if has_inflight {
+            false
+        } else {
+            *mgr = MigrationManager::new();
+            if let Some(path) = inbound_state_path {
+                crate::cluster::migration::persist_inbound_state(path, &mgr);
+            }
+            if let Some(path) = outbound_state_path {
+                crate::cluster::migration::persist_outbound_state(path, &mgr);
+            }
+            true
         }
-        if let Some(path) = outbound_state_path {
-            crate::cluster::migration::persist_outbound_state(path, &mgr);
-        }
-    }
+    };
 
-    fenced_bm.clear_all();
-    migrating_bm.clear_all();
-    inbound_bm.clear_all();
+    if reset {
+        fenced_bm.clear_all();
+        migrating_bm.clear_all();
+        inbound_bm.clear_all();
+    }
     true
 }
 
@@ -10420,6 +10441,71 @@ mod tests {
         let table = shard_table.read();
         assert_eq!(table.pending_handoff_count(), pending_before);
         assert_eq!(table.effective_assignment(shard).master, effective_before);
+    }
+
+    /// C7: a TopologyStale catch-up that installs a newer routing snapshot must
+    /// NOT wipe an in-flight INBOUND migration. Wiping it clears the shard's
+    /// pending-inbound entry + fence bit, flipping `is_master` from
+    /// Transitioning to Yes so the node would serve an INCOMPLETE shard as if
+    /// fully owned (and persist that lie across a restart). The projection
+    /// (shard table) still updates; only the migration incompleteness survives.
+    #[test]
+    fn catch_up_routing_snapshot_preserves_in_flight_inbound_migration() {
+        let shard = 3u16;
+        let shard_table = Arc::new(ShardTableLock::new(ShardTable::compute_with_epoch(
+            &[NodeId(1), NodeId(2)],
+            2,
+            1,
+            1,
+        )));
+        let migration = Arc::new(Mutex::new(MigrationManager::new()));
+        let fenced_bm = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+        let migrating_bm = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+        let inbound_bm = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+        let active_members = Arc::new(RwLock::new(vec![NodeId(1), NodeId(2)]));
+
+        // This node is a subset master still receiving data for `shard`.
+        {
+            let mut mgr = migration.lock();
+            assert!(mgr.mark_inbound_active(shard));
+        }
+        inbound_bm.set(shard);
+
+        // A newer routing snapshot (version 5, member 3 added) arriving via
+        // catch-up while the inbound migration is still mid-flight.
+        let routing = crate::cluster::routing::RoutingInfo {
+            shard_table_version: 5,
+            nodes: Vec::new(),
+            shard_assignments: Vec::new(),
+            committed_members: vec![NodeId(1), NodeId(2), NodeId(3)],
+            placement_version: 1,
+        };
+
+        let installed = install_active_routing_snapshot(
+            &routing,
+            2,
+            &shard_table,
+            &migration,
+            &fenced_bm,
+            &migrating_bm,
+            &inbound_bm,
+            &active_members,
+            None,
+            None,
+        );
+        assert!(installed, "the routing projection must install");
+
+        // The projection updated (new members installed)…
+        assert_eq!(*active_members.read(), vec![NodeId(1), NodeId(2), NodeId(3)]);
+        // …but the in-flight inbound migration MUST survive.
+        assert!(
+            migration.lock().has_pending_inbound(shard),
+            "C7: inbound migration entry was wiped by the routing snapshot",
+        );
+        assert!(
+            inbound_bm.test(shard),
+            "C7: inbound bitmap bit was cleared by the routing snapshot",
+        );
     }
 
     #[test]
