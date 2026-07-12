@@ -2576,6 +2576,11 @@ impl Client {
 
     /// Query transactions that have been unmined since before `cutoff_height`.
     ///
+    /// In cluster mode the query is fanned out to every node and the
+    /// deduplicated union is returned: the server filters each node's response
+    /// to the shards it masters, so a single-node call would return only that
+    /// node's slice. See [`Client::query_nodes_union`].
+    ///
     /// A single response is capped at one 16 MiB frame. Against a version-3+
     /// server (FU#5) the remainder is paged transparently via a resume cursor
     /// and the complete set is returned. Against an older server a single
@@ -2589,23 +2594,35 @@ impl Client {
     /// [`ClientError::QueryTruncated`] when a pre-v3 server truncated the
     /// result, or [`ClientError::Protocol`] on a malformed response.
     pub async fn query_old_unmined(&self, cutoff_height: u32) -> Result<Vec<TxID>, ClientError> {
-        self.page_query(
-            OP_QUERY_OLD_UNMINED,
-            move |cursor: Option<&TxID>| {
-                let mut payload = cutoff_height.to_le_bytes().to_vec();
-                if let Some(c) = cursor {
-                    payload.extend_from_slice(c);
-                }
-                payload
-            },
-            decode_query_old_unmined_response,
-        )
-        .await
+        let encode = move |cursor: Option<&TxID>| {
+            let mut payload = cutoff_height.to_le_bytes().to_vec();
+            if let Some(c) = cursor {
+                payload.extend_from_slice(c);
+            }
+            payload
+        };
+        if self.cluster.is_some() {
+            self.query_nodes_union(
+                OP_QUERY_OLD_UNMINED,
+                encode,
+                decode_query_old_unmined_response,
+            )
+            .await
+        } else {
+            self.page_query(
+                OP_QUERY_OLD_UNMINED,
+                encode,
+                decode_query_old_unmined_response,
+            )
+            .await
+        }
     }
 
     /// Query all transactions currently flagged CONFLICTING.
     ///
     /// The request carries no parameters beyond the optional FU#5 resume cursor.
+    /// In cluster mode the query is fanned out to every node and the
+    /// deduplicated union is returned (see [`Client::query_nodes_union`]).
     /// Pagination and the capability gate behave exactly as
     /// [`Client::query_old_unmined`].
     ///
@@ -2615,18 +2632,28 @@ impl Client {
     /// [`ClientError::QueryTruncated`] when a pre-v3 server truncated the
     /// result, or [`ClientError::Protocol`] on a malformed response.
     pub async fn query_conflicting(&self) -> Result<Vec<TxID>, ClientError> {
-        self.page_query(
-            OP_QUERY_CONFLICTING,
-            |cursor: Option<&TxID>| {
-                let mut payload = Vec::new();
-                if let Some(c) = cursor {
-                    payload.extend_from_slice(c);
-                }
-                payload
-            },
-            decode_query_conflicting_response,
-        )
-        .await
+        let encode = |cursor: Option<&TxID>| {
+            let mut payload = Vec::new();
+            if let Some(c) = cursor {
+                payload.extend_from_slice(c);
+            }
+            payload
+        };
+        if self.cluster.is_some() {
+            self.query_nodes_union(
+                OP_QUERY_CONFLICTING,
+                encode,
+                decode_query_conflicting_response,
+            )
+            .await
+        } else {
+            self.page_query(
+                OP_QUERY_CONFLICTING,
+                encode,
+                decode_query_conflicting_response,
+            )
+            .await
+        }
     }
 
     /// Run a diagnostic txid-list query, transparently following the FU#5
@@ -2679,6 +2706,116 @@ impl Client {
                 }
             }
         }
+    }
+
+    /// Fan a diagnostic txid-list query out across every distinct node in the
+    /// cluster and return the deduplicated union of results.
+    ///
+    /// In cluster mode the server filters each node's response to the shards it
+    /// masters, so a single-node call returns only that node's slice; the union
+    /// across all nodes is the cluster-wide answer. Each node caps its response
+    /// independently, so every node is paged to completion via the FU#5 resume
+    /// cursor (resuming within that node's own sorted candidate set) before the
+    /// next node is queried.
+    ///
+    /// Paging is gated on the negotiated server version (`>= 3`); against an
+    /// older cluster the cursor is not followed. The Rust pool tracks only one
+    /// client-global negotiated version (not a per-node version like the Go
+    /// client), so — independently and load-bearing — a non-advancing-cursor
+    /// guard stops paging any node whose next page does not advance strictly
+    /// past the cursor just sent. Without it a node that ignores the cursor (a
+    /// still-v2 node the global gate misjudged during a rolling upgrade, or any
+    /// non-paging node) would loop forever. If any node is left partial (pre-v3,
+    /// or the guard tripped), the deduplicated union is returned as
+    /// [`ClientError::QueryTruncated`] so the truncation is visible while every
+    /// other node's full contribution is preserved.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError::Server`] on a server error,
+    /// [`ClientError::QueryTruncated`] when any node's slice was truncated and
+    /// could not be paged, [`ClientError::Connection`] when the cluster has no
+    /// pools, or [`ClientError::Protocol`] on a malformed response.
+    async fn query_nodes_union(
+        &self,
+        op_code: u16,
+        encode: impl Fn(Option<&TxID>) -> Vec<u8>,
+        decode: impl Fn(&[u8]) -> Result<(Vec<TxID>, bool), ClientError>,
+    ) -> Result<Vec<TxID>, ClientError> {
+        let cluster = self.cluster.as_ref().ok_or(ClientError::NoPartitionMap)?;
+        let pools = cluster.all_pools();
+        if pools.is_empty() {
+            return Err(ClientError::Connection(
+                "cluster query: no pools available".to_string(),
+            ));
+        }
+        let supports_paging = self.ensure_server_version().await >= 3;
+        let mut seen: std::collections::HashSet<TxID> = std::collections::HashSet::new();
+        let mut union: Vec<TxID> = Vec::new();
+        let mut incomplete = false;
+        for pool in pools {
+            let mut cursor: Option<TxID> = None;
+            loop {
+                let payload = encode(cursor.as_ref());
+                let conn = pool.get().await?;
+                let resp = conn.round_trip(op_code, 0, payload).await?;
+                if resp.status != STATUS_OK {
+                    if resp.status == STATUS_ERROR {
+                        let (code, msg) = decode_error_payload(&resp.payload)?;
+                        return Err(ClientError::Server { code, message: msg });
+                    }
+                    return Err(ClientError::Protocol(format!(
+                        "unexpected status: {}",
+                        resp.status
+                    )));
+                }
+                let (txids, truncated) = decode(&resp.payload)?;
+                for t in &txids {
+                    if seen.insert(*t) {
+                        union.push(*t);
+                    }
+                }
+                if !truncated {
+                    break;
+                }
+                if !supports_paging {
+                    // This node cannot resume from a cursor: keep its partial
+                    // page and move to the next node rather than looping. The
+                    // union is flagged incomplete so the caller sees it.
+                    incomplete = true;
+                    break;
+                }
+                let last = match txids.last() {
+                    Some(last) => *last,
+                    None => {
+                        // A conforming v3 server never emits a truncated-but-
+                        // empty page; treat it as a protocol violation rather
+                        // than looping forever on an empty cursor.
+                        return Err(ClientError::Protocol(
+                            "query paging: truncated response with empty page".to_string(),
+                        ));
+                    }
+                };
+                // Non-advancing-cursor guard (load-bearing). The server returns
+                // txids strictly greater than the sent cursor in ascending
+                // order, so a new page's last txid MUST exceed it. If it does
+                // not, the node ignored the cursor and paging would loop
+                // forever. Stop, keep the partial page, flag the union
+                // incomplete. The first page has no cursor, so the guard applies
+                // only from the second round-trip on.
+                if let Some(prev) = cursor
+                    && last <= prev
+                {
+                    incomplete = true;
+                    break;
+                }
+                cursor = Some(last);
+            }
+        }
+        if incomplete {
+            return Err(ClientError::QueryTruncated { partial: union });
+        }
+        Ok(union)
     }
 
     /// The wire protocol version negotiated with the server via `OP_HELLO`, or
@@ -5025,6 +5162,212 @@ mod tests {
             other => panic!("want ClientError::QueryTruncated, got {other:?}"),
         }
         assert_eq!(client.negotiated_version(), 2);
+        client.close().await;
+    }
+
+    // -----------------------------------------------------------------------
+    // FU#5-E — cluster-wide query fan-out (union across all nodes).
+    //
+    // In cluster mode the server filters each node's query response to the
+    // shards it masters, so a single-node call returns only that node's slice.
+    // The client must fan out to every node and return the deduplicated union.
+    // -----------------------------------------------------------------------
+
+    /// Build a `[u64 range]` of txids whose first byte is `start..start+n`, so
+    /// two disjoint ranges never collide across nodes.
+    fn seq_txids_from(start: u8, n: u8) -> Vec<TxID> {
+        (0..n)
+            .map(|i| {
+                let mut t = [0u8; 32];
+                t[0] = start + i;
+                t
+            })
+            .collect()
+    }
+
+    /// Encode a partition map (the wire format `decode_partition_map` expects)
+    /// listing one node per address. Node ids are `1..=addrs.len()`; the 4096
+    /// shard assignments are round-robined across the nodes. The fan-out
+    /// iterates every node's pool, so the exact assignment is immaterial — it
+    /// only needs to be a valid, decodable map that names every node.
+    fn build_cluster_partition_map(addrs: &[String]) -> Vec<u8> {
+        let mut p = Vec::new();
+        p.extend_from_slice(&1u64.to_le_bytes()); // version
+        p.extend_from_slice(&(addrs.len() as u32).to_le_bytes()); // node_count
+        for (i, addr) in addrs.iter().enumerate() {
+            let node_id = (i as u64) + 1;
+            p.extend_from_slice(&node_id.to_le_bytes());
+            p.extend_from_slice(&(addr.len() as u16).to_le_bytes());
+            p.extend_from_slice(addr.as_bytes());
+            p.push(1); // is_alive
+        }
+        for shard in 0..crate::types::NUM_SHARDS {
+            let node_id = ((shard % addrs.len()) as u64) + 1;
+            p.extend_from_slice(&node_id.to_le_bytes());
+        }
+        p
+    }
+
+    /// Stand up an in-process cluster of `PagingMock`s. Every node serves the
+    /// SAME partition map (so the client bootstraps a pool for each), answers
+    /// `OP_HELLO` with its own version, and answers the two diagnostic queries
+    /// with ONLY its own txid set (simulating the server's per-shard master
+    /// filtering). Returns the node addresses to seed the cluster client with.
+    async fn spawn_paging_cluster(mocks: Vec<Arc<PagingMock>>) -> Vec<String> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        // Phase 1: bind every node so the partition map can name real addresses.
+        let mut listeners = Vec::with_capacity(mocks.len());
+        let mut addrs = Vec::with_capacity(mocks.len());
+        for _ in &mocks {
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            addrs.push(l.local_addr().unwrap().to_string());
+            listeners.push(l);
+        }
+        let pm = Arc::new(build_cluster_partition_map(&addrs));
+        // Phase 2: spawn an accept loop per node serving the shared map.
+        for (listener, mock) in listeners.into_iter().zip(mocks) {
+            let pm = pm.clone();
+            tokio::spawn(async move {
+                loop {
+                    let (mut sock, _) = match listener.accept().await {
+                        Ok(x) => x,
+                        Err(_) => return,
+                    };
+                    let mock = mock.clone();
+                    let pm = pm.clone();
+                    tokio::spawn(async move {
+                        loop {
+                            let mut len_buf = [0u8; 4];
+                            if sock.read_exact(&mut len_buf).await.is_err() {
+                                return;
+                            }
+                            let total = u32::from_le_bytes(len_buf) as usize;
+                            if total < 12 {
+                                return;
+                            }
+                            let mut body = vec![0u8; total];
+                            if sock.read_exact(&mut body).await.is_err() {
+                                return;
+                            }
+                            let request_id = u64::from_le_bytes(body[0..8].try_into().unwrap());
+                            let op_code = u16::from_le_bytes([body[8], body[9]]);
+                            let payload = &body[12..];
+                            let resp_payload = match op_code {
+                                OP_HELLO => mock.version.to_le_bytes().to_vec(),
+                                OP_GET_PARTITION_MAP => (*pm).clone(),
+                                OP_QUERY_OLD_UNMINED | OP_QUERY_CONFLICTING => {
+                                    mock.page_payload(op_code, payload)
+                                }
+                                _ => Vec::new(),
+                            };
+                            let inner_len = 8 + 1 + resp_payload.len();
+                            let mut out = (inner_len as u32).to_le_bytes().to_vec();
+                            out.extend_from_slice(&request_id.to_le_bytes());
+                            out.push(STATUS_OK);
+                            out.extend_from_slice(&resp_payload);
+                            if sock.write_all(&out).await.is_err() {
+                                return;
+                            }
+                        }
+                    });
+                }
+            });
+        }
+        addrs
+    }
+
+    /// RED (pre-fix): `query_conflicting` in cluster mode funnels through a
+    /// single node and returns only that node's mastered slice. Post-fix it
+    /// fans out to every node and returns the deduplicated union. Two nodes
+    /// hold DISJOINT sets and each pages (cap 2 < set size), so a correct fan-
+    /// out must page every node to completion and union the two sets.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rust_cluster_query_conflicting_unions_all_nodes() {
+        let set_a = seq_txids_from(1, 5);
+        let set_b = seq_txids_from(100, 5);
+        let node_a = Arc::new(PagingMock::new(3, 2, true, set_a.clone()));
+        let node_b = Arc::new(PagingMock::new(3, 2, true, set_b.clone()));
+        let addrs = spawn_paging_cluster(vec![node_a, node_b]).await;
+
+        let client = Client::new(ClientConfig {
+            seeds: addrs,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+        let got = client.query_conflicting().await.unwrap();
+        let mut want = set_a;
+        want.extend_from_slice(&set_b);
+        assert_same_set(&got, &want);
+        client.close().await;
+    }
+
+    /// Old-unmined sibling of the union test: same two-node disjoint-set fan-
+    /// out, exercised through `query_old_unmined` (which also carries the
+    /// cutoff-height parameter alongside the resume cursor).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rust_cluster_query_old_unmined_unions_all_nodes() {
+        let set_a = seq_txids_from(1, 4);
+        let set_b = seq_txids_from(200, 6);
+        let node_a = Arc::new(PagingMock::new(3, 3, true, set_a.clone()));
+        let node_b = Arc::new(PagingMock::new(3, 3, true, set_b.clone()));
+        let addrs = spawn_paging_cluster(vec![node_a, node_b]).await;
+
+        let client = Client::new(ClientConfig {
+            seeds: addrs,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+        let got = client.query_old_unmined(1000).await.unwrap();
+        let mut want = set_a;
+        want.extend_from_slice(&set_b);
+        assert_same_set(&got, &want);
+        client.close().await;
+    }
+
+    /// A node that advertises v3 but ignores the resume cursor (returns page 1
+    /// forever) must NOT hang the fan-out: the non-advancing-cursor guard stops
+    /// paging it, keeps its partial page, and the union still contains the other
+    /// node's FULL results. The incomplete slice is surfaced via
+    /// `ClientError::QueryTruncated` rather than being silently dropped.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rust_cluster_query_union_guards_non_advancing_node() {
+        let good = seq_txids_from(1, 5); // paged to completion (cap 2)
+        let bad = seq_txids_from(100, 5); // cursor ignored -> page 1 forever
+        let good_node = Arc::new(PagingMock::new(3, 2, true, good.clone()));
+        // version 3 but honor_cursor = false: lies about paging support.
+        let bad_node = Arc::new(PagingMock::new(3, 2, false, bad));
+        let addrs = spawn_paging_cluster(vec![good_node, bad_node]).await;
+
+        let client = Client::new(ClientConfig {
+            seeds: addrs,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+        let res = tokio::time::timeout(Duration::from_secs(3), client.query_conflicting())
+            .await
+            .expect("fan-out must not loop forever against a cursor-ignoring node");
+        match res {
+            Err(ClientError::QueryTruncated { partial }) => {
+                for t in &good {
+                    assert!(
+                        partial.contains(t),
+                        "the healthy node's full results must survive the guard",
+                    );
+                }
+                // The bad node still contributed its (truncated) first page.
+                assert!(
+                    partial.len() > good.len(),
+                    "the cursor-ignoring node's partial page must also be kept",
+                );
+            }
+            other => panic!("want ClientError::QueryTruncated, got {other:?}"),
+        }
         client.close().await;
     }
 

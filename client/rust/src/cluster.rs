@@ -340,6 +340,18 @@ impl Cluster {
         self.part_map.read().clone()
     }
 
+    /// Return a connection pool for each distinct node currently known to the
+    /// cluster.
+    ///
+    /// Used by cluster-wide fan-out queries (`query_old_unmined` /
+    /// `query_conflicting`): the server filters each node's response to the
+    /// shards it masters, so the deduplicated union across every node's pool is
+    /// the cluster-wide answer. The order is unspecified (backed by a
+    /// `HashMap`), which is fine because the caller dedups.
+    pub fn all_pools(&self) -> Vec<Arc<ConnPool>> {
+        self.pools.read().values().cloned().collect()
+    }
+
     /// Return a connection pool for any available node (for non-routed operations).
     pub fn any_pool(&self) -> Result<Arc<ConnPool>, ClientError> {
         let pools = self.pools.read();
