@@ -1877,6 +1877,11 @@ fn main() {
             // Stash for the runtime lag monitor (spawned after this block).
             catchup_ctx = Some(ctx.clone());
 
+            // G12: snapshot the topology's EXPECTED replica set so the startup
+            // pass catches up a replica the master has never ACKed (no tracker
+            // entry) rather than no-opping on an empty tracker.
+            let expected_replicas = running.expected_replica_addrs();
+
             std::thread::spawn(move || {
                 // Use the process-wide ACK tracker installed by
                 // `init_ack_tracker` above — constructing a second
@@ -1886,9 +1891,6 @@ fn main() {
                     None => return,
                 };
                 let all_acked = tracker.all_acked();
-                if all_acked.is_empty() {
-                    return; // No known replicas yet
-                }
 
                 let current_seq = ctx
                     .redo_log
@@ -1896,10 +1898,14 @@ fn main() {
                     .map(|rl| rl.lock().current_sequence())
                     .unwrap_or(0);
 
-                for (addr, last_acked) in &all_acked {
-                    if *last_acked >= current_seq {
-                        continue; // Already caught up
-                    }
+                // G12: drive the UNION of tracker-known and expected replicas.
+                // An expected-but-absent replica gets from_seq = 0 + 1 = 1.
+                let targets = teraslab::server::dispatch::startup_catchup_targets(
+                    &all_acked,
+                    &expected_replicas,
+                    current_seq,
+                );
+                for (addr, last_acked) in targets {
                     tracing::info!(
                         %addr,
                         lag = current_seq - last_acked,
@@ -1909,7 +1915,7 @@ fn main() {
                     run_one_catchup_pass(
                         &ctx,
                         tracker,
-                        *addr,
+                        addr,
                         last_acked + 1,
                         current_seq,
                         10_000, // max_ops_per_pass

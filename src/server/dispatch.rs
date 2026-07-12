@@ -414,6 +414,49 @@ pub fn min_acked_over_expected(
         .unwrap_or(floor)
 }
 
+/// G12: enumerate the replicas the startup catch-up pass must drive, over
+/// the UNION of the ACK tracker's known replicas and the topology's
+/// EXPECTED-replica set.
+///
+/// The startup pass previously iterated only `all_acked()` and early-returned
+/// when the tracker was empty, so a replica the master has never ACKed (no
+/// tracker entry — a fresh master, or one whose ACK file was discarded as
+/// corrupt) was silently skipped and never caught up. Seeding the expected
+/// replicas here gives every one of them a `from_seq` of `last_acked + 1`
+/// (defaulting to `0 + 1 = 1` when absent), so it is streamed the redo it is
+/// missing — or, if that prefix was already reclaimed, driven onto a
+/// full-shard resync by `run_one_catchup_pass`.
+///
+/// Returns `(addr, last_acked)` for every replica whose `last_acked` is
+/// strictly below `current_seq` (i.e. genuinely behind), de-duplicated,
+/// with expected replicas listed first. A replica already at/above
+/// `current_seq` is omitted (nothing to send).
+pub fn startup_catchup_targets(
+    acked: &HashMap<SocketAddr, u64>,
+    expected: &[SocketAddr],
+    current_seq: u64,
+) -> Vec<(SocketAddr, u64)> {
+    let mut seen: std::collections::BTreeSet<SocketAddr> = std::collections::BTreeSet::new();
+    let mut out: Vec<(SocketAddr, u64)> = Vec::new();
+    // Expected replicas first — including any with no tracker entry (last_acked
+    // defaults to 0), which is exactly the case the pre-fix loop dropped.
+    for addr in expected {
+        let last = acked.get(addr).copied().unwrap_or(0);
+        if last < current_seq && seen.insert(*addr) {
+            out.push((*addr, last));
+        }
+    }
+    // Plus any replica the tracker knows about that is not in the expected set
+    // (e.g. a still-behind node mid-topology-change) so we never regress the
+    // prior tracker-driven behavior.
+    for (addr, last) in acked {
+        if *last < current_seq && seen.insert(*addr) {
+            out.push((*addr, *last));
+        }
+    }
+    out
+}
+
 /// Initialize the persistent receiver-side applied tracker.
 ///
 /// Must be called once during clustered server startup before accepting
@@ -19767,6 +19810,48 @@ mod tests {
             min_acked_over_expected(&acked_stale, &[], floor),
             floor,
             "with no expected replica the reset is unconstrained even if the tracker holds a demoted node"
+        );
+    }
+
+    #[test]
+    fn g12_startup_catchup_targets_expected_but_absent_replica() {
+        // G12: the startup catch-up pass must initiate catch-up for a replica
+        // the topology EXPECTS even when the ACK tracker has no entry for it.
+        // Pre-fix the pass iterated only `all_acked()` and early-returned on an
+        // empty tracker, so this replica was never caught up.
+        let expected: SocketAddr = "10.0.0.2:7000".parse().unwrap();
+        let current_seq: u64 = 100;
+
+        // Empty tracker, one expected replica → one target from seq 0 (→ from_seq 1).
+        let empty: HashMap<SocketAddr, u64> = HashMap::new();
+        let targets = startup_catchup_targets(&empty, &[expected], current_seq);
+        assert_eq!(
+            targets,
+            vec![(expected, 0u64)],
+            "an expected-but-absent replica must be scheduled for catch-up from sequence 0"
+        );
+
+        // A tracker replica NOT in the expected set that is still behind is also
+        // driven (no regression of the prior tracker-only behavior).
+        let other: SocketAddr = "10.0.0.9:7000".parse().unwrap();
+        let mut acked = HashMap::new();
+        acked.insert(other, 40u64);
+        let targets = startup_catchup_targets(&acked, &[expected], current_seq);
+        assert!(
+            targets.contains(&(expected, 0u64)),
+            "expected replica still scheduled"
+        );
+        assert!(
+            targets.contains(&(other, 40u64)),
+            "a still-behind tracker replica is not dropped"
+        );
+
+        // A replica already at/above current_seq is not re-driven.
+        let mut caught_up = HashMap::new();
+        caught_up.insert(expected, current_seq);
+        assert!(
+            startup_catchup_targets(&caught_up, &[expected], current_seq).is_empty(),
+            "a caught-up replica produces no catch-up target"
         );
     }
 
