@@ -207,6 +207,31 @@ impl AckTracker {
         inner.last_acked.clone()
     }
 
+    /// Reverse-heal Tier-1 fast-path (finding C1): the replicas whose durably
+    /// persisted last-ACK sequence is STRICTLY greater than `floor`.
+    ///
+    /// `floor` is this node's recovered `shared_sequence_floor` — the highest
+    /// master-global redo sequence it still holds after crash recovery. Both
+    /// quantities live in this master's own global redo-sequence space (the
+    /// tracker stores the master-global `redo_high` each replica ACKed), so the
+    /// comparison is valid. A NON-EMPTY result means this node returned
+    /// `STATUS_OK` for at least one write it can no longer prove it holds after
+    /// recovery — a lost acked tail. Empty means Tier-1 sees no gap.
+    ///
+    /// This is a *fast-path* filter, not the sole authority: the tracker
+    /// flushes on a <=1s / 100-ACK cadence, so it can be stale-low and MISS a
+    /// gap in the sub-second window. The per-shard generation-manifest confirm
+    /// (Tier-2) is the authoritative backstop.
+    pub fn acked_beyond(&self, floor: u64) -> Vec<(SocketAddr, u64)> {
+        let inner = self.inner.lock();
+        inner
+            .last_acked
+            .iter()
+            .filter(|&(_, &seq)| seq > floor)
+            .map(|(addr, &seq)| (*addr, seq))
+            .collect()
+    }
+
     /// Force a flush of any dirty state to disk.
     pub fn flush(&self) {
         let mut inner = self.inner.lock();
@@ -1130,6 +1155,68 @@ mod tests {
         let tracker = AckTracker::new(path);
         assert_eq!(tracker.last_acked(&test_addr(5000)), 42);
         assert_eq!(tracker.last_acked(&test_addr(5001)), 99);
+    }
+
+    /// Reverse-heal Phase 1 Tier-1 (finding C1): a downstream replica's
+    /// durably-persisted ACK that survives recovery ABOVE the recovered
+    /// `shared_sequence_floor` proves this node acked a write it no longer
+    /// holds — the detector must fire. An ACK at or below the floor is covered
+    /// by the recovered log and must NOT fire.
+    #[test]
+    fn recovery_detects_lost_acked_tail_when_acktracker_ahead_of_fence() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ack.dat");
+
+        // A master durably ACKs a downstream replica through master-global
+        // sequence 100, then "crashes".
+        {
+            let tracker = AckTracker::new(path.clone());
+            tracker.record_ack(test_addr(5000), 100);
+            tracker.flush();
+        }
+
+        // Recovery reloads the persisted tracker.
+        let recovered = AckTracker::new(path);
+
+        // floor < acked → lost acked tail (fires).
+        let lost = recovered.acked_beyond(50);
+        assert_eq!(lost.len(), 1, "replica acked 100 > floor 50 → lost tail");
+        assert_eq!(lost[0], (test_addr(5000), 100));
+
+        // floor == acked → clean (STRICTLY-greater comparison: the ACK is
+        // covered by the recovered log, not lost).
+        assert!(
+            recovered.acked_beyond(100).is_empty(),
+            "acked == floor is covered, not lost",
+        );
+
+        // floor > acked → clean.
+        assert!(
+            recovered.acked_beyond(150).is_empty(),
+            "floor ahead of every ACK → nothing lost",
+        );
+    }
+
+    /// Reverse-heal Phase 1 NEGATIVE: a node whose every replica ACK is at or
+    /// below the recovered floor (and a fresh/empty tracker) must not fire the
+    /// Tier-1 detector — no false positive.
+    #[test]
+    fn recovery_no_lost_tail_does_not_fire_detector() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ack.dat");
+        let tracker = AckTracker::new(path);
+        tracker.record_ack(test_addr(5000), 40);
+        tracker.record_ack(test_addr(5001), 50);
+        assert!(
+            tracker.acked_beyond(50).is_empty(),
+            "no replica acked beyond the floor → detector must not fire",
+        );
+
+        let empty = AckTracker::new(dir.path().join("empty.dat"));
+        assert!(
+            empty.acked_beyond(0).is_empty(),
+            "empty tracker never fires the detector",
+        );
     }
 
     #[test]
