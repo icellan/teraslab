@@ -3437,13 +3437,24 @@ impl ClusterCoordinator {
         if preserved_tasks.is_empty() {
             fenced_bm.clear_all();
             migrating_bm.clear_all();
-            inbound_bm.clear_all();
+            // C17 — `clear_inbound` (above) RETAINS unproven LOST inbound
+            // entries and keeps their `inbound_bitmap` fence bit set. Reload
+            // the hot-path atomic FROM the manager rather than `clear_all()`:
+            // a blind clear would drop the lost shard's fence and let
+            // `is_master` serve a partially received shard as full authority
+            // (the exact hole C17 closes) until the next periodic sync.
+            let mgr = migration.lock();
+            inbound_bm.load_from(mgr.inbound_bitmap());
+            drop(mgr);
         } else {
             // Reload fenced bitmap from the manager (preserves fences for active migrations).
             let mgr = migration.lock();
             fenced_bm.load_from(mgr.fenced_bitmap());
-            // Inbound was already cleared in the manager, so clear its atomic.
-            inbound_bm.clear_all();
+            // C17 — `clear_inbound` no longer wipes LOST/unproven inbound
+            // entries; it retains them with their fence bit. Reload the atomic
+            // from the manager (NOT `clear_all()`) so those preserved fences
+            // mirror into the hot path.
+            inbound_bm.load_from(mgr.inbound_bitmap());
             // Rebuild migrating bitmap from the active migration list.
             migrating_bm.clear_all();
             for p in mgr.active_migrations() {
@@ -3465,6 +3476,16 @@ impl ClusterCoordinator {
 
         if all_new_tasks.is_empty() {
             *shard_table.write() = new_table;
+            // C17 — no migration tasks to install, but the supersede's
+            // `clear_inbound` may have preserved LOST/unproven inbound fences
+            // in the manager. Mirror the manager's bitmaps into the hot-path
+            // atomics so NO install path leaves a stale-cleared `inbound_bm`
+            // that would let `is_master` serve a partially received shard as
+            // full authority (the non-empty branch below already re-syncs via
+            // `sync_atomic_migration_bitmaps` after `start_outbound`).
+            let mgr = migration.lock();
+            sync_atomic_migration_bitmaps(&mgr, fenced_bm, migrating_bm, inbound_bm);
+            drop(mgr);
         } else {
             let all_tasks = all_new_tasks;
 
@@ -15925,6 +15946,114 @@ mod tests {
             other => panic!(
                 "a lost shard superseded by a topology change must NOT be served as full \
                  authority; got {other:?}",
+            ),
+        }
+    }
+
+    /// C17 (P1) — the manager-level `clear_inbound` fix must be MIRRORED into
+    /// the hot-path `inbound_atomic` on the REAL production supersede path
+    /// (`activate_topology_with_view`), not only via a later
+    /// `sync_migration_bitmaps`. A topology supersede that preserves a LOST
+    /// (unproven) inbound shard must leave that shard fenced in the atomic the
+    /// write hot path reads, so `is_master` returns `Transitioning` (never
+    /// `Yes`) WITHOUT any follow-up sync. Before the fix the empty-task install
+    /// branch cleared `inbound_atomic` with no reload, leaking a partially
+    /// received shard as full authority for up to one event-loop tick.
+    #[test]
+    fn activate_topology_supersede_mirrors_lost_fence_into_inbound_atomic() {
+        // The supersede drives `sync_atomic_migration_bitmaps`, which (post P2)
+        // writes the shared `migration_lost` gauge; serialize against other
+        // metrics-touching tests and install a metrics sink.
+        let _guard = migration_metrics_test_guard();
+        let _metrics = install_test_migration_metrics();
+
+        let members = vec![NodeId(1)];
+        let epoch = 5u64;
+        let placement_version = 1u16;
+        let rf = 1u8;
+        let table = ShardTable::compute_with_epoch(&members, rf, epoch, placement_version);
+        let cluster = new_test_running_cluster(
+            NodeId(1),
+            table,
+            &[(NodeId(1), "127.0.0.1:4871".parse().unwrap())],
+            &members,
+            &[],
+            &[],
+            &[],
+            1,
+        );
+        let shard = 0u16;
+        let key = key_for_shard(shard);
+
+        // Engine holds data so the empty-engine single-node fast path is
+        // skipped and the real supersede logic (which hits the empty-task
+        // install branch) runs.
+        let engine = Arc::new(test_engine());
+        create_test_record(&engine, key_for_shard(1));
+        assert!(engine.index_len() > 0, "precondition: engine is non-empty");
+
+        // Incomplete inbound, source dies, settled-inbound GC marks the shard
+        // LOST and syncs the fence into the hot-path atomic — exactly the
+        // production state right before a topology supersede lands.
+        {
+            let mgr = &mut cluster.migration.lock();
+            mgr.register_inbound_source(shard, NodeId(2));
+            let settled =
+                mgr.pending_inbound_shards_excluding_recent_requests(Duration::from_secs(1));
+            assert_eq!(mgr.mark_inbound_lost(&settled), 1);
+            assert!(mgr.is_shard_lost(shard));
+        }
+        cluster.sync_migration_bitmaps();
+        assert!(
+            cluster.inbound_atomic.test(shard),
+            "precondition: the lost fence is present in the hot-path atomic before the supersede",
+        );
+
+        // Drive the REAL production supersede at the committed term, so the
+        // `is_master` epoch guard stays OPEN and the ONLY thing that can fence
+        // the shard is the inbound atomic.
+        let view: std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>> =
+            std::collections::HashMap::new();
+        ClusterCoordinator::activate_topology_with_view(
+            &members,
+            epoch,
+            placement_version,
+            NodeId(1),
+            rf,
+            &cluster.shard_table,
+            &cluster.migration,
+            &cluster.node_addrs,
+            &engine,
+            &None,
+            1,
+            1,
+            1,
+            &cluster.fenced_bitmap,
+            &cluster.migrating_bitmap,
+            &cluster.inbound_atomic,
+            &cluster.active_topology_members,
+            &view,
+            &cluster.migration_throttle,
+            &cluster.cluster_secret,
+        );
+
+        // The manager retained the unproven lost entry across the supersede (C17).
+        assert!(
+            cluster.migration.lock().is_shard_lost(shard),
+            "manager keeps the unproven lost entry across the supersede",
+        );
+        // ...and the hot-path atomic must STILL mirror it — WITHOUT a follow-up
+        // `sync_migration_bitmaps` (which reloads the atomic and would hide the
+        // bug this test targets).
+        assert!(
+            cluster.inbound_atomic.test(shard),
+            "supersede must not clear the lost shard's hot-path inbound fence",
+        );
+        match cluster.is_master(&key) {
+            MasterQueryResult::Transitioning { .. } => {}
+            other => panic!(
+                "a supersede that preserves a LOST inbound shard must NOT serve it as full \
+                 authority on the production `activate_topology_with_view` path; got {other:?}",
             ),
         }
     }
