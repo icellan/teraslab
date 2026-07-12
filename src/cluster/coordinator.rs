@@ -958,6 +958,20 @@ pub struct PartitionVersionEntry {
     pub replica_count: u8,
     /// Last replication sequence applied for this shard (0 if unknown).
     pub last_applied_seq: u64,
+    /// Reverse-heal recency signal (finding C1): an order-independent 64-bit
+    /// fingerprint of the shard's `(txid, generation)` set, produced by
+    /// `Engine::shard_recency`. Two nodes with byte-identical shard state
+    /// report the same digest; any diverging generation flips it. `0` from a
+    /// legacy (pre-Phase-1) peer that did not report a digest — the wire field
+    /// is additive, so an absent digest is indistinguishable from a genuine
+    /// empty-shard digest only by count, which is why detection treats a
+    /// digest mismatch as a mere pre-filter, not proof.
+    pub manifest_digest: u64,
+    /// Reverse-heal recency signal (finding C1): the maximum record
+    /// `generation` in the shard under WRAPPING-serial ordering (see
+    /// `crate::record::generation_target_ahead`), `0` when the shard holds no
+    /// record or when reported by a legacy peer.
+    pub max_generation: u32,
 }
 
 /// In-progress collection of `PartitionVersionEntry` reports from cluster
@@ -4514,68 +4528,153 @@ fn send_topology_frame(
 /// the in-process self-report is byte-equivalent to what a peer would receive
 /// over the wire. Empty shards on which this node has no role are excluded
 /// to keep the view compact.
-fn build_self_partition_version_entries(
+pub(crate) fn build_self_partition_version_entries(
     self_id: NodeId,
     engine: &Engine,
     shard_table: &Arc<ShardTableLock<ShardTable>>,
     inbound_bm: &Arc<crate::cluster::migration::AtomicShardBitmap>,
 ) -> Vec<PartitionVersionEntry> {
-    let table = shard_table.read();
-    let mut out = Vec::with_capacity(NUM_SHARDS);
-    for shard in 0..NUM_SHARDS as u16 {
-        let count = engine.shard_record_count(shard);
-        let assignment = table.target_assignment(shard);
-        let is_master = assignment.master == self_id;
-        let is_subset = inbound_bm.test(shard);
-        let is_replica = assignment.replicas.contains(&self_id);
-        if !is_master && !is_replica && !is_subset && count == 0 {
-            continue;
-        }
-        let mut flags = 0u8;
-        if is_master {
-            flags |= 0b01;
-        }
-        if is_subset {
-            flags |= 0b10;
-        }
-        let replica_count = u8::try_from(assignment.replicas.len().min(255)).unwrap_or(255);
-        out.push(PartitionVersionEntry {
-            shard,
-            flags,
-            replica_count,
-            last_applied_seq: count,
-        });
+    // First pass: decide participation and per-shard record count from the
+    // O(1) shard counters, holding the shard-table read lock only briefly.
+    struct Pending {
+        shard: u16,
+        flags: u8,
+        replica_count: u8,
+        count: u64,
     }
-    out
+    let mut pending: Vec<Pending> = Vec::with_capacity(NUM_SHARDS);
+    let mut participating: std::collections::HashSet<u16> = std::collections::HashSet::new();
+    {
+        let table = shard_table.read();
+        for shard in 0..NUM_SHARDS as u16 {
+            let count = engine.shard_record_count(shard);
+            let assignment = table.target_assignment(shard);
+            let is_master = assignment.master == self_id;
+            let is_subset = inbound_bm.test(shard);
+            let is_replica = assignment.replicas.contains(&self_id);
+            if !is_master && !is_replica && !is_subset && count == 0 {
+                continue;
+            }
+            let mut flags = 0u8;
+            if is_master {
+                flags |= 0b01;
+            }
+            if is_subset {
+                flags |= 0b10;
+            }
+            let replica_count = u8::try_from(assignment.replicas.len().min(255)).unwrap_or(255);
+            participating.insert(shard);
+            pending.push(Pending {
+                shard,
+                flags,
+                replica_count,
+                count,
+            });
+        }
+    }
+
+    // Second pass: ONE filtered index scan resolves the participating shards'
+    // keys; fold each shard's `(txid, generation)` into the reverse-heal
+    // recency signal. Only participating shards are read, and the whole thing
+    // runs off the hot path (post-topology-commit exchange), not per client op.
+    let (keys_by_shard, _skipped) = engine.keys_by_shard_filtered(&participating);
+    let empty: Vec<TxKey> = Vec::new();
+    pending
+        .into_iter()
+        .map(|p| {
+            let keys = keys_by_shard.get(&p.shard).unwrap_or(&empty);
+            let (_scan_count, manifest_digest, max_generation) = engine.recency_for_keys(keys);
+            PartitionVersionEntry {
+                shard: p.shard,
+                flags: p.flags,
+                replica_count: p.replica_count,
+                last_applied_seq: p.count,
+                manifest_digest,
+                max_generation,
+            }
+        })
+        .collect()
+}
+
+/// Serialize an `OP_PARTITION_VERSION_REPORT` response payload from a list of
+/// [`PartitionVersionEntry`].
+///
+/// Wire layout matches the doc comment on
+/// [`OP_PARTITION_VERSION_REPORT`](crate::protocol::opcodes::OP_PARTITION_VERSION_REPORT):
+/// `node_id:u64 | cluster_key:u64 | entry_count:u32 | entries` where each entry
+/// is [`PARTITION_VERSION_ENTRY_SIZE`] bytes. Shared by the in-process
+/// self-report and the dispatch handler so both encode byte-identically,
+/// including the Phase-1 additive `manifest_digest` + `max_generation` tail.
+pub(crate) fn encode_partition_version_response(
+    self_id: u64,
+    cluster_key: u64,
+    entries: &[PartitionVersionEntry],
+) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(20 + entries.len() * PARTITION_VERSION_ENTRY_SIZE);
+    payload.extend_from_slice(&self_id.to_le_bytes());
+    payload.extend_from_slice(&cluster_key.to_le_bytes());
+    payload.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+    for e in entries {
+        payload.extend_from_slice(&e.shard.to_le_bytes());
+        payload.push(e.flags);
+        payload.push(e.replica_count);
+        payload.extend_from_slice(&e.last_applied_seq.to_le_bytes());
+        payload.extend_from_slice(&e.manifest_digest.to_le_bytes());
+        payload.extend_from_slice(&e.max_generation.to_le_bytes());
+    }
+    payload
 }
 
 /// Phase D: parse an `OP_PARTITION_VERSION_REPORT` response payload into a
 /// list of [`PartitionVersionEntry`].
 ///
-/// Returns `None` if the payload is truncated or `entry_count * 12` does not
-/// match the trailing bytes — callers treat this as "no data" so a malformed
-/// peer does not corrupt the partition view.
+/// The per-entry stride is ADDITIVE (Phase 1, finding C1): entries are either
+/// the legacy [`PARTITION_VERSION_ENTRY_SIZE_LEGACY`]-byte layout (a
+/// pre-Phase-1 peer that reports no digest) or the current
+/// [`PARTITION_VERSION_ENTRY_SIZE`]-byte layout that appends
+/// `manifest_digest:u64` + `max_generation:u32`. The stride is inferred from
+/// the body length, so a Phase-1 parser reads both; the new fields default to
+/// `0` for a legacy peer. Returns `None` if the payload is truncated or the
+/// trailing bytes match neither stride — callers treat this as "no data" so a
+/// malformed peer does not corrupt the partition view.
 fn parse_partition_version_response(payload: &[u8]) -> Option<Vec<PartitionVersionEntry>> {
     if payload.len() < 20 {
         return None;
     }
     let entry_count = u32::from_le_bytes(payload[16..20].try_into().ok()?) as usize;
-    let expected = 20 + entry_count * PARTITION_VERSION_ENTRY_SIZE;
-    if payload.len() != expected {
-        return None;
+    let body = payload.len() - 20;
+    if entry_count == 0 {
+        return if body == 0 { Some(Vec::new()) } else { None };
     }
+    // Prefer the current (wider) stride; fall back to the legacy stride.
+    let stride = if body == entry_count * PARTITION_VERSION_ENTRY_SIZE {
+        PARTITION_VERSION_ENTRY_SIZE
+    } else if body == entry_count * PARTITION_VERSION_ENTRY_SIZE_LEGACY {
+        PARTITION_VERSION_ENTRY_SIZE_LEGACY
+    } else {
+        return None;
+    };
     let mut entries = Vec::with_capacity(entry_count);
     for i in 0..entry_count {
-        let off = 20 + i * PARTITION_VERSION_ENTRY_SIZE;
+        let off = 20 + i * stride;
         let shard = u16::from_le_bytes(payload[off..off + 2].try_into().ok()?);
         let flags = payload[off + 2];
         let replica_count = payload[off + 3];
         let last_applied_seq = u64::from_le_bytes(payload[off + 4..off + 12].try_into().ok()?);
+        let (manifest_digest, max_generation) = if stride == PARTITION_VERSION_ENTRY_SIZE {
+            let digest = u64::from_le_bytes(payload[off + 12..off + 20].try_into().ok()?);
+            let max_gen = u32::from_le_bytes(payload[off + 20..off + 24].try_into().ok()?);
+            (digest, max_gen)
+        } else {
+            (0, 0)
+        };
         entries.push(PartitionVersionEntry {
             shard,
             flags,
             replica_count,
             last_applied_seq,
+            manifest_digest,
+            max_generation,
         });
     }
     Some(entries)
@@ -14362,6 +14461,8 @@ mod tests {
                     flags: 0,
                     replica_count: 1,
                     last_applied_seq: 5,
+                    manifest_digest: 0,
+                    max_generation: 0,
                 })
                 .collect(),
         );
@@ -14901,6 +15002,8 @@ mod tests {
                     flags: 0,
                     replica_count: 1,
                     last_applied_seq: 9,
+                    manifest_digest: 0,
+                    max_generation: 0,
                 })
                 .collect(),
         );
@@ -17613,6 +17716,8 @@ mod tests {
                 flags: 0,
                 replica_count: 1,
                 last_applied_seq: 0,
+                manifest_digest: 0,
+                max_generation: 0,
             }],
         );
         view.insert(
@@ -17622,6 +17727,8 @@ mod tests {
                 flags: 0,
                 replica_count: 1,
                 last_applied_seq: 9_999,
+                manifest_digest: 0,
+                max_generation: 0,
             }],
         );
 
@@ -17678,6 +17785,8 @@ mod tests {
                 flags: 0,
                 replica_count: 1,
                 last_applied_seq: 9_999,
+                manifest_digest: 0,
+                max_generation: 0,
             }],
         );
         apply_master_election(
@@ -17966,12 +18075,16 @@ mod tests {
                 flags: 0b01,
                 replica_count: 1,
                 last_applied_seq: 100,
+                manifest_digest: 0,
+                max_generation: 0,
             },
             PartitionVersionEntry {
                 shard: 1,
                 flags: 0b00,
                 replica_count: 1,
                 last_applied_seq: 50,
+                manifest_digest: 0,
+                max_generation: 0,
             },
         ];
         let entries2 = vec![PartitionVersionEntry {
@@ -17979,12 +18092,81 @@ mod tests {
             flags: 0b00,
             replica_count: 1,
             last_applied_seq: 90,
+            manifest_digest: 0,
+            max_generation: 0,
         }];
         phase.record(NodeId(10), entries1.clone());
         phase.record(NodeId(20), entries2.clone());
         let view = phase.partition_view();
         assert_eq!(view.get(&NodeId(10)).unwrap(), &entries1);
         assert_eq!(view.get(&NodeId(20)).unwrap(), &entries2);
+    }
+
+    /// Reverse-heal Phase 1: the additive `manifest_digest` + `max_generation`
+    /// recency fields survive an `OP_PARTITION_VERSION_REPORT` wire round-trip.
+    #[test]
+    fn partition_version_entry_roundtrips_digest_and_max_gen() {
+        let entries = vec![
+            PartitionVersionEntry {
+                shard: 7,
+                flags: 0b01,
+                replica_count: 2,
+                last_applied_seq: 42,
+                manifest_digest: 0xDEAD_BEEF_CAFE_F00D,
+                max_generation: 9_999,
+            },
+            PartitionVersionEntry {
+                shard: 4095,
+                flags: 0b11,
+                replica_count: 255,
+                last_applied_seq: 0,
+                manifest_digest: 0,
+                max_generation: 0,
+            },
+        ];
+        let payload = encode_partition_version_response(123, 456, &entries);
+        let parsed =
+            parse_partition_version_response(&payload).expect("well-formed payload parses");
+        assert_eq!(
+            parsed, entries,
+            "digest + max_generation survive the wire round-trip",
+        );
+    }
+
+    /// Reverse-heal Phase 1: the parser is additive — a legacy (pre-Phase-1)
+    /// peer's 12-byte entries still parse, with the new recency fields
+    /// defaulting to 0, so a mixed-version cluster degrades gracefully instead
+    /// of dropping the whole report.
+    #[test]
+    fn partition_version_parser_tolerates_legacy_12byte_entries() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&7u64.to_le_bytes()); // node_id
+        payload.extend_from_slice(&9u64.to_le_bytes()); // cluster_key
+        payload.extend_from_slice(&1u32.to_le_bytes()); // entry_count
+        // one legacy 12-byte entry (no digest / max_generation)
+        payload.extend_from_slice(&3u16.to_le_bytes()); // shard
+        payload.push(0b01); // flags
+        payload.push(1); // replica_count
+        payload.extend_from_slice(&77u64.to_le_bytes()); // last_applied_seq
+        assert_eq!(
+            payload.len(),
+            20 + PARTITION_VERSION_ENTRY_SIZE_LEGACY,
+            "hand-built payload uses the legacy stride",
+        );
+
+        let parsed = parse_partition_version_response(&payload).expect("legacy payload parses");
+        assert_eq!(
+            parsed,
+            vec![PartitionVersionEntry {
+                shard: 3,
+                flags: 0b01,
+                replica_count: 1,
+                last_applied_seq: 77,
+                manifest_digest: 0,
+                max_generation: 0,
+            }],
+            "legacy entry parses with recency fields defaulted to 0",
+        );
     }
 
     #[test]
@@ -18023,6 +18205,8 @@ mod tests {
                 flags: 0b01,
                 replica_count: 1,
                 last_applied_seq: 42,
+                manifest_digest: 0,
+                max_generation: 0,
             }],
         );
         let tasks =
@@ -18066,6 +18250,8 @@ mod tests {
                 flags: 0b01,
                 replica_count: 1,
                 last_applied_seq: 42,
+                manifest_digest: 0,
+                max_generation: 0,
             }],
         );
         let skipped = build_plan_from_partition_view(&old_table, &new_table, &owns_view, NodeId(1));
@@ -18084,6 +18270,8 @@ mod tests {
                 flags: 0b01 | PARTITION_FLAG_PENDING_INBOUND,
                 replica_count: 1,
                 last_applied_seq: 42,
+                manifest_digest: 0,
+                max_generation: 0,
             }],
         );
         let refined =

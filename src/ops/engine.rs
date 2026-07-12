@@ -2798,16 +2798,28 @@ impl Engine {
     /// Intended for boot-time / off-hot-path detection, one call per mastered
     /// shard.
     pub fn shard_recency(&self, shard: u16) -> (u64, u64, u32) {
-        let keys = self.keys_for_shard(shard);
+        self.recency_for_keys(&self.keys_for_shard(shard))
+    }
+
+    /// Fold a resolved key set into a reverse-heal recency fingerprint
+    /// `(count, digest, max_generation)` — see [`Self::shard_recency`] for the
+    /// field semantics.
+    ///
+    /// Split out so the cluster partition-version exchange, which already
+    /// resolves each participating shard's keys in ONE filtered index scan
+    /// ([`Self::keys_by_shard_filtered`]), can fingerprint without re-scanning
+    /// the index per shard. Reads each key's generation via
+    /// [`Self::read_metadata`]; a key that raced a deletion or whose footer is
+    /// unreadable is skipped (still observable via `enumeration_unreadable`).
+    /// An empty slice yields `(0, digest_of_empty, 0)`, which every node
+    /// computes identically for an empty shard.
+    pub fn recency_for_keys(&self, keys: &[TxKey]) -> (u64, u64, u32) {
         let mut manifest = crate::cluster::coordinator::ManifestHasher::new();
         let mut max_generation: u32 = 0;
         let mut count: u64 = 0;
-        for key in &keys {
+        for key in keys {
             let generation = match self.read_metadata(key) {
                 Ok(meta) => meta.generation,
-                // Raced deletion or an unreadable footer: skip it. Such a record
-                // is still observable via `enumeration_unreadable`; excluding it
-                // here only shifts the fingerprint, never correctness.
                 Err(_) => continue,
             };
             manifest.fold(&key.txid, generation);
