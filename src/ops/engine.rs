@@ -8300,21 +8300,31 @@ impl Engine {
         meta.generation = { meta.generation }.wrapping_add(1);
         meta.updated_at = self.now_millis();
 
-        self.write_metadata_fast(device_id, ro, &meta)?;
-        // followup-1 dual-write: the footer just cleared preserve_until, so
-        // mirror PRESERVED = false into the DE-flag cache.
-        self.mirror_de_flags(key, entry.mined_slot, &meta);
-        // Mutual-exclusion transition preserve -> DAH. Remove from the preserve
-        // index BEFORE inserting into DAH so a concurrent reader range-querying
-        // both indexes sees the key in NEITHER transiently (never BOTH),
-        // matching the order the SET path uses (remove-DAH then insert-preserve).
-        self.update_preserve_index(key, preserve, 0)?;
-        if new_dah != 0 {
-            self.update_dah_index(key, 0, new_dah)?;
-        } else {
+        // FU#7-D WAL-first ordering for the NON-ELIGIBLE branch: journal the
+        // `PreserveUntil { block_height: 0 }` CLEAR redo BEFORE the footer write,
+        // not after it. A transient `LogFull` (mapped to `StorageError`, no
+        // poison) then aborts the whole op with NO device change — the footer
+        // stays `preserve_until != 0`, correct and retried by the next scan
+        // once the checkpoint reclaims log space. A crash between the journal
+        // and the footer write is also safe: recovery replays
+        // `PreserveUntil { 0 }`, which completes the clear. Journaling AFTER the
+        // footer write (the pre-fix order) left a window where the footer was
+        // already cleared but a `LogFull` dropped the redo — a retry then saw
+        // `preserve == 0`, re-journaled nothing, so the record escaped
+        // `touched_keys` and a Touched boot re-exposed a stale `MINED_PRESERVED`
+        // until the next checkpoint.
+        //
+        // The ELIGIBLE branch deliberately keeps its footer-then-secondary
+        // ordering: `update_dah_index` emits its `SecondaryDahUpdate` AFTER the
+        // footer write because the redo carries a `delete_at_height` that must
+        // match the footer on replay — reordering it could plant a DAH the
+        // footer never committed. The non-eligible clear has no such coupling:
+        // it only marks the record for a footer re-read, which is idempotent
+        // regardless of which side committed first.
+        if new_dah == 0 {
             // FU#7 Option B superset-invariant fix: an INELIGIBLE expiry emits no
             // DAH transition, so — unlike the eligible branch's
-            // `SecondaryDahUpdate` above — nothing otherwise keys this record into
+            // `SecondaryDahUpdate` below — nothing otherwise keys this record into
             // the redo tail. Journal a `PreserveUntil` CLEAR keyed to this record
             // so recovery's `touched_keys` includes it and a fast-boot Touched
             // reconcile device-reads the footer (now `preserve_until == 0`),
@@ -8338,6 +8348,19 @@ impl Engine {
                     }],
                 )?;
             }
+        }
+
+        self.write_metadata_fast(device_id, ro, &meta)?;
+        // followup-1 dual-write: the footer just cleared preserve_until, so
+        // mirror PRESERVED = false into the DE-flag cache.
+        self.mirror_de_flags(key, entry.mined_slot, &meta);
+        // Mutual-exclusion transition preserve -> DAH. Remove from the preserve
+        // index BEFORE inserting into DAH so a concurrent reader range-querying
+        // both indexes sees the key in NEITHER transiently (never BOTH),
+        // matching the order the SET path uses (remove-DAH then insert-preserve).
+        self.update_preserve_index(key, preserve, 0)?;
+        if new_dah != 0 {
+            self.update_dah_index(key, 0, new_dah)?;
         }
 
         Ok(true)
@@ -13719,6 +13742,113 @@ mod tests {
             Some(2000 + 288),
             "an all-spent, mined, on-chain, no-longer-preserved record MUST get a DAH \
              scheduled (not an immortal, never-swept record)",
+        );
+    }
+
+    /// FU#7-D durability ordering: the NON-ELIGIBLE preserve-expiry journals its
+    /// `PreserveUntil { block_height: 0 }` CLEAR redo BEFORE the device footer
+    /// write, so a transient `LogFull` at that journal aborts the WHOLE op with
+    /// NO device change — the on-device footer keeps `preserve_until != 0`
+    /// (correct; the next scan retries once the checkpoint reclaims log space).
+    ///
+    /// Pre-fix the footer was written FIRST (clearing `preserve_until`) and the
+    /// journal ran AFTER: a `LogFull` there left the footer already cleared but
+    /// no redo emitted, so a retry saw `preserve == 0`, re-journaled nothing, and
+    /// the record escaped `touched_keys` — a Touched boot then re-exposed a stale
+    /// `MINED_PRESERVED` until the next checkpoint.
+    ///
+    /// The test arms a `LogFull` by filling the store's redo log to capacity, then
+    /// asserts the expiry FAILS cleanly (`StorageError`, no poison) AND the
+    /// device footer is UNCHANGED (`preserve_until != 0`). RED today (footer was
+    /// cleared before the failing journal); GREEN after the WAL-first reorder.
+    #[test]
+    fn nonelig_preserve_expiry_logfull_aborts_atomically_leaving_footer_preserved() {
+        use crate::redo::{RedoLog, RedoOp};
+
+        let engine = create_engine();
+
+        // A modest redo log the create/spend/preserve fit into, with room to fill
+        // to capacity below.
+        let log_dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(64 * 1024, 4096).unwrap());
+        let redo = Arc::new(parking_lot::Mutex::new(
+            RedoLog::open(log_dev.clone(), 0, 64 * 1024).unwrap(),
+        ));
+        engine.set_redo_logs(vec![redo.clone()]);
+
+        // A 1-UTXO record spent to ALL-SPENT while UNMINED, then preserved:
+        // all-spent + no-blocks ⇒ NON-ELIGIBLE expiry (`new_dah == 0`), the
+        // branch the fix reorders.
+        let (_h, req) = make_create_req(0xD4, 1);
+        let key = req.tx_key();
+        engine.create(&req).expect("create");
+        engine
+            .spend(&SpendRequest {
+                tx_key: key,
+                offset: 0,
+                utxo_hash: [0u8; 32],
+                spending_data: [0xAB; 36],
+                ignore_conflicting: false,
+                ignore_locked: false,
+                current_block_height: 900,
+                block_height_retention: 288,
+            })
+            .expect("spend to all-spent");
+        engine
+            .preserve_until(&PreserveUntilRequest {
+                tx_key: key,
+                block_height: 1000,
+            })
+            .expect("preserve");
+
+        // Precondition: the footer carries the preservation.
+        assert_ne!(
+            { engine.read_metadata(&key).unwrap().preserve_until },
+            0,
+            "precondition: preserve_until set on the device footer",
+        );
+
+        // Arm the `LogFull`: fill the store's redo log to capacity with single-op
+        // appends (a `PreserveUntil` filler — same size as the op the expiry
+        // journals, so once a filler no longer fits neither does the real op).
+        // `LogFull` does not poison (transient backpressure), so the log stays
+        // healthy — the expiry's journal will hit the SAME full log.
+        let filler_key = TxKey { txid: [0x11u8; 32] };
+        let mut hit_full = false;
+        for _ in 0..100_000u32 {
+            match engine.append_redo_ops_routed(&[RedoOp::PreserveUntil {
+                tx_key: filler_key,
+                block_height: 0,
+            }]) {
+                Ok(_) => continue,
+                Err(e) => {
+                    assert!(
+                        e.contains("redo log full"),
+                        "fill must terminate with a transient LogFull, got: {e}",
+                    );
+                    hit_full = true;
+                    break;
+                }
+            }
+        }
+        assert!(hit_full, "the redo log must reach LogFull to arm the test");
+
+        // The expiry's PreserveUntil{0} journal now hits the full log. WAL-first:
+        // it aborts BEFORE any device change.
+        let err = engine
+            .expire_preservation_set_dah(&key, 2000, 288)
+            .expect_err("a LogFull at the secondary journal must fail the expiry");
+        assert!(
+            matches!(err, SpendError::StorageError { .. }),
+            "a transient LogFull maps to StorageError (no poison), got: {err:?}",
+        );
+
+        // THE fix: the footer is UNCHANGED — the op aborted atomically, so the
+        // record is still preserved and will be retried by a later scan.
+        assert_ne!(
+            { engine.read_metadata(&key).unwrap().preserve_until },
+            0,
+            "WAL-first: a LogFull-aborted non-eligible expiry must leave the device footer's \
+             preserve_until intact (no device change before the failed journal)",
         );
     }
 
