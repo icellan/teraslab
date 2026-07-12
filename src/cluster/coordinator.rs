@@ -3081,35 +3081,50 @@ impl ClusterCoordinator {
                                 if commit.term <= local_term {
                                     continue;
                                 }
-                                if let Some(applied_term) =
-                                    topology_authority.handle_commit(&commit)
-                                {
-                                    tracing::info!(
-                                        term = applied_term,
-                                        %peer_addr,
-                                        members = remote_members.len(),
-                                        "cluster: catch-up: applied term from peer",
-                                    );
-                                    // POST-commit persist: the peer's term is
-                                    // already applied to the in-memory authority
-                                    // (handle_commit above) and cannot be rolled
-                                    // back, so this proceeds regardless. A failure
-                                    // is surfaced by `persist_topology_state`
-                                    // (ERROR + PERSIST_FAILURES); catch-up is
-                                    // idempotent and re-converges on restart.
-                                    if let Some(ref path) = *topology_state_path {
-                                        let peak = peak_size.load(Ordering::Relaxed) as u64;
-                                        let inc = swim_incarnation.load(Ordering::Relaxed);
-                                        let _ = persist_topology_state(
-                                            path,
-                                            &topology_authority.persisted_state(peak, inc),
+                                // G9 — adopt the peer's committed term only after
+                                // it is DURABLE. Ordering the persist after the
+                                // in-memory `handle_commit` left a crash window
+                                // that reverted this node to its prior term while
+                                // the peer held the newer one. Persist-before-serve
+                                // and fail closed: on a persist failure, do NOT
+                                // adopt the term — try the next peer / re-propose.
+                                let peak = peak_size.load(Ordering::Relaxed) as u64;
+                                let inc = swim_incarnation.load(Ordering::Relaxed);
+                                let path = topology_state_path.as_deref();
+                                match topology_authority.handle_commit_durable(
+                                    &commit,
+                                    peak,
+                                    inc,
+                                    |state| persist_topology_state_durable(path, state),
+                                ) {
+                                    crate::cluster::topology::DurableCommitOutcome::Applied(
+                                        applied_term,
+                                    ) => {
+                                        tracing::info!(
+                                            term = applied_term,
+                                            %peer_addr,
+                                            members = remote_members.len(),
+                                            "cluster: catch-up: adopted peer term (persisted first)",
                                         );
+                                        // Signal the event loop to activate.
+                                        let _ = topology_commit_tx
+                                            .send((remote_members.clone(), commit.term));
+                                        caught_up = true;
+                                        break;
                                     }
-                                    // Signal the event loop to activate the topology.
-                                    let _ = topology_commit_tx
-                                        .send((remote_members.clone(), commit.term));
-                                    caught_up = true;
-                                    break;
+                                    crate::cluster::topology::DurableCommitOutcome::PersistFailed => {
+                                        tracing::error!(
+                                            term = commit.term,
+                                            %peer_addr,
+                                            "cluster: catch-up: NOT adopting peer term — durable \
+                                             persist failed (G9); will retry via next peer / re-propose",
+                                        );
+                                        continue;
+                                    }
+                                    crate::cluster::topology::DurableCommitOutcome::NotApplied => {
+                                        // Raced / no longer acceptable — try next peer.
+                                        continue;
+                                    }
                                 }
                             }
                         }
