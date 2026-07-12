@@ -2664,6 +2664,14 @@ impl Client {
     /// cursor and returns page 1 forever, so a naive loop would never terminate.
     /// Against such a server this makes exactly one call and, if the response was
     /// truncated, returns [`ClientError::QueryTruncated`] with the partial page.
+    ///
+    /// A non-advancing-cursor guard backs the version gate: the server returns
+    /// txids strictly greater than the sent cursor in ascending order, so a
+    /// resumed page's last txid MUST exceed the cursor just sent. If it does
+    /// not, the server advertised v3 but ignored the cursor (a misconfigured or
+    /// buggy node), so the stale page is discarded and the pages accumulated so
+    /// far are surfaced as [`ClientError::QueryTruncated`] rather than looping
+    /// forever. This mirrors the guard in [`Client::query_nodes_union`].
     async fn page_query(
         &self,
         op_code: u16,
@@ -2688,6 +2696,18 @@ impl Client {
                 )));
             }
             let (txids, truncated) = decode(&resp.payload)?;
+            // Non-advancing-cursor guard (load-bearing). A resumed page (cursor
+            // is `Some`) whose last txid does not advance strictly past the
+            // cursor just sent means the server ignored the cursor and re-sent
+            // an earlier page. Discard that stale page and surface the pages
+            // accumulated so far rather than looping forever / duplicating
+            // txids. The first page has no cursor, so the guard applies only
+            // from the second round-trip on.
+            if let Some(prev) = cursor
+                && txids.last().is_some_and(|last| *last <= prev)
+            {
+                return Err(ClientError::QueryTruncated { partial: all });
+            }
             all.extend_from_slice(&txids);
             if !truncated {
                 return Ok(all);
@@ -5368,6 +5388,129 @@ mod tests {
             }
             other => panic!("want ClientError::QueryTruncated, got {other:?}"),
         }
+        client.close().await;
+    }
+
+    /// Single (non-cluster) node that advertises v3 but ignores the resume
+    /// cursor — always returns the same truncated first page. A shared counter
+    /// records how many query round-trips it served; after `max_query_calls` it
+    /// closes the connection so a client that fails to stop paging errors out
+    /// (bounded) instead of hanging the test. Returns the node addr + counter.
+    async fn spawn_cursor_ignoring_mock(
+        version: u16,
+        page_cap: usize,
+        txids: Vec<TxID>,
+        max_query_calls: usize,
+    ) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        // honor_cursor = false: always page 1, regardless of the sent cursor.
+        let mock = Arc::new(PagingMock::new(version, page_cap, false, txids));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let calls_ret = calls.clone();
+        tokio::spawn(async move {
+            loop {
+                let (mut sock, _) = match listener.accept().await {
+                    Ok(x) => x,
+                    Err(_) => return,
+                };
+                let mock = mock.clone();
+                let calls = calls.clone();
+                tokio::spawn(async move {
+                    loop {
+                        let mut len_buf = [0u8; 4];
+                        if sock.read_exact(&mut len_buf).await.is_err() {
+                            return;
+                        }
+                        let total = u32::from_le_bytes(len_buf) as usize;
+                        if total < 12 {
+                            return;
+                        }
+                        let mut body = vec![0u8; total];
+                        if sock.read_exact(&mut body).await.is_err() {
+                            return;
+                        }
+                        let request_id = u64::from_le_bytes(body[0..8].try_into().unwrap());
+                        let op_code = u16::from_le_bytes([body[8], body[9]]);
+                        let payload = &body[12..];
+                        let resp_payload = match op_code {
+                            OP_HELLO => mock.version.to_le_bytes().to_vec(),
+                            OP_QUERY_OLD_UNMINED | OP_QUERY_CONFLICTING => {
+                                let n = calls.fetch_add(1, Ordering::SeqCst) + 1;
+                                if n > max_query_calls {
+                                    // A guarded client never reaches here; close
+                                    // the socket so a looping client fails fast.
+                                    return;
+                                }
+                                mock.page_payload(op_code, payload)
+                            }
+                            _ => Vec::new(),
+                        };
+                        let inner_len = 8 + 1 + resp_payload.len();
+                        let mut out = (inner_len as u32).to_le_bytes().to_vec();
+                        out.extend_from_slice(&request_id.to_le_bytes());
+                        out.push(STATUS_OK);
+                        out.extend_from_slice(&resp_payload);
+                        if sock.write_all(&out).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        (addr, calls_ret)
+    }
+
+    /// A single (non-cluster) server that advertises v3 but ignores the resume
+    /// cursor (returns the same truncated page forever) must NOT loop. The
+    /// non-advancing-cursor guard in `page_query` stops paging after the second
+    /// round-trip and surfaces `ClientError::QueryTruncated` with the partial
+    /// page. Without the guard the client loops until the mock caps out and the
+    /// connection drops (asserted bounded via the round-trip counter).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rust_single_node_query_does_not_loop_on_cursor_ignoring_server() {
+        use std::sync::atomic::Ordering;
+        let full = seq_txids(5);
+        // Serve at most 5 query calls; a guarded client stops at 2, so climbing
+        // to the cap proves an unguarded loop.
+        let (addr, calls) = spawn_cursor_ignoring_mock(3, 2, full, 5).await;
+        let client = Client::new(ClientConfig {
+            addr: Some(addr),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+        let res = tokio::time::timeout(Duration::from_secs(3), client.query_old_unmined(1000))
+            .await
+            .expect("guard must stop the single-node paging loop");
+        match res {
+            Err(ClientError::QueryTruncated { partial }) => {
+                assert_eq!(
+                    partial.len(),
+                    2,
+                    "the one capped page must be surfaced as partial",
+                );
+            }
+            other => panic!("want ClientError::QueryTruncated, got {other:?}"),
+        }
+        // First page (nil cursor) + one guard-tripping page = 2 round-trips.
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "the guard must stop paging after the first non-advancing page",
+        );
+
+        // query_conflicting shares page_query and must behave identically.
+        let res2 = tokio::time::timeout(Duration::from_secs(3), client.query_conflicting())
+            .await
+            .expect("guard must stop the single-node paging loop");
+        assert!(
+            matches!(res2, Err(ClientError::QueryTruncated { .. })),
+            "conflicting must also surface truncation, not loop",
+        );
         client.close().await;
     }
 
