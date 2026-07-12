@@ -926,6 +926,14 @@ fn old_master_available_for_handoff(
 ///   currently active shard table.
 /// - bit 1 (`0b10`): this node has a pending inbound migration for `shard`
 ///   (i.e. is a subset master receiving data).
+/// [`PartitionVersionEntry::flags`] bit 1: this node holds only a SUBSET of the
+/// shard — it is a subset master with a pending inbound migration still
+/// receiving data. A holder with this bit set does not fully own the shard even
+/// when its record count is non-zero. Kept in sync with the `0b10` literal set
+/// by the exchange responders (`build_self_partition_version_entries` and the
+/// `OP_PARTITION_VERSION_REPORT` dispatch handler).
+pub const PARTITION_FLAG_PENDING_INBOUND: u8 = 0b10;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PartitionVersionEntry {
     /// Shard number (0..NUM_SHARDS).
@@ -1015,44 +1023,44 @@ pub fn build_plan_from_partition_view(
         return base;
     }
 
-    // Index: (node, shard) -> last_applied_seq.
-    let mut seq_by_node_shard: std::collections::HashMap<(NodeId, u16), u64> =
+    // Index: (node, shard) -> (last_applied_seq, flags). The `flags`
+    // subset bit ([`PARTITION_FLAG_PENDING_INBOUND`]) marks a holder that has
+    // only PART of the shard (a subset master still receiving inbound data), so
+    // its non-zero record count must NOT be read as "already owns the shard".
+    let mut view_by_node_shard: std::collections::HashMap<(NodeId, u16), (u64, u8)> =
         std::collections::HashMap::new();
     for (node, entries) in partition_view {
         for e in entries {
-            seq_by_node_shard.insert((*node, e.shard), e.last_applied_seq);
+            view_by_node_shard.insert((*node, e.shard), (e.last_applied_seq, e.flags));
         }
     }
 
+    // A holder "fully owns" a shard only when it reports data AND its
+    // subset/incomplete bit is clear. C9: skipping an outbound to — or rewriting
+    // the source to — a subset holder promotes a PARTIAL master to full master,
+    // silently dropping every record it never received at handoff.
+    let holder_owns_shard = |node: NodeId, shard: u16| -> bool {
+        match view_by_node_shard.get(&(node, shard)) {
+            Some(&(seq, flags)) => seq > 0 && (flags & PARTITION_FLAG_PENDING_INBOUND) == 0,
+            None => false,
+        }
+    };
+
     let mut refined = Vec::with_capacity(base.len());
     for task in base {
-        // Skip migration if the new master itself already reports data for this shard.
-        let new_master_has_data = seq_by_node_shard
-            .get(&(task.to_node, task.shard))
-            .copied()
-            .unwrap_or(0)
-            > 0;
-        if new_master_has_data {
+        // Skip migration only when the new master itself already FULLY owns the
+        // shard (has data AND is not a subset/incomplete holder).
+        if holder_owns_shard(task.to_node, task.shard) {
             continue;
         }
 
-        // If the planned source reports no data but a known replica reports data,
-        // rewrite the source to that replica.
-        let source_has_data = seq_by_node_shard
-            .get(&(task.from_node, task.shard))
-            .copied()
-            .unwrap_or(0)
-            > 0;
-        if !source_has_data {
+        // If the planned source does not fully own the shard but a known replica
+        // does, rewrite the source to that replica.
+        if !holder_owns_shard(task.from_node, task.shard) {
             let old_assignment = old_table.target_assignment(task.shard);
             let mut better_source: Option<NodeId> = None;
             for r in &old_assignment.replicas {
-                if seq_by_node_shard
-                    .get(&(*r, task.shard))
-                    .copied()
-                    .unwrap_or(0)
-                    > 0
-                {
+                if holder_owns_shard(*r, task.shard) {
                     better_source = Some(*r);
                     break;
                 }
@@ -16519,6 +16527,68 @@ mod tests {
         assert!(
             task_for_shard.is_none(),
             "must skip migration for shard {changed_shard} when new master already has data",
+        );
+    }
+
+    /// C9: a new master that reports data but has its SUBSET/incomplete bit set
+    /// (pending inbound migration — it holds only PART of the shard) must NOT
+    /// cause the migration to be skipped. Skipping would promote a partial
+    /// holder to full master and silently drop the records it never received.
+    #[test]
+    fn build_plan_does_not_skip_migration_for_subset_holder() {
+        use std::collections::HashMap;
+        // Grow the cluster (add node 4) so every old master survives and
+        // `migration_plan` definitely emits a task for the reshuffled shards
+        // (rather than continue-ing because the new master already held the
+        // shard as a replica of a dead old master).
+        let members_a = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let members_b = vec![NodeId(1), NodeId(2), NodeId(3), NodeId(4)];
+        let old_table = ShardTable::compute_with_epoch(&members_a, 2, 1, 1);
+        let new_table = ShardTable::compute_with_epoch(&members_b, 2, 2, 1);
+        let base = ShardTable::migration_plan(&old_table, &new_table);
+        let task = base
+            .first()
+            .expect("topology change must produce a migration task");
+        let shard = task.shard;
+        let new_master = task.to_node;
+
+        // Baseline (non-vacuous guard): a NON-subset holder with data IS
+        // skipped, so the shard's task really is eligible for skipping.
+        let mut owns_view: HashMap<NodeId, Vec<PartitionVersionEntry>> = HashMap::new();
+        owns_view.insert(
+            new_master,
+            vec![PartitionVersionEntry {
+                shard,
+                flags: 0b01,
+                replica_count: 1,
+                last_applied_seq: 42,
+            }],
+        );
+        let skipped =
+            build_plan_from_partition_view(&old_table, &new_table, &owns_view, NodeId(1));
+        assert!(
+            !skipped.iter().any(|t| t.shard == shard),
+            "a fully-owning new master must skip the migration (guards against a \
+             vacuous test)",
+        );
+
+        // The bug: the SAME holder, now flagged subset/incomplete, must NOT skip.
+        let mut subset_view: HashMap<NodeId, Vec<PartitionVersionEntry>> = HashMap::new();
+        subset_view.insert(
+            new_master,
+            vec![PartitionVersionEntry {
+                shard,
+                flags: 0b01 | PARTITION_FLAG_PENDING_INBOUND,
+                replica_count: 1,
+                last_applied_seq: 42,
+            }],
+        );
+        let refined =
+            build_plan_from_partition_view(&old_table, &new_table, &subset_view, NodeId(1));
+        assert!(
+            refined.iter().any(|t| t.shard == shard),
+            "must NOT skip migration for shard {shard}: the new master is a subset \
+             holder (pending inbound) and does not fully own the shard",
         );
     }
 
