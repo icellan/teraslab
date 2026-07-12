@@ -782,8 +782,20 @@ pub(crate) fn handle_request(
             redo_log,
             mutation_barrier,
         ),
-        OP_GET_BATCH => handle_get_batch(request, engine, max_batch_size, cluster),
-        OP_GET_SPEND_BATCH => handle_get_spend_batch(request, engine, max_batch_size, cluster),
+        OP_GET_BATCH => handle_get_batch(
+            request,
+            engine,
+            max_batch_size,
+            cluster,
+            conn_state.local_read_authorized,
+        ),
+        OP_GET_SPEND_BATCH => handle_get_spend_batch(
+            request,
+            engine,
+            max_batch_size,
+            cluster,
+            conn_state.local_read_authorized,
+        ),
         OP_QUERY_OLD_UNMINED => handle_query_old_unmined(request, engine, cluster),
         OP_QUERY_CONFLICTING => handle_query_conflicting(request, engine, cluster),
         OP_PRESERVE_TRANSACTIONS => handle_preserve_transactions(
@@ -2428,6 +2440,25 @@ pub(crate) fn build_replication_targets(
     let mut key_targets: Vec<(TxKey, Vec<SocketAddr>)> = Vec::with_capacity(ops_by_key.len());
     // P4/R4: addr → NodeId for per-target ACK timeout selection.
     let mut addr_nodes: HashMap<SocketAddr, NodeId> = HashMap::new();
+    // C31: `dual_write_targets_for_shard` takes the migration lock and allocates
+    // a Vec on every call. It was invoked once PER KEY in this loop — N lock
+    // acquisitions + N allocations for an N-key batch. Memoize the lookup per
+    // DISTINCT shard so the migration lock is taken at most once per shard the
+    // batch touches (once total for a same-shard batch), with byte-identical
+    // per-key results.
+    //
+    // Safety of a per-shard memo (NOT the visibility guard — that locks records,
+    // not migration state): the quorum-bearing targets come from
+    // `table_guard.target_assignment(shard)` under the `table.read()` lock held
+    // for the whole loop below, so the shard assignment is frozen (a migration
+    // *completion* needs `table.write()` and cannot commit mid-loop). Only the
+    // dual-write EXTRAS are memoized, and dual-write is explicitly best-effort:
+    // a too-few memo is covered by the migration stream, a too-many memo is
+    // deduped against the frozen assignment and otherwise idempotently applied +
+    // orphan-cleaned. So even a migration-window flip between two keys of a
+    // same-shard batch stays within the pre-existing plan-vs-send tolerance and
+    // cannot mis-route a quorum-bearing write.
+    let mut dual_write_by_shard: HashMap<u16, Vec<NodeId>> = HashMap::new();
 
     for (key, ops) in ops_by_key {
         let shard = ShardTable::shard_for_key(key);
@@ -2455,7 +2486,9 @@ pub(crate) fn build_replication_targets(
         // is silently skipped rather than failing the write, because the
         // migration stream itself will deliver baseline+deltas to the
         // destination once the address is known.
-        let dual_write_extras = cluster.dual_write_targets_for_shard(shard);
+        let dual_write_extras: &[NodeId] = dual_write_by_shard
+            .entry(shard)
+            .or_insert_with(|| cluster.dual_write_targets_for_shard(shard));
         for replica_id in &assignment.replicas {
             // A node never makes a NETWORK replication connection to its own
             // address. When the shard's replica set names THIS node (which
@@ -2533,7 +2566,7 @@ pub(crate) fn build_replication_targets(
                 None => {}
             }
         }
-        for extra in &dual_write_extras {
+        for extra in dual_write_extras {
             if *extra == self_id || *extra == current_master || assignment.replicas.contains(extra)
             {
                 continue;
@@ -2850,6 +2883,21 @@ fn replicate_all_ops_with_barrier(
     // one) and a peer master↔master apply can acquire its own barrier
     // instead of deadlocking until the ack timeout. If replication later
     // fails, compensation is a separate durable mutation.
+    //
+    // G4 RESIDUAL (FOLLOW-UP): `barrier` here is the COARSE, engine-wide
+    // EXCLUSIVE visibility barrier used by the mutation handlers that have NOT
+    // been migrated to per-key visibility (unspend / freeze / unfreeze /
+    // reassign / set_conflicting / remove_conflicting_child / set_locked /
+    // preserve_until / mark_longest_chain). Releasing it before the replication
+    // round-trip leaves the SAME read-your-writes / monotonicity window the
+    // fine-grained spend/set_mined paths closed (a reader can observe a write
+    // that a replication failure then rolls back). It is NOT closed the same way
+    // here on purpose: holding this GLOBAL EXCLUSIVE barrier across the network
+    // RTT would serialize the whole engine on every replicated mutation and
+    // block checkpoints for the RTT. Closing it correctly requires first
+    // migrating these ops to per-key `mutation_stripes` visibility (like
+    // spend/set_mined), then holding only the per-key stripes to quorum — a
+    // separate, larger redesign tracked as follow-up.
     if let Some(b) = barrier.as_mut() {
         b.release();
     }
@@ -5534,19 +5582,34 @@ fn handle_spend_batch(
     // path's `ValidatedSpend` would re-acquire the stripe lock and self-deadlock
     // on a stripe collision.
     let txid_keys: Vec<TxKey> = by_txid.keys().map(|t| TxKey { txid: *t }).collect();
-    // Per-key visibility: write-lock the stripes of this batch's keys (plus the
-    // global SHARED side = checkpoint coordination). Excludes any client read of
-    // THESE keys for the apply window (batch-atomic per key) while letting spends
-    // on disjoint keys run fully concurrently — the global exclusive barrier this
-    // replaces serialized every mutation. Dropped before replication, alongside
-    // `stripe_guards`.
+    // Per-key visibility, acquired as its two halves SEPARATELY so they can be
+    // released at different points:
+    //   * `global_vis` — the global SHARED side (checkpoint coordination). Held
+    //     only across local apply, then released before the replication round-
+    //     trip so a checkpoint can still snapshot the engine during it.
+    //   * `visibility_stripes` — the per-key WRITE stripes for this batch's keys.
+    //
+    // G4 (read-your-writes / monotonicity): the per-key stripes are held ACROSS
+    // the replication round-trip and any compensation, NOT dropped before
+    // replication. A concurrent reader of these keys is excluded until the
+    // replication OUTCOME is known — so it never observes a spend that a
+    // replication failure then rolls back (a phantom write that never reached
+    // RF quorum). Disjoint-key spends/reads still run fully concurrently (only
+    // the touched stripes are held), and the GLOBAL side is released before the
+    // network round-trip, so this does NOT hold the coarse barrier across the
+    // RTT (which would throttle the whole engine / block checkpoints). This is
+    // the SAFE default: correctness over the pre-quorum-visible optimization,
+    // at the cost of adding the replication RTT to a reader's wait on the exact
+    // keys being written.
     //
     // LOCK ORDER (deadlock-critical): visibility is acquired BEFORE the engine
     // stripe Mutexes — the SAME order create/set_mined use (they take visibility
     // in the handler, then the stripe lock inside the engine method). Taking the
     // stripe lock first here would invert the order against those handlers and
-    // deadlock under same-stripe contention.
-    let visibility_guard = engine.visibility().mutation(&txid_keys);
+    // deadlock under same-stripe contention. `global_read` before
+    // `mutation_stripes` preserves the global-before-stripes acquisition order.
+    let global_vis = engine.visibility().global_read();
+    let visibility_stripes = engine.visibility().mutation_stripes(&txid_keys);
     let stripe_guards = engine.lock_unique_stripes(&txid_keys);
 
     // Per-group staged mutation carried from validate (Phase 1+2) to apply
@@ -5892,13 +5955,16 @@ fn handle_spend_batch(
         return error_response(req.request_id, ERR_STORAGE_IO, &e.to_string());
     }
 
-    // Release every stripe lock BEFORE replication (network I/O must not run
-    // under the locks). On the error returns above the guards drop at scope end.
+    // Release every engine stripe lock BEFORE replication (network I/O must not
+    // run under them; compensation re-acquires them on the failure path). On the
+    // error returns above the guards drop at scope end.
     drop(stripe_guards);
-    // Release per-key visibility before the replication round-trip (reads of
-    // these keys resume immediately, observing the fully-applied local batch),
-    // mirroring the old MutationBarrier early-release.
-    drop(visibility_guard);
+    // G4: release ONLY the global (checkpoint-coordination) side here so a
+    // checkpoint can run during the replication round-trip. The per-key
+    // `visibility_stripes` stay held across replication (and any compensation)
+    // below — a reader of these keys is excluded until the replication outcome
+    // is known, so it never observes a spend that a failure then rolls back.
+    drop(global_vis);
 
     // Final per-item outcome classification for this batch. `errors` holds
     // validation failures *and* redirect errors (when the txid is not owned
@@ -5956,6 +6022,13 @@ fn handle_spend_batch(
             return error_response(req.request_id, ERR_REPLICATION_FAILED, &e);
         }
     };
+
+    // G4: replication reached a durable outcome (Full / Degraded). Release the
+    // per-key visibility now so readers of these keys observe the committed
+    // batch. On the failure path above, `visibility_stripes` is instead held
+    // through compensation and dropped as the handler returns, so a reader never
+    // observes the rolled-back write.
+    drop(visibility_stripes);
 
     // Same status/degraded-trailer precedence as every other batch mutation:
     // clean → STATUS_OK / STATUS_DEGRADED_DURABILITY, per-item errors →
@@ -6238,11 +6311,21 @@ fn handle_set_mined_batch(
     // write-fence re-check below and before the redo/apply — so a migration's
     // fence drain (which takes the EXCLUSIVE side of this same gate, C18) cannot
     // capture `fence_seq` between our check and our redo append. Held across the
-    // redo append + apply, released before replication. Excludes a client read
-    // of THESE keys while set_mined applies, while disjoint batches run
-    // concurrently.
+    // redo append + apply. Excludes a client read of THESE keys while set_mined
+    // applies, while disjoint batches run concurrently.
+    //
+    // G4 (read-your-writes / monotonicity): acquire the two halves separately,
+    // mirroring `handle_spend_batch`. `global_vis` (checkpoint coordination —
+    // also what excludes the C19 fence drain) is held across the redo append +
+    // apply and released before the replication RTT so a checkpoint can run
+    // during it. `visibility_stripes` (per-key WRITE) is HELD across replication
+    // and any compensation, released only once the durable outcome is known — so
+    // a reader of these keys never observes a set_mined that a replication
+    // failure then rolls back. `global_read` before `mutation_stripes` preserves
+    // the global-before-stripes acquisition order.
     let visibility_keys: Vec<TxKey> = valid_items.iter().map(|v| v.key).collect();
-    let visibility_guard = engine.visibility().mutation(&visibility_keys);
+    let global_vis = engine.visibility().global_read();
+    let visibility_stripes = engine.visibility().mutation_stripes(&visibility_keys);
 
     // C19: re-validate the outbound write-fence UNDER the guard. The first-pass
     // ownership check above ran WITHOUT the guard, so a shard fenced for
@@ -6493,8 +6576,12 @@ fn handle_set_mined_batch(
         }
     }
 
-    // Release per-key visibility before replication (reads of these keys resume).
-    drop(visibility_guard);
+    // G4: release ONLY the global (checkpoint-coordination) side before the
+    // replication RTT so a checkpoint can run during it; the per-key
+    // `visibility_stripes` stay held across replication (and any compensation)
+    // below — a reader of these keys is excluded until the outcome is known, so
+    // it never observes a set_mined that a failure then rolls back.
+    drop(global_vis);
 
     // Phase 4: Replicate.
     let repl_outcome = match replicate_all_ops_with_barrier(
@@ -6509,6 +6596,8 @@ fn handle_set_mined_batch(
         Err(e) => {
             // Gap #8: rollback uses the captured pre-unset block-entry
             // fields so a crash mid-rollback can be replayed exactly.
+            // `visibility_stripes` is still held here, so no reader observes the
+            // rolled-back mined-state; it drops as the handler returns below.
             if let Some(resp) = compensate_replication_failure_or_error(
                 req.request_id,
                 cluster,
@@ -6523,6 +6612,10 @@ fn handle_set_mined_batch(
             return error_response(req.request_id, ERR_REPLICATION_FAILED, &e);
         }
     };
+
+    // G4: replication reached a durable outcome (Full / Degraded). Release the
+    // per-key visibility so readers observe the committed mined-state.
+    drop(visibility_stripes);
 
     // Final batch-level ticks: set_mined_succeeded counts a successful batch,
     // set_mined_attempted incremented at dispatch entry. Tick succeeded only
@@ -6782,6 +6875,18 @@ fn handle_create_batch(
     // the stripe hold to Phase 3 lets stripe-overlapping creates pipeline through
     // the I/O stages. Reads landing before Phase 3 correctly see "not found"
     // (the key is not yet in the index), preserving batch-atomic visibility.
+    //
+    // G4 RESIDUAL (FOLLOW-UP): unlike spend/set_mined, create does NOT hold a
+    // per-key `mutation_stripes` visibility guard — a created key becomes
+    // reader-visible by INDEX PRESENCE (register_create_at_offset in Phase 3
+    // under the engine stripe lock), not by a held visibility stripe. So the
+    // hold-to-quorum discipline applied to spend/set_mined does not transfer
+    // directly: closing create's read-your-writes window (a reader sees a
+    // created record that a replication failure then rolls back) needs the index
+    // registration / reader-visibility deferred to the replication outcome,
+    // which is a separate change from this per-key-stripe pattern. Tracked as
+    // follow-up. (Delete is unaffected — it is local GC prune, never replicated,
+    // so it has no replication-rollback window.)
     let vis_start = std::time::Instant::now();
     let _global_vis = engine.visibility().global_read();
     if let Some(h) = DISPATCH_HISTOGRAMS.get() {
@@ -9537,6 +9642,13 @@ fn handle_get_batch(
     engine: &Engine,
     max_batch: u32,
     cluster: Option<&RunningCluster>,
+    // C23: whether this frame is authorized to honor FLAG_LOCAL_READ. Computed
+    // once per frame in the connection loop as `auth_required ||
+    // cluster_secret.is_none()`. GET is not an inter-node auth opcode, so
+    // `auth_required` is always false here and this is effectively
+    // `cluster_secret.is_none()`: honored only in trusted-overlay mode, disabled
+    // for every client on an auth-enforcing (`cluster_secret`) node.
+    local_read_authorized: bool,
 ) -> ResponseFrame {
     let (field_mask, txids) = match decode_get_batch_checked(&req.payload, max_batch) {
         Ok(r) => r,
@@ -9551,7 +9663,12 @@ fn handle_get_batch(
     let vis_keys: Vec<TxKey> = txids.iter().map(|t| TxKey { txid: *t }).collect();
     let _visibility_guard = engine.visibility().read(&vis_keys);
 
-    let local_read = req.flags & FLAG_LOCAL_READ != 0;
+    // C23: FLAG_LOCAL_READ bypasses the shard-ownership/redirect check, so it is
+    // honored ONLY when the frame is authorized. In practice (see
+    // `local_read_authorized`) that means trusted-overlay mode only; an external
+    // client on an auth-enforcing node is ignored and falls through to the
+    // normal ownership/redirect path.
+    let local_read = local_read_authorized && (req.flags & FLAG_LOCAL_READ != 0);
 
     // P1-3: hoist the shard-master lookup to ONE lock acquisition for the whole
     // GET batch. Skipped entirely for local reads (ownership is not consulted)
@@ -10406,6 +10523,8 @@ fn handle_get_spend_batch(
     engine: &Engine,
     max_batch: u32,
     cluster: Option<&RunningCluster>,
+    // C23: see `handle_get_batch` — gates whether FLAG_LOCAL_READ is honored.
+    local_read_authorized: bool,
 ) -> ResponseFrame {
     let items = match decode_get_spend_batch_checked(&req.payload, max_batch) {
         Ok(r) => r,
@@ -10418,7 +10537,10 @@ fn handle_get_spend_batch(
     let vis_keys: Vec<TxKey> = items.iter().map(|i| TxKey { txid: i.txid }).collect();
     let _visibility_guard = engine.visibility().read(&vis_keys);
 
-    let local_read = req.flags & FLAG_LOCAL_READ != 0;
+    // C23: honor FLAG_LOCAL_READ only for authorized callers (in practice
+    // trusted-overlay mode only — see `handle_get_batch` / `local_read_authorized`);
+    // an external client's flag on an auth-enforcing node is ignored.
+    let local_read = local_read_authorized && (req.flags & FLAG_LOCAL_READ != 0);
 
     let results: Vec<WireGetSpendResult> = match (items.len() >= READ_FANOUT_THRESHOLD)
         .then(read_pool)
@@ -18398,6 +18520,142 @@ mod tests {
         assert_eq!(results[0].status, ERR_REDIRECT as u8);
     }
 
+    /// C23: `FLAG_LOCAL_READ` bypasses the shard-ownership/redirect check and
+    /// reads the record locally. An arbitrary external client must NOT be able
+    /// to set it to read a shard this node does not own — only an authorized
+    /// caller (in production: trusted-overlay mode, i.e. no `cluster_secret`)
+    /// may. This pins that gate at the GET handler: an unauthorized
+    /// caller's flag is ignored (→ REDIRECT), an authorized caller's is honored
+    /// (→ local read).
+    #[test]
+    fn get_batch_local_read_flag_honored_only_for_authorized_callers() {
+        use crate::cluster::shards::{NodeId, ShardTable};
+
+        let h = DispatchTestHarness::new();
+        let txid = DispatchTestHarness::make_txid(123);
+        assert_eq!(h.create_tx(txid, 1).status, STATUS_OK);
+
+        // 2-node cluster where THIS node is not the master of txid's shard, so a
+        // non-local read redirects.
+        let shard = ShardTable::shard_for_key(&TxKey { txid });
+        let members = vec![NodeId(1), NodeId(2)];
+        let table = ShardTable::compute_with_epoch(&members, 2, 11, 1);
+        let master = table.target_assignment(shard).master;
+        let self_id = if master == NodeId(1) {
+            NodeId(2)
+        } else {
+            NodeId(1)
+        };
+        let cluster = crate::cluster::coordinator::new_test_running_cluster(
+            self_id,
+            table,
+            &[
+                (NodeId(1), "127.0.0.1:4471".parse().unwrap()),
+                (NodeId(2), "127.0.0.1:4472".parse().unwrap()),
+            ],
+            &members,
+            &[],
+            &[],
+            &[],
+            2,
+        );
+
+        let req = RequestFrame {
+            request_id: 1,
+            op_code: OP_GET_BATCH,
+            flags: FLAG_LOCAL_READ,
+            payload: crate::protocol::codec::encode_get_batch(FieldMask::ALL_METADATA, &[txid])
+                .into(),
+        };
+
+        // Unauthorized (external client): FLAG_LOCAL_READ ignored → REDIRECT.
+        let ext = handle_get_batch(&req, &h.engine, 8192, Some(&cluster), false);
+        let ext_results = crate::protocol::codec::decode_get_response(&ext.payload).unwrap();
+        assert_eq!(ext_results.len(), 1);
+        assert_eq!(
+            ext_results[0].status, ERR_REDIRECT as u8,
+            "external client's FLAG_LOCAL_READ must be ignored and redirected"
+        );
+
+        // Authorized (cluster-auth / trusted-overlay): flag honored → local read.
+        let int = handle_get_batch(&req, &h.engine, 8192, Some(&cluster), true);
+        let int_results = crate::protocol::codec::decode_get_response(&int.payload).unwrap();
+        assert_eq!(int_results.len(), 1);
+        assert_eq!(
+            int_results[0].status, 0,
+            "authorized caller's FLAG_LOCAL_READ must be honored (local read succeeds)"
+        );
+        assert!(
+            !int_results[0].data.is_empty(),
+            "honored local read must return the record's metadata"
+        );
+    }
+
+    /// C23 (GetSpend): the same authorization gate applies to
+    /// `OP_GET_SPEND_BATCH` — an unauthorized FLAG_LOCAL_READ is ignored and
+    /// the non-owned shard redirects.
+    #[test]
+    fn get_spend_batch_local_read_flag_honored_only_for_authorized_callers() {
+        use crate::cluster::shards::{NodeId, ShardTable};
+
+        let h = DispatchTestHarness::new();
+        let txid = DispatchTestHarness::make_txid(124);
+        assert_eq!(h.create_tx(txid, 1).status, STATUS_OK);
+
+        let shard = ShardTable::shard_for_key(&TxKey { txid });
+        let members = vec![NodeId(1), NodeId(2)];
+        let table = ShardTable::compute_with_epoch(&members, 2, 11, 1);
+        let master = table.target_assignment(shard).master;
+        let self_id = if master == NodeId(1) {
+            NodeId(2)
+        } else {
+            NodeId(1)
+        };
+        let cluster = crate::cluster::coordinator::new_test_running_cluster(
+            self_id,
+            table,
+            &[
+                (NodeId(1), "127.0.0.1:4481".parse().unwrap()),
+                (NodeId(2), "127.0.0.1:4482".parse().unwrap()),
+            ],
+            &members,
+            &[],
+            &[],
+            &[],
+            2,
+        );
+
+        let items = [WireGetSpendItem {
+            txid,
+            vout: 0,
+            utxo_hash: [0u8; 32],
+        }];
+        let req = RequestFrame {
+            request_id: 1,
+            op_code: OP_GET_SPEND_BATCH,
+            flags: FLAG_LOCAL_READ,
+            payload: crate::protocol::codec::encode_get_spend_batch(&items).into(),
+        };
+
+        // Unauthorized: flag ignored → REDIRECT.
+        let ext = handle_get_spend_batch(&req, &h.engine, 8192, Some(&cluster), false);
+        let ext_results = crate::protocol::codec::decode_get_spend_response(&ext.payload).unwrap();
+        assert_eq!(ext_results.len(), 1);
+        assert_eq!(
+            ext_results[0].error_code, ERR_REDIRECT,
+            "external client's FLAG_LOCAL_READ must be ignored and redirected"
+        );
+
+        // Authorized: flag honored → the read is served locally (no REDIRECT).
+        let int = handle_get_spend_batch(&req, &h.engine, 8192, Some(&cluster), true);
+        let int_results = crate::protocol::codec::decode_get_spend_response(&int.payload).unwrap();
+        assert_eq!(int_results.len(), 1);
+        assert_ne!(
+            int_results[0].error_code, ERR_REDIRECT,
+            "authorized caller's FLAG_LOCAL_READ must be honored (served locally, not redirected)"
+        );
+    }
+
     // R-041: REDIRECT now carries shard_table_version so clients can detect
     // a stale-route loop instead of chasing redirects forever. This test
     // exercises the per-item REDIRECT path on both write (BatchItemError)
@@ -20647,6 +20905,95 @@ mod tests {
         assert!(!plan.addr_nodes.contains_key(&n1_addr));
     }
 
+    /// C31: the dual-write-target lookup (which takes the migration lock and
+    /// allocates a Vec) must be memoized per DISTINCT shard, not re-run per key.
+    /// A same-shard multi-key batch under an open dual-write window must resolve
+    /// the migration lock exactly ONCE (not once per key), while every key still
+    /// gets byte-identical dual-write targets.
+    #[test]
+    fn build_replication_targets_memoizes_dual_write_lookup_per_shard() {
+        let n1 = crate::cluster::shards::NodeId(1);
+        let n2 = crate::cluster::shards::NodeId(2);
+        let n3 = crate::cluster::shards::NodeId(3);
+        let members = vec![n1, n2, n3];
+        let table = crate::cluster::shards::ShardTable::compute_with_epoch(&members, 2, 200, 1);
+        let shard = (0..crate::cluster::shards::NUM_SHARDS as u16)
+            .find(|&s| {
+                let a = table.target_assignment(s);
+                a.master == n1 && a.replicas.contains(&n2) && !a.replicas.contains(&n3)
+            })
+            .expect("expected shard mastered by n1 with n2 (not n3) as replica");
+
+        let n1_addr: SocketAddr = "127.0.0.1:8911".parse().unwrap();
+        let n2_addr: SocketAddr = "127.0.0.1:8912".parse().unwrap();
+        let n3_addr: SocketAddr = "127.0.0.1:8913".parse().unwrap();
+
+        let cluster = crate::cluster::coordinator::new_test_running_cluster(
+            n1,
+            table,
+            &[(n1, n1_addr), (n2, n2_addr), (n3, n3_addr)],
+            &members,
+            &[],
+            &[],
+            &[],
+            3,
+        );
+        cluster.test_open_dual_write_window(shard, n3);
+
+        // Five DISTINCT keys, all routed to the SAME shard.
+        let keys: Vec<TxKey> = (0..5u8)
+            .map(|i| TxKey {
+                txid: txid_for_shard(shard, i),
+            })
+            .collect();
+        assert!(
+            keys.iter()
+                .all(|k| crate::cluster::shards::ShardTable::shard_for_key(k) == shard),
+            "test keys must all map to the same shard"
+        );
+        let ops: Vec<(TxKey, Vec<crate::replication::protocol::ReplicaOp>)> = keys
+            .iter()
+            .map(|k| {
+                (
+                    *k,
+                    vec![crate::replication::protocol::ReplicaOp::Delete { tx_key: *k }],
+                )
+            })
+            .collect();
+
+        let before = cluster.dual_write_lookup_calls();
+        let plan = build_replication_targets(&cluster, &ops)
+            .expect("dual-write target resolution should succeed");
+        let calls = cluster.dual_write_lookup_calls() - before;
+
+        // The heart of C31: ONE migration-lock acquisition for the whole
+        // same-shard batch, not one per key (was 5).
+        assert_eq!(
+            calls,
+            1,
+            "dual-write lookup must be memoized per distinct shard (1 call), \
+             not re-run per key (would be {})",
+            keys.len(),
+        );
+
+        // Behavior preserved: every key still fans out to the dual-write
+        // destination n3, and n3 is tagged dual-write-only.
+        assert!(
+            plan.by_addr.contains_key(&n3_addr),
+            "dual-write destination n3 must be in fan-out for the memoized batch: {:?}",
+            plan.by_addr,
+        );
+        assert!(
+            plan.dual_write_only.contains(&n3_addr),
+            "n3 must still be tagged dual-write-only after memoization: {:?}",
+            plan.dual_write_only,
+        );
+        assert_eq!(plan.addr_nodes.get(&n3_addr), Some(&n3));
+        // Every key's regular replica set is unchanged (n2 present, self absent).
+        assert!(plan.by_addr.contains_key(&n2_addr));
+        assert!(!plan.by_addr.contains_key(&n1_addr));
+    }
+
     /// The per-mutation replication intent (a durable fsync on the hot write
     /// path) is gated by `replication_active`: skipped at RF<=1 with no
     /// migration (no replicas to ACK), kept when RF>1 or a migration dual-write
@@ -21118,6 +21465,10 @@ mod tests {
         /// Sleep `ms` before ACKing each non-probe batch — simulates a
         /// slow replication RTT.
         SlowAck(u64),
+        /// Sleep `ms` before NAKing each non-probe batch — a slow replication
+        /// RTT that then FAILS, giving a controlled window during which the
+        /// spend is mid-replication before it fails and compensates.
+        SlowNak(u64),
     }
 
     /// Spawn a minimal OP_REPLICA_BATCH receiver on `127.0.0.1:0`, returning
@@ -21202,6 +21553,18 @@ mod tests {
                                     }
                                     .serialize(),
                                 },
+                                ReplicaBehaviour::SlowNak(ms) => {
+                                    std::thread::sleep(std::time::Duration::from_millis(ms));
+                                    ResponseFrame {
+                                        request_id: req.request_id,
+                                        status: STATUS_ERROR,
+                                        payload: ReplicaAck::Error {
+                                            failed_sequence: batch.first_sequence,
+                                            message: "test slow NAK".to_string(),
+                                        }
+                                        .serialize(),
+                                    }
+                                }
                             }
                         };
                         if stream.write_all(&resp.encode()).is_err() {
@@ -21347,6 +21710,240 @@ mod tests {
         let outcome = replicate_all_ops(Some(&cluster), &ops, (10, 10), &[])
             .expect("key reached its own replica — batch must succeed");
         assert_eq!(outcome, ReplicationOutcome::Full);
+    }
+
+    /// G4 (read-your-writes / monotonicity): a spend on an RF>1 node holds the
+    /// per-key visibility across the replication round-trip. A reader concurrent
+    /// with a spend whose replication FAILS must never observe the spent slot —
+    /// it is excluded until the outcome is known and the write is rolled back,
+    /// so it observes only the pre-write (UNSPENT) state. Before the fix the
+    /// visibility was released before replication, so the reader could observe
+    /// the SPENT slot that compensation then rolled back (a phantom write that
+    /// never reached quorum).
+    #[test]
+    fn spend_holds_visibility_until_replication_outcome_reader_never_sees_rolled_back_write() {
+        use crate::record::{UTXO_SPENT, UTXO_UNSPENT};
+        use std::sync::atomic::{AtomicU8, Ordering};
+
+        // A window long enough that the reader reliably issues its
+        // visibility-respecting read while the spend is still mid-replication.
+        const SLOW_NAK_MS: u64 = 500;
+        let replica = spawn_replica_receiver(ReplicaBehaviour::SlowNak(SLOW_NAK_MS));
+        let (cluster, key) = two_node_rf2(replica, Some(AckPolicy::WriteMajority));
+
+        // Real engine + redo so the spend applies locally (WAL-first) before it
+        // replicates and, on the NAK, compensates back to UNSPENT.
+        let h = RedoDispatchHarness::new();
+        assert_eq!(
+            h.create_tx(key.txid, 1).status,
+            STATUS_OK,
+            "seed create must succeed"
+        );
+        let slot_hash = h.engine.read_slot(&key, 0).expect("seeded slot").hash;
+        assert_eq!(
+            h.engine.read_slot(&key, 0).expect("seeded slot").status,
+            UTXO_UNSPENT,
+            "precondition: seeded slot is UNSPENT",
+        );
+
+        let spend_params = SpendBatchParams {
+            ignore_conflicting: false,
+            ignore_locked: false,
+            current_block_height: 100,
+            block_height_retention: 288,
+        };
+        let spend_items = [WireSpendItem {
+            txid: key.txid,
+            vout: 0,
+            utxo_hash: slot_hash,
+            spending_data: [0xA5u8; 36],
+        }];
+        let spend_payload = encode_spend_batch(&spend_params, &spend_items);
+
+        // What a visibility-respecting reader observed while the spend was in
+        // flight. 0xFF = "not yet recorded"; the reader writes the slot status
+        // it saw AFTER acquiring the read-visibility guard for `key`.
+        const UNSET: u8 = 0xFF;
+        let observed = AtomicU8::new(UNSET);
+
+        std::thread::scope(|s| {
+            // Spender: applies locally, blocks ~SLOW_NAK_MS in replication, then
+            // the NAK fails the write and compensation rolls it back to UNSPENT.
+            let spend_resp = s.spawn(|| {
+                let req = RequestFrame {
+                    request_id: 1,
+                    op_code: OP_SPEND_BATCH,
+                    flags: 0,
+                    payload: spend_payload.into(),
+                };
+                let mut cs = crate::server::ConnectionState::new();
+                handle_request(
+                    &req,
+                    &h.engine,
+                    8192,
+                    Some(&cluster),
+                    Some(&h.redo_log),
+                    &mut cs,
+                    None,
+                )
+            });
+
+            // Reader: wait (via a dirty read that bypasses visibility) until the
+            // spend has applied locally, so we know replication is now in flight.
+            // Then take the read-visibility guard for `key` and record the slot
+            // status it exposes. After the fix this guard BLOCKS until the
+            // spender's replication outcome + rollback (→ UNSPENT); before the
+            // fix it acquires immediately and exposes the (soon-rolled-back)
+            // SPENT slot.
+            s.spawn(|| {
+                loop {
+                    if let Ok(slot) = h.engine.read_slot(&key, 0) {
+                        let status = slot.status;
+                        if status == UTXO_SPENT {
+                            break;
+                        }
+                    }
+                    std::thread::yield_now();
+                }
+                let _read_guard = h.engine.visibility().read(std::slice::from_ref(&key));
+                let status = h.engine.read_slot(&key, 0).map(|slot| slot.status);
+                observed.store(status.unwrap_or(UNSET), Ordering::SeqCst);
+            });
+
+            let resp = spend_resp.join().expect("spender thread panicked");
+            assert_eq!(
+                resp.status, STATUS_ERROR,
+                "the spend must fail: its sole replica NAKed (below WriteMajority)",
+            );
+        });
+
+        // The reader must have observed the pre-write UNSPENT state, NEVER the
+        // SPENT slot that replication rolled back.
+        assert_eq!(
+            observed.load(Ordering::SeqCst),
+            UTXO_UNSPENT,
+            "reader observed a spend that replication failed and rolled back \
+             (read-your-writes / monotonicity violation)",
+        );
+        // And the durable local state is the rolled-back UNSPENT slot.
+        assert_eq!(
+            h.engine
+                .read_slot(&key, 0)
+                .expect("slot still present")
+                .status,
+            UTXO_UNSPENT,
+            "compensation must have rolled the slot back to UNSPENT",
+        );
+    }
+
+    /// G4 (set_mined): the fine-grained per-key hold-to-quorum discipline
+    /// extends to set_mined. A reader concurrent with an RF>1 set_mined whose
+    /// replication FAILS must never observe the mined-state — it is excluded
+    /// until the outcome is known and the mined-state is rolled back, so it
+    /// observes only the pre-write UNMINED state. Mirrors the spend test.
+    #[test]
+    fn set_mined_holds_visibility_until_replication_outcome_reader_never_sees_rolled_back_mined() {
+        use std::sync::atomic::{AtomicU8, Ordering};
+
+        const SLOW_NAK_MS: u64 = 500;
+        let replica = spawn_replica_receiver(ReplicaBehaviour::SlowNak(SLOW_NAK_MS));
+        let (cluster, key) = two_node_rf2(replica, Some(AckPolicy::WriteMajority));
+
+        let h = RedoDispatchHarness::new();
+        assert_eq!(
+            h.create_tx(key.txid, 1).status,
+            STATUS_OK,
+            "seed create must succeed"
+        );
+        // Precondition: freshly-created record is UNMINED (no block entries).
+        let mined_now = |k: &TxKey| -> bool {
+            h.engine
+                .mined_block_entries(k)
+                .map(|(entries, _)| !entries.is_empty())
+                .unwrap_or(false)
+        };
+        assert!(!mined_now(&key), "precondition: seeded record is UNMINED");
+
+        let set_mined_params = SetMinedBatchParams {
+            block_id: 7,
+            block_height: 100,
+            subtree_idx: 0,
+            on_longest_chain: true,
+            unset_mined: false,
+            current_block_height: 100,
+            block_height_retention: 288,
+        };
+        let set_mined_payload = encode_set_mined_batch(&set_mined_params, &[key.txid]);
+
+        // Reader's observation: 0 = observed UNMINED, 1 = observed MINED,
+        // 0xFF = not recorded.
+        const UNSET: u8 = 0xFF;
+        const OBS_UNMINED: u8 = 0;
+        const OBS_MINED: u8 = 1;
+        let observed = AtomicU8::new(UNSET);
+
+        std::thread::scope(|s| {
+            // set_mined applies locally, blocks ~SLOW_NAK_MS in replication, then
+            // the NAK fails it and compensation rolls the mined-state back.
+            let set_mined_resp = s.spawn(|| {
+                let req = RequestFrame {
+                    request_id: 1,
+                    op_code: OP_SET_MINED_BATCH,
+                    flags: 0,
+                    payload: set_mined_payload.into(),
+                };
+                let mut cs = crate::server::ConnectionState::new();
+                handle_request(
+                    &req,
+                    &h.engine,
+                    8192,
+                    Some(&cluster),
+                    Some(&h.redo_log),
+                    &mut cs,
+                    None,
+                )
+            });
+
+            // Reader: wait (dirty read, bypassing visibility) until the mined
+            // state has applied locally, so replication is now in flight. Then
+            // take the read-visibility guard and record whether the record looks
+            // MINED. After the fix this guard BLOCKS until the replication
+            // outcome + rollback (→ UNMINED); before the fix it acquires
+            // immediately and exposes the soon-rolled-back MINED state.
+            s.spawn(|| {
+                loop {
+                    if mined_now(&key) {
+                        break;
+                    }
+                    std::thread::yield_now();
+                }
+                let _read_guard = h.engine.visibility().read(std::slice::from_ref(&key));
+                let obs = if mined_now(&key) {
+                    OBS_MINED
+                } else {
+                    OBS_UNMINED
+                };
+                observed.store(obs, Ordering::SeqCst);
+            });
+
+            let resp = set_mined_resp.join().expect("set_mined thread panicked");
+            assert_eq!(
+                resp.status, STATUS_ERROR,
+                "set_mined must fail: its sole replica NAKed (below WriteMajority)",
+            );
+        });
+
+        assert_eq!(
+            observed.load(Ordering::SeqCst),
+            OBS_UNMINED,
+            "reader observed a set_mined that replication failed and rolled back \
+             (read-your-writes / monotonicity violation)",
+        );
+        // The durable local state is the rolled-back UNMINED record.
+        assert!(
+            !mined_now(&key),
+            "compensation must have rolled the mined-state back to UNMINED",
+        );
     }
 
     /// Task 14 live/master→replica coverage: 3 txids owned by the SAME

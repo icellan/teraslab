@@ -206,6 +206,16 @@ pub(crate) struct ConnectionState {
     /// independently of connection close. `None` disables the reaper. See
     /// [`ServerConfig::stream_idle_timeout_secs`].
     pub(crate) stream_idle_timeout: Option<Duration>,
+    /// C23: whether the current frame is authorized to honor `FLAG_LOCAL_READ`
+    /// (which bypasses the shard-ownership/redirect check on GET). Set per frame
+    /// by the connection loop to `auth_required || cluster_secret.is_none()`.
+    /// Because GET is not an inter-node auth opcode, `auth_required` is always
+    /// false for the frames that read this flag, so it is effectively
+    /// `cluster_secret.is_none()`: honored only in trusted-overlay mode, disabled
+    /// for all clients on any `cluster_secret`-configured node. Defaults to
+    /// `false` (external client / test double) so the flag is ignored unless the
+    /// connection loop explicitly grants it.
+    pub(crate) local_read_authorized: bool,
 }
 
 /// An in-progress streaming blob upload for a single txid.
@@ -228,6 +238,7 @@ impl ConnectionState {
             stream_idle_timeout: Some(Duration::from_secs(
                 ServerConfig::DEFAULT_STREAM_IDLE_TIMEOUT_SECS,
             )),
+            local_read_authorized: false,
         }
     }
 
@@ -1261,6 +1272,25 @@ fn handle_connection_inner(
         // mutations reach the redo group-commit at once. Stateful blob-stream
         // ops and authenticated inter-node frames take a drain barrier and run
         // inline against `conn_state`, so their semantics are unchanged.
+        // C23: a GET's FLAG_LOCAL_READ (bypass shard ownership + read locally)
+        // must NOT be settable by an arbitrary external client on an
+        // auth-enforcing node — that is exactly the shard-bypass this gate
+        // closes; the flag is ignored for such clients and they fall through to
+        // the normal ownership/redirect path.
+        //
+        // NOTE on the effective rule: `auth_required` is
+        // `is_inter_node_auth_opcode(op) && cluster_secret.is_some()`, and GET
+        // (the ONLY opcode that reads FLAG_LOCAL_READ) is NOT an inter-node auth
+        // opcode — so for every GET frame `auth_required` is always false and
+        // this collapses to `cluster_secret.is_none()`. In practice
+        // FLAG_LOCAL_READ is therefore honored ONLY in trusted-overlay mode (no
+        // `cluster_secret`); on ANY `cluster_secret`-configured node it is
+        // disabled for all clients (a GET is never HMAC-authenticated as an
+        // inter-node frame). The `auth_required` disjunct is kept as the correct
+        // general rule, but re-enabling local reads for authenticated peers
+        // would require adding GET to the inter-node auth set — deliberately NOT
+        // done, since that would reopen the client-forced-local-read hole.
+        let local_read_authorized = auth_required || opts.cluster_secret.is_none();
         if pipelining && is_pipelineable(&request, auth_required) {
             // Reserve a per-connection slot (backpressure to `depth`) then hand
             // the request to the shared pool; the worker writes the response.
@@ -1273,6 +1303,7 @@ fn handle_connection_inner(
                     writer: Arc::clone(&writer),
                     inflight: Arc::clone(&inflight),
                     _permit: _inflight_permit,
+                    local_read_authorized,
                 });
         } else {
             // Barrier / serial path: drain the connection's pooled requests so
@@ -1298,6 +1329,8 @@ fn handle_connection_inner(
                 )
                 .map_err(|e| format!("stream read: {e}"))?;
             } else {
+                // C23: thread the per-frame authorization into the handler.
+                conn_state.local_read_authorized = local_read_authorized;
                 let response = dispatch::handle_request(
                     &request,
                     engine,
@@ -1335,6 +1368,10 @@ struct WorkItem {
     writer: Arc<Mutex<TcpStream>>,
     inflight: Arc<ConnInFlight>,
     _permit: InflightBytesPermit,
+    /// C23: per-frame authorization to honor FLAG_LOCAL_READ, captured on the
+    /// connection loop before hand-off (the shared worker pool has no
+    /// per-connection state of its own). See [`ConnectionState::local_read_authorized`].
+    local_read_authorized: bool,
 }
 
 /// Per-connection in-flight accounting for pooled dispatch. Bounds a single
@@ -1688,6 +1725,11 @@ fn dispatch_worker(
 ) {
     let mut conn_state = ConnectionState::new();
     while let Some(item) = pool.recv(shard_idx) {
+        // C23: apply this frame's captured FLAG_LOCAL_READ authorization. The
+        // worker's `conn_state` is a shared throwaway (pipeline-eligible ops
+        // never touch per-connection state), so the per-frame grant travels on
+        // the WorkItem rather than the connection.
+        conn_state.local_read_authorized = item.local_read_authorized;
         let response = dispatch::handle_request(
             &item.request,
             engine,
