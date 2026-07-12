@@ -1809,27 +1809,27 @@ fn main() {
         // longer holds. This build is DETECTION-ONLY: LOG loudly + METER the
         // suspicion via the `stale_suspect_shards` gauge (scoped to the shards
         // this node masters). No fence, no pull — those land in later phases.
-        if config.replication_factor > 1 {
-            if let Some(tracker) = teraslab::server::dispatch::ack_tracker_handle() {
-                let lost = tracker.acked_beyond(shared_seq_floor);
-                if lost.is_empty() {
-                    tracing::debug!(
-                        floor = shared_seq_floor,
-                        "reverse-heal: no lost acked tail at boot (Tier-1 clean)",
-                    );
-                } else {
-                    let suspects = running.mastered_shards();
-                    tracing::error!(
-                        floor = shared_seq_floor,
-                        lost_replicas = lost.len(),
-                        suspect_shards = suspects.len(),
-                        ?lost,
-                        "reverse-heal: LOST ACKED TAIL detected at boot (Tier-1) — this \
-                         node acked writes beyond its recovered redo floor; marking its \
-                         mastered shards stale-suspect (detection-only: no fence, no pull)",
-                    );
-                    running.record_stale_suspect_shards(suspects);
-                }
+        if config.replication_factor > 1
+            && let Some(tracker) = teraslab::server::dispatch::ack_tracker_handle()
+        {
+            let lost = tracker.acked_beyond(shared_seq_floor);
+            if lost.is_empty() {
+                tracing::debug!(
+                    floor = shared_seq_floor,
+                    "reverse-heal: no lost acked tail at boot (Tier-1 clean)",
+                );
+            } else {
+                let suspects = running.mastered_shards();
+                tracing::error!(
+                    floor = shared_seq_floor,
+                    lost_replicas = lost.len(),
+                    suspect_shards = suspects.len(),
+                    ?lost,
+                    "reverse-heal: LOST ACKED TAIL detected at boot (Tier-1) — this \
+                     node acked writes beyond its recovered redo floor; marking its \
+                     mastered shards stale-suspect (detection-only: no fence, no pull)",
+                );
+                running.record_stale_suspect_shards(suspects);
             }
         }
 

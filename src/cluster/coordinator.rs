@@ -18586,7 +18586,11 @@ mod tests {
         );
 
         let stale = detect_stale_shards_from_view(NodeId(1), &table, &view);
-        assert_eq!(stale, vec![shard], "only the ahead-replica mastered shard is flagged");
+        assert_eq!(
+            stale,
+            vec![shard],
+            "only the ahead-replica mastered shard is flagged"
+        );
 
         // A node that masters this shard but whose replica is BEHIND is clean.
         view.get_mut(&replica).unwrap()[0].max_generation = 50;

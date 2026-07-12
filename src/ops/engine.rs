@@ -2775,7 +2775,7 @@ impl Engine {
     ///
     /// - `count` — number of live records read for the shard. A record whose
     ///   footer is unreadable or that raced a concurrent deletion
-    ///   ([`SpendError::TxNotFound`](crate::ops::error::SpendError::TxNotFound))
+    ///   (`SpendError::TxNotFound`)
     ///   is skipped, so this can trail the O(1) [`Self::shard_record_count`] by
     ///   the number of such records; it is a best-effort content count.
     /// - `digest` — an order-independent 64-bit fingerprint of the shard's
@@ -28867,7 +28867,10 @@ mod tests {
 
         let (count_after, digest_after, gen_after) = h.engine.shard_recency(shard);
         assert_eq!(count_after, count_before, "record count is unchanged");
-        assert_eq!(gen_after, bumped, "max_generation reflects the new generation");
+        assert_eq!(
+            gen_after, bumped,
+            "max_generation reflects the new generation"
+        );
         assert_ne!(
             digest_after, digest_before,
             "a divergent generation flips the shard fingerprint",

@@ -11669,9 +11669,9 @@ fn handle_admin_cluster_health(
 /// strictly greater than zero, so the proxy never causes a wrong skip.
 ///
 /// Each entry also carries the reverse-heal recency signal (`manifest_digest`
-/// + `max_generation`, finding C1), computed by the shared
-/// [`build_self_partition_version_entries`](crate::cluster::coordinator) so the
-/// wire response is byte-identical to this node's in-process self-report.
+/// and `max_generation`, finding C1), computed by the shared
+/// `build_self_partition_version_entries` so the wire response is
+/// byte-identical to this node's in-process self-report.
 fn handle_partition_version_report(
     req: &RequestFrame,
     engine: &Engine,
