@@ -728,6 +728,23 @@ pub struct TopologyAuthority {
     /// take it too so a follower vote cannot interleave a proposer's
     /// self-vote.
     vote_decision: Mutex<()>,
+    /// Item 1 — serializes the whole commit gate→persist→apply sequence.
+    ///
+    /// `commit_passes_gates` reads `committed_term`, then (in the durable path)
+    /// a multi-ms persist fsync runs, then `apply_commit` mutates term/members/
+    /// placement. Without a critical section spanning all three, two commits T
+    /// and T+1 can both pass the gate at `committed_term = T-1` and interleave
+    /// so the LOWER term's late apply clobbers the higher one that already
+    /// applied and was ACKed — an ACK-then-forget authority split (the fsync in
+    /// the gap widened the race from µs to ms). Held across gate + persist +
+    /// apply in [`TopologyAuthority::handle_commit`] and
+    /// [`TopologyAuthority::handle_commit_durable`]. This is the OUTERMOST lock:
+    /// it is only ever acquired at the top of those two methods, before any of
+    /// the inner `committed_*` RwLocks / atomics, and the `persist` closure runs
+    /// pure file I/O that never touches the authority — so there is no lock-order
+    /// inversion. Commits are rare (topology changes only), so serializing the
+    /// fsync here is acceptable.
+    commit_apply: Mutex<()>,
     /// Pending proposal (if this node is the proposer).
     pending_proposal: Mutex<Option<PendingProposal>>,
     /// Timeout before a non-proposer becomes a fallback proposer.
@@ -797,6 +814,7 @@ impl TopologyAuthority {
             committed_voter_ever_seen: Arc::new(RwLock::new(HashSet::new())),
             voted_term: AtomicU64::new(0),
             vote_decision: Mutex::new(()),
+            commit_apply: Mutex::new(()),
             pending_proposal: Mutex::new(None),
             propose_timeout,
             last_membership_change: Mutex::new(Instant::now()),
@@ -1428,11 +1446,20 @@ impl TopologyAuthority {
     /// remains for tests and single-node paths where a crash cannot produce a
     /// peer holding a term this node forgot.
     pub fn handle_commit(&self, commit: &TopologyCommit) -> Option<u64> {
+        // Item 1 — hold the commit critical section across gate + apply so a
+        // concurrent commit cannot interleave and regress the served term.
+        let _apply_guard = self.commit_apply.lock();
         if !self.commit_passes_gates(commit) {
             return None;
         }
-        self.apply_commit(commit);
-        Some(commit.term)
+        if self.apply_commit_locked(commit) {
+            Some(commit.term)
+        } else {
+            // Superseded under the lock (a higher term already applied). The
+            // gate above should have caught it, but the apply-time re-check is
+            // the authoritative guard — report "not applied".
+            None
+        }
     }
 
     /// Run every acceptance gate for an incoming commit WITHOUT applying it.
@@ -1532,9 +1559,25 @@ impl TopologyAuthority {
     /// Apply a commit that has already passed every validation gate in
     /// [`TopologyAuthority::handle_commit`]. Advances `committed_term` — the
     /// value `is_master` serves — so callers that require durability first must
-    /// go through [`TopologyAuthority::handle_commit_durable`] (G9), never call
-    /// this directly.
-    fn apply_commit(&self, commit: &TopologyCommit) {
+    /// go through [`TopologyAuthority::handle_commit_durable`] (G9).
+    ///
+    /// PRECONDITION: the caller MUST hold [`Self::commit_apply`]. That lock is
+    /// what makes the term/members/placement mutation atomic w.r.t. a
+    /// concurrent commit; the apply-time re-check below relies on
+    /// `committed_term` not changing under it.
+    ///
+    /// Item 1 — re-checks `commit.term <= committed_term` at apply time and, if
+    /// superseded, abandons the apply ENTIRELY (mutates nothing — not the term,
+    /// not members, not placement). A bare `fetch_max` on `committed_term` alone
+    /// would still write this commit's members/placement, leaving the higher
+    /// term paired with a lower term's members. Returns `true` if the commit was
+    /// applied, `false` if it was abandoned as superseded.
+    fn apply_commit_locked(&self, commit: &TopologyCommit) -> bool {
+        // Item 1 — abandon a superseded lower term outright. Under
+        // `commit_apply` this load is stable for the rest of the function.
+        if commit.term <= self.committed_term.load(Ordering::Relaxed) {
+            return false;
+        }
         // E-01: a committed term with N members is direct evidence the
         // cluster reached size N — raise the peak so any later
         // SWIM-observed shrink is gated on the majority of this size.
@@ -1575,15 +1618,16 @@ impl TopologyAuthority {
 
         // Clear any pending proposal (superseded by this commit).
         *self.pending_proposal.lock() = None;
+        true
     }
 
     /// G9 — the `PersistedTopologyState` this authority WOULD hold after
     /// applying `commit`, computed WITHOUT mutating any state.
     ///
     /// Lets a caller persist the post-commit durable record BEFORE
-    /// [`TopologyAuthority::apply_commit`] advances the served `committed_term`
+    /// `apply_commit_locked` advances the served `committed_term`
     /// (see [`TopologyAuthority::handle_commit_durable`]). Mirrors exactly what
-    /// [`TopologyAuthority::persisted_state`] returns after `apply_commit`:
+    /// [`TopologyAuthority::persisted_state`] returns after apply:
     /// term/members/voters/placement taken from the commit, peak raised to the
     /// committed size, and the ever-seen set unioned with the commit's
     /// members+voters. `voted_term` is left as-is (apply does not touch it).
@@ -1633,6 +1677,14 @@ impl TopologyAuthority {
     where
         F: FnOnce(&PersistedTopologyState) -> bool,
     {
+        // Item 1 — hold the commit critical section across the ENTIRE
+        // gate→persist→apply sequence. Without it, a concurrent higher-term
+        // commit can apply+ACK during this call's multi-ms persist, and this
+        // call's later apply would clobber it (ACK-then-forget authority split).
+        // `commit_apply` is the outermost lock; the `persist` closure below runs
+        // pure file I/O that never re-enters the authority, so holding it across
+        // the fsync introduces no lock-order inversion (see the field docs).
+        let _apply_guard = self.commit_apply.lock();
         if !self.commit_passes_gates(commit) {
             return DurableCommitOutcome::NotApplied;
         }
@@ -1640,8 +1692,16 @@ impl TopologyAuthority {
         if !persist(&state) {
             return DurableCommitOutcome::PersistFailed;
         }
-        self.apply_commit(commit);
-        DurableCommitOutcome::Applied(commit.term)
+        if self.apply_commit_locked(commit) {
+            DurableCommitOutcome::Applied(commit.term)
+        } else {
+            // Superseded under the lock. Cannot happen while the guard is held
+            // (the gate already required `commit.term > committed_term` and
+            // nothing else advances the term without this lock), but the
+            // apply-time re-check is the authoritative guard: report NotApplied
+            // rather than a phantom `Applied` for a term we did not install.
+            DurableCommitOutcome::NotApplied
+        }
     }
 
     /// Phase I — millis since UNIX epoch of the most recent observed
@@ -4133,6 +4193,182 @@ mod tests {
             "an invalid commit must not reach the persist step"
         );
         assert_eq!(auth.committed_term(), 0);
+    }
+
+    /// Item 1 (RED before fix) — `handle_commit_durable` must never let a
+    /// LOWER term regress `committed_term` after a HIGHER term has already
+    /// applied and been ACKed.
+    ///
+    /// G9 widened this from µs to ms: the gate reads `committed_term`, then the
+    /// multi-ms persist fsync runs, then (pre-fix) `apply_commit` stores
+    /// `commit.term` UNCONDITIONALLY. Two commits T and T+1 can both pass the
+    /// gate at `committed_term = T-1`; if the lower term's persist finishes
+    /// AFTER the higher term applies, the lower term's late apply clobbers the
+    /// higher one — the node ACKed T+1 but now serves/gates on T and would
+    /// reboot at T while peers hold T+1 (the exact authority split G9 exists to
+    /// prevent).
+    ///
+    /// This drives the interleave deterministically with ordering primitives
+    /// (no wall-clock assertions): the LOWER term (6) blocks inside its persist
+    /// closure until released; the HIGHER term (7) is spawned while 6 is parked.
+    /// Pre-fix, 7 is unsynchronized, overtakes, applies, and is ACKed; then 6's
+    /// late apply regresses `committed_term` to 6 AND the members to the 6-set.
+    /// Post-fix, 6 holds the commit critical section across its persist, so 7 is
+    /// serialized behind it (6 applies, then 7 applies) and the final durable
+    /// authority is term 7 with the 7-member set — never a regression.
+    ///
+    /// A bare `fetch_max` on `committed_term` alone would NOT pass: it would
+    /// leave term 7 paired with the lower term's member set. The members
+    /// assertion pins that the superseded apply mutates NOTHING.
+    #[test]
+    fn handle_commit_durable_lower_term_never_regresses_committed_term() {
+        use std::sync::mpsc;
+
+        // Baseline: commit term 5 with members {1,2,3,4} so BOTH later member
+        // sets are already "ever seen" (the split-brain fallback would else
+        // reject re-introducing node 4). `committed_term` starts at 5 = T-1.
+        let auth = Arc::new(TopologyAuthority::new(NodeId(1), Duration::from_secs(1)));
+        let base_members = members(&[1, 2, 3, 4]);
+        let baseline = TopologyCommit {
+            term: 5,
+            proposer: NodeId(1),
+            members: base_members.clone(),
+            cluster_id: ClusterId::UNSET,
+            placement_version: 1,
+            digest: TopologyTerm::compute_digest(5, &ClusterId::UNSET, &base_members, 1),
+            voters: base_members.clone(),
+        };
+        assert_eq!(auth.handle_commit(&baseline), Some(5));
+        assert_eq!(auth.committed_term(), 5);
+
+        // Lower term 6, DIFFERENT (subset) member set {1,2,3}.
+        let lo_members = members(&[1, 2, 3]);
+        let commit_lo = TopologyCommit {
+            term: 6,
+            proposer: NodeId(1),
+            members: lo_members.clone(),
+            cluster_id: ClusterId::UNSET,
+            placement_version: 1,
+            digest: TopologyTerm::compute_digest(6, &ClusterId::UNSET, &lo_members, 1),
+            voters: lo_members.clone(),
+        };
+        // Higher term 7, full member set {1,2,3,4}.
+        let hi_members = members(&[1, 2, 3, 4]);
+        let commit_hi = TopologyCommit {
+            term: 7,
+            proposer: NodeId(1),
+            members: hi_members.clone(),
+            cluster_id: ClusterId::UNSET,
+            placement_version: 1,
+            digest: TopologyTerm::compute_digest(7, &ClusterId::UNSET, &hi_members, 1),
+            voters: hi_members.clone(),
+        };
+
+        let (lo_in_persist_tx, lo_in_persist_rx) = mpsc::channel::<()>();
+        let (release_lo_tx, release_lo_rx) = mpsc::channel::<()>();
+        let (hi_done_tx, hi_done_rx) = mpsc::channel::<()>();
+
+        // Worker A — the LOWER term. Its persist closure announces that it has
+        // passed the gate and is now mid-persist, then BLOCKS until released.
+        let auth_a = auth.clone();
+        let a = std::thread::spawn(move || {
+            auth_a.handle_commit_durable(&commit_lo, 4, 1, move |_state| {
+                lo_in_persist_tx.send(()).expect("send lo_in_persist");
+                release_lo_rx.recv().expect("recv release_lo");
+                true
+            })
+        });
+
+        // Wait until the lower term has passed its gate and is parked in
+        // persist (committed_term still 5). Pre-fix no lock is held here;
+        // post-fix the commit critical section IS held — which is exactly what
+        // serializes the higher term behind it.
+        lo_in_persist_rx
+            .recv()
+            .expect("lower term must reach persist");
+
+        // Worker B — the HIGHER term. Its persist returns immediately.
+        let auth_b = auth.clone();
+        let b = std::thread::spawn(move || {
+            let out = auth_b.handle_commit_durable(&commit_hi, 4, 1, |_state| true);
+            hi_done_tx.send(()).expect("send hi_done");
+            out
+        });
+
+        // Pre-fix: B is unsynchronized, overtakes A, applies term 7, signals
+        // done (well within the fallback). Post-fix: B blocks acquiring the
+        // commit lock A holds, so it cannot finish until A is released — this
+        // `recv_timeout` is a pure LIVENESS fallback, not a timing assertion
+        // (the real assertions below are on committed state). Either way we then
+        // release A. The window is orders of magnitude larger than a lock-free
+        // apply, so pre-fix reproduction is deterministic.
+        let _hi_applied_before_release = hi_done_rx.recv_timeout(Duration::from_secs(1)).is_ok();
+        release_lo_tx.send(()).expect("release lower term");
+
+        let _outcome_a = a.join().expect("A joins");
+        let outcome_b = b.join().expect("B joins");
+
+        // The higher term must be the durable authority — never regressed to 6.
+        assert_eq!(
+            auth.committed_term(),
+            7,
+            "committed_term must NOT regress to the lower term after the higher \
+             term applied and was ACKed"
+        );
+        assert_eq!(
+            auth.committed_members(),
+            hi_members,
+            "members must be the higher term's set — a bare fetch_max on the term \
+             alone would leave term 7 paired with the lower term's members"
+        );
+        assert_eq!(
+            outcome_b,
+            DurableCommitOutcome::Applied(7),
+            "the higher term must report Applied",
+        );
+    }
+
+    /// Item 1 liveness guard — the commit critical section must NOT stall
+    /// normal forward progress: two DISTINCT sequential terms (T then T+1) both
+    /// apply and advance `committed_term` monotonically.
+    #[test]
+    fn handle_commit_durable_sequential_terms_both_apply() {
+        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+
+        let m1 = members(&[1, 2, 3, 4]);
+        let c1 = TopologyCommit {
+            term: 1,
+            proposer: NodeId(1),
+            members: m1.clone(),
+            cluster_id: ClusterId::UNSET,
+            placement_version: 1,
+            digest: TopologyTerm::compute_digest(1, &ClusterId::UNSET, &m1, 1),
+            voters: m1.clone(),
+        };
+        assert_eq!(
+            auth.handle_commit_durable(&c1, 4, 1, |_s| true),
+            DurableCommitOutcome::Applied(1),
+        );
+        assert_eq!(auth.committed_term(), 1);
+        assert_eq!(auth.committed_members(), m1);
+
+        // A higher term with a DIFFERENT (subset drain) member set also applies.
+        let m2 = members(&[1, 2, 3]);
+        let c2 = TopologyCommit {
+            term: 2,
+            proposer: NodeId(1),
+            members: m2.clone(),
+            cluster_id: ClusterId::UNSET,
+            placement_version: 1,
+            digest: TopologyTerm::compute_digest(2, &ClusterId::UNSET, &m2, 1),
+            voters: m2.clone(),
+        };
+        assert_eq!(
+            auth.handle_commit_durable(&c2, 4, 1, |_s| true),
+            DurableCommitOutcome::Applied(2),
+        );
+        assert_eq!(auth.committed_term(), 2);
+        assert_eq!(auth.committed_members(), m2);
     }
 
     /// G9 — `persisted_state_for_commit` mirrors exactly what
