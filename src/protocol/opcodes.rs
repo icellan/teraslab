@@ -694,6 +694,32 @@ pub const FLAG_MIGRATION_ABORT: u16 = 0x0008;
 /// prune, no commit, no inbound clear), so a mismatch is harmless.
 pub const FLAG_MIGRATION_SUPERSET_OK: u16 = 0x0010;
 
+/// Request flag on `OP_MIGRATION_COMPLETE` (reverse-heal Phase 2b, only
+/// meaningful together with `FLAG_MIGRATION_VERIFY_ONLY`): select the
+/// tombstone-aware per-record MANIFEST-DIFF response instead of the boolean
+/// superset containment answer.
+///
+/// # Why it exists (reverse-heal direction — finding P1-2 / P1-3)
+///
+/// The boolean superset probe ([`FLAG_MIGRATION_SUPERSET_OK`]) answers only
+/// "does the target hold EVERY entry at `>=` generation?" — pure containment.
+/// It cannot tell a healing ex-master WHICH records it is actually behind on
+/// (the sub-max lost write, P1-2), and it mis-reads a correctly-DELETED record
+/// as "target missing key → not a superset" (the resurrection bug, P1-3). The
+/// manifest-diff instead carries the ex-master's own per-record view — LIVE
+/// entries AND tombstone (deleted) entries, tagged by a 1-byte
+/// [`crate::cluster::coordinator::HealEntryKind`] marker — so DIRECTION can be
+/// computed per record against the source's generations: ship only the records
+/// the source is strictly ahead on, and never a record the ex-master holds or
+/// tombstoned at an at-or-ahead generation.
+///
+/// Additive and PROTOCOL_VERSION-gated: the flag selects a NEW frame shape only
+/// two Phase-2b peers exchange; a legacy peer neither sets nor accepts it and
+/// keeps taking the boolean superset path. The Phase-2b work computes the diff
+/// (WHAT to ship, FROM WHOM); the actual pull/apply that consumes it lands in
+/// Phase 2c.
+pub const FLAG_MIGRATION_MANIFEST_DIFF: u16 = 0x0020;
+
 /// Maximum frame payload size (16 MiB) for normal client/server traffic.
 ///
 /// BSV mainnet has transactions exceeding 300 MB, but those payloads are
