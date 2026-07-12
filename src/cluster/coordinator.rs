@@ -4681,6 +4681,152 @@ fn parse_partition_version_response(payload: &[u8]) -> Option<Vec<PartitionVersi
 }
 
 // ---------------------------------------------------------------------------
+// Reverse-heal Tier-2 detection (finding C1) — per-shard generation manifest
+// ---------------------------------------------------------------------------
+
+/// A shard's reverse-heal recency, as produced by `Engine::shard_recency` and
+/// carried in [`PartitionVersionEntry`]. Used by the Tier-2 detector to compare
+/// this node's shard state against a peer's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ShardRecency {
+    /// Live record count for the shard (best-effort; see `Engine::shard_recency`).
+    pub count: u64,
+    /// Order-independent 64-bit `(txid, generation)` fingerprint.
+    pub digest: u64,
+    /// Maximum record generation under WRAPPING-serial ordering (0 when empty).
+    pub max_generation: u32,
+}
+
+impl ShardRecency {
+    /// Build from the `Engine::shard_recency` tuple `(count, digest, max_gen)`.
+    pub fn from_engine(recency: (u64, u64, u32)) -> Self {
+        Self {
+            count: recency.0,
+            digest: recency.1,
+            max_generation: recency.2,
+        }
+    }
+
+    /// Read the recency a peer reported for a shard out of its
+    /// [`PartitionVersionEntry`] (`last_applied_seq` is the record-count proxy).
+    pub fn from_entry(entry: &PartitionVersionEntry) -> Self {
+        Self {
+            count: entry.last_applied_seq,
+            digest: entry.manifest_digest,
+            max_generation: entry.max_generation,
+        }
+    }
+}
+
+/// Conservative "does THIS node hold a superset of `replica`'s shard manifest?"
+/// approximation from recency alone, for the Phase-1 detector where a full
+/// network manifest confirm is not run.
+///
+/// Returns `true` (this node is a superset ⇒ NOT stale vs `replica`) when this
+/// node's max generation is at-or-ahead of the replica's AND its record count
+/// is at least the replica's — the two signals a behind/subset replica always
+/// satisfies. It is deliberately conservative: it may return `false`
+/// (→ SUSPECT) on a divergence a full manifest confirm would clear, but it
+/// NEVER returns `true` for a replica strictly ahead in generation, so the
+/// "never heal FROM a behind node" invariant holds. The authoritative reverse
+/// `confirm_target_holds_superset` manifest exchange replaces it in the
+/// Phase-2 heal path.
+pub fn recency_indicates_superset(self_recency: ShardRecency, replica: ShardRecency) -> bool {
+    crate::record::generation_at_or_ahead(self_recency.max_generation, replica.max_generation)
+        && self_recency.count >= replica.count
+}
+
+/// Reverse-heal Tier-2 (finding C1): is a mastered shard stale on THIS node
+/// relative to its live replicas?
+///
+/// `self_recency` is this node's recency for the shard. `replica_recencies` is
+/// the recency each live replica of the shard reported (the caller filters to
+/// the shard's committed replica set). `self_holds_superset_of` is the
+/// containment probe: given a replica's recency it returns `true` iff this node
+/// holds a SUPERSET of that replica's shard manifest. In production it is
+/// backed by the reverse `confirm_target_holds_superset` manifest exchange; the
+/// Phase-1 detector passes the cheap [`recency_indicates_superset`]
+/// approximation.
+///
+/// # Safety invariant — "never heal FROM a behind node"
+///
+/// The result flags stale ONLY when some replica's digest differs from this
+/// node's AND this node does NOT hold a superset of that replica. A replica
+/// that is itself behind (a subset of this node) satisfies
+/// `self_holds_superset_of == true`, so a lower-generation / behind peer can
+/// NEVER make this node think it is stale — it takes a replica that
+/// demonstrably holds state this node lacks. A digest match short-circuits to
+/// "not stale" (identical shard state), so the probe runs only on a genuine
+/// divergence. An empty `replica_recencies` can never flag stale (nothing to
+/// heal from).
+pub fn is_shard_stale_vs_replicas<F>(
+    self_recency: ShardRecency,
+    replica_recencies: &[ShardRecency],
+    mut self_holds_superset_of: F,
+) -> bool
+where
+    F: FnMut(ShardRecency) -> bool,
+{
+    replica_recencies
+        .iter()
+        .any(|&replica| replica.digest != self_recency.digest && !self_holds_superset_of(replica))
+}
+
+/// Reverse-heal Tier-2 composition: the set of shards this node masters that
+/// look stale versus the peers in `partition_view` (finding C1).
+///
+/// For each shard `self_id` masters in `shard_table`, this reads self's recency
+/// and every committed replica's reported recency out of the partition view and
+/// runs [`is_shard_stale_vs_replicas`] with the Phase-1
+/// [`recency_indicates_superset`] predicate. Detection only — the returned
+/// shards are logged + metered by the caller; Phase 1 neither fences nor pulls.
+///
+/// Note on quorum: Phase 1 flags SUSPECT from any single ahead replica (safe,
+/// since the superset predicate still forbids healing from a behind node).
+/// Quorum-corroboration of the heal *source* is a Phase-3 concern
+/// (`elect_master` recency) and does not gate a detection-only flag.
+pub(crate) fn detect_stale_shards_from_view(
+    self_id: NodeId,
+    shard_table: &ShardTable,
+    partition_view: &std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>>,
+) -> Vec<u16> {
+    // Index each node's reported entries by shard for O(1) lookup.
+    let recency_of = |node: NodeId, shard: u16| -> Option<ShardRecency> {
+        partition_view
+            .get(&node)?
+            .iter()
+            .find(|e| e.shard == shard)
+            .map(ShardRecency::from_entry)
+    };
+
+    let mut stale = Vec::new();
+    for shard in 0..NUM_SHARDS as u16 {
+        let assignment = shard_table.target_assignment(shard);
+        if assignment.master != self_id {
+            continue;
+        }
+        // Self's recency for the shard (absent ⇒ empty shard).
+        let self_recency = recency_of(self_id, shard).unwrap_or(ShardRecency {
+            count: 0,
+            digest: 0,
+            max_generation: 0,
+        });
+        let replica_recencies: Vec<ShardRecency> = assignment
+            .replicas
+            .iter()
+            .filter(|r| **r != self_id)
+            .filter_map(|r| recency_of(*r, shard))
+            .collect();
+        if is_shard_stale_vs_replicas(self_recency, &replica_recencies, |replica| {
+            recency_indicates_superset(self_recency, replica)
+        }) {
+            stale.push(shard);
+        }
+    }
+    stale
+}
+
+// ---------------------------------------------------------------------------
 // Shard manifest hash — order-independent content fingerprint
 // ---------------------------------------------------------------------------
 
@@ -18166,6 +18312,171 @@ mod tests {
                 max_generation: 0,
             }],
             "legacy entry parses with recency fields defaulted to 0",
+        );
+    }
+
+    /// Reverse-heal Phase 1: when Tier-1 (the AckTracker fast-path) is
+    /// stale-low and misses a sub-second gap, the Tier-2 manifest confirm is
+    /// the backstop that catches it.
+    #[test]
+    fn recovery_acktracker_stalelow_missed_gap_is_caught_by_manifest_confirm() {
+        use crate::replication::durable::AckTracker;
+
+        let floor = 100u64;
+
+        // Tier-1 is stale-low: the tracker only persisted an ACK at seq 100
+        // (== floor) before the crash, missing later writes acked in the
+        // sub-second flush window. So Tier-1 reports NO lost tail.
+        let dir = tempfile::tempdir().unwrap();
+        let tracker = AckTracker::new(dir.path().join("ack.dat"));
+        let replica_addr: std::net::SocketAddr = "127.0.0.1:6000".parse().unwrap();
+        tracker.record_ack(replica_addr, 100);
+        assert!(
+            tracker.acked_beyond(floor).is_empty(),
+            "Tier-1 is stale-low here and misses the gap",
+        );
+
+        // Tier-2 is the backstop: a live replica reports a shard whose digest
+        // differs AND whose generation is strictly ahead of this node's, and
+        // this node does NOT hold a superset of it → stale detected.
+        let self_recency = ShardRecency {
+            count: 5,
+            digest: 0xAAAA,
+            max_generation: 100,
+        };
+        let replica_recency = ShardRecency {
+            count: 6,
+            digest: 0xBBBB,
+            max_generation: 101,
+        };
+        let stale = is_shard_stale_vs_replicas(self_recency, &[replica_recency], |r| {
+            recency_indicates_superset(self_recency, r)
+        });
+        assert!(stale, "Tier-2 catches the gap Tier-1 missed");
+    }
+
+    /// Reverse-heal Phase 1 safety invariant ("never heal FROM a behind
+    /// node"): a replica with a DIFFERENT digest but strictly BEHIND generation
+    /// must NOT make this node think it is stale, and a digest match
+    /// short-circuits to not-stale regardless of the probe.
+    #[test]
+    fn is_shard_stale_never_flags_from_a_behind_replica() {
+        let self_recency = ShardRecency {
+            count: 10,
+            digest: 0x1111,
+            max_generation: 200,
+        };
+
+        let behind_replica = ShardRecency {
+            count: 8,
+            digest: 0x2222,
+            max_generation: 150,
+        };
+        assert!(
+            !is_shard_stale_vs_replicas(self_recency, &[behind_replica], |r| {
+                recency_indicates_superset(self_recency, r)
+            }),
+            "a behind replica's differing digest must not flag this node stale",
+        );
+
+        let same_state = ShardRecency {
+            count: 10,
+            digest: 0x1111,
+            max_generation: 200,
+        };
+        assert!(
+            !is_shard_stale_vs_replicas(self_recency, &[same_state], |_| false),
+            "a digest match short-circuits to not-stale regardless of the probe",
+        );
+    }
+
+    /// Reverse-heal Phase 1 NEGATIVE: a node with no ahead replica (empty set,
+    /// or all replicas matching) does not fire the Tier-2 detector.
+    #[test]
+    fn is_shard_stale_clean_when_no_replica_is_ahead() {
+        let self_recency = ShardRecency {
+            count: 3,
+            digest: 0xF00D,
+            max_generation: 42,
+        };
+        assert!(
+            !is_shard_stale_vs_replicas(self_recency, &[], |_| false),
+            "no replicas → detector does not fire",
+        );
+        let identical = ShardRecency {
+            count: 3,
+            digest: 0xF00D,
+            max_generation: 42,
+        };
+        assert!(
+            !is_shard_stale_vs_replicas(self_recency, &[identical, identical], |r| {
+                recency_indicates_superset(self_recency, r)
+            }),
+            "identical replicas → detector does not fire",
+        );
+    }
+
+    /// Reverse-heal Phase 1 composition: `detect_stale_shards_from_view` flags
+    /// exactly the mastered shards whose replicas are ahead, leaving
+    /// unmastered and healthy shards alone.
+    #[test]
+    fn detect_stale_shards_from_view_flags_only_ahead_mastered_shards() {
+        let members = [NodeId(1), NodeId(2), NodeId(3)];
+        let table = ShardTable::compute_with_epoch(&members, 2, 1, 1);
+
+        // Pick a shard NodeId(1) masters that has at least one replica.
+        let shard = (0..NUM_SHARDS as u16)
+            .find(|&s| {
+                let a = table.target_assignment(s);
+                a.master == NodeId(1) && !a.replicas.is_empty()
+            })
+            .expect("N1 masters some shard with a replica");
+        let replica = table.target_assignment(shard).replicas[0];
+
+        let mut view: std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>> =
+            std::collections::HashMap::new();
+        // Self (master) reports an OLDER generation than the replica.
+        view.insert(
+            NodeId(1),
+            vec![PartitionVersionEntry {
+                shard,
+                flags: 0b01,
+                replica_count: 1,
+                last_applied_seq: 5,
+                manifest_digest: 0xAAAA,
+                max_generation: 100,
+            }],
+        );
+        // The replica reports a divergent digest AND a strictly-ahead generation.
+        view.insert(
+            replica,
+            vec![PartitionVersionEntry {
+                shard,
+                flags: 0,
+                replica_count: 1,
+                last_applied_seq: 6,
+                manifest_digest: 0xBBBB,
+                max_generation: 101,
+            }],
+        );
+
+        let stale = detect_stale_shards_from_view(NodeId(1), &table, &view);
+        assert_eq!(stale, vec![shard], "only the ahead-replica mastered shard is flagged");
+
+        // A node that masters this shard but whose replica is BEHIND is clean.
+        view.get_mut(&replica).unwrap()[0].max_generation = 50;
+        view.get_mut(&replica).unwrap()[0].last_applied_seq = 1;
+        let clean = detect_stale_shards_from_view(NodeId(1), &table, &view);
+        assert!(
+            clean.is_empty(),
+            "a behind replica must not flag the mastered shard stale",
+        );
+
+        // A non-master (NodeId(2) for a shard N1 masters) is never flagged.
+        let from_n2 = detect_stale_shards_from_view(NodeId(2), &table, &view);
+        assert!(
+            !from_n2.contains(&shard),
+            "detection only considers shards the node actually masters",
         );
     }
 
