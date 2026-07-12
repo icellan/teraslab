@@ -1136,9 +1136,28 @@ func runStreamRead(ctx context.Context, conn net.Conn, txid TxID, offset uint64)
 		_ = conn.SetDeadline(dl)
 	}
 
+	// Cancellation watchdog: a ctx WITHOUT a deadline (context.WithCancel) can't
+	// interrupt the blocking multi-frame Read loop below via a socket deadline.
+	// Mirror the roundTrip path's ctx-driven model by closing the conn on
+	// cancellation so an in-flight Read/Write unblocks with an error, which the
+	// loop translates back into ctx.Err(). `stop` is closed on return so the
+	// goroutine never leaks and never closes a conn we still use.
+	stop := make(chan struct{})
+	defer close(stop)
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = conn.Close()
+		case <-stop:
+		}
+	}()
+
 	payload := encodeStreamReadRequest(nil, txid, StreamReadFieldColdData, offset)
 	f := &requestFrame{RequestID: 1, OpCode: OpStreamRead, Flags: 0, Payload: payload}
 	if _, err := writeRequest(conn, f, nil); err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
 		return nil, fmt.Errorf("stream-read write: %w", err)
 	}
 
@@ -1149,6 +1168,11 @@ func runStreamRead(ctx context.Context, conn net.Conn, txid TxID, offset uint64)
 		resp, newBuf, err := readResponse(conn, buf)
 		buf = newBuf
 		if err != nil {
+			// A ctx cancellation closes the conn out from under the Read; surface
+			// the ctx error rather than the resulting "use of closed connection".
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return nil, ctxErr
+			}
 			return nil, fmt.Errorf("stream-read read: %w", err)
 		}
 		switch resp.Status {

@@ -21,6 +21,11 @@ type streamReadServer struct {
 	chunkSize  int
 	endHash    [32]byte
 	forceError uint16
+	// silentAfterFirstChunk emits exactly the first StatusStreamChunk and then
+	// goes silent (no more chunks, no END) while keeping the connection OPEN —
+	// an alive-but-stalled server used to exercise the client's mid-burst ctx
+	// cancellation watchdog.
+	silentAfterFirstChunk bool
 }
 
 func (s *streamReadServer) serveLoop(ln net.Listener) {
@@ -102,6 +107,11 @@ func (s *streamReadServer) writeBurst(conn net.Conn, reqID uint64) error {
 			return err
 		}
 		offset += uint64(end - start)
+		if s.silentAfterFirstChunk {
+			// Sent one chunk; go silent (no more chunks, no END trailer) but
+			// leave the connection open so the client blocks mid-burst.
+			return nil
+		}
 	}
 	payload := encodeStreamReadEnd(nil, uint64(len(s.blob)), s.endHash)
 	_, err := conn.Write(encodeResponseFrame(responseFrame{RequestID: reqID, Status: StatusStreamEnd, Payload: payload}))
@@ -201,5 +211,55 @@ func TestStreamReadColdDataSurfacesErrorFrame(t *testing.T) {
 	}
 	if se.Code != ErrCodeBlobNotFound {
 		t.Fatalf("want ErrCodeBlobNotFound, got %d", se.Code)
+	}
+}
+
+// FU#4-B: a ctx CANCELLATION (via context.WithCancel, no deadline) must
+// interrupt a stream-read blocked mid-burst against an alive-but-silent server,
+// mirroring the roundTrip path's ctx-driven model. The server sends the first
+// chunk then goes silent; without a mid-burst cancellation watchdog the blocking
+// multi-frame Read loop would hang until the OUTER test timeout — so a
+// regression fails (bounded select) rather than hanging the suite.
+func TestStreamReadColdDataHonorsContextCancellationMidBurst(t *testing.T) {
+	blob := make([]byte, 300_000)
+	for i := range blob {
+		blob[i] = byte(i % 256)
+	}
+	hash := sha256.Sum256(blob)
+	cli := startStreamReadServer(t, &streamReadServer{
+		blob:                  blob,
+		chunkSize:             64 * 1024, // several chunks — the first leaves us mid-burst
+		endHash:               hash,
+		silentAfterFirstChunk: true,
+	})
+
+	var txid TxID
+	txid[0] = 0x44
+
+	// A cancellable ctx with NO deadline: only a cancellation watchdog (not a
+	// socket deadline) can unblock the Read.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		cancel()
+	}()
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := cli.StreamReadColdData(ctx, txid)
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("expected a context-cancellation error, got nil (server sent one chunk then went silent)")
+		}
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("want context.Canceled, got: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("StreamReadColdData hung past the ctx cancellation — mid-burst cancellation not honored")
 	}
 }
