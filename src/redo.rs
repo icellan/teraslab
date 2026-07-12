@@ -2429,6 +2429,22 @@ pub struct RedoAtomics {
     /// `false -> true` in normal operation (recovery on restart constructs a
     /// fresh log); no path clears it in-process.
     poisoned: AtomicBool,
+    /// FU#6b: bytes of forward headroom that a multi-store batch's pre-flight
+    /// has RESERVED under the ascending log locks but has not yet made durable
+    /// (the commit fan-out re-locks the log). Treated as already-consumed by
+    /// [`Self::available_space`] and [`RedoLog::would_fit`] so a CONCURRENT
+    /// multi-store batch's fit-check sees the outstanding reservation and cleanly
+    /// (retryably) `LogFull`s instead of racing into the check-to-commit window
+    /// and producing a durable-sibling + transient-full partial that the
+    /// poison-on-partial guard would then fence the whole node for. Reserved by
+    /// [`Self::reserve`] after every touched store's `would_fit` passes; released
+    /// by [`Self::release`] via an RAII guard once the commit lands (on EVERY
+    /// path — success, early return, or panic — so a reservation can never leak
+    /// and permanently under-count the store's capacity). Only ever mutated by
+    /// [`crate::ops::engine::Engine::append_redo_ops_routed`]'s pre-flight; every
+    /// other path leaves it at 0, so single-store and no-reservation behaviour is
+    /// byte-identical.
+    reserved: AtomicU64,
 }
 
 impl RedoAtomics {
@@ -2467,14 +2483,46 @@ impl RedoAtomics {
     /// `logical_start` here (the prior bug) over-reported headroom after a
     /// past-tail fuzzy compaction, so the backpressure gate admitted bursts
     /// that then hit `LogFull` — the failure this gate exists to prevent.
+    ///
+    /// FU#6b: an outstanding multi-store [`Self::reserve`]ation is subtracted
+    /// too, so headroom a concurrent batch's pre-flight has already claimed (but
+    /// not yet committed) counts as consumed.
     pub fn available_space(&self) -> u64 {
-        self.entries_region_size
-            .saturating_sub(self.write_pos.load(AtomicOrdering::Relaxed))
+        self.entries_region_size.saturating_sub(
+            self.write_pos
+                .load(AtomicOrdering::Relaxed)
+                .saturating_add(self.reserved.load(AtomicOrdering::Relaxed)),
+        )
     }
 
     /// Total entries-region capacity in bytes (mirrors [`RedoLog::capacity`]).
     pub fn capacity(&self) -> u64 {
         self.entries_region_size
+    }
+
+    /// FU#6b: bytes currently reserved by an in-flight multi-store pre-flight
+    /// (0 in the common case). Read WITHOUT the log lock.
+    pub fn reserved(&self) -> u64 {
+        self.reserved.load(AtomicOrdering::Relaxed)
+    }
+
+    /// FU#6b: reserve `bytes` of forward headroom for a multi-store batch that
+    /// has passed its `would_fit` pre-flight, so a concurrent batch treats the
+    /// bytes as consumed. Balanced by exactly one [`Self::release`] once the
+    /// commit lands. `Relaxed` is sufficient: the reservation is published/observed
+    /// under each log's mutex in the pre-flight (which establishes the
+    /// happens-before), and the lock-free reads only need monotonic visibility of
+    /// the counter, not ordering against other memory.
+    pub fn reserve(&self, bytes: u64) {
+        self.reserved.fetch_add(bytes, AtomicOrdering::Relaxed);
+    }
+
+    /// FU#6b: release a prior [`Self::reserve`]ation of `bytes`. Called exactly
+    /// once per reservation by the RAII guard in `append_redo_ops_routed`, on
+    /// every exit path, so the counter always returns to its baseline and a
+    /// panic or early `?` can never leak headroom.
+    pub fn release(&self, bytes: u64) {
+        self.reserved.fetch_sub(bytes, AtomicOrdering::Relaxed);
     }
 }
 
@@ -2951,6 +2999,7 @@ impl RedoLog {
                 write_pos: AtomicU64::new(0),
                 entries_region_size: log_size - header_block_size,
                 poisoned: AtomicBool::new(false),
+                reserved: AtomicU64::new(0),
             }),
             shared_seq: None,
             ring: None,
@@ -3905,9 +3954,48 @@ impl RedoLog {
     /// (ring full) or contains an entry larger than a whole segment. No state is
     /// mutated — the actual append performs the same rolls.
     fn ring_batch_fits(&self, lens: &[u64]) -> Result<()> {
+        self.ring_batch_fits_reserved(lens, 0)
+    }
+
+    /// [`Self::ring_batch_fits`] with an outstanding FU#6b `reserved` byte
+    /// prefix consumed from the current cursor BEFORE the batch is simulated.
+    ///
+    /// `reserved` is the roll-aware FORWARD DISTANCE the reserving batch(es) will
+    /// advance the ring cursor — computed by [`Self::batch_reservation_bytes`],
+    /// which already folds each per-entry segment-roll tail-waste INTO the byte
+    /// count. So consuming it contiguously here (rolling at segment boundaries,
+    /// returning `LogFull` on an `oldest_seg` collision) lands the cursor at the
+    /// reserving batch's TRUE post-commit position — not an approximation. The
+    /// value is a safe over-estimate of the real advance (it over-counts only the
+    /// final segment's sub-alignment tail), so this can only reject a batch
+    /// early (retryable), never over-admit into a partial-poison. `reserved == 0`
+    /// (the common case, and every commit-time caller) is byte-identical to the
+    /// pre-FU#6b `ring_batch_fits`.
+    fn ring_batch_fits_reserved(&self, lens: &[u64], reserved: u64) -> Result<()> {
         let r = self.ring.as_ref().expect("ring log");
         let mut cur_seg = r.active_seg;
         let mut cur_off = r.write_pos_in_seg + self.buffer.len() as u64;
+        // Consume the outstanding reservation ahead of the batch.
+        let mut rem = reserved;
+        while rem > 0 {
+            let seg_free = r.segment_size.saturating_sub(cur_off);
+            if rem < seg_free {
+                cur_off += rem;
+                break;
+            }
+            // The reservation fills the rest of this segment (or exactly it) and
+            // rolls: the next append starts at a fresh segment base.
+            rem -= seg_free;
+            let next = (cur_seg + 1) % r.segment_count;
+            if next == r.oldest_seg {
+                return Err(RedoError::LogFull {
+                    used: self.ring_used(),
+                    capacity: self.ring_capacity(),
+                });
+            }
+            cur_seg = next;
+            cur_off = 0;
+        }
         for &len in lens {
             if len > r.segment_size {
                 return Err(RedoError::LogFull {
@@ -3963,12 +4051,91 @@ impl RedoLog {
             .iter()
             .map(|op| (ENTRY_HEADER_SIZE + ENTRY_OVERHEAD + op.serialized_data_len()) as u64)
             .collect();
+        // FU#6b: an in-flight multi-store pre-flight may have RESERVED forward
+        // headroom that is not yet reflected in `write_pos` (its commit re-locks
+        // the log). Count it as consumed so a concurrent batch cleanly `LogFull`s
+        // here instead of racing into the check-to-commit window. This is a
+        // PRE-FLIGHT-only account: the commit-time checks (`append_atomic` /
+        // `append_preencoded_atomic`) deliberately ignore `reserved` so a batch's
+        // own reservation never blocks its own commit. `reserved` is 0 outside
+        // that window, so the common path is unchanged.
+        let reserved = self.atomics.reserved();
         if self.is_ring() {
-            self.ring_batch_fits(&lens).is_ok()
+            self.ring_batch_fits_reserved(&lens, reserved).is_ok()
         } else {
             let total: u64 = lens.iter().sum();
-            let used = self.write_pos + self.buffer.len() as u64;
+            let used = self.write_pos + self.buffer.len() as u64 + reserved;
             used + total <= self.append_capacity()
+        }
+    }
+
+    /// The raw on-disk byte footprint of `ops` appended as one batch — the sum of
+    /// per-entry sizes (`ENTRY_HEADER_SIZE + ENTRY_OVERHEAD + serialized_data_len`,
+    /// the same formula [`Self::would_fit`] / [`Self::append_atomic`] use). This is
+    /// the UNPADDED, layout-independent footprint; the number of headroom bytes a
+    /// commit actually advances is a SAFE OVER-ESTIMATE of this — see
+    /// [`Self::batch_reservation_bytes`]. Associated (no `self`).
+    pub(crate) fn batch_footprint(ops: &[&RedoOp]) -> u64 {
+        ops.iter()
+            .map(|op| (ENTRY_HEADER_SIZE + ENTRY_OVERHEAD + op.serialized_data_len()) as u64)
+            .sum()
+    }
+
+    /// FU#6b: a SAFE OVER-ESTIMATE of the forward headroom (bytes) that appending
+    /// `ops` as one batch will consume on THIS log right now — the amount
+    /// `append_redo_ops_routed`'s pre-flight must reserve so a concurrent batch's
+    /// [`Self::would_fit`] can NEVER over-admit. It is always `>=` the reserving
+    /// batch's TRUE forward advance, so the reservation errs only toward an
+    /// occasional early (retryable) `LogFull`, never toward a durable-sibling +
+    /// transient-full partial that the poison-on-partial guard would fence for.
+    ///
+    /// The raw footprint under-counts on BOTH layouts, which is why this exists:
+    /// * LINEAR: a flush pads the write cursor UP to the device alignment, so the
+    ///   real advance is `align_up(footprint)`, up to `align - 1` bytes more than
+    ///   the raw footprint.
+    /// * RING: a real append rolls PER ENTRY — an entry that does not fit the
+    ///   active segment's tail moves to the next segment, and the wasted tail is
+    ///   forward distance a concurrent batch must skip. A flat contiguous byte
+    ///   run ignores that waste and leaves the cursor EARLIER than reality (more
+    ///   apparent room → over-admit). Here the placement is REPLAYED roll-aware
+    ///   from where prior outstanding reservations leave the cursor (the active
+    ///   segment offset advanced contiguously by the current `reserved`, which the
+    ///   per-store log lock serializes), counting each wasted tail as distance, so
+    ///   `ring_batch_fits_reserved`'s contiguous consumption of this value lands at
+    ///   the reserving batch's true post-commit cursor. Rounding the result up to
+    ///   alignment covers the final flush's padding. (A segment that ROLLS is
+    ///   counted whole by both the replay and the real append, so the estimate
+    ///   over-counts only the final segment's sub-alignment tail — never under.)
+    pub(crate) fn batch_reservation_bytes(&self, ops: &[&RedoOp]) -> u64 {
+        let align = self.device.alignment() as u64;
+        match &self.ring {
+            // Linear: the flush aligns the cursor, so the real advance is the
+            // aligned footprint (>= raw). `align >= 1` is guaranteed at open.
+            None => Self::batch_footprint(ops).next_multiple_of(align),
+            Some(r) => {
+                // Roll-aware forward distance of this batch's real placement,
+                // starting where prior outstanding reservations leave the cursor.
+                let reserved = self.atomics.reserved();
+                let seg = r.segment_size;
+                // Intra-segment offset after prior reservations (contiguous).
+                let mut off = (r.write_pos_in_seg + self.buffer.len() as u64 + reserved) % seg;
+                let mut distance = 0u64;
+                for op in ops {
+                    let len =
+                        (ENTRY_HEADER_SIZE + ENTRY_OVERHEAD + op.serialized_data_len()) as u64;
+                    if off + len > seg {
+                        // Roll: the rest of this segment is wasted forward distance
+                        // (a real append flushes + moves to the next segment here).
+                        distance += seg - off;
+                        off = 0;
+                    }
+                    distance += len;
+                    off += len;
+                }
+                // Round up for the final flush's alignment padding — a safe
+                // over-estimate (never an under-count).
+                distance.next_multiple_of(align)
+            }
         }
     }
 
@@ -8921,6 +9088,104 @@ mod tests {
         assert_eq!(log.capacity(), 8192 * 5);
         assert_eq!(log.usage_fraction(), 0.0);
         assert!(log.is_ring());
+    }
+
+    /// FU#6b: `would_fit` on a RING log accounts for an outstanding reservation
+    /// — a concurrent multi-store batch's claimed headroom is consumed from the
+    /// ring cursor (rolling segments, failing closed on an `oldest_seg`
+    /// collision) before the batch is simulated. Proves the ring branch, not just
+    /// the linear one, respects the reservation, and that the accounting is
+    /// exactly reversible.
+    #[test]
+    fn would_fit_ring_accounts_for_reservation() {
+        // 3 segments of 4096 B (the ring minimum), so capacity = 12288 B.
+        let (_dev, log) = make_ring(4096, 3);
+        let op = RedoOp::AllocateRegion {
+            device_id: 0,
+            offset: 0,
+            size: 4096,
+        };
+        let ops = [&op];
+
+        // Empty ring: a single 34-byte op fits.
+        assert!(
+            log.would_fit(&ops),
+            "a lone op must fit an empty ring with no reservation"
+        );
+
+        // Reserve nearly the whole ring (2 full segments + all but 20 B of the
+        // third): the reservation advances the cursor across segments 0 -> 1 -> 2
+        // and leaves < one op of room, so the op must roll from segment 2 into
+        // segment 0 == oldest_seg -> `LogFull`, and `would_fit` flips to false.
+        let reserved = 3 * 4096 - 20;
+        log.atomics().reserve(reserved);
+        assert!(
+            !log.would_fit(&ops),
+            "the op must NOT fit once a reservation has consumed the ring headroom"
+        );
+
+        // Releasing the reservation restores capacity exactly.
+        log.atomics().release(reserved);
+        assert_eq!(log.atomics().reserved(), 0, "reservation fully released");
+        assert!(
+            log.would_fit(&ops),
+            "the op must fit again once the reservation is released"
+        );
+    }
+
+    /// FU#6b RING segment-roll boundary: [`RedoLog::batch_reservation_bytes`]
+    /// must OVER-ESTIMATE a rolling batch's true forward consumption, because a
+    /// real append rolls PER ENTRY (wasting each segment's tail) and spans MORE
+    /// ring distance than a flat contiguous byte run of the raw footprint. If the
+    /// pre-flight reserved only the raw footprint, a concurrent batch would
+    /// `would_fit`-pass, then the real placement (A's rolls + B's rolls) collides
+    /// with `oldest_seg` → `LogFull` on a sibling → partial → poison. This proves
+    /// the roll-aware reservation is a strict over-estimate of the footprint AND
+    /// that it closes the window the raw footprint leaves open.
+    #[test]
+    fn ring_reservation_roll_aware_prevents_over_admit() {
+        // 3 segments of 4096 B. Entries ~2100 B each so TWO roll within a segment
+        // (2 * 2100 = 4200 > 4096), wasting ~1996 B of tail on the roll — the
+        // per-entry waste a flat footprint ignores.
+        let (_dev, log) = make_ring(4096, 3);
+        // HashtableResizeBegin footprint = 4 + 13 + (8 + 4 + path.len()); path 2071
+        // → serialized_data_len 2083 → footprint 2100 B.
+        let big = |cap: u64| RedoOp::HashtableResizeBegin {
+            tmp_path_bytes: vec![7u8; 2071],
+            new_capacity: cap,
+        };
+        let (a1, a2) = (big(1), big(2));
+        let a_ops = [&a1, &a2];
+        let (b1, b2) = (big(3), big(4));
+        let b_ops = [&b1, &b2];
+
+        let footprint = RedoLog::batch_footprint(&a_ops);
+        assert_eq!(footprint, 4200, "two 2100 B entries");
+        let reservation = log.batch_reservation_bytes(&a_ops);
+        assert!(
+            reservation > footprint,
+            "roll-aware reservation ({reservation}) must EXCEED the raw footprint \
+             ({footprint}) — it counts the wasted segment tail + flush alignment"
+        );
+
+        // The raw footprint (the pre-fix reservation) UNDER-counts A's real
+        // segment-roll consumption, so a concurrent B `would_fit`-passes — the
+        // over-admit the review found.
+        log.atomics().reserve(footprint);
+        assert!(
+            log.would_fit(&b_ops),
+            "the raw footprint under-counts the per-entry roll waste → B over-admits (the residual)"
+        );
+        log.atomics().release(footprint);
+
+        // The roll-aware over-estimate closes it: B is cleanly rejected.
+        log.atomics().reserve(reservation);
+        assert!(
+            !log.would_fit(&b_ops),
+            "the roll-aware reservation closes the window → B rejected (retryable LogFull)"
+        );
+        log.atomics().release(reservation);
+        assert_eq!(log.atomics().reserved(), 0, "reservation fully released");
     }
 
     /// Phase 2: bad ring geometry is rejected at format time.
