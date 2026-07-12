@@ -159,7 +159,7 @@ fn decode_entry(src: &[u8]) -> Result<(TxKey, TombValue), TombstoneDecodeError> 
 }
 
 /// In-RAM per-key tombstone state.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct TombValue {
     generation: u32,
     height: u32,
@@ -185,6 +185,14 @@ pub struct TombstoneLog {
     retention_blocks: u32,
     shards: Vec<RwLock<HashMap<TxKey, TombValue>>>,
     file: Mutex<FileState>,
+    /// Test-only deterministic seam for the P1 compaction-window race repro: a
+    /// `(key, generation, height, cause)` injected as a `record()` INSIDE
+    /// [`Self::persist`]'s compaction branch, AFTER the atomic rewrite but
+    /// BEFORE `pending` is reconciled — the exact window in which the old
+    /// `pending.clear()` dropped a concurrently recorded delete from both the
+    /// written file and `pending`. Fired at most once (taken on use).
+    #[cfg(test)]
+    inject_in_compaction_window: Mutex<Option<(TxKey, u32, u32, TombstoneCause)>>,
 }
 
 impl TombstoneLog {
@@ -206,6 +214,8 @@ impl TombstoneLog {
                 pending: Vec::new(),
                 needs_compaction: false,
             }),
+            #[cfg(test)]
+            inject_in_compaction_window: Mutex::new(None),
         }
     }
 
@@ -363,6 +373,31 @@ impl TombstoneLog {
         dropped
     }
 
+    /// Drop the tombstone for `key` from the in-RAM index AND any un-persisted
+    /// append buffered for it, flagging the durable file for compaction when
+    /// something was removed. Returns `true` if a tombstone was present.
+    ///
+    /// Called from the create / (re)register-live path (Invariant TS-1): a key
+    /// that comes back LIVE must carry no tombstone, so a later online heal
+    /// (Phase 3/4) cannot use a stale tombstone to drop the resurrected record.
+    /// Draining `pending` here is what makes the removal durable-safe against
+    /// [`Self::persist`]'s compaction `retain`: were the entry left in `pending`,
+    /// the next compaction would re-append the tombstone we just cleared. O(1)
+    /// for the common create of a never-deleted key (the shard `remove` misses,
+    /// so neither the file lock nor the `pending` scan is taken).
+    pub fn clear(&self, key: &TxKey) -> bool {
+        let removed = self.shards[self.shard_index(key)]
+            .write()
+            .remove(key)
+            .is_some();
+        if removed {
+            let mut fs = self.file.lock();
+            fs.pending.retain(|(pk, _)| pk != key);
+            fs.needs_compaction = true;
+        }
+        removed
+    }
+
     /// Make the tombstone set durable at a checkpoint: GC past the retention
     /// horizon, then either COMPACT (atomic rewrite from the in-RAM index, when
     /// GC / reconcile dropped entries) or APPEND the buffered tail. Fsyncs
@@ -379,8 +414,36 @@ impl TombstoneLog {
         if needs_compaction {
             let all = self.snapshot_all();
             self.write_all_atomic(&all)?;
+            // Test-only: inject a `record()` into the compaction window (after the
+            // rewrite, before the `pending` reconcile below) to reproduce the P1
+            // race deterministically.
+            #[cfg(test)]
+            if let Some((k, generation, height, cause)) =
+                self.inject_in_compaction_window.lock().take()
+            {
+                self.record(&k, generation, height, cause);
+            }
+            // Retain in `pending` exactly the entries this compaction did NOT make
+            // durable — DO NOT blindly `clear()`. A `record()` (delete) can land in
+            // the window above [after `snapshot_all` read its shard, before this
+            // reconcile]; its `(key, value)` is absent from the just-written
+            // snapshot, so it must stay buffered and be re-appended next checkpoint,
+            // preserving Invariant TS-1 (tombstone durable ⟺ delete durable). An
+            // unconditional `clear()` dropped it from `pending` while the delete
+            // could still become durable → durable-delete-without-tombstone →
+            // Phase-2c resurrection / double-spend.
+            //
+            // `record()` inserts into the shard map BEFORE pushing to `pending`, so
+            // any `pending` entry whose exact `(key, value)` is in the written
+            // snapshot had its shard-insert captured by `snapshot_all` — durable,
+            // drop it. A value NOT in the snapshot was recorded after that shard was
+            // read (or is a newer value for a re-deleted key) — keep it. Re-append
+            // is harmless: replay is last-writer-wins by key. (An entry removed from
+            // the shard AND drained from `pending` — see [`Self::clear`] — is not in
+            // `pending` at all, so it can never be resurrected here.)
+            let written: HashMap<TxKey, TombValue> = all.into_iter().collect();
             let mut fs = self.file.lock();
-            fs.pending.clear();
+            fs.pending.retain(|(k, v)| written.get(k) != Some(v));
             fs.needs_compaction = false;
             return Ok(());
         }
@@ -581,6 +644,80 @@ mod tests {
         assert_eq!(dropped, 1);
         assert!(log.lookup(&tk(1)).is_none());
         assert!(log.lookup(&tk(2)).is_some());
+    }
+
+    /// P1 race repro. A `record()` that lands in the compaction window — after
+    /// `snapshot_all()`/`write_all_atomic` but before `pending` is reconciled —
+    /// must NOT be lost. The old `pending.clear()` dropped it from both the
+    /// written file and `pending`, so it survived only in the volatile shard map
+    /// until some later compaction; a crash in that window left a durable delete
+    /// with no durable tombstone (→ Phase-2c resurrection). The `retain` keeps it
+    /// buffered so the next checkpoint appends it. This drives the REAL `persist`
+    /// via the deterministic in-window injection seam, then models the next
+    /// checkpoint's append + a fresh reload from the DURABLE file only (pending is
+    /// volatile — a crash keeps only what reached disk).
+    #[test]
+    fn compaction_window_record_survives_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.tombstones");
+        let log = TombstoneLog::new(path.clone(), 0, 4, 100);
+
+        // A first durable entry (append path), then force the COMPACT branch.
+        log.record(&tk(1), 1, 500, TombstoneCause::Dah);
+        log.persist(0).unwrap();
+        log.file.lock().needs_compaction = true;
+
+        // Arm the in-window injection: this `record(tk(2))` runs after the atomic
+        // rewrite (which captured only tk(1)) but before the `pending` reconcile.
+        *log.inject_in_compaction_window.lock() =
+            Some((tk(2), 9, 600, TombstoneCause::ClientDelete));
+        log.persist(0).unwrap();
+
+        // Next checkpoint: append whatever stayed buffered in `pending`. With
+        // `retain` tk(2) is still buffered and reaches disk here; with the old
+        // `clear()` it was dropped and only the (now discarded) shard map held it.
+        log.persist(0).unwrap();
+
+        // Reload from the DURABLE FILE only (no in-RAM carry-over): tk(2) must be
+        // present, proving it survived a crash-equivalent reload.
+        let reloaded = TombstoneLog::load(path, 0, 4, 100).unwrap();
+        assert_eq!(
+            reloaded.lookup(&tk(2)),
+            Some((9, 600)),
+            "a delete recorded in the compaction window must survive to the durable \
+             file (retain), not be lost by pending.clear()",
+        );
+        assert!(reloaded.at_or_ahead(&tk(2), 0));
+        // tk(1) is unaffected.
+        assert_eq!(reloaded.lookup(&tk(1)), Some((1, 500)));
+    }
+
+    /// `clear` drops the tombstone from the in-RAM index and from any un-persisted
+    /// `pending` append, so a subsequent compaction cannot re-append it (the P1
+    /// `retain` + P2-2 `clear` interaction). A never-deleted key is a no-op.
+    #[test]
+    fn clear_removes_tombstone_from_index_and_pending() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.tombstones");
+        let log = TombstoneLog::new(path.clone(), 0, 4, 100);
+        log.record(&tk(1), 3, 500, TombstoneCause::Dah);
+
+        assert!(!log.clear(&tk(99)), "clearing an absent key is a no-op");
+
+        assert!(log.clear(&tk(1)), "clearing a present key reports removal");
+        assert!(log.lookup(&tk(1)).is_none(), "in-RAM index entry is gone");
+        assert!(
+            log.file.lock().pending.iter().all(|(k, _)| *k != tk(1)),
+            "the buffered append for the cleared key is drained too",
+        );
+
+        // Compaction after a clear must not resurrect the tombstone in the file.
+        log.persist(0).unwrap();
+        let reloaded = TombstoneLog::load(path, 0, 4, 100).unwrap();
+        assert!(
+            reloaded.lookup(&tk(1)).is_none(),
+            "a cleared tombstone must not be re-appended by compaction",
+        );
     }
 
     #[test]
