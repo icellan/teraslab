@@ -2440,6 +2440,14 @@ pub(crate) fn build_replication_targets(
     let mut key_targets: Vec<(TxKey, Vec<SocketAddr>)> = Vec::with_capacity(ops_by_key.len());
     // P4/R4: addr → NodeId for per-target ACK timeout selection.
     let mut addr_nodes: HashMap<SocketAddr, NodeId> = HashMap::new();
+    // C31: `dual_write_targets_for_shard` takes the migration lock and allocates
+    // a Vec on every call. It was invoked once PER KEY in this loop — N lock
+    // acquisitions + N allocations for an N-key batch. The batch runs under the
+    // per-key visibility guard, so migration state cannot change mid-batch;
+    // memoize the lookup per DISTINCT shard so the migration lock is taken at
+    // most once per shard the batch touches (once total for a same-shard batch),
+    // with byte-identical per-key results.
+    let mut dual_write_by_shard: HashMap<u16, Vec<NodeId>> = HashMap::new();
 
     for (key, ops) in ops_by_key {
         let shard = ShardTable::shard_for_key(key);
@@ -2467,7 +2475,9 @@ pub(crate) fn build_replication_targets(
         // is silently skipped rather than failing the write, because the
         // migration stream itself will deliver baseline+deltas to the
         // destination once the address is known.
-        let dual_write_extras = cluster.dual_write_targets_for_shard(shard);
+        let dual_write_extras: &[NodeId] = dual_write_by_shard
+            .entry(shard)
+            .or_insert_with(|| cluster.dual_write_targets_for_shard(shard));
         for replica_id in &assignment.replicas {
             // A node never makes a NETWORK replication connection to its own
             // address. When the shard's replica set names THIS node (which
@@ -2545,7 +2555,7 @@ pub(crate) fn build_replication_targets(
                 None => {}
             }
         }
-        for extra in &dual_write_extras {
+        for extra in dual_write_extras {
             if *extra == self_id || *extra == current_master || assignment.replicas.contains(extra)
             {
                 continue;
@@ -20806,6 +20816,95 @@ mod tests {
         assert_eq!(plan.addr_nodes.get(&n2_addr), Some(&n2));
         assert_eq!(plan.addr_nodes.get(&n3_addr), Some(&n3));
         assert!(!plan.addr_nodes.contains_key(&n1_addr));
+    }
+
+    /// C31: the dual-write-target lookup (which takes the migration lock and
+    /// allocates a Vec) must be memoized per DISTINCT shard, not re-run per key.
+    /// A same-shard multi-key batch under an open dual-write window must resolve
+    /// the migration lock exactly ONCE (not once per key), while every key still
+    /// gets byte-identical dual-write targets.
+    #[test]
+    fn build_replication_targets_memoizes_dual_write_lookup_per_shard() {
+        let n1 = crate::cluster::shards::NodeId(1);
+        let n2 = crate::cluster::shards::NodeId(2);
+        let n3 = crate::cluster::shards::NodeId(3);
+        let members = vec![n1, n2, n3];
+        let table = crate::cluster::shards::ShardTable::compute_with_epoch(&members, 2, 200, 1);
+        let shard = (0..crate::cluster::shards::NUM_SHARDS as u16)
+            .find(|&s| {
+                let a = table.target_assignment(s);
+                a.master == n1 && a.replicas.contains(&n2) && !a.replicas.contains(&n3)
+            })
+            .expect("expected shard mastered by n1 with n2 (not n3) as replica");
+
+        let n1_addr: SocketAddr = "127.0.0.1:8911".parse().unwrap();
+        let n2_addr: SocketAddr = "127.0.0.1:8912".parse().unwrap();
+        let n3_addr: SocketAddr = "127.0.0.1:8913".parse().unwrap();
+
+        let cluster = crate::cluster::coordinator::new_test_running_cluster(
+            n1,
+            table,
+            &[(n1, n1_addr), (n2, n2_addr), (n3, n3_addr)],
+            &members,
+            &[],
+            &[],
+            &[],
+            3,
+        );
+        cluster.test_open_dual_write_window(shard, n3);
+
+        // Five DISTINCT keys, all routed to the SAME shard.
+        let keys: Vec<TxKey> = (0..5u8)
+            .map(|i| TxKey {
+                txid: txid_for_shard(shard, i),
+            })
+            .collect();
+        assert!(
+            keys.iter()
+                .all(|k| crate::cluster::shards::ShardTable::shard_for_key(k) == shard),
+            "test keys must all map to the same shard"
+        );
+        let ops: Vec<(TxKey, Vec<crate::replication::protocol::ReplicaOp>)> = keys
+            .iter()
+            .map(|k| {
+                (
+                    *k,
+                    vec![crate::replication::protocol::ReplicaOp::Delete { tx_key: *k }],
+                )
+            })
+            .collect();
+
+        let before = cluster.dual_write_lookup_calls();
+        let plan = build_replication_targets(&cluster, &ops)
+            .expect("dual-write target resolution should succeed");
+        let calls = cluster.dual_write_lookup_calls() - before;
+
+        // The heart of C31: ONE migration-lock acquisition for the whole
+        // same-shard batch, not one per key (was 5).
+        assert_eq!(
+            calls,
+            1,
+            "dual-write lookup must be memoized per distinct shard (1 call), \
+             not re-run per key (would be {})",
+            keys.len(),
+        );
+
+        // Behavior preserved: every key still fans out to the dual-write
+        // destination n3, and n3 is tagged dual-write-only.
+        assert!(
+            plan.by_addr.contains_key(&n3_addr),
+            "dual-write destination n3 must be in fan-out for the memoized batch: {:?}",
+            plan.by_addr,
+        );
+        assert!(
+            plan.dual_write_only.contains(&n3_addr),
+            "n3 must still be tagged dual-write-only after memoization: {:?}",
+            plan.dual_write_only,
+        );
+        assert_eq!(plan.addr_nodes.get(&n3_addr), Some(&n3));
+        // Every key's regular replica set is unchanged (n2 present, self absent).
+        assert!(plan.by_addr.contains_key(&n2_addr));
+        assert!(!plan.by_addr.contains_key(&n1_addr));
     }
 
     /// The per-mutation replication intent (a durable fsync on the hot write

@@ -2677,6 +2677,8 @@ impl ClusterCoordinator {
             startup_reactivation_needed,
             #[cfg(any(test, feature = "fault-injection"))]
             drop_commit_signals: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            dual_write_lookup_calls: AtomicU64::new(0),
             _swim_handle: swim_handle,
             _event_handle: event_handle,
         }
@@ -8388,6 +8390,13 @@ pub struct RunningCluster {
     /// masking the deadlock. Always false in production.
     #[cfg(any(test, feature = "fault-injection"))]
     drop_commit_signals: Arc<AtomicBool>,
+    /// C31 test observability: counts calls to
+    /// [`RunningCluster::dual_write_targets_for_shard`], each of which takes the
+    /// migration lock. Lets a test assert the batch dual-write path memoizes the
+    /// lookup per distinct shard (one lock acquisition per shard) instead of per
+    /// key. Test-only — no production overhead.
+    #[cfg(test)]
+    dual_write_lookup_calls: AtomicU64,
     _swim_handle: std::thread::JoinHandle<()>,
     _event_handle: std::thread::JoinHandle<()>,
 }
@@ -9525,10 +9534,23 @@ impl RunningCluster {
     /// during the migration window. This protects durability when the new
     /// master is promoted before the migration has finished streaming.
     pub fn dual_write_targets_for_shard(&self, shard: u16) -> Vec<NodeId> {
+        // C31 test observability: count each migration-lock acquisition so a
+        // test can pin the per-shard memoization in the batch dual-write path.
+        #[cfg(test)]
+        self.dual_write_lookup_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.migration
             .lock()
             .dual_write_targets_for_shard(shard)
             .to_vec()
+    }
+
+    /// C31 test observability: number of [`Self::dual_write_targets_for_shard`]
+    /// calls (== migration-lock acquisitions) since construction.
+    #[cfg(test)]
+    pub(crate) fn dual_write_lookup_calls(&self) -> u64 {
+        self.dual_write_lookup_calls
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Test-only: register an outbound migration task on this cluster's
@@ -9966,6 +9988,8 @@ pub(crate) fn new_test_running_cluster(
         startup_reactivation_needed: Arc::new(AtomicBool::new(false)),
         #[cfg(any(test, feature = "fault-injection"))]
         drop_commit_signals: Arc::new(AtomicBool::new(false)),
+        #[cfg(test)]
+        dual_write_lookup_calls: AtomicU64::new(0),
         _swim_handle: std::thread::spawn(|| {}),
         _event_handle: std::thread::spawn(|| {}),
     }
