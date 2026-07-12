@@ -4818,6 +4818,34 @@ const MIGRATION_PIPELINE_SUB_BATCH: usize = 32;
 ///
 /// This is orders of magnitude faster than per-shard connections:
 /// a 3-node cluster migrating 1300 shards uses 1 connection instead of 1300.
+///
+/// # C25 — why `topology_epoch` (not the quorum-committed `cluster_key`) here
+///
+/// `topology_epoch` is the LOCAL shard-table version this migration was
+/// planned at. It plays two roles, and the local version — not
+/// `committed_cluster_key` — is correct for BOTH:
+///
+///  1. **Local abort fence** (`migration_epoch_current`): a migration must be
+///     discarded the instant the LOCAL table advances past the epoch it was
+///     planned at, regardless of the quorum-committed term. Gating on
+///     `committed_cluster_key` would let a migration keep streaming under a
+///     shard plan the node has already replaced. See the `migration_epoch_current`
+///     doc for the full rationale.
+///  2. **Outbound `cluster_key`** stamped on the streamed baseline / redo delta
+///     batches and the `OP_MIGRATION_COMPLETE` handshake (via
+///     `stream_shard_baseline` / `send_completion_only_handshakes`).
+///
+/// These do not diverge in a way that mis-fences: `activate_topology` computes
+/// the table at `commit.term` AND stores `topology_epoch = commit.term`
+/// together, and every migration in this batch is spawned from that same
+/// activation — so `topology_epoch == committed_term == shard_table.version`
+/// at spawn time, which is exactly the `committed_cluster_key` the receiver
+/// gates inbound batches on. The only window where the per-node
+/// `topology_epoch` leads `committed_term` is a membership proposed/observed
+/// but not yet quorum-committed (the `is_master` `Transitioning` gate); NO
+/// migration is spawned in that window, so the stamped key always matches the
+/// activated, committed term. (Pinned by
+/// `activation_keeps_topology_epoch_equal_to_committed_term`.)
 #[allow(clippy::too_many_arguments)]
 fn run_migration_batch(
     tasks: Vec<MigrationTask>,
@@ -4827,6 +4855,9 @@ fn run_migration_batch(
     migration: &Arc<Mutex<MigrationManager>>,
     shard_table: &Arc<ShardTableLock<ShardTable>>,
     redo_log: &Option<Arc<ParkingMutex<RedoLog>>>,
+    // C25: the LOCAL table version this migration was planned at — the abort
+    // fence AND the outbound migration `cluster_key`. Equals `committed_term`
+    // at spawn (see the fn-level doc). Intentionally not `committed_cluster_key`.
     topology_epoch: u64,
     pool_size: usize,
     batch_size: usize,
@@ -17212,6 +17243,55 @@ mod tests {
             7,
             "cluster_key_handle() must back the same value (7) so manager \
              and receiver observe the committed term, not topology_epoch",
+        );
+    }
+
+    /// C25 pin — in a converged / activated topology the per-node
+    /// `topology_epoch`, the quorum-committed term, and the local shard-table
+    /// version all agree. This is the invariant that makes `topology_epoch` a
+    /// safe migration `cluster_key`: `activate_topology` sets all three to
+    /// `commit.term` together, so the key stamped on outbound migration traffic
+    /// (see `run_migration_batch`'s C25 doc) equals the `committed_term` the
+    /// receiver gates inbound batches on. The ONLY divergence
+    /// (`topology_epoch` leading `committed_term` — pinned by
+    /// `local_cluster_key_returns_committed_term_not_topology_epoch`) is a
+    /// proposed-but-not-committed membership, and NO migration is spawned in
+    /// that window.
+    #[test]
+    fn activation_keeps_topology_epoch_equal_to_committed_term() {
+        let members = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let table = ShardTable::compute_with_epoch(&members, 2, 7, 1);
+        let cluster = new_test_running_cluster(
+            NodeId(1),
+            table,
+            &[
+                (NodeId(1), "127.0.0.1:4881".parse().unwrap()),
+                (NodeId(2), "127.0.0.1:4882".parse().unwrap()),
+                (NodeId(3), "127.0.0.1:4883".parse().unwrap()),
+            ],
+            &members,
+            &[],
+            &[],
+            &[],
+            3,
+        );
+
+        let epoch = cluster.topology_epoch();
+        let committed = cluster.topology_authority.committed_term();
+        let table_ver = cluster.shard_table().read().version;
+        assert_eq!(epoch, 7, "activated epoch");
+        assert_eq!(
+            epoch, committed,
+            "migration cluster_key (topology_epoch) must equal the committed term"
+        );
+        assert_eq!(
+            epoch, table_ver,
+            "and the local shard-table version the migration is planned at"
+        );
+        assert_eq!(
+            cluster.local_cluster_key(),
+            committed,
+            "committed_cluster_key (the receiver's inbound gate) mirrors committed_term"
         );
     }
 
