@@ -5556,19 +5556,34 @@ fn handle_spend_batch(
     // path's `ValidatedSpend` would re-acquire the stripe lock and self-deadlock
     // on a stripe collision.
     let txid_keys: Vec<TxKey> = by_txid.keys().map(|t| TxKey { txid: *t }).collect();
-    // Per-key visibility: write-lock the stripes of this batch's keys (plus the
-    // global SHARED side = checkpoint coordination). Excludes any client read of
-    // THESE keys for the apply window (batch-atomic per key) while letting spends
-    // on disjoint keys run fully concurrently — the global exclusive barrier this
-    // replaces serialized every mutation. Dropped before replication, alongside
-    // `stripe_guards`.
+    // Per-key visibility, acquired as its two halves SEPARATELY so they can be
+    // released at different points:
+    //   * `global_vis` — the global SHARED side (checkpoint coordination). Held
+    //     only across local apply, then released before the replication round-
+    //     trip so a checkpoint can still snapshot the engine during it.
+    //   * `visibility_stripes` — the per-key WRITE stripes for this batch's keys.
+    //
+    // G4 (read-your-writes / monotonicity): the per-key stripes are held ACROSS
+    // the replication round-trip and any compensation, NOT dropped before
+    // replication. A concurrent reader of these keys is excluded until the
+    // replication OUTCOME is known — so it never observes a spend that a
+    // replication failure then rolls back (a phantom write that never reached
+    // RF quorum). Disjoint-key spends/reads still run fully concurrently (only
+    // the touched stripes are held), and the GLOBAL side is released before the
+    // network round-trip, so this does NOT hold the coarse barrier across the
+    // RTT (which would throttle the whole engine / block checkpoints). This is
+    // the SAFE default: correctness over the pre-quorum-visible optimization,
+    // at the cost of adding the replication RTT to a reader's wait on the exact
+    // keys being written.
     //
     // LOCK ORDER (deadlock-critical): visibility is acquired BEFORE the engine
     // stripe Mutexes — the SAME order create/set_mined use (they take visibility
     // in the handler, then the stripe lock inside the engine method). Taking the
     // stripe lock first here would invert the order against those handlers and
-    // deadlock under same-stripe contention.
-    let visibility_guard = engine.visibility().mutation(&txid_keys);
+    // deadlock under same-stripe contention. `global_read` before
+    // `mutation_stripes` preserves the global-before-stripes acquisition order.
+    let global_vis = engine.visibility().global_read();
+    let visibility_stripes = engine.visibility().mutation_stripes(&txid_keys);
     let stripe_guards = engine.lock_unique_stripes(&txid_keys);
 
     // Per-group staged mutation carried from validate (Phase 1+2) to apply
@@ -5914,13 +5929,16 @@ fn handle_spend_batch(
         return error_response(req.request_id, ERR_STORAGE_IO, &e.to_string());
     }
 
-    // Release every stripe lock BEFORE replication (network I/O must not run
-    // under the locks). On the error returns above the guards drop at scope end.
+    // Release every engine stripe lock BEFORE replication (network I/O must not
+    // run under them; compensation re-acquires them on the failure path). On the
+    // error returns above the guards drop at scope end.
     drop(stripe_guards);
-    // Release per-key visibility before the replication round-trip (reads of
-    // these keys resume immediately, observing the fully-applied local batch),
-    // mirroring the old MutationBarrier early-release.
-    drop(visibility_guard);
+    // G4: release ONLY the global (checkpoint-coordination) side here so a
+    // checkpoint can run during the replication round-trip. The per-key
+    // `visibility_stripes` stay held across replication (and any compensation)
+    // below — a reader of these keys is excluded until the replication outcome
+    // is known, so it never observes a spend that a failure then rolls back.
+    drop(global_vis);
 
     // Final per-item outcome classification for this batch. `errors` holds
     // validation failures *and* redirect errors (when the txid is not owned
@@ -5978,6 +5996,13 @@ fn handle_spend_batch(
             return error_response(req.request_id, ERR_REPLICATION_FAILED, &e);
         }
     };
+
+    // G4: replication reached a durable outcome (Full / Degraded). Release the
+    // per-key visibility now so readers of these keys observe the committed
+    // batch. On the failure path above, `visibility_stripes` is instead held
+    // through compensation and dropped as the handler returns, so a reader never
+    // observes the rolled-back write.
+    drop(visibility_stripes);
 
     // Same status/degraded-trailer precedence as every other batch mutation:
     // clean → STATUS_OK / STATUS_DEGRADED_DURABILITY, per-item errors →
@@ -21378,6 +21403,10 @@ mod tests {
         /// Sleep `ms` before ACKing each non-probe batch — simulates a
         /// slow replication RTT.
         SlowAck(u64),
+        /// Sleep `ms` before NAKing each non-probe batch — a slow replication
+        /// RTT that then FAILS, giving a controlled window during which the
+        /// spend is mid-replication before it fails and compensates.
+        SlowNak(u64),
     }
 
     /// Spawn a minimal OP_REPLICA_BATCH receiver on `127.0.0.1:0`, returning
@@ -21462,6 +21491,18 @@ mod tests {
                                     }
                                     .serialize(),
                                 },
+                                ReplicaBehaviour::SlowNak(ms) => {
+                                    std::thread::sleep(std::time::Duration::from_millis(ms));
+                                    ResponseFrame {
+                                        request_id: req.request_id,
+                                        status: STATUS_ERROR,
+                                        payload: ReplicaAck::Error {
+                                            failed_sequence: batch.first_sequence,
+                                            message: "test slow NAK".to_string(),
+                                        }
+                                        .serialize(),
+                                    }
+                                }
                             }
                         };
                         if stream.write_all(&resp.encode()).is_err() {
@@ -21607,6 +21648,130 @@ mod tests {
         let outcome = replicate_all_ops(Some(&cluster), &ops, (10, 10), &[])
             .expect("key reached its own replica — batch must succeed");
         assert_eq!(outcome, ReplicationOutcome::Full);
+    }
+
+    /// G4 (read-your-writes / monotonicity): a spend on an RF>1 node holds the
+    /// per-key visibility across the replication round-trip. A reader concurrent
+    /// with a spend whose replication FAILS must never observe the spent slot —
+    /// it is excluded until the outcome is known and the write is rolled back,
+    /// so it observes only the pre-write (UNSPENT) state. Before the fix the
+    /// visibility was released before replication, so the reader could observe
+    /// the SPENT slot that compensation then rolled back (a phantom write that
+    /// never reached quorum).
+    #[test]
+    fn spend_holds_visibility_until_replication_outcome_reader_never_sees_rolled_back_write() {
+        use crate::record::{UTXO_SPENT, UTXO_UNSPENT};
+        use std::sync::atomic::{AtomicU8, Ordering};
+
+        // A window long enough that the reader reliably issues its
+        // visibility-respecting read while the spend is still mid-replication.
+        const SLOW_NAK_MS: u64 = 500;
+        let replica = spawn_replica_receiver(ReplicaBehaviour::SlowNak(SLOW_NAK_MS));
+        let (cluster, key) = two_node_rf2(replica, Some(AckPolicy::WriteMajority));
+
+        // Real engine + redo so the spend applies locally (WAL-first) before it
+        // replicates and, on the NAK, compensates back to UNSPENT.
+        let h = RedoDispatchHarness::new();
+        assert_eq!(
+            h.create_tx(key.txid, 1).status,
+            STATUS_OK,
+            "seed create must succeed"
+        );
+        let slot_hash = h.engine.read_slot(&key, 0).expect("seeded slot").hash;
+        assert_eq!(
+            h.engine.read_slot(&key, 0).expect("seeded slot").status,
+            UTXO_UNSPENT,
+            "precondition: seeded slot is UNSPENT",
+        );
+
+        let spend_params = SpendBatchParams {
+            ignore_conflicting: false,
+            ignore_locked: false,
+            current_block_height: 100,
+            block_height_retention: 288,
+        };
+        let spend_items = [WireSpendItem {
+            txid: key.txid,
+            vout: 0,
+            utxo_hash: slot_hash,
+            spending_data: [0xA5u8; 36],
+        }];
+        let spend_payload = encode_spend_batch(&spend_params, &spend_items);
+
+        // What a visibility-respecting reader observed while the spend was in
+        // flight. 0xFF = "not yet recorded"; the reader writes the slot status
+        // it saw AFTER acquiring the read-visibility guard for `key`.
+        const UNSET: u8 = 0xFF;
+        let observed = AtomicU8::new(UNSET);
+
+        std::thread::scope(|s| {
+            // Spender: applies locally, blocks ~SLOW_NAK_MS in replication, then
+            // the NAK fails the write and compensation rolls it back to UNSPENT.
+            let spend_resp = s.spawn(|| {
+                let req = RequestFrame {
+                    request_id: 1,
+                    op_code: OP_SPEND_BATCH,
+                    flags: 0,
+                    payload: spend_payload.into(),
+                };
+                let mut cs = crate::server::ConnectionState::new();
+                handle_request(
+                    &req,
+                    &h.engine,
+                    8192,
+                    Some(&cluster),
+                    Some(&h.redo_log),
+                    &mut cs,
+                    None,
+                )
+            });
+
+            // Reader: wait (via a dirty read that bypasses visibility) until the
+            // spend has applied locally, so we know replication is now in flight.
+            // Then take the read-visibility guard for `key` and record the slot
+            // status it exposes. After the fix this guard BLOCKS until the
+            // spender's replication outcome + rollback (→ UNSPENT); before the
+            // fix it acquires immediately and exposes the (soon-rolled-back)
+            // SPENT slot.
+            s.spawn(|| {
+                loop {
+                    if let Ok(slot) = h.engine.read_slot(&key, 0) {
+                        let status = slot.status;
+                        if status == UTXO_SPENT {
+                            break;
+                        }
+                    }
+                    std::thread::yield_now();
+                }
+                let _read_guard = h.engine.visibility().read(std::slice::from_ref(&key));
+                let status = h.engine.read_slot(&key, 0).map(|slot| slot.status);
+                observed.store(status.unwrap_or(UNSET), Ordering::SeqCst);
+            });
+
+            let resp = spend_resp.join().expect("spender thread panicked");
+            assert_eq!(
+                resp.status, STATUS_ERROR,
+                "the spend must fail: its sole replica NAKed (below WriteMajority)",
+            );
+        });
+
+        // The reader must have observed the pre-write UNSPENT state, NEVER the
+        // SPENT slot that replication rolled back.
+        assert_eq!(
+            observed.load(Ordering::SeqCst),
+            UTXO_UNSPENT,
+            "reader observed a spend that replication failed and rolled back \
+             (read-your-writes / monotonicity violation)",
+        );
+        // And the durable local state is the rolled-back UNSPENT slot.
+        assert_eq!(
+            h.engine
+                .read_slot(&key, 0)
+                .expect("slot still present")
+                .status,
+            UTXO_UNSPENT,
+            "compensation must have rolled the slot back to UNSPENT",
+        );
     }
 
     /// Task 14 live/master→replica coverage: 3 txids owned by the SAME
