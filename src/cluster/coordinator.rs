@@ -100,6 +100,19 @@ fn sync_atomic_migration_bitmaps(
             migrating_bm.set(progress.shard);
         }
     }
+    // P2 — refresh the LOST/UNAVAILABLE-shard gauge from the manager on every
+    // bitmap sync (the GC window, topology activation, and periodic resync all
+    // funnel through here). It is a level, not a counter: `store` the current
+    // count so a shard that stays lost across GC cycles remains continuously
+    // visible on `/metrics`, and the gauge drops to 0 the moment the shard is
+    // completed or re-migrated. `lost_count()` is O(inbound entries), off the
+    // write hot path.
+    if let Some(m) = crate::metrics::migration_metrics() {
+        m.migration_lost.store(
+            mgr.lost_count() as u32,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
 }
 
 /// Decide whether a migration task scheduled at `topology_epoch` is still
@@ -16056,6 +16069,77 @@ mod tests {
                  authority on the production `activate_topology_with_view` path; got {other:?}",
             ),
         }
+    }
+
+    /// C8/C17 (P2) — the `migration_lost` gauge must reflect the number of
+    /// shards currently marked LOST/UNAVAILABLE and stay current across syncs,
+    /// so a persistently-lost shard is continuously visible on `/metrics`. It
+    /// is a level (current count), not a monotonic counter, and drops back to
+    /// 0 once the shard is completed / re-migrated.
+    #[test]
+    fn migration_lost_gauge_tracks_lost_shards() {
+        let _guard = migration_metrics_test_guard();
+        let metrics = install_test_migration_metrics();
+
+        let members = vec![NodeId(1)];
+        let table = ShardTable::compute_with_epoch(&members, 1, 5, 1);
+        let cluster = new_test_running_cluster(
+            NodeId(1),
+            table,
+            &[(NodeId(1), "127.0.0.1:4881".parse().unwrap())],
+            &members,
+            &[],
+            &[],
+            &[],
+            1,
+        );
+        let shard = 3u16;
+
+        // No lost shards yet: a sync reports zero (the gauge is absolute — a
+        // store of the current count, so it is independent of any prior test's
+        // residue on the shared metrics sink).
+        cluster.sync_migration_bitmaps();
+        assert_eq!(
+            metrics.migration_lost.load(Ordering::Relaxed),
+            0,
+            "no lost shards → migration_lost gauge is 0",
+        );
+
+        // Incomplete inbound, source dies, settled-inbound GC marks it LOST.
+        {
+            let mgr = &mut cluster.migration.lock();
+            mgr.register_inbound_source(shard, NodeId(2));
+            let settled =
+                mgr.pending_inbound_shards_excluding_recent_requests(Duration::from_secs(1));
+            assert_eq!(mgr.mark_inbound_lost(&settled), 1);
+        }
+        cluster.sync_migration_bitmaps();
+        assert_eq!(
+            metrics.migration_lost.load(Ordering::Relaxed),
+            1,
+            "a shard marked LOST must raise the migration_lost gauge",
+        );
+
+        // A later sync while the shard is STILL lost keeps the gauge at 1 — the
+        // level does not decay while the shard remains unavailable. This is the
+        // observability the P2 warn-log gap left silent (the warn fires only on
+        // the cycle that marks NEW shards lost).
+        cluster.sync_migration_bitmaps();
+        assert_eq!(
+            metrics.migration_lost.load(Ordering::Relaxed),
+            1,
+            "a persistently-lost shard stays visible on the gauge across syncs",
+        );
+
+        // Completion (equivalently, a re-migration that clears the lost mark)
+        // drops the count; the gauge follows back to 0.
+        cluster.migration.lock().mark_inbound_complete(shard);
+        cluster.sync_migration_bitmaps();
+        assert_eq!(
+            metrics.migration_lost.load(Ordering::Relaxed),
+            0,
+            "completing the shard drops the migration_lost gauge back to 0",
+        );
     }
 
     /// C5 (SAFE DEFAULT: reconcile-don't-clobber) — restoring an interrupted
