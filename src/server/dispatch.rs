@@ -782,8 +782,20 @@ pub(crate) fn handle_request(
             redo_log,
             mutation_barrier,
         ),
-        OP_GET_BATCH => handle_get_batch(request, engine, max_batch_size, cluster),
-        OP_GET_SPEND_BATCH => handle_get_spend_batch(request, engine, max_batch_size, cluster),
+        OP_GET_BATCH => handle_get_batch(
+            request,
+            engine,
+            max_batch_size,
+            cluster,
+            conn_state.local_read_authorized,
+        ),
+        OP_GET_SPEND_BATCH => handle_get_spend_batch(
+            request,
+            engine,
+            max_batch_size,
+            cluster,
+            conn_state.local_read_authorized,
+        ),
         OP_QUERY_OLD_UNMINED => handle_query_old_unmined(request, engine, cluster),
         OP_QUERY_CONFLICTING => handle_query_conflicting(request, engine, cluster),
         OP_PRESERVE_TRANSACTIONS => handle_preserve_transactions(
@@ -9537,6 +9549,11 @@ fn handle_get_batch(
     engine: &Engine,
     max_batch: u32,
     cluster: Option<&RunningCluster>,
+    // C23: whether this frame is authorized to honor FLAG_LOCAL_READ. Computed
+    // once per frame in the connection loop: true for HMAC-authenticated cluster
+    // peers and for trusted-overlay mode (no `cluster_secret`); false for an
+    // arbitrary external client on an auth-enforcing node.
+    local_read_authorized: bool,
 ) -> ResponseFrame {
     let (field_mask, txids) = match decode_get_batch_checked(&req.payload, max_batch) {
         Ok(r) => r,
@@ -9551,7 +9568,11 @@ fn handle_get_batch(
     let vis_keys: Vec<TxKey> = txids.iter().map(|t| TxKey { txid: *t }).collect();
     let _visibility_guard = engine.visibility().read(&vis_keys);
 
-    let local_read = req.flags & FLAG_LOCAL_READ != 0;
+    // C23: FLAG_LOCAL_READ bypasses the shard-ownership/redirect check, so it is
+    // honored ONLY when the frame is authorized (authenticated cluster peer, or
+    // trusted-overlay mode). An arbitrary external client that sets the flag is
+    // ignored and falls through to the normal ownership/redirect path.
+    let local_read = local_read_authorized && (req.flags & FLAG_LOCAL_READ != 0);
 
     // P1-3: hoist the shard-master lookup to ONE lock acquisition for the whole
     // GET batch. Skipped entirely for local reads (ownership is not consulted)
@@ -10406,6 +10427,8 @@ fn handle_get_spend_batch(
     engine: &Engine,
     max_batch: u32,
     cluster: Option<&RunningCluster>,
+    // C23: see `handle_get_batch` — gates whether FLAG_LOCAL_READ is honored.
+    local_read_authorized: bool,
 ) -> ResponseFrame {
     let items = match decode_get_spend_batch_checked(&req.payload, max_batch) {
         Ok(r) => r,
@@ -10418,7 +10441,9 @@ fn handle_get_spend_batch(
     let vis_keys: Vec<TxKey> = items.iter().map(|i| TxKey { txid: i.txid }).collect();
     let _visibility_guard = engine.visibility().read(&vis_keys);
 
-    let local_read = req.flags & FLAG_LOCAL_READ != 0;
+    // C23: honor FLAG_LOCAL_READ only for authorized (cluster-auth / trusted-
+    // overlay) callers; an external client's flag is ignored.
+    let local_read = local_read_authorized && (req.flags & FLAG_LOCAL_READ != 0);
 
     let results: Vec<WireGetSpendResult> = match (items.len() >= READ_FANOUT_THRESHOLD)
         .then(read_pool)
@@ -18396,6 +18421,142 @@ mod tests {
         let results = crate::protocol::codec::decode_get_response(&resp.payload).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].status, ERR_REDIRECT as u8);
+    }
+
+    /// C23: `FLAG_LOCAL_READ` bypasses the shard-ownership/redirect check and
+    /// reads the record locally. An arbitrary external client must NOT be able
+    /// to set it to read a shard this node does not own — only a caller the
+    /// transport authorized (authenticated cluster peer, or trusted-overlay
+    /// mode) may. This pins that gate at the GET handler: an unauthorized
+    /// caller's flag is ignored (→ REDIRECT), an authorized caller's is honored
+    /// (→ local read).
+    #[test]
+    fn get_batch_local_read_flag_honored_only_for_authorized_callers() {
+        use crate::cluster::shards::{NodeId, ShardTable};
+
+        let h = DispatchTestHarness::new();
+        let txid = DispatchTestHarness::make_txid(123);
+        assert_eq!(h.create_tx(txid, 1).status, STATUS_OK);
+
+        // 2-node cluster where THIS node is not the master of txid's shard, so a
+        // non-local read redirects.
+        let shard = ShardTable::shard_for_key(&TxKey { txid });
+        let members = vec![NodeId(1), NodeId(2)];
+        let table = ShardTable::compute_with_epoch(&members, 2, 11, 1);
+        let master = table.target_assignment(shard).master;
+        let self_id = if master == NodeId(1) {
+            NodeId(2)
+        } else {
+            NodeId(1)
+        };
+        let cluster = crate::cluster::coordinator::new_test_running_cluster(
+            self_id,
+            table,
+            &[
+                (NodeId(1), "127.0.0.1:4471".parse().unwrap()),
+                (NodeId(2), "127.0.0.1:4472".parse().unwrap()),
+            ],
+            &members,
+            &[],
+            &[],
+            &[],
+            2,
+        );
+
+        let req = RequestFrame {
+            request_id: 1,
+            op_code: OP_GET_BATCH,
+            flags: FLAG_LOCAL_READ,
+            payload: crate::protocol::codec::encode_get_batch(FieldMask::ALL_METADATA, &[txid])
+                .into(),
+        };
+
+        // Unauthorized (external client): FLAG_LOCAL_READ ignored → REDIRECT.
+        let ext = handle_get_batch(&req, &h.engine, 8192, Some(&cluster), false);
+        let ext_results = crate::protocol::codec::decode_get_response(&ext.payload).unwrap();
+        assert_eq!(ext_results.len(), 1);
+        assert_eq!(
+            ext_results[0].status, ERR_REDIRECT as u8,
+            "external client's FLAG_LOCAL_READ must be ignored and redirected"
+        );
+
+        // Authorized (cluster-auth / trusted-overlay): flag honored → local read.
+        let int = handle_get_batch(&req, &h.engine, 8192, Some(&cluster), true);
+        let int_results = crate::protocol::codec::decode_get_response(&int.payload).unwrap();
+        assert_eq!(int_results.len(), 1);
+        assert_eq!(
+            int_results[0].status, 0,
+            "authorized caller's FLAG_LOCAL_READ must be honored (local read succeeds)"
+        );
+        assert!(
+            !int_results[0].data.is_empty(),
+            "honored local read must return the record's metadata"
+        );
+    }
+
+    /// C23 (GetSpend): the same authorization gate applies to
+    /// `OP_GET_SPEND_BATCH` — an unauthorized FLAG_LOCAL_READ is ignored and
+    /// the non-owned shard redirects.
+    #[test]
+    fn get_spend_batch_local_read_flag_honored_only_for_authorized_callers() {
+        use crate::cluster::shards::{NodeId, ShardTable};
+
+        let h = DispatchTestHarness::new();
+        let txid = DispatchTestHarness::make_txid(124);
+        assert_eq!(h.create_tx(txid, 1).status, STATUS_OK);
+
+        let shard = ShardTable::shard_for_key(&TxKey { txid });
+        let members = vec![NodeId(1), NodeId(2)];
+        let table = ShardTable::compute_with_epoch(&members, 2, 11, 1);
+        let master = table.target_assignment(shard).master;
+        let self_id = if master == NodeId(1) {
+            NodeId(2)
+        } else {
+            NodeId(1)
+        };
+        let cluster = crate::cluster::coordinator::new_test_running_cluster(
+            self_id,
+            table,
+            &[
+                (NodeId(1), "127.0.0.1:4481".parse().unwrap()),
+                (NodeId(2), "127.0.0.1:4482".parse().unwrap()),
+            ],
+            &members,
+            &[],
+            &[],
+            &[],
+            2,
+        );
+
+        let items = [WireGetSpendItem {
+            txid,
+            vout: 0,
+            utxo_hash: [0u8; 32],
+        }];
+        let req = RequestFrame {
+            request_id: 1,
+            op_code: OP_GET_SPEND_BATCH,
+            flags: FLAG_LOCAL_READ,
+            payload: crate::protocol::codec::encode_get_spend_batch(&items).into(),
+        };
+
+        // Unauthorized: flag ignored → REDIRECT.
+        let ext = handle_get_spend_batch(&req, &h.engine, 8192, Some(&cluster), false);
+        let ext_results = crate::protocol::codec::decode_get_spend_response(&ext.payload).unwrap();
+        assert_eq!(ext_results.len(), 1);
+        assert_eq!(
+            ext_results[0].error_code, ERR_REDIRECT,
+            "external client's FLAG_LOCAL_READ must be ignored and redirected"
+        );
+
+        // Authorized: flag honored → the read is served locally (no REDIRECT).
+        let int = handle_get_spend_batch(&req, &h.engine, 8192, Some(&cluster), true);
+        let int_results = crate::protocol::codec::decode_get_spend_response(&int.payload).unwrap();
+        assert_eq!(int_results.len(), 1);
+        assert_ne!(
+            int_results[0].error_code, ERR_REDIRECT,
+            "authorized caller's FLAG_LOCAL_READ must be honored (served locally, not redirected)"
+        );
     }
 
     // R-041: REDIRECT now carries shard_table_version so clients can detect

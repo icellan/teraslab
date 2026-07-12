@@ -206,6 +206,14 @@ pub(crate) struct ConnectionState {
     /// independently of connection close. `None` disables the reaper. See
     /// [`ServerConfig::stream_idle_timeout_secs`].
     pub(crate) stream_idle_timeout: Option<Duration>,
+    /// C23: whether the current frame is authorized to honor `FLAG_LOCAL_READ`
+    /// (which bypasses the shard-ownership/redirect check on GET). Set per frame
+    /// by the connection loop to `auth_required || cluster_secret.is_none()` —
+    /// true for HMAC-authenticated cluster peers and for trusted-overlay mode,
+    /// false for an arbitrary external client on an auth-enforcing node. Defaults
+    /// to `false` (external client / test double) so the flag is ignored unless
+    /// the connection loop explicitly grants it.
+    pub(crate) local_read_authorized: bool,
 }
 
 /// An in-progress streaming blob upload for a single txid.
@@ -228,6 +236,7 @@ impl ConnectionState {
             stream_idle_timeout: Some(Duration::from_secs(
                 ServerConfig::DEFAULT_STREAM_IDLE_TIMEOUT_SECS,
             )),
+            local_read_authorized: false,
         }
     }
 
@@ -1261,6 +1270,14 @@ fn handle_connection_inner(
         // mutations reach the redo group-commit at once. Stateful blob-stream
         // ops and authenticated inter-node frames take a drain barrier and run
         // inline against `conn_state`, so their semantics are unchanged.
+        // C23: a GET's FLAG_LOCAL_READ (bypass shard ownership + read locally)
+        // is honored only for a frame the transport authenticated as a cluster
+        // peer (`auth_required`) or on a trusted-overlay node (no
+        // `cluster_secret`, the fail-open default). An arbitrary external client
+        // on an auth-enforcing node must NOT be able to set the flag to read a
+        // shard it does not own, so its flag is ignored and it falls through to
+        // the normal ownership/redirect path.
+        let local_read_authorized = auth_required || opts.cluster_secret.is_none();
         if pipelining && is_pipelineable(&request, auth_required) {
             // Reserve a per-connection slot (backpressure to `depth`) then hand
             // the request to the shared pool; the worker writes the response.
@@ -1273,6 +1290,7 @@ fn handle_connection_inner(
                     writer: Arc::clone(&writer),
                     inflight: Arc::clone(&inflight),
                     _permit: _inflight_permit,
+                    local_read_authorized,
                 });
         } else {
             // Barrier / serial path: drain the connection's pooled requests so
@@ -1298,6 +1316,8 @@ fn handle_connection_inner(
                 )
                 .map_err(|e| format!("stream read: {e}"))?;
             } else {
+                // C23: thread the per-frame authorization into the handler.
+                conn_state.local_read_authorized = local_read_authorized;
                 let response = dispatch::handle_request(
                     &request,
                     engine,
@@ -1335,6 +1355,10 @@ struct WorkItem {
     writer: Arc<Mutex<TcpStream>>,
     inflight: Arc<ConnInFlight>,
     _permit: InflightBytesPermit,
+    /// C23: per-frame authorization to honor FLAG_LOCAL_READ, captured on the
+    /// connection loop before hand-off (the shared worker pool has no
+    /// per-connection state of its own). See [`ConnectionState::local_read_authorized`].
+    local_read_authorized: bool,
 }
 
 /// Per-connection in-flight accounting for pooled dispatch. Bounds a single
@@ -1688,6 +1712,11 @@ fn dispatch_worker(
 ) {
     let mut conn_state = ConnectionState::new();
     while let Some(item) = pool.recv(shard_idx) {
+        // C23: apply this frame's captured FLAG_LOCAL_READ authorization. The
+        // worker's `conn_state` is a shared throwaway (pipeline-eligible ops
+        // never touch per-connection state), so the per-frame grant travels on
+        // the WorkItem rather than the connection.
+        conn_state.local_read_authorized = item.local_read_authorized;
         let response = dispatch::handle_request(
             &item.request,
             engine,
