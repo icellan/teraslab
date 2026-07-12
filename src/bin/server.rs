@@ -212,25 +212,34 @@ fn run_one_catchup_pass(
                 Ok(e) => e,
                 Err(_) => return Vec::new(),
             };
-            entries
+            // CRITICAL FIX: `RedoOp::tx_key()` only represents a
+            // `SetMinedBatch` of exactly one txid (`None` for 0 or 2+), so a
+            // genuine multi-txid batch must be expanded across every shard its
+            // txids belong to — there is no single "the" shard to derive via
+            // `tx_key()` the way single-key ops have. Without this, a live
+            // setMined RPC touching 2+ txids was silently dropped from replica
+            // catch-up with no error or retry (permanent divergence).
+            //
+            // Each entry keeps its own sequence paired with its full `ReplicaOp`
+            // expansion (rather than flattening into one list) so
+            // `run_catchup_for_replica` can apply the per-pass op budget at
+            // entry granularity — never splitting one entry's (possibly
+            // multi-op) expansion across two passes, and never over-reporting
+            // the watermark past ops that were not actually sent.
+            //
+            // The converter is fail-closed: a create whose current record state
+            // cannot be read back (unreadable slot/mined-state, or a
+            // missing/unreadable EXTERNAL blob) returns `Err` rather than
+            // shipping a partial/corrupt record. On any such error we return an
+            // empty batch (same as the redo-read error above), which forces a
+            // full-shard resync instead of silently advancing the catch-up
+            // watermark past the unshippable entry.
+            let built: Result<
+                Vec<(u64, Vec<teraslab::replication::protocol::ReplicaOp>)>,
+                teraslab::cluster::coordinator::ReplicaConvertError,
+            > = entries
                 .iter()
                 .map(|e| {
-                    // CRITICAL FIX: `RedoOp::tx_key()` only represents a
-                    // `SetMinedBatch` of exactly one txid (`None` for 0 or
-                    // 2+), so a genuine multi-txid batch must be expanded
-                    // across every shard its txids belong to — there is no
-                    // single "the" shard to derive via `tx_key()` the way
-                    // single-key ops have. Without this, a live setMined RPC
-                    // touching 2+ txids was silently dropped from replica
-                    // catch-up with no error or retry (permanent divergence).
-                    //
-                    // Each entry keeps its own sequence paired with its full
-                    // `ReplicaOp` expansion (rather than flattening into one
-                    // list) so `run_catchup_for_replica` can apply the
-                    // per-pass op budget at entry granularity — never
-                    // splitting one entry's (possibly multi-op) expansion
-                    // across two passes, and never over-reporting the
-                    // watermark past ops that were not actually sent.
                     let ops: Vec<teraslab::replication::protocol::ReplicaOp> =
                         if let teraslab::redo::RedoOp::SetMinedBatch { txids, .. } = &e.op {
                             let mut ops = Vec::new();
@@ -242,7 +251,7 @@ fn run_one_catchup_pass(
                                     ops.extend(
                                         teraslab::cluster::coordinator::redo_entry_to_replica_ops(
                                             e, shard, &eng_ref,
-                                        ),
+                                        )?,
                                     );
                                 }
                             }
@@ -252,15 +261,26 @@ fn run_one_catchup_pass(
                                 teraslab::cluster::shards::ShardTable::shard_for_key(tx_key);
                             teraslab::cluster::coordinator::redo_entry_to_replica_op(
                                 e, shard, &eng_ref,
-                            )
+                            )?
                             .into_iter()
                             .collect()
                         } else {
                             Vec::new()
                         };
-                    (e.sequence, ops)
+                    Ok((e.sequence, ops))
                 })
-                .collect()
+                .collect();
+            match built {
+                Ok(v) => v,
+                Err(err) => {
+                    tracing::warn!(
+                        %addr,
+                        err = %err,
+                        "catchup: converter failed to read record state — forcing resync",
+                    );
+                    Vec::new()
+                }
+            }
         },
         first_avail_seq,
         &move |chunk| {
