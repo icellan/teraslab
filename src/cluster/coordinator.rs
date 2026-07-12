@@ -1289,7 +1289,11 @@ impl ClusterCoordinator {
             persisted_incarnation: config.persisted_incarnation,
             committed_term: topology_authority.committed_term_shared(),
         });
-        let swim_incarnation = Arc::new(std::sync::atomic::AtomicU64::new(swim.incarnation()));
+        // Share the runner's live incarnation atomic (NOT a fresh copy of its
+        // starting value) so refute bumps are visible to the persistence path
+        // and survive a reboot — otherwise the node reboots below its peers'
+        // max_seen and is permanently exiled (S1).
+        let swim_incarnation = swim.incarnation_shared();
 
         let mut addrs = std::collections::HashMap::new();
         addrs.insert(config.self_id, config.self_addr);
