@@ -935,14 +935,22 @@ where
 
     // 2c. Persist the deletion-tombstone log (reverse-heal Phase 2a): retention
     //     GC + durable write + fsync. A no-op when tombstones are disabled (no
-    //     log attached). NON-FATAL like the height above: the deletes are
-    //     already durable via the index snapshot, and the tombstone set is
-    //     re-derived/retried at the next checkpoint, so a transient tombstone
-    //     write error must not block redo reclamation. The atomic write
-    //     self-fsyncs, so it does not depend on the step-3 device barrier.
-    if let Err(e) = engine.persist_tombstones() {
-        tracing::warn!(err = %e, "checkpoint: tombstone-log persist failed (non-fatal)");
-    }
+    //     log attached). FATAL / fail-closed like the index + mined-index
+    //     snapshots above, NOT best-effort like the height: this delete's
+    //     durability MUST NOT outrun its tombstone's. If the tombstone write
+    //     fails and we let the checkpoint continue, step 3-5 make the delete
+    //     durable (device sync) and reclaim the redo prefix that covers it — a
+    //     later crash before a successful persist then leaves a durable delete
+    //     with NO durable tombstone (the in-RAM index is volatile) → a Phase-2c
+    //     laggard resurrects the record → double-spend. Propagating the error
+    //     aborts the checkpoint HERE, BEFORE the redo fence/reclaim (step 4-5),
+    //     so the delete's redo entry stays replayable and re-drives `record()`
+    //     on the next recovery/checkpoint, keeping the tombstone recoverable.
+    //     The atomic write self-fsyncs, so it does not depend on the step-3
+    //     device barrier. Retried on the next checkpoint.
+    engine
+        .persist_tombstones()
+        .map_err(|e| format!("tombstone-log persist: {e}"))?;
 
     // 3. Durability barrier (B-1/G-1 audit fixes). Redo reclamation is
     //    only legal once every store the fenced entries cover is durable:
@@ -3214,6 +3222,88 @@ mod tests {
         assert!(
             redo.lock().recover().unwrap().is_empty(),
             "the fence must now cover the previously appended entries"
+        );
+    }
+
+    /// P2-1 (reverse-heal Phase 2a, fail-closed tombstone persist). A
+    /// tombstone-log persist failure must abort the checkpoint like the index
+    /// snapshot — NOT log-and-continue — so a delete's durability can never
+    /// outrun its tombstone's. If the checkpoint advanced the redo fence /
+    /// reclaimed the prefix while the tombstone write failed, a later crash
+    /// would leave a durable delete with no durable tombstone (→ Phase-2c
+    /// resurrection). Here the tombstone path is unwritable (missing parent
+    /// dir), so `persist_tombstones` errors: the checkpoint must surface the
+    /// error, write no fence, and reclaim no redo.
+    #[test]
+    fn checkpoint_aborts_and_preserves_redo_when_tombstone_persist_fails() {
+        use crate::index::{PrimaryBackend, TxKey};
+        use crate::ops::tombstone::{TombstoneCause, TombstoneLog};
+
+        let dir = tempfile::tempdir().unwrap();
+        let snap_path = dir.path().join("tomb-gate.snap");
+
+        let dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(8 * 1024 * 1024, 4096).unwrap());
+        let alloc = SlotAllocator::new(dev.clone()).unwrap();
+        let engine = Engine::new(
+            dev,
+            PrimaryBackend::new_in_memory(1024).unwrap(),
+            alloc,
+            StripedLocks::new(16),
+            DahIndex::new(),
+        );
+
+        // Attach a tombstone log whose backing file is UNWRITABLE: its parent
+        // directory does not exist, so the buffered append below fails at persist.
+        let bad_path = dir.path().join("no-such-dir").join("x.tombstones");
+        let log = TombstoneLog::new(
+            bad_path,
+            engine.index_seed(),
+            engine.index_shard_count(),
+            100,
+        );
+        // Buffer one un-persisted tombstone so persist actually attempts a write.
+        log.record(
+            &TxKey { txid: [7u8; 32] },
+            3,
+            100,
+            TombstoneCause::ClientDelete,
+        );
+        engine.set_tombstone_log(log);
+
+        let redo_dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(64 * 1024, 4096).unwrap());
+        let redo = Mutex::new(RedoLog::open(redo_dev, 0, 64 * 1024).unwrap());
+        {
+            let mut log = redo.lock();
+            for i in 0..4u64 {
+                log.append(RedoOp::AllocateRegion {
+                    offset: 4096 * (i + 1),
+                    size: 4096,
+                    device_id: 0,
+                })
+                .unwrap();
+            }
+            log.flush().unwrap();
+        }
+        let write_pos_before = redo.lock().write_position();
+
+        let cfg = CheckpointConfig::new(snap_path);
+        let err = perform_checkpoint(&cfg, &engine, &redo)
+            .expect_err("checkpoint must abort when the tombstone persist fails");
+        assert!(
+            err.contains("tombstone-log persist"),
+            "error must name the failing step, got: {err}"
+        );
+
+        let log = redo.lock();
+        assert_eq!(
+            log.write_position(),
+            write_pos_before,
+            "aborted checkpoint must append no fence and compact nothing"
+        );
+        assert_eq!(
+            log.recover().unwrap().len(),
+            4,
+            "every redo entry must remain replayable after the aborted checkpoint"
         );
     }
 

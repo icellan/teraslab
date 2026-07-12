@@ -2069,8 +2069,10 @@ impl Engine {
     /// fsync). No-op when disabled.
     ///
     /// # Errors
-    /// Returns a [`std::io::Error`] on filesystem failure; the checkpoint treats
-    /// it like the last-durable-height persist — non-fatal, retried next round.
+    /// Returns a [`std::io::Error`] on filesystem failure. The checkpoint treats
+    /// this as FATAL (fail-closed, like the index snapshot): it aborts before the
+    /// redo fence/reclaim so a delete's durability can never outrun its
+    /// tombstone's. Retried on the next checkpoint.
     pub fn persist_tombstones(&self) -> std::io::Result<()> {
         match self.tombstone_log.get() {
             Some(log) => log.persist(self.last_durable_height()),
