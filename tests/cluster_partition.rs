@@ -57,10 +57,26 @@ const CLUSTER_SECRET: &str = "n05-partition-proxy-secret";
 struct ProxiedNode {
     server: Arc<Server>,
     cluster: Arc<RunningCluster>,
+    /// The node's engine — exposed so a reboot can assert the on-disk
+    /// recovery directly (physical presence of every acked record),
+    /// independent of cluster read routing.
+    engine: Arc<Engine>,
     /// Real TCP port (test clients connect here, bypassing the proxy).
     real_tcp_port: u16,
+    /// Real SWIM/UDP port — retained so the node can be REBOOTED over the
+    /// same sockets (an on-disk boot reuses the identical proxy relay, so
+    /// peers keep dialing the unchanged advertised endpoint).
+    real_swim_port: u16,
     /// Proxy endpoints advertised to peers.
     proxy: ProxyEndpoints,
+    /// Node identity + replication factor, kept for the reboot path.
+    node_id: u64,
+    rf: u8,
+    /// The node's backing "disk". A `MemoryDevice::new` retains its buffer
+    /// while the `Arc` is alive, so dropping the server/cluster (process
+    /// death) and reconstructing an engine over THIS device models a crash
+    /// followed by a boot from persisted on-disk state.
+    data_dev: Arc<MemoryDevice>,
 }
 
 fn reserve_tcp_port() -> u16 {
@@ -96,17 +112,119 @@ fn create_proxied_node(
     let real_tcp: std::net::SocketAddr = format!("127.0.0.1:{real_tcp_port}").parse().unwrap();
     let real_swim: std::net::SocketAddr = format!("127.0.0.1:{real_swim_port}").parse().unwrap();
 
+    // Registering spawns this node's proxy relay threads and returns the
+    // endpoints peers dial. A reboot REUSES these (see
+    // `reboot_proxied_node_from_disk`) — it does not re-register — so the
+    // relay keeps pointing at the same real ports and peers never learn a
+    // new address.
     let proxy = net.register(node_id, real_swim, real_tcp);
 
-    let dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(32 * 1024 * 1024, 4096).unwrap());
-    let alloc = SlotAllocator::new(dev.clone()).unwrap();
+    let data_dev = Arc::new(MemoryDevice::new(32 * 1024 * 1024, 4096).unwrap());
+    let alloc = SlotAllocator::new(data_dev.clone() as Arc<dyn BlockDevice>).unwrap();
     let index = Index::new(1000).unwrap();
+    let dah = DahIndex::new();
+
+    spawn_proxied_server(
+        node_id,
+        rf,
+        seed_swim,
+        data_dev,
+        index,
+        alloc,
+        dah,
+        real_tcp_port,
+        real_swim_port,
+        real_swim,
+        proxy,
+        0, // fresh boot: incarnation 0
+    )
+}
+
+/// Boot a node from its persisted on-disk state after a crash.
+///
+/// The caller must have already shut the old instance down (freeing the real
+/// sockets). This reconstructs the engine by RECOVERING the allocator and
+/// REBUILDING the primary + secondary indexes from `old.data_dev` (the exact
+/// production cold-start path), then restarts the coordinator + server on the
+/// SAME node id, real ports, and proxy relay — a genuine reboot rather than a
+/// replacement node. The SWIM incarnation is bumped so peers that marked the
+/// crashed instance dead accept the rebooted one as alive.
+fn reboot_proxied_node_from_disk(
+    old: &ProxiedNode,
+    seed_swim: &[std::net::SocketAddr],
+) -> ProxiedNode {
+    let data_dev = old.data_dev.clone();
+    let dev_dyn = data_dev.clone() as Arc<dyn BlockDevice>;
+
+    // Production cold start: recover the persisted allocator high-water, then
+    // scan the device to rebuild the primary + DAH secondary indexes.
+    let (alloc, origin) = teraslab::server::startup::recover_or_create_allocator(dev_dyn.clone())
+        .expect("allocator must recover from the crashed node's device");
+    assert_eq!(
+        origin,
+        teraslab::server::startup::AllocatorOrigin::Recovered,
+        "the crashed node must have persisted its allocator before the crash \
+         (else the device scan sees no records and the recovery is meaningless)"
+    );
+    let index = Index::rebuild(&*dev_dyn, &alloc).expect("rebuild primary index from device");
+    let dah_index =
+        Index::rebuild_secondary(&*dev_dyn, &alloc).expect("rebuild DAH secondary from device");
+
+    // Wait for the old real ports to free up before rebinding them.
+    let real_swim: std::net::SocketAddr =
+        format!("127.0.0.1:{}", old.real_swim_port).parse().unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        let tcp_free =
+            std::net::TcpListener::bind(format!("127.0.0.1:{}", old.real_tcp_port)).is_ok();
+        let udp_free = std::net::UdpSocket::bind(real_swim).is_ok();
+        if tcp_free && udp_free {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    spawn_proxied_server(
+        old.node_id,
+        old.rf,
+        seed_swim,
+        data_dev,
+        index,
+        alloc,
+        dah_index,
+        old.real_tcp_port,
+        old.real_swim_port,
+        real_swim,
+        old.proxy,
+        1, // rebooted instance: bump incarnation to refute stale "dead"
+    )
+}
+
+/// Shared node-spawn used by both the fresh boot and the reboot path. Binds
+/// the real sockets on the GIVEN ports and wires the engine, coordinator, and
+/// server together; the proxy relay is passed in (never re-registered) so a
+/// reboot keeps the same advertised endpoints.
+#[allow(clippy::too_many_arguments)]
+fn spawn_proxied_server(
+    node_id: u64,
+    rf: u8,
+    seed_swim: &[std::net::SocketAddr],
+    data_dev: Arc<MemoryDevice>,
+    index: impl Into<teraslab::index::PrimaryBackend>,
+    alloc: SlotAllocator,
+    dah: impl Into<teraslab::index::DahBackend>,
+    real_tcp_port: u16,
+    real_swim_port: u16,
+    real_swim: std::net::SocketAddr,
+    proxy: ProxyEndpoints,
+    persisted_incarnation: u64,
+) -> ProxiedNode {
     let engine = Arc::new(Engine::new(
-        dev,
+        data_dev.clone() as Arc<dyn BlockDevice>,
         index,
         alloc,
         StripedLocks::new(256),
-        DahIndex::new(),
+        dah,
     ));
 
     let cluster_config = ClusterConfig {
@@ -128,7 +246,7 @@ fn create_proxied_node(
         topology_debounce: Duration::from_millis(100),
         migration_pool_size: 4,
         migration_batch_size: 100,
-        persisted_incarnation: 0,
+        persisted_incarnation,
         cluster_id: TEST_CLUSTER_ID,
     };
 
@@ -158,7 +276,7 @@ fn create_proxied_node(
         strict_auth: false,
         ..Default::default()
     };
-    let server = Arc::new(Server::new(engine, config).with_cluster(running.clone()));
+    let server = Arc::new(Server::new(engine.clone(), config).with_cluster(running.clone()));
     let server_clone = server.clone();
     std::thread::spawn(move || {
         let _ = server_clone.run();
@@ -182,8 +300,13 @@ fn create_proxied_node(
     ProxiedNode {
         server,
         cluster: running,
+        engine,
         real_tcp_port,
+        real_swim_port,
         proxy,
+        node_id,
+        rf,
+        data_dev,
     }
 }
 
@@ -692,6 +815,288 @@ fn partitioned_minority_never_self_activates_topology() {
     );
 
     shutdown_node(&node1);
+    shutdown_node(&node2);
+    shutdown_node(&node3);
+}
+
+// ---------------------------------------------------------------------------
+// C30 — combined PARTITION + CRASH + on-disk BOOT recovery
+// ---------------------------------------------------------------------------
+
+/// The three failure modes stacked on one node: it is PARTITIONED from the
+/// majority, CRASHES while isolated, then BOOTS from its persisted on-disk
+/// state and rejoins the healed cluster. Asserts it recovers to a CONSISTENT
+/// state:
+///
+///   * **No lost acked writes** — every record acked before the crash is
+///     physically present after the device-scan rebuild, with intact metadata
+///     and utxo slot (asserted directly against the recovered engine).
+///   * **No fabrication** — the rebuild invents no records.
+///   * **Correct ownership / no dual-master** — after the cluster re-converges
+///     to a single 3-node topology, no key is mastered by two nodes at once.
+///   * **No divergence** — every acked record is still readable from its
+///     post-heal master.
+///
+/// Combines the live partition + topology-change path of
+/// `partitioned_minority_never_self_activates_topology` with a genuine on-disk
+/// boot: [`reboot_proxied_node_from_disk`] recovers the persisted allocator
+/// and rebuilds the primary + DAH indexes from the SAME `MemoryDevice`, then
+/// restarts the coordinator + server on the same identity, ports, and proxy.
+///
+/// The "crash" is process death with a retained device buffer (a
+/// `MemoryDevice::new` is non-volatile once written), so this exercises a
+/// crash whose acked writes had reached durable storage — the on-disk BOOT is
+/// what is under test, not sub-record write tearing (covered by the volatile
+/// `simulate_power_loss` engine/redo tests). See the returned note.
+#[test]
+#[serial]
+fn partition_then_crash_then_on_disk_boot_recovers_consistently() {
+    let net = ProxyNet::new();
+    let node1 = create_proxied_node(&net, 441, 2, &[]);
+    let node2 = create_proxied_node(&net, 442, 2, &[node1.proxy.swim]);
+    let node3 = create_proxied_node(&net, 443, 2, &[node1.proxy.swim, node2.proxy.swim]);
+
+    // Full 3-node convergence.
+    wait_until(
+        || {
+            [&node1, &node2, &node3]
+                .iter()
+                .all(|n| n.cluster.committed_topology_members().len() == 3)
+        },
+        Duration::from_secs(30),
+    )
+    .unwrap_or_else(|_| {
+        panic!(
+            "3-node cluster did not converge: {:?} {:?} {:?}",
+            node1.cluster.committed_topology_members(),
+            node2.cluster.committed_topology_members(),
+            node3.cluster.committed_topology_members(),
+        )
+    });
+
+    // Right after the topology commits, node1's LOCAL shard table can still
+    // lag the committed term — every shard then resolves to `NodeId(0)` and
+    // `is_master` answers `Transitioning`, never `Yes`. Wait until node1 has
+    // actually applied its table and masters at least one shard before writing
+    // to keys it owns.
+    wait_until(
+        || {
+            (0..4096u32).any(|i| {
+                matches!(
+                    node1.cluster.is_master(&TxKey {
+                        txid: make_txid(440_000 + i)
+                    }),
+                    MasterQueryResult::Yes
+                )
+            })
+        },
+        Duration::from_secs(30),
+    )
+    .expect("node1 should master at least one shard once its committed table applies");
+
+    // Write records to keys node1 masters. Each ack means the primary copy is
+    // durable on node1's device (plus one replica under RF=2). Seed bases are
+    // spaced past the 8192-candidate search window so the keys are distinct.
+    let written: Vec<([u8; 32], [u8; 32])> = (0..8u32)
+        .map(|i| {
+            let txid = find_key_mastered_by(&node1, 440_000 + i * 10_000);
+            let hash = make_txid(441_500 + i);
+            let mut stream = connect(node1.real_tcp_port);
+            let resp = send_request(
+                &mut stream,
+                &RequestFrame {
+                    request_id: 100 + i as u64,
+                    op_code: OP_CREATE_BATCH,
+                    flags: 0,
+                    payload: encode_create_payload(&txid, &hash).into(),
+                },
+            );
+            assert_eq!(
+                resp.status, STATUS_OK,
+                "pre-partition create for a node1-mastered key must be acked"
+            );
+            (txid, hash)
+        })
+        .collect();
+
+    // Checkpoint node1's allocator so its on-disk state is recoverable by the
+    // cold-start device scan (`recover_or_create_allocator` needs a persisted
+    // header; without it the reboot would see a fresh allocator and scan zero
+    // records — a false "loss").
+    node1
+        .engine
+        .allocator()
+        .lock()
+        .persist()
+        .expect("persist node1 allocator before crash");
+    node1
+        .data_dev
+        .sync()
+        .expect("sync node1 device before crash");
+
+    // --- PARTITION node1 from {2,3}; the majority re-commits a 2-node topology. ---
+    net.isolate(441, &[442, 443]);
+    wait_until(
+        || node1.cluster.alive_node_count() == 1,
+        Duration::from_secs(20),
+    )
+    .expect("partitioned node1 should mark both peers dead");
+    wait_until(
+        || {
+            node2.cluster.committed_topology_members().len() == 2
+                && node3.cluster.committed_topology_members().len() == 2
+        },
+        Duration::from_secs(30),
+    )
+    .expect("majority side {2,3} should re-commit a 2-node topology");
+    // No dual-master DURING the partition: a majority-mastered key is not `Yes`
+    // on the isolated node.
+    let majority_key = find_key_mastered_by(&node2, 600_000);
+    assert!(
+        !matches!(
+            node1.cluster.is_master(&TxKey { txid: majority_key }),
+            MasterQueryResult::Yes
+        ),
+        "isolated node1 must not claim mastership of a majority-side shard"
+    );
+
+    // --- CRASH node1 while isolated (process death; its device buffer survives). ---
+    shutdown_node(&node1);
+
+    // --- BOOT node1 from its on-disk state (recover allocator + rebuild index). ---
+    let node1b = reboot_proxied_node_from_disk(&node1, &[node2.proxy.swim, node3.proxy.swim]);
+
+    // (A) NO LOST ACKED WRITES — every pre-crash record is physically present
+    //     after the device-scan rebuild, with intact metadata + slot. This is
+    //     asserted against the recovered engine directly, so it holds
+    //     regardless of cluster read routing.
+    for (txid, hash) in &written {
+        let k = TxKey { txid: *txid };
+        assert!(
+            node1b.engine.lookup(&k).is_some(),
+            "acked pre-crash record missing after on-disk boot: {txid:?}",
+        );
+        let meta = node1b
+            .engine
+            .read_metadata(&k)
+            .expect("recovered record metadata must be readable");
+        let utxo_count = { meta.utxo_count };
+        assert!(
+            utxo_count >= 1,
+            "recovered record must retain its utxo slot (count={utxo_count})",
+        );
+        let slot = node1b
+            .engine
+            .read_slot(&k, 0)
+            .expect("recovered utxo slot must be readable");
+        assert_eq!(
+            &slot.hash, hash,
+            "recovered utxo hash must match the acked write for {txid:?}",
+        );
+    }
+    // (A') NO FABRICATION — a txid that was never written must be absent.
+    assert!(
+        node1b
+            .engine
+            .lookup(&TxKey {
+                txid: make_txid(999_999)
+            })
+            .is_none(),
+        "device rebuild must not fabricate records",
+    );
+
+    // --- HEAL + rejoin: the cluster re-converges to a single 3-node topology. ---
+    net.heal_all();
+    let nodes = [&node1b, &node2, &node3];
+    wait_until(
+        || {
+            nodes
+                .iter()
+                .all(|n| n.cluster.committed_topology_members().len() == 3)
+        },
+        Duration::from_secs(60),
+    )
+    .unwrap_or_else(|_| {
+        panic!(
+            "cluster did not re-converge to 3 nodes after crash+boot+heal: {:?} {:?} {:?}",
+            node1b.cluster.committed_topology_members(),
+            node2.cluster.committed_topology_members(),
+            node3.cluster.committed_topology_members(),
+        )
+    });
+
+    // (B) NO DUAL-MASTER — after reconvergence no key is mastered by two nodes
+    //     at once. Sample a spread of keys; each may have at most one `Yes`.
+    let no_dual = wait_until(
+        || {
+            (0..256u32).all(|i| {
+                let k = TxKey {
+                    txid: make_txid(700_000 + i),
+                };
+                nodes
+                    .iter()
+                    .filter(|n| matches!(n.cluster.is_master(&k), MasterQueryResult::Yes))
+                    .count()
+                    <= 1
+            })
+        },
+        Duration::from_secs(30),
+    );
+    assert!(
+        no_dual.is_ok(),
+        "a key was mastered by two nodes after reconvergence (dual-master)"
+    );
+
+    // (C) NO DIVERGENCE — every acked record stays readable from its post-heal
+    //     master (rebalance/migration may relocate it; poll the authority).
+    for (txid, hash) in &written {
+        let query = encode_get_spend_batch(&[WireGetSpendItem {
+            txid: *txid,
+            vout: 0,
+            utxo_hash: *hash,
+        }]);
+        let mut read_ok = false;
+        let read_agrees = wait_until(
+            || {
+                for node in nodes {
+                    if !matches!(
+                        node.cluster.is_master(&TxKey { txid: *txid }),
+                        MasterQueryResult::Yes
+                    ) {
+                        continue;
+                    }
+                    let mut stream = connect(node.real_tcp_port);
+                    let resp = send_request(
+                        &mut stream,
+                        &RequestFrame {
+                            request_id: 900,
+                            op_code: OP_GET_SPEND_BATCH,
+                            flags: 0,
+                            payload: query.clone().into(),
+                        },
+                    );
+                    if resp.status != STATUS_OK {
+                        return false;
+                    }
+                    match decode_get_spend_response(&resp.payload) {
+                        Some(r) if r.len() == 1 && r[0].status == 0 => {
+                            read_ok = true;
+                            return true;
+                        }
+                        _ => return false,
+                    }
+                }
+                false
+            },
+            Duration::from_secs(30),
+        );
+        assert!(
+            read_agrees.is_ok() && read_ok,
+            "acked record unreadable from its post-heal master (divergence/loss): {txid:?}",
+        );
+    }
+
+    shutdown_node(&node1b);
     shutdown_node(&node2);
     shutdown_node(&node3);
 }
