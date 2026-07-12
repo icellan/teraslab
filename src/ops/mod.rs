@@ -9,4 +9,5 @@ pub mod remaining;
 pub mod set_mined;
 pub mod signal;
 pub mod spend;
+pub mod tombstone;
 pub mod unspend;
