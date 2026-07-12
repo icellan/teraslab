@@ -6122,10 +6122,42 @@ fn stream_shard_baseline(
             meta_buf.extend_from_slice(&meta.delete_at_height.to_le_bytes());
             meta_buf.extend_from_slice(&meta.preserve_until.to_le_bytes());
 
-            let cold_data = if meta.flags.contains(crate::record::TxFlags::EXTERNAL) {
-                engine
-                    .blob_store()
-                    .and_then(|bs| bs.get(&key.txid).ok().flatten())
+            // S3 (baseline path): an EXTERNAL record's cold blob MUST accompany
+            // its baseline create, else the joining/migration target gets a LIVE
+            // record with a dangling `ExternalRef` (permanent payload loss). The
+            // pre-fix `.and_then(|bs| bs.get(..).ok().flatten())` silently
+            // yielded `cold_data = None` on a missing/unreadable blob while still
+            // shipping `is_external = true`. Mirror the delta converter
+            // (`convert_migration_create`) and the dispatch write path
+            // (`create_repl_cold_data` / `SkipReplicationBlobMissing`): a missing
+            // blob, an unreadable blob, or no configured blob store all FAIL the
+            // baseline task so the source retries rather than shipping an
+            // incomplete record.
+            let is_external = meta.flags.contains(crate::record::TxFlags::EXTERNAL);
+            let cold_data = if is_external {
+                match engine.blob_store() {
+                    Some(bs) => match bs.get(&key.txid) {
+                        Ok(Some(blob)) => Some(blob),
+                        Ok(None) => {
+                            return Err(format!(
+                                "baseline external blob missing shard {} key {:?}",
+                                task.shard, key
+                            ));
+                        }
+                        Err(e) => {
+                            return Err(format!(
+                                "baseline external blob read shard {} key {:?}: {e}",
+                                task.shard, key
+                            ));
+                        }
+                    },
+                    None => {
+                        return Err(format!(
+                            "baseline external blob missing (no blob store) shard {} key {:?}",
+                            task.shard, key
+                        ));
+                    }
+                }
             } else {
                 None
             };
@@ -6135,7 +6167,7 @@ fn stream_shard_baseline(
                 metadata_bytes: meta_buf,
                 utxo_hashes,
                 cold_data,
-                is_external: meta.flags.contains(crate::record::TxFlags::EXTERNAL),
+                is_external,
             });
 
             // Replay spent/frozen slot state so the replica matches the master.
@@ -10489,6 +10521,96 @@ mod tests {
             shipped_unmined, device_unmined,
             "regression guard: the stale device value must never be what ships"
         );
+    }
+
+    /// S3 (baseline path): `stream_shard_baseline` must FAIL when an EXTERNAL
+    /// record's blob is absent from the blob store, rather than emit a baseline
+    /// `ReplicaOp::Create` with `is_external = true` and `cold_data = None`. The
+    /// latter would create a live EXTERNAL record on the joining/migration
+    /// target whose `ExternalRef` dangles — permanent payload loss. This mirrors
+    /// the delta converter's S3 fix and the dispatch write path's
+    /// `SkipReplicationBlobMissing` discipline.
+    #[test]
+    fn migration_baseline_fails_closed_when_external_blob_missing() {
+        use std::io::{Read, Write};
+
+        let mut engine = test_engine();
+        // Blob store configured, but no blob ever uploaded for this record —
+        // the lost/GC'd/never-written case: `bs.get(txid)` -> `Ok(None)`.
+        let blob: std::sync::Arc<dyn crate::storage::blobstore::BlobStore> =
+            std::sync::Arc::new(crate::storage::blobstore::MemoryBlobStore::new());
+        engine.set_blob_store(blob);
+
+        let shard = 71u16;
+        let key = tx_key_for_shard(shard, 1);
+        create_external_record(&engine, key);
+        assert!(
+            engine.lookup(&key).is_some(),
+            "the EXTERNAL record must be registered (only its blob is missing)"
+        );
+
+        // Receiver: accept, and — should the (pre-fix) sender ship a batch — read
+        // it and ACK so the sender returns Ok (making the `Ok` arm below panic:
+        // a clean RED before the fix). Once fixed, the sender returns Err before
+        // writing anything; the receiver's read then hits EOF when the test drops
+        // the client stream, and the thread returns.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let receiver = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut header = [0u8; 4];
+            if stream.read_exact(&mut header).is_err() {
+                return;
+            }
+            let payload_len = u32::from_le_bytes(header) as usize;
+            let mut body = vec![0u8; payload_len];
+            if stream.read_exact(&mut body).is_err() {
+                return;
+            }
+            let mut frame_bytes = header.to_vec();
+            frame_bytes.extend_from_slice(&body);
+            let (request, _) = crate::protocol::frame::RequestFrame::decode(&frame_bytes).unwrap();
+            let response = crate::protocol::frame::ResponseFrame {
+                request_id: request.request_id,
+                status: crate::protocol::opcodes::STATUS_OK,
+                payload: crate::replication::protocol::ReplicaAck::Ok {
+                    through_sequence: 0,
+                }
+                .serialize(),
+            };
+            let _ = stream.write_all(&response.encode());
+        });
+
+        let mut stream = std::net::TcpStream::connect(addr).unwrap();
+        let task = MigrationTask {
+            shard,
+            from_node: NodeId(1),
+            to_node: NodeId(2),
+            is_master: true,
+        };
+        let result = stream_shard_baseline(
+            &task,
+            &[&key],
+            &engine,
+            &mut stream,
+            64,
+            /* cluster_key */ 0,
+            None,
+        );
+
+        match result {
+            Err(msg) => assert!(
+                msg.contains("external blob missing"),
+                "baseline must fail-closed with an external-blob-missing error, got: {msg}"
+            ),
+            Ok(_) => panic!(
+                "stream_shard_baseline must FAIL for an EXTERNAL record with a missing blob — \
+                 a dangling-ref (is_external=true, cold_data=None) create must never ship"
+            ),
+        }
+
+        drop(stream); // unblock the receiver if it is still waiting for a batch
+        let _ = receiver.join();
     }
 
     /// Task 15 (full convergence): replay a captured migration baseline batch
