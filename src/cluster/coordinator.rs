@@ -855,20 +855,41 @@ fn install_active_routing_snapshot(
     *shard_table.write() = snapshot;
     *active_topology_members.write() = routing.committed_members.clone();
 
-    {
+    // C7: a routing/assignment projection update (shard_table +
+    // active_topology_members, installed above) must NOT destroy in-flight
+    // migration incompleteness. Resetting the manager here would drop the
+    // inbound entry + fence for a shard still receiving data, so `is_master`
+    // would flip from Transitioning to Yes and this node would serve — and
+    // persist — an INCOMPLETE shard as if fully owned. Only reset (and clear
+    // the bitmaps / rewrite the persisted state) when nothing is in flight;
+    // otherwise preserve the migration state and its bitmaps so the
+    // migration's own completion path clears them once the data is whole. A
+    // superseding activation that proves completeness clears them via that
+    // path, never via a bare routing snapshot.
+    let reset = {
         let mut mgr = migration.lock();
-        *mgr = MigrationManager::new();
-        if let Some(path) = inbound_state_path {
-            crate::cluster::migration::persist_inbound_state(path, &mgr);
+        let has_inflight = !mgr.pending_inbound_entries().is_empty()
+            || !mgr.active_migrations().is_empty()
+            || mgr.fenced_count() > 0;
+        if has_inflight {
+            false
+        } else {
+            *mgr = MigrationManager::new();
+            if let Some(path) = inbound_state_path {
+                crate::cluster::migration::persist_inbound_state(path, &mgr);
+            }
+            if let Some(path) = outbound_state_path {
+                crate::cluster::migration::persist_outbound_state(path, &mgr);
+            }
+            true
         }
-        if let Some(path) = outbound_state_path {
-            crate::cluster::migration::persist_outbound_state(path, &mgr);
-        }
-    }
+    };
 
-    fenced_bm.clear_all();
-    migrating_bm.clear_all();
-    inbound_bm.clear_all();
+    if reset {
+        fenced_bm.clear_all();
+        migrating_bm.clear_all();
+        inbound_bm.clear_all();
+    }
     true
 }
 
@@ -894,6 +915,14 @@ fn old_master_available_for_handoff(
 // Phase D: exchange phase before migration
 // ---------------------------------------------------------------------------
 
+/// [`PartitionVersionEntry::flags`] bit 1 (subset/incomplete): the reporting
+/// node holds only a SUBSET of the shard — it is a subset master with a pending
+/// inbound migration still receiving data, so it does not fully own the shard
+/// even when its record count is non-zero. Kept in sync with the `0b10` literal
+/// set by the exchange responders (`build_self_partition_version_entries` and
+/// the `OP_PARTITION_VERSION_REPORT` dispatch handler).
+pub const PARTITION_FLAG_PENDING_INBOUND: u8 = 0b10;
+
 /// One node's view of a single shard's local data state.
 ///
 /// Reported by every alive peer during the post-commit exchange phase so the
@@ -904,7 +933,8 @@ fn old_master_available_for_handoff(
 /// - bit 0 (`0b01`): this node believes it is the master of `shard` in the
 ///   currently active shard table.
 /// - bit 1 (`0b10`): this node has a pending inbound migration for `shard`
-///   (i.e. is a subset master receiving data).
+///   (i.e. is a subset master receiving data). See
+///   [`PARTITION_FLAG_PENDING_INBOUND`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PartitionVersionEntry {
     /// Shard number (0..NUM_SHARDS).
@@ -994,44 +1024,44 @@ pub fn build_plan_from_partition_view(
         return base;
     }
 
-    // Index: (node, shard) -> last_applied_seq.
-    let mut seq_by_node_shard: std::collections::HashMap<(NodeId, u16), u64> =
+    // Index: (node, shard) -> (last_applied_seq, flags). The `flags`
+    // subset bit ([`PARTITION_FLAG_PENDING_INBOUND`]) marks a holder that has
+    // only PART of the shard (a subset master still receiving inbound data), so
+    // its non-zero record count must NOT be read as "already owns the shard".
+    let mut view_by_node_shard: std::collections::HashMap<(NodeId, u16), (u64, u8)> =
         std::collections::HashMap::new();
     for (node, entries) in partition_view {
         for e in entries {
-            seq_by_node_shard.insert((*node, e.shard), e.last_applied_seq);
+            view_by_node_shard.insert((*node, e.shard), (e.last_applied_seq, e.flags));
         }
     }
 
+    // A holder "fully owns" a shard only when it reports data AND its
+    // subset/incomplete bit is clear. C9: skipping an outbound to — or rewriting
+    // the source to — a subset holder promotes a PARTIAL master to full master,
+    // silently dropping every record it never received at handoff.
+    let holder_owns_shard = |node: NodeId, shard: u16| -> bool {
+        match view_by_node_shard.get(&(node, shard)) {
+            Some(&(seq, flags)) => seq > 0 && (flags & PARTITION_FLAG_PENDING_INBOUND) == 0,
+            None => false,
+        }
+    };
+
     let mut refined = Vec::with_capacity(base.len());
     for task in base {
-        // Skip migration if the new master itself already reports data for this shard.
-        let new_master_has_data = seq_by_node_shard
-            .get(&(task.to_node, task.shard))
-            .copied()
-            .unwrap_or(0)
-            > 0;
-        if new_master_has_data {
+        // Skip migration only when the new master itself already FULLY owns the
+        // shard (has data AND is not a subset/incomplete holder).
+        if holder_owns_shard(task.to_node, task.shard) {
             continue;
         }
 
-        // If the planned source reports no data but a known replica reports data,
-        // rewrite the source to that replica.
-        let source_has_data = seq_by_node_shard
-            .get(&(task.from_node, task.shard))
-            .copied()
-            .unwrap_or(0)
-            > 0;
-        if !source_has_data {
+        // If the planned source does not fully own the shard but a known replica
+        // does, rewrite the source to that replica.
+        if !holder_owns_shard(task.from_node, task.shard) {
             let old_assignment = old_table.target_assignment(task.shard);
             let mut better_source: Option<NodeId> = None;
             for r in &old_assignment.replicas {
-                if seq_by_node_shard
-                    .get(&(*r, task.shard))
-                    .copied()
-                    .unwrap_or(0)
-                    > 0
-                {
+                if holder_owns_shard(*r, task.shard) {
                     better_source = Some(*r);
                     break;
                 }
@@ -4649,26 +4679,46 @@ fn compute_manifest_for_entries(entries: &[(TxKey, u32)]) -> [u8; 32] {
 
 /// Wait for in-flight client mutations to drain after raising a shard fence.
 ///
-/// Every mutating dispatch holds the EXCLUSIVE side of the engine's
-/// dispatch-visibility barrier from before its shard-fence check until
-/// after its engine apply + redo append (see
-/// `dispatch::acquire_dispatch_visibility_guard`). Acquiring — and
-/// immediately releasing — the SHARED side therefore blocks until every
-/// mutation that passed the fence check *before* the fence was raised has
-/// fully applied and journaled. Any mutation that begins after this
-/// returns runs its fence check against the already-set fence bit and is
-/// rejected with `ERR_MIGRATION_IN_PROGRESS`.
+/// The hot mutating dispatches (spend / set_mined / create) take the
+/// **SHARED** side of the engine's per-key visibility barrier —
+/// `engine.visibility().mutation(&keys)` = `global.read()` plus per-key stripe
+/// writes — held from their shard-fence check through their engine apply +
+/// redo append. A SHARED-vs-SHARED acquisition never blocks, so the pre-fix
+/// drain (which also took `global.read()`) returned IMMEDIATELY while such a
+/// mutation was still mid-apply: it could journal a redo seq *beyond* the
+/// captured `fence_seq`, so the migration delta/manifest cutoff missed it and
+/// the write was lost at handoff (C18).
+///
+/// This drain instead briefly takes the **EXCLUSIVE** side (`global.write()`,
+/// the same checkpoint-style guard reads use to exclude a checkpoint). A
+/// write lock cannot be granted until every in-flight SHARED holder has
+/// released, so on return every mutation that passed the fence check *before*
+/// the fence was raised has fully applied and journaled — its seq is strictly
+/// below any `fence_seq` captured afterwards. Any mutation beginning after
+/// this returns re-reads the already-set fence bit under its own guard and is
+/// rejected with `ERR_MIGRATION_IN_PROGRESS` (see the set_mined post-guard
+/// re-check, C19). The exclusive side is acquired and released *immediately*
+/// here — it is a barrier, NOT held across migration I/O — so the whole write
+/// path is stalled only for the instant it takes existing in-flight mutations
+/// to finish, not for the duration of the migration.
 ///
 /// Called between raising a shard fence and capturing `fence_seq` /
 /// re-reading shard keys, so that no mutation can apply after the
 /// migration delta/manifest cutoff while the shard is still fenced
 /// (the apply-after-fence-check TOCTOU).
 ///
-/// MUST NOT be called while holding the migration-manager mutex: mutating
-/// dispatches acquire that mutex (dual-write fan-out) while holding the
-/// exclusive barrier, so nesting the two would deadlock.
+/// LOCK ORDER (deadlock-critical): the barrier (`global.write()`) is always
+/// acquired here holding NO other lock, and released before this returns. A
+/// hot-path mutation takes `global.read()` BEFORE the migration-manager mutex
+/// (the dual-write fan-out mutex is taken only after the visibility guard is
+/// released, at replication time), so the order is uniformly
+/// `visibility → migration mutex`, never the reverse. Therefore this MUST NOT
+/// be called while holding the migration-manager mutex: doing so would let a
+/// mutation holding `global.read()` and waiting on that mutex sit under this
+/// barrier's `global.write()` wait, closing a cycle. Both call sites release
+/// the migration mutex before draining.
 fn drain_in_flight_mutations(engine: &Engine) {
-    drop(engine.acquire_dispatch_visibility_guard());
+    drop(engine.acquire_mutation_visibility_guard());
 }
 
 /// Maximum number of shards a migration worker fences together in one
@@ -10422,6 +10472,74 @@ mod tests {
         assert_eq!(table.effective_assignment(shard).master, effective_before);
     }
 
+    /// C7: a TopologyStale catch-up that installs a newer routing snapshot must
+    /// NOT wipe an in-flight INBOUND migration. Wiping it clears the shard's
+    /// pending-inbound entry + fence bit, flipping `is_master` from
+    /// Transitioning to Yes so the node would serve an INCOMPLETE shard as if
+    /// fully owned (and persist that lie across a restart). The projection
+    /// (shard table) still updates; only the migration incompleteness survives.
+    #[test]
+    fn catch_up_routing_snapshot_preserves_in_flight_inbound_migration() {
+        let shard = 3u16;
+        let shard_table = Arc::new(ShardTableLock::new(ShardTable::compute_with_epoch(
+            &[NodeId(1), NodeId(2)],
+            2,
+            1,
+            1,
+        )));
+        let migration = Arc::new(Mutex::new(MigrationManager::new()));
+        let fenced_bm = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+        let migrating_bm = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+        let inbound_bm = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+        let active_members = Arc::new(RwLock::new(vec![NodeId(1), NodeId(2)]));
+
+        // This node is a subset master still receiving data for `shard`.
+        {
+            let mut mgr = migration.lock();
+            assert!(mgr.mark_inbound_active(shard));
+        }
+        inbound_bm.set(shard);
+
+        // A newer routing snapshot (version 5, member 3 added) arriving via
+        // catch-up while the inbound migration is still mid-flight.
+        let routing = crate::cluster::routing::RoutingInfo {
+            shard_table_version: 5,
+            nodes: Vec::new(),
+            shard_assignments: Vec::new(),
+            committed_members: vec![NodeId(1), NodeId(2), NodeId(3)],
+            placement_version: 1,
+        };
+
+        let installed = install_active_routing_snapshot(
+            &routing,
+            2,
+            &shard_table,
+            &migration,
+            &fenced_bm,
+            &migrating_bm,
+            &inbound_bm,
+            &active_members,
+            None,
+            None,
+        );
+        assert!(installed, "the routing projection must install");
+
+        // The projection updated (new members installed)…
+        assert_eq!(
+            *active_members.read(),
+            vec![NodeId(1), NodeId(2), NodeId(3)]
+        );
+        // …but the in-flight inbound migration MUST survive.
+        assert!(
+            migration.lock().has_pending_inbound(shard),
+            "C7: inbound migration entry was wiped by the routing snapshot",
+        );
+        assert!(
+            inbound_bm.test(shard),
+            "C7: inbound bitmap bit was cleared by the routing snapshot",
+        );
+    }
+
     #[test]
     fn current_migration_failure_marks_failed_and_clears_bitmaps() {
         let shard = 7;
@@ -14965,26 +15083,34 @@ mod tests {
         );
     }
 
-    /// The post-fence drain (`drain_in_flight_mutations`) must not return
-    /// while a mutating dispatch still holds the exclusive side of the
-    /// dispatch-visibility barrier — closing the TOCTOU where a write that
-    /// passed the fence check before the fence was raised applies its
-    /// mutation after `fence_seq` capture / manifest collection.
+    /// C18: the post-fence drain (`drain_in_flight_mutations`) must not return
+    /// while a HOT mutating dispatch still holds its per-key visibility guard.
+    ///
+    /// The hot path (spend / set_mined / create) takes
+    /// `engine.visibility().mutation(&keys)` — the SHARED side of the global
+    /// gate plus per-key stripe writes — from before its fence check through
+    /// its apply + redo append. The pre-fix drain also took the SHARED side, so
+    /// SHARED-vs-SHARED never blocked and the drain returned while the write was
+    /// still mid-apply; that write could journal a redo seq beyond the captured
+    /// `fence_seq` and be lost at handoff. Modelled here with the REAL hot-path
+    /// guard, so this fails against the old shared drain and passes against the
+    /// exclusive barrier.
     #[test]
     fn fence_drain_waits_for_in_flight_mutation() {
         let engine = Arc::new(test_engine());
+        let key = tx_key_for_shard(3, 1);
 
         let (acquired_tx, acquired_rx) = std::sync::mpsc::channel::<()>();
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
         let applied = Arc::new(AtomicBool::new(false));
 
-        // Simulated in-flight mutation: passed the fence check (i.e. holds
-        // the exclusive barrier), stalls, then applies and releases.
+        // Simulated in-flight hot mutation: passed the fence check while holding
+        // the SHARED per-key guard, stalls, then applies and releases.
         let writer = {
             let engine = engine.clone();
             let applied = applied.clone();
             std::thread::spawn(move || {
-                let guard = engine.acquire_mutation_visibility_guard();
+                let guard = engine.visibility().mutation(std::slice::from_ref(&key));
                 acquired_tx.send(()).unwrap();
                 release_rx.recv().unwrap();
                 // The "apply + redo append" happens strictly before the
@@ -15006,14 +15132,14 @@ mod tests {
             })
         };
 
-        // Bounded negative check: while the writer holds the exclusive
-        // barrier the drain must stay blocked.
+        // Bounded negative check: while the writer holds the SHARED per-key
+        // guard the drain (exclusive barrier) must stay blocked.
         let hold_deadline = std::time::Instant::now() + Duration::from_millis(200);
         while std::time::Instant::now() < hold_deadline {
             assert!(
                 !drain.is_finished(),
-                "drain returned while a mutation still held the exclusive \
-                 dispatch-visibility barrier",
+                "drain returned while a hot mutation still held its SHARED per-key \
+                 visibility guard — its redo append could land beyond fence_seq",
             );
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -16433,6 +16559,67 @@ mod tests {
         assert!(
             task_for_shard.is_none(),
             "must skip migration for shard {changed_shard} when new master already has data",
+        );
+    }
+
+    /// C9: a new master that reports data but has its SUBSET/incomplete bit set
+    /// (pending inbound migration — it holds only PART of the shard) must NOT
+    /// cause the migration to be skipped. Skipping would promote a partial
+    /// holder to full master and silently drop the records it never received.
+    #[test]
+    fn build_plan_does_not_skip_migration_for_subset_holder() {
+        use std::collections::HashMap;
+        // Grow the cluster (add node 4) so every old master survives and
+        // `migration_plan` definitely emits a task for the reshuffled shards
+        // (rather than continue-ing because the new master already held the
+        // shard as a replica of a dead old master).
+        let members_a = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let members_b = vec![NodeId(1), NodeId(2), NodeId(3), NodeId(4)];
+        let old_table = ShardTable::compute_with_epoch(&members_a, 2, 1, 1);
+        let new_table = ShardTable::compute_with_epoch(&members_b, 2, 2, 1);
+        let base = ShardTable::migration_plan(&old_table, &new_table);
+        let task = base
+            .first()
+            .expect("topology change must produce a migration task");
+        let shard = task.shard;
+        let new_master = task.to_node;
+
+        // Baseline (non-vacuous guard): a NON-subset holder with data IS
+        // skipped, so the shard's task really is eligible for skipping.
+        let mut owns_view: HashMap<NodeId, Vec<PartitionVersionEntry>> = HashMap::new();
+        owns_view.insert(
+            new_master,
+            vec![PartitionVersionEntry {
+                shard,
+                flags: 0b01,
+                replica_count: 1,
+                last_applied_seq: 42,
+            }],
+        );
+        let skipped = build_plan_from_partition_view(&old_table, &new_table, &owns_view, NodeId(1));
+        assert!(
+            !skipped.iter().any(|t| t.shard == shard),
+            "a fully-owning new master must skip the migration (guards against a \
+             vacuous test)",
+        );
+
+        // The bug: the SAME holder, now flagged subset/incomplete, must NOT skip.
+        let mut subset_view: HashMap<NodeId, Vec<PartitionVersionEntry>> = HashMap::new();
+        subset_view.insert(
+            new_master,
+            vec![PartitionVersionEntry {
+                shard,
+                flags: 0b01 | PARTITION_FLAG_PENDING_INBOUND,
+                replica_count: 1,
+                last_applied_seq: 42,
+            }],
+        );
+        let refined =
+            build_plan_from_partition_view(&old_table, &new_table, &subset_view, NodeId(1));
+        assert!(
+            refined.iter().any(|t| t.shard == shard),
+            "must NOT skip migration for shard {shard}: the new master is a subset \
+             holder (pending inbound) and does not fully own the shard",
         );
     }
 
