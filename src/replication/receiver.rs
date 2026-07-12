@@ -1211,6 +1211,29 @@ fn apply_create_replica(
     cold_data: &Option<Vec<u8>>,
     is_migration: bool,
 ) -> std::result::Result<(), String> {
+    // RULE-DS (reverse-heal Phase 2c, design §C) — the resurrection close on the
+    // currently-ungated Create path. `Create` returns `None` from
+    // `master_generation()`, so the pre-apply generation guard skips it: an
+    // absent (deleted) key would otherwise be `engine.create`d fresh =
+    // resurrection. Consult this node's OWN deletion tombstone BEFORE creating
+    // and drop (idempotent no-op) if it forbids the apply. Scoped to the heal /
+    // migration baseline (`is_migration`) so the client-create path and the
+    // normal master→replica create stream are NOT gated — a legitimate re-create
+    // must apply and clears the tombstone (design §E5). Zero-cost no-op when
+    // tombstones are disabled.
+    //
+    // Gated on the key being currently ABSENT: RULE-DS exists to stop
+    // resurrecting a DELETED record, so it never fires over a live record. Were
+    // a stale tombstone ever to dangle over a live key (a TS-1 violation the
+    // create-path clear + boot reconcile already prevent), this keeps the
+    // generation logic below — not the tombstone — the authority for a present
+    // record, so a dangling tombstone can never drop a legitimate live update.
+    if is_migration && engine.lookup(tx_key).is_none() {
+        let incoming_gen = incoming_create_generation(metadata_bytes).unwrap_or(0);
+        if engine.tombstone_blocks_heal_apply(tx_key, incoming_gen) {
+            return Ok(());
+        }
+    }
     match engine.create(create_req) {
         Ok(_) => {}
         Err(CreateError::DuplicateTxId)
@@ -1259,6 +1282,23 @@ fn apply_create_replica(
                 .map_err(|e| format!("replace duplicate create: {e}"))?;
         }
         Err(e) => return Err(format!("create: {e}")),
+    }
+
+    // REASSIGNED wire fix (reverse-heal Phase 2c): `create_metadata_flag_bytes`
+    // now carries the persisted REASSIGNED marker in the create flag byte
+    // (offset 45, wire bit CREATE_FLAG_REASSIGNED). Restore it on the healed /
+    // migrated image — pre-2c it was silently dropped, un-reassigning a
+    // court-ordered record on the target. Applied BEFORE the lifecycle patch so
+    // `restore_migrated_lifecycle`'s read-modify-write preserves it. Only the
+    // paths that fall through to the lifecycle apply reach here (the
+    // keep-newer-copy early return above skips it, preserving the newer local
+    // record's own flags).
+    if metadata_bytes.len() >= 46
+        && metadata_bytes[45] & crate::protocol::opcodes::CREATE_FLAG_REASSIGNED != 0
+    {
+        engine
+            .set_reassigned_for_heal(tx_key)
+            .map_err(|e| format!("restore reassigned flag: {e}"))?;
     }
 
     apply_create_lifecycle_and_blob(engine, tx_key, metadata_bytes, cold_data, is_migration)
@@ -1580,6 +1620,35 @@ fn apply_op_journal_inner(
         }
         // If read_metadata fails (TxNotFound), the record may not exist yet
         // or was deleted. Let the match arm handle it gracefully.
+    }
+
+    // RULE-DS defense-in-depth (reverse-heal Phase 2c, design §C): a heal /
+    // migration baseline apply must be delete-safe even for ops that carry NO
+    // `master_generation` — the `Create`/`Delete` images the baseline ships skip
+    // the generation guard above. If this node holds a deletion tombstone that
+    // forbids a heal apply for the op's key AND the key is currently ABSENT (a
+    // genuine resurrection, not a mutation of a live record), drop the op as an
+    // idempotent no-op so NO heal apply (not only `apply_create_replica`) can
+    // resurrect a deleted record. The absence gate keeps a (TS-1-forbidden)
+    // dangling tombstone from ever dropping a live record's legitimate mutation.
+    // Scoped to `is_migration`; a zero-cost no-op when tombstones are disabled or
+    // no tombstone covers the key.
+    if is_migration
+        && let Some(tx_key) = op.tx_key()
+        && engine.lookup(&tx_key).is_none()
+    {
+        let incoming_gen = op
+            .master_generation()
+            .or_else(|| match op {
+                ReplicaOp::Create { metadata_bytes, .. } => {
+                    incoming_create_generation(metadata_bytes)
+                }
+                _ => None,
+            })
+            .unwrap_or(0);
+        if engine.tombstone_blocks_heal_apply(&tx_key, incoming_gen) {
+            return Ok(());
+        }
     }
 
     // A Delete removes the index entry, so the post-apply redo's owning store
@@ -2787,6 +2856,7 @@ mod tests {
     use crate::device::{BlockDevice, MemoryDevice};
     use crate::index::{DahIndex, Index, TxKey};
     use crate::locks::StripedLocks;
+    use crate::ops::error::SpendError;
 
     fn make_engine() -> Arc<Engine> {
         let dev: Arc<dyn BlockDevice> =
@@ -8738,6 +8808,301 @@ mod tests {
         assert!(
             engine.dah_index().range_query(dah).contains(&k),
             "DAH index must agree with the on-device footer",
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // Reverse-heal Phase 2c — delete-safe reverse-pull (RULE-DS) apply tests.
+    // ---------------------------------------------------------------------
+
+    /// Attach an in-RAM deletion-tombstone log routing keys identically to the
+    /// engine's primary index (reverse-heal Phase 2a). No file I/O — `persist`
+    /// is never called, so the `/nonexistent` path is never touched.
+    fn enable_tombstones(engine: &Engine) {
+        let log = crate::ops::tombstone::TombstoneLog::new(
+            std::path::PathBuf::from("/nonexistent/rev-heal-2c-test.tombstones"),
+            engine.index_seed(),
+            engine.index_shard_count(),
+            10_000,
+        );
+        engine.set_tombstone_log(log);
+    }
+
+    /// A full-baseline Create image (core+lifecycle, 70 bytes) carrying
+    /// `generation`, as `stream_shard_baseline` ships it.
+    fn baseline_create(tx_key: TxKey, generation: u32, wire_flags: u8) -> ReplicaOp {
+        ReplicaOp::Create {
+            tx_key,
+            metadata_bytes: build_full_metadata(1, false, wire_flags, generation, 0, &[], &[]),
+            utxo_hashes: vec![[0xAA; 32]],
+            cold_data: None,
+            is_external: false,
+        }
+    }
+
+    /// THE resurrection test (design §D Phase 2c). The ex-master swept a
+    /// fully-spent record `k` (tombstone `k@N`); a laggard source still holds an
+    /// older `k`. A FULL-baseline reverse-pull must NOT bring `k` back — a
+    /// resurrected spent UTXO is a double-spend.
+    ///
+    /// Pre-RULE-DS this RESURRECTS `k` (the Create arm is generation-ungated for
+    /// an absent key); post-RULE-DS `k` stays absent.
+    #[test]
+    fn reverse_pull_does_not_resurrect_deleted_record() {
+        let engine = make_engine();
+        enable_tombstones(&engine);
+        let k = key(140);
+
+        // Create k (one output), spend it (fully spent, gen 2), then delete via
+        // the real client-delete path so delete_inner records the tombstone.
+        apply_op(&engine, &baseline_create(k, 1, 0)).unwrap();
+        apply_op(
+            &engine,
+            &ReplicaOp::Spend {
+                tx_key: k,
+                offset: 0,
+                spending_data: [0x11; 36],
+                current_block_height: 0,
+                block_height_retention: 0,
+                master_generation: 2,
+            },
+        )
+        .unwrap();
+        engine
+            .delete(&DeleteRequest {
+                tx_key: k,
+                due_guard: None,
+            })
+            .expect("client delete removes the fully-spent record");
+        assert!(
+            matches!(engine.read_metadata(&k), Err(SpendError::TxNotFound)),
+            "precondition: record deleted",
+        );
+        assert!(
+            engine.tombstone_lookup(&k).is_some(),
+            "precondition: the delete recorded a tombstone",
+        );
+
+        // Laggard source ships k@1 (the unspent pre-spend state it never advanced
+        // past) as a full baseline Create image; apply as a migration/heal pull.
+        apply_op_journal(&engine, &baseline_create(k, 1, 0), false, true)
+            .expect("reverse-pull apply is an idempotent no-op, not an error");
+
+        assert!(
+            matches!(engine.read_metadata(&k), Err(SpendError::TxNotFound)),
+            "RULE-DS violated: reverse-pull resurrected a deleted spent record (double-spend)",
+        );
+    }
+
+    /// Lost-acked-spend convergence (design §D Phase 2c). A replica source holds
+    /// `k` SPENT at gen 2 (an acked spend the master replicated); the ex-master
+    /// recovered from a crash that lost that spend and holds only the create
+    /// (unspent, gen 1). The reverse-pull (full baseline = Create@2 + Spend@2,
+    /// exactly stream_shard_baseline's op sequence) converges the ex-master to
+    /// the source's spent-status + generation. No tombstone ⇒ RULE-DS must NOT
+    /// block (regression guard against over-blocking).
+    #[test]
+    fn master_loses_acked_spend_reverse_pull_converges() {
+        // Source replica: create + spend → k spent @ gen 2.
+        let source = make_engine();
+        let k = key(141);
+        apply_op(&source, &baseline_create(k, 1, 0)).unwrap();
+        apply_op(
+            &source,
+            &ReplicaOp::Spend {
+                tx_key: k,
+                offset: 0,
+                spending_data: [0x11; 36],
+                current_block_height: 0,
+                block_height_retention: 0,
+                master_generation: 2,
+            },
+        )
+        .unwrap();
+        assert_eq!({ source.read_metadata(&k).unwrap().generation }, 2);
+        assert_eq!(source.read_slot(&k, 0).unwrap().status, UTXO_SPENT);
+
+        // Ex-master, post-crash: only the create survived (unspent @ gen 1).
+        let exmaster = make_engine();
+        enable_tombstones(&exmaster);
+        apply_op(&exmaster, &baseline_create(k, 1, 0)).unwrap();
+        assert_eq!({ exmaster.read_metadata(&k).unwrap().generation }, 1);
+        assert_eq!(exmaster.read_slot(&k, 0).unwrap().status, UTXO_UNSPENT);
+
+        // Reverse-pull the source's full baseline.
+        apply_op_journal(&exmaster, &baseline_create(k, 2, 0), false, true).unwrap();
+        apply_op_journal(
+            &exmaster,
+            &ReplicaOp::Spend {
+                tx_key: k,
+                offset: 0,
+                spending_data: [0x11; 36],
+                current_block_height: 0,
+                block_height_retention: 0,
+                master_generation: 2,
+            },
+            false,
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(
+            { exmaster.read_metadata(&k).unwrap().generation },
+            2,
+            "reverse-pull must converge the generation to the source",
+        );
+        assert_eq!(
+            exmaster.read_slot(&k, 0).unwrap().status,
+            UTXO_SPENT,
+            "reverse-pull must converge the spent status to the source",
+        );
+    }
+
+    /// A full baseline drops BOTH kinds of no-op image and never resurrects:
+    /// (a) a record the ex-master already holds at a newer generation (downgrade
+    /// no-op — keep the newer local copy); (b) a DAH-tombstoned record where the
+    /// source is at-or-behind the frozen generation (drop by generation, no
+    /// resurrection). A genuinely-lost record with no tombstone is adopted.
+    #[test]
+    fn reverse_pull_full_baseline_drops_noop_and_tombstoned_by_generation() {
+        let engine = make_engine();
+        // Pre-populate a DAH tombstone for k_tomb@5 (terminal), then attach the
+        // log — this exercises the generation-based (Dah) leg of RULE-DS.
+        let log = crate::ops::tombstone::TombstoneLog::new(
+            std::path::PathBuf::from("/nonexistent/rev-heal-2c-bygen.tombstones"),
+            engine.index_seed(),
+            engine.index_shard_count(),
+            10_000,
+        );
+        let k_tomb = key(150);
+        log.record(&k_tomb, 5, 0, crate::ops::tombstone::TombstoneCause::Dah);
+        engine.set_tombstone_log(log);
+
+        // A live local record already at a newer generation (7).
+        let k_live = key(151);
+        apply_op_journal(&engine, &baseline_create(k_live, 7, 0), false, true).unwrap();
+        assert_eq!({ engine.read_metadata(&k_live).unwrap().generation }, 7);
+
+        let k_new = key(152);
+
+        // Full baseline: k_tomb@3 (≤ N=5, drop by generation), k_live@4 (< 7,
+        // downgrade no-op), k_new@2 (lost entirely, adopt).
+        apply_op_journal(&engine, &baseline_create(k_tomb, 3, 0), false, true).unwrap();
+        apply_op_journal(&engine, &baseline_create(k_live, 4, 0), false, true).unwrap();
+        apply_op_journal(&engine, &baseline_create(k_new, 2, 0), false, true).unwrap();
+
+        assert!(
+            matches!(engine.read_metadata(&k_tomb), Err(SpendError::TxNotFound)),
+            "a DAH-tombstoned record at-or-behind the frozen generation must stay absent",
+        );
+        assert_eq!(
+            { engine.read_metadata(&k_live).unwrap().generation },
+            7,
+            "a strictly-older baseline image must not downgrade the newer local record",
+        );
+        assert_eq!(
+            { engine.read_metadata(&k_new).unwrap().generation },
+            2,
+            "a genuinely-lost record with no tombstone must be adopted",
+        );
+    }
+
+    /// A second pull re-ships the same baseline images: every one is now a no-op
+    /// — the newer local generation is preserved (no downgrade) and a tombstoned
+    /// record stays absent (no resurrection).
+    #[test]
+    fn reverse_pull_is_idempotent_on_repull() {
+        let engine = make_engine();
+        enable_tombstones(&engine);
+
+        // First pull adopts k@3; local then advances to gen 5.
+        let k = key(153);
+        apply_op_journal(&engine, &baseline_create(k, 3, 0), false, true).unwrap();
+        apply_op(
+            &engine,
+            &ReplicaOp::Spend {
+                tx_key: k,
+                offset: 0,
+                spending_data: [0x22; 36],
+                current_block_height: 0,
+                block_height_retention: 0,
+                master_generation: 5,
+            },
+        )
+        .unwrap();
+        assert_eq!({ engine.read_metadata(&k).unwrap().generation }, 5);
+
+        // A separate key the ex-master deleted (tombstoned).
+        let k2 = key(154);
+        apply_op_journal(&engine, &baseline_create(k2, 1, 0), false, true).unwrap();
+        engine
+            .delete(&DeleteRequest {
+                tx_key: k2,
+                due_guard: None,
+            })
+            .unwrap();
+
+        // Second (re)pull ships the SAME images: k@3 and k2@1.
+        apply_op_journal(&engine, &baseline_create(k, 3, 0), false, true).unwrap();
+        apply_op_journal(&engine, &baseline_create(k2, 1, 0), false, true).unwrap();
+
+        assert_eq!(
+            { engine.read_metadata(&k).unwrap().generation },
+            5,
+            "re-pull must not downgrade a newer local generation",
+        );
+        assert!(
+            matches!(engine.read_metadata(&k2), Err(SpendError::TxNotFound)),
+            "re-pull must not resurrect a tombstoned record",
+        );
+    }
+
+    /// The REASSIGNED wire fix: a healed create image carrying the
+    /// `CREATE_FLAG_REASSIGNED` bit restores the persisted REASSIGNED marker
+    /// (pre-2c it was silently dropped, un-reassigning a court-ordered record).
+    #[test]
+    fn reverse_pull_preserves_reassigned_flag() {
+        let engine = make_engine();
+        let k = key(155);
+        let op = baseline_create(k, 3, crate::protocol::opcodes::CREATE_FLAG_REASSIGNED);
+        apply_op_journal(&engine, &op, false, true).unwrap();
+        let meta = engine.read_metadata(&k).unwrap();
+        assert!(
+            { meta.flags }.contains(TxFlags::REASSIGNED),
+            "a healed create image must preserve the persisted REASSIGNED flag",
+        );
+    }
+
+    /// Consensus closure (the carried 2a/2b-review concern, under a double-spend
+    /// lens): a CLIENT-delete tombstone has NO terminal-generation guarantee, so
+    /// a diverged source holding a STRICTLY NEWER generation than the delete must
+    /// STILL be dropped. A generation-only gate would let `g_src > N` slip
+    /// through and resurrect the client-deleted record; the cause-aware
+    /// unconditional drop closes it.
+    #[test]
+    fn reverse_pull_client_delete_drops_even_when_source_newer() {
+        let engine = make_engine();
+        enable_tombstones(&engine);
+        let k = key(156);
+        apply_op(&engine, &baseline_create(k, 1, 0)).unwrap();
+        engine
+            .delete(&DeleteRequest {
+                tx_key: k,
+                due_guard: None,
+            })
+            .unwrap();
+        assert_eq!(
+            engine.tombstone_lookup(&k).map(|(g, _)| g),
+            Some(1),
+            "client-delete tombstone captured at the still-mutating generation",
+        );
+
+        // A diverged source ships k@9 — strictly NEWER than the delete gen 1.
+        apply_op_journal(&engine, &baseline_create(k, 9, 0), false, true).unwrap();
+
+        assert!(
+            matches!(engine.read_metadata(&k), Err(SpendError::TxNotFound)),
+            "a client-delete tombstone must drop even a strictly-newer source image",
         );
     }
 }

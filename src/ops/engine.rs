@@ -2065,6 +2065,20 @@ impl Engine {
         self.tombstone_log.get().and_then(|log| log.lookup(key))
     }
 
+    /// Reverse-heal RULE-DS apply gate (design §C, consumed by the Phase 2c
+    /// receiver apply): must a heal/migration-shipped image for `key` at
+    /// `incoming_generation` be dropped as a resurrection of this node's delete?
+    /// Always `false` when tombstones are disabled (no log attached), so RULE-DS
+    /// is a zero-cost no-op on single-node / RF=1 / `reverse_heal.tombstones`-off
+    /// deployments. See
+    /// [`crate::ops::tombstone::TombstoneLog::blocks_heal_apply`] for the
+    /// cause-aware rule and its consensus rationale.
+    pub fn tombstone_blocks_heal_apply(&self, key: &TxKey, incoming_generation: u32) -> bool {
+        self.tombstone_log
+            .get()
+            .is_some_and(|log| log.blocks_heal_apply(key, incoming_generation))
+    }
+
     /// Persist the tombstone log at a checkpoint (retention GC + durable write +
     /// fsync). No-op when disabled.
     ///
@@ -2542,6 +2556,46 @@ impl Engine {
         // record is invisible to this node's expiry sweep until the next
         // restart's `rebuild_preserve_index_from_device`.
         self.update_preserve_index(key, old_preserve, preserve_until)
+    }
+
+    /// Restore the persisted [`TxFlags::REASSIGNED`] marker on a healed/migrated
+    /// create image (reverse-heal Phase 2c REASSIGNED wire fix).
+    ///
+    /// The baseline stream carries REASSIGNED in the create-metadata flag byte
+    /// ([`crate::replication::protocol::create_metadata_flag_bytes`], wire bit
+    /// [`crate::protocol::opcodes::CREATE_FLAG_REASSIGNED`]); PRE-2c that bit was
+    /// dropped, silently un-reassigning a court-ordered record on the target —
+    /// which then became DAH-sweepable, destroying the old→new-hash audit trail
+    /// the flag exists to preserve.
+    ///
+    /// ORs REASSIGNED into the footer and re-mirrors the DE-flag cache. It does
+    /// NOT bump `generation` — the flag is part of the generation already stamped
+    /// by the create / lifecycle apply, so a re-mirror is a faithful restore, not
+    /// a new mutation. Idempotent: a second call (idempotent re-pull) sees the
+    /// flag already set and returns early. Must run BEFORE
+    /// [`Self::restore_migrated_lifecycle`] so that method's read-modify-write
+    /// preserves the flag.
+    ///
+    /// # Errors
+    /// [`SpendError::TxNotFound`] if the record is absent; [`SpendError::StorageError`]
+    /// on an index/device failure.
+    pub fn set_reassigned_for_heal(&self, key: &TxKey) -> Result<(), SpendError> {
+        let _guard = self.locks.lock(key);
+        let entry = self
+            .index
+            .lookup_checked(key)
+            .map_err(|e| SpendError::StorageError {
+                detail: format!("index lookup failed: {e}"),
+            })?
+            .ok_or(SpendError::TxNotFound)?;
+        let mut meta = self.read_metadata_for_key(entry.device_id, key, entry.record_offset)?;
+        if meta.flags.contains(TxFlags::REASSIGNED) {
+            return Ok(());
+        }
+        meta.flags |= TxFlags::REASSIGNED;
+        self.write_metadata_fast(entry.device_id, entry.record_offset, &meta)?;
+        self.mirror_de_flags(key, entry.mined_slot, &meta);
+        Ok(())
     }
 
     /// Refresh the cached wall-clock time from the system clock.

@@ -3232,8 +3232,10 @@ mod tests {
         // failures so old clients matching on 255 still receive a value.
         assert_eq!(ERR_INTERNAL, 255);
         // PROTOCOL_VERSION: 2 = typed-error revision, 3 = FU#5 query pagination
-        // (optional request cursor on OP_QUERY_OLD_UNMINED / OP_QUERY_CONFLICTING).
-        assert_eq!(PROTOCOL_VERSION, 3);
+        // (optional request cursor on OP_QUERY_OLD_UNMINED / OP_QUERY_CONFLICTING),
+        // 4 = reverse-heal Phase 2c (create REASSIGNED wire bit 0x10 +
+        // tombstone-aware FLAG_MIGRATION_MANIFEST_DIFF frame).
+        assert_eq!(PROTOCOL_VERSION, 4);
     }
 
     // -- Redirect response --

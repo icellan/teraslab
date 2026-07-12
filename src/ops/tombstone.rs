@@ -317,6 +317,43 @@ impl TombstoneLog {
         }
     }
 
+    /// Reverse-heal RULE-DS apply gate (design §C, consumed by Phase 2c): must a
+    /// heal/migration-shipped image for `key` at `incoming_generation` be DROPPED
+    /// as a resurrection of this node's delete?
+    ///
+    /// The rule is CAUSE-AWARE, because the generation guarantee differs:
+    ///
+    /// - A [`TombstoneCause::Dah`] tombstone marks a fully-spent TERMINAL record:
+    ///   a terminal record admits no further mutation, so its frozen generation
+    ///   `N` is the per-record MAXIMUM and every source's generation is
+    ///   at-or-behind `N`. The wrapping compare `generation_at_or_ahead(N,
+    ///   incoming)` is therefore the exact, airtight drop test (design §C, P1-3
+    ///   proof) — always true for a genuine laggard.
+    ///
+    /// - A [`TombstoneCause::ClientDelete`] / [`TombstoneCause::PruneReplace`]
+    ///   tombstone carries NO terminal-generation guarantee: a client may delete
+    ///   a STILL-MUTATING record whose generation a diverged source later exceeds
+    ///   (the 2a/2b-review consensus concern — a generation-only gate would miss
+    ///   it and resurrect the record). For those causes the heal drops
+    ///   UNCONDITIONALLY: a record this node explicitly removed is never brought
+    ///   back by a boot heal, closing the concern under a double-spend lens. A
+    ///   LEGITIMATE re-create instead flows through the client-create / normal
+    ///   master→replica path — which clears the tombstone
+    ///   ([`Self::clear`]) — never the migration baseline this gate is scoped to.
+    ///   The residual is a self-healing availability gap for a legitimately
+    ///   superseded client-deleted record (design §G E5), NOT a correctness
+    ///   violation: the divergence is re-detected and re-healed after the fence
+    ///   clears.
+    pub fn blocks_heal_apply(&self, key: &TxKey, incoming_generation: u32) -> bool {
+        match self.shards[self.shard_index(key)].read().get(key) {
+            None => false,
+            Some(v) if v.cause == TombstoneCause::Dah as u8 => {
+                generation_at_or_ahead(v.generation, incoming_generation)
+            }
+            Some(_) => true,
+        }
+    }
+
     /// The recorded `(generation, height)` for `key`, if a tombstone exists.
     pub fn lookup(&self, key: &TxKey) -> Option<(u32, u32)> {
         self.shards[self.shard_index(key)]
@@ -718,6 +755,48 @@ mod tests {
             reloaded.lookup(&tk(1)).is_none(),
             "a cleared tombstone must not be re-appended by compaction",
         );
+    }
+
+    /// Reverse-heal Phase 2c RULE-DS gate is CAUSE-AWARE: a `Dah` (terminal)
+    /// tombstone drops by the wrapping generation compare; a `ClientDelete` /
+    /// `PruneReplace` tombstone — with no terminal-generation guarantee — drops
+    /// UNCONDITIONALLY, so a diverged source's strictly-newer image cannot
+    /// resurrect a client-deleted record (the consensus closure).
+    #[test]
+    fn blocks_heal_apply_is_cause_aware() {
+        let log = TombstoneLog::new(PathBuf::from("/nonexistent/x.tombstones"), 0, 4, 100);
+
+        // Dah (terminal): generation-based — drops at-or-behind N, admits newer.
+        let dah = tk(1);
+        log.record(&dah, 5, 900, TombstoneCause::Dah);
+        assert!(
+            log.blocks_heal_apply(&dah, 4),
+            "Dah drops a source behind N"
+        );
+        assert!(log.blocks_heal_apply(&dah, 5), "Dah drops a source at N");
+        assert!(
+            !log.blocks_heal_apply(&dah, 6),
+            "Dah admits a strictly-newer source (a terminal record cannot exceed N, \
+             so this is unreachable in practice but proves the generation leg)",
+        );
+
+        // ClientDelete: unconditional — drops even a strictly-newer source image.
+        let client = tk(2);
+        log.record(&client, 5, 900, TombstoneCause::ClientDelete);
+        assert!(log.blocks_heal_apply(&client, 4));
+        assert!(log.blocks_heal_apply(&client, 5));
+        assert!(
+            log.blocks_heal_apply(&client, 9),
+            "ClientDelete drops a strictly-newer source (consensus closure)",
+        );
+
+        // PruneReplace: also unconditional.
+        let prune = tk(3);
+        log.record(&prune, 5, 900, TombstoneCause::PruneReplace);
+        assert!(log.blocks_heal_apply(&prune, 99));
+
+        // No tombstone → never blocks.
+        assert!(!log.blocks_heal_apply(&tk(42), 0));
     }
 
     #[test]

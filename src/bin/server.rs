@@ -1872,6 +1872,49 @@ fn main() {
             }
         }
 
+        // Reverse-heal Phase 2c (finding C1): the detected stale-suspect shards
+        // now drive a DELETE-SAFE reverse-PULL — gated on
+        // `reverse_heal.tombstones` (the same enable that attached the tombstone
+        // log above; RULE-DS is a no-op without it). SAFETY —
+        // NO-SERVE-BEFORE-HEAL: this runs BEFORE the readiness transition below,
+        // so every stale shard is fenced (its `is_master` answers
+        // `Transitioning`, never `Yes`) until its heal completes or is proven
+        // impossible. The window that remains for Phase 3's full fence: a source
+        // that never converges leaves the shard fenced fail-closed here rather
+        // than timing out + giving up, and the pull is boot-triggered only (no
+        // online re-heal) — both are Phase-3 state-machine scope.
+        if config.reverse_heal.tombstones {
+            let stale = running.stale_suspect_shards();
+            if !stale.is_empty() {
+                // No membership exchange has converged a partition view at boot,
+                // so source selection falls back to the shard's committed replica
+                // set (a data holder by assignment; the source re-validates
+                // ownership before streaming, and RULE-DS + generation
+                // idempotency gate every applied image). Shards with a source are
+                // fenced + queued for the pull; shards with NONE are fenced
+                // FAIL-CLOSED (never served un-healed).
+                let empty_view = std::collections::HashMap::new();
+                let sources = running.select_reverse_heal_sources(&stale, &empty_view);
+                let queued = running.begin_reverse_heal(&sources);
+                let sourced: std::collections::HashSet<u16> =
+                    sources.iter().map(|(s, _)| *s).collect();
+                let mut fenced_fail_closed = 0usize;
+                for &shard in &stale {
+                    if !sourced.contains(&shard) {
+                        running.mark_inbound_active(shard);
+                        fenced_fail_closed += 1;
+                    }
+                }
+                tracing::warn!(
+                    stale_shards = stale.len(),
+                    pull_queued = queued,
+                    fenced_fail_closed,
+                    "reverse-heal Phase 2c: fenced stale shards (no-serve-before-heal) \
+                     and queued delete-safe reverse-pull from committed sources",
+                );
+            }
+        }
+
         if config.replication_factor > 1 {
             // Startup barrier: durable pending replication intents must be
             // resolved before any HTTP or TCP listener is started below. If a

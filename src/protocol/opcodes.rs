@@ -540,7 +540,19 @@ pub const ERR_RESPONSE_TOO_LARGE: u16 = 38;
 /// and always returns page 1, so a paging client MUST gate its resume loop on
 /// the negotiated version (`>= 3`) to avoid looping forever against an older
 /// server. The response wire format is unchanged, so old clients keep working.
-pub const PROTOCOL_VERSION: u16 = 3;
+///
+/// Bumped to `4` (reverse-heal Phase 2c) for two additive wire extensions,
+/// exchanged only between two `>= 4` peers, invisible to older ones:
+///
+/// - the create-metadata flag byte now carries [`CREATE_FLAG_REASSIGNED`] (wire
+///   0x10) so a healed / migrated create image preserves the persisted
+///   REASSIGNED marker instead of dropping it; and
+/// - [`FLAG_MIGRATION_MANIFEST_DIFF`] selects the tombstone-aware per-record
+///   manifest-diff response on `OP_MIGRATION_COMPLETE`.
+///
+/// Both are ignored by a `< 4` peer (unset bit / unrecognized flag), so old
+/// clients and mixed-version clusters keep working.
+pub const PROTOCOL_VERSION: u16 = 4;
 
 pub const ERR_INTERNAL: u16 = 255;
 
@@ -603,8 +615,8 @@ pub const STATUS_STREAM_END: u8 = 7;
 // `replication::receiver`). The engine maps these wire bits onto the persisted
 // [`crate::record::TxFlags`], which use a DIFFERENT numbering:
 //
-//   wire (here):       LOCKED=0x01, CONFLICTING=0x02, FROZEN=0x04, EXTERNAL_BLOB=0x08
-//   persisted TxFlags: IS_COINBASE=0x01, CONFLICTING=0x02, LOCKED=0x04, EXTERNAL=0x08
+//   wire (here):       LOCKED=0x01, CONFLICTING=0x02, FROZEN=0x04, EXTERNAL_BLOB=0x08, REASSIGNED=0x10
+//   persisted TxFlags: IS_COINBASE=0x01, CONFLICTING=0x02, LOCKED=0x04, EXTERNAL=0x08, REASSIGNED=0x40
 //
 // The footgun these named constants exist to prevent: a caller that reaches for
 // the *persisted* LOCKED bit (0x04) and puts it on the CREATE wire silently
@@ -636,6 +648,20 @@ pub const CREATE_FLAG_EXTERNAL_BLOB: u8 = 0x08;
 /// Retained name for existing call sites; identical to
 /// [`CREATE_FLAG_EXTERNAL_BLOB`].
 pub const FLAG_EXTERNAL_BLOB: u8 = 0x08;
+
+/// CREATE-wire bit: this record carries the persisted
+/// [`crate::record::TxFlags::REASSIGNED`] marker — a court-ordered reassignment,
+/// permanently excluded from the DAH sweep so the old→new-hash audit trail is
+/// never pruned. Wire 0x10 — a SEPARATE CREATE-wire namespace bit, NOT the
+/// persisted `TxFlags::REASSIGNED` value (0x40).
+///
+/// Additive in PROTOCOL_VERSION 4 (reverse-heal Phase 2c): a pre-4 peer neither
+/// sets nor reads it, so a healed / migrated create image no longer silently
+/// drops REASSIGNED (the pre-2c gap — the baseline stream replayed
+/// CONFLICTING/LOCKED but never REASSIGNED). Encoded by
+/// [`crate::replication::protocol::create_metadata_flag_bytes`]; decoded in the
+/// replica-receiver Create apply.
+pub const CREATE_FLAG_REASSIGNED: u8 = 0x10;
 
 /// Request flag: bypass shard ownership check and read locally.
 ///
@@ -908,5 +934,23 @@ mod create_flag_tests {
         let combined = CREATE_FLAG_LOCKED | CREATE_FLAG_FROZEN;
         assert_eq!(decode_create_flags(combined), (true, false, true, false));
         assert_eq!(decode_create_flags(0), (false, false, false, false));
+    }
+
+    /// Reverse-heal Phase 2c: REASSIGNED is a distinct single create-wire bit
+    /// (0x10), disjoint from the pre-existing four (0x01..0x08), so adding it
+    /// never re-decodes an old peer's flags as reassigned.
+    #[test]
+    fn create_flag_reassigned_is_distinct_single_bit() {
+        assert_eq!(CREATE_FLAG_REASSIGNED, 0x10);
+        assert_eq!(CREATE_FLAG_REASSIGNED.count_ones(), 1);
+        let others = CREATE_FLAG_LOCKED
+            | CREATE_FLAG_CONFLICTING
+            | CREATE_FLAG_FROZEN
+            | CREATE_FLAG_EXTERNAL_BLOB;
+        assert_eq!(
+            CREATE_FLAG_REASSIGNED & others,
+            0,
+            "REASSIGNED must not overlap the existing create-wire bits",
+        );
     }
 }
