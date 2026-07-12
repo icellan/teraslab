@@ -3135,21 +3135,54 @@ pub fn recover_pending_replication_intents(
         Some(t) => t,
         None => return Ok(()),
     };
-    recover_pending_replication_intents_from_tracker(tracker, redo_log, engine, |ops, range| {
-        // The intent range is already present in the durable tracker; this
-        // recovery path commits it explicitly after successful fan-out.
-        replicate_all_ops(Some(cluster), ops, range, &[]).map(|_| ())
-    })
+    let resync_handle = cluster.resync_sender_handle();
+    recover_pending_replication_intents_from_tracker(
+        tracker,
+        redo_log,
+        engine,
+        |ops, range| {
+            // The intent range is already present in the durable tracker; this
+            // recovery path commits it explicitly after successful fan-out.
+            replicate_all_ops(Some(cluster), ops, range, &[]).map(|_| ())
+        },
+        |keys| {
+            // C2: a reclaimed intent can no longer be incrementally replayed —
+            // post an explicit full-shard resync to every replica node of the
+            // reclaimed keys' shards so the divergent prefix is repaired even if
+            // the lag-monitor catch-up loop would otherwise skip a node whose
+            // ACK watermark already caught up.
+            let table = cluster.shard_table();
+            let table = table.read();
+            let mut per_node: std::collections::BTreeMap<NodeId, std::collections::BTreeSet<u16>> =
+                std::collections::BTreeMap::new();
+            for key in keys {
+                let shard = ShardTable::shard_for_key(key);
+                for replica in table.replicas_for_key(key) {
+                    per_node.entry(*replica).or_default().insert(shard);
+                }
+            }
+            for (node, shards) in per_node {
+                if !resync_handle.signal_for_node(node, shards.into_iter().collect()) {
+                    tracing::warn!(
+                        node_id = node.0,
+                        "intent-recovery: reclaimed-range resync could not be queued (coordinator stopped)",
+                    );
+                }
+            }
+        },
+    )
 }
 
-fn recover_pending_replication_intents_from_tracker<F>(
+fn recover_pending_replication_intents_from_tracker<F, R>(
     tracker: &crate::replication::durable::ReplicationIntentTracker,
     redo_log: Option<&Mutex<RedoLog>>,
     engine: &Engine,
     mut replicate: F,
+    mut resync: R,
 ) -> std::result::Result<(), String>
 where
     F: FnMut(&[(TxKey, Vec<ReplicaOp>)], (u64, u64)) -> std::result::Result<(), String>,
+    R: FnMut(&[TxKey]),
 {
     let pending = tracker.pending_with_keys();
     if pending.is_empty() {
@@ -3242,6 +3275,14 @@ where
                 current_sequence,
                 "pending replication intent refers to reclaimed redo range; clearing marker and requiring replica full resync/catch-up",
             );
+            // C2: the reclaimed range can no longer be incrementally replayed,
+            // so enqueue an EXPLICIT full resync for this intent's keys BEFORE
+            // clearing the marker. Pre-fix the marker was committed with no
+            // resync, leaving repair to depend entirely on the lag-monitor
+            // catch-up loop noticing the divergence later; a node that had
+            // fully caught up on its ACK watermark (so the loop skips it) would
+            // never be repaired for this reclaimed prefix.
+            resync(&intent_keys);
             tracker
                 .commit(range.first_sequence, range.last_sequence)
                 .map_err(|e| format!("replication intent commit: {e}"))?;
@@ -19566,11 +19607,14 @@ mod tests {
         tracker.begin(7, 7, &[]).unwrap();
         let h = DispatchTestHarness::new();
 
-        let err =
-            recover_pending_replication_intents_from_tracker(&tracker, None, &h.engine, |_, _| {
-                panic!("replication must not run without redo")
-            })
-            .unwrap_err();
+        let err = recover_pending_replication_intents_from_tracker(
+            &tracker,
+            None,
+            &h.engine,
+            |_, _| panic!("replication must not run without redo"),
+            |_: &[TxKey]| {},
+        )
+        .unwrap_err();
 
         assert!(err.contains("requires redo log"), "err was: {err}");
         assert_eq!(tracker.pending().len(), 1);
@@ -19611,6 +19655,7 @@ mod tests {
                 observed_ops = ops.to_vec();
                 Ok(())
             },
+            |_: &[TxKey]| {},
         )
         .expect("pending intent recovery succeeds");
 
@@ -19756,6 +19801,7 @@ mod tests {
                 replicated = true;
                 Ok(())
             },
+            |_: &[TxKey]| {},
         )
         .expect("reclaimed redo range should clear stale intent instead of bricking startup");
 
@@ -19923,6 +19969,7 @@ mod tests {
                 observed.extend_from_slice(ops);
                 Ok(())
             },
+            |_: &[TxKey]| {},
         )
         .expect("merged read must resolve a range spanning both store logs");
 
@@ -20010,6 +20057,7 @@ mod tests {
                 observed.extend_from_slice(ops);
                 Ok(())
             },
+            |_: &[TxKey]| {},
         )
         .expect("recovery of a satisfiable (non-reclaimed) range must succeed");
 
@@ -20157,6 +20205,7 @@ mod tests {
                 observed_ops.extend_from_slice(ops);
                 Ok(())
             },
+            |_: &[TxKey]| {},
         )
         .expect("pending intent recovery succeeds");
 
@@ -20231,6 +20280,8 @@ mod tests {
         }
 
         let mut replicated = false;
+        // C2: capture the explicit resync the reclaim branch must enqueue.
+        let mut resync_keys: Vec<TxKey> = Vec::new();
         recover_pending_replication_intents_from_tracker(
             &tracker,
             Some(&redo_log),
@@ -20239,12 +20290,21 @@ mod tests {
                 replicated = true;
                 Ok(())
             },
+            |keys: &[TxKey]| resync_keys.extend_from_slice(keys),
         )
         .expect("reclaimed keyed range should clear stale intent, not brick startup");
 
         assert!(
             !replicated,
             "a reclaimed range cannot be incrementally replayed even with a key set"
+        );
+        // C2: the reclaim branch must have enqueued an EXPLICIT resync for the
+        // intent's own key BEFORE clearing the marker — not deferred repair to
+        // the lag-monitor catch-up loop. Pre-fix `resync_keys` stayed empty.
+        assert_eq!(
+            resync_keys,
+            vec![tx_key],
+            "reclaimed intent must enqueue an explicit resync for its keys"
         );
         assert!(
             tracker.pending().is_empty(),
@@ -21328,6 +21388,7 @@ mod tests {
             Some(&redo_log),
             &h.engine,
             |ops, r| replicate_all_ops(Some(&cluster), ops, r, &[]).map(|_| ()),
+            |_: &[TxKey]| {},
         );
 
         result.expect(

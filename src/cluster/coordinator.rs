@@ -8137,6 +8137,21 @@ impl ResyncSenderHandle {
             .send(crate::replication::manager::ResyncRequest { node_id, shards })
             .is_ok()
     }
+
+    /// C2 — post a `ResyncRequest` directly for a known `NodeId`, without an
+    /// address round-trip. Used by pending-intent recovery, which already
+    /// knows the replica `NodeId`s of a reclaimed range's shards from the
+    /// shard table. `shards` empty means "every shard the named replica
+    /// should hold per the current shard table". Returns `true` on
+    /// successful queue, `false` when the receiver has been dropped.
+    pub fn signal_for_node(&self, node_id: NodeId, shards: Vec<u16>) -> bool {
+        self.tx
+            .send(crate::replication::manager::ResyncRequest {
+                node_id: node_id.0,
+                shards,
+            })
+            .is_ok()
+    }
 }
 
 /// Phase I — snapshot of this node's readiness for client traffic.
