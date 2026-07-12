@@ -1735,7 +1735,15 @@ fn main() {
         );
         // Restore migration state from a previous run so shards that were
         // mid-migration remain blocked (inbound) or tracked (outbound).
-        running.restore_inbound_state();
+        //
+        // A corrupt/truncated inbound-fence file is fail-closed: it is the only
+        // record of which shards were still receiving data, so we abort startup
+        // rather than come up serving those (incomplete) shards as complete
+        // authority. Re-sync from the source node clears the condition.
+        if let Err(e) = running.restore_inbound_state() {
+            tracing::error!(err = %e, "cluster: inbound-fence state corrupt — refusing to start (incomplete shards would be served as complete)");
+            std::process::exit(1);
+        }
         running.restore_outbound_state();
         // Initialize persistent ACK tracker alongside the cluster state file.
         let ack_path = {
