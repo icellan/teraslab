@@ -206,6 +206,18 @@ fn key(n: usize) -> TxKey {
     TxKey { txid }
 }
 
+/// Keys for a node's OWN, disjoint shard. Bytes 0..2 differ from [`key`]
+/// (`0x22, 0x05` vs `0x11, 0x02`) so the records hash into a DIFFERENT shard
+/// with disjoint txids — used to build a second, legitimately-held master set
+/// for the no-dual-master partition check.
+fn owned_key(n: usize) -> TxKey {
+    let mut txid = [0u8; 32];
+    txid[0] = 0x22;
+    txid[1] = 0x05;
+    txid[8..16].copy_from_slice(&(n as u64).to_le_bytes());
+    TxKey { txid }
+}
+
 fn slot_hash(n: usize, vout: u32) -> [u8; 32] {
     let mut h = [0u8; 32];
     h[0] = n as u8;
@@ -215,8 +227,14 @@ fn slot_hash(n: usize, vout: u32) -> [u8; 32] {
 }
 
 fn create_req(n: usize, hashes: &[[u8; 32]]) -> CreateRequest<'_> {
+    create_req_for(key(n).txid, hashes)
+}
+
+/// Companion to [`create_req`] for an explicit txid (the latter is hard-wired
+/// to `key(n)`). Used to materialize a second node's own, disjoint shard.
+fn create_req_for(tx_id: [u8; 32], hashes: &[[u8; 32]]) -> CreateRequest<'_> {
     CreateRequest {
-        tx_id: key(n).txid,
+        tx_id,
         tx_version: 1,
         locktime: 0,
         fee: 300,
@@ -398,17 +416,79 @@ fn crash_mid_migration_no_loss_no_dup_no_dual_master() {
         new_committed_master,
     );
 
-    // INVARIANT 2 (no dual-live master): no record is master-authoritative on
-    // both nodes at once. The new master is fenced → its master set is empty.
-    let dual: Vec<_> = old_set.intersection(&new_set).collect();
-    assert!(
-        dual.is_empty(),
-        "no record may be live on BOTH masters after a crashed migration; \
-         dual-live: {dual:?}",
-    );
+    // INVARIANT 2 (no dual-live master). Two parts:
+    //
+    // (a) FENCE — the crashed target restored its inbound fence, so it serves
+    //     NOTHING as master for the migrating shard; the old master remains the
+    //     sole authority. (Intersecting `old_set` with this correctly-empty
+    //     set is a tautology on its own, which is why part (b) exists.)
     assert!(
         new_set.is_empty(),
-        "fenced new master must not serve any record as master",
+        "fenced new master must not serve any record as master for the migrating shard",
+    );
+    let fenced_dual: Vec<_> = old_set.intersection(&new_set).collect();
+    assert!(
+        fenced_dual.is_empty(),
+        "no record may be live on BOTH masters after a crashed migration; \
+         dual-live: {fenced_dual:?}",
+    );
+
+    // (b) PARTITION — the real no-dual-master invariant is "no record is
+    //     mastered by two nodes at once". Exercise it against two REAL,
+    //     NON-EMPTY master sets: the old master's shard and a SECOND node that
+    //     legitimately masters its OWN, disjoint shard (a migration target
+    //     keeps serving shards it already owns during an unrelated inbound
+    //     migration). Both sets non-empty + empty intersection ⇒ no shard has
+    //     two masters — a claim the fenced-set tautology above cannot make.
+    let owned = Node::new(false);
+    let owned_keys: Vec<TxKey> = (0..NUM_RECORDS).map(owned_key).collect();
+    for (n, k) in owned_keys.iter().enumerate() {
+        let hashes = [slot_hash(n, 0), slot_hash(n, 1)];
+        owned
+            .engine
+            .create(&create_req_for(k.txid, &hashes))
+            .expect("create the target's own-shard record");
+    }
+    owned.make_durable();
+    let owned_shard = ShardTable::shard_for_key(&owned_keys[0]);
+    assert_ne!(
+        owned_shard, shard,
+        "the target's own shard must differ from the migrating shard",
+    );
+    let owned_set = master_record_set(
+        &owned.engine,
+        &owned_keys,
+        &new_mgr_source(),
+        owned_shard,
+        true,
+    );
+    assert!(
+        !old_set.is_empty(),
+        "old master's shard set must be non-empty for the partition check to bite",
+    );
+    assert!(
+        !owned_set.is_empty(),
+        "the target's own-shard master set must be non-empty for the partition check to bite",
+    );
+    let partition_dual: BTreeSet<[u8; 32]> = old_set.intersection(&owned_set).cloned().collect();
+    assert!(
+        partition_dual.is_empty(),
+        "no record may be mastered by two nodes at once; dual-mastered: {partition_dual:?}",
+    );
+
+    // NON-VACUITY — prove the empty-intersection assertion above has teeth:
+    // inject a dual-mastered record (an old-master txid ALSO claimed by the
+    // second node) and confirm the identical intersection now reports the
+    // conflict, i.e. the assertion WOULD fail were a dual-master introduced.
+    let injected_txid = *old_set.iter().next().expect("old_set is non-empty");
+    let mut conflicting = owned_set.clone();
+    conflicting.insert(injected_txid);
+    let injected_dual: BTreeSet<[u8; 32]> = old_set.intersection(&conflicting).cloned().collect();
+    assert_eq!(
+        injected_dual,
+        BTreeSet::from([injected_txid]),
+        "with a dual-mastered record injected, the no-dual-master check must catch \
+         exactly it — proving the empty-intersection assertion is non-vacuous",
     );
 
     // INVARIANT 3 (no loss): the union of all master-served records equals the
