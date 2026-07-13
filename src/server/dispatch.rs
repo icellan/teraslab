@@ -1144,6 +1144,30 @@ pub(crate) fn handle_request(
 
             let verify_only = request.flags & FLAG_MIGRATION_VERIFY_ONLY != 0;
 
+            // Reverse-heal completion (design §C, RULE-DS drop-awareness). A
+            // reverse-heal reuses this completion handshake, but the healing
+            // ex-master's apply legitimately DROPPED every source key it holds a
+            // blocking tombstone for (RULE-DS anti-resurrection) and KEPT its own
+            // higher-generation copy (generation-idempotency). The
+            // forward-migration exact-holding verify below would reject those
+            // expected drops as "missing exact key"/"generation mismatch", so the
+            // task never reaches `verified_tasks`, the fence-clearing batched
+            // completion never fires, and the shard WEDGES `Transitioning` forever.
+            //
+            // Detect a heal completion from LOCAL FENCE STATE (server-side only —
+            // no wire change): an active, uncompleted `heal_pending` inbound entry
+            // for `(shard, source)` means the source's completion is a reverse-heal.
+            // Scope the drop-aware tolerance to it so forward-migration completion
+            // keeps exact-holding semantics unchanged. When `reverse_heal.tombstones`
+            // is off there are NO heal entries, so this is always `false` and the
+            // path is byte-identical to before.
+            let is_heal_completion = match (completion_from_node, cluster) {
+                (Some(source), Some(cluster)) => {
+                    cluster.has_pending_heal_from_source(shard, source)
+                }
+                _ => false,
+            };
+
             // SUPERSET probe (sc09/sc05 drain convergence — transfer-then-
             // relinquish). A gracefully-draining node that re-asserted stale
             // mastership of a NON-empty shard a live peer already took over
@@ -1415,9 +1439,25 @@ pub(crate) fn handle_request(
                     let meta = match engine.read_metadata(key) {
                         Ok(meta) => meta,
                         Err(e) => {
-                            // Missing source key: the target does NOT hold a
-                            // record the source streamed. No-loss reject — never
-                            // commit when a source key is absent.
+                            // Missing source key. For a FORWARD migration this is
+                            // always a reject — the target must hold every streamed
+                            // record (no-loss). For a REVERSE-HEAL it may be an
+                            // EXPECTED RULE-DS drop: this node holds a blocking
+                            // tombstone at >= the source's generation, so the apply
+                            // legitimately did NOT resurrect the key. That is
+                            // exactly the drop the receiver made
+                            // (`tombstone_blocks_heal_apply`), so tolerate it. A
+                            // missing key with NO blocking tombstone is a GENUINE
+                            // gap and STILL rejects (the shard stays fenced) — the
+                            // tolerance never papers over a real deficit, and it
+                            // never causes the target to APPLY the key (RULE-DS
+                            // already dropped it), so resurrection-safety is
+                            // unchanged.
+                            if is_heal_completion
+                                && engine.tombstone_blocks_heal_apply(key, *expected_generation)
+                            {
+                                continue;
+                            }
                             return error_response(
                                 request.request_id,
                                 ERR_MIGRATION_IN_PROGRESS,
@@ -1426,7 +1466,19 @@ pub(crate) fn handle_request(
                         }
                     };
                     let actual_generation = meta.generation;
-                    if actual_generation != *expected_generation {
+                    // FORWARD migration: exact generation match. REVERSE-HEAL: the
+                    // target may legitimately be AHEAD (it KEPT its own
+                    // higher-generation copy instead of the source's older one —
+                    // generation-idempotency), so accept `actual >= expected` and
+                    // reject only a target that is BEHIND (a genuine un-applied
+                    // newer source record). This mirrors the SUPERSET probe's
+                    // equal-or-newer containment.
+                    let generation_ok = if is_heal_completion {
+                        actual_generation >= *expected_generation
+                    } else {
+                        actual_generation == *expected_generation
+                    };
+                    if !generation_ok {
                         return error_response(
                             request.request_id,
                             ERR_MIGRATION_IN_PROGRESS,
@@ -1516,7 +1568,15 @@ pub(crate) fn handle_request(
             //   * anything not epoch-current (and not reconcile_active): STRICT
             //     `actual == expected_records` (preserves #29).
             let actual = engine.shard_record_count(shard);
-            let count_ok = if expected_records == 0 && completion_epoch_current {
+            let count_ok = if is_heal_completion && exact_entries_verified {
+                // REVERSE-HEAL: the drop-aware per-key verify above IS the
+                // completeness proof. The healed target legitimately holds FEWER
+                // records than the source's full-baseline manifest (every
+                // RULE-DS-dropped key), so neither `actual == expected` nor
+                // `actual >= expected` holds — the count is not a meaningful gate
+                // for a heal. Accept; genuine gaps were already rejected per-key.
+                true
+            } else if expected_records == 0 && completion_epoch_current {
                 true
             } else if exact_entries_verified && completion_epoch_current {
                 actual >= expected_records
@@ -24109,6 +24169,424 @@ mod tests {
             1,
             "verify-only completion must not clear pending inbound until the batched durable completion arrives"
         );
+    }
+
+    /// Helper: encode + dispatch an `OP_MIGRATION_BATCH_COMPLETE` for one shard
+    /// from `from_node` (the fence-clearing commit that follows a verified-only
+    /// completion). Mirrors `send_completion_only_handshakes`'s wire frame.
+    fn dispatch_batch_complete(
+        engine: &Engine,
+        cluster: &crate::cluster::coordinator::RunningCluster,
+        shard: u16,
+        from_node: NodeId,
+    ) -> ResponseFrame {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&1u32.to_le_bytes()); // shard_count
+        payload.extend_from_slice(&shard.to_le_bytes()); // shard id
+        payload.extend_from_slice(&from_node.0.to_le_bytes()); // from_node
+        payload.extend_from_slice(&0u64.to_le_bytes()); // topology_epoch (legacy 0)
+        let req = RequestFrame {
+            request_id: 0,
+            op_code: OP_MIGRATION_BATCH_COMPLETE,
+            flags: 0,
+            payload: payload.into(),
+        };
+        let mut conn_state = crate::server::ConnectionState::new();
+        handle_request(
+            &req,
+            engine,
+            8192,
+            Some(cluster),
+            None,
+            &mut conn_state,
+            None,
+        )
+    }
+
+    /// Reverse-heal completion drop-awareness (final blocking P1). A reverse-heal
+    /// reuses the migration completion handshake: the heal SOURCE streams its FULL
+    /// live baseline, then sends a verify-only `OP_MIGRATION_COMPLETE` whose
+    /// manifest is its ENTIRE live key set for the shard. But RULE-DS legitimately
+    /// DROPS every source key the healing ex-master holds a blocking tombstone for
+    /// (it must NOT resurrect a record it deleted) and KEEPS its own
+    /// higher-generation copy. The forward-migration exact-holding verify then
+    /// rejects that expected drop as "missing exact key" → the task never reaches
+    /// `verified_tasks` → the fence-clearing batched completion never fires →
+    /// `heal_pending` never clears → the shard WEDGES `Transitioning` forever.
+    ///
+    /// This drives the COMPLETION handshake end to end: with an active heal fence
+    /// for `(shard, source)` and a Dah tombstone over a source key the target
+    /// correctly dropped, the verify-only completion must return `STATUS_OK`
+    /// (pre-fix: `STATUS_ERROR` / `ERR_MIGRATION_IN_PROGRESS`, so the shard
+    /// wedges); the follow-on batched completion then clears the fence (the
+    /// inbound bit `is_master` reads for `Transitioning` drops), and the
+    /// tombstoned key stays ABSENT — no resurrection.
+    #[test]
+    fn reverse_heal_with_tombstoned_source_key_completes_and_clears_fence() {
+        let h = DispatchTestHarness::new();
+        // Enable deletion tombstones (`reverse_heal.tombstones` on) with a
+        // pre-recorded Dah tombstone for the key the target deleted.
+        let shard = 40u16;
+        let txid_tomb = txid_for_shard(shard, 2);
+        let key_tomb = TxKey { txid: txid_tomb };
+        let tomb_log = crate::ops::tombstone::TombstoneLog::new(
+            std::path::PathBuf::from("/nonexistent/heal-complete.tombstones"),
+            0,
+            4,
+            100,
+        );
+        // Target spent+deleted this record at generation 5 (Dah); the stale source
+        // still holds it live at the older generation 3. RULE-DS drops the older
+        // source image on apply, so the target holds NO record for it.
+        tomb_log.record(
+            &key_tomb,
+            5,
+            900,
+            crate::ops::tombstone::TombstoneCause::Dah,
+        );
+        h.engine.set_tombstone_log(tomb_log);
+
+        // k_live: a record BOTH the source and the healed target hold live.
+        let txid_live = txid_for_shard(shard, 1);
+        assert_eq!(h.create_tx(txid_live, 1).status, STATUS_OK);
+        let key_live = TxKey { txid: txid_live };
+        let gen_live = h.engine.read_metadata(&key_live).unwrap().generation;
+        assert!(
+            h.engine.read_metadata(&key_tomb).is_err(),
+            "precondition: the tombstoned key is ABSENT on the target"
+        );
+
+        let source = crate::cluster::shards::NodeId(2);
+        let members = vec![crate::cluster::shards::NodeId(1)];
+        let table = crate::cluster::shards::ShardTable::compute_with_epoch(&members, 1, 70, 1);
+        let cluster = crate::cluster::coordinator::new_test_running_cluster(
+            crate::cluster::shards::NodeId(1),
+            table,
+            &[(
+                crate::cluster::shards::NodeId(1),
+                "127.0.0.1:4740".parse().unwrap(),
+            )],
+            &members,
+            &[], // no plain inbound — a HEAL fence is registered explicitly below
+            &[],
+            &[],
+            1,
+        );
+        cluster.register_test_heal_source(shard, source);
+        assert_eq!(
+            cluster.inbound_pending_count(),
+            1,
+            "heal fence registered → shard fenced"
+        );
+        assert!(
+            cluster.has_pending_inbound_shard(shard),
+            "heal fence raises the inbound bit (is_master → Transitioning)"
+        );
+
+        // Source's verify-only completion: its FULL live manifest, which includes
+        // the key the target legitimately dropped (RULE-DS).
+        let entries = vec![(key_live, gen_live), (key_tomb, 3u32)];
+        let payload = build_migration_complete_payload(2, 0, 0, None, Some(&entries), Some(source));
+        let req = RequestFrame {
+            request_id: shard as u64,
+            op_code: OP_MIGRATION_COMPLETE,
+            flags: FLAG_MIGRATION_VERIFY_ONLY,
+            payload: payload.into(),
+        };
+        let mut conn_state = crate::server::ConnectionState::new();
+        let resp = handle_request(
+            &req,
+            &h.engine,
+            8192,
+            Some(&cluster),
+            None,
+            &mut conn_state,
+            None,
+        );
+        assert_eq!(
+            resp.status, STATUS_OK,
+            "heal verify must TOLERATE the RULE-DS-dropped source key (pre-fix: \
+             rejected as 'missing exact key' → the shard wedges fenced forever)"
+        );
+        assert!(
+            cluster.has_pending_inbound_shard(shard),
+            "verify-only leaves the fence up until the batched completion arrives"
+        );
+
+        // The batched completion the source sends once the verify passes clears
+        // the heal fence — the shard converges out of Transitioning.
+        let resp2 = dispatch_batch_complete(&h.engine, &cluster, shard, source);
+        assert_eq!(
+            resp2.status, STATUS_OK,
+            "batched completion accepted → heal commits"
+        );
+        assert_eq!(
+            cluster.inbound_pending_count(),
+            0,
+            "heal_pending cleared → shard no longer fenced"
+        );
+        assert!(
+            !cluster.has_pending_inbound_shard(shard),
+            "inbound bit cleared → is_master flips out of Transitioning"
+        );
+
+        // No resurrection: the tombstoned source key stays ABSENT.
+        assert!(
+            h.engine.read_metadata(&key_tomb).is_err(),
+            "the completion must NOT resurrect the tombstoned key"
+        );
+        assert!(
+            h.engine.lookup(&key_tomb).is_none(),
+            "the tombstoned key stays absent in the index (no double-spend)"
+        );
+    }
+
+    /// Reverse-heal completion must STILL fail on a GENUINE gap — a source key the
+    /// target should hold but does NOT, with NO blocking tombstone and the target
+    /// not ahead. The drop-aware tolerance must not paper over a real un-healed
+    /// deficit: the completion is rejected and the shard stays fenced so the pull
+    /// re-drives (fail-closed).
+    #[test]
+    fn reverse_heal_genuine_missing_key_still_fails_completion_stays_fenced() {
+        let h = DispatchTestHarness::new();
+        // Tombstones enabled, but NO tombstone for the gap key.
+        h.engine
+            .set_tombstone_log(crate::ops::tombstone::TombstoneLog::new(
+                std::path::PathBuf::from("/nonexistent/heal-gap.tombstones"),
+                0,
+                4,
+                100,
+            ));
+
+        let shard = 42u16;
+        let txid_live = txid_for_shard(shard, 1);
+        assert_eq!(h.create_tx(txid_live, 1).status, STATUS_OK);
+        let key_live = TxKey { txid: txid_live };
+        let gen_live = h.engine.read_metadata(&key_live).unwrap().generation;
+
+        // k_gap: the target genuinely lacks this key AND holds no tombstone for it
+        // — the heal should have applied it but didn't.
+        let key_gap = TxKey {
+            txid: txid_for_shard(shard, 9),
+        };
+        assert!(h.engine.read_metadata(&key_gap).is_err());
+        assert!(
+            !h.engine.tombstone_blocks_heal_apply(&key_gap, 0),
+            "precondition: no blocking tombstone for the gap key"
+        );
+
+        let source = crate::cluster::shards::NodeId(2);
+        let members = vec![crate::cluster::shards::NodeId(1)];
+        let table = crate::cluster::shards::ShardTable::compute_with_epoch(&members, 1, 71, 1);
+        let cluster = crate::cluster::coordinator::new_test_running_cluster(
+            crate::cluster::shards::NodeId(1),
+            table,
+            &[(
+                crate::cluster::shards::NodeId(1),
+                "127.0.0.1:4742".parse().unwrap(),
+            )],
+            &members,
+            &[],
+            &[],
+            &[],
+            1,
+        );
+        cluster.register_test_heal_source(shard, source);
+
+        let entries = vec![(key_live, gen_live), (key_gap, 0u32)];
+        let payload = build_migration_complete_payload(2, 0, 0, None, Some(&entries), Some(source));
+        let req = RequestFrame {
+            request_id: shard as u64,
+            op_code: OP_MIGRATION_COMPLETE,
+            flags: FLAG_MIGRATION_VERIFY_ONLY,
+            payload: payload.into(),
+        };
+        let mut conn_state = crate::server::ConnectionState::new();
+        let resp = handle_request(
+            &req,
+            &h.engine,
+            8192,
+            Some(&cluster),
+            None,
+            &mut conn_state,
+            None,
+        );
+        assert_eq!(
+            resp.status, STATUS_ERROR,
+            "a genuine missing key (no tombstone, not ahead) must STILL fail"
+        );
+        let err_code = u16::from_le_bytes(resp.payload[..2].try_into().unwrap());
+        assert_eq!(err_code, ERR_MIGRATION_IN_PROGRESS);
+        assert_eq!(
+            cluster.inbound_pending_count(),
+            1,
+            "the shard stays fenced on a genuine gap — no papering over"
+        );
+    }
+
+    /// Reverse-heal completion PASSES when the target is AHEAD of the source on a
+    /// key — it KEPT its own higher-generation copy (generation-idempotency)
+    /// instead of the source's older one, so the exact-holding verify's
+    /// `generation mismatch` must not reject it.
+    #[test]
+    fn reverse_heal_target_ahead_key_completes() {
+        let h = DispatchTestHarness::new();
+        let shard = 41u16;
+        let txid = txid_for_shard(shard, 3);
+        // Create with 2 UTXOs, then spend ONE (partial) so the record stays LIVE
+        // but its generation is bumped above the source's.
+        assert_eq!(h.create_tx(txid, 2).status, STATUS_OK);
+        let key = TxKey { txid };
+        let hashes: Vec<[u8; 32]> = (0..2)
+            .map(|v| h.engine.read_slot(&key, v).unwrap().hash)
+            .collect();
+        let params = SpendBatchParams {
+            ignore_conflicting: false,
+            ignore_locked: false,
+            current_block_height: 100,
+            block_height_retention: 288,
+        };
+        let items = vec![WireSpendItem {
+            txid,
+            vout: 0,
+            utxo_hash: hashes[0],
+            spending_data: [0xC0; 36],
+        }];
+        assert_eq!(
+            h.request(OP_SPEND_BATCH, encode_spend_batch(&params, &items))
+                .status,
+            STATUS_OK
+        );
+        let gen_ahead = h.engine.read_metadata(&key).unwrap().generation;
+        assert!(
+            gen_ahead >= 1,
+            "partial spend bumps the target's generation above the source's"
+        );
+        let source_gen = gen_ahead - 1; // source is one generation behind.
+
+        let source = crate::cluster::shards::NodeId(2);
+        let members = vec![crate::cluster::shards::NodeId(1)];
+        let table = crate::cluster::shards::ShardTable::compute_with_epoch(&members, 1, 72, 1);
+        let cluster = crate::cluster::coordinator::new_test_running_cluster(
+            crate::cluster::shards::NodeId(1),
+            table,
+            &[(
+                crate::cluster::shards::NodeId(1),
+                "127.0.0.1:4741".parse().unwrap(),
+            )],
+            &members,
+            &[],
+            &[],
+            &[],
+            1,
+        );
+        cluster.register_test_heal_source(shard, source);
+
+        let entries = vec![(key, source_gen)];
+        let payload = build_migration_complete_payload(1, 0, 0, None, Some(&entries), Some(source));
+        let req = RequestFrame {
+            request_id: shard as u64,
+            op_code: OP_MIGRATION_COMPLETE,
+            flags: FLAG_MIGRATION_VERIFY_ONLY,
+            payload: payload.into(),
+        };
+        let mut conn_state = crate::server::ConnectionState::new();
+        let resp = handle_request(
+            &req,
+            &h.engine,
+            8192,
+            Some(&cluster),
+            None,
+            &mut conn_state,
+            None,
+        );
+        assert_eq!(
+            resp.status, STATUS_OK,
+            "heal verify must PASS when the target is ahead (kept-newer) — pre-fix \
+             rejected as 'generation mismatch'"
+        );
+    }
+
+    /// Regression: a FORWARD migration completion is UNCHANGED — it must still
+    /// require exact holding. Same tombstone+missing-key shape as the heal test,
+    /// but with a PLAIN inbound (no heal fence): the RULE-DS drop tolerance is
+    /// heal-scoped and must NOT leak into a forward migration, so a missing source
+    /// key still rejects.
+    #[test]
+    fn forward_migration_completion_unchanged_still_exact() {
+        let h = DispatchTestHarness::new();
+        let shard = 43u16;
+        let txid_tomb = txid_for_shard(shard, 2);
+        let key_tomb = TxKey { txid: txid_tomb };
+        let tomb_log = crate::ops::tombstone::TombstoneLog::new(
+            std::path::PathBuf::from("/nonexistent/fwd-unchanged.tombstones"),
+            0,
+            4,
+            100,
+        );
+        tomb_log.record(
+            &key_tomb,
+            5,
+            900,
+            crate::ops::tombstone::TombstoneCause::Dah,
+        );
+        h.engine.set_tombstone_log(tomb_log);
+        // Even though a blocking tombstone EXISTS for the missing key, a forward
+        // migration must NOT tolerate it.
+        assert!(h.engine.tombstone_blocks_heal_apply(&key_tomb, 3));
+
+        let txid_live = txid_for_shard(shard, 1);
+        assert_eq!(h.create_tx(txid_live, 1).status, STATUS_OK);
+        let key_live = TxKey { txid: txid_live };
+        let gen_live = h.engine.read_metadata(&key_live).unwrap().generation;
+
+        let source = crate::cluster::shards::NodeId(2);
+        let members = vec![crate::cluster::shards::NodeId(1)];
+        let table = crate::cluster::shards::ShardTable::compute_with_epoch(&members, 1, 73, 1);
+        let cluster = crate::cluster::coordinator::new_test_running_cluster(
+            crate::cluster::shards::NodeId(1),
+            table,
+            &[(
+                crate::cluster::shards::NodeId(1),
+                "127.0.0.1:4743".parse().unwrap(),
+            )],
+            &members,
+            &[shard], // PLAIN inbound (mark_inbound_active) — NOT a heal fence
+            &[],
+            &[],
+            1,
+        );
+        assert!(
+            !cluster.has_pending_heal_from_source(shard, source),
+            "precondition: this is a forward migration, not a heal"
+        );
+
+        let entries = vec![(key_live, gen_live), (key_tomb, 3u32)];
+        let payload = build_migration_complete_payload(2, 0, 0, None, Some(&entries), Some(source));
+        let req = RequestFrame {
+            request_id: shard as u64,
+            op_code: OP_MIGRATION_COMPLETE,
+            flags: FLAG_MIGRATION_VERIFY_ONLY,
+            payload: payload.into(),
+        };
+        let mut conn_state = crate::server::ConnectionState::new();
+        let resp = handle_request(
+            &req,
+            &h.engine,
+            8192,
+            Some(&cluster),
+            None,
+            &mut conn_state,
+            None,
+        );
+        assert_eq!(
+            resp.status, STATUS_ERROR,
+            "forward migration must still require EXACT holding — the heal \
+             tolerance must not leak into it"
+        );
+        let err_code = u16::from_le_bytes(resp.payload[..2].try_into().unwrap());
+        assert_eq!(err_code, ERR_MIGRATION_IN_PROGRESS);
+        assert_eq!(cluster.inbound_pending_count(), 1);
     }
 
     /// sc09/sc05 drain convergence (transfer-then-relinquish) — the SUPERSET

@@ -1887,15 +1887,33 @@ fn main() {
                     "reverse-heal: no lost acked tail at boot (Tier-1 clean)",
                 );
             } else {
-                let suspects = running.mastered_shards();
+                // P2 — scope the suspicion to the shards this node masters that
+                // REPLICATE to a lost-tail replica, not ALL mastered shards. The
+                // lost tail was acked by specific downstream replicas
+                // (`lost[..].0`), and a replica only holds the shards it replicates
+                // for, so `{ mastered } ∩ { replicating to a lost replica }` is the
+                // tightest correct bound (the AckTracker's redo sequences are
+                // node-coarse and carry no shard). Reduces the wedge blast radius
+                // and boot cost. If the mapping is empty (a lost replica no longer
+                // resolves to a known address), fall back to all mastered shards —
+                // fail-closed: better to over-suspect than to miss a real gap.
+                let lost_addrs: Vec<std::net::SocketAddr> =
+                    lost.iter().map(|(addr, _)| *addr).collect();
+                let scoped = running.mastered_shards_replicating_to(&lost_addrs);
+                let suspects = if scoped.is_empty() {
+                    running.mastered_shards()
+                } else {
+                    scoped
+                };
                 tracing::error!(
                     floor = shared_seq_floor,
                     lost_replicas = lost.len(),
                     suspect_shards = suspects.len(),
                     ?lost,
                     "reverse-heal: LOST ACKED TAIL detected at boot (Tier-1) — this \
-                     node acked writes beyond its recovered redo floor; marking its \
-                     mastered shards stale-suspect (detection-only: no fence, no pull)",
+                     node acked writes beyond its recovered redo floor; marking the \
+                     shards it masters that replicate to a lost-tail replica \
+                     stale-suspect (detection-only: no fence, no pull)",
                 );
                 running.record_stale_suspect_shards(suspects);
             }
