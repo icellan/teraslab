@@ -9517,6 +9517,137 @@ impl RunningCluster {
         }
     }
 
+    /// Reverse-heal Phase 2c — begin the delete-safe reverse-PULL for the shards
+    /// this node booted SUSPECTING held a lost acked tail (Phase-1 detection),
+    /// each paired with the [`select_heal_source`] quorum-current source (see
+    /// [`Self::select_reverse_heal_sources`]).
+    ///
+    /// For every `(shard, source)` this registers a pending inbound migration
+    /// from the concrete `source` — a single primitive
+    /// ([`crate::cluster::migration::MigrationManager::register_inbound_source`])
+    /// that does BOTH halves of Phase 2c's boot behaviour:
+    ///
+    /// 1. **NO-SERVE-BEFORE-HEAL** — it sets the shard's inbound fence bit
+    ///    (`inbound_atomic`), so [`Self::is_master`] answers
+    ///    [`MasterQueryResult::Transitioning`] — NOT `Yes` — for the shard until
+    ///    the pull completes. Called at boot BEFORE the node advertises
+    ///    readiness, the node never serves un-healed data as authority. The fence
+    ///    is durably persisted, so a crash mid-heal re-fences on restart.
+    /// 2. **PULL** — a concrete-source inbound entry is exactly what the
+    ///    coordinator's requester loop pulls on: it sends
+    ///    `OP_MIGRATION_TRANSFER_REQUEST` to `source`, which streams the shard
+    ///    baseline back; the receiver applies it under RULE-DS (delete-safe) and
+    ///    the completion handshake calls
+    ///    [`Self::mark_inbound_complete_from_source`], clearing the fence so the
+    ///    shard becomes servable.
+    ///
+    /// Returns the number of shards newly fenced + queued. Idempotent per
+    /// `(shard, source)`; skips a `source` equal to self or the `NodeId(0)`
+    /// sentinel (no concrete peer to pull from).
+    pub fn begin_reverse_heal(&self, shard_sources: &[(u16, NodeId)]) -> usize {
+        if shard_sources.is_empty() {
+            return 0;
+        }
+        let mgr = &mut self.migration.lock();
+        let mut started = 0usize;
+        for &(shard, source) in shard_sources {
+            if source == self.self_id || source == NodeId(0) {
+                continue;
+            }
+            // P0 — `register_heal_source` (not `register_inbound_source`) raises
+            // the `heal_pending` marker so the no-serve-before-heal fence
+            // SURVIVES a concurrent runtime topology commit's `clear_inbound`.
+            if mgr.register_heal_source(shard, source) {
+                started += 1;
+            }
+        }
+        self.inbound_atomic.load_from(mgr.inbound_bitmap());
+        if let Some(ref path) = self.inbound_state_path {
+            crate::cluster::migration::persist_inbound_state(path, mgr);
+        }
+        started
+    }
+
+    /// P0 (reverse-heal Phase 2c) — raise the no-source FAIL-CLOSED heal fence
+    /// for a stale shard with no available heal source at boot.
+    ///
+    /// Unlike [`Self::mark_inbound_active`] (the normal REPLICA_BATCH-arrival
+    /// path, whose fence is dropped by a topology supersede), this raises the
+    /// `heal_pending` marker so the fence SURVIVES `clear_inbound` — the shard
+    /// stays client-invisible (`is_master` = `Transitioning`) and is never
+    /// served un-healed until an operator or a Phase-3 give-up path resolves it.
+    /// Persists the fence and syncs the hot-path atomic immediately.
+    pub fn mark_inbound_heal_fence(&self, shard: u16) {
+        let mgr = &mut self.migration.lock();
+        let changed = mgr.mark_heal_fence_active(shard);
+        self.inbound_atomic.load_from(mgr.inbound_bitmap());
+        if changed && let Some(ref path) = self.inbound_state_path {
+            crate::cluster::migration::persist_inbound_state(path, mgr);
+        }
+    }
+
+    /// Reverse-heal Phase 2c — choose a heal SOURCE per stale-suspect shard.
+    ///
+    /// Prefers the Phase-2b quorum-current [`select_heal_source`] (a committed
+    /// replica that reported the shard in `partition_view` with the highest
+    /// recency and is not still receiving inbound data). When that yields no
+    /// pick — at boot, before the first membership exchange has converged a
+    /// `partition_view`, or when no live replica reported THIS shard — it falls
+    /// back to the shard's committed REPLICA set from the active table,
+    /// PREFERRING a replica that is LIVE (present in `partition_view`, i.e. it
+    /// reported in this membership round) over a silent one, and only then the
+    /// lowest committed NodeId. Preferring a live source matters because there
+    /// is no online re-heal this phase: a pick that is down or unreachable
+    /// leaves the shard fenced-forever, so a live holder is strictly better
+    /// availability at zero correctness cost.
+    ///
+    /// SAFETY: this is safe under the single-fault model — a committed replica
+    /// is a data holder by assignment, the SOURCE side re-validates ownership
+    /// in [`split_transfer_request_tasks`] before streaming, and RULE-DS +
+    /// generation idempotency gate every applied image, so a stale pick can
+    /// only waste a request or (for a key the ex-master lost ENTIRELY, with no
+    /// tombstone to compare against) adopt a stale image only under a SECOND,
+    /// independent fault (outside the single-fault model). A source-CURRENCY
+    /// check that would close that double-fault residual is deferred to
+    /// Phase 3. Returns `(shard, source)` for shards with a source; a shard
+    /// with NONE is omitted so the caller can fence it fail-closed (Phase-3
+    /// give-up territory).
+    pub fn select_reverse_heal_sources(
+        &self,
+        shards: &[u16],
+        partition_view: &std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>>,
+    ) -> Vec<(u16, NodeId)> {
+        let table = self.shard_table.read();
+        let mut out = Vec::new();
+        for &shard in shards {
+            if (shard as usize) >= NUM_SHARDS {
+                continue;
+            }
+            let assignment = table.target_assignment(shard);
+            let committed: Vec<NodeId> = std::iter::once(assignment.master)
+                .chain(assignment.replicas.iter().copied())
+                .filter(|&n| n != self.self_id && n != NodeId(0))
+                .collect();
+            let source = select_heal_source(self.self_id, &committed, partition_view, shard)
+                .or_else(|| {
+                    // P2-2 — prefer a LIVE committed replica (one that reported
+                    // in this membership round) over a silent one; among equals,
+                    // lowest NodeId. Falls back to the lowest committed NodeId
+                    // only when the view carries no liveness signal (boot).
+                    committed
+                        .iter()
+                        .copied()
+                        .filter(|n| partition_view.contains_key(n))
+                        .min_by_key(|n| n.0)
+                        .or_else(|| committed.iter().copied().min_by_key(|n| n.0))
+                });
+            if let Some(src) = source {
+                out.push((shard, src));
+            }
+        }
+        out
+    }
+
     /// Test-only (F-02) — engage the outbound write fence for `shard`,
     /// exactly as the delta-streaming migration path does when a shard
     /// enters [`crate::cluster::migration::MigrationState::Fenced`]
@@ -16999,6 +17130,174 @@ mod tests {
         assert_eq!(mastered.last().copied(), Some(NUM_SHARDS as u16 - 1));
     }
 
+    /// Reverse-heal Phase 2c: a restarted ex-master IS the committed master of
+    /// its shards, so a source translating its transfer request produces the
+    /// `from_source → to_ex-master, is_master=true` task — the replica→ex-master
+    /// pull shape the existing transport already supports (design §A.3 / Q4).
+    #[test]
+    fn transfer_request_from_ex_master_produces_replica_to_exmaster_task() {
+        let members = vec![NodeId(1), NodeId(2)];
+        let table = ShardTable::compute_with_epoch(&members, 2, 5, 1);
+        let exmaster = NodeId(1); // the requester (restarted ex-master)
+        let source = NodeId(2); // the node answering the request
+        let shard = (0..NUM_SHARDS as u16)
+            .find(|&s| table.target_assignment(s).master == exmaster)
+            .expect("some shard is mastered by NodeId(1)");
+
+        let (tasks, diverged) = split_transfer_request_tasks(&table, source, exmaster, &[shard]);
+
+        assert_eq!(
+            diverged, 0,
+            "the requester is the current master, not diverged"
+        );
+        assert_eq!(tasks.len(), 1);
+        let t = &tasks[0];
+        assert_eq!(t.shard, shard);
+        assert_eq!(t.from_node, source, "task streams FROM the source");
+        assert_eq!(t.to_node, exmaster, "task streams TO the ex-master");
+        assert!(
+            t.is_master,
+            "the ex-master is the shard's committed master ⇒ is_master task",
+        );
+    }
+
+    /// Reverse-heal Phase 2c SAFETY — NO-SERVE-BEFORE-HEAL. Beginning the pull
+    /// for a stale suspect shard raises the inbound fence, so `is_master` answers
+    /// `Transitioning` (client-invisible / retryable) — NOT `Yes` — until the
+    /// heal completes. Only the completion handshake clears it, after which the
+    /// shard is served as authority.
+    #[test]
+    fn reverse_heal_fence_blocks_is_master_until_complete() {
+        let cluster = single_node_cluster_for_master_query_tests();
+        let shard = 0u16;
+        let k = key_for_shard(shard);
+
+        // Before the heal the node serves the shard as authority.
+        assert!(
+            matches!(cluster.is_master(&k), MasterQueryResult::Yes),
+            "precondition: node masters the shard",
+        );
+
+        // Begin the reverse-heal pull from a source replica → raises the fence.
+        let source = NodeId(2);
+        assert_eq!(cluster.begin_reverse_heal(&[(shard, source)]), 1);
+        assert!(
+            matches!(
+                cluster.is_master(&k),
+                MasterQueryResult::Transitioning { .. }
+            ),
+            "a stale shard must NOT answer is_master=Yes before its heal completes",
+        );
+
+        // A second call for the same (shard, source) is idempotent.
+        assert_eq!(cluster.begin_reverse_heal(&[(shard, source)]), 0);
+
+        // Heal completes (baseline streamed + verified) → fence clears.
+        cluster.mark_inbound_complete_from_source(shard, source);
+        assert!(
+            matches!(cluster.is_master(&k), MasterQueryResult::Yes),
+            "after the heal completes the shard is served as authority",
+        );
+    }
+
+    /// Reverse-heal Phase 2c: with no converged partition view (boot), source
+    /// selection falls back to the shard's committed replica — a data holder by
+    /// assignment — so the pull can start immediately without waiting for the
+    /// first membership exchange.
+    #[test]
+    fn select_reverse_heal_sources_falls_back_to_committed_replica_at_boot() {
+        let members = vec![NodeId(1), NodeId(2)];
+        // RF=2 so a shard mastered by NodeId(1) lists NodeId(2) as a replica.
+        let table = ShardTable::compute_with_epoch(&members, 2, 5, 1);
+        let shard = (0..NUM_SHARDS as u16)
+            .find(|&s| {
+                let a = table.target_assignment(s);
+                a.master == NodeId(1) && a.replicas.contains(&NodeId(2))
+            })
+            .expect("some shard mastered by NodeId(1) with NodeId(2) replica");
+        let cluster = new_test_running_cluster(
+            NodeId(1),
+            table,
+            &[
+                (NodeId(1), "127.0.0.1:4901".parse().unwrap()),
+                (NodeId(2), "127.0.0.1:4902".parse().unwrap()),
+            ],
+            &members,
+            &[],
+            &[],
+            &[],
+            2,
+        );
+
+        let empty_view = std::collections::HashMap::new();
+        let sources = cluster.select_reverse_heal_sources(&[shard], &empty_view);
+        assert_eq!(
+            sources,
+            vec![(shard, NodeId(2))],
+            "boot selection falls back to the committed replica as the heal source",
+        );
+    }
+
+    /// P2-2 — when no live replica reported THIS shard (so `select_heal_source`
+    /// yields nothing) but the partition view DOES carry liveness, the fallback
+    /// prefers a committed replica that is LIVE (present in the view) over a
+    /// silent lower-NodeId one — a down/stale pick would fence the shard forever
+    /// (no online re-heal this phase).
+    #[test]
+    fn select_reverse_heal_sources_prefers_live_replica_over_silent_lower_id() {
+        let members = vec![NodeId(1), NodeId(2), NodeId(3)];
+        // RF=3 so a shard mastered by NodeId(1) lists NodeId(2) and NodeId(3).
+        let table = ShardTable::compute_with_epoch(&members, 3, 5, 1);
+        let shard = (0..NUM_SHARDS as u16)
+            .find(|&s| {
+                let a = table.target_assignment(s);
+                a.master == NodeId(1)
+                    && a.replicas.contains(&NodeId(2))
+                    && a.replicas.contains(&NodeId(3))
+            })
+            .expect("some shard mastered by NodeId(1) with NodeId(2)+NodeId(3) replicas");
+        let cluster = new_test_running_cluster(
+            NodeId(1),
+            table,
+            &[
+                (NodeId(1), "127.0.0.1:4941".parse().unwrap()),
+                (NodeId(2), "127.0.0.1:4942".parse().unwrap()),
+                (NodeId(3), "127.0.0.1:4943".parse().unwrap()),
+            ],
+            &members,
+            &[],
+            &[],
+            &[],
+            3,
+        );
+
+        // NodeId(3) is LIVE (reported in this round) but reported only a
+        // DIFFERENT shard, so `select_heal_source`'s per-shard gate excludes it.
+        // NodeId(2) (lower id) is absent from the view entirely (silent/down).
+        let other_shard = if shard == 0 { 1 } else { 0 };
+        let mut view: std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>> =
+            std::collections::HashMap::new();
+        view.insert(
+            NodeId(3),
+            vec![PartitionVersionEntry {
+                shard: other_shard,
+                flags: 0,
+                replica_count: 1,
+                last_applied_seq: 10,
+                manifest_digest: 1,
+                max_generation: 1,
+            }],
+        );
+
+        let sources = cluster.select_reverse_heal_sources(&[shard], &view);
+        assert_eq!(
+            sources,
+            vec![(shard, NodeId(3))],
+            "fallback must prefer the LIVE committed replica (NodeId(3)) over the \
+             silent lower-id NodeId(2)",
+        );
+    }
+
     #[test]
     fn is_master_returns_no_when_remote_master() {
         let members = vec![NodeId(1), NodeId(2)];
@@ -17463,6 +17762,310 @@ mod tests {
                  authority on the production `activate_topology_with_view` path; got {other:?}",
             ),
         }
+    }
+
+    /// P0 (BLOCKER — this PR's central no-serve-before-heal invariant) — the
+    /// reverse-heal fence MUST survive a concurrent runtime topology commit.
+    ///
+    /// `begin_reverse_heal` raises the fence with a NON-completed, NON-lost
+    /// inbound entry: the transfer-request grace keeps it `lost = false` for the
+    /// ENTIRE pull window, so the C17 `!completed && lost` retain in
+    /// `clear_inbound` (run on EVERY runtime topology commit inside
+    /// `activate_topology_with_view`) DROPPED it — clearing the shard's inbound
+    /// fence bit and letting `is_master` answer `Yes` for an UN-HEALED shard
+    /// (serves a lost/resurrected tail = double-spend). The fix adds a DISTINCT
+    /// `heal_pending` marker retained by `clear_inbound` alongside `lost`.
+    ///
+    /// This drives the REAL production supersede keeping the shard LOCAL and
+    /// asserts the fence still answers `Transitioning` WITHOUT any heal
+    /// completion. Pre-fix: `Yes` (the hole). Post-fix: `Transitioning`. Only a
+    /// genuine completion handshake lifts it.
+    #[test]
+    fn reverse_heal_fence_survives_topology_supersede() {
+        // The supersede drives `sync_atomic_migration_bitmaps`, which writes the
+        // shared `migration_lost` gauge; serialize + install a metrics sink.
+        let _guard = migration_metrics_test_guard();
+        let _metrics = install_test_migration_metrics();
+
+        let members = vec![NodeId(1)];
+        let epoch = 7u64;
+        let placement_version = 1u16;
+        let rf = 1u8;
+        let table = ShardTable::compute_with_epoch(&members, rf, epoch, placement_version);
+        let cluster = new_test_running_cluster(
+            NodeId(1),
+            table,
+            &[(NodeId(1), "127.0.0.1:4931".parse().unwrap())],
+            &members,
+            &[],
+            &[],
+            &[],
+            1,
+        );
+        let shard = 0u16;
+        let key = key_for_shard(shard);
+
+        // Non-empty engine so the single-node empty-engine fast path is skipped
+        // and the REAL supersede logic (empty-task install branch, which runs
+        // `clear_inbound`) executes.
+        let engine = Arc::new(test_engine());
+        create_test_record(&engine, key_for_shard(1));
+        assert!(engine.index_len() > 0, "precondition: engine is non-empty");
+
+        // Raise the reverse-heal fence from a concrete boot source (the pull).
+        let source = NodeId(2);
+        assert_eq!(cluster.begin_reverse_heal(&[(shard, source)]), 1);
+        assert!(
+            matches!(
+                cluster.is_master(&key),
+                MasterQueryResult::Transitioning { .. }
+            ),
+            "precondition: the reverse-heal fence is up before the supersede",
+        );
+        // The exact P0 condition: the healing shard is NOT marked lost during
+        // the pull (transfer-request grace), so the C17 `lost` retain would
+        // drop it.
+        assert!(
+            !cluster.migration.lock().is_shard_lost(shard),
+            "precondition: a healing shard is NOT `lost` (it is `heal_pending`)",
+        );
+
+        // Drive the REAL production supersede at the committed term, keeping the
+        // shard LOCAL (same members/epoch), so the ONLY thing that can fence the
+        // shard is the preserved inbound atomic.
+        let view: std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>> =
+            std::collections::HashMap::new();
+        ClusterCoordinator::activate_topology_with_view(
+            &members,
+            epoch,
+            placement_version,
+            NodeId(1),
+            rf,
+            &cluster.shard_table,
+            &cluster.migration,
+            &cluster.node_addrs,
+            &engine,
+            &None,
+            1,
+            1,
+            1,
+            &cluster.fenced_bitmap,
+            &cluster.migrating_bitmap,
+            &cluster.inbound_atomic,
+            &cluster.active_topology_members,
+            &view,
+            &cluster.migration_throttle,
+            &cluster.cluster_secret,
+        );
+
+        // The heal entry must survive the supersede (manager + hot-path atomic).
+        assert!(
+            cluster.inbound_atomic.test(shard),
+            "P0: supersede must not clear the healing shard's hot-path inbound fence",
+        );
+        match cluster.is_master(&key) {
+            MasterQueryResult::Transitioning { .. } => {}
+            other => panic!(
+                "P0: a topology supersede that keeps an UN-HEALED reverse-heal shard local \
+                 must NOT serve it as authority; got {other:?}",
+            ),
+        }
+        // A healing shard is NOT counted as `lost` — the gauge stays clean.
+        assert!(
+            !cluster.migration.lock().is_shard_lost(shard),
+            "a healing shard preserved across the supersede is not `lost`",
+        );
+
+        // Only the genuine completion handshake lifts the fence.
+        cluster.mark_inbound_complete_from_source(shard, source);
+        assert!(
+            matches!(cluster.is_master(&key), MasterQueryResult::Yes),
+            "after the heal completes the shard is served as authority",
+        );
+    }
+
+    /// P0 (BLOCKER) — the no-source FAIL-CLOSED heal fence variant. A stale
+    /// shard with NO available heal source is fenced fail-closed at boot
+    /// (`RunningCluster::mark_inbound_heal_fence` → `NodeId(0)` sentinel,
+    /// `heal_pending`). Like the sourced fence it is NON-lost, so pre-fix a
+    /// topology supersede dropped it → `is_master` = `Yes` for an un-healed
+    /// shard. The `heal_pending` marker must make it SURVIVE the supersede so
+    /// the shard stays `Transitioning` (client-invisible) — never served.
+    #[test]
+    fn no_source_heal_fence_survives_topology_supersede() {
+        let _guard = migration_metrics_test_guard();
+        let _metrics = install_test_migration_metrics();
+
+        let members = vec![NodeId(1)];
+        let epoch = 7u64;
+        let placement_version = 1u16;
+        let rf = 1u8;
+        let table = ShardTable::compute_with_epoch(&members, rf, epoch, placement_version);
+        let cluster = new_test_running_cluster(
+            NodeId(1),
+            table,
+            &[(NodeId(1), "127.0.0.1:4932".parse().unwrap())],
+            &members,
+            &[],
+            &[],
+            &[],
+            1,
+        );
+        let shard = 0u16;
+        let key = key_for_shard(shard);
+
+        let engine = Arc::new(test_engine());
+        create_test_record(&engine, key_for_shard(1));
+        assert!(engine.index_len() > 0, "precondition: engine is non-empty");
+
+        // Fail-closed heal fence (no concrete source to pull from).
+        cluster.mark_inbound_heal_fence(shard);
+        assert!(
+            matches!(
+                cluster.is_master(&key),
+                MasterQueryResult::Transitioning { .. }
+            ),
+            "precondition: the fail-closed heal fence is up before the supersede",
+        );
+        assert!(
+            !cluster.migration.lock().is_shard_lost(shard),
+            "precondition: a fail-closed healing shard is NOT `lost`",
+        );
+
+        let view: std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>> =
+            std::collections::HashMap::new();
+        ClusterCoordinator::activate_topology_with_view(
+            &members,
+            epoch,
+            placement_version,
+            NodeId(1),
+            rf,
+            &cluster.shard_table,
+            &cluster.migration,
+            &cluster.node_addrs,
+            &engine,
+            &None,
+            1,
+            1,
+            1,
+            &cluster.fenced_bitmap,
+            &cluster.migrating_bitmap,
+            &cluster.inbound_atomic,
+            &cluster.active_topology_members,
+            &view,
+            &cluster.migration_throttle,
+            &cluster.cluster_secret,
+        );
+
+        assert!(
+            cluster.inbound_atomic.test(shard),
+            "P0: supersede must not clear the fail-closed heal fence",
+        );
+        match cluster.is_master(&key) {
+            MasterQueryResult::Transitioning { .. } => {}
+            other => panic!(
+                "P0: a topology supersede must not serve a fail-closed un-healed shard \
+                 as authority; got {other:?}",
+            ),
+        }
+    }
+
+    /// P0 (reverse-heal Phase 2c, ROUND 2) — a MIGRATION-ABORT for a healing
+    /// shard must NOT clear the no-serve-before-heal fence.
+    ///
+    /// Reachable with NO second fault: boot raises the reverse-heal fence
+    /// (`is_master` = `Transitioning`); the requester pulls from source P; P's
+    /// baseline stream hits a TRANSIENT failure and P sends
+    /// `OP_MIGRATION_COMPLETE | FLAG_MIGRATION_ABORT`; the healing node's abort
+    /// handler (`abort_inbound_migration` → `clear_pending_inbound_for_shards`)
+    /// DROPPED the heal entry, clearing the hot-path atomic bit → `is_master`
+    /// answered `Yes` for the UN-HEALED shard (serves a lost/resurrected tail =
+    /// double-spend), with no online re-heal so the fence never returned until
+    /// reboot. The abort's clear-the-fence reasoning is correct for a FORWARD
+    /// migration (target isn't the master → `is_master` stays `No`) but UNSAFE
+    /// for reverse-heal where the target IS the committed master.
+    ///
+    /// The fix preserves `heal_pending` in `clear_pending_inbound_for_shards`,
+    /// so the shard STAYS `Transitioning` and the entry stays pullable (the
+    /// requester loop re-requests the transient failure). Pre-fix: `Yes` (the
+    /// hole). Post-fix: `Transitioning`. Only a genuine completion handshake
+    /// lifts it.
+    #[test]
+    fn abort_during_reverse_heal_keeps_shard_fenced() {
+        let members = vec![NodeId(1)];
+        let epoch = 7u64;
+        let placement_version = 1u16;
+        let rf = 1u8;
+        let table = ShardTable::compute_with_epoch(&members, rf, epoch, placement_version);
+        let cluster = new_test_running_cluster(
+            NodeId(1),
+            table,
+            &[(NodeId(1), "127.0.0.1:4933".parse().unwrap())],
+            &members,
+            &[],
+            &[],
+            &[],
+            1,
+        );
+        let shard = 0u16;
+        let key = key_for_shard(shard);
+
+        // Raise the reverse-heal fence from a concrete boot source (the pull).
+        let source = NodeId(2);
+        assert_eq!(cluster.begin_reverse_heal(&[(shard, source)]), 1);
+        assert!(
+            matches!(
+                cluster.is_master(&key),
+                MasterQueryResult::Transitioning { .. }
+            ),
+            "precondition: the reverse-heal fence is up before the abort",
+        );
+        // The exact P0 condition: the healing shard is NOT marked lost during
+        // the pull, so a `lost`-only retain would drop it.
+        assert!(
+            !cluster.migration.lock().is_shard_lost(shard),
+            "precondition: a healing shard is NOT `lost` (it is `heal_pending`)",
+        );
+
+        // A TRANSIENT source-side stream failure delivers a migration-abort for
+        // the healing shard (the real dispatch path calls this unconditionally,
+        // with no master/heal guard).
+        cluster.abort_inbound_migration(shard);
+
+        // The heal fence must survive the abort (hot-path atomic bit).
+        assert!(
+            cluster.inbound_atomic.test(shard),
+            "P0: the abort must not clear the healing shard's hot-path inbound fence",
+        );
+        match cluster.is_master(&key) {
+            MasterQueryResult::Transitioning { .. } => {}
+            other => panic!(
+                "P0: a migration-abort must NOT serve an UN-HEALED reverse-heal shard \
+                 as authority; got {other:?}",
+            ),
+        }
+        // AVAILABILITY: the heal entry survives as pullable (concrete source),
+        // so the requester loop re-requests the transient failure rather than
+        // fencing forever.
+        assert!(
+            cluster
+                .pending_inbound_entries()
+                .iter()
+                .any(|&(s, from)| s == shard && from == source),
+            "the aborted heal entry must survive as pullable so the requester re-requests it",
+        );
+        // A healing shard is NOT counted as `lost` — the gauge stays clean.
+        assert!(
+            !cluster.migration.lock().is_shard_lost(shard),
+            "an aborted healing shard is not `lost`",
+        );
+
+        // Only the genuine completion handshake lifts the fence.
+        cluster.mark_inbound_complete_from_source(shard, source);
+        assert!(
+            matches!(cluster.is_master(&key), MasterQueryResult::Yes),
+            "after the heal completes the shard is served as authority",
+        );
     }
 
     /// C8/C17 (P2) — the `migration_lost` gauge must reflect the number of

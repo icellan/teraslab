@@ -66,8 +66,15 @@ pub type Result<T> = std::result::Result<T, ProtocolError>;
 ///
 /// Offset 32 in create metadata is the standalone `is_coinbase` boolean.
 /// Offset 45 is the client create flags byte (locked=0x01,
-/// conflicting=0x02, frozen=0x04, external=0x08). Frozen is a per-slot state
-/// during migration replay, so this helper never sets it.
+/// conflicting=0x02, frozen=0x04, external=0x08, reassigned=0x10). Frozen is a
+/// per-slot state during migration replay, so this helper never sets it.
+///
+/// REASSIGNED (wire 0x10, reverse-heal Phase 2c) is additive and
+/// PROTOCOL_VERSION-gated: a pre-4 peer neither sets nor reads it. Carrying it
+/// stops a healed / migrated create image from silently dropping the
+/// court-ordered [`crate::record::TxFlags::REASSIGNED`] marker (which excludes
+/// the record from the DAH sweep) — the pre-2c gap where the baseline stream
+/// replayed CONFLICTING/LOCKED but never REASSIGNED.
 pub fn create_metadata_flag_bytes(flags: crate::record::TxFlags) -> (u8, u8) {
     let is_coinbase = u8::from(flags.contains(crate::record::TxFlags::IS_COINBASE));
     let mut wire_flags = 0u8;
@@ -79,6 +86,9 @@ pub fn create_metadata_flag_bytes(flags: crate::record::TxFlags) -> (u8, u8) {
     }
     if flags.contains(crate::record::TxFlags::EXTERNAL) {
         wire_flags |= crate::protocol::opcodes::FLAG_EXTERNAL_BLOB;
+    }
+    if flags.contains(crate::record::TxFlags::REASSIGNED) {
+        wire_flags |= crate::protocol::opcodes::CREATE_FLAG_REASSIGNED;
     }
     (is_coinbase, wire_flags)
 }
@@ -1440,6 +1450,38 @@ mod tests {
             crate::protocol::opcodes::FLAG_EXTERNAL_BLOB,
         );
         assert_eq!(wire_flags & 0x04, 0, "frozen is not a persisted tx flag");
+    }
+
+    /// Reverse-heal Phase 2c: the REASSIGNED marker is now carried on the create
+    /// wire flag byte (bit 0x10), so a healed/migrated create image preserves it
+    /// instead of silently dropping the court-ordered reassignment.
+    #[test]
+    fn create_metadata_flag_bytes_carries_reassigned() {
+        use crate::protocol::opcodes::CREATE_FLAG_REASSIGNED;
+
+        // Absent when the record is not reassigned.
+        let (_, plain) = create_metadata_flag_bytes(TxFlags::CONFLICTING);
+        assert_eq!(
+            plain & CREATE_FLAG_REASSIGNED,
+            0,
+            "REASSIGNED not set when absent"
+        );
+
+        // Present when the persisted REASSIGNED (0x40) flag is set — and it is a
+        // SEPARATE wire bit (0x10), not the persisted value.
+        let (_, wire_flags) = create_metadata_flag_bytes(TxFlags::REASSIGNED);
+        assert_eq!(CREATE_FLAG_REASSIGNED, 0x10);
+        assert_eq!(
+            wire_flags & CREATE_FLAG_REASSIGNED,
+            CREATE_FLAG_REASSIGNED,
+            "REASSIGNED must map to create-wire bit 0x10",
+        );
+        // Does not collide with the existing four create-wire bits.
+        assert_eq!(
+            wire_flags & 0x0F,
+            0,
+            "REASSIGNED must not set any of bits 0..3"
+        );
     }
 
     #[test]

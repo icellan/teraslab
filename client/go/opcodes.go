@@ -55,8 +55,11 @@ const (
 // ProtocolVersion is the wire protocol version this client implements.
 // Matches src/protocol/opcodes.rs PROTOCOL_VERSION. Version 3 (FU#5) adds the
 // optional resume cursor on OP_QUERY_OLD_UNMINED / OP_QUERY_CONFLICTING; the
-// paging loop gates on the negotiated server version being >= 3.
-const ProtocolVersion uint16 = 3
+// paging loop gates on the negotiated server version being >= 3. Version 4
+// (reverse-heal Phase 2c) is additive on INTER-NODE wire only (create-metadata
+// REASSIGNED bit + tombstone-aware manifest-diff), so the client-facing surface
+// is unchanged and a v3 client stays fully compatible with a v4 server.
+const ProtocolVersion uint16 = 4
 
 // Streaming blob upload opcodes.
 const (

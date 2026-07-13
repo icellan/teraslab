@@ -94,8 +94,8 @@ func TestGoldenHelloOpcode(t *testing.T) {
 	if OpHello != 107 {
 		t.Fatalf("OpHello = %d, want 107", OpHello)
 	}
-	if ProtocolVersion != 3 {
-		t.Fatalf("ProtocolVersion = %d, want 3", ProtocolVersion)
+	if ProtocolVersion != 4 {
+		t.Fatalf("ProtocolVersion = %d, want 4", ProtocolVersion)
 	}
 }
 
