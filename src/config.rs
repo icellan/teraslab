@@ -1113,7 +1113,19 @@ pub struct ReverseHealConfig {
     /// Retention horizon for a tombstone, in blocks: a tombstone is GC'd once
     /// `deletion_height + retention <= last_durable_height`. `None` (default)
     /// reuses `block_height_retention` — the same replica-lag window spends
-    /// already use (design §E1).
+    /// already use (design §E1), whose default (288 blocks ≈ 2 days at BSV's
+    /// ~10-min target) comfortably exceeds any practical reorg/finality horizon.
+    ///
+    /// Phase 3b — this horizon closes the ClientDelete re-create OFFLINE residual.
+    /// The online path heals a reorg re-create the instant it arrives as a normal
+    /// replica `Create` (RULE-DS gates only absent-key BOOT-heal baselines), but a
+    /// node down for the WHOLE window whose re-create is delivered ONLY by a
+    /// boot-heal baseline has that baseline dropped by the (cause-unconditional)
+    /// ClientDelete tombstone until it GCs. Sizing retention ≥ the reorg/finality
+    /// horizon lifts the block PRECISELY when a legitimate re-mine of the key is no
+    /// longer possible, so the ClientDelete self-heal relies on the tombstone GCing
+    /// within this window. Set it explicitly only to widen (never below the reorg
+    /// horizon — that would reopen a real-loss gap).
     pub tombstone_retention_blocks: Option<u32>,
 }
 

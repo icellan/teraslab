@@ -122,6 +122,7 @@ fn create_node_with_cluster_id(
         migration_batch_size: 100,
         persisted_incarnation: 0,
         cluster_id,
+        reverse_heal_online: false,
     };
 
     let coordinator = ClusterCoordinator::new(cluster_config, 1);

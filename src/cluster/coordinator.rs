@@ -1155,6 +1155,13 @@ pub struct ClusterConfig {
     /// pre-orchestrator deployments — those nodes fall back to the
     /// F-G8-001 ever-seen heuristic.
     pub cluster_id: crate::cluster::topology::ClusterId,
+    /// Reverse-heal Phase 3b — enable RUNTIME online re-heal (re-detect stale
+    /// mastered shards on each partition-view refresh and reverse-pull them, not
+    /// just at boot). Set from `reverse_heal.tombstones` (the reverse-heal enable
+    /// — RULE-DS is a no-op without it). `false` (default) leaves online re-heal
+    /// off, so non-reverse-heal deployments keep byte-for-byte the prior runtime
+    /// behaviour.
+    pub reverse_heal_online: bool,
 }
 
 /// Runtime replication policy passed to a started cluster coordinator.
@@ -1226,6 +1233,10 @@ pub struct ClusterCoordinator {
     /// changes before the event loop proposes a new topology term. Consumed
     /// when the event loop starts to build its [`TopologyDebounce`].
     topology_debounce: Duration,
+    /// Reverse-heal Phase 3b — RUNTIME online re-heal enable (see
+    /// [`ClusterConfig::reverse_heal_online`]). Captured into the event loop so
+    /// each partition-view refresh runs the online re-detect + reverse-pull.
+    reverse_heal_online: bool,
 }
 
 /// C6 — reconstruct the shard table for a RESTORED committed topology at boot.
@@ -1360,6 +1371,7 @@ impl ClusterCoordinator {
             cluster_secret: config.cluster_secret.map(Arc::new),
             activation_hold: Arc::new(AtomicBool::new(false)),
             topology_debounce: config.topology_debounce,
+            reverse_heal_online: config.reverse_heal_online,
         }
     }
 
@@ -1454,6 +1466,12 @@ impl ClusterCoordinator {
         let fenced_bm_event = fenced_bitmap.clone();
         let migrating_bm_event = migrating_bitmap.clone();
         let inbound_bm_event = inbound_atomic.clone();
+        // Reverse-heal Phase 3b — online re-heal backoff cache, shared between the
+        // event loop (which mutates it on each partition-view refresh) and the
+        // struct (whose `run_online_reheal` also touches it in tests).
+        let reheal_backoff = Arc::new(Mutex::new(std::collections::HashMap::<u16, u64>::new()));
+        let reheal_backoff_for_cluster = reheal_backoff.clone();
+        let reheal_backoff_event = reheal_backoff;
         let (topology_commit_tx, topology_commit_rx) = std::sync::mpsc::channel();
         let topology_commit_tx_event = topology_commit_tx.clone();
         // Phase H — resync request channel. The catchup loop in
@@ -1519,6 +1537,10 @@ impl ClusterCoordinator {
         // W3.3 — debounce window for coalescing membership changes before
         // proposing a new topology term.
         let topology_debounce_window = self.topology_debounce;
+        // Reverse-heal Phase 3b — RUNTIME online re-heal enable, captured so the
+        // exchange-complete handler runs the online re-detect + reverse-pull on
+        // each partition-view refresh.
+        let reverse_heal_online = self.reverse_heal_online;
 
         // Event processing thread
         let event_handle = std::thread::spawn(move || {
@@ -2330,6 +2352,35 @@ impl ClusterCoordinator {
                         &migration_throttle_event,
                         &cluster_secret_event,
                     );
+                    // Reverse-heal Phase 3b — RUNTIME online re-heal. The
+                    // partition view just refreshed carries every peer's per-shard
+                    // generation digest, so re-run the Tier-2 detector against this
+                    // node's freshly-activated mastered shards and, for any newly
+                    // stale-vs-a-live-replica shard NOT already healing, raise the
+                    // no-serve-before-heal fence and queue a delete-safe
+                    // reverse-pull (the requester loop below drives it). This is
+                    // the online closer for the boot-heal-missed / re-diverged
+                    // case; gated on the reverse-heal enable and a no-op on an
+                    // empty view.
+                    if reverse_heal_online {
+                        let queued = trigger_online_reheal(
+                            self_id,
+                            &shard_table,
+                            &migration,
+                            &inbound_bm_event,
+                            &inbound_state_path_event,
+                            &reheal_backoff_event,
+                            &partition_view,
+                        );
+                        if queued > 0 {
+                            tracing::warn!(
+                                queued,
+                                term,
+                                "reverse-heal Phase 3b: runtime online re-heal fenced + \
+                                 queued reverse-pull for newly-stale mastered shard(s)",
+                            );
+                        }
+                    }
                     last_activation_at = std::time::Instant::now();
                     if let Some(ref path) = cluster_state_path {
                         let peak = peak_size_event.load(Ordering::Relaxed) as u64;
@@ -2720,6 +2771,7 @@ impl ClusterCoordinator {
             swim_incarnation: swim_incarnation_for_cluster,
             startup_reactivation_needed,
             stale_suspect_shards: Arc::new(RwLock::new(std::collections::BTreeSet::new())),
+            reheal_backoff: reheal_backoff_for_cluster,
             #[cfg(any(test, feature = "fault-injection"))]
             drop_commit_signals: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
@@ -4836,6 +4888,133 @@ pub(crate) fn detect_stale_shards_from_view(
     stale
 }
 
+/// Reverse-heal Phase 3b DIRECTION pre-filter (coarse, NON-fencing): is THIS node
+/// (coarsely) BEHIND any live replica on a shard — the NECESSARY condition for a
+/// genuine online re-heal?
+///
+/// Self is a heal candidate iff some committed replica reports a strictly higher
+/// `max_generation` OR a strictly higher live `count`. Contrapositive (the hard
+/// invariant this enforces): when self's `max_generation` AND `count` both
+/// dominate (`>=`) every replica, NO replica is strictly ahead on either axis, so
+/// self is ahead-or-equal and is NEVER flagged — an ahead/equal master is never
+/// fenced by the online re-heal.
+///
+/// This is a coarse NECESSARY condition, not a sufficient one: `max_generation`
+/// is a max over independent per-record counters (blind to sub-max divergence)
+/// and `count` conflates "newer" with "different set", so it can over-flag (a
+/// replica ahead on one axis but not actually holding a superset triggers a
+/// possibly no-op pull) and it cannot see a sub-max-only divergence (same
+/// `max_generation` + `count`, different digest) — that case is left to the
+/// authoritative per-record manifest exchange the boot heal runs. The trade is
+/// deliberate: it guarantees an ahead/equal master is never fenced online.
+pub fn is_self_behind_any_replica_coarse(
+    self_recency: ShardRecency,
+    replica_recencies: &[ShardRecency],
+) -> bool {
+    replica_recencies
+        .iter()
+        .any(|r| r.max_generation > self_recency.max_generation || r.count > self_recency.count)
+}
+
+/// A stale-mastered-shard classification produced by
+/// [`classify_stale_mastered_shards`] for the Phase-3b online re-heal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RehealCandidate {
+    /// The mastered shard that diverges (digest mismatch) from a live replica.
+    pub shard: u16,
+    /// Change-detector over `(self_recency, sorted replica_recencies)` — the
+    /// BACKOFF key. Stable while the source view is unchanged; a change forces a
+    /// fresh direction evaluation.
+    pub signature: u64,
+    /// DIRECTION: coarsely BEHIND a live replica
+    /// ([`is_self_behind_any_replica_coarse`]) — the fence + pull gate. `false`
+    /// for an ahead/equal master (never fenced).
+    pub self_behind: bool,
+}
+
+/// Order-independent change-detector signature over this node's recency and its
+/// live replicas' recencies for a shard — the online re-heal BACKOFF key.
+///
+/// Replicas are a SET, so their recencies are sorted before hashing to make the
+/// signature independent of partition-view iteration order. Direction is a pure
+/// function of these same inputs, so an unchanged signature implies (barring a
+/// 64-bit hash collision) an unchanged direction verdict — making it sound to
+/// skip re-evaluating a shard whose signature has not moved. A collision only
+/// defers a heal to the next signature change, never loses data.
+fn shard_view_signature(self_recency: ShardRecency, replica_recencies: &[ShardRecency]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut replicas: Vec<(u64, u64, u32)> = replica_recencies
+        .iter()
+        .map(|r| (r.count, r.digest, r.max_generation))
+        .collect();
+    replicas.sort_unstable();
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    (
+        self_recency.count,
+        self_recency.digest,
+        self_recency.max_generation,
+    )
+        .hash(&mut hasher);
+    replicas.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Reverse-heal Phase 3b — classify the mastered shards this node diverges from
+/// (digest mismatch) BY DIRECTION, WITHOUT fencing. For each shard `self_id`
+/// masters in `shard_table`, this reads self's recency and every committed
+/// replica's reported recency out of `partition_view`, and — for shards flagged
+/// stale by [`is_shard_stale_vs_replicas`] — records a [`RehealCandidate`]
+/// carrying the coarse DIRECTION verdict ([`is_self_behind_any_replica_coarse`])
+/// and a BACKOFF [`shard_view_signature`].
+///
+/// This is the runtime online re-heal analogue of
+/// [`detect_stale_shards_from_view`] (which the BOOT path still uses unchanged):
+/// it adds the non-fencing direction check the boot heal gets from its per-record
+/// manifest exchange, so [`trigger_online_reheal`] can fence + pull ONLY the
+/// shards on which self is genuinely behind and leave an ahead/equal master
+/// serving. Detection + classification only — it never fences or pulls.
+pub(crate) fn classify_stale_mastered_shards(
+    self_id: NodeId,
+    shard_table: &ShardTable,
+    partition_view: &std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>>,
+) -> Vec<RehealCandidate> {
+    let recency_of = |node: NodeId, shard: u16| -> Option<ShardRecency> {
+        partition_view
+            .get(&node)?
+            .iter()
+            .find(|e| e.shard == shard)
+            .map(ShardRecency::from_entry)
+    };
+
+    let mut out = Vec::new();
+    for shard in 0..NUM_SHARDS as u16 {
+        let assignment = shard_table.target_assignment(shard);
+        if assignment.master != self_id {
+            continue;
+        }
+        let self_recency = recency_of(self_id, shard).unwrap_or(ShardRecency {
+            count: 0,
+            digest: 0,
+            max_generation: 0,
+        });
+        let replica_recencies: Vec<ShardRecency> = assignment
+            .replicas
+            .iter()
+            .filter(|r| **r != self_id)
+            .filter_map(|r| recency_of(*r, shard))
+            .collect();
+        if !is_shard_stale_vs_replicas(self_recency, &replica_recencies) {
+            continue;
+        }
+        out.push(RehealCandidate {
+            shard,
+            signature: shard_view_signature(self_recency, &replica_recencies),
+            self_behind: is_self_behind_any_replica_coarse(self_recency, &replica_recencies),
+        });
+    }
+    out
+}
+
 // ---------------------------------------------------------------------------
 // Shard manifest hash — order-independent content fingerprint
 // ---------------------------------------------------------------------------
@@ -5244,6 +5423,182 @@ pub fn select_heal_source(
         };
     }
     best.map(|(node, _)| node)
+}
+
+/// Reverse-heal — choose a heal SOURCE per stale shard against `table` +
+/// `partition_view`. The pure core shared by the boot path
+/// ([`RunningCluster::select_reverse_heal_sources`]) and the Phase-3b runtime
+/// online re-heal ([`trigger_online_reheal`]).
+///
+/// Prefers the quorum-current [`select_heal_source`] (a committed replica that
+/// reported the shard with the highest recency and is not still receiving inbound
+/// data). When that yields no pick — no live replica reported THIS shard — it
+/// falls back to the shard's committed replica set, PREFERRING a replica present
+/// in `partition_view` (LIVE this round) over a silent one, then the lowest
+/// committed `NodeId`. Skips `self_id` and the `NodeId(0)` sentinel. Returns
+/// `(shard, source)` for shards with a source; a shard with NONE is omitted.
+pub(crate) fn select_reverse_heal_sources_for(
+    self_id: NodeId,
+    table: &ShardTable,
+    shards: &[u16],
+    partition_view: &std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>>,
+) -> Vec<(u16, NodeId)> {
+    let mut out = Vec::new();
+    for &shard in shards {
+        if (shard as usize) >= NUM_SHARDS {
+            continue;
+        }
+        let assignment = table.target_assignment(shard);
+        let committed: Vec<NodeId> = std::iter::once(assignment.master)
+            .chain(assignment.replicas.iter().copied())
+            .filter(|&n| n != self_id && n != NodeId(0))
+            .collect();
+        let source = select_heal_source(self_id, &committed, partition_view, shard).or_else(|| {
+            committed
+                .iter()
+                .copied()
+                .filter(|n| partition_view.contains_key(n))
+                .min_by_key(|n| n.0)
+                .or_else(|| committed.iter().copied().min_by_key(|n| n.0))
+        });
+        if let Some(src) = source {
+            out.push((shard, src));
+        }
+    }
+    out
+}
+
+/// Reverse-heal Phase 3b — RUNTIME online re-heal: detect → DIRECTION → fence →
+/// queue-pull for the shards this node MASTERS that a live replica demonstrably
+/// diverges from AND on which this node is genuinely BEHIND, using the freshest
+/// `partition_view`. The online completeness closer for the one open consensus P1
+/// (design §, "safe fallback"): a shard that boot-heal missed — or that
+/// re-diverges at runtime — is re-detected here and re-pulled once a
+/// quorum-current source is available, reusing the SAME machinery the boot heal
+/// uses.
+///
+/// DIRECTION before fencing: the detector is direction-BLIND (flags on ANY digest
+/// mismatch), so before fencing this runs a non-fencing coarse pre-filter
+/// ([`classify_stale_mastered_shards`] / [`is_self_behind_any_replica_coarse`])
+/// and fences + pulls ONLY when self is coarsely behind a live replica — an
+/// ahead/equal master is NEVER fenced (a serving master must not blip for a no-op
+/// baseline pull, nor risk a fail-closed wedge if the behind source dies
+/// mid-heal). A not-behind mismatched shard is recorded in a per-shard BACKOFF
+/// cache keyed on the source-view signature so it is neither re-checked nor
+/// re-fenced on subsequent topology commits until its source view changes.
+///
+/// For each newly-stale-AND-behind mastered shard it registers a delete-safe
+/// reverse-PULL from the argmax-recency quorum-current source
+/// ([`select_reverse_heal_sources_for`]) via
+/// [`MigrationManager::register_heal_source`](crate::cluster::migration::MigrationManager::register_heal_source),
+/// which BOTH raises the no-serve-before-heal `heal_pending` fence (so
+/// [`RunningCluster::is_master`] answers `Transitioning`, never `Yes`, until the
+/// pull completes) AND queues a concrete-source inbound entry the existing
+/// requester loop drives — the receiver applies the streamed baseline under
+/// RULE-DS + generation idempotency, and the completion handshake clears the
+/// fence. The inbound fence is persisted so a crash mid-heal re-fences on reboot.
+///
+/// SINGLE-FLIGHT: a shard already inbound-fenced (a heal in flight, a fail-closed
+/// fence, or a forward migration) is skipped, so a stale-but-being-healed shard
+/// stays single-flighted and never thrashes; a shard that heals then re-diverges
+/// later re-triggers (its fence has cleared by then). An empty `partition_view`
+/// (no exchange data) is a no-op. Returns the number of shards newly fenced +
+/// queued.
+fn trigger_online_reheal(
+    self_id: NodeId,
+    shard_table: &Arc<ShardTableLock<ShardTable>>,
+    migration: &Arc<Mutex<MigrationManager>>,
+    inbound_atomic: &Arc<crate::cluster::migration::AtomicShardBitmap>,
+    inbound_state_path: &Option<std::path::PathBuf>,
+    reheal_backoff: &Arc<Mutex<std::collections::HashMap<u16, u64>>>,
+    partition_view: &std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>>,
+) -> usize {
+    if partition_view.is_empty() {
+        return 0;
+    }
+    // DIRECTION before fencing (the P1 fix). The Tier-2 detector
+    // ([`detect_stale_shards_from_view`]) flags on ANY digest mismatch and is
+    // deliberately direction-BLIND — a healthy master merely AHEAD of a lagging
+    // replica also trips it. Fencing on that alone (as the pre-fix code did)
+    // fences a serving master for a no-op baseline pull on every topology commit,
+    // and — worse — leaves the shard fail-closed if the behind source dies
+    // mid-no-op-heal (the heal_pending entry is excluded from GC reap). So before
+    // fencing we run a NON-fencing, coarse DIRECTION pre-filter
+    // ([`classify_stale_mastered_shards`]): a shard is a genuine heal candidate
+    // only when self is (coarsely) BEHIND a live replica — a replica reporting a
+    // strictly higher `max_generation` OR live `count`. An ahead/equal master
+    // (self dominates every replica on BOTH dims) is NEVER fenced.
+    //
+    // Completeness note: the coarse pre-filter is a NECESSARY condition, not a
+    // sufficient one — a sub-max-only divergence (same `max_generation` + `count`
+    // as every replica but a different digest) is not fenced here and is deferred
+    // to the authoritative per-record manifest exchange the boot heal runs (or the
+    // next real generation/count change that trips the coarse gate). This trades a
+    // rare deferred-completeness gap for the hard invariant that an ahead/equal
+    // master is never fenced online. Detect + classify + select under a single
+    // shard-table read so all three see one consistent table.
+    let sources = {
+        let table = shard_table.read();
+        let candidates = classify_stale_mastered_shards(self_id, &table, partition_view);
+        // Apply SINGLE-FLIGHT, DIRECTION, and BACKOFF to pick the shards to fence.
+        let mut to_fence: Vec<u16> = Vec::new();
+        {
+            let mut backoff = reheal_backoff.lock();
+            for c in &candidates {
+                // SINGLE-FLIGHT: a shard already inbound-fenced (heal in flight,
+                // fail-closed fence, or forward migration) is skipped so a
+                // being-healed shard never thrashes. `register_heal_source` keys on
+                // `(shard, from_node)`; gating on the per-shard fence here makes the
+                // dedup robust to a source that changes between detector passes.
+                if inbound_atomic.test(c.shard) {
+                    continue;
+                }
+                // BACKOFF: if we already evaluated this exact source view for the
+                // shard and did NOT fence it (an ahead/equal master), skip
+                // re-evaluating until the source view changes — no re-check, no
+                // re-fence on every topology commit.
+                if backoff.get(&c.shard) == Some(&c.signature) {
+                    continue;
+                }
+                if c.self_behind {
+                    // Genuine heal candidate: clear any stale not-behind cache
+                    // entry so a completed/re-diverged heal is never suppressed,
+                    // then fence + pull.
+                    backoff.remove(&c.shard);
+                    to_fence.push(c.shard);
+                } else {
+                    // Ahead/equal master — NEVER fence. Record the source-view
+                    // signature so repeated commits with an unchanged view do not
+                    // re-check (and certainly do not re-fence) this shard.
+                    backoff.insert(c.shard, c.signature);
+                }
+            }
+        }
+        if to_fence.is_empty() {
+            return 0;
+        }
+        select_reverse_heal_sources_for(self_id, &table, &to_fence, partition_view)
+    };
+    if sources.is_empty() {
+        return 0;
+    }
+    let mut started = 0usize;
+    {
+        let mgr = &mut migration.lock();
+        for &(shard, source) in &sources {
+            if source == self_id || source == NodeId(0) {
+                continue;
+            }
+            if mgr.register_heal_source(shard, source) {
+                started += 1;
+            }
+        }
+        inbound_atomic.load_from(mgr.inbound_bitmap());
+        if let Some(path) = inbound_state_path {
+            crate::cluster::migration::persist_inbound_state(path, mgr);
+        }
+    }
+    started
 }
 
 // ---------------------------------------------------------------------------
@@ -9010,6 +9365,16 @@ pub struct RunningCluster {
     /// to fence reads/writes or trigger a pull. `BTreeSet` keeps it sorted +
     /// deduplicated for the getter and the gauge count.
     stale_suspect_shards: Arc<RwLock<std::collections::BTreeSet<u16>>>,
+    /// Reverse-heal Phase 3b — online re-heal BACKOFF cache: shard → signature of
+    /// the last replica view this node evaluated and found NOT-behind (an ahead /
+    /// equal master, so NOT fenced). While the source view for a shard is
+    /// unchanged (same signature), [`trigger_online_reheal`] skips re-evaluating
+    /// it, so a persistently-mismatched-but-not-behind shard is neither re-checked
+    /// nor re-fenced on every topology commit. An entry is dropped the moment the
+    /// shard becomes a genuine heal candidate (self behind) so the fence+pull is
+    /// never suppressed; a signature change (the source moved) forces a fresh
+    /// evaluation. Empty in the boot path — this gates only the runtime path.
+    reheal_backoff: Arc<Mutex<std::collections::HashMap<u16, u64>>>,
     /// Test-only: when set, [`RunningCluster::signal_topology_committed`]
     /// drops the signal instead of queuing it. Models the production race
     /// where a node's authority commits a new term (via the dispatch
@@ -9633,34 +9998,46 @@ impl RunningCluster {
         partition_view: &std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>>,
     ) -> Vec<(u16, NodeId)> {
         let table = self.shard_table.read();
-        let mut out = Vec::new();
-        for &shard in shards {
-            if (shard as usize) >= NUM_SHARDS {
-                continue;
-            }
-            let assignment = table.target_assignment(shard);
-            let committed: Vec<NodeId> = std::iter::once(assignment.master)
-                .chain(assignment.replicas.iter().copied())
-                .filter(|&n| n != self.self_id && n != NodeId(0))
-                .collect();
-            let source = select_heal_source(self.self_id, &committed, partition_view, shard)
-                .or_else(|| {
-                    // P2-2 — prefer a LIVE committed replica (one that reported
-                    // in this membership round) over a silent one; among equals,
-                    // lowest NodeId. Falls back to the lowest committed NodeId
-                    // only when the view carries no liveness signal (boot).
-                    committed
-                        .iter()
-                        .copied()
-                        .filter(|n| partition_view.contains_key(n))
-                        .min_by_key(|n| n.0)
-                        .or_else(|| committed.iter().copied().min_by_key(|n| n.0))
-                });
-            if let Some(src) = source {
-                out.push((shard, src));
-            }
-        }
-        out
+        select_reverse_heal_sources_for(self.self_id, &table, shards, partition_view)
+    }
+
+    /// Reverse-heal Phase 3b — run ONE round of RUNTIME online re-heal against
+    /// `partition_view`: re-detect the shards this node MASTERS that a live
+    /// replica diverges from and, for each newly-stale shard NOT already healing
+    /// (single-flight), raise the no-serve-before-heal fence and queue a
+    /// delete-safe reverse-PULL from the argmax-recency quorum-current source —
+    /// the SAME `register_heal_source` + requester-loop + RULE-DS machinery the
+    /// boot heal uses. Returns the number of shards newly fenced + queued.
+    ///
+    /// This is the online completeness closer for the open consensus P1: a shard
+    /// the boot heal missed (or that re-diverges at runtime) is healed here once a
+    /// source is available. Idempotent per shard while a heal is in flight (its
+    /// inbound fence suppresses re-triggers); a shard that heals then re-diverges
+    /// re-triggers. Driven from the event loop on each partition-view refresh when
+    /// `reverse_heal.tombstones` is enabled; an empty view is a no-op.
+    pub fn run_online_reheal(
+        &self,
+        partition_view: &std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>>,
+    ) -> usize {
+        trigger_online_reheal(
+            self.self_id,
+            &self.shard_table,
+            &self.migration,
+            &self.inbound_atomic,
+            &self.inbound_state_path,
+            &self.reheal_backoff,
+            partition_view,
+        )
+    }
+
+    /// Test-only — snapshot of the online re-heal not-behind BACKOFF cache
+    /// (shard → last-evaluated not-behind source-view signature). Lets a test
+    /// assert that an ahead master is parked in the cache (so it is not
+    /// re-evaluated across repeated commits) while a genuinely-behind shard is
+    /// NOT (so its heal is never suppressed).
+    #[cfg(test)]
+    pub(crate) fn reheal_backoff_snapshot(&self) -> std::collections::HashMap<u16, u64> {
+        self.reheal_backoff.lock().clone()
     }
 
     /// Test-only (F-02) — engage the outbound write fence for `shard`,
@@ -10968,6 +11345,7 @@ pub(crate) fn new_test_running_cluster(
         swim_incarnation: Arc::new(std::sync::atomic::AtomicU64::new(1)),
         startup_reactivation_needed: Arc::new(AtomicBool::new(false)),
         stale_suspect_shards: Arc::new(RwLock::new(std::collections::BTreeSet::new())),
+        reheal_backoff: Arc::new(Mutex::new(std::collections::HashMap::new())),
         #[cfg(any(test, feature = "fault-injection"))]
         drop_commit_signals: Arc::new(AtomicBool::new(false)),
         #[cfg(test)]
@@ -17313,6 +17691,410 @@ mod tests {
         );
     }
 
+    /// Reverse-heal Phase 3b — build a partition view in which the shard's
+    /// `master` and `replica` report DIVERGENT manifest digests, so the Tier-2
+    /// detector ([`detect_stale_shards_from_view`]) flags the shard stale and
+    /// [`select_heal_source`] picks `replica` (it reported the shard, no pending
+    /// inbound) as the argmax-recency quorum-current source.
+    fn divergent_view_for(
+        shard: u16,
+        master: NodeId,
+        replica: NodeId,
+    ) -> std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>> {
+        let mut view: std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>> =
+            std::collections::HashMap::new();
+        view.insert(
+            master,
+            vec![PartitionVersionEntry {
+                shard,
+                flags: 0,
+                replica_count: 1,
+                last_applied_seq: 5,
+                manifest_digest: 0xAAAA,
+                max_generation: 100,
+            }],
+        );
+        view.insert(
+            replica,
+            vec![PartitionVersionEntry {
+                shard,
+                flags: 0,
+                replica_count: 1,
+                last_applied_seq: 9,
+                manifest_digest: 0xBBBB,
+                max_generation: 105,
+            }],
+        );
+        view
+    }
+
+    /// Reverse-heal Phase 3b — the DIRECTION-inverted companion of
+    /// [`divergent_view_for`]: `master` (THIS node) reports a HIGHER `count`
+    /// (`last_applied_seq`) AND a HIGHER `max_generation` than `replica`, but a
+    /// DIFFERENT manifest digest — i.e. an ahead master serving alongside an
+    /// ordinarily-lagging replica. The Tier-2 detector still flags the shard on
+    /// the digest mismatch (it is direction-blind), but the online re-heal
+    /// DIRECTION pre-filter must recognise self as ahead/equal and NEVER fence it
+    /// (the P1). Mirrors the replica-AHEAD [`divergent_view_for`] so both
+    /// directions of divergence are covered.
+    fn divergent_view_replica_behind_for(
+        shard: u16,
+        master: NodeId,
+        replica: NodeId,
+    ) -> std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>> {
+        let mut view: std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>> =
+            std::collections::HashMap::new();
+        view.insert(
+            master,
+            vec![PartitionVersionEntry {
+                shard,
+                flags: 0,
+                replica_count: 1,
+                last_applied_seq: 9,
+                manifest_digest: 0xAAAA,
+                max_generation: 105,
+            }],
+        );
+        view.insert(
+            replica,
+            vec![PartitionVersionEntry {
+                shard,
+                flags: 0,
+                replica_count: 1,
+                last_applied_seq: 5,
+                manifest_digest: 0xBBBB,
+                max_generation: 100,
+            }],
+        );
+        view
+    }
+
+    fn three_node_cluster_mastering_with_replica() -> (RunningCluster, u16, NodeId) {
+        let members = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let table = ShardTable::compute_with_epoch(&members, 3, 5, 1);
+        let (shard, replica) = (0..NUM_SHARDS as u16)
+            .find_map(|s| {
+                let a = table.target_assignment(s);
+                (a.master == NodeId(1) && !a.replicas.is_empty()).then(|| (s, a.replicas[0]))
+            })
+            .expect("N1 masters some shard with a replica");
+        let cluster = new_test_running_cluster(
+            NodeId(1),
+            table,
+            &[
+                (NodeId(1), "127.0.0.1:4991".parse().unwrap()),
+                (NodeId(2), "127.0.0.1:4992".parse().unwrap()),
+                (NodeId(3), "127.0.0.1:4993".parse().unwrap()),
+            ],
+            &members,
+            &[],
+            &[],
+            &[],
+            3,
+        );
+        (cluster, shard, replica)
+    }
+
+    /// Reverse-heal Phase 3b (RED→GREEN) — a mastered shard that becomes stale at
+    /// RUNTIME (a live replica reports a divergent digest in the freshest
+    /// partition view, NOT at boot) is detected and healed via the ONLINE path:
+    /// the no-serve-before-heal fence is raised, a concrete-source pull is queued
+    /// from the argmax-recency replica (the existing requester loop drives it, and
+    /// the receiver applies the baseline under RULE-DS), and the fence clears when
+    /// the pull completes. A shard that heals then RE-diverges later re-triggers.
+    #[test]
+    fn online_reheal_detects_and_heals_runtime_divergence() {
+        let (cluster, shard, replica) = three_node_cluster_mastering_with_replica();
+        let k = key_for_shard(shard);
+
+        // Runtime baseline: before any divergence the node serves the shard.
+        assert!(
+            matches!(cluster.is_master(&k), MasterQueryResult::Yes),
+            "precondition: the node masters + serves the shard",
+        );
+
+        // A fresh partition view arrives at RUNTIME showing `replica` diverged.
+        let view = divergent_view_for(shard, NodeId(1), replica);
+        assert_eq!(
+            cluster.run_online_reheal(&view),
+            1,
+            "the runtime-detected stale shard is queued for an online heal once",
+        );
+
+        // No-serve-before-heal: the shard is fenced Transitioning, not Yes.
+        assert!(
+            matches!(
+                cluster.is_master(&k),
+                MasterQueryResult::Transitioning { .. }
+            ),
+            "a runtime-re-detected stale shard must fence BEFORE it is re-served",
+        );
+        // The queued pull names the divergent replica as the concrete source.
+        let pending = cluster.migration.lock().pending_inbound_entries();
+        assert!(
+            pending
+                .iter()
+                .any(|(s, from)| *s == shard && *from == replica),
+            "the online heal queues a concrete-source pull from the divergent replica",
+        );
+
+        // The pull completes (receiver applied the baseline under RULE-DS) → the
+        // fence clears and the shard is served as authority again.
+        cluster.mark_inbound_complete_from_source(shard, replica);
+        assert!(
+            matches!(cluster.is_master(&k), MasterQueryResult::Yes),
+            "after the online heal completes the shard is served as authority again",
+        );
+
+        // Re-divergence AFTER completion re-triggers (single-flight only holds
+        // while a heal is in flight, so a re-diverged shard heals again).
+        assert_eq!(
+            cluster.run_online_reheal(&view),
+            1,
+            "a shard that heals then re-diverges re-triggers the online heal",
+        );
+    }
+
+    /// Reverse-heal Phase 3b (RED→GREEN) — SINGLE-FLIGHT / dedup. While a heal is
+    /// in flight for a shard (its inbound fence is up), re-running the online
+    /// detector against the SAME still-divergent view must NOT re-trigger: no
+    /// second pull is queued and the shard is not thrashed.
+    #[test]
+    fn online_reheal_does_not_retrigger_inflight_heal() {
+        let (cluster, shard, replica) = three_node_cluster_mastering_with_replica();
+        let view = divergent_view_for(shard, NodeId(1), replica);
+
+        assert_eq!(
+            cluster.run_online_reheal(&view),
+            1,
+            "first detection queues the online heal",
+        );
+        // The heal is still in flight and the view is still divergent, but the
+        // shard is already fenced → single-flight suppresses a re-trigger.
+        assert_eq!(
+            cluster.run_online_reheal(&view),
+            0,
+            "an in-flight heal is single-flighted (no re-trigger)",
+        );
+        assert_eq!(
+            cluster.run_online_reheal(&view),
+            0,
+            "and stays single-flighted across repeated detector passes",
+        );
+        let inflight = cluster
+            .migration
+            .lock()
+            .pending_inbound_entries()
+            .into_iter()
+            .filter(|(s, _)| *s == shard)
+            .count();
+        assert_eq!(
+            inflight, 1,
+            "single-flight: exactly ONE in-flight pull for the shard, no thrash",
+        );
+    }
+
+    /// Reverse-heal Phase 3b (RED→GREEN) — the online analogue of the Phase-2c
+    /// no-serve-before-heal fence: a shard re-detected stale at RUNTIME answers
+    /// `Transitioning` (client-invisible / retryable) — NOT `Yes` — from the
+    /// instant of detection until its online heal completes, and the fence is
+    /// scoped to the DETECTED-stale shard only (a clean mastered shard in the same
+    /// view stays served).
+    #[test]
+    fn online_reheal_fences_before_serving() {
+        let members = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let table = ShardTable::compute_with_epoch(&members, 3, 5, 1);
+        let mut mastered = (0..NUM_SHARDS as u16).filter(|&s| {
+            let a = table.target_assignment(s);
+            a.master == NodeId(1) && !a.replicas.is_empty()
+        });
+        let stale_shard = mastered.next().expect("N1 masters a shard with a replica");
+        let clean_shard = mastered
+            .next()
+            .expect("N1 masters a second shard with a replica");
+        let replica = table.target_assignment(stale_shard).replicas[0];
+        let cluster = new_test_running_cluster(
+            NodeId(1),
+            table,
+            &[
+                (NodeId(1), "127.0.0.1:4995".parse().unwrap()),
+                (NodeId(2), "127.0.0.1:4996".parse().unwrap()),
+                (NodeId(3), "127.0.0.1:4997".parse().unwrap()),
+            ],
+            &members,
+            &[],
+            &[],
+            &[],
+            3,
+        );
+
+        let stale_k = key_for_shard(stale_shard);
+        let clean_k = key_for_shard(clean_shard);
+        assert!(matches!(
+            cluster.is_master(&stale_k),
+            MasterQueryResult::Yes
+        ));
+        assert!(matches!(
+            cluster.is_master(&clean_k),
+            MasterQueryResult::Yes
+        ));
+
+        // Only `stale_shard` diverges in this view.
+        let view = divergent_view_for(stale_shard, NodeId(1), replica);
+        assert_eq!(cluster.run_online_reheal(&view), 1);
+
+        // Fence-before-serve: the detected-stale shard is Transitioning...
+        assert!(
+            matches!(
+                cluster.is_master(&stale_k),
+                MasterQueryResult::Transitioning { .. }
+            ),
+            "the runtime-re-detected stale shard is fenced BEFORE it is served",
+        );
+        // ...while a mastered shard the detector did NOT flag is untouched.
+        assert!(
+            matches!(cluster.is_master(&clean_k), MasterQueryResult::Yes),
+            "online re-heal fences ONLY the detected-stale shard, not every mastered shard",
+        );
+
+        // The fence persists until the heal completes, then the shard serves.
+        cluster.mark_inbound_complete_from_source(stale_shard, replica);
+        assert!(
+            matches!(cluster.is_master(&stale_k), MasterQueryResult::Yes),
+            "the fence clears only once the online heal completes",
+        );
+    }
+
+    /// Reverse-heal Phase 3b (RED→GREEN — the P1 regression). A mastered shard on
+    /// which THIS node is AHEAD of a lagging replica (self reports higher
+    /// count + max_generation, differing digest — ordinary replication lag) must
+    /// NOT be fenced by the online re-heal: `run_online_reheal` returns 0, NO
+    /// `heal_pending` fence is raised, no reverse-pull is queued, and
+    /// `is_master` stays `Yes`. Pre-fix the direction-blind detector fenced it
+    /// (a serving blip + no-op baseline pull, repeating every topology commit).
+    #[test]
+    fn online_reheal_does_not_fence_ahead_master() {
+        let (cluster, shard, replica) = three_node_cluster_mastering_with_replica();
+        let k = key_for_shard(shard);
+
+        // Baseline: the node serves the shard as master.
+        assert!(
+            matches!(cluster.is_master(&k), MasterQueryResult::Yes),
+            "precondition: the node masters + serves the shard",
+        );
+
+        // A fresh runtime view where self (master) is AHEAD of a lagging replica
+        // but the digests differ (ordinary replication lag).
+        let view = divergent_view_replica_behind_for(shard, NodeId(1), replica);
+
+        assert_eq!(
+            cluster.run_online_reheal(&view),
+            0,
+            "an ahead master must NOT be fenced by online re-heal (P1)",
+        );
+        assert!(
+            matches!(cluster.is_master(&k), MasterQueryResult::Yes),
+            "the ahead master keeps serving — no heal_pending fence raised (P1)",
+        );
+        assert!(
+            !cluster
+                .migration
+                .lock()
+                .pending_inbound_entries()
+                .iter()
+                .any(|(s, _)| *s == shard),
+            "no reverse-pull is queued for an ahead master (P1)",
+        );
+    }
+
+    /// Reverse-heal Phase 3b — the direction gate still HEALS when this node is
+    /// genuinely BEHIND: a replica reporting a higher count + max_generation +
+    /// differing digest (the replica-ahead [`divergent_view_for`]) is detected,
+    /// fenced, and pulled. Guards against an over-tightened direction filter that
+    /// would suppress a real heal.
+    #[test]
+    fn online_reheal_still_heals_when_genuinely_behind() {
+        let (cluster, shard, replica) = three_node_cluster_mastering_with_replica();
+        let k = key_for_shard(shard);
+        assert!(matches!(cluster.is_master(&k), MasterQueryResult::Yes));
+
+        // Replica genuinely ahead (higher count + max_generation) → self behind.
+        let view = divergent_view_for(shard, NodeId(1), replica);
+        assert_eq!(
+            cluster.run_online_reheal(&view),
+            1,
+            "a genuinely-behind master is still fenced + queued for a reverse-pull",
+        );
+        assert!(
+            matches!(
+                cluster.is_master(&k),
+                MasterQueryResult::Transitioning { .. }
+            ),
+            "the behind master fences BEFORE re-serving",
+        );
+        assert!(
+            cluster
+                .migration
+                .lock()
+                .pending_inbound_entries()
+                .iter()
+                .any(|(s, from)| *s == shard && *from == replica),
+            "the online heal queues a concrete-source pull from the ahead replica",
+        );
+        // A genuinely-behind shard is NEVER parked in the not-behind backoff cache
+        // (so it can re-heal after completion / re-divergence).
+        assert!(
+            !cluster.reheal_backoff_snapshot().contains_key(&shard),
+            "a behind shard must not be suppressed by the not-behind backoff cache",
+        );
+    }
+
+    /// Reverse-heal Phase 3b (RED→GREEN) — BACKOFF. A not-behind, digest-mismatched
+    /// mastered shard (ahead master) is evaluated once, recorded in the not-behind
+    /// backoff cache, and thereafter NOT re-checked or re-fenced across repeated
+    /// topology-commit-driven `run_online_reheal` passes carrying the same view.
+    /// It never fences, never queues a pull, and stays served throughout.
+    #[test]
+    fn online_reheal_backoff_no_refence_on_repeated_commits() {
+        let (cluster, shard, replica) = three_node_cluster_mastering_with_replica();
+        let k = key_for_shard(shard);
+        let view = divergent_view_replica_behind_for(shard, NodeId(1), replica);
+
+        // First pass: evaluated, found not-behind, recorded in the backoff cache.
+        assert_eq!(cluster.run_online_reheal(&view), 0);
+        let cached = cluster.reheal_backoff_snapshot();
+        let sig = *cached
+            .get(&shard)
+            .expect("a not-behind mismatched shard is recorded in the backoff cache");
+
+        // Repeated commits with the SAME view never re-fence and never re-evaluate
+        // (the cached signature is stable — no re-check churn).
+        for _ in 0..5 {
+            assert_eq!(
+                cluster.run_online_reheal(&view),
+                0,
+                "a not-behind mismatched shard is never re-fenced across repeated commits",
+            );
+            assert!(
+                matches!(cluster.is_master(&k), MasterQueryResult::Yes),
+                "the shard stays served across repeated commits (no serving blip)",
+            );
+            assert_eq!(
+                cluster.reheal_backoff_snapshot().get(&shard),
+                Some(&sig),
+                "the backoff signature is stable while the source view is unchanged",
+            );
+        }
+        assert!(
+            cluster
+                .migration
+                .lock()
+                .pending_inbound_entries()
+                .is_empty(),
+            "no reverse-pull is ever queued for a not-behind mismatched shard",
+        );
+    }
+
     #[test]
     fn is_master_returns_no_when_remote_master() {
         let members = vec![NodeId(1), NodeId(2)];
@@ -19595,6 +20377,79 @@ mod tests {
             !is_shard_stale_vs_replicas(self_recency, &[matching_digest, matching_digest]),
             "matching digests → detector does not fire even with count/gen skew",
         );
+    }
+
+    /// Reverse-heal Phase 3b DIRECTION pre-filter — the coarse necessary-condition
+    /// gate ([`is_self_behind_any_replica_coarse`]) that keeps an ahead/equal
+    /// master from being fenced online (the P1). It must:
+    /// - flag BEHIND when a replica is strictly ahead on EITHER axis
+    ///   (`max_generation` or `count`),
+    /// - NOT flag when self dominates (`>=`) every replica on BOTH axes — the
+    ///   hard invariant an ahead/equal master is never fenced,
+    /// - defer the sub-max-only divergence (equal on both axes, different digest)
+    ///   to the boot manifest exchange (coarse gate says NOT behind here).
+    #[test]
+    fn coarse_direction_gate_flags_only_a_genuinely_behind_master() {
+        let self_recency = ShardRecency {
+            count: 5,
+            digest: 0xAAAA,
+            max_generation: 100,
+        };
+
+        // Empty replica set → never behind.
+        assert!(!is_self_behind_any_replica_coarse(self_recency, &[]));
+
+        // Replica strictly ahead on max_generation only → BEHIND.
+        let ahead_gen = ShardRecency {
+            count: 5,
+            digest: 0xBBBB,
+            max_generation: 101,
+        };
+        assert!(is_self_behind_any_replica_coarse(
+            self_recency,
+            &[ahead_gen]
+        ));
+
+        // Replica strictly ahead on count only → BEHIND.
+        let ahead_count = ShardRecency {
+            count: 6,
+            digest: 0xBBBB,
+            max_generation: 100,
+        };
+        assert!(is_self_behind_any_replica_coarse(
+            self_recency,
+            &[ahead_count]
+        ));
+
+        // A lagging replica (strictly behind on both axes) with a differing
+        // digest → self ahead → NOT behind (the P1: never fence this master).
+        let behind_replica = ShardRecency {
+            count: 3,
+            digest: 0xBBBB,
+            max_generation: 90,
+        };
+        assert!(!is_self_behind_any_replica_coarse(
+            self_recency,
+            &[behind_replica]
+        ));
+
+        // Sub-max-only divergence: equal on both axes, different digest → coarse
+        // gate says NOT behind (deferred to the boot manifest exchange).
+        let sub_max_divergent = ShardRecency {
+            count: 5,
+            digest: 0xCCCC,
+            max_generation: 100,
+        };
+        assert!(!is_self_behind_any_replica_coarse(
+            self_recency,
+            &[sub_max_divergent]
+        ));
+
+        // Mixed set: one lagging + one ahead-on-count → BEHIND (any() over the set).
+        assert!(is_self_behind_any_replica_coarse(
+            self_recency,
+            &[behind_replica, ahead_count]
+        ));
     }
 
     /// Reverse-heal Phase 1 composition: `detect_stale_shards_from_view` flags
