@@ -17970,6 +17970,104 @@ mod tests {
         }
     }
 
+    /// P0 (reverse-heal Phase 2c, ROUND 2) — a MIGRATION-ABORT for a healing
+    /// shard must NOT clear the no-serve-before-heal fence.
+    ///
+    /// Reachable with NO second fault: boot raises the reverse-heal fence
+    /// (`is_master` = `Transitioning`); the requester pulls from source P; P's
+    /// baseline stream hits a TRANSIENT failure and P sends
+    /// `OP_MIGRATION_COMPLETE | FLAG_MIGRATION_ABORT`; the healing node's abort
+    /// handler (`abort_inbound_migration` → `clear_pending_inbound_for_shards`)
+    /// DROPPED the heal entry, clearing the hot-path atomic bit → `is_master`
+    /// answered `Yes` for the UN-HEALED shard (serves a lost/resurrected tail =
+    /// double-spend), with no online re-heal so the fence never returned until
+    /// reboot. The abort's clear-the-fence reasoning is correct for a FORWARD
+    /// migration (target isn't the master → `is_master` stays `No`) but UNSAFE
+    /// for reverse-heal where the target IS the committed master.
+    ///
+    /// The fix preserves `heal_pending` in `clear_pending_inbound_for_shards`,
+    /// so the shard STAYS `Transitioning` and the entry stays pullable (the
+    /// requester loop re-requests the transient failure). Pre-fix: `Yes` (the
+    /// hole). Post-fix: `Transitioning`. Only a genuine completion handshake
+    /// lifts it.
+    #[test]
+    fn abort_during_reverse_heal_keeps_shard_fenced() {
+        let members = vec![NodeId(1)];
+        let epoch = 7u64;
+        let placement_version = 1u16;
+        let rf = 1u8;
+        let table = ShardTable::compute_with_epoch(&members, rf, epoch, placement_version);
+        let cluster = new_test_running_cluster(
+            NodeId(1),
+            table,
+            &[(NodeId(1), "127.0.0.1:4933".parse().unwrap())],
+            &members,
+            &[],
+            &[],
+            &[],
+            1,
+        );
+        let shard = 0u16;
+        let key = key_for_shard(shard);
+
+        // Raise the reverse-heal fence from a concrete boot source (the pull).
+        let source = NodeId(2);
+        assert_eq!(cluster.begin_reverse_heal(&[(shard, source)]), 1);
+        assert!(
+            matches!(
+                cluster.is_master(&key),
+                MasterQueryResult::Transitioning { .. }
+            ),
+            "precondition: the reverse-heal fence is up before the abort",
+        );
+        // The exact P0 condition: the healing shard is NOT marked lost during
+        // the pull, so a `lost`-only retain would drop it.
+        assert!(
+            !cluster.migration.lock().is_shard_lost(shard),
+            "precondition: a healing shard is NOT `lost` (it is `heal_pending`)",
+        );
+
+        // A TRANSIENT source-side stream failure delivers a migration-abort for
+        // the healing shard (the real dispatch path calls this unconditionally,
+        // with no master/heal guard).
+        cluster.abort_inbound_migration(shard);
+
+        // The heal fence must survive the abort (hot-path atomic bit).
+        assert!(
+            cluster.inbound_atomic.test(shard),
+            "P0: the abort must not clear the healing shard's hot-path inbound fence",
+        );
+        match cluster.is_master(&key) {
+            MasterQueryResult::Transitioning { .. } => {}
+            other => panic!(
+                "P0: a migration-abort must NOT serve an UN-HEALED reverse-heal shard \
+                 as authority; got {other:?}",
+            ),
+        }
+        // AVAILABILITY: the heal entry survives as pullable (concrete source),
+        // so the requester loop re-requests the transient failure rather than
+        // fencing forever.
+        assert!(
+            cluster
+                .pending_inbound_entries()
+                .iter()
+                .any(|&(s, from)| s == shard && from == source),
+            "the aborted heal entry must survive as pullable so the requester re-requests it",
+        );
+        // A healing shard is NOT counted as `lost` — the gauge stays clean.
+        assert!(
+            !cluster.migration.lock().is_shard_lost(shard),
+            "an aborted healing shard is not `lost`",
+        );
+
+        // Only the genuine completion handshake lifts the fence.
+        cluster.mark_inbound_complete_from_source(shard, source);
+        assert!(
+            matches!(cluster.is_master(&key), MasterQueryResult::Yes),
+            "after the heal completes the shard is served as authority",
+        );
+    }
+
     /// C8/C17 (P2) — the `migration_lost` gauge must reflect the number of
     /// shards currently marked LOST/UNAVAILABLE and stay current across syncs,
     /// so a persistently-lost shard is continuously visible on `/metrics`. It

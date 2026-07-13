@@ -1575,7 +1575,26 @@ impl MigrationManager {
     ///
     /// This is used when the coordinator knows those shards are fully
     /// settled in the active topology and any remaining inbound entries are
-    /// stale bookkeeping that would otherwise block the hot path forever.
+    /// stale bookkeeping that would otherwise block the hot path forever. The
+    /// migration-abort path (`RunningCluster::abort_inbound_migration`) also
+    /// routes through here: a source that could not finish streaming tells the
+    /// target to abandon the in-flight inbound.
+    ///
+    /// P0 (reverse-heal Phase 2c, ROUND 2) — a `heal_pending` entry is a boot
+    /// reverse-heal PULL fence (or the no-source fail-closed fence) whose target
+    /// IS the committed master of the shard. Unlike a FORWARD migration (where
+    /// the target is not the master, so unfencing keeps `is_master` = `No`),
+    /// dropping a reverse-heal fence here lets `RunningCluster::is_master`
+    /// answer `Yes` for an UN-HEALED shard and serve a lost/resurrected tail as
+    /// authority — the P0 double-spend. Reachable with no second fault: the
+    /// source's baseline stream to the healing node hits a transient failure and
+    /// sends `OP_MIGRATION_COMPLETE | FLAG_MIGRATION_ABORT`, unconditionally on
+    /// `is_master`. So the retain PRESERVES `heal_pending` (mirroring
+    /// [`Self::clear_inbound`]): an aborted reverse-heal shard STAYS fenced
+    /// (`Transitioning`) and its non-completed entry stays pullable, so the
+    /// requester loop re-requests the transient failure rather than fencing
+    /// forever. A FORWARD-migration entry (heal_pending=false) for an aborted
+    /// shard is still cleared (unchanged behaviour).
     ///
     /// Returns the number of entries removed.
     pub fn clear_pending_inbound_for_shards(
@@ -1584,7 +1603,7 @@ impl MigrationManager {
     ) -> usize {
         let before = self.inbound_migrations.len();
         self.inbound_migrations
-            .retain(|m| m.completed || !shards.contains(&m.shard));
+            .retain(|m| m.completed || !shards.contains(&m.shard) || m.heal_pending);
         let removed = before - self.inbound_migrations.len();
         if removed > 0 {
             self.inbound_bitmap.clear_all();
@@ -3671,6 +3690,54 @@ mod tests {
         assert!(
             !mgr.has_pending_inbound(3),
             "a non-lost in-flight inbound is still superseded by clear_inbound",
+        );
+    }
+
+    /// P0 (reverse-heal Phase 2c, ROUND 2) — `clear_pending_inbound_for_shards`
+    /// (the migration-abort fence-clearing path) must NOT drop a `heal_pending`
+    /// entry for the aborted shard: a reverse-heal target IS the committed
+    /// master, so unfencing it serves an un-healed tail = double-spend. A
+    /// FORWARD-migration entry (heal_pending=false) for the same aborted shard
+    /// is still cleared (unchanged behaviour).
+    #[test]
+    fn clear_pending_inbound_preserves_heal_fence() {
+        let mut mgr = MigrationManager::new();
+        // Shard 7: a reverse-heal PULL fence (heal_pending, non-lost).
+        assert!(mgr.register_heal_source(7, NodeId(2)));
+        assert!(mgr.has_pending_inbound(7));
+        assert!(!mgr.is_shard_lost(7));
+        // Shard 8: an ordinary forward inbound (heal_pending=false).
+        assert!(mgr.register_inbound_source(8, NodeId(3)));
+        assert!(mgr.has_pending_inbound(8));
+
+        // Abort both shards.
+        let abort: std::collections::HashSet<u16> = [7, 8].into_iter().collect();
+        let removed = mgr.clear_pending_inbound_for_shards(&abort);
+
+        // Only the forward (non-heal) entry is removed; the heal fence survives.
+        assert_eq!(removed, 1, "only the forward-migration entry is cleared");
+        assert!(
+            mgr.has_pending_inbound(7),
+            "the aborted reverse-heal shard STAYS fenced (heal_pending preserved)",
+        );
+        assert!(
+            !mgr.has_pending_inbound(8),
+            "an aborted forward-migration shard is still cleared",
+        );
+        // The heal entry survives as pullable (non-completed, concrete source)
+        // so the requester re-requests the transient failure.
+        assert!(
+            mgr.pending_inbound_entries()
+                .iter()
+                .any(|&(s, from)| s == 7 && from == NodeId(2)),
+            "the surviving heal entry stays pullable",
+        );
+
+        // Only a genuine completion proof lifts the fence.
+        mgr.mark_inbound_complete_from_source(7, NodeId(2));
+        assert!(
+            !mgr.has_pending_inbound(7),
+            "completion proof clears the heal fence",
         );
     }
 
