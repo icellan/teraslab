@@ -338,11 +338,38 @@ struct InboundMigration {
     /// entry as plain-pending (still fenced); the GC re-marks it lost after
     /// the next idle window — the fence is what matters and it survives.
     lost: bool,
+    /// P0 (reverse-heal Phase 2c) — the no-serve-before-heal FENCE marker.
+    ///
+    /// Set when this inbound entry represents a boot reverse-heal PULL
+    /// ([`Self::register_heal_source`]) or the no-source FAIL-CLOSED fence
+    /// ([`Self::mark_heal_fence_active`]). A mid-heal shard is an unproven
+    /// inbound — the same "fence-until-proven" intent as `lost` — but it is
+    /// NOT `lost` in the C8 sense: its source is alive and being pulled, so it
+    /// must NOT be reaped by the settled-inbound GC, must NOT raise the
+    /// `migration_lost` gauge, and must NOT answer `is_shard_lost`.
+    ///
+    /// A DISTINCT marker (rather than overloading `lost`) is used precisely so
+    /// those three compose cleanly: the GC skip
+    /// ([`Self::pending_inbound_shards_excluding_recent_requests`]) and the
+    /// `lost`-scoped counters all gate on `lost`, untouched, while
+    /// [`Self::clear_inbound`] retains BOTH `lost` and `heal_pending` so a
+    /// runtime topology commit cannot wipe the reverse-heal fence and serve an
+    /// un-healed (lost/resurrected) tail as authority (the P0 double-spend).
+    /// The pull requester loop keys off `pending_inbound_entries` (which gates
+    /// only on `!completed`), so the marker never stops the pull. Cleared when
+    /// the completion handshake proves the shard complete.
+    ///
+    /// Not serialized (like `lost`): a restart re-loads the entry as
+    /// plain-pending (still fenced via the bitmap); the boot reverse-heal path
+    /// re-detects the stale shard and re-raises `heal_pending`, and the GC
+    /// re-marks a genuinely-orphaned entry `lost` — the fence is what matters
+    /// and it survives.
+    heal_pending: bool,
 }
 
 impl InboundMigration {
     /// A freshly-registered, not-yet-received inbound entry (fence up, not
-    /// completed, no outstanding transfer request, not lost).
+    /// completed, no outstanding transfer request, not lost, not heal-pending).
     fn pending(shard: u16, from_node: NodeId) -> Self {
         Self {
             shard,
@@ -350,6 +377,7 @@ impl InboundMigration {
             completed: false,
             transfer_requested_at: None,
             lost: false,
+            heal_pending: false,
         }
     }
 }
@@ -726,6 +754,67 @@ impl MigrationManager {
         true
     }
 
+    /// P0 (reverse-heal Phase 2c) — register a boot reverse-heal PULL from a
+    /// CONCRETE `from_node`, raising the no-serve-before-heal FENCE that
+    /// SURVIVES `clear_inbound`.
+    ///
+    /// Identical to [`Self::register_inbound_source`] (sets the inbound fence
+    /// bit; the concrete source drives the pull requester loop) but ALSO raises
+    /// `heal_pending`, so a runtime topology commit's [`Self::clear_inbound`]
+    /// preserves the fence instead of dropping a `lost = false` heal entry and
+    /// serving the un-healed shard as authority. Returns `true` if a new entry
+    /// was added, `false` if an existing `(shard, from_node)` entry was revived.
+    pub fn register_heal_source(&mut self, shard: u16, from_node: NodeId) -> bool {
+        if let Some(existing) = self
+            .inbound_migrations
+            .iter_mut()
+            .find(|m| m.shard == shard && m.from_node == from_node && !m.completed)
+        {
+            // Revive a prior orphaned/lost attempt as an active heal fence.
+            existing.lost = false;
+            existing.heal_pending = true;
+            return false;
+        }
+        self.inbound_migrations.push(InboundMigration {
+            heal_pending: true,
+            ..InboundMigration::pending(shard, from_node)
+        });
+        self.inbound_bitmap.set(shard);
+        true
+    }
+
+    /// P0 (reverse-heal Phase 2c) — raise the no-source FAIL-CLOSED heal fence
+    /// for `shard` (a stale shard with no available heal source at boot).
+    ///
+    /// Like [`Self::mark_inbound_active`] it registers the `NodeId(0)` sentinel
+    /// (no concrete peer, so the pull requester loop skips it) and sets the
+    /// inbound fence bit, but ALSO raises `heal_pending` so the fence SURVIVES
+    /// a runtime topology commit's [`Self::clear_inbound`]. The shard stays
+    /// client-invisible (fenced fail-closed) until an operator or a Phase-3
+    /// give-up path resolves it — it is never served un-healed. If an entry for
+    /// the shard already exists, its `heal_pending` is raised and the fence bit
+    /// re-set. Returns `true` if a new entry was added.
+    pub fn mark_heal_fence_active(&mut self, shard: u16) -> bool {
+        let mut existed = false;
+        for m in self
+            .inbound_migrations
+            .iter_mut()
+            .filter(|m| m.shard == shard)
+        {
+            m.heal_pending = true;
+            existed = true;
+        }
+        self.inbound_bitmap.set(shard);
+        if existed {
+            return false;
+        }
+        self.inbound_migrations.push(InboundMigration {
+            heal_pending: true,
+            ..InboundMigration::pending(shard, NodeId(0))
+        });
+        true
+    }
+
     /// Mark an inbound shard as received (data has arrived and been verified).
     ///
     /// Marks the first non-completed entry for this shard as completed.
@@ -737,6 +826,8 @@ impl MigrationManager {
             .find(|m| m.shard == shard && !m.completed)
         {
             m.completed = true;
+            // P0 — completion proves the shard: drop the reverse-heal fence marker.
+            m.heal_pending = false;
         } else {
             self.record_completed_inbound_tombstone(shard, NodeId(0));
         }
@@ -759,6 +850,7 @@ impl MigrationManager {
             .filter(|m| m.shard == shard)
         {
             inbound.completed = true;
+            inbound.heal_pending = false;
             found = true;
         }
         if !found {
@@ -777,12 +869,14 @@ impl MigrationManager {
             .find(|m| m.shard == shard && m.from_node == from_node && !m.completed)
         {
             m.completed = true;
+            m.heal_pending = false;
         } else if let Some(m) = self
             .inbound_migrations
             .iter_mut()
             .find(|m| m.shard == shard && m.from_node == NodeId(0) && !m.completed)
         {
             m.completed = true;
+            m.heal_pending = false;
         } else {
             self.record_completed_inbound_tombstone(shard, from_node);
         }
@@ -1222,6 +1316,13 @@ impl MigrationManager {
             // cycle. It leaves this set only via a completeness proof or a
             // fresh re-acquiring migration (both clear the `lost` predicate).
             .filter(|m| !m.lost)
+            // P0 — a `heal_pending` shard is a LIVE reverse-heal in flight: its
+            // source is alive and being pulled, so the settled-inbound GC must
+            // NOT reap it as an orphan (marking it `lost` would mis-raise the
+            // `migration_lost` gauge and make `is_shard_lost` true for a shard
+            // that is merely healing). It stays fenced fail-closed and keeps
+            // being pulled; the completion handshake clears the marker.
+            .filter(|m| !m.heal_pending)
             .filter(|m| match m.transfer_requested_at {
                 Some(at) => now.duration_since(at) >= request_grace,
                 None => true,
@@ -1448,11 +1549,22 @@ impl MigrationManager {
     /// the supersede's fresh plan re-registers whatever the new topology needs
     /// via [`Self::start_outbound`], and a re-acquiring migration clears the
     /// lost mark of any preserved entry it supersedes.
+    ///
+    /// P0 (reverse-heal Phase 2c) — a `heal_pending` entry is ALSO an unproven
+    /// inbound (a boot reverse-heal pull, or the no-source fail-closed fence)
+    /// that is deliberately NOT `lost` for the whole pull window (its source is
+    /// alive / transfer-request grace keeps it non-lost). It is retained here
+    /// for the SAME "fence-until-proven" reason as `lost`: dropping it would
+    /// clear the no-serve-before-heal fence and let `is_master` serve an
+    /// un-healed (lost/resurrected) tail as full authority — the P0
+    /// double-spend. So the retain preserves BOTH `lost` and `heal_pending`.
     pub fn clear_inbound(&mut self) {
-        self.inbound_migrations.retain(|m| !m.completed && m.lost);
+        self.inbound_migrations
+            .retain(|m| !m.completed && (m.lost || m.heal_pending));
         self.inbound_bitmap.clear_all();
         for m in &self.inbound_migrations {
-            // Every surviving entry is an unproven LOST shard — keep it fenced.
+            // Every surviving entry is an unproven LOST or HEAL-PENDING shard —
+            // keep it fenced.
             self.inbound_bitmap.set(m.shard);
         }
         // BUG4 (b): no non-lost shard is pending after this clear → drop the

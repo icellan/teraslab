@@ -1883,6 +1883,19 @@ fn main() {
         // that never converges leaves the shard fenced fail-closed here rather
         // than timing out + giving up, and the pull is boot-triggered only (no
         // online re-heal) — both are Phase-3 state-machine scope.
+        //
+        // P1 (DOCUMENT-ONLY, consensus, carry to Phase 3/4): because the pull is
+        // boot-triggered with no online re-heal, and RULE-DS drops a
+        // `ClientDelete`-tombstoned key's baseline Create unconditionally
+        // (`TombstoneLog::blocks_heal_apply`), a legitimately RE-CREATED UTXO is
+        // LOST when this boot heal is its SOLE carrier (client-delete k → node
+        // down → reorg re-creates k while down → boot heal drops k, tombstone
+        // never cleared, no online re-heal → node masters missing a live UTXO).
+        // This is the CONSERVATIVE direction (a LOSS, not a double-spend;
+        // design-acked E5) and is DEFAULT-OFF. Closing it needs a HEIGHT-AWARE
+        // ClientDelete gate (admit a re-org re-create at height > deletion_height)
+        // AND/OR the Phase-3 online re-heal path — both consensus-critical,
+        // designed + reviewed in Phase 3/4, NOT implemented here.
         if config.reverse_heal.tombstones {
             let stale = running.stale_suspect_shards();
             if !stale.is_empty() {
@@ -1901,7 +1914,11 @@ fn main() {
                 let mut fenced_fail_closed = 0usize;
                 for &shard in &stale {
                     if !sourced.contains(&shard) {
-                        running.mark_inbound_active(shard);
+                        // P0 — `mark_inbound_heal_fence` (not `mark_inbound_active`)
+                        // raises the `heal_pending` marker so this fail-closed
+                        // fence SURVIVES a concurrent runtime topology commit's
+                        // `clear_inbound` — the un-healed shard is never served.
+                        running.mark_inbound_heal_fence(shard);
                         fenced_fail_closed += 1;
                     }
                 }

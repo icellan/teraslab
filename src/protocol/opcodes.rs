@@ -541,17 +541,22 @@ pub const ERR_RESPONSE_TOO_LARGE: u16 = 38;
 /// the negotiated version (`>= 3`) to avoid looping forever against an older
 /// server. The response wire format is unchanged, so old clients keep working.
 ///
-/// Bumped to `4` (reverse-heal Phase 2c) for two additive wire extensions,
-/// exchanged only between two `>= 4` peers, invisible to older ones:
+/// Bumped to `4` (reverse-heal Phase 2c) for ONE genuinely-new additive wire
+/// extension, exchanged only between two `>= 4` peers and invisible to older
+/// ones:
 ///
 /// - the create-metadata flag byte now carries [`CREATE_FLAG_REASSIGNED`] (wire
 ///   0x10) so a healed / migrated create image preserves the persisted
-///   REASSIGNED marker instead of dropping it; and
-/// - [`FLAG_MIGRATION_MANIFEST_DIFF`] selects the tombstone-aware per-record
-///   manifest-diff response on `OP_MIGRATION_COMPLETE`.
+///   REASSIGNED marker instead of dropping it.
 ///
-/// Both are ignored by a `< 4` peer (unset bit / unrecognized flag), so old
-/// clients and mixed-version clusters keep working.
+/// It is ignored by a `< 4` peer (unset bit), so old clients and mixed-version
+/// clusters keep working.
+///
+/// (For clarity: [`FLAG_MIGRATION_MANIFEST_DIFF`] — the tombstone-aware
+/// per-record manifest-diff response on `OP_MIGRATION_COMPLETE` — is NOT new
+/// here. It was defined in Phase 2b (which computed the ship-set direction);
+/// Phase 2c only adds the pull/apply that CONSUMES it. It is not part of this
+/// version bump's diff.)
 pub const PROTOCOL_VERSION: u16 = 4;
 
 pub const ERR_INTERNAL: u16 = 255;

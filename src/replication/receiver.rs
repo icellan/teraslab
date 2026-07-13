@@ -1216,11 +1216,14 @@ fn apply_create_replica(
     // `master_generation()`, so the pre-apply generation guard skips it: an
     // absent (deleted) key would otherwise be `engine.create`d fresh =
     // resurrection. Consult this node's OWN deletion tombstone BEFORE creating
-    // and drop (idempotent no-op) if it forbids the apply. Scoped to the heal /
-    // migration baseline (`is_migration`) so the client-create path and the
-    // normal master→replica create stream are NOT gated — a legitimate re-create
-    // must apply and clears the tombstone (design §E5). Zero-cost no-op when
-    // tombstones are disabled.
+    // and drop (idempotent no-op) if it forbids the apply. Scoped to the
+    // migration baseline (`is_migration`) — which covers EVERY migration apply
+    // when tombstones are enabled (a forward rebalance as well as a reverse-heal
+    // pull, NOT reverse-heal-only; see the general RULE-DS gate below for why a
+    // forward-rebalance drop is a safe self-healing availability gap) — so the
+    // client-create path and the normal master→replica create stream are NOT
+    // gated: a legitimate re-create must apply and clears the tombstone (design
+    // §E5). Zero-cost no-op when tombstones are disabled.
     //
     // Gated on the key being currently ABSENT: RULE-DS exists to stop
     // resurrecting a DELETED record, so it never fires over a live record. Were
@@ -1631,8 +1634,18 @@ fn apply_op_journal_inner(
     // idempotent no-op so NO heal apply (not only `apply_create_replica`) can
     // resurrect a deleted record. The absence gate keeps a (TS-1-forbidden)
     // dangling tombstone from ever dropping a live record's legitimate mutation.
-    // Scoped to `is_migration`; a zero-cost no-op when tombstones are disabled or
-    // no tombstone covers the key.
+    //
+    // SCOPE (P2-3): the gate keys off `is_migration`, so it applies to EVERY
+    // migration baseline apply when tombstones are enabled — a FORWARD rebalance
+    // as much as a reverse-heal PULL, NOT reverse-heal-only. Consequence: a
+    // normal forward rebalance to a node that still holds a stale `ClientDelete`
+    // tombstone for an absent key also drops that key's baseline `Create`. That
+    // is SAFE and intended: it is a self-healing AVAILABILITY gap (the divergence
+    // is re-detected and re-healed after the fence clears; design §G E5), never a
+    // correctness violation — the drop is absence-gated (a live record is never
+    // touched) and the tombstone is reconciled/cleared on the legitimate
+    // client-create path. A zero-cost no-op when tombstones are disabled or no
+    // tombstone covers the key.
     if is_migration
         && let Some(tx_key) = op.tx_key()
         && engine.lookup(&tx_key).is_none()
