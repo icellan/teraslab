@@ -9643,6 +9643,41 @@ impl RunningCluster {
             .collect()
     }
 
+    /// Reverse-heal Tier-1 boot detector scoping (finding C1, P2). The shards
+    /// this node masters whose replica set includes one of `lost_replica_addrs` —
+    /// the downstream replicas the AckTracker proved acked BEYOND this node's
+    /// recovered redo floor.
+    ///
+    /// The Tier-1 detector otherwise suspects EVERY mastered shard on any
+    /// lost-acked tail, which over-fences and inflates boot cost. The lost tail
+    /// was acked by specific downstream replicas, and a replica only holds the
+    /// shards it replicates for, so the affected shards are bounded by
+    /// `{ mastered } ∩ { shards replicating to a lost replica }`. The AckTracker's
+    /// redo sequences are node-coarse (they do not carry a shard), so this is the
+    /// tightest correct over-approximation available at boot — strictly narrower
+    /// than [`Self::mastered_shards`]. Returns ascending, deduplicated.
+    pub fn mastered_shards_replicating_to(&self, lost_replica_addrs: &[SocketAddr]) -> Vec<u16> {
+        if lost_replica_addrs.is_empty() {
+            return Vec::new();
+        }
+        let lost: std::collections::HashSet<SocketAddr> =
+            lost_replica_addrs.iter().copied().collect();
+        // Snapshot the address map first (drop its lock) so we never hold it while
+        // iterating the shard table — mirrors `expected_replica_addrs`.
+        let addrs = self.node_addrs.read().clone();
+        let table = self.shard_table.read();
+        (0..NUM_SHARDS as u16)
+            .filter(|&s| {
+                let assignment = table.target_assignment(s);
+                assignment.master == self.self_id
+                    && assignment.replicas.iter().any(|replica| {
+                        *replica != self.self_id
+                            && addrs.get(replica).is_some_and(|a| lost.contains(a))
+                    })
+            })
+            .collect()
+    }
+
     /// Reverse-heal (finding C1): the shards this node currently suspects hold
     /// a LOST ACKED TAIL, sorted ascending. Empty on a clean boot. Phase 1
     /// exposes this for observability only — it does not gate serving.
@@ -10007,6 +10042,18 @@ impl RunningCluster {
         }
     }
 
+    /// Reverse-heal completion discriminator (see
+    /// [`crate::cluster::migration::MigrationManager::has_pending_heal_from_source`]).
+    /// Does this node hold an ACTIVE reverse-heal fence for `shard` sourced from
+    /// `from_node`? The `OP_MIGRATION_COMPLETE` verify consults it to apply
+    /// RULE-DS drop-aware tolerance to a heal completion — and ONLY a heal
+    /// completion, so forward-migration completions keep exact-holding semantics.
+    pub fn has_pending_heal_from_source(&self, shard: u16, from_node: NodeId) -> bool {
+        self.migration
+            .lock()
+            .has_pending_heal_from_source(shard, from_node)
+    }
+
     #[cfg(test)]
     pub(crate) fn register_test_inbound_from_source(&self, shard: u16, from_node: NodeId) {
         let mgr = &mut self.migration.lock();
@@ -10021,6 +10068,17 @@ impl RunningCluster {
             self.self_id,
             &std::collections::HashSet::new(),
         );
+        self.inbound_atomic.load_from(mgr.inbound_bitmap());
+    }
+
+    /// Register an ACTIVE reverse-heal PULL fence for `shard` sourced from
+    /// `from_node` (raises `heal_pending` + the inbound fence bit), mirroring the
+    /// boot reverse-heal path. Test-only harness for the completion drop-awareness
+    /// tests.
+    #[cfg(test)]
+    pub(crate) fn register_test_heal_source(&self, shard: u16, from_node: NodeId) {
+        let mgr = &mut self.migration.lock();
+        mgr.register_heal_source(shard, from_node);
         self.inbound_atomic.load_from(mgr.inbound_bitmap());
     }
 
@@ -17844,6 +17902,74 @@ mod tests {
         );
         assert_eq!(mastered.first().copied(), Some(0));
         assert_eq!(mastered.last().copied(), Some(NUM_SHARDS as u16 - 1));
+    }
+
+    /// Reverse-heal Tier-1 boot detector scoping (P2): the suspicion is scoped to
+    /// the shards this node masters that replicate to a LOST-tail replica, not
+    /// every mastered shard. Exactly `{ mastered } ∩ { replicating to the lost
+    /// replica }`, strictly narrower than `mastered_shards()`.
+    #[test]
+    fn mastered_shards_replicating_to_scopes_to_affected_shards() {
+        let members = vec![NodeId(1), NodeId(2), NodeId(3)];
+        // RF=2 → each shard has master + ONE replica, so a shard N1 masters
+        // replicates to EITHER N2 or N3 (not both) — a lost N2 affects only the
+        // subset replicating to N2.
+        let table = ShardTable::compute_with_epoch(&members, 2, 7, 1);
+        let n1: SocketAddr = "127.0.0.1:5001".parse().unwrap();
+        let n2: SocketAddr = "127.0.0.1:5002".parse().unwrap();
+        let n3: SocketAddr = "127.0.0.1:5003".parse().unwrap();
+        let cluster = new_test_running_cluster(
+            NodeId(1),
+            table.clone(),
+            &[(NodeId(1), n1), (NodeId(2), n2), (NodeId(3), n3)],
+            &members,
+            &[],
+            &[],
+            &[],
+            1,
+        );
+
+        // Exact expectation recomputed from the table: shards N1 masters whose
+        // replica set includes N2.
+        let expected: Vec<u16> = (0..NUM_SHARDS as u16)
+            .filter(|&s| {
+                let a = table.target_assignment(s);
+                a.master == NodeId(1) && a.replicas.contains(&NodeId(2))
+            })
+            .collect();
+        let scoped = cluster.mastered_shards_replicating_to(&[n2]);
+        assert_eq!(
+            scoped, expected,
+            "scoped exactly to mastered shards replicating to the lost replica",
+        );
+
+        let mastered = cluster.mastered_shards();
+        assert!(
+            scoped.iter().all(|s| mastered.contains(s)),
+            "scoped ⊆ mastered",
+        );
+
+        // Completeness + narrowing: every mastered shard replicates to N2 or N3
+        // (RF=2), so the union of the two scopes is exactly `mastered` and neither
+        // scope alone covers it (unless the placement happened to be degenerate).
+        let scoped_n3 = cluster.mastered_shards_replicating_to(&[n3]);
+        let mut union: Vec<u16> = scoped.iter().chain(scoped_n3.iter()).copied().collect();
+        union.sort_unstable();
+        union.dedup();
+        assert_eq!(
+            union, mastered,
+            "every mastered shard replicates to exactly one of N2/N3 → union == mastered",
+        );
+
+        // An empty lost set, or an address that resolves to no known replica,
+        // yields an empty scope.
+        assert!(cluster.mastered_shards_replicating_to(&[]).is_empty());
+        let unknown: SocketAddr = "127.0.0.1:5999".parse().unwrap();
+        assert!(
+            cluster
+                .mastered_shards_replicating_to(&[unknown])
+                .is_empty()
+        );
     }
 
     /// Reverse-heal Phase 2c: a restarted ex-master IS the committed master of

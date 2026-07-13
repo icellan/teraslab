@@ -834,6 +834,30 @@ impl MigrationManager {
         true
     }
 
+    /// Reverse-heal completion drop-awareness — is there an ACTIVE (uncompleted)
+    /// `heal_pending` inbound entry for `shard` sourced from `from_node` (or the
+    /// no-source `NodeId(0)` sentinel)?
+    ///
+    /// A `true` answer means a completion handshake arriving for this
+    /// `(shard, from_node)` is a REVERSE-HEAL completion, not a forward migration:
+    /// the source ships/manifests its FULL live key set, while RULE-DS
+    /// legitimately DROPS every source key this node holds a blocking tombstone
+    /// for (and KEEPS its own higher-generation copy). The completion verify must
+    /// therefore be drop-aware for it — a source key the target legitimately did
+    /// NOT apply is NOT a gap. Matching the `NodeId(0)` sentinel mirrors
+    /// [`Self::mark_inbound_complete_from_source`], which clears the same entry, so
+    /// the discriminator and the fence-clear agree on which entry is the heal.
+    /// Forward migrations (no `heal_pending` entry) answer `false` and keep exact
+    /// holding semantics unchanged.
+    pub fn has_pending_heal_from_source(&self, shard: u16, from_node: NodeId) -> bool {
+        self.inbound_migrations.iter().any(|m| {
+            m.heal_pending
+                && !m.completed
+                && m.shard == shard
+                && (m.from_node == from_node || m.from_node == NodeId(0))
+        })
+    }
+
     /// Reverse-heal Phase 3c (design §E3) — the shards whose `heal_pending` fence
     /// has been up (uncompleted) for at least `deadline` — i.e. STUCK heals whose
     /// deadline fallback (escalate / alert-and-hold) is due.
@@ -885,14 +909,31 @@ impl MigrationManager {
 
     /// Mark an inbound shard as received (data has arrived and been verified).
     ///
-    /// Marks the first non-completed entry for this shard as completed.
-    /// The entry is retained until `cleanup_completed()` removes it.
+    /// Marks the first non-completed entry for this shard as completed. The entry
+    /// is retained until `cleanup_completed()` removes it.
+    ///
+    /// This SOURCE-LESS variant is only reached by a completion that carries no
+    /// `from_node` (a legacy / no-source frame). A REVERSE-HEAL completion always
+    /// carries its source and routes through
+    /// [`Self::mark_inbound_complete_from_source`], so a source-less completion is
+    /// never a heal. Prefer a NON-`heal_pending` entry here so that if a future
+    /// path ever co-registered a forward inbound AND a heal fence for one shard,
+    /// this source-less completion cannot clear the heal fence (whose completeness
+    /// it did not prove). Fall back to any non-completed entry only when no
+    /// non-heal candidate exists, preserving the prior behaviour for the common
+    /// single-entry case.
     pub fn mark_inbound_complete(&mut self, shard: u16) {
-        if let Some(m) = self
+        let target = self
             .inbound_migrations
-            .iter_mut()
-            .find(|m| m.shard == shard && !m.completed)
-        {
+            .iter()
+            .position(|m| m.shard == shard && !m.completed && !m.heal_pending)
+            .or_else(|| {
+                self.inbound_migrations
+                    .iter()
+                    .position(|m| m.shard == shard && !m.completed)
+            });
+        if let Some(idx) = target {
+            let m = &mut self.inbound_migrations[idx];
             m.completed = true;
             // P0 — completion proves the shard: drop the reverse-heal fence marker.
             m.heal_pending = false;
@@ -2177,6 +2218,72 @@ mod tests {
 
         mgr.mark_inbound_complete(42);
         assert!(!mgr.has_pending_inbound(42));
+    }
+
+    #[test]
+    fn has_pending_heal_from_source_discriminates_heal_from_forward() {
+        let mut mgr = MigrationManager::new();
+        let source = NodeId(2);
+
+        // A plain forward inbound is NOT a heal.
+        assert!(mgr.register_inbound_source(10, source));
+        assert!(
+            !mgr.has_pending_heal_from_source(10, source),
+            "a forward inbound entry (heal_pending clear) is not a heal",
+        );
+
+        // A registered heal source IS a heal for its (shard, source).
+        assert!(mgr.register_heal_source(11, source));
+        assert!(mgr.has_pending_heal_from_source(11, source));
+        // Wrong source does not match.
+        assert!(!mgr.has_pending_heal_from_source(11, NodeId(9)));
+        // Wrong shard does not match.
+        assert!(!mgr.has_pending_heal_from_source(12, source));
+
+        // The no-source FAIL-CLOSED fence (NodeId(0) sentinel) matches any source
+        // (mirrors mark_inbound_complete_from_source's sentinel fallback).
+        assert!(mgr.mark_heal_fence_active(13));
+        assert!(mgr.has_pending_heal_from_source(13, NodeId(42)));
+
+        // Once completed, the heal no longer matches.
+        mgr.mark_inbound_complete_from_source(11, source);
+        assert!(
+            !mgr.has_pending_heal_from_source(11, source),
+            "a completed heal entry is no longer pending",
+        );
+    }
+
+    #[test]
+    fn mark_inbound_complete_source_less_prefers_non_heal_entry() {
+        // A shard with BOTH a forward inbound (no source, heal_pending clear) and a
+        // heal fence: a SOURCE-LESS completion must complete the forward entry and
+        // leave the heal fence UP (it did not prove the heal's completeness).
+        let mut mgr = MigrationManager::new();
+        let shard = 20u16;
+        assert!(mgr.mark_inbound_active(shard)); // forward inbound, NodeId(0), no heal
+        assert!(mgr.register_heal_source(shard, NodeId(3))); // heal fence
+        assert_eq!(mgr.inbound_count(), 2);
+        assert!(mgr.has_pending_heal_from_source(shard, NodeId(3)));
+
+        mgr.mark_inbound_complete(shard);
+
+        // The heal fence must survive — the source-less completion cleared the
+        // forward entry, not the heal.
+        assert!(
+            mgr.has_pending_heal_from_source(shard, NodeId(3)),
+            "source-less completion must not clear the heal fence",
+        );
+        assert_eq!(mgr.inbound_count(), 1, "only the forward entry completed");
+        assert!(
+            mgr.has_pending_inbound(shard),
+            "the shard stays fenced while the heal is pending",
+        );
+
+        // A second source-less completion now (only the heal remains) does
+        // complete it — the fallback path.
+        mgr.mark_inbound_complete(shard);
+        assert!(!mgr.has_pending_heal_from_source(shard, NodeId(3)));
+        assert!(!mgr.has_pending_inbound(shard));
     }
 
     #[test]
