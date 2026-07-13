@@ -314,7 +314,12 @@ pub fn recover(
         }
         match replay_entry(device, index, &mut offset_owners, entry) {
             ReplayResult::Applied => stats.entries_replayed += 1,
-            ReplayResult::Skipped => stats.entries_skipped += 1,
+            // A missing-create-bytes drop is a benign buffered-tail skip here;
+            // the G3 reverse-heal signal is only surfaced by the multi-store
+            // boot path (`recover_all_multi_store`), which the server uses.
+            ReplayResult::Skipped | ReplayResult::SkippedMissingCreateBytes => {
+                stats.entries_skipped += 1
+            }
             ReplayResult::Failed(cause) => {
                 stats.record_failure(cause);
                 // F-G4-007: stop on first non-tolerable failure so
@@ -584,14 +589,24 @@ pub fn recover_all_with_allocator_collecting_pending_conflicts_progress(
 }
 
 /// The success payload of [`recover_all_multi_store`]: `(stats,
-/// pending_conflicting_children, pending_deleted_children, touched_keys)`. Named
-/// so the 4-tuple stays under clippy's `type_complexity` bar (FU#7 Option B
-/// added the trailing `touched_keys` set).
+/// pending_conflicting_children, pending_deleted_children, touched_keys,
+/// resync_create_keys)`. Named so the 5-tuple stays under clippy's
+/// `type_complexity` bar (FU#7 Option B added `touched_keys`; reverse-heal G3
+/// added the trailing `resync_create_keys`).
+///
+/// `resync_create_keys` (finding G3): keys of co-located `CreateV2` entries whose
+/// record bytes were not durable on the buffered tail (a benign `Skipped` drop).
+/// The server boot path folds them into the reverse-heal `stale_suspect_shards`
+/// set — under active replication (RF>1) with reverse-heal enabled — so the lost
+/// create is pulled from a quorum-current replica rather than silently vanishing.
+/// Empty on the RF=1 / single-device path (the boot layer gates on RF and the
+/// reverse-heal enable, not this recovery layer).
 pub type MultiStoreRecoveryOutcome = (
     RecoveryStats,
     Vec<PendingAppendConflictingChild>,
     Vec<PendingAppendDeletedChild>,
     std::collections::HashSet<TxKey>,
+    Vec<TxKey>,
 );
 
 /// Multi-store recovery: replay each store's OWN redo log against that store.
@@ -668,6 +683,13 @@ pub fn recover_all_multi_store(
     let mut total = RecoveryStats::default();
     let mut pending_cc = Vec::new();
     let mut pending_dc = Vec::new();
+    // Reverse-heal finding G3: keys of co-located `CreateV2` entries whose record
+    // bytes were NOT durable on the buffered tail (a benign `Skipped` drop today).
+    // Surfaced to the boot layer so that — under active replication (RF>1) with
+    // reverse-heal enabled — the create's shard is marked stale-suspect and the
+    // lost create is pulled from a quorum-current replica instead of silently
+    // vanishing. Empty on the RF=1 / single-device path (the boot layer gates).
+    let mut resync_creates: Vec<TxKey> = Vec::new();
 
     // GLOBAL-SEQUENCE-ORDER REPLAY (single-threaded). Per-store PARALLEL replay
     // is unsound: record placement is round-robin (`place_new_record`), so a
@@ -723,6 +745,16 @@ pub fn recover_all_multi_store(
         match outcome {
             ReplayResult::Applied => total.entries_replayed += 1,
             ReplayResult::Skipped => total.entries_skipped += 1,
+            // G3: a co-located `CreateV2` whose bytes were lost on the buffered
+            // tail — accounted as a skip (benign drop) AND recorded so the boot
+            // layer can reverse-heal it under RF>1. `tx_key()` is `Some` for
+            // every `CreateV2` (the only op that returns this variant).
+            ReplayResult::SkippedMissingCreateBytes => {
+                total.entries_skipped += 1;
+                if let Some(key) = entry.op.tx_key() {
+                    resync_creates.push(*key);
+                }
+            }
             ReplayResult::Failed(cause) => total.record_failure(cause),
         }
         // F-G4-007: stop on the first non-tolerable failure so later entries
@@ -814,7 +846,7 @@ pub fn recover_all_multi_store(
     // ignores it. When `!defer_secondary_reconcile` it was already consumed by
     // the in-line `reconcile_secondary_indexes_for_keys_multi` above; returning
     // it as well is harmless (a clone-free move of a set no later code reads).
-    Ok((total, pending_cc, pending_dc, touched_keys))
+    Ok((total, pending_cc, pending_dc, touched_keys, resync_creates))
 }
 
 // Each argument is a distinct recovery input (device, the two index
@@ -1125,6 +1157,7 @@ fn recover_entries_with_allocator_collecting_pending_conflicts(
             outcome,
             ReplayResult::Applied
                 | ReplayResult::Skipped
+                | ReplayResult::SkippedMissingCreateBytes
                 | ReplayResult::Failed(ReplayCause::MissingPrimary)
         );
         // F-G4-007: capture cause BEFORE we move `outcome` into the
@@ -1135,7 +1168,11 @@ fn recover_entries_with_allocator_collecting_pending_conflicts(
         );
         match outcome {
             ReplayResult::Applied => stats.entries_replayed += 1,
-            ReplayResult::Skipped => stats.entries_skipped += 1,
+            // This single-store entry point does not surface the G3 reverse-heal
+            // signal (only the multi-store boot path does); count as a skip.
+            ReplayResult::Skipped | ReplayResult::SkippedMissingCreateBytes => {
+                stats.entries_skipped += 1
+            }
             ReplayResult::Failed(cause) => stats.record_failure(cause),
         }
         if progress_safe {
@@ -1460,6 +1497,18 @@ fn replay_secondary_dah(
 /// - `Skipped`: the entry was idempotent against current state, or
 ///   pointed to a record that was concurrently deleted between the
 ///   redo append and recovery (a benign, non-fatal condition).
+/// - `SkippedMissingCreateBytes`: a co-located index-only `CreateV2`
+///   ([`replay_create_v2`]) whose record bytes were NOT durable on the
+///   buffered tail (unreadable metadata, or a `tx_id`/`utxo_count`
+///   mismatch that proves the data write never landed). Accounted exactly
+///   like `Skipped` for the startup tolerance policy (a benign buffered-tail
+///   drop, never fatal), but DISTINGUISHED from it so the boot layer can — under
+///   active replication (RF>1) with reverse-heal enabled — mark the create's
+///   shard STALE-SUSPECT (finding G3) and pull the lost create back from a
+///   quorum-current replica, instead of silently dropping an acked create the
+///   replica still holds. RF=1 / single-device has no replica to heal from, so
+///   the boot layer treats it as a plain drop. The distinction is inert unless
+///   the boot layer acts on it.
 /// - `Failed(cause)`: replay could not proceed; `cause` carries the
 ///   classification used by the startup tolerance policy. See
 ///   [`ReplayCause`] for the per-cause semantics.
@@ -1467,6 +1516,7 @@ fn replay_secondary_dah(
 enum ReplayResult {
     Applied,
     Skipped,
+    SkippedMissingCreateBytes,
     Failed(ReplayCause),
 }
 
@@ -2359,7 +2409,10 @@ fn replay_delete(
     if record_offset != 0 && record_size != 0 {
         match write_zeroed_metadata_header(device, record_offset, record_size) {
             ReplayResult::Applied => applied = true,
-            ReplayResult::Skipped => {}
+            // `write_zeroed_metadata_header` only ever yields Applied/Skipped/
+            // Failed — the create-only `SkippedMissingCreateBytes` cannot arise
+            // here; treat any skip as the no-op it is.
+            ReplayResult::Skipped | ReplayResult::SkippedMissingCreateBytes => {}
             failed @ ReplayResult::Failed(_) => return failed,
         }
     }
@@ -2528,18 +2581,22 @@ fn replay_create_v2(
 
     // Read the record's metadata back from the device. Under buffered durability
     // a missing/torn data write means this create's bytes were lost on the same
-    // tail this redo entry's flush did NOT cover → drop it (Skipped).
+    // tail this redo entry's flush did NOT cover → drop it. Distinguished from a
+    // plain `Skipped` as `SkippedMissingCreateBytes` (finding G3): under RF>1 a
+    // quorum-current replica may still hold this acked create, so the boot layer
+    // can mark the shard stale-suspect and reverse-heal it rather than silently
+    // dropping it. Still a benign, non-fatal buffered-tail drop for tolerance.
     let meta = match crate::io::read_metadata(device, record_offset) {
         Ok(m) => m,
-        Err(_) => return ReplayResult::Skipped,
+        Err(_) => return ReplayResult::SkippedMissingCreateBytes,
     };
 
     // The on-device record must be THIS create's: a mismatched tx_id means the
     // data write never landed and the offset still holds an older (since-freed,
     // reused) record's bytes; a mismatched utxo_count means a partial/torn
-    // write. Either way the create did not durably land → Skipped.
+    // write. Either way the create did not durably land → drop it (G3 signal).
     if { meta.tx_id } != tx_key.txid || { meta.utxo_count } != utxo_count {
-        return ReplayResult::Skipped;
+        return ReplayResult::SkippedMissingCreateBytes;
     }
 
     let entry = TxIndexEntry {
@@ -5187,7 +5244,7 @@ mod tests {
         let devices = [dev0.clone(), dev1.clone()];
         let mut allocators = [alloc0, alloc1];
         let mut redo_logs = [redo0, redo1];
-        let (stats, _, _, _) = recover_all_multi_store(
+        let (stats, _, _, _, _) = recover_all_multi_store(
             &devices,
             &mut allocators,
             &mut redo_logs,
@@ -5298,7 +5355,7 @@ mod tests {
         let devices = [dev0.clone(), dev1.clone()];
         let mut allocators = [alloc0, alloc1];
         let mut redo_logs = [redo0, redo1];
-        let (stats, _, _, _) = recover_all_multi_store(
+        let (stats, _, _, _, _) = recover_all_multi_store(
             &devices,
             &mut allocators,
             &mut redo_logs,
@@ -5319,6 +5376,181 @@ mod tests {
         assert_eq!(recovered.record_offset, record_offset);
         let m = io::read_metadata(&*dev1, recovered.record_offset).unwrap();
         assert_eq!({ m.utxo_count }, utxo_count);
+    }
+
+    /// Reverse-heal G3 (recovery-layer signal). A co-located `CreateV2` whose
+    /// record bytes were NOT durable on the buffered tail (the offset is
+    /// allocated so the range gate passes, but no record was written there) is a
+    /// benign `Skipped` drop today — the acked create silently vanishes. This
+    /// test pins the NEW behaviour: recovery still DROPS the create (record
+    /// absent from the index — LOST) but SURFACES its key in the trailing
+    /// `resync_create_keys` of [`recover_all_multi_store`], so the server boot
+    /// path can (under RF>1 + reverse-heal) mark the shard stale-suspect and pull
+    /// it back. Pre-fix there was no such signal; the record was dropped with no
+    /// trace. Counterpart boot-gate + heal-wiring tests live in
+    /// `cluster::coordinator` (`colocated_createv2_*`).
+    #[test]
+    fn colocated_createv2_missing_bytes_flags_resync_create_not_silent_drop() {
+        let dev0: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let redo_dev0 = Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
+        let mut alloc0: crate::allocator::BoxedAllocator =
+            Box::new(SlotAllocator::new(dev0.clone()).unwrap());
+        alloc0.set_redo_device_id(0);
+        let index = ShardedIndex::from_single(PrimaryBackend::new_in_memory(1000).unwrap());
+
+        // A co-located store: the CreateV2's data write shares the buffered tail
+        // with its redo flush. Model the lost-tail crash by ALLOCATING the record
+        // offset (so the recovery `is_allocated_range` gate passes) but NEVER
+        // writing the record bytes — `read_metadata` at that offset returns a
+        // zeroed header whose tx_id does not match the create's key.
+        let utxo_count: u32 = 2;
+        let txid = {
+            let mut t = [0u8; 32];
+            t[0] = 0x63;
+            t[31] = 0x63;
+            t
+        };
+        let key = TxKey { txid };
+        let base = TxMetadata::record_size_for(utxo_count);
+        let record_offset = alloc0.allocate(base).unwrap();
+        // Deliberately DO NOT write the record — the bytes were lost on the tail.
+
+        let mut redo0 = RedoLog::open(redo_dev0.clone(), 0, 1024 * 1024).unwrap();
+        let shared = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
+            RedoLog::shared_sequence_floor(&[&redo0]),
+        ));
+        redo0.attach_shared_sequence(shared.clone());
+        redo0
+            .append_and_flush(RedoOp::CreateV2 {
+                tx_key: key,
+                device_id: 0,
+                record_offset,
+                utxo_count,
+                is_conflicting: false,
+                parent_txids: Vec::new(),
+            })
+            .unwrap();
+
+        let mut dah = DahBackend::new_in_memory();
+        let devices = [dev0.clone()];
+        let mut allocators = [alloc0];
+        let mut redo_logs = [redo0];
+        let (stats, _, _, _, resync_creates) = recover_all_multi_store(
+            &devices,
+            &mut allocators,
+            &mut redo_logs,
+            &index,
+            &mut dah,
+            true,
+            false,
+        )
+        .unwrap();
+
+        // The create did NOT apply and is NOT a hard failure — it is dropped as a
+        // benign buffered-tail skip, exactly as before (no regression to the
+        // tolerance policy).
+        assert_eq!(stats.entries_replayed, 0, "the create must not apply");
+        assert_eq!(stats.entries_skipped, 1, "the lost create is a benign skip");
+        assert_eq!(stats.entries_failed, 0, "a lost buffered tail is not fatal");
+
+        // The record is LOST locally (silent drop today) …
+        assert!(
+            index.lookup(&key).is_none(),
+            "the create's bytes were lost, so no index entry may point at them",
+        );
+        // … but recovery now FLAGS it for reverse-heal instead of vanishing.
+        assert_eq!(
+            resync_creates,
+            vec![key],
+            "the dropped co-located CreateV2's key must be surfaced for reverse-heal",
+        );
+    }
+
+    /// Reverse-heal G3 — the idempotent already-indexed `CreateV2` skip (a later
+    /// checkpoint already covered the record) must NOT be flagged for reverse
+    /// heal: it is not a lost create, so surfacing it would falsely mark a
+    /// healthy shard stale-suspect. Only the missing-bytes skip is a G3 signal.
+    #[test]
+    fn colocated_createv2_already_indexed_skip_is_not_flagged_for_resync() {
+        let dev0: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let redo_dev0 = Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
+        let mut alloc0: crate::allocator::BoxedAllocator =
+            Box::new(SlotAllocator::new(dev0.clone()).unwrap());
+        alloc0.set_redo_device_id(0);
+        let index = ShardedIndex::from_single(PrimaryBackend::new_in_memory(1000).unwrap());
+
+        // Write a REAL, complete record and pre-register it in the index (as a
+        // prior checkpoint would have) so replay hits the idempotent
+        // already-indexed skip, not the missing-bytes path.
+        let utxo_count: u32 = 2;
+        let txid = {
+            let mut t = [0u8; 32];
+            t[0] = 0x64;
+            t
+        };
+        let key = TxKey { txid };
+        let mut meta = TxMetadata::new(utxo_count);
+        meta.tx_id = txid;
+        meta.generation = 1;
+        let base = TxMetadata::record_size_for(utxo_count);
+        meta.record_size = base as u32;
+        let slots: Vec<UtxoSlot> = (0..utxo_count)
+            .map(|_| UtxoSlot::new_unspent([0x64; 32]))
+            .collect();
+        let record_offset = alloc0.allocate(base).unwrap();
+        io::write_full_record(&*dev0, record_offset, &meta, &slots).unwrap();
+        index
+            .register(
+                key,
+                TxIndexEntry {
+                    device_id: 0,
+                    record_offset,
+                    mined_slot: crate::index::mined_index::NO_MINED_SLOT,
+                },
+            )
+            .unwrap();
+
+        let mut redo0 = RedoLog::open(redo_dev0.clone(), 0, 1024 * 1024).unwrap();
+        let shared = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
+            RedoLog::shared_sequence_floor(&[&redo0]),
+        ));
+        redo0.attach_shared_sequence(shared.clone());
+        redo0
+            .append_and_flush(RedoOp::CreateV2 {
+                tx_key: key,
+                device_id: 0,
+                record_offset,
+                utxo_count,
+                is_conflicting: false,
+                parent_txids: Vec::new(),
+            })
+            .unwrap();
+
+        let mut dah = DahBackend::new_in_memory();
+        let devices = [dev0.clone()];
+        let mut allocators = [alloc0];
+        let mut redo_logs = [redo0];
+        let (stats, _, _, _, resync_creates) = recover_all_multi_store(
+            &devices,
+            &mut allocators,
+            &mut redo_logs,
+            &index,
+            &mut dah,
+            true,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(
+            stats.entries_skipped, 1,
+            "already-indexed create is skipped"
+        );
+        assert!(
+            resync_creates.is_empty(),
+            "an idempotent already-indexed skip is NOT a lost create — must not flag",
+        );
     }
 
     /// Multi-store Delete recovery: replaying a `RedoOp::Delete` (with real
@@ -5413,7 +5645,7 @@ mod tests {
         let devices = [dev0.clone(), dev1.clone()];
         let mut allocators = [alloc0, alloc1];
         let mut redo_logs = [redo0, redo1];
-        let (stats, _, _, _) = recover_all_multi_store(
+        let (stats, _, _, _, _) = recover_all_multi_store(
             &devices,
             &mut allocators,
             &mut redo_logs,
@@ -5549,7 +5781,7 @@ mod tests {
             let devices = [dev0.clone(), dev1.clone()];
             let mut allocators = [alloc0, alloc1];
             let mut redo_logs = [redo0, redo1];
-            let (stats, _, _, _) = recover_all_multi_store(
+            let (stats, _, _, _, _) = recover_all_multi_store(
                 &devices,
                 &mut allocators,
                 &mut redo_logs,
@@ -5710,7 +5942,7 @@ mod tests {
         let devices = [dev0.clone(), dev1.clone()];
         let mut allocators = [alloc0, alloc1];
         let mut redo_logs = [redo0, redo1];
-        let (stats, _, _, _) = recover_all_multi_store(
+        let (stats, _, _, _, _) = recover_all_multi_store(
             &devices,
             &mut allocators,
             &mut redo_logs,
@@ -5831,7 +6063,7 @@ mod tests {
         }
 
         let mut dah = DahBackend::new_in_memory();
-        let (stats, _, _, _) = recover_all_multi_store(
+        let (stats, _, _, _, _) = recover_all_multi_store(
             &devices,
             &mut allocators,
             &mut redo_logs,

@@ -5469,6 +5469,41 @@ pub fn select_heal_source(
     best.map(|(node, _)| node)
 }
 
+/// Reverse-heal G3 — map a batch of co-located `CreateV2` keys that recovery
+/// DROPPED (their record bytes were lost on the buffered tail; see
+/// [`crate::recovery::MultiStoreRecoveryOutcome`]'s `resync_create_keys`) to the
+/// set of shards to mark STALE-SUSPECT for the reverse-pull.
+///
+/// Returns EMPTY unless BOTH gates hold:
+/// - `replication_factor > 1` — a single-device / RF=1 node has NO replica to
+///   pull the lost create from, so the skip is unrecoverable and must stay a
+///   logged drop (marking it stale-suspect would be a false positive that fences
+///   a shard forever with no source).
+/// - `reverse_heal_enabled` — without the reverse-heal transport (and its
+///   delete-safe tombstone gate) enabled, there is no pull to feed, so the mark
+///   would be inert; the brief gates the mark on the enable, matching Phase-2c.
+///
+/// Otherwise each key is mapped to its cluster shard via
+/// [`ShardTable::shard_for_key`] (the same hash the client and router use), and
+/// the result is sorted + deduped so the caller can union it into the existing
+/// `stale_suspect_shards` set without double-counting.
+pub fn colocated_create_stale_shards(
+    resync_create_keys: &[TxKey],
+    replication_factor: u8,
+    reverse_heal_enabled: bool,
+) -> Vec<u16> {
+    if replication_factor <= 1 || !reverse_heal_enabled || resync_create_keys.is_empty() {
+        return Vec::new();
+    }
+    let mut shards: Vec<u16> = resync_create_keys
+        .iter()
+        .map(ShardTable::shard_for_key)
+        .collect();
+    shards.sort_unstable();
+    shards.dedup();
+    shards
+}
+
 /// Reverse-heal — choose a heal SOURCE per stale shard against `table` +
 /// `partition_view`. The pure core shared by the boot path
 /// ([`RunningCluster::select_reverse_heal_sources`]) and the Phase-3b runtime
@@ -11074,6 +11109,38 @@ impl RunningCluster {
     /// covers records the target still holds; it does NOT cover a record the
     /// target authoritatively DELETED (a re-shipped create would resurrect it).
     /// Closing that needs a record-level tombstone and is tracked separately.
+    ///
+    /// # C5 Phase-4 superset-reconcile — DEFERRED optimization (no correctness gap)
+    ///
+    /// A Phase-4 optimization was scoped to run [`confirm_target_holds_superset`]
+    /// here FIRST: if the target already absorbed every write, complete the task
+    /// cleanly with NO baseline re-ship; else heal only the deficit. It is
+    /// deliberately NOT implemented — the SAFE reconcile above already holds (no
+    /// data loss, no clobber), so this is purely a bandwidth optimization, and
+    /// building it is disproportionate to that gain:
+    ///
+    /// 1. **The probe cannot distinguish "deficit" from "inconclusive".**
+    ///    [`confirm_target_holds_superset`] returns `bool` — "any error,
+    ///    rejection, or connection failure returns `false`". The scoped
+    ///    three-way branch (superset→complete / deficit→heal-deficit /
+    ///    inconclusive→safe-fallback) is therefore inexpressible without widening
+    ///    the probe to a three-state result AND teaching the receiver's
+    ///    superset-check to report a definitive "I lack records" vs a transient
+    ///    reject — a return-type + wire-protocol change rippling to its two live
+    ///    call sites in the migration worker.
+    /// 2. **Boot-latency regression on the critical synchronous path.** This runs
+    ///    synchronously at boot (`bin/server.rs`) BEFORE peers are reliably up:
+    ///    the probe is a blocking TCP round-trip with a 6-attempt retry ladder
+    ///    (each `connect_timeout` up to 3 s + inter-attempt sleeps), so an
+    ///    unreachable target costs up to ~19 s PER restored task. On the exact
+    ///    cluster-wide restart that produced the interrupted-outbound state the
+    ///    target is typically DOWN, so every probe would exhaust to `false` (fall
+    ///    back to `mark_failed` anyway) while stalling boot.
+    /// 3. **"Heal only the deficit" is perf-only over the safe full re-ship.**
+    ///    The re-plan's full baseline re-ship already heals the deficit
+    ///    correctly — generation-idempotency at the receiver drops the no-op
+    ///    records — so delta-bounding saves bandwidth, not correctness (the
+    ///    design's own "full baseline first, manifest-diff second" note).
     pub fn restore_outbound_state(&self) {
         if let Some(ref path) = self.outbound_state_path {
             let data = crate::cluster::migration::load_outbound_state(path);
@@ -17643,6 +17710,124 @@ mod tests {
         assert!(
             cluster.stale_suspect_shards().is_empty(),
             "clearing drops all suspects",
+        );
+    }
+
+    /// Reverse-heal G3 (gate + heal wiring). A co-located `CreateV2` whose record
+    /// bytes were lost on the buffered tail is DROPPED by recovery
+    /// (`colocated_createv2_missing_bytes_flags_resync_create_not_silent_drop`
+    /// proves the record is LOST + surfaced). Under active replication (RF>1)
+    /// with reverse-heal enabled, [`colocated_create_stale_shards`] maps the
+    /// dropped create's key to its shard, which then drives the SAME Phase-2c
+    /// stale-suspect → source-select → reverse-pull machinery: the shard is
+    /// queued for a pull from the committed replica that still holds the create,
+    /// and is fenced (`is_master` = `Transitioning`) so the node never serves it
+    /// stale until the create is healed back.
+    #[test]
+    fn colocated_createv2_skipped_under_rf_marks_shard_stale_and_heals() {
+        // 2-node RF=2 cluster; pick a shard self (NodeId(1)) masters with
+        // NodeId(2) as its committed replica (the holder to heal from).
+        let members = vec![NodeId(1), NodeId(2)];
+        let table = ShardTable::compute_with_epoch(&members, 2, 5, 1);
+        let shard = (0..NUM_SHARDS as u16)
+            .find(|&s| {
+                let a = table.target_assignment(s);
+                a.master == NodeId(1) && a.replicas.contains(&NodeId(2))
+            })
+            .expect("some shard mastered by NodeId(1) with NodeId(2) replica");
+        let cluster = new_test_running_cluster(
+            NodeId(1),
+            table,
+            &[
+                (NodeId(1), "127.0.0.1:4971".parse().unwrap()),
+                (NodeId(2), "127.0.0.1:4972".parse().unwrap()),
+            ],
+            &members,
+            &[],
+            &[],
+            &[],
+            2,
+        );
+
+        // A create for a key on THIS shard was dropped by recovery (bytes lost on
+        // the buffered tail). G3's boot gate maps it to its shard under RF>1 +
+        // reverse-heal.
+        let key = key_for_shard(shard);
+        assert_eq!(
+            ShardTable::shard_for_key(&key),
+            shard,
+            "precondition: the key hashes to the chosen shard",
+        );
+        let stale = colocated_create_stale_shards(std::slice::from_ref(&key), 2, true);
+        assert_eq!(
+            stale,
+            vec![shard],
+            "RF>1 + reverse-heal: the lost create's shard is marked stale-suspect",
+        );
+
+        // The silent-drop bug: pre-heal the node would serve the shard as
+        // authority WITHOUT the lost create.
+        assert!(
+            matches!(cluster.is_master(&key), MasterQueryResult::Yes),
+            "precondition: the node masters the shard (would serve it stale)",
+        );
+
+        // Drive the SAME Phase-2c boot machinery the stale set feeds.
+        cluster.record_stale_suspect_shards(stale.clone());
+        let empty_view = std::collections::HashMap::new();
+        let sources = cluster.select_reverse_heal_sources(&stale, &empty_view);
+        assert_eq!(
+            sources,
+            vec![(shard, NodeId(2))],
+            "heal source = the committed replica that still holds the acked create",
+        );
+        assert_eq!(
+            cluster.begin_reverse_heal(&sources),
+            1,
+            "the lost create's shard is queued for a reverse-pull from the replica",
+        );
+
+        // No-serve-before-heal: the shard is now fenced, so `is_master` answers
+        // Transitioning (client-invisible / retryable) — the node never serves it
+        // stale, and the create is pulled from the replica before it serves.
+        assert!(
+            matches!(
+                cluster.is_master(&key),
+                MasterQueryResult::Transitioning { .. }
+            ),
+            "the shard must be fenced until its lost create is healed from the replica",
+        );
+    }
+
+    /// Reverse-heal G3 — single-device / RF=1 (or reverse-heal disabled) has NO
+    /// replica to pull a lost create from, so a co-located `CreateV2` dropped on
+    /// the buffered tail stays an UNRECOVERABLE logged drop and must NOT be marked
+    /// stale-suspect (a false mark would fence the shard forever with no source).
+    /// The gate opens only with BOTH RF>1 and reverse-heal enabled.
+    #[test]
+    fn colocated_createv2_skip_single_device_still_drops_and_logs() {
+        let key = key_for_shard(3);
+
+        // RF=1 / single-device: no replica → no stale-suspect (unchanged drop).
+        assert!(
+            colocated_create_stale_shards(std::slice::from_ref(&key), 1, true).is_empty(),
+            "RF=1 has no replica to heal from → no false stale-suspect",
+        );
+        // Reverse-heal disabled: no transport to feed → the mark would be inert.
+        assert!(
+            colocated_create_stale_shards(std::slice::from_ref(&key), 2, false).is_empty(),
+            "reverse-heal disabled → no stale-suspect mark",
+        );
+        // An empty batch never marks anything.
+        assert!(
+            colocated_create_stale_shards(&[], 2, true).is_empty(),
+            "no dropped creates → nothing to mark",
+        );
+        // Both gates open (RF>1 AND reverse-heal) → the shard IS flagged.
+        assert_eq!(
+            colocated_create_stale_shards(std::slice::from_ref(&key), 2, true),
+            vec![ShardTable::shard_for_key(&key)],
+            "RF>1 + reverse-heal enabled → the lost create's shard is flagged",
         );
     }
 
