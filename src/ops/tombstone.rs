@@ -402,15 +402,30 @@ impl TombstoneLog {
 
     /// Drop every tombstone past its retention horizon
     /// (`deletion_height + retention_blocks <= last_durable_height`) from the
-    /// in-RAM index. Flags the durable file for compaction if anything was
-    /// dropped. Returns the number removed.
-    pub fn gc(&self, last_durable_height: u32) -> usize {
+    /// in-RAM index, EXCEPT those `is_protected` reports as guarded by an
+    /// in-flight reverse-heal (Phase 2d). Flags the durable file for compaction
+    /// if anything was dropped. Returns the number removed.
+    ///
+    /// # The heal-vs-GC race (Phase 2d)
+    ///
+    /// A reverse-heal that spans a checkpoint must not let the checkpoint GC a
+    /// tombstone the heal still needs to gate an incoming record (which would
+    /// open a resurrection window mid-heal). `is_protected(key)` returns `true`
+    /// while a heal references the key's shard; a past-retention tombstone whose
+    /// shard is protected is RETAINED (so RULE-DS — [`Self::blocks_heal_apply`]
+    /// — can still drop a resurrecting image), and re-GC'd on the next
+    /// checkpoint once the heal completes and the protection lifts. Pass
+    /// `|_| false` when no heal can be in flight (the retention bound is then the
+    /// sole horizon). Protection only DEFERS GC; it never retains a tombstone
+    /// past the point the shard stops being referenced, so it cannot leak.
+    pub fn gc(&self, last_durable_height: u32, is_protected: impl Fn(&TxKey) -> bool) -> usize {
         let retention = self.retention_blocks;
         let mut dropped = 0usize;
         for shard in &self.shards {
             let mut g = shard.write();
             let before = g.len();
-            g.retain(|_, v| !expired(v.height, retention, last_durable_height));
+            // Drop only when BOTH past retention AND not heal-protected.
+            g.retain(|k, v| !expired(v.height, retention, last_durable_height) || is_protected(k));
             dropped += before - g.len();
         }
         if dropped > 0 {
@@ -464,16 +479,21 @@ impl TombstoneLog {
     }
 
     /// Make the tombstone set durable at a checkpoint: GC past the retention
-    /// horizon, then either COMPACT (atomic rewrite from the in-RAM index, when
-    /// GC / reconcile dropped entries) or APPEND the buffered tail. Fsyncs
-    /// before returning.
+    /// horizon (retaining any tombstone `is_protected` guards for an in-flight
+    /// reverse-heal, Phase 2d — see [`Self::gc`]), then either COMPACT (atomic
+    /// rewrite from the in-RAM index, when GC / reconcile dropped entries) or
+    /// APPEND the buffered tail. Fsyncs before returning.
     ///
     /// # Errors
     ///
     /// Returns a [`std::io::Error`] on any filesystem failure; on an append
     /// failure the buffered tail is restored so the next checkpoint retries it.
-    pub fn persist(&self, last_durable_height: u32) -> std::io::Result<()> {
-        self.gc(last_durable_height);
+    pub fn persist(
+        &self,
+        last_durable_height: u32,
+        is_protected: impl Fn(&TxKey) -> bool,
+    ) -> std::io::Result<()> {
+        self.gc(last_durable_height, is_protected);
 
         let needs_compaction = { self.file.lock().needs_compaction };
         if needs_compaction {
@@ -659,11 +679,65 @@ mod tests {
         log.record(&tk(1), 1, 100, TombstoneCause::Dah);
         log.record(&tk(2), 1, 200, TombstoneCause::Dah);
         // floor 109: tk(1) at 100 => 100+10=110 > 109 retained; tk(2) retained.
-        assert_eq!(log.gc(109), 0);
+        assert_eq!(log.gc(109, |_| false), 0);
         // floor 110: tk(1) expires (100+10<=110), tk(2) retained (200+10>110).
-        assert_eq!(log.gc(110), 1);
+        assert_eq!(log.gc(110, |_| false), 1);
         assert!(log.lookup(&tk(1)).is_none());
         assert!(log.lookup(&tk(2)).is_some());
+    }
+
+    /// Phase 2d — the retention/GC-vs-heal race guard at the log level: a
+    /// past-retention tombstone whose shard `is_protected` reports as guarded by
+    /// an in-flight reverse-heal is RETAINED (so RULE-DS can still gate an
+    /// incoming image); an unprotected past-retention tombstone is dropped in
+    /// the same pass. Once protection lifts, the next GC drops it normally — the
+    /// guard only DEFERS, it never leaks.
+    #[test]
+    fn gc_retains_expired_tombstone_while_shard_protected() {
+        let log = TombstoneLog::new(PathBuf::from("/nonexistent/x.tombstones"), 0, 4, 10);
+        let healed = tk(1); // protected by an in-flight heal
+        let unrelated = tk(2); // no heal references its shard
+        log.record(&healed, 7, 100, TombstoneCause::Dah);
+        log.record(&unrelated, 7, 100, TombstoneCause::Dah);
+
+        // floor 200: BOTH are past retention (100 + 10 <= 200). While `healed`
+        // is protected, only `unrelated` is dropped; `healed` is retained.
+        let protect_healed = |k: &TxKey| *k == healed;
+        assert_eq!(
+            log.gc(200, protect_healed),
+            1,
+            "only the unprotected past-retention tombstone is GC'd mid-heal",
+        );
+        assert!(
+            log.at_or_ahead(&healed, 7),
+            "the protected tombstone is retained so RULE-DS still blocks a \
+             resurrecting heal image at its shard",
+        );
+        assert!(
+            log.lookup(&unrelated).is_none(),
+            "the unrelated past-retention tombstone is GC'd normally mid-heal",
+        );
+
+        // Heal completes → protection lifts → the next GC drops it normally.
+        assert_eq!(
+            log.gc(200, |_| false),
+            1,
+            "once the heal completes the deferred tombstone is GC'd (no leak)",
+        );
+        assert!(log.lookup(&healed).is_none());
+    }
+
+    /// Phase 2d — with NO shard protected (the common no-heal-in-flight case),
+    /// `gc` is byte-for-byte the pre-guard behaviour: every past-retention
+    /// tombstone is dropped, none leaked.
+    #[test]
+    fn gc_unchanged_when_nothing_protected() {
+        let log = TombstoneLog::new(PathBuf::from("/nonexistent/x.tombstones"), 0, 4, 10);
+        log.record(&tk(1), 1, 100, TombstoneCause::Dah);
+        log.record(&tk(2), 1, 100, TombstoneCause::Dah);
+        // Both past retention (100 + 10 <= 200), nothing protected → both drop.
+        assert_eq!(log.gc(200, |_| false), 2);
+        assert!(log.is_empty());
     }
 
     #[test]
@@ -673,7 +747,7 @@ mod tests {
         let log = TombstoneLog::new(path.clone(), 0, 4, 100);
         log.record(&tk(1), 3, 500, TombstoneCause::ClientDelete);
         log.record(&tk(2), 7, 600, TombstoneCause::Dah);
-        log.persist(0).unwrap();
+        log.persist(0, |_| false).unwrap();
 
         let reloaded = TombstoneLog::load(path.clone(), 0, 4, 100).unwrap();
         assert_eq!(reloaded.len(), 2);
@@ -688,11 +762,11 @@ mod tests {
         let log = TombstoneLog::new(path.clone(), 0, 4, 10);
         log.record(&tk(1), 1, 100, TombstoneCause::Dah);
         log.record(&tk(2), 1, 200, TombstoneCause::Dah);
-        log.persist(0).unwrap(); // both durable (append)
+        log.persist(0, |_| false).unwrap(); // both durable (append)
 
         // Advance the floor past tk(1)'s horizon and persist: GC drops tk(1) and
         // the file is COMPACTED, so a fresh reload sees only tk(2).
-        log.persist(110).unwrap();
+        log.persist(110, |_| false).unwrap();
         let reloaded = TombstoneLog::load(path, 0, 4, 10).unwrap();
         assert_eq!(reloaded.len(), 1);
         assert!(reloaded.lookup(&tk(1)).is_none());
@@ -729,19 +803,19 @@ mod tests {
 
         // A first durable entry (append path), then force the COMPACT branch.
         log.record(&tk(1), 1, 500, TombstoneCause::Dah);
-        log.persist(0).unwrap();
+        log.persist(0, |_| false).unwrap();
         log.file.lock().needs_compaction = true;
 
         // Arm the in-window injection: this `record(tk(2))` runs after the atomic
         // rewrite (which captured only tk(1)) but before the `pending` reconcile.
         *log.inject_in_compaction_window.lock() =
             Some((tk(2), 9, 600, TombstoneCause::ClientDelete));
-        log.persist(0).unwrap();
+        log.persist(0, |_| false).unwrap();
 
         // Next checkpoint: append whatever stayed buffered in `pending`. With
         // `retain` tk(2) is still buffered and reaches disk here; with the old
         // `clear()` it was dropped and only the (now discarded) shard map held it.
-        log.persist(0).unwrap();
+        log.persist(0, |_| false).unwrap();
 
         // Reload from the DURABLE FILE only (no in-RAM carry-over): tk(2) must be
         // present, proving it survived a crash-equivalent reload.
@@ -777,7 +851,7 @@ mod tests {
         );
 
         // Compaction after a clear must not resurrect the tombstone in the file.
-        log.persist(0).unwrap();
+        log.persist(0, |_| false).unwrap();
         let reloaded = TombstoneLog::load(path, 0, 4, 100).unwrap();
         assert!(
             reloaded.lookup(&tk(1)).is_none(),

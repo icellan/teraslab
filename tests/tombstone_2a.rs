@@ -21,6 +21,8 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 
 use teraslab::allocator::SlotAllocator;
+use teraslab::cluster::migration::AtomicShardBitmap;
+use teraslab::cluster::shards::ShardTable;
 use teraslab::device::{BlockDevice, MemoryDevice};
 use teraslab::index::{DahBackend, PrimaryBackend, ShardedIndex, TxKey};
 use teraslab::locks::StripedLocks;
@@ -567,4 +569,150 @@ fn tombstone_gc_expires_past_retention_horizon() {
     );
     // Sanity: the cause enum is exercised end-to-end.
     assert_eq!(TombstoneCause::ClientDelete as u8, 1);
+}
+
+// ---------------------------------------------------------------------------
+// Reverse-heal Phase 2d — retention / GC-vs-heal race hardening.
+//
+// A reverse-heal spanning a checkpoint must NOT let the checkpoint GC a
+// tombstone the heal still needs to gate an incoming record (which would open a
+// resurrection window mid-heal). The engine's checkpoint retention GC consults a
+// shared inbound-fence bitmap (`Engine::set_tombstone_gc_guard`): while a heal
+// (or forward migration) references a key's CLUSTER shard, that key's tombstone
+// is RETAINED past its retention horizon so RULE-DS still blocks a resurrecting
+// image; once the heal completes and the fence clears, the next checkpoint GC's
+// it normally. These tests drive the REAL delete + retention-GC pipeline with a
+// guard bitmap standing in for the cluster's inbound fence.
+// ---------------------------------------------------------------------------
+
+/// A tombstone that WOULD be GC'd by retention
+/// (`deletion_height + RETENTION_BLOCKS <= last_durable_height`) is RETAINED
+/// while a heal references its shard, and is GC'd normally once the heal
+/// completes. Pre-fix (guard not consulted) it is GC'd mid-heal — the
+/// resurrection window this phase closes.
+#[test]
+fn tombstone_retained_across_inflight_heal() {
+    let h = Harness::new_with_tombstones();
+    // The cluster inbound-fence bitmap stand-in; a set bit == "shard S has an
+    // in-flight reverse-heal", exactly the handle the boot path shares via
+    // `RunningCluster::inbound_fence_bitmap()`.
+    let guard = Arc::new(AtomicShardBitmap::new());
+    h.engine.set_tombstone_gc_guard(guard.clone());
+
+    // Delete `k` at height H, stamping a tombstone at deletion_height = H.
+    let base_h = 100u32;
+    h.engine.observe_block_height(base_h);
+    let k = h.seed_record(11, 2);
+    h.engine
+        .delete(&DeleteRequest {
+            tx_key: k,
+            due_guard: None,
+        })
+        .expect("delete must succeed");
+    let (frozen_gen, height) = h
+        .engine
+        .tombstone_lookup(&k)
+        .expect("tombstone present at delete");
+    assert_eq!(
+        height, base_h,
+        "deletion_height must be the observed height"
+    );
+
+    // A reverse-heal begins for `k`'s CLUSTER shard: raise the inbound fence.
+    let shard = ShardTable::shard_for_key(&k);
+    guard.set(shard);
+
+    // Advance strictly PAST the retention horizon and checkpoint. Without the
+    // guard this GC's the tombstone (the pre-fix resurrection window); WITH the
+    // guard the healing shard's tombstone is RETAINED.
+    h.engine.observe_block_height(base_h + TEST_RETENTION);
+    h.engine.persist_tombstones().unwrap();
+
+    assert!(
+        h.engine.tombstone_lookup(&k).is_some(),
+        "a past-retention tombstone must be RETAINED while its shard is being \
+         reverse-healed (else the heal reopens a resurrection window)",
+    );
+    // RULE-DS still fires on the retained tombstone: an incoming heal image at
+    // any generation <= the frozen N is dropped, never resurrected.
+    assert!(
+        h.engine.tombstone_blocks_heal_apply(&k, frozen_gen),
+        "RULE-DS must still block a resurrecting heal image while the tombstone \
+         is retained mid-heal",
+    );
+    assert!(h.engine.tombstone_at_or_ahead(&k, frozen_gen));
+
+    // The heal completes → the inbound fence clears → the next checkpoint GC's
+    // the now-unprotected, past-retention tombstone normally (no permanent leak).
+    guard.clear(shard);
+    h.engine.persist_tombstones().unwrap();
+    assert!(
+        h.engine.tombstone_lookup(&k).is_none(),
+        "once the heal completes the deferred tombstone is GC'd on the next \
+         checkpoint — the guard defers, it never leaks",
+    );
+
+    // The durable log is compacted too: a fresh reload sees no tombstone.
+    let reloaded = TombstoneLog::load(
+        h.tombstone_path.clone(),
+        h.engine.index_seed(),
+        h.engine.index_shard_count(),
+        TEST_RETENTION,
+    )
+    .unwrap();
+    assert!(!reloaded.at_or_ahead(&k, frozen_gen));
+}
+
+/// The guard NEVER leaks tombstones when no heal is in flight: with a guard
+/// attached but no shard fenced, a past-retention tombstone is GC'd exactly as
+/// it is without the guard — normal retention GC is unchanged.
+#[test]
+fn tombstone_gc_unaffected_when_no_heal_inflight() {
+    let h = Harness::new_with_tombstones();
+    let guard = Arc::new(AtomicShardBitmap::new());
+    h.engine.set_tombstone_gc_guard(guard.clone());
+
+    let base_h = 100u32;
+    h.engine.observe_block_height(base_h);
+    let k = h.seed_record(12, 2);
+    h.engine
+        .delete(&DeleteRequest {
+            tx_key: k,
+            due_guard: None,
+        })
+        .expect("delete must succeed");
+    assert!(h.engine.tombstone_lookup(&k).is_some());
+
+    // No shard fenced (no heal in flight). Advance past retention and checkpoint:
+    // the tombstone is GC'd normally — the guard adds no retention when empty.
+    h.engine.observe_block_height(base_h + TEST_RETENTION);
+    h.engine.persist_tombstones().unwrap();
+    assert!(
+        h.engine.tombstone_lookup(&k).is_none(),
+        "with no heal in flight the guard must not retain a past-retention \
+         tombstone — normal GC is unchanged",
+    );
+
+    // A heal on a DIFFERENT shard must not protect this key either (per-shard
+    // scoping). `observe_block_height` is a running max, so use a HIGHER base for
+    // k2 (the first half already advanced the height). Delete k2, fence a shard
+    // guaranteed NOT to be k2's (flip the low bit), and confirm k2's tombstone
+    // still GC's past retention.
+    let base_h2 = base_h + TEST_RETENTION + 100;
+    h.engine.observe_block_height(base_h2);
+    let k2 = h.seed_record(13, 2);
+    h.engine
+        .delete(&DeleteRequest {
+            tx_key: k2,
+            due_guard: None,
+        })
+        .expect("delete must succeed");
+    let unrelated_shard = ShardTable::shard_for_key(&k2) ^ 1; // != k2's shard
+    guard.set(unrelated_shard);
+    h.engine.observe_block_height(base_h2 + TEST_RETENTION);
+    h.engine.persist_tombstones().unwrap();
+    assert!(
+        h.engine.tombstone_lookup(&k2).is_none(),
+        "a heal on an unrelated shard must not retain this key's tombstone",
+    );
 }

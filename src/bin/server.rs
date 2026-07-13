@@ -1815,6 +1815,15 @@ fn main() {
             std::process::exit(1);
         }
         running.restore_outbound_state();
+        // Reverse-heal Phase 2d: hand the engine's checkpoint retention GC a
+        // shared handle to the inbound-fence bitmap so a reverse-heal that spans
+        // a checkpoint cannot GC a tombstone it still needs to gate an incoming
+        // image (RULE-DS). Only meaningful when tombstones are enabled (the GC is
+        // a no-op otherwise); every heal raises the inbound fence, so this covers
+        // every heal_pending shard. See `Engine::set_tombstone_gc_guard`.
+        if config.reverse_heal.tombstones {
+            engine.set_tombstone_gc_guard(running.inbound_fence_bitmap());
+        }
         // Initialize persistent ACK tracker alongside the cluster state file.
         let ack_path = {
             let mut p = config.resolved_cluster_state_path().into_os_string();
