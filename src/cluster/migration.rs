@@ -365,6 +365,18 @@ struct InboundMigration {
     /// re-marks a genuinely-orphaned entry `lost` — the fence is what matters
     /// and it survives.
     heal_pending: bool,
+    /// Reverse-heal Phase 3c — wall-clock instant at which this entry's
+    /// `heal_pending` fence was (last) raised, or `None` when it is not a heal
+    /// fence. Drives the fenced-heal DEADLINE ([`Self::expired_heal_shards`]): a
+    /// heal that has held the fence past the configured deadline without
+    /// completing is judged STUCK and escalated (or alert-held).
+    ///
+    /// Process-local timing state (NOT serialized), exactly like
+    /// `transfer_requested_at`: a restart re-loads the entry as plain-pending and
+    /// the boot reverse-heal re-raises `heal_pending` with a FRESH timer. Resetting
+    /// the deadline clock on restart is conservative-safe — it grants another full
+    /// window before escalation rather than tripping instantly on a slow restart.
+    heal_started_at: Option<std::time::Instant>,
 }
 
 impl InboundMigration {
@@ -378,6 +390,7 @@ impl InboundMigration {
             transfer_requested_at: None,
             lost: false,
             heal_pending: false,
+            heal_started_at: None,
         }
     }
 }
@@ -773,10 +786,13 @@ impl MigrationManager {
             // Revive a prior orphaned/lost attempt as an active heal fence.
             existing.lost = false;
             existing.heal_pending = true;
+            // Phase 3c — (re)start the fenced-heal deadline clock on (re)raise.
+            existing.heal_started_at = Some(std::time::Instant::now());
             return false;
         }
         self.inbound_migrations.push(InboundMigration {
             heal_pending: true,
+            heal_started_at: Some(std::time::Instant::now()),
             ..InboundMigration::pending(shard, from_node)
         });
         self.inbound_bitmap.set(shard);
@@ -802,6 +818,8 @@ impl MigrationManager {
             .filter(|m| m.shard == shard)
         {
             m.heal_pending = true;
+            // Phase 3c — (re)start the fenced-heal deadline clock on (re)raise.
+            m.heal_started_at = Some(std::time::Instant::now());
             existed = true;
         }
         self.inbound_bitmap.set(shard);
@@ -810,9 +828,89 @@ impl MigrationManager {
         }
         self.inbound_migrations.push(InboundMigration {
             heal_pending: true,
+            heal_started_at: Some(std::time::Instant::now()),
             ..InboundMigration::pending(shard, NodeId(0))
         });
         true
+    }
+
+    /// Reverse-heal Phase 3c (design §E3) — the shards whose `heal_pending` fence
+    /// has been up (uncompleted) for at least `deadline` — i.e. STUCK heals whose
+    /// deadline fallback (escalate / alert-and-hold) is due.
+    ///
+    /// A shard qualifies iff it has an inbound entry with `heal_pending` set,
+    /// `completed` clear, and a `heal_started_at` at least `deadline` in the past.
+    /// A heal without a timer (`heal_started_at == None`) or one raised more
+    /// recently than `deadline` is NOT returned — so a slow-but-still-progressing
+    /// pull is never escalated prematurely (the deadline is sized to comfortably
+    /// exceed a normal round-trip). Deduplicated and returned ascending; a shard
+    /// whose heal completed no longer qualifies (the completion cleared the fence).
+    pub fn expired_heal_shards(&self, deadline: std::time::Duration) -> Vec<u16> {
+        let mut out: Vec<u16> = self
+            .inbound_migrations
+            .iter()
+            .filter(|m| {
+                m.heal_pending
+                    && !m.completed
+                    && m.heal_started_at
+                        .map(|t| t.elapsed() >= deadline)
+                        .unwrap_or(false)
+            })
+            .map(|m| m.shard)
+            .collect();
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
+    /// Reverse-heal Phase 3c — RESET the fenced-heal deadline clock for `shard`'s
+    /// heal entries (set `heal_started_at` to now). Called after an ALERT-AND-HOLD
+    /// (or an escalate that found no fresher source): the shard STAYS fenced, but
+    /// resetting the timer bounds the alert cadence to one per deadline window
+    /// rather than one per event-loop tick. Returns `true` if any entry was
+    /// refreshed.
+    pub fn refresh_heal_deadline(&mut self, shard: u16) -> bool {
+        let now = std::time::Instant::now();
+        let mut refreshed = false;
+        for m in self
+            .inbound_migrations
+            .iter_mut()
+            .filter(|m| m.shard == shard && m.heal_pending && !m.completed)
+        {
+            m.heal_started_at = Some(now);
+            refreshed = true;
+        }
+        refreshed
+    }
+
+    /// Reverse-heal Phase 3c — RELEASE the reverse-heal fence for `shard` after a
+    /// successful ESCALATION: the shard has been handed to a fresher master via a
+    /// committed-term reassignment, so it is no longer this node's responsibility
+    /// to heal as master. Drops the `heal_pending` inbound entries for the shard
+    /// (and clears the fence bit when no other pending inbound remains), so the
+    /// node stops re-escalating it and can re-acquire it as a plain REPLICA of the
+    /// new master via ordinary forward replication.
+    ///
+    /// Distinct from [`Self::clear_inbound`] (which deliberately RETAINS
+    /// `heal_pending` so a routine topology commit cannot wipe an in-flight heal
+    /// fence): this is the ONE deliberate release, gated on the ownership having
+    /// already moved via the durable-commit path. Forward-migration inbound
+    /// entries for the shard are untouched. Returns `true` if a heal entry was
+    /// removed.
+    pub fn release_heal_shard(&mut self, shard: u16) -> bool {
+        let before = self.inbound_migrations.len();
+        self.inbound_migrations
+            .retain(|m| !(m.shard == shard && m.heal_pending && !m.completed));
+        let removed = before != self.inbound_migrations.len();
+        if removed
+            && !self
+                .inbound_migrations
+                .iter()
+                .any(|m| m.shard == shard && !m.completed)
+        {
+            self.inbound_bitmap.clear(shard);
+        }
+        removed
     }
 
     /// Mark an inbound shard as received (data has arrived and been verified).
@@ -3738,6 +3836,60 @@ mod tests {
         assert!(
             !mgr.has_pending_inbound(7),
             "completion proof clears the heal fence",
+        );
+    }
+
+    /// Reverse-heal Phase 3c — `expired_heal_shards` returns only heal fences
+    /// older than the deadline; `refresh_heal_deadline` resets the clock (so an
+    /// alert-and-held shard re-arms); `release_heal_shard` drops the fence after
+    /// an escalation. A completed heal never counts as expired.
+    #[test]
+    fn expired_heal_shards_respects_deadline_refresh_and_release() {
+        let mut mgr = MigrationManager::new();
+        // A reverse-heal fence on shard 7 and a plain forward inbound on shard 8.
+        assert!(mgr.register_heal_source(7, NodeId(2)));
+        assert!(mgr.register_inbound_source(8, NodeId(3)));
+
+        // A huge deadline → nothing is expired yet (the fence is fresh).
+        assert!(
+            mgr.expired_heal_shards(std::time::Duration::from_secs(3600))
+                .is_empty(),
+            "a fresh heal is not past its deadline",
+        );
+        // A zero deadline → the heal fence (only shard 7, NOT the forward 8) is due.
+        assert_eq!(
+            mgr.expired_heal_shards(std::time::Duration::from_millis(0)),
+            vec![7],
+            "only the heal_pending fence is subject to the deadline, not a forward inbound",
+        );
+
+        // Refreshing the clock re-arms it: the same zero deadline still reports it
+        // (elapsed since the reset is >= 0), but a huge deadline still excludes it.
+        assert!(mgr.refresh_heal_deadline(7));
+        assert!(
+            mgr.expired_heal_shards(std::time::Duration::from_secs(3600))
+                .is_empty(),
+            "after a refresh a huge deadline is not yet exceeded",
+        );
+
+        // Releasing the fence after an escalation drops it entirely.
+        assert!(mgr.release_heal_shard(7));
+        assert!(!mgr.has_pending_inbound(7), "release clears the heal fence");
+        assert!(
+            mgr.expired_heal_shards(std::time::Duration::from_millis(0))
+                .is_empty(),
+            "a released heal is no longer tracked for the deadline",
+        );
+        // The forward inbound on shard 8 is untouched by the heal machinery.
+        assert!(mgr.has_pending_inbound(8), "forward inbound survives");
+
+        // A completed heal never counts as expired.
+        assert!(mgr.register_heal_source(9, NodeId(4)));
+        mgr.mark_inbound_complete_from_source(9, NodeId(4));
+        assert!(
+            mgr.expired_heal_shards(std::time::Duration::from_millis(0))
+                .is_empty(),
+            "a completed heal is not subject to the deadline",
         );
     }
 

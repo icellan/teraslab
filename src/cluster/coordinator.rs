@@ -1162,6 +1162,16 @@ pub struct ClusterConfig {
     /// off, so non-reverse-heal deployments keep byte-for-byte the prior runtime
     /// behaviour.
     pub reverse_heal_online: bool,
+    /// Reverse-heal Phase 3c (design §E3) — wall-clock deadline for a fenced
+    /// reverse-heal. A heal that holds the no-serve-before-heal fence longer than
+    /// this without completing is judged STUCK and the [`Self::heal_deadline_action`]
+    /// fallback fires. Sourced from
+    /// [`crate::config::ReverseHealConfig::resolved_heal_deadline`]; only consulted
+    /// when `reverse_heal_online` is enabled.
+    pub heal_deadline: Duration,
+    /// Reverse-heal Phase 3c (design §E3) — the fallback taken when a fenced heal
+    /// misses `heal_deadline`. Default [`crate::config::HealDeadlineAction::Escalate`].
+    pub heal_deadline_action: crate::config::HealDeadlineAction,
 }
 
 /// Runtime replication policy passed to a started cluster coordinator.
@@ -1237,6 +1247,13 @@ pub struct ClusterCoordinator {
     /// [`ClusterConfig::reverse_heal_online`]). Captured into the event loop so
     /// each partition-view refresh runs the online re-detect + reverse-pull.
     reverse_heal_online: bool,
+    /// Reverse-heal Phase 3c — fenced-heal deadline (see
+    /// [`ClusterConfig::heal_deadline`]). Captured into the event loop so each
+    /// partition-view refresh enforces the deadline on stuck heals.
+    heal_deadline: Duration,
+    /// Reverse-heal Phase 3c — deadline fallback action (see
+    /// [`ClusterConfig::heal_deadline_action`]).
+    heal_deadline_action: crate::config::HealDeadlineAction,
 }
 
 /// C6 — reconstruct the shard table for a RESTORED committed topology at boot.
@@ -1372,6 +1389,8 @@ impl ClusterCoordinator {
             activation_hold: Arc::new(AtomicBool::new(false)),
             topology_debounce: config.topology_debounce,
             reverse_heal_online: config.reverse_heal_online,
+            heal_deadline: config.heal_deadline,
+            heal_deadline_action: config.heal_deadline_action,
         }
     }
 
@@ -1541,6 +1560,10 @@ impl ClusterCoordinator {
         // exchange-complete handler runs the online re-detect + reverse-pull on
         // each partition-view refresh.
         let reverse_heal_online = self.reverse_heal_online;
+        // Reverse-heal Phase 3c — fenced-heal deadline + fallback, captured so the
+        // same exchange-complete handler enforces the deadline on stuck heals.
+        let heal_deadline = self.heal_deadline;
+        let heal_deadline_action = self.heal_deadline_action;
 
         // Event processing thread
         let event_handle = std::thread::spawn(move || {
@@ -2378,6 +2401,40 @@ impl ClusterCoordinator {
                                 term,
                                 "reverse-heal Phase 3b: runtime online re-heal fenced + \
                                  queued reverse-pull for newly-stale mastered shard(s)",
+                            );
+                        }
+                        // Reverse-heal Phase 3c (design §E3) — enforce the
+                        // fenced-heal DEADLINE against this fresh partition view: a
+                        // heal (boot or online) stuck past the deadline is escalated
+                        // to a fresher master (default) or alert-and-held, so it
+                        // never fences the shard forever. The view just refreshed
+                        // above carries the recency needed to pick the fresher
+                        // source; a no-op when nothing is overdue.
+                        let peak = peak_size_event.load(Ordering::Relaxed) as u64;
+                        let inc = swim_incarnation_event.load(Ordering::Relaxed);
+                        let report = enforce_heal_deadlines_inner(
+                            self_id,
+                            &shard_table,
+                            &migration,
+                            &inbound_bm_event,
+                            &inbound_state_path_event,
+                            &topo_authority_event,
+                            &topology_epoch,
+                            peak,
+                            inc,
+                            &topo_state_path_event,
+                            &topology_commit_tx_event,
+                            heal_deadline,
+                            heal_deadline_action,
+                            &partition_view,
+                        );
+                        if report.escalated > 0 || report.alerted > 0 {
+                            tracing::warn!(
+                                escalated = report.escalated,
+                                alerted = report.alerted,
+                                term,
+                                "reverse-heal Phase 3c: enforced fenced-heal deadline on \
+                                 stuck heal(s)",
                             );
                         }
                     }
@@ -5602,6 +5659,278 @@ fn trigger_online_reheal(
 }
 
 // ---------------------------------------------------------------------------
+// Reverse-heal Phase 3c — fenced-heal deadline + escalate/alert-hold (§E3)
+// ---------------------------------------------------------------------------
+
+/// Outcome of one [`RunningCluster::enforce_heal_deadlines`] pass: how many
+/// stuck shards were handed to a fresher master vs kept fenced + alerted.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HealDeadlineReport {
+    /// Shards whose stuck heal was ESCALATED — handed to a fresher committed
+    /// replica via a durable, recency-aware master reassignment (G9).
+    pub escalated: usize,
+    /// Shards ALERT-AND-HELD — kept fenced fail-closed with a loud operator
+    /// signal (operator-chosen `AlertAndHold` mode, OR escalate mode with no
+    /// fresher quorum-current source available). Never served stale.
+    pub alerted: usize,
+}
+
+/// Reverse-heal Phase 3c — pick the fresher master to escalate a stuck shard to,
+/// via the recency-aware [`elect_master`].
+///
+/// Candidates are the shard's committed REPLICAS (never `self`, never the
+/// `NodeId(0)` sentinel) that are QUORUM-CURRENT full holders of the shard in
+/// `partition_view`: they reported an entry for the shard, that entry is NOT
+/// flagged [`PARTITION_FLAG_PENDING_INBOUND`] (a subset holder still migrating in
+/// is not a sound master), and it carries data (`last_applied_seq > 0`). Each is
+/// tagged with its `max_generation` recency, so `elect_master` (recency term)
+/// returns the FRESHEST such replica, breaking ties by lowest `NodeId`.
+///
+/// Returns `None` when no committed replica qualifies — the correlated-loss /
+/// no-fresher-source case, where escalation is impossible and the caller must
+/// alert-and-hold instead of handing the shard to a node that does not hold it.
+fn select_escalation_master(
+    self_id: NodeId,
+    shard: u16,
+    table: &ShardTable,
+    partition_view: &std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>>,
+) -> Option<NodeId> {
+    let assignment = table.target_assignment(shard);
+    let mut candidates: Vec<MasterCandidate> = Vec::new();
+    for &node in &assignment.replicas {
+        if node == self_id || node == NodeId(0) {
+            continue;
+        }
+        let Some(entry) = partition_view
+            .get(&node)
+            .and_then(|entries| entries.iter().find(|e| e.shard == shard))
+        else {
+            continue;
+        };
+        if entry.flags & PARTITION_FLAG_PENDING_INBOUND != 0 {
+            continue;
+        }
+        if entry.last_applied_seq == 0 {
+            continue;
+        }
+        candidates.push(MasterCandidate {
+            node_id: node,
+            was_previous_master: false,
+            is_subset: false,
+            was_evicted: false,
+            durable_recency: entry.max_generation as u64,
+        });
+    }
+    let elected = elect_master(shard, &candidates)?;
+    (elected != self_id && elected != NodeId(0)).then_some(elected)
+}
+
+/// Reverse-heal Phase 3c — escalate ONE stuck shard to a fresher master, routing
+/// the ownership move through the G9 durable-commit path.
+///
+/// Selects the freshest quorum-current committed replica via
+/// [`select_escalation_master`] (the recency-aware [`elect_master`]), builds the
+/// reassigned shard table (`set_master_for_shard` demotes the stuck node into the
+/// replica set), and commits it at `committed_term + 1` through
+/// [`TopologyAuthority::handle_commit_durable`] — so the ownership move is
+/// PERSISTED before it is served (the G1/G9 split-brain discipline). On a durable
+/// `Applied`, it installs the reassigned table, advances the epoch, propagates the
+/// commit, and RELEASES the stuck node's heal fence (the shard is no longer its to
+/// heal as master — it re-acquires it as a plain replica of the new master).
+///
+/// Returns `Some(new_master)` on a completed escalation, or `None` when it cannot
+/// safely escalate (no fresher source, ownership already moving, or the durable
+/// commit did not apply) — the caller then alert-and-holds, never serving stale.
+///
+/// LOCK ORDER: the shard-table read is dropped before `handle_commit_durable`
+/// (which takes the authority's `commit_apply` lock and runs the persist I/O), and
+/// the migration mutex is taken only afterwards, so no lock is held across the
+/// durable commit.
+#[allow(clippy::too_many_arguments)]
+fn try_escalate_stuck_shard(
+    self_id: NodeId,
+    shard: u16,
+    shard_table: &Arc<ShardTableLock<ShardTable>>,
+    migration: &Arc<Mutex<MigrationManager>>,
+    inbound_atomic: &Arc<crate::cluster::migration::AtomicShardBitmap>,
+    inbound_state_path: &Option<std::path::PathBuf>,
+    topology_authority: &Arc<crate::cluster::topology::TopologyAuthority>,
+    topology_epoch: &Arc<std::sync::atomic::AtomicU64>,
+    peak: u64,
+    incarnation: u64,
+    topology_state_path: &Option<std::path::PathBuf>,
+    topology_commit_tx: &std::sync::mpsc::Sender<(Vec<NodeId>, u64)>,
+    partition_view: &std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>>,
+) -> Option<NodeId> {
+    let (elected, new_table, new_term, members) = {
+        let table = shard_table.read();
+        let committed = topology_authority.committed_term();
+        // Only escalate from a CURRENT committed table where self is STILL the
+        // shard's master. A lagging/ahead table (version != committed) or a shard
+        // whose ownership already moved is left alone — recency must never race a
+        // committed-term change (the split-brain guard).
+        if table.version != committed {
+            return None;
+        }
+        if table.target_assignment(shard).master != self_id {
+            return None;
+        }
+        let elected = select_escalation_master(self_id, shard, &table, partition_view)?;
+        let mut nt = table.clone();
+        nt.set_master_for_shard(shard, elected);
+        // `set_master_for_shard` is a no-op if `elected` fell outside the shard's
+        // assignment; confirm the reassignment took before minting a term for it.
+        if nt.target_assignment(shard).master != elected {
+            return None;
+        }
+        nt.version = committed + 1;
+        (
+            elected,
+            nt,
+            committed + 1,
+            topology_authority.committed_members(),
+        )
+    };
+    let cluster_id = topology_authority.cluster_id();
+    let placement_version = topology_authority.committed_placement_version();
+    let digest = crate::cluster::topology::TopologyTerm::compute_digest(
+        new_term,
+        &cluster_id,
+        &members,
+        placement_version,
+    );
+    let commit = crate::cluster::topology::TopologyCommit {
+        term: new_term,
+        proposer: self_id,
+        members: members.clone(),
+        cluster_id,
+        placement_version,
+        digest,
+        voters: members.clone(),
+    };
+    let path = topology_state_path.as_deref();
+    match topology_authority.handle_commit_durable(&commit, peak, incarnation, |state| {
+        persist_topology_state_durable(path, state)
+    }) {
+        crate::cluster::topology::DurableCommitOutcome::Applied(_) => {
+            // Durable-before-served: authority is committed + persisted; now reflect
+            // the reassigned ownership locally and advance the epoch.
+            *shard_table.write() = new_table;
+            topology_epoch.store(new_term, Ordering::Relaxed);
+            // Propagate through the standard commit path so peers (and the new
+            // master) adopt the reassignment.
+            let _ = topology_commit_tx.send((members, new_term));
+            // Release the stuck node's heal fence: the shard is no longer ours to
+            // heal as master. We re-acquire it as a plain replica of the new master
+            // via ordinary forward replication.
+            {
+                let mgr = &mut migration.lock();
+                mgr.release_heal_shard(shard);
+                inbound_atomic.load_from(mgr.inbound_bitmap());
+                if let Some(p) = inbound_state_path {
+                    crate::cluster::migration::persist_inbound_state(p, mgr);
+                }
+            }
+            Some(elected)
+        }
+        // Fail-closed: a persist failure or a raced supersede leaves the shard
+        // fenced (unavailable beats an un-persisted ownership grant). The caller
+        // alert-and-holds.
+        crate::cluster::topology::DurableCommitOutcome::PersistFailed
+        | crate::cluster::topology::DurableCommitOutcome::NotApplied => None,
+    }
+}
+
+/// Reverse-heal Phase 3c — enforce the fenced-heal DEADLINE over every stuck heal,
+/// taking the configured `action`. The pure core shared by
+/// [`RunningCluster::enforce_heal_deadlines`] and the event-loop wiring.
+///
+/// For each shard whose `heal_pending` fence has been up past `deadline`
+/// ([`MigrationManager::expired_heal_shards`]):
+/// - **Escalate** (default): hand it to a fresher master via
+///   [`try_escalate_stuck_shard`] (durable, recency-aware). If no fresher
+///   quorum-current source exists, fall through to alert-and-hold.
+/// - **AlertAndHold**: keep it fenced fail-closed; NEVER auto-move.
+///
+/// Both fallbacks KEEP the shard non-serving-stale: escalate redirects to the new
+/// master; alert-and-hold stays `Transitioning`. An alert-and-held shard has its
+/// deadline clock reset so the loud alert fires once per window rather than once
+/// per event-loop tick.
+#[allow(clippy::too_many_arguments)]
+fn enforce_heal_deadlines_inner(
+    self_id: NodeId,
+    shard_table: &Arc<ShardTableLock<ShardTable>>,
+    migration: &Arc<Mutex<MigrationManager>>,
+    inbound_atomic: &Arc<crate::cluster::migration::AtomicShardBitmap>,
+    inbound_state_path: &Option<std::path::PathBuf>,
+    topology_authority: &Arc<crate::cluster::topology::TopologyAuthority>,
+    topology_epoch: &Arc<std::sync::atomic::AtomicU64>,
+    peak: u64,
+    incarnation: u64,
+    topology_state_path: &Option<std::path::PathBuf>,
+    topology_commit_tx: &std::sync::mpsc::Sender<(Vec<NodeId>, u64)>,
+    deadline: Duration,
+    action: crate::config::HealDeadlineAction,
+    partition_view: &std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>>,
+) -> HealDeadlineReport {
+    let expired = migration.lock().expired_heal_shards(deadline);
+    let mut report = HealDeadlineReport::default();
+    for shard in expired {
+        let escalated = if matches!(action, crate::config::HealDeadlineAction::Escalate) {
+            try_escalate_stuck_shard(
+                self_id,
+                shard,
+                shard_table,
+                migration,
+                inbound_atomic,
+                inbound_state_path,
+                topology_authority,
+                topology_epoch,
+                peak,
+                incarnation,
+                topology_state_path,
+                topology_commit_tx,
+                partition_view,
+            )
+        } else {
+            None
+        };
+        match escalated {
+            Some(new_master) => {
+                report.escalated += 1;
+                if let Some(m) = crate::metrics::migration_metrics() {
+                    m.heal_deadline_escalations.inc();
+                }
+                tracing::warn!(
+                    shard,
+                    new_master = new_master.0,
+                    "reverse-heal Phase 3c: stuck heal past deadline ESCALATED to a fresher \
+                     committed master via durable reassignment (node released its master claim)",
+                );
+            }
+            None => {
+                // Alert-and-hold: keep the shard fenced fail-closed, reset its
+                // deadline clock (one alert per window), and emit a LOUD signal.
+                migration.lock().refresh_heal_deadline(shard);
+                report.alerted += 1;
+                if let Some(m) = crate::metrics::migration_metrics() {
+                    m.heal_deadline_alerts.inc();
+                }
+                tracing::error!(
+                    shard,
+                    ?action,
+                    "reverse-heal Phase 3c: stuck heal past deadline — shard HELD fenced \
+                     fail-closed (alert-and-hold mode, or no fresher quorum-current source to \
+                     escalate to); shard is UNAVAILABLE but never served stale — operator \
+                     intervention needed",
+                );
+            }
+        }
+    }
+    report
+}
+
+// ---------------------------------------------------------------------------
 // Batched migration
 // ---------------------------------------------------------------------------
 
@@ -8780,6 +9109,12 @@ pub struct MasterCandidate {
     /// (failed to report, persistent suspect). Evicted nodes are never
     /// eligible for master.
     pub was_evicted: bool,
+    /// Reverse-heal Phase 3c (design §D Phase 3) — this candidate's per-shard
+    /// RECENCY signal (higher = fresher shard data; `max_generation` from the
+    /// partition view, `0` when unknown). Used ONLY as a WITHIN-term tie-breaker
+    /// in [`elect_master`], STRICTLY SUBORDINATE to the data-ownership `score` and
+    /// the `was_evicted` filter — see the split-brain guard on [`elect_master`].
+    pub durable_recency: u64,
 }
 
 /// Phase F — score every candidate via [`rank_master_candidate`] and return
@@ -8792,18 +9127,51 @@ pub struct MasterCandidate {
 /// `_shard` is accepted purely for diagnostics; the algorithm is shard-
 /// independent because all per-shard signals are already encoded in the
 /// candidate descriptors.
+///
+/// # Reverse-heal Phase 3c — the `durable_recency` term and its split-brain guard
+///
+/// The tuple carries a `durable_recency` component (design §D Phase 3) so a
+/// recency-driven ESCALATION picks the candidate that demonstrably holds the
+/// freshest shard data. It sits STRICTLY BELOW the `score` in significance and
+/// AFTER the `was_evicted` filter, and that ordering is the SAFETY GUARD, not a
+/// cosmetic choice:
+///
+/// - **Recency NEVER overrides ownership.** A `score` of 3 (full) always beats a
+///   `score` of 2 (subset) regardless of recency, so a behind/incomplete node can
+///   never be elected over a full holder just by claiming to be fresher.
+/// - **Recency NEVER resurrects an evicted node.** Evicted candidates are filtered
+///   out BEFORE ranking, so the committed quorum's eviction decision dominates any
+///   recency claim.
+/// - **Recency only breaks a WITHIN-term tie.** Among equally-scored, non-evicted
+///   candidates it prefers the fresher one over the (previously-lower-priority)
+///   `was_previous_master` stickiness — the "hand the stuck shard to a fresher
+///   replica" decision. This is entirely a same-election refinement: `elect_master`
+///   computes ONE term's assignment, and its result is served only once that term
+///   is quorum-committed and durably persisted (G9). Recency can therefore never
+///   flip authority ACROSS a committed term (the split-brain class of G1/G9/C11);
+///   the committed term stays the sole authority over WHO may become master, and
+///   recency is only a per-shard "prefer this holder within this term".
 pub fn elect_master(_shard: u16, candidates: &[MasterCandidate]) -> Option<NodeId> {
     candidates
         .iter()
         .filter(|c| !c.was_evicted)
         .max_by_key(|c| {
             // Higher tuple wins. Tuple components in decreasing significance:
-            //   1. score: 3 = full, 2 = subset (data ownership trumps stickiness)
-            //   2. was_previous_master: 1 = sticky preference, 0 = otherwise
-            //   3. lower NodeId via Reverse so smaller NodeIds compare "larger"
+            //   1. score: 3 = full, 2 = subset (data ownership trumps everything
+            //      below — recency can NEVER promote a subset over a full holder)
+            //   2. durable_recency: fresher shard data wins a within-term tie
+            //      (Phase 3c) — the escalation-to-fresher-master signal, kept
+            //      SUBORDINATE to score so it never manufactures authority
+            //   3. was_previous_master: 1 = sticky preference, 0 = otherwise
+            //   4. lower NodeId via Reverse so smaller NodeIds compare "larger"
             let score = if c.is_subset { 2u8 } else { 3u8 };
             let prev = u8::from(c.was_previous_master);
-            (score, prev, std::cmp::Reverse(c.node_id.0))
+            (
+                score,
+                c.durable_recency,
+                prev,
+                std::cmp::Reverse(c.node_id.0),
+            )
         })
         .map(|c| c.node_id)
 }
@@ -8992,12 +9360,18 @@ pub fn apply_master_election(
     // (node, shard) -> last_applied_seq, used to decide is_subset.
     let mut seq_by_node_shard: std::collections::HashMap<(NodeId, u16), u64> =
         std::collections::HashMap::new();
+    // Reverse-heal Phase 3c — (node, shard) -> max_generation, the per-shard
+    // RECENCY signal fed to `elect_master` as a within-term tie-breaker so an
+    // escalation prefers the freshest holder. Absent ⇒ 0 (unknown / no data).
+    let mut recency_by_node_shard: std::collections::HashMap<(NodeId, u16), u64> =
+        std::collections::HashMap::new();
     let mut nodes_with_view: std::collections::HashSet<NodeId> =
         std::collections::HashSet::with_capacity(partition_view.len());
     for (node, entries) in partition_view {
         nodes_with_view.insert(*node);
         for e in entries {
             seq_by_node_shard.insert((*node, e.shard), e.last_applied_seq);
+            recency_by_node_shard.insert((*node, e.shard), e.max_generation as u64);
         }
     }
 
@@ -9067,6 +9441,11 @@ pub fn apply_master_election(
                     was_previous_master: node_id == prev_master,
                     is_subset: !has_data,
                     was_evicted: evicted.contains(&node_id),
+                    // Phase 3c — freshness tie-breaker (subordinate to score).
+                    durable_recency: recency_by_node_shard
+                        .get(&(node_id, shard))
+                        .copied()
+                        .unwrap_or(0),
                 }
             })
             .collect();
@@ -10026,6 +10405,52 @@ impl RunningCluster {
             &self.inbound_atomic,
             &self.inbound_state_path,
             &self.reheal_backoff,
+            partition_view,
+        )
+    }
+
+    /// Reverse-heal Phase 3c (design §E3) — enforce the fenced-heal DEADLINE over
+    /// every stuck heal on this node, taking `action` when one expires.
+    ///
+    /// A heal that has held the no-serve-before-heal fence past `deadline` without
+    /// completing is judged STUCK (it can never complete: dead source, correlated
+    /// loss). Rather than fence the shard forever:
+    /// - [`crate::config::HealDeadlineAction::Escalate`] hands it to a fresher
+    ///   committed replica via a DURABLE, recency-aware master reassignment (the
+    ///   ownership move is committed + persisted before served — G9), then releases
+    ///   this node's master claim. If no fresher quorum-current source exists it
+    ///   falls through to alert-and-hold.
+    /// - [`crate::config::HealDeadlineAction::AlertAndHold`] keeps the shard fenced
+    ///   fail-closed and emits a loud metric + log; it never auto-moves the shard.
+    ///
+    /// Neither fallback ever serves the stale copy: escalate redirects clients to
+    /// the fresher new master; alert-and-hold stays `Transitioning`. Sibling shards
+    /// are untouched. Returns a [`HealDeadlineReport`] counting each disposition.
+    /// Driven from the event loop on each partition-view refresh when online
+    /// re-heal is enabled; a heal that completes before the deadline is never
+    /// touched.
+    pub fn enforce_heal_deadlines(
+        &self,
+        deadline: Duration,
+        action: crate::config::HealDeadlineAction,
+        partition_view: &std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>>,
+    ) -> HealDeadlineReport {
+        let peak = self.peak_size.load(Ordering::Relaxed) as u64;
+        let incarnation = self.swim_incarnation.load(Ordering::Relaxed);
+        enforce_heal_deadlines_inner(
+            self.self_id,
+            &self.shard_table,
+            &self.migration,
+            &self.inbound_atomic,
+            &self.inbound_state_path,
+            &self.topology_authority,
+            &self.topology_epoch,
+            peak,
+            incarnation,
+            &self.topology_state_path,
+            &self.topology_commit_tx,
+            deadline,
+            action,
             partition_view,
         )
     }
@@ -17593,6 +18018,573 @@ mod tests {
         );
     }
 
+    // ── Reverse-heal Phase 3c — heal deadline / escalate + elect_master recency ──
+
+    /// Phase 3c helper: a 3-node RF=3 cluster where NodeId(1) (self) is the
+    /// committed master of the returned shard, with NodeId(2)+NodeId(3) as its
+    /// committed replicas. Committed term = 5, placement version 1.
+    fn three_node_heal_cluster() -> (RunningCluster, u16) {
+        let members = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let table = ShardTable::compute_with_epoch(&members, 3, 5, 1);
+        let shard = (0..NUM_SHARDS as u16)
+            .find(|&s| {
+                let a = table.target_assignment(s);
+                a.master == NodeId(1)
+                    && a.replicas.contains(&NodeId(2))
+                    && a.replicas.contains(&NodeId(3))
+            })
+            .expect("some shard mastered by NodeId(1) with NodeId(2)+NodeId(3) replicas");
+        let cluster = new_test_running_cluster(
+            NodeId(1),
+            table,
+            &[
+                (NodeId(1), "127.0.0.1:5101".parse().unwrap()),
+                (NodeId(2), "127.0.0.1:5102".parse().unwrap()),
+                (NodeId(3), "127.0.0.1:5103".parse().unwrap()),
+            ],
+            &members,
+            &[],
+            &[],
+            &[],
+            3,
+        );
+        (cluster, shard)
+    }
+
+    /// Phase 3c helper: a partition view where NodeId(2) and NodeId(3) both hold
+    /// `shard`, with NodeId(3) the FRESHER holder (higher `max_generation`).
+    fn fresher_n3_view(
+        shard: u16,
+    ) -> std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>> {
+        let mut view = std::collections::HashMap::new();
+        view.insert(
+            NodeId(2),
+            vec![PartitionVersionEntry {
+                shard,
+                flags: 0,
+                replica_count: 2,
+                last_applied_seq: 100,
+                manifest_digest: 7,
+                max_generation: 50,
+            }],
+        );
+        view.insert(
+            NodeId(3),
+            vec![PartitionVersionEntry {
+                shard,
+                flags: 0,
+                replica_count: 2,
+                last_applied_seq: 120,
+                manifest_digest: 9,
+                max_generation: 80,
+            }],
+        );
+        view
+    }
+
+    /// Reverse-heal Phase 3c SAFETY-CRITICAL (design §D Phase 3, split-brain
+    /// guard). The `elect_master` recency term may only DOWNGRADE (fence self) or
+    /// break a WITHIN-term tie; it must NEVER grant authority a committed term did
+    /// not — no flipping `No→Yes` across terms (the G1/G9/C11 split-brain class).
+    #[test]
+    fn recency_never_overrides_committed_term() {
+        // (1) Recency BREAKS a within-term tie: among equally-full, non-evicted
+        // candidates in ONE election, the FRESHER one wins over the previous
+        // master's stickiness. This is the "hand the stuck shard to a fresher
+        // replica" refinement — allowed, because it is entirely within one term.
+        let candidates = [
+            MasterCandidate {
+                node_id: NodeId(3),
+                was_previous_master: true,
+                is_subset: false,
+                was_evicted: false,
+                durable_recency: 10,
+            },
+            MasterCandidate {
+                node_id: NodeId(4),
+                was_previous_master: false,
+                is_subset: false,
+                was_evicted: false,
+                durable_recency: 99,
+            },
+        ];
+        assert_eq!(
+            elect_master(0, &candidates),
+            Some(NodeId(4)),
+            "recency must break a within-term tie: the fresher full candidate wins \
+             over previous-master stickiness",
+        );
+
+        // (2) Recency NEVER overrides the data-ownership SCORE: a max-recency
+        // SUBSET (behind / incomplete) candidate must lose to a full holder with
+        // ZERO recency. Recency can never promote a behind node to master.
+        let candidates = [
+            MasterCandidate {
+                node_id: NodeId(1),
+                was_previous_master: false,
+                is_subset: true,
+                was_evicted: false,
+                durable_recency: u64::MAX,
+            },
+            MasterCandidate {
+                node_id: NodeId(2),
+                was_previous_master: false,
+                is_subset: false,
+                was_evicted: false,
+                durable_recency: 0,
+            },
+        ];
+        assert_eq!(
+            elect_master(0, &candidates),
+            Some(NodeId(2)),
+            "recency must NEVER override the ownership score: a max-recency SUBSET \
+             loses to a full holder",
+        );
+
+        // (3) Recency NEVER resurrects an EVICTED node: the committed quorum's
+        // eviction dominates any recency claim (No stays No across the term).
+        let candidates = [
+            MasterCandidate {
+                node_id: NodeId(1),
+                was_previous_master: true,
+                is_subset: false,
+                was_evicted: true,
+                durable_recency: u64::MAX,
+            },
+            MasterCandidate {
+                node_id: NodeId(2),
+                was_previous_master: false,
+                is_subset: false,
+                was_evicted: false,
+                durable_recency: 1,
+            },
+        ];
+        assert_eq!(
+            elect_master(0, &candidates),
+            Some(NodeId(2)),
+            "recency must NEVER resurrect an evicted node: committed eviction \
+             dominates recency",
+        );
+
+        // (4) is_master composition: a fresher-recency signal is NOT an authority
+        // input. A node the committed term does NOT master answers `No` no matter
+        // how fresh it is; authority moves ONLY by advancing `committed_term`
+        // (the escalation's durable G9 commit). Recency never flips `No→Yes`.
+        let members = vec![NodeId(1), NodeId(2)];
+        let table = ShardTable::compute_with_epoch(&members, 2, 5, 1);
+        let shard = (0..NUM_SHARDS as u16)
+            .find(|&s| {
+                let a = table.target_assignment(s);
+                a.master == NodeId(1) && a.replicas.contains(&NodeId(2))
+            })
+            .expect("a shard mastered by NodeId(1) with NodeId(2) replica");
+        // Build the cluster AS NodeId(2) — a committed REPLICA (not master) of S.
+        let cluster = new_test_running_cluster(
+            NodeId(2),
+            table,
+            &[
+                (NodeId(1), "127.0.0.1:5201".parse().unwrap()),
+                (NodeId(2), "127.0.0.1:5202".parse().unwrap()),
+            ],
+            &members,
+            &[],
+            &[],
+            &[],
+            2,
+        );
+        let k = key_for_shard(shard);
+        assert_eq!(
+            cluster.is_master(&k),
+            MasterQueryResult::No,
+            "a committed non-master answers No — recency is not an authority input",
+        );
+        let committed_before = cluster.topology_authority.committed_term();
+        // Feed a view where NodeId(2) is by far the freshest holder of S.
+        let mut view = std::collections::HashMap::new();
+        view.insert(
+            NodeId(2),
+            vec![PartitionVersionEntry {
+                shard,
+                flags: 0,
+                replica_count: 1,
+                last_applied_seq: 999,
+                manifest_digest: 1,
+                max_generation: u32::MAX,
+            }],
+        );
+        // No heal fence is up on NodeId(2) for S, so enforcement is a no-op — the
+        // recency signal alone must NOT invent an ownership move.
+        let report = cluster.enforce_heal_deadlines(
+            Duration::from_millis(0),
+            crate::config::HealDeadlineAction::Escalate,
+            &view,
+        );
+        assert_eq!(
+            (report.escalated, report.alerted),
+            (0, 0),
+            "no stuck heal fence → recency must NOT trigger an ownership move",
+        );
+        assert_eq!(
+            cluster.is_master(&k),
+            MasterQueryResult::No,
+            "recency must NEVER flip a non-master to Yes within a committed term",
+        );
+        assert_eq!(
+            cluster.topology_authority.committed_term(),
+            committed_before,
+            "authority moves ONLY by advancing committed_term — recency never does",
+        );
+    }
+
+    /// Reverse-heal Phase 3c (design §E3, escalate default). A fenced heal that
+    /// never completes, once past the deadline, is handed to the FRESHER committed
+    /// replica via a durable, recency-aware master reassignment; the stuck node
+    /// stops claiming master for the shard. The reassignment is committed through
+    /// the G9 durable-commit path (committed_term advances), never served stale.
+    #[test]
+    fn stuck_heal_escalates_to_fresher_master_after_deadline() {
+        let _guard = migration_metrics_test_guard();
+        let metrics = install_test_migration_metrics();
+
+        let (cluster, shard) = three_node_heal_cluster();
+        let k = key_for_shard(shard);
+        assert!(
+            matches!(cluster.is_master(&k), MasterQueryResult::Yes),
+            "precondition: self masters the shard",
+        );
+
+        // Begin a reverse-heal from NodeId(2) that will never complete → fenced.
+        assert_eq!(cluster.begin_reverse_heal(&[(shard, NodeId(2))]), 1);
+        assert!(
+            matches!(
+                cluster.is_master(&k),
+                MasterQueryResult::Transitioning { .. }
+            ),
+            "a stale shard is fenced (Transitioning) while healing",
+        );
+
+        let view = fresher_n3_view(shard);
+        let committed_before = cluster.topology_authority.committed_term();
+        let esc_before = metrics.heal_deadline_escalations.get();
+        let alert_before = metrics.heal_deadline_alerts.get();
+
+        // Within the deadline (huge) → NO escalation; still fenced, still healing.
+        let early = cluster.enforce_heal_deadlines(
+            Duration::from_secs(3600),
+            crate::config::HealDeadlineAction::Escalate,
+            &view,
+        );
+        assert_eq!(
+            (early.escalated, early.alerted),
+            (0, 0),
+            "a heal within its deadline is never escalated",
+        );
+        assert!(
+            matches!(
+                cluster.is_master(&k),
+                MasterQueryResult::Transitioning { .. }
+            ),
+            "still fenced before the deadline",
+        );
+        assert_eq!(
+            cluster.topology_authority.committed_term(),
+            committed_before,
+            "no reassignment before the deadline",
+        );
+
+        // Past the deadline (0) → escalate to the freshest replica (NodeId(3)).
+        let report = cluster.enforce_heal_deadlines(
+            Duration::from_millis(0),
+            crate::config::HealDeadlineAction::Escalate,
+            &view,
+        );
+        assert_eq!(report.escalated, 1, "stuck heal past deadline escalates");
+        assert_eq!(report.alerted, 0);
+
+        // The ownership move is DURABLE: committed_term advanced (G9).
+        assert_eq!(
+            cluster.topology_authority.committed_term(),
+            committed_before + 1,
+            "escalation commits a new term through the G9 durable-commit path",
+        );
+        // Handed to the FRESHER replica (NodeId(3), higher max_generation), chosen
+        // by the recency-aware elect_master — NOT the lower-recency NodeId(2).
+        assert_eq!(
+            cluster.shard_table().read().target_assignment(shard).master,
+            NodeId(3),
+            "escalation hands the shard to the freshest committed replica",
+        );
+        // The stuck node RELEASED its master claim — it no longer answers Yes.
+        assert!(
+            !matches!(cluster.is_master(&k), MasterQueryResult::Yes),
+            "the stuck node must stop claiming master for the escalated shard",
+        );
+        assert_eq!(
+            metrics.heal_deadline_escalations.get() - esc_before,
+            1,
+            "one escalation metered",
+        );
+        assert_eq!(
+            metrics.heal_deadline_alerts.get() - alert_before,
+            0,
+            "no alert metered on a successful escalation",
+        );
+    }
+
+    /// Reverse-heal Phase 3c (design §E3, conservative mode). In `AlertAndHold`
+    /// the stuck shard is KEPT fenced fail-closed with a loud alert; it is NEVER
+    /// auto-reassigned (committed_term unchanged, self stays committed master).
+    #[test]
+    fn heal_deadline_alert_and_hold_mode_keeps_fenced_and_alerts() {
+        let _guard = migration_metrics_test_guard();
+        let metrics = install_test_migration_metrics();
+
+        let (cluster, shard) = three_node_heal_cluster();
+        let k = key_for_shard(shard);
+        assert_eq!(cluster.begin_reverse_heal(&[(shard, NodeId(2))]), 1);
+
+        let view = fresher_n3_view(shard);
+        let committed_before = cluster.topology_authority.committed_term();
+        let esc_before = metrics.heal_deadline_escalations.get();
+        let alert_before = metrics.heal_deadline_alerts.get();
+
+        let report = cluster.enforce_heal_deadlines(
+            Duration::from_millis(0),
+            crate::config::HealDeadlineAction::AlertAndHold,
+            &view,
+        );
+        assert_eq!(report.escalated, 0, "alert-and-hold never escalates");
+        assert_eq!(
+            report.alerted, 1,
+            "the stuck shard raises exactly one alert"
+        );
+
+        // No reassignment: self stays committed master, no new term.
+        assert_eq!(
+            cluster.topology_authority.committed_term(),
+            committed_before,
+            "alert-and-hold must NOT commit a reassignment",
+        );
+        assert_eq!(
+            cluster.shard_table().read().target_assignment(shard).master,
+            NodeId(1),
+            "self remains the committed master under alert-and-hold",
+        );
+        // Still fenced fail-closed — never served stale.
+        assert!(
+            matches!(
+                cluster.is_master(&k),
+                MasterQueryResult::Transitioning { .. }
+            ),
+            "alert-and-hold keeps the shard fenced fail-closed (Transitioning)",
+        );
+        assert_eq!(
+            metrics.heal_deadline_alerts.get() - alert_before,
+            1,
+            "one alert metered",
+        );
+        assert_eq!(
+            metrics.heal_deadline_escalations.get() - esc_before,
+            0,
+            "no escalation metered under alert-and-hold",
+        );
+    }
+
+    /// Reverse-heal Phase 3c — escalate mode with NO fresher quorum-current source
+    /// falls back to alert-and-hold (never hands the shard to a node that does not
+    /// demonstrably hold it): the correlated-loss window stays fenced, not moved.
+    #[test]
+    fn heal_deadline_escalate_with_no_source_holds_and_alerts() {
+        let _guard = migration_metrics_test_guard();
+        let metrics = install_test_migration_metrics();
+
+        let (cluster, shard) = three_node_heal_cluster();
+        let k = key_for_shard(shard);
+        assert_eq!(cluster.begin_reverse_heal(&[(shard, NodeId(2))]), 1);
+
+        // Empty view: no replica reported the shard → no quorum-current source.
+        let empty_view = std::collections::HashMap::new();
+        let committed_before = cluster.topology_authority.committed_term();
+        let esc_before = metrics.heal_deadline_escalations.get();
+        let alert_before = metrics.heal_deadline_alerts.get();
+
+        let report = cluster.enforce_heal_deadlines(
+            Duration::from_millis(0),
+            crate::config::HealDeadlineAction::Escalate,
+            &empty_view,
+        );
+        assert_eq!(report.escalated, 0, "no fresher source → cannot escalate");
+        assert_eq!(report.alerted, 1, "falls back to alert-and-hold");
+        assert_eq!(
+            cluster.topology_authority.committed_term(),
+            committed_before,
+            "no reassignment when there is no fresher source",
+        );
+        assert!(
+            matches!(
+                cluster.is_master(&k),
+                MasterQueryResult::Transitioning { .. }
+            ),
+            "the shard stays fenced fail-closed rather than move to nobody",
+        );
+        assert_eq!(
+            metrics.heal_deadline_alerts.get() - alert_before,
+            1,
+            "one alert metered",
+        );
+        assert_eq!(
+            metrics.heal_deadline_escalations.get() - esc_before,
+            0,
+            "no escalation metered when there is no fresher source",
+        );
+    }
+
+    /// Reverse-heal Phase 3c — a fenced/escalating shard does NOT affect a healthy
+    /// SIBLING shard the same node masters: the sibling keeps serving locally
+    /// throughout the heal and the escalation (per-shard isolation).
+    #[test]
+    fn healthy_sibling_shard_still_serves_while_s_heals() {
+        let members = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let table = ShardTable::compute_with_epoch(&members, 3, 5, 1);
+        let mut mastered = (0..NUM_SHARDS as u16).filter(|&s| {
+            let a = table.target_assignment(s);
+            a.master == NodeId(1)
+                && a.replicas.contains(&NodeId(2))
+                && a.replicas.contains(&NodeId(3))
+        });
+        let s = mastered.next().expect("a healable shard for NodeId(1)");
+        let sib = mastered.next().expect("a sibling shard for NodeId(1)");
+        let cluster = new_test_running_cluster(
+            NodeId(1),
+            table,
+            &[
+                (NodeId(1), "127.0.0.1:5301".parse().unwrap()),
+                (NodeId(2), "127.0.0.1:5302".parse().unwrap()),
+                (NodeId(3), "127.0.0.1:5303".parse().unwrap()),
+            ],
+            &members,
+            &[],
+            &[],
+            &[],
+            3,
+        );
+        let ks = key_for_shard(s);
+        let ksib = key_for_shard(sib);
+        assert!(matches!(cluster.is_master(&ks), MasterQueryResult::Yes));
+        assert!(matches!(cluster.is_master(&ksib), MasterQueryResult::Yes));
+
+        // Fence ONLY s.
+        assert_eq!(cluster.begin_reverse_heal(&[(s, NodeId(2))]), 1);
+        assert!(
+            matches!(
+                cluster.is_master(&ks),
+                MasterQueryResult::Transitioning { .. }
+            ),
+            "the healing shard s is fenced",
+        );
+        assert!(
+            matches!(cluster.is_master(&ksib), MasterQueryResult::Yes),
+            "the healthy sibling keeps serving while s heals",
+        );
+
+        // Escalate s past the deadline; the sibling is untouched.
+        let report = cluster.enforce_heal_deadlines(
+            Duration::from_millis(0),
+            crate::config::HealDeadlineAction::Escalate,
+            &fresher_n3_view(s),
+        );
+        assert_eq!(report.escalated, 1);
+        assert!(
+            !matches!(cluster.is_master(&ks), MasterQueryResult::Yes),
+            "s was handed off — self no longer serves it",
+        );
+        assert!(
+            matches!(cluster.is_master(&ksib), MasterQueryResult::Yes),
+            "the sibling shard STILL serves locally after s escalates",
+        );
+    }
+
+    /// Reverse-heal Phase 3c — the normal completion path is unchanged: a heal
+    /// that completes clears the fence and the shard is served again. Enforcing
+    /// the deadline (generously) while the pull is still in flight must NOT
+    /// interfere with a heal that then completes.
+    #[test]
+    fn fence_clears_after_reverse_pull_completes() {
+        let (cluster, shard) = three_node_heal_cluster();
+        let k = key_for_shard(shard);
+        assert_eq!(cluster.begin_reverse_heal(&[(shard, NodeId(2))]), 1);
+        assert!(matches!(
+            cluster.is_master(&k),
+            MasterQueryResult::Transitioning { .. }
+        ));
+
+        // A generous deadline enforcement mid-pull leaves the heal alone.
+        let report = cluster.enforce_heal_deadlines(
+            Duration::from_secs(3600),
+            crate::config::HealDeadlineAction::Escalate,
+            &fresher_n3_view(shard),
+        );
+        assert_eq!((report.escalated, report.alerted), (0, 0));
+        assert!(
+            matches!(
+                cluster.is_master(&k),
+                MasterQueryResult::Transitioning { .. }
+            ),
+            "an in-flight heal within its deadline stays fenced (not escalated)",
+        );
+
+        // The pull completes → fence clears → served as authority again.
+        cluster.mark_inbound_complete_from_source(shard, NodeId(2));
+        assert!(
+            matches!(cluster.is_master(&k), MasterQueryResult::Yes),
+            "a completed reverse-pull clears the fence and the shard serves again",
+        );
+    }
+
+    /// Reverse-heal Phase 3c — the deadline must exceed a normal heal round-trip:
+    /// a slow-but-still-progressing heal (age well under the deadline) is NEVER
+    /// escalated prematurely, and then completes normally.
+    #[test]
+    fn escalation_does_not_prematurely_trip_on_a_slow_but_completing_heal() {
+        let _guard = migration_metrics_test_guard();
+        let metrics = install_test_migration_metrics();
+
+        let (cluster, shard) = three_node_heal_cluster();
+        let k = key_for_shard(shard);
+        assert_eq!(cluster.begin_reverse_heal(&[(shard, NodeId(2))]), 1);
+        let esc_before = metrics.heal_deadline_escalations.get();
+
+        // A generous deadline (the heal's age is microseconds): the deadline
+        // comfortably exceeds the round-trip, so nothing is escalated.
+        let report = cluster.enforce_heal_deadlines(
+            Duration::from_secs(300),
+            crate::config::HealDeadlineAction::Escalate,
+            &fresher_n3_view(shard),
+        );
+        assert_eq!(
+            (report.escalated, report.alerted),
+            (0, 0),
+            "a slow-but-progressing heal well within its deadline is not escalated",
+        );
+        assert_eq!(
+            metrics.heal_deadline_escalations.get() - esc_before,
+            0,
+            "no escalation metered for a heal within its deadline",
+        );
+        assert_eq!(
+            cluster.shard_table().read().target_assignment(shard).master,
+            NodeId(1),
+            "no premature reassignment for a heal that is still within its deadline",
+        );
+
+        // The heal then completes normally → fence clears.
+        cluster.mark_inbound_complete_from_source(shard, NodeId(2));
+        assert!(
+            matches!(cluster.is_master(&k), MasterQueryResult::Yes),
+            "the slow heal completes within its deadline and the shard serves again",
+        );
+    }
+
     /// Reverse-heal Phase 2c: with no converged partition view (boot), source
     /// selection falls back to the shard's committed replica — a data holder by
     /// assignment — so the pull can start immediately without waiting for the
@@ -19650,12 +20642,14 @@ mod tests {
                 was_previous_master: false,
                 is_subset: false,
                 was_evicted: false,
+                durable_recency: 0,
             },
             MasterCandidate {
                 node_id: NodeId(3),
                 was_previous_master: true,
                 is_subset: false,
                 was_evicted: false,
+                durable_recency: 0,
             },
         ];
         assert_eq!(
@@ -19677,12 +20671,14 @@ mod tests {
                 was_previous_master: false,
                 is_subset: true,
                 was_evicted: false,
+                durable_recency: 0,
             },
             MasterCandidate {
                 node_id: NodeId(2),
                 was_previous_master: false,
                 is_subset: false,
                 was_evicted: false,
+                durable_recency: 0,
             },
         ];
         assert_eq!(
@@ -19702,18 +20698,21 @@ mod tests {
                 was_previous_master: true,
                 is_subset: false,
                 was_evicted: true,
+                durable_recency: 0,
             },
             MasterCandidate {
                 node_id: NodeId(2),
                 was_previous_master: false,
                 is_subset: false,
                 was_evicted: false,
+                durable_recency: 0,
             },
             MasterCandidate {
                 node_id: NodeId(3),
                 was_previous_master: false,
                 is_subset: true,
                 was_evicted: false,
+                durable_recency: 0,
             },
         ];
         assert_eq!(
@@ -19734,18 +20733,21 @@ mod tests {
                 was_previous_master: false,
                 is_subset: false,
                 was_evicted: false,
+                durable_recency: 0,
             },
             MasterCandidate {
                 node_id: NodeId(4),
                 was_previous_master: false,
                 is_subset: false,
                 was_evicted: false,
+                durable_recency: 0,
             },
             MasterCandidate {
                 node_id: NodeId(7),
                 was_previous_master: false,
                 is_subset: false,
                 was_evicted: false,
+                durable_recency: 0,
             },
         ];
         assert_eq!(
@@ -19763,12 +20765,14 @@ mod tests {
                 was_previous_master: true,
                 is_subset: false,
                 was_evicted: true,
+                durable_recency: 0,
             },
             MasterCandidate {
                 node_id: NodeId(2),
                 was_previous_master: false,
                 is_subset: false,
                 was_evicted: true,
+                durable_recency: 0,
             },
         ];
         assert_eq!(
