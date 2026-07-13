@@ -1280,6 +1280,14 @@ pub struct MigrationMetrics {
     /// that the convergence backstop fired — a drained/rejoined node shed a
     /// shard a live peer had already taken over.
     pub phantom_master_relinquished: PaddedCounter,
+    /// Reverse-heal Phase 3c (design §E3) — number of times a STUCK fenced heal
+    /// past its deadline was ALERT-AND-HELD: kept fenced fail-closed with a loud
+    /// operator signal and NO ownership move (a shard's master is not committable
+    /// here, so the deadline never auto-reassigns). A persistently climbing value
+    /// is the LOUD operator signal that a shard is stuck fenced and needs
+    /// intervention (manual reassign / reboot) — the shard is unavailable but its
+    /// data is never lost or served stale, and the reverse-pull keeps retrying.
+    pub heal_deadline_alerts: PaddedCounter,
 }
 
 /// Number of {direction, role} buckets for migration byte counters.
@@ -1342,6 +1350,7 @@ impl MigrationMetrics {
             stale_suspect_shards: AtomicU32::new(0),
             topology_epoch_mismatch: PaddedCounter::new(),
             phantom_master_relinquished: PaddedCounter::new(),
+            heal_deadline_alerts: PaddedCounter::new(),
         }
     }
 

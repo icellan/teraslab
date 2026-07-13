@@ -123,6 +123,8 @@ fn create_node_with_cluster_id(
         persisted_incarnation: 0,
         cluster_id,
         reverse_heal_online: false,
+        heal_deadline: Duration::from_secs(300),
+        heal_deadline_action: teraslab::config::HealDeadlineAction::AlertAndHold,
     };
 
     let coordinator = ClusterCoordinator::new(cluster_config, 1);

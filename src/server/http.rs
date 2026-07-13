@@ -1339,6 +1339,11 @@ pub(crate) fn render_metrics_text(
             "teraslab_phantom_master_relinquished_total",
             mm.phantom_master_relinquished.get(),
         );
+        prom_counter(
+            &mut out,
+            "teraslab_heal_deadline_alerts_total",
+            mm.heal_deadline_alerts.get(),
+        );
     }
     if let Some(sw) = swim_metrics() {
         prom_counter(

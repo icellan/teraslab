@@ -1162,6 +1162,18 @@ pub struct ClusterConfig {
     /// off, so non-reverse-heal deployments keep byte-for-byte the prior runtime
     /// behaviour.
     pub reverse_heal_online: bool,
+    /// Reverse-heal Phase 3c (design §E3) — wall-clock deadline for a fenced
+    /// reverse-heal. A heal that holds the no-serve-before-heal fence longer than
+    /// this without completing is judged STUCK and the [`Self::heal_deadline_action`]
+    /// fallback fires. Sourced from
+    /// [`crate::config::ReverseHealConfig::resolved_heal_deadline`]; only consulted
+    /// when `reverse_heal_online` is enabled.
+    pub heal_deadline: Duration,
+    /// Reverse-heal Phase 3c (design §E3) — the fallback taken when a fenced heal
+    /// misses `heal_deadline`: the sole variant
+    /// [`crate::config::HealDeadlineAction::AlertAndHold`] (keep the shard fenced
+    /// fail-closed and alert; never auto-move it).
+    pub heal_deadline_action: crate::config::HealDeadlineAction,
 }
 
 /// Runtime replication policy passed to a started cluster coordinator.
@@ -1237,6 +1249,13 @@ pub struct ClusterCoordinator {
     /// [`ClusterConfig::reverse_heal_online`]). Captured into the event loop so
     /// each partition-view refresh runs the online re-detect + reverse-pull.
     reverse_heal_online: bool,
+    /// Reverse-heal Phase 3c — fenced-heal deadline (see
+    /// [`ClusterConfig::heal_deadline`]). Captured into the event loop so each
+    /// partition-view refresh enforces the deadline on stuck heals.
+    heal_deadline: Duration,
+    /// Reverse-heal Phase 3c — deadline fallback action (see
+    /// [`ClusterConfig::heal_deadline_action`]).
+    heal_deadline_action: crate::config::HealDeadlineAction,
 }
 
 /// C6 — reconstruct the shard table for a RESTORED committed topology at boot.
@@ -1372,6 +1391,8 @@ impl ClusterCoordinator {
             activation_hold: Arc::new(AtomicBool::new(false)),
             topology_debounce: config.topology_debounce,
             reverse_heal_online: config.reverse_heal_online,
+            heal_deadline: config.heal_deadline,
+            heal_deadline_action: config.heal_deadline_action,
         }
     }
 
@@ -1541,6 +1562,10 @@ impl ClusterCoordinator {
         // exchange-complete handler runs the online re-detect + reverse-pull on
         // each partition-view refresh.
         let reverse_heal_online = self.reverse_heal_online;
+        // Reverse-heal Phase 3c — fenced-heal deadline + fallback, captured so the
+        // same exchange-complete handler enforces the deadline on stuck heals.
+        let heal_deadline = self.heal_deadline;
+        let heal_deadline_action = self.heal_deadline_action;
 
         // Event processing thread
         let event_handle = std::thread::spawn(move || {
@@ -2378,6 +2403,25 @@ impl ClusterCoordinator {
                                 term,
                                 "reverse-heal Phase 3b: runtime online re-heal fenced + \
                                  queued reverse-pull for newly-stale mastered shard(s)",
+                            );
+                        }
+                        // Reverse-heal Phase 3c (design §E3) — enforce the
+                        // fenced-heal DEADLINE: a heal (boot or online) stuck past
+                        // the deadline is kept fenced fail-closed and ALERTED (never
+                        // silently fenced-forever, never served stale, and never
+                        // auto-reassigned — no topology commit is minted from this
+                        // path). A no-op when nothing is overdue.
+                        let report = enforce_heal_deadlines_inner(
+                            &migration,
+                            heal_deadline,
+                            heal_deadline_action,
+                        );
+                        if report.alerted > 0 {
+                            tracing::warn!(
+                                alerted = report.alerted,
+                                term,
+                                "reverse-heal Phase 3c: enforced fenced-heal deadline on \
+                                 stuck heal(s) — held fenced + alerted",
                             );
                         }
                     }
@@ -5599,6 +5643,71 @@ fn trigger_online_reheal(
         }
     }
     started
+}
+
+// ---------------------------------------------------------------------------
+// Reverse-heal Phase 3c — fenced-heal deadline → alert-and-hold (§E3)
+// ---------------------------------------------------------------------------
+
+/// Outcome of one [`RunningCluster::enforce_heal_deadlines`] pass: how many
+/// stuck shards were kept fenced fail-closed and alerted.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HealDeadlineReport {
+    /// Shards ALERT-AND-HELD — a heal that missed its deadline was kept fenced
+    /// fail-closed with a loud operator signal (metric + log). The shard is
+    /// UNAVAILABLE but never served stale, and NO ownership move is made (no
+    /// topology commit is minted from this path). The reverse-pull keeps retrying
+    /// underneath, so a source that returns still heals the shard automatically.
+    pub alerted: usize,
+}
+
+/// Reverse-heal Phase 3c — enforce the fenced-heal DEADLINE over every stuck heal
+/// via ALERT-AND-HOLD. The pure core shared by
+/// [`RunningCluster::enforce_heal_deadlines`] and the event-loop wiring.
+///
+/// For each shard whose `heal_pending` fence has been up past `deadline`
+/// ([`MigrationManager::expired_heal_shards`]) the shard is KEPT fenced fail-closed
+/// (`heal_pending` stays → `is_master` `Transitioning`, never serving stale), its
+/// deadline clock is reset (so the loud alert fires once per window rather than
+/// once per event-loop tick), the [`crate::metrics::MigrationMetrics::heal_deadline_alerts`]
+/// counter is incremented, and a rate-limited `warn!` naming the stuck shard is
+/// emitted for the operator.
+///
+/// This path NEVER mints a topology-reassignment commit: a hard authority review
+/// established that a node cannot safely hand a specific shard's mastership to a
+/// peer here (a shard's master is not carried in a `TopologyCommit` — only members
+/// are; the master is HRW/`apply_master_election`-derived), so a unilateral mint
+/// would fork the committed topology. Ownership only ever moves through the normal
+/// quorum-committed topology path (operator-driven reassign / reboot). `action` is
+/// the only [`crate::config::HealDeadlineAction`] variant (`AlertAndHold`); it is
+/// carried purely to name the mode in the operator alert.
+fn enforce_heal_deadlines_inner(
+    migration: &Arc<Mutex<MigrationManager>>,
+    deadline: Duration,
+    action: crate::config::HealDeadlineAction,
+) -> HealDeadlineReport {
+    let expired = migration.lock().expired_heal_shards(deadline);
+    let mut report = HealDeadlineReport::default();
+    for shard in expired {
+        // Alert-and-hold: keep the shard fenced fail-closed, reset its deadline
+        // clock (one alert per window), and emit a LOUD operator signal. No
+        // ownership move — the shard stays this node's to heal, and the pull keeps
+        // retrying underneath.
+        migration.lock().refresh_heal_deadline(shard);
+        report.alerted += 1;
+        if let Some(m) = crate::metrics::migration_metrics() {
+            m.heal_deadline_alerts.inc();
+        }
+        tracing::warn!(
+            shard,
+            ?action,
+            "reverse-heal Phase 3c: stuck heal past deadline — shard HELD fenced \
+             fail-closed (alert-and-hold); shard is UNAVAILABLE but never served \
+             stale and NO ownership move is made — operator intervention needed \
+             (manual reassign / reboot); the reverse-pull keeps retrying",
+        );
+    }
+    report
 }
 
 // ---------------------------------------------------------------------------
@@ -10028,6 +10137,35 @@ impl RunningCluster {
             &self.reheal_backoff,
             partition_view,
         )
+    }
+
+    /// Reverse-heal Phase 3c (design §E3) — enforce the fenced-heal DEADLINE over
+    /// every stuck heal on this node via ALERT-AND-HOLD.
+    ///
+    /// A heal that has held the no-serve-before-heal fence past `deadline` without
+    /// completing is judged STUCK (it may never complete: dead source, correlated
+    /// loss). Rather than fence the shard SILENTLY forever, the shard is kept fenced
+    /// fail-closed (`is_master` stays `Transitioning`, never served stale) and a
+    /// loud, rate-limited operator signal is raised (the
+    /// [`crate::metrics::MigrationMetrics::heal_deadline_alerts`] counter + a `warn!`
+    /// naming the shard). NO ownership move is made — this path never mints a
+    /// topology-reassignment commit (a shard's master is not committable here, so a
+    /// unilateral mint would fork the committed topology). Ownership only moves via
+    /// the normal quorum-committed path (operator-driven reassign / reboot), and the
+    /// reverse-pull keeps retrying underneath so a returning source still heals the
+    /// shard automatically. Sibling shards are untouched.
+    ///
+    /// `action` is the sole [`crate::config::HealDeadlineAction`] variant
+    /// (`AlertAndHold`); it is threaded through purely to name the mode in the alert.
+    /// Returns a [`HealDeadlineReport`] counting the alerted shards. Driven from the
+    /// event loop on each partition-view refresh when online re-heal is enabled; a
+    /// heal that completes before the deadline is never touched.
+    pub fn enforce_heal_deadlines(
+        &self,
+        deadline: Duration,
+        action: crate::config::HealDeadlineAction,
+    ) -> HealDeadlineReport {
+        enforce_heal_deadlines_inner(&self.migration, deadline, action)
     }
 
     /// Test-only — snapshot of the online re-heal not-behind BACKOFF cache
@@ -17590,6 +17728,313 @@ mod tests {
         assert!(
             matches!(cluster.is_master(&k), MasterQueryResult::Yes),
             "after the heal completes the shard is served as authority",
+        );
+    }
+
+    // ── Reverse-heal Phase 3c — fenced-heal deadline → alert-and-hold ──
+
+    /// Phase 3c helper: a 3-node RF=3 cluster where NodeId(1) (self) is the
+    /// committed master of the returned shard, with NodeId(2)+NodeId(3) as its
+    /// committed replicas. Committed term = 5, placement version 1.
+    fn three_node_heal_cluster() -> (RunningCluster, u16) {
+        let members = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let table = ShardTable::compute_with_epoch(&members, 3, 5, 1);
+        let shard = (0..NUM_SHARDS as u16)
+            .find(|&s| {
+                let a = table.target_assignment(s);
+                a.master == NodeId(1)
+                    && a.replicas.contains(&NodeId(2))
+                    && a.replicas.contains(&NodeId(3))
+            })
+            .expect("some shard mastered by NodeId(1) with NodeId(2)+NodeId(3) replicas");
+        let cluster = new_test_running_cluster(
+            NodeId(1),
+            table,
+            &[
+                (NodeId(1), "127.0.0.1:5101".parse().unwrap()),
+                (NodeId(2), "127.0.0.1:5102".parse().unwrap()),
+                (NodeId(3), "127.0.0.1:5103".parse().unwrap()),
+            ],
+            &members,
+            &[],
+            &[],
+            &[],
+            3,
+        );
+        (cluster, shard)
+    }
+
+    /// Reverse-heal Phase 3c (design §E3) — a fenced heal that never completes,
+    /// once past the deadline, is KEPT fenced fail-closed and ALERTED. It is never
+    /// served stale and — the P0 fix — NO topology-reassignment commit is minted
+    /// from the heal-deadline path, so `committed_term` is UNCHANGED (the fork the
+    /// prior escalation opened is closed). The reverse-pull keeps retrying.
+    #[test]
+    fn heal_deadline_holds_fenced_and_alerts() {
+        let _guard = migration_metrics_test_guard();
+        let metrics = install_test_migration_metrics();
+
+        let (cluster, shard) = three_node_heal_cluster();
+        let k = key_for_shard(shard);
+        assert!(
+            matches!(cluster.is_master(&k), MasterQueryResult::Yes),
+            "precondition: self masters the shard",
+        );
+
+        // Begin a reverse-heal from NodeId(2) that will never complete → fenced.
+        assert_eq!(cluster.begin_reverse_heal(&[(shard, NodeId(2))]), 1);
+        assert!(
+            matches!(
+                cluster.is_master(&k),
+                MasterQueryResult::Transitioning { .. }
+            ),
+            "a stale shard is fenced (Transitioning) while healing",
+        );
+
+        let committed_before = cluster.topology_authority.committed_term();
+        let alert_before = metrics.heal_deadline_alerts.get();
+
+        // Within the deadline (huge) → nothing fires; still fenced, still healing.
+        let early = cluster.enforce_heal_deadlines(
+            Duration::from_secs(3600),
+            crate::config::HealDeadlineAction::AlertAndHold,
+        );
+        assert_eq!(
+            early.alerted, 0,
+            "a heal within its deadline is never alerted",
+        );
+        assert!(
+            matches!(
+                cluster.is_master(&k),
+                MasterQueryResult::Transitioning { .. }
+            ),
+            "still fenced before the deadline",
+        );
+        assert_eq!(
+            cluster.topology_authority.committed_term(),
+            committed_before,
+            "no topology commit before the deadline",
+        );
+
+        // Past the deadline (0) → alert-and-hold: the shard STAYS fenced, the alert
+        // metric increments, and NO topology commit is minted (committed_term
+        // UNCHANGED — proving the fork the prior escalation opened is closed).
+        let report = cluster.enforce_heal_deadlines(
+            Duration::from_millis(0),
+            crate::config::HealDeadlineAction::AlertAndHold,
+        );
+        assert_eq!(
+            report.alerted, 1,
+            "a stuck heal past its deadline is held fenced + alerted",
+        );
+        assert_eq!(
+            cluster.topology_authority.committed_term(),
+            committed_before,
+            "the heal-deadline path mints NO topology commit — committed_term is \
+             UNCHANGED (no fork)",
+        );
+        assert!(
+            matches!(
+                cluster.is_master(&k),
+                MasterQueryResult::Transitioning { .. }
+            ),
+            "the shard STAYS fenced fail-closed (Transitioning) — never served stale",
+        );
+        assert_eq!(
+            metrics.heal_deadline_alerts.get() - alert_before,
+            1,
+            "one alert metered",
+        );
+    }
+
+    /// Reverse-heal Phase 3c (design §E3) — the heal-deadline path makes ZERO
+    /// autonomous ownership moves: repeated enforcement never reassigns the shard's
+    /// master (no `set_master_for_shard`), never changes the committed member set,
+    /// and never advances `committed_term` (no minted commit → no broadcast).
+    #[test]
+    fn heal_deadline_does_not_change_ownership() {
+        let _guard = migration_metrics_test_guard();
+        let _metrics = install_test_migration_metrics();
+
+        let (cluster, shard) = three_node_heal_cluster();
+        assert_eq!(cluster.begin_reverse_heal(&[(shard, NodeId(2))]), 1);
+
+        let master_before = cluster.shard_table().read().target_assignment(shard).master;
+        let members_before = cluster.topology_authority.committed_members();
+        let term_before = cluster.topology_authority.committed_term();
+
+        // Enforce the (expired) deadline repeatedly — a persistently stuck heal.
+        for _ in 0..3 {
+            let report = cluster.enforce_heal_deadlines(
+                Duration::from_millis(0),
+                crate::config::HealDeadlineAction::AlertAndHold,
+            );
+            assert_eq!(
+                report.alerted, 1,
+                "each pass holds + alerts, never moves ownership"
+            );
+        }
+
+        assert_eq!(
+            cluster.shard_table().read().target_assignment(shard).master,
+            master_before,
+            "self remains the shard's master — the deadline never reassigns it",
+        );
+        assert_eq!(
+            cluster.topology_authority.committed_members(),
+            members_before,
+            "the committed member set is unchanged",
+        );
+        assert_eq!(
+            cluster.topology_authority.committed_term(),
+            term_before,
+            "no topology commit is minted — committed_term is unchanged (no broadcast)",
+        );
+    }
+
+    /// Reverse-heal Phase 3c — a fenced/held shard does NOT affect a healthy
+    /// SIBLING shard the same node masters: the sibling keeps serving locally while
+    /// s is fenced and while s is held past its deadline (per-shard isolation).
+    #[test]
+    fn healthy_sibling_shard_still_serves_while_s_heals() {
+        let members = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let table = ShardTable::compute_with_epoch(&members, 3, 5, 1);
+        let mut mastered = (0..NUM_SHARDS as u16).filter(|&s| {
+            let a = table.target_assignment(s);
+            a.master == NodeId(1)
+                && a.replicas.contains(&NodeId(2))
+                && a.replicas.contains(&NodeId(3))
+        });
+        let s = mastered.next().expect("a healable shard for NodeId(1)");
+        let sib = mastered.next().expect("a sibling shard for NodeId(1)");
+        let cluster = new_test_running_cluster(
+            NodeId(1),
+            table,
+            &[
+                (NodeId(1), "127.0.0.1:5301".parse().unwrap()),
+                (NodeId(2), "127.0.0.1:5302".parse().unwrap()),
+                (NodeId(3), "127.0.0.1:5303".parse().unwrap()),
+            ],
+            &members,
+            &[],
+            &[],
+            &[],
+            3,
+        );
+        let ks = key_for_shard(s);
+        let ksib = key_for_shard(sib);
+        assert!(matches!(cluster.is_master(&ks), MasterQueryResult::Yes));
+        assert!(matches!(cluster.is_master(&ksib), MasterQueryResult::Yes));
+
+        // Fence ONLY s.
+        assert_eq!(cluster.begin_reverse_heal(&[(s, NodeId(2))]), 1);
+        assert!(
+            matches!(
+                cluster.is_master(&ks),
+                MasterQueryResult::Transitioning { .. }
+            ),
+            "the healing shard s is fenced",
+        );
+        assert!(
+            matches!(cluster.is_master(&ksib), MasterQueryResult::Yes),
+            "the healthy sibling keeps serving while s heals",
+        );
+
+        // Hold s past the deadline (alert-and-hold); the sibling is untouched and s
+        // stays fenced fail-closed (never handed off).
+        let report = cluster.enforce_heal_deadlines(
+            Duration::from_millis(0),
+            crate::config::HealDeadlineAction::AlertAndHold,
+        );
+        assert_eq!(report.alerted, 1);
+        assert!(
+            matches!(
+                cluster.is_master(&ks),
+                MasterQueryResult::Transitioning { .. }
+            ),
+            "s stays fenced fail-closed under alert-and-hold — never handed off",
+        );
+        assert!(
+            matches!(cluster.is_master(&ksib), MasterQueryResult::Yes),
+            "the sibling shard STILL serves locally while s is held",
+        );
+    }
+
+    /// Reverse-heal Phase 3c — the normal completion path is unchanged: a heal that
+    /// completes clears the fence and the shard is served again. Enforcing the
+    /// deadline (generously) while the pull is still in flight must NOT interfere
+    /// with a heal that then completes.
+    #[test]
+    fn fence_clears_after_reverse_pull_completes() {
+        let (cluster, shard) = three_node_heal_cluster();
+        let k = key_for_shard(shard);
+        assert_eq!(cluster.begin_reverse_heal(&[(shard, NodeId(2))]), 1);
+        assert!(matches!(
+            cluster.is_master(&k),
+            MasterQueryResult::Transitioning { .. }
+        ));
+
+        // A generous deadline enforcement mid-pull leaves the heal alone.
+        let report = cluster.enforce_heal_deadlines(
+            Duration::from_secs(3600),
+            crate::config::HealDeadlineAction::AlertAndHold,
+        );
+        assert_eq!(report.alerted, 0);
+        assert!(
+            matches!(
+                cluster.is_master(&k),
+                MasterQueryResult::Transitioning { .. }
+            ),
+            "an in-flight heal within its deadline stays fenced (not alerted)",
+        );
+
+        // The pull completes → fence clears → served as authority again.
+        cluster.mark_inbound_complete_from_source(shard, NodeId(2));
+        assert!(
+            matches!(cluster.is_master(&k), MasterQueryResult::Yes),
+            "a completed reverse-pull clears the fence and the shard serves again",
+        );
+    }
+
+    /// Reverse-heal Phase 3c — the deadline must exceed a normal heal round-trip: a
+    /// slow-but-still-progressing heal (age well under the deadline) is NEVER
+    /// alerted prematurely, and then completes normally.
+    #[test]
+    fn no_premature_alert_on_slow_but_completing_heal() {
+        let _guard = migration_metrics_test_guard();
+        let metrics = install_test_migration_metrics();
+
+        let (cluster, shard) = three_node_heal_cluster();
+        let k = key_for_shard(shard);
+        assert_eq!(cluster.begin_reverse_heal(&[(shard, NodeId(2))]), 1);
+        let alert_before = metrics.heal_deadline_alerts.get();
+
+        // A generous deadline (the heal's age is microseconds): the deadline
+        // comfortably exceeds the round-trip, so nothing is alerted.
+        let report = cluster.enforce_heal_deadlines(
+            Duration::from_secs(300),
+            crate::config::HealDeadlineAction::AlertAndHold,
+        );
+        assert_eq!(
+            report.alerted, 0,
+            "a slow-but-progressing heal well within its deadline is not alerted",
+        );
+        assert_eq!(
+            metrics.heal_deadline_alerts.get() - alert_before,
+            0,
+            "no alert metered for a heal within its deadline",
+        );
+        assert_eq!(
+            cluster.shard_table().read().target_assignment(shard).master,
+            NodeId(1),
+            "no reassignment for a heal that is still within its deadline",
+        );
+
+        // The heal then completes normally → fence clears.
+        cluster.mark_inbound_complete_from_source(shard, NodeId(2));
+        assert!(
+            matches!(cluster.is_master(&k), MasterQueryResult::Yes),
+            "the slow heal completes within its deadline and the shard serves again",
         );
     }
 

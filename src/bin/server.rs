@@ -1764,6 +1764,11 @@ fn main() {
             // enable (`reverse_heal.tombstones`): RULE-DS, the delete-safe apply the
             // pull relies on, is a no-op without it. Default OFF.
             reverse_heal_online: config.reverse_heal.tombstones,
+            // Reverse-heal Phase 3c — fenced-heal deadline + fallback (design §E3).
+            // Only consulted when online re-heal is enabled; a heal stuck past the
+            // deadline escalates to a fresher master (default) or alert-and-holds.
+            heal_deadline: config.reverse_heal.resolved_heal_deadline(),
+            heal_deadline_action: config.reverse_heal.heal_deadline_action,
         };
         if initial_peak > 1 {
             tracing::info!(

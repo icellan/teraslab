@@ -1098,6 +1098,36 @@ where
 /// could under-lock a shared block, so packing is refused above this.
 const PACKED_MAX_DEVICE_ALIGNMENT: usize = 4096;
 
+/// What a node does when a fenced reverse-heal misses its
+/// [`ReverseHealConfig::heal_deadline_secs`] deadline (design §E3).
+///
+/// A fenced heal (boot or online) that never completes must NOT stay fenced
+/// fail-closed *silently* forever (the "brick until reboot" gap the 2c/3b reviews
+/// flagged). On the deadline the node takes this action — non-bricking in the
+/// sense that it turns a silent fence into a LOUD, operator-visible one, and it
+/// never serves stale data.
+///
+/// A prior 3c revision also offered an `Escalate` action that auto-reassigned the
+/// stuck shard to a fresher replica by minting a topology-reassignment commit from
+/// this node. A hard authority review rejected it as fundamentally unsafe in this
+/// architecture: a specific shard's master is NOT carried in a `TopologyCommit`
+/// (only the member set is; the master is HRW/`apply_master_election`-derived), so
+/// a unilaterally-minted "reassignment" forks the committed topology at a shared
+/// term against a concurrent real proposer and fabricates a quorum proof no one
+/// voted on. Autonomous ownership moves are therefore intentionally NOT offered
+/// here; the deadline surfaces the stuck shard for operator action instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum HealDeadlineAction {
+    /// Keep the shard fenced fail-closed and emit a loud metric + log for operator
+    /// action; NEVER auto-move the shard. Makes zero autonomous ownership
+    /// decisions — the operator drives any reassignment (manual reassign / reboot),
+    /// and the reverse-pull keeps retrying underneath, so a source that comes back
+    /// still heals the shard automatically.
+    #[default]
+    AlertAndHold,
+}
+
 /// Reverse-heal configuration (`[reverse_heal]`) — the delete-safe reverse-pull
 /// subsystem. Everything here is OFF by default so single-node / RF=1
 /// deployments pay nothing (the derived `Default` — `tombstones = false`,
@@ -1127,6 +1157,46 @@ pub struct ReverseHealConfig {
     /// within this window. Set it explicitly only to widen (never below the reorg
     /// horizon — that would reopen a real-loss gap).
     pub tombstone_retention_blocks: Option<u32>,
+
+    /// Phase 3c (design §E3) — wall-clock deadline, in SECONDS, for a fenced
+    /// reverse-heal (boot or online). A heal that has held the no-serve-before-heal
+    /// fence for at least this long without completing is judged STUCK and the
+    /// [`Self::heal_deadline_action`] fallback fires, so a heal that can never
+    /// complete (source dead, correlated loss) does not fence the shard forever.
+    ///
+    /// `None` (default) resolves to [`Self::DEFAULT_HEAL_DEADLINE_SECS`]. The
+    /// deadline must comfortably EXCEED a normal heal round-trip so a slow but
+    /// completing pull is never alerted prematurely; the default (300 s) is
+    /// orders of magnitude above a per-shard baseline transfer. Raise it for very
+    /// large shards or slow links; a value of `0` is clamped up to 1 s.
+    pub heal_deadline_secs: Option<u64>,
+
+    /// Phase 3c (design §E3) — what to do when a fenced heal misses
+    /// [`Self::heal_deadline_secs`]. The only (and default) action is
+    /// [`HealDeadlineAction::AlertAndHold`]: keep the shard fenced fail-closed and
+    /// emit a loud metric + log, making zero autonomous ownership moves (see the
+    /// [`HealDeadlineAction`] docs for why auto-escalation is unsafe here).
+    pub heal_deadline_action: HealDeadlineAction,
+}
+
+impl ReverseHealConfig {
+    /// Default fenced-heal deadline when `heal_deadline_secs` is unset: 5 minutes.
+    /// Chosen to sit far above any realistic single-shard baseline heal round-trip
+    /// so an in-progress pull is never tripped, while still bounding the
+    /// fenced-forever window to minutes rather than "until an operator reboots".
+    pub const DEFAULT_HEAL_DEADLINE_SECS: u64 = 300;
+
+    /// The resolved fenced-heal deadline as a [`std::time::Duration`]: the
+    /// configured `heal_deadline_secs` (clamped up to at least 1 s so a
+    /// misconfigured `0` cannot escalate every heal instantly), else
+    /// [`Self::DEFAULT_HEAL_DEADLINE_SECS`].
+    pub fn resolved_heal_deadline(&self) -> std::time::Duration {
+        let secs = self
+            .heal_deadline_secs
+            .unwrap_or(Self::DEFAULT_HEAL_DEADLINE_SECS)
+            .max(1);
+        std::time::Duration::from_secs(secs)
+    }
 }
 
 /// TeraSlab server configuration.
