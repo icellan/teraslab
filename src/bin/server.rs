@@ -1620,12 +1620,20 @@ fn main() {
         "node last-durable height restored (height subsystem)",
     );
 
+    // Resolve the reverse-heal enable ONCE: an explicit `reverse_heal.tombstones`
+    // wins; unset defaults to ON for a clustered node (RF>1) and OFF for
+    // single-node / RF=1 (a heal has no replica source there, so tombstones would
+    // add cost with no benefit).
+    let reverse_heal_enabled = config
+        .reverse_heal
+        .tombstones_enabled(config.replication_factor);
+
     // Reverse-heal Phase 2a: attach the deletion-tombstone log ONLY when
-    // enabled (`reverse_heal.tombstones`). Runs AFTER the height restore so the
-    // boot floor-GC sees the restored last-durable height, and AFTER recovery
-    // has rebuilt + reconciled the primary index so the live-reconcile
-    // (Invariant TS-1) can drop any tombstone whose record came back live.
-    if config.reverse_heal.tombstones {
+    // enabled. Runs AFTER the height restore so the boot floor-GC sees the
+    // restored last-durable height, and AFTER recovery has rebuilt + reconciled
+    // the primary index so the live-reconcile (Invariant TS-1) can drop any
+    // tombstone whose record came back live.
+    if reverse_heal_enabled {
         let tombstone_path = config.resolved_tombstone_log_path();
         let retention = config.resolved_tombstone_retention_blocks();
         match teraslab::ops::tombstone::TombstoneLog::load(
@@ -1774,7 +1782,7 @@ fn main() {
             // Reverse-heal Phase 3b — RUNTIME online re-heal rides the reverse-heal
             // enable (`reverse_heal.tombstones`): RULE-DS, the delete-safe apply the
             // pull relies on, is a no-op without it. Default OFF.
-            reverse_heal_online: config.reverse_heal.tombstones,
+            reverse_heal_online: reverse_heal_enabled,
             // Reverse-heal Phase 3c — fenced-heal deadline + fallback (design §E3).
             // Only consulted when online re-heal is enabled; a heal stuck past the
             // deadline escalates to a fresher master (default) or alert-and-holds.
@@ -1841,7 +1849,7 @@ fn main() {
         // image (RULE-DS). Only meaningful when tombstones are enabled (the GC is
         // a no-op otherwise); every heal raises the inbound fence, so this covers
         // every heal_pending shard. See `Engine::set_tombstone_gc_guard`.
-        if config.reverse_heal.tombstones {
+        if reverse_heal_enabled {
             engine.set_tombstone_gc_guard(running.inbound_fence_bitmap());
         }
         // Initialize persistent ACK tracker alongside the cluster state file.
@@ -1936,7 +1944,7 @@ fn main() {
             let g3_shards = teraslab::cluster::coordinator::colocated_create_stale_shards(
                 &g3_resync_create_keys,
                 config.replication_factor,
-                config.reverse_heal.tombstones,
+                reverse_heal_enabled,
             );
             if !g3_shards.is_empty() {
                 let mut suspects: std::collections::BTreeSet<u16> =
@@ -1960,7 +1968,7 @@ fn main() {
                 tracing::warn!(
                     lost_creates = g3_resync_create_keys.len(),
                     replication_factor = config.replication_factor,
-                    reverse_heal = config.reverse_heal.tombstones,
+                    reverse_heal = reverse_heal_enabled,
                     "reverse-heal G3: co-located CreateV2 record bytes lost on the \
                      buffered tail, but no replica to heal from (RF=1 / single-device \
                      or reverse-heal disabled) — dropping the creates (unchanged)",
@@ -1992,7 +2000,7 @@ fn main() {
         // ClientDelete gate (admit a re-org re-create at height > deletion_height)
         // AND/OR the Phase-3 online re-heal path — both consensus-critical,
         // designed + reviewed in Phase 3/4, NOT implemented here.
-        if config.reverse_heal.tombstones {
+        if reverse_heal_enabled {
             let stale = running.stale_suspect_shards();
             if !stale.is_empty() {
                 // No membership exchange has converged a partition view at boot,

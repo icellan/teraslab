@@ -1135,10 +1135,16 @@ pub enum HealDeadlineAction {
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(default)]
 pub struct ReverseHealConfig {
-    /// Enable per-store generation-aware deletion tombstones (Phase 2a). When
-    /// off (default) no tombstone log is attached and the delete path records
-    /// nothing — a zero-cost no-op.
-    pub tombstones: bool,
+    /// Enable per-store generation-aware deletion tombstones (Phase 2a) and the
+    /// reverse-heal that consumes them. `None` (unset — the default) resolves
+    /// per [`Self::tombstones_enabled`]: **ON for a clustered node (RF>1)**,
+    /// where the heal has a replica to pull a lost acked tail back from, and
+    /// **OFF for single-node / RF=1**, where a heal has no source and tombstones
+    /// would only add cost (an append-log write per delete + an in-RAM index +
+    /// checkpoint GC) with no benefit. `Some(true)`/`Some(false)` force it on/off
+    /// regardless of RF. When off, no tombstone log is attached and the delete
+    /// path records nothing — a zero-cost no-op.
+    pub tombstones: Option<bool>,
 
     /// Retention horizon for a tombstone, in blocks: a tombstone is GC'd once
     /// `deletion_height + retention <= last_durable_height`. `None` (default)
@@ -1180,6 +1186,15 @@ pub struct ReverseHealConfig {
 }
 
 impl ReverseHealConfig {
+    /// Whether the reverse-heal (tombstones + detection + heal) is enabled for a
+    /// node with this `replication_factor`. An explicit [`Self::tombstones`]
+    /// (`Some(true)`/`Some(false)`) always wins; when unset (`None`), the default
+    /// is **RF-gated**: enabled iff `replication_factor > 1` (a heal needs a
+    /// replica to pull from, so single-node / RF=1 gets the zero-cost no-op).
+    pub fn tombstones_enabled(&self, replication_factor: u8) -> bool {
+        self.tombstones.unwrap_or(replication_factor > 1)
+    }
+
     /// Default fenced-heal deadline when `heal_deadline_secs` is unset: 5 minutes.
     /// Chosen to sit far above any realistic single-shard baseline heal round-trip
     /// so an in-progress pull is never tripped, while still bounding the
@@ -2795,6 +2810,36 @@ pub(crate) fn check_cluster_secret_agreement(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reverse_heal_default_gates_on_replication_factor() {
+        // Default (unset): ON for a clustered node (RF>1), OFF for single-node
+        // (RF<=1) where a heal has no replica to pull from and would only add
+        // tombstone/GC cost.
+        let cfg = ReverseHealConfig::default();
+        assert!(cfg.tombstones.is_none(), "default is unset (auto)");
+        assert!(!cfg.tombstones_enabled(1), "single-node default OFF");
+        assert!(cfg.tombstones_enabled(2), "RF>1 default ON");
+        assert!(cfg.tombstones_enabled(3), "RF>1 default ON");
+
+        // Explicit config always wins over the RF-gated default.
+        let forced_on = ReverseHealConfig {
+            tombstones: Some(true),
+            ..Default::default()
+        };
+        assert!(
+            forced_on.tombstones_enabled(1),
+            "explicit true overrides on single-node"
+        );
+        let forced_off = ReverseHealConfig {
+            tombstones: Some(false),
+            ..Default::default()
+        };
+        assert!(
+            !forced_off.tombstones_enabled(3),
+            "explicit false overrides on RF>1"
+        );
+    }
 
     #[test]
     fn default_index_config_is_memory() {
