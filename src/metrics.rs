@@ -1281,18 +1281,12 @@ pub struct MigrationMetrics {
     /// shard a live peer had already taken over.
     pub phantom_master_relinquished: PaddedCounter,
     /// Reverse-heal Phase 3c (design §E3) — number of times a STUCK fenced heal
-    /// (one that missed its deadline) was ESCALATED: the shard was handed to a
-    /// fresher committed replica via a durable, recency-aware master election. A
-    /// non-zero value is the operator-visible signal that a node could not heal a
-    /// shard it mastered and released it to a peer that demonstrably holds the
-    /// data — availability was preserved without ever serving the stale copy.
-    pub heal_deadline_escalations: PaddedCounter,
-    /// Reverse-heal Phase 3c (design §E3) — number of times a STUCK fenced heal
-    /// past its deadline was ALERT-AND-HELD: kept fenced fail-closed (either the
-    /// operator-chosen conservative mode, or escalate mode with NO fresher
-    /// quorum-current source available). A persistently climbing value is the LOUD
-    /// operator signal that a shard is stuck fenced and needs intervention — the
-    /// shard is unavailable but its data is never lost or served stale.
+    /// past its deadline was ALERT-AND-HELD: kept fenced fail-closed with a loud
+    /// operator signal and NO ownership move (a shard's master is not committable
+    /// here, so the deadline never auto-reassigns). A persistently climbing value
+    /// is the LOUD operator signal that a shard is stuck fenced and needs
+    /// intervention (manual reassign / reboot) — the shard is unavailable but its
+    /// data is never lost or served stale, and the reverse-pull keeps retrying.
     pub heal_deadline_alerts: PaddedCounter,
 }
 
@@ -1356,7 +1350,6 @@ impl MigrationMetrics {
             stale_suspect_shards: AtomicU32::new(0),
             topology_epoch_mismatch: PaddedCounter::new(),
             phantom_master_relinquished: PaddedCounter::new(),
-            heal_deadline_escalations: PaddedCounter::new(),
             heal_deadline_alerts: PaddedCounter::new(),
         }
     }

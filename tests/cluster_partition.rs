@@ -250,7 +250,7 @@ fn spawn_proxied_server(
         cluster_id: TEST_CLUSTER_ID,
         reverse_heal_online: false,
         heal_deadline: Duration::from_secs(300),
-        heal_deadline_action: teraslab::config::HealDeadlineAction::Escalate,
+        heal_deadline_action: teraslab::config::HealDeadlineAction::AlertAndHold,
     };
 
     let coordinator = ClusterCoordinator::new(cluster_config, 1);

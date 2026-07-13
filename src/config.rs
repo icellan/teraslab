@@ -1102,24 +1102,29 @@ const PACKED_MAX_DEVICE_ALIGNMENT: usize = 4096;
 /// [`ReverseHealConfig::heal_deadline_secs`] deadline (design §E3).
 ///
 /// A fenced heal (boot or online) that never completes must NOT stay fenced
-/// fail-closed forever (the "brick until reboot" gap the 2c/3b reviews flagged).
-/// On the deadline the node takes ONE of these actions — both are non-bricking
-/// and never serve stale data:
+/// fail-closed *silently* forever (the "brick until reboot" gap the 2c/3b reviews
+/// flagged). On the deadline the node takes this action — non-bricking in the
+/// sense that it turns a silent fence into a LOUD, operator-visible one, and it
+/// never serves stale data.
+///
+/// A prior 3c revision also offered an `Escalate` action that auto-reassigned the
+/// stuck shard to a fresher replica by minting a topology-reassignment commit from
+/// this node. A hard authority review rejected it as fundamentally unsafe in this
+/// architecture: a specific shard's master is NOT carried in a `TopologyCommit`
+/// (only the member set is; the master is HRW/`apply_master_election`-derived), so
+/// a unilaterally-minted "reassignment" forks the committed topology at a shared
+/// term against a concurrent real proposer and fabricates a quorum proof no one
+/// voted on. Autonomous ownership moves are therefore intentionally NOT offered
+/// here; the deadline surfaces the stuck shard for operator action instead.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum HealDeadlineAction {
-    /// Hand the stuck shard to a FRESHER committed replica via a recency-aware
-    /// master election ([`crate::cluster::coordinator::elect_master`]), committed
-    /// DURABLY through the G9 durable-commit path before it is served. The stuck
-    /// node releases its master claim and stays fenced/redirecting (never serving
-    /// stale) until it re-heals from the new master. The default: keeps the shard
-    /// AVAILABLE on a node that demonstrably holds the data.
-    #[default]
-    Escalate,
     /// Keep the shard fenced fail-closed and emit a loud metric + log for operator
-    /// action; NEVER auto-move the shard. The conservative alternative: accepts
-    /// availability loss for the shard but makes zero autonomous ownership
-    /// decisions. Choose this when an operator wants to gate every reassignment.
+    /// action; NEVER auto-move the shard. Makes zero autonomous ownership
+    /// decisions — the operator drives any reassignment (manual reassign / reboot),
+    /// and the reverse-pull keeps retrying underneath, so a source that comes back
+    /// still heals the shard automatically.
+    #[default]
     AlertAndHold,
 }
 
@@ -1161,16 +1166,16 @@ pub struct ReverseHealConfig {
     ///
     /// `None` (default) resolves to [`Self::DEFAULT_HEAL_DEADLINE_SECS`]. The
     /// deadline must comfortably EXCEED a normal heal round-trip so a slow but
-    /// completing pull is never escalated prematurely; the default (300 s) is
+    /// completing pull is never alerted prematurely; the default (300 s) is
     /// orders of magnitude above a per-shard baseline transfer. Raise it for very
     /// large shards or slow links; a value of `0` is clamped up to 1 s.
     pub heal_deadline_secs: Option<u64>,
 
     /// Phase 3c (design §E3) — what to do when a fenced heal misses
-    /// [`Self::heal_deadline_secs`]. Default [`HealDeadlineAction::Escalate`]
-    /// (hand the shard to a fresher committed replica via a durable, recency-aware
-    /// election). Set to [`HealDeadlineAction::AlertAndHold`] to keep the shard
-    /// fenced fail-closed and only alert, making zero autonomous ownership moves.
+    /// [`Self::heal_deadline_secs`]. The only (and default) action is
+    /// [`HealDeadlineAction::AlertAndHold`]: keep the shard fenced fail-closed and
+    /// emit a loud metric + log, making zero autonomous ownership moves (see the
+    /// [`HealDeadlineAction`] docs for why auto-escalation is unsafe here).
     pub heal_deadline_action: HealDeadlineAction,
 }
 

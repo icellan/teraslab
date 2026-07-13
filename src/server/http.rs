@@ -1341,11 +1341,6 @@ pub(crate) fn render_metrics_text(
         );
         prom_counter(
             &mut out,
-            "teraslab_heal_deadline_escalations_total",
-            mm.heal_deadline_escalations.get(),
-        );
-        prom_counter(
-            &mut out,
             "teraslab_heal_deadline_alerts_total",
             mm.heal_deadline_alerts.get(),
         );

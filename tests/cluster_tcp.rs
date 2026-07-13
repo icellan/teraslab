@@ -235,7 +235,7 @@ fn create_node_full_engine(
         cluster_id,
         reverse_heal_online: false,
         heal_deadline: Duration::from_secs(300),
-        heal_deadline_action: teraslab::config::HealDeadlineAction::Escalate,
+        heal_deadline_action: teraslab::config::HealDeadlineAction::AlertAndHold,
     };
 
     let coordinator = ClusterCoordinator::new(cluster_config, 1);
