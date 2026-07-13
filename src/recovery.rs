@@ -690,6 +690,17 @@ pub fn recover_all_multi_store(
     // lost create is pulled from a quorum-current replica instead of silently
     // vanishing. Empty on the RF=1 / single-device path (the boot layer gates).
     let mut resync_creates: Vec<TxKey> = Vec::new();
+    // P2 (PR #77 review): membership mirror of the keys still pending in
+    // `resync_creates`, bounded to the (small) flagged set. Offset reuse is the
+    // norm in a hot UTXO store, so a key flagged as "missing bytes" is routinely
+    // resolved LATER in the same global-order pass — by a `Delete` (created-then-
+    // deleted → legitimately gone, not lost) or by a successful re-`Create` at a
+    // now-durable offset (offset reused by the SAME key). Either resolution scrubs
+    // the flag so it does not falsely mark its shard stale-suspect → unnecessary
+    // boot heal (the 3b over-fence availability class). `resync_creates` itself
+    // stays append-ordered; a single `retain` on this set after the loop drops
+    // the scrubbed keys while preserving order.
+    let mut resync_pending: std::collections::HashSet<TxKey> = std::collections::HashSet::new();
 
     // GLOBAL-SEQUENCE-ORDER REPLAY (single-threaded). Per-store PARALLEL replay
     // is unsound: record placement is round-robin (`place_new_record`), so a
@@ -743,7 +754,17 @@ pub fn recover_all_multi_store(
         );
         let fatal = matches!(outcome, ReplayResult::Failed(c) if is_fatal_replay_cause(c));
         match outcome {
-            ReplayResult::Applied => total.entries_replayed += 1,
+            ReplayResult::Applied => {
+                total.entries_replayed += 1;
+                // P2: a previously-flagged key whose later op APPLIED is durable
+                // again — the only op that can apply against a not-yet-indexed
+                // (flagged) key is a successful re-`Create` registering it (every
+                // other op skips a missing record), so this scrubs the offset-
+                // reuse-by-same-key case. A no-op for keys never flagged.
+                if let Some(key) = entry.op.tx_key() {
+                    resync_pending.remove(key);
+                }
+            }
             ReplayResult::Skipped => total.entries_skipped += 1,
             // G3: a co-located `CreateV2` whose bytes were lost on the buffered
             // tail — accounted as a skip (benign drop) AND recorded so the boot
@@ -753,15 +774,31 @@ pub fn recover_all_multi_store(
                 total.entries_skipped += 1;
                 if let Some(key) = entry.op.tx_key() {
                     resync_creates.push(*key);
+                    resync_pending.insert(*key);
                 }
             }
             ReplayResult::Failed(cause) => total.record_failure(cause),
+        }
+        // P2: a replayed `Delete` for a flagged key proves it was created-then-
+        // deleted in THIS recovery window (a legitimately-deleted key, not a lost
+        // create) — scrub its stale-suspect flag. Keyed on the op, not the replay
+        // outcome, because an offset-0 `Delete` (pure index unregister) replays as
+        // `Skipped` yet is still a delete. `remove` is O(1) and a no-op for keys
+        // never flagged, so this stays cheap on a delete-heavy log.
+        if let RedoOp::Delete { tx_key, .. } = &entry.op {
+            resync_pending.remove(tx_key);
         }
         // F-G4-007: stop on the first non-tolerable failure so later entries
         // cannot land partially-applied state on a broken intermediate replay.
         if fatal {
             break;
         }
+    }
+    // P2: drop every scrubbed flag (deleted or durably re-created after being
+    // flagged) while preserving the append order of the survivors. Bounded by
+    // `resync_creates.len()` (small); each membership check is O(1).
+    if !resync_creates.is_empty() {
+        resync_creates.retain(|k| resync_pending.contains(k));
     }
 
     // Clean up orphan resize tmp files (mirrors the single-store path).
@@ -5550,6 +5587,241 @@ mod tests {
         assert!(
             resync_creates.is_empty(),
             "an idempotent already-indexed skip is NOT a lost create — must not flag",
+        );
+    }
+
+    /// Reverse-heal G3 / P2 (PR #77 review): `resync_creates` must NOT flag a key
+    /// that was created-then-DELETED in the SAME recovery pass. Offset reuse is
+    /// the norm in a hot UTXO store: a co-located `CreateV2` whose bytes were
+    /// overwritten by a since-reused offset replays as `SkippedMissingCreateBytes`
+    /// (flagged), but a LATER `Delete` of that same key in the same global-order
+    /// pass proves it was legitimately deleted — not a lost create. Pre-fix the
+    /// append-only `resync_creates` was never scrubbed, so the deleted key falsely
+    /// marked its shard stale-suspect → unnecessary boot heal (the 3b over-fence
+    /// availability class). A genuinely-lost create with NO later delete MUST
+    /// still flag (no over-scrub).
+    #[test]
+    fn resync_creates_scrubbed_when_key_deleted_in_same_recovery_pass() {
+        let dev0: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let redo_dev0 = Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
+        let mut alloc0: crate::allocator::BoxedAllocator =
+            Box::new(SlotAllocator::new(dev0.clone()).unwrap());
+        alloc0.set_redo_device_id(0);
+        let index = ShardedIndex::from_single(PrimaryBackend::new_in_memory(1000).unwrap());
+
+        let utxo_count: u32 = 2;
+        let base = TxMetadata::record_size_for(utxo_count);
+        let mk_key = |b: u8| TxKey {
+            txid: {
+                let mut t = [0u8; 32];
+                t[0] = b;
+                t[31] = b;
+                t
+            },
+        };
+        // A: co-located create whose bytes were lost (allocated, never written →
+        // zeroed header → tx_id mismatch → SkippedMissingCreateBytes → flagged).
+        let key_a = mk_key(0xA1);
+        let off_a = alloc0.allocate(base).unwrap();
+        // B: a real, durable create — reads back matching bytes → Applied →
+        // indexed. Kept at a DISTINCT offset so A's `Delete` tombstone cannot
+        // clobber B's bytes (that replayed-delete-vs-reused-offset hazard is a
+        // separate concern; this test isolates the resync scrub).
+        let key_b = mk_key(0xB2);
+        let off_b = alloc0.allocate(base).unwrap();
+        {
+            let mut meta = TxMetadata::new(utxo_count);
+            meta.tx_id = key_b.txid;
+            meta.record_size = base as u32;
+            let slots: Vec<UtxoSlot> = (0..utxo_count)
+                .map(|_| UtxoSlot::new_unspent([0xB2; 32]))
+                .collect();
+            io::write_full_record(&*dev0, off_b, &meta, &slots).unwrap();
+        }
+        // C: a genuinely-lost create with NO later delete — MUST stay flagged.
+        let key_c = mk_key(0xC3);
+        let off_c = alloc0.allocate(base).unwrap();
+
+        let mut redo0 = RedoLog::open(redo_dev0.clone(), 0, 1024 * 1024).unwrap();
+        let shared = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
+            RedoLog::shared_sequence_floor(&[&redo0]),
+        ));
+        redo0.attach_shared_sequence(shared.clone());
+        // Global-order sequence: Create(A) flagged → Delete(A) scrubs it →
+        // Create(B) applies → Create(C) flagged (never deleted).
+        redo0
+            .append_and_flush(RedoOp::CreateV2 {
+                tx_key: key_a,
+                device_id: 0,
+                record_offset: off_a,
+                utxo_count,
+                is_conflicting: false,
+                parent_txids: Vec::new(),
+            })
+            .unwrap();
+        redo0
+            .append_and_flush(RedoOp::Delete {
+                tx_key: key_a,
+                record_offset: off_a,
+                record_size: base,
+            })
+            .unwrap();
+        redo0
+            .append_and_flush(RedoOp::CreateV2 {
+                tx_key: key_b,
+                device_id: 0,
+                record_offset: off_b,
+                utxo_count,
+                is_conflicting: false,
+                parent_txids: Vec::new(),
+            })
+            .unwrap();
+        redo0
+            .append_and_flush(RedoOp::CreateV2 {
+                tx_key: key_c,
+                device_id: 0,
+                record_offset: off_c,
+                utxo_count,
+                is_conflicting: false,
+                parent_txids: Vec::new(),
+            })
+            .unwrap();
+
+        let mut dah = DahBackend::new_in_memory();
+        let devices = [dev0.clone()];
+        let mut allocators = [alloc0];
+        let mut redo_logs = [redo0];
+        let (_stats, _, _, _, resync_creates) = recover_all_multi_store(
+            &devices,
+            &mut allocators,
+            &mut redo_logs,
+            &index,
+            &mut dah,
+            true,
+            false,
+        )
+        .unwrap();
+
+        // A was created-then-deleted → NOT lost → MUST NOT be flagged.
+        assert!(
+            !resync_creates.contains(&key_a),
+            "a created-then-deleted key must be scrubbed from resync_creates, not flag its shard stale-suspect",
+        );
+        // C was genuinely lost with no later delete → MUST still flag (no over-scrub).
+        assert!(
+            resync_creates.contains(&key_c),
+            "a genuinely-lost create with no later delete must remain flagged for reverse-heal",
+        );
+        // Exactly the still-lost create is flagged.
+        assert_eq!(
+            resync_creates,
+            vec![key_c],
+            "exactly the still-lost create is flagged",
+        );
+        // B durably applied → indexed; A gone; C never indexed.
+        assert!(
+            index.lookup(&key_b).is_some(),
+            "B's durable create must be indexed",
+        );
+        assert!(
+            index.lookup(&key_a).is_none(),
+            "A was deleted — no index entry",
+        );
+        assert!(
+            index.lookup(&key_c).is_none(),
+            "C's bytes were lost — no index entry",
+        );
+    }
+
+    /// Reverse-heal G3 / P2 (PR #77 review): a co-located `CreateV2` flagged for
+    /// missing bytes (offset reused, bytes not yet durable) that is RE-CREATED
+    /// later in the SAME pass with matching bytes (offset reuse by the SAME key)
+    /// is NOT lost — the later successful create makes it durable, so its
+    /// stale-suspect flag must be scrubbed.
+    #[test]
+    fn resync_creates_scrubbed_when_same_key_recreated_with_matching_bytes() {
+        let dev0: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let redo_dev0 = Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
+        let mut alloc0: crate::allocator::BoxedAllocator =
+            Box::new(SlotAllocator::new(dev0.clone()).unwrap());
+        alloc0.set_redo_device_id(0);
+        let index = ShardedIndex::from_single(PrimaryBackend::new_in_memory(1000).unwrap());
+
+        let utxo_count: u32 = 2;
+        let base = TxMetadata::record_size_for(utxo_count);
+        let key = TxKey {
+            txid: {
+                let mut t = [0u8; 32];
+                t[0] = 0xE5;
+                t[31] = 0xE5;
+                t
+            },
+        };
+        // First (flagged) create points at an allocated-but-unwritten offset →
+        // SkippedMissingCreateBytes. The later create points at a DIFFERENT,
+        // durably-written offset for the SAME key → Applied → indexed.
+        let off_lost = alloc0.allocate(base).unwrap();
+        let off_durable = alloc0.allocate(base).unwrap();
+        {
+            let mut meta = TxMetadata::new(utxo_count);
+            meta.tx_id = key.txid;
+            meta.record_size = base as u32;
+            let slots: Vec<UtxoSlot> = (0..utxo_count)
+                .map(|_| UtxoSlot::new_unspent([0xE5; 32]))
+                .collect();
+            io::write_full_record(&*dev0, off_durable, &meta, &slots).unwrap();
+        }
+
+        let mut redo0 = RedoLog::open(redo_dev0.clone(), 0, 1024 * 1024).unwrap();
+        let shared = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
+            RedoLog::shared_sequence_floor(&[&redo0]),
+        ));
+        redo0.attach_shared_sequence(shared.clone());
+        redo0
+            .append_and_flush(RedoOp::CreateV2 {
+                tx_key: key,
+                device_id: 0,
+                record_offset: off_lost,
+                utxo_count,
+                is_conflicting: false,
+                parent_txids: Vec::new(),
+            })
+            .unwrap();
+        redo0
+            .append_and_flush(RedoOp::CreateV2 {
+                tx_key: key,
+                device_id: 0,
+                record_offset: off_durable,
+                utxo_count,
+                is_conflicting: false,
+                parent_txids: Vec::new(),
+            })
+            .unwrap();
+
+        let mut dah = DahBackend::new_in_memory();
+        let devices = [dev0.clone()];
+        let mut allocators = [alloc0];
+        let mut redo_logs = [redo0];
+        let (_stats, _, _, _, resync_creates) = recover_all_multi_store(
+            &devices,
+            &mut allocators,
+            &mut redo_logs,
+            &index,
+            &mut dah,
+            true,
+            false,
+        )
+        .unwrap();
+
+        assert!(
+            resync_creates.is_empty(),
+            "a flagged key re-created with matching bytes in the same pass is durable — must be scrubbed",
+        );
+        assert!(
+            index.lookup(&key).is_some(),
+            "the durable re-create must be indexed at its final offset",
         );
     }
 
