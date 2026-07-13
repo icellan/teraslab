@@ -701,6 +701,17 @@ pub fn recover_all_multi_store(
     // stays append-ordered; a single `retain` on this set after the loop drops
     // the scrubbed keys while preserving order.
     let mut resync_pending: std::collections::HashSet<TxKey> = std::collections::HashSet::new();
+    // P2 (PR #77 review, coordinator follow-up): the PRODUCTION delete path
+    // journals NO `RedoOp::Delete` — a DAH-sweep/prune delete frees the record's
+    // region with a fsynced `RedoOp::FreeRegion { offset, device_id }` carrying no
+    // txid (`Engine::spend` prune GC). So a flagged create whose slot is later
+    // freed can only be scrubbed by OFFSET, not by txid. Map each flagged create's
+    // `(device_id, record_offset)` → key (offsets are per-device under
+    // `device_split`, so the pair, not the bare offset, is the identity). A later
+    // `FreeRegion` at that exact slot means the create was deleted/superseded (its
+    // region reclaimed) → not lost → scrub. Bounded to the flagged set.
+    let mut flagged_by_offset: std::collections::HashMap<(u8, u64), TxKey> =
+        std::collections::HashMap::new();
 
     // GLOBAL-SEQUENCE-ORDER REPLAY (single-threaded). Per-store PARALLEL replay
     // is unsound: record placement is round-robin (`place_new_record`), so a
@@ -775,16 +786,42 @@ pub fn recover_all_multi_store(
                 if let Some(key) = entry.op.tx_key() {
                     resync_creates.push(*key);
                     resync_pending.insert(*key);
+                    // Record the flagged create's device slot so a later
+                    // `FreeRegion` (the production delete) can scrub it by offset.
+                    // Only `CreateV2` yields this variant, so only it carries a
+                    // meaningful (device_id, offset).
+                    if let RedoOp::CreateV2 {
+                        device_id,
+                        record_offset,
+                        ..
+                    } = &entry.op
+                    {
+                        flagged_by_offset.insert((*device_id, *record_offset), *key);
+                    }
                 }
             }
             ReplayResult::Failed(cause) => total.record_failure(cause),
         }
-        // P2: a replayed `Delete` for a flagged key proves it was created-then-
-        // deleted in THIS recovery window (a legitimately-deleted key, not a lost
-        // create) — scrub its stale-suspect flag. Keyed on the op, not the replay
-        // outcome, because an offset-0 `Delete` (pure index unregister) replays as
-        // `Skipped` yet is still a delete. `remove` is O(1) and a no-op for keys
-        // never flagged, so this stays cheap on a delete-heavy log.
+        // P2 (production delete path): a `FreeRegion` that reclaims a flagged
+        // create's exact device slot proves that create was deleted/superseded (a
+        // DAH-sweep/prune delete frees the region with NO `RedoOp::Delete`) — scrub
+        // its stale-suspect flag. Keyed on (device_id, offset) and on the op (not
+        // the replay outcome: an idempotent re-replay `Skipped`s yet still proves
+        // the slot was freed). This is the COMMON case in a hot UTXO store.
+        if let RedoOp::FreeRegion {
+            offset, device_id, ..
+        } = &entry.op
+            && let Some(freed_key) = flagged_by_offset.remove(&(*device_id, *offset))
+        {
+            resync_pending.remove(&freed_key);
+        }
+        // P2 (migration replace-duplicate path): a replayed `Delete` for a flagged
+        // key proves it was created-then-deleted in THIS recovery window (a
+        // legitimately-deleted key, not a lost create) — scrub its stale-suspect
+        // flag. Keyed on the op, not the replay outcome, because an offset-0
+        // `Delete` (pure index unregister) replays as `Skipped` yet is still a
+        // delete. Belt-and-suspenders alongside the `FreeRegion` (production) scrub
+        // above. `remove` is O(1) and a no-op for keys never flagged.
         if let RedoOp::Delete { tx_key, .. } = &entry.op {
             resync_pending.remove(tx_key);
         }
@@ -5822,6 +5859,158 @@ mod tests {
         assert!(
             index.lookup(&key).is_some(),
             "the durable re-create must be indexed at its final offset",
+        );
+    }
+
+    /// Reverse-heal G3 / P2 (PR #77 review, coordinator follow-up): the PRODUCTION
+    /// delete mechanism. DAH-sweep deletes journal NO `RedoOp::Delete` — they
+    /// free the record's region via a fsynced `RedoOp::FreeRegion { offset,
+    /// device_id }` (no txid); see `Engine::spend`/prune GC (`engine.rs`, "deletes
+    /// are local prune GC, so redo-replay does NOT [emit RedoOp::Delete]"). So the
+    /// exact P2 scenario — Create(A)@X → DAH-delete(A) [= FreeRegion(X)] →
+    /// Create(B)@X (X reused) — has NO `RedoOp::Delete` for A: the by-txid scrub
+    /// never fires, and B's Applied create scrubs B, not A. A (a legitimately-
+    /// deleted key) must be scrubbed by keying the flag on its (device_id, offset)
+    /// and clearing it when a later `FreeRegion` frees that exact slot. `FreeRegion`
+    /// does not touch the device, so B's durable bytes at X survive replay and B
+    /// stays indexed.
+    #[test]
+    fn resync_creates_scrubbed_when_flagged_offset_freed_via_freeregion() {
+        let dev0: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let redo_dev0 = Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
+        let mut alloc0: crate::allocator::BoxedAllocator =
+            Box::new(SlotAllocator::new(dev0.clone()).unwrap());
+        alloc0.set_redo_device_id(0);
+        let index = ShardedIndex::from_single(PrimaryBackend::new_in_memory(1000).unwrap());
+
+        let utxo_count: u32 = 2;
+        let base = TxMetadata::record_size_for(utxo_count);
+        let mk_key = |b: u8| TxKey {
+            txid: {
+                let mut t = [0u8; 32];
+                t[0] = b;
+                t[31] = b;
+                t
+            },
+        };
+        // A and B reuse the SAME offset X (the true offset-reuse case). B's durable
+        // bytes are the final state at X, so A's CreateV2@X reads B's bytes →
+        // tx_id mismatch → flagged.
+        let key_a = mk_key(0xA1);
+        let key_b = mk_key(0xB2);
+        let off_x = alloc0.allocate(base).unwrap();
+        {
+            let mut meta = TxMetadata::new(utxo_count);
+            meta.tx_id = key_b.txid;
+            meta.record_size = base as u32;
+            let slots: Vec<UtxoSlot> = (0..utxo_count)
+                .map(|_| UtxoSlot::new_unspent([0xB2; 32]))
+                .collect();
+            io::write_full_record(&*dev0, off_x, &meta, &slots).unwrap();
+        }
+        // C: a genuinely-lost create whose region is NEVER freed — MUST stay flagged.
+        let key_c = mk_key(0xC3);
+        let off_c = alloc0.allocate(base).unwrap();
+
+        let mut redo0 = RedoLog::open(redo_dev0.clone(), 0, 1024 * 1024).unwrap();
+        let shared = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
+            RedoLog::shared_sequence_floor(&[&redo0]),
+        ));
+        redo0.attach_shared_sequence(shared.clone());
+        // Production offset-reuse sequence (NO RedoOp::Delete anywhere):
+        //   CreateV2(A)@X flagged → FreeRegion(X) [A's DAH-delete] scrubs A →
+        //   AllocateRegion(X) [B reuses X] → CreateV2(B)@X applies →
+        //   CreateV2(C) flagged (region never freed).
+        redo0
+            .append_and_flush(RedoOp::CreateV2 {
+                tx_key: key_a,
+                device_id: 0,
+                record_offset: off_x,
+                utxo_count,
+                is_conflicting: false,
+                parent_txids: Vec::new(),
+            })
+            .unwrap();
+        redo0
+            .append_and_flush(RedoOp::FreeRegion {
+                offset: off_x,
+                size: base,
+                device_id: 0,
+            })
+            .unwrap();
+        redo0
+            .append_and_flush(RedoOp::AllocateRegion {
+                offset: off_x,
+                size: base,
+                device_id: 0,
+            })
+            .unwrap();
+        redo0
+            .append_and_flush(RedoOp::CreateV2 {
+                tx_key: key_b,
+                device_id: 0,
+                record_offset: off_x,
+                utxo_count,
+                is_conflicting: false,
+                parent_txids: Vec::new(),
+            })
+            .unwrap();
+        redo0
+            .append_and_flush(RedoOp::CreateV2 {
+                tx_key: key_c,
+                device_id: 0,
+                record_offset: off_c,
+                utxo_count,
+                is_conflicting: false,
+                parent_txids: Vec::new(),
+            })
+            .unwrap();
+
+        let mut dah = DahBackend::new_in_memory();
+        let devices = [dev0.clone()];
+        let mut allocators = [alloc0];
+        let mut redo_logs = [redo0];
+        let (_stats, _, _, _, resync_creates) = recover_all_multi_store(
+            &devices,
+            &mut allocators,
+            &mut redo_logs,
+            &index,
+            &mut dah,
+            true,
+            false,
+        )
+        .unwrap();
+
+        // A's slot was freed by FreeRegion (the production delete) → NOT lost →
+        // MUST NOT flag its shard stale-suspect, even with NO RedoOp::Delete.
+        assert!(
+            !resync_creates.contains(&key_a),
+            "a create whose offset is later freed by FreeRegion (production DAH delete) must be scrubbed",
+        );
+        // C's region is never freed → genuinely lost → MUST still flag.
+        assert!(
+            resync_creates.contains(&key_c),
+            "a genuinely-lost create whose region is never freed must remain flagged",
+        );
+        assert_eq!(
+            resync_creates,
+            vec![key_c],
+            "exactly the still-lost create is flagged",
+        );
+        // B durably applied at the reused offset → indexed (FreeRegion never
+        // touched the device); A gone; C never indexed.
+        assert!(
+            index.lookup(&key_b).is_some(),
+            "B's durable create at the reused offset must be indexed",
+        );
+        assert!(
+            index.lookup(&key_a).is_none(),
+            "A's region was freed — no index entry",
+        );
+        assert!(
+            index.lookup(&key_c).is_none(),
+            "C's bytes were lost — no index entry",
         );
     }
 
