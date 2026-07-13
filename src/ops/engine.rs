@@ -386,6 +386,25 @@ pub struct Engine {
     /// record nothing and every query returns `false` (default OFF, so
     /// single-node / RF=1 deployments pay nothing).
     tombstone_log: std::sync::OnceLock<crate::ops::tombstone::TombstoneLog>,
+    /// Reverse-heal Phase 2d — the tombstone-GC-vs-heal race guard.
+    ///
+    /// A shared handle to the cluster's inbound-fence bitmap
+    /// (`RunningCluster::inbound_atomic`): a set bit means the cluster shard has
+    /// an in-flight INBOUND transfer — a reverse-HEAL pull (`register_heal_source`
+    /// / `mark_heal_fence_active`, which BOTH raise the inbound fence) or a
+    /// forward migration. The checkpoint retention GC ([`Self::persist_tombstones`] /
+    /// [`Self::gc_tombstones`]) consults it per-key so a tombstone whose shard is
+    /// being pulled is RETAINED past its retention horizon — a heal that spans a
+    /// checkpoint can never GC a tombstone it still needs to gate an incoming
+    /// image (RULE-DS), which would otherwise open a mid-heal resurrection
+    /// window. Because every heal raises the inbound fence, `heal_pending` ⊆
+    /// inbound-fenced, so the guard never UNDER-protects a heal; a forward
+    /// migration is protected too, which merely defers that shard's GC until the
+    /// migration completes and clears the fence (no leak — the retention bound
+    /// remains the backstop). Absent (default / single-node / unclustered) ⇒
+    /// protect nothing, GC unchanged.
+    tombstone_gc_guard:
+        std::sync::OnceLock<std::sync::Arc<crate::cluster::migration::AtomicShardBitmap>>,
     /// Segments the LAST checkpoint's defrag compaction pass relocated live
     /// records out of. Published by the checkpoint via
     /// [`Self::record_last_checkpoint_defrag`] and read by the `/status`
@@ -685,6 +704,7 @@ impl Engine {
             last_durable_height: std::sync::atomic::AtomicU32::new(0),
             last_durable_height_path: std::sync::OnceLock::new(),
             tombstone_log: std::sync::OnceLock::new(),
+            tombstone_gc_guard: std::sync::OnceLock::new(),
             last_checkpoint_compacted: std::sync::atomic::AtomicU64::new(0),
             last_checkpoint_reclaimed: std::sync::atomic::AtomicU64::new(0),
             blob_store: None,
@@ -2044,6 +2064,38 @@ impl Engine {
         self.tombstone_log.get().is_some()
     }
 
+    /// Attach the reverse-heal tombstone-GC-vs-heal race guard (Phase 2d): the
+    /// cluster's inbound-fence bitmap. While a cluster shard is inbound-fenced (a
+    /// reverse-heal pull or a forward migration in flight), the checkpoint
+    /// retention GC RETAINS that shard's tombstones so RULE-DS
+    /// ([`Self::tombstone_blocks_heal_apply`]) can still drop a resurrecting
+    /// image mid-pull. Called once at boot only when clustered AND
+    /// `reverse_heal.tombstones` is on; a second call is ignored (first wins).
+    /// See the [`Self::tombstone_gc_guard`] field doc for why gating on the
+    /// inbound fence covers every `heal_pending` shard.
+    pub fn set_tombstone_gc_guard(
+        &self,
+        guard: std::sync::Arc<crate::cluster::migration::AtomicShardBitmap>,
+    ) {
+        if self.tombstone_gc_guard.set(guard).is_err() {
+            tracing::warn!(
+                target: "teraslab::engine",
+                "set_tombstone_gc_guard called twice; keeping the first guard",
+            );
+        }
+    }
+
+    /// Whether `key`'s CLUSTER shard is currently guarded against tombstone
+    /// retention GC by an in-flight reverse-heal / inbound migration (Phase 2d).
+    /// `false` when no guard is attached (single-node / unclustered / flag off),
+    /// so the retention bound is then the sole GC horizon.
+    fn tombstone_gc_protected(&self, key: &TxKey) -> bool {
+        match self.tombstone_gc_guard.get() {
+            Some(guard) => guard.test(crate::cluster::shards::ShardTable::shard_for_key(key)),
+            None => false,
+        }
+    }
+
     /// The primary index's shard seed — so an attached tombstone log routes each
     /// key to the SAME shard number as the primary index.
     pub fn index_seed(&self) -> u64 {
@@ -2089,7 +2141,9 @@ impl Engine {
     /// tombstone's. Retried on the next checkpoint.
     pub fn persist_tombstones(&self) -> std::io::Result<()> {
         match self.tombstone_log.get() {
-            Some(log) => log.persist(self.last_durable_height()),
+            Some(log) => log.persist(self.last_durable_height(), |k| {
+                self.tombstone_gc_protected(k)
+            }),
             None => Ok(()),
         }
     }
@@ -2098,9 +2152,11 @@ impl Engine {
     /// (boot floor-GC / checkpoint pre-pass). Returns the number dropped, `0`
     /// when disabled.
     pub fn gc_tombstones(&self) -> usize {
-        self.tombstone_log
-            .get()
-            .map_or(0, |log| log.gc(self.last_durable_height()))
+        self.tombstone_log.get().map_or(0, |log| {
+            log.gc(self.last_durable_height(), |k| {
+                self.tombstone_gc_protected(k)
+            })
+        })
     }
 
     /// Boot reconcile (Invariant TS-1): drop any tombstone whose key came back

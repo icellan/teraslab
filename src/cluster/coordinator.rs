@@ -9395,6 +9395,21 @@ impl RunningCluster {
         self.inbound_atomic.test(shard)
     }
 
+    /// Reverse-heal Phase 2d — the inbound-fence bitmap, shared as the engine's
+    /// tombstone-GC-vs-heal race guard ([`Engine::set_tombstone_gc_guard`]).
+    ///
+    /// A set bit means the shard has an in-flight INBOUND transfer: a
+    /// reverse-heal pull (`register_heal_source` / `mark_heal_fence_active` BOTH
+    /// raise this fence) or a forward migration. Handing this same `Arc` to the
+    /// engine lets the checkpoint retention GC retain a healing shard's
+    /// tombstones so RULE-DS can still gate an incoming image mid-pull. Because
+    /// every heal raises the inbound fence, every `heal_pending` shard is
+    /// covered; the fence is cleared by the completion handshake
+    /// (`mark_inbound_complete*`), so normal GC resumes once the pull finishes.
+    pub fn inbound_fence_bitmap(&self) -> Arc<crate::cluster::migration::AtomicShardBitmap> {
+        self.inbound_atomic.clone()
+    }
+
     /// Check if writes are fenced for the given key's shard.
     ///
     /// Returns true when this node is the source of an outbound migration
