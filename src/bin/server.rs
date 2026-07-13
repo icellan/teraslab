@@ -1105,6 +1105,10 @@ fn main() {
     // per-store allocators so freelist mutations between snapshots are not lost.
     let mut pending_conflicting_children = Vec::new();
     let mut pending_deleted_children = Vec::new();
+    // Reverse-heal G3: co-located `CreateV2` keys whose bytes were lost on the
+    // buffered tail (populated by `recover_all_multi_store` below). Folded into
+    // the reverse-heal stale-suspect set after the Tier-1 detector runs.
+    let mut g3_resync_create_keys: Vec<teraslab::index::TxKey> = Vec::new();
     // Height subsystem (deletion-tombstone design §4; BUG3): the max block
     // height the replayed redo entries prove this node has durably seen. Folded
     // into the last-durable-height floor below so a lost/corrupt `.height` file
@@ -1147,10 +1151,17 @@ fn main() {
             // AFTER `engine.recover_mined_index`.
             true,
         ) {
-            Ok((stats, pending, deleted, touched)) => {
+            Ok((stats, pending, deleted, touched, resync_creates)) => {
                 pending_conflicting_children = pending;
                 pending_deleted_children = deleted;
                 recovery_touched_keys = touched;
+                // Reverse-heal G3: keys of co-located `CreateV2` entries whose
+                // record bytes were lost on the buffered tail (dropped by
+                // recovery). Consumed below (after the engine is up and the
+                // Tier-1 detector has run) to mark their shards stale-suspect
+                // under RF>1 + reverse-heal, so the lost creates are pulled from
+                // a quorum-current replica instead of vanishing silently.
+                g3_resync_create_keys = resync_creates;
                 recovery_height_floor = stats.max_observed_block_height;
                 tracing::info!(
                     replayed = stats.entries_replayed,
@@ -1887,6 +1898,55 @@ fn main() {
                      mastered shards stale-suspect (detection-only: no fence, no pull)",
                 );
                 running.record_stale_suspect_shards(suspects);
+            }
+        }
+
+        // Reverse-heal G3 (finding G3): a co-located `CreateV2` whose record
+        // bytes were lost on the buffered tail is DROPPED by recovery — a silent
+        // loss of an acked create that, under active replication (RF>1), a
+        // quorum-current replica still holds. The Tier-1 AckTracker detector
+        // above can MISS this (it flags only when the persistent AckTracker
+        // proves a lost tail, which lags on a ≤1 s / 100-ACK cadence and is
+        // node-coarse), so surface the precise per-shard signal recovery
+        // collected and fold it into the SAME `stale_suspect_shards` set the
+        // Phase-2c pull below consumes. Gated on RF>1 + reverse-heal enabled: a
+        // single-device / RF=1 node has no replica to pull the lost create from,
+        // so the skip stays a logged drop (no false stale-suspect). Runs AFTER
+        // Tier-1 (which replaces the set) and BEFORE Phase 2c (which reads it),
+        // and UNIONs with any Tier-1 suspects.
+        {
+            let g3_shards = teraslab::cluster::coordinator::colocated_create_stale_shards(
+                &g3_resync_create_keys,
+                config.replication_factor,
+                config.reverse_heal.tombstones,
+            );
+            if !g3_shards.is_empty() {
+                let mut suspects: std::collections::BTreeSet<u16> =
+                    running.stale_suspect_shards().into_iter().collect();
+                let before = suspects.len();
+                suspects.extend(g3_shards.iter().copied());
+                let added = suspects.len() - before;
+                tracing::error!(
+                    lost_creates = g3_resync_create_keys.len(),
+                    g3_stale_shards = g3_shards.len(),
+                    newly_marked = added,
+                    "reverse-heal G3: co-located CreateV2 record bytes lost on the \
+                     buffered tail under RF>1 — marking their shards stale-suspect \
+                     so the reverse-pull recovers the acked creates from a \
+                     quorum-current replica (instead of a silent drop)",
+                );
+                running.record_stale_suspect_shards(suspects);
+            } else if !g3_resync_create_keys.is_empty() {
+                // RF=1 / single-device, or reverse-heal disabled: no replica to
+                // pull from → the lost creates stay a logged drop (unchanged).
+                tracing::warn!(
+                    lost_creates = g3_resync_create_keys.len(),
+                    replication_factor = config.replication_factor,
+                    reverse_heal = config.reverse_heal.tombstones,
+                    "reverse-heal G3: co-located CreateV2 record bytes lost on the \
+                     buffered tail, but no replica to heal from (RF=1 / single-device \
+                     or reverse-heal disabled) — dropping the creates (unchanged)",
+                );
             }
         }
 
