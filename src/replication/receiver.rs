@@ -9118,4 +9118,133 @@ mod tests {
             "a client-delete tombstone must drop even a strictly-newer source image",
         );
     }
+
+    /// Reverse-heal Phase 3b — the P1 COMPLETENESS test (design §, "safe
+    /// fallback"). A reorg re-create that reaches an ONLINE node arrives as an
+    /// ordinary `ReplicaOp::Create` (`is_migration = false`), NOT a boot-heal
+    /// baseline. RULE-DS gates ONLY absent-key MIGRATION baselines, so the normal
+    /// online create is NEVER consulted against the tombstone: it applies and the
+    /// key becomes PRESENT — closing the client-delete re-create loss for the
+    /// online case with zero resurrection surface (a migration baseline of the
+    /// same image would still be dropped, proving RULE-DS is armed).
+    #[test]
+    fn clientdelete_reorg_recreate_heals_online() {
+        let engine = make_engine();
+        enable_tombstones(&engine);
+        let k = key(160);
+
+        // Client-delete k after creating it → a ClientDelete tombstone at gen 1.
+        apply_op(&engine, &baseline_create(k, 1, 0)).unwrap();
+        engine
+            .delete(&DeleteRequest {
+                tx_key: k,
+                due_guard: None,
+            })
+            .expect("client delete records a tombstone");
+        assert!(
+            matches!(engine.read_metadata(&k), Err(SpendError::TxNotFound)),
+            "precondition: the record is deleted",
+        );
+        assert!(
+            engine.tombstone_lookup(&k).is_some(),
+            "precondition: a ClientDelete tombstone covers the absent key",
+        );
+
+        // A MIGRATION baseline of a re-create is STILL dropped by RULE-DS (armed).
+        apply_op_journal(&engine, &baseline_create(k, 2, 0), false, true)
+            .expect("a blocked heal baseline is an idempotent no-op, not an error");
+        assert!(
+            matches!(engine.read_metadata(&k), Err(SpendError::TxNotFound)),
+            "RULE-DS still drops an absent-key MIGRATION baseline (armed) — the \
+             online path is what closes the loss, not a weakened RULE-DS",
+        );
+
+        // The reorg re-create arrives ONLINE as a NORMAL replica Create
+        // (is_migration = false) → RULE-DS is NOT consulted → the key is PRESENT.
+        apply_op(&engine, &baseline_create(k, 2, 0))
+            .expect("a normal online create on an absent key applies");
+        let meta = engine
+            .read_metadata(&k)
+            .expect("the online re-create heals the key to PRESENT, bypassing RULE-DS");
+        assert_eq!(
+            { meta.generation },
+            2,
+            "the re-created record is live at the reorg re-create generation",
+        );
+        assert_eq!(
+            engine.read_slot(&k, 0).unwrap().status,
+            UTXO_UNSPENT,
+            "the online-healed re-create is a live (unspent) UTXO",
+        );
+    }
+
+    /// Reverse-heal Phase 3b — the OFFLINE residual closer. When the node was down
+    /// for the whole retention window and the re-create is delivered ONLY by a
+    /// boot-heal baseline (never online replication), the ClientDelete tombstone
+    /// unconditionally drops it — UNTIL the tombstone GCs at the retention horizon
+    /// (`deletion_height + retention <= last_durable_height`). Setting retention ≥
+    /// the reorg/finality horizon makes the block lift precisely when a legitimate
+    /// re-mine of `k` is no longer possible, so a post-horizon baseline re-create
+    /// succeeds.
+    #[test]
+    fn clientdelete_reorg_recreate_heals_after_retention_expiry() {
+        let engine = make_engine();
+        // A short retention so the test can cross the horizon deterministically.
+        let retention: u32 = 100;
+        let log = crate::ops::tombstone::TombstoneLog::new(
+            std::path::PathBuf::from("/nonexistent/rev-heal-3b-retention.tombstones"),
+            engine.index_seed(),
+            engine.index_shard_count(),
+            retention,
+        );
+        engine.set_tombstone_log(log);
+        let k = key(161);
+        let deletion_height: u32 = 1_000;
+
+        // Create k, then client-delete it at `deletion_height` → a ClientDelete
+        // tombstone whose GC key is `deletion_height` (a `None` due_guard records
+        // the current durable height).
+        apply_op(&engine, &baseline_create(k, 1, 0)).unwrap();
+        engine.observe_block_height(deletion_height);
+        engine
+            .delete(&DeleteRequest {
+                tx_key: k,
+                due_guard: None,
+            })
+            .expect("client delete records a tombstone at the durable height");
+        assert_eq!(
+            engine.tombstone_lookup(&k).map(|(_, h)| h),
+            Some(deletion_height),
+            "the tombstone is keyed at the deletion height",
+        );
+
+        // Within retention: a boot-heal baseline re-create is dropped (the P1
+        // offline residual — the node masters MISSING a live UTXO).
+        apply_op_journal(&engine, &baseline_create(k, 2, 0), false, true).unwrap();
+        assert!(
+            matches!(engine.read_metadata(&k), Err(SpendError::TxNotFound)),
+            "within retention the boot-heal baseline re-create is dropped",
+        );
+
+        // Advance the durable height PAST the retention horizon and GC: the
+        // tombstone lifts precisely when a legitimate re-mine is no longer possible.
+        engine.observe_block_height(deletion_height + retention);
+        let dropped = engine.gc_tombstones();
+        assert_eq!(dropped, 1, "the past-horizon tombstone is GC'd");
+        assert!(
+            engine.tombstone_lookup(&k).is_none(),
+            "the tombstone is gone after the retention horizon",
+        );
+
+        // Now the SAME offline baseline re-create succeeds — the residual is closed.
+        apply_op_journal(&engine, &baseline_create(k, 2, 0), false, true).unwrap();
+        let meta = engine
+            .read_metadata(&k)
+            .expect("after the retention horizon the baseline re-create heals the key");
+        assert_eq!(
+            { meta.generation },
+            2,
+            "the re-created record is live at the re-create generation",
+        );
+    }
 }

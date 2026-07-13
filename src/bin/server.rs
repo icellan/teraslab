@@ -1760,6 +1760,10 @@ fn main() {
             migration_batch_size: config.migration_batch_size,
             persisted_incarnation: topo_state.incarnation,
             cluster_id: resolved_cluster_id,
+            // Reverse-heal Phase 3b — RUNTIME online re-heal rides the reverse-heal
+            // enable (`reverse_heal.tombstones`): RULE-DS, the delete-safe apply the
+            // pull relies on, is a no-op without it. Default OFF.
+            reverse_heal_online: config.reverse_heal.tombstones,
         };
         if initial_peak > 1 {
             tracing::info!(

@@ -1155,6 +1155,13 @@ pub struct ClusterConfig {
     /// pre-orchestrator deployments — those nodes fall back to the
     /// F-G8-001 ever-seen heuristic.
     pub cluster_id: crate::cluster::topology::ClusterId,
+    /// Reverse-heal Phase 3b — enable RUNTIME online re-heal (re-detect stale
+    /// mastered shards on each partition-view refresh and reverse-pull them, not
+    /// just at boot). Set from `reverse_heal.tombstones` (the reverse-heal enable
+    /// — RULE-DS is a no-op without it). `false` (default) leaves online re-heal
+    /// off, so non-reverse-heal deployments keep byte-for-byte the prior runtime
+    /// behaviour.
+    pub reverse_heal_online: bool,
 }
 
 /// Runtime replication policy passed to a started cluster coordinator.
@@ -1226,6 +1233,10 @@ pub struct ClusterCoordinator {
     /// changes before the event loop proposes a new topology term. Consumed
     /// when the event loop starts to build its [`TopologyDebounce`].
     topology_debounce: Duration,
+    /// Reverse-heal Phase 3b — RUNTIME online re-heal enable (see
+    /// [`ClusterConfig::reverse_heal_online`]). Captured into the event loop so
+    /// each partition-view refresh runs the online re-detect + reverse-pull.
+    reverse_heal_online: bool,
 }
 
 /// C6 — reconstruct the shard table for a RESTORED committed topology at boot.
@@ -1360,6 +1371,7 @@ impl ClusterCoordinator {
             cluster_secret: config.cluster_secret.map(Arc::new),
             activation_hold: Arc::new(AtomicBool::new(false)),
             topology_debounce: config.topology_debounce,
+            reverse_heal_online: config.reverse_heal_online,
         }
     }
 
@@ -1519,6 +1531,10 @@ impl ClusterCoordinator {
         // W3.3 — debounce window for coalescing membership changes before
         // proposing a new topology term.
         let topology_debounce_window = self.topology_debounce;
+        // Reverse-heal Phase 3b — RUNTIME online re-heal enable, captured so the
+        // exchange-complete handler runs the online re-detect + reverse-pull on
+        // each partition-view refresh.
+        let reverse_heal_online = self.reverse_heal_online;
 
         // Event processing thread
         let event_handle = std::thread::spawn(move || {
@@ -2330,6 +2346,34 @@ impl ClusterCoordinator {
                         &migration_throttle_event,
                         &cluster_secret_event,
                     );
+                    // Reverse-heal Phase 3b — RUNTIME online re-heal. The
+                    // partition view just refreshed carries every peer's per-shard
+                    // generation digest, so re-run the Tier-2 detector against this
+                    // node's freshly-activated mastered shards and, for any newly
+                    // stale-vs-a-live-replica shard NOT already healing, raise the
+                    // no-serve-before-heal fence and queue a delete-safe
+                    // reverse-pull (the requester loop below drives it). This is
+                    // the online closer for the boot-heal-missed / re-diverged
+                    // case; gated on the reverse-heal enable and a no-op on an
+                    // empty view.
+                    if reverse_heal_online {
+                        let queued = trigger_online_reheal(
+                            self_id,
+                            &shard_table,
+                            &migration,
+                            &inbound_bm_event,
+                            &inbound_state_path_event,
+                            &partition_view,
+                        );
+                        if queued > 0 {
+                            tracing::warn!(
+                                queued,
+                                term,
+                                "reverse-heal Phase 3b: runtime online re-heal fenced + \
+                                 queued reverse-pull for newly-stale mastered shard(s)",
+                            );
+                        }
+                    }
                     last_activation_at = std::time::Instant::now();
                     if let Some(ref path) = cluster_state_path {
                         let peak = peak_size_event.load(Ordering::Relaxed) as u64;
@@ -5244,6 +5288,125 @@ pub fn select_heal_source(
         };
     }
     best.map(|(node, _)| node)
+}
+
+/// Reverse-heal — choose a heal SOURCE per stale shard against `table` +
+/// `partition_view`. The pure core shared by the boot path
+/// ([`RunningCluster::select_reverse_heal_sources`]) and the Phase-3b runtime
+/// online re-heal ([`trigger_online_reheal`]).
+///
+/// Prefers the quorum-current [`select_heal_source`] (a committed replica that
+/// reported the shard with the highest recency and is not still receiving inbound
+/// data). When that yields no pick — no live replica reported THIS shard — it
+/// falls back to the shard's committed replica set, PREFERRING a replica present
+/// in `partition_view` (LIVE this round) over a silent one, then the lowest
+/// committed `NodeId`. Skips `self_id` and the `NodeId(0)` sentinel. Returns
+/// `(shard, source)` for shards with a source; a shard with NONE is omitted.
+pub(crate) fn select_reverse_heal_sources_for(
+    self_id: NodeId,
+    table: &ShardTable,
+    shards: &[u16],
+    partition_view: &std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>>,
+) -> Vec<(u16, NodeId)> {
+    let mut out = Vec::new();
+    for &shard in shards {
+        if (shard as usize) >= NUM_SHARDS {
+            continue;
+        }
+        let assignment = table.target_assignment(shard);
+        let committed: Vec<NodeId> = std::iter::once(assignment.master)
+            .chain(assignment.replicas.iter().copied())
+            .filter(|&n| n != self_id && n != NodeId(0))
+            .collect();
+        let source = select_heal_source(self_id, &committed, partition_view, shard).or_else(|| {
+            committed
+                .iter()
+                .copied()
+                .filter(|n| partition_view.contains_key(n))
+                .min_by_key(|n| n.0)
+                .or_else(|| committed.iter().copied().min_by_key(|n| n.0))
+        });
+        if let Some(src) = source {
+            out.push((shard, src));
+        }
+    }
+    out
+}
+
+/// Reverse-heal Phase 3b — RUNTIME online re-heal: detect → fence → queue-pull
+/// for the shards this node MASTERS that a live replica demonstrably diverges
+/// from, using the freshest `partition_view`. The online completeness closer for
+/// the one open consensus P1 (design §, "safe fallback"): a shard that boot-heal
+/// missed — or that re-diverges at runtime — is re-detected here and re-pulled
+/// once a quorum-current source is available, reusing the SAME machinery the boot
+/// heal uses.
+///
+/// For each newly-stale mastered shard it registers a delete-safe reverse-PULL
+/// from the argmax-recency quorum-current source
+/// ([`select_reverse_heal_sources_for`]) via
+/// [`MigrationManager::register_heal_source`](crate::cluster::migration::MigrationManager::register_heal_source),
+/// which BOTH raises the no-serve-before-heal `heal_pending` fence (so
+/// [`RunningCluster::is_master`] answers `Transitioning`, never `Yes`, until the
+/// pull completes) AND queues a concrete-source inbound entry the existing
+/// requester loop drives — the receiver applies the streamed baseline under
+/// RULE-DS + generation idempotency, and the completion handshake clears the
+/// fence. The inbound fence is persisted so a crash mid-heal re-fences on reboot.
+///
+/// SINGLE-FLIGHT: a shard already inbound-fenced (a heal in flight, a fail-closed
+/// fence, or a forward migration) is skipped, so a stale-but-being-healed shard
+/// stays single-flighted and never thrashes; a shard that heals then re-diverges
+/// later re-triggers (its fence has cleared by then). An empty `partition_view`
+/// (no exchange data) is a no-op. Returns the number of shards newly fenced +
+/// queued.
+fn trigger_online_reheal(
+    self_id: NodeId,
+    shard_table: &Arc<ShardTableLock<ShardTable>>,
+    migration: &Arc<Mutex<MigrationManager>>,
+    inbound_atomic: &Arc<crate::cluster::migration::AtomicShardBitmap>,
+    inbound_state_path: &Option<std::path::PathBuf>,
+    partition_view: &std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>>,
+) -> usize {
+    if partition_view.is_empty() {
+        return 0;
+    }
+    // Detect the stale mastered shards and select their sources under a single
+    // shard-table read so detection + selection see one consistent table.
+    let sources = {
+        let table = shard_table.read();
+        let stale = detect_stale_shards_from_view(self_id, &table, partition_view);
+        // SINGLE-FLIGHT: drop any shard already inbound-fenced (heal in flight,
+        // fail-closed fence, or forward migration). `register_heal_source` keys on
+        // `(shard, from_node)`; gating on the per-shard fence here makes the dedup
+        // robust to a source that changes between detector passes.
+        let fresh: Vec<u16> = stale
+            .into_iter()
+            .filter(|&s| !inbound_atomic.test(s))
+            .collect();
+        if fresh.is_empty() {
+            return 0;
+        }
+        select_reverse_heal_sources_for(self_id, &table, &fresh, partition_view)
+    };
+    if sources.is_empty() {
+        return 0;
+    }
+    let mut started = 0usize;
+    {
+        let mgr = &mut migration.lock();
+        for &(shard, source) in &sources {
+            if source == self_id || source == NodeId(0) {
+                continue;
+            }
+            if mgr.register_heal_source(shard, source) {
+                started += 1;
+            }
+        }
+        inbound_atomic.load_from(mgr.inbound_bitmap());
+        if let Some(path) = inbound_state_path {
+            crate::cluster::migration::persist_inbound_state(path, mgr);
+        }
+    }
+    started
 }
 
 // ---------------------------------------------------------------------------
@@ -9633,34 +9796,35 @@ impl RunningCluster {
         partition_view: &std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>>,
     ) -> Vec<(u16, NodeId)> {
         let table = self.shard_table.read();
-        let mut out = Vec::new();
-        for &shard in shards {
-            if (shard as usize) >= NUM_SHARDS {
-                continue;
-            }
-            let assignment = table.target_assignment(shard);
-            let committed: Vec<NodeId> = std::iter::once(assignment.master)
-                .chain(assignment.replicas.iter().copied())
-                .filter(|&n| n != self.self_id && n != NodeId(0))
-                .collect();
-            let source = select_heal_source(self.self_id, &committed, partition_view, shard)
-                .or_else(|| {
-                    // P2-2 — prefer a LIVE committed replica (one that reported
-                    // in this membership round) over a silent one; among equals,
-                    // lowest NodeId. Falls back to the lowest committed NodeId
-                    // only when the view carries no liveness signal (boot).
-                    committed
-                        .iter()
-                        .copied()
-                        .filter(|n| partition_view.contains_key(n))
-                        .min_by_key(|n| n.0)
-                        .or_else(|| committed.iter().copied().min_by_key(|n| n.0))
-                });
-            if let Some(src) = source {
-                out.push((shard, src));
-            }
-        }
-        out
+        select_reverse_heal_sources_for(self.self_id, &table, shards, partition_view)
+    }
+
+    /// Reverse-heal Phase 3b — run ONE round of RUNTIME online re-heal against
+    /// `partition_view`: re-detect the shards this node MASTERS that a live
+    /// replica diverges from and, for each newly-stale shard NOT already healing
+    /// (single-flight), raise the no-serve-before-heal fence and queue a
+    /// delete-safe reverse-PULL from the argmax-recency quorum-current source —
+    /// the SAME `register_heal_source` + requester-loop + RULE-DS machinery the
+    /// boot heal uses. Returns the number of shards newly fenced + queued.
+    ///
+    /// This is the online completeness closer for the open consensus P1: a shard
+    /// the boot heal missed (or that re-diverges at runtime) is healed here once a
+    /// source is available. Idempotent per shard while a heal is in flight (its
+    /// inbound fence suppresses re-triggers); a shard that heals then re-diverges
+    /// re-triggers. Driven from the event loop on each partition-view refresh when
+    /// `reverse_heal.tombstones` is enabled; an empty view is a no-op.
+    pub fn run_online_reheal(
+        &self,
+        partition_view: &std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>>,
+    ) -> usize {
+        trigger_online_reheal(
+            self.self_id,
+            &self.shard_table,
+            &self.migration,
+            &self.inbound_atomic,
+            &self.inbound_state_path,
+            partition_view,
+        )
     }
 
     /// Test-only (F-02) — engage the outbound write fence for `shard`,
@@ -17310,6 +17474,239 @@ mod tests {
             vec![(shard, NodeId(3))],
             "fallback must prefer the LIVE committed replica (NodeId(3)) over the \
              silent lower-id NodeId(2)",
+        );
+    }
+
+    /// Reverse-heal Phase 3b — build a partition view in which the shard's
+    /// `master` and `replica` report DIVERGENT manifest digests, so the Tier-2
+    /// detector ([`detect_stale_shards_from_view`]) flags the shard stale and
+    /// [`select_heal_source`] picks `replica` (it reported the shard, no pending
+    /// inbound) as the argmax-recency quorum-current source.
+    fn divergent_view_for(
+        shard: u16,
+        master: NodeId,
+        replica: NodeId,
+    ) -> std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>> {
+        let mut view: std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>> =
+            std::collections::HashMap::new();
+        view.insert(
+            master,
+            vec![PartitionVersionEntry {
+                shard,
+                flags: 0,
+                replica_count: 1,
+                last_applied_seq: 5,
+                manifest_digest: 0xAAAA,
+                max_generation: 100,
+            }],
+        );
+        view.insert(
+            replica,
+            vec![PartitionVersionEntry {
+                shard,
+                flags: 0,
+                replica_count: 1,
+                last_applied_seq: 9,
+                manifest_digest: 0xBBBB,
+                max_generation: 105,
+            }],
+        );
+        view
+    }
+
+    fn three_node_cluster_mastering_with_replica() -> (RunningCluster, u16, NodeId) {
+        let members = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let table = ShardTable::compute_with_epoch(&members, 3, 5, 1);
+        let (shard, replica) = (0..NUM_SHARDS as u16)
+            .find_map(|s| {
+                let a = table.target_assignment(s);
+                (a.master == NodeId(1) && !a.replicas.is_empty()).then(|| (s, a.replicas[0]))
+            })
+            .expect("N1 masters some shard with a replica");
+        let cluster = new_test_running_cluster(
+            NodeId(1),
+            table,
+            &[
+                (NodeId(1), "127.0.0.1:4991".parse().unwrap()),
+                (NodeId(2), "127.0.0.1:4992".parse().unwrap()),
+                (NodeId(3), "127.0.0.1:4993".parse().unwrap()),
+            ],
+            &members,
+            &[],
+            &[],
+            &[],
+            3,
+        );
+        (cluster, shard, replica)
+    }
+
+    /// Reverse-heal Phase 3b (RED→GREEN) — a mastered shard that becomes stale at
+    /// RUNTIME (a live replica reports a divergent digest in the freshest
+    /// partition view, NOT at boot) is detected and healed via the ONLINE path:
+    /// the no-serve-before-heal fence is raised, a concrete-source pull is queued
+    /// from the argmax-recency replica (the existing requester loop drives it, and
+    /// the receiver applies the baseline under RULE-DS), and the fence clears when
+    /// the pull completes. A shard that heals then RE-diverges later re-triggers.
+    #[test]
+    fn online_reheal_detects_and_heals_runtime_divergence() {
+        let (cluster, shard, replica) = three_node_cluster_mastering_with_replica();
+        let k = key_for_shard(shard);
+
+        // Runtime baseline: before any divergence the node serves the shard.
+        assert!(
+            matches!(cluster.is_master(&k), MasterQueryResult::Yes),
+            "precondition: the node masters + serves the shard",
+        );
+
+        // A fresh partition view arrives at RUNTIME showing `replica` diverged.
+        let view = divergent_view_for(shard, NodeId(1), replica);
+        assert_eq!(
+            cluster.run_online_reheal(&view),
+            1,
+            "the runtime-detected stale shard is queued for an online heal once",
+        );
+
+        // No-serve-before-heal: the shard is fenced Transitioning, not Yes.
+        assert!(
+            matches!(
+                cluster.is_master(&k),
+                MasterQueryResult::Transitioning { .. }
+            ),
+            "a runtime-re-detected stale shard must fence BEFORE it is re-served",
+        );
+        // The queued pull names the divergent replica as the concrete source.
+        let pending = cluster.migration.lock().pending_inbound_entries();
+        assert!(
+            pending
+                .iter()
+                .any(|(s, from)| *s == shard && *from == replica),
+            "the online heal queues a concrete-source pull from the divergent replica",
+        );
+
+        // The pull completes (receiver applied the baseline under RULE-DS) → the
+        // fence clears and the shard is served as authority again.
+        cluster.mark_inbound_complete_from_source(shard, replica);
+        assert!(
+            matches!(cluster.is_master(&k), MasterQueryResult::Yes),
+            "after the online heal completes the shard is served as authority again",
+        );
+
+        // Re-divergence AFTER completion re-triggers (single-flight only holds
+        // while a heal is in flight, so a re-diverged shard heals again).
+        assert_eq!(
+            cluster.run_online_reheal(&view),
+            1,
+            "a shard that heals then re-diverges re-triggers the online heal",
+        );
+    }
+
+    /// Reverse-heal Phase 3b (RED→GREEN) — SINGLE-FLIGHT / dedup. While a heal is
+    /// in flight for a shard (its inbound fence is up), re-running the online
+    /// detector against the SAME still-divergent view must NOT re-trigger: no
+    /// second pull is queued and the shard is not thrashed.
+    #[test]
+    fn online_reheal_does_not_retrigger_inflight_heal() {
+        let (cluster, shard, replica) = three_node_cluster_mastering_with_replica();
+        let view = divergent_view_for(shard, NodeId(1), replica);
+
+        assert_eq!(
+            cluster.run_online_reheal(&view),
+            1,
+            "first detection queues the online heal",
+        );
+        // The heal is still in flight and the view is still divergent, but the
+        // shard is already fenced → single-flight suppresses a re-trigger.
+        assert_eq!(
+            cluster.run_online_reheal(&view),
+            0,
+            "an in-flight heal is single-flighted (no re-trigger)",
+        );
+        assert_eq!(
+            cluster.run_online_reheal(&view),
+            0,
+            "and stays single-flighted across repeated detector passes",
+        );
+        let inflight = cluster
+            .migration
+            .lock()
+            .pending_inbound_entries()
+            .into_iter()
+            .filter(|(s, _)| *s == shard)
+            .count();
+        assert_eq!(
+            inflight, 1,
+            "single-flight: exactly ONE in-flight pull for the shard, no thrash",
+        );
+    }
+
+    /// Reverse-heal Phase 3b (RED→GREEN) — the online analogue of the Phase-2c
+    /// no-serve-before-heal fence: a shard re-detected stale at RUNTIME answers
+    /// `Transitioning` (client-invisible / retryable) — NOT `Yes` — from the
+    /// instant of detection until its online heal completes, and the fence is
+    /// scoped to the DETECTED-stale shard only (a clean mastered shard in the same
+    /// view stays served).
+    #[test]
+    fn online_reheal_fences_before_serving() {
+        let members = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let table = ShardTable::compute_with_epoch(&members, 3, 5, 1);
+        let mut mastered = (0..NUM_SHARDS as u16).filter(|&s| {
+            let a = table.target_assignment(s);
+            a.master == NodeId(1) && !a.replicas.is_empty()
+        });
+        let stale_shard = mastered.next().expect("N1 masters a shard with a replica");
+        let clean_shard = mastered
+            .next()
+            .expect("N1 masters a second shard with a replica");
+        let replica = table.target_assignment(stale_shard).replicas[0];
+        let cluster = new_test_running_cluster(
+            NodeId(1),
+            table,
+            &[
+                (NodeId(1), "127.0.0.1:4995".parse().unwrap()),
+                (NodeId(2), "127.0.0.1:4996".parse().unwrap()),
+                (NodeId(3), "127.0.0.1:4997".parse().unwrap()),
+            ],
+            &members,
+            &[],
+            &[],
+            &[],
+            3,
+        );
+
+        let stale_k = key_for_shard(stale_shard);
+        let clean_k = key_for_shard(clean_shard);
+        assert!(matches!(
+            cluster.is_master(&stale_k),
+            MasterQueryResult::Yes
+        ));
+        assert!(matches!(
+            cluster.is_master(&clean_k),
+            MasterQueryResult::Yes
+        ));
+
+        // Only `stale_shard` diverges in this view.
+        let view = divergent_view_for(stale_shard, NodeId(1), replica);
+        assert_eq!(cluster.run_online_reheal(&view), 1);
+
+        // Fence-before-serve: the detected-stale shard is Transitioning...
+        assert!(
+            matches!(
+                cluster.is_master(&stale_k),
+                MasterQueryResult::Transitioning { .. }
+            ),
+            "the runtime-re-detected stale shard is fenced BEFORE it is served",
+        );
+        // ...while a mastered shard the detector did NOT flag is untouched.
+        assert!(
+            matches!(cluster.is_master(&clean_k), MasterQueryResult::Yes),
+            "online re-heal fences ONLY the detected-stale shard, not every mastered shard",
+        );
+
+        // The fence persists until the heal completes, then the shard serves.
+        cluster.mark_inbound_complete_from_source(stale_shard, replica);
+        assert!(
+            matches!(cluster.is_master(&stale_k), MasterQueryResult::Yes),
+            "the fence clears only once the online heal completes",
         );
     }
 

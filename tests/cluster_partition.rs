@@ -248,6 +248,7 @@ fn spawn_proxied_server(
         migration_batch_size: 100,
         persisted_incarnation,
         cluster_id: TEST_CLUSTER_ID,
+        reverse_heal_online: false,
     };
 
     let coordinator = ClusterCoordinator::new(cluster_config, 1);
