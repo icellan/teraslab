@@ -2324,16 +2324,16 @@ fn apply_op_journal_inner(
             .set_record_generation(&tx_key, master_gen)
             .map_err(|e| format!("generation sync: {e}"))?
         {
-            // Fix C: for a CONCURRENT multi-source migration baseline, "absent
-            // after apply" means another source streaming the SAME record to the
-            // same target already deleted+recreated it between this apply and the
-            // generation sync. That is benign: the record will be present from
-            // the other source's apply, and the OP_MIGRATION_COMPLETE handshake
-            // independently verifies every source key is present at the matching
-            // generation before committing. Skip rather than hard-fail the
-            // batch. For NON-migration replica batches this remains a hard error
-            // — there a missing record is a real generation-counter divergence.
-            if is_migration {
+            // A record absent after apply is a real generation-counter divergence
+            // ONLY on a tracked steady-state batch. For a MIGRATION baseline (Fix C:
+            // a concurrent multi-source stream may delete+recreate the record between
+            // this apply and the sync; the OP_MIGRATION_COMPLETE handshake verifies
+            // presence@generation independently) AND for an OUT-OF-BAND / compensation
+            // batch (which the op arms already tolerate as a skip, nak_on_missing=false),
+            // absence is benign — skip rather than hard-fail, consistent with the
+            // op-arm missing-record handling. `nak_on_missing` is true only for a
+            // tracked (non-migration, non-out-of-band) batch.
+            if !nak_on_missing {
                 record_apply_skipped_missing_tx("generation_sync", &tx_key);
                 return Ok(());
             }
@@ -3992,12 +3992,21 @@ mod tests {
         assert!(engine.read_metadata(&missing).is_err());
     }
 
-    /// Fix C (gen-sync hard error — NON-migration path). The SAME absent-after-
-    /// apply condition on a normal replica batch (`is_migration=false`) must
-    /// still be a HARD error: a missing record there is a real generation-counter
-    /// divergence, not a benign concurrent re-create.
+    /// R7: the single-op [`apply_op_journal`] convenience always drives
+    /// `apply_op_journal_inner` with `nak_on_missing = false` (see its doc
+    /// comment) — exactly like a migration baseline and an out-of-band
+    /// compensation apply. So a non-migration single-op apply with an
+    /// absent-after-apply record is ALSO a benign skip, not a hard error:
+    /// the generation-sync gate must be consistent with the op-arm handling,
+    /// which already tolerates this case for every `nak_on_missing = false`
+    /// caller. (Superseded the old `non_migration_gen_sync_absent_after_apply_
+    /// hard_errors` expectation, which asserted the pre-R7 inconsistency this
+    /// fix removes; the real "hard error on non-migration" case is exercised
+    /// by `generation_sync_tracked_absent_record_still_hard_fails` below,
+    /// which drives the gate with `nak_on_missing = true` — the only case
+    /// that still hard-fails.)
     #[test]
-    fn non_migration_gen_sync_absent_after_apply_hard_errors() {
+    fn non_migration_single_op_gen_sync_absent_after_apply_skips() {
         let engine = make_engine();
         let missing = key(121);
         let op = ReplicaOp::MarkLongestChain {
@@ -4007,13 +4016,90 @@ mod tests {
             block_height_retention: 288,
             master_generation: 5,
         };
-        // is_migration = false (normal replication). journal = true.
-        let err = apply_op_journal(&engine, &op, true, false)
-            .expect_err("non-migration gen-sync on an absent record must hard-error");
+        // is_migration = false (normal replication), journal = true — but
+        // `apply_op_journal` still hardcodes `nak_on_missing = false`.
+        let r = apply_op_journal(&engine, &op, true, false);
+        assert!(
+            r.is_ok(),
+            "non-migration SINGLE-OP gen-sync on an absent record must be a \
+             benign skip (nak_on_missing is always false on this path), got {r:?}"
+        );
+        assert!(engine.read_metadata(&missing).is_err());
+    }
+
+    /// R7 regression (out-of-band): an out-of-band / compensation batch has
+    /// `nak_on_missing = false` (see the batch handler's `tracked = !is_migration
+    /// && !is_out_of_band`), just like a migration baseline. Absent-after-apply
+    /// on that path must be a benign skip, not the hard error the pre-fix gate
+    /// produced by keying only off `is_migration`. Drive `apply_op_journal_inner`
+    /// directly with `is_migration = false, nak_on_missing = false` — the exact
+    /// out-of-band batch shape — since constructing a full out-of-band
+    /// `ReplicaBatch` end-to-end is not needed to exercise this gate.
+    #[test]
+    fn generation_sync_out_of_band_absent_record_skips_not_hard_fails() {
+        let engine = make_engine();
+        let missing = key(122);
+        let op = ReplicaOp::MarkLongestChain {
+            tx_key: missing,
+            on_longest_chain: true,
+            current_block_height: 700_000,
+            block_height_retention: 288,
+            master_generation: 5,
+        };
+        let mut redo_out = Vec::new();
+        let r = apply_op_journal_inner(&engine, &op, true, false, false, &mut redo_out);
+        assert!(
+            r.is_ok(),
+            "out-of-band gen-sync on an absent record must be a benign skip \
+             (nak_on_missing = false), got {r:?}"
+        );
+        assert!(engine.read_metadata(&missing).is_err());
+    }
+
+    /// R7 regression: a TRACKED steady-state batch (`nak_on_missing = true`)
+    /// must still hard-fail on absent-after-apply — that is the real
+    /// generation-counter divergence case (C15) the gate exists to catch.
+    /// This is the one case the R7 fix must NOT loosen.
+    #[test]
+    fn generation_sync_tracked_absent_record_still_hard_fails() {
+        let engine = make_engine();
+        let missing = key(123);
+        let op = ReplicaOp::MarkLongestChain {
+            tx_key: missing,
+            on_longest_chain: true,
+            current_block_height: 700_000,
+            block_height_retention: 288,
+            master_generation: 5,
+        };
+        let mut redo_out = Vec::new();
+        let err = apply_op_journal_inner(&engine, &op, true, false, true, &mut redo_out)
+            .expect_err("tracked-batch gen-sync on an absent record must still hard-error");
         assert!(
             err.contains("absent after apply"),
             "expected the 'absent after apply' hard error, got: {err}"
         );
+    }
+
+    /// R7 regression: the migration path is unchanged by the fix — it was
+    /// already exempt (`is_migration` implies `nak_on_missing = false`), and
+    /// stays a benign skip after re-keying the gate off `nak_on_missing`.
+    #[test]
+    fn generation_sync_migration_absent_record_still_skips() {
+        let engine = make_engine();
+        let missing = key(124);
+        let op = ReplicaOp::MarkLongestChain {
+            tx_key: missing,
+            on_longest_chain: true,
+            current_block_height: 700_000,
+            block_height_retention: 288,
+            master_generation: 5,
+        };
+        let r = apply_op_journal(&engine, &op, false, true);
+        assert!(
+            r.is_ok(),
+            "migration gen-sync on an absent record must remain a benign skip, got {r:?}"
+        );
+        assert!(engine.read_metadata(&missing).is_err());
     }
 
     /// #3 multi-store: a replica `Delete` redo MUST land in the record's OWN
