@@ -3887,7 +3887,19 @@ fn compensate_replication_failure(
                             current_block_height: *current_block_height,
                             block_height_retention: *block_height_retention,
                         };
-                        let _ = engine.unspend(&req);
+                        // R8/C16: a compensating unspend that fails for a
+                        // reason other than the record already being gone
+                        // (TxNotFound, benign) must not be swallowed — it
+                        // leaves the slot SPENT while every replica rolled
+                        // back to UNSPENT, a silent divergence between this
+                        // node and its replicas that the next restart-
+                        // recovery would not otherwise catch.
+                        if let Err(e) = engine.unspend(&req)
+                            && !matches!(e, SpendError::TxNotFound)
+                            && restore_write_err.is_none()
+                        {
+                            restore_write_err = Some(format!("compensate spend (unspend): {e}"));
+                        }
                         comp_redo.push(RedoOp::Unspend {
                             tx_key: *key,
                             offset: *offset,
@@ -3935,6 +3947,21 @@ fn compensate_replication_failure(
                             current_block_height: *current_block_height,
                             block_height_retention: *block_height_retention,
                         };
+                        // R8/C16 KNOWN RESIDUAL (tracked follow-up): unlike the
+                        // other arms, this compensating re-spend swallows its
+                        // failures and is NOT wired into `restore_write_err`. It
+                        // is two-phase (`validate_spend_multi` then `.apply`),
+                        // and even a top-level `Ok(v)` carries a per-slot
+                        // `v.errors: BTreeMap<u32, SpendError>` (AlreadySpent /
+                        // Frozen / Pruned) that `let _ = v.apply(engine)` drops —
+                        // exactly the divergence class the receiver's Spend apply
+                        // treats as a hard NAK. A naive "top-level Err minus
+                        // TxNotFound" capture (the pattern the other arms use)
+                        // would give false completeness by missing those per-item
+                        // errors, so closing this needs a purpose-built shape, not
+                        // a classification list. Left swallowed deliberately until
+                        // that is designed rather than guessed on the most fragile
+                        // path.
                         if let Ok(v) = engine.validate_spend_multi(&req) {
                             let _ = v.apply(engine);
                         }
@@ -3966,7 +3993,17 @@ fn compensate_replication_failure(
                             offset: *offset,
                             utxo_hash: slot.hash,
                         };
-                        let _ = engine.unfreeze(&req);
+                        // R8/C16: benign = TxNotFound | NotFrozen (mirrors
+                        // the receiver's own Unfreeze apply arm, which
+                        // tolerates exactly these two as Ok). Anything else
+                        // (device I/O, etc.) is a real divergence and must
+                        // surface rather than be swallowed.
+                        if let Err(e) = engine.unfreeze(&req)
+                            && !matches!(e, SpendError::TxNotFound | SpendError::NotFrozen { .. })
+                            && restore_write_err.is_none()
+                        {
+                            restore_write_err = Some(format!("compensate freeze (unfreeze): {e}"));
+                        }
                         comp_redo.push(RedoOp::UnfreezeV2 {
                             tx_key: *key,
                             offset: *offset,
@@ -3981,7 +4018,20 @@ fn compensate_replication_failure(
                             offset: *offset,
                             utxo_hash: slot.hash,
                         };
-                        let _ = engine.freeze(&req);
+                        // R8/C16: benign = TxNotFound | AlreadyFrozen |
+                        // AlreadySpent (mirrors the receiver's own Freeze
+                        // apply arm). Anything else must surface.
+                        if let Err(e) = engine.freeze(&req)
+                            && !matches!(
+                                e,
+                                SpendError::TxNotFound
+                                    | SpendError::AlreadyFrozen { .. }
+                                    | SpendError::AlreadySpent { .. }
+                            )
+                            && restore_write_err.is_none()
+                        {
+                            restore_write_err = Some(format!("compensate unfreeze (freeze): {e}"));
+                        }
                         comp_redo.push(RedoOp::FreezeV2 {
                             tx_key: *key,
                             offset: *offset,
@@ -4007,7 +4057,14 @@ fn compensate_replication_failure(
                         current_block_height: *current_block_height,
                         block_height_retention: *block_height_retention,
                     };
-                    let _ = engine.set_mined(&req);
+                    // R8/C16: benign = TxNotFound (mirrors the receiver's
+                    // own SetMined apply arm). Anything else must surface.
+                    if let Err(e) = engine.set_mined(&req)
+                        && !matches!(e, SpendError::TxNotFound)
+                        && restore_write_err.is_none()
+                    {
+                        restore_write_err = Some(format!("compensate set_mined (unset): {e}"));
+                    }
                     comp_redo.push(RedoOp::SetMinedBatch {
                         block_id: *block_id,
                         block_height: *block_height,
@@ -4049,7 +4106,13 @@ fn compensate_replication_failure(
                         current_block_height: *current_block_height,
                         block_height_retention: *block_height_retention,
                     };
-                    let _ = engine.set_mined(&req);
+                    // R8/C16: benign = TxNotFound. Anything else must surface.
+                    if let Err(e) = engine.set_mined(&req)
+                        && !matches!(e, SpendError::TxNotFound)
+                        && restore_write_err.is_none()
+                    {
+                        restore_write_err = Some(format!("compensate unset_mined (re-set): {e}"));
+                    }
                     // Forward redo entry: re-add the original block entry
                     // (so a recovery replay applies the same restoration).
                     comp_redo.push(RedoOp::SetMinedBatch {
@@ -4125,7 +4188,15 @@ fn compensate_replication_failure(
                                 current_block_height: *current_block_height,
                                 block_height_retention: *block_height_retention,
                             };
-                            let _ = engine.set_mined(&req);
+                            // R8/C16: benign = TxNotFound. Anything else
+                            // must surface.
+                            if let Err(e) = engine.set_mined(&req)
+                                && !matches!(e, SpendError::TxNotFound)
+                                && restore_write_err.is_none()
+                            {
+                                restore_write_err =
+                                    Some(format!("compensate set_mined_batch (re-set): {e}"));
+                            }
                             comp_redo.push(RedoOp::SetMinedBatch {
                                 block_id: *block_id,
                                 block_height: bh,
@@ -4157,7 +4228,15 @@ fn compensate_replication_failure(
                                 current_block_height: *current_block_height,
                                 block_height_retention: *block_height_retention,
                             };
-                            let _ = engine.set_mined(&req);
+                            // R8/C16: benign = TxNotFound. Anything else
+                            // must surface.
+                            if let Err(e) = engine.set_mined(&req)
+                                && !matches!(e, SpendError::TxNotFound)
+                                && restore_write_err.is_none()
+                            {
+                                restore_write_err =
+                                    Some(format!("compensate set_mined_batch (unset): {e}"));
+                            }
                             comp_redo.push(RedoOp::SetMinedBatch {
                                 block_id: *block_id,
                                 block_height: *block_height,
@@ -4305,7 +4384,14 @@ fn compensate_replication_failure(
                         current_block_height: *current_block_height,
                         block_height_retention: *retention,
                     };
-                    let _ = engine.set_conflicting(&req);
+                    // R8/C16: benign = TxNotFound. Anything else must
+                    // surface.
+                    if let Err(e) = engine.set_conflicting(&req)
+                        && !matches!(e, SpendError::TxNotFound)
+                        && restore_write_err.is_none()
+                    {
+                        restore_write_err = Some(format!("compensate set_conflicting: {e}"));
+                    }
                     comp_redo.push(RedoOp::SetConflicting {
                         tx_key: *key,
                         value: !value,
@@ -4321,8 +4407,15 @@ fn compensate_replication_failure(
                         } => (prior_locked, prior_delete_at_height),
                         _ => (!value, 0),
                     };
-                    let _ =
-                        engine.restore_set_locked_for_compensation(key, target_locked, target_dah);
+                    // R8/C16: benign = TxNotFound. Anything else must
+                    // surface.
+                    if let Err(e) =
+                        engine.restore_set_locked_for_compensation(key, target_locked, target_dah)
+                        && !matches!(e, SpendError::TxNotFound)
+                        && restore_write_err.is_none()
+                    {
+                        restore_write_err = Some(format!("compensate set_locked: {e}"));
+                    }
                     comp_redo.push(RedoOp::SetLocked {
                         tx_key: *key,
                         value: target_locked,
@@ -4340,7 +4433,14 @@ fn compensate_replication_failure(
                         tx_key: *key,
                         block_height: 0,
                     };
-                    let _ = engine.preserve_until(&req);
+                    // R8/C16: benign = TxNotFound. Anything else must
+                    // surface.
+                    if let Err(e) = engine.preserve_until(&req)
+                        && !matches!(e, SpendError::TxNotFound)
+                        && restore_write_err.is_none()
+                    {
+                        restore_write_err = Some(format!("compensate preserve_until: {e}"));
+                    }
                     comp_redo.push(RedoOp::PreserveUntil {
                         tx_key: *key,
                         block_height: 0,
@@ -4351,7 +4451,19 @@ fn compensate_replication_failure(
                         tx_key: *key,
                         due_guard: None,
                     };
-                    let _ = engine.delete(&req);
+                    // R8/C16 (named anchor): a compensating delete that
+                    // fails for a reason other than the record already being
+                    // gone (TxNotFound, benign) must not be swallowed — the
+                    // create this rolls back would still be live on this
+                    // node while every replica never applied it, a silent
+                    // divergence that a clean-rollback report would hide
+                    // from the caller until the next restart-recovery.
+                    if let Err(e) = engine.delete(&req)
+                        && !matches!(e, SpendError::TxNotFound)
+                        && restore_write_err.is_none()
+                    {
+                        restore_write_err = Some(format!("compensate create (delete): {e}"));
+                    }
                     comp_redo.push(RedoOp::Delete {
                         tx_key: *key,
                         record_offset: 0,
@@ -4383,14 +4495,34 @@ fn compensate_replication_failure(
                         current_block_height: *current_block_height,
                         block_height_retention: *block_height_retention,
                     };
-                    if let Ok(resp) = engine.mark_on_longest_chain(&req) {
-                        comp_redo.push(RedoOp::MarkOnLongestChain {
-                            tx_key: *key,
-                            on_longest_chain: !on_longest_chain,
-                            current_block_height: *current_block_height,
-                            block_height_retention: *block_height_retention,
-                            generation: resp.generation,
-                        });
+                    match engine.mark_on_longest_chain(&req) {
+                        Ok(resp) => {
+                            comp_redo.push(RedoOp::MarkOnLongestChain {
+                                tx_key: *key,
+                                on_longest_chain: !on_longest_chain,
+                                current_block_height: *current_block_height,
+                                block_height_retention: *block_height_retention,
+                                generation: resp.generation,
+                            });
+                        }
+                        // R8/C16: benign = TxNotFound (mirrors the
+                        // receiver's own MarkLongestChain apply arm). We
+                        // cannot build the comp_redo entry without
+                        // `resp.generation`, so a non-benign failure here
+                        // emits NO compensating redo entry at all — on
+                        // restart, recovery replays only the still-durable
+                        // ORIGINAL mark redo (double-fault territory,
+                        // acceptable per this function's header). Surfacing
+                        // the error still keeps the replication intent
+                        // pending so the caller does not report a clean
+                        // rollback over an unreversed flip.
+                        Err(e) if !matches!(e, SpendError::TxNotFound) => {
+                            if restore_write_err.is_none() {
+                                restore_write_err =
+                                    Some(format!("compensate mark_longest_chain: {e}"));
+                            }
+                        }
+                        Err(_) => {}
                     }
                 }
                 ReplicaOp::RemoveConflictingChild { child_txid, .. } => {
@@ -4398,7 +4530,20 @@ fn compensate_replication_failure(
                     // (`key` is the parent). append/remove are exact inverses
                     // and both idempotent. The forward redo entry mirrors the
                     // compensating engine call for recovery replay.
-                    let _ = engine.append_conflicting_child(key, *child_txid);
+                    // R8/C16: surface a genuine failure (StorageError,
+                    // ConflictingChildrenFull) so the intent stays pending.
+                    // `append_conflicting_child` resolves a missing parent to
+                    // Ok(()) internally and never returns TxNotFound here, so
+                    // the `!matches!(TxNotFound)` guard is defensive-only (kept
+                    // for shape-parity with the other arms), not a live benign
+                    // case.
+                    if let Err(e) = engine.append_conflicting_child(key, *child_txid)
+                        && !matches!(e, SpendError::TxNotFound)
+                        && restore_write_err.is_none()
+                    {
+                        restore_write_err =
+                            Some(format!("compensate remove_conflicting_child (append): {e}"));
+                    }
                     comp_redo.push(RedoOp::AppendConflictingChild {
                         parent_key: *key,
                         child_txid: *child_txid,
@@ -30272,6 +30417,257 @@ mod tests {
         assert!(
             has_compensate,
             "compensating redo entry must be durable even when the in-line restore write fails"
+        );
+    }
+
+    /// R8/C16 (named anchor): a failing compensating `delete` for
+    /// `ReplicaOp::Create` must surface as `Err`, not be swallowed by the old
+    /// `let _ = engine.delete(&req);`. Pre-fix this arm always returned
+    /// `Ok`, so a genuine device failure during rollback of a replicated
+    /// Create was reported as a clean rollback and the pending replication
+    /// intent was cleared over a record this node never actually deleted —
+    /// a silent divergence from every replica that DID roll the create back.
+    #[test]
+    fn compensation_create_delete_failure_surfaces_error() {
+        use crate::ops::create::CreateRequest;
+
+        let (engine, redo_log, fail, _guard) = write_failing_engine();
+        let mut txid = [0u8; 32];
+        txid[0] = 0xC1;
+        let key = TxKey { txid };
+
+        // A second, throwaway record used ONLY to prove (without disturbing
+        // `key`'s state) that the armed device really does make a
+        // compensating `engine.delete` fail synchronously. `delete_inner`
+        // unregisters the index entry BEFORE it tombstones the metadata
+        // header, so probing on `key` itself would leave it already
+        // unregistered and turn the real assertion below into a benign
+        // `TxNotFound` instead of the device failure this test targets.
+        let mut probe_txid = [0u8; 32];
+        probe_txid[0] = 0xC0;
+        let probe_key = TxKey { txid: probe_txid };
+
+        // Seed the record the Create replicated (fail off: this write must
+        // succeed so there is something for the compensating delete to find).
+        for (id, hash) in [(txid, [0x11u8; 32]), (probe_txid, [0x33u8; 32])] {
+            engine
+                .create(&CreateRequest {
+                    tx_id: id,
+                    tx_version: 1,
+                    locktime: 0,
+                    fee: 0,
+                    size_in_bytes: 0,
+                    extended_size: 0,
+                    is_coinbase: false,
+                    spending_height: 0,
+                    utxo_hashes: &[hash],
+                    inputs: None,
+                    outputs: None,
+                    inpoints: None,
+                    is_external: false,
+                    created_at: 0,
+                    block_height: 0,
+                    mined_block_infos: &[],
+                    frozen: false,
+                    conflicting: false,
+                    locked: false,
+                    external_ref: None,
+                    parent_txids: &[],
+                })
+                .expect("seed create");
+        }
+
+        // Sanity check (would-pass-pre-fix guard): confirm the armed device
+        // actually makes a compensating `engine.delete` call return `Err`
+        // — otherwise this test would be vacuous. `delete_inner` tombstones
+        // the metadata header via a device write that this harness's
+        // `WriteFailingDevice` (no direct mmap pointer: `as_raw_ptr` returns
+        // `None`) routes through `pwrite`, which the armed `fail` flag trips.
+        fail.store(true, std::sync::atomic::Ordering::SeqCst);
+        let direct_err = engine
+            .delete(&crate::ops::remaining::DeleteRequest {
+                tx_key: probe_key,
+                due_guard: None,
+            })
+            .expect_err("armed device must make the tombstone write fail");
+        assert!(
+            matches!(direct_err, SpendError::StorageError { .. }),
+            "expected a StorageError from the armed device, got {direct_err:?}"
+        );
+
+        // `key` is untouched by the probe above — still present for the
+        // real compensation call below to exercise the same failing path.
+        assert!(
+            engine.lookup(&key).is_some(),
+            "the untouched key must still be present ahead of the real compensation call"
+        );
+
+        let repl_ops = vec![(
+            key,
+            vec![ReplicaOp::Create {
+                tx_key: key,
+                metadata_bytes: Vec::new(),
+                utxo_hashes: Vec::new(),
+                cold_data: None,
+                is_external: false,
+            }],
+        )];
+        let before_images = vec![(key, vec![BeforeImage::None])];
+
+        let err =
+            compensate_replication_failure(&engine, &repl_ops, &before_images, Some(&redo_log))
+                .expect_err(
+                    "R8/C16: a failed compensating delete must surface as Err, not be swallowed",
+                );
+        assert!(
+            err.contains("compensate create (delete)"),
+            "error must identify the swallowed compensating delete; got {err:?}"
+        );
+
+        // DC-1 durability: the compensating `RedoOp::Delete` must still be
+        // durable even though the in-memory delete failed — recovery relies
+        // on it to replay the rollback.
+        fail.store(false, std::sync::atomic::Ordering::SeqCst);
+        let entries = redo_log.lock().recover().expect("recover redo entries");
+        assert!(
+            entries
+                .iter()
+                .any(|e| matches!(&e.op, RedoOp::Delete { tx_key, .. } if *tx_key == key)),
+            "compensating delete redo entry must be durable even when the engine delete fails"
+        );
+    }
+
+    /// R8/C16: guards against over-surfacing. A compensating delete whose
+    /// target record is already gone (`TxNotFound`) is benign — the create
+    /// being rolled back has no live record to diverge, so the rollback is
+    /// still clean and the intent may be cleared.
+    #[test]
+    fn compensation_create_delete_txnotfound_is_benign_ok() {
+        let (engine, redo_log, _fail, _guard) = write_failing_engine();
+        let mut txid = [0u8; 32];
+        txid[0] = 0xC2;
+        let key = TxKey { txid };
+
+        // Deliberately never create `key` — `engine.delete` returns
+        // `Err(SpendError::TxNotFound)` for it.
+        let direct_err = engine
+            .delete(&crate::ops::remaining::DeleteRequest {
+                tx_key: key,
+                due_guard: None,
+            })
+            .expect_err("delete of a never-created key must fail");
+        assert!(
+            matches!(direct_err, SpendError::TxNotFound),
+            "expected TxNotFound, got {direct_err:?}"
+        );
+
+        let repl_ops = vec![(
+            key,
+            vec![ReplicaOp::Create {
+                tx_key: key,
+                metadata_bytes: Vec::new(),
+                utxo_hashes: Vec::new(),
+                cold_data: None,
+                is_external: false,
+            }],
+        )];
+        let before_images = vec![(key, vec![BeforeImage::None])];
+
+        let result =
+            compensate_replication_failure(&engine, &repl_ops, &before_images, Some(&redo_log))
+                .expect("TxNotFound on the compensating delete must be treated as benign (Ok)");
+        let _ = result;
+
+        // Even on the benign path the compensating redo entry is still
+        // written (the comp_redo push is unconditional).
+        let entries = redo_log.lock().recover().expect("recover redo entries");
+        assert!(
+            entries
+                .iter()
+                .any(|e| matches!(&e.op, RedoOp::Delete { tx_key, .. } if *tx_key == key)),
+            "compensating delete redo entry must still be written on the benign TxNotFound path"
+        );
+    }
+
+    /// R8/C16: a second non-benign arm (`ReplicaOp::PreserveUntil`) proving
+    /// the fix generalizes beyond the named Create/delete anchor. Pre-fix
+    /// `let _ = engine.preserve_until(&req);` swallowed the same class of
+    /// device failure.
+    #[test]
+    fn compensation_preserve_until_failure_surfaces_error() {
+        use crate::ops::create::CreateRequest;
+
+        let (engine, redo_log, fail, _guard) = write_failing_engine();
+        let mut txid = [0u8; 32];
+        txid[0] = 0xC3;
+        let key = TxKey { txid };
+
+        engine
+            .create(&CreateRequest {
+                tx_id: txid,
+                tx_version: 1,
+                locktime: 0,
+                fee: 0,
+                size_in_bytes: 0,
+                extended_size: 0,
+                is_coinbase: false,
+                spending_height: 0,
+                utxo_hashes: &[[0x22u8; 32]],
+                inputs: None,
+                outputs: None,
+                inpoints: None,
+                is_external: false,
+                created_at: 0,
+                block_height: 0,
+                mined_block_infos: &[],
+                frozen: false,
+                conflicting: false,
+                locked: false,
+                external_ref: None,
+                parent_txids: &[],
+            })
+            .expect("seed create");
+
+        // Confirm the armed device actually fails `preserve_until`'s
+        // metadata write, so the compensation-path assertion below is not
+        // vacuous.
+        fail.store(true, std::sync::atomic::Ordering::SeqCst);
+        let direct_err = engine
+            .preserve_until(&crate::ops::remaining::PreserveUntilRequest {
+                tx_key: key,
+                block_height: 0,
+            })
+            .expect_err("armed device must make the preserve_until metadata write fail");
+        assert!(
+            matches!(direct_err, SpendError::StorageError { .. }),
+            "expected a StorageError from the armed device, got {direct_err:?}"
+        );
+
+        let repl_ops = vec![(
+            key,
+            vec![ReplicaOp::PreserveUntil {
+                tx_key: key,
+                block_height: 700_000,
+                master_generation: 0,
+            }],
+        )];
+        let before_images = vec![(key, vec![BeforeImage::None])];
+
+        let err =
+            compensate_replication_failure(&engine, &repl_ops, &before_images, Some(&redo_log))
+                .expect_err("R8/C16: a failed compensating preserve_until must surface as Err");
+        assert!(
+            err.contains("compensate preserve_until"),
+            "error must identify the swallowed compensating preserve_until; got {err:?}"
+        );
+
+        fail.store(false, std::sync::atomic::Ordering::SeqCst);
+        let entries = redo_log.lock().recover().expect("recover redo entries");
+        assert!(
+            entries
+                .iter()
+                .any(|e| matches!(&e.op, RedoOp::PreserveUntil { tx_key, .. } if *tx_key == key)),
+            "compensating preserve_until redo entry must be durable even when the engine call fails"
         );
     }
 
