@@ -178,6 +178,9 @@ redo_buffered = true                  # default TRUE: ack mutation after in-memo
 redo_flush_interval_ms = 5            # How often the background flusher fsyncs the redo log (ms).
                                       # Only relevant when redo_buffered = true. Lower = narrower
                                       # crash-loss window at the cost of more frequent fsyncs.
+                                      # RF=1 only — under replication_factor > 1 the redo tail and
+                                      # data devices are fsync-forced before every ack (C1), so no
+                                      # crash-loss window applies regardless of this interval.
 
 # --- Durable node height ---
 # last_durable_height_path = "..."    # Optional path for the durable node-height file

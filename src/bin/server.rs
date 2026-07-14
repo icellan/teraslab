@@ -58,6 +58,22 @@ fn is_redo_pressure(err: &str) -> bool {
     err.contains(teraslab::redo::LOG_FULL_MESSAGE_PREFIX)
 }
 
+/// Whether the RF=1 buffered-durability "up to one flush interval of acked
+/// writes may be lost on an unclean shutdown" loss window applies to this
+/// node's boot warning.
+///
+/// Only true for single-node (`replication_factor <= 1`) deployments. Under
+/// `replication_factor > 1`, `ensure_local_write_durable`
+/// (`src/server/dispatch.rs`, C-1 / G3) forces the master's redo tail and
+/// data devices durable before every ack, concurrently with the replica
+/// round-trip — an acked write is already locally fsync-durable there, so
+/// the flush-interval loss window this warning describes does not exist.
+/// See `rf_gt_1_mutation_is_locally_fsync_durable_before_ack`
+/// (`src/server/dispatch.rs`).
+fn buffered_loss_window_applies(replication_factor: u8) -> bool {
+    replication_factor <= 1
+}
+
 /// Walk local interfaces via `getifaddrs(3)` and return the first
 /// non-loopback IPv4 address. Used as a best-effort fallback when
 /// `listen_addr = 0.0.0.0` and the operator did not configure
@@ -1566,13 +1582,24 @@ fn main() {
         // `redo_buffered_effective`).
         if config.redo_buffered_effective() {
             engine.set_buffered_durability(true);
-            tracing::warn!(
-                flush_interval_ms = config.redo_flush_interval_ms,
-                buffered_io = config.redo_buffered_io,
-                "BUFFERED redo durability enabled — mutations are acked before \
-                 fsync; up to one flush interval of acked writes may be lost on \
-                 an unclean shutdown (relaxed-durability mode)"
-            );
+            if buffered_loss_window_applies(config.replication_factor) {
+                tracing::warn!(
+                    flush_interval_ms = config.redo_flush_interval_ms,
+                    buffered_io = config.redo_buffered_io,
+                    "BUFFERED redo durability enabled — mutations are acked before \
+                     fsync; up to one flush interval of acked writes may be lost on \
+                     an unclean shutdown (relaxed-durability mode)"
+                );
+            } else {
+                tracing::info!(
+                    flush_interval_ms = config.redo_flush_interval_ms,
+                    buffered_io = config.redo_buffered_io,
+                    replication_factor = config.replication_factor,
+                    "BUFFERED redo durability enabled — under replication_factor > 1 \
+                     the redo tail and data devices are fsync-forced before every ack \
+                     (C1), so no acked-write loss window applies"
+                );
+            }
         }
     }
 
@@ -1979,27 +2006,37 @@ fn main() {
         // Reverse-heal Phase 2c (finding C1): the detected stale-suspect shards
         // now drive a DELETE-SAFE reverse-PULL — gated on
         // `reverse_heal.tombstones` (the same enable that attached the tombstone
-        // log above; RULE-DS is a no-op without it). SAFETY —
-        // NO-SERVE-BEFORE-HEAL: this runs BEFORE the readiness transition below,
-        // so every stale shard is fenced (its `is_master` answers
-        // `Transitioning`, never `Yes`) until its heal completes or is proven
-        // impossible. The window that remains for Phase 3's full fence: a source
-        // that never converges leaves the shard fenced fail-closed here rather
-        // than timing out + giving up, and the pull is boot-triggered only (no
-        // online re-heal) — both are Phase-3 state-machine scope.
+        // log above; RULE-DS is a no-op without it; defaults ON for a clustered
+        // node, RF>1). SAFETY — NO-SERVE-BEFORE-HEAL: this runs BEFORE the
+        // readiness transition below, so every stale shard is fenced (its
+        // `is_master` answers `Transitioning`, never `Yes`) until its heal
+        // completes or is proven impossible. A source that never converges
+        // leaves the shard fenced fail-closed rather than timing out + giving
+        // up, bounded by `heal_deadline_secs` (design §E3, Phase 3c) which
+        // surfaces the stuck shard loudly without un-fencing it (auto-escalation
+        // was rejected as unsafe — see `HealDeadlineAction`). This boot-time
+        // pull is now complemented by Phase 3b RUNTIME online re-heal
+        // (`RunningCluster::run_online_reheal`) — the pull is NOT boot-triggered
+        // only anymore.
         //
-        // P1 (DOCUMENT-ONLY, consensus, carry to Phase 3/4): because the pull is
-        // boot-triggered with no online re-heal, and RULE-DS drops a
-        // `ClientDelete`-tombstoned key's baseline Create unconditionally
-        // (`TombstoneLog::blocks_heal_apply`), a legitimately RE-CREATED UTXO is
-        // LOST when this boot heal is its SOLE carrier (client-delete k → node
-        // down → reorg re-creates k while down → boot heal drops k, tombstone
-        // never cleared, no online re-heal → node masters missing a live UTXO).
-        // This is the CONSERVATIVE direction (a LOSS, not a double-spend;
-        // design-acked E5) and is DEFAULT-OFF. Closing it needs a HEIGHT-AWARE
-        // ClientDelete gate (admit a re-org re-create at height > deletion_height)
-        // AND/OR the Phase-3 online re-heal path — both consensus-critical,
-        // designed + reviewed in Phase 3/4, NOT implemented here.
+        // P1 — ACCEPTED RESIDUAL (consensus, design-acked E5, do NOT treat as
+        // fixed): RULE-DS drops a `ClientDelete`-tombstoned key's baseline
+        // Create unconditionally (`TombstoneLog::blocks_heal_apply`), so a
+        // legitimately RE-CREATED UTXO is LOST when a BOOT heal is its SOLE
+        // carrier (client-delete k → node down → reorg re-creates k while down
+        // → boot heal drops k, tombstone stays live → node masters missing a
+        // live UTXO until the tombstone GCs at `tombstone_retention_blocks`).
+        // Phase 3b online re-heal closes the common case — a re-create
+        // delivered via the normal replica `Create` path is admitted
+        // immediately, since RULE-DS here only ever gates an ABSENT-key
+        // BOOT-heal baseline — but not this specific gap: there is nothing for
+        // online re-heal to re-detect until the boot heal itself runs. This is
+        // the CONSERVATIVE direction (a LOSS, not a double-spend). A
+        // HEIGHT-AWARE ClientDelete gate (admit a re-org re-create at height >
+        // deletion_height) was proposed and REJECTED in review — there is no
+        // immutable create-height to gate on, so the gate would itself open a
+        // latent double-spend window. The accepted mitigation is sizing
+        // `tombstone_retention_blocks` at or above the reorg/finality horizon.
         if reverse_heal_enabled {
             let stale = running.stale_suspect_shards();
             if !stale.is_empty() {
@@ -2753,7 +2790,7 @@ fn init_tracing_subscriber_fallback() {
 
 #[cfg(test)]
 mod tests {
-    use super::is_redo_pressure;
+    use super::{buffered_loss_window_applies, is_redo_pressure};
     use teraslab::redo::RedoError;
 
     /// The intent-recovery startup barrier downgrades `RedoError::LogFull`
@@ -2804,6 +2841,31 @@ mod tests {
         assert!(
             !is_redo_pressure(&io),
             "device I/O failure is terminal, must not route to retry; got {io:?}",
+        );
+    }
+
+    /// Single-node (RF=1) buffered durability still has a flush-interval
+    /// loss window — the boot warning must fire.
+    #[test]
+    fn buffered_loss_window_applies_rf1_warns() {
+        assert!(
+            buffered_loss_window_applies(1),
+            "RF=1 buffered mode must still warn about the flush-interval loss window",
+        );
+    }
+
+    /// RF>1 buffered durability is protected by C-1's concurrent
+    /// local-fsync-before-ack — the flush-interval loss window does not
+    /// exist there, so the boot warning must NOT fire.
+    #[test]
+    fn buffered_loss_window_applies_rf_gt_1_no_warn() {
+        assert!(
+            !buffered_loss_window_applies(2),
+            "RF>1 buffered mode must not warn — C1 removes the loss window",
+        );
+        assert!(
+            !buffered_loss_window_applies(5),
+            "RF>1 buffered mode must not warn — C1 removes the loss window",
         );
     }
 }

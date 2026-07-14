@@ -357,21 +357,39 @@ impl TombstoneLog {
     ///   violation: the divergence is re-detected and re-healed after the fence
     ///   clears.
     ///
-    ///   PHASE-3/4 PREREQUISITE (P1, consensus-critical — DO NOT close here):
-    ///   the unconditional drop LOSES a legitimately RE-CREATED UTXO when the
-    ///   boot heal is its SOLE carrier. Sequence: client deletes `k` → this node
-    ///   goes down → a reorg re-creates `k` (a genuinely-newer state) while the
-    ///   node is down → at reboot the heal ships `k`'s re-create but this gate
-    ///   drops it unconditionally, the tombstone is never cleared, and there is
-    ///   NO online re-heal this phase → the node masters MISSING a live UTXO.
-    ///   This is the CONSERVATIVE direction — a LOSS, not a double-spend (no
-    ///   single-fault double-spend exists; design-acked E5) — and it is
-    ///   DEFAULT-OFF. The real fix is a HEIGHT-AWARE ClientDelete gate (block iff
-    ///   `g_src <= N` AND the shipped record's create-height `<= deletion_height`,
-    ///   so a re-org re-create at height `> deletion_height` is admitted, not
-    ///   dropped) AND/OR the Phase-3 ONLINE re-heal path. Both are
-    ///   consensus-critical and must be designed + reviewed in Phase 3/4; the
-    ///   height-aware gate is intentionally NOT implemented here.
+    ///   ACCEPTED RESIDUAL (P1, consensus-critical, design-acked E5 — do NOT
+    ///   treat as fixed): the unconditional drop LOSES a legitimately
+    ///   RE-CREATED UTXO when the boot heal is its SOLE carrier. Sequence:
+    ///   client deletes `k` → this node goes down → a reorg re-creates `k` (a
+    ///   genuinely-newer state) while the node is down → at reboot the heal
+    ///   ships `k`'s re-create but this gate drops it unconditionally, and the
+    ///   tombstone stays live (blocking any further re-delivery of `k` the same
+    ///   way) until it GCs at `tombstone_retention_blocks` (`src/config.rs`,
+    ///   design §E1). This is the CONSERVATIVE direction — a LOSS, not a
+    ///   double-spend (no single-fault double-spend exists).
+    ///
+    ///   As of Phase 3b, `reverse_heal.tombstones` defaults ON for a clustered
+    ///   node (RF>1) (`ReverseHealConfig::tombstones_enabled`) and RUNTIME
+    ///   ONLINE re-heal IS wired
+    ///   ([`crate::cluster::coordinator::RunningCluster::run_online_reheal`]) —
+    ///   not deferred. Online re-heal closes the common case: a reorg
+    ///   re-create that arrives via the normal replica `Create` path is
+    ///   admitted the instant it lands, because this gate only ever fires
+    ///   against an ABSENT-key BOOT-heal baseline. The residual above survives
+    ///   specifically when a node is down for the whole reorg/re-create AND its
+    ///   only future delivery of `k` is a boot-heal baseline — online re-heal
+    ///   does not help there because there is nothing to re-detect until the
+    ///   boot heal itself runs.
+    ///
+    ///   A HEIGHT-AWARE ClientDelete gate (block iff `g_src <= N` AND the
+    ///   shipped record's create-height `<= deletion_height`, admitting a
+    ///   reorg re-create at height `> deletion_height`) was proposed to close
+    ///   this and was REJECTED in review: there is no immutable create-height
+    ///   to gate on, so the gate would itself open a latent double-spend
+    ///   window. Sizing `tombstone_retention_blocks` at or above the
+    ///   reorg/finality horizon is the accepted mitigation instead — it lifts
+    ///   the block precisely when a legitimate re-mine of the key is no longer
+    ///   possible, at which point the unconditional drop stops mattering.
     pub fn blocks_heal_apply(&self, key: &TxKey, incoming_generation: u32) -> bool {
         match self.shards[self.shard_index(key)].read().get(key) {
             None => false,
