@@ -30236,6 +30236,189 @@ mod tests {
         );
     }
 
+    /// R8: covers the three-level classification's LEVEL 3 branch — a
+    /// top-level `Ok(resp)` from the compensating re-spend whose per-slot
+    /// `resp.errors.get(&0)` is `Some(SpendError)`. This is the branch that
+    /// motivated the whole three-level design (see the doc comment on the
+    /// `ReplicaOp::Unspend` arm), yet had no permanent regression test —
+    /// `compensation_unspend_respend_device_failure_surfaces_error` only
+    /// exercises level 2 (`apply` → `Err`). Drives the compensating
+    /// re-spend's slot to FROZEN via `engine.freeze` — a per-slot status
+    /// distinct from the record-level `TxFlags::LOCKED` that the
+    /// compensation request's `ignore_locked: true` already bypasses — so
+    /// `validate_spend_multi`'s per-item check inserts `SpendError::Frozen`
+    /// at idx 0 while both `validate_spend_multi` and `.apply` themselves
+    /// return `Ok`.
+    #[test]
+    fn compensation_unspend_per_slot_error_surfaces_error() {
+        use crate::ops::create::CreateRequest;
+        use crate::ops::remaining::FreezeRequest;
+        use crate::ops::spend::{SpendItem, SpendMultiRequest};
+        use crate::ops::unspend::UnspendRequest;
+
+        let (engine, redo_log, _fail, _guard) = write_failing_engine();
+
+        let mut txid = [0u8; 32];
+        txid[0] = 0xE3;
+        let key = TxKey { txid };
+        let hash = [0x77u8; 32];
+        let spending_data = [0xCCu8; 36];
+
+        // Seed a 1-slot record, spend it, then unspend it — the real
+        // precondition for a `ReplicaOp::Unspend` compensation event: the
+        // slot must be genuinely UNSPENT for the compensating re-spend to
+        // have anything to do.
+        engine
+            .create(&CreateRequest {
+                tx_id: txid,
+                tx_version: 1,
+                locktime: 0,
+                fee: 0,
+                size_in_bytes: 0,
+                extended_size: 0,
+                is_coinbase: false,
+                spending_height: 0,
+                utxo_hashes: &[hash],
+                inputs: None,
+                outputs: None,
+                inpoints: None,
+                is_external: false,
+                created_at: 0,
+                block_height: 0,
+                mined_block_infos: &[],
+                frozen: false,
+                conflicting: false,
+                locked: false,
+                external_ref: None,
+                parent_txids: &[],
+            })
+            .expect("seed create");
+        engine
+            .spend_multi(&SpendMultiRequest {
+                tx_key: key,
+                spends: vec![SpendItem {
+                    offset: 0,
+                    utxo_hash: hash,
+                    spending_data,
+                    idx: 0,
+                }],
+                ignore_conflicting: false,
+                ignore_locked: false,
+                current_block_height: 1000,
+                block_height_retention: 288,
+            })
+            .expect("seed spend");
+        engine
+            .unspend(&UnspendRequest {
+                tx_key: key,
+                offset: 0,
+                utxo_hash: hash,
+                spending_data,
+                current_block_height: 1000,
+                block_height_retention: 288,
+            })
+            .expect("seed unspend");
+        assert!(
+            engine.read_slot(&key, 0).unwrap().is_unspent(),
+            "seed must leave the slot UNSPENT (matching a real reverse-unspend precondition)"
+        );
+
+        // Independently move the slot to FROZEN. `ignore_locked: true` on
+        // the compensation request only bypasses the record-level
+        // `TxFlags::LOCKED` bit checked in `prepare_spend_multi` step 3 — it
+        // does NOT touch the per-slot `UTXO_FROZEN` status checked later,
+        // per-item, in the same function.
+        engine
+            .freeze(&FreezeRequest {
+                tx_key: key,
+                offset: 0,
+                utxo_hash: hash,
+            })
+            .expect("freeze slot");
+        assert!(
+            engine.read_slot(&key, 0).unwrap().is_frozen(),
+            "precondition: slot must be FROZEN ahead of the compensating re-spend"
+        );
+
+        // Sanity check (would-pass-vacuously guard): confirm the SAME
+        // re-spend shape the compensation arm performs
+        // (`validate_spend_multi` then `.apply`) returns a top-level `Ok`
+        // with a per-item error at idx 0 — i.e. this genuinely exercises
+        // level 3, not level 1 (`validate` → `Err`) or level 2 (`apply` →
+        // `Err`). `apply` here is a no-op on the device (spent_count == 0
+        // short-circuits before any write), so this probe cannot disturb
+        // the slot state the real compensation call below observes.
+        let probe_resp = engine
+            .validate_spend_multi(&SpendMultiRequest {
+                tx_key: key,
+                spends: vec![SpendItem {
+                    offset: 0,
+                    utxo_hash: hash,
+                    spending_data,
+                    idx: 0,
+                }],
+                ignore_conflicting: true,
+                ignore_locked: true,
+                current_block_height: 1000,
+                block_height_retention: 288,
+            })
+            .expect("validate must succeed at the top level: this probes level 3, not level 1")
+            .apply(&engine)
+            .expect("apply must succeed at the top level: this probes level 3, not level 2");
+        assert!(
+            matches!(
+                probe_resp.errors.get(&0),
+                Some(SpendError::Frozen { offset: 0 })
+            ),
+            "expected a per-slot Frozen error at idx 0, got {:?}",
+            probe_resp.errors
+        );
+        assert!(
+            engine.read_slot(&key, 0).unwrap().is_frozen(),
+            "the probe apply must be a no-op on the FROZEN slot; the real compensation call \
+             below must see the same state"
+        );
+
+        let repl_ops = vec![(
+            key,
+            vec![ReplicaOp::Unspend {
+                tx_key: key,
+                offset: 0,
+                spending_data,
+                current_block_height: 1000,
+                block_height_retention: 288,
+                master_generation: 0,
+            }],
+        )];
+        let before_images = vec![(key, vec![BeforeImage::None])];
+
+        let err =
+            compensate_replication_failure(&engine, &repl_ops, &before_images, Some(&redo_log))
+                .expect_err(
+                    "R8 level 3: a per-slot resp.errors[0] on a top-level-Ok compensating \
+                     re-spend must surface as Err, not be swallowed",
+                );
+        assert!(
+            err.contains("compensate unspend"),
+            "error must identify the swallowed compensating re-spend; got {err:?}"
+        );
+
+        // DC-1 durability: the compensating `RedoOp::SpendV2` must still be
+        // durable even though the per-slot re-spend failed — recovery
+        // relies on it to replay the rollback. `comp_redo.push` for this arm
+        // is unconditional once `read_slot` succeeds.
+        let entries = redo_log.lock().recover().expect("recover redo entries");
+        assert!(
+            entries.iter().any(|e| matches!(
+                &e.op,
+                RedoOp::SpendV2 { tx_key, offset: 0, spending_data: sd, .. }
+                    if *tx_key == key && *sd == spending_data
+            )),
+            "compensating SpendV2 redo entry must be durable even when the per-slot re-spend \
+             fails"
+        );
+    }
+
     /// R8: guards against over-surfacing. The Unspend arm's outer
     /// `engine.read_slot` existence check shares the SAME index-absence
     /// condition as `validate_spend_multi`'s own first check (both resolve
@@ -30244,7 +30427,7 @@ mod tests {
     /// absent record is caught there, before the two-phase classification
     /// even runs. This is benign — the record being rolled back has nothing
     /// left to diverge, so the rollback is still clean and the intent may be
-    /// cleared. It mirrors the `ReplicaOp::MarkOnLongestChain` arm's own
+    /// cleared. It mirrors the `ReplicaOp::MarkLongestChain` arm's own
     /// documented TxNotFound-benign case: when the data needed to build the
     /// compensating redo entry (here, the slot read) is unavailable, no
     /// redo entry is emitted for this op — not a divergence, since there is
@@ -30286,7 +30469,7 @@ mod tests {
         assert!(
             comp_range.is_none(),
             "no compensating redo entry can be built without a successful slot read, mirroring \
-             the MarkOnLongestChain arm's identical TxNotFound-benign 'no redo without data' \
+             the MarkLongestChain arm's identical TxNotFound-benign 'no redo without data' \
              pattern; got {comp_range:?}"
         );
     }
