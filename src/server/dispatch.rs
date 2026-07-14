@@ -7177,28 +7177,29 @@ fn handle_create_batch(
     // memory but its `AllocateRegion` redo is not yet durable (Phases 1b–2). The
     // global side is SHARED, so concurrent creates never contend on it.
     //
-    // The contended part — the per-key stripe WRITES that give a reader its
-    // batch-atomic view — is taken separately and held only around Phase 3 (the
-    // index registration, which is the moment a created key becomes reader-
-    // visible). Previously the combined `mutation()` guard held those stripes for
-    // the ENTIRE handler, so two creates sharing any one of their up-to-256
-    // stripes serialized on each other's multi-ms redo fsync + device writes
-    // (measured: ~50% of create latency was just acquiring this guard). Narrowing
-    // the stripe hold to Phase 3 lets stripe-overlapping creates pipeline through
-    // the I/O stages. Reads landing before Phase 3 correctly see "not found"
-    // (the key is not yet in the index), preserving batch-atomic visibility.
-    //
-    // G4 RESIDUAL (FOLLOW-UP): unlike spend/set_mined, create does NOT hold a
-    // per-key `mutation_stripes` visibility guard — a created key becomes
-    // reader-visible by INDEX PRESENCE (register_create_at_offset in Phase 3
-    // under the engine stripe lock), not by a held visibility stripe. So the
-    // hold-to-quorum discipline applied to spend/set_mined does not transfer
-    // directly: closing create's read-your-writes window (a reader sees a
-    // created record that a replication failure then rolls back) needs the index
-    // registration / reader-visibility deferred to the replication outcome,
-    // which is a separate change from this per-key-stripe pattern. Tracked as
-    // follow-up. (Delete is unaffected — it is local GC prune, never replicated,
-    // so it has no replication-rollback window.)
+    // G4 (read-your-writes / monotonicity) / R9 RESOLVED: create now mirrors
+    // `handle_set_mined_batch` — the per-key `mutation_stripes` WRITE guard
+    // (`visibility_stripes`, acquired below just before Phase 3 once
+    // `valid_items` — the exact set of keys about to be registered — is final)
+    // is HELD across Phase 3 (index registration) and Phase 4 (replication) and
+    // any compensation, released only once the durable outcome is known. A
+    // reader/spender of these keys is excluded until the create's outcome
+    // resolves, so it can never observe (or spend) a created record that a
+    // replication failure then rolls back — closing the cross-op divergence
+    // where an uncontested concurrent spend of the same not-yet-replicated
+    // txid could reach its own quorum and leave a replica holding a Spend redo
+    // for a create this node never durably committed. Only stripe-overlapping
+    // creates now contend, and only across Phase 3 + replication — the SAME
+    // cost spend/set_mined already pay; disjoint-key creates still pipeline
+    // fully (the old combined whole-handler `mutation()` guard, replaced here,
+    // measured ~50% of create latency just from acquiring it). KNOWN CAVEAT:
+    // `OP_QUERY_CONFLICTING` / `OP_QUERY_OLD_UNMINED` take only the coarse
+    // global SHARED side (see `needs_dispatch_visibility_barrier`), not this
+    // per-key stripe, so a CONFLICTING-flagged create that fails replication is
+    // still momentarily visible to those admin/background query paths; a
+    // narrower, lower-traffic residual left open. (Delete is unaffected — it is
+    // local GC prune, never replicated, so it has no replication-rollback
+    // window.)
     let vis_start = std::time::Instant::now();
     let _global_vis = engine.visibility().global_read();
     if let Some(h) = DISPATCH_HISTOGRAMS.get() {
@@ -7774,6 +7775,24 @@ fn handle_create_batch(
     }
     drop(bulk_by_store);
 
+    // G4 (read-your-writes / monotonicity): acquire the per-key WRITE stripes
+    // for exactly the keys about to be registered — `valid_items` is final by
+    // this point (every item that failed reservation/redo/device-write has
+    // already been filtered out or returned early above). `global_read`
+    // (`_global_vis`, acquired above) is held before `mutation_stripes`,
+    // preserving the global-before-stripes acquisition order (see the LOCK
+    // ORDER comment in `handle_spend_batch`: visibility is acquired BEFORE the
+    // engine's own per-key stripe Mutexes — `register_create_at_offset` takes
+    // `Engine.locks` internally, a DIFFERENT lock object, so holding this
+    // guard across it is not reentrant and cannot deadlock).
+    let create_keys: Vec<TxKey> = valid_items
+        .iter()
+        .map(|v| TxKey {
+            txid: v.create_req.tx_id,
+        })
+        .collect();
+    let visibility_stripes = engine.visibility().mutation_stripes(&create_keys);
+
     // Phase 3: register the index entries (records already on device, Phase 2b).
     //
     // P2 (review): this loop is parallelized across scoped threads. Each item's
@@ -7984,19 +8003,21 @@ fn handle_create_batch(
     // per-chunk fragments IN CHUNK ORDER so `repl_ops_by_key` matches serial.
     let mut repl_ops_by_key: Vec<(TxKey, Vec<ReplicaOp>)> = Vec::new();
     let index_start = std::time::Instant::now();
-    // No per-key visibility stripes on the create path. A create is a single
-    // atomic index insert of an already-device-written record: a concurrent
-    // reader of the key sees it either present (post-register, record already on
-    // device from Phase 2b) or absent (pre-register) — never torn — because
-    // `register_create_at_offset` and the reader's lookup take the same per-key
-    // index lock. Unlike spend/set_mined (read-modify-write, which DO need the
-    // stripe write-lock to hide a half-updated record), a create has no
-    // intermediate visible state to protect. The old whole-handler / Phase-3
-    // stripe guard was therefore pure contention: at high pipelined concurrency
-    // every create grabbed ~256 of 65536 stripes and held them across its own
-    // (contended) register, serializing stripe-overlapping creates on each
-    // other's register time. Checkpoint quiescence + the issue-#14 un-journaled-
-    // reservation window are still covered by the `_global_vis` guard above.
+    // Two DIFFERENT lock layers guard two DIFFERENT concerns here — do not
+    // conflate them. `register_create_at_offset` and a reader's lookup take
+    // the SAME per-key INDEX lock, so a concurrent reader of the key sees it
+    // either present (post-register) or absent (pre-register) — never TORN.
+    // That guards against a half-written record; a create has no intermediate
+    // byte-level state to protect (unlike spend/set_mined's read-modify-
+    // write), so no stripe is needed for torn-read safety. What the index
+    // lock does NOT guard is the PRE-QUORUM-VISIBLE window: once this loop
+    // registers a key it is index-present and reader-visible even though
+    // replication has not yet resolved. The per-key VISIBILITY WRITE stripe
+    // (`visibility_stripes`, acquired above just before this phase) is what
+    // closes that window — it excludes a reader/spender of these keys until
+    // the replication outcome is known, mirroring spend/set_mined.
+    // Checkpoint quiescence + the issue-#14 un-journaled-reservation window
+    // are still covered by the `_global_vis` guard above.
     if !valid_items.is_empty() {
         let max_threads = std::thread::available_parallelism()
             .map(|n| n.get())
@@ -8062,6 +8083,9 @@ fn handle_create_batch(
     ) {
         Ok(o) => o,
         Err(e) => {
+            // `visibility_stripes` is still held here, so no reader/spender
+            // observes the rolled-back create; it drops as the handler
+            // returns below (mirrors `handle_set_mined_batch`).
             let before_images = no_before_images(&repl_ops_by_key);
             if let Some(resp) = compensate_replication_failure_or_error(
                 req.request_id,
@@ -8077,6 +8101,10 @@ fn handle_create_batch(
             return error_response(req.request_id, ERR_REPLICATION_FAILED, &e);
         }
     };
+
+    // G4: replication reached a durable outcome (Full / Degraded). Release the
+    // per-key visibility so readers observe the committed created record.
+    drop(visibility_stripes);
 
     // Tick per-item outcome counters. Succeeded = items.len() - errors.len().
     let failed_total = errors.len() as u64;
@@ -22800,6 +22828,257 @@ mod tests {
         assert!(
             !mined_now(&key),
             "compensation must have rolled the mined-state back to UNMINED",
+        );
+    }
+
+    /// Build a single-item `OP_CREATE_BATCH` payload for `txid`, mirroring
+    /// `RedoDispatchHarness::create_tx`'s item shape (1 UTXO, standard
+    /// non-external/non-conflicting fields) — but returned as a payload rather
+    /// than dispatched, so the caller can drive it through `handle_request`
+    /// with an explicit `cluster` (the harness helper hardcodes `cluster:
+    /// None`, which would skip replication entirely).
+    fn encode_single_create(txid: [u8; 32]) -> Vec<u8> {
+        let item = WireCreateItem {
+            txid,
+            tx_version: 1,
+            locktime: 0,
+            fee: 500,
+            size_in_bytes: 250,
+            extended_size: 250,
+            is_coinbase: false,
+            spending_height: 0,
+            created_at: 1700000000000,
+            flags: 0,
+            utxo_hashes: vec![[0u8; 32]],
+            cold_data: vec![],
+            block_height: 0,
+            mined_block_id: None,
+            mined_block_height: None,
+            mined_subtree_idx: None,
+            parent_txids: vec![],
+        };
+        encode_create_batch(&[item])
+    }
+
+    /// G4 (create) / R9-G4: the hold-to-quorum discipline extends to create.
+    /// A reader concurrent with an RF>1 create whose replication FAILS must
+    /// never observe the created record — it is excluded until the outcome is
+    /// known and the create is compensated (deleted), so it observes only the
+    /// pre-write "not found" state. Before the fix create held no per-key
+    /// visibility stripe (only the coarse global SHARED side), so a reader
+    /// could observe the record the moment Phase 3 registered it in the
+    /// index — well before replication resolved — and that phantom write was
+    /// then rolled back underneath it (a read-your-writes / monotonicity
+    /// violation). Mirrors `spend_holds_visibility_until_replication_outcome_
+    /// reader_never_sees_rolled_back_write`.
+    #[test]
+    fn create_holds_visibility_until_replication_outcome_reader_never_sees_rolled_back_write() {
+        use std::sync::atomic::{AtomicU8, Ordering};
+
+        // A window long enough that the reader reliably issues its
+        // visibility-respecting read while the create is still mid-replication.
+        const SLOW_NAK_MS: u64 = 500;
+        let replica = spawn_replica_receiver(ReplicaBehaviour::SlowNak(SLOW_NAK_MS));
+        let (cluster, key) = two_node_rf2(replica, Some(AckPolicy::WriteMajority));
+
+        // Real engine + redo so the create applies (device write + index
+        // register) locally (WAL-first) before it replicates and, on the NAK,
+        // compensates back to "not found" via `engine.delete`.
+        let h = RedoDispatchHarness::new();
+        let create_payload = encode_single_create(key.txid);
+
+        // What a visibility-respecting reader observed while the create was in
+        // flight. 0xFF = "not yet recorded", 1 = observed present (phantom), 0
+        // = observed absent (correct: either pre-register or post-rollback).
+        const UNSET: u8 = 0xFF;
+        const OBS_PRESENT: u8 = 1;
+        const OBS_ABSENT: u8 = 0;
+        let observed = AtomicU8::new(UNSET);
+
+        std::thread::scope(|s| {
+            // Creator: applies locally (index register), blocks ~SLOW_NAK_MS in
+            // replication, then the NAK fails the write and compensation
+            // deletes the record.
+            let create_resp = s.spawn(|| {
+                let req = RequestFrame {
+                    request_id: 1,
+                    op_code: OP_CREATE_BATCH,
+                    flags: 0,
+                    payload: create_payload.into(),
+                };
+                let mut cs = crate::server::ConnectionState::new();
+                handle_request(
+                    &req,
+                    &h.engine,
+                    8192,
+                    Some(&cluster),
+                    Some(&h.redo_log),
+                    &mut cs,
+                    None,
+                )
+            });
+
+            // Reader: wait (via a dirty lookup that bypasses visibility) until
+            // the create has registered the key locally, so we know
+            // replication is now in flight. Then take the read-visibility
+            // guard for `key` and record whether the key looks present. After
+            // the fix this guard BLOCKS until the creator's replication
+            // outcome + compensation (delete) resolve; before the fix it
+            // acquires immediately and exposes the (soon-deleted) record.
+            s.spawn(|| {
+                loop {
+                    if h.engine.lookup(&key).is_some() {
+                        break;
+                    }
+                    std::thread::yield_now();
+                }
+                let _read_guard = h.engine.visibility().read(std::slice::from_ref(&key));
+                let obs = if h.engine.lookup(&key).is_some() {
+                    OBS_PRESENT
+                } else {
+                    OBS_ABSENT
+                };
+                observed.store(obs, Ordering::SeqCst);
+            });
+
+            let resp = create_resp.join().expect("creator thread panicked");
+            assert_eq!(
+                resp.status, STATUS_ERROR,
+                "the create must fail: its sole replica NAKed (below WriteMajority)",
+            );
+        });
+
+        // The reader must have observed "not found", NEVER the phantom record
+        // that replication rolled back.
+        assert_eq!(
+            observed.load(Ordering::SeqCst),
+            OBS_ABSENT,
+            "reader observed a create that replication failed and rolled back \
+             (read-your-writes / monotonicity violation)",
+        );
+        // And the durable local state is the compensated (deleted) record.
+        assert!(
+            h.engine.lookup(&key).is_none(),
+            "compensation must have deleted the record",
+        );
+    }
+
+    /// R9/G4 cross-op divergence: a concurrent WRITER of the same not-yet-
+    /// replicated create key (the exact per-key `mutation_stripes` acquisition
+    /// `handle_spend_batch`/`handle_set_mined_batch` make before touching a
+    /// key) must be excluded for as long as the create's own
+    /// `visibility_stripes` guard is held — i.e. across the create's
+    /// replication RTT — not merely "eventually consistent" after the fact.
+    /// Before the fix create held no per-key stripe at all, so this
+    /// acquisition would have succeeded immediately, letting a concurrent
+    /// spend of the same uncommitted txid reach its own quorum independently
+    /// of whether the create itself ever did.
+    #[test]
+    fn create_holds_stripe_blocks_concurrent_spend_of_uncommitted_txid() {
+        const SLOW_NAK_MS: u64 = 500;
+        let replica = spawn_replica_receiver(ReplicaBehaviour::SlowNak(SLOW_NAK_MS));
+        let (cluster, key) = two_node_rf2(replica, Some(AckPolicy::WriteMajority));
+
+        let h = RedoDispatchHarness::new();
+        let create_payload = encode_single_create(key.txid);
+
+        std::thread::scope(|s| {
+            let create_resp = s.spawn(|| {
+                let req = RequestFrame {
+                    request_id: 1,
+                    op_code: OP_CREATE_BATCH,
+                    flags: 0,
+                    payload: create_payload.into(),
+                };
+                let mut cs = crate::server::ConnectionState::new();
+                handle_request(
+                    &req,
+                    &h.engine,
+                    8192,
+                    Some(&cluster),
+                    Some(&h.redo_log),
+                    &mut cs,
+                    None,
+                )
+            });
+
+            // Writer: wait (dirty lookup) until the create has registered the
+            // key locally, so replication is now in flight, then take the
+            // SAME per-key WRITE stripe a concurrent spend/set_mined handler
+            // would take before validating/applying against this key. Time
+            // how long the acquisition takes: if create's own stripe genuinely
+            // excludes it, the acquisition cannot complete until create's
+            // replication outcome resolves (~SLOW_NAK_MS away).
+            loop {
+                if h.engine.lookup(&key).is_some() {
+                    break;
+                }
+                std::thread::yield_now();
+            }
+            let wait_start = std::time::Instant::now();
+            let _writer_guard = h
+                .engine
+                .visibility()
+                .mutation_stripes(std::slice::from_ref(&key));
+            let stripe_wait = wait_start.elapsed();
+
+            let resp = create_resp.join().expect("creator thread panicked");
+            assert_eq!(
+                resp.status, STATUS_ERROR,
+                "the create must fail: its sole replica NAKed (below WriteMajority)",
+            );
+
+            assert!(
+                stripe_wait >= Duration::from_millis(SLOW_NAK_MS / 2),
+                "a concurrent writer of the create's key acquired the per-key \
+                 write stripe after only {stripe_wait:?} — it must block \
+                 behind create's held `visibility_stripes` until the create's \
+                 replication outcome resolves (proves the cross-op divergence \
+                 this fix closes: an uncontested concurrent spend of the same \
+                 not-yet-replicated txid could otherwise reach its own quorum \
+                 independently of the create)",
+            );
+        });
+    }
+
+    /// Regression: a create on an RF>1 node whose replica ACKs still succeeds
+    /// and the record is visible (and spendable) afterward — the new held
+    /// stripe must not change the happy path's outcome, only its timing
+    /// relative to a concurrent same-key reader/writer.
+    #[test]
+    fn create_rf2_replica_acks_succeeds_and_record_visible() {
+        let replica = spawn_replica_receiver(ReplicaBehaviour::Ack);
+        let (cluster, key) = two_node_rf2(replica, Some(AckPolicy::WriteMajority));
+
+        let h = RedoDispatchHarness::new();
+        let create_payload = encode_single_create(key.txid);
+        let req = RequestFrame {
+            request_id: 1,
+            op_code: OP_CREATE_BATCH,
+            flags: 0,
+            payload: create_payload.into(),
+        };
+        let mut cs = crate::server::ConnectionState::new();
+        let resp = handle_request(
+            &req,
+            &h.engine,
+            8192,
+            Some(&cluster),
+            Some(&h.redo_log),
+            &mut cs,
+            None,
+        );
+
+        assert_eq!(
+            resp.status, STATUS_OK,
+            "create must succeed: its sole replica ACKed"
+        );
+        assert!(
+            h.engine
+                .lookup_checked(&key)
+                .expect("index read ok")
+                .is_some(),
+            "record must be visible after a successfully-replicated create"
         );
     }
 
