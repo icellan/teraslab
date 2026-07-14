@@ -111,7 +111,7 @@ enum Command {
     Replication,
     /// Redo log info.
     Redo,
-    /// Trigger cluster rebalance.
+    /// Self-drain this node (alias for `drain`; no cluster-wide rebalance exists).
     Rebalance {
         /// Preview without executing.
         #[arg(long)]

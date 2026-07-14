@@ -2111,12 +2111,21 @@ async fn handle_admin_replication(State(state): State<Arc<HttpState>>) -> impl I
     json_response(body)
 }
 
-/// Trigger cluster rebalance (quiesce current node).
+/// Self-drain alias. TeraSlab has NO cluster-wide data-rebalance operation;
+/// this endpoint quiesces (drains) THIS node — its mastered shards fail over
+/// to peers — identical to `/admin/drain/{self_id}`.
 async fn handle_admin_rebalance(State(state): State<Arc<HttpState>>) -> axum::response::Response {
     match state.cluster {
         Some(ref cluster) => {
             cluster.quiesce();
-            (StatusCode::OK, "rebalance initiated".to_string()).into_response()
+            (
+                StatusCode::OK,
+                "drained (quiesced) this node; no cluster-wide rebalance is performed — \
+                 this node's mastered shards fail over to peers. Use PUT /admin/drain/{id} \
+                 for the canonical verb."
+                    .to_string(),
+            )
+                .into_response()
         }
         None => http_error(
             StatusCode::BAD_REQUEST,
@@ -5165,6 +5174,72 @@ mod tests {
         assert!(
             cached_replica_lag_exceeds(&state_a),
             "instance A still independent after B was read",
+        );
+    }
+
+    /// R6: `/admin/rebalance` calls `cluster.quiesce()` — a self-drain, this
+    /// node's mastered shards fail over to peers — but historically responded
+    /// `"rebalance initiated"`, implying a cluster-wide data-rebalance had
+    /// run. TeraSlab has no such operation. The response must honestly
+    /// describe a self-drain and must NOT claim `"rebalance initiated"`.
+    ///
+    /// Pre-fix this wedges: the body was the literal string
+    /// `"rebalance initiated"`, which contains no honest self-drain /
+    /// no-cluster-wide-rebalance disclosure.
+    #[tokio::test]
+    async fn admin_rebalance_response_is_honest_self_drain() {
+        use crate::cluster::coordinator::new_test_running_cluster;
+
+        let cluster = Arc::new(new_test_running_cluster(
+            NodeId(1),
+            ShardTable::compute(&[NodeId(1)], 1),
+            &[],
+            &[NodeId(1)],
+            &[],
+            &[],
+            &[],
+            0,
+        ));
+        let state = build_ready_test_state(true, Some(cluster));
+
+        let resp = handle_admin_rebalance(State(state)).await.into_response();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "self-drain still succeeds with 200"
+        );
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        let body = String::from_utf8(body.to_vec()).expect("utf8 body");
+
+        assert_ne!(
+            body, "rebalance initiated",
+            "response must no longer claim a cluster-wide rebalance occurred \
+             (that claim was false — this is a self-drain)",
+        );
+        assert!(
+            body.contains("no cluster-wide rebalance"),
+            "response must honestly disclose that no cluster-wide rebalance \
+             is performed; got: {body:?}",
+        );
+    }
+
+    /// Regression: the `cluster == None` (`not_in_cluster_mode`) error path
+    /// on `/admin/rebalance` is unchanged by the honesty fix above.
+    #[tokio::test]
+    async fn admin_rebalance_returns_bad_request_when_not_clustered() {
+        let state = build_ready_test_state(true, None);
+
+        let resp = handle_admin_rebalance(State(state)).await.into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        let body = String::from_utf8(body.to_vec()).expect("utf8 body");
+        assert!(
+            body.contains("not_in_cluster_mode"),
+            "not-in-cluster-mode error code must be preserved; got: {body:?}",
         );
     }
 

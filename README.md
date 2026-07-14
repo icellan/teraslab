@@ -702,7 +702,7 @@ curl -X PUT http://localhost:9100/admin/quiesce
 # Drain a specific node by ID
 curl -X PUT http://localhost:9100/admin/drain/2
 
-# Trigger cluster rebalance
+# Self-drain alias — identical to /admin/quiesce (no cluster-wide rebalance exists)
 curl -X PUT http://localhost:9100/admin/rebalance
 ```
 
@@ -953,7 +953,7 @@ Available commands:
 | `index` | Index statistics (load factor, capacity) |
 | `replication` | Replication configuration and status |
 | `redo` | Redo log position and utilization |
-| `rebalance` | Trigger cluster rebalance |
+| `rebalance` | Self-drain alias for this node (no cluster-wide rebalance exists — see `drain`) |
 | `drain <node_id>` | Drain shards from a node |
 | `log-level [LEVEL]` | Get or set runtime log level |
 | `bench` | Run a quick benchmark against the server |
