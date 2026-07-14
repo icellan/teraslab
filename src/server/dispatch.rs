@@ -393,19 +393,31 @@ pub fn ack_tracker_handle() -> Option<&'static crate::replication::durable::AckT
 /// the minimum to `0` and blocks a reclaim until that replica proves it has
 /// the range.
 ///
-/// Returns `floor` only when `expected` is empty — a genuine single-node /
-/// RF=1 deployment with no fan-out target, where nothing holds the reset
-/// back. Replicas that appear in `acked` but are NOT in `expected` (e.g. a
-/// node demoted out of the shard's replica set by a topology change) are
-/// ignored: they no longer need this master's redo, so they must not pin
-/// the log.
+/// When `expected` is empty, the result is gated by `replication_factor`:
+/// on a genuine single-node / RF=1 deployment (no fan-out target) `floor` is
+/// returned, since nothing holds the reset back. On an RF>1 node an empty
+/// `expected` means the topology's replica set resolved empty — which may be
+/// transient (topology momentarily unresolved) rather than a real absence of
+/// replicas — so R13 treats it as "no replica has proven catch-up" and
+/// returns `0` (below `floor` for any `floor > 0`), blocking/deferring the
+/// reset instead of free-reclaiming a prefix a replica may still need.
+/// Replicas that appear in `acked` but are NOT in `expected` (e.g. a node
+/// demoted out of the shard's replica set by a topology change) are ignored:
+/// they no longer need this master's redo, so they must not pin the log.
 pub fn min_acked_over_expected(
     acked: &HashMap<SocketAddr, u64>,
     expected: &[SocketAddr],
     floor: u64,
+    replication_factor: u8,
 ) -> u64 {
     if expected.is_empty() {
-        return floor;
+        // R13: an empty expected set is only "nothing pins the log" for a
+        // genuine RF=1 node. On an RF>1 node an empty set means the
+        // topology's replica set resolved empty transiently — treat it as
+        // "no replica has proven catch-up" (return a watermark below
+        // `floor` so the reset is BLOCKED / deferred), never as free
+        // reclaim, so we don't erase a redo prefix a replica needs.
+        return if replication_factor > 1 { 0 } else { floor };
     }
     expected
         .iter()
@@ -20325,7 +20337,7 @@ mod tests {
         // Empty tracker (no ACKs yet) + one expected replica → min_acked 0,
         // which is < floor, so the reset guard must refuse.
         let empty: HashMap<SocketAddr, u64> = HashMap::new();
-        let min_acked = min_acked_over_expected(&empty, &[expected], floor);
+        let min_acked = min_acked_over_expected(&empty, &[expected], floor, 3);
         assert_eq!(
             min_acked, 0,
             "an expected replica with no ACK entry must count as caught-up-to-nothing (0)"
@@ -20339,19 +20351,67 @@ mod tests {
         let mut acked = HashMap::new();
         acked.insert(expected, floor + 5);
         assert!(
-            min_acked_over_expected(&acked, &[expected], floor) >= floor,
+            min_acked_over_expected(&acked, &[expected], floor, 3) >= floor,
             "reclaim proceeds only after the expected replica acks at/above the floor"
         );
 
         // A replica present in the tracker but NOT expected (demoted out of the
-        // shard set) must not pin the log.
+        // shard set) must not pin the log. This is a genuine RF=1 deployment
+        // (no fan-out target), so the empty-expected branch takes the RF=1 path.
         let stale: SocketAddr = "10.0.0.9:7000".parse().unwrap();
         let mut acked_stale = HashMap::new();
         acked_stale.insert(stale, 0);
         assert_eq!(
-            min_acked_over_expected(&acked_stale, &[], floor),
+            min_acked_over_expected(&acked_stale, &[], floor, 1),
             floor,
-            "with no expected replica the reset is unconstrained even if the tracker holds a demoted node"
+            "with no expected replica on an RF=1 node the reset is unconstrained even if the tracker holds a demoted node"
+        );
+    }
+
+    #[test]
+    fn min_acked_empty_expected_rf1_allows_reset() {
+        // R13: a genuine RF=1 deployment has no replicas to wait for, so an
+        // empty expected set must still permit the reset (unchanged from the
+        // pre-fix behaviour).
+        let acked: HashMap<SocketAddr, u64> = HashMap::new();
+        let floor: u64 = 100;
+        assert_eq!(
+            min_acked_over_expected(&acked, &[], floor, 1),
+            100,
+            "RF=1 with no expected replicas must reclaim freely (returns floor)"
+        );
+    }
+
+    #[test]
+    fn min_acked_empty_expected_rf_gt_1_blocks_reset() {
+        // R13: an RF>1 node whose expected-replica set transiently resolves
+        // empty (topology momentarily unresolved) must NOT be treated as
+        // "nothing pins the log". Pre-fix this returned `floor` (100) here,
+        // which would let the checkpoint reset erase a redo prefix a real
+        // replica still needs. The fix must return a watermark below floor
+        // (0) so the reset guard's `min_acked >= floor_sequence` check
+        // blocks the reclaim instead of wrongly allowing it.
+        let acked: HashMap<SocketAddr, u64> = HashMap::new();
+        let floor: u64 = 100;
+        assert_eq!(
+            min_acked_over_expected(&acked, &[], floor, 3),
+            0,
+            "RF>1 with a transiently-empty expected set must block the reset (return below floor), not free-reclaim"
+        );
+    }
+
+    #[test]
+    fn min_acked_empty_expected_rf_gt_1_floor_zero_is_noop() {
+        // R13: when floor is 0 the fail-closed 0 still satisfies
+        // `can_reset = 0 >= 0`, but reclaiming to sequence 0 erases nothing,
+        // so this is harmless even though the empty-expected set is treated
+        // as fail-closed.
+        let acked: HashMap<SocketAddr, u64> = HashMap::new();
+        let floor: u64 = 0;
+        assert_eq!(
+            min_acked_over_expected(&acked, &[], floor, 3),
+            0,
+            "RF>1 with floor=0 still returns 0 (fail-closed value happens to equal floor here — a no-op reclaim)"
         );
     }
 

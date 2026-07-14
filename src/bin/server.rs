@@ -2298,6 +2298,9 @@ fn main() {
         cfg.defrag = config.storage.defrag.clone();
         if let Some(tracker) = teraslab::server::dispatch::ack_tracker_handle() {
             let cluster_for_reset = cluster.clone();
+            // R13: capture the replication factor by value (u8 is Copy) so the
+            // reset-guard closure stays 'static without borrowing `config`.
+            let replication_factor = config.replication_factor;
             let reset_guard: std::sync::Arc<dyn Fn(u64) -> bool + Send + Sync + 'static> =
                 std::sync::Arc::new(move |floor_sequence| {
                     let acked = tracker.all_acked();
@@ -2315,6 +2318,7 @@ fn main() {
                         &acked,
                         &expected,
                         floor_sequence,
+                        replication_factor,
                     );
                     let can_reset = min_acked >= floor_sequence;
                     if !can_reset {
