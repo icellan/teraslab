@@ -1077,7 +1077,9 @@ fn migration_serialize_outbound_preserves_fenced_state() {
 
     let data = mgr.serialize_outbound();
     let mut restored = MigrationManager::new();
-    restored.restore_outbound(&data);
+    restored
+        .restore_outbound(&data)
+        .expect("valid round-trip data must restore cleanly");
 
     let p = restored
         .active_migrations()

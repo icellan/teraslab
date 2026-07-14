@@ -1757,19 +1757,27 @@ impl MigrationManager {
     /// Format:
     /// ```text
     /// [count:4][ shard:2 + from_node:8 + to_node:8 + is_master:1
-    ///   + state:1 + snapshot_seq:8 + fence_seq:8 ] × count
+    ///   + state:1 + snapshot_seq:8 + fence_seq:8 ] × count [crc32:4]
     /// ```
     ///
     /// Per-entry size: 36 bytes. Only non-complete, non-failed entries
     /// are persisted — on restart these indicate migrations that were
     /// interrupted and may need to be re-initiated.
+    ///
+    /// The trailing CRC32 (computed over the count header and all entries,
+    /// same scheme as [`Self::serialize_inbound`]) lets [`Self::restore_outbound`]
+    /// fail closed on a corrupt or truncated file instead of silently
+    /// mis-parsing it into wrong migration state (R17). This is a one-time
+    /// on-disk format break; an old pre-CRC file with N>=1 entries is
+    /// rejected by `restore_outbound` (the bare `[count=0]` empty-state stub
+    /// is still accepted for back-compat, mirroring `restore_inbound`).
     pub fn serialize_outbound(&self) -> Vec<u8> {
         let active: Vec<_> = self
             .active
             .iter()
             .filter(|p| !p.is_complete() && p.state != MigrationState::Failed)
             .collect();
-        let mut buf = Vec::with_capacity(4 + active.len() * 36);
+        let mut buf = Vec::with_capacity(4 + active.len() * 36 + 4);
         buf.extend_from_slice(&(active.len() as u32).to_le_bytes());
         for p in &active {
             buf.extend_from_slice(&p.shard.to_le_bytes());
@@ -1787,6 +1795,8 @@ impl MigrationManager {
             buf.extend_from_slice(&p.snapshot_sequence.to_le_bytes());
             buf.extend_from_slice(&p.fence_sequence.to_le_bytes());
         }
+        let crc = crc32fast::hash(&buf);
+        buf.extend_from_slice(&crc.to_le_bytes());
         buf
     }
 
@@ -1795,16 +1805,71 @@ impl MigrationManager {
     /// Restored entries start in the state they were serialized with.
     /// The coordinator can inspect these on startup to decide whether
     /// to resume, abort, or re-plan each migration.
-    pub fn restore_outbound(&mut self, data: &[u8]) {
-        if data.len() < 4 {
-            return;
+    ///
+    /// # Fail-closed integrity, advisory severity
+    ///
+    /// Unlike [`Self::restore_inbound`] (a safety fence — dropping a fence
+    /// entry can let a partial shard serve as full authority), outbound state
+    /// is ADVISORY: it only tells the coordinator which outbound migrations
+    /// were in flight so it can resume/abort/re-plan them. So this still
+    /// validates the WHOLE file before mutating anything (a truncated or
+    /// CRC-corrupt file must never be silently mis-parsed into a wrong
+    /// migration task — R17), but a caller that gets `Err` back should WARN
+    /// and continue booting with no resumable outbound migrations rather than
+    /// failing to come up, unlike a corrupt inbound-fence file. See
+    /// `RunningCluster::restore_outbound_state` for the caller-side handling.
+    ///
+    /// Empty `data` (an absent state file) is not corruption and is a no-op.
+    /// A bare 4-byte `[count=0]` file (the pre-CRC empty-state stub) is also
+    /// accepted as an empty state.
+    ///
+    /// # Errors
+    ///
+    /// - [`OutboundRestoreError::TooShort`] if `data` is non-empty but
+    ///   shorter than the 8-byte minimum (count header + CRC) and is not the
+    ///   4-byte old empty-state stub.
+    /// - [`OutboundRestoreError::LengthMismatch`] if the declared count does
+    ///   not match the file length (short read or trailing garbage).
+    /// - [`OutboundRestoreError::ChecksumMismatch`] if the trailing CRC32
+    ///   does not match the body.
+    pub fn restore_outbound(&mut self, data: &[u8]) -> Result<(), OutboundRestoreError> {
+        // An absent file (empty bytes) carries no state — nothing to restore.
+        if data.is_empty() {
+            return Ok(());
         }
-        let count = u32::from_le_bytes(data[0..4].try_into().unwrap_or([0; 4])) as usize;
+        // Back-compat: the pre-CRC format wrote a bare 4-byte `[count=0]`
+        // stub for the empty state. Accept it as a valid empty state so an
+        // upgraded node with nothing outstanding boots cleanly instead of
+        // rejecting on the one-time format break (mirrors `restore_inbound`).
+        if data.len() == 4 && u32::from_le_bytes(data[0..4].try_into().unwrap_or([0; 4])) == 0 {
+            return Ok(());
+        }
+        if data.len() < 8 {
+            return Err(OutboundRestoreError::TooShort { len: data.len() });
+        }
+        let count = u32::from_le_bytes(data[0..4].try_into().unwrap_or([0; 4]));
+        // Exact-length check: [count:4] + count * [entry:36] + [crc:4]. This
+        // rejects both a truncated file (short read) and trailing garbage.
+        let expected = 4usize
+            .saturating_add((count as usize).saturating_mul(36))
+            .saturating_add(4);
+        if data.len() != expected {
+            return Err(OutboundRestoreError::LengthMismatch {
+                count,
+                expected,
+                actual: data.len(),
+            });
+        }
+        let crc_off = data.len() - 4;
+        let stored = u32::from_le_bytes(data[crc_off..].try_into().unwrap_or([0; 4]));
+        let computed = crc32fast::hash(&data[..crc_off]);
+        if stored != computed {
+            return Err(OutboundRestoreError::ChecksumMismatch { stored, computed });
+        }
+        // Validation passed — apply the entries. No error path remains, so
+        // `self.active` is never left partially mutated.
         let mut pos = 4;
         for _ in 0..count {
-            if pos + 36 > data.len() {
-                break;
-            }
             let shard = u16::from_le_bytes(data[pos..pos + 2].try_into().unwrap_or([0; 2]));
             let from_node = NodeId(u64::from_le_bytes(
                 data[pos + 2..pos + 10].try_into().unwrap_or([0; 8]),
@@ -1841,6 +1906,7 @@ impl MigrationManager {
                 self.active.push(progress);
             }
         }
+        Ok(())
     }
 }
 
@@ -1882,6 +1948,40 @@ pub enum InboundRestoreError {
     ReadError { detail: String },
 }
 
+/// Error returned by [`MigrationManager::restore_outbound`] when the
+/// persisted outbound-migration-state file fails its integrity checks.
+///
+/// Unlike [`InboundRestoreError`], outbound state is ADVISORY rather than a
+/// safety fence: every variant still leaves the manager's existing `active`
+/// list untouched (a corrupt/truncated file must never apply a partial or
+/// wrong migration task — R17), but the caller treats an `Err` as "no
+/// resumable outbound migrations" and continues booting rather than
+/// bricking, unlike a corrupt inbound-fence file.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum OutboundRestoreError {
+    /// The file is non-empty but too short to contain the 4-byte count header
+    /// plus the trailing 4-byte CRC32.
+    #[error("outbound-migration-state file too short: {len} bytes (need >= 8)")]
+    TooShort { len: usize },
+
+    /// The declared entry count does not match the file length — the file was
+    /// truncated (short read) or carries trailing garbage.
+    #[error(
+        "outbound-migration-state file length mismatch: got {actual} bytes, expected {expected} for count={count}"
+    )]
+    LengthMismatch {
+        count: u32,
+        expected: usize,
+        actual: usize,
+    },
+
+    /// The trailing CRC32 does not match the checksum computed over the body.
+    #[error(
+        "outbound-migration-state file checksum mismatch: stored={stored:#010x}, computed={computed:#010x}"
+    )]
+    ChecksumMismatch { stored: u32, computed: u32 },
+}
+
 /// Persist inbound migration state to disk (atomic write via temp + rename).
 ///
 /// Best-effort: errors are logged but do not propagate. On restart the
@@ -1894,6 +1994,13 @@ pub fn persist_inbound_state(path: &std::path::Path, mgr: &MigrationManager) {
         std::io::Write::write_all(&mut f, &data)?;
         f.sync_all()?;
         std::fs::rename(&tmp, path)?;
+        // R5: the rename's directory entry is not durable until the parent
+        // dir is fsync'd; without this a crash after rename but before the
+        // dirent is durable can roll the fence file back to ABSENT, letting
+        // a node fail to refuse writes for shards mid-migration (a
+        // split-ownership / double-serve window). Same pattern as
+        // `persist_cluster_state` / `persist_topology_state`.
+        crate::fsutil::fsync_parent_dir(path)?;
         Ok(())
     })();
     if let Err(e) = result {
@@ -1935,6 +2042,10 @@ pub fn persist_outbound_state(path: &std::path::Path, mgr: &MigrationManager) {
         std::io::Write::write_all(&mut f, &data)?;
         f.sync_all()?;
         std::fs::rename(&tmp, path)?;
+        // R5: same durability gap as `persist_inbound_state` — make the
+        // rename's directory entry durable so a crash cannot roll the
+        // outbound-state file back to a stale/absent version.
+        crate::fsutil::fsync_parent_dir(path)?;
         Ok(())
     })();
     if let Err(e) = result {
@@ -2736,6 +2847,51 @@ mod tests {
         assert_eq!(restored.inbound_count(), 2);
     }
 
+    /// R5: `persist_inbound_state` must fsync the parent directory after the
+    /// atomic rename so the dirent update survives a crash (a rename alone is
+    /// not durable on crash-consistent filesystems until the containing dir
+    /// is fsync'd). Exercising the actual fsync call in isolation isn't
+    /// observable from a unit test, so this asserts the round trip through a
+    /// real directory still succeeds with the added `fsync_parent_dir` call
+    /// in the write path (i.e. the new `?` does not turn a normal persist
+    /// into a failure).
+    #[test]
+    fn persist_inbound_state_fsyncs_parent_dir() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let path = dir.path().join("inbound.state");
+
+        let mut mgr = MigrationManager::new();
+        mgr.mark_inbound_active(7);
+
+        super::persist_inbound_state(&path, &mgr);
+        assert!(path.exists(), "persist must have written the file");
+
+        let data = super::load_inbound_state(&path).expect("load persisted state");
+        let mut restored = MigrationManager::new();
+        restored
+            .restore_inbound(&data)
+            .expect("round-trip restores after the parent-dir fsync");
+        assert!(restored.has_pending_inbound(7));
+    }
+
+    /// R5: a parent directory that does not exist must be handled via the
+    /// existing best-effort warn-and-continue path (errors are logged, not
+    /// propagated) rather than panicking — this exercises the new
+    /// `fsync_parent_dir(path)?` call's error path alongside the pre-existing
+    /// `File::create` failure on a missing directory.
+    #[test]
+    fn persist_inbound_state_missing_parent_dir_no_panic() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let path = dir.path().join("no-such-subdir").join("inbound.state");
+
+        let mut mgr = MigrationManager::new();
+        mgr.mark_inbound_active(7);
+
+        // Must not panic; the write fails (missing directory) and is logged.
+        super::persist_inbound_state(&path, &mgr);
+        assert!(!path.exists(), "no file should have been created");
+    }
+
     #[test]
     fn load_inbound_state_missing_file() {
         // An absent file is a safe empty state, NOT a read error.
@@ -2784,7 +2940,9 @@ mod tests {
 
         let data = mgr.serialize_outbound();
         let mut restored = MigrationManager::new();
-        restored.restore_outbound(&data);
+        restored
+            .restore_outbound(&data)
+            .expect("valid round-trip data must restore cleanly");
 
         // Both tasks should be restored.
         assert_eq!(restored.active_count(), 2);
@@ -2836,7 +2994,9 @@ mod tests {
 
         let data = mgr.serialize_outbound();
         let mut restored = MigrationManager::new();
-        restored.restore_outbound(&data);
+        restored
+            .restore_outbound(&data)
+            .expect("valid round-trip data must restore cleanly");
 
         // Only t3 (Preparing) should be restored.
         assert_eq!(restored.active_count(), 1);
@@ -2866,19 +3026,196 @@ mod tests {
 
         let data = super::load_outbound_state(&path);
         let mut restored = MigrationManager::new();
-        restored.restore_outbound(&data);
+        restored
+            .restore_outbound(&data)
+            .expect("round-trip restores");
         assert_eq!(restored.active_count(), 1);
         assert_eq!(restored.active_migrations()[0].snapshot_sequence, 100);
     }
 
+    /// R5: same durability requirement as `persist_inbound_state_fsyncs_parent_dir`
+    /// for the outbound-state persist path.
     #[test]
-    fn restore_outbound_empty_data() {
+    fn persist_outbound_state_fsyncs_parent_dir() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let path = dir.path().join("outbound.state");
+
         let mut mgr = MigrationManager::new();
-        mgr.restore_outbound(&[]);
+        let t = MigrationTask {
+            shard: 42,
+            from_node: NodeId(1),
+            to_node: NodeId(2),
+            is_master: true,
+        };
+        mgr.start_outbound(
+            std::slice::from_ref(&t),
+            NodeId(1),
+            &std::collections::HashSet::new(),
+        );
+
+        super::persist_outbound_state(&path, &mgr);
+        assert!(path.exists(), "persist must have written the file");
+
+        let data = super::load_outbound_state(&path);
+        let mut restored = MigrationManager::new();
+        restored
+            .restore_outbound(&data)
+            .expect("round-trip restores after the parent-dir fsync");
+        assert_eq!(restored.active_count(), 1);
+    }
+
+    /// R5: a missing parent directory must be handled via the existing
+    /// warn-and-continue best-effort path, not a panic.
+    #[test]
+    fn persist_outbound_state_missing_parent_dir_no_panic() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let path = dir.path().join("no-such-subdir").join("outbound.state");
+
+        let mgr = MigrationManager::new();
+        super::persist_outbound_state(&path, &mgr);
+        assert!(!path.exists(), "no file should have been created");
+    }
+
+    /// R17: an absent-file empty state (`&[]`) and the pre-CRC old empty-state
+    /// stub (`[count=0]`, no trailing CRC) must both be accepted as a valid
+    /// empty state — this is the same back-compat carve-out `restore_inbound`
+    /// already applies, so an upgraded node with nothing outstanding boots
+    /// cleanly rather than bricking on the one-time format break.
+    #[test]
+    fn restore_outbound_accepts_empty_and_old_stub() {
+        let mut mgr = MigrationManager::new();
+        mgr.restore_outbound(&[]).expect("empty data is a no-op");
         assert_eq!(mgr.active_count(), 0);
 
-        mgr.restore_outbound(&[0, 0, 0, 0]); // count = 0
+        mgr.restore_outbound(&[0, 0, 0, 0]) // pre-CRC empty stub: count = 0
+            .expect("old bare [count=0] stub is a no-op, not TooShort");
         assert_eq!(mgr.active_count(), 0);
+    }
+
+    /// R17: a truncated outbound-state file must fail closed (`Err`) instead
+    /// of being silently best-effort-parsed. PRE-FIX, `restore_outbound`
+    /// returned `()` and its loop did `if pos + 36 > data.len() { break; }` —
+    /// a truncated file silently applied whatever entries fit and dropped the
+    /// rest with no signal to the caller, exactly the "truncated/corrupt
+    /// outbound file is silently mis-parsed into wrong migration state" bug
+    /// this test proves is now closed.
+    #[test]
+    fn restore_outbound_rejects_truncated_file() {
+        let mut mgr = MigrationManager::new();
+        let t1 = MigrationTask {
+            shard: 1,
+            from_node: NodeId(1),
+            to_node: NodeId(2),
+            is_master: true,
+        };
+        let t2 = MigrationTask {
+            shard: 2,
+            from_node: NodeId(1),
+            to_node: NodeId(3),
+            is_master: false,
+        };
+        mgr.start_outbound(
+            &[t1.clone(), t2.clone()],
+            NodeId(1),
+            &std::collections::HashSet::new(),
+        );
+        let mut data = mgr.serialize_outbound();
+        // Chop off the trailing CRC and part of the second entry — the
+        // pre-fix loop would silently `break` here and apply only t1.
+        let cut = data.len() - 6;
+        data.truncate(cut);
+
+        // `restored` already carries an unrelated pre-existing active entry
+        // so this proves a rejected restore leaves EXISTING state untouched,
+        // not merely that it adds nothing to an empty manager.
+        let mut restored = MigrationManager::new();
+        let pre_existing = MigrationTask {
+            shard: 99,
+            from_node: NodeId(5),
+            to_node: NodeId(6),
+            is_master: true,
+        };
+        restored.start_outbound(
+            std::slice::from_ref(&pre_existing),
+            NodeId(5),
+            &std::collections::HashSet::new(),
+        );
+        let before_len = restored.active_count();
+        assert_eq!(before_len, 1);
+
+        let err = restored
+            .restore_outbound(&data)
+            .expect_err("a truncated file must be rejected, not silently partially applied");
+        assert!(
+            matches!(
+                err,
+                OutboundRestoreError::LengthMismatch { .. } | OutboundRestoreError::TooShort { .. }
+            ),
+            "expected LengthMismatch or TooShort, got {err:?}"
+        );
+        assert_eq!(
+            restored.active_count(),
+            before_len,
+            "self.active must be untouched (unchanged len) when the restore is rejected"
+        );
+        assert_eq!(
+            restored.active_migrations()[0].shard,
+            99,
+            "the pre-existing entry must survive unmodified"
+        );
+    }
+
+    /// R17: a CRC-corrupt outbound-state file must fail closed (`Err`)
+    /// instead of being applied with silently wrong field values (the old
+    /// code had no checksum at all, so a single flipped bit produced a
+    /// migration task with a corrupted `snapshot_sequence`/`fence_sequence`/
+    /// node id with no detection).
+    #[test]
+    fn restore_outbound_rejects_corrupt_crc() {
+        let mut mgr = MigrationManager::new();
+        let t1 = MigrationTask {
+            shard: 1,
+            from_node: NodeId(1),
+            to_node: NodeId(2),
+            is_master: true,
+        };
+        mgr.start_outbound(
+            std::slice::from_ref(&t1),
+            NodeId(1),
+            &std::collections::HashSet::new(),
+        );
+        let mut data = mgr.serialize_outbound();
+        // Flip a body byte (not the trailing CRC) so the length still
+        // matches but the checksum no longer does.
+        data[4] ^= 0xFF;
+
+        let mut restored = MigrationManager::new();
+        let pre_existing = MigrationTask {
+            shard: 99,
+            from_node: NodeId(5),
+            to_node: NodeId(6),
+            is_master: true,
+        };
+        restored.start_outbound(
+            std::slice::from_ref(&pre_existing),
+            NodeId(5),
+            &std::collections::HashSet::new(),
+        );
+        let before_len = restored.active_count();
+
+        let err = restored
+            .restore_outbound(&data)
+            .expect_err("a CRC-corrupt file must be rejected");
+        assert!(
+            matches!(err, OutboundRestoreError::ChecksumMismatch { .. }),
+            "expected ChecksumMismatch, got {err:?}"
+        );
+        assert_eq!(
+            restored.active_count(),
+            before_len,
+            "self.active must be untouched (unchanged len) when the restore is rejected"
+        );
+        assert_eq!(restored.active_migrations()[0].shard, 99);
     }
 
     // ---------- Bug fix regression tests ----------
@@ -3539,7 +3876,9 @@ mod tests {
 
         let data = mgr.serialize_outbound();
         let mut restored = MigrationManager::new();
-        restored.restore_outbound(&data);
+        restored
+            .restore_outbound(&data)
+            .expect("valid round-trip data must restore cleanly");
 
         assert_eq!(restored.active_count(), 3);
         let r1 = restored

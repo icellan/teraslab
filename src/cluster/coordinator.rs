@@ -11204,7 +11204,20 @@ impl RunningCluster {
             let data = crate::cluster::migration::load_outbound_state(path);
             if !data.is_empty() {
                 let mut mgr = self.migration.lock();
-                mgr.restore_outbound(&data);
+                if let Err(e) = mgr.restore_outbound(&data) {
+                    // R17: outbound state is ADVISORY (the coordinator only
+                    // uses it to decide whether to resume/abort/re-plan
+                    // in-flight migrations), unlike the inbound write fence.
+                    // A corrupt/truncated file must therefore warn and
+                    // continue with no resumable outbound migrations rather
+                    // than bricking boot the way a corrupt inbound-fence file
+                    // does.
+                    tracing::warn!(
+                        err = %e,
+                        "cluster: outbound migration state corrupt — ignoring (in-flight migrations will need re-planning)"
+                    );
+                    return;
+                }
                 let restored_tasks: Vec<MigrationTask> = mgr
                     .active_migrations()
                     .iter()
