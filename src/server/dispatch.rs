@@ -3496,6 +3496,12 @@ where
         }
 
         if ops_by_key.is_empty() {
+            // R1: fail-safe — an empty owned window on a non-reclaimed range is not
+            // provably a local no-op (owned Create -> None on metadata-read failure;
+            // pre-ACK crash may leave a replica ahead). Resync the intent's keys
+            // before clearing the barrier, mirroring the reclaimed branch, rather
+            // than silently committing over a possible divergence.
+            resync(&intent_keys);
             tracker
                 .commit(range.first_sequence, range.last_sequence)
                 .map_err(|e| format!("replication intent commit: {e}"))?;
@@ -20539,6 +20545,11 @@ mod tests {
         tracker.begin(s_a, s_b, &[k_a]).unwrap();
 
         let mut observed: Vec<(TxKey, Vec<ReplicaOp>)> = Vec::new();
+        // R1 scoping: a satisfiable range with a NON-empty owned window must
+        // take the normal replicate path, not the empty-ops fail-safe resync
+        // — capture resync calls to prove the fix stayed scoped to the empty
+        // branch only.
+        let mut resync_keys: Vec<TxKey> = Vec::new();
         recover_pending_replication_intents_from_tracker(
             &tracker,
             Some(log0_arc.as_ref()),
@@ -20547,7 +20558,7 @@ mod tests {
                 observed.extend_from_slice(ops);
                 Ok(())
             },
-            |_: &[TxKey]| {},
+            |keys: &[TxKey]| resync_keys.extend_from_slice(keys),
         )
         .expect("recovery of a satisfiable (non-reclaimed) range must succeed");
 
@@ -20565,6 +20576,10 @@ mod tests {
             observed.len(),
             1,
             "exactly one op — RPC-A's K_A — must be replayed"
+        );
+        assert!(
+            resync_keys.is_empty(),
+            "a non-empty owned-ops window must NOT spuriously resync, got {resync_keys:?}"
         );
         assert!(
             tracker.pending().is_empty(),
@@ -20799,6 +20814,100 @@ mod tests {
         assert!(
             tracker.pending().is_empty(),
             "stale pending intent must be cleared after redo reclamation (resync path)"
+        );
+    }
+
+    /// R1: an owned window that converts to an EMPTY `ops_by_key` on a
+    /// NON-reclaimed range is not provably a local no-op. An owned `Create`
+    /// whose metadata read fails converts to `None` in
+    /// `redo_entry_to_replica_op` (`convert_migration_create` fails closed
+    /// rather than shipping a corrupt op), so the intent's own keys can
+    /// produce zero shippable ops even though a replica may hold (or be
+    /// missing) that record. Recovery must resync the intent's keys before
+    /// clearing the barrier here too, exactly like the reclaimed branch —
+    /// not silently commit over a possible divergence.
+    #[test]
+    fn intent_recovery_empty_owned_window_still_resyncs() {
+        let h = DispatchTestHarness::new();
+        let redo_dev: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(4 * 1024 * 1024, 4096).unwrap());
+        let redo_log = Mutex::new(
+            RedoLog::open(redo_dev, 0, 4 * 1024 * 1024).expect("redo log opens on memory device"),
+        );
+        let tracker = crate::replication::durable::ReplicationIntentTracker::in_memory();
+        let tx_key = TxKey {
+            txid: txid_for_shard(41, 9),
+        };
+
+        // An owned `Create` redo entry whose record was never actually
+        // materialized in the engine's index (no `Engine::create` call ran
+        // for it) — the same shape a metadata-read failure produces.
+        // `convert_migration_create` reads `engine.read_metadata(tx_key)`
+        // first; with no index entry that errors `TxNotFound`, so the
+        // conversion fails CLOSED to `Ok(None)` rather than shipping a
+        // fabricated op. This is the hidden-divergence trigger R1 covers:
+        // the intent owns this key, yet it contributes nothing to
+        // `ops_by_key`.
+        let range = write_redo_ops(
+            &h.engine,
+            Some(&redo_log),
+            &[RedoOp::Create {
+                tx_key,
+                device_id: 0,
+                record_offset: 4096,
+                utxo_count: 1,
+                is_conflicting: false,
+                record_bytes: Arc::from(Vec::new()),
+                parent_txids: Vec::new(),
+            }],
+        )
+        .expect("redo write succeeds");
+        tracker.begin(range.0, range.1, &[tx_key]).unwrap();
+
+        // Sanity: the range is NOT reclaimed — the entry is still readable,
+        // so this exercises the empty-owned-window branch, not the
+        // already-covered reclaimed branch.
+        {
+            let log = redo_log.lock();
+            assert_eq!(log.earliest_sequence().unwrap(), Some(range.0));
+        }
+        assert!(
+            h.engine.read_metadata(&tx_key).is_err(),
+            "the record must be absent from the index so conversion fails closed to None"
+        );
+
+        let mut replicated = false;
+        // R1: capture the explicit resync the empty-owned-window branch must
+        // enqueue, mirroring the reclaimed branch's `resync_keys` capture.
+        let mut resync_keys: Vec<TxKey> = Vec::new();
+        recover_pending_replication_intents_from_tracker(
+            &tracker,
+            Some(&redo_log),
+            &h.engine,
+            |_ops, _range| {
+                replicated = true;
+                Ok(())
+            },
+            |keys: &[TxKey]| resync_keys.extend_from_slice(keys),
+        )
+        .expect("empty owned-ops window must clear the stale intent, not brick startup");
+
+        assert!(
+            !replicated,
+            "an empty owned-ops window has nothing to incrementally replay"
+        );
+        // R1: the empty-ops branch must enqueue an EXPLICIT resync for the
+        // intent's own keys BEFORE clearing the marker — not silently commit
+        // over a possible divergence. Pre-fix `resync_keys` stayed empty for
+        // this path (the branch called `tracker.commit` with no resync).
+        assert_eq!(
+            resync_keys,
+            vec![tx_key],
+            "empty owned-ops window must enqueue an explicit resync for its keys"
+        );
+        assert!(
+            tracker.pending().is_empty(),
+            "pending intent must still be cleared after the fail-safe resync"
         );
     }
 
