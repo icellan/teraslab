@@ -8919,6 +8919,18 @@ pub struct MasterCandidate {
     /// True iff this node holds an incomplete copy of the shard's data
     /// (e.g. a still-in-flight inbound migration). Subset candidates lose
     /// to any non-subset, non-evicted candidate.
+    ///
+    /// Classified from raw `last_applied_seq > 0` in `apply_master_election`.
+    /// DO NOT classify this off the `PARTITION_FLAG_PENDING_INBOUND` flag
+    /// (finding R4, rejected): that flag is the SAME `inbound_atomic` bit the
+    /// serving fence reads (`is_master` -> Transitioning), so "an elector sees
+    /// the flag clear" is equivalent to "the node's own fence is down" — a
+    /// node mis-classified full at the migration-completion boundary is
+    /// therefore UNFENCED and would serve, so a cross-elector skew on the flag
+    /// yields a dual-SERVING master, not a fail-safe fenced one. `seq > 0` is a
+    /// monotone threshold all electors agree on once crossed; the flag is not.
+    /// Electing a still-fenced subset holder is already SAFE (it cannot serve),
+    /// so this term buys only availability at the cost of a double-spend window.
     pub is_subset: bool,
     /// True iff the prior exchange phase classified this node as evicted
     /// (failed to report, persistent suspect). Evicted nodes are never
@@ -8937,6 +8949,20 @@ pub struct MasterCandidate {
 /// independent because all per-shard signals are already encoded in the
 /// candidate descriptors.
 pub fn elect_master(_shard: u16, candidates: &[MasterCandidate]) -> Option<NodeId> {
+    // DO NOT re-add max_generation / any recency signal to this ranking.
+    // Reverted twice (PR #76 / commit 3712018, then finding R4): max_generation
+    // is a LIVE-MOVING per-report value (build_self_partition_version_entries ->
+    // engine.recency_for_keys, computed at each responder's poll instant). The
+    // Task #22 gate (all_candidates_reported) only proves each candidate NODE is
+    // PRESENT in the view — it does NOT prove two electors observed the same
+    // max_generation for a live-writing peer. Any recency comparison between two
+    // equal-score candidates is therefore observer-dependent across the ~2000ms
+    // exchange skew -> two electors elect different masters -> dual-SERVING
+    // master (double-spend). "Subordinate to score" does not help: the hazard is
+    // at the score-tie level, which is exactly where recency would decide. A
+    // stale/behind elected master is the reactive online re-heal's job
+    // (trigger_online_reheal: fail-closed self-fence, never a second authority),
+    // NOT the election's.
     candidates
         .iter()
         .filter(|c| !c.was_evicted)
