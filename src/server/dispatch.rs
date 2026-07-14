@@ -2476,18 +2476,43 @@ fn clear_replication_intents_after_success(ranges: &[(u64, u64)]) {
 ///
 /// `dual_write_only` is the subset of `by_addr` keys that exist
 /// *solely* because at least one shard in the batch is migrating
-/// outbound and the dual-write window names the target. Replicate
-/// callers use this to enforce the per-set ACK invariant: a write
-/// that touched a migrating shard cannot succeed unless at least one
-/// `dual_write_only` address ACKed, regardless of the configured
-/// `WriteAll` / `WriteMajority` policy. Without this, a `WriteMajority`
-/// fan-out over the unioned set could ACK on the OLD replicas alone
-/// and silently leave the new master with stale data, defeating the
-/// dual-write durability invariant.
+/// outbound and the dual-write window names the target — i.e. the
+/// target is NOT also a regular quorum member (`current_master` or a
+/// shard replica) for this batch. This is a bookkeeping/exclusion set
+/// only: when the dual-write destination named by the migration window
+/// happens to be the shard's `target_assignment` master (the normal,
+/// real-handoff ordering — `to_node` IS the new master), it is absorbed
+/// into the REGULAR quorum set and therefore does NOT appear here. See
+/// `handoff_targets` for the set that actually enforces the migration
+/// ACK invariant.
+///
+/// `handoff_targets` (R2) is the FULL new-side holder set — new master
+/// plus new replicas — named by every open outbound dual-write window
+/// this batch touched, resolved to addresses, minus `self`. Unlike
+/// `dual_write_only` it is NOT reduced by the regular-set/current-master
+/// exclusions, so it still contains `to_node` even though `to_node` is
+/// legitimately also a regular quorum member. Replicate callers use
+/// this to enforce the per-set ACK invariant: a write that touched a
+/// migrating shard cannot succeed unless at least one `handoff_targets`
+/// address ACKed, regardless of the configured `WriteAll` /
+/// `WriteMajority` policy. Without this, a `WriteMajority` fan-out over
+/// the unioned set could ACK on the OLD replicas alone and silently
+/// leave the new master with stale data, defeating the dual-write
+/// durability invariant.
 #[derive(Debug, Clone)]
 pub(crate) struct ReplicationPlan {
     pub by_addr: HashMap<SocketAddr, Vec<ReplicaOp>>,
+    // R2: no longer read by the migration ACK invariant gate (that reads
+    // `handoff_targets` instead — see its doc) — kept only for its
+    // exclusion-bookkeeping role, exercised by `build_replication_targets`
+    // tests.
+    #[allow(dead_code)]
     pub dual_write_only: std::collections::HashSet<SocketAddr>,
+    /// R2: see the invariant-enforcing set described above. Populated
+    /// independently of `dual_write_only` / `regular_addrs` so a
+    /// dual-write destination that is ALSO the new master (the real
+    /// handoff ordering) is still counted here.
+    pub handoff_targets: std::collections::HashSet<SocketAddr>,
     /// D-6: per-key set of *regular* replica addresses this key was sent
     /// to (the shard's replica set, excluding dual-write-only migration
     /// extras and excluding `self`). Used to evaluate the ACK policy
@@ -2513,6 +2538,13 @@ pub(crate) fn build_replication_targets(
     let mut by_addr: HashMap<SocketAddr, Vec<ReplicaOp>> = HashMap::new();
     let mut regular_addrs: std::collections::HashSet<SocketAddr> = std::collections::HashSet::new();
     let mut dual_write_addrs: std::collections::HashSet<SocketAddr> =
+        std::collections::HashSet::new();
+    // R2: the full new-side holder set (new master + new replicas) named by
+    // every open outbound dual-write window this batch touches — see the
+    // `ReplicationPlan::handoff_targets` doc for why this must NOT be
+    // reduced by the same regular-set/current-master exclusions that gate
+    // `dual_write_addrs`.
+    let mut handoff_targets: std::collections::HashSet<SocketAddr> =
         std::collections::HashSet::new();
     let mut target_errors: Vec<String> = Vec::new();
     let self_id = cluster.self_id();
@@ -2647,11 +2679,24 @@ pub(crate) fn build_replication_targets(
             }
         }
         for extra in dual_write_extras {
-            if *extra == self_id || *extra == current_master || assignment.replicas.contains(extra)
-            {
+            if *extra == self_id {
                 continue;
             }
-            if let Some(addr) = cluster.node_addr(extra) {
+            let extra_addr = cluster.node_addr(extra);
+            // R2: record the resolved address as a handoff target BEFORE /
+            // independent of the current-master / regular-replica
+            // exclusions below, so `to_node` still lands here even when it
+            // is ALSO the regular quorum master (the real handoff order —
+            // the topology table's `target_assignment` is updated before
+            // the migration finishes streaming). `dual_write_addrs` keeps
+            // its existing exclusion-based population untouched.
+            if let Some(addr) = extra_addr {
+                handoff_targets.insert(addr);
+            }
+            if *extra == current_master || assignment.replicas.contains(extra) {
+                continue;
+            }
+            if let Some(addr) = extra_addr {
                 by_addr.entry(addr).or_default().extend(ops.clone());
                 dual_write_addrs.insert(addr);
                 addr_nodes.insert(addr, *extra);
@@ -2693,6 +2738,7 @@ pub(crate) fn build_replication_targets(
     Ok(ReplicationPlan {
         by_addr,
         dual_write_only: dual_write_addrs,
+        handoff_targets,
         key_targets,
         addr_nodes,
     })
@@ -2936,11 +2982,17 @@ fn replicate_all_ops_with_barrier(
     // built — admission is per target address — and after the barrier is
     // released, so a bounded permit wait never stalls concurrent reads.)
     let plan = build_replication_targets(cluster, ops_by_key)?;
+    // R2: `dual_write_only` is retained on `ReplicationPlan` for its
+    // exclusion-bookkeeping role (and existing `build_replication_targets`
+    // tests), but the migration ACK invariant below is gated on
+    // `handoff_targets` — see the struct doc for why `dual_write_only`
+    // alone cannot carry it.
     let ReplicationPlan {
         by_addr,
-        dual_write_only,
         key_targets,
         addr_nodes,
+        handoff_targets,
+        ..
     } = plan;
     let rf = cluster.shard_table().read().replication_factor();
 
@@ -3120,16 +3172,12 @@ fn replicate_all_ops_with_barrier(
     }
 
     let mut last_error: Option<String> = None;
-    let mut dual_write_acks: usize = 0;
     // D-6: the set of addresses that ACKed, used for per-key quorum.
     let mut acked: std::collections::HashSet<SocketAddr> = std::collections::HashSet::new();
     for (addr, result) in &results {
         match result {
             Ok(()) => {
                 acked.insert(*addr);
-                if dual_write_only.contains(addr) {
-                    dual_write_acks += 1;
-                }
             }
             Err(e) => {
                 tracing::warn!(err = %e, "replication to replica failed");
@@ -3138,25 +3186,42 @@ fn replicate_all_ops_with_barrier(
         }
     }
     let total_targets = results.len();
-    let dual_write_total = dual_write_only.len();
     let ack_policy = cluster.ack_policy();
     let best_effort = cluster.is_replication_best_effort();
 
-    // Phase E per-set ACK invariant: when at least one shard in this
-    // batch is migrating outbound, require ≥1 ACK from the dual-write
-    // set so the new master observes writes during the migration
-    // window. Otherwise a `WriteMajority` policy could ACK on the OLD
-    // replicas alone, leaving the post-handoff record set divergent.
-    if dual_write_total > 0 && dual_write_acks == 0 {
+    // Phase E / R2 migration handoff ACK invariant: when at least one shard
+    // in this batch is migrating outbound, require >=1 ACK from the FULL
+    // new-side holder set (`handoff_targets` — new master + new replicas)
+    // so the future master observes writes during the migration window.
+    //
+    // `to_node` (the new master) is deliberately absorbed into the REGULAR
+    // quorum set above (`current_master`), so it participates in
+    // `WriteAll` / `WriteMajority` like any other holder — but that also
+    // means a `WriteMajority` policy can be satisfied by the OLD replicas
+    // alone without `to_node` ever ACKing, silently leaving the
+    // post-handoff record set divergent. This gate is what actually
+    // enforces "the new master saw the write": it is evaluated separately
+    // over `handoff_targets`, which — unlike `dual_write_only` — is NOT
+    // reduced by the regular-set/current-master exclusions, so it still
+    // names `to_node` even though `to_node` is also a regular quorum
+    // member. (R2: gating this on `dual_write_only` instead left the
+    // invariant dead on every real handoff, because the real handoff order
+    // always has `to_node` absorbed into the regular set.)
+    let handoff_acks = results
+        .iter()
+        .filter(|(addr, result)| result.is_ok() && handoff_targets.contains(addr))
+        .count();
+    let handoff_total = handoff_targets.len();
+    if handoff_total > 0 && handoff_acks == 0 {
         if best_effort {
             tracing::warn!(
-                dual_write_total,
-                "replication: dual-write set produced 0 ACKs (best_effort — write proceeds, new master may need full resync)",
+                handoff_total,
+                "replication: new-side handoff target(s) produced 0 ACKs (best_effort — write proceeds, new master may need full resync)",
             );
         } else {
             return Err(format!(
-                "replication: dual-write set produced 0 ACKs of {dual_write_total} new-master target(s); \
-                 migration durability requires at least one new-master ACK: {}",
+                "replication: new-side handoff target(s) produced 0 ACKs of {handoff_total} target(s); \
+                 migration durability requires at least one new-side handoff ACK: {}",
                 last_error.unwrap_or_default()
             ));
         }
@@ -21474,6 +21539,223 @@ mod tests {
             "no migration in flight ⇒ dual_write_only must be empty: {:?}",
             plan.dual_write_only,
         );
+        // R2 regression: a non-migrating batch must also leave the
+        // handoff-invariant set empty, so the Phase-E/R2 ACK gate stays
+        // inert and the normal quorum path is unchanged.
+        assert!(
+            plan.handoff_targets.is_empty(),
+            "no migration in flight ⇒ handoff_targets must be empty: {:?}",
+            plan.handoff_targets,
+        );
+    }
+
+    /// R2 — the dead dual-write handoff ACK invariant, real handoff order.
+    ///
+    /// Before this fix, `dual_write_only` was the set the Phase-E ACK
+    /// invariant gated on. But in the REAL production handoff order, the
+    /// migration's `to_node` is ALSO the shard's `target_assignment`
+    /// master (the new topology is committed to the table before the
+    /// handoff finishes streaming) — so `to_node` gets absorbed into the
+    /// REGULAR quorum set (`current_master`) and is explicitly excluded
+    /// from `dual_write_only` (`*extra == current_master` in the
+    /// dual-write-extras loop, plus the final `retain`). Net:
+    /// `dual_write_only` ends up EMPTY on every real handoff, so the
+    /// invariant gate keyed on it never fires.
+    ///
+    /// `handoff_targets` is the fix: a separate set populated for every
+    /// dual-write extra BEFORE the regular-set exclusions, so it still
+    /// names `to_node` even when `to_node` is also the new master.
+    #[test]
+    fn handoff_targets_includes_new_master_to_node() {
+        let n1 = crate::cluster::shards::NodeId(1);
+        let n2 = crate::cluster::shards::NodeId(2);
+        let n3 = crate::cluster::shards::NodeId(3);
+        let members = vec![n1, n2, n3];
+        // RF=3 over exactly 3 members: every shard's assignment names ALL
+        // three nodes (1 master + 2 replicas), so whichever shard we pick,
+        // self (n1) is a demoted replica and n3 can be the new master —
+        // the real handoff shape.
+        let table = crate::cluster::shards::ShardTable::compute_with_epoch(&members, 3, 401, 1);
+        let shard = (0..crate::cluster::shards::NUM_SHARDS as u16)
+            .find(|&s| table.target_assignment(s).master == n3)
+            .expect("expected some shard whose target assignment masters to n3");
+        let assignment = table.target_assignment(shard);
+        assert!(
+            assignment.replicas.contains(&n1) && assignment.replicas.contains(&n2),
+            "RF=3 over 3 members must name every node in the assignment: {assignment:?}",
+        );
+
+        let n1_addr: SocketAddr = "127.0.0.1:8941".parse().unwrap();
+        let n2_addr: SocketAddr = "127.0.0.1:8942".parse().unwrap();
+        let n3_addr: SocketAddr = "127.0.0.1:8943".parse().unwrap();
+
+        let cluster = crate::cluster::coordinator::new_test_running_cluster(
+            n1,
+            table,
+            &[(n1, n1_addr), (n2, n2_addr), (n3, n3_addr)],
+            &members,
+            &[],
+            &[],
+            &[],
+            3,
+        );
+        // n1 (self, the OLD master) is migrating this shard out to n3 —
+        // and n3 is ALREADY the target-assignment master (real handoff
+        // order), unlike the existing dual-write tests where the
+        // dual-write destination sits outside the assignment entirely.
+        cluster.test_open_dual_write_window(shard, n3);
+
+        let tx_key = TxKey {
+            txid: txid_for_shard(shard, 41),
+        };
+        let ops = vec![(
+            tx_key,
+            vec![crate::replication::protocol::ReplicaOp::Delete { tx_key }],
+        )];
+
+        let plan = build_replication_targets(&cluster, &ops)
+            .expect("dual-write target resolution should succeed");
+
+        assert!(
+            plan.by_addr.contains_key(&n3_addr),
+            "n3 (new master) must be on the live fan-out: {:?}",
+            plan.by_addr,
+        );
+        assert!(
+            plan.handoff_targets.contains(&n3_addr),
+            "n3 (to_node, the new master) must be a handoff target so the \
+             migration ACK invariant can require its ACK: {:?}",
+            plan.handoff_targets,
+        );
+        assert!(
+            !plan.dual_write_only.contains(&n3_addr),
+            "n3 is a regular quorum member (target-assignment master) in the \
+             real handoff order, so the OLD dual_write_only set correctly \
+             (but insufficiently) excludes it — proving dual_write_only alone \
+             cannot carry the invariant: {:?}",
+            plan.dual_write_only,
+        );
+    }
+
+    /// R2 — the migration ACK invariant gate must actually fire in the real
+    /// handoff order: `to_node` (n3) is the shard's NEW master per
+    /// `target_assignment`, an old replica (n2) ACKs and satisfies
+    /// `WriteMajority` on its own (`required_replica_acks(2, WriteMajority)
+    /// == 1`), but n3 (the future master) never ACKs. Before the fix this
+    /// silently returns `Ok` (STATUS_OK) because `dual_write_only` is empty
+    /// on this exact ordering; after the fix it must return `Err` — the
+    /// future master cannot be handed authority over a shard it never
+    /// observed this write for.
+    #[test]
+    fn mid_migration_write_requires_new_master_ack() {
+        let n2_addr = spawn_replica_receiver(ReplicaBehaviour::Ack);
+        let n3_addr = spawn_replica_receiver(ReplicaBehaviour::Nak);
+        let (cluster, tx_key) =
+            handoff_ordered_rf3(n2_addr, n3_addr, Some(AckPolicy::WriteMajority), false);
+
+        let ops = vec![(
+            tx_key,
+            vec![crate::replication::protocol::ReplicaOp::Delete { tx_key }],
+        )];
+
+        let err = replicate_all_ops(Some(&cluster), &ops, (0, 0), &[])
+            .expect_err("migration durability must fail when the new master (to_node) never ACKs, even though an old replica satisfies WriteMajority alone");
+        assert!(
+            err.contains("handoff") || err.contains("new-side"),
+            "error must name the migration/handoff invariant, not a generic replication failure: {err}",
+        );
+    }
+
+    /// R2 guard against over-blocking: same real-handoff-order setup as
+    /// [`mid_migration_write_requires_new_master_ack`], but the new master
+    /// (n3) DOES ACK — the write must succeed.
+    #[test]
+    fn mid_migration_write_succeeds_when_new_master_acks() {
+        let n2_addr = spawn_replica_receiver(ReplicaBehaviour::Ack);
+        let n3_addr = spawn_replica_receiver(ReplicaBehaviour::Ack);
+        let (cluster, tx_key) =
+            handoff_ordered_rf3(n2_addr, n3_addr, Some(AckPolicy::WriteMajority), false);
+
+        let ops = vec![(
+            tx_key,
+            vec![crate::replication::protocol::ReplicaOp::Delete { tx_key }],
+        )];
+
+        let outcome = replicate_all_ops(Some(&cluster), &ops, (0, 0), &[])
+            .expect("write must succeed when the new master ACKs the handoff-window write");
+        assert!(
+            matches!(outcome, ReplicationOutcome::Full),
+            "all targets ACKed ⇒ Full durability, got {outcome:?}",
+        );
+    }
+
+    /// R2 best-effort parity: same real-handoff-order setup, new master
+    /// (n3) never ACKs, but `best_effort` is enabled — the write must
+    /// proceed with a warning instead of failing (mirrors the old
+    /// best-effort branch that existed for `dual_write_only`).
+    #[test]
+    fn best_effort_downgrades_missing_handoff_ack_to_warn() {
+        let n2_addr = spawn_replica_receiver(ReplicaBehaviour::Ack);
+        let n3_addr = spawn_replica_receiver(ReplicaBehaviour::Nak);
+        let (cluster, tx_key) =
+            handoff_ordered_rf3(n2_addr, n3_addr, Some(AckPolicy::WriteMajority), true);
+
+        let ops = vec![(
+            tx_key,
+            vec![crate::replication::protocol::ReplicaOp::Delete { tx_key }],
+        )];
+
+        let outcome = replicate_all_ops(Some(&cluster), &ops, (0, 0), &[]).expect(
+            "best_effort must downgrade a missing handoff ACK to a warning, not fail the write",
+        );
+        assert!(
+            matches!(outcome, ReplicationOutcome::Full),
+            "old replica (n2) ACKed and satisfies its own quorum ⇒ Full, got {outcome:?}",
+        );
+    }
+
+    /// Shared setup for the R2 gate-level tests: a 3-node, RF=3 cluster
+    /// where self (n1) is migrating a shard out to n3, and n3 is ALREADY
+    /// the shard's `target_assignment` master (the real handoff order —
+    /// see [`handoff_targets_includes_new_master_to_node`]). `n2_addr` /
+    /// `n3_addr` point at test-controlled TCP receivers so the caller
+    /// decides whether each ACKs or NAKs.
+    fn handoff_ordered_rf3(
+        n2_addr: SocketAddr,
+        n3_addr: SocketAddr,
+        ack_policy: Option<AckPolicy>,
+        best_effort: bool,
+    ) -> (crate::cluster::coordinator::RunningCluster, TxKey) {
+        let n1 = crate::cluster::shards::NodeId(1);
+        let n2 = crate::cluster::shards::NodeId(2);
+        let n3 = crate::cluster::shards::NodeId(3);
+        let members = vec![n1, n2, n3];
+        let table = crate::cluster::shards::ShardTable::compute_with_epoch(&members, 3, 402, 1);
+        let shard = (0..crate::cluster::shards::NUM_SHARDS as u16)
+            .find(|&s| table.target_assignment(s).master == n3)
+            .expect("expected some shard whose target assignment masters to n3");
+
+        let mut cluster = crate::cluster::coordinator::new_test_running_cluster(
+            n1,
+            table,
+            &[
+                (n1, "127.0.0.1:1".parse().unwrap()),
+                (n2, n2_addr),
+                (n3, n3_addr),
+            ],
+            &members,
+            &[],
+            &[],
+            &[],
+            3,
+        );
+        cluster.set_replication_policy_for_test(ack_policy, best_effort);
+        cluster.test_open_dual_write_window(shard, n3);
+
+        let tx_key = TxKey {
+            txid: txid_for_shard(shard, 42),
+        };
+        (cluster, tx_key)
     }
 
     #[test]
