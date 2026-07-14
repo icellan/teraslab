@@ -4046,23 +4046,42 @@ fn compensate_replication_failure(
                             current_block_height: *current_block_height,
                             block_height_retention: *block_height_retention,
                         };
-                        // R8/C16 KNOWN RESIDUAL (tracked follow-up): unlike the
-                        // other arms, this compensating re-spend swallows its
-                        // failures and is NOT wired into `restore_write_err`. It
-                        // is two-phase (`validate_spend_multi` then `.apply`),
-                        // and even a top-level `Ok(v)` carries a per-slot
-                        // `v.errors: BTreeMap<u32, SpendError>` (AlreadySpent /
-                        // Frozen / Pruned) that `let _ = v.apply(engine)` drops —
-                        // exactly the divergence class the receiver's Spend apply
-                        // treats as a hard NAK. A naive "top-level Err minus
-                        // TxNotFound" capture (the pattern the other arms use)
-                        // would give false completeness by missing those per-item
-                        // errors, so closing this needs a purpose-built shape, not
-                        // a classification list. Left swallowed deliberately until
-                        // that is designed rather than guessed on the most fragile
-                        // path.
-                        if let Ok(v) = engine.validate_spend_multi(&req) {
-                            let _ = v.apply(engine);
+                        // R8/C16: unlike the other (single-phase) arms, this
+                        // compensating re-spend is two-phase
+                        // (`validate_spend_multi` then `.apply`), and even a
+                        // top-level `Ok(resp)` carries a per-slot
+                        // `resp.errors: BTreeMap<u32, SpendError>` — this
+                        // request has exactly one spend item at idx 0, so a
+                        // failure can surface at three levels: (1) validate
+                        // → Err, (2) apply → Err, (3) top-level Ok but
+                        // `resp.errors[0]` set. Benign = `TxNotFound` ONLY,
+                        // at any level — the record is entirely gone, so the
+                        // re-spend is moot and the compensation is
+                        // effectively done. Everything else (`StorageError`,
+                        // `DahOverflow`, and the per-slot `AlreadySpent` /
+                        // `Frozen` / `Pruned`) is non-benign: the slot was
+                        // NOT restored to the intended SPENT state, matching
+                        // the receiver's own Spend-apply treatment of those
+                        // same per-slot errors as hard divergence.
+                        let comp_err: Option<String> = match engine.validate_spend_multi(&req) {
+                            Err(SpendError::TxNotFound) => None,
+                            Err(e) => Some(format!("compensate unspend (validate): {e}")),
+                            Ok(v) => match v.apply(engine) {
+                                Err(SpendError::TxNotFound) => None,
+                                Err(e) => Some(format!("compensate unspend (apply): {e}")),
+                                Ok(resp) => match resp.errors.get(&0) {
+                                    None => None,
+                                    Some(SpendError::TxNotFound) => None,
+                                    Some(e) => Some(format!(
+                                        "compensate unspend (re-spend slot idx 0): {e}"
+                                    )),
+                                },
+                            },
+                        };
+                        if let Some(cause) = comp_err
+                            && restore_write_err.is_none()
+                        {
+                            restore_write_err = Some(cause);
                         }
                         // C27-residual: emit the hash-guarded SpendV2 (carrying
                         // the slot's utxo_hash) for symmetry with the live spend
@@ -29970,15 +29989,41 @@ mod tests {
         // lacks the V3 identity guard — recovery would re-mark a slot SPENT
         // even after it was reassigned to a new hash.
         let h = CompensationCrashHarness::new();
-        let (key, _spending_data) = h.seed_record_and_spend([0xC7; 32]);
+        let (key, spending_data) = h.seed_record_and_spend([0xC7; 32]);
         let slot_hash = h.engine.read_slot(&key, 0).expect("slot exists").hash;
+
+        // R8: drive a REAL local unspend first so the slot is genuinely
+        // UNSPENT (the actual precondition for a `ReplicaOp::Unspend`
+        // compensation event) and the compensating re-spend below uses the
+        // exact prior `spending_data`, matching production
+        // (`v.item.spending_data` at the live Unspend handler). Pre-R8 this
+        // test skipped straight to compensating with an arbitrary mismatched
+        // `spending_data` against a still-SPENT slot — harmless only because
+        // the swallow being fixed here silently dropped the resulting
+        // per-slot `AlreadySpent` error; R8's classification correctly
+        // surfaces that as `Err`, which would break this test's `Ok`
+        // expectation below without this fix.
+        h.engine
+            .unspend(&crate::ops::unspend::UnspendRequest {
+                tx_key: key,
+                offset: 0,
+                utxo_hash: slot_hash,
+                spending_data,
+                current_block_height: 1000,
+                block_height_retention: 288,
+            })
+            .expect("seed unspend");
+        assert!(
+            h.engine.read_slot(&key, 0).unwrap().is_unspent(),
+            "seed unspend must leave the slot UNSPENT"
+        );
 
         let repl_ops = vec![(
             key,
             vec![ReplicaOp::Unspend {
                 tx_key: key,
                 offset: 0,
-                spending_data: [0u8; 36],
+                spending_data,
                 current_block_height: 1000,
                 block_height_retention: 288,
                 master_generation: 4,
@@ -30014,6 +30059,235 @@ mod tests {
         assert!(
             !comp.iter().any(|e| matches!(&e.op, RedoOp::Spend { .. })),
             "must NOT re-emit the legacy hash-less RedoOp::Spend",
+        );
+    }
+
+    /// R8: a failing compensating re-spend for `ReplicaOp::Unspend` must
+    /// surface as `Err`, not be swallowed by the old
+    /// `if let Ok(v) = engine.validate_spend_multi(&req) { let _ =
+    /// v.apply(engine); }`. Pre-fix this arm always let the top-level
+    /// compensation report success even when the re-spend's device write
+    /// failed, leaving the slot UNSPENT while every replica that applied the
+    /// original Unspend rolled it back to SPENT — a silent divergence this
+    /// node's own recovery would not otherwise catch. Exercises the
+    /// three-level classification's level 2 (`apply` → `Err`).
+    #[test]
+    fn compensation_unspend_respend_device_failure_surfaces_error() {
+        use crate::ops::create::CreateRequest;
+        use crate::ops::spend::{SpendItem, SpendMultiRequest};
+        use crate::ops::unspend::UnspendRequest;
+
+        let (engine, redo_log, fail, _guard) = write_failing_engine();
+
+        // Two 1-slot records, seeded to SPENT then UNSPENT (fail off — every
+        // seeding write must succeed): a throwaway `probe_key` used ONLY to
+        // prove the armed device really does make the compensating
+        // re-spend's `apply` phase fail synchronously, and the real `key`
+        // used for the actual compensation assertion below. Mirrors
+        // `compensation_create_delete_failure_surfaces_error`'s
+        // probe-then-real pattern so the probe cannot disturb `key`'s state.
+        let mut probe_txid = [0u8; 32];
+        probe_txid[0] = 0xE0;
+        let probe_key = TxKey { txid: probe_txid };
+        let probe_hash = [0x55u8; 32];
+        let probe_spending_data = [0xAAu8; 36];
+
+        let mut txid = [0u8; 32];
+        txid[0] = 0xE1;
+        let key = TxKey { txid };
+        let hash = [0x66u8; 32];
+        let spending_data = [0xBBu8; 36];
+
+        for (id, item_hash, item_spending_data) in [
+            (probe_txid, probe_hash, probe_spending_data),
+            (txid, hash, spending_data),
+        ] {
+            let k = TxKey { txid: id };
+            engine
+                .create(&CreateRequest {
+                    tx_id: id,
+                    tx_version: 1,
+                    locktime: 0,
+                    fee: 0,
+                    size_in_bytes: 0,
+                    extended_size: 0,
+                    is_coinbase: false,
+                    spending_height: 0,
+                    utxo_hashes: &[item_hash],
+                    inputs: None,
+                    outputs: None,
+                    inpoints: None,
+                    is_external: false,
+                    created_at: 0,
+                    block_height: 0,
+                    mined_block_infos: &[],
+                    frozen: false,
+                    conflicting: false,
+                    locked: false,
+                    external_ref: None,
+                    parent_txids: &[],
+                })
+                .expect("seed create");
+            engine
+                .spend_multi(&SpendMultiRequest {
+                    tx_key: k,
+                    spends: vec![SpendItem {
+                        offset: 0,
+                        utxo_hash: item_hash,
+                        spending_data: item_spending_data,
+                        idx: 0,
+                    }],
+                    ignore_conflicting: false,
+                    ignore_locked: false,
+                    current_block_height: 1000,
+                    block_height_retention: 288,
+                })
+                .expect("seed spend");
+            engine
+                .unspend(&UnspendRequest {
+                    tx_key: k,
+                    offset: 0,
+                    utxo_hash: item_hash,
+                    spending_data: item_spending_data,
+                    current_block_height: 1000,
+                    block_height_retention: 288,
+                })
+                .expect("seed unspend");
+            assert!(
+                engine.read_slot(&k, 0).unwrap().is_unspent(),
+                "seed must leave the slot UNSPENT (matching a real reverse-unspend precondition)"
+            );
+        }
+
+        // Arm the device to fail the next pwrite (the compensating re-spend's
+        // `apply` write).
+        fail.store(true, std::sync::atomic::Ordering::SeqCst);
+
+        // Sanity check (would-pass-pre-fix guard): confirm the armed device
+        // actually makes the SAME re-spend the compensation arm performs
+        // (`validate_spend_multi` then `.apply`) return `Err`, on the
+        // throwaway probe record — otherwise this test would be vacuous.
+        let probe_validated = engine
+            .validate_spend_multi(&SpendMultiRequest {
+                tx_key: probe_key,
+                spends: vec![SpendItem {
+                    offset: 0,
+                    utxo_hash: probe_hash,
+                    spending_data: probe_spending_data,
+                    idx: 0,
+                }],
+                ignore_conflicting: true,
+                ignore_locked: true,
+                current_block_height: 1000,
+                block_height_retention: 288,
+            })
+            .expect("validate must succeed: it only reads");
+        let direct_err = probe_validated
+            .apply(&engine)
+            .expect_err("armed device must make the compensating re-spend's apply fail");
+        assert!(
+            matches!(direct_err, SpendError::StorageError { .. }),
+            "expected a StorageError from the armed device, got {direct_err:?}"
+        );
+
+        // `key` is untouched by the probe above — still UNSPENT for the real
+        // compensation call below to exercise the same failing path.
+        assert!(
+            engine.read_slot(&key, 0).unwrap().is_unspent(),
+            "the untouched key must still be UNSPENT ahead of the real compensation call"
+        );
+
+        let repl_ops = vec![(
+            key,
+            vec![ReplicaOp::Unspend {
+                tx_key: key,
+                offset: 0,
+                spending_data,
+                current_block_height: 1000,
+                block_height_retention: 288,
+                master_generation: 0,
+            }],
+        )];
+        let before_images = vec![(key, vec![BeforeImage::None])];
+
+        let err =
+            compensate_replication_failure(&engine, &repl_ops, &before_images, Some(&redo_log))
+                .expect_err(
+                    "R8: a failed compensating re-spend must surface as Err, not be swallowed",
+                );
+        assert!(
+            err.contains("compensate unspend"),
+            "error must identify the swallowed compensating re-spend; got {err:?}"
+        );
+
+        // DC-1 durability: the compensating `RedoOp::SpendV2` must still be
+        // durable even though the in-memory re-spend failed — recovery
+        // relies on it to replay the rollback. `comp_redo.push` for this arm
+        // is unconditional once `read_slot` succeeds.
+        fail.store(false, std::sync::atomic::Ordering::SeqCst);
+        let entries = redo_log.lock().recover().expect("recover redo entries");
+        assert!(
+            entries.iter().any(|e| matches!(
+                &e.op,
+                RedoOp::SpendV2 { tx_key, offset: 0, spending_data: sd, .. }
+                    if *tx_key == key && *sd == spending_data
+            )),
+            "compensating SpendV2 redo entry must be durable even when the engine re-spend fails"
+        );
+    }
+
+    /// R8: guards against over-surfacing. The Unspend arm's outer
+    /// `engine.read_slot` existence check shares the SAME index-absence
+    /// condition as `validate_spend_multi`'s own first check (both resolve
+    /// `TxKey → record` via the same primary index with no intervening
+    /// mutation possible within one synchronous call) — so a genuinely
+    /// absent record is caught there, before the two-phase classification
+    /// even runs. This is benign — the record being rolled back has nothing
+    /// left to diverge, so the rollback is still clean and the intent may be
+    /// cleared. It mirrors the `ReplicaOp::MarkOnLongestChain` arm's own
+    /// documented TxNotFound-benign case: when the data needed to build the
+    /// compensating redo entry (here, the slot read) is unavailable, no
+    /// redo entry is emitted for this op — not a divergence, since there is
+    /// nothing durable left to reconcile — and the function still reports a
+    /// clean compensation.
+    #[test]
+    fn compensation_unspend_txnotfound_is_benign_ok() {
+        let (engine, redo_log, _fail, _guard) = write_failing_engine();
+        let mut txid = [0u8; 32];
+        txid[0] = 0xE2;
+        let key = TxKey { txid };
+
+        // Deliberately never create `key` — `engine.read_slot` (the Unspend
+        // arm's own existence gate) returns `Err(SpendError::TxNotFound)`.
+        assert!(
+            matches!(engine.read_slot(&key, 0), Err(SpendError::TxNotFound)),
+            "precondition: the unseeded key's slot read must fail with TxNotFound"
+        );
+
+        let repl_ops = vec![(
+            key,
+            vec![ReplicaOp::Unspend {
+                tx_key: key,
+                offset: 0,
+                spending_data: [0u8; 36],
+                current_block_height: 1000,
+                block_height_retention: 288,
+                master_generation: 0,
+            }],
+        )];
+        let before_images = vec![(key, vec![BeforeImage::None])];
+
+        let comp_range =
+            compensate_replication_failure(&engine, &repl_ops, &before_images, Some(&redo_log))
+                .expect(
+                    "an absent record on the Unspend compensation path must be treated as \
+                     benign (Ok), not surfaced as an error",
+                );
+        assert!(
+            comp_range.is_none(),
+            "no compensating redo entry can be built without a successful slot read, mirroring \
+             the MarkOnLongestChain arm's identical TxNotFound-benign 'no redo without data' \
+             pattern; got {comp_range:?}"
         );
     }
 
