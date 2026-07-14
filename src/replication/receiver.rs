@@ -1813,8 +1813,7 @@ fn apply_op_journal_inner(
             match engine.set_mined(&req) {
                 Ok(_) => Ok(()),
                 Err(crate::ops::error::SpendError::TxNotFound) => {
-                    record_apply_skipped_missing_tx("set_mined", tx_key);
-                    Ok(())
+                    missing_record_apply_outcome("set_mined", tx_key, nak_on_missing)
                 }
                 Err(e) => Err(format!("set_mined: {e}")),
             }
@@ -1839,8 +1838,7 @@ fn apply_op_journal_inner(
             match engine.set_mined(&req) {
                 Ok(_) => Ok(()),
                 Err(crate::ops::error::SpendError::TxNotFound) => {
-                    record_apply_skipped_missing_tx("unset_mined", tx_key);
-                    Ok(())
+                    missing_record_apply_outcome("unset_mined", tx_key, nak_on_missing)
                 }
                 Err(e) => Err(format!("unset_mined: {e}")),
             }
@@ -1874,12 +1872,11 @@ fn apply_op_journal_inner(
             for tx_key in txids {
                 match engine.set_mined_inner(tx_key, &params) {
                     Ok(_) => {}
-                    Err(crate::ops::error::SpendError::TxNotFound) => {
-                        record_apply_skipped_missing_tx(
-                            if *unset { "unset_mined" } else { "set_mined" },
-                            tx_key,
-                        );
-                    }
+                    Err(crate::ops::error::SpendError::TxNotFound) => missing_record_apply_outcome(
+                        if *unset { "unset_mined" } else { "set_mined" },
+                        tx_key,
+                        nak_on_missing,
+                    )?,
                     Err(e) => return Err(format!("set_mined_batch: {e}")),
                 }
             }
@@ -1981,17 +1978,31 @@ fn apply_op_journal_inner(
             match engine.set_conflicting(&req) {
                 Ok(_) => Ok(()),
                 Err(crate::ops::error::SpendError::TxNotFound) => {
-                    record_apply_skipped_missing_tx("set_conflicting", tx_key);
-                    Ok(())
+                    missing_record_apply_outcome("set_conflicting", tx_key, nak_on_missing)
                 }
                 Err(e) => Err(format!("set_conflicting: {e}")),
             }
         }
         ReplicaOp::RemoveConflictingChild { tx_key, child_txid } => {
-            // `tx_key` is the parent; remove is idempotent and tolerates a
-            // parent absent on this replica (it may not hold the parent shard).
+            // `tx_key` is the parent; removing a child from its
+            // conflicting-children set is idempotent and tolerates an absent
+            // parent. The redo->ReplicaOp conversion shard-gates this op on the
+            // PARENT key (see `RedoOp::RemoveConflictingChild` in coordinator.rs),
+            // so a caught-up replica of this shard normally holds the parent —
+            // absence means the parent was legitimately removed via an
+            // independent path (delete / prune / DAH-evict) before this
+            // bookkeeping cleanup arrived, making the removal a moot no-op.
             match engine.remove_conflicting_child(tx_key, *child_txid) {
                 Ok(()) => Ok(()),
+                // Deliberately EXCLUDED from the `missing_record_apply_outcome`
+                // NAK-on-missing routing (R7/C15): an absent parent here is not
+                // an un-caught divergence. A genuinely-missing parent Create
+                // would already have been NAKed on its own tracked Create op; by
+                // the time this cleanup arrives the parent either exists (remove
+                // applies) or was legitimately removed (remove moot). Same
+                // idempotency class as the other tolerant bookkeeping arms —
+                // routing it through `nak_on_missing` would produce FALSE NAKs
+                // on a correctly-caught-up replica.
                 Err(crate::ops::error::SpendError::TxNotFound) => {
                     record_apply_skipped_missing_tx("remove_conflicting_child", tx_key);
                     Ok(())
@@ -2007,8 +2018,7 @@ fn apply_op_journal_inner(
             match engine.set_locked_idempotent(&req) {
                 Ok(_) => Ok(()),
                 Err(crate::ops::error::SpendError::TxNotFound) => {
-                    record_apply_skipped_missing_tx("set_locked", tx_key);
-                    Ok(())
+                    missing_record_apply_outcome("set_locked", tx_key, nak_on_missing)
                 }
                 Err(e) => Err(format!("set_locked: {e}")),
             }
@@ -2025,8 +2035,7 @@ fn apply_op_journal_inner(
             match engine.preserve_until(&req) {
                 Ok(_) => Ok(()),
                 Err(crate::ops::error::SpendError::TxNotFound) => {
-                    record_apply_skipped_missing_tx("preserve_until", tx_key);
-                    Ok(())
+                    missing_record_apply_outcome("preserve_until", tx_key, nak_on_missing)
                 }
                 Err(e) => Err(format!("preserve_until: {e}")),
             }
@@ -8189,6 +8198,313 @@ mod tests {
         assert_eq!(
             mig_resp.status, STATUS_OK,
             "a migration batch must still tolerate an absent record",
+        );
+    }
+
+    /// R7/C15 residual: the tracked SetMined-family mutation ops were left
+    /// tolerating a missing record even on a steady-state tracked batch,
+    /// silently masking a real divergence (the master committed a mutation
+    /// the replica never received a Create for) while the HWM advanced. This
+    /// mirrors `tracked_spend_on_missing_record_naks_without_advancing_hwm`
+    /// for `SetMined`: a tracked batch mutating an absent record must NAK
+    /// (retryable) instead of ACKing.
+    #[test]
+    fn set_mined_missing_record_naks_on_tracked_batch() {
+        let engine = make_engine();
+        let tracker = ReplicaAppliedTracker::in_memory();
+        let last_applied = Arc::new(AtomicU64::new(0));
+        let stream_key = "peer-r7-setmined:5000";
+        tracker.set(stream_key, 9); // first_sequence=10 is next-expected
+
+        // key(201) was never created on this replica.
+        let op = ReplicaOp::SetMined {
+            tx_key: key(201),
+            block_id: 1,
+            block_height: 700_000,
+            subtree_idx: 0,
+            on_longest_chain: true,
+            current_block_height: 700_000,
+            block_height_retention: 288,
+            master_generation: 0,
+        };
+        let batch = ReplicaBatch {
+            first_sequence: 10,
+            ops: vec![op],
+            trace_ctx: None,
+            source_node_id: None,
+            cluster_key: 0,
+        };
+        let resp = handle_replica_batch_with_tracker(
+            &batch_request(&batch, 1),
+            &engine,
+            &last_applied,
+            Some(&tracker),
+            stream_key,
+            0,
+        );
+
+        assert_eq!(
+            resp.status, STATUS_ERROR,
+            "a tracked set_mined for a missing record must NAK, not silently ACK",
+        );
+        match ReplicaAck::deserialize(&resp.payload).expect("ack decodes") {
+            ReplicaAck::Error {
+                failed_sequence,
+                message,
+            } => {
+                assert_eq!(
+                    failed_sequence, 10,
+                    "the NAK must point at the offending sequence",
+                );
+                // Deliberately check for the `missing_record_apply_outcome`
+                // wording (not just "absent") — a separate, pre-existing
+                // post-apply generation-sync gate (receiver.rs ~2298-2337)
+                // ALSO hard-fails a non-migration apply of any op carrying
+                // `master_generation` when the record is absent after apply,
+                // with an unrelated "generation sync: tx ... absent after
+                // apply" message. Without this op-specific check the test
+                // would spuriously pass pre-fix via that OTHER gate instead
+                // of proving the SetMined arm itself now routes through
+                // `missing_record_apply_outcome`.
+                assert!(
+                    message.starts_with("set_mined:") && message.contains("steady-state"),
+                    "the NAK must come from the SetMined arm's own \
+                     missing_record_apply_outcome routing, got: {message}",
+                );
+            }
+            other => panic!("expected a retryable Error NAK, got {other:?}"),
+        }
+        assert_eq!(
+            tracker.get(stream_key),
+            9,
+            "a missing-record NAK must NOT advance the per-stream high-water mark",
+        );
+        assert_eq!(
+            last_applied.load(Ordering::Relaxed),
+            0,
+            "a missing-record NAK must NOT advance last_applied",
+        );
+    }
+
+    /// R7/C15 residual: the migration/untracked path must still keep the
+    /// historical tolerant skip for SetMined — a migration baseline
+    /// legitimately streams a record another source owns.
+    #[test]
+    fn set_mined_missing_record_tolerated_on_migration() {
+        let engine = make_engine();
+        let tracker = ReplicaAppliedTracker::in_memory();
+        let last_applied = Arc::new(AtomicU64::new(0));
+
+        let op = ReplicaOp::SetMined {
+            tx_key: key(202),
+            block_id: 1,
+            block_height: 700_000,
+            subtree_idx: 0,
+            on_longest_chain: true,
+            current_block_height: 700_000,
+            block_height_retention: 288,
+            master_generation: 0,
+        };
+        let batch = ReplicaBatch {
+            first_sequence: 0,
+            ops: vec![op],
+            trace_ctx: None,
+            source_node_id: None,
+            cluster_key: 0,
+        };
+        let mut req = batch_request(&batch, 1);
+        req.flags = FLAG_MIGRATION_BATCH;
+        let resp = handle_replica_batch_with_tracker(
+            &req,
+            &engine,
+            &last_applied,
+            Some(&tracker),
+            "peer-r7-setmined-mig:5000",
+            0,
+        );
+        assert_eq!(
+            resp.status, STATUS_OK,
+            "a migration batch must still tolerate an absent record for set_mined",
+        );
+    }
+
+    /// R7/C15 residual, batch variant: `SetMinedBatch` applies per-txid in a
+    /// loop. On a tracked batch, the FIRST missing txid must abort the whole
+    /// op with a NAK (the master retries the entire idempotent batch) instead
+    /// of silently skipping just that txid.
+    #[test]
+    fn set_mined_batch_missing_txid_naks_on_tracked_batch() {
+        let engine = make_engine();
+        create_record(&engine, key(203), 1); // present
+        // key(204) is deliberately never created — absent.
+
+        let tracker = ReplicaAppliedTracker::in_memory();
+        let last_applied = Arc::new(AtomicU64::new(0));
+        let stream_key = "peer-r7-setminedbatch:5000";
+        tracker.set(stream_key, 9);
+
+        let op = ReplicaOp::SetMinedBatch {
+            block_id: 1,
+            block_height: 700_000,
+            subtree_idx: 0,
+            on_longest_chain: true,
+            current_block_height: 700_000,
+            block_height_retention: 288,
+            unset: false,
+            txids: vec![key(203), key(204)],
+        };
+        let batch = ReplicaBatch {
+            first_sequence: 10,
+            ops: vec![op],
+            trace_ctx: None,
+            source_node_id: None,
+            cluster_key: 0,
+        };
+        let resp = handle_replica_batch_with_tracker(
+            &batch_request(&batch, 1),
+            &engine,
+            &last_applied,
+            Some(&tracker),
+            stream_key,
+            0,
+        );
+
+        assert_eq!(
+            resp.status, STATUS_ERROR,
+            "a tracked set_mined_batch with one missing txid must NAK the whole op",
+        );
+        match ReplicaAck::deserialize(&resp.payload).expect("ack decodes") {
+            ReplicaAck::Error {
+                failed_sequence,
+                message,
+            } => {
+                assert_eq!(
+                    failed_sequence, 10,
+                    "the NAK must point at the offending sequence",
+                );
+                assert!(
+                    message.contains("absent"),
+                    "the NAK message must name the missing-record divergence, got: {message}",
+                );
+            }
+            other => panic!("expected a retryable Error NAK, got {other:?}"),
+        }
+        assert_eq!(
+            tracker.get(stream_key),
+            9,
+            "a missing-txid NAK must NOT advance the per-stream high-water mark",
+        );
+    }
+
+    /// R7/C15 residual, sibling mutation: `SetConflicting` on a tracked batch
+    /// must NAK on a missing record exactly like SetMined/Spend/Freeze.
+    #[test]
+    fn set_conflicting_missing_record_naks_on_tracked_batch() {
+        let engine = make_engine();
+        let tracker = ReplicaAppliedTracker::in_memory();
+        let last_applied = Arc::new(AtomicU64::new(0));
+        let stream_key = "peer-r7-setconflicting:5000";
+        tracker.set(stream_key, 9);
+
+        let op = ReplicaOp::SetConflicting {
+            tx_key: key(205),
+            value: true,
+            current_block_height: 700_000,
+            retention: 288,
+            master_generation: 0,
+        };
+        let batch = ReplicaBatch {
+            first_sequence: 10,
+            ops: vec![op],
+            trace_ctx: None,
+            source_node_id: None,
+            cluster_key: 0,
+        };
+        let resp = handle_replica_batch_with_tracker(
+            &batch_request(&batch, 1),
+            &engine,
+            &last_applied,
+            Some(&tracker),
+            stream_key,
+            0,
+        );
+
+        assert_eq!(
+            resp.status, STATUS_ERROR,
+            "a tracked set_conflicting for a missing record must NAK, not silently ACK",
+        );
+        match ReplicaAck::deserialize(&resp.payload).expect("ack decodes") {
+            ReplicaAck::Error {
+                failed_sequence,
+                message,
+            } => {
+                assert_eq!(
+                    failed_sequence, 10,
+                    "the NAK must point at the offending sequence",
+                );
+                // See the analogous comment in
+                // `set_mined_missing_record_naks_on_tracked_batch`: a
+                // separate pre-existing generation-sync gate also hard-fails
+                // this scenario with an unrelated message, so check for the
+                // SetConflicting arm's own wording specifically.
+                assert!(
+                    message.starts_with("set_conflicting:") && message.contains("steady-state"),
+                    "the NAK must come from the SetConflicting arm's own \
+                     missing_record_apply_outcome routing, got: {message}",
+                );
+            }
+            other => panic!("expected a retryable Error NAK, got {other:?}"),
+        }
+        assert_eq!(
+            tracker.get(stream_key),
+            9,
+            "a missing-record NAK must NOT advance the per-stream high-water mark",
+        );
+    }
+
+    /// R7/C15 residual — the intentional exclusion: `RemoveConflictingChild`'s
+    /// `tx_key` is the PARENT, and a replica may legitimately not hold the
+    /// parent's shard at all, so an absent parent must stay tolerated even on
+    /// a TRACKED batch. This guards against a future "fix" that routes it
+    /// through `missing_record_apply_outcome` to match the other five arms,
+    /// which would produce false NAKs on a correctly-caught-up replica.
+    #[test]
+    fn remove_conflicting_child_missing_parent_still_tolerated() {
+        let engine = make_engine();
+        let tracker = ReplicaAppliedTracker::in_memory();
+        let last_applied = Arc::new(AtomicU64::new(0));
+        let stream_key = "peer-r7-removeconflictingchild:5000";
+        tracker.set(stream_key, 9);
+
+        let op = ReplicaOp::RemoveConflictingChild {
+            tx_key: key(206), // absent parent
+            child_txid: [0x11; 32],
+        };
+        let batch = ReplicaBatch {
+            first_sequence: 10,
+            ops: vec![op],
+            trace_ctx: None,
+            source_node_id: None,
+            cluster_key: 0,
+        };
+        let resp = handle_replica_batch_with_tracker(
+            &batch_request(&batch, 1),
+            &engine,
+            &last_applied,
+            Some(&tracker),
+            stream_key,
+            0,
+        );
+
+        assert_eq!(
+            resp.status, STATUS_OK,
+            "remove_conflicting_child must still tolerate an absent PARENT even on a \
+             tracked batch (the parent may legitimately not live on this replica's shard)",
+        );
+        assert_eq!(
+            tracker.get(stream_key),
+            10,
+            "a tolerated remove_conflicting_child must still advance the HWM",
         );
     }
 
