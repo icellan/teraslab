@@ -2250,6 +2250,36 @@ fn shrink_drops_a_shard_holder(surviving: &[NodeId], rf: u8, placement_version: 
     })
 }
 
+/// G8 emergent review (Critical, data loss) — whether any shard's CURRENT
+/// holder set (master + replicas, read from `table` — the shard table AS
+/// COMMITTED before this shrink, NOT a freshly computed prospective one) is
+/// entirely contained in the removed set, i.e. no member of `surviving`
+/// currently holds that shard's data.
+///
+/// This is a DIFFERENT invariant than [`shrink_drops_a_shard_holder`]: that
+/// check counts SLOTS on the PROSPECTIVE (new) table computed from
+/// `surviving` alone, which is always satisfiable as long as
+/// `surviving.len() >= rf` — it says nothing about whether any of those
+/// slots can actually be filled with real data. Re-seeding a shard's data to
+/// its new holders is PUSH-based FROM a surviving OLD holder
+/// (`should_begin_handoff_for_shard` / `old_master_available_for_handoff` in
+/// `cluster::coordinator` require the old master/replica to still be a
+/// committed member), and `react_to_committed_shrink` marks every removed
+/// node dead immediately on commit. If a shard's entire current holder set
+/// is removed in one shrink step, the new assignment has no source to copy
+/// from and would silently start serving that shard empty — previously
+/// created/spent txids would read back as absent.
+///
+/// Returns the first orphaned shard number found (for the error message), or
+/// `None` if every shard keeps at least one current holder in `surviving`.
+/// One-time admin-path validation over `NUM_SHARDS` shards — not hot path.
+fn shrink_orphans_shard(table: &ShardTable, surviving: &[NodeId]) -> Option<u16> {
+    (0..NUM_SHARDS as u16).find(|&shard| {
+        let a = table.target_assignment(shard);
+        !surviving.contains(&a.master) && !a.replicas.iter().any(|r| surviving.contains(r))
+    })
+}
+
 /// `PUT /admin/shrink?members=<id,id,...>[&wait_seconds=N]` — propose a
 /// quorum-gated cluster SHRINK to the explicit surviving `NodeId` set (see
 /// `RunningCluster::propose_shrink` / `TopologyAuthority::propose_shrink`).
@@ -2384,6 +2414,37 @@ async fn handle_admin_shrink(
             "shrink_drops_shard_holder",
             "the prospective shard table for the surviving members leaves at least one \
              shard with fewer holders than min(replication_factor, surviving members)",
+        );
+    }
+
+    // G8 emergent review (Critical, data loss) — reject up front if this
+    // shrink would remove EVERY current holder of some shard, leaving it
+    // with no surviving source to re-seed the new holders (see
+    // `shrink_orphans_shard`'s doc for why this is a DIFFERENT invariant
+    // than `shrink_drops_a_shard_holder` above). Reads the LIVE shard table
+    // (`cluster.shard_table()`, the same table `mastered_shards` /
+    // `authoritative_master_for_shard` treat as authoritative) rather than a
+    // freshly computed one, so this reflects who ACTUALLY holds each
+    // shard's data right now, not a hypothetical.
+    // Scoped so the read guard is dropped before the function's next
+    // `.await` point (`wait_for_shrink_commit`, further down) — the guard
+    // type must never be held live across an await for the handler's future
+    // to stay `Send` (required by axum's `Handler` bound).
+    let orphaned_shard = {
+        let table = cluster.shard_table();
+        let table = table.read();
+        shrink_orphans_shard(&table, &surviving)
+    };
+    if let Some(orphaned_shard) = orphaned_shard {
+        return http_error_with_details(
+            StatusCode::CONFLICT,
+            "shrink_orphans_shard",
+            format!(
+                "shard {orphaned_shard}'s data lives only on nodes being removed and has no \
+                 surviving source to re-seed the new holders; migrate/rebalance that shard's \
+                 data onto a surviving node before shrinking",
+            ),
+            Some(serde_json::json!({ "shard": orphaned_shard })),
         );
     }
 
@@ -5743,16 +5804,98 @@ mod tests {
         assert!(body.contains("shrink_below_rf"), "got: {body:?}");
     }
 
+    /// G8 emergent review (Critical, data loss): `/admin/shrink` must refuse
+    /// a request that removes EVERY current holder of some shard, since
+    /// re-seed of a shard's data to its new holders is PUSH-based FROM a
+    /// surviving OLD holder — orphaning a shard leaves the new assignment
+    /// with no source, and it would silently serve empty (previously-acked
+    /// UTXOs read back as absent).
+    ///
+    /// 5-node RF=2 round-robin table: shard 3's holders are the consecutive
+    /// pair `{members[3], members[4]}` = `{4, 5}` (master=4, replica=5 —
+    /// `master = members[shard % n]`, `replica = members[(shard+1) % n]`).
+    /// Requesting survivors `{1,2,3}` removes exactly `{4,5}` — shard 3's
+    /// ENTIRE current holder set — while still satisfying every other gate
+    /// (3/5 survivors clears the majority floor of 3 and the RF floor of 2;
+    /// the PROSPECTIVE 3-node table gives every shard the full RF=2 slots,
+    /// so `shrink_drops_a_shard_holder` does not fire). Pre-fix, nothing
+    /// catches this and the request is admitted (202, "shrink proposed at
+    /// term ...") — proving the defect wedges without this check.
+    #[tokio::test]
+    async fn shrink_orphaning_a_shard_is_refused() {
+        let members = vec![NodeId(1), NodeId(2), NodeId(3), NodeId(4), NodeId(5)];
+        let cluster = shrink_test_cluster(&members, NodeId(1), 5, 2);
+        let committed_term_before = cluster.topology_authority().committed_term();
+        let state = build_ready_test_state(true, Some(cluster.clone()));
+
+        let resp = handle_admin_shrink(State(state), shrink_query("1,2,3", 0))
+            .await
+            .into_response();
+        assert_eq!(
+            resp.status(),
+            StatusCode::CONFLICT,
+            "a shrink that orphans a shard's only holders must be refused, not admitted",
+        );
+        let body = body_string(resp).await;
+        assert!(body.contains("shrink_orphans_shard"), "got: {body:?}");
+        assert!(
+            !body.contains("shrink proposed at term"),
+            "must refuse UP FRONT, before any proposal is made; got: {body:?}",
+        );
+        assert_eq!(
+            cluster.topology_authority().committed_term(),
+            committed_term_before,
+            "no commit may occur for a refused shrink",
+        );
+    }
+
+    /// Guard against over-refusal: a shrink where every shard keeps at least
+    /// one CURRENT holder among the survivors must pass the orphan check and
+    /// proceed (here, all the way to a 202 proposal — no other refusal
+    /// applies). Same 5-node RF=2 table as
+    /// `shrink_orphaning_a_shard_is_refused`, but removing only node 5:
+    /// shard 3's holders `{4,5}` still keep `4`, and shard 4's holders
+    /// `{5,1}` still keep `1` — no shard is left holder-less.
+    #[tokio::test]
+    async fn shrink_preserving_a_holder_per_shard_is_allowed() {
+        let members = vec![NodeId(1), NodeId(2), NodeId(3), NodeId(4), NodeId(5)];
+        let cluster = shrink_test_cluster(&members, NodeId(1), 5, 2);
+        let state = build_ready_test_state(true, Some(cluster));
+
+        let resp = handle_admin_shrink(State(state), shrink_query("1,2,3,4", 0))
+            .await
+            .into_response();
+        let status = resp.status();
+        let body = body_string(resp).await;
+        assert!(
+            !body.contains("shrink_orphans_shard"),
+            "no shard is orphaned by removing only node 5; got: {body:?}",
+        );
+        assert_eq!(
+            status,
+            StatusCode::ACCEPTED,
+            "a shrink that preserves a holder per shard must be admitted; got: {body:?}",
+        );
+        assert!(body.contains("shrink proposed at term"), "got: {body:?}");
+    }
+
     /// A migration in flight must refuse `shrink_migration_in_flight`.
+    ///
+    /// RF=2 (not RF=1 — see the G8 orphan-refusal note on
+    /// `admin_shrink_happy_path_proposes`) with survivors `{1,3,5}`: removing
+    /// `{2,4}` leaves every round-robin holder pair `(1,2) (2,3) (3,4) (4,5)
+    /// (5,1)` with at least one surviving member, so the orphan check does
+    /// not fire and this genuinely exercises `shrink_migration_in_flight` in
+    /// isolation.
     #[tokio::test]
     async fn admin_shrink_migration_in_flight_refused() {
         let members = vec![NodeId(1), NodeId(2), NodeId(3), NodeId(4), NodeId(5)];
-        let cluster = shrink_test_cluster(&members, NodeId(1), 5, 1);
+        let cluster = shrink_test_cluster(&members, NodeId(1), 5, 2);
         cluster.test_seed_active_outbound_migration(0, NodeId(1), NodeId(2));
         assert_eq!(cluster.active_migrations(), 1, "fixture precondition");
         let state = build_ready_test_state(true, Some(cluster));
 
-        let resp = handle_admin_shrink(State(state), shrink_query("1,2,3", 0))
+        let resp = handle_admin_shrink(State(state), shrink_query("1,3,5", 0))
             .await
             .into_response();
         assert_eq!(resp.status(), StatusCode::CONFLICT);
@@ -5784,13 +5927,23 @@ mod tests {
     /// coordinator_floor` and friends), so this proves the HTTP layer
     /// correctly ADMITS a structurally-valid request through to proposal
     /// rather than a live multi-node commit.
+    ///
+    /// RF=2 with survivors `{1,3,5}` (not RF=1 with `{1,2,3}` — the G8
+    /// orphan-refusal check correctly refuses THAT combination: with RF=1
+    /// there are no replicas at all, so removing any node always orphans its
+    /// exclusively-mastered shards; `{1,2,3}` also removes an entire
+    /// round-robin holder pair `{4,5}` even at RF=2, per
+    /// `shrink_orphaning_a_shard_is_refused`). `{1,3,5}` removes `{2,4}`,
+    /// leaving every pair `(1,2) (2,3) (3,4) (4,5) (5,1)` with a surviving
+    /// holder, so this is a genuinely non-orphaning, structurally-valid
+    /// shrink.
     #[tokio::test]
     async fn admin_shrink_happy_path_proposes() {
         let members = vec![NodeId(1), NodeId(2), NodeId(3), NodeId(4), NodeId(5)];
-        let cluster = shrink_test_cluster(&members, NodeId(1), 5, 1);
+        let cluster = shrink_test_cluster(&members, NodeId(1), 5, 2);
         let state = build_ready_test_state(true, Some(cluster));
 
-        let resp = handle_admin_shrink(State(state), shrink_query("1,2,3", 0))
+        let resp = handle_admin_shrink(State(state), shrink_query("1,3,5", 0))
             .await
             .into_response();
         assert_eq!(
