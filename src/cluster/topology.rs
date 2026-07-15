@@ -937,6 +937,25 @@ pub struct TopologyAuthority {
     /// yet in the map is treated as v1 (conservative), so the proposer never
     /// proposes a v2 term that a not-yet-heard-from node could reject.
     peer_placement_support: RwLock<std::collections::HashMap<NodeId, u16>>,
+    /// G8 stage 3 — `(term, removed)` of the most recent commit this
+    /// authority applied that LOWERED `committed_peak` (a Gate-B shrink):
+    /// the NodeIds present in the OLD committed membership but absent from
+    /// the new one. Lets the coordinator react (SWIM force-evict + peak
+    /// floor hard-reset + `.multinode` marker cleanup) right after
+    /// activating a shrink, without threading a return value through every
+    /// `handle_commit`/`handle_commit_durable` call site.
+    ///
+    /// `None` until the first shrink ever applied by this authority.
+    /// STICKY: a later NON-shrink commit does not clear it. Callers MUST
+    /// compare the returned `term` against the term they just applied
+    /// before acting on `removed` — an equal term means "this exact apply
+    /// was the shrink"; any other term means the field is stale (left over
+    /// from an earlier shrink) and must be ignored. Safe because commits
+    /// are strictly increasing and serialized through `commit_apply`, so by
+    /// the time a caller reads this immediately after its own apply
+    /// returned, no other commit has had a realistic chance to overwrite it
+    /// (network round-trips dominate any local read-after-write gap).
+    last_shrink: Mutex<Option<(u64, Vec<NodeId>)>>,
 }
 
 impl TopologyAuthority {
@@ -969,6 +988,7 @@ impl TopologyAuthority {
                 );
                 m
             }),
+            last_shrink: Mutex::new(None),
         }
     }
 
@@ -1007,6 +1027,13 @@ impl TopologyAuthority {
     /// quorum-anchored).
     pub fn committed_peak(&self) -> u64 {
         self.committed_peak.load(Ordering::Relaxed)
+    }
+
+    /// G8 stage 3 — see the [`Self::last_shrink`] field doc for the
+    /// staleness caveat: the caller must check `term` against the commit it
+    /// just applied before acting on `removed`.
+    pub fn last_shrink(&self) -> Option<(u64, Vec<NodeId>)> {
+        self.last_shrink.lock().clone()
     }
 
     /// E-01 — votes needed to activate a proposal with `proposal_len`
@@ -1822,6 +1849,23 @@ impl TopologyAuthority {
         // peak below) is authorized.
         let old_committed_peak = self.committed_peak.load(Ordering::Relaxed);
         let is_gate_b_shrink = commit.committed_peak < old_committed_peak;
+
+        // G8 stage 3 — capture exactly which NodeIds this shrink removes
+        // BEFORE `committed_members` is overwritten below, and record them
+        // (tagged with this commit's term) so the coordinator can react
+        // (SWIM force-evict + peak floor reset) after activation. Cheap
+        // clone on the rare shrink path only; a no-op allocation-wise for
+        // every other commit.
+        if is_gate_b_shrink {
+            let old_members = self.committed_members.read().unwrap();
+            let removed: Vec<NodeId> = old_members
+                .iter()
+                .filter(|n| !commit.members.contains(n))
+                .copied()
+                .collect();
+            drop(old_members);
+            *self.last_shrink.lock() = Some((commit.term, removed));
+        }
 
         // G8 stage 1 — adopt the committed_peak carried by this commit. Gate
         // B (upstream, in `commit_passes_gates`) is what makes this

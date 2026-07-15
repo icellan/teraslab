@@ -403,6 +403,7 @@ pub(crate) fn build_http_router(
         .route("/admin/quiesce", put(handle_admin_quiesce))
         .route("/admin/rebalance", put(handle_admin_rebalance))
         .route("/admin/drain/{node_id}", put(handle_admin_drain))
+        .route("/admin/shrink", put(handle_admin_shrink))
         // Online backup: start (POST), poll status (GET), abort (DELETE).
         .route(
             "/admin/backup",
@@ -2195,6 +2196,268 @@ async fn handle_admin_drain(
             "not_in_cluster_mode",
             "not in cluster mode",
         ),
+    }
+}
+
+/// Query parameters for `PUT /admin/shrink`.
+#[derive(Debug, Default, serde::Deserialize)]
+struct ShrinkQuery {
+    /// Comma-separated explicit surviving `NodeId` set (NOT a count).
+    #[serde(default)]
+    members: String,
+    #[serde(default)]
+    wait_seconds: u64,
+}
+
+/// Parse `?members=1,2,3` into a sorted, deduplicated `Vec<NodeId>`.
+///
+/// Returns `Err` with a human-readable reason on a malformed entry (not a
+/// `u64`) or an empty list — both are folded into `shrink_not_subset` by the
+/// caller, since neither can ever be a valid non-empty subset.
+fn parse_shrink_members(raw: &str) -> Result<Vec<NodeId>, String> {
+    let mut out = Vec::new();
+    for tok in raw.split(',') {
+        let tok = tok.trim();
+        if tok.is_empty() {
+            continue;
+        }
+        match tok.parse::<u64>() {
+            Ok(id) => out.push(NodeId(id)),
+            Err(_) => return Err(format!("invalid node id {tok:?} in members list")),
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    Ok(out)
+}
+
+/// G8 stage 3 — whether a prospective shard table computed for `surviving`
+/// (at `rf`/`placement_version`) leaves any shard with fewer holders
+/// (master + replicas) than `min(rf, surviving.len())`.
+///
+/// `ShardTable::compute_with_epoch` clamps every shard's replica count to
+/// `min(RF-1, n-1)` UNIFORMLY (see its doc comment), so this can only fire
+/// if that invariant is ever violated — this check exists as an explicit,
+/// named refusal rather than trusting the invariant silently, matching the
+/// design's "refuse up front with a clear error, never silently hang"
+/// requirement for `/admin/shrink`.
+fn shrink_drops_a_shard_holder(surviving: &[NodeId], rf: u8, placement_version: u16) -> bool {
+    let prospective = ShardTable::compute_with_epoch(surviving, rf, 1, placement_version.max(1));
+    let need = (rf as usize).min(surviving.len());
+    (0..NUM_SHARDS).any(|shard| {
+        let a = prospective.target_assignment(shard as u16);
+        1 + a.replicas.len() < need
+    })
+}
+
+/// `PUT /admin/shrink?members=<id,id,...>[&wait_seconds=N]` — propose a
+/// quorum-gated cluster SHRINK to the explicit surviving `NodeId` set (see
+/// `RunningCluster::propose_shrink` / `TopologyAuthority::propose_shrink`).
+///
+/// Every refusal below is checked UP FRONT, before any proposal is made, so
+/// a shrink that structurally cannot commit (Gate B would reject it) is
+/// refused with a clear, named error instead of being silently proposed and
+/// left to hang. Mirrors `handle_admin_drain`'s explicit-error style.
+///
+/// `shrink_below_majority` mirrors Gate B's own re-check
+/// (`TopologyAuthority::commit_passes_gates`): a single shrink step must
+/// preserve a majority of the OLD peak (`>= committed_peak/2 + 1`); asking
+/// for more than that in one step can never gather enough Gate-B-valid
+/// voters and would otherwise hang as a proposal that never commits. A
+/// larger reduction needs multiple successive shrink steps. Consequently, a
+/// shrink to a single surviving node (RF=1 terminal collapse) is NOT
+/// reachable via this verb for any `committed_peak >= 2` (it always fails
+/// `shrink_below_majority`, since `1 < peak/2 + 1` for every `peak >= 2`) —
+/// that is by design: `/admin/shrink` is the QUORUM-GATED path, and a
+/// single-node RF=1 target is out of its scope.
+async fn handle_admin_shrink(
+    State(state): State<Arc<HttpState>>,
+    Query(query): Query<ShrinkQuery>,
+) -> axum::response::Response {
+    let cluster = match state.cluster {
+        Some(ref c) => c,
+        None => {
+            return http_error(
+                StatusCode::BAD_REQUEST,
+                "not_in_cluster_mode",
+                "not in cluster mode",
+            );
+        }
+    };
+
+    let committed = cluster.committed_topology_members();
+    let proposer = committed.iter().copied().min();
+    if proposer != Some(cluster.self_id()) {
+        return http_error_with_details(
+            StatusCode::BAD_REQUEST,
+            "shrink_wrong_proposer",
+            match proposer {
+                Some(p) => format!(
+                    "this node ({}) is not the deterministic proposer of the current \
+                     committed topology; re-issue against node {}",
+                    cluster.self_id().0,
+                    p.0,
+                ),
+                None => "no committed topology yet; there is no deterministic proposer".to_string(),
+            },
+            proposer.map(|p| serde_json::json!({ "proposer_node_id": p.0 })),
+        );
+    }
+
+    // A parse failure folds into `shrink_not_subset` below (an unparseable
+    // list is never a valid non-empty subset).
+    let surviving = parse_shrink_members(&query.members).unwrap_or_default();
+    let is_strict_subset = !surviving.is_empty()
+        && surviving.len() < committed.len()
+        && surviving.iter().all(|n| committed.contains(n));
+    if !is_strict_subset {
+        return http_error_with_details(
+            StatusCode::BAD_REQUEST,
+            "shrink_not_subset",
+            "members must be a non-empty, strict subset of the current committed topology",
+            Some(serde_json::json!({
+                "requested_members": surviving.iter().map(|n| n.0).collect::<Vec<_>>(),
+                "committed_members": committed.iter().map(|n| n.0).collect::<Vec<_>>(),
+            })),
+        );
+    }
+
+    // G8 stage 2 review follow-up 2 — refuse UP FRONT anything Gate B would
+    // structurally reject: a single shrink step must preserve a majority of
+    // the OLD peak. Checked before the RF/shard-holder/migration checks
+    // below since it is the cheapest, most fundamental structural gate.
+    let committed_peak = cluster.topology_authority().committed_peak();
+    let majority_needed = (committed_peak as usize / 2) + 1;
+    if surviving.len() < majority_needed {
+        return http_error_with_details(
+            StatusCode::CONFLICT,
+            "shrink_below_majority",
+            format!(
+                "a single shrink step must preserve a majority of the current peak \
+                 ({committed_peak}): at least {majority_needed} surviving member(s) are \
+                 required, {} were requested; Gate B structurally rejects a sub-majority \
+                 shrink, so a larger reduction needs multiple successive shrink steps",
+                surviving.len(),
+            ),
+            Some(serde_json::json!({
+                "committed_peak": committed_peak,
+                "majority_needed": majority_needed,
+                "requested": surviving.len(),
+            })),
+        );
+    }
+
+    let rf = cluster.shard_table().read().replication_factor();
+    let rf_floor = (rf as usize).max(1);
+    if surviving.len() < rf_floor {
+        return http_error_with_details(
+            StatusCode::CONFLICT,
+            "shrink_below_rf",
+            format!(
+                "surviving member count ({}) is below the replication factor floor ({rf})",
+                surviving.len(),
+            ),
+            Some(serde_json::json!({ "replication_factor": rf })),
+        );
+    }
+
+    let placement_version = cluster.topology_authority().committed_placement_version();
+    if shrink_drops_a_shard_holder(&surviving, rf, placement_version) {
+        return http_error(
+            StatusCode::CONFLICT,
+            "shrink_drops_shard_holder",
+            "the prospective shard table for the surviving members leaves at least one \
+             shard with fewer holders than min(replication_factor, surviving members)",
+        );
+    }
+
+    if cluster.active_migrations() != 0 {
+        return http_error(
+            StatusCode::CONFLICT,
+            "shrink_migration_in_flight",
+            "a migration is currently in flight; retry once it completes",
+        );
+    }
+
+    if committed_peak == surviving.len() as u64 {
+        return http_error(
+            StatusCode::CONFLICT,
+            "shrink_noop",
+            "the committed peak already equals the requested target size",
+        );
+    }
+
+    match cluster.propose_shrink(surviving.clone()) {
+        Some(term) => {
+            if query.wait_seconds > 0 {
+                if wait_for_shrink_commit(cluster, &surviving, query.wait_seconds).await {
+                    (
+                        StatusCode::OK,
+                        format!(
+                            "shrink committed at term {} (peak now {})",
+                            term.term,
+                            cluster.topology_authority().committed_peak(),
+                        ),
+                    )
+                        .into_response()
+                } else {
+                    (
+                        StatusCode::ACCEPTED,
+                        format!(
+                            "shrink proposed at term {} still in progress after {}s",
+                            term.term, query.wait_seconds,
+                        ),
+                    )
+                        .into_response()
+                }
+            } else {
+                (
+                    StatusCode::ACCEPTED,
+                    format!(
+                        "shrink proposed at term {}; use ?wait_seconds=N to wait for completion",
+                        term.term,
+                    ),
+                )
+                    .into_response()
+            }
+        }
+        None => http_error(
+            StatusCode::CONFLICT,
+            "shrink_proposal_failed",
+            "TopologyAuthority::propose_shrink refused the proposal (a proposal may already \
+             be pending, or the membership changed underneath this request); retry",
+        ),
+    }
+}
+
+/// Poll until `cluster`'s committed topology members equal `surviving`
+/// exactly (the shrink's success condition — proposals may internally retry
+/// at a fresh term, so polling on the outcome rather than a specific term
+/// number is what actually converges), or `wait_seconds` elapses.
+async fn wait_for_shrink_commit(
+    cluster: &RunningCluster,
+    surviving: &[NodeId],
+    wait_seconds: u64,
+) -> bool {
+    let mut want = surviving.to_vec();
+    want.sort_unstable();
+    let shrink_landed = |cluster: &RunningCluster| {
+        let mut committed = cluster.committed_topology_members();
+        committed.sort_unstable();
+        committed == want
+    };
+    if wait_seconds == 0 {
+        return shrink_landed(cluster);
+    }
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(wait_seconds);
+    loop {
+        if shrink_landed(cluster) {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
     }
 }
 
@@ -5270,6 +5533,236 @@ mod tests {
             0,
         ));
         assert!(wait_for_cluster_drain(&drained, 0).await);
+    }
+
+    // ------------------------------------------------------------------
+    // G8 stage 3 — `/admin/shrink` operator verb + every refusal.
+    //
+    // These drive `handle_admin_shrink` directly (matching the
+    // `handle_admin_rebalance`/`handle_admin_drain` test style above), so
+    // they exercise the real HTTP-layer parsing + refusal ordering without
+    // needing a live TCP listener. The refusals must fire UP FRONT, before
+    // any proposal is made — a request that structurally cannot commit
+    // (Gate B would reject it) must be refused with a clear, named error
+    // rather than proposed and left to hang.
+    // ------------------------------------------------------------------
+
+    /// Build a `committed.len()`-node test cluster (`self_id` as the given
+    /// node, every peer SWIM-Alive) for the `/admin/shrink` tests.
+    fn shrink_test_cluster(
+        committed: &[NodeId],
+        self_id: NodeId,
+        peak_size: usize,
+        rf: u8,
+    ) -> Arc<RunningCluster> {
+        use crate::cluster::coordinator::new_test_running_cluster;
+        use std::net::SocketAddr;
+
+        let table = ShardTable::compute_with_epoch(committed, rf, 1, 1);
+        let live_nodes: Vec<(NodeId, SocketAddr)> = committed
+            .iter()
+            .enumerate()
+            .map(|(i, &n)| (n, format!("127.0.0.1:{}", 16100 + i).parse().unwrap()))
+            .collect();
+        Arc::new(new_test_running_cluster(
+            self_id,
+            table,
+            &live_nodes,
+            committed,
+            &[],
+            &[],
+            &[],
+            peak_size,
+        ))
+    }
+
+    fn shrink_query(members: &str, wait_seconds: u64) -> Query<ShrinkQuery> {
+        Query(ShrinkQuery {
+            members: members.to_string(),
+            wait_seconds,
+        })
+    }
+
+    async fn body_string(resp: axum::response::Response) -> String {
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        String::from_utf8(body.to_vec()).expect("utf8 body")
+    }
+
+    #[tokio::test]
+    async fn admin_shrink_returns_bad_request_when_not_clustered() {
+        let state = build_ready_test_state(true, None);
+        let resp = handle_admin_shrink(State(state), shrink_query("1,2,3", 0))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = body_string(resp).await;
+        assert!(body.contains("not_in_cluster_mode"), "got: {body:?}");
+    }
+
+    /// The deterministic proposer is the LOWEST committed `NodeId`. Any
+    /// other node must refuse up front rather than silently propose (only
+    /// the true proposer's `propose_shrink` call would ever succeed).
+    #[tokio::test]
+    async fn admin_shrink_wrong_proposer_refused() {
+        let members = vec![NodeId(1), NodeId(2), NodeId(3), NodeId(4), NodeId(5)];
+        let cluster = shrink_test_cluster(&members, NodeId(2), 5, 1);
+        let state = build_ready_test_state(true, Some(cluster));
+
+        let resp = handle_admin_shrink(State(state), shrink_query("2,3,4", 0))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = body_string(resp).await;
+        assert!(body.contains("shrink_wrong_proposer"), "got: {body:?}");
+        assert!(
+            body.contains("\"proposer_node_id\":1"),
+            "must name the actual (lowest-id) proposer; got: {body:?}",
+        );
+    }
+
+    /// `members` containing a NodeId outside the committed set, or equal to
+    /// the full committed set (not a STRICT subset), must both refuse
+    /// `shrink_not_subset`.
+    #[tokio::test]
+    async fn admin_shrink_not_subset_refused() {
+        let members = vec![NodeId(1), NodeId(2), NodeId(3), NodeId(4), NodeId(5)];
+        let cluster = shrink_test_cluster(&members, NodeId(1), 5, 1);
+        let state = build_ready_test_state(true, Some(cluster));
+
+        // Node 9 is not a committed member.
+        let resp = handle_admin_shrink(State(state.clone()), shrink_query("1,2,9", 0))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = body_string(resp).await;
+        assert!(body.contains("shrink_not_subset"), "got: {body:?}");
+
+        // The full committed set is not a STRICT subset of itself.
+        let resp2 = handle_admin_shrink(State(state), shrink_query("1,2,3,4,5", 0))
+            .await
+            .into_response();
+        assert_eq!(resp2.status(), StatusCode::BAD_REQUEST);
+        let body2 = body_string(resp2).await;
+        assert!(body2.contains("shrink_not_subset"), "got: {body2:?}");
+    }
+
+    /// THE stage-2 review follow-up: a single shrink step must preserve a
+    /// majority of the OLD peak (`>= committed_peak/2 + 1`) — Gate B
+    /// structurally rejects anything smaller, so the verb must refuse up
+    /// front rather than propose a term that can never commit. Peak 5 needs
+    /// >= 3 survivors; this requests only 2.
+    #[tokio::test]
+    async fn admin_shrink_below_majority_refused() {
+        let members = vec![NodeId(1), NodeId(2), NodeId(3), NodeId(4), NodeId(5)];
+        let cluster = shrink_test_cluster(&members, NodeId(1), 5, 1);
+        let state = build_ready_test_state(true, Some(cluster));
+
+        let resp = handle_admin_shrink(State(state), shrink_query("1,2", 0))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let body = body_string(resp).await;
+        assert!(body.contains("shrink_below_majority"), "got: {body:?}");
+    }
+
+    /// `surviving.len() < max(replication_factor, 1)` must refuse
+    /// `shrink_below_rf`. RF=4 on a 5-member cluster: shrinking to 3
+    /// satisfies the majority floor (needs >= 3) but not the RF floor
+    /// (needs >= 4) — proving these are checked as genuinely DISTINCT
+    /// gates, not one masking the other.
+    #[tokio::test]
+    async fn admin_shrink_below_rf_refused() {
+        let members = vec![NodeId(1), NodeId(2), NodeId(3), NodeId(4), NodeId(5)];
+        let cluster = shrink_test_cluster(&members, NodeId(1), 5, 4);
+        let state = build_ready_test_state(true, Some(cluster));
+
+        let resp = handle_admin_shrink(State(state), shrink_query("1,2,3", 0))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let body = body_string(resp).await;
+        assert!(body.contains("shrink_below_rf"), "got: {body:?}");
+    }
+
+    /// A migration in flight must refuse `shrink_migration_in_flight`.
+    #[tokio::test]
+    async fn admin_shrink_migration_in_flight_refused() {
+        let members = vec![NodeId(1), NodeId(2), NodeId(3), NodeId(4), NodeId(5)];
+        let cluster = shrink_test_cluster(&members, NodeId(1), 5, 1);
+        cluster.test_seed_active_outbound_migration(0, NodeId(1), NodeId(2));
+        assert_eq!(cluster.active_migrations(), 1, "fixture precondition");
+        let state = build_ready_test_state(true, Some(cluster));
+
+        let resp = handle_admin_shrink(State(state), shrink_query("1,2,3", 0))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let body = body_string(resp).await;
+        assert!(body.contains("shrink_migration_in_flight"), "got: {body:?}");
+    }
+
+    // NOTE on `shrink_noop` (committed_peak already == target): implemented
+    // per the brief, but NOT independently testable as a distinct HTTP
+    // scenario. `TopologyAuthority::commit_passes_gates` enforces
+    // `committed_peak >= committed_members.len()` for EVERY committed
+    // state (unconditionally, not just for shrinks), and the strict-subset
+    // check above requires `target < committed_members.len()`. Combining
+    // both: `target < committed_members.len() <= committed_peak`, so
+    // `target < committed_peak` STRICTLY whenever the subset check has
+    // already passed — the equality `committed_peak == target` the noop
+    // check guards against can never coexist with a genuine strict subset
+    // request. The check is kept as defense-in-depth (cheap, harmless, and
+    // would matter if the peak invariant is ever relaxed elsewhere) but is,
+    // like `shrink_drops_shard_holder`, currently unreachable through any
+    // legitimate system state — see the stage-3 report's Concerns section.
+
+    /// Happy path: a valid 5\u{2192}3 shrink request passes every refusal gate
+    /// and reaches `RunningCluster::propose_shrink`, which returns the
+    /// proposed term — the handler responds 202 Accepted. A full committed
+    /// round trip needs real peer TCP listeners (out of scope for a
+    /// same-process unit test; the commit-apply mechanics themselves are
+    /// covered by `cluster::coordinator::tests::shrink_lowers_effective_
+    /// coordinator_floor` and friends), so this proves the HTTP layer
+    /// correctly ADMITS a structurally-valid request through to proposal
+    /// rather than a live multi-node commit.
+    #[tokio::test]
+    async fn admin_shrink_happy_path_proposes() {
+        let members = vec![NodeId(1), NodeId(2), NodeId(3), NodeId(4), NodeId(5)];
+        let cluster = shrink_test_cluster(&members, NodeId(1), 5, 1);
+        let state = build_ready_test_state(true, Some(cluster));
+
+        let resp = handle_admin_shrink(State(state), shrink_query("1,2,3", 0))
+            .await
+            .into_response();
+        assert_eq!(
+            resp.status(),
+            StatusCode::ACCEPTED,
+            "a structurally-valid shrink request must be admitted (202), not refused",
+        );
+        let body = body_string(resp).await;
+        assert!(body.contains("shrink proposed at term"), "got: {body:?}");
+    }
+
+    /// `parse_shrink_members` rejects a non-numeric entry; the caller folds
+    /// this into `shrink_not_subset` (an unparseable list is never a valid
+    /// non-empty subset) rather than crashing or silently ignoring the bad
+    /// token.
+    #[test]
+    fn parse_shrink_members_rejects_non_numeric_entries() {
+        assert!(parse_shrink_members("1,2,3").is_ok());
+        assert_eq!(
+            parse_shrink_members("1,2,3").unwrap(),
+            vec![NodeId(1), NodeId(2), NodeId(3)],
+        );
+        assert!(parse_shrink_members("1,abc,3").is_err());
+        assert_eq!(parse_shrink_members("").unwrap(), Vec::<NodeId>::new());
+        // Duplicates are deduplicated.
+        assert_eq!(
+            parse_shrink_members("3,1,1,2").unwrap(),
+            vec![NodeId(1), NodeId(2), NodeId(3)],
+        );
     }
 
     // ------------------------------------------------------------------
