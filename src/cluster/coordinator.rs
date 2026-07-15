@@ -8821,6 +8821,7 @@ pub fn load_topology_state(
             incarnation: 0,
             committed_voter_ever_seen: Vec::new(),
             committed_placement_version: 1,
+            committed_peak: 1,
         },
     };
     if let Some(marker_peak) = load_topology_multi_node_marker_peak(path) {
@@ -10543,17 +10544,20 @@ impl RunningCluster {
         members.sort();
         let cluster_id = self.topology_authority.cluster_id();
         let placement_version = self.topology_authority.committed_placement_version();
+        let committed_peak = self.topology_authority.committed_peak();
         crate::cluster::topology::TopologyCommit {
             term,
             proposer: members[0],
             members: members.clone(),
             cluster_id,
             placement_version,
+            committed_peak,
             digest: crate::cluster::topology::TopologyTerm::compute_digest(
                 term,
                 &cluster_id,
                 &members,
                 placement_version,
+                committed_peak,
             ),
             voters: {
                 let voters = self.topology_authority.committed_voters();
@@ -10951,17 +10955,23 @@ impl RunningCluster {
         // W6 — preserve the committed placement version across a graceful
         // departure (a membership change is not a placement downgrade).
         let placement_version = self.topology_authority.committed_placement_version();
+        // G8 stage 1 — a graceful drain is NON-lowering (see the doc comment
+        // above): stamp the CURRENT effective peak, not `new_members.len()`,
+        // so the drained cluster's floor is unaffected by who left.
+        let committed_peak = self.topology_authority.peak_cluster_size();
         let commit = crate::cluster::topology::TopologyCommit {
             term: new_term,
             proposer: new_members[0],
             members: new_members.clone(),
             cluster_id,
             placement_version,
+            committed_peak,
             digest: crate::cluster::topology::TopologyTerm::compute_digest(
                 new_term,
                 &cluster_id,
                 &new_members,
                 placement_version,
+                committed_peak,
             ),
             // E-4 — THREAT-MODEL DECISION (trust authenticated peers by design):
             //
@@ -11573,6 +11583,7 @@ pub(crate) fn new_test_running_cluster(
             term: table.version,
             proposer: self_id,
             members: committed_members.to_vec(),
+            committed_peak: (committed_members.to_vec()).len() as u64,
             cluster_id,
             placement_version,
             digest: crate::cluster::topology::TopologyTerm::compute_digest(
@@ -11580,6 +11591,7 @@ pub(crate) fn new_test_running_cluster(
                 &cluster_id,
                 committed_members,
                 placement_version,
+                (committed_members).len() as u64,
             ),
             voters: committed_members.to_vec(),
         };
@@ -16998,11 +17010,13 @@ mod tests {
             members: next_members.clone(),
             cluster_id: cid,
             placement_version: 1,
+            committed_peak: (next_members.clone()).len() as u64,
             digest: crate::cluster::topology::TopologyTerm::compute_digest(
                 4,
                 &cid,
                 &next_members,
                 1,
+                (next_members).len() as u64,
             ),
             voters: next_members.clone(),
         };
@@ -17051,11 +17065,13 @@ mod tests {
             members: committed_members.clone(),
             cluster_id: crate::cluster::topology::ClusterId::UNSET,
             placement_version: 1,
+            committed_peak: (committed_members.clone()).len() as u64,
             digest: crate::cluster::topology::TopologyTerm::compute_digest(
                 routing.shard_table_version,
                 &crate::cluster::topology::ClusterId::UNSET,
                 &committed_members,
                 1,
+                (committed_members).len() as u64,
             ),
             voters: vec![NodeId(1), NodeId(2)],
         };
@@ -17099,11 +17115,13 @@ mod tests {
             members: committed_members.clone(),
             cluster_id: cid,
             placement_version: 1,
+            committed_peak: (committed_members.clone()).len() as u64,
             digest: crate::cluster::topology::TopologyTerm::compute_digest(
                 4,
                 &cid,
                 &committed_members,
                 1,
+                (committed_members).len() as u64,
             ),
             voters: committed_members.clone(),
         };
@@ -17120,7 +17138,13 @@ mod tests {
         assert_eq!(decoded.members, committed_members);
         assert_eq!(
             decoded.digest,
-            crate::cluster::topology::TopologyTerm::compute_digest(4, &cid, &committed_members, 1),
+            crate::cluster::topology::TopologyTerm::compute_digest(
+                4,
+                &cid,
+                &committed_members,
+                1,
+                (committed_members).len() as u64
+            ),
         );
     }
 
@@ -18964,8 +18988,13 @@ mod tests {
             members: members.clone(),
             cluster_id: cid,
             placement_version: too_high,
+            committed_peak: (members.clone()).len() as u64,
             digest: crate::cluster::topology::TopologyTerm::compute_digest(
-                6, &cid, &members, too_high,
+                6,
+                &cid,
+                &members,
+                too_high,
+                (members).len() as u64,
             ),
             voters: members.clone(),
         };
@@ -19036,7 +19065,14 @@ mod tests {
             members: members.clone(),
             cluster_id: cid,
             placement_version: 1,
-            digest: crate::cluster::topology::TopologyTerm::compute_digest(6, &cid, &members, 1),
+            committed_peak: (members.clone()).len() as u64,
+            digest: crate::cluster::topology::TopologyTerm::compute_digest(
+                6,
+                &cid,
+                &members,
+                1,
+                (members).len() as u64,
+            ),
             voters: members.clone(),
         };
 
@@ -19094,7 +19130,14 @@ mod tests {
             members: members.clone(),
             cluster_id: cid,
             placement_version: 1,
-            digest: crate::cluster::topology::TopologyTerm::compute_digest(6, &cid, &members, 1),
+            committed_peak: (members.clone()).len() as u64,
+            digest: crate::cluster::topology::TopologyTerm::compute_digest(
+                6,
+                &cid,
+                &members,
+                1,
+                (members).len() as u64,
+            ),
             voters: members.clone(),
         };
 
@@ -20362,11 +20405,13 @@ mod tests {
             members: commit_members.clone(),
             cluster_id: crate::cluster::topology::ClusterId::UNSET,
             placement_version: 1,
+            committed_peak: (commit_members.clone()).len() as u64,
             digest: crate::cluster::topology::TopologyTerm::compute_digest(
                 5,
                 &crate::cluster::topology::ClusterId::UNSET,
                 &commit_members,
                 1,
+                (commit_members).len() as u64,
             ),
             voters: commit_members.clone(),
         };

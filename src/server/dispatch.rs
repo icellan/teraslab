@@ -26501,6 +26501,7 @@ mod tests {
             other,
             crate::cluster::topology::ClusterId::UNSET,
             1,
+            (members.clone()).len() as u64,
         );
         let req = RequestFrame {
             request_id: 1,
@@ -26568,6 +26569,7 @@ mod tests {
             proposer,
             crate::cluster::topology::ClusterId::UNSET,
             1,
+            (members.clone()).len() as u64,
         );
 
         let req = RequestFrame {
@@ -26646,6 +26648,7 @@ mod tests {
             proposer,
             crate::cluster::topology::ClusterId::UNSET,
             1,
+            (members.clone()).len() as u64,
         );
 
         let req = RequestFrame {
@@ -26710,8 +26713,14 @@ mod tests {
 
         // Step 1: accept a proposal (sets voted_term).
         let proposer = crate::cluster::shards::NodeId(2);
-        let propose =
-            crate::cluster::topology::TopologyTerm::new(700, members.clone(), proposer, cid, 1);
+        let propose = crate::cluster::topology::TopologyTerm::new(
+            700,
+            members.clone(),
+            proposer,
+            cid,
+            1,
+            (members.clone()).len() as u64,
+        );
         let req = RequestFrame {
             request_id: 1,
             op_code: OP_TOPOLOGY_PROPOSE,
@@ -26737,7 +26746,14 @@ mod tests {
             members: members.clone(),
             cluster_id: cid,
             placement_version: 1,
-            digest: crate::cluster::topology::TopologyTerm::compute_digest(700, &cid, &members, 1),
+            committed_peak: (members.clone()).len() as u64,
+            digest: crate::cluster::topology::TopologyTerm::compute_digest(
+                700,
+                &cid,
+                &members,
+                1,
+                (members).len() as u64,
+            ),
             voters: members.clone(),
         };
         let req = RequestFrame {

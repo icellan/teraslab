@@ -2567,7 +2567,14 @@ fn tcp_strict_replication_failure_returns_replication_failed() {
         voters: members.clone(),
         cluster_id: ClusterId::UNSET,
         placement_version: 1,
-        digest: TopologyTerm::compute_digest(1, &ClusterId::UNSET, &members, 1),
+        committed_peak: (members.clone()).len() as u64,
+        digest: TopologyTerm::compute_digest(
+            1,
+            &ClusterId::UNSET,
+            &members,
+            1,
+            (members).len() as u64,
+        ),
     };
     let resp = send_request(
         &mut stream,

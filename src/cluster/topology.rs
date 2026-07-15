@@ -81,11 +81,25 @@ pub struct TopologyTerm {
     /// digest binding ALSO guarantees a v1 node and a v2 node can never both
     /// believe they committed the same term at different placement versions.
     pub placement_version: u16,
-    /// SHA-256 digest of (term || cluster_id || members || placement_version),
-    /// used for vote matching. Mixing `cluster_id` and `placement_version` in
-    /// means a tampered id or a divergent placement version changes the
-    /// digest, so the digest check itself rejects a forged matching-cluster
-    /// claim or a placement-version disagreement.
+    /// G8 stage 1 — durable split-brain floor anchor. Carries the effective
+    /// peak (`TopologyAuthority::peak_cluster_size()`) at proposal time for
+    /// every non-lowering producer (`on_membership_changed`, `retry_proposal`,
+    /// `check_timeout`, `upgrade_proposal`), so grows carry the new
+    /// `members.len()` and graceful-leave subsets carry the OLD higher peak
+    /// (non-lowering). Stage 1 has no lowering producer — a future
+    /// `propose_shrink` (stage 2) is the only path allowed to stamp a value
+    /// below the current peak, gated by a quorum-of-old-peak proof (Gate B)
+    /// re-verified by every applying node. Mixed into the digest (see
+    /// below) so a divergent committed_peak cannot be laundered past vote
+    /// matching.
+    pub committed_peak: u64,
+    /// SHA-256 digest of (term || cluster_id || members || placement_version
+    /// || committed_peak), used for vote matching. Mixing `cluster_id`,
+    /// `placement_version`, and `committed_peak` in means a tampered id, a
+    /// divergent placement version, or a divergent floor claim all change
+    /// the digest, so the digest check itself rejects a forged
+    /// matching-cluster claim, a placement-version disagreement, or a
+    /// mismatched committed_peak.
     pub digest: [u8; 32],
 }
 
@@ -97,30 +111,43 @@ impl TopologyTerm {
         proposer: NodeId,
         cluster_id: ClusterId,
         placement_version: u16,
+        committed_peak: u64,
     ) -> Self {
-        let digest = Self::compute_digest(term, &cluster_id, &members, placement_version);
+        let digest = Self::compute_digest(
+            term,
+            &cluster_id,
+            &members,
+            placement_version,
+            committed_peak,
+        );
         Self {
             term,
             members,
             proposer,
             cluster_id,
             placement_version,
+            committed_peak,
             digest,
         }
     }
 
     /// Compute the canonical digest for a (term, cluster_id, members,
-    /// placement_version) tuple. `cluster_id` is mixed in so a
-    /// forged-but-matching id changes the digest; `placement_version` is
+    /// placement_version, committed_peak) tuple. `cluster_id` is mixed in so
+    /// a forged-but-matching id changes the digest; `placement_version` is
     /// mixed in (INVARIANT i) so two terms that differ only in placement
     /// version produce DIFFERENT digests and cannot be conflated.
+    /// `committed_peak` (G8 stage 1) is mixed in last so a divergent
+    /// split-brain floor claim also changes the digest — an intentional
+    /// cross-version digest break requiring a coordinated upgrade, matching
+    /// the repo's deliberate-format-break posture.
     pub fn compute_digest(
         term: u64,
         cluster_id: &ClusterId,
         members: &[NodeId],
         placement_version: u16,
+        committed_peak: u64,
     ) -> [u8; 32] {
-        let mut buf = Vec::with_capacity(8 + 16 + 4 + members.len() * 8 + 2);
+        let mut buf = Vec::with_capacity(8 + 16 + 4 + members.len() * 8 + 2 + 8);
         buf.extend_from_slice(&term.to_le_bytes());
         buf.extend_from_slice(&cluster_id.0);
         buf.extend_from_slice(&(members.len() as u32).to_le_bytes());
@@ -128,19 +155,21 @@ impl TopologyTerm {
             buf.extend_from_slice(&m.0.to_le_bytes());
         }
         buf.extend_from_slice(&placement_version.to_le_bytes());
+        buf.extend_from_slice(&committed_peak.to_le_bytes());
         auth::sha256(&buf)
     }
 
     /// Serialize for the wire.
     ///
-    /// Format: `[term:8][proposer:8][cluster_id:16][member_count:4][member_id:8 * count][digest:32][placement_version:2]`
+    /// Format: `[term:8][proposer:8][cluster_id:16][member_count:4][member_id:8 * count][digest:32][placement_version:2][committed_peak:8]`
     ///
-    /// `placement_version` is appended LAST so a node running the
-    /// pre-W6 reader (which stops after the digest) ignores it, and the
-    /// W6 reader treats its absence as `placement_version = 1` for
+    /// `placement_version` and `committed_peak` (G8 stage 1) are appended
+    /// LAST so a node running the pre-W6 reader (which stops after the
+    /// digest) ignores them, and a W6-but-pre-G8 reader treats a standalone
+    /// term's absent `committed_peak` trailer as `members.len()` for
     /// rolling-upgrade back-compat (see `deserialize`).
     pub fn serialize(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(70 + self.members.len() * 8);
+        let mut buf = Vec::with_capacity(78 + self.members.len() * 8);
         buf.extend_from_slice(&self.term.to_le_bytes());
         buf.extend_from_slice(&self.proposer.0.to_le_bytes());
         buf.extend_from_slice(&self.cluster_id.0);
@@ -150,6 +179,7 @@ impl TopologyTerm {
         }
         buf.extend_from_slice(&self.digest);
         buf.extend_from_slice(&self.placement_version.to_le_bytes());
+        buf.extend_from_slice(&self.committed_peak.to_le_bytes());
         buf
     }
 
@@ -197,25 +227,39 @@ impl TopologyTerm {
         }
         let mut digest = [0u8; 32];
         digest.copy_from_slice(&data[members_end..members_end + 32]);
-        // W6 — `placement_version` is a 2-byte trailer appended ONLY by a
-        // standalone `TopologyTerm` payload (length == members_end + 34).
-        // A `TopologyCommit` payload reuses this parser but has its own
-        // voter list immediately after the digest, so we must NOT read the
-        // trailer there — `TopologyCommit::deserialize` reads its own
-        // placement_version from the tail. A pre-W6 standalone term has no
-        // trailer (length == members_end + 32) and decodes as v1.
+        // W6/G8 — `[placement_version:2][committed_peak:8]` are trailers
+        // appended ONLY by a standalone `TopologyTerm` payload (exact
+        // length match below). A `TopologyCommit` payload reuses this
+        // parser but has its own voter list immediately after the digest,
+        // so we must NOT read either trailer here —
+        // `TopologyCommit::deserialize` reads its own placement_version and
+        // committed_peak from its own tail. A pre-W6 standalone term has no
+        // trailer (length == members_end + 32) and decodes as v1 /
+        // committed_peak = members.len(); a W6-but-pre-G8 term has only the
+        // placement_version trailer and decodes committed_peak the same
+        // legacy way.
         let digest_end = members_end.checked_add(32)?;
-        let placement_version = if data.len() == digest_end.checked_add(2)? {
-            u16::from_le_bytes(data[digest_end..digest_end + 2].try_into().ok()?)
-        } else {
-            1
-        };
+        let mut placement_version = 1u16;
+        let mut committed_peak = members.len() as u64;
+        if data.len() == digest_end.checked_add(10)? {
+            // G8 — full trailer: [placement_version:2][committed_peak:8].
+            placement_version =
+                u16::from_le_bytes(data[digest_end..digest_end + 2].try_into().ok()?);
+            let peak_off = digest_end.checked_add(2)?;
+            committed_peak = u64::from_le_bytes(data[peak_off..peak_off + 8].try_into().ok()?);
+        } else if data.len() == digest_end.checked_add(2)? {
+            // W6-only trailer (pre-G8): placement_version present,
+            // committed_peak absent — legacy default applies.
+            placement_version =
+                u16::from_le_bytes(data[digest_end..digest_end + 2].try_into().ok()?);
+        }
         Some(Self {
             term,
             members,
             proposer,
             cluster_id,
             placement_version,
+            committed_peak,
             digest,
         })
     }
@@ -311,6 +355,10 @@ pub struct TopologyCommit {
     /// W6 — placement version this term committed at (copied from the
     /// `TopologyTerm` that reached quorum; mixed into the digest).
     pub placement_version: u16,
+    /// G8 stage 1 — durable split-brain floor anchor, copied from the
+    /// `TopologyTerm` that reached quorum (mixed into the digest). See
+    /// [`TopologyTerm::committed_peak`].
+    pub committed_peak: u64,
     pub digest: [u8; 32],
     /// Nodes whose accepted votes formed the quorum for this commit.
     pub voters: Vec<NodeId>,
@@ -334,12 +382,15 @@ impl TopologyCommit {
 
     /// Serialize for the wire.
     ///
-    /// Format: `[term:8][proposer:8][cluster_id:16][member_count:4][member_id:8 * count][digest:32][voter_count:4][voter_id:8 * count][placement_version:2]`
+    /// Format: `[term:8][proposer:8][cluster_id:16][member_count:4][member_id:8 * count][digest:32][voter_count:4][voter_id:8 * count][placement_version:2][committed_peak:8]`
     ///
-    /// `placement_version` is appended LAST (after the voter list) so a
-    /// pre-W6 reader ignores it and a W6 reader treats its absence as `1`.
+    /// `placement_version` and `committed_peak` (G8 stage 1) are appended
+    /// LAST (after the voter list) so a pre-W6 reader ignores both, a W6
+    /// reader treats their absence as `1`/`members.len()`, and a
+    /// W6-but-pre-G8 reader treats the absent `committed_peak` trailer as
+    /// `members.len()`.
     pub fn serialize(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(74 + (self.members.len() + self.voters.len()) * 8);
+        let mut buf = Vec::with_capacity(82 + (self.members.len() + self.voters.len()) * 8);
         buf.extend_from_slice(&self.term.to_le_bytes());
         buf.extend_from_slice(&self.proposer.0.to_le_bytes());
         buf.extend_from_slice(&self.cluster_id.0);
@@ -353,6 +404,7 @@ impl TopologyCommit {
             buf.extend_from_slice(&voter.0.to_le_bytes());
         }
         buf.extend_from_slice(&self.placement_version.to_le_bytes());
+        buf.extend_from_slice(&self.committed_peak.to_le_bytes());
         buf
     }
 
@@ -400,10 +452,26 @@ impl TopologyCommit {
         };
         // W6 — optional 2-byte `placement_version` trailer after the voter
         // list. Absent on pre-W6 commits (decode as v1).
-        let placement_version = if data.len() >= voters_tail.checked_add(2)? {
-            u16::from_le_bytes(data[voters_tail..voters_tail + 2].try_into().ok()?)
+        let (placement_version, after_placement_version) =
+            if data.len() >= voters_tail.checked_add(2)? {
+                (
+                    u16::from_le_bytes(data[voters_tail..voters_tail + 2].try_into().ok()?),
+                    voters_tail.checked_add(2)?,
+                )
+            } else {
+                (1, voters_tail)
+            };
+        // G8 stage 1 — optional 8-byte `committed_peak` trailer after
+        // placement_version. Absent on pre-G8 commits (legacy default:
+        // members.len(), reproducing today's floor exactly).
+        let committed_peak = if data.len() >= after_placement_version.checked_add(8)? {
+            u64::from_le_bytes(
+                data[after_placement_version..after_placement_version + 8]
+                    .try_into()
+                    .ok()?,
+            )
         } else {
-            1
+            term.members.len() as u64
         };
         Some(Self {
             term: term.term,
@@ -411,6 +479,7 @@ impl TopologyCommit {
             members: term.members,
             cluster_id: term.cluster_id,
             placement_version,
+            committed_peak,
             digest: term.digest,
             voters,
         })
@@ -448,6 +517,14 @@ pub struct PersistedTopologyState {
     /// (HRW) shard table on recovery instead of falling back to round-robin.
     /// A pre-W6 payload without this trailer decodes as `1`.
     pub committed_placement_version: u16,
+    /// G8 stage 1 — durable split-brain floor anchor (see
+    /// [`TopologyTerm::committed_peak`]). Persisted so a restarting node
+    /// recovers the same floor it committed rather than re-deriving it from
+    /// the (separately-clamped) `peak_cluster_size` field alone. A pre-G8
+    /// payload without this trailer decodes to
+    /// `peak_cluster_size.max(committed_members.len())`, reproducing
+    /// today's restored floor exactly (see `deserialize`).
+    pub committed_peak: u64,
 }
 
 /// G9 — result of [`TopologyAuthority::handle_commit_durable`].
@@ -503,6 +580,10 @@ impl PersistedTopologyState {
         // W6 — placement_version trailer (after ever_seen). Older payloads
         // decode without it and default to v1.
         buf.extend_from_slice(&self.committed_placement_version.to_le_bytes());
+        // G8 stage 1 — committed_peak trailer (after placement_version).
+        // Older payloads decode without it and default to
+        // peak_cluster_size.max(committed_members.len()).
+        buf.extend_from_slice(&self.committed_peak.to_le_bytes());
         buf
     }
 
@@ -581,14 +662,31 @@ impl PersistedTopologyState {
             }
             // W6 — optional [placement_version:2] trailer after ever_seen.
             // Pre-W6 payloads default to v1.
-            let committed_placement_version = if ever_seen_end + 2 <= data.len() {
-                u16::from_le_bytes(
-                    data[ever_seen_end..ever_seen_end + 2]
+            let (committed_placement_version, after_placement_version) =
+                if ever_seen_end + 2 <= data.len() {
+                    (
+                        u16::from_le_bytes(
+                            data[ever_seen_end..ever_seen_end + 2]
+                                .try_into()
+                                .unwrap_or([1, 0]),
+                        ),
+                        ever_seen_end + 2,
+                    )
+                } else {
+                    (1, ever_seen_end)
+                };
+            // G8 stage 1 — optional [committed_peak:8] trailer after
+            // placement_version. A pre-G8 payload decodes to
+            // peak_cluster_size.max(committed_members.len()), reproducing
+            // today's restored floor exactly.
+            let committed_peak = if after_placement_version + 8 <= data.len() {
+                u64::from_le_bytes(
+                    data[after_placement_version..after_placement_version + 8]
                         .try_into()
-                        .unwrap_or([1, 0]),
+                        .unwrap_or([0; 8]),
                 )
             } else {
-                1
+                peak.max(members.len() as u64)
             };
             Self {
                 peak_cluster_size: peak.max(1),
@@ -599,6 +697,7 @@ impl PersistedTopologyState {
                 incarnation,
                 committed_voter_ever_seen: ever_seen,
                 committed_placement_version,
+                committed_peak,
             }
         } else if data.len() >= 16 {
             // Old format: [peak:8][epoch:8]
@@ -613,6 +712,7 @@ impl PersistedTopologyState {
                 incarnation: 0,
                 committed_voter_ever_seen: Vec::new(),
                 committed_placement_version: 1,
+                committed_peak: peak.max(1),
             }
         } else if data.len() >= 8 {
             // Oldest format: [peak:8] only
@@ -626,6 +726,7 @@ impl PersistedTopologyState {
                 incarnation: 0,
                 committed_voter_ever_seen: Vec::new(),
                 committed_placement_version: 1,
+                committed_peak: peak.max(1),
             }
         } else {
             Self {
@@ -637,6 +738,7 @@ impl PersistedTopologyState {
                 incarnation: 0,
                 committed_voter_ever_seen: Vec::new(),
                 committed_placement_version: 1,
+                committed_peak: 1,
             }
         }
     }
@@ -775,6 +877,16 @@ pub struct TopologyAuthority {
     /// remnant therefore needs 2 votes and can never self-commit a
     /// single-node topology.
     peak_cluster_size: AtomicU64,
+    /// G8 stage 1 — durable split-brain floor anchor (the "committed_peak"
+    /// of the design doc), distinct from `peak_cluster_size` above (the
+    /// SWIM/proposal-fed "observed_peak"). Set from the applied commit's
+    /// `committed_peak` in `apply_commit_locked` and restored in `restore`.
+    /// Stage 1 has no lowering producer, so this always tracks the same
+    /// value `peak_cluster_size` would already report; stage 2 makes a
+    /// quorum-gated `propose_shrink` the sole path that may lower it. The
+    /// effective floor is `peak_cluster_size()` (the getter below):
+    /// `max(committed_peak, peak_cluster_size).max(1)`.
+    committed_peak: AtomicU64,
     /// W6 — placement version of the last committed term (stored as `u64`
     /// for atomic access; logically a `u16`). `1` until the cluster
     /// unanimously upgrades to HRW.
@@ -832,6 +944,7 @@ impl TopologyAuthority {
             observed_membership: Mutex::new(Vec::new()),
             last_commit_at_unix_ms: AtomicU64::new(0),
             peak_cluster_size: AtomicU64::new(1),
+            committed_peak: AtomicU64::new(0),
             committed_placement_version: AtomicU64::new(1),
             unapplicable_committed_term: AtomicU64::new(0),
             peer_placement_support: RwLock::new({
@@ -854,12 +967,32 @@ impl TopologyAuthority {
             .fetch_max(observed, Ordering::Relaxed);
     }
 
-    /// E-01 — highest cluster size ever observed by this authority
-    /// (minimum 1). The activation quorum for new topology terms is
-    /// derived from this value, not from the live (possibly
-    /// SWIM-shrunken) member set alone.
+    /// G8 stage 1 — the split-brain floor: `max(committed_peak,
+    /// observed_peak)` (minimum 1). `observed_peak` is the pre-existing
+    /// monotonic SWIM/proposal-fed peak (the `peak_cluster_size` atomic);
+    /// `committed_peak` is the durable, quorum-committed floor anchor. The
+    /// activation quorum for new topology terms is derived from this
+    /// value, not from the live (possibly SWIM-shrunken) member set alone.
+    /// Stage 1 has no lowering producer, so `committed_peak` never exceeds
+    /// `observed_peak` in practice and this returns exactly what
+    /// `observed_peak` alone would have returned before this field
+    /// existed — the getter change is behavior-preserving until stage 2's
+    /// `propose_shrink` lands.
     pub fn peak_cluster_size(&self) -> u64 {
-        self.peak_cluster_size.load(Ordering::Relaxed).max(1)
+        self.committed_peak
+            .load(Ordering::Relaxed)
+            .max(self.peak_cluster_size.load(Ordering::Relaxed))
+            .max(1)
+    }
+
+    /// G8 stage 1 — the raw durable `committed_peak` anchor (NOT maxed with
+    /// `observed_peak`). Distinct from [`Self::peak_cluster_size`], which is
+    /// the effective floor. Used by stage 2's shrink gate (Gate B compares
+    /// a candidate commit's claimed floor against this node's OWN durable
+    /// `committed_peak`, not the observed one, since only committed_peak is
+    /// quorum-anchored).
+    pub fn committed_peak(&self) -> u64 {
+        self.committed_peak.load(Ordering::Relaxed)
     }
 
     /// E-01 — votes needed to activate a proposal with `proposal_len`
@@ -1010,19 +1143,26 @@ impl TopologyAuthority {
 
     /// Restore from persisted state on startup.
     pub fn restore(&self, state: &PersistedTopologyState) {
-        // E-01: reinstate the persisted peak so a node that reboots into
-        // a partition cannot self-activate a shrunken topology.
+        // G8 stage 1 — restore the durable committed_peak floor, then seed
+        // the observed peak from it (NOT from `state.peak_cluster_size`
+        // separately — see below).
         //
         // AUDIT M1.3 — floor the restored peak at the persisted committed
         // member count. A file written before the persist-side clamp, or by a
         // failed/partial earlier persist, could carry a peak below the committed
         // membership; loading it verbatim would weaken quorum on restart. This
         // is raise-only and self-heals such a stale on-disk peak at load time.
-        self.observe_peak_cluster_size(
-            state
-                .peak_cluster_size
-                .max(state.committed_members.len() as u64),
-        );
+        //
+        // For a pre-G8 file, `PersistedTopologyState::deserialize` already
+        // decodes `committed_peak` as `peak_cluster_size.max(committed_members.len())`
+        // — exactly what this method used to seed `observe_peak_cluster_size`
+        // with directly — so seeding both atomics from `committed_peak` alone
+        // reproduces today's restored floor exactly (behavior-preserving).
+        let committed_peak = state
+            .committed_peak
+            .max(state.committed_members.len() as u64);
+        self.committed_peak.store(committed_peak, Ordering::Relaxed);
+        self.observe_peak_cluster_size(committed_peak);
         self.committed_term
             .store(state.committed_term, Ordering::Relaxed);
         self.voted_term.store(state.voted_term, Ordering::Relaxed);
@@ -1166,6 +1306,7 @@ impl TopologyAuthority {
             incarnation,
             committed_voter_ever_seen: self.committed_voter_ever_seen_snapshot(),
             committed_placement_version: self.committed_placement_version(),
+            committed_peak: self.committed_peak(),
         }
     }
 
@@ -1262,19 +1403,25 @@ impl TopologyAuthority {
         // (via `upgrade_proposal`) once every member's v2 support is learned
         // from its votes.
         let placement_version = self.achievable_placement_version(members);
+
+        // E-01: raise the peak from the proposed set BEFORE deriving the
+        // quorum, so growth (1 → N) is gated on the majority of the new,
+        // larger cluster, and a later shrink is gated on the majority of
+        // the peak — never on the shrunken set alone.
+        //
+        // G8 stage 1: this must also happen BEFORE stamping the term's
+        // committed_peak below, so a grow's stamped floor reflects the
+        // newly-raised peak (`members.len()`), not the pre-grow one.
+        self.observe_peak_cluster_size(members.len() as u64);
+        let committed_peak = self.peak_cluster_size();
         let term = TopologyTerm::new(
             new_term,
             members.to_vec(),
             self.self_id,
             self.cluster_id(),
             placement_version,
+            committed_peak,
         );
-
-        // E-01: raise the peak from the proposed set BEFORE deriving the
-        // quorum, so growth (1 → N) is gated on the majority of the new,
-        // larger cluster, and a later shrink is gated on the majority of
-        // the peak — never on the shrunken set alone.
-        self.observe_peak_cluster_size(members.len() as u64);
         let quorum_needed = self.activation_quorum_needed(members.len());
         let mut votes = std::collections::HashMap::new();
         votes.insert(self.self_id, true);
@@ -1302,6 +1449,7 @@ impl TopologyAuthority {
                 &propose.cluster_id,
                 &propose.members,
                 propose.placement_version,
+                propose.committed_peak,
             );
 
         // W6 (INVARIANT ii) — REFUSE, do not fall back. A voter that cannot
@@ -1441,6 +1589,7 @@ impl TopologyAuthority {
                 members: proposal.term.members.clone(),
                 cluster_id: proposal.term.cluster_id,
                 placement_version: proposal.term.placement_version,
+                committed_peak: proposal.term.committed_peak,
                 digest: proposal.term.digest,
                 voters,
             };
@@ -1496,15 +1645,27 @@ impl TopologyAuthority {
         }
 
         // Validate digest. The digest is computed over
-        // (term || cluster_id || members || placement_version) so a forged
-        // cluster_id or a divergent placement version still mismatches.
+        // (term || cluster_id || members || placement_version ||
+        // committed_peak) so a forged cluster_id, a divergent placement
+        // version, or a divergent committed_peak claim still mismatches.
         let expected_digest = TopologyTerm::compute_digest(
             commit.term,
             &commit.cluster_id,
             &commit.members,
             commit.placement_version,
+            commit.committed_peak,
         );
         if commit.digest != expected_digest {
+            return false;
+        }
+
+        // G8 stage 1 — gate invariant: a floor below the live member count
+        // is nonsensical (it would claim the cluster's historical peak was
+        // smaller than the membership this very commit is installing).
+        // Stage 1 has no lowering producer so every legitimate commit has
+        // committed_peak >= members.len() by construction; this rejects a
+        // malformed or forged commit that violates it.
+        if commit.committed_peak < commit.members.len() as u64 {
             return false;
         }
 
@@ -1614,6 +1775,12 @@ impl TopologyAuthority {
         // cluster reached size N — raise the peak so any later
         // SWIM-observed shrink is gated on the majority of this size.
         self.observe_peak_cluster_size(commit.members.len() as u64);
+        // G8 stage 1 — adopt the committed_peak carried by this commit.
+        // Stage 1 has no lowering producer, so this is always non-lowering
+        // in practice; stage 2's Gate B is what will make this the sole
+        // authorized path to LOWER the durable floor.
+        self.committed_peak
+            .store(commit.committed_peak, Ordering::Relaxed);
         // W6 — adopt the committed placement version. The coordinator reads
         // this when it (re)installs the shard table for `commit.term`, so the
         // first v2 commit triggers the planned full reshuffle via the normal
@@ -1683,6 +1850,10 @@ impl TopologyAuthority {
             incarnation,
             committed_voter_ever_seen: ever_seen.into_iter().collect(),
             committed_placement_version: commit.placement_version.max(1),
+            // G8 stage 1 — set VERBATIM from the commit (the design's one
+            // path allowed to lower once stage 2's Gate B exists; stage 1
+            // has no lowering producer so this is always non-lowering).
+            committed_peak: commit.committed_peak,
         }
     }
 
@@ -1824,17 +1995,21 @@ impl TopologyAuthority {
         // W6 — stamp the achievable placement version (unanimity, see
         // on_membership_changed).
         let placement_version = self.achievable_placement_version(&target_members);
+
+        // E-01: peak-derived activation quorum (see on_membership_changed).
+        // G8 stage 1: raise the peak BEFORE stamping committed_peak below.
+        self.observe_peak_cluster_size(target_members.len() as u64);
+        let committed_peak = self.peak_cluster_size();
         let term = TopologyTerm::new(
             new_term,
             target_members.clone(),
             self.self_id,
             self.cluster_id(),
             placement_version,
+            committed_peak,
         );
         self.voted_term.store(new_term, Ordering::Relaxed);
 
-        // E-01: peak-derived activation quorum (see on_membership_changed).
-        self.observe_peak_cluster_size(target_members.len() as u64);
         let quorum_needed = self.activation_quorum_needed(target_members.len());
         let mut votes = std::collections::HashMap::new();
         votes.insert(self.self_id, true);
@@ -1900,16 +2075,21 @@ impl TopologyAuthority {
         let voted = self.voted_term.load(Ordering::Relaxed);
         let new_term = committed_term.max(voted) + 1;
 
+        // G8 stage 1: raise the peak BEFORE stamping committed_peak below.
+        // (Already >= peak_cluster_size() per the guard above, so this is a
+        // no-op in practice — kept for symmetry with the other producers.)
+        self.observe_peak_cluster_size(committed_members.len() as u64);
+        let committed_peak = self.peak_cluster_size();
         let term = TopologyTerm::new(
             new_term,
             committed_members.clone(),
             self.self_id,
             self.cluster_id(),
             achievable,
+            committed_peak,
         );
         self.voted_term.store(new_term, Ordering::Relaxed);
 
-        self.observe_peak_cluster_size(committed_members.len() as u64);
         let quorum_needed = self.activation_quorum_needed(committed_members.len());
         let mut votes = std::collections::HashMap::new();
         votes.insert(self.self_id, true);
@@ -2005,17 +2185,21 @@ impl TopologyAuthority {
 
         // W6 — stamp the achievable placement version (unanimity).
         let placement_version = self.achievable_placement_version(&target_members);
+
+        // E-01: peak-derived activation quorum (see on_membership_changed).
+        // G8 stage 1: raise the peak BEFORE stamping committed_peak below.
+        self.observe_peak_cluster_size(target_members.len() as u64);
+        let committed_peak = self.peak_cluster_size();
         let term = TopologyTerm::new(
             new_term,
             target_members.clone(),
             self.self_id,
             self.cluster_id(),
             placement_version,
+            committed_peak,
         );
         self.voted_term.store(new_term, Ordering::Relaxed);
 
-        // E-01: peak-derived activation quorum (see on_membership_changed).
-        self.observe_peak_cluster_size(target_members.len() as u64);
         let quorum_needed = self.activation_quorum_needed(target_members.len());
         let mut votes = std::collections::HashMap::new();
         votes.insert(self.self_id, true);
@@ -2206,7 +2390,14 @@ mod tests {
     #[test]
     fn vote_accept_valid_proposal() {
         let auth = TopologyAuthority::new(NodeId(2), Duration::from_secs(1));
-        let propose = TopologyTerm::new(1, members(&[1, 2, 3]), NodeId(1), ClusterId::UNSET, 1);
+        let propose = TopologyTerm::new(
+            1,
+            members(&[1, 2, 3]),
+            NodeId(1),
+            ClusterId::UNSET,
+            1,
+            (members(&[1, 2, 3])).len() as u64,
+        );
         let vote = auth.handle_propose(&propose);
         assert!(vote.accepted);
         assert_eq!(vote.term, 1);
@@ -2219,7 +2410,14 @@ mod tests {
         // Simulate already having voted for term 5
         auth.voted_term.store(5, Ordering::Relaxed);
 
-        let propose = TopologyTerm::new(3, members(&[1, 2, 3]), NodeId(1), ClusterId::UNSET, 1);
+        let propose = TopologyTerm::new(
+            3,
+            members(&[1, 2, 3]),
+            NodeId(1),
+            ClusterId::UNSET,
+            1,
+            (members(&[1, 2, 3])).len() as u64,
+        );
         let vote = auth.handle_propose(&propose);
         assert!(!vote.accepted);
     }
@@ -2227,7 +2425,14 @@ mod tests {
     #[test]
     fn vote_reject_bad_digest() {
         let auth = TopologyAuthority::new(NodeId(2), Duration::from_secs(1));
-        let mut propose = TopologyTerm::new(1, members(&[1, 2, 3]), NodeId(1), ClusterId::UNSET, 1);
+        let mut propose = TopologyTerm::new(
+            1,
+            members(&[1, 2, 3]),
+            NodeId(1),
+            ClusterId::UNSET,
+            1,
+            (members(&[1, 2, 3])).len() as u64,
+        );
         propose.digest = [0xFF; 32]; // corrupt
         let vote = auth.handle_propose(&propose);
         assert!(!vote.accepted);
@@ -2269,6 +2474,7 @@ mod tests {
                 &ClusterId::UNSET,
                 &members(&[1, 2, 3, 4, 5]),
                 1,
+                (members(&[1, 2, 3, 4, 5])).len() as u64,
             ),
             voter: NodeId(2),
             accepted: true,
@@ -2285,6 +2491,7 @@ mod tests {
                 &ClusterId::UNSET,
                 &members(&[1, 2, 3, 4, 5]),
                 1,
+                (members(&[1, 2, 3, 4, 5])).len() as u64,
             ),
             voter: NodeId(3),
             accepted: true,
@@ -2305,7 +2512,14 @@ mod tests {
             members: mems.clone(),
             cluster_id: ClusterId::UNSET,
             placement_version: 1,
-            digest: TopologyTerm::compute_digest(5, &ClusterId::UNSET, &mems, 1),
+            committed_peak: (mems.clone()).len() as u64,
+            digest: TopologyTerm::compute_digest(
+                5,
+                &ClusterId::UNSET,
+                &mems,
+                1,
+                (mems).len() as u64,
+            ),
             voters: mems.clone(),
         };
         let result = auth.handle_commit(&commit);
@@ -2341,7 +2555,14 @@ mod tests {
             members: mems.clone(),
             cluster_id: ClusterId::UNSET,
             placement_version: 1,
-            digest: TopologyTerm::compute_digest(7, &ClusterId::UNSET, &mems, 1),
+            committed_peak: (mems.clone()).len() as u64,
+            digest: TopologyTerm::compute_digest(
+                7,
+                &ClusterId::UNSET,
+                &mems,
+                1,
+                (mems).len() as u64,
+            ),
             voters: mems.clone(),
         };
         assert_eq!(auth.handle_commit(&commit), Some(7));
@@ -2368,7 +2589,14 @@ mod tests {
             members: mems.clone(),
             cluster_id: ClusterId::UNSET,
             placement_version: 1,
-            digest: TopologyTerm::compute_digest(5, &ClusterId::UNSET, &mems, 1),
+            committed_peak: (mems.clone()).len() as u64,
+            digest: TopologyTerm::compute_digest(
+                5,
+                &ClusterId::UNSET,
+                &mems,
+                1,
+                (mems).len() as u64,
+            ),
             voters: mems.clone(),
         };
         assert!(auth.handle_commit(&commit).is_none());
@@ -2387,7 +2615,14 @@ mod tests {
             members: mems.clone(),
             cluster_id: ClusterId::UNSET,
             placement_version: 1,
-            digest: TopologyTerm::compute_digest(5, &ClusterId::UNSET, &mems, 1),
+            committed_peak: (mems.clone()).len() as u64,
+            digest: TopologyTerm::compute_digest(
+                5,
+                &ClusterId::UNSET,
+                &mems,
+                1,
+                (mems).len() as u64,
+            ),
             voters: mems.clone(),
         };
 
@@ -2416,6 +2651,7 @@ mod tests {
             members: mems.clone(),
             cluster_id: ClusterId::UNSET,
             placement_version: 1,
+            committed_peak: (mems.clone()).len() as u64,
             digest: [0xFF; 32], // corrupt
             voters: mems.clone(),
         };
@@ -2433,6 +2669,7 @@ mod tests {
             incarnation: 99,
             committed_voter_ever_seen: members(&[1, 2, 3, 7]),
             committed_placement_version: 1,
+            committed_peak: 5,
         };
         let data = state.serialize();
         let restored = PersistedTopologyState::deserialize(&data);
@@ -2443,6 +2680,7 @@ mod tests {
         assert_eq!(restored.committed_members[0], NodeId(1));
         assert_eq!(restored.committed_voters, members(&[1, 2, 3]));
         assert_eq!(restored.incarnation, 99);
+        assert_eq!(restored.committed_peak, 5);
     }
 
     #[test]
@@ -2461,7 +2699,14 @@ mod tests {
 
     #[test]
     fn wire_format_round_trip() {
-        let term = TopologyTerm::new(42, members(&[1, 2, 3]), NodeId(1), ClusterId::UNSET, 1);
+        let term = TopologyTerm::new(
+            42,
+            members(&[1, 2, 3]),
+            NodeId(1),
+            ClusterId::UNSET,
+            1,
+            (members(&[1, 2, 3])).len() as u64,
+        );
         let data = term.serialize();
         let restored = TopologyTerm::deserialize(&data).unwrap();
         assert_eq!(restored.term, 42);
@@ -2490,6 +2735,7 @@ mod tests {
             members: term.members.clone(),
             cluster_id: ClusterId::UNSET,
             placement_version: 1,
+            committed_peak: (term.members.clone()).len() as u64,
             digest: term.digest,
             voters: members(&[1, 2]),
         };
@@ -2530,12 +2776,26 @@ mod tests {
     fn cannot_vote_twice_for_same_term() {
         let auth = TopologyAuthority::new(NodeId(2), Duration::from_secs(1));
 
-        let p1 = TopologyTerm::new(1, members(&[1, 2, 3]), NodeId(1), ClusterId::UNSET, 1);
+        let p1 = TopologyTerm::new(
+            1,
+            members(&[1, 2, 3]),
+            NodeId(1),
+            ClusterId::UNSET,
+            1,
+            (members(&[1, 2, 3])).len() as u64,
+        );
         let v1 = auth.handle_propose(&p1);
         assert!(v1.accepted);
 
         // Second proposal at same term from a different proposer
-        let p2 = TopologyTerm::new(1, members(&[1, 2, 3]), NodeId(3), ClusterId::UNSET, 1);
+        let p2 = TopologyTerm::new(
+            1,
+            members(&[1, 2, 3]),
+            NodeId(3),
+            ClusterId::UNSET,
+            1,
+            (members(&[1, 2, 3])).len() as u64,
+        );
         let v2 = auth.handle_propose(&p2);
         assert!(!v2.accepted); // Already voted for term 1
     }
@@ -2554,6 +2814,7 @@ mod tests {
             members: members(&[1, 2, 3]),
             cluster_id: ClusterId::UNSET,
             placement_version: 1,
+            committed_peak: (members(&[1, 2, 3])).len() as u64,
             digest: t1.digest,
             voters: members(&[1, 2, 3]),
         });
@@ -2580,7 +2841,14 @@ mod tests {
             members: remote_members.clone(),
             cluster_id: ClusterId::UNSET,
             placement_version: 1,
-            digest: TopologyTerm::compute_digest(5, &ClusterId::UNSET, &remote_members, 1),
+            committed_peak: (remote_members.clone()).len() as u64,
+            digest: TopologyTerm::compute_digest(
+                5,
+                &ClusterId::UNSET,
+                &remote_members,
+                1,
+                (remote_members).len() as u64,
+            ),
             voters: remote_members.clone(),
         };
         let result = auth.handle_commit(&commit);
@@ -2602,7 +2870,14 @@ mod tests {
             members: remote_members.clone(),
             cluster_id: ClusterId::UNSET,
             placement_version: 1,
-            digest: TopologyTerm::compute_digest(5, &ClusterId::UNSET, &remote_members, 1),
+            committed_peak: (remote_members.clone()).len() as u64,
+            digest: TopologyTerm::compute_digest(
+                5,
+                &ClusterId::UNSET,
+                &remote_members,
+                1,
+                (remote_members).len() as u64,
+            ),
             voters: remote_members.clone(),
         };
         let result = auth.handle_commit(&commit);
@@ -2620,6 +2895,7 @@ mod tests {
             members: members(&[1, 2, 3]),
             cluster_id: ClusterId::UNSET,
             placement_version: 1,
+            committed_peak: (members(&[1, 2, 3])).len() as u64,
             digest: [0xFF; 32], // corrupt
             voters: members(&[1, 2, 3]),
         };
@@ -2641,7 +2917,14 @@ mod tests {
             members: mems.clone(),
             cluster_id: ClusterId::UNSET,
             placement_version: 1,
-            digest: TopologyTerm::compute_digest(5, &ClusterId::UNSET, &mems, 1),
+            committed_peak: (mems.clone()).len() as u64,
+            digest: TopologyTerm::compute_digest(
+                5,
+                &ClusterId::UNSET,
+                &mems,
+                1,
+                (mems).len() as u64,
+            ),
             voters: mems.clone(),
         };
         auth.handle_commit(&commit);
@@ -2663,12 +2946,23 @@ mod tests {
 
         // The original term 5 was committed with members [1, 3].
         let original_members = members(&[1, 3]);
-        let original_digest =
-            TopologyTerm::compute_digest(5, &ClusterId::UNSET, &original_members, 1);
+        let original_digest = TopologyTerm::compute_digest(
+            5,
+            &ClusterId::UNSET,
+            &original_members,
+            1,
+            (original_members).len() as u64,
+        );
 
         // Synthetic commit with wrong members [1, 2, 3] (SWIM-alive view).
         let wrong_members = members(&[1, 2, 3]);
-        let wrong_digest = TopologyTerm::compute_digest(5, &ClusterId::UNSET, &wrong_members, 1);
+        let wrong_digest = TopologyTerm::compute_digest(
+            5,
+            &ClusterId::UNSET,
+            &wrong_members,
+            1,
+            (wrong_members).len() as u64,
+        );
 
         // The digests MUST differ.
         assert_ne!(
@@ -2683,6 +2977,7 @@ mod tests {
             members: wrong_members.clone(),
             cluster_id: ClusterId::UNSET,
             placement_version: 1,
+            committed_peak: (wrong_members.clone()).len() as u64,
             digest: wrong_digest,
             voters: wrong_members,
         };
@@ -2706,6 +3001,7 @@ mod tests {
             members: original_members.clone(),
             cluster_id: ClusterId::UNSET,
             placement_version: 1,
+            committed_peak: (original_members.clone()).len() as u64,
             digest: original_digest,
             voters: original_members.clone(),
         };
@@ -2763,7 +3059,14 @@ mod tests {
             members: members(&[1, 2, 3, 4]),
             cluster_id: ClusterId::UNSET,
             placement_version: 1,
-            digest: TopologyTerm::compute_digest(5, &ClusterId::UNSET, &members(&[1, 2, 3, 4]), 1),
+            committed_peak: (members(&[1, 2, 3, 4])).len() as u64,
+            digest: TopologyTerm::compute_digest(
+                5,
+                &ClusterId::UNSET,
+                &members(&[1, 2, 3, 4]),
+                1,
+                (members(&[1, 2, 3, 4])).len() as u64,
+            ),
             voters: members(&[1, 2, 3, 4]),
         };
         auth.handle_commit(&commit);
@@ -2865,7 +3168,14 @@ mod tests {
             members: mems.clone(),
             cluster_id: ClusterId::UNSET,
             placement_version: 1,
-            digest: TopologyTerm::compute_digest(5, &ClusterId::UNSET, &mems, 1),
+            committed_peak: (mems.clone()).len() as u64,
+            digest: TopologyTerm::compute_digest(
+                5,
+                &ClusterId::UNSET,
+                &mems,
+                1,
+                (mems).len() as u64,
+            ),
             voters: mems.clone(),
         };
         auth.handle_commit(&commit);
@@ -2892,7 +3202,14 @@ mod tests {
             members: original.clone(),
             cluster_id: ClusterId::UNSET,
             placement_version: 1,
-            digest: TopologyTerm::compute_digest(4, &ClusterId::UNSET, &original, 1),
+            committed_peak: (original.clone()).len() as u64,
+            digest: TopologyTerm::compute_digest(
+                4,
+                &ClusterId::UNSET,
+                &original,
+                1,
+                (original).len() as u64,
+            ),
             voters: original.clone(),
         });
         auth.handle_commit(&TopologyCommit {
@@ -2901,7 +3218,14 @@ mod tests {
             members: drained.clone(),
             cluster_id: ClusterId::UNSET,
             placement_version: 1,
-            digest: TopologyTerm::compute_digest(5, &ClusterId::UNSET, &drained, 1),
+            committed_peak: (drained.clone()).len() as u64,
+            digest: TopologyTerm::compute_digest(
+                5,
+                &ClusterId::UNSET,
+                &drained,
+                1,
+                (drained).len() as u64,
+            ),
             voters: drained.clone(),
         });
 
@@ -2935,7 +3259,14 @@ mod tests {
             // from the original compute_digest(5, [1,3]).
             cluster_id: ClusterId::UNSET,
             placement_version: 1,
-            digest: TopologyTerm::compute_digest(5, &ClusterId::UNSET, &members(&[1, 2, 3]), 1),
+            committed_peak: (members(&[1, 2, 3])).len() as u64,
+            digest: TopologyTerm::compute_digest(
+                5,
+                &ClusterId::UNSET,
+                &members(&[1, 2, 3]),
+                1,
+                (members(&[1, 2, 3])).len() as u64,
+            ),
             voters: members(&[1, 2, 3]),
         };
 
@@ -2952,7 +3283,14 @@ mod tests {
             members: original_members.clone(),
             cluster_id: ClusterId::UNSET,
             placement_version: 1,
-            digest: TopologyTerm::compute_digest(5, &ClusterId::UNSET, &original_members, 1),
+            committed_peak: (original_members.clone()).len() as u64,
+            digest: TopologyTerm::compute_digest(
+                5,
+                &ClusterId::UNSET,
+                &original_members,
+                1,
+                (original_members).len() as u64,
+            ),
             voters: original_members.clone(),
         };
         let result = auth.handle_commit(&good_commit);
@@ -2972,7 +3310,14 @@ mod tests {
         let auth = TopologyAuthority::new(NodeId(2), Duration::from_secs(1));
 
         // Vote for term 3
-        let p = TopologyTerm::new(3, members(&[1, 2, 3]), NodeId(1), ClusterId::UNSET, 1);
+        let p = TopologyTerm::new(
+            3,
+            members(&[1, 2, 3]),
+            NodeId(1),
+            ClusterId::UNSET,
+            1,
+            (members(&[1, 2, 3])).len() as u64,
+        );
         let v = auth.handle_propose(&p);
         assert!(v.accepted);
         assert_eq!(auth.voted_term.load(Ordering::Relaxed), 3);
@@ -2985,7 +3330,14 @@ mod tests {
             members: mems.clone(),
             cluster_id: ClusterId::UNSET,
             placement_version: 1,
-            digest: TopologyTerm::compute_digest(10, &ClusterId::UNSET, &mems, 1),
+            committed_peak: (mems.clone()).len() as u64,
+            digest: TopologyTerm::compute_digest(
+                10,
+                &ClusterId::UNSET,
+                &mems,
+                1,
+                (mems).len() as u64,
+            ),
             voters: mems.clone(),
         };
         auth.handle_commit(&commit);
@@ -2994,7 +3346,14 @@ mod tests {
         assert_eq!(auth.voted_term.load(Ordering::Relaxed), 3);
 
         // Proposal for term 8: > voted(3) but NOT > committed(10) → reject
-        let p2 = TopologyTerm::new(8, members(&[1, 2, 3]), NodeId(1), ClusterId::UNSET, 1);
+        let p2 = TopologyTerm::new(
+            8,
+            members(&[1, 2, 3]),
+            NodeId(1),
+            ClusterId::UNSET,
+            1,
+            (members(&[1, 2, 3])).len() as u64,
+        );
         let v2 = auth.handle_propose(&p2);
         assert!(!v2.accepted, "term 8 < committed_term 10 → must reject");
     }
@@ -3035,7 +3394,14 @@ mod tests {
             members: mems.clone(),
             cluster_id: ClusterId::UNSET,
             placement_version: 1,
-            digest: TopologyTerm::compute_digest(1, &ClusterId::UNSET, &mems, 1),
+            committed_peak: (mems.clone()).len() as u64,
+            digest: TopologyTerm::compute_digest(
+                1,
+                &ClusterId::UNSET,
+                &mems,
+                1,
+                (mems).len() as u64,
+            ),
             voters: mems.clone(),
         });
         *auth.observed_membership.lock() = mems;
@@ -3079,7 +3445,14 @@ mod tests {
             members: old_mems.clone(),
             cluster_id: ClusterId::UNSET,
             placement_version: 1,
-            digest: TopologyTerm::compute_digest(1, &ClusterId::UNSET, &old_mems, 1),
+            committed_peak: (old_mems.clone()).len() as u64,
+            digest: TopologyTerm::compute_digest(
+                1,
+                &ClusterId::UNSET,
+                &old_mems,
+                1,
+                (old_mems).len() as u64,
+            ),
             voters: old_mems.clone(),
         });
         // F-G8-001: pre-seed the ever-seen set with node 3 so the
@@ -3127,7 +3500,14 @@ mod tests {
     /// Verify that deserialize rejects truncated data at various boundaries.
     #[test]
     fn topology_term_deserialize_truncation_boundaries() {
-        let term = TopologyTerm::new(42, members(&[1, 2, 3]), NodeId(1), ClusterId::UNSET, 1);
+        let term = TopologyTerm::new(
+            42,
+            members(&[1, 2, 3]),
+            NodeId(1),
+            ClusterId::UNSET,
+            1,
+            (members(&[1, 2, 3])).len() as u64,
+        );
         let data = term.serialize();
 
         // Truncate at various points — all should return None.
@@ -3156,6 +3536,7 @@ mod tests {
             incarnation: 0,
             committed_voter_ever_seen: Vec::new(),
             committed_placement_version: 1,
+            committed_peak: 1,
         };
         let data = state.serialize();
         let restored = PersistedTopologyState::deserialize(&data);
@@ -3198,7 +3579,14 @@ mod tests {
             members: single.clone(),
             cluster_id: ClusterId::UNSET,
             placement_version: 1,
-            digest: TopologyTerm::compute_digest(1, &ClusterId::UNSET, &single, 1),
+            committed_peak: (single.clone()).len() as u64,
+            digest: TopologyTerm::compute_digest(
+                1,
+                &ClusterId::UNSET,
+                &single,
+                1,
+                (single).len() as u64,
+            ),
             voters: single.clone(),
         });
         // F-G8-001: the proposal introduces nodes 1 and 3 that were
@@ -3215,7 +3603,14 @@ mod tests {
         // Actually after commit, voted_term is still 0 (handle_commit doesn't
         // update it), and committed_term = 1. no_outstanding_vote = (voted <= committed)
         // = (0 <= 1) = true. propose.term >= committed = (1 >= 1) = true.
-        let proposal = TopologyTerm::new(1, members(&[1, 2, 3]), NodeId(1), ClusterId::UNSET, 1);
+        let proposal = TopologyTerm::new(
+            1,
+            members(&[1, 2, 3]),
+            NodeId(1),
+            ClusterId::UNSET,
+            1,
+            (members(&[1, 2, 3])).len() as u64,
+        );
         let v = auth.handle_propose(&proposal);
         assert!(
             v.accepted,
@@ -3237,7 +3632,14 @@ mod tests {
             members: mems.clone(),
             cluster_id: ClusterId::UNSET,
             placement_version: 1,
-            digest: TopologyTerm::compute_digest(term, &ClusterId::UNSET, &mems, 1),
+            committed_peak: (mems.clone()).len() as u64,
+            digest: TopologyTerm::compute_digest(
+                term,
+                &ClusterId::UNSET,
+                &mems,
+                1,
+                (mems).len() as u64,
+            ),
             voters: mems.clone(),
         };
         auth.handle_commit(&commit);
@@ -3452,7 +3854,14 @@ mod tests {
     #[test]
     fn topology_term_deserialize_accepts_count_at_cap() {
         let ids: Vec<u64> = (0..MAX_TOPOLOGY_MEMBERS as u64).collect();
-        let term = TopologyTerm::new(1, members(&ids), NodeId(0), ClusterId::UNSET, 1);
+        let term = TopologyTerm::new(
+            1,
+            members(&ids),
+            NodeId(0),
+            ClusterId::UNSET,
+            1,
+            (members(&ids)).len() as u64,
+        );
         let bytes = term.serialize();
         let decoded = TopologyTerm::deserialize(&bytes).expect("at-cap term should decode");
         assert_eq!(decoded.members.len(), MAX_TOPOLOGY_MEMBERS);
@@ -3463,7 +3872,14 @@ mod tests {
     /// commit frame cannot drive a multi-megabyte voter allocation either.
     #[test]
     fn topology_commit_deserialize_rejects_oversized_voter_count() {
-        let term = TopologyTerm::new(1, members(&[1, 2, 3]), NodeId(1), ClusterId::UNSET, 1);
+        let term = TopologyTerm::new(
+            1,
+            members(&[1, 2, 3]),
+            NodeId(1),
+            ClusterId::UNSET,
+            1,
+            (members(&[1, 2, 3])).len() as u64,
+        );
         let mut bytes = term.serialize();
         // Append voter section claiming MAX_TOPOLOGY_MEMBERS + 1 voters
         // without their bytes.
@@ -3516,6 +3932,7 @@ mod tests {
                         proposer,
                         ClusterId::UNSET,
                         1,
+                        (vec![proposer, NodeId(99)]).len() as u64,
                     );
                     barrier.wait();
                     let vote = auth.handle_propose(&propose);
@@ -3567,7 +3984,14 @@ mod tests {
             members: local_members.clone(),
             cluster_id: cluster_a,
             placement_version: 1,
-            digest: TopologyTerm::compute_digest(5, &cluster_a, &local_members, 1),
+            committed_peak: (local_members.clone()).len() as u64,
+            digest: TopologyTerm::compute_digest(
+                5,
+                &cluster_a,
+                &local_members,
+                1,
+                (local_members).len() as u64,
+            ),
             voters: local_members.clone(),
         };
         assert_eq!(auth.handle_commit(&local_commit), Some(5));
@@ -3582,7 +4006,14 @@ mod tests {
             members: foreign_members.clone(),
             cluster_id: cluster_b,
             placement_version: 1,
-            digest: TopologyTerm::compute_digest(7, &cluster_b, &foreign_members, 1),
+            committed_peak: (foreign_members.clone()).len() as u64,
+            digest: TopologyTerm::compute_digest(
+                7,
+                &cluster_b,
+                &foreign_members,
+                1,
+                (foreign_members).len() as u64,
+            ),
             voters: foreign_members.clone(),
         };
 
@@ -3612,7 +4043,14 @@ mod tests {
             members: local_members.clone(),
             cluster_id: cid,
             placement_version: 1,
-            digest: TopologyTerm::compute_digest(5, &cid, &local_members, 1),
+            committed_peak: (local_members.clone()).len() as u64,
+            digest: TopologyTerm::compute_digest(
+                5,
+                &cid,
+                &local_members,
+                1,
+                (local_members).len() as u64,
+            ),
             voters: local_members.clone(),
         };
         assert_eq!(auth.handle_commit(&local_commit), Some(5));
@@ -3627,7 +4065,14 @@ mod tests {
             members: merged_members.clone(),
             cluster_id: cid,
             placement_version: 1,
-            digest: TopologyTerm::compute_digest(7, &cid, &merged_members, 1),
+            committed_peak: (merged_members.clone()).len() as u64,
+            digest: TopologyTerm::compute_digest(
+                7,
+                &cid,
+                &merged_members,
+                1,
+                (merged_members).len() as u64,
+            ),
             voters: merged_members.clone(),
         };
 
@@ -3654,7 +4099,14 @@ mod tests {
             members: local_members.clone(),
             cluster_id: cid,
             placement_version: 1,
-            digest: TopologyTerm::compute_digest(5, &cid, &local_members, 1),
+            committed_peak: (local_members.clone()).len() as u64,
+            digest: TopologyTerm::compute_digest(
+                5,
+                &cid,
+                &local_members,
+                1,
+                (local_members).len() as u64,
+            ),
             voters: local_members.clone(),
         };
         assert_eq!(auth.handle_commit(&local_commit), Some(5));
@@ -3667,7 +4119,14 @@ mod tests {
             members: grown_members.clone(),
             cluster_id: cid,
             placement_version: 1,
-            digest: TopologyTerm::compute_digest(7, &cid, &grown_members, 1),
+            committed_peak: (grown_members.clone()).len() as u64,
+            digest: TopologyTerm::compute_digest(
+                7,
+                &cid,
+                &grown_members,
+                1,
+                (grown_members).len() as u64,
+            ),
             voters: grown_members.clone(),
         };
         assert_eq!(
@@ -3694,7 +4153,14 @@ mod tests {
             members: local_members.clone(),
             cluster_id: ClusterId::UNSET,
             placement_version: 1,
-            digest: TopologyTerm::compute_digest(5, &ClusterId::UNSET, &local_members, 1),
+            committed_peak: (local_members.clone()).len() as u64,
+            digest: TopologyTerm::compute_digest(
+                5,
+                &ClusterId::UNSET,
+                &local_members,
+                1,
+                (local_members).len() as u64,
+            ),
             voters: local_members.clone(),
         };
         assert_eq!(auth.handle_commit(&local_commit), Some(5));
@@ -3708,7 +4174,14 @@ mod tests {
             members: foreign_members.clone(),
             cluster_id: ClusterId::UNSET,
             placement_version: 1,
-            digest: TopologyTerm::compute_digest(7, &ClusterId::UNSET, &foreign_members, 1),
+            committed_peak: (foreign_members.clone()).len() as u64,
+            digest: TopologyTerm::compute_digest(
+                7,
+                &ClusterId::UNSET,
+                &foreign_members,
+                1,
+                (foreign_members).len() as u64,
+            ),
             voters: foreign_members.clone(),
         };
         assert!(
@@ -3811,6 +4284,7 @@ mod tests {
             members: term.members.clone(),
             cluster_id: term.cluster_id,
             placement_version: 1,
+            committed_peak: (term.members.clone()).len() as u64,
             digest: term.digest,
             voters: term.members.clone(),
         };
@@ -3892,14 +4366,21 @@ mod tests {
         // produce different digests, so a v1 node and a v2 node can never
         // agree they committed "the same term".
         let mems = members(&[1, 2, 3]);
-        let d1 = TopologyTerm::compute_digest(7, &ClusterId::UNSET, &mems, 1);
-        let d2 = TopologyTerm::compute_digest(7, &ClusterId::UNSET, &mems, 2);
+        let d1 = TopologyTerm::compute_digest(7, &ClusterId::UNSET, &mems, 1, (mems).len() as u64);
+        let d2 = TopologyTerm::compute_digest(7, &ClusterId::UNSET, &mems, 2, (mems).len() as u64);
         assert_ne!(d1, d2, "placement_version must be mixed into the digest");
     }
 
     #[test]
     fn term_serialize_round_trip_preserves_placement_version() {
-        let t = TopologyTerm::new(9, members(&[1, 2, 3]), NodeId(1), ClusterId::UNSET, 2);
+        let t = TopologyTerm::new(
+            9,
+            members(&[1, 2, 3]),
+            NodeId(1),
+            ClusterId::UNSET,
+            2,
+            (members(&[1, 2, 3])).len() as u64,
+        );
         let decoded = TopologyTerm::deserialize(&t.serialize()).expect("decode");
         assert_eq!(decoded.placement_version, 2);
         assert_eq!(decoded.digest, t.digest);
@@ -3913,7 +4394,14 @@ mod tests {
             members: members(&[1, 2, 3]),
             cluster_id: ClusterId::UNSET,
             placement_version: 2,
-            digest: TopologyTerm::compute_digest(5, &ClusterId::UNSET, &members(&[1, 2, 3]), 2),
+            committed_peak: (members(&[1, 2, 3])).len() as u64,
+            digest: TopologyTerm::compute_digest(
+                5,
+                &ClusterId::UNSET,
+                &members(&[1, 2, 3]),
+                2,
+                (members(&[1, 2, 3])).len() as u64,
+            ),
             voters: members(&[1, 2, 3]),
         };
         let decoded = TopologyCommit::deserialize(&commit.serialize()).expect("decode");
@@ -3948,6 +4436,7 @@ mod tests {
             incarnation: 4,
             committed_voter_ever_seen: members(&[1, 2, 3]),
             committed_placement_version: 2,
+            committed_peak: 3,
         };
         let decoded = PersistedTopologyState::deserialize(&state.serialize());
         assert_eq!(decoded.committed_placement_version, 2);
@@ -3958,7 +4447,14 @@ mod tests {
     fn pre_w6_term_payload_decodes_as_placement_version_one() {
         // A term payload truncated before the placement trailer (the pre-W6
         // wire shape) must decode as v1, not garbage.
-        let t = TopologyTerm::new(2, members(&[1, 2]), NodeId(1), ClusterId::UNSET, 1);
+        let t = TopologyTerm::new(
+            2,
+            members(&[1, 2]),
+            NodeId(1),
+            ClusterId::UNSET,
+            1,
+            (members(&[1, 2])).len() as u64,
+        );
         let mut bytes = t.serialize();
         bytes.truncate(bytes.len() - 2); // drop the 2-byte placement trailer
         let decoded = TopologyTerm::deserialize(&bytes).expect("decode");
@@ -3977,6 +4473,7 @@ mod tests {
             NodeId(1),
             ClusterId::UNSET,
             too_high,
+            (members(&[1, 2, 3])).len() as u64,
         );
         let vote = auth.handle_propose(&propose);
         assert!(
@@ -3999,7 +4496,14 @@ mod tests {
             members: mems.clone(),
             cluster_id: ClusterId::UNSET,
             placement_version: too_high,
-            digest: TopologyTerm::compute_digest(1, &ClusterId::UNSET, &mems, too_high),
+            committed_peak: (mems.clone()).len() as u64,
+            digest: TopologyTerm::compute_digest(
+                1,
+                &ClusterId::UNSET,
+                &mems,
+                too_high,
+                (mems).len() as u64,
+            ),
             voters: mems.clone(),
         };
         assert_eq!(auth.handle_commit(&commit), None);
@@ -4024,7 +4528,14 @@ mod tests {
             members: mems.clone(),
             cluster_id: ClusterId::UNSET,
             placement_version: too_high,
-            digest: TopologyTerm::compute_digest(4, &ClusterId::UNSET, &mems, too_high),
+            committed_peak: (mems.clone()).len() as u64,
+            digest: TopologyTerm::compute_digest(
+                4,
+                &ClusterId::UNSET,
+                &mems,
+                too_high,
+                (mems).len() as u64,
+            ),
             voters: mems.clone(),
         };
         assert_eq!(auth.handle_commit(&commit), None);
@@ -4049,7 +4560,14 @@ mod tests {
             members: mems.clone(),
             cluster_id: ClusterId::UNSET,
             placement_version: too_high,
-            digest: TopologyTerm::compute_digest(4, &ClusterId::UNSET, &mems, too_high),
+            committed_peak: (mems.clone()).len() as u64,
+            digest: TopologyTerm::compute_digest(
+                4,
+                &ClusterId::UNSET,
+                &mems,
+                too_high,
+                (mems).len() as u64,
+            ),
             // No quorum: a single voter cannot prove a 3-member commit.
             voters: members(&[1]),
         };
@@ -4073,8 +4591,15 @@ mod tests {
             proposer: NodeId(1),
             members: mems.clone(),
             cluster_id: ClusterId::UNSET,
-            placement_version: 1, // supported
-            digest: TopologyTerm::compute_digest(4, &ClusterId::UNSET, &mems, 1),
+            placement_version: 1,
+            committed_peak: (mems.clone()).len() as u64, // supported
+            digest: TopologyTerm::compute_digest(
+                4,
+                &ClusterId::UNSET,
+                &mems,
+                1,
+                (mems).len() as u64,
+            ),
             voters: mems.clone(),
         };
         assert_eq!(auth.handle_commit(&commit), Some(4));
@@ -4100,7 +4625,14 @@ mod tests {
             members: mems.clone(),
             cluster_id: ClusterId::UNSET,
             placement_version: too_high,
-            digest: TopologyTerm::compute_digest(4, &ClusterId::UNSET, &mems, too_high),
+            committed_peak: (mems.clone()).len() as u64,
+            digest: TopologyTerm::compute_digest(
+                4,
+                &ClusterId::UNSET,
+                &mems,
+                too_high,
+                (mems).len() as u64,
+            ),
             voters: mems.clone(),
         };
         assert_eq!(auth.handle_commit(&bad), None);
@@ -4113,7 +4645,14 @@ mod tests {
             members: mems.clone(),
             cluster_id: ClusterId::UNSET,
             placement_version: 1,
-            digest: TopologyTerm::compute_digest(5, &ClusterId::UNSET, &mems, 1),
+            committed_peak: (mems.clone()).len() as u64,
+            digest: TopologyTerm::compute_digest(
+                5,
+                &ClusterId::UNSET,
+                &mems,
+                1,
+                (mems).len() as u64,
+            ),
             voters: mems.clone(),
         };
         assert_eq!(auth.handle_commit(&good), Some(5));
@@ -4138,7 +4677,14 @@ mod tests {
             members: mems.clone(),
             cluster_id: ClusterId::UNSET,
             placement_version: 1,
-            digest: TopologyTerm::compute_digest(4, &ClusterId::UNSET, &mems, 1),
+            committed_peak: (mems.clone()).len() as u64,
+            digest: TopologyTerm::compute_digest(
+                4,
+                &ClusterId::UNSET,
+                &mems,
+                1,
+                (mems).len() as u64,
+            ),
             voters: mems.clone(),
         };
         // Persist reports failure.
@@ -4169,7 +4715,14 @@ mod tests {
             members: mems.clone(),
             cluster_id: ClusterId::UNSET,
             placement_version: 1,
-            digest: TopologyTerm::compute_digest(4, &ClusterId::UNSET, &mems, 1),
+            committed_peak: (mems.clone()).len() as u64,
+            digest: TopologyTerm::compute_digest(
+                4,
+                &ClusterId::UNSET,
+                &mems,
+                1,
+                (mems).len() as u64,
+            ),
             voters: mems.clone(),
         };
         let persisted_term = std::cell::Cell::new(u64::MAX);
@@ -4211,6 +4764,7 @@ mod tests {
             members: mems.clone(),
             cluster_id: ClusterId::UNSET,
             placement_version: 1,
+            committed_peak: (mems.clone()).len() as u64,
             digest: [0u8; 32],
             voters: mems.clone(),
         };
@@ -4267,7 +4821,14 @@ mod tests {
             members: base_members.clone(),
             cluster_id: ClusterId::UNSET,
             placement_version: 1,
-            digest: TopologyTerm::compute_digest(5, &ClusterId::UNSET, &base_members, 1),
+            committed_peak: (base_members.clone()).len() as u64,
+            digest: TopologyTerm::compute_digest(
+                5,
+                &ClusterId::UNSET,
+                &base_members,
+                1,
+                (base_members).len() as u64,
+            ),
             voters: base_members.clone(),
         };
         assert_eq!(auth.handle_commit(&baseline), Some(5));
@@ -4281,7 +4842,14 @@ mod tests {
             members: lo_members.clone(),
             cluster_id: ClusterId::UNSET,
             placement_version: 1,
-            digest: TopologyTerm::compute_digest(6, &ClusterId::UNSET, &lo_members, 1),
+            committed_peak: (lo_members.clone()).len() as u64,
+            digest: TopologyTerm::compute_digest(
+                6,
+                &ClusterId::UNSET,
+                &lo_members,
+                1,
+                (lo_members).len() as u64,
+            ),
             voters: lo_members.clone(),
         };
         // Higher term 7, full member set {1,2,3,4}.
@@ -4292,7 +4860,14 @@ mod tests {
             members: hi_members.clone(),
             cluster_id: ClusterId::UNSET,
             placement_version: 1,
-            digest: TopologyTerm::compute_digest(7, &ClusterId::UNSET, &hi_members, 1),
+            committed_peak: (hi_members.clone()).len() as u64,
+            digest: TopologyTerm::compute_digest(
+                7,
+                &ClusterId::UNSET,
+                &hi_members,
+                1,
+                (hi_members).len() as u64,
+            ),
             voters: hi_members.clone(),
         };
 
@@ -4374,7 +4949,8 @@ mod tests {
             members: m1.clone(),
             cluster_id: ClusterId::UNSET,
             placement_version: 1,
-            digest: TopologyTerm::compute_digest(1, &ClusterId::UNSET, &m1, 1),
+            committed_peak: (m1.clone()).len() as u64,
+            digest: TopologyTerm::compute_digest(1, &ClusterId::UNSET, &m1, 1, (m1).len() as u64),
             voters: m1.clone(),
         };
         assert_eq!(
@@ -4392,7 +4968,8 @@ mod tests {
             members: m2.clone(),
             cluster_id: ClusterId::UNSET,
             placement_version: 1,
-            digest: TopologyTerm::compute_digest(2, &ClusterId::UNSET, &m2, 1),
+            committed_peak: (m2.clone()).len() as u64,
+            digest: TopologyTerm::compute_digest(2, &ClusterId::UNSET, &m2, 1, (m2).len() as u64),
             voters: m2.clone(),
         };
         assert_eq!(
@@ -4415,7 +4992,14 @@ mod tests {
             members: mems.clone(),
             cluster_id: ClusterId::UNSET,
             placement_version: 1,
-            digest: TopologyTerm::compute_digest(4, &ClusterId::UNSET, &mems, 1),
+            committed_peak: (mems.clone()).len() as u64,
+            digest: TopologyTerm::compute_digest(
+                4,
+                &ClusterId::UNSET,
+                &mems,
+                1,
+                (mems).len() as u64,
+            ),
             voters: mems.clone(),
         };
 
@@ -4441,6 +5025,7 @@ mod tests {
             incarnation: projected_incarnation,
             committed_voter_ever_seen: projected_ever_seen,
             committed_placement_version: projected_placement,
+            committed_peak: projected_committed_peak,
         } = projected;
         let PersistedTopologyState {
             peak_cluster_size: actual_peak,
@@ -4451,6 +5036,7 @@ mod tests {
             incarnation: actual_incarnation,
             committed_voter_ever_seen: actual_ever_seen,
             committed_placement_version: actual_placement,
+            committed_peak: actual_committed_peak,
         } = actual;
 
         assert_eq!(projected_term, actual_term);
@@ -4458,6 +5044,11 @@ mod tests {
         assert_eq!(projected_voters, actual_voters);
         assert_eq!(projected_peak, actual_peak);
         assert_eq!(projected_placement, actual_placement);
+        assert_eq!(
+            projected_committed_peak, actual_committed_peak,
+            "G8 stage 1 — persisted_state_for_commit's committed_peak projection \
+             must match the post-apply persisted_state's committed_peak exactly",
+        );
         assert_eq!(projected_voted_term, actual_voted_term);
         assert_eq!(projected_incarnation, actual_incarnation);
         let mut a: Vec<u64> = projected_ever_seen.iter().map(|n| n.0).collect();
@@ -4513,7 +5104,14 @@ mod tests {
             members: mems.clone(),
             cluster_id: ClusterId::UNSET,
             placement_version: 1,
-            digest: TopologyTerm::compute_digest(1, &ClusterId::UNSET, &mems, 1),
+            committed_peak: (mems.clone()).len() as u64,
+            digest: TopologyTerm::compute_digest(
+                1,
+                &ClusterId::UNSET,
+                &mems,
+                1,
+                (mems).len() as u64,
+            ),
             voters: mems.clone(),
         };
         assert_eq!(auth.handle_commit(&commit), Some(1));
@@ -4539,7 +5137,14 @@ mod tests {
             members: mems.clone(),
             cluster_id: ClusterId::UNSET,
             placement_version: 1,
-            digest: TopologyTerm::compute_digest(1, &ClusterId::UNSET, &mems, 1),
+            committed_peak: (mems.clone()).len() as u64,
+            digest: TopologyTerm::compute_digest(
+                1,
+                &ClusterId::UNSET,
+                &mems,
+                1,
+                (mems).len() as u64,
+            ),
             voters: mems.clone(),
         };
         assert_eq!(auth.handle_commit(&commit), Some(1));
@@ -4559,7 +5164,14 @@ mod tests {
             members: mems.clone(),
             cluster_id: ClusterId::UNSET,
             placement_version: 1,
-            digest: TopologyTerm::compute_digest(1, &ClusterId::UNSET, &mems, 1),
+            committed_peak: (mems.clone()).len() as u64,
+            digest: TopologyTerm::compute_digest(
+                1,
+                &ClusterId::UNSET,
+                &mems,
+                1,
+                (mems).len() as u64,
+            ),
             voters: mems.clone(),
         };
         auth.handle_commit(&commit_v1);
@@ -4572,11 +5184,326 @@ mod tests {
             members: mems.clone(),
             cluster_id: ClusterId::UNSET,
             placement_version: 2,
+            committed_peak: (mems.clone()).len() as u64,
             digest: upgrade.digest,
             voters: mems.clone(),
         };
         assert_eq!(auth.handle_commit(&commit_v2), Some(upgrade.term));
         assert_eq!(auth.committed_placement_version(), 2);
         assert!(auth.upgrade_proposal().is_none()); // no second upgrade
+    }
+
+    // -----------------------------------------------------------------------
+    // G8 stage 1 — committed_peak data model, digest binding, persistence,
+    // recovery, and the split-brain floor getter. NO shrink capability yet:
+    // every producer stamps committed_peak == the current effective peak, so
+    // these tests prove the change is additive and behavior-preserving.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn topology_term_serde_roundtrips_committed_peak() {
+        let term = TopologyTerm::new(9, members(&[1, 2, 3]), NodeId(1), ClusterId::UNSET, 1, 5);
+        let data = term.serialize();
+        let decoded = TopologyTerm::deserialize(&data).expect("decode");
+        assert_eq!(decoded.committed_peak, 5);
+        assert_eq!(decoded.digest, term.digest);
+    }
+
+    #[test]
+    fn topology_commit_serde_roundtrips_committed_peak() {
+        let mems = members(&[1, 2, 3]);
+        let commit = TopologyCommit {
+            term: 9,
+            proposer: NodeId(1),
+            members: mems.clone(),
+            cluster_id: ClusterId::UNSET,
+            placement_version: 1,
+            committed_peak: 5,
+            digest: TopologyTerm::compute_digest(9, &ClusterId::UNSET, &mems, 1, 5),
+            voters: mems.clone(),
+        };
+        let decoded = TopologyCommit::deserialize(&commit.serialize()).expect("decode");
+        assert_eq!(decoded.committed_peak, 5);
+        assert_eq!(decoded.digest, commit.digest);
+    }
+
+    #[test]
+    fn persisted_state_roundtrips_committed_peak() {
+        let state = PersistedTopologyState {
+            peak_cluster_size: 3,
+            committed_term: 1,
+            committed_members: members(&[1, 2, 3]),
+            committed_voters: members(&[1, 2, 3]),
+            voted_term: 1,
+            incarnation: 0,
+            committed_voter_ever_seen: members(&[1, 2, 3]),
+            committed_placement_version: 1,
+            // Deliberately DIFFERENT from committed_members.len() (3) so a
+            // coincidental match with the legacy-default formula can't mask
+            // a broken round trip.
+            committed_peak: 7,
+        };
+        let decoded = PersistedTopologyState::deserialize(&state.serialize());
+        assert_eq!(decoded.committed_peak, 7);
+    }
+
+    #[test]
+    fn legacy_wire_frame_without_committed_peak_decodes_to_members_len() {
+        // Hand-craft a pre-G8 (W6-only) standalone TopologyTerm frame that
+        // carries the placement_version trailer but NOT the new
+        // committed_peak trailer — exactly what a pre-G8 binary would have
+        // written: [term:8][proposer:8][cluster_id:16][count:4][members:8*N]
+        // [digest:32][placement_version:2].
+        let mems = members(&[1, 2, 3, 4]);
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&9u64.to_le_bytes()); // term
+        buf.extend_from_slice(&NodeId(1).0.to_le_bytes()); // proposer
+        buf.extend_from_slice(&ClusterId::UNSET.0); // cluster_id
+        buf.extend_from_slice(&(mems.len() as u32).to_le_bytes());
+        for m in &mems {
+            buf.extend_from_slice(&m.0.to_le_bytes());
+        }
+        buf.extend_from_slice(&[0xAB; 32]); // digest (opaque for this test)
+        buf.extend_from_slice(&1u16.to_le_bytes()); // placement_version trailer only
+
+        let decoded = TopologyTerm::deserialize(&buf).expect("legacy W6 frame must still decode");
+        assert_eq!(
+            decoded.committed_peak,
+            mems.len() as u64,
+            "absent committed_peak trailer must default to members.len()"
+        );
+        assert_eq!(decoded.placement_version, 1);
+        assert_eq!(decoded.digest, [0xAB; 32]);
+
+        // Even older: no trailer at all (pre-W6). Must decode the same way.
+        let pre_w6_len = buf.len() - 2;
+        let pre_w6 = &buf[..pre_w6_len];
+        let decoded_pre_w6 = TopologyTerm::deserialize(pre_w6).expect("pre-W6 frame must decode");
+        assert_eq!(decoded_pre_w6.committed_peak, mems.len() as u64);
+        assert_eq!(decoded_pre_w6.placement_version, 1);
+    }
+
+    #[test]
+    fn legacy_persisted_file_decodes_to_monotonic_floor() {
+        // Hand-craft a pre-G8 persisted blob: has the W6 placement_version
+        // trailer but NOT the new committed_peak trailer.
+        let peak = 4u64;
+        let committed_term = 2u64;
+        let voted_term = 2u64;
+        let committed_members = members(&[1, 2, 3]); // len 3, < peak (4)
+        let incarnation = 0u64;
+        let committed_placement_version = 1u16;
+
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&peak.to_le_bytes());
+        buf.extend_from_slice(&committed_term.to_le_bytes());
+        buf.extend_from_slice(&voted_term.to_le_bytes());
+        buf.extend_from_slice(&(committed_members.len() as u32).to_le_bytes());
+        for m in &committed_members {
+            buf.extend_from_slice(&m.0.to_le_bytes());
+        }
+        buf.extend_from_slice(&incarnation.to_le_bytes());
+        buf.extend_from_slice(&0u32.to_le_bytes()); // committed_voters count = 0
+        buf.extend_from_slice(&0u32.to_le_bytes()); // ever_seen count = 0
+        buf.extend_from_slice(&committed_placement_version.to_le_bytes());
+        // NOTE: committed_peak trailer intentionally omitted.
+
+        let decoded = PersistedTopologyState::deserialize(&buf);
+        assert_eq!(
+            decoded.committed_peak,
+            peak.max(committed_members.len() as u64),
+            "absent committed_peak trailer must decode to peak_cluster_size.max(committed_members.len())"
+        );
+        assert_eq!(decoded.peak_cluster_size, peak);
+        assert_eq!(decoded.committed_placement_version, 1);
+    }
+
+    #[test]
+    fn compute_digest_changes_with_committed_peak() {
+        let mems = members(&[1, 2, 3]);
+        let d1 = TopologyTerm::compute_digest(5, &ClusterId::UNSET, &mems, 1, 3);
+        let d2 = TopologyTerm::compute_digest(5, &ClusterId::UNSET, &mems, 1, 4);
+        assert_ne!(d1, d2, "committed_peak must be mixed into the digest");
+
+        let d3 = TopologyTerm::compute_digest(5, &ClusterId::UNSET, &mems, 1, 3);
+        assert_eq!(
+            d1, d3,
+            "identical committed_peak must produce an identical digest"
+        );
+    }
+
+    #[test]
+    fn peak_floor_is_max_committed_and_observed() {
+        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+        // Directly manipulate the two underlying atomics to prove the
+        // getter returns their max, independent of how each was populated.
+        auth.committed_peak.store(3, Ordering::Relaxed);
+        auth.peak_cluster_size.store(5, Ordering::Relaxed);
+        assert_eq!(
+            auth.peak_cluster_size(),
+            5,
+            "observed_peak higher: floor = observed"
+        );
+
+        auth.committed_peak.store(7, Ordering::Relaxed);
+        assert_eq!(
+            auth.peak_cluster_size(),
+            7,
+            "committed_peak higher: floor = committed_peak"
+        );
+
+        // Stage 1 behavior-preservation: on every REAL non-lowering
+        // producer, committed_peak is stamped from peak_cluster_size()
+        // itself, so committed_peak never exceeds observed_peak in
+        // practice and the floor equals exactly what observed_peak alone
+        // would have reported before this field existed.
+        let auth2 = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+        let term = auth2
+            .on_membership_changed(&members(&[1, 2, 3]))
+            .expect("proposer");
+        assert_eq!(
+            term.committed_peak,
+            auth2.peak_cluster_size.load(Ordering::Relaxed),
+            "committed_peak stamped on a proposal equals the (already-raised) observed peak"
+        );
+        assert_eq!(auth2.peak_cluster_size(), 3);
+    }
+
+    #[test]
+    fn commit_rejected_when_committed_peak_below_members_len() {
+        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+        let mems = members(&[1, 2, 3, 4]);
+        // committed_peak (3) < members.len() (4) — nonsensical, must be
+        // rejected by the gate invariant even though the commit otherwise
+        // carries a full quorum voter proof.
+        let bad_peak = 3u64;
+        let commit = TopologyCommit {
+            term: 1,
+            proposer: NodeId(1),
+            members: mems.clone(),
+            cluster_id: ClusterId::UNSET,
+            placement_version: 1,
+            committed_peak: bad_peak,
+            digest: TopologyTerm::compute_digest(1, &ClusterId::UNSET, &mems, 1, bad_peak),
+            voters: mems.clone(),
+        };
+        assert!(
+            auth.handle_commit(&commit).is_none(),
+            "committed_peak < members.len() must be rejected by the gate invariant"
+        );
+        assert_eq!(auth.committed_term(), 0, "nothing should have applied");
+    }
+
+    #[test]
+    fn restore_seeds_observed_from_committed_peak() {
+        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+        let state = PersistedTopologyState {
+            // Deliberately HIGHER than committed_peak, to prove restore()
+            // no longer separately re-observes this raw field: the
+            // effective floor now comes from committed_peak alone. In
+            // production this raw evidence is NOT lost —
+            // `ClusterCoordinator::new`'s `initial_peak` wiring
+            // independently seeds the same monotonic atom from this exact
+            // field BEFORE `restore()` runs (see server.rs).
+            peak_cluster_size: 10,
+            committed_term: 9,
+            committed_members: members(&[1, 2, 3]),
+            committed_voters: members(&[1, 2, 3]),
+            voted_term: 9,
+            incarnation: 0,
+            committed_voter_ever_seen: members(&[1, 2, 3]),
+            committed_placement_version: 1,
+            committed_peak: 6,
+        };
+        auth.restore(&state);
+        assert_eq!(
+            auth.committed_peak(),
+            6,
+            "committed_peak restored verbatim (raise-floored at committed_members.len())"
+        );
+        assert_eq!(
+            auth.peak_cluster_size.load(Ordering::Relaxed),
+            6,
+            "observed_peak must be seeded from committed_peak, not separately from state.peak_cluster_size (10)"
+        );
+        assert_eq!(auth.peak_cluster_size(), 6);
+    }
+
+    #[test]
+    fn grow_carries_new_members_len_in_committed_peak() {
+        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+        let small = members(&[1, 2, 3]);
+        let term1 = auth
+            .on_membership_changed(&small)
+            .expect("bootstrap proposer");
+        assert_eq!(term1.committed_peak, 3);
+
+        let commit1 = TopologyCommit {
+            term: term1.term,
+            proposer: term1.proposer,
+            members: term1.members.clone(),
+            cluster_id: term1.cluster_id,
+            placement_version: term1.placement_version,
+            committed_peak: term1.committed_peak,
+            digest: term1.digest,
+            voters: small.clone(),
+        };
+        assert_eq!(auth.handle_commit(&commit1), Some(term1.term));
+
+        // Grow to 5 members. F-G8-001: with cluster_id unset, the ever-seen
+        // fallback rejects a proposal introducing never-before-seen members
+        // — pre-seed nodes 4 and 5 as known voters, matching how the other
+        // legitimate-grow tests in this module handle the same fallback.
+        auth.set_committed_voter_ever_seen(&[
+            NodeId(1),
+            NodeId(2),
+            NodeId(3),
+            NodeId(4),
+            NodeId(5),
+        ]);
+        let grown = members(&[1, 2, 3, 4, 5]);
+        let term2 = auth
+            .on_membership_changed(&grown)
+            .expect("proposer for the grow");
+        assert_eq!(
+            term2.committed_peak, 5,
+            "a grow must carry the NEW members.len() as committed_peak"
+        );
+    }
+
+    #[test]
+    fn graceful_leave_subset_carries_old_higher_peak_in_committed_peak() {
+        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+        // Establish a committed 5-node cluster (peak raised to 5).
+        let full = members(&[1, 2, 3, 4, 5]);
+        let commit = TopologyCommit {
+            term: 1,
+            proposer: NodeId(1),
+            members: full.clone(),
+            cluster_id: ClusterId::UNSET,
+            placement_version: 1,
+            committed_peak: full.len() as u64,
+            digest: TopologyTerm::compute_digest(1, &ClusterId::UNSET, &full, 1, full.len() as u64),
+            voters: full.clone(),
+        };
+        assert_eq!(auth.handle_commit(&commit), Some(1));
+        assert_eq!(auth.peak_cluster_size(), 5);
+
+        // Graceful leave: propose a SUBSET (3 nodes). committed_peak on
+        // the resulting proposal must stay at the OLD peak (5), not drop
+        // to 3 — preserving today's quiesce/fencing semantics exactly.
+        let subset = members(&[1, 2, 3]);
+        let term = auth
+            .on_membership_changed(&subset)
+            .expect("proposer for the subset");
+        assert_eq!(
+            term.committed_peak, 5,
+            "graceful-leave subset must carry the OLD higher peak (non-lowering)"
+        );
+        assert_eq!(
+            auth.peak_cluster_size(),
+            5,
+            "peak must not drop after a subset proposal"
+        );
     }
 }

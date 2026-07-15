@@ -32,7 +32,14 @@ fn commit_membership(auth: &TopologyAuthority, term: u64, ids: &[u64]) {
         members: mems.clone(),
         cluster_id: ClusterId::UNSET,
         placement_version: 1,
-        digest: TopologyTerm::compute_digest(term, &ClusterId::UNSET, &mems, 1),
+        committed_peak: (mems.clone()).len() as u64,
+        digest: TopologyTerm::compute_digest(
+            term,
+            &ClusterId::UNSET,
+            &mems,
+            1,
+            (mems).len() as u64,
+        ),
         voters: mems.clone(),
     };
     let applied = auth.handle_commit(&commit);
@@ -84,10 +91,22 @@ fn handle_propose_rejects_unseen_member_superset() {
 
     // A buggy proposer (e.g. node 1 of an attacker side) constructs a
     // legitimate-looking `TopologyTerm` for the merged set.
-    let mut propose = TopologyTerm::new(2, members(&[1, 2, 3, 4]), NodeId(1), ClusterId::UNSET, 1);
+    let mut propose = TopologyTerm::new(
+        2,
+        members(&[1, 2, 3, 4]),
+        NodeId(1),
+        ClusterId::UNSET,
+        1,
+        (members(&[1, 2, 3, 4])).len() as u64,
+    );
     // Digest is valid by construction. Voter must still reject.
-    propose.digest =
-        TopologyTerm::compute_digest(propose.term, &ClusterId::UNSET, &propose.members, 1);
+    propose.digest = TopologyTerm::compute_digest(
+        propose.term,
+        &ClusterId::UNSET,
+        &propose.members,
+        1,
+        (propose.members).len() as u64,
+    );
 
     let vote = auth.handle_propose(&propose);
     assert!(
@@ -374,6 +393,7 @@ fn restored_peak_blocks_minority_after_restart() {
         incarnation: 0,
         committed_voter_ever_seen: members(&[1, 2, 3]),
         committed_placement_version: 1,
+        committed_peak: 3,
     });
     assert_eq!(auth.peak_cluster_size(), 3, "restore must reinstate peak");
 
