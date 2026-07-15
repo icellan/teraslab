@@ -77,6 +77,24 @@ always see the missing-secret state in their log aggregator.
 passed validation, which made the HMAC trivially forgeable; the gate is
 now enforced regardless of `strict_auth`.
 
+### Topology mutations (including `/admin/shrink`) in fail-open mode
+
+Cluster topology commits — membership changes, growth, and the
+quorum-gated `PUT /admin/shrink` cluster-shrink verb — are `cluster`
+frames like any other, so the rule above applies fully: their integrity
+(the `voters` list and the committed cluster-size floor) rests on the
+frame HMAC. The quorum gates (`TopologyAuthority::commit_passes_gates`,
+including the shrink-specific Gate B) are *structural* checks — they
+reject an internally inconsistent or under-voted commit — not proof of
+who sent it. In fail-open (`cluster_secret`-less) mode there is no HMAC,
+so an unauthenticated peer on the data port can forge a self-consistent,
+fully-padded topology commit — including one claiming a low committed
+floor — that satisfies those structural gates and drives a split-brain.
+This is not a new hole introduced by shrink; it is the same trusted-overlay
+residual described above, applied to the topology/shrink path specifically.
+Set `cluster_secret` (and keep `strict_auth = true`) before relying on
+`/admin/shrink` or any multi-node topology change in production.
+
 ## 2. HTTP observability port (default 9100)
 
 The HTTP server on `http_listen_addr` (default `127.0.0.1:9100`) exposes:
@@ -84,8 +102,10 @@ The HTTP server on `http_listen_addr` (default `127.0.0.1:9100`) exposes:
 - `/metrics` — Prometheus scrape target. Always public on the bound
   interface, even with admin endpoints disabled.
 - `/health/live`, `/health/ready`, `/status` — Read-only health/readiness.
-- `/admin/*` (mutating) — quiesce, drain, rebalance, log level.
-  **Off by default** (`enable_admin_endpoints = false`).
+- `/admin/*` (mutating) — quiesce, drain, rebalance, shrink, log level.
+  **Off by default** (`enable_admin_endpoints = false`). `/admin/shrink`
+  additionally requires `cluster_secret`/`strict_auth` to be safe against
+  a forged topology commit — see §1 above.
 - `/debug/*` — Record / index / redo introspection.
   Mutating debug endpoints are gated by the admin token; read-only ones
   (e.g. `GET /debug/log-level`, `/debug/freelist`) are public.

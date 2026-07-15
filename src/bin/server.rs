@@ -517,7 +517,11 @@ fn main() {
              `strict_auth = false`. This is the legacy trusted-overlay mode (see \
              docs/DEPLOYMENT_ASSUMPTIONS.md); only safe on a fully audited private \
              network. Remove `strict_auth = false` from your TOML AND configure \
-             `cluster_secret` to restore the production-safe default.",
+             `cluster_secret` to restore the production-safe default. This INCLUDES \
+             topology mutations such as `PUT /admin/shrink`: without a cluster_secret, \
+             an unauthenticated peer on the data port can forge a committed topology \
+             (including a low committed_peak) and drive a split-brain — the quorum \
+             gates are a structural, not cryptographic, defense in this mode.",
         );
     }
 
@@ -1772,7 +1776,19 @@ fn main() {
         // Load topology state (backward-compatible with old format).
         let topo_state =
             teraslab::cluster::coordinator::load_startup_topology_state(&cluster_state_path);
-        let initial_peak = topo_state.peak_cluster_size as usize;
+        // G8 final review (finding 1) — seed from the durable ANCHOR
+        // (`committed_peak`/`committed_members.len()`), not the vestigial
+        // `peak_cluster_size` field. `persisted_state_for_commit`
+        // (topology.rs) computes `peak_cluster_size` PRE-apply from the
+        // OLD peak, so on a committed shrink it is stale-HIGH (still the
+        // pre-shrink peak) while `committed_peak` is already correctly
+        // lowered. Seeding `initial_peak` from the stale field re-inflated
+        // a shrunk floor straight back to the old peak on every restart.
+        // Stale-LOW is unreachable here: persist is raise-only and
+        // `committed_peak` is floored at `committed_members.len()`.
+        let initial_peak = topo_state
+            .committed_peak
+            .max(topo_state.committed_members.len() as u64) as usize;
         let initial_epoch = topo_state.committed_term;
 
         let resolved_cluster_id = match config.resolved_cluster_id() {

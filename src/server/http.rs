@@ -2270,6 +2270,22 @@ fn shrink_drops_a_shard_holder(surviving: &[NodeId], rf: u8, placement_version: 
 /// `shrink_below_majority`, since `1 < peak/2 + 1` for every `peak >= 2`) —
 /// that is by design: `/admin/shrink` is the QUORUM-GATED path, and a
 /// single-node RF=1 target is out of its scope.
+///
+/// SECURITY (G8 final review, finding 3): this verb, and the shrink
+/// authority it drives, are only safe against a forged topology when
+/// `cluster_secret`/`strict_auth` are configured. Gate A/Gate B
+/// (`TopologyAuthority::commit_passes_gates`) are STRUCTURAL checks — they
+/// reject an internally-inconsistent or under-voted commit, but they do not
+/// prove who sent it. Integrity of a commit (its `voters` list and
+/// `committed_peak`) rests entirely on the inter-node frame HMAC. In
+/// `cluster_secret`-less (fail-open / trusted-overlay) mode there is no
+/// HMAC, so an unauthenticated peer on the data port can forge a
+/// self-consistent, fully-padded `OP_TOPOLOGY_COMMIT` — including a low
+/// `committed_peak` — that satisfies Gate B structurally and drives a
+/// split-brain. This is a PRE-EXISTING trusted-overlay residual (fail-open
+/// already permitted forged topology commits before this verb existed),
+/// widened in consequence by shrink, not a new gate defect. See
+/// `docs/DEPLOYMENT_ASSUMPTIONS.md`.
 async fn handle_admin_shrink(
     State(state): State<Arc<HttpState>>,
     Query(query): Query<ShrinkQuery>,
@@ -2430,6 +2446,21 @@ async fn handle_admin_shrink(
     }
 }
 
+/// G8 final review (finding 2, minor) — upper bound for an operator-supplied
+/// `wait_seconds` on `/admin/shrink`. `wait_for_shrink_commit` adds
+/// `Duration::from_secs(wait_seconds)` to `Instant::now()`; an unbounded
+/// `u64` near `u64::MAX` overflows that addition and panics the request
+/// task. 300s comfortably covers any real shrink commit while keeping the
+/// addend far from `Instant`'s range limit.
+const SHRINK_WAIT_SECONDS_CAP: u64 = 300;
+
+/// Cap an operator-supplied `wait_seconds` at [`SHRINK_WAIT_SECONDS_CAP`].
+/// See that constant's doc for why this must run before any
+/// `Instant + Duration::from_secs(wait_seconds)` addition.
+fn capped_wait_seconds(wait_seconds: u64) -> u64 {
+    wait_seconds.min(SHRINK_WAIT_SECONDS_CAP)
+}
+
 /// Poll until `cluster`'s committed topology members equal `surviving`
 /// exactly (the shrink's success condition — proposals may internally retry
 /// at a fresh term, so polling on the outcome rather than a specific term
@@ -2439,6 +2470,7 @@ async fn wait_for_shrink_commit(
     surviving: &[NodeId],
     wait_seconds: u64,
 ) -> bool {
+    let wait_seconds = capped_wait_seconds(wait_seconds);
     let mut want = surviving.to_vec();
     want.sort_unstable();
     let shrink_landed = |cluster: &RunningCluster| {
@@ -5588,6 +5620,31 @@ mod tests {
             .await
             .expect("body bytes");
         String::from_utf8(body.to_vec()).expect("utf8 body")
+    }
+
+    /// G8 final review (finding 2, minor) — `wait_for_shrink_commit` used to
+    /// compute `Instant::now() + Duration::from_secs(wait_seconds)` with an
+    /// unbounded, operator-supplied `wait_seconds`; a value near `u64::MAX`
+    /// overflows the `Instant` addition and panics the request task.
+    /// `capped_wait_seconds` caps it before that addition ever runs.
+    #[test]
+    fn capped_wait_seconds_bounds_large_values_and_preserves_small_ones() {
+        assert_eq!(capped_wait_seconds(u64::MAX), SHRINK_WAIT_SECONDS_CAP);
+        assert_eq!(
+            capped_wait_seconds(SHRINK_WAIT_SECONDS_CAP + 1),
+            SHRINK_WAIT_SECONDS_CAP
+        );
+        assert_eq!(
+            capped_wait_seconds(SHRINK_WAIT_SECONDS_CAP),
+            SHRINK_WAIT_SECONDS_CAP
+        );
+        assert_eq!(capped_wait_seconds(10), 10);
+        assert_eq!(capped_wait_seconds(0), 0);
+
+        // Regression: this must not panic. Pre-fix, adding a
+        // `Duration::from_secs(u64::MAX)` to `Instant::now()` overflows and
+        // panics; the cap keeps the addend bounded.
+        let _ = tokio::time::Instant::now() + Duration::from_secs(capped_wait_seconds(u64::MAX));
     }
 
     #[tokio::test]

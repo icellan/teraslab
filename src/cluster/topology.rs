@@ -1203,7 +1203,21 @@ impl TopologyAuthority {
             .committed_peak
             .max(state.committed_members.len() as u64);
         self.committed_peak.store(committed_peak, Ordering::Relaxed);
-        self.observe_peak_cluster_size(committed_peak);
+        // G8 final review (finding 1) — hard-store (not the raise-only
+        // `observe_peak_cluster_size`) the observed-peak seed.
+        // `ClusterCoordinator::new` runs BEFORE `restore()` on every boot
+        // and folds a startup guess into this same atomic via
+        // `observe_peak_cluster_size`'s `fetch_max`; that guess can be
+        // stale-HIGH (see `bin/server.rs`'s `initial_peak` derivation), and
+        // a raise-only re-observe here could never correct it back down —
+        // the exact bug that re-inflated a committed shrink's lowered
+        // floor on restart. `restore()` runs once at boot, before any
+        // concurrent SWIM/proposal activity can race it, so it is safe —
+        // and necessary — for it to be the AUTHORITATIVE last word on the
+        // boot-time observed peak, independent of `new()`/`restore()` call
+        // order.
+        self.peak_cluster_size
+            .store(committed_peak, Ordering::Relaxed);
         self.committed_term
             .store(state.committed_term, Ordering::Relaxed);
         self.voted_term.store(state.voted_term, Ordering::Relaxed);
@@ -1722,6 +1736,21 @@ impl TopologyAuthority {
         // quorum of THIS node's old peak here. Inert for every non-shrink
         // commit (grows/graceful-leave/unchanged carry committed_peak equal
         // to the current peak, so the comparison below is false).
+        //
+        // SECURITY (G8 final review, finding 3): `has_quorum_voter_proof_for`
+        // is a purely STRUCTURAL check (voter count/membership/dedup on a
+        // plaintext, self-declared `voters` field) — like
+        // `has_quorum_voter_proof` above, it defends the honest-but-
+        // partitioned minority (a real node can't fabricate votes it never
+        // cast), not a malicious sender. Integrity of `committed_peak` and
+        // `voters` rests entirely on the inter-node frame HMAC
+        // (`cluster_secret`). In fail-open (`cluster_secret`-less) mode
+        // there is no HMAC, so an unauthenticated peer can forge a
+        // self-consistent, fully-padded commit with a fabricated low
+        // `committed_peak` that satisfies Gate B here and drives a
+        // split-brain. Do not treat this gate as a substitute for
+        // authentication; see `docs/DEPLOYMENT_ASSUMPTIONS.md` and the
+        // `/admin/shrink` handler doc (http.rs).
         let local_peak = self.committed_peak();
         if commit.committed_peak < local_peak {
             let need = (local_peak as usize / 2) + 1;
@@ -5646,11 +5675,17 @@ mod tests {
         let state = PersistedTopologyState {
             // Deliberately HIGHER than committed_peak, to prove restore()
             // no longer separately re-observes this raw field: the
-            // effective floor now comes from committed_peak alone. In
-            // production this raw evidence is NOT lost —
-            // `ClusterCoordinator::new`'s `initial_peak` wiring
-            // independently seeds the same monotonic atom from this exact
-            // field BEFORE `restore()` runs (see server.rs).
+            // effective floor comes from committed_peak alone.
+            //
+            // G8 final review (finding 1) — this test exercises `restore()`
+            // IN ISOLATION on a fresh authority, which is NOT the production
+            // sequence: `bin/server.rs` calls `ClusterCoordinator::new()`
+            // (which pre-seeds this same atom) BEFORE `restore()` runs. That
+            // gap is exactly what let a stale-HIGH pre-restore seed survive
+            // a raise-only re-observe here undetected — see
+            // `restart_after_shrink_keeps_lowered_floor_via_new_then_restore`
+            // below, which drives the real `new()`-then-`restore()` path and
+            // is the regression test that would have caught it.
             peak_cluster_size: 10,
             committed_term: 9,
             committed_members: members(&[1, 2, 3]),
@@ -5673,6 +5708,97 @@ mod tests {
             "observed_peak must be seeded from committed_peak, not separately from state.peak_cluster_size (10)"
         );
         assert_eq!(auth.peak_cluster_size(), 6);
+    }
+
+    /// G8 final review (finding 1, BLOCKING) — a committed 5→3 shrink must
+    /// NOT re-inflate back to the old peak (5) on restart.
+    ///
+    /// Bug trace: `persisted_state_for_commit` computes the vestigial
+    /// `PersistedTopologyState::peak_cluster_size` field PRE-apply, so on
+    /// the very commit that lowers `committed_peak` it is still the OLD
+    /// peak (5). `bin/server.rs` used to seed `ClusterCoordinator::new`'s
+    /// `initial_peak` from exactly that stale field, which
+    /// `ClusterCoordinator::new` folds into the observed-peak atom via the
+    /// raise-only `observe_peak_cluster_size` — BEFORE `restore()` runs.
+    /// `restore()`'s own re-observe of the correctly-lowered
+    /// `committed_peak` (3) was ALSO raise-only (`fetch_max`), so it could
+    /// never pull the atom back down from 5. Net: the getter reports
+    /// `max(3, 5) = 5` forever after restart — the shrink is silently
+    /// reverted.
+    ///
+    /// This test drives the EXACT production boot sequence —
+    /// `ClusterCoordinator::new(config, loaded.peak_cluster_size)` THEN
+    /// `topology_authority.restore(&loaded)`, exactly as `bin/server.rs`
+    /// calls it — NOT a fresh-authority `restore()` in isolation (that
+    /// isolated shape is what let this bug through review the first time;
+    /// see `restore_seeds_observed_from_committed_peak` above).
+    #[test]
+    fn restart_after_shrink_keeps_lowered_floor_via_new_then_restore() {
+        use crate::cluster::coordinator::{ClusterConfig, ClusterCoordinator};
+
+        // A shrunk state as it would actually be found on disk after a
+        // committed 5→3 shrink: `committed_peak`/`committed_members` are
+        // correctly lowered to 3, but the vestigial `peak_cluster_size`
+        // field still carries the pre-shrink peak (5) — exactly what
+        // `persisted_state_for_commit` writes (see its doc comment).
+        let loaded = PersistedTopologyState {
+            peak_cluster_size: 5, // vestigial pre-apply field — stale-HIGH
+            committed_term: 10,
+            committed_members: members(&[1, 2, 3]),
+            committed_voters: members(&[1, 2, 3]),
+            voted_term: 10,
+            incarnation: 0,
+            committed_voter_ever_seen: members(&[1, 2, 3, 4, 5]),
+            committed_placement_version: 1,
+            committed_peak: 3, // the durable, correctly-lowered anchor
+        };
+
+        let config = ClusterConfig {
+            self_id: NodeId(1),
+            self_addr: "127.0.0.1:17100".parse().unwrap(),
+            swim_bind: "127.0.0.1:17101".parse().unwrap(),
+            swim_advertise_addr: None,
+            seed_nodes: Vec::new(),
+            replication_factor: 3,
+            probe_interval: Duration::from_millis(100),
+            suspicion_timeout: Duration::from_secs(1),
+            cluster_secret: None,
+            max_migration_threads: 1,
+            topology_propose_timeout: Duration::from_millis(500),
+            topology_debounce: Duration::from_millis(0),
+            migration_pool_size: 1,
+            migration_batch_size: 1,
+            persisted_incarnation: 0,
+            cluster_id: ClusterId::UNSET,
+            reverse_heal_online: false,
+            heal_deadline: Duration::from_secs(60),
+            heal_deadline_action: crate::config::HealDeadlineAction::AlertAndHold,
+        };
+
+        // The EXACT production sequence (bin/server.rs): `initial_peak`
+        // seeded from the loaded state's `peak_cluster_size` (the buggy,
+        // stale-HIGH field pre-fix)...
+        let coordinator = ClusterCoordinator::new(config, loaded.peak_cluster_size as usize);
+        // ...THEN restore(), which must correct the floor to the durable
+        // anchor regardless of what `new()` already seeded.
+        coordinator.topology_authority.restore(&loaded);
+
+        assert_eq!(
+            coordinator.topology_authority.peak_cluster_size(),
+            3,
+            "restart must keep the shrink's LOWERED floor (3), not re-inflate \
+             to the pre-shrink peak (5) folded in by new()'s pre-restore seed",
+        );
+        // Downstream consequence: the quorum majority derived from the
+        // restored floor must use the peak-3 majority (2), not the stale
+        // peak-5 majority (3) — the difference between a minority remnant
+        // being able to force a commit or not.
+        assert_eq!(
+            coordinator.topology_authority.activation_quorum_needed(3),
+            2,
+            "quorum derived from the restored floor must reflect the \
+             lowered peak (3/2+1=2), not the stale one (5/2+1=3)",
+        );
     }
 
     #[test]
