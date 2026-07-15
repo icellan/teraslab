@@ -365,10 +365,17 @@ pub struct TopologyCommit {
 }
 
 impl TopologyCommit {
-    /// Check that the embedded voter list is a quorum proof for `members`.
-    pub fn has_quorum_voter_proof(&self) -> bool {
-        let quorum_needed = (self.members.len() / 2) + 1;
-        if self.voters.len() < quorum_needed {
+    /// Check that the embedded voter list is a quorum proof for `members`,
+    /// requiring at least `n` distinct, in-`members` voters.
+    ///
+    /// G8 stage 2 — generalizes the fixed `members.len()/2 + 1` threshold in
+    /// [`Self::has_quorum_voter_proof`] so Gate B
+    /// (`TopologyAuthority::commit_passes_gates`) can re-verify a shrink
+    /// commit against a threshold derived from the APPLYING NODE's own
+    /// (higher, pre-shrink) peak rather than the commit's own (already
+    /// lowered) `members.len()`. The membership/dedup checks are unchanged.
+    pub fn has_quorum_voter_proof_for(&self, n: usize) -> bool {
+        if self.voters.len() < n {
             return false;
         }
         let mut seen = std::collections::HashSet::with_capacity(self.voters.len());
@@ -378,6 +385,13 @@ impl TopologyCommit {
             }
         }
         true
+    }
+
+    /// Check that the embedded voter list is a quorum proof for `members`
+    /// (the commit's own majority: `members.len()/2 + 1`). Unchanged
+    /// behavior — delegates to [`Self::has_quorum_voter_proof_for`].
+    pub fn has_quorum_voter_proof(&self) -> bool {
+        self.has_quorum_voter_proof_for((self.members.len() / 2) + 1)
     }
 
     /// Serialize for the wire.
@@ -1669,6 +1683,26 @@ impl TopologyAuthority {
             return false;
         }
 
+        // Gate B (G8 stage 2): a commit that LOWERS this node's committed_peak
+        // floor is a shrink and must carry a quorum of the CURRENT (higher)
+        // peak's voters — evaluated against THIS node's OWN durable
+        // `committed_peak` (local_peak), so a stale/behind proposer that set a
+        // low Gate-A bar (derived from ITS OWN low peak) cannot get a lower
+        // floor applied by a node that is already caught up to a higher one.
+        // This is the load-bearing gap-closer left open by stage 1's
+        // unconditional `.store` in `apply_commit_locked`: by the time a
+        // lowering commit reaches that store, it has already proven a
+        // quorum of THIS node's old peak here. Inert for every non-shrink
+        // commit (grows/graceful-leave/unchanged carry committed_peak equal
+        // to the current peak, so the comparison below is false).
+        let local_peak = self.committed_peak();
+        if commit.committed_peak < local_peak {
+            let need = (local_peak as usize / 2) + 1;
+            if !commit.has_quorum_voter_proof_for(need) {
+                return false;
+            }
+        }
+
         // W6 (INVARIANT ii) — activation gate. REFUSE to apply (and thus to
         // serve as authoritative) a committed term whose placement version
         // this build cannot run. We do NOT fall back to a different
@@ -1774,11 +1808,24 @@ impl TopologyAuthority {
         // E-01: a committed term with N members is direct evidence the
         // cluster reached size N — raise the peak so any later
         // SWIM-observed shrink is gated on the majority of this size.
+        // Unconditional and monotonic (fetch_max): harmless no-op for a
+        // shrink, since a shrink's `members.len()` never exceeds the
+        // existing observed peak.
         self.observe_peak_cluster_size(commit.members.len() as u64);
-        // G8 stage 1 — adopt the committed_peak carried by this commit.
-        // Stage 1 has no lowering producer, so this is always non-lowering
-        // in practice; stage 2's Gate B is what will make this the sole
-        // authorized path to LOWER the durable floor.
+
+        // G8 stage 2 — detect BEFORE overwriting whether this commit LOWERS
+        // the durable floor (a shrink). Gate B in `commit_passes_gates` has
+        // already re-verified, against this exact `old_committed_peak`
+        // value, that a lowering commit carries a quorum of the OLD peak's
+        // voters — so by the time we get here, adopting a lower
+        // `committed_peak` (and, for a shrink, hard-resetting the observed
+        // peak below) is authorized.
+        let old_committed_peak = self.committed_peak.load(Ordering::Relaxed);
+        let is_gate_b_shrink = commit.committed_peak < old_committed_peak;
+
+        // G8 stage 1 — adopt the committed_peak carried by this commit. Gate
+        // B (upstream, in `commit_passes_gates`) is what makes this
+        // unconditional `.store` safe even when it lowers the value.
         self.committed_peak
             .store(commit.committed_peak, Ordering::Relaxed);
         // W6 — adopt the committed placement version. The coordinator reads
@@ -1789,6 +1836,22 @@ impl TopologyAuthority {
         self.committed_placement_version
             .store(commit.placement_version.max(1) as u64, Ordering::Relaxed);
         *self.committed_members.write().unwrap() = commit.members.clone();
+
+        // G8 stage 2 — the ONLY site allowed to LOWER `observed_peak` (the
+        // `peak_cluster_size` atom, otherwise strictly monotonic via
+        // `observe_peak_cluster_size`'s `fetch_max` above and everywhere
+        // else in this authority). Authorized because it only runs on a
+        // commit that just passed Gate B: every node applying it has
+        // independently proven a quorum of ITS OWN prior (higher) peak's
+        // voters. Without this hard reset, `peak_cluster_size()` (the
+        // combined `max(committed_peak, observed_peak)` getter) would keep
+        // reporting the stale pre-shrink peak forever — the "re-inflation"
+        // bug the design's monotonic-observe fix targets.
+        if is_gate_b_shrink {
+            self.peak_cluster_size
+                .store(commit.committed_peak, Ordering::Relaxed);
+        }
+
         *self.committed_voters.write().unwrap() = commit.voters.clone();
         *self.observed_membership.lock() = commit.members.clone();
         // F-G8-001 fallback: every member of a committed term is, from
@@ -2107,6 +2170,145 @@ impl TopologyAuthority {
             from_version = current,
             to_version = achievable,
             "cluster: proposing placement-version upgrade (HRW)",
+        );
+
+        Some(term)
+    }
+
+    /// G8 stage 2 — propose a quorum-gated SHRINK of the cluster's
+    /// committed floor. The ONLY producer allowed to stamp `committed_peak`
+    /// BELOW the current effective peak (every other producer —
+    /// `on_membership_changed`, `retry_proposal`, `check_timeout`,
+    /// `upgrade_proposal` — is non-lowering by construction; see their doc
+    /// comments). Safety does NOT rest on this method: it rests on two
+    /// gates evaluated elsewhere.
+    ///   * Gate A (propose/vote, unchanged machinery): `handle_vote`'s
+    ///     quorum check uses `activation_quorum_needed`, which derives its
+    ///     majority from `self.peak_cluster_size()` — still the OLD, higher
+    ///     value at propose time (nothing has lowered it yet) — so a
+    ///     minority can never gather enough accepting votes to produce a
+    ///     `TopologyCommit` in the first place.
+    ///   * Gate B (apply time, `TopologyAuthority::commit_passes_gates`):
+    ///     every node that later evaluates the resulting commit
+    ///     re-verifies, against ITS OWN durable `committed_peak`
+    ///     (`local_peak`), that the commit carries a quorum of votes sized
+    ///     against that local peak — so even a hand-forged low-peak commit
+    ///     is rejected by every node whose own floor is still high.
+    ///
+    /// `surviving` is the explicit target membership after the shrink (NOT
+    /// a count). It is sorted and deduplicated internally so caller order
+    /// does not matter. Must be a non-empty STRICT subset of the currently
+    /// committed membership — this path only ever removes members.
+    ///
+    /// # Proposer determinism and the self-omit special case
+    ///
+    /// The deterministic proposer is evaluated against the CURRENT
+    /// committed membership (its lowest `NodeId`) — NOT against
+    /// `surviving`. This is what lets the lowest-current-node propose a
+    /// shrink that DROPS ITSELF (a self-excluding shrink, e.g.
+    /// decommissioning the historically-lowest node), relaxing the
+    /// standard `members[0] == self_id` / proposer-in-members invariant
+    /// used by the other producers.
+    ///
+    /// A self-excluding shrink deliberately does NOT record a self-vote:
+    /// [`TopologyCommit::has_quorum_voter_proof`] (unchanged — see
+    /// [`TopologyCommit::has_quorum_voter_proof_for`]) requires every voter
+    /// to be a member of the commit's OWN `members` list. If the proposer
+    /// excluded itself from `surviving` and still counted its own vote,
+    /// the resulting commit's voter list would contain a NodeId not in
+    /// `members` and could never pass that check on ANY node — including
+    /// its own. So when `self.self_id` is not in `surviving`, the full
+    /// `quorum_needed` votes must come from `surviving` members alone; when
+    /// `self.self_id` IS in `surviving` (the common case), the normal
+    /// self-vote is recorded as usual.
+    ///
+    /// Returns `None` when: there is no committed membership yet, this
+    /// node is not the deterministic proposer of the CURRENT committed
+    /// set, `surviving` is empty or not a strict subset of the committed
+    /// membership, the change fails the split-brain safety check, or a
+    /// proposal is already pending.
+    pub fn propose_shrink(&self, surviving: Vec<NodeId>) -> Option<TopologyTerm> {
+        let mut surviving = surviving;
+        surviving.sort_unstable_by_key(|n| n.0);
+        surviving.dedup();
+
+        let committed_members = self.committed_members.read().unwrap().clone();
+        if committed_members.is_empty() {
+            return None;
+        }
+
+        // Proposer determinism: lowest NodeId in the CURRENT committed
+        // membership — NOT in `surviving` (see the self-omit note above).
+        let proposer = committed_members.iter().copied().min()?;
+        if proposer != self.self_id {
+            return None;
+        }
+
+        // Must be a genuine, non-empty shrink of the CURRENT membership.
+        if surviving.is_empty() || surviving.len() >= committed_members.len() {
+            return None;
+        }
+        if !surviving.iter().all(|n| committed_members.contains(n)) {
+            return None; // not a subset — this path only removes members
+        }
+
+        if !self.membership_change_is_safe(&surviving, Some(self.cluster_id())) {
+            return None;
+        }
+
+        // Don't stomp an in-flight proposal.
+        if self.pending_proposal.lock().is_some() {
+            return None;
+        }
+
+        let committed = self.committed_term.load(Ordering::Relaxed);
+        let voted = self.voted_term.load(Ordering::Relaxed);
+        let new_term = committed.max(voted) + 1;
+
+        let placement_version = self.achievable_placement_version(&surviving);
+
+        // THE lowering stamp — `surviving.len()`, NOT `self.peak_cluster_size()`.
+        // This is the one and only place in the authority that stamps a
+        // `committed_peak` below the current effective peak.
+        let committed_peak = surviving.len() as u64;
+        let term = TopologyTerm::new(
+            new_term,
+            surviving.clone(),
+            self.self_id,
+            self.cluster_id(),
+            placement_version,
+            committed_peak,
+        );
+        self.voted_term.store(new_term, Ordering::Relaxed);
+
+        // Gate A: quorum is derived from the OLD peak (`peak_cluster_size()`
+        // has not been lowered yet at propose time), so a minority can never
+        // gather enough votes to produce a commit.
+        let quorum_needed = self.activation_quorum_needed(surviving.len());
+        let mut votes = std::collections::HashMap::new();
+        let self_excluded = !surviving.contains(&self.self_id);
+        if !self_excluded {
+            votes.insert(self.self_id, true);
+        }
+        // else: self-omit case — see doc comment above. Self does not
+        // self-vote; all `quorum_needed` votes must come from `surviving`
+        // members so the resulting commit's voters stay a subset of
+        // `members`.
+
+        *self.pending_proposal.lock() = Some(PendingProposal {
+            term: term.clone(),
+            votes,
+            quorum_needed,
+            _started_at: Instant::now(),
+        });
+
+        tracing::info!(
+            self_id = self.self_id.0,
+            term = new_term,
+            surviving = ?surviving.iter().map(|n| n.0).collect::<Vec<_>>(),
+            committed_peak,
+            self_excluded,
+            "cluster: proposing quorum-gated shrink (G8)",
         );
 
         Some(term)
@@ -5504,6 +5706,469 @@ mod tests {
             auth.peak_cluster_size(),
             5,
             "peak must not drop after a subset proposal"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // G8 stage 2 — Gate B (apply-time shrink floor) + propose_shrink +
+    // observed_peak reset.
+    //
+    // Stage 1 shipped the data model with an UNCONDITIONAL
+    // `committed_peak.store(commit.committed_peak)` in `apply_commit_locked`
+    // and no floor re-check on the voter/apply side. That is the exposure
+    // these tests close: a stale/behind proposer's low-committed_peak commit
+    // must be rejected by every node whose OWN durable `committed_peak` is
+    // still high, while a genuinely quorate shrink (a real majority of the
+    // OLD peak voted) must apply everywhere.
+    // -----------------------------------------------------------------------
+
+    /// Build a `TopologyCommit` with a consistent digest — small helper to
+    /// cut boilerplate across the stage-2 tests below.
+    fn quorum_commit(
+        term: u64,
+        proposer: NodeId,
+        members: Vec<NodeId>,
+        committed_peak: u64,
+        voters: Vec<NodeId>,
+    ) -> TopologyCommit {
+        let digest =
+            TopologyTerm::compute_digest(term, &ClusterId::UNSET, &members, 1, committed_peak);
+        TopologyCommit {
+            term,
+            proposer,
+            members,
+            cluster_id: ClusterId::UNSET,
+            placement_version: 1,
+            committed_peak,
+            digest,
+            voters,
+        }
+    }
+
+    /// Seed `auth` with a committed N-member cluster at `committed_peak ==
+    /// members.len()` (term 1), so subsequent tests start from a settled,
+    /// non-shrunk floor.
+    fn seed_committed(auth: &TopologyAuthority, members: Vec<NodeId>) {
+        let commit = quorum_commit(
+            1,
+            members[0],
+            members.clone(),
+            members.len() as u64,
+            members,
+        );
+        assert_eq!(
+            auth.handle_commit(&commit),
+            Some(1),
+            "seed commit must apply"
+        );
+    }
+
+    #[test]
+    fn has_quorum_voter_proof_for_generalizes_threshold() {
+        let commit = quorum_commit(1, NodeId(1), members(&[1, 2, 3]), 3, members(&[1, 2]));
+        // Default threshold (majority of 3 = 2): 2 voters is enough.
+        assert!(commit.has_quorum_voter_proof());
+        assert!(commit.has_quorum_voter_proof_for(2));
+        // A stricter threshold the same 2 voters cannot satisfy.
+        assert!(!commit.has_quorum_voter_proof_for(3));
+        // A voter outside `members` still fails regardless of threshold.
+        let poisoned = quorum_commit(1, NodeId(1), members(&[1, 2, 3]), 3, members(&[1, 9]));
+        assert!(!poisoned.has_quorum_voter_proof_for(1));
+    }
+
+    /// THE reviewer's required test: a stale/behind proposer's
+    /// lower-committed_peak commit is rejected by a caught-up node, and an
+    /// equivalent commit that DOES carry a quorum of the node's own
+    /// (higher) local peak is accepted.
+    #[test]
+    fn gate_b_rejects_shrink_without_old_peak_quorum_voters() {
+        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+        seed_committed(&auth, members(&[1, 2, 3, 4, 5]));
+        assert_eq!(auth.committed_peak(), 5, "local peak established at 5");
+
+        // Reject: a shrink-to-2 commit whose ONLY 2 voters are the 2
+        // surviving members themselves — insufficient against local_peak=5
+        // (needs 5/2+1 = 3).
+        let insufficient = quorum_commit(2, NodeId(4), members(&[4, 5]), 2, members(&[4, 5]));
+        assert!(
+            auth.handle_commit(&insufficient).is_none(),
+            "a 2-voter shrink commit must be rejected when local committed_peak is 5 (needs 3)"
+        );
+        assert_eq!(
+            auth.committed_peak(),
+            5,
+            "a rejected commit must not mutate the durable floor"
+        );
+        assert_eq!(
+            auth.committed_term(),
+            1,
+            "a rejected commit must not advance the term"
+        );
+
+        // Accept: a shrink-to-3 commit carrying 3 distinct in-member voters
+        // — meets the same local_peak=5 threshold (3 >= 3).
+        let sufficient = quorum_commit(2, NodeId(3), members(&[3, 4, 5]), 3, members(&[3, 4, 5]));
+        assert_eq!(
+            auth.handle_commit(&sufficient),
+            Some(2),
+            "a 3-voter shrink commit must be accepted when local committed_peak is 5 (needs 3)"
+        );
+        assert_eq!(auth.committed_peak(), 3);
+        assert_eq!(
+            auth.peak_cluster_size(),
+            3,
+            "observed_peak must also drop to 3"
+        );
+    }
+
+    /// Failure mode 1: a minority (2-of-5) cannot shrink the cluster to
+    /// itself, at either gate.
+    #[test]
+    fn minority_cannot_shrink() {
+        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+        seed_committed(&auth, members(&[1, 2, 3, 4, 5]));
+
+        // Gate A: node 1 (the deterministic proposer) attempts to shrink to
+        // just itself + node 2 — a minority of the OLD peak (5).
+        let term = auth
+            .propose_shrink(members(&[1, 2]))
+            .expect("the deterministic proposer may attempt the proposal");
+        assert_eq!(term.committed_peak, 2);
+
+        let vote2 = TopologyVote {
+            term: term.term,
+            digest: term.digest,
+            voter: NodeId(2),
+            accepted: true,
+            voter_current_term: 0,
+            voter_placement_support: 1,
+        };
+        let commit = auth.handle_vote(&vote2);
+        assert!(
+            commit.is_none(),
+            "2 votes (self + node 2) never reaches the peak-derived quorum of 3 — Gate A blocks"
+        );
+
+        // Gate B: even a hand-forged 2-voter commit (bypassing the normal
+        // propose/vote path entirely) is rejected — on the SAME node and on
+        // an independently-seeded node, both with local committed_peak=5.
+        let forged = quorum_commit(2, NodeId(1), members(&[1, 2]), 2, members(&[1, 2]));
+        assert!(
+            auth.handle_commit(&forged).is_none(),
+            "Gate B must reject a forged 2-voter shrink commit at local_peak=5"
+        );
+        assert_eq!(auth.committed_peak(), 5, "floor must remain unlowered");
+
+        let other = TopologyAuthority::new(NodeId(3), Duration::from_secs(1));
+        seed_committed(&other, members(&[1, 2, 3, 4, 5]));
+        assert!(
+            other.handle_commit(&forged).is_none(),
+            "Gate B rejection is per-node: every high-local_peak node refuses the same forged commit"
+        );
+    }
+
+    /// A real majority of the OLD peak (3 of 5) can shrink the cluster to
+    /// 3, and the new floor is then used for subsequent quorum math.
+    #[test]
+    fn majority_can_shrink_5_to_3() {
+        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+        seed_committed(&auth, members(&[1, 2, 3, 4, 5]));
+
+        let term = auth
+            .propose_shrink(members(&[1, 2, 3]))
+            .expect("the deterministic proposer may propose the shrink");
+        assert_eq!(term.committed_peak, 3);
+
+        // Gate A quorum = max(3/2+1=2, 5/2+1=3) = 3. Self-vote (1) + 2 more.
+        let commit_after_first = auth.handle_vote(&TopologyVote {
+            term: term.term,
+            digest: term.digest,
+            voter: NodeId(2),
+            accepted: true,
+            voter_current_term: 0,
+            voter_placement_support: 1,
+        });
+        assert!(
+            commit_after_first.is_none(),
+            "2/3 accepted so far, not yet quorum"
+        );
+
+        let commit = auth
+            .handle_vote(&TopologyVote {
+                term: term.term,
+                digest: term.digest,
+                voter: NodeId(3),
+                accepted: true,
+                voter_current_term: 0,
+                voter_placement_support: 1,
+            })
+            .expect("3rd accepting vote reaches the peak-derived quorum of 3");
+        assert_eq!(commit.voters.len(), 3);
+
+        assert_eq!(auth.handle_commit(&commit), Some(term.term));
+        assert_eq!(auth.committed_peak(), 3, "durable floor lowered to 3");
+        assert_eq!(
+            auth.peak_cluster_size.load(Ordering::Relaxed),
+            3,
+            "raw observed_peak atom must ALSO be force-reset to 3, not left at the stale 5"
+        );
+        assert_eq!(
+            auth.peak_cluster_size(),
+            3,
+            "combined getter reflects the new floor"
+        );
+        assert_eq!(auth.committed_members(), members(&[1, 2, 3]));
+
+        // Subsequent activation quorum uses the new floor (3), not the
+        // pre-shrink 5.
+        assert_eq!(
+            auth.activation_quorum_needed(3),
+            2,
+            "quorum math must now derive from the lowered peak"
+        );
+    }
+
+    /// The proposer may exclude itself from the surviving set. Its own vote
+    /// must NOT be recorded (see `propose_shrink`'s doc comment) — the full
+    /// quorum must come from `surviving` members so the resulting commit's
+    /// voters stay a subset of its own `members` and can pass
+    /// `has_quorum_voter_proof`/Gate B on every node, including the
+    /// proposer's own eventual view of the commit.
+    #[test]
+    fn propose_shrink_self_omit_excludes_self_from_voters() {
+        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+        seed_committed(&auth, members(&[1, 2, 3, 4, 5]));
+
+        let term = auth
+            .propose_shrink(members(&[2, 3, 4]))
+            .expect("the lowest committed node may propose dropping itself");
+        assert_eq!(term.members, members(&[2, 3, 4]));
+        assert_eq!(term.committed_peak, 3);
+        assert!(
+            !term.members.contains(&NodeId(1)),
+            "self-excluding shrink must not include the proposer in the new membership"
+        );
+
+        // Quorum needed = max(3/2+1=2, 5/2+1=3) = 3. Since self did NOT
+        // self-vote, all 3 votes must come from members 2, 3, 4.
+        let mut commit_opt = None;
+        for voter in [NodeId(2), NodeId(3)] {
+            let c = auth.handle_vote(&TopologyVote {
+                term: term.term,
+                digest: term.digest,
+                voter,
+                accepted: true,
+                voter_current_term: 0,
+                voter_placement_support: 1,
+            });
+            assert!(c.is_none(), "quorum not yet reached without self-vote");
+            commit_opt = c;
+        }
+        let commit = auth
+            .handle_vote(&TopologyVote {
+                term: term.term,
+                digest: term.digest,
+                voter: NodeId(4),
+                accepted: true,
+                voter_current_term: 0,
+                voter_placement_support: 1,
+            })
+            .expect("3rd external vote (2,3,4) reaches quorum without a self-vote");
+        assert!(commit_opt.is_none());
+        assert!(
+            !commit.voters.contains(&NodeId(1)),
+            "the proposer's own id must not appear in the commit's voter list"
+        );
+        assert_eq!(commit.voters.len(), 3);
+
+        // Apply on an INDEPENDENT node (simulating a peer) whose local
+        // committed_peak is also 5 — proves the commit passes both the
+        // unmodified has_quorum_voter_proof (voters subset of members) and
+        // Gate B (quorum of the old peak).
+        let peer = TopologyAuthority::new(NodeId(2), Duration::from_secs(1));
+        seed_committed(&peer, members(&[1, 2, 3, 4, 5]));
+        assert_eq!(peer.handle_commit(&commit), Some(term.term));
+        assert_eq!(peer.committed_members(), members(&[2, 3, 4]));
+        assert_eq!(peer.committed_peak(), 3);
+    }
+
+    /// Failure mode 2: a 3|2 split where each side proposes a shrink to
+    /// itself. The 3-side gathers a real majority-of-5 and commits; the
+    /// 2-side (simulated as a forged commit, since only the deterministic
+    /// global proposer — node 1, on the 3-side here — can drive
+    /// `propose_shrink`) is rejected at both gates. On heal, a 2-side node
+    /// adopts the 3-side's higher-term, properly-quorate commit. No
+    /// split-brain: final committed_peak == 3 everywhere.
+    #[test]
+    fn split_then_shrink_both_sides() {
+        // 3-side: node 1 (global deterministic proposer) shrinks to {1,2,3}
+        // and reaches a real quorum of the old peak (3 of 5).
+        let side_a = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+        seed_committed(&side_a, members(&[1, 2, 3, 4, 5]));
+        let term = side_a
+            .propose_shrink(members(&[1, 2, 3]))
+            .expect("3-side proposer");
+        side_a.handle_vote(&TopologyVote {
+            term: term.term,
+            digest: term.digest,
+            voter: NodeId(2),
+            accepted: true,
+            voter_current_term: 0,
+            voter_placement_support: 1,
+        });
+        let commit_3_side = side_a
+            .handle_vote(&TopologyVote {
+                term: term.term,
+                digest: term.digest,
+                voter: NodeId(3),
+                accepted: true,
+                voter_current_term: 0,
+                voter_placement_support: 1,
+            })
+            .expect("3-side reaches quorum (3 of old peak 5)");
+        assert_eq!(side_a.handle_commit(&commit_3_side), Some(term.term));
+        assert_eq!(side_a.committed_peak(), 3, "3-side commits its shrink");
+
+        // 2-side: nodes 4/5 cannot drive propose_shrink (they are not the
+        // global deterministic proposer), so simulate their best-effort
+        // minority attempt as a forged 2-voter commit at the SAME term.
+        let side_b = TopologyAuthority::new(NodeId(4), Duration::from_secs(1));
+        seed_committed(&side_b, members(&[1, 2, 3, 4, 5]));
+        let forged_2_side =
+            quorum_commit(term.term, NodeId(4), members(&[4, 5]), 2, members(&[4, 5]));
+        assert!(
+            side_b.handle_commit(&forged_2_side).is_none(),
+            "2-side's minority shrink must be rejected (Gate A/B both fail)"
+        );
+        assert_eq!(
+            side_b.committed_peak(),
+            5,
+            "2-side floor unchanged before heal"
+        );
+
+        // Heal: the 2-side node receives the 3-side's higher-term,
+        // properly-quorate commit and adopts it.
+        assert_eq!(side_b.handle_commit(&commit_3_side), Some(term.term));
+        assert_eq!(
+            side_b.committed_peak(),
+            3,
+            "2-side heals to the 3-side's committed_peak"
+        );
+        assert_eq!(side_b.committed_members(), members(&[1, 2, 3]));
+        assert_eq!(
+            side_a.committed_peak(),
+            side_b.committed_peak(),
+            "no split-brain: both sides converge to 3"
+        );
+    }
+
+    /// Failure mode 3: a shrink and a grow proposed at the same term are
+    /// serialized by strict term monotonicity — the loser is rejected
+    /// outright (not partially applied), and Gate B's threshold correctly
+    /// tracks whichever commit actually won.
+    #[test]
+    fn shrink_racing_grow_serialized() {
+        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+        seed_committed(&auth, members(&[1, 2, 3, 4, 5]));
+        auth.set_committed_voter_ever_seen(&[
+            NodeId(1),
+            NodeId(2),
+            NodeId(3),
+            NodeId(4),
+            NodeId(5),
+            NodeId(6),
+        ]);
+
+        let grow = quorum_commit(
+            2,
+            NodeId(1),
+            members(&[1, 2, 3, 4, 5, 6]),
+            6,
+            members(&[1, 2, 3, 4]),
+        );
+        let shrink = quorum_commit(2, NodeId(1), members(&[1, 2, 3]), 3, members(&[1, 2, 3]));
+
+        // Grow wins the race for term 2.
+        assert_eq!(auth.handle_commit(&grow), Some(2));
+        assert_eq!(auth.committed_peak(), 6);
+        assert_eq!(auth.committed_members(), members(&[1, 2, 3, 4, 5, 6]));
+
+        // The shrink, same term, arrives second: rejected outright by
+        // strict term monotonicity — nothing is torn.
+        assert!(
+            auth.handle_commit(&shrink).is_none(),
+            "same-term commit must be rejected (term must be strictly higher)"
+        );
+        assert_eq!(
+            auth.committed_peak(),
+            6,
+            "no torn floor — grow's state is untouched"
+        );
+        assert_eq!(auth.committed_members(), members(&[1, 2, 3, 4, 5, 6]));
+
+        // Retried at term 3 with the SAME (now stale) voter set: Gate B
+        // recomputes its threshold against the CURRENT local_peak (6, not
+        // the 5 it was computed against originally), so the same 3 voters
+        // are now insufficient (need 6/2+1 = 4).
+        let shrink_retry = quorum_commit(3, NodeId(1), members(&[1, 2, 3]), 3, members(&[1, 2, 3]));
+        assert!(
+            auth.handle_commit(&shrink_retry).is_none(),
+            "Gate B must re-derive its threshold from the post-grow peak (6), rejecting the stale 3-voter proof"
+        );
+        assert_eq!(
+            auth.committed_peak(),
+            6,
+            "floor still unaffected by the rejected retry"
+        );
+    }
+
+    /// observed_peak (the raw SWIM/proposal-fed atom) is lowered ONLY by a
+    /// Gate-B-passed shrink; every other path stays monotonic (`fetch_max`).
+    #[test]
+    fn observed_peak_lowered_only_on_shrink() {
+        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+        seed_committed(&auth, members(&[1, 2, 3, 4, 5]));
+
+        // Simulate some other SWIM-driven observation bumping the raw
+        // observed atom above the durable committed_peak.
+        auth.observe_peak_cluster_size(10);
+        assert_eq!(
+            auth.peak_cluster_size(),
+            10,
+            "observed peak dominates for now"
+        );
+
+        // A NON-shrink commit (same membership, same committed_peak==5,
+        // just a new term) must NOT touch the raw observed atom.
+        let non_shrink = quorum_commit(
+            2,
+            NodeId(1),
+            members(&[1, 2, 3, 4, 5]),
+            5,
+            members(&[1, 2, 3]),
+        );
+        assert_eq!(auth.handle_commit(&non_shrink), Some(2));
+        assert_eq!(auth.committed_peak(), 5);
+        assert_eq!(
+            auth.peak_cluster_size.load(Ordering::Relaxed),
+            10,
+            "non-shrink apply must leave the raw observed_peak atom untouched (still monotonic)"
+        );
+
+        // A Gate-B-passed shrink (committed_peak 5 -> 3) DOES force-reset
+        // the raw observed atom, even though it was sitting at 10.
+        let shrink = quorum_commit(3, NodeId(1), members(&[1, 2, 3]), 3, members(&[1, 2, 3]));
+        assert_eq!(auth.handle_commit(&shrink), Some(3));
+        assert_eq!(auth.committed_peak(), 3);
+        assert_eq!(
+            auth.peak_cluster_size.load(Ordering::Relaxed),
+            3,
+            "a Gate-B-passed shrink is the ONLY path allowed to lower the raw observed_peak atom"
+        );
+        assert_eq!(
+            auth.peak_cluster_size(),
+            3,
+            "the combined getter must also reflect the lowered floor (no re-inflation from the stale 10)"
         );
     }
 }
