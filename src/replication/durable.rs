@@ -380,6 +380,12 @@ pub enum ReplicationIntentError {
     Io(#[from] std::io::Error),
     #[error("replication intent tracker state corrupt: {0}")]
     Corrupt(String),
+    /// R12 review (Critical, fail-closed fix): a prior compaction's
+    /// post-rename reopen of the append handle failed, and every subsequent
+    /// write/sync is refused rather than risk silently persisting to the
+    /// stale, now-unlinked handle. See [`AppendState::Poisoned`].
+    #[error("replication intent tracker poisoned (durability barrier unavailable): {0}")]
+    Poisoned(String),
 }
 
 /// Persistent master-side journal of pending replication ranges.
@@ -441,6 +447,35 @@ pub struct ReplicationIntentTracker {
     inner: Mutex<ReplicationIntentInner>,
 }
 
+/// Durability state of the on-disk log's append handle.
+///
+/// R12 review (Critical, fail-closed fix): `compact_locked` writes a fresh
+/// `SNAPSHOT` (atomic temp-write + rename), then reopens the append handle
+/// on the new file (`rename` does not redirect an already-open fd to the
+/// new inode). If that reopen fails AFTER the rename already succeeded, the
+/// PREVIOUS handle is left pointing at an unlinked, orphaned inode — POSIX
+/// permits `write()`/`fsync()` on an unlinked fd to succeed, so leaving that
+/// stale handle in place would make every subsequent `begin`/`commit`
+/// silently "succeed" while writing to a file no path-based recovery can
+/// ever see. `Poisoned` makes that failure fail CLOSED instead: every write
+/// or sync then hard-errors until the process restarts and reloads from
+/// disk (poison-until-restart; no automatic self-heal — a fresh compaction
+/// is never attempted again once poisoned, since `begin`/`commit`/`flush`
+/// all error out before reaching `maybe_compact_locked`).
+#[derive(Debug)]
+enum AppendState {
+    /// The in-memory / empty-path tracker — every write/sync is a no-op.
+    InMemory,
+    /// A real tracker with a healthy, open `O_APPEND|O_WRONLY|O_CREAT`
+    /// handle, opened once in `load` (and again after each successful
+    /// compaction) so `begin`/`commit` never pay a fresh `open()` on the
+    /// hot path.
+    Active(std::fs::File),
+    /// A compaction's post-rename reopen failed; the string is the
+    /// captured cause. See the type-level doc above.
+    Poisoned(String),
+}
+
 #[derive(Debug)]
 struct ReplicationIntentInner {
     /// Each pending range carries the EXACT key set of the RPC that recorded
@@ -451,23 +486,28 @@ struct ReplicationIntentInner {
     commit_dirty: bool,
     last_flush: Instant,
     dirty_commit_count: u32,
-    /// Open append handle for the on-disk log — `None` for the in-memory /
-    /// empty-path tracker. Opened once (in `load`, and again after each
-    /// compaction) in `O_APPEND|O_WRONLY|O_CREAT` mode so `begin`/`commit`
-    /// never pay the cost of a fresh `open()` on the hot path.
-    append_file: Option<std::fs::File>,
+    /// Durability state of the append handle — see [`AppendState`].
+    append_state: AppendState,
     /// Records appended to the log since the last `SNAPSHOT` (the record
     /// count found at load time, or the count reset by the last
     /// compaction). Drives the compaction trigger.
     records_since_snapshot: u32,
-    /// Encoded `COMMIT` frames not yet written to `append_file`, preserving
-    /// the amortized-commit contract: a `write()` (not just its `fdatasync`)
-    /// stays off-disk until the existing time/count threshold trips (or the
-    /// next `begin`), so a plain reload without an intervening flush still
-    /// observes the pre-commit (stale) state — a lost buffered commit on an
-    /// actual crash just leaves a stale range that recovery replays
-    /// idempotently, unchanged from the pre-R12 contract.
+    /// Encoded `COMMIT` frames not yet written to the append handle,
+    /// preserving the amortized-commit contract: a `write()` (not just its
+    /// `fdatasync`) stays off-disk until the existing time/count threshold
+    /// trips (or the next `begin`), so a plain reload without an
+    /// intervening flush still observes the pre-commit (stale) state — a
+    /// lost buffered commit on an actual crash just leaves a stale range
+    /// that recovery replays idempotently, unchanged from the pre-R12
+    /// contract.
     unflushed_commit_frames: Vec<u8>,
+    /// Test-only fault injection (R12 review): when `true`, the NEXT
+    /// `compact_locked` call fails its post-rename reopen with a synthetic
+    /// error instead of actually reopening the file — exercising the
+    /// fail-closed poisoning path without needing real fd exhaustion.
+    /// One-shot: consumed (reset to `false`) on use.
+    #[cfg(test)]
+    force_reopen_failure: bool,
 }
 
 /// Encode one record frame: `[payload_len:4 LE][crc32:4 LE][type:1][payload]`.
@@ -708,9 +748,11 @@ impl ReplicationIntentTracker {
                 commit_dirty: false,
                 last_flush: Instant::now(),
                 dirty_commit_count: 0,
-                append_file: Some(append_file),
+                append_state: AppendState::Active(append_file),
                 records_since_snapshot: record_count,
                 unflushed_commit_frames: Vec::new(),
+                #[cfg(test)]
+                force_reopen_failure: false,
             }),
         })
     }
@@ -723,9 +765,11 @@ impl ReplicationIntentTracker {
                 commit_dirty: false,
                 last_flush: Instant::now(),
                 dirty_commit_count: 0,
-                append_file: None,
+                append_state: AppendState::InMemory,
                 records_since_snapshot: 0,
                 unflushed_commit_frames: Vec::new(),
+                #[cfg(test)]
+                force_reopen_failure: false,
             }),
         }
     }
@@ -863,15 +907,22 @@ impl ReplicationIntentTracker {
     }
 
     /// Append one record's frame to the log via the held handle. No-op for
-    /// the in-memory tracker (`append_file` is `None`).
+    /// the in-memory tracker. Hard `Err(Poisoned)` — WITHOUT touching the
+    /// filesystem — if a prior compaction reopen failed (see
+    /// [`AppendState::Poisoned`]): the stale pre-compaction handle must
+    /// never be written to again.
     fn append_record_locked(
         &self,
         inner: &mut ReplicationIntentInner,
         record_type: u8,
         payload: &[u8],
     ) -> std::result::Result<(), ReplicationIntentError> {
-        let Some(file) = inner.append_file.as_mut() else {
-            return Ok(());
+        let file = match &mut inner.append_state {
+            AppendState::InMemory => return Ok(()),
+            AppendState::Poisoned(cause) => {
+                return Err(ReplicationIntentError::Poisoned(cause.clone()));
+            }
+            AppendState::Active(file) => file,
         };
         let frame = intent_log_encode_frame(record_type, payload);
         file.write_all(&frame).map_err(ReplicationIntentError::Io)?;
@@ -880,30 +931,59 @@ impl ReplicationIntentTracker {
     }
 
     /// `fdatasync` the append handle. No-op for the in-memory tracker.
+    /// Hard `Err(Poisoned)` if a prior compaction reopen failed — see
+    /// [`append_record_locked`](Self::append_record_locked).
     fn sync_locked(
         inner: &mut ReplicationIntentInner,
     ) -> std::result::Result<(), ReplicationIntentError> {
-        if let Some(file) = inner.append_file.as_ref() {
-            file.sync_data().map_err(ReplicationIntentError::Io)?;
+        match &inner.append_state {
+            AppendState::InMemory => Ok(()),
+            AppendState::Poisoned(cause) => Err(ReplicationIntentError::Poisoned(cause.clone())),
+            AppendState::Active(file) => file.sync_data().map_err(ReplicationIntentError::Io),
         }
-        Ok(())
     }
 
     /// Write out any buffered `COMMIT` frames accumulated by `commit()`
     /// (does not sync — callers fsync afterward). No-op if nothing is
-    /// buffered or the tracker is in-memory.
+    /// buffered or the tracker is in-memory. Hard `Err(Poisoned)` if a
+    /// prior compaction reopen failed — see
+    /// [`append_record_locked`](Self::append_record_locked).
     fn drain_unflushed_commits_locked(
         inner: &mut ReplicationIntentInner,
     ) -> std::result::Result<(), ReplicationIntentError> {
         if inner.unflushed_commit_frames.is_empty() {
             return Ok(());
         }
-        if let Some(file) = inner.append_file.as_mut() {
-            file.write_all(&inner.unflushed_commit_frames)
-                .map_err(ReplicationIntentError::Io)?;
-            inner.records_since_snapshot = inner
-                .records_since_snapshot
-                .saturating_add(inner.dirty_commit_count);
+        match &mut inner.append_state {
+            AppendState::InMemory => {}
+            AppendState::Poisoned(cause) => {
+                return Err(ReplicationIntentError::Poisoned(cause.clone()));
+            }
+            AppendState::Active(file) => {
+                // Invariant this accounting relies on: `dirty_commit_count`
+                // at this point equals exactly the number of buffered
+                // frames we are about to write (i.e. "frames just
+                // drained"). That holds only because every call site that
+                // resets `dirty_commit_count` to 0 (`begin`, `flush_locked`)
+                // does so AFTER calling this drain in the same invocation —
+                // never before, and never without draining first. A future
+                // refactor that reset `dirty_commit_count` (or repopulated
+                // `unflushed_commit_frames`) out of that order would
+                // silently corrupt the `records_since_snapshot` count that
+                // drives the compaction trigger.
+                debug_assert!(
+                    inner.dirty_commit_count > 0,
+                    "unflushed_commit_frames is non-empty but dirty_commit_count == 0 — \
+                     every buffered COMMIT frame push increments dirty_commit_count in \
+                     lockstep (see `commit()`), so this violates the invariant the \
+                     records_since_snapshot accounting below depends on",
+                );
+                file.write_all(&inner.unflushed_commit_frames)
+                    .map_err(ReplicationIntentError::Io)?;
+                inner.records_since_snapshot = inner
+                    .records_since_snapshot
+                    .saturating_add(inner.dirty_commit_count);
+            }
         }
         inner.unflushed_commit_frames.clear();
         Ok(())
@@ -942,6 +1022,16 @@ impl ReplicationIntentTracker {
     /// current in-memory `pending` state (temp-write + `sync_all` + rename +
     /// parent-dir fsync — the same pattern [`write_durable_file`] uses
     /// elsewhere), then reopen the append handle on the fresh file.
+    ///
+    /// R12 review (Critical, fail-closed fix): by the time the reopen below
+    /// runs, the `SNAPSHOT` has already been durably renamed into place. If
+    /// the reopen itself then fails, the OLD handle in `inner.append_state`
+    /// is left pointing at that renamed-away file's now-unlinked inode —
+    /// POSIX permits `write()`/`fsync()` on an unlinked fd to succeed, so
+    /// leaving it in place would make every subsequent `begin`/`commit`
+    /// silently "succeed" while writing to a file no recovery can ever see.
+    /// Poison the tracker instead (dropping the stale handle) so every
+    /// later write/sync hard-errors — see [`AppendState`].
     fn compact_locked(
         &self,
         inner: &mut ReplicationIntentInner,
@@ -952,12 +1042,36 @@ impl ReplicationIntentTracker {
         // `rename` (inside `write_durable_file`) does not redirect an
         // already-open append fd to the new inode — reopen on `self.path` so
         // subsequent appends land in the file that now exists there.
-        let file = std::fs::OpenOptions::new()
+        #[cfg(test)]
+        let reopened = if inner.force_reopen_failure {
+            inner.force_reopen_failure = false; // one-shot
+            Err(std::io::Error::other(
+                "injected compaction reopen failure (test)",
+            ))
+        } else {
+            std::fs::OpenOptions::new()
+                .append(true)
+                .create(true)
+                .open(&self.path)
+        };
+        #[cfg(not(test))]
+        let reopened = std::fs::OpenOptions::new()
             .append(true)
             .create(true)
-            .open(&self.path)
-            .map_err(ReplicationIntentError::Io)?;
-        inner.append_file = Some(file);
+            .open(&self.path);
+        let file = match reopened {
+            Ok(file) => file,
+            Err(e) => {
+                let cause = format!("intent log compaction reopen failed: {e}");
+                // Replace (dropping/closing) the stale pre-compaction
+                // handle rather than leaving it as the live append target —
+                // fail CLOSED, not silently no-op (which `None` would mean
+                // to `append_record_locked`/`sync_locked`).
+                inner.append_state = AppendState::Poisoned(cause);
+                return Err(ReplicationIntentError::Io(e));
+            }
+        };
+        inner.append_state = AppendState::Active(file);
         inner.records_since_snapshot = 1; // the SNAPSHOT record just written
         inner.commit_dirty = false;
         inner.dirty_commit_count = 0;
@@ -2499,6 +2613,101 @@ mod tests {
             reopened.pending(),
             expected,
             "reload after compaction must reconstruct pending exactly",
+        );
+    }
+
+    /// R12 review (Critical, silent durability loss): `compact_locked`
+    /// writes a fresh `SNAPSHOT` via atomic temp-write+rename, then reopens
+    /// the append handle on the renamed-into-place file. Pre-fix, if that
+    /// reopen failed, `inner.append_file` stayed the OLD handle — now an fd
+    /// on an unlinked, orphaned inode. POSIX permits `write()`+`fsync()` on
+    /// an unlinked fd to succeed, so every subsequent `begin` would
+    /// silently return `Ok` while durably writing to a file no recovery
+    /// could ever see: a crash after that point loses every begin/commit
+    /// since the failed reopen with NO error ever surfaced. This forces
+    /// that reopen to fail via the `force_reopen_failure` test-only seam
+    /// (mirroring the engine's `WriteFailingDevice` fault-injection
+    /// pattern) — exercising the real `compact_locked` code path, not a
+    /// hand-rolled substitute — and asserts the tracker fails CLOSED.
+    #[test]
+    fn intent_log_poisoned_on_compaction_reopen_failure_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("intent.dat");
+        let tracker = ReplicationIntentTracker::load(path.clone()).unwrap();
+
+        // Establish pending state before poisoning, to prove `pending()`
+        // (an in-memory read) keeps working afterward.
+        tracker.begin(1, 1, &[]).unwrap();
+
+        // Arm the seam: the NEXT compact_locked's reopen fails.
+        tracker.inner.lock().force_reopen_failure = true;
+
+        // Drive compact_locked directly — the record-count trigger that
+        // normally invokes it is covered by
+        // `intent_log_compaction_bounds_file_and_preserves_pending`; this
+        // test targets compact_locked's failure handling specifically. The
+        // preceding `write_durable_file` inside it still runs for real
+        // (the SNAPSHOT is genuinely written and renamed into place) —
+        // only the reopen that follows is faked to fail, exactly
+        // reproducing the pre-fix bug scenario.
+        let compact_result = {
+            let mut inner = tracker.inner.lock();
+            tracker.compact_locked(&mut inner)
+        };
+        assert!(
+            compact_result.is_err(),
+            "the forced reopen failure must surface as an Err from compact_locked",
+        );
+
+        // Fail-closed assertion: pre-fix, `append_file` still held the
+        // stale (now-unlinked) handle and this `begin` returned `Ok`,
+        // silently writing/fsyncing to a file recovery could never see.
+        // Post-fix, the tracker is poisoned and this MUST return `Err`.
+        let begin_after_poison = tracker.begin(2, 2, &[]);
+        assert!(
+            begin_after_poison.is_err(),
+            "begin() after a poisoned compaction reopen must fail loudly, not silently \
+             succeed as it did pre-fix",
+        );
+        assert!(
+            matches!(
+                begin_after_poison.unwrap_err(),
+                ReplicationIntentError::Poisoned(_)
+            ),
+            "the error must be the dedicated Poisoned variant",
+        );
+
+        // A second call must ALSO fail — poisoning is not one-shot.
+        let commit_after_poison = tracker.commit(1, 1);
+        // commit() only touches the append handle once its buffered frame
+        // is actually flushed (time/count threshold or a subsequent
+        // begin/flush); force that here via an explicit flush() so the
+        // poisoned state is exercised on the commit path too.
+        assert!(
+            commit_after_poison.is_ok(),
+            "commit() itself only buffers in memory and does not touch the append handle",
+        );
+        assert!(
+            tracker.flush().is_err(),
+            "flush() must fail loudly once poisoned, refusing to write the buffered commit \
+             frame to the stale handle",
+        );
+
+        // In-memory reads must still work — poisoning blocks writes/
+        // durability, not pure reads of already-recorded pending state.
+        // `begin()` updates `pending` before attempting the (now-poisoned)
+        // write, so range 2 is present despite `begin(2, 2, ..)` returning
+        // Err above (unchanged, pre-existing in-memory-vs-disk divergence
+        // on a failed write — not part of this fix); range 1 was removed
+        // by the `commit(1, 1)` call. Either way, `pending()` must simply
+        // not panic and reflect exactly that in-memory truth.
+        assert_eq!(
+            tracker.pending(),
+            vec![ReplicationIntentRange {
+                first_sequence: 2,
+                last_sequence: 2,
+            }],
+            "pending() (in-memory read) must still work while poisoned",
         );
     }
 
