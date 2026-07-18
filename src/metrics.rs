@@ -1012,6 +1012,15 @@ pub struct ReplicationMetrics {
     /// A non-zero counter means the on-disk ACK watermarks were lost
     /// and replicas are being re-verified from scratch.
     pub ack_tracker_load_failures: PaddedCounter,
+    /// Observability follow-up: incremented exactly once at the
+    /// `ReplicationIntentTracker`'s Active->Poisoned transition (see
+    /// [`crate::replication::durable`]'s `compact_locked`), i.e. when a
+    /// post-compaction reopen of the append-only intent log fails. That
+    /// transition is a durability barrier loss: the tracker fails closed
+    /// and every subsequent `begin`/`commit` hard-errors until restart.
+    /// A non-zero value is a LOUD, urgent signal — pair with the
+    /// `tracing::error!` emitted at the same site.
+    pub intent_log_poisoned: PaddedCounter,
     /// F-G7-009: master-side counter — incremented every time the
     /// `replicate_batch` fan-out's scoped worker panics. The panic
     /// payload is logged + the replica transitions to Down via the
@@ -1094,6 +1103,7 @@ impl ReplicationMetrics {
             replica_apply_divergence_total: PaddedCounter::new(),
             ack_tracker_flush_failures: PaddedCounter::new(),
             ack_tracker_load_failures: PaddedCounter::new(),
+            intent_log_poisoned: PaddedCounter::new(),
             replica_worker_panics_total: PaddedCounter::new(),
             replica_unauthenticated_accept_total: PaddedCounter::new(),
             replica_rejected_sequence_gap: PaddedCounter::new(),

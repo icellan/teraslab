@@ -1067,7 +1067,21 @@ impl ReplicationIntentTracker {
                 // handle rather than leaving it as the live append target —
                 // fail CLOSED, not silently no-op (which `None` would mean
                 // to `append_record_locked`/`sync_locked`).
-                inner.append_state = AppendState::Poisoned(cause);
+                inner.append_state = AppendState::Poisoned(cause.clone());
+                // Observability follow-up: this transition previously had
+                // no dedicated signal — the poison only surfaced later,
+                // indirectly, the next time a caller's begin/commit
+                // returned Err(Poisoned). Emit a loud ERROR at the
+                // transition itself and bump a counter so operators don't
+                // have to wait for (or scrape logs for) the next write.
+                tracing::error!(
+                    cause = %cause,
+                    "replication intent log POISONED — durability barrier lost (compaction \
+                     reopen failed); begin/commit will fail until restart",
+                );
+                if let Some(m) = crate::metrics::replication_metrics() {
+                    m.intent_log_poisoned.inc();
+                }
                 return Err(ReplicationIntentError::Io(e));
             }
         };
@@ -2708,6 +2722,51 @@ mod tests {
                 last_sequence: 2,
             }],
             "pending() (in-memory read) must still work while poisoned",
+        );
+    }
+
+    /// Follow-up to `intent_log_poisoned_on_compaction_reopen_failure_fails_closed`:
+    /// the Active->Poisoned transition in `compact_locked` previously emitted
+    /// no dedicated signal at all — the poison only surfaced indirectly, the
+    /// next time a caller's `begin`/`commit` happened to return
+    /// `Err(Poisoned)`. An operator whose intent log has silently gone
+    /// non-durable needs a signal AT the transition, not just on next use.
+    /// Assert the `intent_log_poisoned` metric bumps 0->1 exactly at
+    /// `compact_locked`'s failure point.
+    #[test]
+    fn intent_log_poison_transition_increments_metric() {
+        static TEST_METRICS: std::sync::OnceLock<&'static crate::metrics::ReplicationMetrics> =
+            std::sync::OnceLock::new();
+        let metrics_ref = *TEST_METRICS
+            .get_or_init(|| Box::leak(Box::new(crate::metrics::ReplicationMetrics::new())));
+        crate::metrics::init_replication_metrics(metrics_ref);
+        let metrics =
+            crate::metrics::replication_metrics().expect("replication metrics installed for test");
+        let before = metrics.intent_log_poisoned.get();
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("intent.dat");
+        let tracker = ReplicationIntentTracker::load(path).unwrap();
+        tracker.begin(1, 1, &[]).unwrap();
+
+        // Arm the seam: the NEXT compact_locked's reopen fails, exactly as
+        // in `intent_log_poisoned_on_compaction_reopen_failure_fails_closed`.
+        tracker.inner.lock().force_reopen_failure = true;
+        let compact_result = {
+            let mut inner = tracker.inner.lock();
+            tracker.compact_locked(&mut inner)
+        };
+        assert!(
+            compact_result.is_err(),
+            "the forced reopen failure must surface as an Err from compact_locked",
+        );
+
+        let after = metrics.intent_log_poisoned.get();
+        assert_eq!(
+            after,
+            before + 1,
+            "intent_log_poisoned must bump by exactly 1 at the Active->Poisoned \
+             transition (was {before}, now {after})",
         );
     }
 
