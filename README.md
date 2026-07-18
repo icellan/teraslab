@@ -178,6 +178,9 @@ redo_buffered = true                  # default TRUE: ack mutation after in-memo
 redo_flush_interval_ms = 5            # How often the background flusher fsyncs the redo log (ms).
                                       # Only relevant when redo_buffered = true. Lower = narrower
                                       # crash-loss window at the cost of more frequent fsyncs.
+                                      # RF=1 only — under replication_factor > 1 the redo tail and
+                                      # data devices are fsync-forced before every ack (C1), so no
+                                      # crash-loss window applies regardless of this interval.
 
 # --- Durable node height ---
 # last_durable_height_path = "..."    # Optional path for the durable node-height file
@@ -702,7 +705,7 @@ curl -X PUT http://localhost:9100/admin/quiesce
 # Drain a specific node by ID
 curl -X PUT http://localhost:9100/admin/drain/2
 
-# Trigger cluster rebalance
+# Self-drain alias — identical to /admin/quiesce (no cluster-wide rebalance exists)
 curl -X PUT http://localhost:9100/admin/rebalance
 ```
 
@@ -953,7 +956,7 @@ Available commands:
 | `index` | Index statistics (load factor, capacity) |
 | `replication` | Replication configuration and status |
 | `redo` | Redo log position and utilization |
-| `rebalance` | Trigger cluster rebalance |
+| `rebalance` | Self-drain alias for this node (no cluster-wide rebalance exists — see `drain`) |
 | `drain <node_id>` | Drain shards from a node |
 | `log-level [LEVEL]` | Get or set runtime log level |
 | `bench` | Run a quick benchmark against the server |

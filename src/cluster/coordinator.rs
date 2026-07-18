@@ -1457,6 +1457,10 @@ impl ClusterCoordinator {
         // the runner, so `alive_node_count` can exclude Suspect/Dead peers from
         // the mutation-quorum count.
         let swim_membership = swim.membership();
+        // G8 stage 3 — the event loop needs its own handle to force-evict
+        // removed NodeIds from the local SWIM view right after activating a
+        // quorum-gated shrink (see `react_to_committed_shrink`).
+        let swim_membership_event = swim_membership.clone();
         let (swim_shutdown, swim_handle, event_rx) = swim.start();
 
         let shard_table = self.shard_table.clone();
@@ -1654,6 +1658,7 @@ impl ClusterCoordinator {
                                 &active_topology_members_event,
                                 &migration_throttle_event,
                                 &cluster_secret_event,
+                                &swim_membership_event,
                             );
                             let activated_term = topology_epoch.load(Ordering::Relaxed);
                             if activated_term > last_activated_term {
@@ -1890,6 +1895,7 @@ impl ClusterCoordinator {
                         &active_topology_members_event,
                         &migration_throttle_event,
                         &cluster_secret_event,
+                        &swim_membership_event,
                     );
                     let activated_term = topology_epoch.load(Ordering::Relaxed);
                     if activated_term > last_activated_term {
@@ -2234,6 +2240,24 @@ impl ClusterCoordinator {
 
                 // Poll topology commit signals from dispatch or proposer threads.
                 while !activation_held && let Ok((members, term)) = topology_commit_rx.try_recv() {
+                    // G8 stage 3 — every commit this node applies (proposer's
+                    // own local apply, a receiver's OP_TOPOLOGY_COMMIT, or a
+                    // catch-up re-proposal/peer-fetch) signals here before
+                    // activation, so this is the single choke point that
+                    // reacts to a just-applied shrink regardless of which
+                    // path produced it. Run BEFORE the duplicate-activation
+                    // skip below: a duplicate signal for an already-applied
+                    // shrink term is still worth re-running (idempotent) in
+                    // case an earlier attempt raced a transient SWIM lock
+                    // contention, and skipping it here would risk never
+                    // reacting to a shrink whose activation was deduped.
+                    react_to_committed_shrink(
+                        &topo_authority_event,
+                        term,
+                        &swim_membership_event,
+                        &peak_size_event,
+                        topo_state_path_event.as_deref(),
+                    );
                     // Guard: skip if this term was already activated. This
                     // prevents double activation when two commit signals for
                     // the same term arrive close together (e.g., deterministic
@@ -2853,6 +2877,12 @@ impl ClusterCoordinator {
         active_topology_members: &Arc<RwLock<Vec<NodeId>>>,
         migration_throttle: &Arc<crate::cluster::migration::MigrationThrottle>,
         cluster_secret: &Option<Arc<Vec<u8>>>,
+        // G8 stage 3 — the `TopologyStale` catch-up thread's routing-snapshot
+        // adopt path applies a commit via the non-durable `handle_commit`
+        // directly (bypassing `topology_commit_tx`), so it needs its own
+        // handle to react to a just-applied shrink (see
+        // `react_to_committed_shrink`).
+        swim_membership: &Arc<Mutex<crate::cluster::membership::Membership>>,
     ) {
         match event {
             ClusterEvent::NodeJoined(node, addr) => {
@@ -3086,6 +3116,12 @@ impl ClusterCoordinator {
                     let catch_up_peak = peak_size.clone();
                     let catch_up_si = swim_incarnation.clone();
                     let catch_up_secret = cluster_secret.clone();
+                    // G8 stage 3 — this thread's routing-snapshot-adopt path
+                    // below applies a commit via non-durable `handle_commit`
+                    // directly, bypassing `topology_commit_tx` (the event
+                    // loop's shared shrink-reaction choke point), so it needs
+                    // its own handle to react in place.
+                    let catch_up_swim = swim_membership.clone();
                     let remote_term = *remote_term;
                     std::thread::spawn(move || {
                         tracing::info!(
@@ -3108,6 +3144,7 @@ impl ClusterCoordinator {
                         let peak_size = &catch_up_peak;
                         let swim_incarnation = &catch_up_si;
                         let cluster_secret = &catch_up_secret;
+                        let swim_membership = &catch_up_swim;
                         let committed_members = topology_authority.committed_members();
                         let peers: Vec<SocketAddr> = {
                             let addrs = node_addrs_for_topo.read();
@@ -3140,7 +3177,20 @@ impl ClusterCoordinator {
                                     if let Some(commit) =
                                         committed_topology_from_routing_snapshot(&routing)
                                     {
-                                        let _ = topology_authority.handle_commit(&commit);
+                                        if let Some(applied_term) =
+                                            topology_authority.handle_commit(&commit)
+                                        {
+                                            // G8 stage 3 — this apply bypasses
+                                            // `topology_commit_tx`, so react here
+                                            // in case it was a shrink.
+                                            react_to_committed_shrink(
+                                                topology_authority,
+                                                applied_term,
+                                                swim_membership,
+                                                peak_size,
+                                                topology_state_path.as_deref(),
+                                            );
+                                        }
                                     } else {
                                         tracing::debug!(
                                             term = routing.shard_table_version,
@@ -4561,6 +4611,90 @@ fn try_run_topology_proposal(
             true
         }
     }
+}
+
+/// G8 stage 3 — react to a commit this node just durably applied, in case it
+/// turned out to be a quorum-gated SHRINK.
+///
+/// Checks `TopologyAuthority::last_shrink()` against `applied_term`: an
+/// exact match means the commit this node just applied LOWERED
+/// `committed_peak` (Gate B), and:
+///   * force-evicts the removed NodeIds from the local SWIM view (marks
+///     each Dead at ITS OWN currently-known incarnation — not `u64::MAX` —
+///     so a genuinely-alive removed node can still refute and legitimately
+///     re-grow the cluster later; this only closes the IMMEDIATE window
+///     before SWIM's own suspicion-timeout would otherwise reap it,
+///     preventing a lingering ALIVE/SUSPECT rumor from feeding back into
+///     `observe_peak_cluster_size` and re-inflating the floor the shrink
+///     just lowered),
+///   * hard-resets the coordinator's legacy `peak_size` atom to the new
+///     lower floor (so no residual reader — e.g. the next
+///     `persisted_state` call — sees the stale pre-shrink value; the
+///     EFFECTIVE floor no longer reads this atom at all post the
+///     `peak_cluster_size()` collapse, so this is defense-in-depth, not
+///     load-bearing for safety), and
+///   * deletes the `.multinode` marker when the shrink lands on exactly
+///     ONE surviving member (the RF=1 terminal case): the marker's
+///     presence would otherwise re-inflate the floor above 1 forever on
+///     the next restart (`ClusterCoordinator::new` folds the loaded
+///     `initial_peak` into the authority via a MONOTONIC
+///     `observe_peak_cluster_size`), permanently blocking RF=1.
+///
+/// A no-op for any non-shrink commit (the common case) — `last_shrink()`'s
+/// term will not equal `applied_term`. Also a no-op if `last_shrink()` has
+/// never fired (fresh authority) or is stale (an earlier shrink's term).
+///
+/// Idempotent: safe to call more than once for the SAME applied commit
+/// (`mark_dead` on an already-`Dead` peer, a `peak_size` store of the same
+/// value, and deleting an already-absent marker file are all no-ops) — so
+/// every apply path (proposer-self, dispatch receiver, catch-up) can call
+/// this unconditionally after a successful apply without needing to track
+/// which path "owns" the reaction.
+fn react_to_committed_shrink(
+    topology_authority: &crate::cluster::topology::TopologyAuthority,
+    applied_term: u64,
+    swim_membership: &Arc<Mutex<crate::cluster::membership::Membership>>,
+    peak_size: &Arc<std::sync::atomic::AtomicUsize>,
+    topology_state_path: Option<&std::path::Path>,
+) {
+    let Some((shrink_term, removed)) = topology_authority.last_shrink() else {
+        return;
+    };
+    if shrink_term != applied_term || removed.is_empty() {
+        return;
+    }
+
+    let new_peak = topology_authority.peak_cluster_size();
+    peak_size.store(new_peak as usize, Ordering::Relaxed);
+
+    {
+        let mut membership = swim_membership.lock();
+        for node in &removed {
+            if let Some(info) = membership.member_info(node) {
+                let incarnation = info.incarnation;
+                membership.mark_dead(*node, incarnation);
+            }
+        }
+    }
+
+    if topology_authority.committed_members().len() == 1
+        && let Some(path) = topology_state_path
+        && let Err(e) = delete_topology_multi_node_marker(path)
+    {
+        tracing::warn!(
+            err = %e,
+            "cluster: failed to delete .multinode marker after RF=1 terminal shrink; \
+             a lingering marker could re-inflate the floor above 1 on a future restart",
+        );
+    }
+
+    tracing::warn!(
+        term = applied_term,
+        removed = ?removed.iter().map(|n| n.0).collect::<Vec<_>>(),
+        new_peak,
+        "cluster: quorum-gated shrink applied — force-evicted removed node(s) from SWIM \
+         and reset the coordinator peak floor (G8)",
+    );
 }
 
 /// Send a request frame on an existing TCP stream and read the response.
@@ -8686,8 +8820,8 @@ fn persist_topology_state(
         // This is the safety-critical restart-quorum state (peak/committed_term);
         // a crash before the dir fsync could resurrect a stale peak.
         crate::fsutil::fsync_parent_dir(path)?;
-        if let Some(peak) = topology_multi_node_evidence_peak(state) {
-            persist_topology_multi_node_marker(path, peak)?;
+        if topology_multi_node_evidence_peak(state).is_some() {
+            persist_topology_multi_node_marker(path)?;
         }
         Ok(())
     };
@@ -8770,31 +8904,58 @@ fn topology_multi_node_evidence_peak(
     (peak >= 2).then_some(peak)
 }
 
+/// G8 stage 3 — the `.multinode` marker is now a PRESENCE-ONLY flag: its
+/// mere existence contributes a fixed floor of exactly `2`, never the
+/// historical peak the cluster once reached. Before this it stored (and
+/// `.max()`-grew) the actual peak, which would re-inflate the restored floor
+/// straight back to the pre-shrink size on every restart (`committed_peak`
+/// in the `.topo` file is now the authoritative anchor — see
+/// `load_topology_state`). Any on-disk content is ignored (including a
+/// legacy file written by a pre-stage-3 binary that DID store a grown
+/// number) — presence is the only signal.
 fn load_topology_multi_node_marker_peak(path: &std::path::Path) -> Option<u64> {
-    match std::fs::read(topology_multi_node_marker_path(path)) {
-        Ok(data) if data.len() >= 8 => {
-            Some(u64::from_le_bytes(data[..8].try_into().unwrap_or([0; 8])).max(2))
-        }
+    match std::fs::metadata(topology_multi_node_marker_path(path)) {
         Ok(_) => Some(2),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        // Fail-safe: an unreadable (not merely absent) marker is treated as
+        // present — "once genuinely multi-node, never silently regress"
+        // errs toward the safer (higher) floor on an I/O error.
         Err(_) => Some(2),
     }
 }
 
-fn persist_topology_multi_node_marker(path: &std::path::Path, peak: u64) -> std::io::Result<()> {
+/// Write (or refresh) the presence-only `.multinode` marker. The stored
+/// content is a fixed sentinel (`2u64`) kept only for the 8-byte on-disk
+/// layout; `load_topology_multi_node_marker_peak` never parses it — see that
+/// function's doc comment for why a growing numeric peak was removed.
+fn persist_topology_multi_node_marker(path: &std::path::Path) -> std::io::Result<()> {
     use std::io::Write as _;
 
     let marker = topology_multi_node_marker_path(path);
     let tmp = marker.with_extension("multinode.tmp");
-    let prior_peak = load_topology_multi_node_marker_peak(path).unwrap_or(0);
-    let marker_peak = peak.max(prior_peak).max(2);
     let mut f = std::fs::File::create(&tmp)?;
-    f.write_all(&marker_peak.to_le_bytes())?;
+    f.write_all(&2u64.to_le_bytes())?;
     f.sync_all()?;
     std::fs::rename(&tmp, &marker)?;
     // Make the rename's directory entry durable — see persist_cluster_state.
     crate::fsutil::fsync_parent_dir(&marker)?;
     Ok(())
+}
+
+/// G8 stage 3 — delete the `.multinode` marker on a shrink-to-1 (RF=1
+/// terminal) commit. Its presence would otherwise permanently pin the floor
+/// at 2 on every future restart (`ClusterCoordinator::new` folds the loaded
+/// `initial_peak` into the authority via a MONOTONIC `observe_peak_cluster_
+/// size`, so even the fixed floor of 2 can never be un-observed), making
+/// RF=1 unreachable after the very first restart post-shrink. A missing
+/// marker is not an error (idempotent — the common case once deleted).
+fn delete_topology_multi_node_marker(path: &std::path::Path) -> std::io::Result<()> {
+    let marker = topology_multi_node_marker_path(path);
+    match std::fs::remove_file(&marker) {
+        Ok(()) => crate::fsutil::fsync_parent_dir(&marker),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
 }
 
 /// Derive the full topology-state path from the legacy cluster-state path.
@@ -8821,23 +8982,61 @@ pub fn load_topology_state(
             incarnation: 0,
             committed_voter_ever_seen: Vec::new(),
             committed_placement_version: 1,
+            committed_peak: 1,
         },
     };
-    if let Some(marker_peak) = load_topology_multi_node_marker_peak(path) {
+    // G8 stage 3 — apply the (now presence-only, fixed-at-2) marker floor to
+    // BOTH `peak_cluster_size` (feeds `bin/server.rs`'s `initial_peak`, which
+    // `ClusterCoordinator::new` folds straight into the authority) AND
+    // `committed_peak` (the field `TopologyAuthority::restore` actually
+    // anchors on) — stage 1 only ever touched the former, leaving the
+    // latter's restore path unprotected by the marker.
+    //
+    // GATED on `committed_members.len() != 1`: a freshly-deserialized `.topo`
+    // file reporting exactly ONE committed member is the unforgeable
+    // signature of a completed, quorum-approved RF=1 terminal shrink — Gate
+    // B makes an accidental/minority 1-member commit unreachable, and that
+    // commit's own apply path deletes the marker (see
+    // `react_to_committed_shrink`), so a HEALTHY restart never has both a
+    // genuine 1-member `.topo` file and a marker present. This check is
+    // defense-in-depth for the residual crash race between committing the
+    // shrink and the marker-delete's own fsync landing: trusting a GENUINE
+    // 1-member file over a possibly-stale marker is what makes RF=1
+    // reachable AT ALL — the marker's fixed floor of 2 would otherwise
+    // permanently pin the floor above 1 via `ClusterCoordinator::new`'s
+    // monotonic `observe_peak_cluster_size(initial_peak)` seed. A DEFAULTED
+    // state (`committed_members.len() == 0`, e.g. a missing/corrupt `.topo`
+    // file) still gets the marker applied — see
+    // `deleted_topo_file_prevents_single_node_bootstrap`.
+    if state.committed_members.len() != 1
+        && let Some(marker_peak) = load_topology_multi_node_marker_peak(path)
+    {
         state.peak_cluster_size = state.peak_cluster_size.max(marker_peak);
+        state.committed_peak = state.committed_peak.max(marker_peak);
     }
     state
 }
 
 /// Load startup topology state from the full `.topo` file, preserving legacy
-/// peak/term evidence from the original cluster-state file.
+/// term evidence from the original cluster-state file.
+///
+/// G8 stage 3 — no longer `.max()`s in the legacy file's peak. That file
+/// (`persist_cluster_state`, `[peak:8][epoch:8]`) is written from the
+/// coordinator's own SWIM-fed `peak_size` atom, an INDEPENDENT and
+/// uncontrolled re-inflation vector: it is never lowered by a shrink (see
+/// `RunningCluster::peak_cluster_size`'s doc comment), so folding it in here
+/// would silently restore the stale pre-shrink peak even when the `.topo`
+/// file itself and the `.multinode` marker both correctly reflect the lower,
+/// post-shrink floor. `committed_peak` in the `.topo` file (via
+/// `load_topology_state`) is now the sole authoritative anchor; the legacy
+/// epoch fallback below is unrelated (term recovery for pre-`.topo` files)
+/// and is kept.
 pub fn load_startup_topology_state(
     cluster_state_path: &std::path::Path,
 ) -> crate::cluster::topology::PersistedTopologyState {
     let topology_path = topology_state_path_for_cluster_state(cluster_state_path);
     let mut state = load_topology_state(&topology_path);
-    let (legacy_peak, legacy_epoch) = load_cluster_state(cluster_state_path);
-    state.peak_cluster_size = state.peak_cluster_size.max(legacy_peak as u64);
+    let (_legacy_peak, legacy_epoch) = load_cluster_state(cluster_state_path);
     if state.committed_term == 0 && legacy_epoch > 0 {
         state.committed_term = legacy_epoch;
         state.voted_term = state.voted_term.max(legacy_epoch);
@@ -8919,6 +9118,18 @@ pub struct MasterCandidate {
     /// True iff this node holds an incomplete copy of the shard's data
     /// (e.g. a still-in-flight inbound migration). Subset candidates lose
     /// to any non-subset, non-evicted candidate.
+    ///
+    /// Classified from raw `last_applied_seq > 0` in `apply_master_election`.
+    /// DO NOT classify this off the `PARTITION_FLAG_PENDING_INBOUND` flag
+    /// (finding R4, rejected): that flag is the SAME `inbound_atomic` bit the
+    /// serving fence reads (`is_master` -> Transitioning), so "an elector sees
+    /// the flag clear" is equivalent to "the node's own fence is down" — a
+    /// node mis-classified full at the migration-completion boundary is
+    /// therefore UNFENCED and would serve, so a cross-elector skew on the flag
+    /// yields a dual-SERVING master, not a fail-safe fenced one. `seq > 0` is a
+    /// monotone threshold all electors agree on once crossed; the flag is not.
+    /// Electing a still-fenced subset holder is already SAFE (it cannot serve),
+    /// so this term buys only availability at the cost of a double-spend window.
     pub is_subset: bool,
     /// True iff the prior exchange phase classified this node as evicted
     /// (failed to report, persistent suspect). Evicted nodes are never
@@ -8937,6 +9148,20 @@ pub struct MasterCandidate {
 /// independent because all per-shard signals are already encoded in the
 /// candidate descriptors.
 pub fn elect_master(_shard: u16, candidates: &[MasterCandidate]) -> Option<NodeId> {
+    // DO NOT re-add max_generation / any recency signal to this ranking.
+    // Reverted twice (PR #76 / commit 3712018, then finding R4): max_generation
+    // is a LIVE-MOVING per-report value (build_self_partition_version_entries ->
+    // engine.recency_for_keys, computed at each responder's poll instant). The
+    // Task #22 gate (all_candidates_reported) only proves each candidate NODE is
+    // PRESENT in the view — it does NOT prove two electors observed the same
+    // max_generation for a live-writing peer. Any recency comparison between two
+    // equal-score candidates is therefore observer-dependent across the ~2000ms
+    // exchange skew -> two electors elect different masters -> dual-SERVING
+    // master (double-spend). "Subordinate to score" does not help: the hazard is
+    // at the score-tie level, which is exactly where recency would decide. A
+    // stale/behind elected master is the reactive online re-heal's job
+    // (trigger_online_reheal: fail-closed self-fence, never a second authority),
+    // NOT the election's.
     candidates
         .iter()
         .filter(|c| !c.was_evicted)
@@ -10517,17 +10742,20 @@ impl RunningCluster {
         members.sort();
         let cluster_id = self.topology_authority.cluster_id();
         let placement_version = self.topology_authority.committed_placement_version();
+        let committed_peak = self.topology_authority.committed_peak();
         crate::cluster::topology::TopologyCommit {
             term,
             proposer: members[0],
             members: members.clone(),
             cluster_id,
             placement_version,
+            committed_peak,
             digest: crate::cluster::topology::TopologyTerm::compute_digest(
                 term,
                 &cluster_id,
                 &members,
                 placement_version,
+                committed_peak,
             ),
             voters: {
                 let voters = self.topology_authority.committed_voters();
@@ -10570,6 +10798,40 @@ impl RunningCluster {
         // Incarnation 1 matches the value the test constructor used to mark the
         // peer Alive, satisfying `mark_suspect`'s `incarnation >= current` gate.
         self.swim_membership.lock().mark_suspect(node, 1);
+    }
+
+    /// Test-only (G8 stage 3) — the local SWIM membership's sorted alive-
+    /// member list (Suspect included, Dead excluded — see
+    /// `Membership::alive_members`), i.e. exactly what a real
+    /// `ClusterEvent::MembershipChanged` payload would carry. Lets a test
+    /// verify that a force-evicted (shrink-removed) node no longer appears
+    /// here without needing a live SWIM probe loop.
+    #[cfg(test)]
+    pub(crate) fn test_swim_alive_members(&self) -> Vec<NodeId> {
+        self.swim_membership.lock().alive_members()
+    }
+
+    /// Test-only (G8 stage 3) — seed a synthetic active outbound migration
+    /// so `active_migrations()` reports non-zero, modelling "a migration is
+    /// currently in flight" for the `/admin/shrink` `shrink_migration_in_
+    /// flight` refusal without needing a real handoff. `new_test_running_
+    /// cluster`'s `migrating_shards` constructor param only seeds the
+    /// lock-free atomic mirror (`migrating_bitmap`), not the real
+    /// `MigrationManager` `active_migrations()` reads from — this fills
+    /// that gap for tests that need the real counter to be non-zero.
+    #[cfg(test)]
+    pub(crate) fn test_seed_active_outbound_migration(&self, shard: u16, from: NodeId, to: NodeId) {
+        let task = crate::cluster::shards::MigrationTask {
+            shard,
+            from_node: from,
+            to_node: to,
+            is_master: true,
+        };
+        self.migration.lock().start_outbound(
+            std::slice::from_ref(&task),
+            from,
+            &std::collections::HashSet::new(),
+        );
     }
 
     /// Number of alive nodes in the cluster.
@@ -10651,18 +10913,29 @@ impl RunningCluster {
 
     /// Highest cluster size ever observed (for quorum calculation).
     ///
-    /// Unifies the two peak sources so write gating can never use a stale value:
-    /// the SWIM-fed `peak_size` atomic AND the `TopologyAuthority`'s
-    /// commit-raised peak. `handle_commit` raises only the authority's peak
-    /// (`topology.rs`), so a node that committed an N-member topology without a
-    /// corresponding SWIM burst would otherwise gate writes on a smaller peak
-    /// and wrongly accept mutations that should return `ERR_NO_QUORUM`. Taking
-    /// the max only ever raises the effective peak (the safe, more-conservative
-    /// direction for quorum).
+    /// G8 stage 3 — the `TopologyAuthority` is the SOLE floor source. Prior
+    /// to this, the getter unified two peak sources (`max(peak_size,
+    /// topology_authority.peak_cluster_size())`): the SWIM-fed `peak_size`
+    /// atomic here on `RunningCluster`, and the authority's own combined
+    /// `committed_peak`/`observed_peak`. That `peak_size` atom is
+    /// MONOTONIC-ONLY (raised via SWIM membership bursts and `initial_peak`
+    /// at restart, never lowered) — folding it into the getter meant a
+    /// quorum-gated shrink that correctly lowered the authority's floor
+    /// could never actually take effect: the coordinator's own stale-high
+    /// atom would keep winning the `max`, permanently defeating the shrink.
+    /// The authority's `peak_cluster_size()` (`max(committed_peak,
+    /// observed_peak)`) is already the complete, correctly-gated floor —
+    /// `committed_peak` is durable and quorum-anchored (Gate B), and
+    /// `observed_peak` is hard-reset on every Gate-B shrink apply (see
+    /// `TopologyAuthority::apply_commit_locked`) — so reading it alone is
+    /// both sufficient and (post-shrink) strictly more correct than the old
+    /// `max`. `peak_size` is KEPT as a field for its other, non-floor uses
+    /// (seeding `persisted_state`'s `peak` argument, the legacy
+    /// `cluster_state_path` file) and is hard-reset to the new floor on a
+    /// shrink apply (see `react_to_committed_shrink`) so no residual reader
+    /// observes the stale pre-shrink value either.
     pub fn peak_cluster_size(&self) -> usize {
-        self.peak_size
-            .load(Ordering::Relaxed)
-            .max(self.topology_authority.peak_cluster_size() as usize)
+        self.topology_authority.peak_cluster_size() as usize
     }
 
     /// Current monotonic topology epoch.
@@ -10925,17 +11198,23 @@ impl RunningCluster {
         // W6 — preserve the committed placement version across a graceful
         // departure (a membership change is not a placement downgrade).
         let placement_version = self.topology_authority.committed_placement_version();
+        // G8 stage 1 — a graceful drain is NON-lowering (see the doc comment
+        // above): stamp the CURRENT effective peak, not `new_members.len()`,
+        // so the drained cluster's floor is unaffected by who left.
+        let committed_peak = self.topology_authority.peak_cluster_size();
         let commit = crate::cluster::topology::TopologyCommit {
             term: new_term,
             proposer: new_members[0],
             members: new_members.clone(),
             cluster_id,
             placement_version,
+            committed_peak,
             digest: crate::cluster::topology::TopologyTerm::compute_digest(
                 new_term,
                 &cluster_id,
                 &new_members,
                 placement_version,
+                committed_peak,
             ),
             // E-4 — THREAT-MODEL DECISION (trust authenticated peers by design):
             //
@@ -10986,6 +11265,57 @@ impl RunningCluster {
             members = new_members.len(),
             "cluster: quiesce: committed topology (excluding self)",
         );
+    }
+
+    /// G8 stage 3 — propose a quorum-gated cluster SHRINK to `surviving` (the
+    /// explicit target membership after the shrink, NOT a count — see
+    /// [`crate::cluster::topology::TopologyAuthority::propose_shrink`]).
+    ///
+    /// Unlike [`Self::quiesce`] (a fabricated, unratified commit that never
+    /// lowers the peak floor), this drives a REAL propose/vote/commit round
+    /// through the same broadcast machinery as an ordinary topology change
+    /// (`run_topology_proposer`, spawned on a background thread) — the
+    /// resulting commit's `committed_peak` is only accepted once every node
+    /// (including this one) has verified a quorum of the OLD, higher peak's
+    /// voters (Gate B), which is what makes a QUORUM-RATIFIED floor
+    /// reduction safe.
+    ///
+    /// Returns the proposed [`crate::cluster::topology::TopologyTerm`] once
+    /// the proposal is under way (asynchronous — the caller should poll
+    /// [`Self::committed_topology_members`] / [`Self::topology_authority`]`.
+    /// committed_peak()` for completion), or `None` if
+    /// `TopologyAuthority::propose_shrink` itself refused (this node is not
+    /// the deterministic proposer of the CURRENT committed set, `surviving`
+    /// is empty / not a strict subset / fails the split-brain safety check,
+    /// or a proposal is already pending — see its doc comment for the exact
+    /// conditions).
+    ///
+    /// This method does NOT itself produce the structured, named refusals
+    /// (`shrink_below_rf`, `shrink_below_majority`, `shrink_drops_shard_
+    /// holder`, `shrink_migration_in_flight`, `shrink_noop`, ...) the
+    /// `/admin/shrink` operator verb promises — callers that need those
+    /// MUST pre-validate them before calling this (see
+    /// `server::http::handle_admin_shrink`), so a proposal that structurally
+    /// cannot commit (Gate B would reject it) is refused up front with a
+    /// clear error instead of being silently proposed and left to hang.
+    pub fn propose_shrink(
+        &self,
+        surviving: Vec<NodeId>,
+    ) -> Option<crate::cluster::topology::TopologyTerm> {
+        let term = self.topology_authority.propose_shrink(surviving)?;
+        let ta = self.topology_authority.clone();
+        let na = self.node_addrs.clone();
+        let tx = self.topology_commit_tx.clone();
+        let tp = self.topology_state_path.clone();
+        let ps = self.peak_size.clone();
+        let si = self.swim_incarnation.clone();
+        let secret = self.cluster_secret.clone();
+        let self_id = self.self_id;
+        let proposal = term.clone();
+        std::thread::spawn(move || {
+            run_topology_proposer(proposal, ta, na, self_id, tx, tp, ps, si, secret);
+        });
+        Some(term)
     }
 
     /// Get a snapshot of active migration progress.
@@ -11204,7 +11534,20 @@ impl RunningCluster {
             let data = crate::cluster::migration::load_outbound_state(path);
             if !data.is_empty() {
                 let mut mgr = self.migration.lock();
-                mgr.restore_outbound(&data);
+                if let Err(e) = mgr.restore_outbound(&data) {
+                    // R17: outbound state is ADVISORY (the coordinator only
+                    // uses it to decide whether to resume/abort/re-plan
+                    // in-flight migrations), unlike the inbound write fence.
+                    // A corrupt/truncated file must therefore warn and
+                    // continue with no resumable outbound migrations rather
+                    // than bricking boot the way a corrupt inbound-fence file
+                    // does.
+                    tracing::warn!(
+                        err = %e,
+                        "cluster: outbound migration state corrupt — ignoring (in-flight migrations will need re-planning)"
+                    );
+                    return;
+                }
                 let restored_tasks: Vec<MigrationTask> = mgr
                     .active_migrations()
                     .iter()
@@ -11417,12 +11760,32 @@ impl RunningCluster {
         let peak = self.peak_size.load(Ordering::Relaxed) as u64;
         let inc = self.swim_incarnation.load(Ordering::Relaxed);
         let path = self.topology_state_path.as_deref();
-        self.topology_authority
+        let outcome = self
+            .topology_authority
             .handle_commit_durable(commit, peak, inc, |state| {
                 // `None` path (no state file — ephemeral single-node test) is
                 // trivially durable; a real path must fsync successfully.
                 persist_topology_state_durable(path, state)
-            })
+            });
+        // G8 stage 3 — react immediately (SWIM force-evict + peak_size hard
+        // reset + `.multinode` marker cleanup) if this commit turned out to
+        // be a shrink, rather than waiting for the event loop to drain
+        // `topology_commit_tx` (which this path also signals separately via
+        // `signal_topology_committed` — see the `OP_TOPOLOGY_COMMIT`
+        // dispatch handler). Idempotent w.r.t. that later reaction; this is
+        // also the ONLY reaction site a caller that applies a commit
+        // directly (without a running event loop, e.g. a unit test) ever
+        // reaches.
+        if let crate::cluster::topology::DurableCommitOutcome::Applied(term) = outcome {
+            react_to_committed_shrink(
+                &self.topology_authority,
+                term,
+                &self.swim_membership,
+                &self.peak_size,
+                path,
+            );
+        }
+        outcome
     }
 
     /// Access the fenced-shards atomic bitmap directly.
@@ -11522,6 +11885,14 @@ pub(crate) fn new_test_running_cluster(
         self_id,
         Duration::from_secs(1),
     ));
+    // G8 stage 3 — `RunningCluster::peak_cluster_size()` now reads ONLY the
+    // authority's own `peak_cluster_size()` (the `peak_size` atom below is no
+    // longer folded into the getter). Seed the authority from `peak_size` too
+    // so this fixture's `peak_size` parameter keeps meaning what its callers
+    // already assume: "the effective peak `RunningCluster::peak_cluster_size()`
+    // reports." Monotonic (`fetch_max`), so this only ever RAISES the peak the
+    // `committed_members` commit below already established — order-independent.
+    topology_authority.observe_peak_cluster_size(peak_size as u64);
     let active_topology_members = Arc::new(RwLock::new(if committed_members.is_empty() {
         vec![self_id]
     } else {
@@ -11534,6 +11905,7 @@ pub(crate) fn new_test_running_cluster(
             term: table.version,
             proposer: self_id,
             members: committed_members.to_vec(),
+            committed_peak: (committed_members.to_vec()).len() as u64,
             cluster_id,
             placement_version,
             digest: crate::cluster::topology::TopologyTerm::compute_digest(
@@ -11541,6 +11913,7 @@ pub(crate) fn new_test_running_cluster(
                 &cluster_id,
                 committed_members,
                 placement_version,
+                (committed_members).len() as u64,
             ),
             voters: committed_members.to_vec(),
         };
@@ -14631,6 +15004,315 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------------
+    // G8 stage 3 — coordinator floor collapse + SWIM force-evict + operator
+    // verb (complete safe-shrink). Stages 1/2 (topology.rs) built the
+    // durable committed_peak + Gate B + propose_shrink; these tests prove
+    // the lowered floor actually takes effect at the RunningCluster level
+    // and does not re-inflate from a lingering SWIM rumor about a removed
+    // node.
+    // -----------------------------------------------------------------------
+
+    /// Build a 5-node `RunningCluster` (committed members + `peak_size` both
+    /// 5, every peer SWIM-Alive) and a hand-fabricated, Gate-B-satisfying
+    /// 5→3 shrink `TopologyCommit` (voters = all 3 survivors — a >50% cut
+    /// needs old_peak/2+1 = 3 distinct voters, and Gate B/`has_quorum_voter_
+    /// proof` both require voters ⊆ the commit's own 3-member `members`, so
+    /// unanimous survivor consent is the only way to satisfy both at once).
+    /// Mirrors the `quorum_commit`/`seed_committed` pattern in `topology.rs`'s
+    /// stage-2 tests, but built on a real `RunningCluster` so the
+    /// COORDINATOR-level reaction (not just the authority) is exercised.
+    fn shrink_5_to_3_fixture() -> (RunningCluster, crate::cluster::topology::TopologyCommit) {
+        let members5 = vec![NodeId(1), NodeId(2), NodeId(3), NodeId(4), NodeId(5)];
+        let table = ShardTable::compute_with_epoch(&members5, 1, 1, 1);
+        let live_nodes: Vec<(NodeId, SocketAddr)> = members5
+            .iter()
+            .enumerate()
+            .map(|(i, &n)| (n, format!("127.0.0.1:{}", 15300 + i).parse().unwrap()))
+            .collect();
+        let cluster =
+            new_test_running_cluster(NodeId(1), table, &live_nodes, &members5, &[], &[], &[], 5);
+        assert_eq!(
+            cluster.peak_cluster_size(),
+            5,
+            "fixture precondition: 5-node cluster peak is 5",
+        );
+
+        let cid = cluster.topology_authority.cluster_id();
+        let surviving = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let commit = crate::cluster::topology::TopologyCommit {
+            term: 2,
+            proposer: NodeId(1),
+            members: surviving.clone(),
+            cluster_id: cid,
+            placement_version: 1,
+            committed_peak: surviving.len() as u64,
+            digest: crate::cluster::topology::TopologyTerm::compute_digest(
+                2,
+                &cid,
+                &surviving,
+                1,
+                surviving.len() as u64,
+            ),
+            voters: surviving,
+        };
+        (cluster, commit)
+    }
+
+    /// `shrink_lowers_effective_coordinator_floor` — RED pre-fix / GREEN
+    /// post-fix.
+    ///
+    /// Pre-fix, `RunningCluster::peak_cluster_size()` computed
+    /// `max(peak_size_atom, authority.peak_cluster_size())`. The
+    /// coordinator's own `peak_size` atom is monotonic-only (raised by SWIM
+    /// bursts, never lowered), so after this exact 5→3 shrink it stayed at
+    /// 5 and the getter kept reporting 5 even though the authority's OWN
+    /// `committed_peak` had correctly dropped to 3 — the shrink never took
+    /// effect at the coordinator/quorum-gating level (this assertion FAILED
+    /// with `left: 5, right: 3` before the collapse fix). Post-fix, the
+    /// authority is the sole floor source, so the getter reflects the
+    /// lowered peak immediately.
+    #[test]
+    fn shrink_lowers_effective_coordinator_floor() {
+        let (cluster, commit) = shrink_5_to_3_fixture();
+
+        let outcome = cluster.apply_committed_topology_durable(&commit);
+        assert_eq!(
+            outcome,
+            crate::cluster::topology::DurableCommitOutcome::Applied(2),
+            "a Gate-B-satisfying 5\u{2192}3 shrink commit must apply",
+        );
+
+        assert_eq!(
+            cluster.peak_cluster_size(),
+            3,
+            "coordinator floor must reflect the lowered committed_peak (3), \
+             not the stale SWIM-fed peak_size atom (5) — the shrink must \
+             take effect end-to-end, not just inside the authority",
+        );
+
+        // A subsequent activation's quorum arithmetic (mirrors
+        // `server::dispatch::check_quorum`) must derive from the new floor.
+        let quorum_needed = (cluster.peak_cluster_size() / 2) + 1;
+        assert_eq!(
+            quorum_needed, 2,
+            "post-shrink activation quorum must be derived from peak=3 (needs \
+             2), not the stale peak=5 (which would need 3)",
+        );
+
+        // Defense-in-depth: the legacy `peak_size` atom itself must also be
+        // hard-reset, not merely out-voted by the getter collapse.
+        assert_eq!(
+            cluster.peak_size.load(Ordering::Relaxed),
+            3,
+            "peak_size atom must be hard-reset to the new floor on shrink \
+             apply, not left stale at 5",
+        );
+    }
+
+    /// `observed_peak_does_not_reinflate_from_removed_node_rumor` — HARD
+    /// REQUIREMENT: a lingering SWIM rumor about a removed node must not
+    /// re-inflate the floor a shrink just lowered.
+    ///
+    /// Proves both halves: (1) force-evict — nodes 4 and 5 no longer read
+    /// Alive/Suspect in the local SWIM view once the shrink applies, and (2)
+    /// re-observing whatever the (now correctly reduced) alive set reports
+    /// — exactly what a real `ClusterEvent::MembershipChanged` handler would
+    /// feed into `observe_peak_cluster_size` — does not raise the floor back
+    /// toward the stale pre-shrink peak of 5.
+    #[test]
+    fn observed_peak_does_not_reinflate_from_removed_node_rumor() {
+        let (cluster, commit) = shrink_5_to_3_fixture();
+        let outcome = cluster.apply_committed_topology_durable(&commit);
+        assert_eq!(
+            outcome,
+            crate::cluster::topology::DurableCommitOutcome::Applied(2)
+        );
+        assert_eq!(cluster.peak_cluster_size(), 3);
+
+        let alive_now = cluster.test_swim_alive_members();
+        assert!(
+            !alive_now.contains(&NodeId(4)) && !alive_now.contains(&NodeId(5)),
+            "shrink-removed nodes 4 and 5 must be force-evicted (Dead) from \
+             the local SWIM view, not still reported Alive/Suspect; got {alive_now:?}",
+        );
+
+        // Simulate exactly what the event loop's MembershipChanged handler
+        // feeds into observe_peak_cluster_size right after the shrink: the
+        // (post-evict) alive count. If eviction had not run, this would
+        // still be 5 (nodes 4/5 still Alive) and this call would re-inflate
+        // the floor straight back to 5.
+        cluster
+            .topology_authority
+            .observe_peak_cluster_size(alive_now.len() as u64);
+        assert_eq!(
+            cluster.peak_cluster_size(),
+            3,
+            "observing the post-evict alive count must not re-inflate the \
+             floor back toward the stale pre-shrink peak of 5",
+        );
+    }
+
+    /// After a shrink, a full persist→restore round trip (simulating a
+    /// restart) must keep the LOWERED peak — not resurrect the pre-shrink
+    /// value via the vestigial `peak_cluster_size` field or the
+    /// `.multinode` marker.
+    #[test]
+    fn restore_after_shrink_keeps_lowered_peak() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let topo_path = dir.path().join("node.cluster.topo");
+
+        let (cluster, commit) = shrink_5_to_3_fixture();
+
+        // Seed disk with the PRE-shrink (5-member) state, mirroring what a
+        // real node would have persisted before the shrink commits. This
+        // also creates the `.multinode` marker (5-member evidence).
+        let pre_state = cluster.topology_authority.persisted_state(5, 1);
+        persist_topology_state(&topo_path, &pre_state).expect("seed persist");
+        assert!(
+            load_topology_multi_node_marker_peak(&topo_path).is_some(),
+            "seed persist must create the .multinode marker",
+        );
+
+        // Apply the shrink through the DURABLE path so the on-disk state
+        // reflects the post-shrink floor.
+        let outcome = cluster
+            .topology_authority
+            .handle_commit_durable(&commit, 5, 1, |state| {
+                persist_topology_state(&topo_path, state).is_ok()
+            });
+        assert_eq!(
+            outcome,
+            crate::cluster::topology::DurableCommitOutcome::Applied(2)
+        );
+
+        let loaded = load_topology_state(&topo_path);
+        assert_eq!(
+            loaded.committed_peak, 3,
+            "loaded committed_peak must be the lowered 3, not 5",
+        );
+
+        // Simulate a restart: restore from the loaded state into a FRESH
+        // authority (a brand-new process would never see the in-memory
+        // cluster from `shrink_5_to_3_fixture` above).
+        let fresh =
+            crate::cluster::topology::TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+        fresh.restore(&loaded);
+        assert_eq!(
+            fresh.peak_cluster_size(),
+            3,
+            "restore must NOT resurrect the pre-shrink peak of 5",
+        );
+    }
+
+    /// The `.multinode` marker is a PRESENCE-only flag: its effect is a
+    /// FIXED floor of exactly 2, never the historical peak (e.g. 5) it was
+    /// originally written for. This is what distinguishes stage 3 from the
+    /// pre-fix monotonic-growth marker, which would have resurrected the
+    /// full pre-shrink peak on every restart regardless of what the
+    /// freshest `.topo` file itself reported.
+    #[test]
+    fn multinode_marker_floors_at_2_not_old_peak() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("node.cluster.topo");
+
+        // Seed evidence + marker from a 5-member cluster.
+        let five_member = crate::cluster::topology::PersistedTopologyState {
+            peak_cluster_size: 5,
+            committed_term: 1,
+            committed_members: vec![NodeId(1), NodeId(2), NodeId(3), NodeId(4), NodeId(5)],
+            committed_voters: vec![NodeId(1), NodeId(2), NodeId(3), NodeId(4), NodeId(5)],
+            voted_term: 1,
+            incarnation: 0,
+            committed_voter_ever_seen: Vec::new(),
+            committed_placement_version: 1,
+            committed_peak: 5,
+        };
+        persist_topology_state(&path, &five_member).expect("seed persist creates marker");
+
+        // A later shrink overwrites the `.topo` file directly with a
+        // genuinely-smaller 3-member state (the marker is presence-only and
+        // never re-derives a number from its own stored content, so it is
+        // NOT rewritten here — this models the marker surviving untouched
+        // across an ordinary, non-terminal shrink).
+        let three_member = crate::cluster::topology::PersistedTopologyState {
+            peak_cluster_size: 1,
+            committed_term: 2,
+            committed_members: vec![NodeId(1), NodeId(2), NodeId(3)],
+            committed_voters: vec![NodeId(1), NodeId(2), NodeId(3)],
+            voted_term: 2,
+            incarnation: 0,
+            committed_voter_ever_seen: Vec::new(),
+            committed_placement_version: 1,
+            committed_peak: 1, // pretend the raw .topo content under-reports
+        };
+        std::fs::write(&path, three_member.serialize()).expect("overwrite .topo directly");
+
+        let loaded = load_topology_state(&path);
+        assert_eq!(
+            loaded.committed_peak, 2,
+            "marker floors committed_peak at exactly 2, not the old peak of \
+             5 the marker was originally written for",
+        );
+        assert_eq!(
+            loaded.peak_cluster_size, 2,
+            "marker floors peak_cluster_size at exactly 2 too",
+        );
+    }
+
+    /// A GENUINE 1-member `.topo` file (the unforgeable signature of a
+    /// completed, quorum-approved RF=1 terminal shrink — Gate B makes an
+    /// accidental/minority 1-member commit unreachable) must NOT be floored
+    /// by a lingering `.multinode` marker, even if the marker's own delete
+    /// (tied to the shrink-to-1 commit) hasn't landed yet. Otherwise RF=1 is
+    /// unreachable after the very first restart: `ClusterCoordinator::new`
+    /// folds the loaded `initial_peak` into the authority via a MONOTONIC
+    /// `observe_peak_cluster_size`, so even the marker's fixed floor of 2
+    /// can never be un-observed once seeded.
+    #[test]
+    fn multinode_marker_does_not_block_genuine_rf1_restart() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("node.cluster.topo");
+
+        let multi = crate::cluster::topology::PersistedTopologyState {
+            peak_cluster_size: 3,
+            committed_term: 1,
+            committed_members: vec![NodeId(1), NodeId(2), NodeId(3)],
+            committed_voters: vec![NodeId(1), NodeId(2), NodeId(3)],
+            voted_term: 1,
+            incarnation: 0,
+            committed_voter_ever_seen: Vec::new(),
+            committed_placement_version: 1,
+            committed_peak: 3,
+        };
+        persist_topology_state(&path, &multi).expect("seed persist creates marker");
+        assert!(load_topology_multi_node_marker_peak(&path).is_some());
+
+        // A completed RF=1 shrink overwrites the `.topo` file with a genuine
+        // 1-member state but (simulating the residual crash race between
+        // committing the shrink and the marker-delete's own fsync) the
+        // marker delete has NOT landed yet.
+        let rf1 = crate::cluster::topology::PersistedTopologyState {
+            peak_cluster_size: 1,
+            committed_term: 2,
+            committed_members: vec![NodeId(1)],
+            committed_voters: vec![NodeId(1)],
+            voted_term: 2,
+            incarnation: 0,
+            committed_voter_ever_seen: Vec::new(),
+            committed_placement_version: 1,
+            committed_peak: 1,
+        };
+        std::fs::write(&path, rf1.serialize()).expect("overwrite with RF=1 state");
+
+        let loaded = load_topology_state(&path);
+        assert_eq!(
+            loaded.committed_peak, 1,
+            "a genuine 1-member .topo file must be trusted over a lingering \
+             marker — otherwise RF=1 is unreachable after restart",
+        );
+    }
+
     #[test]
     fn empty_shard_completion_failure_rolls_back_master_handoff() {
         let old_members = vec![NodeId(1), NodeId(2)];
@@ -16959,11 +17641,13 @@ mod tests {
             members: next_members.clone(),
             cluster_id: cid,
             placement_version: 1,
+            committed_peak: (next_members.clone()).len() as u64,
             digest: crate::cluster::topology::TopologyTerm::compute_digest(
                 4,
                 &cid,
                 &next_members,
                 1,
+                (next_members).len() as u64,
             ),
             voters: next_members.clone(),
         };
@@ -17012,11 +17696,13 @@ mod tests {
             members: committed_members.clone(),
             cluster_id: crate::cluster::topology::ClusterId::UNSET,
             placement_version: 1,
+            committed_peak: (committed_members.clone()).len() as u64,
             digest: crate::cluster::topology::TopologyTerm::compute_digest(
                 routing.shard_table_version,
                 &crate::cluster::topology::ClusterId::UNSET,
                 &committed_members,
                 1,
+                (committed_members).len() as u64,
             ),
             voters: vec![NodeId(1), NodeId(2)],
         };
@@ -17060,11 +17746,13 @@ mod tests {
             members: committed_members.clone(),
             cluster_id: cid,
             placement_version: 1,
+            committed_peak: (committed_members.clone()).len() as u64,
             digest: crate::cluster::topology::TopologyTerm::compute_digest(
                 4,
                 &cid,
                 &committed_members,
                 1,
+                (committed_members).len() as u64,
             ),
             voters: committed_members.clone(),
         };
@@ -17081,7 +17769,13 @@ mod tests {
         assert_eq!(decoded.members, committed_members);
         assert_eq!(
             decoded.digest,
-            crate::cluster::topology::TopologyTerm::compute_digest(4, &cid, &committed_members, 1),
+            crate::cluster::topology::TopologyTerm::compute_digest(
+                4,
+                &cid,
+                &committed_members,
+                1,
+                (committed_members).len() as u64
+            ),
         );
     }
 
@@ -18925,8 +19619,13 @@ mod tests {
             members: members.clone(),
             cluster_id: cid,
             placement_version: too_high,
+            committed_peak: (members.clone()).len() as u64,
             digest: crate::cluster::topology::TopologyTerm::compute_digest(
-                6, &cid, &members, too_high,
+                6,
+                &cid,
+                &members,
+                too_high,
+                (members).len() as u64,
             ),
             voters: members.clone(),
         };
@@ -18997,7 +19696,14 @@ mod tests {
             members: members.clone(),
             cluster_id: cid,
             placement_version: 1,
-            digest: crate::cluster::topology::TopologyTerm::compute_digest(6, &cid, &members, 1),
+            committed_peak: (members.clone()).len() as u64,
+            digest: crate::cluster::topology::TopologyTerm::compute_digest(
+                6,
+                &cid,
+                &members,
+                1,
+                (members).len() as u64,
+            ),
             voters: members.clone(),
         };
 
@@ -19055,7 +19761,14 @@ mod tests {
             members: members.clone(),
             cluster_id: cid,
             placement_version: 1,
-            digest: crate::cluster::topology::TopologyTerm::compute_digest(6, &cid, &members, 1),
+            committed_peak: (members.clone()).len() as u64,
+            digest: crate::cluster::topology::TopologyTerm::compute_digest(
+                6,
+                &cid,
+                &members,
+                1,
+                (members).len() as u64,
+            ),
             voters: members.clone(),
         };
 
@@ -20323,11 +21036,13 @@ mod tests {
             members: commit_members.clone(),
             cluster_id: crate::cluster::topology::ClusterId::UNSET,
             placement_version: 1,
+            committed_peak: (commit_members.clone()).len() as u64,
             digest: crate::cluster::topology::TopologyTerm::compute_digest(
                 5,
                 &crate::cluster::topology::ClusterId::UNSET,
                 &commit_members,
                 1,
+                (commit_members).len() as u64,
             ),
             voters: commit_members.clone(),
         };

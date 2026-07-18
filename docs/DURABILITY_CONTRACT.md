@@ -15,22 +15,60 @@ mode, a mutation is acknowledged after its redo entry is appended to the
 in-memory redo buffer. A background flusher calls `fsync` on the redo log
 every `redo_flush_interval_ms` (default **5 ms**). This means:
 
-- On an **unclean shutdown**, acknowledged mutations written in the last flush
-  interval (up to 5 ms by default) may be lost. The store will never expose
-  a partially-applied mutation — the redo log is the source of truth, and a
-  lost tail entry's mutation simply vanishes atomically. There is no
-  corruption: recovered state is consistent but may lag acknowledged state by
-  at most one flush window.
+- On a **single-node (`replication_factor = 1`) unclean shutdown**,
+  acknowledged mutations written in the last flush interval (up to 5 ms by
+  default) may be lost. The store will never expose a partially-applied
+  mutation — the redo log is the source of truth, and a lost tail entry's
+  mutation simply vanishes atomically. There is no corruption: recovered
+  state is consistent but may lag acknowledged state by at most one flush
+  window. **This window does not apply when `replication_factor > 1`** — see
+  "RF>1: Concurrent Local fsync-Before-Ack (C1)" below.
 - The store **remains internally consistent** after any crash. The B2 fix
   ensures lost tail entries never cause silent freelist reuse — the mutation
   is absent, not corrupted.
-- Operators who need to reduce the loss window can lower
+- Operators who need to reduce the RF=1 loss window can lower
   `redo_flush_interval_ms` at the cost of more frequent fsyncs.
 
-This is the appropriate default for BSV Teranode deployments where replication
-provides the cluster-level durability guarantee: the replica holds a copy of
-every acked mutation, so a single-node crash within the flush window does not
-lose data from the cluster's perspective.
+This is the appropriate default for BSV Teranode deployments. For `RF=1`
+deployments, the flush-interval loss window above applies as described —
+there is no replica to fall back on. For `replication_factor > 1`
+deployments, the loss window does not apply at all: the master's local redo
+tail and data devices are forced fsync-durable BEFORE the client ack (C1,
+below), and the replica separately holds a copy of every acked mutation — so
+an RF>1 crash within the flush window loses nothing, locally or from the
+cluster's perspective.
+
+### RF>1: Concurrent Local fsync-Before-Ack (C1)
+
+Under buffered durability (the default) with `replication_factor > 1` and
+active replication, an acked write does not rely on the replica alone for
+durability. `ensure_local_write_durable` (`src/server/dispatch.rs`) forces
+the master's own redo tail (`Engine::flush_all_redo`) and every touched data
+device (`Engine::sync_all_store_devices`) durable BEFORE the client ack is
+classified. This runs on its own thread CONCURRENTLY with the synchronous
+replica round-trip, so the local `fsync` hides behind the network RTT instead
+of adding to request latency. The gate matches the master-side
+replication-intent gate (`replication_active`) exactly, so every write this
+mechanism protects is one whose replication intent was already durably
+recorded.
+
+The result: on an RF>1 node, `STATUS_OK` means the write is BOTH locally
+fsync-durable AND replicated to a quorum — the RF=1 flush-interval loss
+window described above does not exist for RF>1. See the
+`rf_gt_1_mutation_is_locally_fsync_durable_before_ack` test
+(`src/server/dispatch.rs`) for the behavior under test. Strict durability
+(`redo_buffered = false`) and single-node (RF = 1, no migration) skip this
+gate — they are already fsync-durable per commit, or have no replica RTT to
+hide the local `fsync` behind.
+
+**Reverse-heal, a separate mechanism:** `reverse_heal.tombstones` defaults ON
+for `replication_factor > 1` (`ReverseHealConfig::tombstones_enabled`,
+`src/config.rs`). It recovers a stale-suspect shard's missing/behind records
+from a quorum-current replica via a master↔replica reverse-pull, both at boot
+and via the Phase 3b runtime online re-heal. This is additional to, not a
+substitute for, C1 above: C1 removes the RF>1 acked-write loss window at ack
+time; reverse-heal is the recovery path for a node whose local state falls
+behind for other reasons (e.g. it was offline).
 
 ### Strict Mode: fsync-Before-Ack
 
@@ -108,20 +146,25 @@ whether the redo append is fsynced before or after the ack:
 
 A client success response guarantees:
 
-- The mutation is recorded in the redo log. In **buffered mode** (default),
-  the redo entry will reach durable storage within one flush interval (default
-  ≤ 5 ms). In **strict mode** (`redo_buffered = false`), the entry is fsynced
-  before the ack is sent.
+- The mutation is recorded in the redo log. In **buffered mode** (default)
+  with **`replication_factor = 1`**, the redo entry will reach durable
+  storage within one flush interval (default ≤ 5 ms). In **buffered mode
+  with `replication_factor > 1`**, the redo entry (and every touched data
+  device) is already fsync-durable by ack time (C1) — there is no
+  flush-interval window. In **strict mode** (`redo_buffered = false`), the
+  entry is fsynced before the ack is sent regardless of RF.
 - The mutation is applied to the engine (O_DIRECT write, durable if the redo
   entry is durable).
 - The mutation was sent to all configured replicas. Replica failures may
   surface as a degraded-durability status byte but do not roll back the
   local commit.
 
-In buffered mode, an acknowledged mutation may be lost on unclean shutdown if
-the crash occurs within the last flush window. The store remains consistent —
-the lost mutation is absent, not corrupted. Replication provides the cluster
-durability guarantee for multi-node deployments.
+In buffered mode with `replication_factor = 1`, an acknowledged mutation may
+be lost on unclean shutdown if the crash occurs within the last flush window.
+The store remains consistent — the lost mutation is absent, not corrupted.
+In buffered mode with `replication_factor > 1`, this window does not apply
+(C1, above); reverse-heal is additionally default-on for RF>1 as a separate
+recovery path for a stale-suspect shard.
 
 ### Crash Recovery
 
@@ -152,7 +195,8 @@ matches. Replay can therefore run multiple times without divergence
 
 | Failure point | Outcome |
 |---------------|---------|
-| **Buffered mode** — crash before background fsync (within last flush window) | The redo entry is in the OS page cache but not yet on disk. The mutation is lost; the store recovers to consistent pre-mutation state. No corruption. Replication may still have a copy. |
+| **Buffered mode, RF=1** — crash before background fsync (within last flush window) | The redo entry is in the OS page cache but not yet on disk. The mutation is lost; the store recovers to consistent pre-mutation state. No corruption. |
+| **Buffered mode, RF>1** — crash before background fsync | Not reachable for an ACKED write: C1 forces the local redo tail + data devices durable before the ack (concurrently with the replica round-trip), so an acked mutation's redo entry is always on disk by ack time. An in-flight write the client never got a response for can still be lost the same way as RF=1. |
 | **Strict mode** — crash before redo fsync | No durable record. The mutation never happened from the perspective of every observer (client, replica, recovery). |
 | Crash after redo fsync, before engine write | Recovery replays the entry. `CreateV2` reconstructs the record, spend/unspend write the correct counter, the slot transition is idempotently re-applied. |
 | Crash after engine write, before replication | Local state is fully consistent. The replica is behind by the unsent batch and catches up via `RedoLog::read_from_sequence` on reconnect. |

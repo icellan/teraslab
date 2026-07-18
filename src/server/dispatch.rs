@@ -393,19 +393,31 @@ pub fn ack_tracker_handle() -> Option<&'static crate::replication::durable::AckT
 /// the minimum to `0` and blocks a reclaim until that replica proves it has
 /// the range.
 ///
-/// Returns `floor` only when `expected` is empty — a genuine single-node /
-/// RF=1 deployment with no fan-out target, where nothing holds the reset
-/// back. Replicas that appear in `acked` but are NOT in `expected` (e.g. a
-/// node demoted out of the shard's replica set by a topology change) are
-/// ignored: they no longer need this master's redo, so they must not pin
-/// the log.
+/// When `expected` is empty, the result is gated by `replication_factor`:
+/// on a genuine single-node / RF=1 deployment (no fan-out target) `floor` is
+/// returned, since nothing holds the reset back. On an RF>1 node an empty
+/// `expected` means the topology's replica set resolved empty — which may be
+/// transient (topology momentarily unresolved) rather than a real absence of
+/// replicas — so R13 treats it as "no replica has proven catch-up" and
+/// returns `0` (below `floor` for any `floor > 0`), blocking/deferring the
+/// reset instead of free-reclaiming a prefix a replica may still need.
+/// Replicas that appear in `acked` but are NOT in `expected` (e.g. a node
+/// demoted out of the shard's replica set by a topology change) are ignored:
+/// they no longer need this master's redo, so they must not pin the log.
 pub fn min_acked_over_expected(
     acked: &HashMap<SocketAddr, u64>,
     expected: &[SocketAddr],
     floor: u64,
+    replication_factor: u8,
 ) -> u64 {
     if expected.is_empty() {
-        return floor;
+        // R13: an empty expected set is only "nothing pins the log" for a
+        // genuine RF=1 node. On an RF>1 node an empty set means the
+        // topology's replica set resolved empty transiently — treat it as
+        // "no replica has proven catch-up" (return a watermark below
+        // `floor` so the reset is BLOCKED / deferred), never as free
+        // reclaim, so we don't erase a redo prefix a replica needs.
+        return if replication_factor > 1 { 0 } else { floor };
     }
     expected
         .iter()
@@ -2464,18 +2476,48 @@ fn clear_replication_intents_after_success(ranges: &[(u64, u64)]) {
 ///
 /// `dual_write_only` is the subset of `by_addr` keys that exist
 /// *solely* because at least one shard in the batch is migrating
-/// outbound and the dual-write window names the target. Replicate
-/// callers use this to enforce the per-set ACK invariant: a write
-/// that touched a migrating shard cannot succeed unless at least one
-/// `dual_write_only` address ACKed, regardless of the configured
-/// `WriteAll` / `WriteMajority` policy. Without this, a `WriteMajority`
-/// fan-out over the unioned set could ACK on the OLD replicas alone
-/// and silently leave the new master with stale data, defeating the
-/// dual-write durability invariant.
+/// outbound and the dual-write window names the target — i.e. the
+/// target is NOT also a regular quorum member (`current_master` or a
+/// shard replica) for this batch. This is a bookkeeping/exclusion set
+/// only: when the dual-write destination named by the migration window
+/// happens to be the shard's `target_assignment` master (the normal,
+/// real-handoff ordering — `to_node` IS the new master), it is absorbed
+/// into the REGULAR quorum set and therefore does NOT appear here. See
+/// `handoff_targets` for the set that actually enforces the migration
+/// ACK invariant.
+///
+/// `handoff_targets` (R2/P7b) is the PER-SHARD new-side holder set — new
+/// master plus new replicas — named by every open outbound dual-write
+/// window this batch touched, resolved to addresses, minus `self`, keyed
+/// by the shard the destinations belong to. Unlike `dual_write_only` it
+/// is NOT reduced by the regular-set/current-master exclusions, so a
+/// shard's set still contains its `to_node` even though `to_node` is
+/// legitimately also a regular quorum member. Replicate callers use
+/// this to enforce the per-shard ACK invariant: a migrating shard is
+/// durable only when at least one address in ITS OWN entry ACKed,
+/// regardless of the configured `WriteAll` / `WriteMajority` policy.
+/// This is evaluated PER SHARD (not over the batch-wide union) for the
+/// same reason D-6 evaluates quorum per key: a batch touching two
+/// migrating shards to two different new masters must not let one
+/// shard's handoff ACK mask another shard's missed handoff ACK. Without
+/// per-shard evaluation, a `WriteMajority` fan-out over the unioned set
+/// could ACK on the OLD replicas (or another shard's new master) alone
+/// and silently leave THIS shard's new master with stale data, defeating
+/// the dual-write durability invariant.
 #[derive(Debug, Clone)]
 pub(crate) struct ReplicationPlan {
     pub by_addr: HashMap<SocketAddr, Vec<ReplicaOp>>,
+    // R2: no longer read by the migration ACK invariant gate (that reads
+    // `handoff_targets` instead — see its doc) — kept only for its
+    // exclusion-bookkeeping role, exercised by `build_replication_targets`
+    // tests.
+    #[allow(dead_code)]
     pub dual_write_only: std::collections::HashSet<SocketAddr>,
+    /// R2/P7b: see the invariant-enforcing per-shard map described above.
+    /// Populated independently of `dual_write_only` / `regular_addrs` so a
+    /// dual-write destination that is ALSO the new master (the real
+    /// handoff ordering) is still counted here.
+    pub handoff_targets: HashMap<u16, std::collections::HashSet<SocketAddr>>,
     /// D-6: per-key set of *regular* replica addresses this key was sent
     /// to (the shard's replica set, excluding dual-write-only migration
     /// extras and excluding `self`). Used to evaluate the ACK policy
@@ -2502,6 +2544,13 @@ pub(crate) fn build_replication_targets(
     let mut regular_addrs: std::collections::HashSet<SocketAddr> = std::collections::HashSet::new();
     let mut dual_write_addrs: std::collections::HashSet<SocketAddr> =
         std::collections::HashSet::new();
+    // R2/P7b: the per-shard new-side holder set (new master + new replicas)
+    // named by every open outbound dual-write window this batch touches —
+    // see the `ReplicationPlan::handoff_targets` doc for why this must NOT
+    // be reduced by the same regular-set/current-master exclusions that
+    // gate `dual_write_addrs`, and why it is keyed by shard rather than
+    // flattened into one batch-wide set.
+    let mut handoff_targets: HashMap<u16, std::collections::HashSet<SocketAddr>> = HashMap::new();
     let mut target_errors: Vec<String> = Vec::new();
     let self_id = cluster.self_id();
     // D-6: per-key regular replica address set, in input order.
@@ -2635,11 +2684,25 @@ pub(crate) fn build_replication_targets(
             }
         }
         for extra in dual_write_extras {
-            if *extra == self_id || *extra == current_master || assignment.replicas.contains(extra)
-            {
+            if *extra == self_id {
                 continue;
             }
-            if let Some(addr) = cluster.node_addr(extra) {
+            let extra_addr = cluster.node_addr(extra);
+            // R2/P7b: record the resolved address as a handoff target,
+            // keyed by THIS shard, BEFORE / independent of the
+            // current-master / regular-replica exclusions below, so
+            // `to_node` still lands here even when it is ALSO the regular
+            // quorum master (the real handoff order — the topology table's
+            // `target_assignment` is updated before the migration finishes
+            // streaming). `dual_write_addrs` keeps its existing
+            // exclusion-based population untouched.
+            if let Some(addr) = extra_addr {
+                handoff_targets.entry(shard).or_default().insert(addr);
+            }
+            if *extra == current_master || assignment.replicas.contains(extra) {
+                continue;
+            }
+            if let Some(addr) = extra_addr {
                 by_addr.entry(addr).or_default().extend(ops.clone());
                 dual_write_addrs.insert(addr);
                 addr_nodes.insert(addr, *extra);
@@ -2681,6 +2744,7 @@ pub(crate) fn build_replication_targets(
     Ok(ReplicationPlan {
         by_addr,
         dual_write_only: dual_write_addrs,
+        handoff_targets,
         key_targets,
         addr_nodes,
     })
@@ -2924,11 +2988,17 @@ fn replicate_all_ops_with_barrier(
     // built — admission is per target address — and after the barrier is
     // released, so a bounded permit wait never stalls concurrent reads.)
     let plan = build_replication_targets(cluster, ops_by_key)?;
+    // R2: `dual_write_only` is retained on `ReplicationPlan` for its
+    // exclusion-bookkeeping role (and existing `build_replication_targets`
+    // tests), but the migration ACK invariant below is gated on
+    // `handoff_targets` — see the struct doc for why `dual_write_only`
+    // alone cannot carry it.
     let ReplicationPlan {
         by_addr,
-        dual_write_only,
         key_targets,
         addr_nodes,
+        handoff_targets,
+        ..
     } = plan;
     let rf = cluster.shard_table().read().replication_factor();
 
@@ -3108,16 +3178,12 @@ fn replicate_all_ops_with_barrier(
     }
 
     let mut last_error: Option<String> = None;
-    let mut dual_write_acks: usize = 0;
     // D-6: the set of addresses that ACKed, used for per-key quorum.
     let mut acked: std::collections::HashSet<SocketAddr> = std::collections::HashSet::new();
     for (addr, result) in &results {
         match result {
             Ok(()) => {
                 acked.insert(*addr);
-                if dual_write_only.contains(addr) {
-                    dual_write_acks += 1;
-                }
             }
             Err(e) => {
                 tracing::warn!(err = %e, "replication to replica failed");
@@ -3126,27 +3192,54 @@ fn replicate_all_ops_with_barrier(
         }
     }
     let total_targets = results.len();
-    let dual_write_total = dual_write_only.len();
     let ack_policy = cluster.ack_policy();
     let best_effort = cluster.is_replication_best_effort();
 
-    // Phase E per-set ACK invariant: when at least one shard in this
-    // batch is migrating outbound, require ≥1 ACK from the dual-write
-    // set so the new master observes writes during the migration
-    // window. Otherwise a `WriteMajority` policy could ACK on the OLD
-    // replicas alone, leaving the post-handoff record set divergent.
-    if dual_write_total > 0 && dual_write_acks == 0 {
-        if best_effort {
-            tracing::warn!(
-                dual_write_total,
-                "replication: dual-write set produced 0 ACKs (best_effort — write proceeds, new master may need full resync)",
-            );
-        } else {
-            return Err(format!(
-                "replication: dual-write set produced 0 ACKs of {dual_write_total} new-master target(s); \
-                 migration durability requires at least one new-master ACK: {}",
-                last_error.unwrap_or_default()
-            ));
+    // Phase E / R2/P7b migration handoff ACK invariant: when a shard in
+    // this batch is migrating outbound, require >=1 ACK from THAT SHARD's
+    // own new-side holder set (`handoff_targets[shard]` — new master + new
+    // replicas) so its future master observes writes during the migration
+    // window.
+    //
+    // `to_node` (the new master) is deliberately absorbed into the REGULAR
+    // quorum set above (`current_master`), so it participates in
+    // `WriteAll` / `WriteMajority` like any other holder — but that also
+    // means a `WriteMajority` policy can be satisfied by the OLD replicas
+    // alone without `to_node` ever ACKing, silently leaving the
+    // post-handoff record set divergent. This gate is what actually
+    // enforces "the new master saw the write": it is evaluated separately
+    // over `handoff_targets`, which — unlike `dual_write_only` — is NOT
+    // reduced by the regular-set/current-master exclusions, so it still
+    // names `to_node` even though `to_node` is also a regular quorum
+    // member. (R2: gating this on `dual_write_only` instead left the
+    // invariant dead on every real handoff, because the real handoff order
+    // always has `to_node` absorbed into the regular set.)
+    //
+    // R2 (per-shard): each shard migrating outbound must have ≥1 ACK from
+    // ITS own new-side handoff set. Evaluated per-shard (not batch-union)
+    // for the same reason D-6 evaluates quorum per-key: a batch touching
+    // two migrating shards must not let one shard's handoff ACK mask
+    // another shard's miss.
+    for (shard, targets) in &handoff_targets {
+        if targets.is_empty() {
+            continue;
+        }
+        let shard_handoff_acked = targets.iter().any(|a| acked.contains(a));
+        if !shard_handoff_acked {
+            if best_effort {
+                tracing::warn!(
+                    shard = *shard,
+                    handoff_total = targets.len(),
+                    "replication: shard's new-side handoff target(s) produced 0 ACKs (best_effort — write proceeds, new master may need full resync)",
+                );
+            } else {
+                return Err(format!(
+                    "replication: shard {shard} new-side handoff target(s) produced 0 ACKs of {} target(s); \
+                     migration durability requires at least one new-side handoff ACK per migrating shard: {}",
+                    targets.len(),
+                    last_error.clone().unwrap_or_default()
+                ));
+            }
         }
     }
 
@@ -3496,6 +3589,12 @@ where
         }
 
         if ops_by_key.is_empty() {
+            // R1: fail-safe — an empty owned window on a non-reclaimed range is not
+            // provably a local no-op (owned Create -> None on metadata-read failure;
+            // pre-ACK crash may leave a replica ahead). Resync the intent's keys
+            // before clearing the barrier, mirroring the reclaimed branch, rather
+            // than silently committing over a possible divergence.
+            resync(&intent_keys);
             tracker
                 .commit(range.first_sequence, range.last_sequence)
                 .map_err(|e| format!("replication intent commit: {e}"))?;
@@ -3887,7 +3986,19 @@ fn compensate_replication_failure(
                             current_block_height: *current_block_height,
                             block_height_retention: *block_height_retention,
                         };
-                        let _ = engine.unspend(&req);
+                        // R8/C16: a compensating unspend that fails for a
+                        // reason other than the record already being gone
+                        // (TxNotFound, benign) must not be swallowed — it
+                        // leaves the slot SPENT while every replica rolled
+                        // back to UNSPENT, a silent divergence between this
+                        // node and its replicas that the next restart-
+                        // recovery would not otherwise catch.
+                        if let Err(e) = engine.unspend(&req)
+                            && !matches!(e, SpendError::TxNotFound)
+                            && restore_write_err.is_none()
+                        {
+                            restore_write_err = Some(format!("compensate spend (unspend): {e}"));
+                        }
                         comp_redo.push(RedoOp::Unspend {
                             tx_key: *key,
                             offset: *offset,
@@ -3935,8 +4046,42 @@ fn compensate_replication_failure(
                             current_block_height: *current_block_height,
                             block_height_retention: *block_height_retention,
                         };
-                        if let Ok(v) = engine.validate_spend_multi(&req) {
-                            let _ = v.apply(engine);
+                        // R8/C16: unlike the other (single-phase) arms, this
+                        // compensating re-spend is two-phase
+                        // (`validate_spend_multi` then `.apply`), and even a
+                        // top-level `Ok(resp)` carries a per-slot
+                        // `resp.errors: BTreeMap<u32, SpendError>` — this
+                        // request has exactly one spend item at idx 0, so a
+                        // failure can surface at three levels: (1) validate
+                        // → Err, (2) apply → Err, (3) top-level Ok but
+                        // `resp.errors[0]` set. Benign = `TxNotFound` ONLY,
+                        // at any level — the record is entirely gone, so the
+                        // re-spend is moot and the compensation is
+                        // effectively done. Everything else (`StorageError`,
+                        // `DahOverflow`, and the per-slot `AlreadySpent` /
+                        // `Frozen` / `Pruned`) is non-benign: the slot was
+                        // NOT restored to the intended SPENT state, matching
+                        // the receiver's own Spend-apply treatment of those
+                        // same per-slot errors as hard divergence.
+                        let comp_err: Option<String> = match engine.validate_spend_multi(&req) {
+                            Err(SpendError::TxNotFound) => None,
+                            Err(e) => Some(format!("compensate unspend (validate): {e}")),
+                            Ok(v) => match v.apply(engine) {
+                                Err(SpendError::TxNotFound) => None,
+                                Err(e) => Some(format!("compensate unspend (apply): {e}")),
+                                Ok(resp) => match resp.errors.get(&0) {
+                                    None => None,
+                                    Some(SpendError::TxNotFound) => None,
+                                    Some(e) => Some(format!(
+                                        "compensate unspend (re-spend slot idx 0): {e}"
+                                    )),
+                                },
+                            },
+                        };
+                        if let Some(cause) = comp_err
+                            && restore_write_err.is_none()
+                        {
+                            restore_write_err = Some(cause);
                         }
                         // C27-residual: emit the hash-guarded SpendV2 (carrying
                         // the slot's utxo_hash) for symmetry with the live spend
@@ -3966,7 +4111,17 @@ fn compensate_replication_failure(
                             offset: *offset,
                             utxo_hash: slot.hash,
                         };
-                        let _ = engine.unfreeze(&req);
+                        // R8/C16: benign = TxNotFound | NotFrozen (mirrors
+                        // the receiver's own Unfreeze apply arm, which
+                        // tolerates exactly these two as Ok). Anything else
+                        // (device I/O, etc.) is a real divergence and must
+                        // surface rather than be swallowed.
+                        if let Err(e) = engine.unfreeze(&req)
+                            && !matches!(e, SpendError::TxNotFound | SpendError::NotFrozen { .. })
+                            && restore_write_err.is_none()
+                        {
+                            restore_write_err = Some(format!("compensate freeze (unfreeze): {e}"));
+                        }
                         comp_redo.push(RedoOp::UnfreezeV2 {
                             tx_key: *key,
                             offset: *offset,
@@ -3981,7 +4136,20 @@ fn compensate_replication_failure(
                             offset: *offset,
                             utxo_hash: slot.hash,
                         };
-                        let _ = engine.freeze(&req);
+                        // R8/C16: benign = TxNotFound | AlreadyFrozen |
+                        // AlreadySpent (mirrors the receiver's own Freeze
+                        // apply arm). Anything else must surface.
+                        if let Err(e) = engine.freeze(&req)
+                            && !matches!(
+                                e,
+                                SpendError::TxNotFound
+                                    | SpendError::AlreadyFrozen { .. }
+                                    | SpendError::AlreadySpent { .. }
+                            )
+                            && restore_write_err.is_none()
+                        {
+                            restore_write_err = Some(format!("compensate unfreeze (freeze): {e}"));
+                        }
                         comp_redo.push(RedoOp::FreezeV2 {
                             tx_key: *key,
                             offset: *offset,
@@ -4007,7 +4175,14 @@ fn compensate_replication_failure(
                         current_block_height: *current_block_height,
                         block_height_retention: *block_height_retention,
                     };
-                    let _ = engine.set_mined(&req);
+                    // R8/C16: benign = TxNotFound (mirrors the receiver's
+                    // own SetMined apply arm). Anything else must surface.
+                    if let Err(e) = engine.set_mined(&req)
+                        && !matches!(e, SpendError::TxNotFound)
+                        && restore_write_err.is_none()
+                    {
+                        restore_write_err = Some(format!("compensate set_mined (unset): {e}"));
+                    }
                     comp_redo.push(RedoOp::SetMinedBatch {
                         block_id: *block_id,
                         block_height: *block_height,
@@ -4049,7 +4224,13 @@ fn compensate_replication_failure(
                         current_block_height: *current_block_height,
                         block_height_retention: *block_height_retention,
                     };
-                    let _ = engine.set_mined(&req);
+                    // R8/C16: benign = TxNotFound. Anything else must surface.
+                    if let Err(e) = engine.set_mined(&req)
+                        && !matches!(e, SpendError::TxNotFound)
+                        && restore_write_err.is_none()
+                    {
+                        restore_write_err = Some(format!("compensate unset_mined (re-set): {e}"));
+                    }
                     // Forward redo entry: re-add the original block entry
                     // (so a recovery replay applies the same restoration).
                     comp_redo.push(RedoOp::SetMinedBatch {
@@ -4125,7 +4306,15 @@ fn compensate_replication_failure(
                                 current_block_height: *current_block_height,
                                 block_height_retention: *block_height_retention,
                             };
-                            let _ = engine.set_mined(&req);
+                            // R8/C16: benign = TxNotFound. Anything else
+                            // must surface.
+                            if let Err(e) = engine.set_mined(&req)
+                                && !matches!(e, SpendError::TxNotFound)
+                                && restore_write_err.is_none()
+                            {
+                                restore_write_err =
+                                    Some(format!("compensate set_mined_batch (re-set): {e}"));
+                            }
                             comp_redo.push(RedoOp::SetMinedBatch {
                                 block_id: *block_id,
                                 block_height: bh,
@@ -4157,7 +4346,15 @@ fn compensate_replication_failure(
                                 current_block_height: *current_block_height,
                                 block_height_retention: *block_height_retention,
                             };
-                            let _ = engine.set_mined(&req);
+                            // R8/C16: benign = TxNotFound. Anything else
+                            // must surface.
+                            if let Err(e) = engine.set_mined(&req)
+                                && !matches!(e, SpendError::TxNotFound)
+                                && restore_write_err.is_none()
+                            {
+                                restore_write_err =
+                                    Some(format!("compensate set_mined_batch (unset): {e}"));
+                            }
                             comp_redo.push(RedoOp::SetMinedBatch {
                                 block_id: *block_id,
                                 block_height: *block_height,
@@ -4305,7 +4502,14 @@ fn compensate_replication_failure(
                         current_block_height: *current_block_height,
                         block_height_retention: *retention,
                     };
-                    let _ = engine.set_conflicting(&req);
+                    // R8/C16: benign = TxNotFound. Anything else must
+                    // surface.
+                    if let Err(e) = engine.set_conflicting(&req)
+                        && !matches!(e, SpendError::TxNotFound)
+                        && restore_write_err.is_none()
+                    {
+                        restore_write_err = Some(format!("compensate set_conflicting: {e}"));
+                    }
                     comp_redo.push(RedoOp::SetConflicting {
                         tx_key: *key,
                         value: !value,
@@ -4321,8 +4525,15 @@ fn compensate_replication_failure(
                         } => (prior_locked, prior_delete_at_height),
                         _ => (!value, 0),
                     };
-                    let _ =
-                        engine.restore_set_locked_for_compensation(key, target_locked, target_dah);
+                    // R8/C16: benign = TxNotFound. Anything else must
+                    // surface.
+                    if let Err(e) =
+                        engine.restore_set_locked_for_compensation(key, target_locked, target_dah)
+                        && !matches!(e, SpendError::TxNotFound)
+                        && restore_write_err.is_none()
+                    {
+                        restore_write_err = Some(format!("compensate set_locked: {e}"));
+                    }
                     comp_redo.push(RedoOp::SetLocked {
                         tx_key: *key,
                         value: target_locked,
@@ -4340,7 +4551,14 @@ fn compensate_replication_failure(
                         tx_key: *key,
                         block_height: 0,
                     };
-                    let _ = engine.preserve_until(&req);
+                    // R8/C16: benign = TxNotFound. Anything else must
+                    // surface.
+                    if let Err(e) = engine.preserve_until(&req)
+                        && !matches!(e, SpendError::TxNotFound)
+                        && restore_write_err.is_none()
+                    {
+                        restore_write_err = Some(format!("compensate preserve_until: {e}"));
+                    }
                     comp_redo.push(RedoOp::PreserveUntil {
                         tx_key: *key,
                         block_height: 0,
@@ -4351,7 +4569,19 @@ fn compensate_replication_failure(
                         tx_key: *key,
                         due_guard: None,
                     };
-                    let _ = engine.delete(&req);
+                    // R8/C16 (named anchor): a compensating delete that
+                    // fails for a reason other than the record already being
+                    // gone (TxNotFound, benign) must not be swallowed — the
+                    // create this rolls back would still be live on this
+                    // node while every replica never applied it, a silent
+                    // divergence that a clean-rollback report would hide
+                    // from the caller until the next restart-recovery.
+                    if let Err(e) = engine.delete(&req)
+                        && !matches!(e, SpendError::TxNotFound)
+                        && restore_write_err.is_none()
+                    {
+                        restore_write_err = Some(format!("compensate create (delete): {e}"));
+                    }
                     comp_redo.push(RedoOp::Delete {
                         tx_key: *key,
                         record_offset: 0,
@@ -4383,14 +4613,34 @@ fn compensate_replication_failure(
                         current_block_height: *current_block_height,
                         block_height_retention: *block_height_retention,
                     };
-                    if let Ok(resp) = engine.mark_on_longest_chain(&req) {
-                        comp_redo.push(RedoOp::MarkOnLongestChain {
-                            tx_key: *key,
-                            on_longest_chain: !on_longest_chain,
-                            current_block_height: *current_block_height,
-                            block_height_retention: *block_height_retention,
-                            generation: resp.generation,
-                        });
+                    match engine.mark_on_longest_chain(&req) {
+                        Ok(resp) => {
+                            comp_redo.push(RedoOp::MarkOnLongestChain {
+                                tx_key: *key,
+                                on_longest_chain: !on_longest_chain,
+                                current_block_height: *current_block_height,
+                                block_height_retention: *block_height_retention,
+                                generation: resp.generation,
+                            });
+                        }
+                        // R8/C16: benign = TxNotFound (mirrors the
+                        // receiver's own MarkLongestChain apply arm). We
+                        // cannot build the comp_redo entry without
+                        // `resp.generation`, so a non-benign failure here
+                        // emits NO compensating redo entry at all — on
+                        // restart, recovery replays only the still-durable
+                        // ORIGINAL mark redo (double-fault territory,
+                        // acceptable per this function's header). Surfacing
+                        // the error still keeps the replication intent
+                        // pending so the caller does not report a clean
+                        // rollback over an unreversed flip.
+                        Err(e) if !matches!(e, SpendError::TxNotFound) => {
+                            if restore_write_err.is_none() {
+                                restore_write_err =
+                                    Some(format!("compensate mark_longest_chain: {e}"));
+                            }
+                        }
+                        Err(_) => {}
                     }
                 }
                 ReplicaOp::RemoveConflictingChild { child_txid, .. } => {
@@ -4398,7 +4648,20 @@ fn compensate_replication_failure(
                     // (`key` is the parent). append/remove are exact inverses
                     // and both idempotent. The forward redo entry mirrors the
                     // compensating engine call for recovery replay.
-                    let _ = engine.append_conflicting_child(key, *child_txid);
+                    // R8/C16: surface a genuine failure (StorageError,
+                    // ConflictingChildrenFull) so the intent stays pending.
+                    // `append_conflicting_child` resolves a missing parent to
+                    // Ok(()) internally and never returns TxNotFound here, so
+                    // the `!matches!(TxNotFound)` guard is defensive-only (kept
+                    // for shape-parity with the other arms), not a live benign
+                    // case.
+                    if let Err(e) = engine.append_conflicting_child(key, *child_txid)
+                        && !matches!(e, SpendError::TxNotFound)
+                        && restore_write_err.is_none()
+                    {
+                        restore_write_err =
+                            Some(format!("compensate remove_conflicting_child (append): {e}"));
+                    }
                     comp_redo.push(RedoOp::AppendConflictingChild {
                         parent_key: *key,
                         child_txid: *child_txid,
@@ -6933,28 +7196,29 @@ fn handle_create_batch(
     // memory but its `AllocateRegion` redo is not yet durable (Phases 1b–2). The
     // global side is SHARED, so concurrent creates never contend on it.
     //
-    // The contended part — the per-key stripe WRITES that give a reader its
-    // batch-atomic view — is taken separately and held only around Phase 3 (the
-    // index registration, which is the moment a created key becomes reader-
-    // visible). Previously the combined `mutation()` guard held those stripes for
-    // the ENTIRE handler, so two creates sharing any one of their up-to-256
-    // stripes serialized on each other's multi-ms redo fsync + device writes
-    // (measured: ~50% of create latency was just acquiring this guard). Narrowing
-    // the stripe hold to Phase 3 lets stripe-overlapping creates pipeline through
-    // the I/O stages. Reads landing before Phase 3 correctly see "not found"
-    // (the key is not yet in the index), preserving batch-atomic visibility.
-    //
-    // G4 RESIDUAL (FOLLOW-UP): unlike spend/set_mined, create does NOT hold a
-    // per-key `mutation_stripes` visibility guard — a created key becomes
-    // reader-visible by INDEX PRESENCE (register_create_at_offset in Phase 3
-    // under the engine stripe lock), not by a held visibility stripe. So the
-    // hold-to-quorum discipline applied to spend/set_mined does not transfer
-    // directly: closing create's read-your-writes window (a reader sees a
-    // created record that a replication failure then rolls back) needs the index
-    // registration / reader-visibility deferred to the replication outcome,
-    // which is a separate change from this per-key-stripe pattern. Tracked as
-    // follow-up. (Delete is unaffected — it is local GC prune, never replicated,
-    // so it has no replication-rollback window.)
+    // G4 (read-your-writes / monotonicity) / R9 RESOLVED: create now mirrors
+    // `handle_set_mined_batch` — the per-key `mutation_stripes` WRITE guard
+    // (`visibility_stripes`, acquired below just before Phase 3 once
+    // `valid_items` — the exact set of keys about to be registered — is final)
+    // is HELD across Phase 3 (index registration) and Phase 4 (replication) and
+    // any compensation, released only once the durable outcome is known. A
+    // reader/spender of these keys is excluded until the create's outcome
+    // resolves, so it can never observe (or spend) a created record that a
+    // replication failure then rolls back — closing the cross-op divergence
+    // where an uncontested concurrent spend of the same not-yet-replicated
+    // txid could reach its own quorum and leave a replica holding a Spend redo
+    // for a create this node never durably committed. Only stripe-overlapping
+    // creates now contend, and only across Phase 3 + replication — the SAME
+    // cost spend/set_mined already pay; disjoint-key creates still pipeline
+    // fully (the old combined whole-handler `mutation()` guard, replaced here,
+    // measured ~50% of create latency just from acquiring it). KNOWN CAVEAT:
+    // `OP_QUERY_CONFLICTING` / `OP_QUERY_OLD_UNMINED` take only the coarse
+    // global SHARED side (see `needs_dispatch_visibility_barrier`), not this
+    // per-key stripe, so a CONFLICTING-flagged create that fails replication is
+    // still momentarily visible to those admin/background query paths; a
+    // narrower, lower-traffic residual left open. (Delete is unaffected — it is
+    // local GC prune, never replicated, so it has no replication-rollback
+    // window.)
     let vis_start = std::time::Instant::now();
     let _global_vis = engine.visibility().global_read();
     if let Some(h) = DISPATCH_HISTOGRAMS.get() {
@@ -7530,6 +7794,24 @@ fn handle_create_batch(
     }
     drop(bulk_by_store);
 
+    // G4 (read-your-writes / monotonicity): acquire the per-key WRITE stripes
+    // for exactly the keys about to be registered — `valid_items` is final by
+    // this point (every item that failed reservation/redo/device-write has
+    // already been filtered out or returned early above). `global_read`
+    // (`_global_vis`, acquired above) is held before `mutation_stripes`,
+    // preserving the global-before-stripes acquisition order (see the LOCK
+    // ORDER comment in `handle_spend_batch`: visibility is acquired BEFORE the
+    // engine's own per-key stripe Mutexes — `register_create_at_offset` takes
+    // `Engine.locks` internally, a DIFFERENT lock object, so holding this
+    // guard across it is not reentrant and cannot deadlock).
+    let create_keys: Vec<TxKey> = valid_items
+        .iter()
+        .map(|v| TxKey {
+            txid: v.create_req.tx_id,
+        })
+        .collect();
+    let visibility_stripes = engine.visibility().mutation_stripes(&create_keys);
+
     // Phase 3: register the index entries (records already on device, Phase 2b).
     //
     // P2 (review): this loop is parallelized across scoped threads. Each item's
@@ -7740,19 +8022,21 @@ fn handle_create_batch(
     // per-chunk fragments IN CHUNK ORDER so `repl_ops_by_key` matches serial.
     let mut repl_ops_by_key: Vec<(TxKey, Vec<ReplicaOp>)> = Vec::new();
     let index_start = std::time::Instant::now();
-    // No per-key visibility stripes on the create path. A create is a single
-    // atomic index insert of an already-device-written record: a concurrent
-    // reader of the key sees it either present (post-register, record already on
-    // device from Phase 2b) or absent (pre-register) — never torn — because
-    // `register_create_at_offset` and the reader's lookup take the same per-key
-    // index lock. Unlike spend/set_mined (read-modify-write, which DO need the
-    // stripe write-lock to hide a half-updated record), a create has no
-    // intermediate visible state to protect. The old whole-handler / Phase-3
-    // stripe guard was therefore pure contention: at high pipelined concurrency
-    // every create grabbed ~256 of 65536 stripes and held them across its own
-    // (contended) register, serializing stripe-overlapping creates on each
-    // other's register time. Checkpoint quiescence + the issue-#14 un-journaled-
-    // reservation window are still covered by the `_global_vis` guard above.
+    // Two DIFFERENT lock layers guard two DIFFERENT concerns here — do not
+    // conflate them. `register_create_at_offset` and a reader's lookup take
+    // the SAME per-key INDEX lock, so a concurrent reader of the key sees it
+    // either present (post-register) or absent (pre-register) — never TORN.
+    // That guards against a half-written record; a create has no intermediate
+    // byte-level state to protect (unlike spend/set_mined's read-modify-
+    // write), so no stripe is needed for torn-read safety. What the index
+    // lock does NOT guard is the PRE-QUORUM-VISIBLE window: once this loop
+    // registers a key it is index-present and reader-visible even though
+    // replication has not yet resolved. The per-key VISIBILITY WRITE stripe
+    // (`visibility_stripes`, acquired above just before this phase) is what
+    // closes that window — it excludes a reader/spender of these keys until
+    // the replication outcome is known, mirroring spend/set_mined.
+    // Checkpoint quiescence + the issue-#14 un-journaled-reservation window
+    // are still covered by the `_global_vis` guard above.
     if !valid_items.is_empty() {
         let max_threads = std::thread::available_parallelism()
             .map(|n| n.get())
@@ -7818,6 +8102,9 @@ fn handle_create_batch(
     ) {
         Ok(o) => o,
         Err(e) => {
+            // `visibility_stripes` is still held here, so no reader/spender
+            // observes the rolled-back create; it drops as the handler
+            // returns below (mirrors `handle_set_mined_batch`).
             let before_images = no_before_images(&repl_ops_by_key);
             if let Some(resp) = compensate_replication_failure_or_error(
                 req.request_id,
@@ -7833,6 +8120,10 @@ fn handle_create_batch(
             return error_response(req.request_id, ERR_REPLICATION_FAILED, &e);
         }
     };
+
+    // G4: replication reached a durable outcome (Full / Degraded). Release the
+    // per-key visibility so readers observe the committed created record.
+    drop(visibility_stripes);
 
     // Tick per-item outcome counters. Succeeded = items.len() - errors.len().
     let failed_total = errors.len() as u64;
@@ -20174,7 +20465,7 @@ mod tests {
         // Empty tracker (no ACKs yet) + one expected replica → min_acked 0,
         // which is < floor, so the reset guard must refuse.
         let empty: HashMap<SocketAddr, u64> = HashMap::new();
-        let min_acked = min_acked_over_expected(&empty, &[expected], floor);
+        let min_acked = min_acked_over_expected(&empty, &[expected], floor, 3);
         assert_eq!(
             min_acked, 0,
             "an expected replica with no ACK entry must count as caught-up-to-nothing (0)"
@@ -20188,19 +20479,67 @@ mod tests {
         let mut acked = HashMap::new();
         acked.insert(expected, floor + 5);
         assert!(
-            min_acked_over_expected(&acked, &[expected], floor) >= floor,
+            min_acked_over_expected(&acked, &[expected], floor, 3) >= floor,
             "reclaim proceeds only after the expected replica acks at/above the floor"
         );
 
         // A replica present in the tracker but NOT expected (demoted out of the
-        // shard set) must not pin the log.
+        // shard set) must not pin the log. This is a genuine RF=1 deployment
+        // (no fan-out target), so the empty-expected branch takes the RF=1 path.
         let stale: SocketAddr = "10.0.0.9:7000".parse().unwrap();
         let mut acked_stale = HashMap::new();
         acked_stale.insert(stale, 0);
         assert_eq!(
-            min_acked_over_expected(&acked_stale, &[], floor),
+            min_acked_over_expected(&acked_stale, &[], floor, 1),
             floor,
-            "with no expected replica the reset is unconstrained even if the tracker holds a demoted node"
+            "with no expected replica on an RF=1 node the reset is unconstrained even if the tracker holds a demoted node"
+        );
+    }
+
+    #[test]
+    fn min_acked_empty_expected_rf1_allows_reset() {
+        // R13: a genuine RF=1 deployment has no replicas to wait for, so an
+        // empty expected set must still permit the reset (unchanged from the
+        // pre-fix behaviour).
+        let acked: HashMap<SocketAddr, u64> = HashMap::new();
+        let floor: u64 = 100;
+        assert_eq!(
+            min_acked_over_expected(&acked, &[], floor, 1),
+            100,
+            "RF=1 with no expected replicas must reclaim freely (returns floor)"
+        );
+    }
+
+    #[test]
+    fn min_acked_empty_expected_rf_gt_1_blocks_reset() {
+        // R13: an RF>1 node whose expected-replica set transiently resolves
+        // empty (topology momentarily unresolved) must NOT be treated as
+        // "nothing pins the log". Pre-fix this returned `floor` (100) here,
+        // which would let the checkpoint reset erase a redo prefix a real
+        // replica still needs. The fix must return a watermark below floor
+        // (0) so the reset guard's `min_acked >= floor_sequence` check
+        // blocks the reclaim instead of wrongly allowing it.
+        let acked: HashMap<SocketAddr, u64> = HashMap::new();
+        let floor: u64 = 100;
+        assert_eq!(
+            min_acked_over_expected(&acked, &[], floor, 3),
+            0,
+            "RF>1 with a transiently-empty expected set must block the reset (return below floor), not free-reclaim"
+        );
+    }
+
+    #[test]
+    fn min_acked_empty_expected_rf_gt_1_floor_zero_is_noop() {
+        // R13: when floor is 0 the fail-closed 0 still satisfies
+        // `can_reset = 0 >= 0`, but reclaiming to sequence 0 erases nothing,
+        // so this is harmless even though the empty-expected set is treated
+        // as fail-closed.
+        let acked: HashMap<SocketAddr, u64> = HashMap::new();
+        let floor: u64 = 0;
+        assert_eq!(
+            min_acked_over_expected(&acked, &[], floor, 3),
+            0,
+            "RF>1 with floor=0 still returns 0 (fail-closed value happens to equal floor here — a no-op reclaim)"
         );
     }
 
@@ -20394,6 +20733,11 @@ mod tests {
         tracker.begin(s_a, s_b, &[k_a]).unwrap();
 
         let mut observed: Vec<(TxKey, Vec<ReplicaOp>)> = Vec::new();
+        // R1 scoping: a satisfiable range with a NON-empty owned window must
+        // take the normal replicate path, not the empty-ops fail-safe resync
+        // — capture resync calls to prove the fix stayed scoped to the empty
+        // branch only.
+        let mut resync_keys: Vec<TxKey> = Vec::new();
         recover_pending_replication_intents_from_tracker(
             &tracker,
             Some(log0_arc.as_ref()),
@@ -20402,7 +20746,7 @@ mod tests {
                 observed.extend_from_slice(ops);
                 Ok(())
             },
-            |_: &[TxKey]| {},
+            |keys: &[TxKey]| resync_keys.extend_from_slice(keys),
         )
         .expect("recovery of a satisfiable (non-reclaimed) range must succeed");
 
@@ -20420,6 +20764,10 @@ mod tests {
             observed.len(),
             1,
             "exactly one op — RPC-A's K_A — must be replayed"
+        );
+        assert!(
+            resync_keys.is_empty(),
+            "a non-empty owned-ops window must NOT spuriously resync, got {resync_keys:?}"
         );
         assert!(
             tracker.pending().is_empty(),
@@ -20654,6 +21002,100 @@ mod tests {
         assert!(
             tracker.pending().is_empty(),
             "stale pending intent must be cleared after redo reclamation (resync path)"
+        );
+    }
+
+    /// R1: an owned window that converts to an EMPTY `ops_by_key` on a
+    /// NON-reclaimed range is not provably a local no-op. An owned `Create`
+    /// whose metadata read fails converts to `None` in
+    /// `redo_entry_to_replica_op` (`convert_migration_create` fails closed
+    /// rather than shipping a corrupt op), so the intent's own keys can
+    /// produce zero shippable ops even though a replica may hold (or be
+    /// missing) that record. Recovery must resync the intent's keys before
+    /// clearing the barrier here too, exactly like the reclaimed branch —
+    /// not silently commit over a possible divergence.
+    #[test]
+    fn intent_recovery_empty_owned_window_still_resyncs() {
+        let h = DispatchTestHarness::new();
+        let redo_dev: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(4 * 1024 * 1024, 4096).unwrap());
+        let redo_log = Mutex::new(
+            RedoLog::open(redo_dev, 0, 4 * 1024 * 1024).expect("redo log opens on memory device"),
+        );
+        let tracker = crate::replication::durable::ReplicationIntentTracker::in_memory();
+        let tx_key = TxKey {
+            txid: txid_for_shard(41, 9),
+        };
+
+        // An owned `Create` redo entry whose record was never actually
+        // materialized in the engine's index (no `Engine::create` call ran
+        // for it) — the same shape a metadata-read failure produces.
+        // `convert_migration_create` reads `engine.read_metadata(tx_key)`
+        // first; with no index entry that errors `TxNotFound`, so the
+        // conversion fails CLOSED to `Ok(None)` rather than shipping a
+        // fabricated op. This is the hidden-divergence trigger R1 covers:
+        // the intent owns this key, yet it contributes nothing to
+        // `ops_by_key`.
+        let range = write_redo_ops(
+            &h.engine,
+            Some(&redo_log),
+            &[RedoOp::Create {
+                tx_key,
+                device_id: 0,
+                record_offset: 4096,
+                utxo_count: 1,
+                is_conflicting: false,
+                record_bytes: Arc::from(Vec::new()),
+                parent_txids: Vec::new(),
+            }],
+        )
+        .expect("redo write succeeds");
+        tracker.begin(range.0, range.1, &[tx_key]).unwrap();
+
+        // Sanity: the range is NOT reclaimed — the entry is still readable,
+        // so this exercises the empty-owned-window branch, not the
+        // already-covered reclaimed branch.
+        {
+            let log = redo_log.lock();
+            assert_eq!(log.earliest_sequence().unwrap(), Some(range.0));
+        }
+        assert!(
+            h.engine.read_metadata(&tx_key).is_err(),
+            "the record must be absent from the index so conversion fails closed to None"
+        );
+
+        let mut replicated = false;
+        // R1: capture the explicit resync the empty-owned-window branch must
+        // enqueue, mirroring the reclaimed branch's `resync_keys` capture.
+        let mut resync_keys: Vec<TxKey> = Vec::new();
+        recover_pending_replication_intents_from_tracker(
+            &tracker,
+            Some(&redo_log),
+            &h.engine,
+            |_ops, _range| {
+                replicated = true;
+                Ok(())
+            },
+            |keys: &[TxKey]| resync_keys.extend_from_slice(keys),
+        )
+        .expect("empty owned-ops window must clear the stale intent, not brick startup");
+
+        assert!(
+            !replicated,
+            "an empty owned-ops window has nothing to incrementally replay"
+        );
+        // R1: the empty-ops branch must enqueue an EXPLICIT resync for the
+        // intent's own keys BEFORE clearing the marker — not silently commit
+        // over a possible divergence. Pre-fix `resync_keys` stayed empty for
+        // this path (the branch called `tracker.commit` with no resync).
+        assert_eq!(
+            resync_keys,
+            vec![tx_key],
+            "empty owned-ops window must enqueue an explicit resync for its keys"
+        );
+        assert!(
+            tracker.pending().is_empty(),
+            "pending intent must still be cleared after the fail-safe resync"
         );
     }
 
@@ -21159,6 +21601,420 @@ mod tests {
             plan.dual_write_only.is_empty(),
             "no migration in flight ⇒ dual_write_only must be empty: {:?}",
             plan.dual_write_only,
+        );
+        // R2 regression: a non-migrating batch must also leave the
+        // handoff-invariant set empty, so the Phase-E/R2 ACK gate stays
+        // inert and the normal quorum path is unchanged.
+        assert!(
+            plan.handoff_targets.is_empty(),
+            "no migration in flight ⇒ handoff_targets must be empty: {:?}",
+            plan.handoff_targets,
+        );
+    }
+
+    /// R2 — the dead dual-write handoff ACK invariant, real handoff order.
+    ///
+    /// Before this fix, `dual_write_only` was the set the Phase-E ACK
+    /// invariant gated on. But in the REAL production handoff order, the
+    /// migration's `to_node` is ALSO the shard's `target_assignment`
+    /// master (the new topology is committed to the table before the
+    /// handoff finishes streaming) — so `to_node` gets absorbed into the
+    /// REGULAR quorum set (`current_master`) and is explicitly excluded
+    /// from `dual_write_only` (`*extra == current_master` in the
+    /// dual-write-extras loop, plus the final `retain`). Net:
+    /// `dual_write_only` ends up EMPTY on every real handoff, so the
+    /// invariant gate keyed on it never fires.
+    ///
+    /// `handoff_targets` is the fix: a separate set populated for every
+    /// dual-write extra BEFORE the regular-set exclusions, so it still
+    /// names `to_node` even when `to_node` is also the new master.
+    #[test]
+    fn handoff_targets_includes_new_master_to_node() {
+        let n1 = crate::cluster::shards::NodeId(1);
+        let n2 = crate::cluster::shards::NodeId(2);
+        let n3 = crate::cluster::shards::NodeId(3);
+        let members = vec![n1, n2, n3];
+        // RF=3 over exactly 3 members: every shard's assignment names ALL
+        // three nodes (1 master + 2 replicas), so whichever shard we pick,
+        // self (n1) is a demoted replica and n3 can be the new master —
+        // the real handoff shape.
+        let table = crate::cluster::shards::ShardTable::compute_with_epoch(&members, 3, 401, 1);
+        let shard = (0..crate::cluster::shards::NUM_SHARDS as u16)
+            .find(|&s| table.target_assignment(s).master == n3)
+            .expect("expected some shard whose target assignment masters to n3");
+        let assignment = table.target_assignment(shard);
+        assert!(
+            assignment.replicas.contains(&n1) && assignment.replicas.contains(&n2),
+            "RF=3 over 3 members must name every node in the assignment: {assignment:?}",
+        );
+
+        let n1_addr: SocketAddr = "127.0.0.1:8941".parse().unwrap();
+        let n2_addr: SocketAddr = "127.0.0.1:8942".parse().unwrap();
+        let n3_addr: SocketAddr = "127.0.0.1:8943".parse().unwrap();
+
+        let cluster = crate::cluster::coordinator::new_test_running_cluster(
+            n1,
+            table,
+            &[(n1, n1_addr), (n2, n2_addr), (n3, n3_addr)],
+            &members,
+            &[],
+            &[],
+            &[],
+            3,
+        );
+        // n1 (self, the OLD master) is migrating this shard out to n3 —
+        // and n3 is ALREADY the target-assignment master (real handoff
+        // order), unlike the existing dual-write tests where the
+        // dual-write destination sits outside the assignment entirely.
+        cluster.test_open_dual_write_window(shard, n3);
+
+        let tx_key = TxKey {
+            txid: txid_for_shard(shard, 41),
+        };
+        let ops = vec![(
+            tx_key,
+            vec![crate::replication::protocol::ReplicaOp::Delete { tx_key }],
+        )];
+
+        let plan = build_replication_targets(&cluster, &ops)
+            .expect("dual-write target resolution should succeed");
+
+        assert!(
+            plan.by_addr.contains_key(&n3_addr),
+            "n3 (new master) must be on the live fan-out: {:?}",
+            plan.by_addr,
+        );
+        assert!(
+            plan.handoff_targets
+                .get(&shard)
+                .is_some_and(|s| s.contains(&n3_addr)),
+            "n3 (to_node, the new master) must be a handoff target for ITS shard so the \
+             migration ACK invariant can require its ACK: {:?}",
+            plan.handoff_targets,
+        );
+        assert!(
+            !plan.dual_write_only.contains(&n3_addr),
+            "n3 is a regular quorum member (target-assignment master) in the \
+             real handoff order, so the OLD dual_write_only set correctly \
+             (but insufficiently) excludes it — proving dual_write_only alone \
+             cannot carry the invariant: {:?}",
+            plan.dual_write_only,
+        );
+    }
+
+    /// R2 — the migration ACK invariant gate must actually fire in the real
+    /// handoff order: `to_node` (n3) is the shard's NEW master per
+    /// `target_assignment`, an old replica (n2) ACKs and satisfies
+    /// `WriteMajority` on its own (`required_replica_acks(2, WriteMajority)
+    /// == 1`), but n3 (the future master) never ACKs. Before the fix this
+    /// silently returns `Ok` (STATUS_OK) because `dual_write_only` is empty
+    /// on this exact ordering; after the fix it must return `Err` — the
+    /// future master cannot be handed authority over a shard it never
+    /// observed this write for.
+    #[test]
+    fn mid_migration_write_requires_new_master_ack() {
+        let n2_addr = spawn_replica_receiver(ReplicaBehaviour::Ack);
+        let n3_addr = spawn_replica_receiver(ReplicaBehaviour::Nak);
+        let (cluster, tx_key) =
+            handoff_ordered_rf3(n2_addr, n3_addr, Some(AckPolicy::WriteMajority), false);
+
+        let ops = vec![(
+            tx_key,
+            vec![crate::replication::protocol::ReplicaOp::Delete { tx_key }],
+        )];
+
+        let err = replicate_all_ops(Some(&cluster), &ops, (0, 0), &[])
+            .expect_err("migration durability must fail when the new master (to_node) never ACKs, even though an old replica satisfies WriteMajority alone");
+        assert!(
+            err.contains("handoff") || err.contains("new-side"),
+            "error must name the migration/handoff invariant, not a generic replication failure: {err}",
+        );
+    }
+
+    /// R2 guard against over-blocking: same real-handoff-order setup as
+    /// [`mid_migration_write_requires_new_master_ack`], but the new master
+    /// (n3) DOES ACK — the write must succeed.
+    #[test]
+    fn mid_migration_write_succeeds_when_new_master_acks() {
+        let n2_addr = spawn_replica_receiver(ReplicaBehaviour::Ack);
+        let n3_addr = spawn_replica_receiver(ReplicaBehaviour::Ack);
+        let (cluster, tx_key) =
+            handoff_ordered_rf3(n2_addr, n3_addr, Some(AckPolicy::WriteMajority), false);
+
+        let ops = vec![(
+            tx_key,
+            vec![crate::replication::protocol::ReplicaOp::Delete { tx_key }],
+        )];
+
+        let outcome = replicate_all_ops(Some(&cluster), &ops, (0, 0), &[])
+            .expect("write must succeed when the new master ACKs the handoff-window write");
+        assert!(
+            matches!(outcome, ReplicationOutcome::Full),
+            "all targets ACKed ⇒ Full durability, got {outcome:?}",
+        );
+    }
+
+    /// R2 best-effort parity: same real-handoff-order setup, new master
+    /// (n3) never ACKs, but `best_effort` is enabled — the write must
+    /// proceed with a warning instead of failing (mirrors the old
+    /// best-effort branch that existed for `dual_write_only`).
+    #[test]
+    fn best_effort_downgrades_missing_handoff_ack_to_warn() {
+        let n2_addr = spawn_replica_receiver(ReplicaBehaviour::Ack);
+        let n3_addr = spawn_replica_receiver(ReplicaBehaviour::Nak);
+        let (cluster, tx_key) =
+            handoff_ordered_rf3(n2_addr, n3_addr, Some(AckPolicy::WriteMajority), true);
+
+        let ops = vec![(
+            tx_key,
+            vec![crate::replication::protocol::ReplicaOp::Delete { tx_key }],
+        )];
+
+        let outcome = replicate_all_ops(Some(&cluster), &ops, (0, 0), &[]).expect(
+            "best_effort must downgrade a missing handoff ACK to a warning, not fail the write",
+        );
+        assert!(
+            matches!(outcome, ReplicationOutcome::Full),
+            "old replica (n2) ACKed and satisfies its own quorum ⇒ Full, got {outcome:?}",
+        );
+    }
+
+    /// Shared setup for the R2 gate-level tests: a 3-node, RF=3 cluster
+    /// where self (n1) is migrating a shard out to n3, and n3 is ALREADY
+    /// the shard's `target_assignment` master (the real handoff order —
+    /// see [`handoff_targets_includes_new_master_to_node`]). `n2_addr` /
+    /// `n3_addr` point at test-controlled TCP receivers so the caller
+    /// decides whether each ACKs or NAKs.
+    fn handoff_ordered_rf3(
+        n2_addr: SocketAddr,
+        n3_addr: SocketAddr,
+        ack_policy: Option<AckPolicy>,
+        best_effort: bool,
+    ) -> (crate::cluster::coordinator::RunningCluster, TxKey) {
+        let n1 = crate::cluster::shards::NodeId(1);
+        let n2 = crate::cluster::shards::NodeId(2);
+        let n3 = crate::cluster::shards::NodeId(3);
+        let members = vec![n1, n2, n3];
+        let table = crate::cluster::shards::ShardTable::compute_with_epoch(&members, 3, 402, 1);
+        let shard = (0..crate::cluster::shards::NUM_SHARDS as u16)
+            .find(|&s| table.target_assignment(s).master == n3)
+            .expect("expected some shard whose target assignment masters to n3");
+
+        let mut cluster = crate::cluster::coordinator::new_test_running_cluster(
+            n1,
+            table,
+            &[
+                (n1, "127.0.0.1:1".parse().unwrap()),
+                (n2, n2_addr),
+                (n3, n3_addr),
+            ],
+            &members,
+            &[],
+            &[],
+            &[],
+            3,
+        );
+        cluster.set_replication_policy_for_test(ack_policy, best_effort);
+        cluster.test_open_dual_write_window(shard, n3);
+
+        let tx_key = TxKey {
+            txid: txid_for_shard(shard, 42),
+        };
+        (cluster, tx_key)
+    }
+
+    /// P7b — the multi-shard hole the batch-UNION handoff gate missed: a
+    /// client batch spanning TWO simultaneously-migrating shards to
+    /// DIFFERENT new masters. Shard A migrates to n3 (which ACKs); shard B
+    /// migrates to n5 (which NAKs) — but shard B's OTHER regular replica
+    /// ACKs and independently satisfies shard B's own per-key
+    /// `WriteMajority` quorum (proven below via `key_targets`, so this is
+    /// not just a regular-quorum miss in disguise).
+    ///
+    /// Under the OLD batch-union gate (`handoff_acks` counted over the
+    /// union of every shard's `handoff_targets`), n3's ACK alone made the
+    /// union count > 0 and the whole batch passed — masking that shard B's
+    /// future master (n5) never observed the write. The per-shard gate
+    /// must catch this: shard B's OWN handoff set (`{n5}`) has zero ACKs,
+    /// so the batch must fail even though shard A's handoff and shard B's
+    /// regular quorum are both individually fine.
+    #[test]
+    fn multi_shard_batch_fails_when_one_shards_handoff_misses() {
+        let n1 = crate::cluster::shards::NodeId(1);
+        let n2 = crate::cluster::shards::NodeId(2);
+        let n3 = crate::cluster::shards::NodeId(3);
+        let n4 = crate::cluster::shards::NodeId(4);
+        let n5 = crate::cluster::shards::NodeId(5);
+        let members = vec![n1, n2, n3, n4, n5];
+        let table = crate::cluster::shards::ShardTable::compute_with_epoch(&members, 3, 501, 2);
+
+        let shard_a = (0..crate::cluster::shards::NUM_SHARDS as u16)
+            .find(|&s| {
+                let a = table.target_assignment(s);
+                a.master == n3 && a.replicas.contains(&n1)
+            })
+            .expect("expected some shard mastered by n3 with n1 as replica");
+        let shard_b = (0..crate::cluster::shards::NUM_SHARDS as u16)
+            .find(|&s| {
+                let a = table.target_assignment(s);
+                s != shard_a && a.master == n5 && a.replicas.contains(&n1)
+            })
+            .expect("expected some OTHER shard mastered by n5 with n1 as replica");
+
+        let n2_addr = spawn_replica_receiver(ReplicaBehaviour::Ack);
+        let n3_addr = spawn_replica_receiver(ReplicaBehaviour::Ack);
+        let n4_addr = spawn_replica_receiver(ReplicaBehaviour::Ack);
+        let n5_addr = spawn_replica_receiver(ReplicaBehaviour::Nak);
+
+        let mut cluster = crate::cluster::coordinator::new_test_running_cluster(
+            n1,
+            table,
+            &[
+                (n1, "127.0.0.1:1".parse().unwrap()),
+                (n2, n2_addr),
+                (n3, n3_addr),
+                (n4, n4_addr),
+                (n5, n5_addr),
+            ],
+            &members,
+            &[],
+            &[],
+            &[],
+            3,
+        );
+        cluster.set_replication_policy_for_test(Some(AckPolicy::WriteMajority), false);
+        // Shard A migrates n1 -> n3 (n3 is ALSO shard A's target-assignment
+        // master, the real handoff order); shard B migrates n1 -> n5,
+        // likewise already the target-assignment master for shard B.
+        cluster.test_open_dual_write_window(shard_a, n3);
+        cluster.test_open_dual_write_window(shard_b, n5);
+
+        let key_a = TxKey {
+            txid: txid_for_shard(shard_a, 71),
+        };
+        let key_b = TxKey {
+            txid: txid_for_shard(shard_b, 72),
+        };
+        let ops = vec![
+            (
+                key_a,
+                vec![crate::replication::protocol::ReplicaOp::Delete { tx_key: key_a }],
+            ),
+            (
+                key_b,
+                vec![crate::replication::protocol::ReplicaOp::Delete { tx_key: key_b }],
+            ),
+        ];
+
+        // Sanity: shard B's OWN regular quorum set contains a holder OTHER
+        // than the handoff target n5, so shard B's per-key WriteMajority
+        // quorum is satisfiable WITHOUT n5 ever ACKing — proving the
+        // handoff gate (not the regular per-key quorum) is what must catch
+        // the miss.
+        let plan = build_replication_targets(&cluster, &ops)
+            .expect("target resolution should succeed for both shards");
+        let shard_b_regular = plan
+            .key_targets
+            .iter()
+            .find(|(k, _)| *k == key_b)
+            .map(|(_, targets)| targets.clone())
+            .expect("key_b must have a regular target set");
+        assert!(
+            shard_b_regular.iter().any(|a| *a != n5_addr),
+            "shard B must have a regular replica OTHER than the handoff target n5 \
+             so its own per-key quorum can be satisfied independently of n5: {shard_b_regular:?}",
+        );
+
+        // The write must fail: shard B's future master (n5) never ACKed
+        // its handoff, even though shard A's handoff (n3) ACKed and shard
+        // B's own regular quorum is independently satisfied by its other
+        // replica. Pre-P7b (the batch-union gate), n3's ACK alone made the
+        // union handoff-ack count > 0 and this wrongly returned `Ok`.
+        let err = replicate_all_ops(Some(&cluster), &ops, (0, 0), &[]).expect_err(
+            "shard B's future master (n5) never ACKed its handoff — the batch must fail even \
+             though shard A's handoff (n3) ACKed and shard B's own regular quorum is \
+             independently satisfied by its other replica",
+        );
+        assert!(
+            err.contains("shard") && (err.contains("handoff") || err.contains("new-side")),
+            "error must name the per-shard migration/handoff invariant: {err}",
+        );
+    }
+
+    /// R2/P7b guard against over-blocking: same two-shard setup as
+    /// [`multi_shard_batch_fails_when_one_shards_handoff_misses`], but BOTH
+    /// n3 and n5 ACK their respective shard's handoff — the batch must
+    /// succeed.
+    #[test]
+    fn multi_shard_batch_succeeds_when_all_shard_handoffs_ack() {
+        let n1 = crate::cluster::shards::NodeId(1);
+        let n2 = crate::cluster::shards::NodeId(2);
+        let n3 = crate::cluster::shards::NodeId(3);
+        let n4 = crate::cluster::shards::NodeId(4);
+        let n5 = crate::cluster::shards::NodeId(5);
+        let members = vec![n1, n2, n3, n4, n5];
+        let table = crate::cluster::shards::ShardTable::compute_with_epoch(&members, 3, 502, 2);
+
+        let shard_a = (0..crate::cluster::shards::NUM_SHARDS as u16)
+            .find(|&s| {
+                let a = table.target_assignment(s);
+                a.master == n3 && a.replicas.contains(&n1)
+            })
+            .expect("expected some shard mastered by n3 with n1 as replica");
+        let shard_b = (0..crate::cluster::shards::NUM_SHARDS as u16)
+            .find(|&s| {
+                let a = table.target_assignment(s);
+                s != shard_a && a.master == n5 && a.replicas.contains(&n1)
+            })
+            .expect("expected some OTHER shard mastered by n5 with n1 as replica");
+
+        let n2_addr = spawn_replica_receiver(ReplicaBehaviour::Ack);
+        let n3_addr = spawn_replica_receiver(ReplicaBehaviour::Ack);
+        let n4_addr = spawn_replica_receiver(ReplicaBehaviour::Ack);
+        let n5_addr = spawn_replica_receiver(ReplicaBehaviour::Ack);
+
+        let mut cluster = crate::cluster::coordinator::new_test_running_cluster(
+            n1,
+            table,
+            &[
+                (n1, "127.0.0.1:1".parse().unwrap()),
+                (n2, n2_addr),
+                (n3, n3_addr),
+                (n4, n4_addr),
+                (n5, n5_addr),
+            ],
+            &members,
+            &[],
+            &[],
+            &[],
+            3,
+        );
+        cluster.set_replication_policy_for_test(Some(AckPolicy::WriteMajority), false);
+        cluster.test_open_dual_write_window(shard_a, n3);
+        cluster.test_open_dual_write_window(shard_b, n5);
+
+        let key_a = TxKey {
+            txid: txid_for_shard(shard_a, 73),
+        };
+        let key_b = TxKey {
+            txid: txid_for_shard(shard_b, 74),
+        };
+        let ops = vec![
+            (
+                key_a,
+                vec![crate::replication::protocol::ReplicaOp::Delete { tx_key: key_a }],
+            ),
+            (
+                key_b,
+                vec![crate::replication::protocol::ReplicaOp::Delete { tx_key: key_b }],
+            ),
+        ];
+
+        let outcome = replicate_all_ops(Some(&cluster), &ops, (0, 0), &[])
+            .expect("both shards' handoff targets ACKed — the batch must succeed");
+        assert!(
+            matches!(outcome, ReplicationOutcome::Full),
+            "all targets ACKed ⇒ Full durability, got {outcome:?}",
         );
     }
 
@@ -21991,6 +22847,257 @@ mod tests {
         assert!(
             !mined_now(&key),
             "compensation must have rolled the mined-state back to UNMINED",
+        );
+    }
+
+    /// Build a single-item `OP_CREATE_BATCH` payload for `txid`, mirroring
+    /// `RedoDispatchHarness::create_tx`'s item shape (1 UTXO, standard
+    /// non-external/non-conflicting fields) — but returned as a payload rather
+    /// than dispatched, so the caller can drive it through `handle_request`
+    /// with an explicit `cluster` (the harness helper hardcodes `cluster:
+    /// None`, which would skip replication entirely).
+    fn encode_single_create(txid: [u8; 32]) -> Vec<u8> {
+        let item = WireCreateItem {
+            txid,
+            tx_version: 1,
+            locktime: 0,
+            fee: 500,
+            size_in_bytes: 250,
+            extended_size: 250,
+            is_coinbase: false,
+            spending_height: 0,
+            created_at: 1700000000000,
+            flags: 0,
+            utxo_hashes: vec![[0u8; 32]],
+            cold_data: vec![],
+            block_height: 0,
+            mined_block_id: None,
+            mined_block_height: None,
+            mined_subtree_idx: None,
+            parent_txids: vec![],
+        };
+        encode_create_batch(&[item])
+    }
+
+    /// G4 (create) / R9-G4: the hold-to-quorum discipline extends to create.
+    /// A reader concurrent with an RF>1 create whose replication FAILS must
+    /// never observe the created record — it is excluded until the outcome is
+    /// known and the create is compensated (deleted), so it observes only the
+    /// pre-write "not found" state. Before the fix create held no per-key
+    /// visibility stripe (only the coarse global SHARED side), so a reader
+    /// could observe the record the moment Phase 3 registered it in the
+    /// index — well before replication resolved — and that phantom write was
+    /// then rolled back underneath it (a read-your-writes / monotonicity
+    /// violation). Mirrors `spend_holds_visibility_until_replication_outcome_
+    /// reader_never_sees_rolled_back_write`.
+    #[test]
+    fn create_holds_visibility_until_replication_outcome_reader_never_sees_rolled_back_write() {
+        use std::sync::atomic::{AtomicU8, Ordering};
+
+        // A window long enough that the reader reliably issues its
+        // visibility-respecting read while the create is still mid-replication.
+        const SLOW_NAK_MS: u64 = 500;
+        let replica = spawn_replica_receiver(ReplicaBehaviour::SlowNak(SLOW_NAK_MS));
+        let (cluster, key) = two_node_rf2(replica, Some(AckPolicy::WriteMajority));
+
+        // Real engine + redo so the create applies (device write + index
+        // register) locally (WAL-first) before it replicates and, on the NAK,
+        // compensates back to "not found" via `engine.delete`.
+        let h = RedoDispatchHarness::new();
+        let create_payload = encode_single_create(key.txid);
+
+        // What a visibility-respecting reader observed while the create was in
+        // flight. 0xFF = "not yet recorded", 1 = observed present (phantom), 0
+        // = observed absent (correct: either pre-register or post-rollback).
+        const UNSET: u8 = 0xFF;
+        const OBS_PRESENT: u8 = 1;
+        const OBS_ABSENT: u8 = 0;
+        let observed = AtomicU8::new(UNSET);
+
+        std::thread::scope(|s| {
+            // Creator: applies locally (index register), blocks ~SLOW_NAK_MS in
+            // replication, then the NAK fails the write and compensation
+            // deletes the record.
+            let create_resp = s.spawn(|| {
+                let req = RequestFrame {
+                    request_id: 1,
+                    op_code: OP_CREATE_BATCH,
+                    flags: 0,
+                    payload: create_payload.into(),
+                };
+                let mut cs = crate::server::ConnectionState::new();
+                handle_request(
+                    &req,
+                    &h.engine,
+                    8192,
+                    Some(&cluster),
+                    Some(&h.redo_log),
+                    &mut cs,
+                    None,
+                )
+            });
+
+            // Reader: wait (via a dirty lookup that bypasses visibility) until
+            // the create has registered the key locally, so we know
+            // replication is now in flight. Then take the read-visibility
+            // guard for `key` and record whether the key looks present. After
+            // the fix this guard BLOCKS until the creator's replication
+            // outcome + compensation (delete) resolve; before the fix it
+            // acquires immediately and exposes the (soon-deleted) record.
+            s.spawn(|| {
+                loop {
+                    if h.engine.lookup(&key).is_some() {
+                        break;
+                    }
+                    std::thread::yield_now();
+                }
+                let _read_guard = h.engine.visibility().read(std::slice::from_ref(&key));
+                let obs = if h.engine.lookup(&key).is_some() {
+                    OBS_PRESENT
+                } else {
+                    OBS_ABSENT
+                };
+                observed.store(obs, Ordering::SeqCst);
+            });
+
+            let resp = create_resp.join().expect("creator thread panicked");
+            assert_eq!(
+                resp.status, STATUS_ERROR,
+                "the create must fail: its sole replica NAKed (below WriteMajority)",
+            );
+        });
+
+        // The reader must have observed "not found", NEVER the phantom record
+        // that replication rolled back.
+        assert_eq!(
+            observed.load(Ordering::SeqCst),
+            OBS_ABSENT,
+            "reader observed a create that replication failed and rolled back \
+             (read-your-writes / monotonicity violation)",
+        );
+        // And the durable local state is the compensated (deleted) record.
+        assert!(
+            h.engine.lookup(&key).is_none(),
+            "compensation must have deleted the record",
+        );
+    }
+
+    /// R9/G4 cross-op divergence: a concurrent WRITER of the same not-yet-
+    /// replicated create key (the exact per-key `mutation_stripes` acquisition
+    /// `handle_spend_batch`/`handle_set_mined_batch` make before touching a
+    /// key) must be excluded for as long as the create's own
+    /// `visibility_stripes` guard is held — i.e. across the create's
+    /// replication RTT — not merely "eventually consistent" after the fact.
+    /// Before the fix create held no per-key stripe at all, so this
+    /// acquisition would have succeeded immediately, letting a concurrent
+    /// spend of the same uncommitted txid reach its own quorum independently
+    /// of whether the create itself ever did.
+    #[test]
+    fn create_holds_stripe_blocks_concurrent_spend_of_uncommitted_txid() {
+        const SLOW_NAK_MS: u64 = 500;
+        let replica = spawn_replica_receiver(ReplicaBehaviour::SlowNak(SLOW_NAK_MS));
+        let (cluster, key) = two_node_rf2(replica, Some(AckPolicy::WriteMajority));
+
+        let h = RedoDispatchHarness::new();
+        let create_payload = encode_single_create(key.txid);
+
+        std::thread::scope(|s| {
+            let create_resp = s.spawn(|| {
+                let req = RequestFrame {
+                    request_id: 1,
+                    op_code: OP_CREATE_BATCH,
+                    flags: 0,
+                    payload: create_payload.into(),
+                };
+                let mut cs = crate::server::ConnectionState::new();
+                handle_request(
+                    &req,
+                    &h.engine,
+                    8192,
+                    Some(&cluster),
+                    Some(&h.redo_log),
+                    &mut cs,
+                    None,
+                )
+            });
+
+            // Writer: wait (dirty lookup) until the create has registered the
+            // key locally, so replication is now in flight, then take the
+            // SAME per-key WRITE stripe a concurrent spend/set_mined handler
+            // would take before validating/applying against this key. Time
+            // how long the acquisition takes: if create's own stripe genuinely
+            // excludes it, the acquisition cannot complete until create's
+            // replication outcome resolves (~SLOW_NAK_MS away).
+            loop {
+                if h.engine.lookup(&key).is_some() {
+                    break;
+                }
+                std::thread::yield_now();
+            }
+            let wait_start = std::time::Instant::now();
+            let _writer_guard = h
+                .engine
+                .visibility()
+                .mutation_stripes(std::slice::from_ref(&key));
+            let stripe_wait = wait_start.elapsed();
+
+            let resp = create_resp.join().expect("creator thread panicked");
+            assert_eq!(
+                resp.status, STATUS_ERROR,
+                "the create must fail: its sole replica NAKed (below WriteMajority)",
+            );
+
+            assert!(
+                stripe_wait >= Duration::from_millis(SLOW_NAK_MS / 2),
+                "a concurrent writer of the create's key acquired the per-key \
+                 write stripe after only {stripe_wait:?} — it must block \
+                 behind create's held `visibility_stripes` until the create's \
+                 replication outcome resolves (proves the cross-op divergence \
+                 this fix closes: an uncontested concurrent spend of the same \
+                 not-yet-replicated txid could otherwise reach its own quorum \
+                 independently of the create)",
+            );
+        });
+    }
+
+    /// Regression: a create on an RF>1 node whose replica ACKs still succeeds
+    /// and the record is visible (and spendable) afterward — the new held
+    /// stripe must not change the happy path's outcome, only its timing
+    /// relative to a concurrent same-key reader/writer.
+    #[test]
+    fn create_rf2_replica_acks_succeeds_and_record_visible() {
+        let replica = spawn_replica_receiver(ReplicaBehaviour::Ack);
+        let (cluster, key) = two_node_rf2(replica, Some(AckPolicy::WriteMajority));
+
+        let h = RedoDispatchHarness::new();
+        let create_payload = encode_single_create(key.txid);
+        let req = RequestFrame {
+            request_id: 1,
+            op_code: OP_CREATE_BATCH,
+            flags: 0,
+            payload: create_payload.into(),
+        };
+        let mut cs = crate::server::ConnectionState::new();
+        let resp = handle_request(
+            &req,
+            &h.engine,
+            8192,
+            Some(&cluster),
+            Some(&h.redo_log),
+            &mut cs,
+            None,
+        );
+
+        assert_eq!(
+            resp.status, STATUS_OK,
+            "create must succeed: its sole replica ACKed"
+        );
+        assert!(
+            h.engine
+                .lookup_checked(&key)
+                .expect("index read ok")
+                .is_some(),
+            "record must be visible after a successfully-replicated create"
         );
     }
 
@@ -25394,6 +26501,7 @@ mod tests {
             other,
             crate::cluster::topology::ClusterId::UNSET,
             1,
+            (members.clone()).len() as u64,
         );
         let req = RequestFrame {
             request_id: 1,
@@ -25461,6 +26569,7 @@ mod tests {
             proposer,
             crate::cluster::topology::ClusterId::UNSET,
             1,
+            (members.clone()).len() as u64,
         );
 
         let req = RequestFrame {
@@ -25539,6 +26648,7 @@ mod tests {
             proposer,
             crate::cluster::topology::ClusterId::UNSET,
             1,
+            (members.clone()).len() as u64,
         );
 
         let req = RequestFrame {
@@ -25603,8 +26713,14 @@ mod tests {
 
         // Step 1: accept a proposal (sets voted_term).
         let proposer = crate::cluster::shards::NodeId(2);
-        let propose =
-            crate::cluster::topology::TopologyTerm::new(700, members.clone(), proposer, cid, 1);
+        let propose = crate::cluster::topology::TopologyTerm::new(
+            700,
+            members.clone(),
+            proposer,
+            cid,
+            1,
+            (members.clone()).len() as u64,
+        );
         let req = RequestFrame {
             request_id: 1,
             op_code: OP_TOPOLOGY_PROPOSE,
@@ -25630,7 +26746,14 @@ mod tests {
             members: members.clone(),
             cluster_id: cid,
             placement_version: 1,
-            digest: crate::cluster::topology::TopologyTerm::compute_digest(700, &cid, &members, 1),
+            committed_peak: (members.clone()).len() as u64,
+            digest: crate::cluster::topology::TopologyTerm::compute_digest(
+                700,
+                &cid,
+                &members,
+                1,
+                (members).len() as u64,
+            ),
             voters: members.clone(),
         };
         let req = RequestFrame {
@@ -28882,15 +30005,41 @@ mod tests {
         // lacks the V3 identity guard — recovery would re-mark a slot SPENT
         // even after it was reassigned to a new hash.
         let h = CompensationCrashHarness::new();
-        let (key, _spending_data) = h.seed_record_and_spend([0xC7; 32]);
+        let (key, spending_data) = h.seed_record_and_spend([0xC7; 32]);
         let slot_hash = h.engine.read_slot(&key, 0).expect("slot exists").hash;
+
+        // R8: drive a REAL local unspend first so the slot is genuinely
+        // UNSPENT (the actual precondition for a `ReplicaOp::Unspend`
+        // compensation event) and the compensating re-spend below uses the
+        // exact prior `spending_data`, matching production
+        // (`v.item.spending_data` at the live Unspend handler). Pre-R8 this
+        // test skipped straight to compensating with an arbitrary mismatched
+        // `spending_data` against a still-SPENT slot — harmless only because
+        // the swallow being fixed here silently dropped the resulting
+        // per-slot `AlreadySpent` error; R8's classification correctly
+        // surfaces that as `Err`, which would break this test's `Ok`
+        // expectation below without this fix.
+        h.engine
+            .unspend(&crate::ops::unspend::UnspendRequest {
+                tx_key: key,
+                offset: 0,
+                utxo_hash: slot_hash,
+                spending_data,
+                current_block_height: 1000,
+                block_height_retention: 288,
+            })
+            .expect("seed unspend");
+        assert!(
+            h.engine.read_slot(&key, 0).unwrap().is_unspent(),
+            "seed unspend must leave the slot UNSPENT"
+        );
 
         let repl_ops = vec![(
             key,
             vec![ReplicaOp::Unspend {
                 tx_key: key,
                 offset: 0,
-                spending_data: [0u8; 36],
+                spending_data,
                 current_block_height: 1000,
                 block_height_retention: 288,
                 master_generation: 4,
@@ -28926,6 +30075,418 @@ mod tests {
         assert!(
             !comp.iter().any(|e| matches!(&e.op, RedoOp::Spend { .. })),
             "must NOT re-emit the legacy hash-less RedoOp::Spend",
+        );
+    }
+
+    /// R8: a failing compensating re-spend for `ReplicaOp::Unspend` must
+    /// surface as `Err`, not be swallowed by the old
+    /// `if let Ok(v) = engine.validate_spend_multi(&req) { let _ =
+    /// v.apply(engine); }`. Pre-fix this arm always let the top-level
+    /// compensation report success even when the re-spend's device write
+    /// failed, leaving the slot UNSPENT while every replica that applied the
+    /// original Unspend rolled it back to SPENT — a silent divergence this
+    /// node's own recovery would not otherwise catch. Exercises the
+    /// three-level classification's level 2 (`apply` → `Err`).
+    #[test]
+    fn compensation_unspend_respend_device_failure_surfaces_error() {
+        use crate::ops::create::CreateRequest;
+        use crate::ops::spend::{SpendItem, SpendMultiRequest};
+        use crate::ops::unspend::UnspendRequest;
+
+        let (engine, redo_log, fail, _guard) = write_failing_engine();
+
+        // Two 1-slot records, seeded to SPENT then UNSPENT (fail off — every
+        // seeding write must succeed): a throwaway `probe_key` used ONLY to
+        // prove the armed device really does make the compensating
+        // re-spend's `apply` phase fail synchronously, and the real `key`
+        // used for the actual compensation assertion below. Mirrors
+        // `compensation_create_delete_failure_surfaces_error`'s
+        // probe-then-real pattern so the probe cannot disturb `key`'s state.
+        let mut probe_txid = [0u8; 32];
+        probe_txid[0] = 0xE0;
+        let probe_key = TxKey { txid: probe_txid };
+        let probe_hash = [0x55u8; 32];
+        let probe_spending_data = [0xAAu8; 36];
+
+        let mut txid = [0u8; 32];
+        txid[0] = 0xE1;
+        let key = TxKey { txid };
+        let hash = [0x66u8; 32];
+        let spending_data = [0xBBu8; 36];
+
+        for (id, item_hash, item_spending_data) in [
+            (probe_txid, probe_hash, probe_spending_data),
+            (txid, hash, spending_data),
+        ] {
+            let k = TxKey { txid: id };
+            engine
+                .create(&CreateRequest {
+                    tx_id: id,
+                    tx_version: 1,
+                    locktime: 0,
+                    fee: 0,
+                    size_in_bytes: 0,
+                    extended_size: 0,
+                    is_coinbase: false,
+                    spending_height: 0,
+                    utxo_hashes: &[item_hash],
+                    inputs: None,
+                    outputs: None,
+                    inpoints: None,
+                    is_external: false,
+                    created_at: 0,
+                    block_height: 0,
+                    mined_block_infos: &[],
+                    frozen: false,
+                    conflicting: false,
+                    locked: false,
+                    external_ref: None,
+                    parent_txids: &[],
+                })
+                .expect("seed create");
+            engine
+                .spend_multi(&SpendMultiRequest {
+                    tx_key: k,
+                    spends: vec![SpendItem {
+                        offset: 0,
+                        utxo_hash: item_hash,
+                        spending_data: item_spending_data,
+                        idx: 0,
+                    }],
+                    ignore_conflicting: false,
+                    ignore_locked: false,
+                    current_block_height: 1000,
+                    block_height_retention: 288,
+                })
+                .expect("seed spend");
+            engine
+                .unspend(&UnspendRequest {
+                    tx_key: k,
+                    offset: 0,
+                    utxo_hash: item_hash,
+                    spending_data: item_spending_data,
+                    current_block_height: 1000,
+                    block_height_retention: 288,
+                })
+                .expect("seed unspend");
+            assert!(
+                engine.read_slot(&k, 0).unwrap().is_unspent(),
+                "seed must leave the slot UNSPENT (matching a real reverse-unspend precondition)"
+            );
+        }
+
+        // Arm the device to fail the next pwrite (the compensating re-spend's
+        // `apply` write).
+        fail.store(true, std::sync::atomic::Ordering::SeqCst);
+
+        // Sanity check (would-pass-pre-fix guard): confirm the armed device
+        // actually makes the SAME re-spend the compensation arm performs
+        // (`validate_spend_multi` then `.apply`) return `Err`, on the
+        // throwaway probe record — otherwise this test would be vacuous.
+        let probe_validated = engine
+            .validate_spend_multi(&SpendMultiRequest {
+                tx_key: probe_key,
+                spends: vec![SpendItem {
+                    offset: 0,
+                    utxo_hash: probe_hash,
+                    spending_data: probe_spending_data,
+                    idx: 0,
+                }],
+                ignore_conflicting: true,
+                ignore_locked: true,
+                current_block_height: 1000,
+                block_height_retention: 288,
+            })
+            .expect("validate must succeed: it only reads");
+        let direct_err = probe_validated
+            .apply(&engine)
+            .expect_err("armed device must make the compensating re-spend's apply fail");
+        assert!(
+            matches!(direct_err, SpendError::StorageError { .. }),
+            "expected a StorageError from the armed device, got {direct_err:?}"
+        );
+
+        // `key` is untouched by the probe above — still UNSPENT for the real
+        // compensation call below to exercise the same failing path.
+        assert!(
+            engine.read_slot(&key, 0).unwrap().is_unspent(),
+            "the untouched key must still be UNSPENT ahead of the real compensation call"
+        );
+
+        let repl_ops = vec![(
+            key,
+            vec![ReplicaOp::Unspend {
+                tx_key: key,
+                offset: 0,
+                spending_data,
+                current_block_height: 1000,
+                block_height_retention: 288,
+                master_generation: 0,
+            }],
+        )];
+        let before_images = vec![(key, vec![BeforeImage::None])];
+
+        let err =
+            compensate_replication_failure(&engine, &repl_ops, &before_images, Some(&redo_log))
+                .expect_err(
+                    "R8: a failed compensating re-spend must surface as Err, not be swallowed",
+                );
+        assert!(
+            err.contains("compensate unspend"),
+            "error must identify the swallowed compensating re-spend; got {err:?}"
+        );
+
+        // DC-1 durability: the compensating `RedoOp::SpendV2` must still be
+        // durable even though the in-memory re-spend failed — recovery
+        // relies on it to replay the rollback. `comp_redo.push` for this arm
+        // is unconditional once `read_slot` succeeds.
+        fail.store(false, std::sync::atomic::Ordering::SeqCst);
+        let entries = redo_log.lock().recover().expect("recover redo entries");
+        assert!(
+            entries.iter().any(|e| matches!(
+                &e.op,
+                RedoOp::SpendV2 { tx_key, offset: 0, spending_data: sd, .. }
+                    if *tx_key == key && *sd == spending_data
+            )),
+            "compensating SpendV2 redo entry must be durable even when the engine re-spend fails"
+        );
+    }
+
+    /// R8: covers the three-level classification's LEVEL 3 branch — a
+    /// top-level `Ok(resp)` from the compensating re-spend whose per-slot
+    /// `resp.errors.get(&0)` is `Some(SpendError)`. This is the branch that
+    /// motivated the whole three-level design (see the doc comment on the
+    /// `ReplicaOp::Unspend` arm), yet had no permanent regression test —
+    /// `compensation_unspend_respend_device_failure_surfaces_error` only
+    /// exercises level 2 (`apply` → `Err`). Drives the compensating
+    /// re-spend's slot to FROZEN via `engine.freeze` — a per-slot status
+    /// distinct from the record-level `TxFlags::LOCKED` that the
+    /// compensation request's `ignore_locked: true` already bypasses — so
+    /// `validate_spend_multi`'s per-item check inserts `SpendError::Frozen`
+    /// at idx 0 while both `validate_spend_multi` and `.apply` themselves
+    /// return `Ok`.
+    #[test]
+    fn compensation_unspend_per_slot_error_surfaces_error() {
+        use crate::ops::create::CreateRequest;
+        use crate::ops::remaining::FreezeRequest;
+        use crate::ops::spend::{SpendItem, SpendMultiRequest};
+        use crate::ops::unspend::UnspendRequest;
+
+        let (engine, redo_log, _fail, _guard) = write_failing_engine();
+
+        let mut txid = [0u8; 32];
+        txid[0] = 0xE3;
+        let key = TxKey { txid };
+        let hash = [0x77u8; 32];
+        let spending_data = [0xCCu8; 36];
+
+        // Seed a 1-slot record, spend it, then unspend it — the real
+        // precondition for a `ReplicaOp::Unspend` compensation event: the
+        // slot must be genuinely UNSPENT for the compensating re-spend to
+        // have anything to do.
+        engine
+            .create(&CreateRequest {
+                tx_id: txid,
+                tx_version: 1,
+                locktime: 0,
+                fee: 0,
+                size_in_bytes: 0,
+                extended_size: 0,
+                is_coinbase: false,
+                spending_height: 0,
+                utxo_hashes: &[hash],
+                inputs: None,
+                outputs: None,
+                inpoints: None,
+                is_external: false,
+                created_at: 0,
+                block_height: 0,
+                mined_block_infos: &[],
+                frozen: false,
+                conflicting: false,
+                locked: false,
+                external_ref: None,
+                parent_txids: &[],
+            })
+            .expect("seed create");
+        engine
+            .spend_multi(&SpendMultiRequest {
+                tx_key: key,
+                spends: vec![SpendItem {
+                    offset: 0,
+                    utxo_hash: hash,
+                    spending_data,
+                    idx: 0,
+                }],
+                ignore_conflicting: false,
+                ignore_locked: false,
+                current_block_height: 1000,
+                block_height_retention: 288,
+            })
+            .expect("seed spend");
+        engine
+            .unspend(&UnspendRequest {
+                tx_key: key,
+                offset: 0,
+                utxo_hash: hash,
+                spending_data,
+                current_block_height: 1000,
+                block_height_retention: 288,
+            })
+            .expect("seed unspend");
+        assert!(
+            engine.read_slot(&key, 0).unwrap().is_unspent(),
+            "seed must leave the slot UNSPENT (matching a real reverse-unspend precondition)"
+        );
+
+        // Independently move the slot to FROZEN. `ignore_locked: true` on
+        // the compensation request only bypasses the record-level
+        // `TxFlags::LOCKED` bit checked in `prepare_spend_multi` step 3 — it
+        // does NOT touch the per-slot `UTXO_FROZEN` status checked later,
+        // per-item, in the same function.
+        engine
+            .freeze(&FreezeRequest {
+                tx_key: key,
+                offset: 0,
+                utxo_hash: hash,
+            })
+            .expect("freeze slot");
+        assert!(
+            engine.read_slot(&key, 0).unwrap().is_frozen(),
+            "precondition: slot must be FROZEN ahead of the compensating re-spend"
+        );
+
+        // Sanity check (would-pass-vacuously guard): confirm the SAME
+        // re-spend shape the compensation arm performs
+        // (`validate_spend_multi` then `.apply`) returns a top-level `Ok`
+        // with a per-item error at idx 0 — i.e. this genuinely exercises
+        // level 3, not level 1 (`validate` → `Err`) or level 2 (`apply` →
+        // `Err`). `apply` here is a no-op on the device (spent_count == 0
+        // short-circuits before any write), so this probe cannot disturb
+        // the slot state the real compensation call below observes.
+        let probe_resp = engine
+            .validate_spend_multi(&SpendMultiRequest {
+                tx_key: key,
+                spends: vec![SpendItem {
+                    offset: 0,
+                    utxo_hash: hash,
+                    spending_data,
+                    idx: 0,
+                }],
+                ignore_conflicting: true,
+                ignore_locked: true,
+                current_block_height: 1000,
+                block_height_retention: 288,
+            })
+            .expect("validate must succeed at the top level: this probes level 3, not level 1")
+            .apply(&engine)
+            .expect("apply must succeed at the top level: this probes level 3, not level 2");
+        assert!(
+            matches!(
+                probe_resp.errors.get(&0),
+                Some(SpendError::Frozen { offset: 0 })
+            ),
+            "expected a per-slot Frozen error at idx 0, got {:?}",
+            probe_resp.errors
+        );
+        assert!(
+            engine.read_slot(&key, 0).unwrap().is_frozen(),
+            "the probe apply must be a no-op on the FROZEN slot; the real compensation call \
+             below must see the same state"
+        );
+
+        let repl_ops = vec![(
+            key,
+            vec![ReplicaOp::Unspend {
+                tx_key: key,
+                offset: 0,
+                spending_data,
+                current_block_height: 1000,
+                block_height_retention: 288,
+                master_generation: 0,
+            }],
+        )];
+        let before_images = vec![(key, vec![BeforeImage::None])];
+
+        let err =
+            compensate_replication_failure(&engine, &repl_ops, &before_images, Some(&redo_log))
+                .expect_err(
+                    "R8 level 3: a per-slot resp.errors[0] on a top-level-Ok compensating \
+                     re-spend must surface as Err, not be swallowed",
+                );
+        assert!(
+            err.contains("compensate unspend"),
+            "error must identify the swallowed compensating re-spend; got {err:?}"
+        );
+
+        // DC-1 durability: the compensating `RedoOp::SpendV2` must still be
+        // durable even though the per-slot re-spend failed — recovery
+        // relies on it to replay the rollback. `comp_redo.push` for this arm
+        // is unconditional once `read_slot` succeeds.
+        let entries = redo_log.lock().recover().expect("recover redo entries");
+        assert!(
+            entries.iter().any(|e| matches!(
+                &e.op,
+                RedoOp::SpendV2 { tx_key, offset: 0, spending_data: sd, .. }
+                    if *tx_key == key && *sd == spending_data
+            )),
+            "compensating SpendV2 redo entry must be durable even when the per-slot re-spend \
+             fails"
+        );
+    }
+
+    /// R8: guards against over-surfacing. The Unspend arm's outer
+    /// `engine.read_slot` existence check shares the SAME index-absence
+    /// condition as `validate_spend_multi`'s own first check (both resolve
+    /// `TxKey → record` via the same primary index with no intervening
+    /// mutation possible within one synchronous call) — so a genuinely
+    /// absent record is caught there, before the two-phase classification
+    /// even runs. This is benign — the record being rolled back has nothing
+    /// left to diverge, so the rollback is still clean and the intent may be
+    /// cleared. It mirrors the `ReplicaOp::MarkLongestChain` arm's own
+    /// documented TxNotFound-benign case: when the data needed to build the
+    /// compensating redo entry (here, the slot read) is unavailable, no
+    /// redo entry is emitted for this op — not a divergence, since there is
+    /// nothing durable left to reconcile — and the function still reports a
+    /// clean compensation.
+    #[test]
+    fn compensation_unspend_txnotfound_is_benign_ok() {
+        let (engine, redo_log, _fail, _guard) = write_failing_engine();
+        let mut txid = [0u8; 32];
+        txid[0] = 0xE2;
+        let key = TxKey { txid };
+
+        // Deliberately never create `key` — `engine.read_slot` (the Unspend
+        // arm's own existence gate) returns `Err(SpendError::TxNotFound)`.
+        assert!(
+            matches!(engine.read_slot(&key, 0), Err(SpendError::TxNotFound)),
+            "precondition: the unseeded key's slot read must fail with TxNotFound"
+        );
+
+        let repl_ops = vec![(
+            key,
+            vec![ReplicaOp::Unspend {
+                tx_key: key,
+                offset: 0,
+                spending_data: [0u8; 36],
+                current_block_height: 1000,
+                block_height_retention: 288,
+                master_generation: 0,
+            }],
+        )];
+        let before_images = vec![(key, vec![BeforeImage::None])];
+
+        let comp_range =
+            compensate_replication_failure(&engine, &repl_ops, &before_images, Some(&redo_log))
+                .expect(
+                    "an absent record on the Unspend compensation path must be treated as \
+                     benign (Ok), not surfaced as an error",
+                );
+        assert!(
+            comp_range.is_none(),
+            "no compensating redo entry can be built without a successful slot read, mirroring \
+             the MarkLongestChain arm's identical TxNotFound-benign 'no redo without data' \
+             pattern; got {comp_range:?}"
         );
     }
 
@@ -30272,6 +31833,257 @@ mod tests {
         assert!(
             has_compensate,
             "compensating redo entry must be durable even when the in-line restore write fails"
+        );
+    }
+
+    /// R8/C16 (named anchor): a failing compensating `delete` for
+    /// `ReplicaOp::Create` must surface as `Err`, not be swallowed by the old
+    /// `let _ = engine.delete(&req);`. Pre-fix this arm always returned
+    /// `Ok`, so a genuine device failure during rollback of a replicated
+    /// Create was reported as a clean rollback and the pending replication
+    /// intent was cleared over a record this node never actually deleted —
+    /// a silent divergence from every replica that DID roll the create back.
+    #[test]
+    fn compensation_create_delete_failure_surfaces_error() {
+        use crate::ops::create::CreateRequest;
+
+        let (engine, redo_log, fail, _guard) = write_failing_engine();
+        let mut txid = [0u8; 32];
+        txid[0] = 0xC1;
+        let key = TxKey { txid };
+
+        // A second, throwaway record used ONLY to prove (without disturbing
+        // `key`'s state) that the armed device really does make a
+        // compensating `engine.delete` fail synchronously. `delete_inner`
+        // unregisters the index entry BEFORE it tombstones the metadata
+        // header, so probing on `key` itself would leave it already
+        // unregistered and turn the real assertion below into a benign
+        // `TxNotFound` instead of the device failure this test targets.
+        let mut probe_txid = [0u8; 32];
+        probe_txid[0] = 0xC0;
+        let probe_key = TxKey { txid: probe_txid };
+
+        // Seed the record the Create replicated (fail off: this write must
+        // succeed so there is something for the compensating delete to find).
+        for (id, hash) in [(txid, [0x11u8; 32]), (probe_txid, [0x33u8; 32])] {
+            engine
+                .create(&CreateRequest {
+                    tx_id: id,
+                    tx_version: 1,
+                    locktime: 0,
+                    fee: 0,
+                    size_in_bytes: 0,
+                    extended_size: 0,
+                    is_coinbase: false,
+                    spending_height: 0,
+                    utxo_hashes: &[hash],
+                    inputs: None,
+                    outputs: None,
+                    inpoints: None,
+                    is_external: false,
+                    created_at: 0,
+                    block_height: 0,
+                    mined_block_infos: &[],
+                    frozen: false,
+                    conflicting: false,
+                    locked: false,
+                    external_ref: None,
+                    parent_txids: &[],
+                })
+                .expect("seed create");
+        }
+
+        // Sanity check (would-pass-pre-fix guard): confirm the armed device
+        // actually makes a compensating `engine.delete` call return `Err`
+        // — otherwise this test would be vacuous. `delete_inner` tombstones
+        // the metadata header via a device write that this harness's
+        // `WriteFailingDevice` (no direct mmap pointer: `as_raw_ptr` returns
+        // `None`) routes through `pwrite`, which the armed `fail` flag trips.
+        fail.store(true, std::sync::atomic::Ordering::SeqCst);
+        let direct_err = engine
+            .delete(&crate::ops::remaining::DeleteRequest {
+                tx_key: probe_key,
+                due_guard: None,
+            })
+            .expect_err("armed device must make the tombstone write fail");
+        assert!(
+            matches!(direct_err, SpendError::StorageError { .. }),
+            "expected a StorageError from the armed device, got {direct_err:?}"
+        );
+
+        // `key` is untouched by the probe above — still present for the
+        // real compensation call below to exercise the same failing path.
+        assert!(
+            engine.lookup(&key).is_some(),
+            "the untouched key must still be present ahead of the real compensation call"
+        );
+
+        let repl_ops = vec![(
+            key,
+            vec![ReplicaOp::Create {
+                tx_key: key,
+                metadata_bytes: Vec::new(),
+                utxo_hashes: Vec::new(),
+                cold_data: None,
+                is_external: false,
+            }],
+        )];
+        let before_images = vec![(key, vec![BeforeImage::None])];
+
+        let err =
+            compensate_replication_failure(&engine, &repl_ops, &before_images, Some(&redo_log))
+                .expect_err(
+                    "R8/C16: a failed compensating delete must surface as Err, not be swallowed",
+                );
+        assert!(
+            err.contains("compensate create (delete)"),
+            "error must identify the swallowed compensating delete; got {err:?}"
+        );
+
+        // DC-1 durability: the compensating `RedoOp::Delete` must still be
+        // durable even though the in-memory delete failed — recovery relies
+        // on it to replay the rollback.
+        fail.store(false, std::sync::atomic::Ordering::SeqCst);
+        let entries = redo_log.lock().recover().expect("recover redo entries");
+        assert!(
+            entries
+                .iter()
+                .any(|e| matches!(&e.op, RedoOp::Delete { tx_key, .. } if *tx_key == key)),
+            "compensating delete redo entry must be durable even when the engine delete fails"
+        );
+    }
+
+    /// R8/C16: guards against over-surfacing. A compensating delete whose
+    /// target record is already gone (`TxNotFound`) is benign — the create
+    /// being rolled back has no live record to diverge, so the rollback is
+    /// still clean and the intent may be cleared.
+    #[test]
+    fn compensation_create_delete_txnotfound_is_benign_ok() {
+        let (engine, redo_log, _fail, _guard) = write_failing_engine();
+        let mut txid = [0u8; 32];
+        txid[0] = 0xC2;
+        let key = TxKey { txid };
+
+        // Deliberately never create `key` — `engine.delete` returns
+        // `Err(SpendError::TxNotFound)` for it.
+        let direct_err = engine
+            .delete(&crate::ops::remaining::DeleteRequest {
+                tx_key: key,
+                due_guard: None,
+            })
+            .expect_err("delete of a never-created key must fail");
+        assert!(
+            matches!(direct_err, SpendError::TxNotFound),
+            "expected TxNotFound, got {direct_err:?}"
+        );
+
+        let repl_ops = vec![(
+            key,
+            vec![ReplicaOp::Create {
+                tx_key: key,
+                metadata_bytes: Vec::new(),
+                utxo_hashes: Vec::new(),
+                cold_data: None,
+                is_external: false,
+            }],
+        )];
+        let before_images = vec![(key, vec![BeforeImage::None])];
+
+        let result =
+            compensate_replication_failure(&engine, &repl_ops, &before_images, Some(&redo_log))
+                .expect("TxNotFound on the compensating delete must be treated as benign (Ok)");
+        let _ = result;
+
+        // Even on the benign path the compensating redo entry is still
+        // written (the comp_redo push is unconditional).
+        let entries = redo_log.lock().recover().expect("recover redo entries");
+        assert!(
+            entries
+                .iter()
+                .any(|e| matches!(&e.op, RedoOp::Delete { tx_key, .. } if *tx_key == key)),
+            "compensating delete redo entry must still be written on the benign TxNotFound path"
+        );
+    }
+
+    /// R8/C16: a second non-benign arm (`ReplicaOp::PreserveUntil`) proving
+    /// the fix generalizes beyond the named Create/delete anchor. Pre-fix
+    /// `let _ = engine.preserve_until(&req);` swallowed the same class of
+    /// device failure.
+    #[test]
+    fn compensation_preserve_until_failure_surfaces_error() {
+        use crate::ops::create::CreateRequest;
+
+        let (engine, redo_log, fail, _guard) = write_failing_engine();
+        let mut txid = [0u8; 32];
+        txid[0] = 0xC3;
+        let key = TxKey { txid };
+
+        engine
+            .create(&CreateRequest {
+                tx_id: txid,
+                tx_version: 1,
+                locktime: 0,
+                fee: 0,
+                size_in_bytes: 0,
+                extended_size: 0,
+                is_coinbase: false,
+                spending_height: 0,
+                utxo_hashes: &[[0x22u8; 32]],
+                inputs: None,
+                outputs: None,
+                inpoints: None,
+                is_external: false,
+                created_at: 0,
+                block_height: 0,
+                mined_block_infos: &[],
+                frozen: false,
+                conflicting: false,
+                locked: false,
+                external_ref: None,
+                parent_txids: &[],
+            })
+            .expect("seed create");
+
+        // Confirm the armed device actually fails `preserve_until`'s
+        // metadata write, so the compensation-path assertion below is not
+        // vacuous.
+        fail.store(true, std::sync::atomic::Ordering::SeqCst);
+        let direct_err = engine
+            .preserve_until(&crate::ops::remaining::PreserveUntilRequest {
+                tx_key: key,
+                block_height: 0,
+            })
+            .expect_err("armed device must make the preserve_until metadata write fail");
+        assert!(
+            matches!(direct_err, SpendError::StorageError { .. }),
+            "expected a StorageError from the armed device, got {direct_err:?}"
+        );
+
+        let repl_ops = vec![(
+            key,
+            vec![ReplicaOp::PreserveUntil {
+                tx_key: key,
+                block_height: 700_000,
+                master_generation: 0,
+            }],
+        )];
+        let before_images = vec![(key, vec![BeforeImage::None])];
+
+        let err =
+            compensate_replication_failure(&engine, &repl_ops, &before_images, Some(&redo_log))
+                .expect_err("R8/C16: a failed compensating preserve_until must surface as Err");
+        assert!(
+            err.contains("compensate preserve_until"),
+            "error must identify the swallowed compensating preserve_until; got {err:?}"
+        );
+
+        fail.store(false, std::sync::atomic::Ordering::SeqCst);
+        let entries = redo_log.lock().recover().expect("recover redo entries");
+        assert!(
+            entries
+                .iter()
+                .any(|e| matches!(&e.op, RedoOp::PreserveUntil { tx_key, .. } if *tx_key == key)),
+            "compensating preserve_until redo entry must be durable even when the engine call fails"
         );
     }
 

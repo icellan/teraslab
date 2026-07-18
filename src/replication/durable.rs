@@ -342,6 +342,29 @@ impl AckTracker {
 // Master-side pending replication intent tracker
 // ---------------------------------------------------------------------------
 
+/// Append-only intent log record-type tags (frame format documented on
+/// [`ReplicationIntentTracker`]). No version field: the on-disk layout may
+/// change freely across releases — a node resets its intent file on
+/// upgrade.
+const INTENT_RECORD_SNAPSHOT: u8 = 0;
+const INTENT_RECORD_BEGIN: u8 = 1;
+const INTENT_RECORD_COMMIT: u8 = 2;
+
+/// Guards [`intent_log_parse_frames`] against an implausible/garbage length
+/// field (a torn write can leave any 4 bytes at a length-field offset). No
+/// real intent record — even a `SNAPSHOT` of a very large pending set —
+/// comes close to this; anything bigger is corruption or a torn tail, and
+/// either way parsing must stop rather than attempt to read gigabytes.
+const INTENT_LOG_MAX_FRAME_PAYLOAD_LEN: u32 = 256 * 1024 * 1024;
+
+/// Number of records the append-only intent log may accumulate since its
+/// last `SNAPSHOT` before compaction rewrites it back down to one. Chosen
+/// generously above realistic per-restart record volume (each `begin`/
+/// `commit` is one record) so compaction stays a rare, amortized event —
+/// not a per-op cost — while still bounding on-disk log size and worst-case
+/// recovery replay length.
+const INTENT_LOG_COMPACT_RECORD_THRESHOLD: u32 = 512;
+
 /// A durable redo sequence range that has been applied locally but has not
 /// yet been proven replicated to the required holders.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -357,6 +380,12 @@ pub enum ReplicationIntentError {
     Io(#[from] std::io::Error),
     #[error("replication intent tracker state corrupt: {0}")]
     Corrupt(String),
+    /// R12 review (Critical, fail-closed fix): a prior compaction's
+    /// post-rename reopen of the append handle failed, and every subsequent
+    /// write/sync is refused rather than risk silently persisting to the
+    /// stale, now-unlinked handle. See [`AppendState::Poisoned`].
+    #[error("replication intent tracker poisoned (durability barrier unavailable): {0}")]
+    Poisoned(String),
 }
 
 /// Persistent master-side journal of pending replication ranges.
@@ -365,10 +394,86 @@ pub enum ReplicationIntentError {
 /// it only after the configured ACK policy is satisfied (or after a failed
 /// client mutation has been durably compensated). On restart, any range left in
 /// this file must be replicated to current holders before the node serves.
+///
+/// ## On-disk format (R12/C32): append-only, CRC-framed record log
+///
+/// No version field — nodes reset their intent file on upgrade, so this
+/// format may change freely. Each record is framed as:
+///
+/// ```text
+/// [payload_len:4 LE][crc32:4 LE][type:1][payload]
+/// ```
+///
+/// `payload_len` covers `type` + `payload` (i.e. `1 + payload.len()`);
+/// `crc32 = crc32fast::hash(&[type] ++ payload)`. Three record types:
+///
+/// - `SNAPSHOT` (0): payload is the full pending set — `[range_count:4]
+///   ( [first:8][last:8][key_count:4][txid:32]{key_count} )*`. Written only
+///   by compaction; on replay it RESETS the reconstructed map to exactly
+///   its contents.
+/// - `BEGIN` (1): payload is one `[first:8][last:8][key_count:4]
+///   [txid:32]{key_count}`. On replay, inserts/overwrites that range.
+/// - `COMMIT` (2): payload is `[first:8][last:8]`. On replay, removes that
+///   range.
+///
+/// `begin` appends exactly one `BEGIN` record and calls `sync_data`
+/// (fdatasync) before returning — the append-only replacement for the old
+/// per-`begin` full-snapshot-rewrite + dual-fsync (temp-write + rename +
+/// parent-dir fsync). `commit` stays amortized: it appends a `COMMIT`
+/// record immediately but only fsyncs on the existing time/count-threshold
+/// cadence, so a lost `COMMIT` just leaves a stale range that recovery
+/// replays idempotently (unchanged contract).
+///
+/// Recovery ([`read_from_disk`](Self::read_from_disk)) applies records in
+/// order and is torn-tail-safe: it stops — without erroring — at the first
+/// frame that is truncated (EOF before a full frame), has an implausible
+/// length, or fails its CRC check; everything before that frame is valid
+/// and is applied. Only a frame whose CRC is otherwise valid but whose
+/// *decoded contents* are structurally invalid (e.g. a key section shorter
+/// than its declared count, or an unrecognized record type) is a hard
+/// [`ReplicationIntentError::Corrupt`] error, since a valid CRC over
+/// consistent bytes cannot be explained by a crash mid-append.
+///
+/// When the log grows past [`INTENT_LOG_COMPACT_RECORD_THRESHOLD`] records
+/// since its last snapshot, it is compacted: rewritten as a single fresh
+/// `SNAPSHOT` via the same atomic temp+`sync_all`+rename+parent-fsync
+/// pattern used elsewhere in this module (a rare, amortized event — unlike
+/// per-`begin` durability), and the append handle is reopened on the new
+/// file (`rename` does not redirect an already-open file descriptor to the
+/// new inode).
 #[derive(Debug)]
 pub struct ReplicationIntentTracker {
     path: PathBuf,
     inner: Mutex<ReplicationIntentInner>,
+}
+
+/// Durability state of the on-disk log's append handle.
+///
+/// R12 review (Critical, fail-closed fix): `compact_locked` writes a fresh
+/// `SNAPSHOT` (atomic temp-write + rename), then reopens the append handle
+/// on the new file (`rename` does not redirect an already-open fd to the
+/// new inode). If that reopen fails AFTER the rename already succeeded, the
+/// PREVIOUS handle is left pointing at an unlinked, orphaned inode — POSIX
+/// permits `write()`/`fsync()` on an unlinked fd to succeed, so leaving that
+/// stale handle in place would make every subsequent `begin`/`commit`
+/// silently "succeed" while writing to a file no path-based recovery can
+/// ever see. `Poisoned` makes that failure fail CLOSED instead: every write
+/// or sync then hard-errors until the process restarts and reloads from
+/// disk (poison-until-restart; no automatic self-heal — a fresh compaction
+/// is never attempted again once poisoned, since `begin`/`commit`/`flush`
+/// all error out before reaching `maybe_compact_locked`).
+#[derive(Debug)]
+enum AppendState {
+    /// The in-memory / empty-path tracker — every write/sync is a no-op.
+    InMemory,
+    /// A real tracker with a healthy, open `O_APPEND|O_WRONLY|O_CREAT`
+    /// handle, opened once in `load` (and again after each successful
+    /// compaction) so `begin`/`commit` never pay a fresh `open()` on the
+    /// hot path.
+    Active(std::fs::File),
+    /// A compaction's post-rename reopen failed; the string is the
+    /// captured cause. See the type-level doc above.
+    Poisoned(String),
 }
 
 #[derive(Debug)]
@@ -381,12 +486,261 @@ struct ReplicationIntentInner {
     commit_dirty: bool,
     last_flush: Instant,
     dirty_commit_count: u32,
+    /// Durability state of the append handle — see [`AppendState`].
+    append_state: AppendState,
+    /// Records appended to the log since the last `SNAPSHOT` (the record
+    /// count found at load time, or the count reset by the last
+    /// compaction). Drives the compaction trigger.
+    records_since_snapshot: u32,
+    /// Encoded `COMMIT` frames not yet written to the append handle,
+    /// preserving the amortized-commit contract: a `write()` (not just its
+    /// `fdatasync`) stays off-disk until the existing time/count threshold
+    /// trips (or the next `begin`), so a plain reload without an
+    /// intervening flush still observes the pre-commit (stale) state — a
+    /// lost buffered commit on an actual crash just leaves a stale range
+    /// that recovery replays idempotently, unchanged from the pre-R12
+    /// contract.
+    unflushed_commit_frames: Vec<u8>,
+    /// Test-only fault injection (R12 review): when `true`, the NEXT
+    /// `compact_locked` call fails its post-rename reopen with a synthetic
+    /// error instead of actually reopening the file — exercising the
+    /// fail-closed poisoning path without needing real fd exhaustion.
+    /// One-shot: consumed (reset to `false`) on use.
+    #[cfg(test)]
+    force_reopen_failure: bool,
+}
+
+/// Encode one record frame: `[payload_len:4 LE][crc32:4 LE][type:1][payload]`.
+/// `payload_len` = `1 + payload.len()` (covers `type` + `payload`); the CRC
+/// covers the same `type ++ payload` bytes.
+fn intent_log_encode_frame(record_type: u8, payload: &[u8]) -> Vec<u8> {
+    let mut body = Vec::with_capacity(1 + payload.len());
+    body.push(record_type);
+    body.extend_from_slice(payload);
+    let crc = crc32fast::hash(&body);
+    let payload_len = body.len() as u32;
+    let mut frame = Vec::with_capacity(8 + body.len());
+    frame.extend_from_slice(&payload_len.to_le_bytes());
+    frame.extend_from_slice(&crc.to_le_bytes());
+    frame.extend_from_slice(&body);
+    frame
+}
+
+/// Parse `data` into `(record_type, payload)` frames, stopping — without
+/// erroring — at the first frame that is torn (EOF before a full frame),
+/// has an implausible length, or fails its CRC check. This is the standard
+/// WAL torn-tail contract: a crash mid-append leaves at most one partial
+/// trailing record, and everything before it remains valid and ordered.
+fn intent_log_parse_frames(data: &[u8]) -> Vec<(u8, Vec<u8>)> {
+    let mut records = Vec::new();
+    let mut pos = 0usize;
+    loop {
+        if pos + 8 > data.len() {
+            break;
+        }
+        let payload_len = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap_or([0; 4]));
+        let crc_stored = u32::from_le_bytes(data[pos + 4..pos + 8].try_into().unwrap_or([0; 4]));
+        if payload_len == 0 || payload_len > INTENT_LOG_MAX_FRAME_PAYLOAD_LEN {
+            break;
+        }
+        let body_start = pos + 8;
+        let body_end = body_start + payload_len as usize;
+        if body_end > data.len() {
+            break;
+        }
+        let body = &data[body_start..body_end];
+        if crc32fast::hash(body) != crc_stored {
+            break;
+        }
+        records.push((body[0], body[1..].to_vec()));
+        pos = body_end;
+    }
+    records
+}
+
+/// Encode a `[first:8][last:8][key_count:4][txid:32]{key_count}` body —
+/// shared by the `BEGIN` record payload and each entry of a `SNAPSHOT`
+/// payload.
+fn intent_log_encode_range_and_keys(range: &ReplicationIntentRange, keys: &[TxKey]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(20 + keys.len() * 32);
+    buf.extend_from_slice(&range.first_sequence.to_le_bytes());
+    buf.extend_from_slice(&range.last_sequence.to_le_bytes());
+    buf.extend_from_slice(&(keys.len() as u32).to_le_bytes());
+    for key in keys {
+        buf.extend_from_slice(&key.txid);
+    }
+    buf
+}
+
+/// Encode a `SNAPSHOT` record payload: `[range_count:4]
+/// ( [first:8][last:8][key_count:4][txid:32]{key_count} )*`.
+fn intent_log_encode_snapshot_payload(
+    pending: &BTreeMap<ReplicationIntentRange, Vec<TxKey>>,
+) -> Vec<u8> {
+    let total_keys: usize = pending.values().map(Vec::len).sum();
+    let mut buf = Vec::with_capacity(4 + pending.len() * 20 + total_keys * 32);
+    buf.extend_from_slice(&(pending.len() as u32).to_le_bytes());
+    for (range, keys) in pending {
+        buf.extend_from_slice(&intent_log_encode_range_and_keys(range, keys));
+    }
+    buf
+}
+
+/// Decode a `BEGIN` (or one `SNAPSHOT` entry's) `[first:8][last:8]
+/// [key_count:4][txid:32]{key_count}` body. A structurally invalid decode
+/// (bad range, or a key section whose length disagrees with its declared
+/// count) is a hard error — the frame's CRC already validated these exact
+/// bytes, so this cannot be a torn-tail write.
+fn intent_log_decode_range_and_keys(
+    payload: &[u8],
+) -> std::result::Result<(ReplicationIntentRange, Vec<TxKey>), ReplicationIntentError> {
+    if payload.len() < 20 {
+        return Err(ReplicationIntentError::Corrupt(
+            "truncated begin record".into(),
+        ));
+    }
+    let first_sequence = u64::from_le_bytes(payload[0..8].try_into().unwrap());
+    let last_sequence = u64::from_le_bytes(payload[8..16].try_into().unwrap());
+    if first_sequence == 0 || last_sequence < first_sequence {
+        return Err(ReplicationIntentError::Corrupt(format!(
+            "invalid range {first_sequence}..{last_sequence}",
+        )));
+    }
+    let key_count = u32::from_le_bytes(payload[16..20].try_into().unwrap()) as usize;
+    let keys_bytes = key_count
+        .checked_mul(32)
+        .ok_or_else(|| ReplicationIntentError::Corrupt("key count overflow".into()))?;
+    if 20 + keys_bytes != payload.len() {
+        return Err(ReplicationIntentError::Corrupt(
+            "truncated intent keys".into(),
+        ));
+    }
+    let mut keys = Vec::with_capacity(key_count);
+    let mut pos = 20;
+    for _ in 0..key_count {
+        let mut txid = [0u8; 32];
+        txid.copy_from_slice(&payload[pos..pos + 32]);
+        pos += 32;
+        keys.push(TxKey { txid });
+    }
+    Ok((
+        ReplicationIntentRange {
+            first_sequence,
+            last_sequence,
+        },
+        keys,
+    ))
+}
+
+/// Decode a `SNAPSHOT` record payload. On replay the caller REPLACES its
+/// whole reconstructed map with the result (reset semantics).
+fn intent_log_decode_snapshot_payload(
+    payload: &[u8],
+) -> std::result::Result<BTreeMap<ReplicationIntentRange, Vec<TxKey>>, ReplicationIntentError> {
+    if payload.len() < 4 {
+        return Err(ReplicationIntentError::Corrupt(
+            "truncated snapshot header".into(),
+        ));
+    }
+    let count = u32::from_le_bytes(payload[0..4].try_into().unwrap()) as usize;
+    let mut pending = BTreeMap::new();
+    let mut pos = 4;
+    for _ in 0..count {
+        if pos + 20 > payload.len() {
+            return Err(ReplicationIntentError::Corrupt(
+                "truncated snapshot ranges".into(),
+            ));
+        }
+        let first_sequence = u64::from_le_bytes(payload[pos..pos + 8].try_into().unwrap());
+        let last_sequence = u64::from_le_bytes(payload[pos + 8..pos + 16].try_into().unwrap());
+        if first_sequence == 0 || last_sequence < first_sequence {
+            return Err(ReplicationIntentError::Corrupt(format!(
+                "invalid range {first_sequence}..{last_sequence}",
+            )));
+        }
+        let key_count =
+            u32::from_le_bytes(payload[pos + 16..pos + 20].try_into().unwrap()) as usize;
+        pos += 20;
+        let keys_bytes = key_count
+            .checked_mul(32)
+            .ok_or_else(|| ReplicationIntentError::Corrupt("key count overflow".into()))?;
+        if pos + keys_bytes > payload.len() {
+            return Err(ReplicationIntentError::Corrupt(
+                "truncated snapshot keys".into(),
+            ));
+        }
+        let mut keys = Vec::with_capacity(key_count);
+        for _ in 0..key_count {
+            let mut txid = [0u8; 32];
+            txid.copy_from_slice(&payload[pos..pos + 32]);
+            pos += 32;
+            keys.push(TxKey { txid });
+        }
+        pending.insert(
+            ReplicationIntentRange {
+                first_sequence,
+                last_sequence,
+            },
+            keys,
+        );
+    }
+    Ok(pending)
+}
+
+/// Decode a `COMMIT` record payload: `[first:8][last:8]`.
+fn intent_log_decode_commit_payload(
+    payload: &[u8],
+) -> std::result::Result<ReplicationIntentRange, ReplicationIntentError> {
+    if payload.len() != 16 {
+        return Err(ReplicationIntentError::Corrupt(
+            "malformed commit record".into(),
+        ));
+    }
+    let first_sequence = u64::from_le_bytes(payload[0..8].try_into().unwrap());
+    let last_sequence = u64::from_le_bytes(payload[8..16].try_into().unwrap());
+    Ok(ReplicationIntentRange {
+        first_sequence,
+        last_sequence,
+    })
+}
+
+/// Apply one decoded record to the in-progress reconstructed map:
+/// `SNAPSHOT` resets it, `BEGIN` inserts/overwrites, `COMMIT` removes.
+fn intent_log_apply_record(
+    pending: &mut BTreeMap<ReplicationIntentRange, Vec<TxKey>>,
+    record_type: u8,
+    payload: &[u8],
+) -> std::result::Result<(), ReplicationIntentError> {
+    match record_type {
+        INTENT_RECORD_SNAPSHOT => {
+            *pending = intent_log_decode_snapshot_payload(payload)?;
+        }
+        INTENT_RECORD_BEGIN => {
+            let (range, keys) = intent_log_decode_range_and_keys(payload)?;
+            pending.insert(range, keys);
+        }
+        INTENT_RECORD_COMMIT => {
+            let range = intent_log_decode_commit_payload(payload)?;
+            pending.remove(&range);
+        }
+        other => {
+            return Err(ReplicationIntentError::Corrupt(format!(
+                "unknown intent record type {other}",
+            )));
+        }
+    }
+    Ok(())
 }
 
 impl ReplicationIntentTracker {
     pub fn load(path: PathBuf) -> std::result::Result<Self, ReplicationIntentError> {
         ensure_parent_dir(&path).map_err(ReplicationIntentError::Io)?;
-        let pending = Self::read_from_disk(&path)?;
+        let (pending, record_count) = Self::read_from_disk(&path)?;
+        let append_file = std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(&path)
+            .map_err(ReplicationIntentError::Io)?;
         Ok(Self {
             path,
             inner: Mutex::new(ReplicationIntentInner {
@@ -394,6 +748,11 @@ impl ReplicationIntentTracker {
                 commit_dirty: false,
                 last_flush: Instant::now(),
                 dirty_commit_count: 0,
+                append_state: AppendState::Active(append_file),
+                records_since_snapshot: record_count,
+                unflushed_commit_frames: Vec::new(),
+                #[cfg(test)]
+                force_reopen_failure: false,
             }),
         })
     }
@@ -406,6 +765,11 @@ impl ReplicationIntentTracker {
                 commit_dirty: false,
                 last_flush: Instant::now(),
                 dirty_commit_count: 0,
+                append_state: AppendState::InMemory,
+                records_since_snapshot: 0,
+                unflushed_commit_frames: Vec::new(),
+                #[cfg(test)]
+                force_reopen_failure: false,
             }),
         }
     }
@@ -420,8 +784,10 @@ impl ReplicationIntentTracker {
     /// (`first_sequence == 0` or `last_sequence < first_sequence`) are ignored,
     /// matching the prior contract.
     ///
-    /// On a real (non-empty path) tracker the new pending set is written
-    /// durably before returning. Errors surface I/O failures from that write.
+    /// On a real (non-empty path) tracker, a single `BEGIN` record is
+    /// appended and `fdatasync`'d before returning — this is the durability
+    /// barrier: a crash immediately after `begin` returns `Ok` MUST recover
+    /// this range. Errors surface I/O failures from that append/sync.
     pub fn begin(
         &self,
         first_sequence: u64,
@@ -452,11 +818,20 @@ impl ReplicationIntentTracker {
             None => true,
         };
         if changed {
+            let payload = intent_log_encode_range_and_keys(&range, &deduped);
             inner.pending.insert(range, deduped);
-            self.write_locked(&inner.pending)?;
+            // Drain any buffered (not-yet-written) COMMIT frames first: the
+            // old full-rewrite always incorporated committed-away ranges on
+            // every begin, so the append-only equivalent is to write those
+            // out before this BEGIN record, then fdatasync everything
+            // together as one durability barrier.
+            Self::drain_unflushed_commits_locked(&mut inner)?;
+            self.append_record_locked(&mut inner, INTENT_RECORD_BEGIN, &payload)?;
+            Self::sync_locked(&mut inner)?;
             inner.commit_dirty = false;
             inner.dirty_commit_count = 0;
             inner.last_flush = Instant::now();
+            self.maybe_compact_locked(&mut inner)?;
         }
         Ok(())
     }
@@ -481,6 +856,16 @@ impl ReplicationIntentTracker {
             if self.path.as_os_str().is_empty() {
                 return Ok(());
             }
+            // Buffer the COMMIT record's frame rather than writing it now:
+            // preserves the amortized contract that an unflushed commit
+            // stays entirely invisible on disk (not merely unsynced) until
+            // the existing time/count threshold — or a subsequent `begin` —
+            // forces it out.
+            let mut payload = Vec::with_capacity(16);
+            payload.extend_from_slice(&first_sequence.to_le_bytes());
+            payload.extend_from_slice(&last_sequence.to_le_bytes());
+            let frame = intent_log_encode_frame(INTENT_RECORD_COMMIT, &payload);
+            inner.unflushed_commit_frames.extend_from_slice(&frame);
             inner.commit_dirty = true;
             inner.dirty_commit_count = inner.dirty_commit_count.saturating_add(1);
             let time_due =
@@ -521,113 +906,207 @@ impl ReplicationIntentTracker {
         Ok(())
     }
 
-    fn write_locked(
+    /// Append one record's frame to the log via the held handle. No-op for
+    /// the in-memory tracker. Hard `Err(Poisoned)` — WITHOUT touching the
+    /// filesystem — if a prior compaction reopen failed (see
+    /// [`AppendState::Poisoned`]): the stale pre-compaction handle must
+    /// never be written to again.
+    fn append_record_locked(
         &self,
-        pending: &BTreeMap<ReplicationIntentRange, Vec<TxKey>>,
+        inner: &mut ReplicationIntentInner,
+        record_type: u8,
+        payload: &[u8],
     ) -> std::result::Result<(), ReplicationIntentError> {
-        if self.path.as_os_str().is_empty() {
+        let file = match &mut inner.append_state {
+            AppendState::InMemory => return Ok(()),
+            AppendState::Poisoned(cause) => {
+                return Err(ReplicationIntentError::Poisoned(cause.clone()));
+            }
+            AppendState::Active(file) => file,
+        };
+        let frame = intent_log_encode_frame(record_type, payload);
+        file.write_all(&frame).map_err(ReplicationIntentError::Io)?;
+        inner.records_since_snapshot = inner.records_since_snapshot.saturating_add(1);
+        Ok(())
+    }
+
+    /// `fdatasync` the append handle. No-op for the in-memory tracker.
+    /// Hard `Err(Poisoned)` if a prior compaction reopen failed — see
+    /// [`append_record_locked`](Self::append_record_locked).
+    fn sync_locked(
+        inner: &mut ReplicationIntentInner,
+    ) -> std::result::Result<(), ReplicationIntentError> {
+        match &inner.append_state {
+            AppendState::InMemory => Ok(()),
+            AppendState::Poisoned(cause) => Err(ReplicationIntentError::Poisoned(cause.clone())),
+            AppendState::Active(file) => file.sync_data().map_err(ReplicationIntentError::Io),
+        }
+    }
+
+    /// Write out any buffered `COMMIT` frames accumulated by `commit()`
+    /// (does not sync — callers fsync afterward). No-op if nothing is
+    /// buffered or the tracker is in-memory. Hard `Err(Poisoned)` if a
+    /// prior compaction reopen failed — see
+    /// [`append_record_locked`](Self::append_record_locked).
+    fn drain_unflushed_commits_locked(
+        inner: &mut ReplicationIntentInner,
+    ) -> std::result::Result<(), ReplicationIntentError> {
+        if inner.unflushed_commit_frames.is_empty() {
             return Ok(());
         }
-        Self::write_to_disk(&self.path, pending)
+        match &mut inner.append_state {
+            AppendState::InMemory => {}
+            AppendState::Poisoned(cause) => {
+                return Err(ReplicationIntentError::Poisoned(cause.clone()));
+            }
+            AppendState::Active(file) => {
+                // Invariant this accounting relies on: `dirty_commit_count`
+                // at this point equals exactly the number of buffered
+                // frames we are about to write (i.e. "frames just
+                // drained"). That holds only because every call site that
+                // resets `dirty_commit_count` to 0 (`begin`, `flush_locked`)
+                // does so AFTER calling this drain in the same invocation —
+                // never before, and never without draining first. A future
+                // refactor that reset `dirty_commit_count` (or repopulated
+                // `unflushed_commit_frames`) out of that order would
+                // silently corrupt the `records_since_snapshot` count that
+                // drives the compaction trigger.
+                debug_assert!(
+                    inner.dirty_commit_count > 0,
+                    "unflushed_commit_frames is non-empty but dirty_commit_count == 0 — \
+                     every buffered COMMIT frame push increments dirty_commit_count in \
+                     lockstep (see `commit()`), so this violates the invariant the \
+                     records_since_snapshot accounting below depends on",
+                );
+                file.write_all(&inner.unflushed_commit_frames)
+                    .map_err(ReplicationIntentError::Io)?;
+                inner.records_since_snapshot = inner
+                    .records_since_snapshot
+                    .saturating_add(inner.dirty_commit_count);
+            }
+        }
+        inner.unflushed_commit_frames.clear();
+        Ok(())
     }
 
     fn flush_locked(
         &self,
         inner: &mut ReplicationIntentInner,
     ) -> std::result::Result<(), ReplicationIntentError> {
-        self.write_locked(&inner.pending)?;
+        Self::drain_unflushed_commits_locked(inner)?;
+        Self::sync_locked(inner)?;
+        inner.commit_dirty = false;
+        inner.dirty_commit_count = 0;
+        inner.last_flush = Instant::now();
+        self.maybe_compact_locked(inner)?;
+        Ok(())
+    }
+
+    /// Rewrite the log as a single fresh `SNAPSHOT` once it has grown past
+    /// [`INTENT_LOG_COMPACT_RECORD_THRESHOLD`] records since the last one.
+    /// No-op for the in-memory tracker.
+    fn maybe_compact_locked(
+        &self,
+        inner: &mut ReplicationIntentInner,
+    ) -> std::result::Result<(), ReplicationIntentError> {
+        if self.path.as_os_str().is_empty() {
+            return Ok(());
+        }
+        if inner.records_since_snapshot < INTENT_LOG_COMPACT_RECORD_THRESHOLD {
+            return Ok(());
+        }
+        self.compact_locked(inner)
+    }
+
+    /// Atomically rewrite the log file as one `SNAPSHOT` record of the
+    /// current in-memory `pending` state (temp-write + `sync_all` + rename +
+    /// parent-dir fsync — the same pattern [`write_durable_file`] uses
+    /// elsewhere), then reopen the append handle on the fresh file.
+    ///
+    /// R12 review (Critical, fail-closed fix): by the time the reopen below
+    /// runs, the `SNAPSHOT` has already been durably renamed into place. If
+    /// the reopen itself then fails, the OLD handle in `inner.append_state`
+    /// is left pointing at that renamed-away file's now-unlinked inode —
+    /// POSIX permits `write()`/`fsync()` on an unlinked fd to succeed, so
+    /// leaving it in place would make every subsequent `begin`/`commit`
+    /// silently "succeed" while writing to a file no recovery can ever see.
+    /// Poison the tracker instead (dropping the stale handle) so every
+    /// later write/sync hard-errors — see [`AppendState`].
+    fn compact_locked(
+        &self,
+        inner: &mut ReplicationIntentInner,
+    ) -> std::result::Result<(), ReplicationIntentError> {
+        let payload = intent_log_encode_snapshot_payload(&inner.pending);
+        let frame = intent_log_encode_frame(INTENT_RECORD_SNAPSHOT, &payload);
+        write_durable_file(&self.path, &frame).map_err(ReplicationIntentError::Io)?;
+        // `rename` (inside `write_durable_file`) does not redirect an
+        // already-open append fd to the new inode — reopen on `self.path` so
+        // subsequent appends land in the file that now exists there.
+        #[cfg(test)]
+        let reopened = if inner.force_reopen_failure {
+            inner.force_reopen_failure = false; // one-shot
+            Err(std::io::Error::other(
+                "injected compaction reopen failure (test)",
+            ))
+        } else {
+            std::fs::OpenOptions::new()
+                .append(true)
+                .create(true)
+                .open(&self.path)
+        };
+        #[cfg(not(test))]
+        let reopened = std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(&self.path);
+        let file = match reopened {
+            Ok(file) => file,
+            Err(e) => {
+                let cause = format!("intent log compaction reopen failed: {e}");
+                // Replace (dropping/closing) the stale pre-compaction
+                // handle rather than leaving it as the live append target —
+                // fail CLOSED, not silently no-op (which `None` would mean
+                // to `append_record_locked`/`sync_locked`).
+                inner.append_state = AppendState::Poisoned(cause);
+                return Err(ReplicationIntentError::Io(e));
+            }
+        };
+        inner.append_state = AppendState::Active(file);
+        inner.records_since_snapshot = 1; // the SNAPSHOT record just written
         inner.commit_dirty = false;
         inner.dirty_commit_count = 0;
         inner.last_flush = Instant::now();
         Ok(())
     }
 
-    /// On-disk layout (no version field — nodes reset their intent file on
-    /// upgrade, so this format may change freely):
-    ///
-    /// ```text
-    /// [count:4 LE]
-    ///   ( [first:8 LE][last:8 LE][key_count:4 LE]
-    ///     [txid:32]{key_count} )*
-    /// ```
-    fn write_to_disk(
-        path: &Path,
-        pending: &BTreeMap<ReplicationIntentRange, Vec<TxKey>>,
-    ) -> std::result::Result<(), ReplicationIntentError> {
-        let total_keys: usize = pending.values().map(Vec::len).sum();
-        let mut buf = Vec::with_capacity(4 + pending.len() * 20 + total_keys * 32);
-        buf.extend_from_slice(&(pending.len() as u32).to_le_bytes());
-        for (range, keys) in pending {
-            buf.extend_from_slice(&range.first_sequence.to_le_bytes());
-            buf.extend_from_slice(&range.last_sequence.to_le_bytes());
-            buf.extend_from_slice(&(keys.len() as u32).to_le_bytes());
-            for key in keys {
-                buf.extend_from_slice(&key.txid);
-            }
-        }
-        write_durable_file(path, &buf).map_err(ReplicationIntentError::Io)
-    }
-
+    /// Read + parse the on-disk log, applying records in order to
+    /// reconstruct the pending map. Returns the map together with the
+    /// number of valid records applied, which seeds `records_since_snapshot`
+    /// for the freshly loaded tracker (compaction is not triggered here —
+    /// the next `begin`/`commit` will trip it if the loaded file was
+    /// already over threshold). An absent file yields an empty map.
     fn read_from_disk(
         path: &Path,
-    ) -> std::result::Result<BTreeMap<ReplicationIntentRange, Vec<TxKey>>, ReplicationIntentError>
-    {
+    ) -> std::result::Result<
+        (BTreeMap<ReplicationIntentRange, Vec<TxKey>>, u32),
+        ReplicationIntentError,
+    > {
         let data = match std::fs::read(path) {
             Ok(d) => d,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(BTreeMap::new());
+                return Ok((BTreeMap::new(), 0));
             }
             Err(e) => return Err(ReplicationIntentError::Io(e)),
         };
         if data.is_empty() {
-            return Ok(BTreeMap::new());
+            return Ok((BTreeMap::new(), 0));
         }
-        if data.len() < 4 {
-            return Err(ReplicationIntentError::Corrupt("truncated header".into()));
-        }
-        let count = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
+        let frames = intent_log_parse_frames(&data);
         let mut pending = BTreeMap::new();
-        let mut pos = 4;
-        for _ in 0..count {
-            // Fixed range + key-count header for this entry.
-            if pos + 20 > data.len() {
-                return Err(ReplicationIntentError::Corrupt("truncated ranges".into()));
-            }
-            let first_sequence = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
-            pos += 8;
-            let last_sequence = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
-            pos += 8;
-            if first_sequence == 0 || last_sequence < first_sequence {
-                return Err(ReplicationIntentError::Corrupt(format!(
-                    "invalid range {first_sequence}..{last_sequence}",
-                )));
-            }
-            let key_count = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
-            pos += 4;
-            let keys_bytes = key_count
-                .checked_mul(32)
-                .ok_or_else(|| ReplicationIntentError::Corrupt("key count overflow".into()))?;
-            if pos + keys_bytes > data.len() {
-                return Err(ReplicationIntentError::Corrupt(
-                    "truncated intent keys".into(),
-                ));
-            }
-            let mut keys = Vec::with_capacity(key_count);
-            for _ in 0..key_count {
-                let mut txid = [0u8; 32];
-                txid.copy_from_slice(&data[pos..pos + 32]);
-                pos += 32;
-                keys.push(TxKey { txid });
-            }
-            pending.insert(
-                ReplicationIntentRange {
-                    first_sequence,
-                    last_sequence,
-                },
-                keys,
-            );
+        for (record_type, payload) in &frames {
+            intent_log_apply_record(&mut pending, *record_type, payload)?;
         }
-        Ok(pending)
+        Ok((pending, frames.len() as u32))
     }
 }
 
@@ -1799,12 +2278,12 @@ mod tests {
     fn replication_intent_tracker_corrupt_range_rejected() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("intent.dat");
-        let mut data = Vec::new();
-        data.extend_from_slice(&1u32.to_le_bytes());
-        data.extend_from_slice(&9u64.to_le_bytes()); // first
-        data.extend_from_slice(&8u64.to_le_bytes()); // last < first → invalid
-        data.extend_from_slice(&0u32.to_le_bytes()); // key_count
-        std::fs::write(&path, data).unwrap();
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&9u64.to_le_bytes()); // first
+        payload.extend_from_slice(&8u64.to_le_bytes()); // last < first → invalid
+        payload.extend_from_slice(&0u32.to_le_bytes()); // key_count
+        let frame = intent_log_encode_frame(INTENT_RECORD_BEGIN, &payload);
+        std::fs::write(&path, frame).unwrap();
 
         let err = ReplicationIntentTracker::load(path).expect_err("invalid range should reject");
         match err {
@@ -1914,16 +2393,20 @@ mod tests {
     #[test]
     fn replication_intent_tracker_truncated_key_section_rejected() {
         // A valid header + range + key_count=2 but only ONE txid worth of bytes
-        // must surface a Corrupt error, not a silent partial read.
+        // must surface a Corrupt error, not a silent partial read. Note this is
+        // NOT the torn-tail case: the frame's own CRC validates exactly these
+        // bytes (nothing is missing at the file level), so the mismatch between
+        // the declared key_count and the actual payload length is a genuine
+        // structural corruption, not crash residue — a hard error is correct.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("intent.dat");
-        let mut data = Vec::new();
-        data.extend_from_slice(&1u32.to_le_bytes()); // count = 1
-        data.extend_from_slice(&10u64.to_le_bytes()); // first
-        data.extend_from_slice(&12u64.to_le_bytes()); // last
-        data.extend_from_slice(&2u32.to_le_bytes()); // key_count = 2
-        data.extend_from_slice(&[0xCC; 32]); // only 1 of the 2 promised keys
-        std::fs::write(&path, data).unwrap();
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&10u64.to_le_bytes()); // first
+        payload.extend_from_slice(&12u64.to_le_bytes()); // last
+        payload.extend_from_slice(&2u32.to_le_bytes()); // key_count = 2
+        payload.extend_from_slice(&[0xCC; 32]); // only 1 of the 2 promised keys
+        let frame = intent_log_encode_frame(INTENT_RECORD_BEGIN, &payload);
+        std::fs::write(&path, frame).unwrap();
 
         let err = ReplicationIntentTracker::load(path)
             .expect_err("truncated key section must be rejected");
@@ -1934,6 +2417,352 @@ mod tests {
             ),
             other => panic!("expected Corrupt, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn intent_log_begin_is_durable_after_restart() {
+        // R12/C32: `begin` must fdatasync a single APPENDED record, not
+        // rewrite the whole file. Proven two ways: (1) the bytes written by
+        // the first begin remain an untouched PREFIX after the second begin
+        // (a full-rewrite implementation would re-serialize the whole map
+        // and the prefix would not match byte-for-byte), and (2) both
+        // ranges survive a reload with NO explicit `flush()` call.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("intent.dat");
+        let tracker = ReplicationIntentTracker::load(path.clone()).unwrap();
+
+        tracker.begin(10, 12, &[]).unwrap();
+        let after_first = std::fs::read(&path).unwrap();
+
+        tracker.begin(20, 20, &[]).unwrap();
+        let after_second = std::fs::read(&path).unwrap();
+
+        assert!(
+            after_second.starts_with(&after_first),
+            "begin must APPEND a new record — the first begin's bytes must survive \
+             unmodified as a prefix, not be rewritten",
+        );
+        assert!(
+            after_second.len() > after_first.len(),
+            "second begin must grow the file",
+        );
+
+        drop(tracker); // no flush() — begin's own fdatasync must already be durable
+
+        let reopened = ReplicationIntentTracker::load(path).unwrap();
+        assert_eq!(
+            reopened.pending(),
+            vec![
+                ReplicationIntentRange {
+                    first_sequence: 10,
+                    last_sequence: 12
+                },
+                ReplicationIntentRange {
+                    first_sequence: 20,
+                    last_sequence: 20
+                },
+            ],
+            "both begins must be durable across restart with no flush() call",
+        );
+    }
+
+    #[test]
+    fn intent_log_torn_tail_record_is_discarded_prefix_recovered() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("intent.dat");
+        {
+            let tracker = ReplicationIntentTracker::load(path.clone()).unwrap();
+            tracker.begin(10, 12, &[]).unwrap();
+            tracker.begin(20, 20, &[]).unwrap();
+        }
+        let valid_bytes = std::fs::read(&path).unwrap();
+        let expected_prefix = vec![
+            ReplicationIntentRange {
+                first_sequence: 10,
+                last_sequence: 12,
+            },
+            ReplicationIntentRange {
+                first_sequence: 20,
+                last_sequence: 20,
+            },
+        ];
+
+        // Case 1: EOF mid-frame — a crash mid-`write_all` of a third BEGIN's
+        // frame leaves only part of its bytes on disk.
+        let extra_frame = intent_log_encode_frame(
+            INTENT_RECORD_BEGIN,
+            &intent_log_encode_range_and_keys(
+                &ReplicationIntentRange {
+                    first_sequence: 30,
+                    last_sequence: 30,
+                },
+                &[],
+            ),
+        );
+        let mut torn = valid_bytes.clone();
+        torn.extend_from_slice(&extra_frame[..extra_frame.len() - 3]);
+        std::fs::write(&path, &torn).unwrap();
+
+        let recovered = ReplicationIntentTracker::load(path.clone())
+            .expect("a torn trailing record must NOT be a hard error");
+        assert_eq!(
+            recovered.pending(),
+            expected_prefix,
+            "only the valid prefix must be recovered; the torn record is discarded",
+        );
+
+        // Case 2: full-length frame but a corrupted byte inside it — CRC no
+        // longer matches. Same outcome: discarded, valid prefix kept, no error.
+        let mut crc_corrupt = valid_bytes.clone();
+        crc_corrupt.extend_from_slice(&extra_frame);
+        let last = crc_corrupt.len() - 1;
+        crc_corrupt[last] ^= 0xFF;
+        std::fs::write(&path, &crc_corrupt).unwrap();
+
+        let recovered2 = ReplicationIntentTracker::load(path)
+            .expect("a CRC-corrupted trailing record must NOT be a hard error");
+        assert_eq!(
+            recovered2.pending(),
+            expected_prefix,
+            "CRC mismatch on the trailing record discards it, keeping the valid prefix",
+        );
+    }
+
+    #[test]
+    fn intent_log_commit_removes_range_and_recovers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("intent.dat");
+        {
+            let tracker = ReplicationIntentTracker::load(path.clone()).unwrap();
+            tracker.begin(5, 7, &[]).unwrap();
+            tracker.commit(5, 7).unwrap();
+            tracker.flush().unwrap(); // force durability of the COMMIT record
+        }
+        let reopened = ReplicationIntentTracker::load(path).unwrap();
+        assert!(
+            reopened.pending().is_empty(),
+            "a flushed commit must be durable across restart",
+        );
+
+        // Deferred (unflushed) commit: the amortized-commit contract means a
+        // lost COMMIT just leaves a stale range that recovery replays
+        // idempotently — must NOT be lost silently either way.
+        let dir2 = tempfile::tempdir().unwrap();
+        let path2 = dir2.path().join("intent.dat");
+        {
+            let tracker = ReplicationIntentTracker::load(path2.clone()).unwrap();
+            tracker.begin(5, 7, &[]).unwrap();
+            tracker.commit(5, 7).unwrap(); // below the coalescing threshold — not flushed
+        }
+        let stale_reopen = ReplicationIntentTracker::load(path2).unwrap();
+        assert_eq!(
+            stale_reopen.pending(),
+            vec![ReplicationIntentRange {
+                first_sequence: 5,
+                last_sequence: 7
+            }],
+            "an unflushed commit must leave the range durable (stale, idempotent replay)",
+        );
+    }
+
+    #[test]
+    fn intent_log_compaction_bounds_file_and_preserves_pending() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("intent.dat");
+        let tracker = ReplicationIntentTracker::load(path.clone()).unwrap();
+
+        // Drive well past the compaction threshold with begin/commit pairs:
+        // an uncompacted log would accumulate ~1.5x this many records.
+        let total = u64::from(INTENT_LOG_COMPACT_RECORD_THRESHOLD) + 50;
+        for i in 1..=total {
+            tracker.begin(i, i, &[]).unwrap();
+            if i % 2 == 0 {
+                tracker.commit(i, i).unwrap();
+            }
+        }
+        tracker.flush().unwrap();
+
+        let bytes_after = std::fs::read(&path).unwrap();
+        let frames_after = intent_log_parse_frames(&bytes_after);
+        assert!(
+            frames_after.len() < INTENT_LOG_COMPACT_RECORD_THRESHOLD as usize,
+            "compaction must bound the log well under the threshold — got {} records",
+            frames_after.len(),
+        );
+        assert_eq!(
+            frames_after[0].0, INTENT_RECORD_SNAPSHOT,
+            "the compacted file's base record must be a SNAPSHOT",
+        );
+
+        // Correctness: exactly the odd sequences remain pending.
+        let expected: Vec<ReplicationIntentRange> = (1..=total)
+            .filter(|i| i % 2 != 0)
+            .map(|i| ReplicationIntentRange {
+                first_sequence: i,
+                last_sequence: i,
+            })
+            .collect();
+        assert_eq!(
+            tracker.pending(),
+            expected,
+            "in-memory pending must be exact after compaction",
+        );
+
+        let reopened = ReplicationIntentTracker::load(path).unwrap();
+        assert_eq!(
+            reopened.pending(),
+            expected,
+            "reload after compaction must reconstruct pending exactly",
+        );
+    }
+
+    /// R12 review (Critical, silent durability loss): `compact_locked`
+    /// writes a fresh `SNAPSHOT` via atomic temp-write+rename, then reopens
+    /// the append handle on the renamed-into-place file. Pre-fix, if that
+    /// reopen failed, `inner.append_file` stayed the OLD handle — now an fd
+    /// on an unlinked, orphaned inode. POSIX permits `write()`+`fsync()` on
+    /// an unlinked fd to succeed, so every subsequent `begin` would
+    /// silently return `Ok` while durably writing to a file no recovery
+    /// could ever see: a crash after that point loses every begin/commit
+    /// since the failed reopen with NO error ever surfaced. This forces
+    /// that reopen to fail via the `force_reopen_failure` test-only seam
+    /// (mirroring the engine's `WriteFailingDevice` fault-injection
+    /// pattern) — exercising the real `compact_locked` code path, not a
+    /// hand-rolled substitute — and asserts the tracker fails CLOSED.
+    #[test]
+    fn intent_log_poisoned_on_compaction_reopen_failure_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("intent.dat");
+        let tracker = ReplicationIntentTracker::load(path.clone()).unwrap();
+
+        // Establish pending state before poisoning, to prove `pending()`
+        // (an in-memory read) keeps working afterward.
+        tracker.begin(1, 1, &[]).unwrap();
+
+        // Arm the seam: the NEXT compact_locked's reopen fails.
+        tracker.inner.lock().force_reopen_failure = true;
+
+        // Drive compact_locked directly — the record-count trigger that
+        // normally invokes it is covered by
+        // `intent_log_compaction_bounds_file_and_preserves_pending`; this
+        // test targets compact_locked's failure handling specifically. The
+        // preceding `write_durable_file` inside it still runs for real
+        // (the SNAPSHOT is genuinely written and renamed into place) —
+        // only the reopen that follows is faked to fail, exactly
+        // reproducing the pre-fix bug scenario.
+        let compact_result = {
+            let mut inner = tracker.inner.lock();
+            tracker.compact_locked(&mut inner)
+        };
+        assert!(
+            compact_result.is_err(),
+            "the forced reopen failure must surface as an Err from compact_locked",
+        );
+
+        // Fail-closed assertion: pre-fix, `append_file` still held the
+        // stale (now-unlinked) handle and this `begin` returned `Ok`,
+        // silently writing/fsyncing to a file recovery could never see.
+        // Post-fix, the tracker is poisoned and this MUST return `Err`.
+        let begin_after_poison = tracker.begin(2, 2, &[]);
+        assert!(
+            begin_after_poison.is_err(),
+            "begin() after a poisoned compaction reopen must fail loudly, not silently \
+             succeed as it did pre-fix",
+        );
+        assert!(
+            matches!(
+                begin_after_poison.unwrap_err(),
+                ReplicationIntentError::Poisoned(_)
+            ),
+            "the error must be the dedicated Poisoned variant",
+        );
+
+        // A second call must ALSO fail — poisoning is not one-shot.
+        let commit_after_poison = tracker.commit(1, 1);
+        // commit() only touches the append handle once its buffered frame
+        // is actually flushed (time/count threshold or a subsequent
+        // begin/flush); force that here via an explicit flush() so the
+        // poisoned state is exercised on the commit path too.
+        assert!(
+            commit_after_poison.is_ok(),
+            "commit() itself only buffers in memory and does not touch the append handle",
+        );
+        assert!(
+            tracker.flush().is_err(),
+            "flush() must fail loudly once poisoned, refusing to write the buffered commit \
+             frame to the stale handle",
+        );
+
+        // In-memory reads must still work — poisoning blocks writes/
+        // durability, not pure reads of already-recorded pending state.
+        // `begin()` updates `pending` before attempting the (now-poisoned)
+        // write, so range 2 is present despite `begin(2, 2, ..)` returning
+        // Err above (unchanged, pre-existing in-memory-vs-disk divergence
+        // on a failed write — not part of this fix); range 1 was removed
+        // by the `commit(1, 1)` call. Either way, `pending()` must simply
+        // not panic and reflect exactly that in-memory truth.
+        assert_eq!(
+            tracker.pending(),
+            vec![ReplicationIntentRange {
+                first_sequence: 2,
+                last_sequence: 2,
+            }],
+            "pending() (in-memory read) must still work while poisoned",
+        );
+    }
+
+    #[test]
+    fn intent_log_snapshot_reset_semantics() {
+        // A hand-crafted file: SNAPSHOT{A(key_a), B(key_b)} then BEGIN{C(key_c)}
+        // then COMMIT{A} → reload must yield pending == {B, C}: the SNAPSHOT
+        // resets the base, and later records replay on top of it in order.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("intent.dat");
+
+        let range_a = ReplicationIntentRange {
+            first_sequence: 1,
+            last_sequence: 1,
+        };
+        let range_b = ReplicationIntentRange {
+            first_sequence: 2,
+            last_sequence: 2,
+        };
+        let range_c = ReplicationIntentRange {
+            first_sequence: 3,
+            last_sequence: 3,
+        };
+        let key_a = intent_key(0xAA);
+        let key_b = intent_key(0xBB);
+        let key_c = intent_key(0xCC);
+
+        let mut snapshot_pending = BTreeMap::new();
+        snapshot_pending.insert(range_a, vec![key_a]);
+        snapshot_pending.insert(range_b, vec![key_b]);
+
+        let mut data = Vec::new();
+        data.extend_from_slice(&intent_log_encode_frame(
+            INTENT_RECORD_SNAPSHOT,
+            &intent_log_encode_snapshot_payload(&snapshot_pending),
+        ));
+        data.extend_from_slice(&intent_log_encode_frame(
+            INTENT_RECORD_BEGIN,
+            &intent_log_encode_range_and_keys(&range_c, &[key_c]),
+        ));
+        let mut commit_payload = Vec::new();
+        commit_payload.extend_from_slice(&range_a.first_sequence.to_le_bytes());
+        commit_payload.extend_from_slice(&range_a.last_sequence.to_le_bytes());
+        data.extend_from_slice(&intent_log_encode_frame(
+            INTENT_RECORD_COMMIT,
+            &commit_payload,
+        ));
+        std::fs::write(&path, &data).unwrap();
+
+        let tracker = ReplicationIntentTracker::load(path).unwrap();
+        assert_eq!(
+            tracker.pending_with_keys(),
+            vec![(range_b, vec![key_b]), (range_c, vec![key_c])],
+            "SNAPSHOT resets the base; subsequent BEGIN/COMMIT replay on top of it",
+        );
     }
 
     // -------------------------------------------------------------------

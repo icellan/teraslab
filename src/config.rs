@@ -1129,9 +1129,14 @@ pub enum HealDeadlineAction {
 }
 
 /// Reverse-heal configuration (`[reverse_heal]`) — the delete-safe reverse-pull
-/// subsystem. Everything here is OFF by default so single-node / RF=1
-/// deployments pay nothing (the derived `Default` — `tombstones = false`,
-/// `tombstone_retention_blocks = None` — is exactly the disabled state).
+/// subsystem. `tombstones: Option<bool>` defaults to `None` (unset), which
+/// [`ReverseHealConfig::tombstones_enabled`] resolves to **ON for a clustered
+/// node (RF>1)** — a heal has a replica to pull a lost/behind tail back from
+/// there — and **OFF for single-node / RF=1**, where a heal has no source and
+/// tombstones would only add cost. Single-node / RF=1 deployments pay nothing
+/// by default; RF>1 deployments run the tombstone log + reverse-heal by
+/// default. Set `tombstones = true`/`false` explicitly to force either state
+/// regardless of RF.
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(default)]
 pub struct ReverseHealConfig {

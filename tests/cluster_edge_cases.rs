@@ -594,6 +594,7 @@ fn topology_catchup_does_not_leave_voted_term_gap() {
         NodeId(2),
         ClusterId::UNSET,
         1,
+        (vec![NodeId(1), NodeId(2), NodeId(3)]).len() as u64,
     );
     let vote = auth.handle_propose(&propose);
     assert!(vote.accepted);
@@ -607,7 +608,8 @@ fn topology_catchup_does_not_leave_voted_term_gap() {
         voters: mems.clone(),
         cluster_id: ClusterId::UNSET,
         placement_version: 1,
-        digest: TopologyTerm::compute_digest(10, &ClusterId::UNSET, &mems, 1),
+        committed_peak: (mems.clone()).len() as u64,
+        digest: TopologyTerm::compute_digest(10, &ClusterId::UNSET, &mems, 1, (mems).len() as u64),
     };
     assert_eq!(auth.handle_commit(&commit), Some(10));
 
@@ -619,6 +621,7 @@ fn topology_catchup_does_not_leave_voted_term_gap() {
         NodeId(2),
         ClusterId::UNSET,
         1,
+        (vec![NodeId(1), NodeId(2)]).len() as u64,
     );
     let v = auth.handle_propose(&stale);
     assert!(
@@ -633,6 +636,7 @@ fn topology_catchup_does_not_leave_voted_term_gap() {
         NodeId(2),
         ClusterId::UNSET,
         1,
+        (vec![NodeId(1), NodeId(2), NodeId(3)]).len() as u64,
     );
     let v2 = auth.handle_propose(&fresh);
     assert!(v2.accepted, "proposal for term 11 should be accepted");
@@ -657,7 +661,14 @@ fn topology_fallback_proposer_superseded_by_second_timeout() {
         voters: old_mems.clone(),
         cluster_id: ClusterId::UNSET,
         placement_version: 1,
-        digest: TopologyTerm::compute_digest(1, &ClusterId::UNSET, &old_mems, 1),
+        committed_peak: (old_mems.clone()).len() as u64,
+        digest: TopologyTerm::compute_digest(
+            1,
+            &ClusterId::UNSET,
+            &old_mems,
+            1,
+            (old_mems).len() as u64,
+        ),
     };
     auth.handle_commit(&old_commit);
 
@@ -741,7 +752,14 @@ fn topology_cluster_formation_three_simultaneous_starts() {
             voters: mems.clone(),
             cluster_id: ClusterId::UNSET,
             placement_version: 1,
-            digest: TopologyTerm::compute_digest(1, &ClusterId::UNSET, &mems, 1),
+            committed_peak: (mems.clone()).len() as u64,
+            digest: TopologyTerm::compute_digest(
+                1,
+                &ClusterId::UNSET,
+                &mems,
+                1,
+                (mems).len() as u64,
+            ),
         };
         auth.handle_commit(&commit);
         assert_eq!(auth.committed_term(), 1);
@@ -798,7 +816,8 @@ fn topology_formation_recovery_blocked_by_outstanding_vote() {
         voters: mems.clone(),
         cluster_id: ClusterId::UNSET,
         placement_version: 1,
-        digest: TopologyTerm::compute_digest(1, &ClusterId::UNSET, &mems, 1),
+        committed_peak: (mems.clone()).len() as u64,
+        digest: TopologyTerm::compute_digest(1, &ClusterId::UNSET, &mems, 1, (mems).len() as u64),
     };
     auth.handle_commit(&commit);
 
@@ -817,6 +836,7 @@ fn topology_formation_recovery_blocked_by_outstanding_vote() {
         NodeId(1),
         ClusterId::UNSET,
         1,
+        (vec![NodeId(1), NodeId(2)]).len() as u64,
     );
     let v = auth.handle_propose(&proposal_2);
     assert!(v.accepted);
@@ -829,6 +849,7 @@ fn topology_formation_recovery_blocked_by_outstanding_vote() {
         NodeId(1),
         ClusterId::UNSET,
         1,
+        (vec![NodeId(1), NodeId(2), NodeId(3)]).len() as u64,
     );
     let v2 = auth.handle_propose(&recovery_proposal);
     assert!(
@@ -1077,7 +1098,9 @@ fn migration_serialize_outbound_preserves_fenced_state() {
 
     let data = mgr.serialize_outbound();
     let mut restored = MigrationManager::new();
-    restored.restore_outbound(&data);
+    restored
+        .restore_outbound(&data)
+        .expect("valid round-trip data must restore cleanly");
 
     let p = restored
         .active_migrations()
@@ -1279,6 +1302,7 @@ fn topology_restore_then_vote_safety() {
         incarnation: 0,
         committed_voter_ever_seen: vec![NodeId(1), NodeId(2), NodeId(3)],
         committed_placement_version: 1,
+        committed_peak: 3,
     };
 
     let auth = TopologyAuthority::new(NodeId(2), Duration::from_secs(1));
@@ -1291,6 +1315,7 @@ fn topology_restore_then_vote_safety() {
         NodeId(1),
         ClusterId::UNSET,
         1,
+        (vec![NodeId(1), NodeId(2), NodeId(3)]).len() as u64,
     );
     let v1 = auth.handle_propose(&p1);
     assert!(
@@ -1305,6 +1330,7 @@ fn topology_restore_then_vote_safety() {
         NodeId(1),
         ClusterId::UNSET,
         1,
+        (vec![NodeId(1), NodeId(2), NodeId(3)]).len() as u64,
     );
     let v2 = auth.handle_propose(&p2);
     assert!(v2.accepted, "term 13 should be accepted");
@@ -1635,6 +1661,7 @@ fn topology_full_5_node_quorum_cycle() {
         voters: commit.voters.clone(),
         cluster_id: ClusterId::UNSET,
         placement_version: 1,
+        committed_peak: (commit.members.clone()).len() as u64,
         digest: commit.digest,
     };
     for node in &nodes {
@@ -1797,7 +1824,14 @@ fn split_brain_heal_detects_independent_clusters() {
         voters: a_members.clone(),
         cluster_id: ClusterId::UNSET,
         placement_version: 1,
-        digest: TopologyTerm::compute_digest(5, &ClusterId::UNSET, &a_members, 1),
+        committed_peak: (a_members.clone()).len() as u64,
+        digest: TopologyTerm::compute_digest(
+            5,
+            &ClusterId::UNSET,
+            &a_members,
+            1,
+            (a_members).len() as u64,
+        ),
     });
     assert_eq!(a_proposer.committed_term(), 5);
     assert_eq!(a_proposer.committed_members(), a_members);
@@ -1812,7 +1846,14 @@ fn split_brain_heal_detects_independent_clusters() {
         voters: b_members.clone(),
         cluster_id: ClusterId::UNSET,
         placement_version: 1,
-        digest: TopologyTerm::compute_digest(7, &ClusterId::UNSET, &b_members, 1),
+        committed_peak: (b_members.clone()).len() as u64,
+        digest: TopologyTerm::compute_digest(
+            7,
+            &ClusterId::UNSET,
+            &b_members,
+            1,
+            (b_members).len() as u64,
+        ),
     });
     assert_eq!(b_proposer.committed_term(), 7);
     assert_eq!(b_proposer.committed_members(), b_members);
@@ -1917,7 +1958,14 @@ fn split_brain_heal_detects_independent_clusters() {
         voters: a_members.clone(),
         cluster_id: ClusterId::UNSET,
         placement_version: 1,
-        digest: TopologyTerm::compute_digest(5, &ClusterId::UNSET, &a_members, 1),
+        committed_peak: (a_members.clone()).len() as u64,
+        digest: TopologyTerm::compute_digest(
+            5,
+            &ClusterId::UNSET,
+            &a_members,
+            1,
+            (a_members).len() as u64,
+        ),
     });
 
     // -- Final verification: the regression test would FAIL without R-042
