@@ -420,6 +420,60 @@ fn metrics_includes_new_telemetry_counters() {
     }
 }
 
+/// `ReplicationMetrics` failure/divergence counters (intent-log poison,
+/// ack-tracker persistence failures, replica-apply divergence, etc.) are
+/// incremented on the hot/error paths in `src/replication/durable.rs` and
+/// `src/replication/manager.rs` but — pre-fix — were never rendered on the
+/// `/metrics` endpoint, so an operator could not alert on them (log lines
+/// only). This test bumps two of the failure counters on a private
+/// `ReplicationMetrics` instance installed for this process and asserts
+/// both the counter *names* and their bumped *values* appear in the scrape,
+/// plus name-presence for the remaining COUNTER fields on the struct.
+#[test]
+fn metrics_endpoint_exposes_replication_counters() {
+    use std::sync::OnceLock;
+    use teraslab::metrics::{ReplicationMetrics, init_replication_metrics};
+
+    static REPL: OnceLock<ReplicationMetrics> = OnceLock::new();
+    let repl = REPL.get_or_init(ReplicationMetrics::new);
+    init_replication_metrics(repl);
+
+    // No other test in this binary touches `ReplicationMetrics`, so these
+    // counters start at 0 and the bump below is exact.
+    repl.intent_log_poisoned.add(1);
+    repl.ack_tracker_flush_failures.add(2);
+
+    let (port, _state) = start_test_http_server();
+    let (_, _, body) = http_get(port, "/metrics");
+
+    assert!(
+        body.contains("teraslab_intent_log_poisoned_total 1"),
+        "/metrics output missing bumped teraslab_intent_log_poisoned_total\n--- output ---\n{body}",
+    );
+    assert!(
+        body.contains("teraslab_ack_tracker_flush_failures_total 2"),
+        "/metrics output missing bumped teraslab_ack_tracker_flush_failures_total\n--- output ---\n{body}",
+    );
+
+    // The remaining ReplicationMetrics COUNTER fields must also be
+    // rendered (name presence — values are exercised by the two asserts
+    // above and by the dedicated durable.rs/manager.rs unit tests).
+    for name in [
+        "teraslab_ack_tracker_load_failures_total",
+        "teraslab_replica_apply_divergence_total",
+        "teraslab_replica_apply_skipped_missing_tx_total",
+        "teraslab_replica_worker_panics_total",
+        "teraslab_replica_unauthenticated_accept_total",
+        "teraslab_replica_rejected_sequence_gap_total",
+        "teraslab_replica_rejected_stale_cluster_key_total",
+    ] {
+        assert!(
+            body.contains(name),
+            "/metrics output missing {name}\n--- output ---\n{body}",
+        );
+    }
+}
+
 #[test]
 fn health_live_returns_200() {
     let (port, _state) = start_test_http_server();

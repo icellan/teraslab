@@ -1200,6 +1200,60 @@ pub(crate) fn render_metrics_text(
             "teraslab_repl_bytes_sent_total",
             r.repl_bytes_sent_total.get(),
         );
+        // Failure/divergence counters. These were incremented on the
+        // error paths in `src/replication/durable.rs` / `manager.rs` but
+        // never rendered here, so operators could only see them in logs
+        // (see `tracing::error!` at each increment site) and had no way
+        // to alert on a poisoned intent log or a failed ACK-tracker
+        // persist via Prometheus. Every non-zero rate below is a signal
+        // operators should investigate (see field docs on
+        // `ReplicationMetrics` in `src/metrics.rs` for the failure mode
+        // each one guards).
+        prom_counter(
+            &mut out,
+            "teraslab_replica_rejected_stale_cluster_key_total",
+            r.replica_rejected_stale_cluster_key.get(),
+        );
+        prom_counter(
+            &mut out,
+            "teraslab_replica_apply_skipped_missing_tx_total",
+            r.replica_apply_skipped_missing_tx.get(),
+        );
+        prom_counter(
+            &mut out,
+            "teraslab_replica_apply_divergence_total",
+            r.replica_apply_divergence_total.get(),
+        );
+        prom_counter(
+            &mut out,
+            "teraslab_ack_tracker_flush_failures_total",
+            r.ack_tracker_flush_failures.get(),
+        );
+        prom_counter(
+            &mut out,
+            "teraslab_ack_tracker_load_failures_total",
+            r.ack_tracker_load_failures.get(),
+        );
+        prom_counter(
+            &mut out,
+            "teraslab_intent_log_poisoned_total",
+            r.intent_log_poisoned.get(),
+        );
+        prom_counter(
+            &mut out,
+            "teraslab_replica_worker_panics_total",
+            r.replica_worker_panics_total.get(),
+        );
+        prom_counter(
+            &mut out,
+            "teraslab_replica_unauthenticated_accept_total",
+            r.replica_unauthenticated_accept_total.get(),
+        );
+        prom_counter(
+            &mut out,
+            "teraslab_replica_rejected_sequence_gap_total",
+            r.replica_rejected_sequence_gap.get(),
+        );
         prom_labeled_replica_counter(&mut out, "teraslab_repl_batches_acked_total", |i| {
             r.repl_batches_acked_total.get(i)
         });
@@ -4755,6 +4809,15 @@ mod tests {
             "teraslab_repl_batches_failed_total",
             "teraslab_repl_batch_latency_ns",
             "teraslab_repl_lag_sequences",
+            "teraslab_replica_rejected_stale_cluster_key_total",
+            "teraslab_replica_apply_skipped_missing_tx_total",
+            "teraslab_replica_apply_divergence_total",
+            "teraslab_ack_tracker_flush_failures_total",
+            "teraslab_ack_tracker_load_failures_total",
+            "teraslab_intent_log_poisoned_total",
+            "teraslab_replica_worker_panics_total",
+            "teraslab_replica_unauthenticated_accept_total",
+            "teraslab_replica_rejected_sequence_gap_total",
             "teraslab_redo_flush_latency_ns",
             "teraslab_redo_bytes_per_flush",
             "teraslab_redo_entries_per_flush",

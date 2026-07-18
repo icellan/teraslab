@@ -1587,6 +1587,17 @@ mod tests {
         format!("127.0.0.1:{port}").parse().unwrap()
     }
 
+    /// The tests below read counters off the process-global
+    /// `ReplicationMetrics` (installed once via `init_replication_metrics`;
+    /// every later call is a no-op, so all tests in this binary share one
+    /// instance). Under `cargo test`'s default parallel threads, two such
+    /// tests' before/after snapshot windows can interleave and pollute each
+    /// other's delta. Every metrics-asserting test in this module acquires
+    /// this lock across its whole before-snapshot -> action -> after-assert
+    /// window; poison is cleared manually so a panicking test doesn't wedge
+    /// the rest.
+    static DURABLE_METRICS_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn record_and_read() {
         let dir = tempfile::tempdir().unwrap();
@@ -2028,6 +2039,10 @@ mod tests {
     /// observable on the standard metrics pipeline.
     #[test]
     fn ack_tracker_flush_failure_bumps_metric() {
+        let _guard = DURABLE_METRICS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
         // Install the metric subsystem so the counter has somewhere
         // to live (idempotent — any prior test wins).
         static TEST_METRICS: std::sync::OnceLock<&'static crate::metrics::ReplicationMetrics> =
@@ -2065,6 +2080,10 @@ mod tests {
     /// idempotent catch-up), and bumps `ack_tracker_load_failures`.
     #[test]
     fn corrupt_ack_file_is_discarded_and_starts_empty() {
+        let _guard = DURABLE_METRICS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
         static TEST_METRICS: std::sync::OnceLock<&'static crate::metrics::ReplicationMetrics> =
             std::sync::OnceLock::new();
         let metrics_ref = *TEST_METRICS
@@ -2731,10 +2750,21 @@ mod tests {
     /// next time a caller's `begin`/`commit` happened to return
     /// `Err(Poisoned)`. An operator whose intent log has silently gone
     /// non-durable needs a signal AT the transition, not just on next use.
-    /// Assert the `intent_log_poisoned` metric bumps 0->1 exactly at
+    /// Assert the `intent_log_poisoned` metric bumps at
     /// `compact_locked`'s failure point.
+    ///
+    /// Asserts a DELTA (`after > before`), not an exact `before + 1`:
+    /// `intent_log_poisoned_on_compaction_reopen_failure_fails_closed`
+    /// drives the identical `force_reopen_failure` seam without holding
+    /// `DURABLE_METRICS_TEST_LOCK` (it doesn't assert on metrics, so it
+    /// isn't required to), and can bump this same process-global counter
+    /// concurrently — an exact `+1` would flake under parallel `cargo test`.
     #[test]
     fn intent_log_poison_transition_increments_metric() {
+        let _guard = DURABLE_METRICS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
         static TEST_METRICS: std::sync::OnceLock<&'static crate::metrics::ReplicationMetrics> =
             std::sync::OnceLock::new();
         let metrics_ref = *TEST_METRICS
@@ -2762,10 +2792,9 @@ mod tests {
         );
 
         let after = metrics.intent_log_poisoned.get();
-        assert_eq!(
-            after,
-            before + 1,
-            "intent_log_poisoned must bump by exactly 1 at the Active->Poisoned \
+        assert!(
+            after > before,
+            "intent_log_poisoned must bump at the Active->Poisoned \
              transition (was {before}, now {after})",
         );
     }
