@@ -350,9 +350,25 @@ fn fenced_shard_rejects_create_delete_set_mined() {
         "fence must be visible on the hot-path bitmap"
     );
 
-    // A fresh txid on the SAME shard (same first two bytes) for the CREATE arm.
+    // A fresh txid on the SAME cluster shard as `txid` for the CREATE arm.
+    // `ShardTable::shard_for_key` reads only `txid[0..2]` (src/cluster/shards.rs),
+    // so those two bytes must stay unchanged. The flipped byte must ALSO land
+    // inside the primary index's stored-prefix disambiguation window —
+    // `STORED_TXID_LEN = 12` in src/index/hashtable.rs (Design A, "slim primary
+    // bucket 64B -> 20B", commit f00ad34, 2026-07-05): a bucket now stores only
+    // `txid[0..12]` and `key_matches` compares just that prefix, trading a full
+    // 32-byte compare for a documented ~2.5e-11 collision rate across 2e9 REAL
+    // random txids. This test was added 2026-06-21 (422821a), before f00ad34,
+    // when buckets stored the full 32-byte txid — flipping the LAST byte (31)
+    // correctly produced a distinguishable key back then. Post-f00ad34 that same
+    // technique instead constructs an artificial 12-byte-prefix collision with
+    // the seed `txid` (bytes [0..12) unchanged, only byte 31 flipped), so the
+    // index's `key_matches` treats `create_txid` as the SAME entry as `txid` —
+    // the seeded record's own slot is returned for both keys. Flip a byte inside
+    // [2..12) instead: still the same shard (bytes [0..2) untouched) but now
+    // distinguishable within the index's actual disambiguation window.
     let mut create_txid = txid;
-    create_txid[31] ^= 0xFF;
+    create_txid[2] ^= 0xFF;
     assert_eq!(
         ShardTable::shard_for_key(&TxKey { txid: create_txid }),
         shard,
