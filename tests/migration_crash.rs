@@ -674,8 +674,16 @@ fn migration_batch_frame(source: &Engine, keys: &[TxKey], shard: u16) -> Request
 /// The test proves the drain is LOAD-BEARING, driving the REAL receiver path
 /// (`handle_replica_batch` with `FLAG_MIGRATION_BATCH`, which runs the
 /// backpressure gate + per-batch redo flush):
-///   * fail-before: one big migration batch into a tiny redo with NO drain hits
-///     `redo log full` (STATUS_ERROR) before completing — the pressure is real.
+///   * fail-before: one big migration batch into a tiny redo with NO drain
+///     overflows on the single atomic batch-redo admission (STATUS_ERROR) —
+///     the pressure is real. Post-FU#6a (`collect-then-atomic replica redo
+///     apply + Busy NAK`, commit f9aaf57) that overflow surfaces as a
+///     retryable `ReplicaAck::Busy` NAK, not a hard `Error`: nothing is
+///     journaled or poisoned and the coordinator's `stream_shard_baseline`
+///     explicitly treats `Busy` on a migration batch as "safe to retry, no
+///     partial state" (see `src/cluster/coordinator.rs`). This test predates
+///     FU#6a (added in b33af81, before f9aaf57) and still asserted the
+///     pre-FU#6a `Error(redo log full)` shape.
 ///   * pass-after: the SAME baseline streamed in batches, DRAINING the redo
 ///     (blocking checkpoint reclaim) between batches, COMPLETES with every record
 ///     applied + recoverable and no batch ever overflowing.
@@ -699,7 +707,7 @@ fn large_migration_baseline_completes_without_log_full() {
     }
     source.data_dev.sync().unwrap();
 
-    // --- fail-before: one big migration batch, NO drain → LogFull. ---
+    // --- fail-before: one big migration batch, NO drain → redo-full Busy NAK. ---
     {
         let journalled = TinyRedoNode::new(redo_size);
         let last_applied = AtomicU64::new(0);
@@ -710,12 +718,23 @@ fn large_migration_baseline_completes_without_log_full() {
             "fail-before: {NUM} lightweight baseline creates into a 32 KiB redo \
              with no drain MUST overflow — if it does not, the setup is wrong",
         );
+        // Post-FU#6a (commit f9aaf57, `collect-then-atomic replica redo apply +
+        // Busy NAK`) the whole batch's redo entries are admitted in ONE atomic
+        // step; a transient LogFull on that admission NAKs `ReplicaAck::Busy`
+        // instead of the pre-FU#6a `ReplicaAck::Error` — nothing is journaled or
+        // poisoned, and the batch's `first_sequence` (0 for a migration batch,
+        // see `migration_batch_frame`) is echoed back so the caller can log/retry
+        // it. `stream_shard_baseline` (src/cluster/coordinator.rs) already
+        // special-cases `ReplicaAck::Busy` on a migration batch as "safe to
+        // retry, no partial state to reconcile" — this is the overflow signal
+        // the fail-before phase is proving is real, just carried by the new NAK
+        // shape instead of a hard error.
         match ReplicaAck::deserialize(&resp.payload).unwrap() {
-            ReplicaAck::Error { message, .. } => assert!(
-                message.contains("redo log full"),
-                "the only expected failure is redo log full, got: {message}",
+            ReplicaAck::Busy { first_sequence } => assert_eq!(
+                first_sequence, 0,
+                "Busy must echo the migration batch's first_sequence (always 0)",
             ),
-            other => panic!("expected ReplicaAck::Error(redo log full), got {other:?}"),
+            other => panic!("expected ReplicaAck::Busy(redo log full backpressure), got {other:?}"),
         }
     }
 
