@@ -33,7 +33,11 @@ jobs:
     needs: test
     runs-on: ${{ matrix.os }}
     strategy:
-      fail-fast: true
+      # One target's failure must not cancel the other three: a single broken
+      # matrix entry previously hid the state of every other target, forcing a
+      # rerun per target to diagnose. `needs: build` still gates the release and
+      # image on all four succeeding, so this changes diagnosis, not semantics.
+      fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
