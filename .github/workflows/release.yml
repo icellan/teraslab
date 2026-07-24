@@ -33,7 +33,11 @@ jobs:
     needs: test
     runs-on: ${{ matrix.os }}
     strategy:
-      fail-fast: true
+      # One target's failure must not cancel the other three: a single broken
+      # matrix entry previously hid the state of every other target, forcing a
+      # rerun per target to diagnose. `needs: build` still gates the release and
+      # image on all four succeeding, so this changes diagnosis, not semantics.
+      fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
@@ -52,8 +56,16 @@ jobs:
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
+
+      # rust-toolchain.toml pins the compiler (1.97.0) and OVERRIDES whatever the
+      # action installs, so the action's `targets:` input is a trap: it adds the
+      # std to `stable` (1.97.1) while every cargo invocation in the repo runs
+      # under the pinned 1.97.0. Cross-builds for a non-host triple then fail with
+      # E0463 "can't find crate for `core`" (x86_64-apple-darwin on an arm64 mac
+      # runner). `rustup target add` runs inside the checkout, honours the
+      # override, and installs the std into the toolchain the build actually uses.
+      - name: Install target std into the pinned toolchain
+        run: rustup target add ${{ matrix.target }}
 
       - uses: Swatinem/rust-cache@v2
 
