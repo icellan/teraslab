@@ -644,7 +644,8 @@ fn one_way_udp_drop_creates_asymmetric_partition_and_heals() {
     }
 
     assert_eq!(
-        n2_alive_regression, None,
+        n2_alive_regression,
+        None,
         "nothing node 431 sends can reach node 432 under the drop, so 432's \
          alive count must stay at 1\n{}\n{}",
         cluster_diag("node431", &node1),
@@ -653,7 +654,8 @@ fn one_way_udp_drop_creates_asymmetric_partition_and_heals() {
     // E-01 guard side-effect: the 1-of-2 remnant (peak=2 → quorum 2)
     // must NOT commit a shrunken single-node topology.
     assert_eq!(
-        n2_shrunk_topology, None,
+        n2_shrunk_topology,
+        None,
         "node 432 must not self-activate a 1-node topology (peak-derived quorum)\n{}",
         cluster_diag("node432", &node2),
     );
