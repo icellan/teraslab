@@ -7191,10 +7191,13 @@ fn handle_create_batch(
     }
 
     // Hold ONLY the global (checkpoint-quiescence) side of the visibility
-    // barrier for the whole handler. This is the issue-#14 guarantee: a
-    // checkpoint cannot persist the allocator header while a reservation is in
-    // memory but its `AllocateRegion` redo is not yet durable (Phases 1b–2). The
-    // global side is SHARED, so concurrent creates never contend on it.
+    // barrier, from here through Phase 3 — it is dropped before the Phase 4
+    // replication round-trip (see the `drop(global_vis)` there; holding it
+    // across the fan-out deadlocks the replication ring). This is the issue-#14
+    // guarantee: a checkpoint cannot persist the allocator header while a
+    // reservation is in memory but its `AllocateRegion` redo is not yet durable
+    // (Phases 1b–2). The global side is SHARED, so concurrent creates never
+    // contend on it.
     //
     // G4 (read-your-writes / monotonicity) / R9 RESOLVED: create now mirrors
     // `handle_set_mined_batch` — the per-key `mutation_stripes` WRITE guard
@@ -7220,7 +7223,7 @@ fn handle_create_batch(
     // local GC prune, never replicated, so it has no replication-rollback
     // window.)
     let vis_start = std::time::Instant::now();
-    let _global_vis = engine.visibility().global_read();
+    let global_vis = engine.visibility().global_read();
     if let Some(h) = DISPATCH_HISTOGRAMS.get() {
         h.create_vis_latency.record_since(vis_start);
     }
@@ -8090,6 +8093,27 @@ fn handle_create_batch(
     // (Phase 1 then Phase 3, both iterating in item order), so this sort yields
     // the identical ordering for N=1 / single-chunk.
     errors.sort_by_key(|e| e.item_index);
+
+    // G4: release ONLY the global (checkpoint-coordination) side before the
+    // replication RTT; the per-key `visibility_stripes` stay held across
+    // replication (and any compensation) below, so a reader of these keys is
+    // still excluded until the outcome is known. Mirrors the identical
+    // `drop(global_vis)` in `handle_spend_batch` / `handle_set_mined_batch`.
+    //
+    // This drop is LOAD-BEARING, not just a checkpoint-latency optimisation.
+    // The global side is the SAME `RwLock` a normal (non-migration)
+    // `OP_REPLICA_BATCH` apply takes EXCLUSIVELY
+    // (`acquire_mutation_visibility_guard`). Under RF > 1 every node is both a
+    // master for its own shards and a replica for a peer's, so holding the
+    // SHARED side across this node's fan-out blocks the peer batch arriving
+    // here — and around a 3-node ring that is a circular wait broken only by
+    // the ack timeout: every node times out simultaneously and every replicated
+    // create fails with `ERR_REPLICATION_FAILED`. The issue-#14 quiescence this
+    // guard exists for covers Phases 1b–2 (a reservation in memory whose
+    // `AllocateRegion` redo is not yet durable); both are complete here, and
+    // Phase 3's index registration is durable-covered by the Phase 2 redo, so
+    // the guard has nothing left to protect once replication begins.
+    drop(global_vis);
 
     // Phase 4: Replicate.
     let repl_outcome = match replicate_all_ops_with_barrier(
