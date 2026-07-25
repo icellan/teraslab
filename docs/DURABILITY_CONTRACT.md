@@ -245,6 +245,63 @@ matches. Replay can therefore run multiple times without divergence
    Only `MissingPrimary` is tolerated at startup, and only up to a high
    cap. Every other class fails closed regardless of count.
 
+## Deletes and GC Are Outside the Durability Contract
+
+Everything above describes MUTATIONS. Record removal is deliberately not one:
+it is garbage collection of a record the retention policy has already released,
+and it is exempt from the WAL-first, replicate-then-ack discipline. Full
+behavioural contract: spec §3.18 / §3.18.1. The durability-relevant parts:
+
+- **No redo entry.** A delete writes nothing to the WAL. A crash before the
+  physical cleanup leaves the record present and internally consistent (record
+  + parent-spent slots + allocated region all still agree); the pruner
+  re-deletes it on its next pass. "Lost" delete = "delete has not happened yet",
+  which is a legal state, not corruption.
+- **No replication.** A master's delete is not shipped to its replicas. Each
+  node reclaims its own copy.
+- **Never acknowledged as durable.** `STATUS_OK` on `OP_DELETE_BATCH` /
+  `OP_PROCESS_EXPIRED_PRESERVATIONS` means "removed from this node's live
+  index", not "durably removed everywhere". There is no cluster-wide
+  delete barrier.
+
+### Who reclaims what (RF > 1)
+
+A record physically lives on its shard master AND on every replica of that
+shard. Mastership decides who is *authoritative*, not who pays to store it —
+under RF = 2 roughly half of each node's device is replica copies. The DAH
+sweep is the only driver that ever revisits a stored record, so it reclaims in
+two distinct roles:
+
+| Role | Applies to | Writes a tombstone | Prunes parent slots |
+|---|---|---|---|
+| **Master** (client delete, and the sweep over mastered keys) | keys this node masters | yes (when `reverse_heal.tombstones` is on) | yes |
+| **Held copy** (the sweep over replica copies) | keys this node stores but does not master | **no** | **no** |
+
+The held-copy role re-validates the identical due predicate under the identical
+per-tx stripe lock; it is narrower only in those two columns, and it touches
+exactly one record — its own.
+
+### Why the held-copy reclaim writes no tombstone
+
+A deletion tombstone is the authority's veto over any future copy of the key:
+RULE-DS (`Engine::tombstone_blocks_heal_apply`) drops an incoming
+migration-baseline record when a tombstone at-or-ahead of its generation
+exists. That is correct for a shard master, which is the authority on whether
+the key still exists.
+
+A replica is not that authority. If it drops a copy it should have kept — the
+`PreserveUntil` race, spec §3.18.1 — the master still holds the record and
+MUST be able to put it back: via the resync a replica's NAK-on-missing
+triggers, via a migration baseline, or via a reverse-heal pull. A
+replica-written tombstone would veto exactly that repair and turn a transient,
+self-healing divergence into permanent loss. **The absence of a tombstone on
+the held-copy path is load-bearing, not an omission.**
+
+Consequence for reverse-heal: a healing node can no longer assume its replicas
+still hold every record it has since released. That is intended — both sides
+apply the same retention predicate, so a record missing from both was garbage
+by policy on both.
+
 ## Index Recovery on Startup
 
 The in-memory index (primary hash table + DAH and unmined secondary

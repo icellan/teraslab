@@ -543,6 +543,28 @@ pub enum DahReconcileScope<'a> {
     Touched(&'a std::collections::HashSet<TxKey>),
 }
 
+/// Whether a record removal speaks for the key or only for this node's disk.
+///
+/// Under RF > 1 every record physically lives on several nodes, but exactly one
+/// of them — the shard master — is the AUTHORITY on whether the key still
+/// exists. The two roles need the same physical removal and a different
+/// *durable claim*, and that is the only thing this enum selects: whether
+/// `delete_inner` records a deletion tombstone.
+///
+/// See [`Engine::reclaim_held_copy`] for why a non-authoritative removal must
+/// never leave one behind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RemovalAuthority {
+    /// This node is the key's authority (its shard master, or an unclustered
+    /// single node). The removal is the key's real deletion and records a
+    /// deletion tombstone so a later reverse-heal cannot resurrect it.
+    Authoritative,
+    /// This node merely HOLDS a replica copy. The removal reclaims local device
+    /// space and asserts nothing about the key: no tombstone, so the master can
+    /// always put the record back.
+    HeldCopy,
+}
+
 impl Engine {
     fn external_ref_for_create(req: &CreateRequest) -> Result<Option<ExternalRef>, CreateError> {
         if !req.is_external {
@@ -8380,7 +8402,7 @@ impl Engine {
     /// blob-store I/O path and lets the sweep batch unlinks.
     #[tracing::instrument(level = "debug", skip_all)]
     pub fn delete(&self, req: &DeleteRequest) -> Result<(), SpendError> {
-        self.delete_inner(req)
+        self.delete_inner(req, RemovalAuthority::Authoritative)
     }
 
     /// Local prune-delete: remove a fully-spent record locally with NO redo and
@@ -8396,10 +8418,60 @@ impl Engine {
     /// distinct name documents the pruner's intent at the call site. Returns
     /// `Ok(())` on success or when the record is already gone (idempotent).
     pub fn prune_delete(&self, req: &DeleteRequest) -> Result<(), SpendError> {
-        self.delete_inner(req)
+        self.delete_inner(req, RemovalAuthority::Authoritative)
+    }
+
+    /// **Held-copy reclaim**: drop the local copy of a record this node HOLDS
+    /// but does NOT master, purely to reclaim device space.
+    ///
+    /// Under RF > 1 a node stores every record of every shard it replicates,
+    /// so roughly `RF - 1` of every `RF` records on its device are replica
+    /// copies. Mastership decides who is AUTHORITATIVE for a key; it does not
+    /// decide who pays to store it. A node that only ever reclaimed the keys it
+    /// masters would grow its replica half without bound (F2), because nothing
+    /// else in the system ever revisits a replica copy.
+    ///
+    /// Physically identical to [`Self::prune_delete`] — RAM-index unregister,
+    /// header zero via the write-back cache, region free — with ONE deliberate
+    /// difference: it records **no deletion tombstone**. That difference is the
+    /// whole safety argument, so it must not be "simplified" away:
+    ///
+    /// - A tombstone is durable evidence that *this node deleted this key at
+    ///   generation N*, and RULE-DS
+    ///   ([`crate::ops::tombstone::TombstoneLog::blocks_heal_apply`]) uses it to
+    ///   REFUSE an incoming copy of the key. That veto is legitimate for the
+    ///   shard master, which is the authority on whether the key still exists.
+    /// - A replica is not that authority. If it drops a copy it should have
+    ///   kept (the `PreserveUntil` race — see `handle_process_expired`), the
+    ///   master still holds the record and MUST be able to put it back, via the
+    ///   replication resync the receiver's NAK-on-missing triggers, via a
+    ///   migration baseline, or via a reverse-heal pull. A replica-written
+    ///   tombstone would veto exactly that repair and turn a transient,
+    ///   self-healing divergence into permanent loss.
+    ///
+    /// So the removal stays what its name says: a LOCAL SPACE RECLAIM that is
+    /// not durable, not replicated, not journalled, and always repairable.
+    /// Returns `Ok(())` on success or when the record is already gone
+    /// (idempotent).
+    ///
+    /// # Errors
+    ///
+    /// Same contract as [`Self::prune_delete`]:
+    /// [`SpendError::TxNotFound`] when the key is absent,
+    /// [`SpendError::NotDue`] when `req.due_guard` is set and the under-lock
+    /// re-validation finds the record no longer sweep-due, and
+    /// [`SpendError::StorageError`] on an index/device failure or when a
+    /// guarded sweep delete is attempted on a write-unhealthy node.
+    pub fn reclaim_held_copy(&self, req: &DeleteRequest) -> Result<(), SpendError> {
+        self.delete_inner(req, RemovalAuthority::HeldCopy)
     }
 
     /// Internal delete.
+    ///
+    /// `authority` selects whether the removal is the key's AUTHORITATIVE
+    /// deletion (records a deletion tombstone) or a non-authoritative held-copy
+    /// space reclaim (records none) — see [`RemovalAuthority`] and
+    /// [`Self::reclaim_held_copy`]. Every other step is identical.
     ///
     /// # Ordering (F-G2-001)
     ///
@@ -8409,7 +8481,11 @@ impl Engine {
     /// 3. Unregister the key from the primary index.
     /// 4. Return the region to the allocator (after the primary-index removal,
     ///    so no `lookup(key)` can reach the post-free offset — F-G2-001).
-    fn delete_inner(&self, req: &DeleteRequest) -> Result<(), SpendError> {
+    fn delete_inner(
+        &self,
+        req: &DeleteRequest,
+        authority: RemovalAuthority,
+    ) -> Result<(), SpendError> {
         // P0-11 follow-up: a write-unhealthy (poisoned) node must not PRUNE. The
         // internal DAH sweep journals no redo, so poisoning the redo log does not
         // by itself fence it; refuse the guarded sweep delete (`due_guard` set)
@@ -8610,7 +8686,18 @@ impl Engine {
         // the delete-latency floor is untouched, and a crash before checkpoint
         // reverts BOTH the delete and the tombstone (Invariant TS-1). No-op when
         // tombstones are disabled (no log attached).
-        if let Some(log) = self.tombstone_log.get() {
+        //
+        // SKIPPED ENTIRELY for a `RemovalAuthority::HeldCopy` reclaim: a
+        // tombstone is an authority's veto over any future re-delivery of the
+        // key (RULE-DS), and a node that merely HOLDS a replica copy is not the
+        // key's authority. Recording one there would let a local space reclaim
+        // permanently block the master's repair of a copy the replica should
+        // have kept. See `Self::reclaim_held_copy`.
+        if let Some(log) = self
+            .tombstone_log
+            .get()
+            .filter(|_| authority == RemovalAuthority::Authoritative)
+        {
             let cause = if req.due_guard.is_some() {
                 crate::ops::tombstone::TombstoneCause::Dah
             } else {

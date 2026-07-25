@@ -496,6 +496,14 @@ pub struct ThreadMetrics {
     pub deletes_succeeded: PaddedCounter,
     /// Delete operations that failed.
     pub deletes_failed: PaddedCounter,
+    /// Records reclaimed by the DAH sweep as HELD REPLICA COPIES — this node
+    /// stored them but did not master them (spec §3.18.1). Counted separately
+    /// from `deletes_succeeded` (which includes them) because it answers the
+    /// one question the coarse counter cannot: is replica-side GC running at
+    /// all? Under RF > 1 roughly `(RF-1)/RF` of a node's device is replica
+    /// copies, and this counter staying at zero on a busy clustered node means
+    /// that share is not being reclaimed.
+    pub deletes_held_copy_reclaimed: PaddedCounter,
     /// Total preserve_until operations attempted.
     pub preserve_until_attempted: PaddedCounter,
     /// preserve_until operations that succeeded.
@@ -629,6 +637,7 @@ impl ThreadMetrics {
             deletes_attempted: PaddedCounter::new(),
             deletes_succeeded: PaddedCounter::new(),
             deletes_failed: PaddedCounter::new(),
+            deletes_held_copy_reclaimed: PaddedCounter::new(),
             preserve_until_attempted: PaddedCounter::new(),
             preserve_until_succeeded: PaddedCounter::new(),
             preserve_until_failed: PaddedCounter::new(),

@@ -947,6 +947,11 @@ pub(crate) fn render_metrics_text(
     );
     prom_counter(
         &mut out,
+        "teraslab_deletes_held_copy_reclaimed_total",
+        m.deletes_held_copy_reclaimed.get(),
+    );
+    prom_counter(
+        &mut out,
         "teraslab_preserve_until_attempted_total",
         m.preserve_until_attempted.get(),
     );

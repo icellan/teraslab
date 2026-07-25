@@ -927,6 +927,99 @@ Point read of a single UTXO slot plus the record's locktime. Used for double-spe
 - `UnminedTxRetention`: 144 blocks (~1 day)
 - `ParentPreservationBlocks`: 1440 blocks (~10 days)
 
+#### 3.18.1 Delete authority under replication (RF > 1)
+
+Under `replication_factor > 1` a record physically exists on several nodes:
+the master of its shard and every replica of that shard. **Mastership decides
+who is AUTHORITATIVE for a key; it does not decide who pays to store it.**
+Under RF = 2 roughly half of every node's device is replica copies. The two
+roles must therefore be stated separately — a single "who may delete this?"
+rule cannot serve both.
+
+**What a delete guarantees.** A delete is *garbage collection of a record the
+retention policy has released*, not a transactional client operation:
+
+- It is **not durable**. No redo entry is written. A crash before the physical
+  cleanup leaves the record present and internally consistent (record +
+  parent-spent slots + allocated region all still agree) and the pruner
+  re-deletes it on its next pass. Deletion is idempotent and self-healing.
+- It is **not replicated**. A master's delete is not shipped to its replicas
+  (`OP_DELETE_BATCH` and the DAH sweep emit no `ReplicaOp`). Each holder
+  reclaims its own copy.
+- It is **not ordered against reads on other nodes**. A record deleted on its
+  master may still be readable from a replica's local store until that replica
+  reclaims it. Routed reads always go to the master, so this is invisible to
+  clients; a `FLAG_LOCAL_READ` against a replica can observe it.
+
+**Who reclaims what.**
+
+| Driver | Runs on | Scope | Authority |
+|---|---|---|---|
+| Client `OP_DELETE_BATCH` | shard master only | keys this node masters | authoritative |
+| DAH sweep, master role | shard master | keys this node masters | authoritative |
+| DAH sweep, held-copy role | any holder (replica) | replica copies this node stores | **none — local space reclaim** |
+| Phase-3 preservation expiry | shard master only | keys this node masters | authoritative |
+
+The held-copy role exists because the DAH sweep is the only thing in the system
+that ever revisits a stored record. A node that reclaimed only the keys it
+masters would grow its replica half without bound; nothing else would ever
+reclaim it.
+
+**The held-copy reclaim is deliberately narrower than the master's delete**, in
+exactly two ways:
+
+1. **It writes no deletion tombstone** (see below).
+2. **It does not prune parent slots.** A parent record's UTXO slot is that
+   record's own state, with its own master; marking it `UTXO_PRUNED` is an
+   authoritative bookkeeping write. A holder reclaiming a *child* copy must not
+   perform it — the prune is not replicated, so every other replica of that
+   parent legitimately keeps the slot `UTXO_SPENT`, and writing it locally would
+   diverge this node from the parent's master. A held-copy reclaim therefore
+   touches exactly one record: its own.
+
+Everything else is identical. In particular the held-copy reclaim re-validates
+the SAME sweep predicate under the SAME per-tx stripe lock
+(`DeleteRequest::due_guard`, KO-3), so it can only ever remove a record that is
+`preserve_until == 0` ∧ not `LOCKED` ∧ DAH-due ∧ (CONFLICTING ∨ (all-spent ∧
+has-blocks ∧ on-longest-chain)) — evaluated against its own replicated copy of
+the state, which is the same state the master evaluates.
+
+**Tombstones and reverse-heal.** When `reverse_heal.tombstones` is on (the
+default for RF > 1) an authoritative delete records a generation-aware deletion
+tombstone. RULE-DS then uses it to REFUSE an incoming copy of the key on a
+migration-baseline apply, so a heal cannot resurrect a record its master
+legitimately deleted.
+
+A held-copy reclaim **must not** record one, and does not. A tombstone is the
+authority's veto over any future copy of the key, and a replica is not that
+authority. The soundness of replica-side GC rests on this: if a replica drops a
+copy it should have kept, the master still holds the record and must be able to
+put it back — via the replication resync a replica's NAK-on-missing triggers,
+via a migration baseline, or via a reverse-heal pull. A replica-written
+tombstone would veto precisely that repair and convert a transient,
+self-healing divergence into permanent loss.
+
+**The `PreserveUntil` race.** A client preserves a DAH-due record at its master;
+before the replicated `PreserveUntil` lands, the replica's pruner fires against
+local state that still says the record is due. The two orderings resolve as:
+
+- *Preserve first* — the replica's under-lock re-validation sees
+  `preserve_until != 0` and refuses the reclaim (`SpendError::NotDue`). The two
+  serialize on the same stripe lock, so this is deterministic, not a matter of
+  timing.
+- *Reclaim first* — the replica drops its copy. The master keeps the record (its
+  own re-validation refuses its own sweep), so the record is not lost
+  cluster-wide, and the replica wrote no tombstone, so the master's next
+  delivery of the key restores it. A steady-state replica batch that then
+  applies any mutation to the now-absent key NAKs
+  (`missing_record_apply_outcome`), which is the signal that drives the resync.
+
+The residual is therefore an availability/divergence window on the replica, not
+data loss — and it collapses to loss only under an additional, independent fault
+(the master failing while the divergence is open). No grace margin is applied,
+because the race window is the replication round-trip and not a function of
+block height: widening the DAH margin would not close it.
+
 ---
 
 ## 4. Storage Engine

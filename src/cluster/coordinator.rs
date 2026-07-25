@@ -9804,6 +9804,41 @@ pub struct MasterSnapshot {
     version: u64,
 }
 
+/// Per-shard "this node HOLDS a copy of this shard's records" view, captured
+/// under ONE `shard_table` lock acquisition — the holder-scoped companion to
+/// [`MasterSnapshot`].
+///
+/// **Holding is not mastering.** A shard's records are physically stored by
+/// every node in its assignment — the master AND its replicas — because
+/// replication ships every mutation to all of them. Mastership decides who is
+/// AUTHORITATIVE for a key (who answers routed reads, whose delete is the
+/// key's real deletion); it does not decide who pays to store the bytes. Under
+/// RF = 2 roughly half of every node's device is replica copies.
+///
+/// The DAH sweep needs this distinction: a node must be able to reclaim the
+/// device space of a record it holds as a replica, and it must do so as a local
+/// space reclaim rather than as an authoritative deletion. See
+/// `dispatch::sweep_role_snap` and [`crate::ops::engine::Engine::reclaim_held_copy`].
+pub struct HolderSnapshot {
+    /// Indexed by shard id (`0..NUM_SHARDS`): whether this node is the master
+    /// or a replica of the shard's EFFECTIVE (currently-serving) assignment.
+    /// All `false` when the local shard table lags the committed topology term,
+    /// mirroring [`MasterSnapshot`]'s `NodeId(0)` sentinel.
+    holds: Vec<bool>,
+}
+
+impl HolderSnapshot {
+    /// Whether this node holds a copy of `key`'s shard (as master or replica).
+    ///
+    /// `shard_for_key` is a pure function returning a shard in `0..NUM_SHARDS`
+    /// and `holds` always has exactly `NUM_SHARDS` entries, so the index is in
+    /// bounds by construction (same invariant as [`MasterSnapshot`]).
+    #[inline]
+    pub fn holds_key(&self, key: &TxKey) -> bool {
+        self.holds[ShardTable::shard_for_key(key) as usize]
+    }
+}
+
 impl MasterSnapshot {
     /// The authoritative master captured for `key`'s shard.
     ///
@@ -10090,6 +10125,39 @@ impl RunningCluster {
         } else {
             MasterQueryResult::No
         }
+    }
+
+    /// Capture a batch-scoped [`HolderSnapshot`] — which shards this node holds
+    /// a physical copy of — under a SINGLE `shard_table` lock acquisition, the
+    /// holder-scoped companion to [`Self::master_snapshot`].
+    ///
+    /// Take one per DAH-sweep pass, alongside the master snapshot, immediately
+    /// before the per-candidate loop.
+    pub fn holder_snapshot(&self) -> HolderSnapshot {
+        let table = self.shard_table.read();
+        let committed = self.topology_authority.committed_term();
+        if table.version < committed {
+            // Stale local table: the master snapshot degrades to the `NodeId(0)`
+            // sentinel (nothing is locally mastered) and holdership is equally
+            // untrustworthy. Claim nothing — the sweep skips every candidate
+            // until the committed table is installed.
+            return HolderSnapshot {
+                holds: vec![false; NUM_SHARDS],
+            };
+        }
+        let self_id = self.self_id;
+        let holds = (0..NUM_SHARDS as u16)
+            .map(|shard| {
+                // EFFECTIVE, not target: the currently-serving assignment is the
+                // one replication ships to, so it is the one whose members
+                // actually carry the shard's records. A handoff TARGET that has
+                // not been committed yet is mid-stream and is deliberately not
+                // counted (see `ShardTable::effective_assignment`).
+                let assignment = table.effective_assignment(shard);
+                assignment.master == self_id || assignment.replicas.contains(&self_id)
+            })
+            .collect();
+        HolderSnapshot { holds }
     }
 
     /// Determine how to route a request for the given key.

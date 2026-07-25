@@ -8,7 +8,7 @@
 //! - Redo log entries are appended for crash recovery.
 //! - Replication ops are sent to replica nodes (if in cluster mode with RF > 1).
 
-use crate::cluster::coordinator::{MasterSnapshot, RunningCluster};
+use crate::cluster::coordinator::{HolderSnapshot, MasterSnapshot, RunningCluster};
 use crate::cluster::shards::{NodeId, ShardHandoff, ShardTable};
 use crate::index::TxKey;
 use crate::ops::create::*;
@@ -5679,6 +5679,80 @@ fn check_shard_ownership_snap(
     resolve_shard_ownership(cluster, &key, item_index, mastership, allow_if_migrating)
 }
 
+/// The role this node plays for one DAH-sweep candidate.
+///
+/// The sweep is the ONLY driver that ever revisits a stored record, so it is
+/// the only thing that can reclaim device space. Under RF > 1 a node stores
+/// every record of every shard it replicates, so restricting the sweep to keys
+/// it MASTERS leaves its replica half — roughly `(RF-1)/RF` of the device —
+/// growing without bound (F2). This enum makes the missing case explicit: a
+/// node reclaims the records it HOLDS, in one of two clearly different roles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SweepRole {
+    /// This node is the key's shard master (or is unclustered). The sweep
+    /// delete is the key's AUTHORITATIVE deletion: it prunes the parent slots
+    /// the record's spends claimed and records a deletion tombstone, exactly as
+    /// before this distinction existed.
+    ShardMaster,
+    /// This node holds a REPLICA copy of the key. The sweep delete is a LOCAL
+    /// SPACE RECLAIM and nothing more: no tombstone, no replication, no redo,
+    /// no mutation of any other record. Its safety rests on staying
+    /// non-authoritative — a copy dropped in error is always restorable from
+    /// the master (resync / migration baseline / reverse-heal pull), which a
+    /// tombstone would veto. See [`Engine::reclaim_held_copy`].
+    HeldCopy,
+}
+
+/// Decide whether — and in which role — this node may DAH-sweep `txid`.
+///
+/// `None` means "skip this candidate": another node masters the key and this
+/// node does not hold a copy of it, or the local topology view is not
+/// trustworthy enough to act on (topology transitioning, self-fenced, shard
+/// table stale, migration pending inbound, or write-fenced mid-handoff).
+///
+/// Mastership is resolved FIRST and by the ordinary
+/// [`check_shard_ownership_snap`] gate, so a master's sweep decision — including
+/// every migration fence it already honours — is bit-identical to the
+/// pre-F2 behaviour. Only when that gate reports a plain `ERR_REDIRECT`
+/// ("someone else masters this key") is the holder question asked at all, and
+/// the same migration fences are then applied to the holder answer: a shard
+/// with data streaming in (`has_pending_inbound`) or streaming out
+/// (`is_shard_write_fenced`) is mid-transfer, and reclaiming from under a
+/// transfer would race the very copy that transfer is establishing.
+fn sweep_role_snap(
+    txid: &[u8; 32],
+    cluster: Option<&RunningCluster>,
+    master_snap: Option<&MasterSnapshot>,
+    holder_snap: Option<&HolderSnapshot>,
+) -> Option<SweepRole> {
+    // Unclustered: every record on the device is this node's own.
+    let Some(cluster) = cluster else {
+        return Some(SweepRole::ShardMaster);
+    };
+    let Some(redirect) = check_shard_ownership_snap(txid, 0, Some(cluster), master_snap, false)
+    else {
+        return Some(SweepRole::ShardMaster);
+    };
+    // ERR_REDIRECT is the ONLY "this key is simply someone else's" answer.
+    // ERR_MIGRATION_IN_PROGRESS (transitioning / pending inbound / write-fenced)
+    // and ERR_NO_QUORUM (master address unknown) all mean the local view is
+    // unreliable — fail closed and skip, as the pre-F2 sweep did.
+    if redirect.error_code != ERR_REDIRECT {
+        return None;
+    }
+    let key = TxKey { txid: *txid };
+    if !holder_snap.is_some_and(|snap| snap.holds_key(&key)) {
+        return None;
+    }
+    // Same migration fences the master arm of `resolve_shard_ownership` applies,
+    // re-applied to the holder answer: never reclaim from under an in-flight
+    // shard transfer in either direction.
+    if cluster.has_pending_inbound(&key) || cluster.is_shard_write_fenced(&key) {
+        return None;
+    }
+    Some(SweepRole::HeldCopy)
+}
+
 /// Resolve a shard-ownership decision from an already-computed
 /// [`MasterQueryResult`](crate::cluster::coordinator::MasterQueryResult),
 /// applying the per-key migration gates and building the redirect error.
@@ -9143,6 +9217,10 @@ fn handle_delete_batch(
     let mut errors = Vec::new();
     // Deletes of already-absent keys (idempotent GC no-ops) — not failures.
     let mut idempotent_total: u64 = 0;
+    // F2: of the removals below, how many were REPLICA copies this node holds
+    // but does not master. Reported separately so an operator can see whether
+    // replica-side GC is running at all (spec §3.18.1).
+    let mut held_copy_reclaimed: u64 = 0;
 
     // Fine-grained visibility for the batch: per-key WRITE over the deleted
     // txids + global SHARED (so a checkpoint still excludes us). GATED on
@@ -9156,24 +9234,59 @@ fn handle_delete_batch(
 
     // LOCAL PRUNE. Deletes are independent-node GC of fully-spent records that
     // are no longer needed — NOT part of normal client operation. They are NOT
-    // durable, NOT replicated, and write NO tombstone: a crash before the
-    // physical cleanup just leaves the record present (and consistent — record +
-    // parent-spent slots + allocated region all still agree), and the pruner
-    // re-deletes it next pass (self-healing). Each item:
-    //   1. validate shard ownership + (external records) the cold-blob guard,
-    //   2. mark every parent slot this child spent as PRUNED (UTXO correctness),
-    //   3. remove the record locally (`engine.prune_delete`: RAM-index
-    //      unregister + header zero via the write-back cache + region free).
+    // durable and NOT replicated: a crash before the physical cleanup just
+    // leaves the record present (and consistent — record + parent-spent slots +
+    // allocated region all still agree), and the pruner re-deletes it next pass
+    // (self-healing). Each item:
+    //   1. validate the node's role for the key + (external records) the
+    //      cold-blob guard,
+    //   2. mark every parent slot this child spent as PRUNED (UTXO correctness)
+    //      — MASTER role only, see below,
+    //   3. remove the record locally (RAM-index unregister + header zero via the
+    //      write-back cache + region free).
+    //
+    // ROLE (F2). A client delete (`sweep_due_height == None`) is unchanged:
+    // master-only, exactly as spec §3.18 requires — a client's delete is an
+    // authoritative statement about the key and only its master may make it.
+    // A DAH-SWEEP delete (`sweep_due_height == Some(_)`) additionally reclaims
+    // the REPLICA copies this node holds, because nothing else in the system
+    // ever revisits them. `sweep_role_snap` returns which role applies; the two
+    // roles differ in exactly two places below (parent prune, tombstone) and
+    // nowhere else.
     // P1-3: hoist the shard-master lookup to ONE lock acquisition per batch,
     // shared by both the per-child check below and the per-parent re-check.
     let master_snap = cluster.map(|c| c.master_snapshot());
+    // Only the sweep path asks the holder question, so a client delete does not
+    // pay for the snapshot at all.
+    let holder_snap = sweep_due_height.and(cluster).map(|c| c.holder_snapshot());
     'items: for (i, txid) in txids.iter().enumerate() {
-        if let Some(redirect_err) =
-            check_shard_ownership_snap(txid, i as u32, cluster, master_snap.as_ref(), false)
-        {
-            errors.push(redirect_err);
-            continue;
-        }
+        let role = if sweep_due_height.is_some() {
+            match sweep_role_snap(txid, cluster, master_snap.as_ref(), holder_snap.as_ref()) {
+                Some(role) => role,
+                None => {
+                    // Phase 1 of the sweep already resolved a role for every
+                    // txid it put in this batch; losing it here means the
+                    // topology moved underneath the pass. Skipping is correct
+                    // and self-healing (the next pass re-evaluates), and it is
+                    // reported as the same redirect a client would get.
+                    errors.push(BatchItemError {
+                        item_index: i as u32,
+                        error_code: ERR_REDIRECT,
+                        error_data: Vec::new(),
+                    });
+                    continue;
+                }
+            }
+        } else {
+            // Client delete: master-only, gate unchanged.
+            if let Some(redirect_err) =
+                check_shard_ownership_snap(txid, i as u32, cluster, master_snap.as_ref(), false)
+            {
+                errors.push(redirect_err);
+                continue;
+            }
+            SweepRole::ShardMaster
+        };
         let key = TxKey { txid: *txid };
 
         // External-blob guard: never remove an external record whose cold blob
@@ -9218,19 +9331,33 @@ fn handle_delete_batch(
         // (`UTXO_PRUNED`). Local + idempotent; on a clustered node a parent on
         // another shard master is fail-closed (a distributed prune is required
         // for that topology).
-        let parent_txids = match engine.parent_txids_for_child(&key) {
-            Ok(p) => p,
-            // The child was concurrently deleted/relocated (race): no parents to
-            // prune. Skip to the idempotent prune below rather than failing.
-            Err(crate::ops::error::SpendError::TxNotFound) => Vec::new(),
-            Err(e) => {
-                errors.push(BatchItemError {
-                    item_index: i as u32,
-                    error_code: ERR_STORAGE_IO,
-                    error_data: format!("delete parent-prune input parse failed: {e}").into_bytes(),
-                });
-                continue;
-            }
+        //
+        // MASTER ROLE ONLY. A parent's UTXO slot is the PARENT record's state,
+        // and the parent record has its own master. Marking it is an
+        // authoritative bookkeeping write, so a node reclaiming a replica copy
+        // of the CHILD must not perform it: it would mutate a record this node
+        // does not speak for, diverging the parent's slot from the parent
+        // master's own copy (this prune is not replicated, so the master's
+        // replicas legitimately keep the slot `UTXO_SPENT`). Skipping keeps the
+        // held-copy reclaim confined to exactly one record — its own — which is
+        // what makes it a space reclaim rather than a distributed mutation.
+        let parent_txids = match role {
+            SweepRole::HeldCopy => Vec::new(),
+            SweepRole::ShardMaster => match engine.parent_txids_for_child(&key) {
+                Ok(p) => p,
+                // The child was concurrently deleted/relocated (race): no parents to
+                // prune. Skip to the idempotent prune below rather than failing.
+                Err(crate::ops::error::SpendError::TxNotFound) => Vec::new(),
+                Err(e) => {
+                    errors.push(BatchItemError {
+                        item_index: i as u32,
+                        error_code: ERR_STORAGE_IO,
+                        error_data: format!("delete parent-prune input parse failed: {e}")
+                            .into_bytes(),
+                    });
+                    continue;
+                }
+            },
         };
         for parent_txid in parent_txids {
             if let Some(route_err) = check_shard_ownership_snap(
@@ -9276,12 +9403,23 @@ fn handle_delete_batch(
             }
         }
 
-        // Remove the record locally (no tombstone, no redo, no replication).
-        match engine.prune_delete(&DeleteRequest {
+        // Remove the record locally (no redo, no replication). The role decides
+        // whether this is the key's authoritative deletion (tombstoned, so a
+        // later reverse-heal cannot resurrect it) or a held-copy space reclaim
+        // (no tombstone, so the master can always put the copy back).
+        let del_req = DeleteRequest {
             tx_key: key,
             due_guard: sweep_due_height,
-        }) {
-            Ok(()) => {}
+        };
+        match match role {
+            SweepRole::ShardMaster => engine.prune_delete(&del_req),
+            SweepRole::HeldCopy => engine.reclaim_held_copy(&del_req),
+        } {
+            Ok(()) => {
+                if role == SweepRole::HeldCopy {
+                    held_copy_reclaimed += 1;
+                }
+            }
             // Idempotent GC: the record is already gone — a concurrent or
             // duplicate delete won the race, or it was never present. The
             // delete's post-condition (record absent) already holds, so this is
@@ -9308,6 +9446,7 @@ fn handle_delete_batch(
         m.deletes_succeeded
             .inc_by(succeeded_total + idempotent_total);
         m.deletes_failed.inc_by(failed_total);
+        m.deletes_held_copy_reclaimed.inc_by(held_copy_reclaimed);
         use crate::metrics::{OpCode, Outcome};
         m.operations
             .inc_by(OpCode::Delete, Outcome::Ok, succeeded_total);
@@ -10653,13 +10792,12 @@ fn handle_process_expired(
         }
     }
 
-    // Query the DAH index for transactions due for deletion. The DAH index
-    // is per-node and reflects only records this node knows about, so
-    // it is already (mostly) ownership-filtered when running in cluster
-    // mode — but we still re-check ownership explicitly below because
-    // (a) DAH may transiently include non-master records during
-    // migration, and (b) the index can lag behind the on-device
-    // metadata.
+    // Query the DAH index for transactions due for deletion. The DAH index is
+    // per-node and lists every record this node PHYSICALLY HOLDS whose
+    // delete-at-height has arrived — replica copies included, because
+    // replication ships each shard's mutations (and therefore each record's DAH
+    // transitions) to every node in the shard's assignment. Holdership, not
+    // mastership, is what the sweep must filter on: see `sweep_role_snap`.
     //
     // BOUNDED at `max_batch` candidates per call (#25 follow-up). The full
     // due-set can reach the entire UTXO set during a catch-up sync. Processing
@@ -10679,32 +10817,44 @@ fn handle_process_expired(
         .dah_index()
         .range_query_limited(current_height, max_batch as usize);
 
-    // Phase 1: filter by ownership + re-validate against current metadata.
+    // Phase 1: filter by HOLDERSHIP + re-validate against current metadata.
     // A DAH entry is a hint; the metadata is authoritative. The
     // re-validation is performed UNDER the per-tx stripe lock
     // (`engine.is_due_for_sweep`, KO-2/KO-3) so a concurrent mutation cannot
     // invalidate the decision between this check and the redo-log write — a
-    // record that is no longer due is never added to `owned_due`, so it
+    // record that is no longer due is never added to `held_due`, so it
     // never gets a `Delete` redo op (and can never be wrongly replayed). The
     // predicate also includes the KO-2 conflicting branch: a CONFLICTING
     // record is due regardless of spent/longest-chain state. R-102 / IJK-09.
-    let mut owned_due: Vec<[u8; 32]> = Vec::new();
+    //
+    // F2 — the filter is holdership, NOT mastership. A node reclaims the
+    // records it HOLDS: the ones it masters (authoritatively) and the replica
+    // copies it stores for other masters (as a local space reclaim). Gating on
+    // mastership alone was the F2 defect: each node's replica half — under
+    // RF = 2, half its device — had no reclaim driver at all and grew forever.
+    // `sweep_role_snap` records WHICH role each candidate is swept in; the
+    // delete handler below then applies exactly the authority that role carries.
+    let holder_snap = cluster.map(|c| c.holder_snapshot());
+    let mut held_due: Vec<[u8; 32]> = Vec::new();
     for key in &candidates {
-        // Ownership: skip if not master or not yet ready to write
-        // (pending inbound migration / fenced). P1-3: reuse the per-pass
-        // master snapshot captured above.
-        if check_shard_ownership_snap(&key.txid, 0, cluster, master_snap.as_ref(), false).is_some()
+        if sweep_role_snap(
+            &key.txid,
+            cluster,
+            master_snap.as_ref(),
+            holder_snap.as_ref(),
+        )
+        .is_none()
         {
             continue;
         }
         if engine.is_due_for_sweep(key, current_height) {
-            owned_due.push(key.txid);
+            held_due.push(key.txid);
         }
     }
 
-    let candidate_count = owned_due.len() as u32;
+    let candidate_count = held_due.len() as u32;
 
-    if owned_due.is_empty() {
+    if held_due.is_empty() {
         // Nothing to do for this node — return a count-shaped reply so
         // the client can recognize a clean no-op without parsing
         // errors out of the ERR_INTERNAL channel.
@@ -10732,7 +10882,7 @@ fn handle_process_expired(
     // dispatcher would cost an extra cluster-state read for no benefit.
     // A future maintainer who wants quorum re-checked under a slow path
     // should route through `handle_request` instead.
-    let delete_payload = crate::protocol::codec::encode_txid_batch(&owned_due, &[]);
+    let delete_payload = crate::protocol::codec::encode_txid_batch(&held_due, &[]);
     let delete_req = RequestFrame {
         request_id: req.request_id,
         op_code: crate::protocol::opcodes::OP_DELETE_BATCH,
@@ -19023,6 +19173,142 @@ mod tests {
     // a stale-route loop instead of chasing redirects forever. This test
     // exercises the per-item REDIRECT path on both write (BatchItemError)
     // and read (WireGetResult) flows and asserts the version round-trips.
+    /// F2 — `sweep_role_snap` separates MASTERING a key from HOLDING one.
+    ///
+    /// A node must reclaim the device space of the replica copies it stores
+    /// (nothing else in the system ever revisits them), and must do so in a
+    /// visibly different role from its own authoritative deletions. This pins
+    /// the four answers: master → `ShardMaster`, replica → `HeldCopy`,
+    /// non-holder → skip, and holder-mid-migration → skip.
+    #[test]
+    fn sweep_role_separates_mastered_keys_from_merely_held_ones() {
+        use crate::cluster::shards::{NodeId, ShardTable};
+
+        let members = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let table = ShardTable::compute_with_epoch(&members, 2, 7, 1);
+        let self_id = NodeId(2);
+
+        // Classify every shard against the table so the test asserts over real
+        // placement rather than an assumed one.
+        let mut mastered = None;
+        let mut replicated = None;
+        let mut foreign = None;
+        for shard in 0..crate::cluster::shards::NUM_SHARDS as u16 {
+            let a = table.target_assignment(shard);
+            let slot = if a.master == self_id {
+                &mut mastered
+            } else if a.replicas.contains(&self_id) {
+                &mut replicated
+            } else {
+                &mut foreign
+            };
+            if slot.is_none() {
+                *slot = Some(shard);
+            }
+        }
+        let mastered = mastered.expect("some shard must be mastered by self");
+        let replicated = replicated.expect("some shard must be replicated by self");
+        let foreign = foreign.expect("some shard must be neither, at RF=2 over 3 nodes");
+
+        let addrs = [
+            (NodeId(1), "127.0.0.1:4601".parse().unwrap()),
+            (NodeId(2), "127.0.0.1:4602".parse().unwrap()),
+            (NodeId(3), "127.0.0.1:4603".parse().unwrap()),
+        ];
+        let cluster = crate::cluster::coordinator::new_test_running_cluster(
+            self_id,
+            table.clone(),
+            &addrs,
+            &members,
+            &[],
+            &[],
+            &[],
+            3,
+        );
+        let master_snap = cluster.master_snapshot();
+        let holder_snap = cluster.holder_snapshot();
+        let role = |shard: u16| {
+            sweep_role_snap(
+                &txid_for_shard(shard, 0),
+                Some(&cluster),
+                Some(&master_snap),
+                Some(&holder_snap),
+            )
+        };
+
+        assert_eq!(
+            role(mastered),
+            Some(SweepRole::ShardMaster),
+            "a key this node masters is swept as the authority, exactly as before F2"
+        );
+        assert_eq!(
+            role(replicated),
+            Some(SweepRole::HeldCopy),
+            "a key this node only REPLICATES must still be reclaimable — leaving it \
+             unswept is the F2 defect (the replica half grows without bound)"
+        );
+        assert_eq!(
+            role(foreign),
+            None,
+            "a key this node neither masters nor holds is not its to reclaim"
+        );
+
+        // The same held shard, mid-migration in either direction, is skipped:
+        // reclaiming from under an in-flight transfer would race the very copy
+        // the transfer is establishing.
+        let inbound = crate::cluster::coordinator::new_test_running_cluster(
+            self_id,
+            table.clone(),
+            &addrs,
+            &members,
+            &[replicated],
+            &[],
+            &[],
+            3,
+        );
+        assert_eq!(
+            sweep_role_snap(
+                &txid_for_shard(replicated, 0),
+                Some(&inbound),
+                Some(&inbound.master_snapshot()),
+                Some(&inbound.holder_snapshot()),
+            ),
+            None,
+            "a held shard with pending inbound migration data must not be reclaimed"
+        );
+
+        let fenced = crate::cluster::coordinator::new_test_running_cluster(
+            self_id,
+            table,
+            &addrs,
+            &members,
+            &[],
+            &[],
+            &[replicated],
+            3,
+        );
+        assert_eq!(
+            sweep_role_snap(
+                &txid_for_shard(replicated, 0),
+                Some(&fenced),
+                Some(&fenced.master_snapshot()),
+                Some(&fenced.holder_snapshot()),
+            ),
+            None,
+            "a write-fenced held shard (delta streaming out) must not be reclaimed"
+        );
+    }
+
+    /// An unclustered node holds everything it stores, so every sweep candidate
+    /// is its own authoritative deletion — the pre-cluster behaviour, unchanged.
+    #[test]
+    fn sweep_role_on_an_unclustered_node_is_always_master() {
+        assert_eq!(
+            sweep_role_snap(&txid_for_shard(17, 0), None, None, None),
+            Some(SweepRole::ShardMaster)
+        );
+    }
+
     #[test]
     fn redirect_includes_shard_table_version_for_loop_detection() {
         use crate::cluster::shards::NodeId;

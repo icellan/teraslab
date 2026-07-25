@@ -27,6 +27,8 @@ use teraslab::device::{BlockDevice, MemoryDevice};
 use teraslab::index::{DahIndex, Index, TxKey};
 use teraslab::locks::StripedLocks;
 use teraslab::ops::engine::Engine;
+use teraslab::ops::remaining::PreserveUntilRequest;
+use teraslab::ops::tombstone::TombstoneLog;
 use teraslab::protocol::codec::{
     FieldMask, WireCreateItem, encode_create_batch, encode_get_batch, encode_txid_batch,
 };
@@ -36,12 +38,26 @@ use teraslab::protocol::opcodes::{
     OP_PROCESS_EXPIRED_PRESERVATIONS, OP_SET_MINED_BATCH, OP_SPEND_BATCH, STATUS_OK,
 };
 use teraslab::redo::RedoLog;
+use teraslab::replication::protocol::ReplicaOp;
+use teraslab::replication::receiver::apply_op_journal;
 use teraslab::segment_allocator::SegmentAllocator;
 use teraslab::server::Server;
 
 const TEST_CLUSTER_ID: ClusterId = ClusterId([0xC7; 16]);
 const TEST_SEGMENT_SIZE: u64 = 16 * 4096;
 const ACK_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Install the process-wide dispatch metrics once so the sweep's held-copy
+/// counter is observable. `init_dispatch_metrics` writes a `OnceLock`, so
+/// repeated calls from parallel tests are harmless; the returned handle is the
+/// same one the dispatcher increments.
+fn dispatch_metrics() -> &'static teraslab::metrics::ThreadMetrics {
+    static METRICS: std::sync::OnceLock<teraslab::metrics::ThreadMetrics> =
+        std::sync::OnceLock::new();
+    let m = METRICS.get_or_init(teraslab::metrics::ThreadMetrics::new);
+    teraslab::server::dispatch::init_dispatch_metrics(m);
+    m
+}
 
 struct TestNode {
     server: Arc<Server>,
@@ -50,6 +66,8 @@ struct TestNode {
     tcp_port: u16,
     swim_port: u16,
     shutdown: Arc<AtomicBool>,
+    /// Backing directory for this node's tombstone log; must outlive the engine.
+    _tombstone_dir: tempfile::TempDir,
 }
 
 fn reserve_tcp_port() -> u16 {
@@ -85,6 +103,18 @@ fn create_cluster_node(node_id: u64, seed_swim_ports: &[u16]) -> TestNode {
         seg,
         StripedLocks::new(256),
         DahIndex::new(),
+    ));
+    // Deletion tombstones ON, matching what these nodes get in production:
+    // `ReverseHealConfig::tombstones_enabled` defaults to ON for a clustered
+    // node (RF > 1), and RF is 2 here. Without this the sweep would run with
+    // the whole tombstone subsystem inert and the F2 held-copy-vs-master
+    // distinction (`Engine::reclaim_held_copy`) would be untested.
+    let tomb_dir = tempfile::tempdir().unwrap();
+    engine.set_tombstone_log(TombstoneLog::new(
+        tomb_dir.path().join("teraslab.tombstones"),
+        engine.index_seed(),
+        engine.index_shard_count(),
+        1000,
     ));
     let log_dev: Arc<dyn BlockDevice> =
         Arc::new(MemoryDevice::new(16 * 1024 * 1024, 4096).unwrap());
@@ -165,6 +195,7 @@ fn create_cluster_node(node_id: u64, seed_swim_ports: &[u16]) -> TestNode {
         tcp_port,
         swim_port,
         shutdown: Arc::new(AtomicBool::new(false)),
+        _tombstone_dir: tomb_dir,
     }
 }
 
@@ -456,6 +487,273 @@ fn client_delete_removes_the_record_from_every_holder() {
     );
 }
 
+/// Serialize a source record into the migration-baseline `ReplicaOp::Create`,
+/// reproducing the coordinator's `stream_shard_baseline` wire layout (70-byte
+/// metadata prefix + utxo hashes). This is the path a master's re-delivery of a
+/// record actually takes, and the ONE path RULE-DS
+/// (`Engine::tombstone_blocks_heal_apply`) gates.
+fn build_migration_create_op(source: &Engine, k: &TxKey) -> ReplicaOp {
+    let meta = source.read_metadata(k).unwrap();
+    let utxo_count = { meta.utxo_count };
+    let mut utxo_hashes = Vec::with_capacity(utxo_count as usize);
+    for v in 0..utxo_count {
+        utxo_hashes.push(source.read_slot(k, v).unwrap().hash);
+    }
+    let mut meta_buf = Vec::with_capacity(70);
+    meta_buf.extend_from_slice(&{ meta.tx_version }.to_le_bytes());
+    meta_buf.extend_from_slice(&{ meta.locktime }.to_le_bytes());
+    meta_buf.extend_from_slice(&{ meta.fee }.to_le_bytes());
+    meta_buf.extend_from_slice(&{ meta.size_in_bytes }.to_le_bytes());
+    meta_buf.extend_from_slice(&{ meta.extended_size }.to_le_bytes());
+    let (is_coinbase, wire_flags) =
+        teraslab::replication::protocol::create_metadata_flag_bytes(meta.flags);
+    meta_buf.push(is_coinbase);
+    meta_buf.extend_from_slice(&{ meta.spending_height }.to_le_bytes());
+    meta_buf.extend_from_slice(&{ meta.created_at }.to_le_bytes());
+    meta_buf.push(wire_flags);
+    meta_buf.extend_from_slice(&{ meta.generation }.to_le_bytes());
+    meta_buf.extend_from_slice(&{ meta.updated_at }.to_le_bytes());
+    meta_buf.extend_from_slice(&{ meta.unmined_since }.to_le_bytes());
+    meta_buf.extend_from_slice(&{ meta.delete_at_height }.to_le_bytes());
+    meta_buf.extend_from_slice(&{ meta.preserve_until }.to_le_bytes());
+    ReplicaOp::Create {
+        tx_key: *k,
+        metadata_bytes: meta_buf,
+        utxo_hashes,
+        cold_data: None,
+        is_external: false,
+    }
+}
+
+/// **The `PreserveUntil` hazard, and why replica-side GC is still safe.**
+///
+/// Concrete race: a client preserves a DAH-due record at its master; before the
+/// replicated `PreserveUntil` lands, the replica's own pruner fires and sees a
+/// record its local state still says is due. The replica drops a copy the
+/// master just decided to keep.
+///
+/// This test forces exactly that window — `preserve_until` is applied to the
+/// MASTER's engine only, never shipped — and pins down the outcome:
+///
+///   1. the master KEEPS the record (its own KO-3 under-lock re-validation
+///      refuses the sweep), so the data is never lost cluster-wide;
+///   2. the replica DOES drop its copy (the hazard is real, not hypothetical —
+///      asserted so the rest of this test cannot pass vacuously);
+///   3. the replica records NO tombstone for it, so nothing vetoes its return;
+///   4. re-delivering the master's copy through the real migration-baseline
+///      apply path — the path RULE-DS gates — RESTORES it.
+///
+/// A CONTROL record that the master legitimately sweeps proves the tombstone
+/// subsystem is live in this cluster: the master holds a blocking tombstone for
+/// it, the replica holds none for the copy it reclaimed. Without that contrast,
+/// assertion 3 would pass on a node where tombstones were simply switched off.
+#[test]
+fn preserved_on_master_survives_a_replica_sweep_and_is_restorable() {
+    let node1 = create_cluster_node(881, &[]);
+    let seed = [node1.swim_port];
+    let node2 = create_cluster_node(882, &seed);
+    let node3 = create_cluster_node(883, &seed);
+    let nodes = [&node1, &node2, &node3];
+    wait_for_settled_three_node_topology(&nodes);
+
+    const COUNT: usize = 8;
+    const HEIGHT: u32 = 900_000;
+    const RETENTION: u32 = 100;
+    let all_seeds = owned_seeds(&node1, COUNT);
+    // First half races a preserve; second half is the swept control.
+    let (raced, control) = all_seeds.split_at(COUNT / 2);
+
+    let resp = request_at(node1.tcp_port, OP_CREATE_BATCH, 0, encode_batch(&all_seeds));
+    assert_eq!(resp.status, STATUS_OK, "create batch must be accepted");
+    for s in &all_seeds {
+        set_mined(node1.tcp_port, *s, HEIGHT, RETENTION);
+        spend_to_all_spent(node1.tcp_port, *s, HEIGHT, RETENTION);
+    }
+
+    // Which node holds the replica copy? Under RF = 2 every record has exactly
+    // one holder besides its master (node index 0).
+    let holders_before: Vec<Vec<usize>> = all_seeds
+        .iter()
+        .map(|s| local_holders(&nodes, &make_txid(*s)))
+        .collect();
+    for (s, holders) in all_seeds.iter().zip(&holders_before) {
+        assert_eq!(
+            holders.len(),
+            2,
+            "seed {s} must be on exactly 2 nodes before the sweep, found {holders:?}"
+        );
+        assert!(holders.contains(&0), "seed {s} must be mastered by node 0");
+    }
+    let replica_idx = holders_before[0]
+        .iter()
+        .copied()
+        .find(|i| *i != 0)
+        .expect("a replica holder must exist");
+    let replica = nodes[replica_idx];
+
+    // The generation the REPLICA's copy carries right now. The tombstone
+    // assertion below uses it because it is the worst case: a re-delivery at the
+    // same generation is exactly what a `Dah` tombstone would refuse.
+    let replica_generations: Vec<u32> = raced
+        .iter()
+        .map(|s| {
+            let k = TxKey {
+                txid: make_txid(*s),
+            };
+            let m = replica.engine.read_metadata(&k).expect("replica holds it");
+            m.generation
+        })
+        .collect();
+
+    // FORCE THE RACE: preserve on the MASTER's engine only. This is precisely
+    // the in-flight window — the master has decided to keep the record and the
+    // replica has not heard yet.
+    for s in raced {
+        node1
+            .engine
+            .preserve_until(&PreserveUntilRequest {
+                tx_key: TxKey {
+                    txid: make_txid(*s),
+                },
+                block_height: HEIGHT + RETENTION + 10_000,
+            })
+            .expect("master-side preserve must succeed");
+    }
+
+    let sweep_height = HEIGHT + RETENTION + 1;
+    let mut payload = Vec::with_capacity(8);
+    payload.extend_from_slice(&sweep_height.to_le_bytes());
+    payload.extend_from_slice(&RETENTION.to_le_bytes());
+    for node in &nodes {
+        let resp = request_at(
+            node.tcp_port,
+            OP_PROCESS_EXPIRED_PRESERVATIONS,
+            0,
+            payload.clone(),
+        );
+        assert_eq!(resp.status, STATUS_OK, "sweep must succeed");
+    }
+
+    // (1) + (2): master kept the raced records; the replica dropped them.
+    let mut master_lost = Vec::new();
+    let mut replica_kept = Vec::new();
+    for s in raced {
+        let holders = local_holders(&nodes, &make_txid(*s));
+        if !holders.contains(&0) {
+            master_lost.push(*s);
+        }
+        if holders.contains(&replica_idx) {
+            replica_kept.push(*s);
+        }
+    }
+
+    // (3): no tombstone on the replica for what it reclaimed.
+    let blocking: Vec<u32> = raced
+        .iter()
+        .zip(&replica_generations)
+        .filter(|(s, generation)| {
+            replica.engine.tombstone_blocks_heal_apply(
+                &TxKey {
+                    txid: make_txid(**s),
+                },
+                **generation,
+            )
+        })
+        .map(|(s, _)| *s)
+        .collect();
+
+    // CONTROL: the master's own sweep must still be authoritative — record gone
+    // everywhere, master holds a blocking tombstone, replica holds none.
+    let control_survivors: Vec<u32> = control
+        .iter()
+        .filter(|s| !local_holders(&nodes, &make_txid(**s)).is_empty())
+        .copied()
+        .collect();
+    let control_master_tombstones = control
+        .iter()
+        .filter(|s| {
+            node1.engine.tombstone_blocks_heal_apply(
+                &TxKey {
+                    txid: make_txid(**s),
+                },
+                u32::MAX,
+            )
+        })
+        .count();
+    let control_replica_tombstones = control
+        .iter()
+        .filter(|s| {
+            replica
+                .engine
+                .tombstone_lookup(&TxKey {
+                    txid: make_txid(**s),
+                })
+                .is_some()
+        })
+        .count();
+
+    // (4): re-deliver the master's surviving copy through the migration-baseline
+    // apply path and check it lands on the replica.
+    let mut restored = 0usize;
+    for s in raced {
+        let k = TxKey {
+            txid: make_txid(*s),
+        };
+        if node1.engine.lookup(&k).is_none() {
+            continue;
+        }
+        let op = build_migration_create_op(&node1.engine, &k);
+        apply_op_journal(&replica.engine, &op, false, true).expect("re-delivery must apply");
+        if replica.engine.lookup(&k).is_some() {
+            restored += 1;
+        }
+    }
+
+    shutdown_node(&node1);
+    shutdown_node(&node2);
+    shutdown_node(&node3);
+
+    assert!(
+        master_lost.is_empty(),
+        "the MASTER must keep every record it preserved — the sweep's under-lock \
+         re-validation is what protects the authoritative copy; lost: {master_lost:?}"
+    );
+    assert!(
+        replica_kept.is_empty(),
+        "the replica must have reclaimed its copies, otherwise this test proves nothing \
+         about the hazard (it never materialized); still held: {replica_kept:?}"
+    );
+    assert!(
+        blocking.is_empty(),
+        "a held-copy reclaim must leave NO tombstone that blocks the master re-delivering \
+         the record — a replica is not the authority on whether the key exists, and a \
+         tombstone there turns this transient divergence into permanent loss; blocked: \
+         {blocking:?}"
+    );
+    assert!(
+        control_survivors.is_empty(),
+        "control records the master legitimately swept must be gone everywhere: \
+         {control_survivors:?}"
+    );
+    assert_eq!(
+        control_master_tombstones,
+        control.len(),
+        "the MASTER's sweep must still record a blocking Dah tombstone for every control \
+         record — this is what proves the tombstone subsystem is live here, so the \
+         replica's empty tombstone set above is a real result and not a disabled feature"
+    );
+    assert_eq!(
+        control_replica_tombstones, 0,
+        "the replica must record no tombstone for the control copies it reclaimed either"
+    );
+    assert_eq!(
+        restored,
+        raced.len(),
+        "every record the master still holds must be restorable onto the replica through \
+         the real migration-baseline apply path"
+    );
+}
+
 /// The DAH sweep (`OP_PROCESS_EXPIRED_PRESERVATIONS`) is the pruner's path, and
 /// it must also converge across holders: a record that is all-spent and past
 /// its delete-at-height must end up gone from master AND replica.
@@ -477,6 +775,10 @@ fn dah_sweep_removes_the_record_from_every_holder() {
     const HEIGHT: u32 = 900_000;
     const RETENTION: u32 = 100;
     let seeds = owned_seeds(&node1, COUNT);
+    // Monotonic counter; other tests in this binary can only ADD to it, so a
+    // `>=` delta is exact enough to prove the held-copy path was taken and not
+    // flaky under parallel execution.
+    let held_copy_before = dispatch_metrics().deletes_held_copy_reclaimed.get();
 
     let resp = request_at(node1.tcp_port, OP_CREATE_BATCH, 0, encode_batch(&seeds));
     assert_eq!(resp.status, STATUS_OK, "create batch must be accepted");
@@ -538,10 +840,21 @@ fn dah_sweep_removes_the_record_from_every_holder() {
         .iter()
         .map(|s| local_holders(&nodes, &make_txid(*s)))
         .collect();
+    let held_copy_delta = dispatch_metrics()
+        .deletes_held_copy_reclaimed
+        .get()
+        .saturating_sub(held_copy_before);
 
     shutdown_node(&node1);
     shutdown_node(&node2);
     shutdown_node(&node3);
+
+    assert!(
+        held_copy_delta >= COUNT as u64,
+        "each of the {COUNT} records had exactly one REPLICA holder, so the sweep must have \
+         reported at least {COUNT} held-copy reclaims — the operator-facing signal that \
+         replica-side GC ran at all; saw {held_copy_delta}"
+    );
 
     for (i, status) in sweep_statuses.iter().enumerate() {
         assert_eq!(
