@@ -51,8 +51,23 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # libFuzzer instrumentation requires nightly Rust.
-      - uses: dtolnay/rust-toolchain@nightly
+      # libFuzzer instrumentation requires nightly Rust. Pinned to a specific
+      # dated nightly instead of floating `nightly`: nightly-2026-07-24 and
+      # nightly-2026-07-25 (rustc commits 89c61a754 / da86f4d07) both ICE
+      # compiling tokio under the ASAN/SanitizerCoverage flags below —
+      # "not immediate: OperandRef(Uninit @ ... UnsafeCell<MaybeUninit<
+      # runtime::task::Notified<Arc<multi_thread::handle::Handle>>>>)" at
+      # rustc_codegen_ssa/src/mir/operand.rs:291:18. Reproduced locally on
+      # aarch64-apple-darwin with nightly-2026-07-24, byte-identical panic to
+      # the CI failures (nightly runs 30065645495, 30143215764) — a genuine
+      # rustc regression, not our code. nightly-2026-07-23 (commit 6f72b5dd5)
+      # is the last nightly confirmed clean, both in CI (run 29978434737) and
+      # locally. Bumping this pin requires re-verifying the fuzz target still
+      # builds (`cargo +nightly-<date> fuzz build decode_request`) before
+      # moving the date forward.
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-07-23
 
       - uses: Swatinem/rust-cache@v2
 
@@ -65,9 +80,20 @@ jobs:
         # this is the time-boxed coverage-guided complement. A crash/timeout
         # input fails the job and leaves a repro under fuzz/artifacts/.
         # The fuzz crate is detached from the workspace, so it builds with
-        # the nightly toolchain here; `cargo +nightly fuzz` is used to be
-        # explicit even though nightly is the active toolchain on this job.
-        run: cargo +nightly fuzz run decode_request -- -max_total_time=300 -timeout=10
+        # the nightly toolchain here; `+nightly-2026-07-23` must match the
+        # dated pin above — a bare `+nightly` would silently float onto the
+        # broken compiler again next time GitHub's `nightly` moves forward.
+        #
+        # The grep guard below is load-bearing: a build failure alone already
+        # fails this step (and did, on the ICE above) but a future change
+        # that makes cargo-fuzz exit 0 without ever invoking libFuzzer
+        # (e.g. a flag typo) would go unnoticed by that alone. Requiring at
+        # least one `exec/s:` status line proves the fuzzer actually ran.
+        # Relies on GitHub Actions' default `bash -eo pipefail` so a failure
+        # in `cargo fuzz run` fails the pipeline before the grep runs.
+        run: |
+          cargo +nightly-2026-07-23 fuzz run decode_request -- -max_total_time=300 -timeout=10 2>&1 | tee fuzz-run.log
+          grep -q 'exec/s:' fuzz-run.log || { echo "::error::no libFuzzer stats ('exec/s:') in output — the fuzzer likely never ran"; exit 1; }
 
       - name: Upload crash artifacts on failure
         if: failure()
