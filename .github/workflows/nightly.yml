@@ -89,8 +89,17 @@ jobs:
         # that makes cargo-fuzz exit 0 without ever invoking libFuzzer
         # (e.g. a flag typo) would go unnoticed by that alone. Requiring at
         # least one `exec/s:` status line proves the fuzzer actually ran.
-        # Relies on GitHub Actions' default `bash -eo pipefail` so a failure
-        # in `cargo fuzz run` fails the pipeline before the grep runs.
+        #
+        # `shell: bash` is REQUIRED, not cosmetic: GitHub's default shell is
+        # `bash -e {0}` with NO pipefail, so `cargo fuzz run ... | tee` would
+        # return tee's exit status and mask a non-zero cargo exit. A build
+        # failure would still be caught (no `exec/s:` line -> the grep fails),
+        # but a genuine fuzz CRASH would not: libFuzzer prints its stats,
+        # cargo exits non-zero, tee swallows it, the grep finds `exec/s:` and
+        # the job goes green having discarded a real finding. Naming the shell
+        # opts into `bash --noprofile --norc -eo pipefail {0}`, so cargo's
+        # failure propagates.
+        shell: bash
         run: |
           cargo +nightly-2026-07-23 fuzz run decode_request -- -max_total_time=300 -timeout=10 2>&1 | tee fuzz-run.log
           grep -q 'exec/s:' fuzz-run.log || { echo "::error::no libFuzzer stats ('exec/s:') in output — the fuzzer likely never ran"; exit 1; }
