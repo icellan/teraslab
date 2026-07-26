@@ -417,13 +417,21 @@ async fn run_scenario() -> Result<(), ClientError> {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
+    // Without this, a run where every create batch fails (so `total_ops`
+    // never leaves 0 -- reads/spends below are gated on `workload_txids`
+    // having entries, which never happens if creates never succeed) would
+    // leave `error_rate` at its 0.0 default below despite `total_errors`
+    // climbing every iteration, and the 5% check would pass vacuously.
+    assert!(
+        total_ops > 0,
+        "Test 5.8: zero operations succeeded in the 30s post-recovery \
+         workload ({total_errors} errors) -- the error-rate check below has \
+         nothing to check and cannot be trusted"
+    );
+
     // Allow up to 5% error rate during post-recovery workload — the deferred
     // shard table swap creates a brief window where some writes are rejected.
-    let error_rate = if total_ops > 0 {
-        total_errors as f64 / total_ops as f64 * 100.0
-    } else {
-        0.0
-    };
+    let error_rate = total_errors as f64 / total_ops as f64 * 100.0;
     assert!(
         error_rate < 5.0,
         "Test 5.8: {error_rate:.1}% error rate ({total_errors}/{total_ops}) exceeds 5% threshold"

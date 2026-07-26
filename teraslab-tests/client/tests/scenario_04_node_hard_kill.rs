@@ -544,6 +544,17 @@ async fn run_scenario() -> Result<(), ClientError> {
         total, failed, failure_rate,
     );
 
+    // Without this, a background task that never got scheduled (or panicked
+    // on its first iteration) would leave `total == 0`, `failure_rate`
+    // defaults to 0.0 above, and the assert below passes despite the
+    // workload having done zero real work during the kill window.
+    assert!(
+        total > 0,
+        "Test 4.8: background workload executed zero operations in the 6s \
+         baseline+kill window -- the failure-rate check below has nothing \
+         to check and cannot be trusted"
+    );
+
     assert!(
         failure_rate < 5.0,
         "Test 4.8: failure rate {failure_rate:.1}% exceeds 5% threshold \

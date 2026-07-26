@@ -236,6 +236,16 @@ async fn run_scenario() -> Result<(), ClientError> {
         "[6.5] Background workload: {bg_total_ops} ops, {bg_total_errors} errors, error rate: {:.2}%",
         error_rate * 100.0
     );
+    // Without this, a background task that never got scheduled during the
+    // migration window would leave `bg_total_ops == 0`, `error_rate`
+    // defaults to 0.0 above, and the assert below passes despite the
+    // workload having done zero real work during the scale-up.
+    assert!(
+        bg_total_ops > 0,
+        "Test 6.5: background workload executed zero operations during the \
+         scale-up/migration window -- the error-rate check below has \
+         nothing to check and cannot be trusted"
+    );
     assert!(
         error_rate < 0.01,
         "Test 6.5: error rate {:.2}% exceeds 1% ({bg_total_errors}/{bg_total_ops})",
