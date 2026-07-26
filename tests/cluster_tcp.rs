@@ -1272,9 +1272,19 @@ fn segment_cluster_master_failover_preserves_replicated_record() {
     }
 }
 
-/// Phase 6: a segment node LEAVES the cluster and a fresh segment node REJOINS —
-/// it re-discovers peers, re-commits a 2-node topology, and takes shard ownership,
-/// proving a segment node re-participates after a membership change.
+/// Phase 6: a segment node LEAVES the cluster and REJOINS under the SAME node
+/// identity on a fresh process/engine — it re-discovers peers, catches up to the
+/// committed topology, installs the committed shard table, and serves its share
+/// of the shards as authoritative master. This is the production node-restart
+/// path (the survivor keeps the departed member in its committed topology, so
+/// the returning node re-slots into the topology it left).
+///
+/// A rejoin under a DIFFERENT node id is deliberately NOT this test: replacing
+/// `472` with a never-seen `473` proposes `[471,472] -> [471,473]`, a
+/// simultaneous add+drop that `is_safe_membership_change` (R-042) refuses as the
+/// split-brain merge signature, and the lone survivor cannot shrink to `[471]`
+/// on its own votes (G8 Gate B: quorum is measured against `committed_peak`).
+/// Node replacement therefore requires an operator shrink, not a rejoin.
 #[test]
 fn segment_node_rejoins_and_takes_shard_ownership() {
     let node1 = create_segment_node(471, 0, 0, &[], 2);
@@ -1304,36 +1314,93 @@ fn segment_node_rejoins_and_takes_shard_ownership() {
     )
     .expect("node1 should drop node2 after it leaves");
 
-    // A FRESH segment node rejoins via the same seed.
-    let node2b = create_segment_node(473, 0, 0, &[seed], 2);
+    // A fresh segment node rejoins under the same identity, via the same seed.
+    let node2b = create_segment_node(472, 0, 0, &[seed], 2);
     wait_until(
         || {
-            node1.cluster.committed_topology_members().len() == 2
-                && node2b.cluster.committed_topology_members().len() == 2
+            let survivor = node1.cluster.committed_topology_members();
+            let rejoined = node2b.cluster.committed_topology_members();
+            rejoined == survivor && rejoined.contains(&NodeId(472))
         },
         Duration::from_secs(45),
     )
-    .expect("rejoined segment node should re-commit a 2-node topology");
-    // The rejoined node takes ownership of shards.
+    .expect("rejoined segment node should catch up to the committed 2-node topology");
+
+    // The rejoined node must INSTALL that committed table, not keep the
+    // single-node bootstrap table it starts with. A bootstrap table masters
+    // EVERY shard, so "owns at least one shard" is satisfied before the node
+    // has learned anything about the cluster — the assertion has to be that
+    // node2b's per-shard masters agree with the survivor's on every shard and
+    // that its own share is a non-empty PROPER subset. Both are terminal
+    // states: once installed the table does not change again, so this cannot
+    // pass by sampling a transient.
+    let rejoin_installed = || {
+        let t1 = node1.cluster.shard_table();
+        let t2 = node2b.cluster.shard_table();
+        let (t1, t2) = (t1.read(), t2.read());
+        let mut owned = 0usize;
+        for shard in 0..NUM_SHARDS as u16 {
+            let master = t1.target_assignment(shard).master;
+            if master != t2.target_assignment(shard).master {
+                return false;
+            }
+            if master == NodeId(472) {
+                owned += 1;
+            }
+        }
+        owned > 0 && owned < NUM_SHARDS
+    };
     wait_until(
-        || {
-            node2b
-                .cluster
-                .shard_table()
-                .read()
-                .shard_counts()
-                .get(&NodeId(473))
-                .copied()
-                .unwrap_or(0)
-                > 0
-        },
-        // Rebalance after a rejoin is the slowest step (topology commit →
-        // shard-table recompute → install); this deadline flaked at 15s on a
-        // contended macOS runner. `wait_until` returns the instant the rejoined
-        // node owns a shard, so the larger deadline only helps a slow runner.
-        Duration::from_secs(30),
+        rejoin_installed,
+        // Measured convergence (SWIM discovery -> topology catch-up -> shard
+        // table install) is ~1.8 s idle and ~4 s on a saturated 8-core box.
+        // 25 s is >6x that, and deliberately UNDER the coordinator's 30 s
+        // same-term reactivation cooldown: if a regression ever pushes this
+        // path onto that cooldown instead of the catch-up path, the test still
+        // fails rather than silently absorbing the delay.
+        Duration::from_secs(25),
     )
-    .expect("rejoined segment node must own shards after rebalance");
+    .unwrap_or_else(|()| {
+        let t1 = node1.cluster.shard_table();
+        let t2 = node2b.cluster.shard_table();
+        let (t1, t2) = (t1.read(), t2.read());
+        panic!(
+            "rejoined segment node did not install the committed shard table: \
+             node1 committed={:?} table_version={} counts={:?} | \
+             node2b committed={:?} table_version={} counts={:?}",
+            node1.cluster.committed_topology_members(),
+            t1.version,
+            t1.shard_counts(),
+            node2b.cluster.committed_topology_members(),
+            t2.version,
+            t2.shard_counts(),
+        )
+    });
+
+    // Ownership means SERVING authority, not just a table entry: the rejoined
+    // node must answer `Yes` (not `Transitioning`) for a key in a shard it
+    // masters.
+    let owned_shard = {
+        let table = node2b.cluster.shard_table();
+        let table = table.read();
+        (0..NUM_SHARDS as u16)
+            .find(|&s| table.target_assignment(s).master == NodeId(472))
+            .expect("the rejoined node must master at least one shard")
+    };
+    // `shard_for_key` reads the low 12 bits of the first two txid bytes.
+    let mut txid = [0u8; 32];
+    txid[0..2].copy_from_slice(&owned_shard.to_le_bytes());
+    let key = TxKey { txid };
+    assert_eq!(
+        ShardTable::shard_for_key(&key),
+        owned_shard,
+        "probe key must land in the shard under test"
+    );
+    assert_eq!(
+        node2b.cluster.is_master(&key),
+        MasterQueryResult::Yes,
+        "the rejoined node must be an authoritative master of its shards"
+    );
 
     shutdown_node(&node1);
     shutdown_node(&node2b);
