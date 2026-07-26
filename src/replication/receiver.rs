@@ -8378,20 +8378,25 @@ mod tests {
             "a tracked spend for a missing record must NAK, not silently ACK",
         );
         match ReplicaAck::deserialize(&resp.payload).expect("ack decodes") {
-            ReplicaAck::Error {
+            ReplicaAck::MissingRecord {
                 failed_sequence,
-                message,
+                tx_keys,
             } => {
                 assert_eq!(
                     failed_sequence, 10,
                     "the NAK must point at the offending sequence",
                 );
-                assert!(
-                    message.contains("absent"),
-                    "the NAK message must name the missing-record divergence, got: {message}",
+                // C15 repair: the NAK is a TYPED variant naming the key, not an
+                // opaque `Error` whose message the master would have to parse.
+                // That key is what the master re-ships — a NAK that named the
+                // wrong record (or none) would repair the wrong thing.
+                assert_eq!(
+                    tx_keys,
+                    vec![key(199)],
+                    "the NAK must name exactly the missing record so the master re-ships it",
                 );
             }
-            other => panic!("expected a retryable Error NAK, got {other:?}"),
+            other => panic!("expected a typed MissingRecord NAK, got {other:?}"),
         }
         assert_eq!(
             tracker.get(stream_key),
@@ -8472,31 +8477,38 @@ mod tests {
             "a tracked set_mined for a missing record must NAK, not silently ACK",
         );
         match ReplicaAck::deserialize(&resp.payload).expect("ack decodes") {
-            ReplicaAck::Error {
+            ReplicaAck::MissingRecord {
                 failed_sequence,
-                message,
+                tx_keys,
             } => {
                 assert_eq!(
                     failed_sequence, 10,
                     "the NAK must point at the offending sequence",
                 );
-                // Deliberately check for the `missing_record_apply_outcome`
-                // wording (not just "absent") — a separate, pre-existing
-                // post-apply generation-sync gate (receiver.rs ~2298-2337)
-                // ALSO hard-fails a non-migration apply of any op carrying
-                // `master_generation` when the record is absent after apply,
-                // with an unrelated "generation sync: tx ... absent after
-                // apply" message. Without this op-specific check the test
-                // would spuriously pass pre-fix via that OTHER gate instead
-                // of proving the SetMined arm itself now routes through
-                // `missing_record_apply_outcome`.
-                assert!(
-                    message.starts_with("set_mined:") && message.contains("steady-state"),
-                    "the NAK must come from the SetMined arm's own \
-                     missing_record_apply_outcome routing, got: {message}",
+                assert_eq!(
+                    tx_keys,
+                    vec![key(201)],
+                    "the NAK must name the record the master has to re-ship",
                 );
             }
-            other => panic!("expected a retryable Error NAK, got {other:?}"),
+            other => panic!("expected a typed MissingRecord NAK, got {other:?}"),
+        }
+        // The ack alone cannot say WHICH gate produced it: a separate,
+        // pre-existing post-apply generation-sync gate ALSO reports
+        // `MissingRecord` for any op carrying `master_generation` whose record
+        // is absent after apply. Re-drive the same op through the apply and
+        // assert the typed `op_name`, so this still proves the SetMined arm
+        // itself routes through `missing_record_apply_outcome` rather than
+        // passing via that OTHER gate. (Pre-typed-error this discrimination was
+        // a message-prefix check; the variant field is the same guard, minus the
+        // string matching.)
+        let mut redo_out = Vec::new();
+        match apply_op_journal_inner(&engine, &batch.ops[0], true, false, true, &mut redo_out) {
+            Err(ReplicaApplyError::MissingRecord { op_name, tx_key }) => {
+                assert_eq!(op_name, "set_mined");
+                assert_eq!(tx_key, key(201));
+            }
+            other => panic!("expected the SetMined arm's own MissingRecord, got {other:?}"),
         }
         assert_eq!(
             tracker.get(stream_key),
@@ -8598,20 +8610,25 @@ mod tests {
             "a tracked set_mined_batch with one missing txid must NAK the whole op",
         );
         match ReplicaAck::deserialize(&resp.payload).expect("ack decodes") {
-            ReplicaAck::Error {
+            ReplicaAck::MissingRecord {
                 failed_sequence,
-                message,
+                tx_keys,
             } => {
                 assert_eq!(
                     failed_sequence, 10,
                     "the NAK must point at the offending sequence",
                 );
-                assert!(
-                    message.contains("absent"),
-                    "the NAK message must name the missing-record divergence, got: {message}",
+                // Only the ABSENT txid is named. `SetMinedBatch` returns `None`
+                // from `tx_key()`, so the lookahead cannot expand a multi-key op
+                // — the master must not be told to re-ship key(203), which this
+                // replica already holds.
+                assert_eq!(
+                    tx_keys,
+                    vec![key(204)],
+                    "the NAK must name only the missing txid, not the present one",
                 );
             }
-            other => panic!("expected a retryable Error NAK, got {other:?}"),
+            other => panic!("expected a typed MissingRecord NAK, got {other:?}"),
         }
         assert_eq!(
             tracker.get(stream_key),
@@ -8658,26 +8675,33 @@ mod tests {
             "a tracked set_conflicting for a missing record must NAK, not silently ACK",
         );
         match ReplicaAck::deserialize(&resp.payload).expect("ack decodes") {
-            ReplicaAck::Error {
+            ReplicaAck::MissingRecord {
                 failed_sequence,
-                message,
+                tx_keys,
             } => {
                 assert_eq!(
                     failed_sequence, 10,
                     "the NAK must point at the offending sequence",
                 );
-                // See the analogous comment in
-                // `set_mined_missing_record_naks_on_tracked_batch`: a
-                // separate pre-existing generation-sync gate also hard-fails
-                // this scenario with an unrelated message, so check for the
-                // SetConflicting arm's own wording specifically.
-                assert!(
-                    message.starts_with("set_conflicting:") && message.contains("steady-state"),
-                    "the NAK must come from the SetConflicting arm's own \
-                     missing_record_apply_outcome routing, got: {message}",
+                assert_eq!(
+                    tx_keys,
+                    vec![key(205)],
+                    "the NAK must name the record the master has to re-ship",
                 );
             }
-            other => panic!("expected a retryable Error NAK, got {other:?}"),
+            other => panic!("expected a typed MissingRecord NAK, got {other:?}"),
+        }
+        // See the analogous comment in
+        // `set_mined_missing_record_naks_on_tracked_batch`: the pre-existing
+        // generation-sync gate reports the same ack variant, so assert the typed
+        // `op_name` to prove this came from the SetConflicting arm itself.
+        let mut redo_out = Vec::new();
+        match apply_op_journal_inner(&engine, &batch.ops[0], true, false, true, &mut redo_out) {
+            Err(ReplicaApplyError::MissingRecord { op_name, tx_key }) => {
+                assert_eq!(op_name, "set_conflicting");
+                assert_eq!(tx_key, key(205));
+            }
+            other => panic!("expected the SetConflicting arm's own MissingRecord, got {other:?}"),
         }
         assert_eq!(
             tracker.get(stream_key),
