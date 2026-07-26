@@ -8,7 +8,7 @@
 //! - Redo log entries are appended for crash recovery.
 //! - Replication ops are sent to replica nodes (if in cluster mode with RF > 1).
 
-use crate::cluster::coordinator::{MasterSnapshot, RunningCluster};
+use crate::cluster::coordinator::{HolderSnapshot, MasterSnapshot, RunningCluster};
 use crate::cluster::shards::{NodeId, ShardHandoff, ShardTable};
 use crate::index::TxKey;
 use crate::ops::create::*;
@@ -3106,10 +3106,18 @@ fn replicate_all_ops_with_barrier(
     let want_local_durable =
         engine.is_some_and(|e| e.redo_buffered()) && replication_active(Some(cluster));
     // Preserve the (addr, result) association so we can apply per-set
-    // ACK accounting (Phase E) after the parallel fan-out completes.
+    // ACK accounting (Phase E) after the parallel fan-out completes. The third
+    // element carries that address's ops BACK out of the worker, but ONLY when
+    // the send failed with a repairable missing-record NAK — the repair below
+    // has to re-send the whole per-address op list, and returning the already-
+    // moved `Vec` costs nothing on the success path (it is left empty).
     #[allow(clippy::type_complexity)]
-    let (results, local_durable): (
-        Vec<(SocketAddr, std::result::Result<(), String>)>,
+    let (mut results, local_durable): (
+        Vec<(
+            SocketAddr,
+            std::result::Result<(), ReplicaSendError>,
+            Vec<ReplicaOp>,
+        )>,
         std::result::Result<(), String>,
     ) = std::thread::scope(|scope| {
         // Local redo + data fsync runs on its own scoped thread so it overlaps
@@ -3121,45 +3129,55 @@ fn replicate_all_ops_with_barrier(
             }
             _ => None,
         };
-        let results: Vec<(SocketAddr, std::result::Result<(), String>)> =
-            REPL_RUNTIME.block_on(async {
-                let mut handles = Vec::with_capacity(by_addr.len());
-                for (addr, ops) in by_addr {
-                    let auth_secret = auth_secret.clone();
-                    let ack_timeout = ack_timeouts.get(&addr).copied().unwrap_or(base_timeout);
-                    handles.push(tokio::task::spawn_blocking(move || {
-                        if ops.is_empty() {
-                            return (addr, Ok(()));
-                        }
-                        // R-D1/D-3: per-replica dense stream labels are
-                        // assigned inside `send_replica_ops_to` under the
-                        // per-address slot mutex — NOT the master-global
-                        // redo range, which covers ops this address never
-                        // receives. The redo range's high end is recorded
-                        // against the ACK for catch-up/lag bookkeeping.
-                        let res = send_replica_ops_to(
-                            addr,
-                            &ops,
-                            ack_timeout,
-                            auth_secret.as_deref(),
-                            cluster_key,
-                            source_node_id,
-                            redo_seq_range.1,
-                        );
-                        (addr, res)
-                    }));
-                }
-                let mut results = Vec::with_capacity(handles.len());
-                for handle in handles {
-                    results.push(handle.await.unwrap_or_else(|_| {
-                        (
-                            SocketAddr::from(([0u8, 0, 0, 0], 0)),
-                            Err("task panicked".to_string()),
-                        )
-                    }));
-                }
-                results
-            });
+        #[allow(clippy::type_complexity)]
+        let results: Vec<(
+            SocketAddr,
+            std::result::Result<(), ReplicaSendError>,
+            Vec<ReplicaOp>,
+        )> = REPL_RUNTIME.block_on(async {
+            let mut handles = Vec::with_capacity(by_addr.len());
+            for (addr, ops) in by_addr {
+                let auth_secret = auth_secret.clone();
+                let ack_timeout = ack_timeouts.get(&addr).copied().unwrap_or(base_timeout);
+                handles.push(tokio::task::spawn_blocking(move || {
+                    if ops.is_empty() {
+                        return (addr, Ok(()), Vec::new());
+                    }
+                    // R-D1/D-3: per-replica dense stream labels are
+                    // assigned inside `send_replica_ops_to` under the
+                    // per-address slot mutex — NOT the master-global
+                    // redo range, which covers ops this address never
+                    // receives. The redo range's high end is recorded
+                    // against the ACK for catch-up/lag bookkeeping.
+                    let res = send_replica_ops_to_reporting(
+                        addr,
+                        &ops,
+                        ack_timeout,
+                        auth_secret.as_deref(),
+                        cluster_key,
+                        source_node_id,
+                        redo_seq_range.1,
+                    );
+                    // Hand the ops back only when the repair pass will need
+                    // them; otherwise drop them here as before.
+                    match res {
+                        Err(ReplicaSendError::MissingRecord { .. }) => (addr, res, ops),
+                        _ => (addr, res, Vec::new()),
+                    }
+                }));
+            }
+            let mut results = Vec::with_capacity(handles.len());
+            for handle in handles {
+                results.push(handle.await.unwrap_or_else(|_| {
+                    (
+                        SocketAddr::from(([0u8, 0, 0, 0], 0)),
+                        Err(ReplicaSendError::Failed("task panicked".to_string())),
+                        Vec::new(),
+                    )
+                }));
+            }
+            results
+        });
         let local_durable = match durable_handle {
             Some(h) => h
                 .join()
@@ -3177,17 +3195,64 @@ fn replicate_all_ops_with_barrier(
         return Err(format!("local durability before ack failed: {e}"));
     }
 
+    // C15 REPAIR. A replica that NAKed because it does not have a record this
+    // batch mutates is repairable: this node is that record's master, so it
+    // still holds the authoritative copy. Re-ship the record and re-send the
+    // batch, rather than failing the client's mutation and rolling it back —
+    // which at RF = 2 is deterministic (one replica per key, so one NAK is
+    // 0/1 acked) and leaves the key silently single-copy forever.
+    //
+    // DEADLOCK SAFETY (issue #88 was exactly this shape). This runs at the same
+    // point the fan-out itself just ran, so it holds exactly the same guards and
+    // adds no new lock ordering:
+    //   * the engine-wide visibility barrier was RELEASED above, before the
+    //     fan-out, precisely so a replication RTT never holds the `RwLock` a
+    //     peer's inbound `OP_REPLICA_BATCH` takes exclusively;
+    //   * the per-key `visibility_stripes` some handlers still hold are for keys
+    //     THIS node masters, so no peer's inbound batch can contend on them;
+    //   * `build_record_replay_ops` materialises the record into OWNED ops
+    //     before any socket work and holds no guard across the send — it takes
+    //     only the engine's own per-tx stripe (`read_record_snapshot`), which is
+    //     never held across the network, and never touches `visibility()`;
+    //   * `send_replica_ops_to_reporting` takes the per-address slot mutex fresh
+    //     and releases it on return, the same as the fan-out send did.
+    // The one cost is that the fan-out admission permit is held for the extra
+    // RTT (see `_fanout_permit`), which is bounded by the same per-target ack
+    // timeout and only paid on the rare repair path.
+    if let Some(engine) = engine {
+        for (addr, result, ops) in results.iter_mut() {
+            let Err(ReplicaSendError::MissingRecord { tx_keys, detail }) = result else {
+                continue;
+            };
+            let (missing, detail, addr) = (std::mem::take(tx_keys), detail.clone(), *addr);
+            let ack_timeout = ack_timeouts.get(&addr).copied().unwrap_or(base_timeout);
+            let repaired = repair_missing_record_target(
+                engine,
+                addr,
+                missing,
+                detail,
+                ops,
+                ack_timeout,
+                auth_secret.as_deref(),
+                cluster_key,
+                source_node_id,
+                redo_seq_range.1,
+            );
+            *result = repaired;
+        }
+    }
+
     let mut last_error: Option<String> = None;
     // D-6: the set of addresses that ACKed, used for per-key quorum.
     let mut acked: std::collections::HashSet<SocketAddr> = std::collections::HashSet::new();
-    for (addr, result) in &results {
+    for (addr, result, _) in &results {
         match result {
             Ok(()) => {
                 acked.insert(*addr);
             }
             Err(e) => {
                 tracing::warn!(err = %e, "replication to replica failed");
-                last_error = Some(e.clone());
+                last_error = Some(e.to_string());
             }
         }
     }
@@ -4589,9 +4654,15 @@ fn compensate_replication_failure(
                     });
                 }
                 ReplicaOp::Delete { .. } => {
-                    // If this path is reached the record is already destroyed and
-                    // cannot be restored here (no per-delete compensation; deletes
-                    // are local prune GC).
+                    // A delete has NO compensation: once the record is freed
+                    // there is nothing left to restore from. That is precisely
+                    // why `handle_delete_batch` replicates BEFORE it removes the
+                    // master's copy and never calls this function — a client
+                    // delete whose fan-out fails leaves both copies present and
+                    // is retried. This arm is only reachable for a `Delete` that
+                    // arrived here through another op's `repl_ops_by_key` (redo
+                    // re-emit / migration delta), where the record is already
+                    // gone locally and there is nothing to undo.
                 }
                 ReplicaOp::MarkLongestChain {
                     on_longest_chain,
@@ -4965,6 +5036,201 @@ fn exchange_replica_batch(
     }
 }
 
+/// Bound on missing-record repair rounds for ONE replica address in ONE
+/// fan-out.
+///
+/// A round is designed to be sufficient on its own: the replica's NAK names
+/// EVERY record of the batch it is missing (see
+/// [`ReplicaAck::MissingRecord::tx_keys`]), so one re-ship closes the whole gap
+/// rather than one record per round-trip. The second round exists only for a
+/// record that went missing BETWEEN the NAK and the re-send, or for the tail of
+/// a NAK that hit the wire cap.
+///
+/// Termination is guaranteed twice over, so a replica that keeps NAKing can
+/// never wedge a client's mutation:
+///
+/// 1. **One repair attempt per key.** A key already re-shipped in this fan-out
+///    and reported missing AGAIN is a hard failure — the replica just told us
+///    the re-ship did not take, so re-shipping it again provably would not help,
+///    and retrying is how a ping-pong starts.
+/// 2. **A hard round cap.** Worst-case added latency is 2 × that target's ACK
+///    timeout, and only on the repair path.
+///
+/// A replica missing more records than two capped rounds can carry is not
+/// suffering a sweep race; it has a real hole, and the honest failure below is
+/// the correct answer — it is what drives the operator-visible signal and a real
+/// resync rather than papering over a gap while the client waits.
+const MAX_MISSING_RECORD_REPAIRS: usize = 2;
+
+/// Repair `addr`'s missing records and re-send `ops`.
+///
+/// The replica NAKed [`ReplicaAck::MissingRecord`]: it does not have records
+/// this batch mutates. This node masters them, so it re-ships each record's full
+/// current image ([`build_record_replay_ops`] — create + slot state + mined
+/// state + flags, NOT a bare create) followed by the ORIGINAL ops, in one batch.
+/// The already-applied prefix of `ops` re-applies idempotently (every op is
+/// generation-guarded, and each re-shipped image carries the master's exact
+/// generation, so the replay is an equal-generation no-op rather than a stale
+/// reject or a bump).
+///
+/// Generation is preserved END TO END and deliberately not perturbed: the image
+/// carries `metadata_bytes[46..50]` from the master's own metadata, the receiver
+/// restores it via `restore_migrated_lifecycle`, and every replayed slot/mined
+/// op is stamped with that same value.
+///
+/// A key the master no longer holds either is SKIPPED rather than fatal: the
+/// record is legitimately gone on both sides, so there is nothing to repair and
+/// nothing for the replica to apply against it. If that leaves nothing to
+/// re-ship at all, the original NAK stands.
+///
+/// Returns `Ok(())` when the re-sent batch was ACKed. On ANY failure it returns
+/// [`ReplicaSendError::Failed`] carrying both the original NAK and the repair
+/// failure, so the caller's per-key quorum check fails the client's mutation
+/// exactly as it did before this repair existed. Honesty over liveness stays the
+/// fallback — the repair only removes it as the FIRST resort.
+#[allow(clippy::too_many_arguments)]
+fn repair_missing_record_target(
+    engine: &Engine,
+    addr: SocketAddr,
+    first_missing: Vec<TxKey>,
+    first_detail: String,
+    ops: &[ReplicaOp],
+    ack_timeout: Duration,
+    auth_secret: Option<&[u8]>,
+    cluster_key: u64,
+    source_node_id: u64,
+    redo_high: u64,
+) -> std::result::Result<(), ReplicaSendError> {
+    let mut repaired: Vec<TxKey> = Vec::new();
+    let mut missing = first_missing;
+    let mut detail = first_detail;
+
+    for round in 0..MAX_MISSING_RECORD_REPAIRS {
+        if let Some(seen) = missing.iter().find(|k| repaired.contains(k)) {
+            return Err(ReplicaSendError::Failed(format!(
+                "replica {addr} still reports {seen:?} missing after this node re-shipped it — \
+                 refusing to re-ship again: {detail}"
+            )));
+        }
+        // Materialise every record into OWNED ops FIRST. No engine guard is
+        // held across the send below — see the deadlock note at the call site.
+        let mut repair_ops: Vec<ReplicaOp> = Vec::new();
+        let mut shipped = 0usize;
+        for key in &missing {
+            match crate::cluster::coordinator::build_record_replay_ops(engine, key) {
+                Ok(Some(replay)) => {
+                    repair_ops.extend(replay.ops);
+                    shipped += 1;
+                }
+                // Gone here too (a concurrent local delete): nothing to repair
+                // for this key. The op targeting it will skip or fail on its own
+                // merits, which is the honest answer.
+                Ok(None) => {}
+                Err(e) => {
+                    return Err(ReplicaSendError::Failed(format!(
+                        "replica {addr} is missing {key:?} and re-shipping it failed ({e}): \
+                         {detail}"
+                    )));
+                }
+            }
+            repaired.push(*key);
+        }
+        if shipped == 0 {
+            return Err(ReplicaSendError::Failed(format!(
+                "replica {addr} is missing {} record(s) this master no longer holds either — \
+                 cannot repair: {detail}",
+                missing.len(),
+            )));
+        }
+        repair_ops.extend_from_slice(ops);
+        tracing::warn!(
+            %addr,
+            round,
+            missing = missing.len(),
+            shipped,
+            repair_ops = repair_ops.len(),
+            "replication: replica is missing record(s) this batch mutates — re-shipping them \
+             and re-sending the batch",
+        );
+
+        match send_replica_ops_to_reporting(
+            addr,
+            &repair_ops,
+            ack_timeout,
+            auth_secret,
+            cluster_key,
+            source_node_id,
+            redo_high,
+        ) {
+            Ok(()) => {
+                if let Some(m) = crate::metrics::replication_metrics() {
+                    m.replica_missing_record_repaired.inc_by(shipped as u64);
+                }
+                return Ok(());
+            }
+            // More keys went missing between the NAK and the re-send, or the
+            // NAK's key list hit the wire cap. Loop (bounded).
+            Err(ReplicaSendError::MissingRecord {
+                tx_keys,
+                detail: next,
+            }) => {
+                missing = tx_keys;
+                detail = next;
+            }
+            Err(ReplicaSendError::Failed(e)) => {
+                if let Some(m) = crate::metrics::replication_metrics() {
+                    m.replica_missing_record_repair_failed.inc();
+                }
+                return Err(ReplicaSendError::Failed(format!(
+                    "replica {addr} re-ship of {shipped} record(s) was sent but the batch still \
+                     failed: {e}"
+                )));
+            }
+        }
+    }
+
+    if let Some(m) = crate::metrics::replication_metrics() {
+        m.replica_missing_record_repair_failed.inc();
+    }
+    Err(ReplicaSendError::Failed(format!(
+        "replica {addr} still reports a missing record after {MAX_MISSING_RECORD_REPAIRS} repair \
+         round(s) — failing the mutation so the divergence is not masked: {detail}"
+    )))
+}
+
+/// Why a replica fan-out send failed, in a form the fan-out can ACT on.
+///
+/// [`Self::MissingRecord`] is the one failure the master can fix itself: it
+/// still holds the record the replica is missing, so it re-ships that record's
+/// full current image and re-sends the batch instead of failing the client's
+/// mutation and rolling it back. Every other failure stays [`Self::Failed`] and
+/// keeps the historical honest-failure path.
+///
+/// The distinction is carried by TYPE from the replica's
+/// [`ReplicaAck::MissingRecord`] all the way here; nothing parses a message to
+/// decide whether to repair.
+#[derive(Debug, Clone, thiserror::Error)]
+pub enum ReplicaSendError {
+    /// The replica aborted the batch because these records are absent there.
+    #[error("{detail}")]
+    MissingRecord {
+        /// Every record of this batch the replica reported absent (the aborting
+        /// one first). The master re-ships all of them in one round.
+        tx_keys: Vec<TxKey>,
+        /// Operator-facing detail, for logs and the client-visible error.
+        detail: String,
+    },
+    /// Transport failure, terminal replica error, or budget exhaustion.
+    #[error("{0}")]
+    Failed(String),
+}
+
+impl From<String> for ReplicaSendError {
+    fn from(detail: String) -> Self {
+        Self::Failed(detail)
+    }
+}
+
 /// Maximum send attempts per batch inside [`send_replica_ops_to`]: the
 /// initial send plus one relabeled retry after a cursor-resync signal
 /// (`ReplicaAck::Gap` or a duplicate-skip ACK whose `through_sequence`
@@ -5009,6 +5275,10 @@ const MAX_SEQUENCE_RENEGOTIATIONS: usize = 2;
 ///
 /// Returns `Ok(())` once the replica has durably applied (or provably
 /// already applied) every op in `ops`; `Err(message)` otherwise.
+///
+/// This is the flattened-error entry point kept for callers that cannot act on
+/// WHY the send failed. The fan-out uses [`send_replica_ops_to_reporting`],
+/// which preserves the repairable [`ReplicaSendError::MissingRecord`] case.
 pub fn send_replica_ops_to(
     addr: SocketAddr,
     ops: &[ReplicaOp],
@@ -5018,6 +5288,33 @@ pub fn send_replica_ops_to(
     source_node_id: u64,
     redo_high: u64,
 ) -> std::result::Result<(), String> {
+    send_replica_ops_to_reporting(
+        addr,
+        ops,
+        ack_timeout,
+        auth_secret,
+        cluster_key,
+        source_node_id,
+        redo_high,
+    )
+    .map_err(|e| e.to_string())
+}
+
+/// [`send_replica_ops_to`] with the failure REASON preserved.
+///
+/// Identical behavior; the only difference is the error type, which keeps
+/// [`ReplicaSendError::MissingRecord`] distinguishable so the fan-out can repair
+/// the replica instead of failing the client's mutation.
+#[allow(clippy::too_many_arguments)]
+pub fn send_replica_ops_to_reporting(
+    addr: SocketAddr,
+    ops: &[ReplicaOp],
+    ack_timeout: Duration,
+    auth_secret: Option<&[u8]>,
+    cluster_key: u64,
+    source_node_id: u64,
+    redo_high: u64,
+) -> std::result::Result<(), ReplicaSendError> {
     if ops.is_empty() {
         return Ok(());
     }
@@ -5072,7 +5369,7 @@ fn send_replica_ops_loop(
     next_sequence: &mut Option<u64>,
     last_acked: &mut u64,
     mut exchange: impl FnMut(&ReplicaBatch) -> std::result::Result<ReplicaAck, String>,
-) -> std::result::Result<(), String> {
+) -> std::result::Result<(), ReplicaSendError> {
     // Sync the stream cursor on first contact: adopt the replica's
     // authoritative applied watermark via an empty-batch probe. Initializing
     // from any master-side persisted value instead could label NEW ops at
@@ -5088,14 +5385,16 @@ fn send_replica_ops_loop(
                 source_node_id: Some(source_node_id),
                 cluster_key,
             };
-            match exchange(&probe)? {
+            match exchange(&probe).map_err(ReplicaSendError::Failed)? {
                 ReplicaAck::Ok { through_sequence } => {
                     let n = through_sequence + 1;
                     *next_sequence = Some(n);
                     n
                 }
                 other => {
-                    return Err(format!("watermark probe rejected: {other:?}"));
+                    return Err(ReplicaSendError::Failed(format!(
+                        "watermark probe rejected: {other:?}"
+                    )));
                 }
             }
         }
@@ -5125,7 +5424,7 @@ fn send_replica_ops_loop(
                 // different content could be dedup-skipped by the receiver; a
                 // hole heals via Gap/relabel instead.
                 *next_sequence = Some(last + 1);
-                return Err(e);
+                return Err(ReplicaSendError::Failed(e));
             }
         };
 
@@ -5147,10 +5446,10 @@ fn send_replica_ops_loop(
                 // nothing from THIS batch was applied. Adopt and retry.
                 reneg_attempts += 1;
                 if reneg_attempts >= MAX_SEQUENCE_RENEGOTIATIONS {
-                    return Err(format!(
+                    return Err(ReplicaSendError::Failed(format!(
                         "replication to {addr}: sequence renegotiation did not converge after \
                          {MAX_SEQUENCE_RENEGOTIATIONS} attempts",
-                    ));
+                    )));
                 }
                 tracing::warn!(
                     %addr,
@@ -5170,10 +5469,10 @@ fn send_replica_ops_loop(
                 // replica's next-expected sequence and retry.
                 reneg_attempts += 1;
                 if reneg_attempts >= MAX_SEQUENCE_RENEGOTIATIONS {
-                    return Err(format!(
+                    return Err(ReplicaSendError::Failed(format!(
                         "replication to {addr}: sequence renegotiation did not converge after \
                          {MAX_SEQUENCE_RENEGOTIATIONS} attempts",
-                    ));
+                    )));
                 }
                 tracing::warn!(
                     %addr,
@@ -5197,10 +5496,10 @@ fn send_replica_ops_loop(
                     // positions and fail so the caller's replication-failure
                     // path fires.
                     *next_sequence = Some(last + 1);
-                    return Err(format!(
+                    return Err(ReplicaSendError::Failed(format!(
                         "replica redo busy: still full after {MAX_BUSY_RETRIES} retries \
                          (first_sequence {first_sequence})",
-                    ));
+                    )));
                 }
                 busy_retries += 1;
                 tracing::warn!(
@@ -5216,7 +5515,28 @@ fn send_replica_ops_loop(
                 // Burn the positions — the replica may have applied a prefix
                 // before failing.
                 *next_sequence = Some(last + 1);
-                return Err(format!("replica error: {message}"));
+                return Err(ReplicaSendError::Failed(format!(
+                    "replica error: {message}"
+                )));
+            }
+            ReplicaAck::MissingRecord {
+                failed_sequence,
+                tx_keys,
+            } => {
+                // The replica aborted because it does not have these records.
+                // Burn the positions exactly as for `Error` (the replica may
+                // have applied the prefix before the failing op, and its
+                // watermark did not advance). Report the keys so the caller can
+                // re-ship them and re-send — this loop deliberately does NOT
+                // retry here: it has no engine handle, and a blind resend of the
+                // same ops would NAK identically forever.
+                *next_sequence = Some(last + 1);
+                let detail = format!(
+                    "replica {addr} is missing {} record(s), first {:?} (NAK at seq {failed_sequence})",
+                    tx_keys.len(),
+                    tx_keys.first(),
+                );
+                return Err(ReplicaSendError::MissingRecord { tx_keys, detail });
             }
         }
     }
@@ -5677,6 +5997,111 @@ fn check_shard_ownership_snap(
         None => cluster.is_master(&key),
     };
     resolve_shard_ownership(cluster, &key, item_index, mastership, allow_if_migrating)
+}
+
+/// The role this node plays for one DAH-sweep candidate.
+///
+/// The sweep is the ONLY driver that ever revisits a stored record, so it is
+/// the only thing that can reclaim device space. Under RF > 1 a node stores
+/// every record of every shard it replicates, so restricting the sweep to keys
+/// it MASTERS leaves its replica half — roughly `(RF-1)/RF` of the device —
+/// growing without bound (F2). This enum makes the missing case explicit: a
+/// node reclaims the records it HOLDS, in one of two clearly different roles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SweepRole {
+    /// This node is the key's shard master (or is unclustered). The sweep
+    /// delete is the key's AUTHORITATIVE deletion: it prunes the parent slots
+    /// the record's spends claimed and records a deletion tombstone, exactly as
+    /// before this distinction existed.
+    ShardMaster,
+    /// This node holds a REPLICA copy of the key. The sweep delete is a LOCAL
+    /// SPACE RECLAIM and nothing more: no tombstone, no replication, no
+    /// replayable deletion record, no mutation of any other record. (It is not
+    /// WAL-free — every delete emits a fsynced `RedoOp::FreeRegion` and a
+    /// `RedoOp::SecondaryDahUpdate` intent; neither names the key, so neither
+    /// can leak into a migration delta. See [`Engine::prune_delete`].) Its
+    /// safety rests on staying non-authoritative — a copy dropped in error is
+    /// restored by the master re-shipping the record on the next mutation this
+    /// node cannot apply (`repair_missing_record_target`), or by a migration
+    /// baseline or reverse-heal pull, all of which a tombstone would veto. See
+    /// [`Engine::reclaim_held_copy`].
+    HeldCopy,
+}
+
+/// Decide whether — and in which role — this node may DAH-sweep `txid`.
+///
+/// `None` means "skip this candidate": another node masters the key and this
+/// node does not hold a copy of it, or the local topology view is not
+/// trustworthy enough to act on (topology transitioning, self-fenced, shard
+/// table stale, migration pending inbound, or write-fenced mid-handoff).
+///
+/// Mastership is resolved FIRST and by the ordinary
+/// [`check_shard_ownership_snap`] gate, so a master's sweep decision — including
+/// every migration fence it already honours — is bit-identical to the
+/// pre-F2 behaviour. Only when that gate reports a plain `ERR_REDIRECT`
+/// ("someone else masters this key") is the holder question asked at all, and
+/// the same migration fences are then applied to the holder answer: a shard
+/// with data streaming in (`has_pending_inbound`) or streaming out
+/// (`is_shard_write_fenced`) is mid-transfer, and reclaiming from under a
+/// transfer would race the very copy that transfer is establishing.
+/// P1-2 — how long after a proven inbound-replication hole a node refuses to
+/// reclaim REPLICA copies it holds.
+///
+/// The window has to outlast a catch-up drain, not a round-trip: the hazard is a
+/// replica that blipped off-network, came back, and swept before the master's
+/// queued `PreserveUntil` / reorg for that record was delivered. Ten times the
+/// 3 s foreground ACK timeout is a deliberately blunt, generous bound — skipping
+/// a reclaim costs one deferred sweep pass (the next pass re-evaluates and the
+/// record is still in the DAH index), while a wrong reclaim costs the master a
+/// re-ship and, before that repair existed, cost a client its write.
+const REPLICA_RECLAIM_QUIET_PERIOD_MS: u64 = 30_000;
+
+fn sweep_role_snap(
+    txid: &[u8; 32],
+    cluster: Option<&RunningCluster>,
+    master_snap: Option<&MasterSnapshot>,
+    holder_snap: Option<&HolderSnapshot>,
+    replication_behind: bool,
+) -> Option<SweepRole> {
+    // Unclustered: every record on the device is this node's own.
+    let Some(cluster) = cluster else {
+        return Some(SweepRole::ShardMaster);
+    };
+    let Some(redirect) = check_shard_ownership_snap(txid, 0, Some(cluster), master_snap, false)
+    else {
+        return Some(SweepRole::ShardMaster);
+    };
+    // ERR_REDIRECT is the ONLY "this key is simply someone else's" answer.
+    // ERR_MIGRATION_IN_PROGRESS (transitioning / pending inbound / write-fenced)
+    // and ERR_NO_QUORUM (master address unknown) all mean the local view is
+    // unreliable — fail closed and skip, as the pre-F2 sweep did.
+    if redirect.error_code != ERR_REDIRECT {
+        return None;
+    }
+    let key = TxKey { txid: *txid };
+    if !holder_snap.is_some_and(|snap| snap.holds_key(&key)) {
+        return None;
+    }
+    // Same migration fences the master arm of `resolve_shard_ownership` applies,
+    // re-applied to the holder answer: never reclaim from under an in-flight
+    // shard transfer in either direction.
+    if cluster.has_pending_inbound(&key) || cluster.is_shard_write_fenced(&key) {
+        return None;
+    }
+    // P1-2: both fences above are MIGRATION fences — neither says anything about
+    // replication health. A replica catching up after a partition or a restart
+    // trips neither, so it would reclaim against a local view that is stale by
+    // the whole catch-up backlog (minutes) rather than by a replication
+    // round-trip, dropping copies whose queued `PreserveUntil` or reorg has not
+    // been delivered yet. Fence the reclaim while this node has recently PROVEN
+    // it is behind (see `Engine::note_replica_stream_hole`). Skipping is free and
+    // self-healing: the record stays in the DAH index and the next pass
+    // re-evaluates. Only the HELD-COPY arm is gated — a node's own MASTERED
+    // records are authoritative locally and their sweep is unaffected.
+    if replication_behind {
+        return None;
+    }
+    Some(SweepRole::HeldCopy)
 }
 
 /// Resolve a shard-ownership decision from an already-computed
@@ -7219,9 +7644,10 @@ fn handle_create_batch(
     // global SHARED side (see `needs_dispatch_visibility_barrier`), not this
     // per-key stripe, so a CONFLICTING-flagged create that fails replication is
     // still momentarily visible to those admin/background query paths; a
-    // narrower, lower-traffic residual left open. (Delete is unaffected — it is
-    // local GC prune, never replicated, so it has no replication-rollback
-    // window.)
+    // narrower, lower-traffic residual left open. (Delete has no equivalent
+    // window: a client delete replicates BEFORE it removes the master's copy,
+    // so there is never an applied-but-unreplicated state to roll back — see
+    // `handle_delete_batch`.)
     let vis_start = std::time::Instant::now();
     let global_vis = engine.visibility().global_read();
     if let Some(h) = DISPATCH_HISTOGRAMS.get() {
@@ -9121,9 +9547,11 @@ fn handle_delete_batch(
     engine: &Engine,
     max_batch: u32,
     cluster: Option<&RunningCluster>,
-    // Deletes are local prune GC — not durable, not replicated — so the redo
-    // handle is unused here (kept in the signature for call-site symmetry with
-    // the other batch handlers; removed in a later cleanup).
+    // A delete writes no keyed redo op of its own, so this handler has no
+    // WAL-first phase and never compensates; the handle is unused here (kept in
+    // the signature for call-site symmetry with the other batch handlers). The
+    // engine's own delete path still journals a `FreeRegion` +
+    // `SecondaryDahUpdate` — see `Engine::prune_delete`.
     _redo_log: Option<&Mutex<RedoLog>>,
     // Forwarded coarse exclusive guard from the DAH-sweep caller; when `Some`
     // this handler does NOT take its own per-key visibility (would self-deadlock).
@@ -9143,37 +9571,152 @@ fn handle_delete_batch(
     let mut errors = Vec::new();
     // Deletes of already-absent keys (idempotent GC no-ops) — not failures.
     let mut idempotent_total: u64 = 0;
+    // F2: of the removals below, how many were REPLICA copies this node holds
+    // but does not master. Reported separately so an operator can see whether
+    // replica-side GC is running at all (spec §3.18.1).
+    let mut held_copy_reclaimed: u64 = 0;
 
-    // Fine-grained visibility for the batch: per-key WRITE over the deleted
-    // txids + global SHARED (so a checkpoint still excludes us). GATED on
-    // `barrier.is_none()`: the DAH-sweep caller forwards its EXCLUSIVE global
-    // guard via `barrier`; re-taking `global.read()` here on the same thread
-    // would self-deadlock.
-    let visibility_guard = barrier.is_none().then(|| {
-        let keys: Vec<TxKey> = txids.iter().map(|t| TxKey { txid: *t }).collect();
-        engine.visibility().mutation(&keys)
-    });
+    // #88 INVARIANT (fail closed). A CLIENT delete replicates (Phase 2 below),
+    // and a replication round-trip must never run while this thread holds the
+    // engine-wide EXCLUSIVE visibility barrier — that is the circular wait
+    // issue #88 fixed. The DAH sweep is the ONLY caller that forwards a barrier
+    // and it never replicates, so the two are mutually exclusive by
+    // construction. Refuse rather than deadlock if a future caller breaks that.
+    if sweep_due_height.is_none() && barrier.is_some() {
+        return error_response(
+            req.request_id,
+            ERR_INVARIANT_VIOLATION,
+            "client delete must own its visibility (a forwarded exclusive barrier \
+             cannot be held across the replication round-trip)",
+        );
+    }
 
-    // LOCAL PRUNE. Deletes are independent-node GC of fully-spent records that
-    // are no longer needed — NOT part of normal client operation. They are NOT
-    // durable, NOT replicated, and write NO tombstone: a crash before the
-    // physical cleanup just leaves the record present (and consistent — record +
-    // parent-spent slots + allocated region all still agree), and the pruner
-    // re-deletes it next pass (self-healing). Each item:
-    //   1. validate shard ownership + (external records) the cold-blob guard,
-    //   2. mark every parent slot this child spent as PRUNED (UTXO correctness),
-    //   3. remove the record locally (`engine.prune_delete`: RAM-index
-    //      unregister + header zero via the write-back cache + region free).
+    // Fine-grained visibility for the batch, acquired as its two halves
+    // SEPARATELY so they can be released at different points — the same split
+    // `handle_spend_batch` / `handle_set_mined_batch` / `handle_create_batch`
+    // use:
+    //   * `global_vis` — the global SHARED side (checkpoint coordination). It is
+    //     dropped BEFORE the replication round-trip in Phase 2. That drop is
+    //     LOAD-BEARING, not a latency tweak: the global side is the same
+    //     `RwLock` an inbound (non-migration) `OP_REPLICA_BATCH` apply takes
+    //     EXCLUSIVELY, so holding it across our own fan-out is exactly the
+    //     issue-#88 ring deadlock.
+    //   * `visibility_stripes` — the per-key WRITE stripes, held across
+    //     replication AND the local removal, so a concurrent reader of these
+    //     keys is excluded until the delete's outcome is known cluster-wide and
+    //     never observes the window where the replica has dropped the record
+    //     but this node has not.
+    // Both are GATED on `barrier.is_none()`: the DAH-sweep caller forwards its
+    // EXCLUSIVE global guard via `barrier`; re-taking `global.read()` here on
+    // the same thread would self-deadlock.
+    let keys: Vec<TxKey> = txids.iter().map(|t| TxKey { txid: *t }).collect();
+    let global_vis = barrier.is_none().then(|| engine.visibility().global_read());
+    let visibility_stripes = barrier
+        .is_none()
+        .then(|| engine.visibility().mutation_stripes(&keys));
+
+    // A CLIENT delete is an authoritative statement about the key and must
+    // reach EVERY holder (spec §3.18, `phases/08_replication.md` checklist
+    // "Delete on master: replica no longer has the record"); a DAH-SWEEP delete
+    // is per-holder local GC and must NOT be replicated (each node reclaims its
+    // own copy — see `Engine::reclaim_held_copy`). `sweep_due_height` is the
+    // discriminator, so the three phases below are:
+    //
+    //   Phase 1 — validate the node's role for each key + (external records)
+    //             the cold-blob guard. Nothing is mutated.
+    //   Phase 2 — replicate `ReplicaOp::Delete` for the client path (no-op for
+    //             the sweep, whose op list is empty).
+    //   Phase 3 — remove locally: mark every parent slot this child spent as
+    //             PRUNED (MASTER role only), then drop the record (RAM-index
+    //             unregister + header zero via the write-back cache + region
+    //             free).
+    //
+    // ORDERING (replicate BEFORE the local removal) is deliberate and is the
+    // opposite of every other mutation handler. Those apply first and roll back
+    // with `compensate_replication_failure` if the fan-out fails; a delete has
+    // NO such rollback — once the record is freed there is nothing left to
+    // restore from. So the master's copy is not touched until replication has
+    // succeeded: a delete that fails replication leaves BOTH copies present and
+    // returns `ERR_REPLICATION_FAILED`, which the caller retries. That is safe
+    // precisely because delete is idempotent GC (an already-absent key is
+    // `Ok`), so the retry converges; the reverse ordering would produce exactly
+    // the permanent master-absent/replica-live divergence this path exists to
+    // remove.
+    //
+    // DURABILITY (spec §3.18): the removal is not redo-durable on the master —
+    // it journals `FreeRegion` + `SecondaryDahUpdate`, never a keyed
+    // `RedoOp::Delete`, and the index unregister + tombstone become durable at
+    // the next checkpoint. The replica's apply DOES journal `RedoOp::Delete`
+    // before it ACKs. A master crash between the ACK and its next checkpoint
+    // therefore reverts the master's half only, leaving master-live /
+    // replica-absent — the replica-missing-record condition the master's own
+    // C15 re-ship repairs on the next mutation of the key, and which a client
+    // retry of the delete resolves outright. Eventually consistent, never a
+    // lost UTXO: the authority keeps the record.
+    //
+    // ROLE (F2). A client delete (`sweep_due_height == None`) is unchanged:
+    // master-only, exactly as spec §3.18 requires — a client's delete is an
+    // authoritative statement about the key and only its master may make it.
+    // A DAH-SWEEP delete (`sweep_due_height == Some(_)`) additionally reclaims
+    // the REPLICA copies this node holds, because nothing else in the system
+    // ever revisits them. `sweep_role_snap` returns which role applies; the two
+    // roles differ in exactly two places below (parent prune, tombstone) and
+    // nowhere else.
     // P1-3: hoist the shard-master lookup to ONE lock acquisition per batch,
     // shared by both the per-child check below and the per-parent re-check.
     let master_snap = cluster.map(|c| c.master_snapshot());
-    'items: for (i, txid) in txids.iter().enumerate() {
-        if let Some(redirect_err) =
-            check_shard_ownership_snap(txid, i as u32, cluster, master_snap.as_ref(), false)
-        {
-            errors.push(redirect_err);
-            continue;
-        }
+    // Only the sweep path asks the holder question, so a client delete does not
+    // pay for the snapshot at all.
+    let holder_snap = sweep_due_height.and(cluster).map(|c| c.holder_snapshot());
+    // P1-2: one read per batch, like the snapshots above — the fence is
+    // node-scoped, not per-key.
+    let replication_behind = sweep_due_height.is_some()
+        && engine.replica_stream_hole_within(REPLICA_RECLAIM_QUIET_PERIOD_MS);
+
+    /// An item that cleared Phase 1 and is queued for the Phase 3 removal.
+    struct StagedDelete {
+        /// Index into the request's txid list, for per-item error reporting.
+        idx: usize,
+        key: TxKey,
+        role: SweepRole,
+    }
+    let mut staged: Vec<StagedDelete> = Vec::with_capacity(txids.len());
+
+    // Phase 1: validate. Read-only on the engine.
+    for (i, txid) in txids.iter().enumerate() {
+        let role = if sweep_due_height.is_some() {
+            match sweep_role_snap(
+                txid,
+                cluster,
+                master_snap.as_ref(),
+                holder_snap.as_ref(),
+                replication_behind,
+            ) {
+                Some(role) => role,
+                None => {
+                    // Phase 1 of the sweep already resolved a role for every
+                    // txid it put in this batch; losing it here means the
+                    // topology moved underneath the pass. Skipping is correct
+                    // and self-healing (the next pass re-evaluates), and it is
+                    // reported as the same redirect a client would get.
+                    errors.push(BatchItemError {
+                        item_index: i as u32,
+                        error_code: ERR_REDIRECT,
+                        error_data: Vec::new(),
+                    });
+                    continue;
+                }
+            }
+        } else {
+            // Client delete: master-only, gate unchanged.
+            if let Some(redirect_err) =
+                check_shard_ownership_snap(txid, i as u32, cluster, master_snap.as_ref(), false)
+            {
+                errors.push(redirect_err);
+                continue;
+            }
+            SweepRole::ShardMaster
+        };
         let key = TxKey { txid: *txid };
 
         // External-blob guard: never remove an external record whose cold blob
@@ -9214,23 +9757,121 @@ fn handle_delete_batch(
             continue;
         }
 
+        staged.push(StagedDelete { idx: i, key, role });
+    }
+
+    // Phase 2: replicate the CLIENT deletes. The op list is empty on the
+    // DAH-sweep path (constraint: a sweep delete is per-holder local GC), and
+    // `replicate_all_ops_with_barrier` short-circuits to `NotApplicable` on an
+    // empty list, on a single-node engine, and at RF = 1 — so neither the sweep
+    // nor a non-clustered node pays anything here.
+    //
+    // The replica applies `ReplicaOp::Delete` through `engine.delete` →
+    // `RemovalAuthority::Authoritative`, i.e. it writes a deletion tombstone.
+    // That is correct and deliberate: a replicated CLIENT delete IS an
+    // authoritative deletion, and the tombstone is what stops a later
+    // reverse-heal pull resurrecting the record. It is the exact opposite of
+    // the sweep's `reclaim_held_copy` (no tombstone, because a local space
+    // reclaim asserts nothing about the key) — the two must stay distinct.
+    //
+    // The Delete arm can NEVER produce a `ReplicaAck::MissingRecord` NAK: it
+    // resolves an absent record to `Ok(())` (idempotent GC), and
+    // `ReplicaOp::Delete::master_generation()` is `None`, so the post-apply
+    // generation sync — the other producer of that NAK — is skipped entirely.
+    // This matters: a `MissingRecord` NAK routes into
+    // `repair_missing_record_target`, which would re-ship the record's full
+    // current image, i.e. the master would RESURRECT on the replica the very
+    // record it is deleting.
+    let repl_ops_by_key: Vec<(TxKey, Vec<ReplicaOp>)> = if sweep_due_height.is_none() {
+        staged
+            .iter()
+            .map(|s| (s.key, vec![ReplicaOp::Delete { tx_key: s.key }]))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    // #88: release the GLOBAL shared side before the round-trip (see the
+    // acquisition comment). The per-key stripes stay held.
+    drop(global_vis);
+    // `(0, 0)` / no intent ranges: a delete journals no keyed redo op, so there
+    // is no master redo range for this batch to record against the ACK and no
+    // replication intent to clear. A zero `redo_high` deliberately skips the
+    // ACK-tracker watermark update (see `send_replica_ops_to_reporting`).
+    //
+    // `barrier` is NOT forwarded: it is `Some` only on the sweep path, which
+    // does not replicate, and forwarding it would release the sweep's exclusive
+    // guard before the Phase 3 removals below. The fail-closed check at the top
+    // of this handler pins that invariant.
+    let repl_outcome = match replicate_all_ops_with_barrier(
+        cluster,
+        &repl_ops_by_key,
+        (0, 0),
+        &[],
+        None,
+        Some(engine),
+    ) {
+        Ok(o) => o,
+        Err(e) => {
+            // NOTHING has been removed locally yet, so both copies survive and
+            // the caller can simply retry — the property that makes
+            // replicate-before-remove safe without a compensation path.
+            //
+            // Every item is failed: the Phase-1 rejects on their own codes, the
+            // rest on the replication failure. Tallied here because this is an
+            // early return that never reaches the post-loop block below.
+            if let Some(m) = DISPATCH_METRICS.get() {
+                use crate::metrics::OpCode;
+                for err in &errors {
+                    m.operations
+                        .inc(OpCode::Delete, classify_wire_error_code(err.error_code));
+                }
+                let unreplicated = total_items.saturating_sub(errors.len() as u64);
+                m.operations.inc_by(
+                    OpCode::Delete,
+                    classify_wire_error_code(ERR_REPLICATION_FAILED),
+                    unreplicated,
+                );
+                m.deletes_failed.inc_by(total_items);
+            }
+            return error_response(req.request_id, ERR_REPLICATION_FAILED, &e);
+        }
+    };
+
+    // Phase 3: remove locally.
+    'items: for s in &staged {
+        let (i, key, role) = (s.idx, s.key, s.role);
+
         // Parent prune: mark each parent slot spent by THIS child terminal
         // (`UTXO_PRUNED`). Local + idempotent; on a clustered node a parent on
         // another shard master is fail-closed (a distributed prune is required
         // for that topology).
-        let parent_txids = match engine.parent_txids_for_child(&key) {
-            Ok(p) => p,
-            // The child was concurrently deleted/relocated (race): no parents to
-            // prune. Skip to the idempotent prune below rather than failing.
-            Err(crate::ops::error::SpendError::TxNotFound) => Vec::new(),
-            Err(e) => {
-                errors.push(BatchItemError {
-                    item_index: i as u32,
-                    error_code: ERR_STORAGE_IO,
-                    error_data: format!("delete parent-prune input parse failed: {e}").into_bytes(),
-                });
-                continue;
-            }
+        //
+        // MASTER ROLE ONLY. A parent's UTXO slot is the PARENT record's state,
+        // and the parent record has its own master. Marking it is an
+        // authoritative bookkeeping write, so a node reclaiming a replica copy
+        // of the CHILD must not perform it: it would mutate a record this node
+        // does not speak for, diverging the parent's slot from the parent
+        // master's own copy (this prune is not replicated, so the master's
+        // replicas legitimately keep the slot `UTXO_SPENT`). Skipping keeps the
+        // held-copy reclaim confined to exactly one record — its own — which is
+        // what makes it a space reclaim rather than a distributed mutation.
+        let parent_txids = match role {
+            SweepRole::HeldCopy => Vec::new(),
+            SweepRole::ShardMaster => match engine.parent_txids_for_child(&key) {
+                Ok(p) => p,
+                // The child was concurrently deleted/relocated (race): no parents to
+                // prune. Skip to the idempotent prune below rather than failing.
+                Err(crate::ops::error::SpendError::TxNotFound) => Vec::new(),
+                Err(e) => {
+                    errors.push(BatchItemError {
+                        item_index: i as u32,
+                        error_code: ERR_STORAGE_IO,
+                        error_data: format!("delete parent-prune input parse failed: {e}")
+                            .into_bytes(),
+                    });
+                    continue;
+                }
+            },
         };
         for parent_txid in parent_txids {
             if let Some(route_err) = check_shard_ownership_snap(
@@ -9276,12 +9917,23 @@ fn handle_delete_batch(
             }
         }
 
-        // Remove the record locally (no tombstone, no redo, no replication).
-        match engine.prune_delete(&DeleteRequest {
+        // Remove the record locally. The role decides whether this is the key's
+        // authoritative deletion (tombstoned, so a later reverse-heal cannot
+        // resurrect it) or a held-copy space reclaim (no tombstone, so the
+        // master can always put the copy back).
+        let del_req = DeleteRequest {
             tx_key: key,
             due_guard: sweep_due_height,
-        }) {
-            Ok(()) => {}
+        };
+        match match role {
+            SweepRole::ShardMaster => engine.prune_delete(&del_req),
+            SweepRole::HeldCopy => engine.reclaim_held_copy(&del_req),
+        } {
+            Ok(()) => {
+                if role == SweepRole::HeldCopy {
+                    held_copy_reclaimed += 1;
+                }
+            }
             // Idempotent GC: the record is already gone — a concurrent or
             // duplicate delete won the race, or it was never present. The
             // delete's post-condition (record absent) already holds, so this is
@@ -9295,7 +9947,14 @@ fn handle_delete_batch(
         }
     }
 
-    drop(visibility_guard);
+    // The delete's outcome is now known cluster-wide, so readers may observe
+    // the removal (mirrors `drop(visibility_stripes)` in create / set_mined).
+    drop(visibility_stripes);
+
+    // Phase 1 and Phase 3 each report errors in item order, so the merged vec
+    // can interleave the two ranges. Sort so the client-visible sparse-error
+    // encoding stays in ascending item order regardless of which phase failed.
+    errors.sort_by_key(|e| e.item_index);
 
     let failed_total = errors.len() as u64;
     let succeeded_total = total_items
@@ -9308,6 +9967,7 @@ fn handle_delete_batch(
         m.deletes_succeeded
             .inc_by(succeeded_total + idempotent_total);
         m.deletes_failed.inc_by(failed_total);
+        m.deletes_held_copy_reclaimed.inc_by(held_copy_reclaimed);
         use crate::metrics::{OpCode, Outcome};
         m.operations
             .inc_by(OpCode::Delete, Outcome::Ok, succeeded_total);
@@ -9319,19 +9979,7 @@ fn handle_delete_batch(
         }
     }
 
-    if errors.is_empty() {
-        ResponseFrame {
-            request_id: req.request_id,
-            status: STATUS_OK,
-            payload: vec![],
-        }
-    } else {
-        ResponseFrame {
-            request_id: req.request_id,
-            status: STATUS_PARTIAL_ERROR,
-            payload: encode_sparse_errors(&errors),
-        }
-    }
+    batch_response_with_outcome(req.request_id, &errors, repl_outcome)
 }
 
 fn handle_mark_longest_chain_batch(
@@ -10653,13 +11301,12 @@ fn handle_process_expired(
         }
     }
 
-    // Query the DAH index for transactions due for deletion. The DAH index
-    // is per-node and reflects only records this node knows about, so
-    // it is already (mostly) ownership-filtered when running in cluster
-    // mode — but we still re-check ownership explicitly below because
-    // (a) DAH may transiently include non-master records during
-    // migration, and (b) the index can lag behind the on-device
-    // metadata.
+    // Query the DAH index for transactions due for deletion. The DAH index is
+    // per-node and lists every record this node PHYSICALLY HOLDS whose
+    // delete-at-height has arrived — replica copies included, because
+    // replication ships each shard's mutations (and therefore each record's DAH
+    // transitions) to every node in the shard's assignment. Holdership, not
+    // mastership, is what the sweep must filter on: see `sweep_role_snap`.
     //
     // BOUNDED at `max_batch` candidates per call (#25 follow-up). The full
     // due-set can reach the entire UTXO set during a catch-up sync. Processing
@@ -10679,32 +11326,47 @@ fn handle_process_expired(
         .dah_index()
         .range_query_limited(current_height, max_batch as usize);
 
-    // Phase 1: filter by ownership + re-validate against current metadata.
+    // Phase 1: filter by HOLDERSHIP + re-validate against current metadata.
     // A DAH entry is a hint; the metadata is authoritative. The
     // re-validation is performed UNDER the per-tx stripe lock
     // (`engine.is_due_for_sweep`, KO-2/KO-3) so a concurrent mutation cannot
     // invalidate the decision between this check and the redo-log write — a
-    // record that is no longer due is never added to `owned_due`, so it
+    // record that is no longer due is never added to `held_due`, so it
     // never gets a `Delete` redo op (and can never be wrongly replayed). The
     // predicate also includes the KO-2 conflicting branch: a CONFLICTING
     // record is due regardless of spent/longest-chain state. R-102 / IJK-09.
-    let mut owned_due: Vec<[u8; 32]> = Vec::new();
+    //
+    // F2 — the filter is holdership, NOT mastership. A node reclaims the
+    // records it HOLDS: the ones it masters (authoritatively) and the replica
+    // copies it stores for other masters (as a local space reclaim). Gating on
+    // mastership alone was the F2 defect: each node's replica half — under
+    // RF = 2, half its device — had no reclaim driver at all and grew forever.
+    // `sweep_role_snap` records WHICH role each candidate is swept in; the
+    // delete handler below then applies exactly the authority that role carries.
+    let holder_snap = cluster.map(|c| c.holder_snapshot());
+    // P1-2: node-scoped replication-lag fence, read once for the pass.
+    let replication_behind = engine.replica_stream_hole_within(REPLICA_RECLAIM_QUIET_PERIOD_MS);
+    let mut held_due: Vec<[u8; 32]> = Vec::new();
     for key in &candidates {
-        // Ownership: skip if not master or not yet ready to write
-        // (pending inbound migration / fenced). P1-3: reuse the per-pass
-        // master snapshot captured above.
-        if check_shard_ownership_snap(&key.txid, 0, cluster, master_snap.as_ref(), false).is_some()
+        if sweep_role_snap(
+            &key.txid,
+            cluster,
+            master_snap.as_ref(),
+            holder_snap.as_ref(),
+            replication_behind,
+        )
+        .is_none()
         {
             continue;
         }
         if engine.is_due_for_sweep(key, current_height) {
-            owned_due.push(key.txid);
+            held_due.push(key.txid);
         }
     }
 
-    let candidate_count = owned_due.len() as u32;
+    let candidate_count = held_due.len() as u32;
 
-    if owned_due.is_empty() {
+    if held_due.is_empty() {
         // Nothing to do for this node — return a count-shaped reply so
         // the client can recognize a clean no-op without parsing
         // errors out of the ERR_INTERNAL channel.
@@ -10732,7 +11394,7 @@ fn handle_process_expired(
     // dispatcher would cost an extra cluster-state read for no benefit.
     // A future maintainer who wants quorum re-checked under a slow path
     // should route through `handle_request` instead.
-    let delete_payload = crate::protocol::codec::encode_txid_batch(&owned_due, &[]);
+    let delete_payload = crate::protocol::codec::encode_txid_batch(&held_due, &[]);
     let delete_req = RequestFrame {
         request_id: req.request_id,
         op_code: crate::protocol::opcodes::OP_DELETE_BATCH,
@@ -12254,10 +12916,16 @@ mod tests {
         );
 
         let err = res.expect_err("an always-Busy replica must fail, not loop forever");
-        assert!(
-            err.contains("busy"),
-            "the exhaustion error must name the redo-busy cause, got: {err}",
-        );
+        match &err {
+            ReplicaSendError::Failed(detail) => assert!(
+                detail.contains("busy"),
+                "the exhaustion error must name the redo-busy cause, got: {detail}",
+            ),
+            other => panic!(
+                "redo-busy exhaustion must NOT be reported as a repairable missing record, \
+                 got: {other:?}"
+            ),
+        }
         // Bounded: the initial send plus MAX_BUSY_RETRIES resends, then it fails.
         assert_eq!(
             calls,
@@ -19023,6 +19691,182 @@ mod tests {
     // a stale-route loop instead of chasing redirects forever. This test
     // exercises the per-item REDIRECT path on both write (BatchItemError)
     // and read (WireGetResult) flows and asserts the version round-trips.
+    /// F2 — `sweep_role_snap` separates MASTERING a key from HOLDING one.
+    ///
+    /// A node must reclaim the device space of the replica copies it stores
+    /// (nothing else in the system ever revisits them), and must do so in a
+    /// visibly different role from its own authoritative deletions. This pins
+    /// the four answers: master → `ShardMaster`, replica → `HeldCopy`,
+    /// non-holder → skip, and holder-mid-migration → skip.
+    #[test]
+    fn sweep_role_separates_mastered_keys_from_merely_held_ones() {
+        use crate::cluster::shards::{NodeId, ShardTable};
+
+        let members = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let table = ShardTable::compute_with_epoch(&members, 2, 7, 1);
+        let self_id = NodeId(2);
+
+        // Classify every shard against the table so the test asserts over real
+        // placement rather than an assumed one.
+        let mut mastered = None;
+        let mut replicated = None;
+        let mut foreign = None;
+        for shard in 0..crate::cluster::shards::NUM_SHARDS as u16 {
+            let a = table.target_assignment(shard);
+            let slot = if a.master == self_id {
+                &mut mastered
+            } else if a.replicas.contains(&self_id) {
+                &mut replicated
+            } else {
+                &mut foreign
+            };
+            if slot.is_none() {
+                *slot = Some(shard);
+            }
+        }
+        let mastered = mastered.expect("some shard must be mastered by self");
+        let replicated = replicated.expect("some shard must be replicated by self");
+        let foreign = foreign.expect("some shard must be neither, at RF=2 over 3 nodes");
+
+        let addrs = [
+            (NodeId(1), "127.0.0.1:4601".parse().unwrap()),
+            (NodeId(2), "127.0.0.1:4602".parse().unwrap()),
+            (NodeId(3), "127.0.0.1:4603".parse().unwrap()),
+        ];
+        let cluster = crate::cluster::coordinator::new_test_running_cluster(
+            self_id,
+            table.clone(),
+            &addrs,
+            &members,
+            &[],
+            &[],
+            &[],
+            3,
+        );
+        let master_snap = cluster.master_snapshot();
+        let holder_snap = cluster.holder_snapshot();
+        let role = |shard: u16| {
+            sweep_role_snap(
+                &txid_for_shard(shard, 0),
+                Some(&cluster),
+                Some(&master_snap),
+                Some(&holder_snap),
+                false,
+            )
+        };
+
+        assert_eq!(
+            role(mastered),
+            Some(SweepRole::ShardMaster),
+            "a key this node masters is swept as the authority, exactly as before F2"
+        );
+        assert_eq!(
+            role(replicated),
+            Some(SweepRole::HeldCopy),
+            "a key this node only REPLICATES must still be reclaimable — leaving it \
+             unswept is the F2 defect (the replica half grows without bound)"
+        );
+        assert_eq!(
+            role(foreign),
+            None,
+            "a key this node neither masters nor holds is not its to reclaim"
+        );
+
+        // The same held shard, mid-migration in either direction, is skipped:
+        // reclaiming from under an in-flight transfer would race the very copy
+        // the transfer is establishing.
+        let inbound = crate::cluster::coordinator::new_test_running_cluster(
+            self_id,
+            table.clone(),
+            &addrs,
+            &members,
+            &[replicated],
+            &[],
+            &[],
+            3,
+        );
+        assert_eq!(
+            sweep_role_snap(
+                &txid_for_shard(replicated, 0),
+                Some(&inbound),
+                Some(&inbound.master_snapshot()),
+                Some(&inbound.holder_snapshot()),
+                false,
+            ),
+            None,
+            "a held shard with pending inbound migration data must not be reclaimed"
+        );
+
+        let fenced = crate::cluster::coordinator::new_test_running_cluster(
+            self_id,
+            table,
+            &addrs,
+            &members,
+            &[],
+            &[],
+            &[replicated],
+            3,
+        );
+        assert_eq!(
+            sweep_role_snap(
+                &txid_for_shard(replicated, 0),
+                Some(&fenced),
+                Some(&fenced.master_snapshot()),
+                Some(&fenced.holder_snapshot()),
+                false,
+            ),
+            None,
+            "a write-fenced held shard (delta streaming out) must not be reclaimed"
+        );
+
+        // P1-2: the SAME healthy, un-migrating cluster that reclaims above must
+        // decline once this node has proven its inbound replication stream has a
+        // hole. The two existing fences are migration-only, so without this gate
+        // a replica draining a catch-up backlog reclaims against a view stale by
+        // the whole backlog. Only the held-copy arm is gated — the node's own
+        // mastered records stay authoritative and keep sweeping.
+        assert_eq!(
+            sweep_role_snap(
+                &txid_for_shard(replicated, 0),
+                Some(&cluster),
+                Some(&master_snap),
+                Some(&holder_snap),
+                true,
+            ),
+            None,
+            "a held copy must NOT be reclaimed while this node is known to be behind on \
+             inbound replication"
+        );
+        assert_eq!(
+            sweep_role_snap(
+                &txid_for_shard(mastered, 0),
+                Some(&cluster),
+                Some(&master_snap),
+                Some(&holder_snap),
+                true,
+            ),
+            Some(SweepRole::ShardMaster),
+            "replication lag must NOT stop a node sweeping the records it MASTERS — those \
+             are authoritative locally, and fencing them would stall GC cluster-wide"
+        );
+    }
+
+    /// An unclustered node holds everything it stores, so every sweep candidate
+    /// is its own authoritative deletion — the pre-cluster behaviour, unchanged.
+    #[test]
+    fn sweep_role_on_an_unclustered_node_is_always_master() {
+        assert_eq!(
+            sweep_role_snap(&txid_for_shard(17, 0), None, None, None, false),
+            Some(SweepRole::ShardMaster)
+        );
+        assert_eq!(
+            sweep_role_snap(&txid_for_shard(17, 0), None, None, None, true),
+            Some(SweepRole::ShardMaster),
+            "an unclustered node has no inbound replication to be behind on; the lag fence \
+             must never stall its own GC"
+        );
+    }
+
     #[test]
     fn redirect_includes_shard_table_version_for_loop_detection() {
         use crate::cluster::shards::NodeId;

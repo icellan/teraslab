@@ -903,6 +903,11 @@ pub fn handle_replica_batch_with_tracker(
                 ops_len = batch.ops.len(),
                 "replica NAK: sequence gap — batch ahead of next-expected",
             );
+            // P1-2: this node just PROVED it missed inbound positions. Fence
+            // its held-copy DAH reclaim until the stream is quiet again — a
+            // replica draining a catch-up backlog would otherwise sweep against
+            // a view stale by the whole backlog, not by a round-trip.
+            engine.note_replica_stream_hole();
             let ack = ReplicaAck::Gap {
                 expected_sequence: expected,
                 received_first_sequence: batch.first_sequence,
@@ -985,13 +990,16 @@ pub fn handle_replica_batch_with_tracker(
     // per-op in the loop (mutate-first, journal-second is preserved); only the
     // journaling is deferred to the ONE atomic admission after the loop.
     let mut redo_entries: Vec<(crate::redo::RedoOp, u8)> = Vec::new();
-    for (seq, op) in (start_seq..).zip(batch.ops.iter().skip(skip_count)) {
+    for (idx, (seq, op)) in (start_seq..)
+        .zip(batch.ops.iter().skip(skip_count))
+        .enumerate()
+    {
         // C15: only a steady-state, dense-sequence–tracked, non-migration batch
         // NAKs on a record it is missing (a real divergence — the master
         // committed a mutation against a record this replica never received).
         // Migration baselines and out-of-band compensation (`!tracked`) keep the
         // tolerant skip.
-        if let Err(msg) = apply_op_journal_inner(
+        if let Err(err) = apply_op_journal_inner(
             engine,
             op,
             journal,
@@ -999,9 +1007,27 @@ pub fn handle_replica_batch_with_tracker(
             tracked,
             &mut redo_entries,
         ) {
-            let ack = ReplicaAck::Error {
-                failed_sequence: seq,
-                message: msg,
+            // Route on the TYPE, never on the message. A missing record is the
+            // one failure the master can repair (it still holds the record), so
+            // it gets its own ack variant carrying the key; everything else is
+            // the historical terminal `Error`. Both abort the batch at `seq` and
+            // return BEFORE the watermark advances, so neither can mask a gap.
+            let ack = match err {
+                ReplicaApplyError::MissingRecord { tx_key, .. } => {
+                    // P1-2: same proof from the other direction — the master
+                    // mutated a record this node does not have. Fence the
+                    // held-copy reclaim so this node stops creating repair work
+                    // while it is demonstrably behind.
+                    engine.note_replica_stream_hole();
+                    ReplicaAck::MissingRecord {
+                        failed_sequence: seq,
+                        tx_keys: absent_keys_from(engine, tx_key, &batch.ops[skip_count + idx..]),
+                    }
+                }
+                ReplicaApplyError::Failed(message) => ReplicaAck::Error {
+                    failed_sequence: seq,
+                    message,
+                },
             };
             return ResponseFrame {
                 request_id: request.request_id,
@@ -1418,6 +1444,51 @@ fn record_apply_skipped_missing_tx(op_name: &'static str, tx_key: &TxKey) {
     );
 }
 
+/// Why a replica-side apply failed, in a form the batch handler can ROUTE on.
+///
+/// The distinction that matters is [`Self::MissingRecord`]: it is the one
+/// failure the master can actually repair (it still holds the record, so it
+/// re-ships the record's current image and re-sends the batch — see
+/// [`crate::replication::protocol::ReplicaAck::MissingRecord`]). Every other
+/// failure is a state contradiction or an I/O fault that the master must NOT
+/// try to paper over, and stays [`Self::Failed`].
+///
+/// This exists as a TYPE, not a message prefix, on purpose: the batch handler
+/// picks the ack variant by matching this enum. Nothing anywhere parses an
+/// apply-failure string to decide what to do, so wording changes here can never
+/// silently disable the repair.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ReplicaApplyError {
+    /// The record this op targets is absent on this replica, on a batch whose
+    /// absence policy is NAK (steady-state, dense-sequence tracked,
+    /// non-migration). Carries the key so the master knows what to re-ship.
+    #[error(
+        "{op_name}: record {tx_key:?} absent on a steady-state replica batch — NAK (retryable) so the master re-ships the record and retries instead of masking the divergence"
+    )]
+    MissingRecord {
+        /// The op that could not be applied, for the operator-facing log.
+        op_name: &'static str,
+        /// The absent record.
+        tx_key: TxKey,
+    },
+    /// Any other apply failure: a hard state divergence, an engine error, or an
+    /// I/O fault. Not repairable by re-shipping — the batch fails honestly.
+    #[error("{0}")]
+    Failed(String),
+}
+
+impl From<String> for ReplicaApplyError {
+    fn from(detail: String) -> Self {
+        Self::Failed(detail)
+    }
+}
+
+impl From<&str> for ReplicaApplyError {
+    fn from(detail: &str) -> Self {
+        Self::Failed(detail.to_string())
+    }
+}
+
 /// Resolve a replica op whose target record is ABSENT on this replica (the
 /// pre-op slot read returned not-found).
 ///
@@ -1432,25 +1503,29 @@ fn record_apply_skipped_missing_tx(op_name: &'static str, tx_key: &TxKey) {
 ///   record there is not a divergence.
 /// * `true` — a steady-state, dense-sequence–tracked, non-migration replica
 ///   batch treats the absence as a REAL divergence (C15): the master committed
-///   a mutation against a record this replica never received. Return `Err` so
-///   the batch NAKs (retryable, surfaced as [`ReplicaAck::Error`]); the caller
-///   returns before advancing the high-water mark, so the master re-ships /
-///   marks the replica Down and resyncs instead of the gap being silently
-///   masked to a metric while a false ACK advances the HWM.
+///   a mutation against a record this replica never received. Return
+///   [`ReplicaApplyError::MissingRecord`] so the batch NAKs (retryable,
+///   surfaced as [`ReplicaAck::MissingRecord`]); the caller returns before
+///   advancing the high-water mark, so the gap is never silently masked to a
+///   metric while a false ACK advances the HWM.
 ///
-/// SAFE DEFAULT: honesty over late-joiner liveness. A genuinely late-joining
-/// replica that legitimately lacks a record now NAKs until it is caught up via
-/// resync — the correct signal, not a silently-tolerated hole.
+/// The master's side of this contract is REAL, not aspirational: on
+/// [`ReplicaAck::MissingRecord`] it re-ships the record's full current image
+/// (`build_record_replay_ops`) and re-sends the batch — see
+/// `server::dispatch::repair_missing_record_targets`. If that repair fails, the
+/// client's mutation still fails loudly: honesty over liveness stays the
+/// fallback, it is just no longer the FIRST resort.
 fn missing_record_apply_outcome(
     op_name: &'static str,
     tx_key: &TxKey,
     nak_on_missing: bool,
-) -> std::result::Result<(), String> {
+) -> std::result::Result<(), ReplicaApplyError> {
     record_apply_skipped_missing_tx(op_name, tx_key);
     if nak_on_missing {
-        Err(format!(
-            "{op_name}: record absent on a steady-state replica batch — NAK (retryable) so the master re-ships/resyncs instead of masking the divergence"
-        ))
+        Err(ReplicaApplyError::MissingRecord {
+            op_name,
+            tx_key: *tx_key,
+        })
     } else {
         Ok(())
     }
@@ -1477,6 +1552,44 @@ fn record_apply_divergence(op_name: &'static str, tx_key: &TxKey, detail: &str) 
         detail = detail,
         "replica apply: local slot state contradicts master — aborting batch to force catch-up",
     );
+}
+
+/// Collect every record the REMAINING ops of an aborted batch target that is
+/// absent locally, starting with `failed` (the key that actually aborted it).
+///
+/// `remaining` is the un-applied tail of the batch, beginning at the failing op.
+/// This is a pure READ-ONLY lookahead — nothing is applied, and the batch's
+/// abort semantics are unchanged (nothing at or beyond the failing sequence
+/// takes effect). Its only job is to let the master repair every gap this batch
+/// would hit in ONE re-ship instead of learning about them one round-trip at a
+/// time: a DAH sweep reclaims records in batches, so a client batch racing one
+/// commonly finds many of its keys gone at once.
+///
+/// Only ops that name a single key are considered — those are exactly the ops
+/// that can produce [`ReplicaApplyError::MissingRecord`]. Keys are deduplicated
+/// (a batch can carry several ops per key) and capped at
+/// [`MAX_MISSING_RECORD_KEYS_PER_NAK`], with `failed` always first so a
+/// truncated list still names the key that aborted the batch.
+/// ([`MAX_MISSING_RECORD_KEYS_PER_NAK`](crate::replication::protocol::MAX_MISSING_RECORD_KEYS_PER_NAK))
+///
+/// Absence is checked with the in-RAM index (`Engine::lookup`), so the scan is
+/// cheap and touches no device; it runs only on the failure path.
+fn absent_keys_from(engine: &Engine, failed: TxKey, remaining: &[ReplicaOp]) -> Vec<TxKey> {
+    let mut keys = Vec::with_capacity(1);
+    keys.push(failed);
+    for op in remaining {
+        if keys.len() >= crate::replication::protocol::MAX_MISSING_RECORD_KEYS_PER_NAK {
+            break;
+        }
+        let Some(tx_key) = op.tx_key() else { continue };
+        if keys.contains(&tx_key) {
+            continue;
+        }
+        if engine.lookup(&tx_key).is_none() {
+            keys.push(tx_key);
+        }
+    }
+    keys
 }
 
 /// Apply a single `ReplicaOp` to the engine.
@@ -1559,8 +1672,11 @@ pub fn apply_op_journal(
     let mut collected: Vec<(crate::redo::RedoOp, u8)> = Vec::new();
     // Single-op / migration-baseline applies preserve the historical tolerant
     // skip on an absent record (`nak_on_missing = false`); the C15 NAK is scoped
-    // to steady-state tracked BATCHES, driven from the batch loop below.
-    apply_op_journal_inner(engine, op, journal, is_migration, false, &mut collected)?;
+    // to steady-state tracked BATCHES, driven from the batch loop below. With
+    // `nak_on_missing = false` the `MissingRecord` variant is unreachable here,
+    // so flattening to a string loses no routing information.
+    apply_op_journal_inner(engine, op, journal, is_migration, false, &mut collected)
+        .map_err(|e| e.to_string())?;
     for (redo_op, device_id) in &collected {
         engine.append_replica_redo_entry_to_store(redo_op, *device_id)?;
     }
@@ -1579,7 +1695,7 @@ fn apply_op_journal_inner(
     is_migration: bool,
     nak_on_missing: bool,
     redo_out: &mut Vec<(crate::redo::RedoOp, u8)>,
-) -> std::result::Result<(), String> {
+) -> std::result::Result<(), ReplicaApplyError> {
     // When journalling is disabled (migration-baseline apply), suppress the
     // HEAVY engine-internal redo writes for the duration of the apply below —
     // a baseline Create drives `engine.create` (unmined secondary insert) and
@@ -1732,10 +1848,10 @@ fn apply_op_journal_inner(
                             &spending_data[..8],
                         ),
                     );
-                    Err(format!(
+                    Err(ReplicaApplyError::Failed(format!(
                         "spend divergence: replica slot AlreadySpent with different spending_data ({:02x?}...)",
                         &spending_data[..8],
-                    ))
+                    )))
                 }
                 // Master sent a Spend on what it observed as Unspent
                 // but the replica's slot is Frozen — the master's
@@ -1747,7 +1863,9 @@ fn apply_op_journal_inner(
                         tx_key,
                         "local slot Frozen but master sent Spend",
                     );
-                    Err("spend divergence: local slot Frozen but master sent Spend".to_string())
+                    Err("spend divergence: local slot Frozen but master sent Spend"
+                        .to_string()
+                        .into())
                 }
                 // Same shape for Pruned — master would not have sent
                 // Spend on a pruned slot if its local state matched
@@ -1758,9 +1876,11 @@ fn apply_op_journal_inner(
                         tx_key,
                         "local slot Pruned but master sent Spend",
                     );
-                    Err("spend divergence: local slot Pruned but master sent Spend".to_string())
+                    Err("spend divergence: local slot Pruned but master sent Spend"
+                        .to_string()
+                        .into())
                 }
-                Err(e) => Err(format!("spend: {e}")),
+                Err(e) => Err(format!("spend: {e}").into()),
             }
         }
         ReplicaOp::Unspend {
@@ -1787,7 +1907,7 @@ fn apply_op_journal_inner(
             };
             match engine.unspend(&req) {
                 Ok(_) => Ok(()),
-                Err(e) => Err(format!("unspend: {e}")),
+                Err(e) => Err(format!("unspend: {e}").into()),
             }
         }
         ReplicaOp::SetMined {
@@ -1815,7 +1935,7 @@ fn apply_op_journal_inner(
                 Err(crate::ops::error::SpendError::TxNotFound) => {
                     missing_record_apply_outcome("set_mined", tx_key, nak_on_missing)
                 }
-                Err(e) => Err(format!("set_mined: {e}")),
+                Err(e) => Err(format!("set_mined: {e}").into()),
             }
         }
         ReplicaOp::UnsetMined {
@@ -1840,7 +1960,7 @@ fn apply_op_journal_inner(
                 Err(crate::ops::error::SpendError::TxNotFound) => {
                     missing_record_apply_outcome("unset_mined", tx_key, nak_on_missing)
                 }
-                Err(e) => Err(format!("unset_mined: {e}")),
+                Err(e) => Err(format!("unset_mined: {e}").into()),
             }
         }
         ReplicaOp::SetMinedBatch {
@@ -1877,7 +1997,7 @@ fn apply_op_journal_inner(
                         tx_key,
                         nak_on_missing,
                     )?,
-                    Err(e) => return Err(format!("set_mined_batch: {e}")),
+                    Err(e) => return Err(format!("set_mined_batch: {e}").into()),
                 }
             }
             Ok(())
@@ -1902,7 +2022,7 @@ fn apply_op_journal_inner(
                     record_apply_skipped_missing_tx("freeze", tx_key);
                     Ok(())
                 }
-                Err(e) => Err(format!("freeze: {e}")),
+                Err(e) => Err(format!("freeze: {e}").into()),
             }
         }
         ReplicaOp::Unfreeze { tx_key, offset, .. } => {
@@ -1924,7 +2044,7 @@ fn apply_op_journal_inner(
                     record_apply_skipped_missing_tx("unfreeze", tx_key);
                     Ok(())
                 }
-                Err(e) => Err(format!("unfreeze: {e}")),
+                Err(e) => Err(format!("unfreeze: {e}").into()),
             }
         }
         ReplicaOp::Reassign {
@@ -1959,7 +2079,7 @@ fn apply_op_journal_inner(
                     record_apply_skipped_missing_tx("reassign", tx_key);
                     Ok(())
                 }
-                Err(e) => Err(format!("reassign: {e}")),
+                Err(e) => Err(format!("reassign: {e}").into()),
             }
         }
         ReplicaOp::SetConflicting {
@@ -1980,7 +2100,7 @@ fn apply_op_journal_inner(
                 Err(crate::ops::error::SpendError::TxNotFound) => {
                     missing_record_apply_outcome("set_conflicting", tx_key, nak_on_missing)
                 }
-                Err(e) => Err(format!("set_conflicting: {e}")),
+                Err(e) => Err(format!("set_conflicting: {e}").into()),
             }
         }
         ReplicaOp::RemoveConflictingChild { tx_key, child_txid } => {
@@ -2007,7 +2127,7 @@ fn apply_op_journal_inner(
                     record_apply_skipped_missing_tx("remove_conflicting_child", tx_key);
                     Ok(())
                 }
-                Err(e) => Err(format!("remove_conflicting_child: {e}")),
+                Err(e) => Err(format!("remove_conflicting_child: {e}").into()),
             }
         }
         ReplicaOp::SetLocked { tx_key, value, .. } => {
@@ -2020,7 +2140,7 @@ fn apply_op_journal_inner(
                 Err(crate::ops::error::SpendError::TxNotFound) => {
                     missing_record_apply_outcome("set_locked", tx_key, nak_on_missing)
                 }
-                Err(e) => Err(format!("set_locked: {e}")),
+                Err(e) => Err(format!("set_locked: {e}").into()),
             }
         }
         ReplicaOp::PreserveUntil {
@@ -2037,7 +2157,7 @@ fn apply_op_journal_inner(
                 Err(crate::ops::error::SpendError::TxNotFound) => {
                     missing_record_apply_outcome("preserve_until", tx_key, nak_on_missing)
                 }
-                Err(e) => Err(format!("preserve_until: {e}")),
+                Err(e) => Err(format!("preserve_until: {e}").into()),
             }
         }
         ReplicaOp::Create {
@@ -2191,6 +2311,7 @@ fn apply_op_journal_inner(
                 cold_data,
                 is_migration,
             )
+            .map_err(ReplicaApplyError::Failed)
         }
         ReplicaOp::Delete { tx_key } => {
             let req = DeleteRequest {
@@ -2200,7 +2321,7 @@ fn apply_op_journal_inner(
             match engine.delete(&req) {
                 Ok(()) => Ok(()),
                 Err(crate::ops::error::SpendError::TxNotFound) => Ok(()),
-                Err(e) => Err(format!("delete: {e}")),
+                Err(e) => Err(format!("delete: {e}").into()),
             }
         }
         ReplicaOp::PruneSlot { tx_key, offset } => {
@@ -2217,7 +2338,7 @@ fn apply_op_journal_inner(
                     record_apply_skipped_missing_tx("prune_slot", tx_key);
                     Ok(())
                 }
-                Err(e) => Err(format!("prune_slot: {e}")),
+                Err(e) => Err(format!("prune_slot: {e}").into()),
             }
         }
         ReplicaOp::PruneSlotIfSpentBy {
@@ -2227,7 +2348,7 @@ fn apply_op_journal_inner(
         } => engine
             .prune_slot_if_spent_by_child(tx_key, *offset, *child_txid)
             .map(|_| ())
-            .map_err(|e| format!("prune_slot_if_spent_by: {e}")),
+            .map_err(|e| ReplicaApplyError::Failed(format!("prune_slot_if_spent_by: {e}"))),
         ReplicaOp::MarkLongestChain {
             tx_key,
             on_longest_chain,
@@ -2280,7 +2401,7 @@ fn apply_op_journal_inner(
                         record_apply_skipped_missing_tx("mark_longest_chain", tx_key);
                         Ok(())
                     }
-                    Err(e) => Err(format!("mark_longest_chain: {e}")),
+                    Err(e) => Err(format!("mark_longest_chain: {e}").into()),
                 }
             }
         }
@@ -2308,9 +2429,9 @@ fn apply_op_journal_inner(
         // that invariant is ever violated, matching the "both branches
         // hard-fail the ACK" discipline this generation sync already uses.
         let Some(tx_key) = op.tx_key() else {
-            return Err(format!(
+            return Err(ReplicaApplyError::Failed(format!(
                 "generation sync: op carries master_generation but no single tx_key: {op:?}"
-            ));
+            )));
         };
         // C-4: route the generation sync through the stripe-locked
         // `engine.set_record_generation` instead of a raw
@@ -2322,7 +2443,7 @@ fn apply_op_journal_inner(
         // reconcile — the op already short-circuited as a skip above.
         if !engine
             .set_record_generation(&tx_key, master_gen)
-            .map_err(|e| format!("generation sync: {e}"))?
+            .map_err(|e| ReplicaApplyError::Failed(format!("generation sync: {e}")))?
         {
             // A record absent after apply is a real generation-counter divergence
             // ONLY on a tracked steady-state batch. For a MIGRATION baseline (Fix C:
@@ -2337,7 +2458,16 @@ fn apply_op_journal_inner(
                 record_apply_skipped_missing_tx("generation_sync", &tx_key);
                 return Ok(());
             }
-            return Err(format!("generation sync: tx {tx_key:?} absent after apply"));
+            // Same remedy as an op-arm absence: the record vanished between the
+            // apply and this sync (only reachable if something removed it
+            // concurrently), and the master can fix it by re-shipping. Route it
+            // through the SAME typed variant so the repair covers it too —
+            // hard-failing here would leave the client's op rejected for a
+            // condition the master demonstrably can repair.
+            return Err(ReplicaApplyError::MissingRecord {
+                op_name: "generation_sync",
+                tx_key,
+            });
         }
     }
 
@@ -4057,9 +4187,14 @@ mod tests {
     }
 
     /// R7 regression: a TRACKED steady-state batch (`nak_on_missing = true`)
-    /// must still hard-fail on absent-after-apply — that is the real
+    /// must still fail the batch on absent-after-apply — that is the real
     /// generation-counter divergence case (C15) the gate exists to catch.
     /// This is the one case the R7 fix must NOT loosen.
+    ///
+    /// C15 repair: the failure is now the TYPED `MissingRecord`, naming the key,
+    /// so the master re-ships the record instead of only logging. It is still an
+    /// `Err` — the batch aborts and the watermark does not advance — so the R7
+    /// property this test pins is unchanged; only the master's remedy improved.
     #[test]
     fn generation_sync_tracked_absent_record_still_hard_fails() {
         let engine = make_engine();
@@ -4074,9 +4209,127 @@ mod tests {
         let mut redo_out = Vec::new();
         let err = apply_op_journal_inner(&engine, &op, true, false, true, &mut redo_out)
             .expect_err("tracked-batch gen-sync on an absent record must still hard-error");
+        match err {
+            ReplicaApplyError::MissingRecord { op_name, tx_key } => {
+                assert_eq!(op_name, "generation_sync");
+                assert_eq!(tx_key, missing);
+            }
+            other => panic!("expected a typed MissingRecord failure, got: {other:?}"),
+        }
+    }
+
+    /// **F1 / C15 interaction — the dangerous one.** A replicated client delete
+    /// (`ReplicaOp::Delete`) whose record this replica does NOT have must be an
+    /// idempotent SUCCESS, never a `MissingRecord` NAK — on a TRACKED
+    /// steady-state batch (`nak_on_missing = true`), which is exactly what a
+    /// client `OP_DELETE_BATCH` fan-out produces.
+    ///
+    /// Why this is not a style preference: a `MissingRecord` NAK is routed by
+    /// `server::dispatch::repair_missing_record_target`, whose whole job is to
+    /// re-ship the record's full current image so the replica can apply the
+    /// batch. For a Delete that would make the master RESURRECT on the replica
+    /// the very record it is deleting — and the re-shipped copy would then
+    /// survive, because the master's local copy is dropped straight afterwards
+    /// and nothing revisits a replica copy.
+    ///
+    /// Two independent properties keep it out of that path, and this test pins
+    /// BOTH: the op arm resolves `TxNotFound` to `Ok(())`, and
+    /// `ReplicaOp::Delete::master_generation()` is `None` so the post-apply
+    /// generation sync — the OTHER producer of `MissingRecord` — is skipped.
+    #[test]
+    fn tracked_delete_of_absent_record_is_idempotent_never_missing_record() {
+        let engine = make_engine();
+        let missing = key(125);
         assert!(
-            err.contains("absent after apply"),
-            "expected the 'absent after apply' hard error, got: {err}"
+            engine.lookup(&missing).is_none(),
+            "precondition: the replica must not hold the record"
+        );
+        let op = ReplicaOp::Delete { tx_key: missing };
+        assert_eq!(
+            op.master_generation(),
+            None,
+            "Delete must carry no master_generation — otherwise the post-apply \
+             generation sync raises MissingRecord for the absent record and the \
+             master re-ships (resurrects) it"
+        );
+
+        let mut redo_out = Vec::new();
+        // nak_on_missing = true, is_migration = false: the tracked steady-state
+        // batch shape a client OP_DELETE_BATCH fan-out actually produces.
+        let r = apply_op_journal_inner(&engine, &op, true, false, true, &mut redo_out);
+        assert_eq!(
+            r,
+            Ok(()),
+            "a tracked replicated delete of an absent record must be an idempotent \
+             success, not a MissingRecord NAK"
+        );
+        assert!(
+            engine.lookup(&missing).is_none(),
+            "the delete must not have resurrected the record"
+        );
+    }
+
+    /// The replicated delete's DURABILITY half, and its idempotence on
+    /// re-delivery — driven on an engine that actually has a redo log attached
+    /// (the shape a replica node runs).
+    ///
+    /// The replica journals a sentinel `RedoOp::Delete` (offset/size 0 = pure
+    /// index unregister) for the removal it just applied, and fsyncs it before
+    /// the batch ACK. That is what makes the REPLICA's half of a replicated
+    /// client delete crash-durable while the master's half is not (spec §3.18,
+    /// `docs/DURABILITY_CONTRACT.md`) — the asymmetry that bounds the crash
+    /// residual to master-live / replica-absent, never the reverse.
+    ///
+    /// A second delivery of the same op (a `Busy` resend, or the master's own
+    /// retry after a partial fan-out) must then be a plain idempotent success:
+    /// no `MissingRecord`, so no repair round-trip, so no resurrection.
+    #[test]
+    fn tracked_delete_journals_its_removal_and_is_idempotent_on_redelivery() {
+        let dev: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let alloc = SlotAllocator::new(dev.clone()).unwrap();
+        let index = Index::new(10_000).unwrap();
+        let engine = Engine::new(dev, index, alloc, StripedLocks::new(1024), DahIndex::new());
+        let log_dev: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(4 * 1024 * 1024, 4096).unwrap());
+        let log = crate::redo::RedoLog::open(log_dev, 0, 4 * 1024 * 1024).unwrap();
+        engine.set_redo_logs(vec![Arc::new(parking_lot::Mutex::new(log))]);
+        let engine = Arc::new(engine);
+
+        let k = key(126);
+        create_record(&engine, k, 3);
+        let op = ReplicaOp::Delete { tx_key: k };
+
+        let mut redo_out = Vec::new();
+        assert_eq!(
+            apply_op_journal_inner(&engine, &op, true, false, true, &mut redo_out),
+            Ok(()),
+            "first delivery must apply"
+        );
+        assert!(engine.lookup(&k).is_none(), "first delivery must remove it");
+        assert!(
+            redo_out.iter().any(|(entry, _)| matches!(
+                entry,
+                crate::redo::RedoOp::Delete {
+                    tx_key,
+                    record_offset: 0,
+                    record_size: 0,
+                } if *tx_key == k
+            )),
+            "the replica must journal a sentinel RedoOp::Delete for the removal so its \
+             half of the delete survives a crash, got {redo_out:?}"
+        );
+
+        let mut redo_out2 = Vec::new();
+        assert_eq!(
+            apply_op_journal_inner(&engine, &op, true, false, true, &mut redo_out2),
+            Ok(()),
+            "re-delivery of the same delete must be an idempotent success, never a \
+             MissingRecord NAK (which would make the master re-ship the record)"
+        );
+        assert!(
+            engine.lookup(&k).is_none(),
+            "re-delivery must not resurrect"
         );
     }
 
@@ -8240,20 +8493,25 @@ mod tests {
             "a tracked spend for a missing record must NAK, not silently ACK",
         );
         match ReplicaAck::deserialize(&resp.payload).expect("ack decodes") {
-            ReplicaAck::Error {
+            ReplicaAck::MissingRecord {
                 failed_sequence,
-                message,
+                tx_keys,
             } => {
                 assert_eq!(
                     failed_sequence, 10,
                     "the NAK must point at the offending sequence",
                 );
-                assert!(
-                    message.contains("absent"),
-                    "the NAK message must name the missing-record divergence, got: {message}",
+                // C15 repair: the NAK is a TYPED variant naming the key, not an
+                // opaque `Error` whose message the master would have to parse.
+                // That key is what the master re-ships — a NAK that named the
+                // wrong record (or none) would repair the wrong thing.
+                assert_eq!(
+                    tx_keys,
+                    vec![key(199)],
+                    "the NAK must name exactly the missing record so the master re-ships it",
                 );
             }
-            other => panic!("expected a retryable Error NAK, got {other:?}"),
+            other => panic!("expected a typed MissingRecord NAK, got {other:?}"),
         }
         assert_eq!(
             tracker.get(stream_key),
@@ -8334,31 +8592,38 @@ mod tests {
             "a tracked set_mined for a missing record must NAK, not silently ACK",
         );
         match ReplicaAck::deserialize(&resp.payload).expect("ack decodes") {
-            ReplicaAck::Error {
+            ReplicaAck::MissingRecord {
                 failed_sequence,
-                message,
+                tx_keys,
             } => {
                 assert_eq!(
                     failed_sequence, 10,
                     "the NAK must point at the offending sequence",
                 );
-                // Deliberately check for the `missing_record_apply_outcome`
-                // wording (not just "absent") — a separate, pre-existing
-                // post-apply generation-sync gate (receiver.rs ~2298-2337)
-                // ALSO hard-fails a non-migration apply of any op carrying
-                // `master_generation` when the record is absent after apply,
-                // with an unrelated "generation sync: tx ... absent after
-                // apply" message. Without this op-specific check the test
-                // would spuriously pass pre-fix via that OTHER gate instead
-                // of proving the SetMined arm itself now routes through
-                // `missing_record_apply_outcome`.
-                assert!(
-                    message.starts_with("set_mined:") && message.contains("steady-state"),
-                    "the NAK must come from the SetMined arm's own \
-                     missing_record_apply_outcome routing, got: {message}",
+                assert_eq!(
+                    tx_keys,
+                    vec![key(201)],
+                    "the NAK must name the record the master has to re-ship",
                 );
             }
-            other => panic!("expected a retryable Error NAK, got {other:?}"),
+            other => panic!("expected a typed MissingRecord NAK, got {other:?}"),
+        }
+        // The ack alone cannot say WHICH gate produced it: a separate,
+        // pre-existing post-apply generation-sync gate ALSO reports
+        // `MissingRecord` for any op carrying `master_generation` whose record
+        // is absent after apply. Re-drive the same op through the apply and
+        // assert the typed `op_name`, so this still proves the SetMined arm
+        // itself routes through `missing_record_apply_outcome` rather than
+        // passing via that OTHER gate. (Pre-typed-error this discrimination was
+        // a message-prefix check; the variant field is the same guard, minus the
+        // string matching.)
+        let mut redo_out = Vec::new();
+        match apply_op_journal_inner(&engine, &batch.ops[0], true, false, true, &mut redo_out) {
+            Err(ReplicaApplyError::MissingRecord { op_name, tx_key }) => {
+                assert_eq!(op_name, "set_mined");
+                assert_eq!(tx_key, key(201));
+            }
+            other => panic!("expected the SetMined arm's own MissingRecord, got {other:?}"),
         }
         assert_eq!(
             tracker.get(stream_key),
@@ -8460,20 +8725,25 @@ mod tests {
             "a tracked set_mined_batch with one missing txid must NAK the whole op",
         );
         match ReplicaAck::deserialize(&resp.payload).expect("ack decodes") {
-            ReplicaAck::Error {
+            ReplicaAck::MissingRecord {
                 failed_sequence,
-                message,
+                tx_keys,
             } => {
                 assert_eq!(
                     failed_sequence, 10,
                     "the NAK must point at the offending sequence",
                 );
-                assert!(
-                    message.contains("absent"),
-                    "the NAK message must name the missing-record divergence, got: {message}",
+                // Only the ABSENT txid is named. `SetMinedBatch` returns `None`
+                // from `tx_key()`, so the lookahead cannot expand a multi-key op
+                // — the master must not be told to re-ship key(203), which this
+                // replica already holds.
+                assert_eq!(
+                    tx_keys,
+                    vec![key(204)],
+                    "the NAK must name only the missing txid, not the present one",
                 );
             }
-            other => panic!("expected a retryable Error NAK, got {other:?}"),
+            other => panic!("expected a typed MissingRecord NAK, got {other:?}"),
         }
         assert_eq!(
             tracker.get(stream_key),
@@ -8520,26 +8790,33 @@ mod tests {
             "a tracked set_conflicting for a missing record must NAK, not silently ACK",
         );
         match ReplicaAck::deserialize(&resp.payload).expect("ack decodes") {
-            ReplicaAck::Error {
+            ReplicaAck::MissingRecord {
                 failed_sequence,
-                message,
+                tx_keys,
             } => {
                 assert_eq!(
                     failed_sequence, 10,
                     "the NAK must point at the offending sequence",
                 );
-                // See the analogous comment in
-                // `set_mined_missing_record_naks_on_tracked_batch`: a
-                // separate pre-existing generation-sync gate also hard-fails
-                // this scenario with an unrelated message, so check for the
-                // SetConflicting arm's own wording specifically.
-                assert!(
-                    message.starts_with("set_conflicting:") && message.contains("steady-state"),
-                    "the NAK must come from the SetConflicting arm's own \
-                     missing_record_apply_outcome routing, got: {message}",
+                assert_eq!(
+                    tx_keys,
+                    vec![key(205)],
+                    "the NAK must name the record the master has to re-ship",
                 );
             }
-            other => panic!("expected a retryable Error NAK, got {other:?}"),
+            other => panic!("expected a typed MissingRecord NAK, got {other:?}"),
+        }
+        // See the analogous comment in
+        // `set_mined_missing_record_naks_on_tracked_batch`: the pre-existing
+        // generation-sync gate reports the same ack variant, so assert the typed
+        // `op_name` to prove this came from the SetConflicting arm itself.
+        let mut redo_out = Vec::new();
+        match apply_op_journal_inner(&engine, &batch.ops[0], true, false, true, &mut redo_out) {
+            Err(ReplicaApplyError::MissingRecord { op_name, tx_key }) => {
+                assert_eq!(op_name, "set_conflicting");
+                assert_eq!(tx_key, key(205));
+            }
+            other => panic!("expected the SetConflicting arm's own MissingRecord, got {other:?}"),
         }
         assert_eq!(
             tracker.get(stream_key),
@@ -8818,10 +9095,14 @@ mod tests {
                     "error message must include diagnostic detail"
                 );
             }
-            ReplicaAck::Ok { .. } | ReplicaAck::Gap { .. } | ReplicaAck::Busy { .. } => {
+            ReplicaAck::Ok { .. }
+            | ReplicaAck::Gap { .. }
+            | ReplicaAck::Busy { .. }
+            | ReplicaAck::MissingRecord { .. } => {
                 panic!(
-                    "R-035: replica must NOT ACK Ok (or NAK Gap/Busy) when an on-device \
-                     metadata write failed"
+                    "R-035: replica must NOT ACK Ok (or NAK Gap/Busy/MissingRecord) when an \
+                     on-device metadata write failed — an on-device write fault is not a \
+                     missing record and must never be routed to the master's re-ship repair"
                 )
             }
         }

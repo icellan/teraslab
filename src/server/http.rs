@@ -947,6 +947,11 @@ pub(crate) fn render_metrics_text(
     );
     prom_counter(
         &mut out,
+        "teraslab_deletes_held_copy_reclaimed_total",
+        m.deletes_held_copy_reclaimed.get(),
+    );
+    prom_counter(
+        &mut out,
         "teraslab_preserve_until_attempted_total",
         m.preserve_until_attempted.get(),
     );
@@ -1223,6 +1228,16 @@ pub(crate) fn render_metrics_text(
             &mut out,
             "teraslab_replica_apply_divergence_total",
             r.replica_apply_divergence_total.get(),
+        );
+        prom_counter(
+            &mut out,
+            "teraslab_replica_missing_record_repaired_total",
+            r.replica_missing_record_repaired.get(),
+        );
+        prom_counter(
+            &mut out,
+            "teraslab_replica_missing_record_repair_failed_total",
+            r.replica_missing_record_repair_failed.get(),
         );
         prom_counter(
             &mut out,
@@ -4812,6 +4827,8 @@ mod tests {
             "teraslab_replica_rejected_stale_cluster_key_total",
             "teraslab_replica_apply_skipped_missing_tx_total",
             "teraslab_replica_apply_divergence_total",
+            "teraslab_replica_missing_record_repaired_total",
+            "teraslab_replica_missing_record_repair_failed_total",
             "teraslab_ack_tracker_flush_failures_total",
             "teraslab_ack_tracker_load_failures_total",
             "teraslab_intent_log_poisoned_total",

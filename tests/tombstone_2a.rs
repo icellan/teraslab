@@ -318,6 +318,147 @@ fn delete_records_tombstone_at_generation_when_enabled() {
     assert!(h.engine.tombstone_at_or_ahead(&k, frozen_gen));
 }
 
+// ---------------------------------------------------------------------------
+// F2 — held-copy reclaim (replica-side GC) vs. authoritative deletion.
+//
+// Under RF > 1 a node stores every record of every shard it replicates, and the
+// DAH sweep is the only thing that ever revisits a stored record. Gating the
+// sweep on MASTERSHIP left each node's replica half with no reclaim driver at
+// all, so it grew without bound. The fix lets a node reclaim what it HOLDS —
+// and the whole safety argument for that is the pair of tests below: the
+// authority's deletion still records a tombstone (and so still vetoes a
+// resurrection), while a held-copy reclaim records none (and so is always
+// repairable by the master).
+// ---------------------------------------------------------------------------
+
+/// Make `txid_byte` a genuine DAH-sweep candidate: mined on the longest chain,
+/// every output spent, DAH planted at `height + 288`. Returns the key and the
+/// record's frozen generation.
+fn seed_sweep_due_record(h: &Harness, txid_byte: u8, height: u32) -> (TxKey, u32) {
+    let hashes: Vec<[u8; 32]> = (0..2u32).map(|v| slot_hash(txid_byte, v)).collect();
+    let mut req = base_create_req(txid_byte, &hashes);
+    let mined = [teraslab::ops::create::MinedBlockInfo {
+        block_id: 7,
+        block_height: height,
+        subtree_idx: 0,
+    }];
+    req.mined_block_infos = &mined;
+    h.engine.create(&req).unwrap();
+    h.make_durable();
+    let k = key(txid_byte);
+    h.spend_output(&k, 0, height);
+    h.spend_output(&k, 1, height);
+    let generation = { h.engine.read_metadata(&k).unwrap().generation };
+    assert!(
+        h.engine.is_due_for_sweep(&k, height + 288),
+        "the record must be a real sweep candidate, else the assertions below are vacuous"
+    );
+    (k, generation)
+}
+
+/// **The load-bearing difference.** A held-copy reclaim removes the record and
+/// records NO tombstone, so a later re-delivery of the SAME generation — the
+/// copy the master still holds — is admitted. The shard master's sweep-delete
+/// of the identical record records one and vetoes exactly that re-delivery.
+///
+/// This is what makes replica-side GC a space reclaim rather than a deletion:
+/// a tombstone is the authority's veto over any future copy of the key
+/// (RULE-DS), and a replica is not the authority. If a replica dropped a copy
+/// it should have kept (the `PreserveUntil` race), a tombstone would turn a
+/// transient, self-healing divergence into permanent loss.
+#[test]
+fn held_copy_reclaim_writes_no_tombstone_while_the_master_sweep_still_does() {
+    // --- replica role: reclaim the held copy ---
+    let replica = Harness::new_with_tombstones();
+    let (k, generation) = seed_sweep_due_record(&replica, 11, 1000);
+
+    replica
+        .engine
+        .reclaim_held_copy(&DeleteRequest {
+            tx_key: k,
+            due_guard: Some(1288),
+        })
+        .expect("a due held copy must be reclaimed");
+
+    assert!(
+        replica.engine.lookup(&k).is_none(),
+        "the held copy must actually be gone — the point is reclaiming its space"
+    );
+    assert!(
+        replica.engine.tombstone_lookup(&k).is_none(),
+        "a held-copy reclaim must record NO tombstone"
+    );
+    assert!(
+        !replica.engine.tombstone_blocks_heal_apply(&k, generation),
+        "nothing may block the master re-delivering the record at the same generation"
+    );
+
+    // --- master role: the same record, the same predicate, real deletion ---
+    let master = Harness::new_with_tombstones();
+    let (mk, master_gen) = seed_sweep_due_record(&master, 11, 1000);
+    assert_eq!(
+        master_gen, generation,
+        "both harnesses must reach the same generation, else the contrast is not like-for-like"
+    );
+
+    master
+        .engine
+        .prune_delete(&DeleteRequest {
+            tx_key: mk,
+            due_guard: Some(1288),
+        })
+        .expect("a due record must be swept by its master");
+
+    assert_eq!(
+        master.engine.tombstone_lookup(&mk),
+        Some((master_gen, 1288)),
+        "the master's sweep-delete must still record a Dah tombstone at the frozen generation"
+    );
+    assert!(
+        master.engine.tombstone_blocks_heal_apply(&mk, master_gen),
+        "the master's tombstone must still veto a same-generation resurrection (RULE-DS)"
+    );
+}
+
+/// The `PreserveUntil` race, ordered preserve-then-sweep: a preservation that
+/// lands on the replica before its sweep reaches the under-lock re-validation
+/// WINS. `reclaim_held_copy` honours `due_guard` exactly as `prune_delete`
+/// does, so the two orderings on a replica are (a) preserve first → the record
+/// is kept, or (b) reclaim first → the record is gone but leaves no tombstone,
+/// and the master's re-delivery restores it (test above).
+#[test]
+fn held_copy_reclaim_refuses_a_record_preserved_under_the_stripe_lock() {
+    let h = Harness::new_with_tombstones();
+    let (k, _generation) = seed_sweep_due_record(&h, 12, 1000);
+
+    h.engine
+        .preserve_until(&teraslab::ops::remaining::PreserveUntilRequest {
+            tx_key: k,
+            block_height: 5000,
+        })
+        .expect("preserve must succeed");
+
+    let err = h
+        .engine
+        .reclaim_held_copy(&DeleteRequest {
+            tx_key: k,
+            due_guard: Some(1288),
+        })
+        .expect_err("a preserved record must not be reclaimed");
+    assert!(
+        matches!(err, SpendError::NotDue),
+        "expected NotDue, got {err:?}"
+    );
+    assert!(
+        h.engine.lookup(&k).is_some(),
+        "the preserved record must still be live on the replica"
+    );
+    assert!(
+        h.engine.tombstone_lookup(&k).is_none(),
+        "a refused reclaim must record no tombstone"
+    );
+}
+
 /// Flag off (no tombstone log attached): the whole subsystem is a zero-cost
 /// no-op — no log, no index, no behavior change to the delete.
 #[test]

@@ -461,6 +461,23 @@ pub struct Engine {
     /// Prometheus counter `teraslab_index_enumeration_unreadable_total`.
     /// Monotonic for the lifetime of the engine.
     enumeration_unreadable: std::sync::atomic::AtomicU64,
+    /// P1-2 — `now_millis()` at the last moment this node PROVED, as a replica,
+    /// that its inbound replication stream has a hole: it NAKed a sequence gap
+    /// (positions it never received) or a missing record (a mutation against a
+    /// record it never received). `0` means no such proof has ever been
+    /// observed.
+    ///
+    /// The held-copy DAH reclaim (`SweepRole::HeldCopy`) is fenced while this is
+    /// recent. `sweep_role_snap`'s existing fences (`has_pending_inbound`,
+    /// `is_shard_write_fenced`) are MIGRATION fences and say nothing about
+    /// replication health: a replica catching up after a partition or a restart
+    /// is not fenced by either, so it would sweep against a view that is stale
+    /// by the whole catch-up backlog rather than by a round-trip — dropping
+    /// copies whose queued `PreserveUntil` / reorg has not arrived yet.
+    ///
+    /// This is deliberately per-ENGINE, not a process global: in-process
+    /// multi-node tests (and any co-tenanted node) must not fence each other.
+    replica_stream_hole_ms: std::sync::atomic::AtomicU64,
     /// FU#7 Option B: `true` iff the last [`Self::recover_mined_index`] restored
     /// from a v3 `.mined` checkpoint snapshot (one that persisted every entry's
     /// DE/LSA cache). `false` after a fresh boot (no snapshot) OR a legacy v2
@@ -541,6 +558,28 @@ pub enum DahReconcileScope<'a> {
     /// whose primary record is gone (deleted post-checkpoint) has its stale DAH
     /// entry removed. Eligible iff `redb && dah_ok && snapshot_was_v3 && flag`.
     Touched(&'a std::collections::HashSet<TxKey>),
+}
+
+/// Whether a record removal speaks for the key or only for this node's disk.
+///
+/// Under RF > 1 every record physically lives on several nodes, but exactly one
+/// of them — the shard master — is the AUTHORITY on whether the key still
+/// exists. The two roles need the same physical removal and a different
+/// *durable claim*, and that is the only thing this enum selects: whether
+/// `delete_inner` records a deletion tombstone.
+///
+/// See [`Engine::reclaim_held_copy`] for why a non-authoritative removal must
+/// never leave one behind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RemovalAuthority {
+    /// This node is the key's authority (its shard master, or an unclustered
+    /// single node). The removal is the key's real deletion and records a
+    /// deletion tombstone so a later reverse-heal cannot resurrect it.
+    Authoritative,
+    /// This node merely HOLDS a replica copy. The removal reclaims local device
+    /// space and asserts nothing about the key: no tombstone, so the master can
+    /// always put the record back.
+    HeldCopy,
 }
 
 impl Engine {
@@ -713,6 +752,7 @@ impl Engine {
             cached_millis: std::sync::atomic::AtomicU64::new(sys_millis()),
             conflicting_children_dropped: std::sync::atomic::AtomicU64::new(0),
             enumeration_unreadable: std::sync::atomic::AtomicU64::new(0),
+            replica_stream_hole_ms: std::sync::atomic::AtomicU64::new(0),
             mined_snapshot_restored_v3: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             fail_next_register: std::sync::atomic::AtomicBool::new(false),
@@ -7311,6 +7351,47 @@ impl Engine {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// P1-2 — record that this node, acting as a REPLICA, just proved its
+    /// inbound replication stream has a hole (a sequence-gap NAK or a
+    /// missing-record NAK).
+    ///
+    /// Called from the receiver on those two NAK paths only. Both mean "the
+    /// master sent me something I cannot place against what I have", which is
+    /// exactly the state a replica is in while a catch-up backlog drains. It is
+    /// NOT armed by migration or out-of-band batches: those already have their
+    /// own fences (`has_pending_inbound` / `is_shard_write_fenced`) and arming
+    /// on them would fence the sweep after every routine rebalance.
+    pub fn note_replica_stream_hole(&self) {
+        let now = self.now_millis();
+        self.replica_stream_hole_ms
+            .store(now.max(1), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// P1-2 — whether a replica-stream hole was observed within the last
+    /// `window_ms`, i.e. whether a held-copy reclaim should be fenced.
+    ///
+    /// Fail-closed on a clock that moved backwards (returns `true`), because the
+    /// cost of skipping a reclaim is one deferred pass and the cost of a wrong
+    /// reclaim is a record the master must re-ship.
+    ///
+    /// HONEST LIMIT: this is a quiet period, not a proof of currency. A replica
+    /// cannot know its own lag — that would require the master to advertise its
+    /// head — so this narrows the window rather than closing it. The
+    /// missing-record repair on the master is the correctness backstop; this
+    /// only stops the replica creating that work in the first place.
+    pub fn replica_stream_hole_within(&self, window_ms: u64) -> bool {
+        let at = self
+            .replica_stream_hole_ms
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if at == 0 {
+            return false;
+        }
+        match self.now_millis().checked_sub(at) {
+            Some(age) => age < window_ms,
+            None => true,
+        }
+    }
+
     /// FU#7 Option B: whether the last [`Self::recover_mined_index`] restored
     /// from a v3 `.mined` checkpoint snapshot (which persists every entry's
     /// DE/LSA cache), enabling the O(redo) Touched-scope secondary reconcile.
@@ -8380,26 +8461,110 @@ impl Engine {
     /// blob-store I/O path and lets the sweep batch unlinks.
     #[tracing::instrument(level = "debug", skip_all)]
     pub fn delete(&self, req: &DeleteRequest) -> Result<(), SpendError> {
-        self.delete_inner(req)
+        self.delete_inner(req, RemovalAuthority::Authoritative)
     }
 
-    /// Local prune-delete: remove a fully-spent record locally with NO redo and
-    /// NO replication.
+    /// Local prune-delete: remove a record from THIS node's store, with no
+    /// replayable deletion record.
     ///
-    /// Deletes are independent-node GC of records that are fully spent and no
-    /// longer needed, NOT part of normal client operation. Durability is
-    /// unnecessary: a crash before the physical cleanup just leaves the record
-    /// present (and consistent — record + parent-spent slots + allocated region
-    /// all still agree), and the pruner re-deletes it on its next pass
-    /// (self-healing). Physically identical to [`Self::delete`] (RAM-index
+    /// This is the LOCAL half of a removal, used by both the DAH sweep (its
+    /// whole job) and a client `OP_DELETE_BATCH` (whose handler replicates
+    /// `ReplicaOp::Delete` to the key's other holders FIRST, then calls this to
+    /// drop the master's copy — see `server::dispatch::handle_delete_batch`).
+    /// This method itself replicates nothing.
+    ///
+    /// Durability of the DELETE is not enforced here: a crash before the
+    /// physical cleanup just leaves the record present (and consistent —
+    /// record + parent-spent slots + allocated region all still agree), and the
+    /// pruner re-deletes it on its next pass (self-healing). For the replicated
+    /// client path that revert is one-sided — the replica journals its own
+    /// `RedoOp::Delete` before ACKing — so a master crash before its next
+    /// checkpoint can leave master-live / replica-absent; see spec §3.18 and
+    /// `docs/DURABILITY_CONTRACT.md` for why that is eventually consistent and
+    /// not a lost UTXO. Physically identical to [`Self::delete`] (RAM-index
     /// unregister + header zero via the write-back cache + region free); the
-    /// distinct name documents the pruner's intent at the call site. Returns
-    /// `Ok(())` on success or when the record is already gone (idempotent).
+    /// distinct name documents the pruner's intent at the call site.
+    /// Returns `Ok(())` on success or when the record is already gone
+    /// (idempotent).
+    ///
+    /// Two things this does NOT mean, both previously mis-stated here:
+    ///
+    /// * **It is not redo-free.** No `RedoOp::Delete` is journalled — that is
+    ///   what "no redo" was reaching for, and it is why recovery's create-scrub
+    ///   has to identify a deleted record by OFFSET. But returning the region to
+    ///   the allocator emits a fsynced `RedoOp::FreeRegion`, and
+    ///   `update_dah_index` journals a `RedoOp::SecondaryDahUpdate` intent.
+    ///   Neither can leak into a migration delta (`redo_entry_to_replica_op`
+    ///   maps both to `None`), so the safety argument stands — but the
+    ///   `FreeRegion` entry is load-bearing and must not be removed on the
+    ///   strength of a "this path writes no WAL" claim.
+    /// * **It is not tombstone-free.** This is an AUTHORITATIVE removal, so
+    ///   [`delete_inner`](Self::delete_inner) records a generation-aware
+    ///   deletion tombstone whenever a tombstone log is attached — which is the
+    ///   default for RF > 1. Only [`Self::reclaim_held_copy`] skips it.
     pub fn prune_delete(&self, req: &DeleteRequest) -> Result<(), SpendError> {
-        self.delete_inner(req)
+        self.delete_inner(req, RemovalAuthority::Authoritative)
+    }
+
+    /// **Held-copy reclaim**: drop the local copy of a record this node HOLDS
+    /// but does NOT master, purely to reclaim device space.
+    ///
+    /// Under RF > 1 a node stores every record of every shard it replicates,
+    /// so roughly `RF - 1` of every `RF` records on its device are replica
+    /// copies. Mastership decides who is AUTHORITATIVE for a key; it does not
+    /// decide who pays to store it. A node that only ever reclaimed the keys it
+    /// masters would grow its replica half without bound (F2), because nothing
+    /// else in the system ever revisits a replica copy.
+    ///
+    /// Physically identical to [`Self::prune_delete`] — RAM-index unregister,
+    /// header zero via the write-back cache, region free — with ONE deliberate
+    /// difference: it records **no deletion tombstone**. That difference is the
+    /// whole safety argument, so it must not be "simplified" away:
+    ///
+    /// - A tombstone is durable evidence that *this node deleted this key at
+    ///   generation N*, and RULE-DS
+    ///   ([`crate::ops::tombstone::TombstoneLog::blocks_heal_apply`]) uses it to
+    ///   REFUSE an incoming copy of the key. That veto is legitimate for the
+    ///   shard master, which is the authority on whether the key still exists.
+    /// - A replica is not that authority. If it drops a copy it should have
+    ///   kept (the `PreserveUntil` race — see `handle_process_expired`), the
+    ///   master still holds the record and MUST be able to put it back. It does,
+    ///   on the next mutation this node cannot apply: the batch NAKs
+    ///   `ReplicaAck::MissingRecord`, and the master re-ships the record's full
+    ///   current image and re-sends the batch
+    ///   (`server::dispatch::repair_missing_record_target`). A migration
+    ///   baseline or a reverse-heal pull restores it too, but neither is
+    ///   triggered by a mutation — the re-ship is. A replica-written tombstone
+    ///   would veto exactly that repair and turn a transient, self-healing
+    ///   divergence into permanent loss.
+    ///
+    /// So the removal stays what its name says: a LOCAL SPACE RECLAIM that
+    /// asserts nothing about the key — no tombstone, no replication, and no
+    /// replayable deletion record. It is not, however, WAL-free: like every
+    /// delete it emits a fsynced `RedoOp::FreeRegion` and a
+    /// `RedoOp::SecondaryDahUpdate` intent (see [`Self::prune_delete`]). Neither
+    /// names the key, so neither can leak into a migration delta.
+    /// Returns `Ok(())` on success or when the record is already gone
+    /// (idempotent).
+    ///
+    /// # Errors
+    ///
+    /// Same contract as [`Self::prune_delete`]:
+    /// [`SpendError::TxNotFound`] when the key is absent,
+    /// [`SpendError::NotDue`] when `req.due_guard` is set and the under-lock
+    /// re-validation finds the record no longer sweep-due, and
+    /// [`SpendError::StorageError`] on an index/device failure or when a
+    /// guarded sweep delete is attempted on a write-unhealthy node.
+    pub fn reclaim_held_copy(&self, req: &DeleteRequest) -> Result<(), SpendError> {
+        self.delete_inner(req, RemovalAuthority::HeldCopy)
     }
 
     /// Internal delete.
+    ///
+    /// `authority` selects whether the removal is the key's AUTHORITATIVE
+    /// deletion (records a deletion tombstone) or a non-authoritative held-copy
+    /// space reclaim (records none) — see [`RemovalAuthority`] and
+    /// [`Self::reclaim_held_copy`]. Every other step is identical.
     ///
     /// # Ordering (F-G2-001)
     ///
@@ -8409,7 +8574,11 @@ impl Engine {
     /// 3. Unregister the key from the primary index.
     /// 4. Return the region to the allocator (after the primary-index removal,
     ///    so no `lookup(key)` can reach the post-free offset — F-G2-001).
-    fn delete_inner(&self, req: &DeleteRequest) -> Result<(), SpendError> {
+    fn delete_inner(
+        &self,
+        req: &DeleteRequest,
+        authority: RemovalAuthority,
+    ) -> Result<(), SpendError> {
         // P0-11 follow-up: a write-unhealthy (poisoned) node must not PRUNE. The
         // internal DAH sweep journals no redo, so poisoning the redo log does not
         // by itself fence it; refuse the guarded sweep delete (`due_guard` set)
@@ -8610,7 +8779,18 @@ impl Engine {
         // the delete-latency floor is untouched, and a crash before checkpoint
         // reverts BOTH the delete and the tombstone (Invariant TS-1). No-op when
         // tombstones are disabled (no log attached).
-        if let Some(log) = self.tombstone_log.get() {
+        //
+        // SKIPPED ENTIRELY for a `RemovalAuthority::HeldCopy` reclaim: a
+        // tombstone is an authority's veto over any future re-delivery of the
+        // key (RULE-DS), and a node that merely HOLDS a replica copy is not the
+        // key's authority. Recording one there would let a local space reclaim
+        // permanently block the master's repair of a copy the replica should
+        // have kept. See `Self::reclaim_held_copy`.
+        if let Some(log) = self
+            .tombstone_log
+            .get()
+            .filter(|_| authority == RemovalAuthority::Authoritative)
+        {
             let cause = if req.due_guard.is_some() {
                 crate::ops::tombstone::TombstoneCause::Dah
             } else {
@@ -29325,6 +29505,46 @@ mod tests {
             .cached_millis
             .load(std::sync::atomic::Ordering::SeqCst);
         assert!(after >= before, "refresh_clock should advance cached time");
+    }
+
+    /// P1-2: the replica-stream-hole marker is the held-copy reclaim's
+    /// replication-health fence. It must start disarmed (a node that has never
+    /// been behind must never have its GC stalled), arm on demand, and expire on
+    /// its own so a single transient hole cannot fence the sweep forever.
+    #[test]
+    fn replica_stream_hole_marker_arms_and_expires() {
+        let h = TestHarness::new(2, TxFlags::empty());
+        h.engine.refresh_clock();
+        assert!(
+            !h.engine.replica_stream_hole_within(u64::MAX),
+            "a node that has never observed an inbound hole must never be fenced — an \
+             always-armed fence would stop replica-side GC entirely"
+        );
+
+        h.engine.note_replica_stream_hole();
+        assert!(
+            h.engine.replica_stream_hole_within(60_000),
+            "a just-observed hole must fence the held-copy reclaim"
+        );
+        assert!(
+            !h.engine.replica_stream_hole_within(0),
+            "a zero-length window fences nothing — the marker is a quiet period, not a latch"
+        );
+
+        // Advance the engine's cached clock past the window: the fence must
+        // release itself with no further inbound traffic, so a replica that
+        // healed but sees no more batches still resumes reclaiming.
+        let now = h
+            .engine
+            .cached_millis
+            .load(std::sync::atomic::Ordering::SeqCst);
+        h.engine
+            .cached_millis
+            .store(now + 120_000, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            !h.engine.replica_stream_hole_within(30_000),
+            "the fence must expire on its own once the quiet period has elapsed"
+        );
     }
 
     #[test]

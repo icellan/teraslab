@@ -613,6 +613,25 @@ impl ReplicationManager {
                                 sequence: first_sequence,
                                 message: "redo busy (backpressure) NAK".to_string(),
                             },
+                            // The record the op targets is absent on the
+                            // replica. The dispatch fan-out repairs this by
+                            // re-shipping the record (see
+                            // `dispatch::repair_missing_record_targets`); THIS
+                            // broadcast path has no engine handle and no retry
+                            // loop, so it degrades to the pre-repair behaviour —
+                            // a (retryable) replica error the caller's
+                            // catch-up/resync bookkeeping re-drives. Never an
+                            // ACK, so the watermark still cannot advance over it.
+                            Ok(ReplicaAck::MissingRecord {
+                                failed_sequence,
+                                tx_keys,
+                            }) => BatchOutcome::ReplicaErr {
+                                sequence: failed_sequence,
+                                message: format!(
+                                    "replica is missing {} record(s) (repairable by re-shipping)",
+                                    tx_keys.len()
+                                ),
+                            },
                             Err(e) => BatchOutcome::TransportErr(e),
                         },
                         Err(e) => BatchOutcome::TransportErr(e),

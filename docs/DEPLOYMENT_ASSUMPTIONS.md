@@ -193,3 +193,35 @@ only on natural exit (which never happened because the accept loop
 polled an unrelated atomic). `kill -9` of course still bypasses
 everything — that's expected behaviour and recovery on next startup
 handles it.
+
+## 6. Capacity: the pruner must run on EVERY node, not just masters
+
+TeraSlab's entire retention design is "reclaim spent outputs once their
+delete-at-height passes". The only driver that ever revisits a stored record is
+the DAH sweep (`OP_PROCESS_EXPIRED_PRESERVATIONS`). Two operational
+consequences follow, and both are capacity-critical:
+
+1. **Every node must be swept.** Under `replication_factor > 1` a node stores
+   the records of every shard it replicates as well as every shard it masters —
+   under RF = 2, roughly half its device is replica copies. A node reclaims
+   those copies from its OWN sweep pass (see spec §3.18.1, "held-copy role");
+   no other node's sweep can reclaim them, because SWEEP deletes are not
+   replicated. (A CLIENT `OP_DELETE_BATCH` is — it removes the record from every
+   holder — but the sweep is what reclaims the bulk of a UTXO store's records,
+   so this consequence stands.)
+   A pruner that fires `OP_PROCESS_EXPIRED_PRESERVATIONS` at only one node, or
+   only at shard masters, leaves every other node's replica half growing without
+   bound. Point the pruner at all of them.
+
+2. **The sweep is capped per call.** Each call processes at most
+   `max_batch_size` DAH-due candidates (and at most that many expired
+   preservations). It is designed to be fired once per persisted block and to
+   converge across calls; the response's `(deleted, failed)` counts reflect only
+   that call. If `deleted` is pinned at the cap every block, the due-set is
+   growing faster than it is draining — raise the sweep frequency or
+   `max_batch_size`.
+
+Sizing note: the same record occupies space on `replication_factor` nodes, so
+plan device capacity per node as `(live UTXO set × RF) / node_count` plus the
+retention tail (`BlockHeightRetention` blocks' worth of spent-but-not-yet-due
+records), not as a share of the logical UTXO set.

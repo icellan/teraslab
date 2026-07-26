@@ -927,6 +927,185 @@ Point read of a single UTXO slot plus the record's locktime. Used for double-spe
 - `UnminedTxRetention`: 144 blocks (~1 day)
 - `ParentPreservationBlocks`: 1440 blocks (~10 days)
 
+#### 3.18.1 Delete authority under replication (RF > 1)
+
+Under `replication_factor > 1` a record physically exists on several nodes:
+the master of its shard and every replica of that shard. **Mastership decides
+who is AUTHORITATIVE for a key; it does not decide who pays to store it.**
+Under RF = 2 roughly half of every node's device is replica copies. The two
+roles must therefore be stated separately — a single "who may delete this?"
+rule cannot serve both.
+
+**What a delete guarantees.** A delete is *garbage collection of a record the
+retention policy has released*, not a transactional client operation:
+
+- It is **not durable as a delete on the master**. The master's local removal
+  journals no redo entry that names the deletion, so recovery can never replay
+  one: there is no `RedoOp::Delete` on this path, and `redo_entry_to_replica_op`
+  maps every entry the path *does* write to `None`, so none can leak into a
+  migration delta. A crash before the physical cleanup leaves the record present
+  and internally consistent (record + parent-spent slots + allocated region all
+  still agree) and the pruner re-deletes it on its next pass. Deletion is
+  idempotent and self-healing.
+
+  It does **not** follow that a delete writes nothing to the WAL — it writes
+  two entries, neither of which is a deletion record: returning the record's
+  region to the allocator emits a fsynced `RedoOp::FreeRegion` (offset +
+  device_id, no txid), and clearing the DAH secondary journals a
+  `RedoOp::SecondaryDahUpdate` intent. Recovery's create-scrub relies on the
+  first (it identifies a deleted record by OFFSET, precisely because no txid is
+  journalled), so the entry is load-bearing and must not be "optimised away" on
+  the strength of a claim that the path is WAL-free.
+- **A CLIENT delete IS replicated; a DAH-sweep delete is not.** A client
+  `OP_DELETE_BATCH` at the key's master emits `ReplicaOp::Delete` to every other
+  holder of the key, so a `STATUS_OK` means the record is gone from the whole
+  holder set — the contract `phases/08_replication.md` states ("Delete on
+  master: replica no longer has the record"). The DAH sweep deliberately does
+  NOT replicate: it is per-holder GC, and every node reclaims its own copy under
+  its own re-validation (see the held-copy role below). Replicating the sweep
+  would re-introduce exactly the cross-node coupling the held-copy role removes.
+
+  **Ordering (replicate before removing).** The client path fans the delete out
+  *before* it frees the master's own copy — the reverse of every other mutation
+  handler. A delete has no compensating rollback: once the record is freed there
+  is nothing left to restore from, so `compensate_replication_failure` cannot
+  undo it. Replicating first means a fan-out failure leaves BOTH copies present
+  and returns `ERR_REPLICATION_FAILED`; the caller retries, which converges
+  because delete is idempotent (an already-absent key is a success on either
+  side). The reverse ordering would produce a permanent master-absent /
+  replica-live divergence — the same class of bug this replication closes.
+
+  **Crash residual.** The replica journals its own `RedoOp::Delete` (sentinel
+  offsets = index unregister) and fsyncs it before ACKing, so the replica's half
+  IS redo-durable; the master's half is not (previous bullet). A master crash
+  between the ACK and its next checkpoint therefore reverts one side only,
+  leaving master-live / replica-absent. That is the replica-missing-record
+  condition described under *The `PreserveUntil` race* below: the master's C15
+  re-ship repairs it inside the next mutation of the key, and a client retry of
+  the delete resolves it outright. Eventually consistent, never a lost UTXO —
+  the authority keeps the record. There is no window in which the authority
+  loses the record while a holder keeps it.
+- It is **not ordered against reads on other nodes**. During the fan-out a
+  record deleted on its master may still be readable from a replica's local
+  store, and after the crash residual above the reverse holds. Routed reads
+  always go to the master, so this is invisible to clients; a `FLAG_LOCAL_READ`
+  against a replica can observe it.
+
+**Who reclaims what.**
+
+| Driver | Runs on | Scope | Replicated | Authority |
+|---|---|---|---|---|
+| Client `OP_DELETE_BATCH` | shard master only | keys this node masters | **yes** — `ReplicaOp::Delete` to every other holder | authoritative |
+| DAH sweep, master role | shard master | keys this node masters | no | authoritative |
+| DAH sweep, held-copy role | any holder (replica) | replica copies this node stores | no | **none — local space reclaim** |
+| Phase-3 preservation expiry | shard master only | keys this node masters | no (schedules a DAH; the sweep removes) | authoritative |
+
+The replica applies `ReplicaOp::Delete` through `Engine::delete`
+(`RemovalAuthority::Authoritative`), so it writes a deletion tombstone of its
+own — a replicated client delete *is* an authoritative deletion, and the
+tombstone is what stops a later reverse-heal pull resurrecting it. That is the
+deliberate opposite of the held-copy reclaim below, which writes none.
+
+An arriving `ReplicaOp::Delete` for a record the replica does not have is an
+**idempotent success**, never a `ReplicaAck::MissingRecord` NAK. This is
+load-bearing, not tidiness: that NAK drives the master's re-ship repair
+(`repair_missing_record_target`), which for a delete would make the master
+resurrect on the replica the record it is deleting — and the resurrected copy
+would outlive the master's own. Two independent properties enforce it: the
+receiver's Delete arm resolves `TxNotFound` to `Ok(())`, and
+`ReplicaOp::Delete::master_generation()` is `None`, which keeps the post-apply
+generation sync (the other producer of that NAK) out of the path.
+
+The held-copy role exists because the DAH sweep is the only thing in the system
+that ever revisits a stored record. A node that reclaimed only the keys it
+masters would grow its replica half without bound; nothing else would ever
+reclaim it.
+
+**The held-copy reclaim is deliberately narrower than the master's delete**, in
+exactly two ways:
+
+1. **It writes no deletion tombstone** (see below).
+2. **It does not prune parent slots.** A parent record's UTXO slot is that
+   record's own state, with its own master; marking it `UTXO_PRUNED` is an
+   authoritative bookkeeping write. A holder reclaiming a *child* copy must not
+   perform it — the prune is not replicated, so every other replica of that
+   parent legitimately keeps the slot `UTXO_SPENT`, and writing it locally would
+   diverge this node from the parent's master. A held-copy reclaim therefore
+   touches exactly one record: its own.
+
+Everything else is identical. In particular the held-copy reclaim re-validates
+the SAME sweep predicate under the SAME per-tx stripe lock
+(`DeleteRequest::due_guard`, KO-3), so it can only ever remove a record that is
+`preserve_until == 0` ∧ not `LOCKED` ∧ DAH-due ∧ (CONFLICTING ∨ (all-spent ∧
+has-blocks ∧ on-longest-chain)) — evaluated against its own replicated copy of
+the state, which is the same state the master evaluates.
+
+**Tombstones and reverse-heal.** When `reverse_heal.tombstones` is on (the
+default for RF > 1) an authoritative delete records a generation-aware deletion
+tombstone. RULE-DS then uses it to REFUSE an incoming copy of the key on a
+migration-baseline apply, so a heal cannot resurrect a record its master
+legitimately deleted.
+
+A held-copy reclaim **must not** record one, and does not. A tombstone is the
+authority's veto over any future copy of the key, and a replica is not that
+authority. The soundness of replica-side GC rests on this: if a replica drops a
+copy it should have kept, the master still holds the record and must be able to
+put it back — via the replication resync a replica's NAK-on-missing triggers,
+via a migration baseline, or via a reverse-heal pull. A replica-written
+tombstone would veto precisely that repair and convert a transient,
+self-healing divergence into permanent loss.
+
+**The `PreserveUntil` race.** A client preserves a DAH-due record at its master;
+before the replicated `PreserveUntil` lands, the replica's pruner fires against
+local state that still says the record is due. The two orderings resolve as:
+
+- *Preserve first* — the replica's under-lock re-validation sees
+  `preserve_until != 0` and refuses the reclaim (`SpendError::NotDue`). The two
+  serialize on the same stripe lock, so this is deterministic, not a matter of
+  timing.
+- *Reclaim first* — the replica drops its copy. The master keeps the record (its
+  own re-validation refuses its own sweep), so the record is not lost
+  cluster-wide, and the replica wrote no tombstone, so nothing vetoes the
+  record's return. A steady-state replica batch that then applies any mutation
+  to the now-absent key NAKs `ReplicaAck::MissingRecord`, naming every key of
+  that batch it is missing.
+
+  That NAK is what makes the copy come back, synchronously, inside the client's
+  own operation. The master re-ships each named record's FULL current image
+  (`build_record_replay_ops` — the same create + slot-state + mined-state + flag
+  sequence a migration baseline streams, NOT a bare `ReplicaOp::Create`, which
+  carries only UTXO hashes and would leave every slot unspent on a record that
+  is all-spent by construction here) and re-sends the batch. The record's exact
+  generation is carried through `metadata_bytes[46..50]` and stamped on every
+  replayed op, so the re-sent originals are equal-generation replays. The
+  client's mutation then succeeds and the key is back on both holders.
+
+  This repair is bounded, not a retry loop: one attempt per key, at most two
+  rounds per replica per fan-out. If it fails, the mutation fails loudly and is
+  compensated — honesty over liveness remains the fallback, it is simply no
+  longer the first resort. Before the repair existed this case was NOT a
+  survivable window at RF = 2: a key has exactly one replica target, so one NAK
+  is a deterministic quorum failure (`best_effort` is rejected outright above
+  RF = 1), and the compensation for `preserve_until` clears both the DAH and the
+  preserve-index entry, leaving the record immortal on the master.
+
+The residual is therefore an availability/divergence window on the replica,
+closed by the master's re-ship on the next mutation — not data loss. No grace
+margin is applied to the reclaim predicate, because the margin would have to
+cover replication LAG rather than block height and widening the DAH margin does
+not do that; the lag itself is fenced directly (see below).
+
+**Replication-lag fence.** The reclaim's migration fences (`has_pending_inbound`,
+`is_shard_write_fenced`) say nothing about replication health, so a replica
+catching up after a partition or restart would reclaim against a view stale by
+the whole catch-up backlog rather than by a round-trip. A node that has recently
+PROVEN it is behind — it NAKed a sequence gap or a missing record — declines the
+held-copy reclaim until its stream has been quiet for
+`REPLICA_RECLAIM_QUIET_PERIOD_MS`. Its own MASTERED records are unaffected, so
+lag can never stall GC cluster-wide. This is a quiet period, not a proof of
+currency (a replica cannot know its own lag without the master advertising its
+head); the re-ship repair above is the correctness backstop.
+
 ---
 
 ## 4. Storage Engine
