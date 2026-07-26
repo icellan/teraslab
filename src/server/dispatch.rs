@@ -6009,11 +6009,16 @@ enum SweepRole {
     /// before this distinction existed.
     ShardMaster,
     /// This node holds a REPLICA copy of the key. The sweep delete is a LOCAL
-    /// SPACE RECLAIM and nothing more: no tombstone, no replication, no redo,
-    /// no mutation of any other record. Its safety rests on staying
-    /// non-authoritative — a copy dropped in error is always restorable from
-    /// the master (resync / migration baseline / reverse-heal pull), which a
-    /// tombstone would veto. See [`Engine::reclaim_held_copy`].
+    /// SPACE RECLAIM and nothing more: no tombstone, no replication, no
+    /// replayable deletion record, no mutation of any other record. (It is not
+    /// WAL-free — every delete emits a fsynced `RedoOp::FreeRegion` and a
+    /// `RedoOp::SecondaryDahUpdate` intent; neither names the key, so neither
+    /// can leak into a migration delta. See [`Engine::prune_delete`].) Its
+    /// safety rests on staying non-authoritative — a copy dropped in error is
+    /// restored by the master re-shipping the record on the next mutation this
+    /// node cannot apply (`repair_missing_record_target`), or by a migration
+    /// baseline or reverse-heal pull, all of which a tombstone would veto. See
+    /// [`Engine::reclaim_held_copy`].
     HeldCopy,
 }
 
@@ -9535,9 +9540,12 @@ fn handle_delete_batch(
     engine: &Engine,
     max_batch: u32,
     cluster: Option<&RunningCluster>,
-    // Deletes are local prune GC — not durable, not replicated — so the redo
-    // handle is unused here (kept in the signature for call-site symmetry with
-    // the other batch handlers; removed in a later cleanup).
+    // Deletes are local prune GC: no replicated op and no replayable deletion
+    // record, so this handler writes nothing through the redo handle and it is
+    // unused here (kept in the signature for call-site symmetry with the other
+    // batch handlers; removed in a later cleanup). The engine's own delete path
+    // still journals a `FreeRegion` + `SecondaryDahUpdate` — see
+    // `Engine::prune_delete`.
     _redo_log: Option<&Mutex<RedoLog>>,
     // Forwarded coarse exclusive guard from the DAH-sweep caller; when `Some`
     // this handler does NOT take its own per-key visibility (would self-deadlock).
@@ -9574,10 +9582,12 @@ fn handle_delete_batch(
 
     // LOCAL PRUNE. Deletes are independent-node GC of fully-spent records that
     // are no longer needed — NOT part of normal client operation. They are NOT
-    // durable and NOT replicated: a crash before the physical cleanup just
-    // leaves the record present (and consistent — record + parent-spent slots +
-    // allocated region all still agree), and the pruner re-deletes it next pass
-    // (self-healing). Each item:
+    // replicated and journal no replayable deletion record, so a crash before
+    // the physical cleanup just leaves the record present (and consistent —
+    // record + parent-spent slots + allocated region all still agree), and the
+    // pruner re-deletes it next pass (self-healing). The engine's delete path
+    // does still journal a `FreeRegion` + `SecondaryDahUpdate`; neither names
+    // the key (see `Engine::prune_delete`). Each item:
     //   1. validate the node's role for the key + (external records) the
     //      cold-blob guard,
     //   2. mark every parent slot this child spent as PRUNED (UTXO correctness)

@@ -8332,16 +8332,16 @@ fn convert_infallible_op(
             // Deletion-tombstone §6 scope note: this converter stays on the V1
             // `ReplicaOp::Delete`. It feeds the migration-baseline catch-up
             // (which must remain V1/unchanged this phase) AND the
-            // replication-intent crash-recovery re-emit. The live foreground
-            // delete path emits `DeleteV2` (carrying tombstone fields) directly
-            // in `handle_delete_batch`; only a master crash BETWEEN the redo
-            // commit and the fan-out falls back here, re-emitting V1 Delete.
-            // The replica then removes the record but records no pre-arm
-            // tombstone — strictly no worse than the pre-tombstone behavior and
-            // never a resurrection of the deleted record itself. Closing this
-            // gap requires a `RedoOp::DeleteV2` carrying the fields (touches the
-            // redo wire format + this shared converter for both callers), which
-            // is deferred to keep this phase surgical.
+            // replication-intent crash-recovery re-emit.
+            //
+            // It does NOT coexist with a richer live path: `ReplicaOp::DeleteV2`
+            // no longer exists, and `handle_delete_batch` emits no `ReplicaOp`
+            // at all — a delete is local GC and is never replicated (spec
+            // §3.18). So this arm is the only producer of a replicated delete,
+            // and it fires only when a master crashed BETWEEN a redo commit and
+            // its fan-out. The replica then removes the record but records no
+            // pre-arm tombstone — strictly no worse than the pre-tombstone
+            // behavior and never a resurrection of the deleted record itself.
             if ShardTable::shard_for_key(tx_key) != shard {
                 return None;
             }

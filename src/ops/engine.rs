@@ -8464,18 +8464,35 @@ impl Engine {
         self.delete_inner(req, RemovalAuthority::Authoritative)
     }
 
-    /// Local prune-delete: remove a fully-spent record locally with NO redo and
-    /// NO replication.
+    /// Local prune-delete: remove a fully-spent record locally, with no
+    /// replication and no replayable deletion record.
     ///
     /// Deletes are independent-node GC of records that are fully spent and no
-    /// longer needed, NOT part of normal client operation. Durability is
-    /// unnecessary: a crash before the physical cleanup just leaves the record
-    /// present (and consistent — record + parent-spent slots + allocated region
-    /// all still agree), and the pruner re-deletes it on its next pass
-    /// (self-healing). Physically identical to [`Self::delete`] (RAM-index
-    /// unregister + header zero via the write-back cache + region free); the
-    /// distinct name documents the pruner's intent at the call site. Returns
-    /// `Ok(())` on success or when the record is already gone (idempotent).
+    /// longer needed, NOT part of normal client operation. Durability of the
+    /// DELETE is unnecessary: a crash before the physical cleanup just leaves
+    /// the record present (and consistent — record + parent-spent slots +
+    /// allocated region all still agree), and the pruner re-deletes it on its
+    /// next pass (self-healing). Physically identical to [`Self::delete`]
+    /// (RAM-index unregister + header zero via the write-back cache + region
+    /// free); the distinct name documents the pruner's intent at the call site.
+    /// Returns `Ok(())` on success or when the record is already gone
+    /// (idempotent).
+    ///
+    /// Two things this does NOT mean, both previously mis-stated here:
+    ///
+    /// * **It is not redo-free.** No `RedoOp::Delete` is journalled — that is
+    ///   what "no redo" was reaching for, and it is why recovery's create-scrub
+    ///   has to identify a deleted record by OFFSET. But returning the region to
+    ///   the allocator emits a fsynced `RedoOp::FreeRegion`, and
+    ///   `update_dah_index` journals a `RedoOp::SecondaryDahUpdate` intent.
+    ///   Neither can leak into a migration delta (`redo_entry_to_replica_op`
+    ///   maps both to `None`), so the safety argument stands — but the
+    ///   `FreeRegion` entry is load-bearing and must not be removed on the
+    ///   strength of a "this path writes no WAL" claim.
+    /// * **It is not tombstone-free.** This is an AUTHORITATIVE removal, so
+    ///   [`delete_inner`](Self::delete_inner) records a generation-aware
+    ///   deletion tombstone whenever a tombstone log is attached — which is the
+    ///   default for RF > 1. Only [`Self::reclaim_held_copy`] skips it.
     pub fn prune_delete(&self, req: &DeleteRequest) -> Result<(), SpendError> {
         self.delete_inner(req, RemovalAuthority::Authoritative)
     }
@@ -8502,14 +8519,22 @@ impl Engine {
     ///   shard master, which is the authority on whether the key still exists.
     /// - A replica is not that authority. If it drops a copy it should have
     ///   kept (the `PreserveUntil` race — see `handle_process_expired`), the
-    ///   master still holds the record and MUST be able to put it back, via the
-    ///   replication resync the receiver's NAK-on-missing triggers, via a
-    ///   migration baseline, or via a reverse-heal pull. A replica-written
-    ///   tombstone would veto exactly that repair and turn a transient,
-    ///   self-healing divergence into permanent loss.
+    ///   master still holds the record and MUST be able to put it back. It does,
+    ///   on the next mutation this node cannot apply: the batch NAKs
+    ///   `ReplicaAck::MissingRecord`, and the master re-ships the record's full
+    ///   current image and re-sends the batch
+    ///   (`server::dispatch::repair_missing_record_target`). A migration
+    ///   baseline or a reverse-heal pull restores it too, but neither is
+    ///   triggered by a mutation — the re-ship is. A replica-written tombstone
+    ///   would veto exactly that repair and turn a transient, self-healing
+    ///   divergence into permanent loss.
     ///
-    /// So the removal stays what its name says: a LOCAL SPACE RECLAIM that is
-    /// not durable, not replicated, not journalled, and always repairable.
+    /// So the removal stays what its name says: a LOCAL SPACE RECLAIM that
+    /// asserts nothing about the key — no tombstone, no replication, and no
+    /// replayable deletion record. It is not, however, WAL-free: like every
+    /// delete it emits a fsynced `RedoOp::FreeRegion` and a
+    /// `RedoOp::SecondaryDahUpdate` intent (see [`Self::prune_delete`]). Neither
+    /// names the key, so neither can leak into a migration delta.
     /// Returns `Ok(())` on success or when the record is already gone
     /// (idempotent).
     ///

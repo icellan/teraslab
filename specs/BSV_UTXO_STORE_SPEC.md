@@ -939,10 +939,22 @@ rule cannot serve both.
 **What a delete guarantees.** A delete is *garbage collection of a record the
 retention policy has released*, not a transactional client operation:
 
-- It is **not durable**. No redo entry is written. A crash before the physical
-  cleanup leaves the record present and internally consistent (record +
-  parent-spent slots + allocated region all still agree) and the pruner
-  re-deletes it on its next pass. Deletion is idempotent and self-healing.
+- It is **not durable as a delete**. No redo entry names the deletion, so
+  recovery can never replay one: there is no `RedoOp::Delete` on this path, and
+  `redo_entry_to_replica_op` maps every entry the path *does* write to `None`,
+  so none can leak into a migration delta. A crash before the physical cleanup
+  leaves the record present and internally consistent (record + parent-spent
+  slots + allocated region all still agree) and the pruner re-deletes it on its
+  next pass. Deletion is idempotent and self-healing.
+
+  It does **not** follow that a delete writes nothing to the WAL — it writes
+  two entries, neither of which is a deletion record: returning the record's
+  region to the allocator emits a fsynced `RedoOp::FreeRegion` (offset +
+  device_id, no txid), and clearing the DAH secondary journals a
+  `RedoOp::SecondaryDahUpdate` intent. Recovery's create-scrub relies on the
+  first (it identifies a deleted record by OFFSET, precisely because no txid is
+  journalled), so the entry is load-bearing and must not be "optimised away" on
+  the strength of a claim that the path is WAL-free.
 - It is **not replicated**. A master's delete is not shipped to its replicas
   (`OP_DELETE_BATCH` and the DAH sweep emit no `ReplicaOp`). Each holder
   reclaims its own copy.
@@ -1009,16 +1021,46 @@ local state that still says the record is due. The two orderings resolve as:
   timing.
 - *Reclaim first* — the replica drops its copy. The master keeps the record (its
   own re-validation refuses its own sweep), so the record is not lost
-  cluster-wide, and the replica wrote no tombstone, so the master's next
-  delivery of the key restores it. A steady-state replica batch that then
-  applies any mutation to the now-absent key NAKs
-  (`missing_record_apply_outcome`), which is the signal that drives the resync.
+  cluster-wide, and the replica wrote no tombstone, so nothing vetoes the
+  record's return. A steady-state replica batch that then applies any mutation
+  to the now-absent key NAKs `ReplicaAck::MissingRecord`, naming every key of
+  that batch it is missing.
 
-The residual is therefore an availability/divergence window on the replica, not
-data loss — and it collapses to loss only under an additional, independent fault
-(the master failing while the divergence is open). No grace margin is applied,
-because the race window is the replication round-trip and not a function of
-block height: widening the DAH margin would not close it.
+  That NAK is what makes the copy come back, synchronously, inside the client's
+  own operation. The master re-ships each named record's FULL current image
+  (`build_record_replay_ops` — the same create + slot-state + mined-state + flag
+  sequence a migration baseline streams, NOT a bare `ReplicaOp::Create`, which
+  carries only UTXO hashes and would leave every slot unspent on a record that
+  is all-spent by construction here) and re-sends the batch. The record's exact
+  generation is carried through `metadata_bytes[46..50]` and stamped on every
+  replayed op, so the re-sent originals are equal-generation replays. The
+  client's mutation then succeeds and the key is back on both holders.
+
+  This repair is bounded, not a retry loop: one attempt per key, at most two
+  rounds per replica per fan-out. If it fails, the mutation fails loudly and is
+  compensated — honesty over liveness remains the fallback, it is simply no
+  longer the first resort. Before the repair existed this case was NOT a
+  survivable window at RF = 2: a key has exactly one replica target, so one NAK
+  is a deterministic quorum failure (`best_effort` is rejected outright above
+  RF = 1), and the compensation for `preserve_until` clears both the DAH and the
+  preserve-index entry, leaving the record immortal on the master.
+
+The residual is therefore an availability/divergence window on the replica,
+closed by the master's re-ship on the next mutation — not data loss. No grace
+margin is applied to the reclaim predicate, because the margin would have to
+cover replication LAG rather than block height and widening the DAH margin does
+not do that; the lag itself is fenced directly (see below).
+
+**Replication-lag fence.** The reclaim's migration fences (`has_pending_inbound`,
+`is_shard_write_fenced`) say nothing about replication health, so a replica
+catching up after a partition or restart would reclaim against a view stale by
+the whole catch-up backlog rather than by a round-trip. A node that has recently
+PROVEN it is behind — it NAKed a sequence gap or a missing record — declines the
+held-copy reclaim until its stream has been quiet for
+`REPLICA_RECLAIM_QUIET_PERIOD_MS`. Its own MASTERED records are unaffected, so
+lag can never stall GC cluster-wide. This is a quiet period, not a proof of
+currency (a replica cannot know its own lag without the master advertising its
+head); the re-ship repair above is the correctness backstop.
 
 ---
 

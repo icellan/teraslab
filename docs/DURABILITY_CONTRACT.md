@@ -252,11 +252,20 @@ it is garbage collection of a record the retention policy has already released,
 and it is exempt from the WAL-first, replicate-then-ack discipline. Full
 behavioural contract: spec §3.18 / §3.18.1. The durability-relevant parts:
 
-- **No redo entry.** A delete writes nothing to the WAL. A crash before the
-  physical cleanup leaves the record present and internally consistent (record
-  + parent-spent slots + allocated region all still agree); the pruner
-  re-deletes it on its next pass. "Lost" delete = "delete has not happened yet",
-  which is a legal state, not corruption.
+- **No redo entry names the deletion.** There is no `RedoOp::Delete` on this
+  path, so recovery can never replay a delete, and `redo_entry_to_replica_op`
+  maps every entry this path *does* write to `None`, so none can leak into a
+  migration delta. A crash before the physical cleanup leaves the record present
+  and internally consistent (record + parent-spent slots + allocated region all
+  still agree); the pruner re-deletes it on its next pass. "Lost" delete =
+  "delete has not happened yet", which is a legal state, not corruption.
+
+  This is NOT the same as "a delete writes nothing to the WAL", which is false:
+  freeing the record's region emits a fsynced `RedoOp::FreeRegion` (offset +
+  device_id, no txid) and clearing the DAH secondary journals a
+  `RedoOp::SecondaryDahUpdate` intent. Recovery's create-scrub identifies a
+  deleted record by OFFSET precisely because no txid is journalled, so the
+  `FreeRegion` entry is load-bearing.
 - **No replication.** A master's delete is not shipped to its replicas. Each
   node reclaims its own copy.
 - **Never acknowledged as durable.** `STATUS_OK` on `OP_DELETE_BATCH` /
@@ -290,12 +299,19 @@ exists. That is correct for a shard master, which is the authority on whether
 the key still exists.
 
 A replica is not that authority. If it drops a copy it should have kept — the
-`PreserveUntil` race, spec §3.18.1 — the master still holds the record and
-MUST be able to put it back: via the resync a replica's NAK-on-missing
-triggers, via a migration baseline, or via a reverse-heal pull. A
-replica-written tombstone would veto exactly that repair and turn a transient,
-self-healing divergence into permanent loss. **The absence of a tombstone on
-the held-copy path is load-bearing, not an omission.**
+`PreserveUntil` race, spec §3.18.1 — the master still holds the record and MUST
+be able to put it back. It does, on the next mutation the replica cannot apply:
+the replica NAKs `ReplicaAck::MissingRecord` naming every key of that batch it
+is missing, and the master re-ships each record's full current image and re-sends
+the batch, synchronously, inside the client's own operation. (A migration
+baseline and a reverse-heal pull restore it too, but neither is triggered by a
+mutation — the re-ship is.) A replica-written tombstone would veto exactly that
+repair and turn a transient, self-healing divergence into permanent loss. **The
+absence of a tombstone on the held-copy path is load-bearing, not an omission.**
+
+The re-ship is bounded — one attempt per key, at most two rounds per replica per
+fan-out — and on failure the client's mutation fails and is compensated. Nothing
+here weakens the rule that a `STATUS_OK` mutation was quorum-replicated.
 
 Consequence for reverse-heal: a healing node can no longer assume its replicas
 still hold every record it has since released. That is intended — both sides
