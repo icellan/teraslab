@@ -461,6 +461,23 @@ pub struct Engine {
     /// Prometheus counter `teraslab_index_enumeration_unreadable_total`.
     /// Monotonic for the lifetime of the engine.
     enumeration_unreadable: std::sync::atomic::AtomicU64,
+    /// P1-2 — `now_millis()` at the last moment this node PROVED, as a replica,
+    /// that its inbound replication stream has a hole: it NAKed a sequence gap
+    /// (positions it never received) or a missing record (a mutation against a
+    /// record it never received). `0` means no such proof has ever been
+    /// observed.
+    ///
+    /// The held-copy DAH reclaim (`SweepRole::HeldCopy`) is fenced while this is
+    /// recent. `sweep_role_snap`'s existing fences (`has_pending_inbound`,
+    /// `is_shard_write_fenced`) are MIGRATION fences and say nothing about
+    /// replication health: a replica catching up after a partition or a restart
+    /// is not fenced by either, so it would sweep against a view that is stale
+    /// by the whole catch-up backlog rather than by a round-trip — dropping
+    /// copies whose queued `PreserveUntil` / reorg has not arrived yet.
+    ///
+    /// This is deliberately per-ENGINE, not a process global: in-process
+    /// multi-node tests (and any co-tenanted node) must not fence each other.
+    replica_stream_hole_ms: std::sync::atomic::AtomicU64,
     /// FU#7 Option B: `true` iff the last [`Self::recover_mined_index`] restored
     /// from a v3 `.mined` checkpoint snapshot (one that persisted every entry's
     /// DE/LSA cache). `false` after a fresh boot (no snapshot) OR a legacy v2
@@ -735,6 +752,7 @@ impl Engine {
             cached_millis: std::sync::atomic::AtomicU64::new(sys_millis()),
             conflicting_children_dropped: std::sync::atomic::AtomicU64::new(0),
             enumeration_unreadable: std::sync::atomic::AtomicU64::new(0),
+            replica_stream_hole_ms: std::sync::atomic::AtomicU64::new(0),
             mined_snapshot_restored_v3: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             fail_next_register: std::sync::atomic::AtomicBool::new(false),
@@ -7331,6 +7349,47 @@ impl Engine {
     pub fn enumeration_unreadable(&self) -> u64 {
         self.enumeration_unreadable
             .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// P1-2 — record that this node, acting as a REPLICA, just proved its
+    /// inbound replication stream has a hole (a sequence-gap NAK or a
+    /// missing-record NAK).
+    ///
+    /// Called from the receiver on those two NAK paths only. Both mean "the
+    /// master sent me something I cannot place against what I have", which is
+    /// exactly the state a replica is in while a catch-up backlog drains. It is
+    /// NOT armed by migration or out-of-band batches: those already have their
+    /// own fences (`has_pending_inbound` / `is_shard_write_fenced`) and arming
+    /// on them would fence the sweep after every routine rebalance.
+    pub fn note_replica_stream_hole(&self) {
+        let now = self.now_millis();
+        self.replica_stream_hole_ms
+            .store(now.max(1), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// P1-2 — whether a replica-stream hole was observed within the last
+    /// `window_ms`, i.e. whether a held-copy reclaim should be fenced.
+    ///
+    /// Fail-closed on a clock that moved backwards (returns `true`), because the
+    /// cost of skipping a reclaim is one deferred pass and the cost of a wrong
+    /// reclaim is a record the master must re-ship.
+    ///
+    /// HONEST LIMIT: this is a quiet period, not a proof of currency. A replica
+    /// cannot know its own lag — that would require the master to advertise its
+    /// head — so this narrows the window rather than closing it. The
+    /// missing-record repair on the master is the correctness backstop; this
+    /// only stops the replica creating that work in the first place.
+    pub fn replica_stream_hole_within(&self, window_ms: u64) -> bool {
+        let at = self
+            .replica_stream_hole_ms
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if at == 0 {
+            return false;
+        }
+        match self.now_millis().checked_sub(at) {
+            Some(age) => age < window_ms,
+            None => true,
+        }
     }
 
     /// FU#7 Option B: whether the last [`Self::recover_mined_index`] restored
@@ -29412,6 +29471,46 @@ mod tests {
             .cached_millis
             .load(std::sync::atomic::Ordering::SeqCst);
         assert!(after >= before, "refresh_clock should advance cached time");
+    }
+
+    /// P1-2: the replica-stream-hole marker is the held-copy reclaim's
+    /// replication-health fence. It must start disarmed (a node that has never
+    /// been behind must never have its GC stalled), arm on demand, and expire on
+    /// its own so a single transient hole cannot fence the sweep forever.
+    #[test]
+    fn replica_stream_hole_marker_arms_and_expires() {
+        let h = TestHarness::new(2, TxFlags::empty());
+        h.engine.refresh_clock();
+        assert!(
+            !h.engine.replica_stream_hole_within(u64::MAX),
+            "a node that has never observed an inbound hole must never be fenced — an \
+             always-armed fence would stop replica-side GC entirely"
+        );
+
+        h.engine.note_replica_stream_hole();
+        assert!(
+            h.engine.replica_stream_hole_within(60_000),
+            "a just-observed hole must fence the held-copy reclaim"
+        );
+        assert!(
+            !h.engine.replica_stream_hole_within(0),
+            "a zero-length window fences nothing — the marker is a quiet period, not a latch"
+        );
+
+        // Advance the engine's cached clock past the window: the fence must
+        // release itself with no further inbound traffic, so a replica that
+        // healed but sees no more batches still resumes reclaiming.
+        let now = h
+            .engine
+            .cached_millis
+            .load(std::sync::atomic::Ordering::SeqCst);
+        h.engine
+            .cached_millis
+            .store(now + 120_000, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            !h.engine.replica_stream_hole_within(30_000),
+            "the fence must expire on its own once the quiet period has elapsed"
+        );
     }
 
     #[test]

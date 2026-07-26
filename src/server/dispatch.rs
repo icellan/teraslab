@@ -6033,11 +6033,24 @@ enum SweepRole {
 /// with data streaming in (`has_pending_inbound`) or streaming out
 /// (`is_shard_write_fenced`) is mid-transfer, and reclaiming from under a
 /// transfer would race the very copy that transfer is establishing.
+/// P1-2 — how long after a proven inbound-replication hole a node refuses to
+/// reclaim REPLICA copies it holds.
+///
+/// The window has to outlast a catch-up drain, not a round-trip: the hazard is a
+/// replica that blipped off-network, came back, and swept before the master's
+/// queued `PreserveUntil` / reorg for that record was delivered. Ten times the
+/// 3 s foreground ACK timeout is a deliberately blunt, generous bound — skipping
+/// a reclaim costs one deferred sweep pass (the next pass re-evaluates and the
+/// record is still in the DAH index), while a wrong reclaim costs the master a
+/// re-ship and, before that repair existed, cost a client its write.
+const REPLICA_RECLAIM_QUIET_PERIOD_MS: u64 = 30_000;
+
 fn sweep_role_snap(
     txid: &[u8; 32],
     cluster: Option<&RunningCluster>,
     master_snap: Option<&MasterSnapshot>,
     holder_snap: Option<&HolderSnapshot>,
+    replication_behind: bool,
 ) -> Option<SweepRole> {
     // Unclustered: every record on the device is this node's own.
     let Some(cluster) = cluster else {
@@ -6062,6 +6075,19 @@ fn sweep_role_snap(
     // re-applied to the holder answer: never reclaim from under an in-flight
     // shard transfer in either direction.
     if cluster.has_pending_inbound(&key) || cluster.is_shard_write_fenced(&key) {
+        return None;
+    }
+    // P1-2: both fences above are MIGRATION fences — neither says anything about
+    // replication health. A replica catching up after a partition or a restart
+    // trips neither, so it would reclaim against a local view that is stale by
+    // the whole catch-up backlog (minutes) rather than by a replication
+    // round-trip, dropping copies whose queued `PreserveUntil` or reorg has not
+    // been delivered yet. Fence the reclaim while this node has recently PROVEN
+    // it is behind (see `Engine::note_replica_stream_hole`). Skipping is free and
+    // self-healing: the record stays in the DAH index and the next pass
+    // re-evaluates. Only the HELD-COPY arm is gated — a node's own MASTERED
+    // records are authoritative locally and their sweep is unaffected.
+    if replication_behind {
         return None;
     }
     Some(SweepRole::HeldCopy)
@@ -9573,9 +9599,19 @@ fn handle_delete_batch(
     // Only the sweep path asks the holder question, so a client delete does not
     // pay for the snapshot at all.
     let holder_snap = sweep_due_height.and(cluster).map(|c| c.holder_snapshot());
+    // P1-2: one read per batch, like the snapshots above — the fence is
+    // node-scoped, not per-key.
+    let replication_behind = sweep_due_height.is_some()
+        && engine.replica_stream_hole_within(REPLICA_RECLAIM_QUIET_PERIOD_MS);
     'items: for (i, txid) in txids.iter().enumerate() {
         let role = if sweep_due_height.is_some() {
-            match sweep_role_snap(txid, cluster, master_snap.as_ref(), holder_snap.as_ref()) {
+            match sweep_role_snap(
+                txid,
+                cluster,
+                master_snap.as_ref(),
+                holder_snap.as_ref(),
+                replication_behind,
+            ) {
                 Some(role) => role,
                 None => {
                     // Phase 1 of the sweep already resolved a role for every
@@ -11149,6 +11185,8 @@ fn handle_process_expired(
     // `sweep_role_snap` records WHICH role each candidate is swept in; the
     // delete handler below then applies exactly the authority that role carries.
     let holder_snap = cluster.map(|c| c.holder_snapshot());
+    // P1-2: node-scoped replication-lag fence, read once for the pass.
+    let replication_behind = engine.replica_stream_hole_within(REPLICA_RECLAIM_QUIET_PERIOD_MS);
     let mut held_due: Vec<[u8; 32]> = Vec::new();
     for key in &candidates {
         if sweep_role_snap(
@@ -11156,6 +11194,7 @@ fn handle_process_expired(
             cluster,
             master_snap.as_ref(),
             holder_snap.as_ref(),
+            replication_behind,
         )
         .is_none()
         {
@@ -19553,6 +19592,7 @@ mod tests {
                 Some(&cluster),
                 Some(&master_snap),
                 Some(&holder_snap),
+                false,
             )
         };
 
@@ -19592,6 +19632,7 @@ mod tests {
                 Some(&inbound),
                 Some(&inbound.master_snapshot()),
                 Some(&inbound.holder_snapshot()),
+                false,
             ),
             None,
             "a held shard with pending inbound migration data must not be reclaimed"
@@ -19613,9 +19654,41 @@ mod tests {
                 Some(&fenced),
                 Some(&fenced.master_snapshot()),
                 Some(&fenced.holder_snapshot()),
+                false,
             ),
             None,
             "a write-fenced held shard (delta streaming out) must not be reclaimed"
+        );
+
+        // P1-2: the SAME healthy, un-migrating cluster that reclaims above must
+        // decline once this node has proven its inbound replication stream has a
+        // hole. The two existing fences are migration-only, so without this gate
+        // a replica draining a catch-up backlog reclaims against a view stale by
+        // the whole backlog. Only the held-copy arm is gated — the node's own
+        // mastered records stay authoritative and keep sweeping.
+        assert_eq!(
+            sweep_role_snap(
+                &txid_for_shard(replicated, 0),
+                Some(&cluster),
+                Some(&master_snap),
+                Some(&holder_snap),
+                true,
+            ),
+            None,
+            "a held copy must NOT be reclaimed while this node is known to be behind on \
+             inbound replication"
+        );
+        assert_eq!(
+            sweep_role_snap(
+                &txid_for_shard(mastered, 0),
+                Some(&cluster),
+                Some(&master_snap),
+                Some(&holder_snap),
+                true,
+            ),
+            Some(SweepRole::ShardMaster),
+            "replication lag must NOT stop a node sweeping the records it MASTERS — those \
+             are authoritative locally, and fencing them would stall GC cluster-wide"
         );
     }
 
@@ -19624,8 +19697,14 @@ mod tests {
     #[test]
     fn sweep_role_on_an_unclustered_node_is_always_master() {
         assert_eq!(
-            sweep_role_snap(&txid_for_shard(17, 0), None, None, None),
+            sweep_role_snap(&txid_for_shard(17, 0), None, None, None, false),
             Some(SweepRole::ShardMaster)
+        );
+        assert_eq!(
+            sweep_role_snap(&txid_for_shard(17, 0), None, None, None, true),
+            Some(SweepRole::ShardMaster),
+            "an unclustered node has no inbound replication to be behind on; the lag fence \
+             must never stall its own GC"
         );
     }
 

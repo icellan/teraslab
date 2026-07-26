@@ -903,6 +903,11 @@ pub fn handle_replica_batch_with_tracker(
                 ops_len = batch.ops.len(),
                 "replica NAK: sequence gap — batch ahead of next-expected",
             );
+            // P1-2: this node just PROVED it missed inbound positions. Fence
+            // its held-copy DAH reclaim until the stream is quiet again — a
+            // replica draining a catch-up backlog would otherwise sweep against
+            // a view stale by the whole backlog, not by a round-trip.
+            engine.note_replica_stream_hole();
             let ack = ReplicaAck::Gap {
                 expected_sequence: expected,
                 received_first_sequence: batch.first_sequence,
@@ -1008,10 +1013,17 @@ pub fn handle_replica_batch_with_tracker(
             // the historical terminal `Error`. Both abort the batch at `seq` and
             // return BEFORE the watermark advances, so neither can mask a gap.
             let ack = match err {
-                ReplicaApplyError::MissingRecord { tx_key, .. } => ReplicaAck::MissingRecord {
-                    failed_sequence: seq,
-                    tx_keys: absent_keys_from(engine, tx_key, &batch.ops[skip_count + idx..]),
-                },
+                ReplicaApplyError::MissingRecord { tx_key, .. } => {
+                    // P1-2: same proof from the other direction — the master
+                    // mutated a record this node does not have. Fence the
+                    // held-copy reclaim so this node stops creating repair work
+                    // while it is demonstrably behind.
+                    engine.note_replica_stream_hole();
+                    ReplicaAck::MissingRecord {
+                        failed_sequence: seq,
+                        tx_keys: absent_keys_from(engine, tx_key, &batch.ops[skip_count + idx..]),
+                    }
+                }
                 ReplicaApplyError::Failed(message) => ReplicaAck::Error {
                     failed_sequence: seq,
                     message,
