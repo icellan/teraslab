@@ -10216,13 +10216,41 @@ impl RunningCluster {
         let self_id = self.self_id;
         let holds = (0..NUM_SHARDS as u16)
             .map(|shard| {
-                // EFFECTIVE, not target: the currently-serving assignment is the
-                // one replication ships to, so it is the one whose members
-                // actually carry the shard's records. A handoff TARGET that has
-                // not been committed yet is mid-stream and is deliberately not
-                // counted (see `ShardTable::effective_assignment`).
-                let assignment = table.effective_assignment(shard);
-                assignment.master == self_id || assignment.replicas.contains(&self_id)
+                // EFFECTIVE ∪ TARGET. Holdership is the question "do this node's
+                // bytes include this shard", and during a handoff BOTH sides can
+                // be true, so neither assignment alone answers it.
+                //
+                // The two differ only in `Copying` / `CommitReady`, entered only
+                // when a shard's MASTER changes, so the union is a no-op outside
+                // a master-moving handoff. Inside one, each half covers a real
+                // failure the other has:
+                //
+                // * TARGET is what replication actually ships to —
+                //   `ShardTable::replicas_for_key` reads `assignments` (the
+                //   target), and `build_replication_targets` requires it
+                //   explicitly ("Replication must go to nodes in the NEW member
+                //   list"). A node in target-but-not-effective therefore receives
+                //   every mutation for the shard. Answering "not a holder" for it
+                //   means it never reclaims that shard, so a handoff that stalls
+                //   in `Copying` (old master dies before `commit_shard`) grows it
+                //   without bound — re-opening the exact defect the held-copy
+                //   reclaim exists to fix.
+                // * EFFECTIVE is who is still serving. A node in
+                //   effective-but-not-target is usually being drained, but
+                //   `ShardTable::rollback_shard` restores the previous assignment
+                //   on a FAILED migration — at which point it is a live holder
+                //   again, and any record it dropped meanwhile is gone.
+                //
+                // Over-claiming holdership is the safe direction: it can only
+                // cause a node to reclaim records it physically stores, gated by
+                // the migration and replication-lag fences in `sweep_role_snap`
+                // and by the sweep's own under-lock due re-validation.
+                let effective = table.effective_assignment(shard);
+                let target = table.target_assignment(shard);
+                let holds_in = |a: &crate::cluster::shards::ShardAssignment| {
+                    a.master == self_id || a.replicas.contains(&self_id)
+                };
+                holds_in(effective) || holds_in(target)
             })
             .collect();
         HolderSnapshot { holds }
@@ -20679,6 +20707,83 @@ mod tests {
         assert!(
             saw_no,
             "test cluster must have at least one remote shard (No)"
+        );
+    }
+
+    /// P1-3: `holder_snapshot` answers "do this node's bytes include this
+    /// shard", and during a master-moving handoff BOTH assignments can be true,
+    /// so neither alone answers it.
+    ///
+    /// Pinned in the direction that actually re-opens F2: a node in the TARGET
+    /// assignment but not the effective one receives every mutation for that
+    /// shard (`replicas_for_key` and `build_replication_targets` both read the
+    /// target), so if it did not count as a holder it would never reclaim, and a
+    /// handoff stalled in `Copying` would grow it without bound. The other
+    /// direction — effective but not target — is pinned too, because
+    /// `rollback_shard` can make that node a live holder again.
+    #[test]
+    fn holder_snapshot_counts_both_the_effective_and_target_assignments() {
+        let old_members = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let new_members = vec![NodeId(1), NodeId(2), NodeId(4)];
+        let new_table = ShardTable::compute_with_epoch(&new_members, 2, 5, 2);
+        let mut table = ShardTable::compute_with_epoch(&old_members, 2, 5, 1);
+        // Every shard has data, so each master move enters `Copying` — the only
+        // state in which effective and target differ.
+        table.begin_handoff(&new_table);
+
+        let holds_for =
+            |node: NodeId, a: &ShardAssignment| a.master == node || a.replicas.contains(&node);
+        // A shard the JOINING node (4) is in per the target but not per the
+        // effective assignment: it is being shipped every mutation already.
+        let target_only = (0..NUM_SHARDS as u16)
+            .find(|s| {
+                holds_for(NodeId(4), table.target_assignment(*s))
+                    && !holds_for(NodeId(4), table.effective_assignment(*s))
+            })
+            .expect("replacing a member must move some shard onto node 4");
+        // A shard the DEPARTING node (3) is in per the effective assignment but
+        // not the target: it still physically stores those records.
+        let effective_only = (0..NUM_SHARDS as u16)
+            .find(|s| {
+                holds_for(NodeId(3), table.effective_assignment(*s))
+                    && !holds_for(NodeId(3), table.target_assignment(*s))
+            })
+            .expect("replacing a member must move some shard off node 3");
+
+        let addrs = [
+            (NodeId(1), "127.0.0.1:4861".parse().unwrap()),
+            (NodeId(2), "127.0.0.1:4862".parse().unwrap()),
+            (NodeId(3), "127.0.0.1:4863".parse().unwrap()),
+            (NodeId(4), "127.0.0.1:4864".parse().unwrap()),
+        ];
+        let joining = new_test_running_cluster(
+            NodeId(4),
+            table.clone(),
+            &addrs,
+            &old_members,
+            &[],
+            &[],
+            &[],
+            3,
+        );
+        assert!(
+            joining
+                .holder_snapshot()
+                .holds_key(&key_for_shard(target_only)),
+            "a node in the TARGET assignment holds the shard: replication ships every \
+             mutation to it, so excluding it from holdership means nothing ever reclaims \
+             that shard on this node — a handoff stalled in Copying then grows it forever"
+        );
+
+        let departing =
+            new_test_running_cluster(NodeId(3), table, &addrs, &old_members, &[], &[], &[], 3);
+        assert!(
+            departing
+                .holder_snapshot()
+                .holds_key(&key_for_shard(effective_only)),
+            "a node still in the EFFECTIVE assignment holds the shard's bytes; a failed \
+             migration can restore it as a live holder via rollback_shard, and anything it \
+             silently dropped meanwhile is gone"
         );
     }
 
