@@ -537,11 +537,36 @@ fn proxied_cluster_converges_and_tcp_block_partitions_inbound() {
     shutdown_node(&node2);
 }
 
-/// One-way UDP drop (asymmetric partition): with 431→432 dropped,
-/// node 432 stops hearing 431 (no pings arrive, its own pings get no
-/// ACK back) and declares it dead, while 431 keeps seeing 432 alive
-/// through 432's still-delivered probes. Healing the direction
-/// resurrects the dead view without restarting anything.
+/// One-way UDP drop (asymmetric partition): with 431→432 dropped, node
+/// 432 stops hearing 431 entirely (no pings arrive, and 431's ACKs to
+/// 432's own pings are dropped on the way back) and reaps it —
+/// permanently, because nothing 431 sends can ever reach it again. 431
+/// meanwhile keeps *receiving* 432's datagrams, so every suspicion it
+/// raises from its own un-ACKed probes is refuted and 432 is re-admitted.
+/// Healing the direction restores the symmetric view without restarting
+/// anything.
+///
+/// The asymmetry has to be asserted as an ONGOING directional property,
+/// never sampled once. `alive_node_count()` deliberately excludes SWIM
+/// `Suspect` peers (G1 fail-closed write quorum) and 431's probes to 432
+/// can NEVER be ACKed under this drop, so 431 re-suspects 432 on every
+/// probe round and its count sawtooths 2 → 1 → 2 for as long as the drop
+/// is installed. Measured over 30 s: 431 read 2 on only ~9% of samples
+/// and re-admitted 432 nineteen separate times. An immediate
+/// `assert_eq!(node1.cluster.alive_node_count(), 2)` after the bounded
+/// wait on 432 therefore sampled a transient — that was this test's flake
+/// (~2 in 6 locally, ~3 in 6 under CI load).
+///
+/// What is terminal AND asymmetric, and is what this test asserts:
+///   * 432 never counts 431 alive again — nothing can reach it. Monotone:
+///     sampling more only makes this harder to satisfy, never easier.
+///   * 431 drops 432 and then RE-ADMITS it — a `< 2` → `2` transition
+///     observed after the drop, which only the still-delivered 432→431
+///     direction can produce.
+///
+/// Negative control: under a TWO-way drop 431 re-admits 432 zero times in
+/// 30 s (it falls to 1 at ~0.3 s and stays there), so this predicate does
+/// reject the symmetric partition it exists to distinguish.
 #[test]
 #[serial]
 fn one_way_udp_drop_creates_asymmetric_partition_and_heals() {
@@ -565,23 +590,84 @@ fn one_way_udp_drop_creates_asymmetric_partition_and_heals() {
         || node2.cluster.alive_node_count() == 1,
         Duration::from_secs(20),
     )
-    .expect("node 432 should mark node 431 dead under the one-way drop");
+    .unwrap_or_else(|_| {
+        panic!(
+            "node 432 should stop counting node 431 under the one-way drop\n{}\n{}",
+            cluster_diag("node431", &node1),
+            cluster_diag("node432", &node2),
+        )
+    });
 
-    // The reverse direction still passes: 431 keeps hearing 432's
-    // probes and holds it alive (suspicion from its own unACKed pings
-    // is continuously refuted by 432's direct contact).
+    // Observe the asymmetric steady state (see the doc comment for why a
+    // single sample cannot express it).
+    //
+    // 432's half is terminal and is checked on EVERY sample: its alive
+    // count must stay at 1, and it must not shrink its committed topology
+    // — the E-01 guard, peak=2 → activation quorum 2, which the 1-of-2
+    // remnant can never reach on its own vote.
+    //
+    // 431's half is the liveness half: it must be seen dropping 432 and
+    // then taking it back. Measured cadence: first re-admission 0.26 s
+    // after the drop and 19 within 30 s; the slowest is one per ~5 s once
+    // 432 has reaped 431 and only 432's backed-off seed JOINs still reach
+    // it, so the 30 s deadline is >5x the worst observed gap. The window
+    // also runs for a 3 s settle floor — past 432's 2 s suspicion timeout,
+    // so its Suspect → Dead transition happens inside the window where the
+    // no-regression and no-shrink checks are live.
+    let observe_start = std::time::Instant::now();
+    let settle = Duration::from_secs(3);
+    let observe_deadline = observe_start + Duration::from_secs(30);
+    let mut n1_dropped_432 = false;
+    let mut n1_readmitted_432 = false;
+    let mut n2_alive_regression: Option<usize> = None;
+    let mut n2_shrunk_topology: Option<usize> = None;
+    while std::time::Instant::now() < observe_deadline {
+        let n2_alive = node2.cluster.alive_node_count();
+        if n2_alive != 1 {
+            n2_alive_regression = Some(n2_alive);
+            break;
+        }
+        let n2_members = node2.cluster.committed_topology_members().len();
+        if n2_members != 2 {
+            n2_shrunk_topology = Some(n2_members);
+            break;
+        }
+        if node1.cluster.alive_node_count() < 2 {
+            n1_dropped_432 = true;
+        } else if n1_dropped_432 {
+            n1_readmitted_432 = true;
+        }
+        if n1_readmitted_432 && observe_start.elapsed() >= settle {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
     assert_eq!(
-        node1.cluster.alive_node_count(),
-        2,
-        "node 431 must still see node 432 alive — the drop is one-way"
+        n2_alive_regression,
+        None,
+        "nothing node 431 sends can reach node 432 under the drop, so 432's \
+         alive count must stay at 1\n{}\n{}",
+        cluster_diag("node431", &node1),
+        cluster_diag("node432", &node2),
     );
-
     // E-01 guard side-effect: the 1-of-2 remnant (peak=2 → quorum 2)
     // must NOT commit a shrunken single-node topology.
     assert_eq!(
-        node2.cluster.committed_topology_members().len(),
-        2,
-        "node 432 must not self-activate a 1-node topology (peak-derived quorum)"
+        n2_shrunk_topology,
+        None,
+        "node 432 must not self-activate a 1-node topology (peak-derived quorum)\n{}",
+        cluster_diag("node432", &node2),
+    );
+    // The reverse direction still passes: 431 keeps hearing 432 and takes
+    // it back after its own un-ACKed probes drop it. Under a two-way drop
+    // the re-admission never happens.
+    assert!(
+        n1_dropped_432 && n1_readmitted_432,
+        "node 431 must keep hearing node 432 and re-admit it — the drop is \
+         one-way (dropped={n1_dropped_432} readmitted={n1_readmitted_432})\n{}\n{}",
+        cluster_diag("node431", &node1),
+        cluster_diag("node432", &node2),
     );
 
     // Heal the direction: 431's traffic reaches 432 again and the dead
