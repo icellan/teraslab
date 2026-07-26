@@ -3106,10 +3106,18 @@ fn replicate_all_ops_with_barrier(
     let want_local_durable =
         engine.is_some_and(|e| e.redo_buffered()) && replication_active(Some(cluster));
     // Preserve the (addr, result) association so we can apply per-set
-    // ACK accounting (Phase E) after the parallel fan-out completes.
+    // ACK accounting (Phase E) after the parallel fan-out completes. The third
+    // element carries that address's ops BACK out of the worker, but ONLY when
+    // the send failed with a repairable missing-record NAK — the repair below
+    // has to re-send the whole per-address op list, and returning the already-
+    // moved `Vec` costs nothing on the success path (it is left empty).
     #[allow(clippy::type_complexity)]
-    let (results, local_durable): (
-        Vec<(SocketAddr, std::result::Result<(), String>)>,
+    let (mut results, local_durable): (
+        Vec<(
+            SocketAddr,
+            std::result::Result<(), ReplicaSendError>,
+            Vec<ReplicaOp>,
+        )>,
         std::result::Result<(), String>,
     ) = std::thread::scope(|scope| {
         // Local redo + data fsync runs on its own scoped thread so it overlaps
@@ -3121,45 +3129,55 @@ fn replicate_all_ops_with_barrier(
             }
             _ => None,
         };
-        let results: Vec<(SocketAddr, std::result::Result<(), String>)> =
-            REPL_RUNTIME.block_on(async {
-                let mut handles = Vec::with_capacity(by_addr.len());
-                for (addr, ops) in by_addr {
-                    let auth_secret = auth_secret.clone();
-                    let ack_timeout = ack_timeouts.get(&addr).copied().unwrap_or(base_timeout);
-                    handles.push(tokio::task::spawn_blocking(move || {
-                        if ops.is_empty() {
-                            return (addr, Ok(()));
-                        }
-                        // R-D1/D-3: per-replica dense stream labels are
-                        // assigned inside `send_replica_ops_to` under the
-                        // per-address slot mutex — NOT the master-global
-                        // redo range, which covers ops this address never
-                        // receives. The redo range's high end is recorded
-                        // against the ACK for catch-up/lag bookkeeping.
-                        let res = send_replica_ops_to(
-                            addr,
-                            &ops,
-                            ack_timeout,
-                            auth_secret.as_deref(),
-                            cluster_key,
-                            source_node_id,
-                            redo_seq_range.1,
-                        );
-                        (addr, res)
-                    }));
-                }
-                let mut results = Vec::with_capacity(handles.len());
-                for handle in handles {
-                    results.push(handle.await.unwrap_or_else(|_| {
-                        (
-                            SocketAddr::from(([0u8, 0, 0, 0], 0)),
-                            Err("task panicked".to_string()),
-                        )
-                    }));
-                }
-                results
-            });
+        #[allow(clippy::type_complexity)]
+        let results: Vec<(
+            SocketAddr,
+            std::result::Result<(), ReplicaSendError>,
+            Vec<ReplicaOp>,
+        )> = REPL_RUNTIME.block_on(async {
+            let mut handles = Vec::with_capacity(by_addr.len());
+            for (addr, ops) in by_addr {
+                let auth_secret = auth_secret.clone();
+                let ack_timeout = ack_timeouts.get(&addr).copied().unwrap_or(base_timeout);
+                handles.push(tokio::task::spawn_blocking(move || {
+                    if ops.is_empty() {
+                        return (addr, Ok(()), Vec::new());
+                    }
+                    // R-D1/D-3: per-replica dense stream labels are
+                    // assigned inside `send_replica_ops_to` under the
+                    // per-address slot mutex — NOT the master-global
+                    // redo range, which covers ops this address never
+                    // receives. The redo range's high end is recorded
+                    // against the ACK for catch-up/lag bookkeeping.
+                    let res = send_replica_ops_to_reporting(
+                        addr,
+                        &ops,
+                        ack_timeout,
+                        auth_secret.as_deref(),
+                        cluster_key,
+                        source_node_id,
+                        redo_seq_range.1,
+                    );
+                    // Hand the ops back only when the repair pass will need
+                    // them; otherwise drop them here as before.
+                    match res {
+                        Err(ReplicaSendError::MissingRecord { .. }) => (addr, res, ops),
+                        _ => (addr, res, Vec::new()),
+                    }
+                }));
+            }
+            let mut results = Vec::with_capacity(handles.len());
+            for handle in handles {
+                results.push(handle.await.unwrap_or_else(|_| {
+                    (
+                        SocketAddr::from(([0u8, 0, 0, 0], 0)),
+                        Err(ReplicaSendError::Failed("task panicked".to_string())),
+                        Vec::new(),
+                    )
+                }));
+            }
+            results
+        });
         let local_durable = match durable_handle {
             Some(h) => h
                 .join()
@@ -3177,17 +3195,64 @@ fn replicate_all_ops_with_barrier(
         return Err(format!("local durability before ack failed: {e}"));
     }
 
+    // C15 REPAIR. A replica that NAKed because it does not have a record this
+    // batch mutates is repairable: this node is that record's master, so it
+    // still holds the authoritative copy. Re-ship the record and re-send the
+    // batch, rather than failing the client's mutation and rolling it back —
+    // which at RF = 2 is deterministic (one replica per key, so one NAK is
+    // 0/1 acked) and leaves the key silently single-copy forever.
+    //
+    // DEADLOCK SAFETY (issue #88 was exactly this shape). This runs at the same
+    // point the fan-out itself just ran, so it holds exactly the same guards and
+    // adds no new lock ordering:
+    //   * the engine-wide visibility barrier was RELEASED above, before the
+    //     fan-out, precisely so a replication RTT never holds the `RwLock` a
+    //     peer's inbound `OP_REPLICA_BATCH` takes exclusively;
+    //   * the per-key `visibility_stripes` some handlers still hold are for keys
+    //     THIS node masters, so no peer's inbound batch can contend on them;
+    //   * `build_record_replay_ops` materialises the record into OWNED ops
+    //     before any socket work and holds no guard across the send — it takes
+    //     only the engine's own per-tx stripe (`read_record_snapshot`), which is
+    //     never held across the network, and never touches `visibility()`;
+    //   * `send_replica_ops_to_reporting` takes the per-address slot mutex fresh
+    //     and releases it on return, the same as the fan-out send did.
+    // The one cost is that the fan-out admission permit is held for the extra
+    // RTT (see `_fanout_permit`), which is bounded by the same per-target ack
+    // timeout and only paid on the rare repair path.
+    if let Some(engine) = engine {
+        for (addr, result, ops) in results.iter_mut() {
+            let Err(ReplicaSendError::MissingRecord { tx_keys, detail }) = result else {
+                continue;
+            };
+            let (missing, detail, addr) = (std::mem::take(tx_keys), detail.clone(), *addr);
+            let ack_timeout = ack_timeouts.get(&addr).copied().unwrap_or(base_timeout);
+            let repaired = repair_missing_record_target(
+                engine,
+                addr,
+                missing,
+                detail,
+                ops,
+                ack_timeout,
+                auth_secret.as_deref(),
+                cluster_key,
+                source_node_id,
+                redo_seq_range.1,
+            );
+            *result = repaired;
+        }
+    }
+
     let mut last_error: Option<String> = None;
     // D-6: the set of addresses that ACKed, used for per-key quorum.
     let mut acked: std::collections::HashSet<SocketAddr> = std::collections::HashSet::new();
-    for (addr, result) in &results {
+    for (addr, result, _) in &results {
         match result {
             Ok(()) => {
                 acked.insert(*addr);
             }
             Err(e) => {
                 tracing::warn!(err = %e, "replication to replica failed");
-                last_error = Some(e.clone());
+                last_error = Some(e.to_string());
             }
         }
     }
@@ -4965,6 +5030,201 @@ fn exchange_replica_batch(
     }
 }
 
+/// Bound on missing-record repair rounds for ONE replica address in ONE
+/// fan-out.
+///
+/// A round is designed to be sufficient on its own: the replica's NAK names
+/// EVERY record of the batch it is missing (see
+/// [`ReplicaAck::MissingRecord::tx_keys`]), so one re-ship closes the whole gap
+/// rather than one record per round-trip. The second round exists only for a
+/// record that went missing BETWEEN the NAK and the re-send, or for the tail of
+/// a NAK that hit the wire cap.
+///
+/// Termination is guaranteed twice over, so a replica that keeps NAKing can
+/// never wedge a client's mutation:
+///
+/// 1. **One repair attempt per key.** A key already re-shipped in this fan-out
+///    and reported missing AGAIN is a hard failure — the replica just told us
+///    the re-ship did not take, so re-shipping it again provably would not help,
+///    and retrying is how a ping-pong starts.
+/// 2. **A hard round cap.** Worst-case added latency is 2 × that target's ACK
+///    timeout, and only on the repair path.
+///
+/// A replica missing more records than two capped rounds can carry is not
+/// suffering a sweep race; it has a real hole, and the honest failure below is
+/// the correct answer — it is what drives the operator-visible signal and a real
+/// resync rather than papering over a gap while the client waits.
+const MAX_MISSING_RECORD_REPAIRS: usize = 2;
+
+/// Repair `addr`'s missing records and re-send `ops`.
+///
+/// The replica NAKed [`ReplicaAck::MissingRecord`]: it does not have records
+/// this batch mutates. This node masters them, so it re-ships each record's full
+/// current image ([`build_record_replay_ops`] — create + slot state + mined
+/// state + flags, NOT a bare create) followed by the ORIGINAL ops, in one batch.
+/// The already-applied prefix of `ops` re-applies idempotently (every op is
+/// generation-guarded, and each re-shipped image carries the master's exact
+/// generation, so the replay is an equal-generation no-op rather than a stale
+/// reject or a bump).
+///
+/// Generation is preserved END TO END and deliberately not perturbed: the image
+/// carries `metadata_bytes[46..50]` from the master's own metadata, the receiver
+/// restores it via `restore_migrated_lifecycle`, and every replayed slot/mined
+/// op is stamped with that same value.
+///
+/// A key the master no longer holds either is SKIPPED rather than fatal: the
+/// record is legitimately gone on both sides, so there is nothing to repair and
+/// nothing for the replica to apply against it. If that leaves nothing to
+/// re-ship at all, the original NAK stands.
+///
+/// Returns `Ok(())` when the re-sent batch was ACKed. On ANY failure it returns
+/// [`ReplicaSendError::Failed`] carrying both the original NAK and the repair
+/// failure, so the caller's per-key quorum check fails the client's mutation
+/// exactly as it did before this repair existed. Honesty over liveness stays the
+/// fallback — the repair only removes it as the FIRST resort.
+#[allow(clippy::too_many_arguments)]
+fn repair_missing_record_target(
+    engine: &Engine,
+    addr: SocketAddr,
+    first_missing: Vec<TxKey>,
+    first_detail: String,
+    ops: &[ReplicaOp],
+    ack_timeout: Duration,
+    auth_secret: Option<&[u8]>,
+    cluster_key: u64,
+    source_node_id: u64,
+    redo_high: u64,
+) -> std::result::Result<(), ReplicaSendError> {
+    let mut repaired: Vec<TxKey> = Vec::new();
+    let mut missing = first_missing;
+    let mut detail = first_detail;
+
+    for round in 0..MAX_MISSING_RECORD_REPAIRS {
+        if let Some(seen) = missing.iter().find(|k| repaired.contains(k)) {
+            return Err(ReplicaSendError::Failed(format!(
+                "replica {addr} still reports {seen:?} missing after this node re-shipped it — \
+                 refusing to re-ship again: {detail}"
+            )));
+        }
+        // Materialise every record into OWNED ops FIRST. No engine guard is
+        // held across the send below — see the deadlock note at the call site.
+        let mut repair_ops: Vec<ReplicaOp> = Vec::new();
+        let mut shipped = 0usize;
+        for key in &missing {
+            match crate::cluster::coordinator::build_record_replay_ops(engine, key) {
+                Ok(Some(replay)) => {
+                    repair_ops.extend(replay.ops);
+                    shipped += 1;
+                }
+                // Gone here too (a concurrent local delete): nothing to repair
+                // for this key. The op targeting it will skip or fail on its own
+                // merits, which is the honest answer.
+                Ok(None) => {}
+                Err(e) => {
+                    return Err(ReplicaSendError::Failed(format!(
+                        "replica {addr} is missing {key:?} and re-shipping it failed ({e}): \
+                         {detail}"
+                    )));
+                }
+            }
+            repaired.push(*key);
+        }
+        if shipped == 0 {
+            return Err(ReplicaSendError::Failed(format!(
+                "replica {addr} is missing {} record(s) this master no longer holds either — \
+                 cannot repair: {detail}",
+                missing.len(),
+            )));
+        }
+        repair_ops.extend_from_slice(ops);
+        tracing::warn!(
+            %addr,
+            round,
+            missing = missing.len(),
+            shipped,
+            repair_ops = repair_ops.len(),
+            "replication: replica is missing record(s) this batch mutates — re-shipping them \
+             and re-sending the batch",
+        );
+
+        match send_replica_ops_to_reporting(
+            addr,
+            &repair_ops,
+            ack_timeout,
+            auth_secret,
+            cluster_key,
+            source_node_id,
+            redo_high,
+        ) {
+            Ok(()) => {
+                if let Some(m) = crate::metrics::replication_metrics() {
+                    m.replica_missing_record_repaired.inc_by(shipped as u64);
+                }
+                return Ok(());
+            }
+            // More keys went missing between the NAK and the re-send, or the
+            // NAK's key list hit the wire cap. Loop (bounded).
+            Err(ReplicaSendError::MissingRecord {
+                tx_keys,
+                detail: next,
+            }) => {
+                missing = tx_keys;
+                detail = next;
+            }
+            Err(ReplicaSendError::Failed(e)) => {
+                if let Some(m) = crate::metrics::replication_metrics() {
+                    m.replica_missing_record_repair_failed.inc();
+                }
+                return Err(ReplicaSendError::Failed(format!(
+                    "replica {addr} re-ship of {shipped} record(s) was sent but the batch still \
+                     failed: {e}"
+                )));
+            }
+        }
+    }
+
+    if let Some(m) = crate::metrics::replication_metrics() {
+        m.replica_missing_record_repair_failed.inc();
+    }
+    Err(ReplicaSendError::Failed(format!(
+        "replica {addr} still reports a missing record after {MAX_MISSING_RECORD_REPAIRS} repair \
+         round(s) — failing the mutation so the divergence is not masked: {detail}"
+    )))
+}
+
+/// Why a replica fan-out send failed, in a form the fan-out can ACT on.
+///
+/// [`Self::MissingRecord`] is the one failure the master can fix itself: it
+/// still holds the record the replica is missing, so it re-ships that record's
+/// full current image and re-sends the batch instead of failing the client's
+/// mutation and rolling it back. Every other failure stays [`Self::Failed`] and
+/// keeps the historical honest-failure path.
+///
+/// The distinction is carried by TYPE from the replica's
+/// [`ReplicaAck::MissingRecord`] all the way here; nothing parses a message to
+/// decide whether to repair.
+#[derive(Debug, Clone, thiserror::Error)]
+pub enum ReplicaSendError {
+    /// The replica aborted the batch because these records are absent there.
+    #[error("{detail}")]
+    MissingRecord {
+        /// Every record of this batch the replica reported absent (the aborting
+        /// one first). The master re-ships all of them in one round.
+        tx_keys: Vec<TxKey>,
+        /// Operator-facing detail, for logs and the client-visible error.
+        detail: String,
+    },
+    /// Transport failure, terminal replica error, or budget exhaustion.
+    #[error("{0}")]
+    Failed(String),
+}
+
+impl From<String> for ReplicaSendError {
+    fn from(detail: String) -> Self {
+        Self::Failed(detail)
+    }
+}
+
 /// Maximum send attempts per batch inside [`send_replica_ops_to`]: the
 /// initial send plus one relabeled retry after a cursor-resync signal
 /// (`ReplicaAck::Gap` or a duplicate-skip ACK whose `through_sequence`
@@ -5009,6 +5269,10 @@ const MAX_SEQUENCE_RENEGOTIATIONS: usize = 2;
 ///
 /// Returns `Ok(())` once the replica has durably applied (or provably
 /// already applied) every op in `ops`; `Err(message)` otherwise.
+///
+/// This is the flattened-error entry point kept for callers that cannot act on
+/// WHY the send failed. The fan-out uses [`send_replica_ops_to_reporting`],
+/// which preserves the repairable [`ReplicaSendError::MissingRecord`] case.
 pub fn send_replica_ops_to(
     addr: SocketAddr,
     ops: &[ReplicaOp],
@@ -5018,6 +5282,33 @@ pub fn send_replica_ops_to(
     source_node_id: u64,
     redo_high: u64,
 ) -> std::result::Result<(), String> {
+    send_replica_ops_to_reporting(
+        addr,
+        ops,
+        ack_timeout,
+        auth_secret,
+        cluster_key,
+        source_node_id,
+        redo_high,
+    )
+    .map_err(|e| e.to_string())
+}
+
+/// [`send_replica_ops_to`] with the failure REASON preserved.
+///
+/// Identical behavior; the only difference is the error type, which keeps
+/// [`ReplicaSendError::MissingRecord`] distinguishable so the fan-out can repair
+/// the replica instead of failing the client's mutation.
+#[allow(clippy::too_many_arguments)]
+pub fn send_replica_ops_to_reporting(
+    addr: SocketAddr,
+    ops: &[ReplicaOp],
+    ack_timeout: Duration,
+    auth_secret: Option<&[u8]>,
+    cluster_key: u64,
+    source_node_id: u64,
+    redo_high: u64,
+) -> std::result::Result<(), ReplicaSendError> {
     if ops.is_empty() {
         return Ok(());
     }
@@ -5072,7 +5363,7 @@ fn send_replica_ops_loop(
     next_sequence: &mut Option<u64>,
     last_acked: &mut u64,
     mut exchange: impl FnMut(&ReplicaBatch) -> std::result::Result<ReplicaAck, String>,
-) -> std::result::Result<(), String> {
+) -> std::result::Result<(), ReplicaSendError> {
     // Sync the stream cursor on first contact: adopt the replica's
     // authoritative applied watermark via an empty-batch probe. Initializing
     // from any master-side persisted value instead could label NEW ops at
@@ -5088,14 +5379,16 @@ fn send_replica_ops_loop(
                 source_node_id: Some(source_node_id),
                 cluster_key,
             };
-            match exchange(&probe)? {
+            match exchange(&probe).map_err(ReplicaSendError::Failed)? {
                 ReplicaAck::Ok { through_sequence } => {
                     let n = through_sequence + 1;
                     *next_sequence = Some(n);
                     n
                 }
                 other => {
-                    return Err(format!("watermark probe rejected: {other:?}"));
+                    return Err(ReplicaSendError::Failed(format!(
+                        "watermark probe rejected: {other:?}"
+                    )));
                 }
             }
         }
@@ -5125,7 +5418,7 @@ fn send_replica_ops_loop(
                 // different content could be dedup-skipped by the receiver; a
                 // hole heals via Gap/relabel instead.
                 *next_sequence = Some(last + 1);
-                return Err(e);
+                return Err(ReplicaSendError::Failed(e));
             }
         };
 
@@ -5147,10 +5440,10 @@ fn send_replica_ops_loop(
                 // nothing from THIS batch was applied. Adopt and retry.
                 reneg_attempts += 1;
                 if reneg_attempts >= MAX_SEQUENCE_RENEGOTIATIONS {
-                    return Err(format!(
+                    return Err(ReplicaSendError::Failed(format!(
                         "replication to {addr}: sequence renegotiation did not converge after \
                          {MAX_SEQUENCE_RENEGOTIATIONS} attempts",
-                    ));
+                    )));
                 }
                 tracing::warn!(
                     %addr,
@@ -5170,10 +5463,10 @@ fn send_replica_ops_loop(
                 // replica's next-expected sequence and retry.
                 reneg_attempts += 1;
                 if reneg_attempts >= MAX_SEQUENCE_RENEGOTIATIONS {
-                    return Err(format!(
+                    return Err(ReplicaSendError::Failed(format!(
                         "replication to {addr}: sequence renegotiation did not converge after \
                          {MAX_SEQUENCE_RENEGOTIATIONS} attempts",
-                    ));
+                    )));
                 }
                 tracing::warn!(
                     %addr,
@@ -5197,10 +5490,10 @@ fn send_replica_ops_loop(
                     // positions and fail so the caller's replication-failure
                     // path fires.
                     *next_sequence = Some(last + 1);
-                    return Err(format!(
+                    return Err(ReplicaSendError::Failed(format!(
                         "replica redo busy: still full after {MAX_BUSY_RETRIES} retries \
                          (first_sequence {first_sequence})",
-                    ));
+                    )));
                 }
                 busy_retries += 1;
                 tracing::warn!(
@@ -5216,7 +5509,28 @@ fn send_replica_ops_loop(
                 // Burn the positions — the replica may have applied a prefix
                 // before failing.
                 *next_sequence = Some(last + 1);
-                return Err(format!("replica error: {message}"));
+                return Err(ReplicaSendError::Failed(format!(
+                    "replica error: {message}"
+                )));
+            }
+            ReplicaAck::MissingRecord {
+                failed_sequence,
+                tx_keys,
+            } => {
+                // The replica aborted because it does not have these records.
+                // Burn the positions exactly as for `Error` (the replica may
+                // have applied the prefix before the failing op, and its
+                // watermark did not advance). Report the keys so the caller can
+                // re-ship them and re-send — this loop deliberately does NOT
+                // retry here: it has no engine handle, and a blind resend of the
+                // same ops would NAK identically forever.
+                *next_sequence = Some(last + 1);
+                let detail = format!(
+                    "replica {addr} is missing {} record(s), first {:?} (NAK at seq {failed_sequence})",
+                    tx_keys.len(),
+                    tx_keys.first(),
+                );
+                return Err(ReplicaSendError::MissingRecord { tx_keys, detail });
             }
         }
     }
@@ -12404,10 +12718,16 @@ mod tests {
         );
 
         let err = res.expect_err("an always-Busy replica must fail, not loop forever");
-        assert!(
-            err.contains("busy"),
-            "the exhaustion error must name the redo-busy cause, got: {err}",
-        );
+        match &err {
+            ReplicaSendError::Failed(detail) => assert!(
+                detail.contains("busy"),
+                "the exhaustion error must name the redo-busy cause, got: {detail}",
+            ),
+            other => panic!(
+                "redo-busy exhaustion must NOT be reported as a repairable missing record, \
+                 got: {other:?}"
+            ),
+        }
         // Bounded: the initial send plus MAX_BUSY_RETRIES resends, then it fails.
         assert_eq!(
             calls,

@@ -34,10 +34,12 @@ use teraslab::protocol::codec::{
 };
 use teraslab::protocol::frame::{RequestFrame, ResponseFrame};
 use teraslab::protocol::opcodes::{
-    FLAG_LOCAL_READ, OP_CREATE_BATCH, OP_DELETE_BATCH, OP_GET_BATCH,
-    OP_PROCESS_EXPIRED_PRESERVATIONS, OP_SET_MINED_BATCH, OP_SPEND_BATCH, STATUS_OK,
+    FLAG_LOCAL_READ, OP_CREATE_BATCH, OP_DELETE_BATCH, OP_GET_BATCH, OP_PRESERVE_UNTIL_BATCH,
+    OP_PROCESS_EXPIRED_PRESERVATIONS, OP_SET_CONFLICTING_BATCH, OP_SET_MINED_BATCH, OP_SPEND_BATCH,
+    STATUS_OK,
 };
 use teraslab::redo::RedoLog;
+use teraslab::replication::manager::AckPolicy;
 use teraslab::replication::protocol::ReplicaOp;
 use teraslab::replication::receiver::apply_op_journal;
 use teraslab::segment_allocator::SegmentAllocator;
@@ -89,6 +91,24 @@ fn reserve_udp_port() -> u16 {
 /// 3 s foreground ACK timeout, so a write that returns `STATUS_OK` has provably
 /// been applied by its replica.
 fn create_cluster_node(node_id: u64, seed_swim_ports: &[u16]) -> TestNode {
+    create_cluster_node_with_ack_policy(node_id, seed_swim_ports, None)
+}
+
+/// [`create_cluster_node`] with an explicit replica-ACK policy.
+///
+/// `ack_policy: None` means `required_replica_acks == 0` — a fan-out that gets
+/// ZERO ACKs is still classified `Durable` and the client still sees
+/// `STATUS_OK`. That is fine for the tests above, which assert on where records
+/// physically live rather than on replication verdicts, but it is NOT what a
+/// production RF = 2 node runs: `ServerConfig::resolved_ack_policy` maps the
+/// default `ack_policy = "auto"` at `replication_factor = 2` to
+/// [`AckPolicy::WriteAll`], i.e. one required ACK. A test that needs a replica
+/// NAK to actually fail the client's write must pass that policy explicitly.
+fn create_cluster_node_with_ack_policy(
+    node_id: u64,
+    seed_swim_ports: &[u16],
+    ack_policy: Option<AckPolicy>,
+) -> TestNode {
     let tcp_port = reserve_tcp_port();
     let mut swim_port = reserve_udp_port();
     while swim_port == tcp_port {
@@ -152,7 +172,7 @@ fn create_cluster_node(node_id: u64, seed_swim_ports: &[u16]) -> TestNode {
     };
 
     let replication = ReplicationRuntimeConfig {
-        ack_policy: None,
+        ack_policy,
         best_effort: false,
         timeout: ACK_TIMEOUT,
         timeout_during_migration: Duration::from_secs(30),
@@ -751,6 +771,260 @@ fn preserved_on_master_survives_a_replica_sweep_and_is_restorable() {
         raced.len(),
         "every record the master still holds must be restorable onto the replica through \
          the real migration-baseline apply path"
+    );
+}
+
+/// Reclaim every held REPLICA copy of `seeds` by firing the DAH sweep at both
+/// non-master nodes, and assert the reclaim actually happened.
+///
+/// Fired at nodes 1 and 2 (never the master at index 0) because a given
+/// master's shards do not all share the same replica — whichever of the two
+/// holds the copy reclaims it, and the other is a no-op. On return every seed
+/// must be down to exactly one holder, the master. If that does not hold, the
+/// caller's assertions about the repair would be vacuous.
+fn force_replica_reclaim(nodes: &[&TestNode], seeds: &[u32], sweep_height: u32, retention: u32) {
+    let mut payload = Vec::with_capacity(8);
+    payload.extend_from_slice(&sweep_height.to_le_bytes());
+    payload.extend_from_slice(&retention.to_le_bytes());
+    for node in &nodes[1..] {
+        let resp = request_at(
+            node.tcp_port,
+            OP_PROCESS_EXPIRED_PRESERVATIONS,
+            0,
+            payload.clone(),
+        );
+        assert_eq!(resp.status, STATUS_OK, "replica-side sweep must succeed");
+    }
+    let still_replicated: Vec<String> = seeds
+        .iter()
+        .map(|s| (s, local_holders(nodes, &make_txid(*s))))
+        .filter(|(_, h)| h.as_slice() != [0])
+        .map(|(s, h)| format!("seed {s}: holders {h:?}"))
+        .collect();
+    assert!(
+        still_replicated.is_empty(),
+        "the replica-side sweep must have reclaimed EVERY replica copy, leaving the master \
+         as the sole holder — otherwise the repair assertions below prove nothing because \
+         there was never anything missing to repair: {}",
+        still_replicated.join(" | ")
+    );
+}
+
+/// **The C15 repair contract, end to end through the production path.**
+///
+/// A replica legitimately reclaims its held copy of a DAH-due record (F2
+/// replica-side GC). Before the master's own pruner reaches the same record, a
+/// client preserves it at the master — the normal Teranode case, where parent
+/// preservation (1440 blocks) far outlives the DAH default (288).
+///
+/// The master now replicates `PreserveUntil` for a record the replica does not
+/// have. At RF = 2 that key has exactly ONE replica target, so a NAK is 0/1
+/// acked — a deterministic quorum failure that `best_effort` cannot rescue
+/// (config rejects `best_effort` when `replication_factor > 1`). Before the
+/// repair existed, the outcome was: the client's preserve REJECTED, the master's
+/// own mutation rolled back by compensation to `preserve_until(0)` — which
+/// clears the DAH *and* the preserve index, so `record_due_for_sweep` returns
+/// false forever and the record is immortal on the master — and the key silently
+/// left on one of two holders.
+///
+/// What must happen instead: the replica's NAK names the missing record, the
+/// master re-ships that record's full current image and re-sends the batch, and
+/// the client's preserve succeeds with the record present on BOTH holders.
+///
+/// This drives the REAL path end to end: a client TCP request, the production
+/// replication fan-out, the replica's own receiver. Nothing here calls
+/// `apply_op_journal` by hand.
+#[test]
+fn master_repairs_a_replica_that_reclaimed_a_record_it_then_preserves() {
+    let node1 = create_cluster_node_with_ack_policy(891, &[], Some(AckPolicy::WriteAll));
+    let seed = [node1.swim_port];
+    let node2 = create_cluster_node_with_ack_policy(892, &seed, Some(AckPolicy::WriteAll));
+    let node3 = create_cluster_node_with_ack_policy(893, &seed, Some(AckPolicy::WriteAll));
+    let nodes = [&node1, &node2, &node3];
+    wait_for_settled_three_node_topology(&nodes);
+
+    const COUNT: usize = 6;
+    const HEIGHT: u32 = 900_000;
+    const RETENTION: u32 = 100;
+    const PRESERVE_TO: u32 = HEIGHT + RETENTION + 10_000;
+    let seeds = owned_seeds(&node1, COUNT);
+
+    let resp = request_at(node1.tcp_port, OP_CREATE_BATCH, 0, encode_batch(&seeds));
+    assert_eq!(resp.status, STATUS_OK, "create batch must be accepted");
+    for s in &seeds {
+        set_mined(node1.tcp_port, *s, HEIGHT, RETENTION);
+        spend_to_all_spent(node1.tcp_port, *s, HEIGHT, RETENTION);
+    }
+    for (s, holders) in seeds
+        .iter()
+        .zip(seeds.iter().map(|s| local_holders(&nodes, &make_txid(*s))))
+    {
+        assert_eq!(
+            holders.len(),
+            2,
+            "seed {s} must be on exactly 2 nodes before the replica sweep, found {holders:?}"
+        );
+        assert!(holders.contains(&0), "seed {s} must be mastered by node 0");
+    }
+
+    // The replica reclaims; the master (never swept) keeps its copy.
+    force_replica_reclaim(&nodes, &seeds, HEIGHT + RETENTION + 1, RETENTION);
+
+    // The client preserve that the replica cannot apply without the record.
+    let txids: Vec<[u8; 32]> = seeds.iter().map(|s| make_txid(*s)).collect();
+    let resp = request_at(
+        node1.tcp_port,
+        OP_PRESERVE_UNTIL_BATCH,
+        0,
+        encode_txid_batch(&txids, &PRESERVE_TO.to_le_bytes()),
+    );
+    let preserve_status = resp.status;
+
+    let after: Vec<Vec<usize>> = txids.iter().map(|t| local_holders(&nodes, t)).collect();
+    // Non-vacuity: the master's preserve must actually have been applied and
+    // KEPT (not compensated back to 0), so a "both holders present" result
+    // cannot come from a preserve that silently did nothing.
+    let master_preserve: Vec<u32> = seeds
+        .iter()
+        .map(|s| {
+            node1
+                .engine
+                .read_metadata(&TxKey {
+                    txid: make_txid(*s),
+                })
+                .map(|m| m.preserve_until)
+                .unwrap_or(0)
+        })
+        .collect();
+
+    shutdown_node(&node1);
+    shutdown_node(&node2);
+    shutdown_node(&node3);
+
+    assert_eq!(
+        preserve_status, STATUS_OK,
+        "the client's preserve must SUCCEED: the only reason the replica could not apply it \
+         is that it had already reclaimed the record, and the master — that record's own \
+         master — still holds it and can re-ship it. Failing here rejects a client operation \
+         for a condition the cluster can repair itself, and the compensation that follows \
+         clears the master's DAH and preserve index, leaking the record forever \
+         (status {preserve_status})"
+    );
+    let unpreserved: Vec<String> = seeds
+        .iter()
+        .zip(&master_preserve)
+        .filter(|(_, p)| **p != PRESERVE_TO)
+        .map(|(s, p)| format!("seed {s}: preserve_until={p}"))
+        .collect();
+    assert!(
+        unpreserved.is_empty(),
+        "every record must carry the requested preserve_until on the master afterwards — a \
+         STATUS_OK with a rolled-back preserve would be worse than an honest failure: {}",
+        unpreserved.join(" | ")
+    );
+    let not_repaired: Vec<String> = seeds
+        .iter()
+        .zip(&after)
+        .filter(|(_, h)| h.len() != 2)
+        .map(|(s, h)| format!("seed {s}: holders {h:?}"))
+        .collect();
+    assert!(
+        not_repaired.is_empty(),
+        "{}/{COUNT} records are still on fewer than 2 holders after an ACKed preserve — the \
+         master must have re-shipped the record the replica was missing, restoring RF=2. A \
+         key left silently single-copy is lost outright if the master then fails: {}",
+        not_repaired.len(),
+        not_repaired.join(" | ")
+    );
+}
+
+/// The same repair must cover the other mutations that hit an absent replica
+/// record — the review names `unspend`, `mark_on_longest_chain(false)`,
+/// `set_conflicting`, `set_locked` and `set_mined` alongside `preserve_until`.
+/// They share ONE code path (`missing_record_apply_outcome` → the typed NAK →
+/// the master's re-ship), so covering a second op with a completely different
+/// handler is what proves the repair is in the shared fan-out and not special-
+/// cased for preserve.
+///
+/// `set_conflicting` is the second op chosen deliberately: like `preserve_until`
+/// it has no block-depth protection, so unlike the reorg variants it is
+/// reachable at any height.
+#[test]
+fn master_repairs_a_replica_that_reclaimed_a_record_it_then_marks_conflicting() {
+    let node1 = create_cluster_node_with_ack_policy(901, &[], Some(AckPolicy::WriteAll));
+    let seed = [node1.swim_port];
+    let node2 = create_cluster_node_with_ack_policy(902, &seed, Some(AckPolicy::WriteAll));
+    let node3 = create_cluster_node_with_ack_policy(903, &seed, Some(AckPolicy::WriteAll));
+    let nodes = [&node1, &node2, &node3];
+    wait_for_settled_three_node_topology(&nodes);
+
+    const COUNT: usize = 4;
+    const HEIGHT: u32 = 900_000;
+    const RETENTION: u32 = 100;
+    let seeds = owned_seeds(&node1, COUNT);
+
+    let resp = request_at(node1.tcp_port, OP_CREATE_BATCH, 0, encode_batch(&seeds));
+    assert_eq!(resp.status, STATUS_OK, "create batch must be accepted");
+    for s in &seeds {
+        set_mined(node1.tcp_port, *s, HEIGHT, RETENTION);
+        spend_to_all_spent(node1.tcp_port, *s, HEIGHT, RETENTION);
+    }
+    force_replica_reclaim(&nodes, &seeds, HEIGHT + RETENTION + 1, RETENTION);
+
+    // OP_SET_CONFLICTING_BATCH shared header: value(1) + current_height(4) +
+    // retention(4). Retention 0 keeps the DAH untouched, so the assertion below
+    // is about the repair and nothing else.
+    let txids: Vec<[u8; 32]> = seeds.iter().map(|s| make_txid(*s)).collect();
+    let mut shared = Vec::with_capacity(9);
+    shared.push(1u8);
+    shared.extend_from_slice(&(HEIGHT + RETENTION + 1).to_le_bytes());
+    shared.extend_from_slice(&0u32.to_le_bytes());
+    let resp = request_at(
+        node1.tcp_port,
+        OP_SET_CONFLICTING_BATCH,
+        0,
+        encode_txid_batch(&txids, &shared),
+    );
+    let status = resp.status;
+    let after: Vec<Vec<usize>> = txids.iter().map(|t| local_holders(&nodes, t)).collect();
+    let master_conflicting = seeds
+        .iter()
+        .filter(|s| {
+            node1
+                .engine
+                .read_metadata(&TxKey {
+                    txid: make_txid(**s),
+                })
+                .map(|m| m.flags.contains(teraslab::record::TxFlags::CONFLICTING))
+                .unwrap_or(false)
+        })
+        .count();
+
+    shutdown_node(&node1);
+    shutdown_node(&node2);
+    shutdown_node(&node3);
+
+    assert_eq!(
+        status, STATUS_OK,
+        "set_conflicting against a record the replica already reclaimed must succeed via the \
+         same re-ship repair as preserve_until (status {status})"
+    );
+    assert_eq!(
+        master_conflicting,
+        seeds.len(),
+        "every record must still be marked conflicting on the master — a compensated rollback \
+         would leave the flag cleared"
+    );
+    let not_repaired: Vec<String> = seeds
+        .iter()
+        .zip(&after)
+        .filter(|(_, h)| h.len() != 2)
+        .map(|(s, h)| format!("seed {s}: holders {h:?}"))
+        .collect();
+    assert!(
+        not_repaired.is_empty(),
+        "the repair must be in the shared replication fan-out, not special-cased per op: {}",
+        not_repaired.join(" | ")
     );
 }
 

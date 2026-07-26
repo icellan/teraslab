@@ -1005,6 +1005,21 @@ pub struct ReplicationMetrics {
     /// should investigate root cause (lost intent range, redo gap,
     /// dedup-tracker drift) before the next sustained climb.
     pub replica_apply_divergence_total: PaddedCounter,
+    /// C15 repair — master-side counter, incremented once per replica batch
+    /// that a replica NAKed with `ReplicaAck::MissingRecord` and that this node
+    /// then RECOVERED by re-shipping the record and re-sending the batch. A
+    /// non-zero value is not itself an error (a replica-side DAH reclaim racing
+    /// a master mutation is a legitimate, expected window), but sustained growth
+    /// means replicas are losing records they should still hold — check
+    /// `replica_apply_skipped_missing_tx` and replication lag.
+    pub replica_missing_record_repaired: PaddedCounter,
+    /// C15 repair — master-side counter, incremented when a missing-record
+    /// repair was attempted and the batch STILL failed (the re-ship could not be
+    /// built, the replica reported another missing record beyond the repair
+    /// bound, or the re-sent batch failed for an unrelated reason). Every
+    /// increment corresponds to a client mutation that was rejected with
+    /// `ERR_REPLICATION_FAILED` and compensated — investigate immediately.
+    pub replica_missing_record_repair_failed: PaddedCounter,
     /// F-G7-008: master-side counter — incremented every time
     /// `AckTracker::flush_locked` fails to persist the last-ACKed
     /// map to disk. A non-zero counter means the on-disk view of
@@ -1110,6 +1125,8 @@ impl ReplicationMetrics {
             replica_rejected_stale_cluster_key: PaddedCounter::new(),
             replica_apply_skipped_missing_tx: PaddedCounter::new(),
             replica_apply_divergence_total: PaddedCounter::new(),
+            replica_missing_record_repaired: PaddedCounter::new(),
+            replica_missing_record_repair_failed: PaddedCounter::new(),
             ack_tracker_flush_failures: PaddedCounter::new(),
             ack_tracker_load_failures: PaddedCounter::new(),
             intent_log_poisoned: PaddedCounter::new(),

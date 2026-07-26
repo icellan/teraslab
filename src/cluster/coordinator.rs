@@ -7250,6 +7250,229 @@ fn decode_migration_batch_error_detail(payload: &[u8]) -> String {
     }
 }
 
+/// One record's full current state, expressed as the [`ReplicaOp`] sequence
+/// that reconstructs it on a peer that does not have it.
+pub(crate) struct RecordReplay {
+    /// The record's generation at the moment the snapshot was taken. Callers
+    /// that maintain a content manifest fold this with the txid.
+    pub generation: u32,
+    /// Create + slot-state + mined-state + flag replay, in apply order.
+    pub ops: Vec<crate::replication::protocol::ReplicaOp>,
+}
+
+/// Build the [`ReplicaOp`] sequence that reconstructs `key`'s CURRENT state on
+/// a peer, from a single generation-consistent snapshot of the record.
+///
+/// This is the one primitive for "ship this whole record somewhere". It backs
+/// both the migration baseline ([`stream_shard_baseline`]) and the steady-state
+/// missing-record repair (`server::dispatch::repair_missing_record_targets`),
+/// so the two cannot drift into shipping different fidelities of the same
+/// record.
+///
+/// Shipping a bare `Create` is NOT sufficient and must never be substituted:
+/// `ReplicaOp::Create` carries only the UTXO *hashes*, so a peer that applied
+/// one alone would hold every slot UNSPENT. For an all-spent record — exactly
+/// the population a DAH sweep reclaims, and therefore exactly the population
+/// this is used to repair — that peer would accept spends of outputs the master
+/// considers spent, and a later promotion would turn that into a double-spend.
+/// The slot replay below is the part that makes the re-ship safe.
+///
+/// Ordering is load-bearing: `Create` first (its extended-lifecycle bytes carry
+/// the master's `generation`, `delete_at_height` and `preserve_until` verbatim),
+/// then the slot/mined/flag ops, each stamped with that SAME generation so the
+/// receiver's idempotency gate sees an equal-generation replay rather than a
+/// stale or advancing one. Slot ops pass `current_block_height = 0` and
+/// `block_height_retention = 0`, which `evaluate_delete_at_height` short-circuits
+/// on, so a restamp can never recompute a DAH from a guessed height and clobber
+/// the lifecycle the `Create` just restored.
+///
+/// Returns `Ok(None)` when the record is not present (raced a concurrent
+/// delete) — the caller skips it. Otherwise FAIL-CLOSED: any part of the
+/// record's authoritative state that cannot be read back is an `Err`, never a
+/// silently degraded image.
+pub(crate) fn build_record_replay_ops(
+    engine: &Engine,
+    key: &TxKey,
+) -> std::result::Result<Option<RecordReplay>, String> {
+    use crate::record::{UTXO_FROZEN, UTXO_PRUNED, UTXO_SPENT};
+    use crate::replication::protocol::ReplicaOp;
+
+    // C-3: read metadata and all slots as one generation-consistent snapshot
+    // under the per-tx stripe lock. A lock-free read_metadata + per-slot
+    // read_slot could observe a torn record (half-old metadata, half-new slots)
+    // if a concurrent mutation landed mid-scan, drifting the manifest generation
+    // and shipping an inconsistent image to the peer.
+    let (meta, slots) = match engine.read_record_snapshot(key) {
+        Ok(snapshot) => snapshot,
+        Err(crate::ops::error::SpendError::TxNotFound) => return Ok(None),
+        Err(e) => return Err(format!("read_record_snapshot {key:?}: {e:?}")),
+    };
+
+    let utxo_hashes: Vec<_> = slots.iter().map(|s| s.hash).collect();
+
+    // Source the record's mined-state — both its block entries AND its
+    // `unmined_since` — from the authoritative in-RAM MinedIndex, NOT the
+    // device footer. Post-16d, setMined/unset write mined-state ONLY to the
+    // MinedIndex; the device footer's `unmined_since` is stale for any tx
+    // mined-then-reorged after creation. Shipping the stale device value in the
+    // Create op below would seed the RECEIVER's MinedIndex with the wrong
+    // (create-time) height and prune the still-unmined UTXO early.
+    let (mined_entries, unmined_since) = match engine.mined_block_entries(key) {
+        Ok(v) => v,
+        Err(crate::ops::error::SpendError::TxNotFound) => {
+            // Raced a concurrent delete between the snapshot above and this
+            // lookup — the ops already queued for this key still ship; there is
+            // simply no mined state left to replay for it. Fall back to the
+            // device footer's `unmined_since` (the record is being removed
+            // anyway, so a stale height is harmless).
+            (Vec::new(), { meta.unmined_since })
+        }
+        Err(e) => return Err(format!("mined_block_entries {key:?}: {e:?}")),
+    };
+
+    // Serialize metadata (70 bytes with extended fields).
+    let mut meta_buf = Vec::with_capacity(70);
+    meta_buf.extend_from_slice(&meta.tx_version.to_le_bytes());
+    meta_buf.extend_from_slice(&meta.locktime.to_le_bytes());
+    meta_buf.extend_from_slice(&meta.fee.to_le_bytes());
+    meta_buf.extend_from_slice(&meta.size_in_bytes.to_le_bytes());
+    meta_buf.extend_from_slice(&meta.extended_size.to_le_bytes());
+    let (is_coinbase, wire_flags) =
+        crate::replication::protocol::create_metadata_flag_bytes(meta.flags);
+    meta_buf.push(is_coinbase);
+    meta_buf.extend_from_slice(&meta.spending_height.to_le_bytes());
+    meta_buf.extend_from_slice(&meta.created_at.to_le_bytes());
+    meta_buf.push(wire_flags);
+    meta_buf.extend_from_slice(&meta.generation.to_le_bytes());
+    meta_buf.extend_from_slice(&meta.updated_at.to_le_bytes());
+    // MinedIndex-sourced (see the `mined_block_entries` read above), NOT
+    // `meta.unmined_since` (stale device footer post-16d).
+    meta_buf.extend_from_slice(&unmined_since.to_le_bytes());
+    meta_buf.extend_from_slice(&meta.delete_at_height.to_le_bytes());
+    meta_buf.extend_from_slice(&meta.preserve_until.to_le_bytes());
+
+    // S3: an EXTERNAL record's cold blob MUST accompany its create, else the
+    // peer gets a LIVE record with a dangling `ExternalRef` (permanent payload
+    // loss). A missing blob, an unreadable blob, or no configured blob store all
+    // FAIL so the caller retries rather than shipping an incomplete record.
+    let is_external = meta.flags.contains(crate::record::TxFlags::EXTERNAL);
+    let cold_data = if is_external {
+        match engine.blob_store() {
+            Some(bs) => match bs.get(&key.txid) {
+                Ok(Some(blob)) => Some(blob),
+                Ok(None) => return Err(format!("external blob missing {key:?}")),
+                Err(e) => return Err(format!("external blob read {key:?}: {e}")),
+            },
+            None => return Err(format!("external blob missing (no blob store) {key:?}")),
+        }
+    } else {
+        None
+    };
+
+    let record_gen = { meta.generation };
+    let mut ops = Vec::with_capacity(1 + slots.len() + mined_entries.len());
+    ops.push(ReplicaOp::Create {
+        tx_key: *key,
+        metadata_bytes: meta_buf,
+        utxo_hashes,
+        cold_data,
+        is_external,
+    });
+
+    // Replay spent/frozen/pruned slot state so the peer matches this node.
+    for (v, slot) in slots.iter().enumerate() {
+        let offset = v as u32;
+        match slot.status {
+            UTXO_SPENT => ops.push(ReplicaOp::Spend {
+                tx_key: *key,
+                offset,
+                spending_data: slot.spending_data,
+                current_block_height: 0,
+                block_height_retention: 0,
+                master_generation: record_gen,
+            }),
+            UTXO_FROZEN => ops.push(ReplicaOp::Freeze {
+                tx_key: *key,
+                offset,
+                master_generation: record_gen,
+            }),
+            // A pruned slot is a SPENT slot whose spending child was later
+            // deleted (`prune_slot_if_spent_by_child` flips the status and
+            // decrements `spent_utxos`, leaving `spending_data` intact).
+            // Replaying it as two ops — the original spend, then the same
+            // child-guarded prune the master performed — reproduces BOTH halves
+            // exactly. Replaying nothing (the pre-extraction behaviour) left the
+            // slot UNSPENT on the peer, which is strictly weaker than either
+            // SPENT or PRUNED and would let a promoted peer re-spend an output
+            // this node considers permanently unspendable.
+            UTXO_PRUNED => {
+                let mut child_txid = [0u8; 32];
+                child_txid.copy_from_slice(&slot.spending_data[..32]);
+                ops.push(ReplicaOp::Spend {
+                    tx_key: *key,
+                    offset,
+                    spending_data: slot.spending_data,
+                    current_block_height: 0,
+                    block_height_retention: 0,
+                    master_generation: record_gen,
+                });
+                ops.push(ReplicaOp::PruneSlotIfSpentBy {
+                    tx_key: *key,
+                    offset,
+                    child_txid,
+                });
+            }
+            _ => {}
+        }
+    }
+
+    // Replay mined state from the authoritative in-RAM MinedIndex — NOT the
+    // device's `meta.block_entries_inline`. A record's blocks can carry
+    // DIFFERENT block_ids, so each is shipped as its own per-block
+    // `ReplicaOp::SetMined`; the coalesced `ReplicaOp::SetMinedBatch` shares one
+    // block_id across MANY txids — the orthogonal live/delta axis, not
+    // applicable to a single record's own block list.
+    //
+    // NO_MINED_SLOT (never mined) yielded `(vec![], 0)` above, so an unmined
+    // record naturally ships no mined ops here.
+    let on_longest_chain = unmined_since == 0;
+    for be in &mined_entries {
+        ops.push(ReplicaOp::SetMined {
+            tx_key: *key,
+            block_id: be.block_id,
+            block_height: be.block_height,
+            subtree_idx: be.subtree_idx,
+            on_longest_chain,
+            current_block_height: 0,
+            block_height_retention: 0,
+            master_generation: record_gen,
+        });
+    }
+
+    // Replay conflicting/locked flags.
+    if meta.flags.contains(crate::record::TxFlags::CONFLICTING) {
+        ops.push(ReplicaOp::SetConflicting {
+            tx_key: *key,
+            value: true,
+            current_block_height: 0,
+            retention: 0,
+            master_generation: record_gen,
+        });
+    }
+    if meta.flags.contains(crate::record::TxFlags::LOCKED) {
+        ops.push(ReplicaOp::SetLocked {
+            tx_key: *key,
+            value: true,
+            master_generation: record_gen,
+        });
+    }
+
+    Ok(Some(RecordReplay {
+        generation: record_gen,
+        ops,
+    }))
+}
+
 /// Stream baseline records for one shard on an existing TCP connection.
 ///
 /// Returns the manifest hash accumulated over all streamed records
@@ -7265,23 +7488,20 @@ fn stream_shard_baseline(
     cluster_key: u64,
     auth_secret: Option<&[u8]>,
 ) -> std::result::Result<ManifestHasher, String> {
-    use crate::record::{UTXO_FROZEN, UTXO_SPENT};
-    use crate::replication::protocol::{ReplicaBatch, ReplicaOp};
+    use crate::replication::protocol::ReplicaBatch;
 
     let batch_size = batch_size.max(1);
     let mut manifest = ManifestHasher::new();
     for chunk in shard_keys.chunks(batch_size) {
         let mut ops = Vec::with_capacity(chunk.len() * 2);
         for key in chunk {
-            // C-3: read metadata and all slots as one generation-consistent
-            // snapshot under the per-tx stripe lock. A lock-free
-            // read_metadata + per-slot read_slot could observe a torn record
-            // (half-old metadata, half-new slots) if a concurrent mutation
-            // landed mid-scan, drifting the manifest generation and shipping
-            // an inconsistent baseline to the joining replica.
-            let (meta, slots) = match engine.read_record_snapshot(key) {
-                Ok(snapshot) => snapshot,
-                Err(crate::ops::error::SpendError::TxNotFound) => {
+            // The per-record op sequence lives in `build_record_replay_ops` so
+            // the baseline and the steady-state missing-record repair ship the
+            // IDENTICAL image; see that function for the fail-closed contract
+            // and why a bare `Create` would be unsafe.
+            let replay = match build_record_replay_ops(engine, key) {
+                Ok(Some(replay)) => replay,
+                Ok(None) => {
                     tracing::debug!(
                         shard = task.shard,
                         key = ?key,
@@ -7290,194 +7510,12 @@ fn stream_shard_baseline(
                     continue;
                 }
                 Err(e) => {
-                    return Err(format!(
-                        "baseline read_record_snapshot shard {} key {:?}: {e:?}",
-                        task.shard, key
-                    ));
+                    return Err(format!("baseline shard {}: {e}", task.shard));
                 }
             };
             // Accumulate (txid, generation) into the manifest hash.
-            manifest.fold(&key.txid, meta.generation);
-
-            let utxo_hashes: Vec<_> = slots.iter().map(|s| s.hash).collect();
-
-            // Source the record's mined-state — both its block entries AND its
-            // `unmined_since` — from the authoritative in-RAM MinedIndex, NOT
-            // the device footer. Post-16d, setMined/unset write mined-state
-            // ONLY to the MinedIndex; the device footer's `unmined_since` is
-            // stale for any tx mined-then-reorged after creation (only
-            // `mark_on_longest_chain` still syncs it back). Shipping the stale
-            // device value in the Create op below would seed the RECEIVER's
-            // MinedIndex with the wrong (create-time) height and prune the
-            // still-unmined UTXO early. This mirrors how the per-block SetMined
-            // ops further down already source their block set from the
-            // MinedIndex (Task 15).
-            let (mined_entries, unmined_since) = match engine.mined_block_entries(key) {
-                Ok(v) => v,
-                Err(crate::ops::error::SpendError::TxNotFound) => {
-                    // Raced a concurrent delete between the
-                    // `read_record_snapshot` above and this lookup — the
-                    // Create/Spend/Freeze ops already queued for this key
-                    // still ship; there is simply no mined state left to
-                    // replay for it. Fall back to the device footer's
-                    // `unmined_since` for the shipped Create (the record is
-                    // being removed anyway, so a stale height is harmless).
-                    tracing::debug!(
-                        shard = task.shard,
-                        key = ?key,
-                        "cluster: mined-state read raced a concurrent delete \
-                         during baseline stream; shipping no mined ops",
-                    );
-                    (Vec::new(), { meta.unmined_since })
-                }
-                Err(e) => {
-                    return Err(format!(
-                        "baseline mined_block_entries shard {} key {:?}: {e:?}",
-                        task.shard, key
-                    ));
-                }
-            };
-
-            // Serialize metadata (70 bytes with extended fields).
-            let mut meta_buf = Vec::with_capacity(70);
-            meta_buf.extend_from_slice(&meta.tx_version.to_le_bytes());
-            meta_buf.extend_from_slice(&meta.locktime.to_le_bytes());
-            meta_buf.extend_from_slice(&meta.fee.to_le_bytes());
-            meta_buf.extend_from_slice(&meta.size_in_bytes.to_le_bytes());
-            meta_buf.extend_from_slice(&meta.extended_size.to_le_bytes());
-            let (is_coinbase, wire_flags) =
-                crate::replication::protocol::create_metadata_flag_bytes(meta.flags);
-            meta_buf.push(is_coinbase);
-            meta_buf.extend_from_slice(&meta.spending_height.to_le_bytes());
-            meta_buf.extend_from_slice(&meta.created_at.to_le_bytes());
-            meta_buf.push(wire_flags);
-            meta_buf.extend_from_slice(&meta.generation.to_le_bytes());
-            meta_buf.extend_from_slice(&meta.updated_at.to_le_bytes());
-            // MinedIndex-sourced (see the `mined_block_entries` read above),
-            // NOT `meta.unmined_since` (stale device footer post-16d).
-            meta_buf.extend_from_slice(&unmined_since.to_le_bytes());
-            meta_buf.extend_from_slice(&meta.delete_at_height.to_le_bytes());
-            meta_buf.extend_from_slice(&meta.preserve_until.to_le_bytes());
-
-            // S3 (baseline path): an EXTERNAL record's cold blob MUST accompany
-            // its baseline create, else the joining/migration target gets a LIVE
-            // record with a dangling `ExternalRef` (permanent payload loss). The
-            // pre-fix `.and_then(|bs| bs.get(..).ok().flatten())` silently
-            // yielded `cold_data = None` on a missing/unreadable blob while still
-            // shipping `is_external = true`. Mirror the delta converter
-            // (`convert_migration_create`) and the dispatch write path
-            // (`create_repl_cold_data` / `SkipReplicationBlobMissing`): a missing
-            // blob, an unreadable blob, or no configured blob store all FAIL the
-            // baseline task so the source retries rather than shipping an
-            // incomplete record.
-            let is_external = meta.flags.contains(crate::record::TxFlags::EXTERNAL);
-            let cold_data = if is_external {
-                match engine.blob_store() {
-                    Some(bs) => match bs.get(&key.txid) {
-                        Ok(Some(blob)) => Some(blob),
-                        Ok(None) => {
-                            return Err(format!(
-                                "baseline external blob missing shard {} key {:?}",
-                                task.shard, key
-                            ));
-                        }
-                        Err(e) => {
-                            return Err(format!(
-                                "baseline external blob read shard {} key {:?}: {e}",
-                                task.shard, key
-                            ));
-                        }
-                    },
-                    None => {
-                        return Err(format!(
-                            "baseline external blob missing (no blob store) shard {} key {:?}",
-                            task.shard, key
-                        ));
-                    }
-                }
-            } else {
-                None
-            };
-
-            ops.push(ReplicaOp::Create {
-                tx_key: **key,
-                metadata_bytes: meta_buf,
-                utxo_hashes,
-                cold_data,
-                is_external,
-            });
-
-            // Replay spent/frozen slot state so the replica matches the master.
-            // Use the master's generation for all replay ops so the replica
-            // ends up with the same generation counter.
-            let tx_key = **key;
-            let record_gen = { meta.generation };
-            for (v, slot) in slots.iter().enumerate() {
-                if slot.status == UTXO_SPENT {
-                    ops.push(ReplicaOp::Spend {
-                        tx_key,
-                        offset: v as u32,
-                        spending_data: slot.spending_data,
-                        // Baseline replay restores lifecycle metadata from
-                        // the preceding Create op; slot restamps should not
-                        // recompute DAH from a guessed height.
-                        current_block_height: 0,
-                        block_height_retention: 0,
-                        master_generation: record_gen,
-                    });
-                } else if slot.status == UTXO_FROZEN {
-                    ops.push(ReplicaOp::Freeze {
-                        tx_key,
-                        offset: v as u32,
-                        master_generation: record_gen,
-                    });
-                }
-            }
-
-            // Replay mined state from the authoritative in-RAM MinedIndex —
-            // NOT the device's `meta.block_entries_inline` — so migration is
-            // store-to-store (a later task drops on-device block entries
-            // entirely). `mined_entries` / `unmined_since` were read from the
-            // MinedIndex ABOVE (so the Create op's shipped `unmined_since`
-            // matches this block set). A record's blocks can carry DIFFERENT
-            // block_ids, so each is shipped as its own per-block
-            // `ReplicaOp::SetMined`; the coalesced `ReplicaOp::SetMinedBatch`
-            // shares one block_id across MANY txids — the orthogonal live/delta
-            // axis, not applicable to a single record's own block list.
-            //
-            // NO_MINED_SLOT (never mined) yielded `(vec![], 0)` above, so an
-            // unmined record naturally ships no mined ops here.
-            let on_longest_chain = unmined_since == 0;
-            for be in &mined_entries {
-                ops.push(ReplicaOp::SetMined {
-                    tx_key,
-                    block_id: be.block_id,
-                    block_height: be.block_height,
-                    subtree_idx: be.subtree_idx,
-                    on_longest_chain,
-                    current_block_height: 0,
-                    block_height_retention: 0,
-                    master_generation: record_gen,
-                });
-            }
-
-            // Replay conflicting/locked flags
-            if meta.flags.contains(crate::record::TxFlags::CONFLICTING) {
-                ops.push(ReplicaOp::SetConflicting {
-                    tx_key,
-                    value: true,
-                    current_block_height: 0,
-                    retention: 0,
-                    master_generation: record_gen,
-                });
-            }
-            if meta.flags.contains(crate::record::TxFlags::LOCKED) {
-                ops.push(ReplicaOp::SetLocked {
-                    tx_key,
-                    value: true,
-                    master_generation: record_gen,
-                });
-            }
+            manifest.fold(&key.txid, replay.generation);
+            ops.extend(replay.ops);
         }
 
         if ops.is_empty() {
@@ -7557,6 +7595,22 @@ fn stream_shard_baseline(
                     // batch is safe to retry (no partial state to reconcile).
                     return Err(format!(
                         "migration batch: replica redo busy (backpressure) at seq {first_sequence}"
+                    ));
+                }
+                Ok(ReplicaAck::MissingRecord {
+                    failed_sequence,
+                    tx_keys,
+                }) => {
+                    // Unreachable by construction: the missing-record NAK is
+                    // raised only when `nak_on_missing` is true, and
+                    // `FLAG_MIGRATION_BATCH` forces it false (the baseline
+                    // legitimately streams records the target lacks). Treat it
+                    // as the protocol bug it would be rather than silently
+                    // succeeding.
+                    return Err(format!(
+                        "migration batch: unexpected missing-record NAK at seq {failed_sequence} \
+                         for {} key(s) (a migration baseline must never NAK on absence)",
+                        tx_keys.len()
                     ));
                 }
                 Err(e) => {
@@ -8722,6 +8776,20 @@ fn send_delta_ops(
                 // applied or journaled, so the whole delta batch is retryable.
                 return Err(format!(
                     "delta batch: replica redo busy (backpressure) at seq {first_sequence}"
+                ));
+            }
+            Ok(ReplicaAck::MissingRecord {
+                failed_sequence,
+                tx_keys,
+            }) => {
+                // Same as the baseline path: `FLAG_MIGRATION_BATCH` forces
+                // `nak_on_missing = false`, so this variant cannot legitimately
+                // reach a delta batch. Fail loudly instead of treating an
+                // unrecognised NAK as success.
+                return Err(format!(
+                    "delta batch: unexpected missing-record NAK at seq {failed_sequence} \
+                     for {} key(s) (a migration delta must never NAK on absence)",
+                    tx_keys.len()
                 ));
             }
             Err(e) => {

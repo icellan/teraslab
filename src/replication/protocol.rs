@@ -1034,7 +1034,55 @@ pub enum ReplicaAck {
         /// The offending batch's `first_sequence`, echoed for the master's log.
         first_sequence: u64,
     },
+    /// C15 repair NAK: the batch aborted because the record `tx_key` targets is
+    /// ABSENT on this replica, so the master's mutation had nothing to apply to.
+    ///
+    /// This is the SAME abort [`Self::Error`] used to signal (nothing was
+    /// journaled past `failed_sequence`, the watermark did NOT advance), but it
+    /// names the missing key so the master can act on it instead of only
+    /// logging: the master re-ships that record's full current image and
+    /// re-sends the batch (`send_replica_ops_to_reporting` →
+    /// `repair_missing_record_targets`). Distinguishing this case by TYPE — not
+    /// by parsing [`Self::Error`]'s message — is what makes the repair possible;
+    /// the message text is diagnostic only and MUST NOT be matched on.
+    ///
+    /// Wire note: additive ack tag (4), same `STATUS_ERROR` envelope as
+    /// [`Self::Error`]/[`Self::Gap`]/[`Self::Busy`]. A pre-upgrade master decodes
+    /// it as [`ProtocolError::UnknownOp`] and treats the batch as a terminal
+    /// error — exactly the pre-repair behavior (honest failure, never a false
+    /// ACK). A new master talking to a pre-upgrade replica receives the old
+    /// [`Self::Error`] and likewise falls back to honest failure. Safe in both
+    /// mixed-version directions.
+    MissingRecord {
+        /// The sequence whose op could not be applied.
+        failed_sequence: u64,
+        /// Every record in this batch that is absent on this replica, starting
+        /// with the one the aborted op targets.
+        ///
+        /// The batch STILL aborts at `failed_sequence` — nothing at or beyond
+        /// it was applied. The extra keys are a read-only lookahead over the
+        /// remaining ops, and they exist so the repair costs ONE extra
+        /// round-trip instead of one per missing record: a DAH sweep reclaims
+        /// records in batches, so a client batch that races it commonly finds
+        /// many of its keys gone at once, and a master that could only learn
+        /// one key per NAK would need one RTT per record.
+        ///
+        /// Capped at [`MAX_MISSING_RECORD_KEYS_PER_NAK`] so the ack always fits
+        /// the receiver's 4 KiB frame budget.
+        tx_keys: Vec<TxKey>,
+    },
 }
+
+/// Cap on [`ReplicaAck::MissingRecord::tx_keys`].
+///
+/// The ack frame budget is 4 KiB (`MAX_ACK_FRAME_SIZE`); this variant costs
+/// `tag(1) + failed_sequence(8) + count(2) + 32 × keys`, so 100 keys is
+/// 3211 bytes and leaves ample room for the frame header and HMAC suffix.
+/// It also matches the migration baseline's per-batch record count, so a repair
+/// re-ship is never a larger batch than a baseline chunk the receiver already
+/// handles routinely. A batch missing MORE than this is not a sweep race — it is
+/// a real hole, and the honest failure that follows is the correct answer.
+pub const MAX_MISSING_RECORD_KEYS_PER_NAK: usize = 100;
 
 /// Sent by a replica to request catchup from the master.
 #[derive(Debug, Clone, PartialEq)]
@@ -1237,6 +1285,22 @@ impl ReplicaAck {
                 buf.push(3);
                 buf.extend_from_slice(&first_sequence.to_le_bytes());
             }
+            ReplicaAck::MissingRecord {
+                failed_sequence,
+                tx_keys,
+            } => {
+                // Defensive truncation: the producer already caps at
+                // MAX_MISSING_RECORD_KEYS_PER_NAK, but a frame that overflows
+                // the master's budget loses the ENTIRE ack (and with it the
+                // repair), so enforce the bound here too.
+                let keys = &tx_keys[..tx_keys.len().min(MAX_MISSING_RECORD_KEYS_PER_NAK)];
+                buf.push(4);
+                buf.extend_from_slice(&failed_sequence.to_le_bytes());
+                buf.extend_from_slice(&(keys.len() as u16).to_le_bytes());
+                for k in keys {
+                    buf.extend_from_slice(&k.txid);
+                }
+            }
         }
         buf
     }
@@ -1273,6 +1337,22 @@ impl ReplicaAck {
                 need(data, 9)?;
                 Ok(ReplicaAck::Busy {
                     first_sequence: u64::from_le_bytes(data[1..9].try_into().unwrap()),
+                })
+            }
+            4 => {
+                need(data, 11)?;
+                let failed_sequence = u64::from_le_bytes(data[1..9].try_into().unwrap());
+                let count = u16::from_le_bytes(data[9..11].try_into().unwrap()) as usize;
+                if count > MAX_MISSING_RECORD_KEYS_PER_NAK {
+                    return Err(ProtocolError::UnknownOp(data[0]));
+                }
+                need(data, 11 + count * 32)?;
+                let tx_keys = (0..count)
+                    .map(|i| read_key(&data[11 + i * 32..11 + (i + 1) * 32]))
+                    .collect();
+                Ok(ReplicaAck::MissingRecord {
+                    failed_sequence,
+                    tx_keys,
                 })
             }
             _ => Err(ProtocolError::UnknownOp(data[0])),
@@ -2110,6 +2190,89 @@ mod tests {
             }
             other => panic!("expected BufferTooShort, got {other:?}"),
         }
+    }
+
+    /// The repair NAK (ack tag 4) round-trips both fields, occupies exactly
+    /// `tag(1) + failed_sequence(8) + txid(32)` bytes, and a truncated frame
+    /// fails to decode rather than mis-decoding into a wrong key (which would
+    /// make the master re-ship the WRONG record).
+    #[test]
+    fn replica_ack_missing_record_round_trips() {
+        let ack = ReplicaAck::MissingRecord {
+            failed_sequence: 4242,
+            tx_keys: vec![key(37), key(38), key(39)],
+        };
+        let bytes = ack.serialize();
+        assert_eq!(
+            bytes.len(),
+            11 + 3 * 32,
+            "tag(1) + failed_sequence(8) + count(2) + 3 txids"
+        );
+        assert_eq!(bytes[0], 4, "MissingRecord NAK uses ack tag 4");
+        let decoded = ReplicaAck::deserialize(&bytes).unwrap();
+        assert_eq!(decoded, ack);
+
+        // Truncation must error, not mis-decode into a SHORTER key list — a
+        // silently dropped key is a record the master never re-ships.
+        let err = ReplicaAck::deserialize(&bytes[..bytes.len() - 1]).unwrap_err();
+        match err {
+            ProtocolError::BufferTooShort { need, have } => {
+                assert_eq!(need, 11 + 3 * 32);
+                assert_eq!(have, 11 + 3 * 32 - 1);
+            }
+            other => panic!("expected BufferTooShort, got {other:?}"),
+        }
+    }
+
+    /// The wire cap keeps the ack inside the receiver's 4 KiB frame budget in
+    /// BOTH directions: serialize truncates an over-long list rather than
+    /// emitting a frame the master would drop whole, and deserialize refuses a
+    /// forged over-long count rather than allocating from it.
+    #[test]
+    fn missing_record_ack_is_capped_within_the_frame_budget() {
+        let keys: Vec<_> = (0..MAX_MISSING_RECORD_KEYS_PER_NAK + 25)
+            .map(|i| key((i % 251) as u8))
+            .collect();
+        let bytes = ReplicaAck::MissingRecord {
+            failed_sequence: 1,
+            tx_keys: keys,
+        }
+        .serialize();
+        assert_eq!(bytes.len(), 11 + MAX_MISSING_RECORD_KEYS_PER_NAK * 32);
+        assert!(bytes.len() < 4096, "must fit MAX_ACK_FRAME_SIZE");
+        match ReplicaAck::deserialize(&bytes).unwrap() {
+            ReplicaAck::MissingRecord { tx_keys, .. } => {
+                assert_eq!(tx_keys.len(), MAX_MISSING_RECORD_KEYS_PER_NAK);
+            }
+            other => panic!("expected MissingRecord, got {other:?}"),
+        }
+
+        let mut forged = bytes.clone();
+        forged[9..11].copy_from_slice(&u16::MAX.to_le_bytes());
+        assert!(
+            ReplicaAck::deserialize(&forged).is_err(),
+            "an over-long count must be rejected, never used to size an allocation"
+        );
+    }
+
+    /// Mixed-version safety: a PRE-upgrade master decodes tag 4 as
+    /// `UnknownOp(4)`, which its ack handling treats as a terminal batch
+    /// failure — the honest-failure behavior that existed before the repair.
+    /// It can never be mistaken for an ACK, so an old master paired with a new
+    /// replica degrades to the pre-fix outcome rather than advancing a
+    /// watermark over an op the replica never applied.
+    #[test]
+    fn pre_upgrade_master_rejects_the_missing_record_tag() {
+        let bytes = ReplicaAck::MissingRecord {
+            failed_sequence: 9,
+            tx_keys: vec![key(1)],
+        }
+        .serialize();
+        // Simulate the old decoder: tags 0..=3 known, everything else unknown.
+        assert!(
+            !matches!(bytes[0], 0..=3),
+            "tag 4 must not collide with a tag a pre-upgrade master already decodes"
+        );
     }
 
     #[test]
