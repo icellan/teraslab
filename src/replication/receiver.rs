@@ -4218,6 +4218,121 @@ mod tests {
         }
     }
 
+    /// **F1 / C15 interaction — the dangerous one.** A replicated client delete
+    /// (`ReplicaOp::Delete`) whose record this replica does NOT have must be an
+    /// idempotent SUCCESS, never a `MissingRecord` NAK — on a TRACKED
+    /// steady-state batch (`nak_on_missing = true`), which is exactly what a
+    /// client `OP_DELETE_BATCH` fan-out produces.
+    ///
+    /// Why this is not a style preference: a `MissingRecord` NAK is routed by
+    /// `server::dispatch::repair_missing_record_target`, whose whole job is to
+    /// re-ship the record's full current image so the replica can apply the
+    /// batch. For a Delete that would make the master RESURRECT on the replica
+    /// the very record it is deleting — and the re-shipped copy would then
+    /// survive, because the master's local copy is dropped straight afterwards
+    /// and nothing revisits a replica copy.
+    ///
+    /// Two independent properties keep it out of that path, and this test pins
+    /// BOTH: the op arm resolves `TxNotFound` to `Ok(())`, and
+    /// `ReplicaOp::Delete::master_generation()` is `None` so the post-apply
+    /// generation sync — the OTHER producer of `MissingRecord` — is skipped.
+    #[test]
+    fn tracked_delete_of_absent_record_is_idempotent_never_missing_record() {
+        let engine = make_engine();
+        let missing = key(125);
+        assert!(
+            engine.lookup(&missing).is_none(),
+            "precondition: the replica must not hold the record"
+        );
+        let op = ReplicaOp::Delete { tx_key: missing };
+        assert_eq!(
+            op.master_generation(),
+            None,
+            "Delete must carry no master_generation — otherwise the post-apply \
+             generation sync raises MissingRecord for the absent record and the \
+             master re-ships (resurrects) it"
+        );
+
+        let mut redo_out = Vec::new();
+        // nak_on_missing = true, is_migration = false: the tracked steady-state
+        // batch shape a client OP_DELETE_BATCH fan-out actually produces.
+        let r = apply_op_journal_inner(&engine, &op, true, false, true, &mut redo_out);
+        assert_eq!(
+            r,
+            Ok(()),
+            "a tracked replicated delete of an absent record must be an idempotent \
+             success, not a MissingRecord NAK"
+        );
+        assert!(
+            engine.lookup(&missing).is_none(),
+            "the delete must not have resurrected the record"
+        );
+    }
+
+    /// The replicated delete's DURABILITY half, and its idempotence on
+    /// re-delivery — driven on an engine that actually has a redo log attached
+    /// (the shape a replica node runs).
+    ///
+    /// The replica journals a sentinel `RedoOp::Delete` (offset/size 0 = pure
+    /// index unregister) for the removal it just applied, and fsyncs it before
+    /// the batch ACK. That is what makes the REPLICA's half of a replicated
+    /// client delete crash-durable while the master's half is not (spec §3.18,
+    /// `docs/DURABILITY_CONTRACT.md`) — the asymmetry that bounds the crash
+    /// residual to master-live / replica-absent, never the reverse.
+    ///
+    /// A second delivery of the same op (a `Busy` resend, or the master's own
+    /// retry after a partial fan-out) must then be a plain idempotent success:
+    /// no `MissingRecord`, so no repair round-trip, so no resurrection.
+    #[test]
+    fn tracked_delete_journals_its_removal_and_is_idempotent_on_redelivery() {
+        let dev: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let alloc = SlotAllocator::new(dev.clone()).unwrap();
+        let index = Index::new(10_000).unwrap();
+        let engine = Engine::new(dev, index, alloc, StripedLocks::new(1024), DahIndex::new());
+        let log_dev: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(4 * 1024 * 1024, 4096).unwrap());
+        let log = crate::redo::RedoLog::open(log_dev, 0, 4 * 1024 * 1024).unwrap();
+        engine.set_redo_logs(vec![Arc::new(parking_lot::Mutex::new(log))]);
+        let engine = Arc::new(engine);
+
+        let k = key(126);
+        create_record(&engine, k, 3);
+        let op = ReplicaOp::Delete { tx_key: k };
+
+        let mut redo_out = Vec::new();
+        assert_eq!(
+            apply_op_journal_inner(&engine, &op, true, false, true, &mut redo_out),
+            Ok(()),
+            "first delivery must apply"
+        );
+        assert!(engine.lookup(&k).is_none(), "first delivery must remove it");
+        assert!(
+            redo_out.iter().any(|(entry, _)| matches!(
+                entry,
+                crate::redo::RedoOp::Delete {
+                    tx_key,
+                    record_offset: 0,
+                    record_size: 0,
+                } if *tx_key == k
+            )),
+            "the replica must journal a sentinel RedoOp::Delete for the removal so its \
+             half of the delete survives a crash, got {redo_out:?}"
+        );
+
+        let mut redo_out2 = Vec::new();
+        assert_eq!(
+            apply_op_journal_inner(&engine, &op, true, false, true, &mut redo_out2),
+            Ok(()),
+            "re-delivery of the same delete must be an idempotent success, never a \
+             MissingRecord NAK (which would make the master re-ship the record)"
+        );
+        assert!(
+            engine.lookup(&k).is_none(),
+            "re-delivery must not resurrect"
+        );
+    }
+
     /// R7 regression: the migration path is unchanged by the fix — it was
     /// already exempt (`is_migration` implies `nak_on_missing = false`), and
     /// stays a benign skip after re-keying the gate off `nak_on_missing`.

@@ -252,13 +252,14 @@ it is garbage collection of a record the retention policy has already released,
 and it is exempt from the WAL-first, replicate-then-ack discipline. Full
 behavioural contract: spec §3.18 / §3.18.1. The durability-relevant parts:
 
-- **No redo entry names the deletion.** There is no `RedoOp::Delete` on this
-  path, so recovery can never replay a delete, and `redo_entry_to_replica_op`
-  maps every entry this path *does* write to `None`, so none can leak into a
-  migration delta. A crash before the physical cleanup leaves the record present
-  and internally consistent (record + parent-spent slots + allocated region all
-  still agree); the pruner re-deletes it on its next pass. "Lost" delete =
-  "delete has not happened yet", which is a legal state, not corruption.
+- **No redo entry names the deletion on the node that removes locally.** There
+  is no `RedoOp::Delete` on that path, so recovery can never replay a local
+  removal, and `redo_entry_to_replica_op` maps every entry this path *does*
+  write to `None`, so none can leak into a migration delta. A crash before the
+  physical cleanup leaves the record present and internally consistent (record +
+  parent-spent slots + allocated region all still agree); the pruner re-deletes
+  it on its next pass. "Lost" delete = "delete has not happened yet", which is a
+  legal state, not corruption.
 
   This is NOT the same as "a delete writes nothing to the WAL", which is false:
   freeing the record's region emits a fsynced `RedoOp::FreeRegion` (offset +
@@ -266,12 +267,31 @@ behavioural contract: spec §3.18 / §3.18.1. The durability-relevant parts:
   `RedoOp::SecondaryDahUpdate` intent. Recovery's create-scrub identifies a
   deleted record by OFFSET precisely because no txid is journalled, so the
   `FreeRegion` entry is load-bearing.
-- **No replication.** A master's delete is not shipped to its replicas. Each
-  node reclaims its own copy.
-- **Never acknowledged as durable.** `STATUS_OK` on `OP_DELETE_BATCH` /
-  `OP_PROCESS_EXPIRED_PRESERVATIONS` means "removed from this node's live
-  index", not "durably removed everywhere". There is no cluster-wide
-  delete barrier.
+- **A CLIENT delete IS replicated; a DAH-sweep delete is not.** A client
+  `OP_DELETE_BATCH` at the key's master ships `ReplicaOp::Delete` to every other
+  holder before it frees its own copy, and the ACK policy is enforced exactly as
+  for a spend — so `STATUS_OK` on `OP_DELETE_BATCH` means the record is gone
+  from the holder set, not just from this node. A fan-out failure returns
+  `ERR_REPLICATION_FAILED` with **both copies still present** (there is no
+  compensating rollback for a delete, so the master's copy is not touched until
+  the outcome is known); the caller retries, which converges because delete is
+  idempotent on both sides. The DAH sweep replicates nothing: each holder
+  reclaims its own copy under its own re-validation.
+- **Asymmetric crash durability, one direction only.** The replica journals its
+  own `RedoOp::Delete` (sentinel offsets = index unregister) and fsyncs it
+  before ACKing, so the replica's half survives a crash; the master's half does
+  not become durable until its next checkpoint. A master crash between the ACK
+  and that checkpoint therefore reverts the master's half only, leaving
+  **master-live / replica-absent**. That is the replica-missing-record condition
+  the master's own re-ship repair (`repair_missing_record_target`) closes on the
+  next mutation of the key, and which a client retry of the delete closes
+  outright. The authority never loses a record a holder still has, so this is an
+  eventual-consistency window, not a lost UTXO. `OP_PROCESS_EXPIRED_PRESERVATIONS`
+  is unchanged: `STATUS_OK` there still means "removed from this node's live
+  index" only.
+- **Still not a cluster-wide delete barrier.** Neither path blocks or orders
+  against a concurrent checkpoint on another node, and a `FLAG_LOCAL_READ`
+  against a holder can observe either side of the window above.
 
 ### Who reclaims what (RF > 1)
 
@@ -281,14 +301,24 @@ under RF = 2 roughly half of each node's device is replica copies. The DAH
 sweep is the only driver that ever revisits a stored record, so it reclaims in
 two distinct roles:
 
-| Role | Applies to | Writes a tombstone | Prunes parent slots |
-|---|---|---|---|
-| **Master** (client delete, and the sweep over mastered keys) | keys this node masters | yes (when `reverse_heal.tombstones` is on) | yes |
-| **Held copy** (the sweep over replica copies) | keys this node stores but does not master | **no** | **no** |
+| Role | Applies to | Writes a tombstone | Prunes parent slots | Replicates |
+|---|---|---|---|---|
+| **Master** (client delete, and the sweep over mastered keys) | keys this node masters | yes (when `reverse_heal.tombstones` is on) | yes | client delete only |
+| **Held copy** (the sweep over replica copies) | keys this node stores but does not master | **no** | **no** | no |
+| **Replicated apply** (`ReplicaOp::Delete` from the key's master) | keys another node masters | yes — this IS an authoritative deletion | no | n/a |
 
 The held-copy role re-validates the identical due predicate under the identical
-per-tx stripe lock; it is narrower only in those two columns, and it touches
-exactly one record — its own.
+per-tx stripe lock; it is narrower only in those columns, and it touches exactly
+one record — its own.
+
+The replicated apply and the held-copy reclaim look alike and must not be
+conflated: the first carries the master's authority (tombstone, so a later
+reverse-heal cannot resurrect the key), the second carries none (no tombstone,
+so the master can always put the copy back). Note that neither propagates the
+master's parent-slot `UTXO_PRUNED` marks — the parent record has its own master,
+and that prune has never been replicated (spec §3.18.1). A replica's copy of a
+deleted child's parent therefore keeps the slot `UTXO_SPENT`; both are terminal
+states and routed reads answer from the parent's own master.
 
 ### Why the held-copy reclaim writes no tombstone
 

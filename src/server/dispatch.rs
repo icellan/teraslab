@@ -4654,9 +4654,15 @@ fn compensate_replication_failure(
                     });
                 }
                 ReplicaOp::Delete { .. } => {
-                    // If this path is reached the record is already destroyed and
-                    // cannot be restored here (no per-delete compensation; deletes
-                    // are local prune GC).
+                    // A delete has NO compensation: once the record is freed
+                    // there is nothing left to restore from. That is precisely
+                    // why `handle_delete_batch` replicates BEFORE it removes the
+                    // master's copy and never calls this function — a client
+                    // delete whose fan-out fails leaves both copies present and
+                    // is retried. This arm is only reachable for a `Delete` that
+                    // arrived here through another op's `repl_ops_by_key` (redo
+                    // re-emit / migration delta), where the record is already
+                    // gone locally and there is nothing to undo.
                 }
                 ReplicaOp::MarkLongestChain {
                     on_longest_chain,
@@ -7638,9 +7644,10 @@ fn handle_create_batch(
     // global SHARED side (see `needs_dispatch_visibility_barrier`), not this
     // per-key stripe, so a CONFLICTING-flagged create that fails replication is
     // still momentarily visible to those admin/background query paths; a
-    // narrower, lower-traffic residual left open. (Delete is unaffected — it is
-    // local GC prune, never replicated, so it has no replication-rollback
-    // window.)
+    // narrower, lower-traffic residual left open. (Delete has no equivalent
+    // window: a client delete replicates BEFORE it removes the master's copy,
+    // so there is never an applied-but-unreplicated state to roll back — see
+    // `handle_delete_batch`.)
     let vis_start = std::time::Instant::now();
     let global_vis = engine.visibility().global_read();
     if let Some(h) = DISPATCH_HISTOGRAMS.get() {
@@ -9540,12 +9547,11 @@ fn handle_delete_batch(
     engine: &Engine,
     max_batch: u32,
     cluster: Option<&RunningCluster>,
-    // Deletes are local prune GC: no replicated op and no replayable deletion
-    // record, so this handler writes nothing through the redo handle and it is
-    // unused here (kept in the signature for call-site symmetry with the other
-    // batch handlers; removed in a later cleanup). The engine's own delete path
-    // still journals a `FreeRegion` + `SecondaryDahUpdate` — see
-    // `Engine::prune_delete`.
+    // A delete writes no keyed redo op of its own, so this handler has no
+    // WAL-first phase and never compensates; the handle is unused here (kept in
+    // the signature for call-site symmetry with the other batch handlers). The
+    // engine's own delete path still journals a `FreeRegion` +
+    // `SecondaryDahUpdate` — see `Engine::prune_delete`.
     _redo_log: Option<&Mutex<RedoLog>>,
     // Forwarded coarse exclusive guard from the DAH-sweep caller; when `Some`
     // this handler does NOT take its own per-key visibility (would self-deadlock).
@@ -9570,30 +9576,83 @@ fn handle_delete_batch(
     // replica-side GC is running at all (spec §3.18.1).
     let mut held_copy_reclaimed: u64 = 0;
 
-    // Fine-grained visibility for the batch: per-key WRITE over the deleted
-    // txids + global SHARED (so a checkpoint still excludes us). GATED on
-    // `barrier.is_none()`: the DAH-sweep caller forwards its EXCLUSIVE global
-    // guard via `barrier`; re-taking `global.read()` here on the same thread
-    // would self-deadlock.
-    let visibility_guard = barrier.is_none().then(|| {
-        let keys: Vec<TxKey> = txids.iter().map(|t| TxKey { txid: *t }).collect();
-        engine.visibility().mutation(&keys)
-    });
+    // #88 INVARIANT (fail closed). A CLIENT delete replicates (Phase 2 below),
+    // and a replication round-trip must never run while this thread holds the
+    // engine-wide EXCLUSIVE visibility barrier — that is the circular wait
+    // issue #88 fixed. The DAH sweep is the ONLY caller that forwards a barrier
+    // and it never replicates, so the two are mutually exclusive by
+    // construction. Refuse rather than deadlock if a future caller breaks that.
+    if sweep_due_height.is_none() && barrier.is_some() {
+        return error_response(
+            req.request_id,
+            ERR_INVARIANT_VIOLATION,
+            "client delete must own its visibility (a forwarded exclusive barrier \
+             cannot be held across the replication round-trip)",
+        );
+    }
 
-    // LOCAL PRUNE. Deletes are independent-node GC of fully-spent records that
-    // are no longer needed — NOT part of normal client operation. They are NOT
-    // replicated and journal no replayable deletion record, so a crash before
-    // the physical cleanup just leaves the record present (and consistent —
-    // record + parent-spent slots + allocated region all still agree), and the
-    // pruner re-deletes it next pass (self-healing). The engine's delete path
-    // does still journal a `FreeRegion` + `SecondaryDahUpdate`; neither names
-    // the key (see `Engine::prune_delete`). Each item:
-    //   1. validate the node's role for the key + (external records) the
-    //      cold-blob guard,
-    //   2. mark every parent slot this child spent as PRUNED (UTXO correctness)
-    //      — MASTER role only, see below,
-    //   3. remove the record locally (RAM-index unregister + header zero via the
-    //      write-back cache + region free).
+    // Fine-grained visibility for the batch, acquired as its two halves
+    // SEPARATELY so they can be released at different points — the same split
+    // `handle_spend_batch` / `handle_set_mined_batch` / `handle_create_batch`
+    // use:
+    //   * `global_vis` — the global SHARED side (checkpoint coordination). It is
+    //     dropped BEFORE the replication round-trip in Phase 2. That drop is
+    //     LOAD-BEARING, not a latency tweak: the global side is the same
+    //     `RwLock` an inbound (non-migration) `OP_REPLICA_BATCH` apply takes
+    //     EXCLUSIVELY, so holding it across our own fan-out is exactly the
+    //     issue-#88 ring deadlock.
+    //   * `visibility_stripes` — the per-key WRITE stripes, held across
+    //     replication AND the local removal, so a concurrent reader of these
+    //     keys is excluded until the delete's outcome is known cluster-wide and
+    //     never observes the window where the replica has dropped the record
+    //     but this node has not.
+    // Both are GATED on `barrier.is_none()`: the DAH-sweep caller forwards its
+    // EXCLUSIVE global guard via `barrier`; re-taking `global.read()` here on
+    // the same thread would self-deadlock.
+    let keys: Vec<TxKey> = txids.iter().map(|t| TxKey { txid: *t }).collect();
+    let global_vis = barrier.is_none().then(|| engine.visibility().global_read());
+    let visibility_stripes = barrier
+        .is_none()
+        .then(|| engine.visibility().mutation_stripes(&keys));
+
+    // A CLIENT delete is an authoritative statement about the key and must
+    // reach EVERY holder (spec §3.18, `phases/08_replication.md` checklist
+    // "Delete on master: replica no longer has the record"); a DAH-SWEEP delete
+    // is per-holder local GC and must NOT be replicated (each node reclaims its
+    // own copy — see `Engine::reclaim_held_copy`). `sweep_due_height` is the
+    // discriminator, so the three phases below are:
+    //
+    //   Phase 1 — validate the node's role for each key + (external records)
+    //             the cold-blob guard. Nothing is mutated.
+    //   Phase 2 — replicate `ReplicaOp::Delete` for the client path (no-op for
+    //             the sweep, whose op list is empty).
+    //   Phase 3 — remove locally: mark every parent slot this child spent as
+    //             PRUNED (MASTER role only), then drop the record (RAM-index
+    //             unregister + header zero via the write-back cache + region
+    //             free).
+    //
+    // ORDERING (replicate BEFORE the local removal) is deliberate and is the
+    // opposite of every other mutation handler. Those apply first and roll back
+    // with `compensate_replication_failure` if the fan-out fails; a delete has
+    // NO such rollback — once the record is freed there is nothing left to
+    // restore from. So the master's copy is not touched until replication has
+    // succeeded: a delete that fails replication leaves BOTH copies present and
+    // returns `ERR_REPLICATION_FAILED`, which the caller retries. That is safe
+    // precisely because delete is idempotent GC (an already-absent key is
+    // `Ok`), so the retry converges; the reverse ordering would produce exactly
+    // the permanent master-absent/replica-live divergence this path exists to
+    // remove.
+    //
+    // DURABILITY (spec §3.18): the removal is not redo-durable on the master —
+    // it journals `FreeRegion` + `SecondaryDahUpdate`, never a keyed
+    // `RedoOp::Delete`, and the index unregister + tombstone become durable at
+    // the next checkpoint. The replica's apply DOES journal `RedoOp::Delete`
+    // before it ACKs. A master crash between the ACK and its next checkpoint
+    // therefore reverts the master's half only, leaving master-live /
+    // replica-absent — the replica-missing-record condition the master's own
+    // C15 re-ship repairs on the next mutation of the key, and which a client
+    // retry of the delete resolves outright. Eventually consistent, never a
+    // lost UTXO: the authority keeps the record.
     //
     // ROLE (F2). A client delete (`sweep_due_height == None`) is unchanged:
     // master-only, exactly as spec §3.18 requires — a client's delete is an
@@ -9613,7 +9672,18 @@ fn handle_delete_batch(
     // node-scoped, not per-key.
     let replication_behind = sweep_due_height.is_some()
         && engine.replica_stream_hole_within(REPLICA_RECLAIM_QUIET_PERIOD_MS);
-    'items: for (i, txid) in txids.iter().enumerate() {
+
+    /// An item that cleared Phase 1 and is queued for the Phase 3 removal.
+    struct StagedDelete {
+        /// Index into the request's txid list, for per-item error reporting.
+        idx: usize,
+        key: TxKey,
+        role: SweepRole,
+    }
+    let mut staged: Vec<StagedDelete> = Vec::with_capacity(txids.len());
+
+    // Phase 1: validate. Read-only on the engine.
+    for (i, txid) in txids.iter().enumerate() {
         let role = if sweep_due_height.is_some() {
             match sweep_role_snap(
                 txid,
@@ -9686,6 +9756,90 @@ fn handle_delete_batch(
             });
             continue;
         }
+
+        staged.push(StagedDelete { idx: i, key, role });
+    }
+
+    // Phase 2: replicate the CLIENT deletes. The op list is empty on the
+    // DAH-sweep path (constraint: a sweep delete is per-holder local GC), and
+    // `replicate_all_ops_with_barrier` short-circuits to `NotApplicable` on an
+    // empty list, on a single-node engine, and at RF = 1 — so neither the sweep
+    // nor a non-clustered node pays anything here.
+    //
+    // The replica applies `ReplicaOp::Delete` through `engine.delete` →
+    // `RemovalAuthority::Authoritative`, i.e. it writes a deletion tombstone.
+    // That is correct and deliberate: a replicated CLIENT delete IS an
+    // authoritative deletion, and the tombstone is what stops a later
+    // reverse-heal pull resurrecting the record. It is the exact opposite of
+    // the sweep's `reclaim_held_copy` (no tombstone, because a local space
+    // reclaim asserts nothing about the key) — the two must stay distinct.
+    //
+    // The Delete arm can NEVER produce a `ReplicaAck::MissingRecord` NAK: it
+    // resolves an absent record to `Ok(())` (idempotent GC), and
+    // `ReplicaOp::Delete::master_generation()` is `None`, so the post-apply
+    // generation sync — the other producer of that NAK — is skipped entirely.
+    // This matters: a `MissingRecord` NAK routes into
+    // `repair_missing_record_target`, which would re-ship the record's full
+    // current image, i.e. the master would RESURRECT on the replica the very
+    // record it is deleting.
+    let repl_ops_by_key: Vec<(TxKey, Vec<ReplicaOp>)> = if sweep_due_height.is_none() {
+        staged
+            .iter()
+            .map(|s| (s.key, vec![ReplicaOp::Delete { tx_key: s.key }]))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    // #88: release the GLOBAL shared side before the round-trip (see the
+    // acquisition comment). The per-key stripes stay held.
+    drop(global_vis);
+    // `(0, 0)` / no intent ranges: a delete journals no keyed redo op, so there
+    // is no master redo range for this batch to record against the ACK and no
+    // replication intent to clear. A zero `redo_high` deliberately skips the
+    // ACK-tracker watermark update (see `send_replica_ops_to_reporting`).
+    //
+    // `barrier` is NOT forwarded: it is `Some` only on the sweep path, which
+    // does not replicate, and forwarding it would release the sweep's exclusive
+    // guard before the Phase 3 removals below. The fail-closed check at the top
+    // of this handler pins that invariant.
+    let repl_outcome = match replicate_all_ops_with_barrier(
+        cluster,
+        &repl_ops_by_key,
+        (0, 0),
+        &[],
+        None,
+        Some(engine),
+    ) {
+        Ok(o) => o,
+        Err(e) => {
+            // NOTHING has been removed locally yet, so both copies survive and
+            // the caller can simply retry — the property that makes
+            // replicate-before-remove safe without a compensation path.
+            //
+            // Every item is failed: the Phase-1 rejects on their own codes, the
+            // rest on the replication failure. Tallied here because this is an
+            // early return that never reaches the post-loop block below.
+            if let Some(m) = DISPATCH_METRICS.get() {
+                use crate::metrics::OpCode;
+                for err in &errors {
+                    m.operations
+                        .inc(OpCode::Delete, classify_wire_error_code(err.error_code));
+                }
+                let unreplicated = total_items.saturating_sub(errors.len() as u64);
+                m.operations.inc_by(
+                    OpCode::Delete,
+                    classify_wire_error_code(ERR_REPLICATION_FAILED),
+                    unreplicated,
+                );
+                m.deletes_failed.inc_by(total_items);
+            }
+            return error_response(req.request_id, ERR_REPLICATION_FAILED, &e);
+        }
+    };
+
+    // Phase 3: remove locally.
+    'items: for s in &staged {
+        let (i, key, role) = (s.idx, s.key, s.role);
 
         // Parent prune: mark each parent slot spent by THIS child terminal
         // (`UTXO_PRUNED`). Local + idempotent; on a clustered node a parent on
@@ -9763,10 +9917,10 @@ fn handle_delete_batch(
             }
         }
 
-        // Remove the record locally (no redo, no replication). The role decides
-        // whether this is the key's authoritative deletion (tombstoned, so a
-        // later reverse-heal cannot resurrect it) or a held-copy space reclaim
-        // (no tombstone, so the master can always put the copy back).
+        // Remove the record locally. The role decides whether this is the key's
+        // authoritative deletion (tombstoned, so a later reverse-heal cannot
+        // resurrect it) or a held-copy space reclaim (no tombstone, so the
+        // master can always put the copy back).
         let del_req = DeleteRequest {
             tx_key: key,
             due_guard: sweep_due_height,
@@ -9793,7 +9947,14 @@ fn handle_delete_batch(
         }
     }
 
-    drop(visibility_guard);
+    // The delete's outcome is now known cluster-wide, so readers may observe
+    // the removal (mirrors `drop(visibility_stripes)` in create / set_mined).
+    drop(visibility_stripes);
+
+    // Phase 1 and Phase 3 each report errors in item order, so the merged vec
+    // can interleave the two ranges. Sort so the client-visible sparse-error
+    // encoding stays in ascending item order regardless of which phase failed.
+    errors.sort_by_key(|e| e.item_index);
 
     let failed_total = errors.len() as u64;
     let succeeded_total = total_items
@@ -9818,19 +9979,7 @@ fn handle_delete_batch(
         }
     }
 
-    if errors.is_empty() {
-        ResponseFrame {
-            request_id: req.request_id,
-            status: STATUS_OK,
-            payload: vec![],
-        }
-    } else {
-        ResponseFrame {
-            request_id: req.request_id,
-            status: STATUS_PARTIAL_ERROR,
-            payload: encode_sparse_errors(&errors),
-        }
-    }
+    batch_response_with_outcome(req.request_id, &errors, repl_outcome)
 }
 
 fn handle_mark_longest_chain_batch(

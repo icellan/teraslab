@@ -8464,17 +8464,26 @@ impl Engine {
         self.delete_inner(req, RemovalAuthority::Authoritative)
     }
 
-    /// Local prune-delete: remove a fully-spent record locally, with no
-    /// replication and no replayable deletion record.
+    /// Local prune-delete: remove a record from THIS node's store, with no
+    /// replayable deletion record.
     ///
-    /// Deletes are independent-node GC of records that are fully spent and no
-    /// longer needed, NOT part of normal client operation. Durability of the
-    /// DELETE is unnecessary: a crash before the physical cleanup just leaves
-    /// the record present (and consistent — record + parent-spent slots +
-    /// allocated region all still agree), and the pruner re-deletes it on its
-    /// next pass (self-healing). Physically identical to [`Self::delete`]
-    /// (RAM-index unregister + header zero via the write-back cache + region
-    /// free); the distinct name documents the pruner's intent at the call site.
+    /// This is the LOCAL half of a removal, used by both the DAH sweep (its
+    /// whole job) and a client `OP_DELETE_BATCH` (whose handler replicates
+    /// `ReplicaOp::Delete` to the key's other holders FIRST, then calls this to
+    /// drop the master's copy — see `server::dispatch::handle_delete_batch`).
+    /// This method itself replicates nothing.
+    ///
+    /// Durability of the DELETE is not enforced here: a crash before the
+    /// physical cleanup just leaves the record present (and consistent —
+    /// record + parent-spent slots + allocated region all still agree), and the
+    /// pruner re-deletes it on its next pass (self-healing). For the replicated
+    /// client path that revert is one-sided — the replica journals its own
+    /// `RedoOp::Delete` before ACKing — so a master crash before its next
+    /// checkpoint can leave master-live / replica-absent; see spec §3.18 and
+    /// `docs/DURABILITY_CONTRACT.md` for why that is eventually consistent and
+    /// not a lost UTXO. Physically identical to [`Self::delete`] (RAM-index
+    /// unregister + header zero via the write-back cache + region free); the
+    /// distinct name documents the pruner's intent at the call site.
     /// Returns `Ok(())` on success or when the record is already gone
     /// (idempotent).
     ///

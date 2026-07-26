@@ -205,7 +205,10 @@ consequences follow, and both are capacity-critical:
    the records of every shard it replicates as well as every shard it masters —
    under RF = 2, roughly half its device is replica copies. A node reclaims
    those copies from its OWN sweep pass (see spec §3.18.1, "held-copy role");
-   no other node's sweep can reclaim them, because deletes are not replicated.
+   no other node's sweep can reclaim them, because SWEEP deletes are not
+   replicated. (A CLIENT `OP_DELETE_BATCH` is — it removes the record from every
+   holder — but the sweep is what reclaims the bulk of a UTXO store's records,
+   so this consequence stands.)
    A pruner that fires `OP_PROCESS_EXPIRED_PRESERVATIONS` at only one node, or
    only at shard masters, leaves every other node's replica half growing without
    bound. Point the pruner at all of them.

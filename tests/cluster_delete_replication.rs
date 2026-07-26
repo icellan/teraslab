@@ -45,9 +45,26 @@ use teraslab::replication::receiver::apply_op_journal;
 use teraslab::segment_allocator::SegmentAllocator;
 use teraslab::server::Server;
 
+use serial_test::serial;
+
 const TEST_CLUSTER_ID: ClusterId = ClusterId([0xC7; 16]);
 const TEST_SEGMENT_SIZE: u64 = 16 * 4096;
 const ACK_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Install the process-wide replication metrics once so the missing-record
+/// repair counter is observable. Like [`dispatch_metrics`], `init_*` writes a
+/// `OnceLock`, so repeated calls are harmless and the handle returned is the
+/// one the replication fan-out increments.
+///
+/// The counter is process-global, so the three tests in this file that can move
+/// it are `#[serial(missing_record_repair)]`.
+fn repl_metrics() -> &'static teraslab::metrics::ReplicationMetrics {
+    static METRICS: std::sync::OnceLock<teraslab::metrics::ReplicationMetrics> =
+        std::sync::OnceLock::new();
+    let m = METRICS.get_or_init(teraslab::metrics::ReplicationMetrics::new);
+    teraslab::metrics::init_replication_metrics(m);
+    m
+}
 
 /// Install the process-wide dispatch metrics once so the sweep's held-copy
 /// counter is observable. `init_dispatch_metrics` writes a `OnceLock`, so
@@ -507,6 +524,115 @@ fn client_delete_removes_the_record_from_every_holder() {
     );
 }
 
+/// **The most dangerous interaction in the delete-replication change, end to
+/// end through the production path.**
+///
+/// The replica has already reclaimed its held copy (F2 replica-side GC), and
+/// the client then deletes the record at its master. The replicated
+/// `ReplicaOp::Delete` therefore targets a record the replica does NOT have.
+///
+/// That must be an idempotent success. The alternative — NAKing
+/// `ReplicaAck::MissingRecord`, the way `preserve_until` / `set_conflicting`
+/// legitimately do — routes into `repair_missing_record_target`, whose job is to
+/// re-ship the record's full current image. For a delete that means the master
+/// RESURRECTS on the replica the very record it is deleting, and the resurrected
+/// copy then outlives the master's own (which is dropped immediately afterwards)
+/// because nothing in the running system revisits a replica copy.
+///
+/// So the assertion is not merely "the client's delete returned OK": it is that
+/// the record is on NO node afterwards. A repair round-trip would leave it on
+/// the replica, which is the exact permanent divergence this file exists to
+/// catch — just reached from the opposite direction.
+///
+/// `AckPolicy::WriteAll` is explicit so a replica NAK would genuinely fail the
+/// client's delete (with `required_replica_acks == 0` a NAK is still classified
+/// `Durable`, and the resurrection would pass unnoticed).
+///
+/// The `replica_missing_record_repaired` delta pins the MECHANISM, not just the
+/// outcome: it counts records the master re-shipped in response to a
+/// `MissingRecord` NAK. It must not move here. Without it this test could pass
+/// on a build that never replicated the delete at all — which is exactly the
+/// behaviour this file exists to reject.
+#[test]
+#[serial(missing_record_repair)]
+fn client_delete_of_a_record_the_replica_reclaimed_does_not_resurrect_it() {
+    let node1 = create_cluster_node_with_ack_policy(911, &[], Some(AckPolicy::WriteAll));
+    let seed = [node1.swim_port];
+    let node2 = create_cluster_node_with_ack_policy(912, &seed, Some(AckPolicy::WriteAll));
+    let node3 = create_cluster_node_with_ack_policy(913, &seed, Some(AckPolicy::WriteAll));
+    let nodes = [&node1, &node2, &node3];
+    wait_for_settled_three_node_topology(&nodes);
+
+    const COUNT: usize = 6;
+    const HEIGHT: u32 = 900_000;
+    const RETENTION: u32 = 100;
+    let seeds = owned_seeds(&node1, COUNT);
+
+    let resp = request_at(node1.tcp_port, OP_CREATE_BATCH, 0, encode_batch(&seeds));
+    assert_eq!(resp.status, STATUS_OK, "create batch must be accepted");
+    for s in &seeds {
+        set_mined(node1.tcp_port, *s, HEIGHT, RETENTION);
+        spend_to_all_spent(node1.tcp_port, *s, HEIGHT, RETENTION);
+    }
+
+    // The replica drops its copy; the master (never swept) keeps its own. This
+    // asserts the reclaim actually happened, so the delete below really does hit
+    // an absent record on the replica.
+    force_replica_reclaim(&nodes, &seeds, HEIGHT + RETENTION + 1, RETENTION);
+
+    // Monotonic process-global counter. The only other tests in this binary that
+    // can move it are the two `master_repairs_*` tests, and all three are
+    // `#[serial(missing_record_repair)]`, so a zero delta here is exact rather
+    // than a race.
+    let repaired_before = repl_metrics().replica_missing_record_repaired.get();
+
+    let txids: Vec<[u8; 32]> = seeds.iter().map(|s| make_txid(*s)).collect();
+    let resp = request_at(
+        node1.tcp_port,
+        OP_DELETE_BATCH,
+        0,
+        encode_txid_batch(&txids, &[]),
+    );
+    let delete_status = resp.status;
+    let after: Vec<Vec<usize>> = txids.iter().map(|t| local_holders(&nodes, t)).collect();
+    let repaired_delta = repl_metrics()
+        .replica_missing_record_repaired
+        .get()
+        .saturating_sub(repaired_before);
+
+    shutdown_node(&node1);
+    shutdown_node(&node2);
+    shutdown_node(&node3);
+
+    assert_eq!(
+        delete_status, STATUS_OK,
+        "deleting a record the replica already reclaimed must SUCCEED — the delete's \
+         post-condition (record absent) already holds on the replica, so there is \
+         nothing to repair and nothing to fail (status {delete_status})"
+    );
+    assert_eq!(
+        repaired_delta, 0,
+        "the master must not have re-shipped ANY record while deleting: a re-ship is \
+         driven by a MissingRecord NAK, and for a Delete that means shipping back the \
+         record being deleted. Saw {repaired_delta} repair(s)"
+    );
+    let resurrected: Vec<String> = seeds
+        .iter()
+        .zip(&after)
+        .filter(|(_, h)| !h.is_empty())
+        .map(|(s, h)| format!("seed {s}: holders {h:?}"))
+        .collect();
+    assert!(
+        resurrected.is_empty(),
+        "{}/{COUNT} deleted records are still present somewhere. If they are on the \
+         REPLICA the master re-shipped a record it was deleting: a replicated Delete for \
+         an absent record must never NAK MissingRecord, because that NAK is what drives \
+         `repair_missing_record_target` to re-ship the full record image: {}",
+        resurrected.len(),
+        resurrected.join(" | ")
+    );
+}
+
 /// Serialize a source record into the migration-baseline `ReplicaOp::Create`,
 /// reproducing the coordinator's `stream_shard_baseline` wire layout (70-byte
 /// metadata prefix + utxo hashes). This is the path a master's re-delivery of a
@@ -835,6 +961,7 @@ fn force_replica_reclaim(nodes: &[&TestNode], seeds: &[u32], sweep_height: u32, 
 /// replication fan-out, the replica's own receiver. Nothing here calls
 /// `apply_op_journal` by hand.
 #[test]
+#[serial(missing_record_repair)]
 fn master_repairs_a_replica_that_reclaimed_a_record_it_then_preserves() {
     let node1 = create_cluster_node_with_ack_policy(891, &[], Some(AckPolicy::WriteAll));
     let seed = [node1.swim_port];
@@ -950,6 +1077,7 @@ fn master_repairs_a_replica_that_reclaimed_a_record_it_then_preserves() {
 /// it has no block-depth protection, so unlike the reorg variants it is
 /// reachable at any height.
 #[test]
+#[serial(missing_record_repair)]
 fn master_repairs_a_replica_that_reclaimed_a_record_it_then_marks_conflicting() {
     let node1 = create_cluster_node_with_ack_policy(901, &[], Some(AckPolicy::WriteAll));
     let seed = [node1.swim_port];

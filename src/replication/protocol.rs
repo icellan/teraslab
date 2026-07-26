@@ -247,25 +247,28 @@ pub enum ReplicaOp {
         cold_data: Option<Vec<u8>>,
         is_external: bool,
     },
+    /// Remove the record for `tx_key` from this holder.
+    ///
+    /// Emitted by a client `OP_DELETE_BATCH` at the key's master (spec §3.18 —
+    /// a client delete is authoritative and must reach every holder), and by
+    /// the redo→replica converter for a migration delta or a crash-recovery
+    /// re-emit (`cluster::coordinator::redo_entry_to_replica_op`). NOT emitted
+    /// by the DAH sweep, which is per-holder local GC.
+    ///
+    /// The receiver applies it via `Engine::delete`
+    /// (`RemovalAuthority::Authoritative`), so the replica also records a
+    /// deletion tombstone — the veto that stops a later reverse-heal pull
+    /// resurrecting the key.
+    ///
+    /// Carries no `master_generation` idempotency token: it is an idempotent
+    /// remove keyed on `tx_key`, and an already-absent record resolves to
+    /// `Ok(())`. Both halves of that are load-bearing — a `MissingRecord` NAK
+    /// here would make the master re-ship (i.e. RESURRECT) the record it is
+    /// deleting, and `master_generation() == None` is what keeps the post-apply
+    /// generation sync (the other producer of that NAK) out of this path.
     Delete {
         tx_key: TxKey,
     },
-    /// Delete carrying the tombstone fields (deletion-tombstone §6).
-    ///
-    /// Applied by the receiver as: remove the record (same as [`Self::Delete`])
-    /// AND write a tombstone via the engine's existing tombstone-write path,
-    /// so the replica's own restart self-purges (§5.2) and its redb tombstone
-    /// index is updated. The master emits this (instead of [`Self::Delete`])
-    /// when `tombstones_enabled`, carrying the same `deletion_height` /
-    /// `generation` / `cause` the master's own tombstone recorded. `cause` is
-    /// the `TombstoneCause` discriminant byte.
-    ///
-    /// Like [`Self::Delete`], this carries no `master_generation` idempotency
-    /// token — it is an idempotent remove keyed on `tx_key`. The `generation`
-    /// here is the *tombstone's* generation (the record's generation at
-    /// deletion), a first-class tombstone field, not the replication ordering
-    /// token. `master_generation()` therefore returns `None` for this op,
-    /// exactly as for [`Self::Delete`].
     PruneSlot {
         tx_key: TxKey,
         offset: u32,

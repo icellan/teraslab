@@ -8334,14 +8334,13 @@ fn convert_infallible_op(
             // (which must remain V1/unchanged this phase) AND the
             // replication-intent crash-recovery re-emit.
             //
-            // It does NOT coexist with a richer live path: `ReplicaOp::DeleteV2`
-            // no longer exists, and `handle_delete_batch` emits no `ReplicaOp`
-            // at all — a delete is local GC and is never replicated (spec
-            // §3.18). So this arm is the only producer of a replicated delete,
-            // and it fires only when a master crashed BETWEEN a redo commit and
-            // its fan-out. The replica then removes the record but records no
-            // pre-arm tombstone — strictly no worse than the pre-tombstone
-            // behavior and never a resurrection of the deleted record itself.
+            // It is not the only producer of a replicated delete: a CLIENT
+            // `OP_DELETE_BATCH` also emits `ReplicaOp::Delete` directly (spec
+            // §3.18, `handle_delete_batch` Phase 2). This arm covers the
+            // redo-derived cases instead — a migration delta, or a master that
+            // crashed BETWEEN a redo commit and its fan-out. Both apply the same
+            // V1 op, and the receiver's Delete arm resolves an absent record to
+            // an idempotent `Ok(())`, so neither can resurrect the record.
             if ShardTable::shard_for_key(tx_key) != shard {
                 return None;
             }

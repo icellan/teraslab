@@ -939,13 +939,14 @@ rule cannot serve both.
 **What a delete guarantees.** A delete is *garbage collection of a record the
 retention policy has released*, not a transactional client operation:
 
-- It is **not durable as a delete**. No redo entry names the deletion, so
-  recovery can never replay one: there is no `RedoOp::Delete` on this path, and
-  `redo_entry_to_replica_op` maps every entry the path *does* write to `None`,
-  so none can leak into a migration delta. A crash before the physical cleanup
-  leaves the record present and internally consistent (record + parent-spent
-  slots + allocated region all still agree) and the pruner re-deletes it on its
-  next pass. Deletion is idempotent and self-healing.
+- It is **not durable as a delete on the master**. The master's local removal
+  journals no redo entry that names the deletion, so recovery can never replay
+  one: there is no `RedoOp::Delete` on this path, and `redo_entry_to_replica_op`
+  maps every entry the path *does* write to `None`, so none can leak into a
+  migration delta. A crash before the physical cleanup leaves the record present
+  and internally consistent (record + parent-spent slots + allocated region all
+  still agree) and the pruner re-deletes it on its next pass. Deletion is
+  idempotent and self-healing.
 
   It does **not** follow that a delete writes nothing to the WAL — it writes
   two entries, neither of which is a deletion record: returning the record's
@@ -955,22 +956,65 @@ retention policy has released*, not a transactional client operation:
   first (it identifies a deleted record by OFFSET, precisely because no txid is
   journalled), so the entry is load-bearing and must not be "optimised away" on
   the strength of a claim that the path is WAL-free.
-- It is **not replicated**. A master's delete is not shipped to its replicas
-  (`OP_DELETE_BATCH` and the DAH sweep emit no `ReplicaOp`). Each holder
-  reclaims its own copy.
-- It is **not ordered against reads on other nodes**. A record deleted on its
-  master may still be readable from a replica's local store until that replica
-  reclaims it. Routed reads always go to the master, so this is invisible to
-  clients; a `FLAG_LOCAL_READ` against a replica can observe it.
+- **A CLIENT delete IS replicated; a DAH-sweep delete is not.** A client
+  `OP_DELETE_BATCH` at the key's master emits `ReplicaOp::Delete` to every other
+  holder of the key, so a `STATUS_OK` means the record is gone from the whole
+  holder set — the contract `phases/08_replication.md` states ("Delete on
+  master: replica no longer has the record"). The DAH sweep deliberately does
+  NOT replicate: it is per-holder GC, and every node reclaims its own copy under
+  its own re-validation (see the held-copy role below). Replicating the sweep
+  would re-introduce exactly the cross-node coupling the held-copy role removes.
+
+  **Ordering (replicate before removing).** The client path fans the delete out
+  *before* it frees the master's own copy — the reverse of every other mutation
+  handler. A delete has no compensating rollback: once the record is freed there
+  is nothing left to restore from, so `compensate_replication_failure` cannot
+  undo it. Replicating first means a fan-out failure leaves BOTH copies present
+  and returns `ERR_REPLICATION_FAILED`; the caller retries, which converges
+  because delete is idempotent (an already-absent key is a success on either
+  side). The reverse ordering would produce a permanent master-absent /
+  replica-live divergence — the same class of bug this replication closes.
+
+  **Crash residual.** The replica journals its own `RedoOp::Delete` (sentinel
+  offsets = index unregister) and fsyncs it before ACKing, so the replica's half
+  IS redo-durable; the master's half is not (previous bullet). A master crash
+  between the ACK and its next checkpoint therefore reverts one side only,
+  leaving master-live / replica-absent. That is the replica-missing-record
+  condition described under *The `PreserveUntil` race* below: the master's C15
+  re-ship repairs it inside the next mutation of the key, and a client retry of
+  the delete resolves it outright. Eventually consistent, never a lost UTXO —
+  the authority keeps the record. There is no window in which the authority
+  loses the record while a holder keeps it.
+- It is **not ordered against reads on other nodes**. During the fan-out a
+  record deleted on its master may still be readable from a replica's local
+  store, and after the crash residual above the reverse holds. Routed reads
+  always go to the master, so this is invisible to clients; a `FLAG_LOCAL_READ`
+  against a replica can observe it.
 
 **Who reclaims what.**
 
-| Driver | Runs on | Scope | Authority |
-|---|---|---|---|
-| Client `OP_DELETE_BATCH` | shard master only | keys this node masters | authoritative |
-| DAH sweep, master role | shard master | keys this node masters | authoritative |
-| DAH sweep, held-copy role | any holder (replica) | replica copies this node stores | **none — local space reclaim** |
-| Phase-3 preservation expiry | shard master only | keys this node masters | authoritative |
+| Driver | Runs on | Scope | Replicated | Authority |
+|---|---|---|---|---|
+| Client `OP_DELETE_BATCH` | shard master only | keys this node masters | **yes** — `ReplicaOp::Delete` to every other holder | authoritative |
+| DAH sweep, master role | shard master | keys this node masters | no | authoritative |
+| DAH sweep, held-copy role | any holder (replica) | replica copies this node stores | no | **none — local space reclaim** |
+| Phase-3 preservation expiry | shard master only | keys this node masters | no (schedules a DAH; the sweep removes) | authoritative |
+
+The replica applies `ReplicaOp::Delete` through `Engine::delete`
+(`RemovalAuthority::Authoritative`), so it writes a deletion tombstone of its
+own — a replicated client delete *is* an authoritative deletion, and the
+tombstone is what stops a later reverse-heal pull resurrecting it. That is the
+deliberate opposite of the held-copy reclaim below, which writes none.
+
+An arriving `ReplicaOp::Delete` for a record the replica does not have is an
+**idempotent success**, never a `ReplicaAck::MissingRecord` NAK. This is
+load-bearing, not tidiness: that NAK drives the master's re-ship repair
+(`repair_missing_record_target`), which for a delete would make the master
+resurrect on the replica the record it is deleting — and the resurrected copy
+would outlive the master's own. Two independent properties enforce it: the
+receiver's Delete arm resolves `TxNotFound` to `Ok(())`, and
+`ReplicaOp::Delete::master_generation()` is `None`, which keeps the post-apply
+generation sync (the other producer of that NAK) out of the path.
 
 The held-copy role exists because the DAH sweep is the only thing in the system
 that ever revisits a stored record. A node that reclaimed only the keys it
