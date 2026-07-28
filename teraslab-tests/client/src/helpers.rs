@@ -557,6 +557,11 @@ services:
     /// # Parameters
     /// - `name`: The node to partition (e.g. "node3").
     /// - `targets`: Slice of target node names to partition from.
+    ///
+    /// # Errors
+    /// Returns `ClientError::Connection` if any `iptables` invocation fails.
+    /// A caller that ignores this `Result` cannot tell a real partition from
+    /// a no-op: propagate it (do not swallow with `let _ =`).
     pub async fn partition_node(&self, name: &str, targets: &[&str]) -> Result<(), ClientError> {
         let source_ip = self.node_ip(name)?.to_string();
         let source_container = self.container_name(name);
@@ -566,7 +571,7 @@ services:
             let target_container = self.container_name(target);
 
             // Block traffic from target on source node
-            let _ = run_docker_cmd(&[
+            run_docker_cmd(&[
                 "exec",
                 &source_container,
                 "iptables",
@@ -577,8 +582,8 @@ services:
                 "-j",
                 "DROP",
             ])
-            .await;
-            let _ = run_docker_cmd(&[
+            .await?;
+            run_docker_cmd(&[
                 "exec",
                 &source_container,
                 "iptables",
@@ -589,10 +594,10 @@ services:
                 "-j",
                 "DROP",
             ])
-            .await;
+            .await?;
 
             // Block traffic from source on target node
-            let _ = run_docker_cmd(&[
+            run_docker_cmd(&[
                 "exec",
                 &target_container,
                 "iptables",
@@ -603,8 +608,8 @@ services:
                 "-j",
                 "DROP",
             ])
-            .await;
-            let _ = run_docker_cmd(&[
+            .await?;
+            run_docker_cmd(&[
                 "exec",
                 &target_container,
                 "iptables",
@@ -615,7 +620,7 @@ services:
                 "-j",
                 "DROP",
             ])
-            .await;
+            .await?;
         }
 
         Ok(())
@@ -623,21 +628,36 @@ services:
 
     /// Heals all network partitions on a single node by flushing iptables.
     ///
-    /// Errors are silently ignored because the node may be stopped or killed.
+    /// `name` is expected to still be a live container (callers only heal
+    /// nodes they previously partitioned, not ones they've since killed or
+    /// removed) so a failure here is real and must not be masked.
+    ///
+    /// # Errors
+    /// Returns `ClientError::Connection` if `iptables -F` fails.
     pub async fn heal_partition(&self, name: &str) -> Result<(), ClientError> {
         let container = self.container_name(name);
-        let _ = run_docker_cmd(&["exec", &container, "iptables", "-F"]).await;
+        run_docker_cmd(&["exec", &container, "iptables", "-F"]).await?;
         Ok(())
     }
 
     /// Heals all network partitions on all 5 nodes.
     ///
-    /// Errors from individual nodes are silently ignored because some nodes
-    /// may not exist or may be stopped/killed.
+    /// This is a best-effort sweep across the whole cluster, unlike
+    /// `heal_partition`: some of the 5 nodes may legitimately not exist or
+    /// may be stopped/killed at call time (e.g. chaos scenarios call this
+    /// before restarting nodes they killed), so a single node's failure
+    /// does not fail the sweep. It is still logged loudly (not silently
+    /// swallowed) so a real iptables regression stays visible instead of
+    /// being indistinguishable from the expected dead-node case.
     pub async fn heal_all_partitions(&self) -> Result<(), ClientError> {
         for i in 1..=5 {
             let name = format!("node{i}");
-            let _ = self.heal_partition(&name).await;
+            if let Err(e) = self.heal_partition(&name).await {
+                eprintln!(
+                    "heal_all_partitions: failed to heal {name} (tolerated -- node may be \
+                     stopped/killed, but check this if {name} should be alive): {e}"
+                );
+            }
         }
         Ok(())
     }
@@ -681,31 +701,48 @@ services:
 
     /// Removes any tc netem configuration from a node's eth0 interface.
     ///
-    /// Errors from the removal are ignored (e.g. if no qdisc was configured).
+    /// Unlike `iptables -F` (used by `heal_partition`), `tc qdisc del` is
+    /// **not** idempotent: deleting a qdisc that isn't there fails with
+    /// "Cannot delete qdisc with handle of zero" (verified directly against
+    /// a live container), a condition that legitimately arises here --
+    /// e.g. scenario_16's chaos loop tracks injected latency and packet
+    /// loss as two independent flags, but `slow_network` applies both
+    /// through a single combined qdisc, so clearing one can leave a
+    /// dangling flag whose later clear finds nothing to delete. That is
+    /// not a real failure the way a genuinely failed `iptables` rule is,
+    /// so (unlike `partition_node`/`heal_partition`) errors here are
+    /// tolerated rather than propagated -- but logged loudly so a real
+    /// regression (dead container, docker daemon issue) stays visible
+    /// instead of silently disappearing.
     ///
     /// # Parameters
     /// - `name`: Node name (e.g. "node1").
-    ///
-    /// # Errors
-    /// Returns `ClientError::Connection` only if the docker exec invocation
-    /// itself fails (not if the tc command reports no qdisc to remove).
     pub async fn clear_network(&self, name: &str) -> Result<(), ClientError> {
         let container = self.container_name(name);
-        let _ = run_docker_cmd(&[
+        if let Err(e) = run_docker_cmd(&[
             "exec", &container, "tc", "qdisc", "del", "dev", "eth0", "root",
         ])
-        .await;
+        .await
+        {
+            eprintln!(
+                "clear_network: tc qdisc del on {name} reported an error (tolerated -- this is \
+                 expected when no qdisc was configured, but check this if {name} should have \
+                 had one): {e}"
+            );
+        }
         Ok(())
     }
 
     /// Clears tc netem configuration on all 5 nodes.
     ///
-    /// Errors from individual nodes are silently ignored because some nodes
-    /// may not exist or may be stopped/killed.
+    /// Best-effort sweep across the whole cluster: some of the 5 nodes may
+    /// legitimately not exist or may be stopped/killed at call time.
+    /// `clear_network` itself already tolerates and loudly logs failures,
+    /// so this is a plain sweep over all 5 nodes.
     pub async fn clear_all_networks(&self) -> Result<(), ClientError> {
         for i in 1..=5 {
             let name = format!("node{i}");
-            let _ = self.clear_network(&name).await;
+            self.clear_network(&name).await?;
         }
         Ok(())
     }
