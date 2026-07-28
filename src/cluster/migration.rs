@@ -403,12 +403,15 @@ impl InboundMigration {
 /// this node so a flood of overlapping migrations cannot starve replica
 /// traffic or exhaust SSD bandwidth.
 ///
-/// Lock-free: a single [`AtomicU64`](std::sync::atomic::AtomicU64) tracks
-/// the bytes currently admitted. [`try_admit`](Self::try_admit) returns a
-/// [`MigrationToken`] RAII guard whose `Drop` returns capacity to the
-/// throttle. A request that would push the in-flight total over
-/// `cap_bytes` is rejected (returns `None`) without consuming any
-/// capacity, so the caller can retry later.
+/// Admission is lock-free: a single
+/// [`AtomicU64`](std::sync::atomic::AtomicU64) tracks the bytes currently
+/// admitted. [`try_admit`](Self::try_admit) returns a [`MigrationToken`]
+/// RAII guard whose `Drop` returns capacity to the throttle. A request
+/// that would push the in-flight total over `cap_bytes` is rejected
+/// (returns `None`) without consuming any capacity, so the caller can
+/// retry later. Blocking callers use
+/// [`admit_or_abort`](Self::admit_or_abort), which parks on a condvar
+/// that every token drop notifies — no sleep-polling for capacity.
 ///
 /// Zero-byte requests are admitted unconditionally and consume no
 /// capacity (small empty shards must never block on the throttle).
@@ -420,6 +423,13 @@ impl InboundMigration {
 pub struct MigrationThrottle {
     cap_bytes: u64,
     in_flight: std::sync::atomic::AtomicU64,
+    /// Pairs with `capacity_returned` for blocking admission
+    /// ([`admit_or_abort`](Self::admit_or_abort)). Guards no data — the
+    /// admission counter stays lock-free — it exists so a waiter can
+    /// re-check admission under the same lock a token drop takes to
+    /// notify, making a missed wakeup impossible.
+    waiter_lock: std::sync::Mutex<()>,
+    capacity_returned: std::sync::Condvar,
 }
 
 impl MigrationThrottle {
@@ -435,6 +445,8 @@ impl MigrationThrottle {
         Self {
             cap_bytes,
             in_flight: std::sync::atomic::AtomicU64::new(0),
+            waiter_lock: std::sync::Mutex::new(()),
+            capacity_returned: std::sync::Condvar::new(),
         }
     }
 
@@ -490,6 +502,49 @@ impl MigrationThrottle {
             }
         }
     }
+
+    /// Admit `bytes`, blocking until capacity is available or
+    /// `should_abort` returns `true`.
+    ///
+    /// Admission is checked before the abort predicate, so an admissible
+    /// request always wins over a pending abort. While blocked, the
+    /// waiter parks on a condvar that every [`MigrationToken`] drop
+    /// notifies; `poll_interval` only bounds how long the waiter can go
+    /// between `should_abort` re-checks when no capacity returns, it is
+    /// not the wakeup mechanism.
+    ///
+    /// Returns `None` iff `should_abort` fired before capacity became
+    /// available; an aborted call consumes no capacity.
+    pub fn admit_or_abort(
+        self: &Arc<Self>,
+        bytes: u64,
+        poll_interval: std::time::Duration,
+        mut should_abort: impl FnMut() -> bool,
+    ) -> Option<MigrationToken> {
+        loop {
+            if let Some(token) = self.try_admit(bytes) {
+                return Some(token);
+            }
+            if should_abort() {
+                return None;
+            }
+            let guard = match self.waiter_lock.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            // Re-check under the lock: a token dropped between the
+            // failed `try_admit` above and this point already took the
+            // lock to notify, so its capacity is visible here — the
+            // wait below can never sleep through the capacity it needs.
+            if let Some(token) = self.try_admit(bytes) {
+                return Some(token);
+            }
+            match self.capacity_returned.wait_timeout(guard, poll_interval) {
+                Ok(_) => {}
+                Err(_poisoned) => {}
+            }
+        }
+    }
 }
 
 impl std::fmt::Debug for MigrationThrottle {
@@ -525,6 +580,14 @@ impl Drop for MigrationToken {
             .in_flight
             .fetch_sub(self.bytes, std::sync::atomic::Ordering::AcqRel);
         debug_assert!(prev >= self.bytes, "throttle underflow on token drop");
+        // Wake blocked `admit_or_abort` waiters. Taking the waiter lock
+        // orders this notify against a waiter's locked re-check; token
+        // drops are per migration target group, so the lock is cold.
+        let _guard = match self.throttle.waiter_lock.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        self.throttle.capacity_returned.notify_all();
     }
 }
 
@@ -4806,5 +4869,90 @@ mod tests {
         unsafe { std::env::remove_var(MigrationThrottle::ENV_VAR) };
         let t = MigrationThrottle::from_env();
         assert_eq!(t.cap_bytes(), MigrationThrottle::DEFAULT_CAP_BYTES);
+    }
+
+    #[test]
+    fn admit_or_abort_returns_immediately_with_capacity() {
+        let throttle = std::sync::Arc::new(MigrationThrottle::new(100_000));
+        let token =
+            throttle.admit_or_abort(50_000, std::time::Duration::from_millis(250), || false);
+        assert!(
+            token.is_some(),
+            "request under cap must be admitted without blocking",
+        );
+        assert_eq!(throttle.in_flight_bytes(), 50_000);
+    }
+
+    #[test]
+    fn admit_or_abort_prefers_admission_over_abort() {
+        // Admission is checked before the abort predicate (matching the
+        // historical epoch-check ordering): capacity available + abort
+        // signalled must still admit.
+        let throttle = std::sync::Arc::new(MigrationThrottle::new(100_000));
+        let token = throttle.admit_or_abort(50_000, std::time::Duration::from_millis(250), || true);
+        assert!(
+            token.is_some(),
+            "an admissible request must win over a pending abort signal",
+        );
+    }
+
+    #[test]
+    fn admit_or_abort_wakes_on_token_drop_not_poll() {
+        // The waiter's poll interval is a deliberately absurd 60 s: if
+        // the wakeup relied on polling (the old 50 ms sleep-spin), the
+        // waiter would sleep out the full interval and trip the 10 s
+        // ceiling. A token drop must wake it via the condvar promptly.
+        let throttle = std::sync::Arc::new(MigrationThrottle::new(100_000));
+        let held = throttle.try_admit(100_000).expect("fill the cap");
+        let waiter = {
+            let t = std::sync::Arc::clone(&throttle);
+            std::thread::spawn(move || {
+                t.admit_or_abort(50_000, std::time::Duration::from_secs(60), || false)
+            })
+        };
+        // Give the waiter a moment to block; if it has not blocked yet
+        // the locked re-check inside admit_or_abort still admits it —
+        // the assertion below holds either way.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let released_at = std::time::Instant::now();
+        drop(held);
+        let token = waiter.join().expect("waiter thread must not panic");
+        assert!(
+            token.is_some(),
+            "waiter must be admitted once the blocking token drops",
+        );
+        assert!(
+            released_at.elapsed() < std::time::Duration::from_secs(10),
+            "wakeup must come from the token-drop notify, not the 60 s poll",
+        );
+        assert_eq!(throttle.in_flight_bytes(), 50_000);
+    }
+
+    #[test]
+    fn admit_or_abort_honours_abort_while_blocked() {
+        let throttle = std::sync::Arc::new(MigrationThrottle::new(100_000));
+        let _held = throttle.try_admit(100_000).expect("fill the cap");
+        let abort = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let waiter = {
+            let t = std::sync::Arc::clone(&throttle);
+            let abort = std::sync::Arc::clone(&abort);
+            std::thread::spawn(move || {
+                t.admit_or_abort(50_000, std::time::Duration::from_millis(25), || {
+                    abort.load(std::sync::atomic::Ordering::Acquire)
+                })
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        abort.store(true, std::sync::atomic::Ordering::Release);
+        let token = waiter.join().expect("waiter thread must not panic");
+        assert!(
+            token.is_none(),
+            "a blocked waiter must return None once the abort predicate fires",
+        );
+        assert_eq!(
+            throttle.in_flight_bytes(),
+            100_000,
+            "an aborted waiter must not consume capacity",
+        );
     }
 }

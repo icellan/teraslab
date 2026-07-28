@@ -4128,9 +4128,10 @@ impl ClusterCoordinator {
 const EST_BYTES_PER_RECORD: u64 = 256;
 
 /// Phase G — try to admit `bytes` of outbound migration work, blocking
-/// (with a short sleep) when the throttle is full. Aborts and returns
-/// `None` if the topology epoch advances while we wait, so a stale
-/// migration cycle does not consume capacity meant for the new one.
+/// on the throttle's capacity condvar when it is full. Aborts and
+/// returns `None` if the topology epoch advances while we wait (checked
+/// at least every 250 ms), so a stale migration cycle does not consume
+/// capacity meant for the new one.
 fn acquire_throttle_or_block(
     throttle: &Arc<crate::cluster::migration::MigrationThrottle>,
     bytes: u64,
@@ -4142,17 +4143,9 @@ fn acquire_throttle_or_block(
     // existing `max_parallel_migrations` behaviour: the throttle
     // tunes pacing, it does not refuse legitimate work.
     let request = bytes.min(throttle.cap_bytes());
-    loop {
-        if let Some(token) = throttle.try_admit(request) {
-            return Some(token);
-        }
-        // Bail out if the topology has advanced — no point holding
-        // up the new cycle for an aborted plan.
-        if shard_table.read().version != spawn_epoch {
-            return None;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
+    throttle.admit_or_abort(request, std::time::Duration::from_millis(250), || {
+        shard_table.read().version != spawn_epoch
+    })
 }
 
 fn should_begin_handoff_for_shard(
