@@ -193,6 +193,10 @@ async fn test_kill_two_of_three() -> Result<(), ClientError> {
     );
     eprintln!("[12.1] Full consistency check passed: zero mismatches");
 
+    let non_deleted = verifier.non_deleted_txids();
+    common::assert_rf2_replication_exact(&client, &docker, 3, &non_deleted, "12.1").await?;
+    eprintln!("[12.1] RF=2 replication check passed with zero mismatches");
+
     eprintln!("[12.1] PASSED");
 
     Ok(())
@@ -406,6 +410,11 @@ async fn test_partition_plus_kill() -> Result<(), ClientError> {
         mismatches.iter().take(10).collect::<Vec<_>>()
     );
     eprintln!("[12.3] Full consistency check passed: zero mismatches");
+
+    let non_deleted = verifier.non_deleted_txids();
+    common::assert_rf2_replication_exact(&fresh_client, &docker, 3, &non_deleted, "12.3").await?;
+    eprintln!("[12.3] RF=2 replication check passed with zero mismatches");
+
     eprintln!("[12.3] PASSED");
 
     Ok(())
@@ -644,6 +653,10 @@ async fn test_rolling_restart_plus_partition() -> Result<(), ClientError> {
         mismatches.iter().take(10).collect::<Vec<_>>()
     );
     eprintln!("[12.5] Full consistency check passed: zero mismatches");
+
+    let non_deleted = verifier.non_deleted_txids();
+    common::assert_rf2_replication_exact(&client, &docker, 3, &non_deleted, "12.5").await?;
+    eprintln!("[12.5] RF=2 replication check passed with zero mismatches");
 
     // Verify we can still write and read.
     // After partitions + kills + restart, server-side replication TCP
