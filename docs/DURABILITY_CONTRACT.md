@@ -292,6 +292,38 @@ behavioural contract: spec §3.18 / §3.18.1. The durability-relevant parts:
 - **Still not a cluster-wide delete barrier.** Neither path blocks or orders
   against a concurrent checkpoint on another node, and a `FLAG_LOCAL_READ`
   against a holder can observe either side of the window above.
+- **The preservation EXPIRY is inside the contract, unlike the reclaim (R1).**
+  The pruner's Phase-0 pass turns an elapsed `preserve_until` into a
+  `delete_at_height`. That is a lifecycle decision about the key, not a local
+  space decision, so it is a full mutation: only the key's master performs it,
+  it is journalled WAL-first as `RedoOp::ExpirePreservation` (one entry carrying
+  BOTH halves — the cleared preservation and the scheduled height — because
+  replaying `PreserveUntil { 0 }` would zero the DAH), a replication intent is
+  opened over those entries, and the result is shipped to every holder as
+  `ReplicaOp::ExpirePreservation`. Holders take the master's `delete_at_height`
+  verbatim rather than re-deriving it — the eligibility test reads the
+  node-local MinedIndex, which lags, and holders must agree on the value (spec
+  §3.18 Phase 3).
+
+  Ordering is the standard apply → journal → replicate → compensate, not the
+  delete path's inverted replicate-then-apply: this transition IS invertible (a
+  preserved record carries no DAH, so restoring the prior `preserve_until`
+  restores the whole pre-expiry footer), so a failed fan-out rolls the master
+  back and the next pruner call retries. A clean rollback does not fail the RPC
+  — the Phase-2 reclaim below is independent and still runs, so degraded
+  replication delays expiry without stalling GC. Only an unclean rollback is
+  surfaced, because only then can holders actually differ.
+
+  **Residual crash window.** The intent is opened AFTER the applies, not before
+  them, because the value the entry carries is only decided by the under-lock
+  eligibility verdict. A master crash in that window (in-memory work only, no
+  I/O between) leaves the expiry durable locally with no intent to re-ship it,
+  so that record's holders stay preserved while the master carries a DAH until
+  the next heal/migration reconciles them. Every other mutation has the mirror
+  window (intent durable, apply not) and resolves it by re-shipping an
+  idempotent op; this one cannot, because the master's own preserve index no
+  longer offers the key. Bounded and rare, and strictly smaller than the
+  pre-R1 behaviour, where the transition reached NO holder at all.
 
 ### Who reclaims what (RF > 1)
 
@@ -305,6 +337,7 @@ two distinct roles:
 |---|---|---|---|---|
 | **Master** (client delete, and the sweep over mastered keys) | keys this node masters | yes (when `reverse_heal.tombstones` is on) | yes | client delete only |
 | **Held copy** (the sweep over replica copies) | keys this node stores but does not master | **no** | **no** | no |
+| **Preservation expiry** (Phase 0, `preserve_until` -> `delete_at_height`) | keys this node masters | n/a (nothing is removed) | n/a | **yes** — `ReplicaOp::ExpirePreservation` |
 | **Replicated apply** (`ReplicaOp::Delete` from the key's master) | keys another node masters | yes — this IS an authoritative deletion | no | n/a |
 
 The held-copy role re-validates the identical due predicate under the identical

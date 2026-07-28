@@ -125,6 +125,21 @@ const OP_SET_MINED_BATCH: u8 = 18;
 /// child's Create/SetConflicting. Idempotent, keyed on (parent, child); no
 /// generation token (like [`OP_DELETE`]).
 const OP_REMOVE_CONFLICTING_CHILD: u8 = 17;
+/// R1: the preservation-expiry transition (`preserve_until` -> 0, plus the
+/// master's scheduled `delete_at_height`), replicated so every holder converges
+/// on ONE deletion schedule.
+///
+/// A NEW tag rather than extra fields on [`OP_PRESERVE_UNTIL`], deliberately.
+/// `ReplicaOp::deserialize` bounds each op with `need(rest, N)` (a MINIMUM) and
+/// `ReplicaBatch::deserialize` discards the per-op `bytes_consumed` in favour of
+/// the framed `op_len`, so a pre-upgrade peer handed a WIDENED `PreserveUntil`
+/// would decode the old prefix, silently ignore the appended DAH, and apply
+/// `delete_at_height = 0` — permanent, undetected holder divergence. An unknown
+/// TAG instead fails closed: [`ProtocolError::UnknownOp`] fails the batch, the
+/// master retries, nothing is applied. This makes the op rolling-upgrade
+/// ORDERED (every node must understand tag 19 before any node emits it), which
+/// is the correct trade against a silent-divergence wire hazard.
+const OP_EXPIRE_PRESERVATION: u8 = 19;
 
 /// A single replication operation sent from master to replica.
 /// A mutation operation to be replicated from master to replica.
@@ -240,6 +255,29 @@ pub enum ReplicaOp {
         block_height: u32,
         master_generation: u32,
     },
+    /// R1: an expired preservation was converted into a deletion schedule on
+    /// the master; apply the SAME transition here.
+    ///
+    /// Emitted by the pruner's Phase-0 expiry at the key's master
+    /// (`server::dispatch::handle_process_expired`) and by the redo->replica
+    /// converter for a migration delta / crash-recovered replication intent.
+    ///
+    /// Carries the master's RESULT (`delete_at_height`), not the inputs the
+    /// master derived it from. Every other lifecycle op ships inputs and lets
+    /// the replica re-derive, which is safe because those derivations read only
+    /// replicated per-record state; this one does not. Expiry eligibility reads
+    /// the node-local `MinedIndex` (`sweep_eligible_with_mined`), which lags
+    /// under replication delay, so a re-deriving replica could legitimately
+    /// reach the opposite verdict and plant a different DAH — a divergence the
+    /// repo's own cross-holder oracle (`payloads_match`, which masks only
+    /// `updated_at`) reports as a mismatch. Shipping the value makes agreement
+    /// structural. `delete_at_height == 0` is the ineligible branch: clear the
+    /// preservation, schedule nothing.
+    ExpirePreservation {
+        tx_key: TxKey,
+        delete_at_height: u32,
+        master_generation: u32,
+    },
     Create {
         tx_key: TxKey,
         metadata_bytes: Vec<u8>,
@@ -318,6 +356,7 @@ impl ReplicaOp {
             | Self::RemoveConflictingChild { tx_key, .. }
             | Self::SetLocked { tx_key, .. }
             | Self::PreserveUntil { tx_key, .. }
+            | Self::ExpirePreservation { tx_key, .. }
             | Self::Create { tx_key, .. }
             | Self::Delete { tx_key, .. }
             | Self::PruneSlot { tx_key, .. }
@@ -365,6 +404,9 @@ impl ReplicaOp {
                 master_generation, ..
             }
             | Self::PreserveUntil {
+                master_generation, ..
+            }
+            | Self::ExpirePreservation {
                 master_generation, ..
             }
             | Self::MarkLongestChain {
@@ -563,6 +605,16 @@ impl ReplicaOp {
                 buf.push(OP_PRESERVE_UNTIL);
                 buf.extend_from_slice(&tx_key.txid);
                 buf.extend_from_slice(&block_height.to_le_bytes());
+                buf.extend_from_slice(&master_generation.to_le_bytes());
+            }
+            ReplicaOp::ExpirePreservation {
+                tx_key,
+                delete_at_height,
+                master_generation,
+            } => {
+                buf.push(OP_EXPIRE_PRESERVATION);
+                buf.extend_from_slice(&tx_key.txid);
+                buf.extend_from_slice(&delete_at_height.to_le_bytes());
                 buf.extend_from_slice(&master_generation.to_le_bytes());
             }
             ReplicaOp::Create {
@@ -913,6 +965,18 @@ impl ReplicaOp {
                         child_txid,
                     },
                     69,
+                ))
+            }
+            OP_EXPIRE_PRESERVATION => {
+                // 32(tx_key) + 4(delete_at_height) + 4(master_generation) = 40.
+                need(rest, 40)?;
+                Ok((
+                    ReplicaOp::ExpirePreservation {
+                        tx_key: read_key(rest),
+                        delete_at_height: r_u32(rest, 32),
+                        master_generation: r_u32(rest, 36),
+                    },
+                    41,
                 ))
             }
             OP_MARK_LONGEST_CHAIN => {
@@ -1454,6 +1518,18 @@ mod tests {
                 tx_key: key(10),
                 block_height: 5000,
                 master_generation: 0,
+            },
+            ReplicaOp::ExpirePreservation {
+                tx_key: key(16),
+                delete_at_height: 5288,
+                master_generation: 41,
+            },
+            // The INELIGIBLE branch: a zero DAH must survive the wire as a
+            // value, not be confused with "no field".
+            ReplicaOp::ExpirePreservation {
+                tx_key: key(17),
+                delete_at_height: 0,
+                master_generation: 42,
             },
             ReplicaOp::Create {
                 tx_key: key(11),

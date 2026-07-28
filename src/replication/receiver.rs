@@ -1281,9 +1281,20 @@ fn apply_create_replica(
         // If the incoming baseline is STRICTLY OLDER than the record already
         // present, keep the newer copy and skip entirely (no downgrade).
         // Otherwise fall through to `apply_create_lifecycle_and_blob`, which
-        // applies the incoming generation/lifecycle atomically in place (and is
-        // an idempotent no-op when generations are equal). Gated on
-        // `is_migration` so non-migration replica behaviour is unchanged.
+        // applies the incoming generation/lifecycle atomically in place. Gated
+        // on `is_migration` so non-migration replica behaviour is unchanged.
+        //
+        // NOT a no-op at equal generations. `Engine::restore_migrated_lifecycle`
+        // assigns `generation` / `updated_at` / `unmined_since` /
+        // `delete_at_height` / `preserve_until` UNCONDITIONALLY — there is no
+        // equal-generation short-circuit anywhere on that path. The guard above
+        // is strictly `incoming < existing`, so an equal-generation baseline
+        // OVERWRITES this node's lifecycle fields with the source's. That is
+        // intended for a migration baseline (the source image is the one being
+        // installed), but it means "equal generation" is NOT a safety net: any
+        // future caller that ships lifecycle state must ensure the value it
+        // ships is the one that should win, because the generation comparison
+        // will not stop it.
         Err(CreateError::DuplicateTxId) if is_migration => {
             if let (Some(incoming), Some(existing)) = (
                 incoming_create_generation(metadata_bytes),
@@ -2160,6 +2171,23 @@ fn apply_op_journal_inner(
                 Err(e) => Err(format!("preserve_until: {e}").into()),
             }
         }
+        ReplicaOp::ExpirePreservation {
+            tx_key,
+            delete_at_height,
+            ..
+        } => {
+            // R1: take the master's SCHEDULED height, do not re-derive it. See
+            // `Engine::apply_replicated_preservation_expiry` for why (this
+            // node's MinedIndex can lag, so a locally-derived eligibility
+            // verdict could disagree with the master's and diverge the DAH).
+            match engine.apply_replicated_preservation_expiry(tx_key, *delete_at_height) {
+                Ok(()) => Ok(()),
+                Err(crate::ops::error::SpendError::TxNotFound) => {
+                    missing_record_apply_outcome("expire_preservation", tx_key, nak_on_missing)
+                }
+                Err(e) => Err(format!("expire_preservation: {e}").into()),
+            }
+        }
         ReplicaOp::Create {
             tx_key,
             metadata_bytes,
@@ -2852,6 +2880,16 @@ fn build_post_apply_redo_op(
             tx_key: *tx_key,
             block_height: *block_height,
         })),
+        // R1: no POST-apply entry. `apply_replicated_preservation_expiry`
+        // journals `RedoOp::ExpirePreservation` itself, WAL-FIRST (before its
+        // footer write) — the same entry, in the same order, that the master's
+        // own expiry writes, which is what makes the two holders' crash
+        // recovery symmetric rather than merely similar. Emitting a second copy
+        // here would be redundant; emitting `PreserveUntil { block_height: 0 }`
+        // instead — the obvious-looking choice — would be WRONG: its replay
+        // forces `delete_at_height = 0` (see `recovery.rs`) and would erase the
+        // schedule this op exists to install.
+        ReplicaOp::ExpirePreservation { .. } => Ok(None),
         ReplicaOp::Create {
             tx_key,
             utxo_hashes,

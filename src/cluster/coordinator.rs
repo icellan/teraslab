@@ -8292,6 +8292,23 @@ fn convert_infallible_op(
                 master_generation: gen_for(tx_key),
             })
         }
+        RedoOp::ExpirePreservation {
+            tx_key,
+            delete_at_height,
+        } => {
+            if ShardTable::shard_for_key(tx_key) != shard {
+                return None;
+            }
+            // R1: forward the master's SCHEDULED height verbatim. The replica
+            // must not re-derive eligibility — its MinedIndex can lag, so two
+            // holders could reach different verdicts and diverge on a field the
+            // cross-holder consistency oracle compares byte-for-byte.
+            Some(ReplicaOp::ExpirePreservation {
+                tx_key: *tx_key,
+                delete_at_height: *delete_at_height,
+                master_generation: gen_for(tx_key),
+            })
+        }
         RedoOp::PruneSlot { tx_key, offset } => {
             if ShardTable::shard_for_key(tx_key) != shard {
                 return None;
@@ -22634,6 +22651,66 @@ mod tests {
             Err(ReplicaConvertError::SlotRead { tx_key, .. }) => assert_eq!(tx_key, key),
             other => panic!("expected SlotRead error from the batch converter, got {other:?}"),
         }
+    }
+
+    /// R1: the crash-recovery re-ship path. A pending replication intent
+    /// replays the master's redo window through this converter, so a
+    /// `RedoOp::ExpirePreservation` must become the matching `ReplicaOp` —
+    /// carrying the SAME scheduled height. If it converted to `None` (the
+    /// default for an unhandled variant) a crash mid-fan-out would silently
+    /// abandon the transition, which is the exact leak R1 closes. The migration
+    /// delta uses the same converter, so this also covers a shard handoff.
+    #[test]
+    fn expire_preservation_converts_to_its_replica_op() {
+        use crate::redo::{RedoEntry, RedoOp};
+        use crate::replication::protocol::ReplicaOp;
+
+        let engine = test_engine();
+        let shard = 11u16;
+        let key = tx_key_for_shard(shard, 3);
+        create_test_record(&engine, key);
+
+        for dah in [750_288u32, 0u32] {
+            let entry = RedoEntry {
+                sequence: 1,
+                op: RedoOp::ExpirePreservation {
+                    tx_key: key,
+                    delete_at_height: dah,
+                },
+            };
+            match redo_entry_to_replica_op(&entry, shard, &engine).unwrap() {
+                Some(ReplicaOp::ExpirePreservation {
+                    tx_key,
+                    delete_at_height,
+                    ..
+                }) => {
+                    assert_eq!(tx_key, key);
+                    assert_eq!(
+                        delete_at_height, dah,
+                        "the converter must forward the master's scheduled height verbatim; \
+                         re-deriving it on the target is what this op exists to prevent",
+                    );
+                }
+                other => panic!("expected ExpirePreservation, got {other:?}"),
+            }
+        }
+
+        // Shard-gated like every other keyed op: an entry for a different shard
+        // must not leak into this shard's delta.
+        let other_shard = shard.wrapping_add(1);
+        let entry = RedoEntry {
+            sequence: 2,
+            op: RedoOp::ExpirePreservation {
+                tx_key: key,
+                delete_at_height: 5288,
+            },
+        };
+        assert!(
+            redo_entry_to_replica_op(&entry, other_shard, &engine)
+                .unwrap()
+                .is_none(),
+            "a foreign shard's expiry must not be converted into this shard's delta",
+        );
     }
 
     fn external_ref_for(txid: [u8; 32]) -> crate::record::ExternalRef {

@@ -613,6 +613,22 @@ const OP_RELOCATE: u8 = 40;
 /// `OP_SET_MINED` (was opcode 3; see [`RedoOp::SetMinedBatch`]).
 const OP_SET_MINED_BATCH: u8 = 42;
 
+/// R1: the preservation-expiry transition as ONE journalled entry.
+///
+/// The pruner's Phase-0 expiry clears `preserve_until` and, when the record is
+/// sweep-eligible, plants the replacement `delete_at_height` in the same footer
+/// write. Both halves must replay together, which no pre-existing entry does:
+/// [`OP_PRESERVE_UNTIL`] with `block_height = 0` clears the preservation but
+/// also forces `delete_at_height = 0` (see the replay arm in `recovery.rs`), so
+/// it would ERASE the DAH the expiry just scheduled, and
+/// [`OP_SECONDARY_DAH_UPDATE`] restores only the index entry, not the footer.
+///
+/// It is also the conversion source for [`crate::replication::protocol::ReplicaOp::ExpirePreservation`]
+/// (`cluster::coordinator::redo_entry_to_replica_ops`), which is what lets a
+/// crash-recovered replication intent — and a migration delta — re-ship the
+/// transition to the record's other holders.
+const OP_EXPIRE_PRESERVATION: u8 = 44;
+
 /// F-G4-006-style cap: bound the allocation a corrupt-but-CRC-valid
 /// `SetMinedBatch` entry can force. A single client RPC is already capped by
 /// `Config::max_batch_size` (default 8192) before it ever reaches the redo
@@ -943,6 +959,29 @@ pub enum RedoOp {
         tx_key: TxKey,
         block_height: u32,
     },
+    /// R1: an expired preservation was converted into a deletion schedule.
+    ///
+    /// Written by [`crate::ops::engine::Engine::expire_preservation_set_dah`]
+    /// (master) and by the replica's apply of
+    /// [`crate::replication::protocol::ReplicaOp::ExpirePreservation`], BEFORE
+    /// the footer write, so a `LogFull` aborts the op with no device change.
+    ///
+    /// Replay sets `preserve_until = 0` and `delete_at_height =
+    /// delete_at_height` in one footer write — both halves of the transition
+    /// together. `delete_at_height == 0` is the INELIGIBLE branch (the record
+    /// is not sweepable yet, so the expiry only clears the preservation and
+    /// lets the normal spend / setMined path re-plant a DAH later).
+    ///
+    /// Deliberately NOT expressible as [`Self::PreserveUntil`] with
+    /// `block_height: 0`: that entry's replay forces `delete_at_height = 0`,
+    /// which would erase the DAH this transition just scheduled.
+    ExpirePreservation {
+        tx_key: TxKey,
+        /// The deletion height the master scheduled, or 0 for an ineligible
+        /// record. Authoritative — a replica takes this value rather than
+        /// re-deriving eligibility, so holders cannot diverge on the DAH.
+        delete_at_height: u32,
+    },
     MarkOnLongestChain {
         tx_key: TxKey,
         on_longest_chain: bool,
@@ -1162,6 +1201,7 @@ impl RedoOp {
             RedoOp::AppendDeletedChild { .. } => OP_APPEND_DELETED_CHILD,
             RedoOp::SetLocked { .. } => OP_SET_LOCKED,
             RedoOp::PreserveUntil { .. } => OP_PRESERVE_UNTIL,
+            RedoOp::ExpirePreservation { .. } => OP_EXPIRE_PRESERVATION,
             RedoOp::MarkOnLongestChain { .. } => OP_MARK_LONGEST_CHAIN,
             RedoOp::SecondaryDahUpdate { .. } => OP_SECONDARY_DAH_UPDATE,
             RedoOp::AllocateRegion { .. } => OP_ALLOCATE_REGION,
@@ -1202,6 +1242,7 @@ impl RedoOp {
             | RedoOp::SetConflicting { tx_key, .. }
             | RedoOp::SetLocked { tx_key, .. }
             | RedoOp::PreserveUntil { tx_key, .. }
+            | RedoOp::ExpirePreservation { tx_key, .. }
             | RedoOp::MarkOnLongestChain { tx_key, .. }
             | RedoOp::SecondaryDahUpdate { tx_key, .. }
             | RedoOp::CompensateUnsetMined { tx_key, .. }
@@ -1297,6 +1338,12 @@ impl RedoOp {
             | RedoOp::RemoveConflictingChild { .. }
             | RedoOp::AppendDeletedChild { .. }
             | RedoOp::SetLocked { .. }
+            // The DAH it carries is `current_height + retention` — a FUTURE
+            // height the node has not observed. Flooring `last_durable_height`
+            // at it would push the GC horizon / rejoin gate past the tip this
+            // node can actually prove it reached, so it contributes nothing
+            // (same reasoning as `SecondaryDahUpdate`).
+            | RedoOp::ExpirePreservation { .. }
             | RedoOp::SecondaryDahUpdate { .. }
             | RedoOp::CompensateReassign { .. }
             | RedoOp::CompensatePrune { .. }
@@ -1356,6 +1403,7 @@ impl RedoOp {
             | RedoOp::AppendDeletedChild { .. } => 32 + 32,
             RedoOp::SetLocked { .. } => 32 + 1,
             RedoOp::PreserveUntil { .. } => 32 + 4,
+            RedoOp::ExpirePreservation { .. } => 32 + 4,
             RedoOp::MarkOnLongestChain { .. } => 32 + 1 + 4 + 4 + 4,
             RedoOp::SecondaryDahUpdate { .. } => 32 + 4 + 4,
             RedoOp::AllocateRegion { .. } | RedoOp::FreeRegion { .. } => 8 + 8 + 1,
@@ -1649,6 +1697,13 @@ impl RedoOp {
             } => {
                 buf.extend_from_slice(&tx_key.txid);
                 buf.extend_from_slice(&block_height.to_le_bytes());
+            }
+            RedoOp::ExpirePreservation {
+                tx_key,
+                delete_at_height,
+            } => {
+                buf.extend_from_slice(&tx_key.txid);
+                buf.extend_from_slice(&delete_at_height.to_le_bytes());
             }
             RedoOp::MarkOnLongestChain {
                 tx_key,
@@ -2177,6 +2232,14 @@ impl RedoOp {
                 Some(RedoOp::PreserveUntil {
                     tx_key: TxKey { txid },
                     block_height: u32::from_le_bytes(data[32..36].try_into().unwrap()),
+                })
+            }
+            OP_EXPIRE_PRESERVATION if data.len() >= 36 => {
+                let mut txid = [0u8; 32];
+                txid.copy_from_slice(&data[..32]);
+                Some(RedoOp::ExpirePreservation {
+                    tx_key: TxKey { txid },
+                    delete_at_height: u32::from_le_bytes(data[32..36].try_into().unwrap()),
                 })
             }
             OP_MARK_LONGEST_CHAIN if data.len() >= 45 => {
@@ -7695,6 +7758,21 @@ mod tests {
             tx_key: make_txid(0x2A),
             record_offset: 0x0000_CAFE_BABE_0000,
             record_size: 4096,
+        });
+    }
+
+    /// R1: the preservation-expiry entry round-trips BOTH branches — an
+    /// eligible expiry (a scheduled deletion height) and an ineligible one
+    /// (`delete_at_height == 0`, "clear the preservation, schedule nothing").
+    #[test]
+    fn round_trip_expire_preservation() {
+        assert_round_trip(RedoOp::ExpirePreservation {
+            tx_key: make_txid(0x5E),
+            delete_at_height: 750_288,
+        });
+        assert_round_trip(RedoOp::ExpirePreservation {
+            tx_key: make_txid(0x5F),
+            delete_at_height: 0,
         });
     }
 
