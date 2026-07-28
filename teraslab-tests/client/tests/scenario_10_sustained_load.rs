@@ -45,6 +45,84 @@ const TOTAL_DURATION_SECS: u64 = 60;
 /// Checkpoint interval: 15 seconds.
 const CHECKPOINT_INTERVAL_SECS: u64 = 15;
 
+/// Maximum tolerated CREATE error rate, as a percentage.
+///
+/// Creates use a fresh random 32-byte txid every attempt, so the collision
+/// probability is effectively zero -- there is no legitimate workload-design
+/// reason for a create to fail. This mirrors the 5% tolerance
+/// `scenario_05_node_recovery_catchup.rs` uses for a genuinely adverse
+/// window (a deferred shard-table swap); this scenario runs no
+/// scale/kill/partition event concurrently, so 5% here is a pure safety
+/// margin against transient errors around the checkpoint pause/resume
+/// boundaries, not a calibrated adverse-condition budget.
+const CREATE_ERROR_RATE_THRESHOLD_PCT: f64 = 5.0;
+
+/// Checks that the sustained-load run actually exercised the cluster before
+/// the invariant checks in [`run_scenario`] (`final_mismatches == 0`, every
+/// checkpoint's `replication_mismatches == 0`) are trusted.
+///
+/// Those checks only walk txids the verifier actually recorded
+/// (`verifier.non_deleted_txids()`), which stays empty if every create
+/// failed. A cluster that rejects every single operation therefore produces
+/// "0 mismatches" for the exact same reason a healthy cluster would --
+/// there is nothing to compare. This is precisely what happened in nightly
+/// run 30143215764: `creates: 0 ok, 50 err`, every other category `0 ok, 0
+/// err`, 100% error rate, and the scenario still printed "All sub-tests
+/// passed". This function is the guard that tells "healthy and quiet" apart
+/// from "broken and quiet".
+///
+/// Only `creates`, `reads`, and `set_mined` are checked for a non-zero
+/// success count (and, for creates, an error-rate ceiling). `spends` and
+/// `deletes` are deliberately excluded from this guard:
+/// - Spends in this scenario's workload are drawn *with replacement* from
+///   the entire historical creates pool (see the spend block in
+///   `run_scenario`), without tracking which slots are already spent. At
+///   this workload's target rates (20000 spends/sec against ~500 creates
+///   worth of fresh UTXOs per 100ms tick), a large and legitimate fraction
+///   of spend attempts are expected "already spent" failures *by design*,
+///   not a health signal -- gating spends on a success count or error rate
+///   here would make the test flaky on a perfectly healthy cluster.
+/// - Deletes only run once the tracked pool exceeds 100 txids (see the
+///   delete block), so a short or heavily create-throttled run can
+///   legitimately never attempt one.
+fn validate_workload_progress(
+    total_ops: u64,
+    creates_ok: u64,
+    creates_err: u64,
+    reads_ok: u64,
+    set_mined_ok: u64,
+) -> Result<(), String> {
+    if total_ops == 0 {
+        return Err(format!(
+            "zero operations were attempted in {TOTAL_DURATION_SECS}s -- the \
+             consistency/replication checks above had nothing to check and \
+             cannot be trusted as a pass"
+        ));
+    }
+    if creates_ok == 0 {
+        return Err(format!(
+            "zero successful creates ({creates_err} errors) -- nothing \
+             downstream (spends/reads/set_mined/deletes) can have done \
+             meaningful work, and verify_consistency's txid set is empty"
+        ));
+    }
+    if reads_ok == 0 {
+        return Err("zero successful reads".to_string());
+    }
+    if set_mined_ok == 0 {
+        return Err("zero successful set_mined ops".to_string());
+    }
+    let creates_attempted = creates_ok + creates_err;
+    let creates_error_rate = (creates_err as f64 / creates_attempted as f64) * 100.0;
+    if creates_error_rate >= CREATE_ERROR_RATE_THRESHOLD_PCT {
+        return Err(format!(
+            "create error rate {creates_error_rate:.1}% ({creates_err}/{creates_attempted}) \
+             exceeds {CREATE_ERROR_RATE_THRESHOLD_PCT}% threshold"
+        ));
+    }
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn scenario_10_sustained_load() {
     let result = tokio::time::timeout(
@@ -569,6 +647,17 @@ async fn run_scenario() -> Result<(), ClientError> {
 
     // -- Final assertions --
 
+    // 0. Sanity: the run actually did meaningful work.
+    //
+    // Without this check, a cluster that rejects every single operation
+    // still passes every check below -- see `validate_workload_progress`
+    // for the full rationale and the nightly-run evidence that motivated it.
+    if let Err(msg) =
+        validate_workload_progress(total_ops, creates_ok, creates_err, reads_ok, set_mined_ok)
+    {
+        panic!("10: {msg}");
+    }
+
     // Pattern D fix: the client now synthesizes per-item success entries
     // from the server's empty STATUS_OK payload, so the workload's
     // verifier is kept in sync with the cluster as operations apply
@@ -796,4 +885,96 @@ fn payloads_match_ignore_updated_at(a: &[u8], b: &[u8]) -> bool {
         b_copy[79..87].fill(0);
     }
     a_copy == b_copy
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_workload_progress_rejects_zero_total_ops() {
+        let err = validate_workload_progress(0, 0, 0, 0, 0).unwrap_err();
+        assert!(
+            err.contains("zero operations were attempted"),
+            "unexpected message: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_workload_progress_rejects_the_actual_nightly_outage() {
+        // Mirrors nightly run 30143215764 exactly: creates: 0 ok, 50 err;
+        // spends/set_mined/reads/deletes: 0 ok, 0 err each; 100% error rate.
+        let err = validate_workload_progress(50, 0, 50, 0, 0).unwrap_err();
+        assert!(
+            err.contains("zero successful creates"),
+            "unexpected message: {err}"
+        );
+        assert!(err.contains("50 errors"), "unexpected message: {err}");
+    }
+
+    #[test]
+    fn validate_workload_progress_rejects_zero_reads_even_with_creates() {
+        let err = validate_workload_progress(1000, 500, 0, 0, 10).unwrap_err();
+        assert!(
+            err.contains("zero successful reads"),
+            "unexpected message: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_workload_progress_rejects_zero_set_mined_even_with_creates_and_reads() {
+        let err = validate_workload_progress(1000, 500, 0, 200, 0).unwrap_err();
+        assert!(
+            err.contains("zero successful set_mined"),
+            "unexpected message: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_workload_progress_rejects_create_error_rate_at_threshold() {
+        // 5/100 = 5.0% exactly -- the ceiling is inclusive-of-failure (>=),
+        // so this must be rejected, not waved through.
+        let err = validate_workload_progress(1000, 95, 5, 100, 100).unwrap_err();
+        assert!(
+            err.contains("create error rate 5.0%"),
+            "unexpected message: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_workload_progress_accepts_just_under_the_create_error_threshold() {
+        // 4/100 = 4.0%, under the 5.0% ceiling.
+        let result = validate_workload_progress(1000, 96, 4, 100, 100);
+        assert!(
+            result.is_ok(),
+            "expected pass just under threshold: {result:?}"
+        );
+    }
+
+    #[test]
+    fn validate_workload_progress_accepts_a_healthy_run() {
+        // Representative of a real 60s run at these workload rates: hundreds
+        // of thousands of ops, a low single-digit create error rate from
+        // transient checkpoint-pause hiccups, and plenty of reads/set_mined.
+        let result = validate_workload_progress(
+            300_000, // total_ops
+            29_700,  // creates_ok
+            300,     // creates_err (1.0%)
+            60_000,  // reads_ok
+            25_000,  // set_mined_ok
+        );
+        assert!(result.is_ok(), "expected healthy run to pass: {result:?}");
+    }
+
+    /// Exercises the exact `if let Err(msg) = ... { panic!("10: {msg}") }`
+    /// shape used at the real call site in `run_scenario`, so this test
+    /// doesn't just check the `Result` plumbing -- it watches the panic
+    /// path itself fire, with the actual nightly-outage numbers.
+    #[test]
+    #[should_panic(expected = "10: zero successful creates (50 errors)")]
+    fn total_outage_evidence_panics_like_the_real_call_site() {
+        if let Err(msg) = validate_workload_progress(50, 0, 50, 0, 0) {
+            panic!("10: {msg}");
+        }
+    }
 }

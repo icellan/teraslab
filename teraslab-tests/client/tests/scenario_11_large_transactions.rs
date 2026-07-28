@@ -207,6 +207,7 @@ async fn run_scenario() -> Result<(), ClientError> {
     };
 
     let mut rng = rand::thread_rng();
+    let mut spend_failures: Vec<&str> = Vec::new();
 
     for (label, txid, utxo_hash) in [
         ("small", small_txid, small_hash),
@@ -226,19 +227,37 @@ async fn run_scenario() -> Result<(), ClientError> {
 
         let start = Instant::now();
         let result = client.spend_batch(&spend_params, &[spend_item]).await;
-        let elapsed = start.elapsed();
-        reporter.record(&format!("spend_{label}"), elapsed);
 
         match result {
             Ok(_) => {
+                // Only record latency for spends that actually happened --
+                // timing an error response and mixing it into the
+                // cross-tier latency comparison below would measure
+                // nothing meaningful.
+                let elapsed = start.elapsed();
+                reporter.record(&format!("spend_{label}"), elapsed);
                 verifier.record_spend(txid, 0);
                 eprintln!("[11.2] Spend on {label}: {elapsed:?}");
             }
             Err(e) => {
-                eprintln!("[11.2] Spend on {label} failed: {e} (may be hash mismatch, continuing)");
+                spend_failures.push(label);
+                eprintln!("[11.2] Spend on {label} failed: {e}");
             }
         }
     }
+
+    // Each of these four spends targets the utxo_hash returned by this
+    // test's own create_batch call moments ago on a never-before-spent
+    // vout -- there is no legitimate reason for any of them to fail.
+    // Silently continuing on failure (as this used to do) would starve the
+    // latency comparison below of that tier's data point and skip
+    // `record_spend`, letting a broken spend path pass this sub-test with
+    // nothing left to actually compare.
+    assert!(
+        spend_failures.is_empty(),
+        "11.2: {}/4 size-tier spends failed: {spend_failures:?}",
+        spend_failures.len()
+    );
 
     // Compare latencies: all should be within 2x of each other
     let all_stats = reporter.all_stats();

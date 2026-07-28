@@ -24,6 +24,74 @@ macro_rules! tlog {
 /// Scenario ID for unique Docker ports and container names.
 const SID: u16 = 13;
 
+/// Maximum tolerated CREATE error rate during the migration window, as a
+/// percentage.
+///
+/// Unlike scenario_10's steady-state baseline (explicitly documented there
+/// as running "no scale/kill/partition event concurrently"), this scenario's
+/// background workload runs *during* an active 3-node -> 4-node migration --
+/// a genuinely adverse window where transient shard-handoff routing errors
+/// are expected. This mirrors the 5% tolerance
+/// `scenario_05_node_recovery_catchup.rs` test 5.8 uses for its own
+/// genuinely adverse window (a deferred shard-table swap).
+const CREATE_ERROR_RATE_THRESHOLD_PCT: f64 = 5.0;
+
+/// Checks that the background workload run during the migration window in
+/// [`run_scenario`] actually exercised the cluster before the checks that
+/// assume it did -- 13.4's `verify_consistency` call and, more sharply,
+/// 13.5's misrouted-record loop over `background_txids` -- are trusted.
+///
+/// `total_ops` counts every attempted operation, success or failure alike
+/// (see the unconditional `bg_t_ops.fetch_add` in the workload loop), so
+/// `total_ops > 0` alone is satisfied even when EVERY operation failed --
+/// exactly the trap that let `scenario_10_sustained_load` report "All
+/// sub-tests passed" on a 100%-error-rate run (see that scenario's
+/// `validate_workload_progress` doc for the full incident). `background_txids`
+/// (read by 13.5 and 13.6) is populated exclusively from successful creates,
+/// so it silently stays empty whenever creates never succeed -- which makes
+/// 13.5's `for txid in &background_txids` loop iterate zero times and its
+/// `count_accessible` call run over an empty slice, so `misrouted` stays 0
+/// and the assertion passes having verified nothing. `creates_ok > 0` here
+/// is what rules that out.
+///
+/// Spends are deliberately excluded: this workload spends with a random,
+/// intentionally-wrong `utxo_hash` purely to generate load (see the comment
+/// at the spend call site), so a near-100% spend failure rate is the
+/// expected, healthy outcome, not a health signal.
+fn validate_workload_progress(
+    total_ops: u64,
+    creates_ok: u64,
+    creates_err: u64,
+    reads_ok: u64,
+) -> Result<(), String> {
+    if total_ops == 0 {
+        return Err(
+            "zero operations were attempted during the migration window -- the \
+             checks below have nothing to check and cannot be trusted as a pass"
+                .to_string(),
+        );
+    }
+    if creates_ok == 0 {
+        return Err(format!(
+            "zero successful creates ({creates_err} errors) during migration -- \
+             background_txids is empty, so 13.5's misrouted-record check and \
+             13.6's write-loss check would vacuously pass with nothing to verify"
+        ));
+    }
+    if reads_ok == 0 {
+        return Err("zero successful reads during migration".to_string());
+    }
+    let creates_attempted = creates_ok + creates_err;
+    let creates_error_rate = (creates_err as f64 / creates_attempted as f64) * 100.0;
+    if creates_error_rate >= CREATE_ERROR_RATE_THRESHOLD_PCT {
+        return Err(format!(
+            "create error rate {creates_error_rate:.1}% ({creates_err}/{creates_attempted}) \
+             during migration exceeds {CREATE_ERROR_RATE_THRESHOLD_PCT}% threshold"
+        ));
+    }
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn scenario_13_data_migration_under_load() {
     let result = tokio::time::timeout(Duration::from_secs(600), run_scenario()).await;
@@ -263,10 +331,12 @@ async fn run_scenario() -> Result<(), ClientError> {
 
     // -- 13.3: Verify writes to migrating shards succeeded (proxied) --
     eprintln!("[13.3] Verifying writes during migration succeeded");
-    assert!(
-        total_ops > 0,
-        "Background workload should have executed operations"
-    );
+    // `total_ops > 0` alone would pass even if every single operation
+    // failed -- see `validate_workload_progress` for why that's not enough
+    // to trust the checks below.
+    if let Err(msg) = validate_workload_progress(total_ops, creates_ok, creates_err, reads_ok) {
+        panic!("13.3: {msg}");
+    }
     // Non-migrating shards should be unaffected, and migrating shards
     // should proxy writes. Verify that background creates are readable.
     eprintln!(
@@ -468,4 +538,87 @@ async fn run_scenario() -> Result<(), ClientError> {
 
     tlog!(t0, "=== SCENARIO COMPLETE ===");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_workload_progress_rejects_zero_total_ops() {
+        let err = validate_workload_progress(0, 0, 0, 0).unwrap_err();
+        assert!(
+            err.contains("zero operations were attempted"),
+            "unexpected message: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_workload_progress_rejects_all_creates_failing() {
+        // Mirrors the scenario_10 nightly-outage shape: every op attempted,
+        // none succeeded. `total_ops > 0` alone (the old check) would have
+        // passed here.
+        let err = validate_workload_progress(1000, 0, 400, 0).unwrap_err();
+        assert!(
+            err.contains("zero successful creates"),
+            "unexpected message: {err}"
+        );
+        assert!(err.contains("400 errors"), "unexpected message: {err}");
+    }
+
+    #[test]
+    fn validate_workload_progress_rejects_zero_reads_even_with_creates() {
+        let err = validate_workload_progress(1000, 400, 0, 0).unwrap_err();
+        assert!(
+            err.contains("zero successful reads"),
+            "unexpected message: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_workload_progress_rejects_create_error_rate_at_threshold() {
+        // 5/100 = 5.0% exactly -- the ceiling is inclusive-of-failure (>=),
+        // so this must be rejected, not waved through.
+        let err = validate_workload_progress(1000, 95, 5, 100).unwrap_err();
+        assert!(
+            err.contains("create error rate 5.0%"),
+            "unexpected message: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_workload_progress_accepts_just_under_the_create_error_threshold() {
+        // 4/100 = 4.0%, under the 5.0% ceiling.
+        let result = validate_workload_progress(1000, 96, 4, 100);
+        assert!(
+            result.is_ok(),
+            "expected pass just under threshold: {result:?}"
+        );
+    }
+
+    #[test]
+    fn validate_workload_progress_accepts_a_healthy_migration_run() {
+        // Representative of a real run: thousands of attempted ops, a low
+        // single-digit create error rate from transient migration-window
+        // handoffs, and plenty of successful reads.
+        let result = validate_workload_progress(
+            60_000, // total_ops (creates + reads + spends attempted)
+            23_000, // creates_ok
+            300,    // creates_err (~1.3%)
+            17_000, // reads_ok
+        );
+        assert!(result.is_ok(), "expected healthy run to pass: {result:?}");
+    }
+
+    /// Exercises the exact `if let Err(msg) = ... { panic!("13.3: {msg}") }`
+    /// shape used at the real call site in `run_scenario`, so this test
+    /// watches the panic path itself fire rather than just checking the
+    /// `Result` plumbing.
+    #[test]
+    #[should_panic(expected = "13.3: zero successful creates (400 errors)")]
+    fn total_outage_evidence_panics_like_the_real_call_site() {
+        if let Err(msg) = validate_workload_progress(1000, 0, 400, 0) {
+            panic!("13.3: {msg}");
+        }
+    }
 }
