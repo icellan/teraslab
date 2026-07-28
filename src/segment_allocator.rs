@@ -1292,9 +1292,10 @@ impl SegmentAllocator {
 }
 
 /// Map a segment-allocator error into the common [`crate::allocator::AllocatorError`]
-/// used by the [`RecordAllocator`] trait. Only the variants reachable from the
-/// trait's `Result`-returning methods (allocate/free/persist/reserve) need a
-/// precise mapping; constructor-only variants fall back to `CorruptedHeader`.
+/// used by the [`RecordAllocator`] trait. Every variant maps precisely —
+/// including constructor-only ones like `InvalidSegmentSize`, which surfaces
+/// as its own config-error variant (never `CorruptedHeader`, which would
+/// misreport a config mistake as on-disk corruption).
 impl From<SegmentAllocatorError> for crate::allocator::AllocatorError {
     fn from(e: SegmentAllocatorError) -> Self {
         use crate::allocator::AllocatorError as A;
@@ -1314,8 +1315,16 @@ impl From<SegmentAllocatorError> for crate::allocator::AllocatorError {
             SegmentAllocatorError::SegmentTableOverflow { entries, max } => {
                 A::FreelistOverflow { entries, max }
             }
-            SegmentAllocatorError::InvalidSegmentSize { .. }
-            | SegmentAllocatorError::CorruptedHeader(_) => A::CorruptedHeader,
+            SegmentAllocatorError::InvalidSegmentSize {
+                segment_size,
+                alignment,
+                data_capacity,
+            } => A::InvalidSegmentSize {
+                segment_size,
+                alignment,
+                data_capacity,
+            },
+            SegmentAllocatorError::CorruptedHeader(_) => A::CorruptedHeader,
         }
     }
 }
@@ -1524,6 +1533,31 @@ mod tests {
             e,
             SegmentAllocatorError::InvalidSegmentSize { .. }
         ));
+    }
+
+    #[test]
+    fn invalid_segment_size_maps_to_its_own_allocator_error() {
+        // Regression: InvalidSegmentSize was collapsed into
+        // AllocatorError::CorruptedHeader ("corrupted freelist header"),
+        // reporting a CONFIG mistake as on-disk corruption and sending
+        // diagnosis down the wipe/restore path.
+        let e = SegmentAllocator::new(dev(64), 0).unwrap_err();
+        let mapped = crate::allocator::AllocatorError::from(e);
+        match &mapped {
+            crate::allocator::AllocatorError::InvalidSegmentSize { segment_size, .. } => {
+                assert_eq!(*segment_size, 0);
+            }
+            other => panic!("expected InvalidSegmentSize, got {other:?}"),
+        }
+        let msg = mapped.to_string();
+        assert!(
+            msg.contains("segment_size"),
+            "display must name segment_size: {msg}"
+        );
+        assert!(
+            !msg.contains("corrupted freelist"),
+            "display must not claim corruption: {msg}"
+        );
     }
 
     #[test]

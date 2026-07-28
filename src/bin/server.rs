@@ -16,6 +16,7 @@ use std::sync::atomic::{AtomicBool, AtomicU8};
 
 use parking_lot::Mutex;
 
+use teraslab::allocator::AllocatorError;
 use teraslab::config::IndexBackendMode;
 use teraslab::config::ServerConfig;
 use teraslab::device::{BlockDevice, DirectDevice};
@@ -747,14 +748,23 @@ fn main() {
     ) {
         Ok(pair) => pair,
         Err(e) => {
-            tracing::error!(
-                err = %e,
-                "FATAL: allocator header unusable — refusing to start with a \
-                 fresh allocator over a device that may hold live records \
-                 (creates would overwrite them). Inspect the device header, \
-                 restore from a replica, or wipe the device explicitly before \
-                 restarting",
-            );
+            if matches!(e, AllocatorError::InvalidSegmentSize { .. }) {
+                tracing::error!(
+                    err = %e,
+                    "FATAL: [storage] segment_size is invalid for this device — \
+                     refusing to start. This is a CONFIG error, not device \
+                     corruption: fix [storage] segment_size and restart.",
+                );
+            } else {
+                tracing::error!(
+                    err = %e,
+                    "FATAL: allocator header unusable — refusing to start with a \
+                     fresh allocator over a device that may hold live records \
+                     (creates would overwrite them). Inspect the device header, \
+                     restore from a replica, or wipe the device explicitly before \
+                     restarting",
+                );
+            }
             std::process::exit(1);
         }
     };
@@ -826,12 +836,22 @@ fn main() {
         ) {
             Ok(pair) => pair,
             Err(e) => {
-                tracing::error!(
-                    store = i,
-                    err = %e,
-                    "FATAL: store allocator header unusable — refusing to start (creates \
-                     could overwrite live records). Inspect/restore the store device.",
-                );
+                if matches!(e, AllocatorError::InvalidSegmentSize { .. }) {
+                    tracing::error!(
+                        store = i,
+                        err = %e,
+                        "FATAL: [storage] segment_size is invalid for this store's \
+                         device — refusing to start. This is a CONFIG error, not \
+                         device corruption: fix [storage] segment_size and restart.",
+                    );
+                } else {
+                    tracing::error!(
+                        store = i,
+                        err = %e,
+                        "FATAL: store allocator header unusable — refusing to start (creates \
+                         could overwrite live records). Inspect/restore the store device.",
+                    );
+                }
                 std::process::exit(1);
             }
         };
