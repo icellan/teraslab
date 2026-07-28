@@ -29,6 +29,39 @@ fn txid_hex(txid: &[u8; 32]) -> String {
         .collect::<String>()
 }
 
+/// Error-rate ceiling for 8c.2 (60s workload under 200ms latency + 5%
+/// packet loss injected on all 3 nodes).
+///
+/// This is a **catastrophe detector, not an SLO**. Under injected chaos a
+/// correct system legitimately errors a great deal -- 200ms of added
+/// latency plus 5% packet loss on every node degrades throughput and
+/// trips client-side timeouts/retries as designed behaviour, not a defect.
+/// A tight ceiling here would manufacture flakes, which is the same
+/// disease as a vacuous pass. This number exists only to catch total
+/// collapse: the 100%-failure shape that made scenario_10 pass vacuously
+/// (nightly run 30143215764 -- 0 creates ok, 50 err, "0 mismatches" only
+/// because there was nothing left to check). Tighten it only once real CI
+/// data shows the actual error-rate distribution under this exact chaos
+/// profile.
+///
+/// Not comparable to `scenario_10_sustained_load.rs`'s
+/// `CREATE_ERROR_RATE_THRESHOLD_PCT` (5%): that scenario runs with no
+/// concurrent chaos event at all, so a much tighter bound is a real signal
+/// there in a way it would not be here.
+const SLOW_NETWORK_ERROR_RATE_CEILING_PCT: f64 = 50.0;
+
+/// Error-rate ceiling for 8d.2 (30s workload during an active asymmetric
+/// partition: node1 <-> node3 traffic is dropped for the whole sub-test).
+///
+/// Same catastrophe-detector rationale as
+/// [`SLOW_NETWORK_ERROR_RATE_CEILING_PCT`] -- not an SLO. Set higher than
+/// 8c.2's because the condition is more severe: with one of three node
+/// pairs actively unreachable for the entire sub-test, a large error
+/// fraction (requests routed toward the unreachable side) is expected
+/// behaviour, not a defect. Exists only to catch total collapse; tighten
+/// only once real CI data shows the actual distribution.
+const ASYMMETRIC_PARTITION_ERROR_RATE_CEILING_PCT: f64 = 80.0;
+
 /// Validates that a sustained workload (8c.2's degraded-network workload,
 /// 8d.2's asymmetric-partition workload) actually created some records,
 /// rather than every single attempt failing while downstream checks over
@@ -37,10 +70,20 @@ fn txid_hex(txid: &[u8; 32]) -> String {
 /// `scenario_10_sustained_load.rs`, where a total outage produced "0
 /// mismatches" only because there was nothing left to check. `label`
 /// identifies the calling sub-test in the error message (e.g. "8c.2").
+///
+/// Also enforces `error_rate_ceiling_pct` as a catastrophe-detector ceiling
+/// (see [`SLOW_NETWORK_ERROR_RATE_CEILING_PCT`] and
+/// [`ASYMMETRIC_PARTITION_ERROR_RATE_CEILING_PCT`] for the "why this
+/// number, and why it is not an SLO" reasoning) -- distinct from the
+/// zero-records-created check above, which only catches a pure create
+/// wipeout; this catches a broader collapse across reads and creates
+/// combined.
 fn validate_workload_made_progress(
     label: &str,
     total_ops: u32,
+    total_errors: u32,
     records_created: usize,
+    error_rate_ceiling_pct: f64,
 ) -> Result<(), String> {
     if total_ops == 0 {
         return Err(format!("{label}: zero operations were attempted"));
@@ -50,6 +93,14 @@ fn validate_workload_made_progress(
             "{label}: zero records were created ({total_ops} ops attempted, all failed) -- \
              the downstream read-back/consistency checks over this workload's records would \
              have nothing to check and cannot be trusted as a pass"
+        ));
+    }
+    let error_rate_pct = (f64::from(total_errors) / f64::from(total_ops)) * 100.0;
+    if error_rate_pct >= error_rate_ceiling_pct {
+        return Err(format!(
+            "{label}: error rate {error_rate_pct:.1}% ({total_errors}/{total_ops}) is at or \
+             above the {error_rate_ceiling_pct:.0}% catastrophe-detector ceiling -- this is not \
+             an SLO, it exists only to catch total collapse under injected chaos"
         ));
     }
     Ok(())
@@ -663,7 +714,13 @@ async fn run_scenario() -> Result<(), ClientError> {
             slow_txids.len()
         );
         eprintln!("[8c.2] {}", reporter.format_summary());
-        if let Err(msg) = validate_workload_made_progress("8c.2", total_ops, slow_txids.len()) {
+        if let Err(msg) = validate_workload_made_progress(
+            "8c.2",
+            total_ops,
+            slow_errors,
+            slow_txids.len(),
+            SLOW_NETWORK_ERROR_RATE_CEILING_PCT,
+        ) {
             panic!("{msg}");
         }
 
@@ -850,8 +907,13 @@ async fn run_scenario() -> Result<(), ClientError> {
             partition_txids.len()
         );
         eprintln!("[8d.2] {}", reporter.format_summary());
-        if let Err(msg) = validate_workload_made_progress("8d.2", total_ops, partition_txids.len())
-        {
+        if let Err(msg) = validate_workload_made_progress(
+            "8d.2",
+            total_ops,
+            errors,
+            partition_txids.len(),
+            ASYMMETRIC_PARTITION_ERROR_RATE_CEILING_PCT,
+        ) {
             panic!("{msg}");
         }
 
@@ -945,7 +1007,9 @@ mod tests {
 
     #[test]
     fn validate_workload_made_progress_rejects_zero_ops() {
-        let err = validate_workload_made_progress("8c.2", 0, 0).unwrap_err();
+        let err =
+            validate_workload_made_progress("8c.2", 0, 0, 0, SLOW_NETWORK_ERROR_RATE_CEILING_PCT)
+                .unwrap_err();
         assert!(
             err.contains("zero operations were attempted"),
             "unexpected message: {err}"
@@ -957,7 +1021,14 @@ mod tests {
         // Every attempted op failed: the exact scenario_10-class failure --
         // downstream checks over an empty records-created list would
         // otherwise pass vacuously.
-        let err = validate_workload_made_progress("8c.2", 180, 0).unwrap_err();
+        let err = validate_workload_made_progress(
+            "8c.2",
+            180,
+            180,
+            0,
+            SLOW_NETWORK_ERROR_RATE_CEILING_PCT,
+        )
+        .unwrap_err();
         assert!(
             err.contains("zero records were created"),
             "unexpected message: {err}"
@@ -970,7 +1041,13 @@ mod tests {
 
     #[test]
     fn validate_workload_made_progress_accepts_a_healthy_run() {
-        let result = validate_workload_made_progress("8d.2", 1500, 300);
+        let result = validate_workload_made_progress(
+            "8d.2",
+            1500,
+            10,
+            300,
+            ASYMMETRIC_PARTITION_ERROR_RATE_CEILING_PCT,
+        );
         assert!(result.is_ok(), "expected healthy run to pass: {result:?}");
     }
 
@@ -979,7 +1056,102 @@ mod tests {
     #[test]
     #[should_panic(expected = "8c.2: zero records were created (180 ops attempted, all failed)")]
     fn total_outage_panics_like_the_real_call_site() {
-        if let Err(msg) = validate_workload_made_progress("8c.2", 180, 0) {
+        if let Err(msg) = validate_workload_made_progress(
+            "8c.2",
+            180,
+            180,
+            0,
+            SLOW_NETWORK_ERROR_RATE_CEILING_PCT,
+        ) {
+            panic!("{msg}");
+        }
+    }
+
+    #[test]
+    fn validate_workload_made_progress_accepts_just_under_the_8c2_ceiling() {
+        // 49.9% errors: below the 50% 8c.2 ceiling.
+        let result = validate_workload_made_progress(
+            "8c.2",
+            1000,
+            499,
+            501,
+            SLOW_NETWORK_ERROR_RATE_CEILING_PCT,
+        );
+        assert!(
+            result.is_ok(),
+            "expected a sub-ceiling run to pass: {result:?}"
+        );
+    }
+
+    #[test]
+    fn validate_workload_made_progress_rejects_at_the_8c2_ceiling() {
+        // Exactly 50% errors: the ceiling is inclusive ("at or above").
+        let err = validate_workload_made_progress(
+            "8c.2",
+            1000,
+            500,
+            500,
+            SLOW_NETWORK_ERROR_RATE_CEILING_PCT,
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("error rate 50.0%"),
+            "unexpected message: {err}"
+        );
+        assert!(
+            err.contains("catastrophe-detector ceiling"),
+            "unexpected message: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_workload_made_progress_accepts_just_under_the_8d2_ceiling() {
+        // 79.9% errors: below the 80% 8d.2 ceiling (an active partition is
+        // expected to produce a much higher error rate than 8c.2's).
+        let result = validate_workload_made_progress(
+            "8d.2",
+            1000,
+            799,
+            201,
+            ASYMMETRIC_PARTITION_ERROR_RATE_CEILING_PCT,
+        );
+        assert!(
+            result.is_ok(),
+            "expected a sub-ceiling run to pass: {result:?}"
+        );
+    }
+
+    #[test]
+    fn validate_workload_made_progress_rejects_at_the_8d2_ceiling() {
+        // Exactly 80% errors: the ceiling is inclusive ("at or above").
+        let err = validate_workload_made_progress(
+            "8d.2",
+            1000,
+            800,
+            200,
+            ASYMMETRIC_PARTITION_ERROR_RATE_CEILING_PCT,
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("error rate 80.0%"),
+            "unexpected message: {err}"
+        );
+    }
+
+    /// Exercises the exact `if let Err(msg) = ... { panic!("{msg}") }` shape
+    /// used at both real call sites, with the actual catastrophe shape this
+    /// ceiling exists to catch: near-total failure under injected chaos.
+    #[test]
+    #[should_panic(expected = "8d.2: error rate 95.0% (950/1000) is at or above the 80% \
+                                catastrophe-detector ceiling")]
+    fn near_total_collapse_panics_like_the_real_call_site() {
+        if let Err(msg) = validate_workload_made_progress(
+            "8d.2",
+            1000,
+            950,
+            50,
+            ASYMMETRIC_PARTITION_ERROR_RATE_CEILING_PCT,
+        ) {
             panic!("{msg}");
         }
     }
