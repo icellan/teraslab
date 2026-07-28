@@ -110,6 +110,28 @@ fn make_test_create_item() -> CreateItem {
     }
 }
 
+/// Validates that Test 12.4 actually observed a migration active before it
+/// killed node2.
+///
+/// Test 12.4 exists to test killing a node WHILE a migration is in flight.
+/// A fixed sleep before the kill can't guarantee that: for a 10k-record
+/// scenario the migration to node4 can complete in under a second, so the
+/// kill would land after migration already finished and the intended race
+/// would never be exercised, while the sub-test would still report
+/// success. Failing here when no migration was ever observed active turns
+/// that silent no-op into a visible test failure -- it means the race
+/// could not be set up and the sub-test verified nothing.
+fn validate_migration_was_active(seen_active: bool, waited: Duration) -> Result<(), String> {
+    if !seen_active {
+        return Err(format!(
+            "12.4: no migration was ever observed active ({waited:?} elapsed) after adding \
+             node4 -- the kill-during-migration race could not be set up and this sub-test \
+             would have verified nothing"
+        ));
+    }
+    Ok(())
+}
+
 // =========================================================================
 // Test 12.1: Kill 2 out of 3 nodes simultaneously
 // =========================================================================
@@ -445,9 +467,46 @@ async fn test_kill_during_migration() -> Result<(), ClientError> {
     let mut docker_5 = common::docker_5node(SID);
     docker_5.compose_up_nodes(&["node4"]).await?;
 
-    // Wait just for node4 to join (cluster_size may not be stable yet)
-    eprintln!("[12.4] Waiting for node4 to be recognized");
-    tokio::time::sleep(Duration::from_secs(1)).await;
+    // Wait for a migration to actually be in flight before killing node2.
+    // A fixed sleep here can't guarantee the race this sub-test exists to
+    // exercise: for a 10k-record scenario the migration to node4 can
+    // complete in under a second, so the kill would land after migration
+    // already finished, and the intended kill-during-migration race would
+    // never be exercised even though the sub-test still reports success.
+    // Poll `active_migrations` (also surfaced via /admin/migration_status)
+    // on every node instead.
+    eprintln!("[12.4] Waiting for a migration to actually be in flight");
+    let migration_active_timeout = Duration::from_secs(30);
+    let migration_active_start = std::time::Instant::now();
+    let mut migration_seen_active = false;
+    loop {
+        let mut any_active = false;
+        for node_num in 1..=4u32 {
+            if let Ok(status) = common::http_status(&docker_5, node_num).await
+                && status["active_migrations"].as_u64().unwrap_or(0) > 0
+            {
+                any_active = true;
+                break;
+            }
+        }
+        if any_active {
+            migration_seen_active = true;
+            eprintln!(
+                "[12.4] Migration confirmed in flight after {:?}",
+                migration_active_start.elapsed()
+            );
+            break;
+        }
+        if migration_active_start.elapsed() >= migration_active_timeout {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    if let Err(msg) =
+        validate_migration_was_active(migration_seen_active, migration_active_start.elapsed())
+    {
+        return Err(ClientError::Connection(msg));
+    }
 
     // Kill node2 during migration
     eprintln!("[12.4] Killing node2 during migration");
@@ -690,4 +749,53 @@ async fn test_rolling_restart_plus_partition() -> Result<(), ClientError> {
     eprintln!("[12.5] PASSED");
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_migration_was_active_rejects_never_observed_active() {
+        // The exact vacuous-race shape this guard exists for: the poll loop
+        // exhausted its timeout without ever seeing active_migrations > 0
+        // on any node, but the old code just slept a fixed 1s and killed
+        // node2 regardless.
+        let err = validate_migration_was_active(false, Duration::from_secs(30)).unwrap_err();
+        assert!(
+            err.contains("no migration was ever observed active"),
+            "err was: {err}"
+        );
+        assert!(err.contains("12.4"), "err was: {err}");
+    }
+
+    #[test]
+    fn validate_migration_was_active_accepts_when_observed() {
+        let result = validate_migration_was_active(true, Duration::from_millis(120));
+        assert!(
+            result.is_ok(),
+            "expected an observed-active migration to pass: {result:?}"
+        );
+    }
+
+    /// Exercises the exact `if let Err(msg) = ... { return Err(...) }` shape
+    /// used at the real call site.
+    #[test]
+    fn never_active_produces_a_connection_error_like_the_real_call_site() {
+        let result: Result<(), ClientError> =
+            match validate_migration_was_active(false, Duration::from_secs(30)) {
+                Err(msg) => Err(ClientError::Connection(msg)),
+                Ok(()) => Ok(()),
+            };
+        let err = result.unwrap_err();
+        match err {
+            ClientError::Connection(msg) => {
+                assert!(
+                    msg.contains("no migration was ever observed active"),
+                    "unexpected message: {msg}"
+                );
+            }
+            other => panic!("expected ClientError::Connection, got {other:?}"),
+        }
+    }
 }
