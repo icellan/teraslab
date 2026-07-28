@@ -582,6 +582,34 @@ enum RemovalAuthority {
     HeldCopy,
 }
 
+/// What a master's preservation expiry produced (R1).
+///
+/// Returned by [`Engine::expire_preservation_set_dah`] so the pruner can ship
+/// the transition to the record's other holders as
+/// [`crate::replication::protocol::ReplicaOp::ExpirePreservation`] and, if that
+/// fan-out fails, restore the preservation it replaced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PreservationExpiry {
+    /// The deletion height the master scheduled, or 0 when the record was not
+    /// sweep-eligible (preservation cleared, nothing scheduled). Replicated
+    /// VERBATIM — holders must not re-derive it.
+    pub delete_at_height: u32,
+    /// The record's generation AFTER the expiry, i.e. the `master_generation`
+    /// the replicated op carries.
+    pub generation: u32,
+    /// The `preserve_until` this transition replaced. A replication-failure
+    /// compensation restores it, which — because a preserved record carries no
+    /// DAH — is an exact inverse of the transition.
+    pub prior_preserve_until: u32,
+    /// Redo sequence range the WAL-first `ExpirePreservation` entry landed in,
+    /// or `None` when no redo log is attached (test / unconfigured paths).
+    ///
+    /// The pruner folds these into ONE window and opens a replication intent
+    /// over it, so a crash mid-fan-out re-ships the transition on the next boot
+    /// instead of leaving this holder expired and the others preserved.
+    pub redo_range: Option<(u64, u64)>,
+}
+
 impl Engine {
     fn external_ref_for_create(req: &CreateRequest) -> Result<Option<ExternalRef>, CreateError> {
         if !req.is_external {
@@ -2339,16 +2367,32 @@ impl Engine {
         log: &Arc<parking_lot::Mutex<crate::redo::RedoLog>>,
         ops: &[crate::redo::RedoOp],
     ) -> Result<(), SpendError> {
+        self.journal_secondary_ops_ranged(log, ops).map(|_| ())
+    }
+
+    /// [`Self::journal_secondary_ops`], additionally reporting the redo
+    /// sequence range the entries landed in (`None` when nothing was written).
+    ///
+    /// R1: the preservation-expiry path needs the range to open a replication
+    /// intent over the entries it just journalled. It cannot use the usual
+    /// `write_replicated_redo_ops` (journal-then-apply) shape, because the
+    /// value the entry carries — the scheduled `delete_at_height` — is only
+    /// known after the under-lock eligibility verdict.
+    fn journal_secondary_ops_ranged(
+        &self,
+        log: &Arc<parking_lot::Mutex<crate::redo::RedoLog>>,
+        ops: &[crate::redo::RedoOp],
+    ) -> Result<Option<(u64, u64)>, SpendError> {
         if ops.is_empty() {
-            return Ok(());
+            return Ok(None);
         }
         let mut guard = log.lock();
         let result = if self.redo_buffered() {
             // Append-only; durability deferred to the background flusher.
-            guard.append_atomic(ops).map(|_| ())
+            guard.append_atomic(ops)
         } else {
             // Strict: fsync the intent before returning.
-            guard.append_batch_and_flush(ops).map(|_| ())
+            guard.append_batch_and_flush(ops).map(Some)
         };
         result.map_err(|e| match e {
             // Transient full log: do NOT poison — the checkpoint reclaims space
@@ -8832,8 +8876,20 @@ impl Engine {
     /// if the re-read `preserve_until` is 0 or still in the future, this is a
     /// no-op and returns `Ok(false)`.
     ///
-    /// Returns `Ok(true)` if the preservation was EXPIRED (i.e. `preserve_until`
-    /// cleared) — whether or not a DAH was scheduled — and `Ok(false)` if the
+    /// R1: this is a MASTER-side entry point. The resulting state is shipped to
+    /// the record's other holders as
+    /// [`crate::replication::protocol::ReplicaOp::ExpirePreservation`], which
+    /// they apply through [`Self::apply_replicated_preservation_expiry`]. The
+    /// eligibility verdict is taken ONCE, here, and the resulting
+    /// `delete_at_height` travels as a value — a replica re-deriving it from
+    /// its own (replication-lagged) `MinedIndex` could reach the opposite
+    /// verdict and diverge on a field the cross-holder consistency oracle
+    /// compares byte-for-byte.
+    ///
+    /// Returns `Ok(Some(_))` with the resulting `delete_at_height`, the record's
+    /// new `generation`, and the `preserve_until` this replaced (the value a
+    /// replication-failure compensation restores) if the preservation was
+    /// EXPIRED — whether or not a DAH was scheduled — and `Ok(None)` if the
     /// record no longer qualifies (preserve cleared, pushed forward, or gone).
     ///
     /// # Errors
@@ -8846,9 +8902,9 @@ impl Engine {
         key: &TxKey,
         current_block_height: u32,
         block_height_retention: u32,
-    ) -> Result<bool, SpendError> {
+    ) -> Result<Option<PreservationExpiry>, SpendError> {
         if block_height_retention == 0 {
-            return Ok(false);
+            return Ok(None);
         }
         let _guard = self.locks.lock(key);
         // G-4: a backend read error must not collapse to "absent".
@@ -8859,19 +8915,19 @@ impl Engine {
                 detail: format!("index lookup failed: {e}"),
             })? {
             Some(e) => e,
-            None => return Ok(false),
+            None => return Ok(None),
         };
         let ro = entry.record_offset;
         let device_id = entry.device_id;
 
-        let mut meta = self.read_metadata_for_key(device_id, key, ro)?;
+        let meta = self.read_metadata_for_key(device_id, key, ro)?;
         let preserve = { meta.preserve_until };
         // Re-validate under the lock: only expire a preservation that is
         // genuinely set and genuinely due. A `preserve_until` that was
         // cleared or pushed past `current_block_height` since the scan must
         // be left untouched.
         if preserve == 0 || preserve > current_block_height {
-            return Ok(false);
+            return Ok(None);
         }
 
         // Only SCHEDULE deletion (set a DAH) when the record is actually
@@ -8915,66 +8971,136 @@ impl Engine {
             0
         };
 
-        // While `preserve_until` is set the record carries no DAH index entry
-        // (see `preserve_until`, which removes any prior DAH entry), so there
-        // is no stale entry to remove here — the transition is 0 → new_dah
-        // (and new_dah is 0 for a non-eligible record, i.e. no DAH at all).
+        let (generation, redo_range) =
+            self.commit_preservation_expiry(key, &entry, meta, new_dah)?;
+        Ok(Some(PreservationExpiry {
+            delete_at_height: new_dah,
+            generation,
+            prior_preserve_until: preserve,
+            redo_range,
+        }))
+    }
+
+    /// Apply a master's preservation-expiry transition on a holder that is NOT
+    /// the record's master (R1).
+    ///
+    /// The receiver's apply for
+    /// [`crate::replication::protocol::ReplicaOp::ExpirePreservation`]. Clears
+    /// `preserve_until` and sets `delete_at_height` to the height the MASTER
+    /// scheduled, so both holders converge on one deletion schedule and one
+    /// footer image (the cross-holder consistency oracle byte-compares the
+    /// whole `FIELD_ALL` payload, masking only `updated_at`).
+    ///
+    /// Deliberately does NOT re-derive eligibility and does NOT re-validate
+    /// that a preservation is still set:
+    ///
+    /// * Re-deriving would read this node's own `MinedIndex`, which lags under
+    ///   replication delay — two holders could reach opposite verdicts and
+    ///   plant different DAHs. The master's verdict is the only one taken.
+    /// * Re-validating `preserve_until != 0` would make the apply a no-op
+    ///   exactly where it is most needed: a holder whose preservation was
+    ///   already cleared by some other route would keep a stale (or absent)
+    ///   DAH and never converge. The write is unconditional and therefore
+    ///   idempotent — applying it twice reaches the same state.
+    ///
+    /// Ordering against a NEWER preservation is not this method's job: the
+    /// receiver's pre-apply generation guard drops an op whose
+    /// `master_generation` is behind the record's local generation, which is
+    /// the same protection every other lifecycle op relies on.
+    ///
+    /// # Errors
+    ///
+    /// [`SpendError::TxNotFound`] if the record is absent on this node (the
+    /// receiver turns that into a `MissingRecord` NAK so the master re-ships
+    /// the record), and [`SpendError::StorageError`] on device / index
+    /// failures.
+    pub fn apply_replicated_preservation_expiry(
+        &self,
+        key: &TxKey,
+        delete_at_height: u32,
+    ) -> Result<(), SpendError> {
+        let _guard = self.locks.lock(key);
+        let entry = self
+            .index
+            .lookup_checked(key)
+            .map_err(|e| SpendError::StorageError {
+                detail: format!("index lookup failed: {e}"),
+            })?
+            .ok_or(SpendError::TxNotFound)?;
+        let meta = self.read_metadata_for_key(entry.device_id, key, entry.record_offset)?;
+        self.commit_preservation_expiry(key, &entry, meta, delete_at_height)?;
+        Ok(())
+    }
+
+    /// The preservation-expiry footer write + secondary maintenance, shared by
+    /// the master ([`Self::expire_preservation_set_dah`]) and the replica
+    /// ([`Self::apply_replicated_preservation_expiry`]) so both holders journal
+    /// and index the transition IDENTICALLY — the property that makes their
+    /// crash-recovery behaviour symmetric rather than merely similar.
+    ///
+    /// Caller must hold the key's stripe lock and pass freshly-read `meta`.
+    /// Returns the record's new `generation` and the redo sequence range its
+    /// WAL-first `ExpirePreservation` entry occupies.
+    fn commit_preservation_expiry(
+        &self,
+        key: &TxKey,
+        entry: &TxIndexEntry,
+        mut meta: TxMetadata,
+        new_dah: u32,
+    ) -> Result<(u32, Option<(u64, u64)>), SpendError> {
+        let old_preserve = { meta.preserve_until };
+        // On the master this is always 0 — `preserve_until` and
+        // `delete_at_height` are mutually exclusive, and the SET path evicts any
+        // prior DAH. Read it rather than assuming it so the replica path (where
+        // the preservation may already have been cleared by another route) still
+        // transitions the DAH index from its ACTUAL previous entry instead of
+        // leaking a stale one.
+        let old_dah = { meta.delete_at_height };
+
         meta.preserve_until = 0;
         meta.delete_at_height = new_dah;
         meta.generation = { meta.generation }.wrapping_add(1);
         meta.updated_at = self.now_millis();
 
-        // FU#7-D WAL-first ordering for the NON-ELIGIBLE branch: journal the
-        // `PreserveUntil { block_height: 0 }` CLEAR redo BEFORE the footer write,
-        // not after it. A transient `LogFull` (mapped to `StorageError`, no
-        // poison) then aborts the whole op with NO device change — the footer
-        // stays `preserve_until != 0`, correct and retried by the next scan
-        // once the checkpoint reclaims log space. A crash between the journal
-        // and the footer write is also safe: recovery replays
-        // `PreserveUntil { 0 }`, which completes the clear. Journaling AFTER the
-        // footer write (the pre-fix order) left a window where the footer was
-        // already cleared but a `LogFull` dropped the redo — a retry then saw
-        // `preserve == 0`, re-journaled nothing, so the record escaped
-        // `touched_keys` and a Touched boot re-exposed a stale `MINED_PRESERVED`
-        // until the next checkpoint.
+        // FU#7-D WAL-first ordering, now applied to BOTH branches: journal the
+        // whole transition BEFORE the footer write. A transient `LogFull`
+        // (mapped to `StorageError`, no poison) aborts the op with NO device
+        // change — the footer keeps `preserve_until != 0`, correct and retried
+        // by the next scan once the checkpoint reclaims log space. A crash
+        // between the journal and the footer write is also safe: recovery
+        // replays `ExpirePreservation`, which completes BOTH halves.
         //
-        // The ELIGIBLE branch deliberately keeps its footer-then-secondary
-        // ordering: `update_dah_index` emits its `SecondaryDahUpdate` AFTER the
-        // footer write because the redo carries a `delete_at_height` that must
-        // match the footer on replay — reordering it could plant a DAH the
-        // footer never committed. The non-eligible clear has no such coupling:
-        // it only marks the record for a footer re-read, which is idempotent
-        // regardless of which side committed first.
-        if new_dah == 0 {
-            // FU#7 Option B superset-invariant fix: an INELIGIBLE expiry emits no
-            // DAH transition, so — unlike the eligible branch's
-            // `SecondaryDahUpdate` below — nothing otherwise keys this record into
-            // the redo tail. Journal a `PreserveUntil` CLEAR keyed to this record
-            // so recovery's `touched_keys` includes it and a fast-boot Touched
-            // reconcile device-reads the footer (now `preserve_until == 0`),
-            // overriding the stale `MINED_PRESERVED` a v3 snapshot restored.
-            // Without this, an all-spent/unmined (or reorg-unmined / REASSIGNED)
-            // expired record keeps a stale-SET PRESERVED bit on a Touched boot; a
-            // later setMined then early-returns on `has_preserve` and never plants
-            // a DAH — an immortal, never-swept record (#25 class). Replaying
-            // `PreserveUntil { block_height: 0 }` is a no-op skip against the
-            // already-cleared footer (idempotent) and never re-inserts a DAH or a
-            // preserve entry. Journaled through `journal_secondary_ops` so it
-            // honors strict-vs-buffered durability and LogFull-no-poison, exactly
-            // like the eligible branch's intent; a no-op when no redo log is
-            // attached (test / unconfigured paths), matching `update_dah_index`.
-            if let Some(log) = self.redo_log_for_key(key) {
-                self.journal_secondary_ops(
-                    &log,
-                    &[crate::redo::RedoOp::PreserveUntil {
-                        tx_key: *key,
-                        block_height: 0,
-                    }],
-                )?;
-            }
-        }
+        // R1 replaced two partial entries with one whole one. The ineligible
+        // branch used to journal `PreserveUntil { block_height: 0 }`, which is
+        // correct only while the DAH is 0 — its replay forces
+        // `delete_at_height = 0`, so on the eligible branch it would ERASE the
+        // DAH just scheduled. The eligible branch therefore relied on
+        // `update_dah_index`'s `SecondaryDahUpdate` (below, after the footer
+        // write), which restores the index entry but not the footer, and left
+        // the preserve clear unjournalled. `ExpirePreservation` carries both
+        // fields, so one WAL-first entry covers both branches and both holders.
+        //
+        // It also keys the record into recovery's `touched_keys` (the FU#7
+        // Option B superset invariant): without an entry naming this key, a
+        // fast-boot Touched reconcile would not device-read the footer and a v3
+        // snapshot's stale `MINED_PRESERVED` bit would survive — after which a
+        // later setMined early-returns on `has_preserve` and never plants a DAH,
+        // the immortal-record (#25) class.
+        //
+        // A no-op when no redo log is attached (test / unconfigured paths),
+        // matching `update_dah_index`.
+        let redo_range = match self.redo_log_for_key(key) {
+            Some(log) => self.journal_secondary_ops_ranged(
+                &log,
+                &[crate::redo::RedoOp::ExpirePreservation {
+                    tx_key: *key,
+                    delete_at_height: new_dah,
+                }],
+            )?,
+            None => None,
+        };
 
-        self.write_metadata_fast(device_id, ro, &meta)?;
+        self.write_metadata_fast(entry.device_id, entry.record_offset, &meta)?;
         // followup-1 dual-write: the footer just cleared preserve_until, so
         // mirror PRESERVED = false into the DE-flag cache.
         self.mirror_de_flags(key, entry.mined_slot, &meta);
@@ -8982,12 +9108,12 @@ impl Engine {
         // index BEFORE inserting into DAH so a concurrent reader range-querying
         // both indexes sees the key in NEITHER transiently (never BOTH),
         // matching the order the SET path uses (remove-DAH then insert-preserve).
-        self.update_preserve_index(key, preserve, 0)?;
-        if new_dah != 0 {
-            self.update_dah_index(key, 0, new_dah)?;
-        }
+        self.update_preserve_index(key, old_preserve, 0)?;
+        // `update_dah_index` early-returns when old == new, so the ineligible
+        // branch (0 -> 0) costs nothing.
+        self.update_dah_index(key, old_dah, new_dah)?;
 
-        Ok(true)
+        Ok((meta.generation, redo_range))
     }
 
     /// Read spending data for a specific UTXO (point read, no lock needed).
@@ -13068,10 +13194,18 @@ mod tests {
             0,
         );
 
-        let expired = engine
+        let expiry = engine
             .expire_preservation_set_dah(&key, 6000, 288)
-            .expect("expire");
-        assert!(expired, "an eligible preserved record must expire");
+            .expect("expire")
+            .expect("an eligible preserved record must expire");
+        assert_eq!(
+            expiry.delete_at_height, 6288,
+            "an eligible expiry schedules current_height + retention",
+        );
+        assert_eq!(
+            expiry.prior_preserve_until, 5000,
+            "the outcome reports the preservation it replaced",
+        );
         assert_eq!(
             engine.mined_index().read_de_flags(&key, slot).unwrap() & MINED_PRESERVED,
             0,
@@ -14280,10 +14414,14 @@ mod tests {
                 .expect("v3 snapshot decodes");
 
         // Expire the due, NON-ELIGIBLE preservation.
-        let expired = engine
+        let expiry = engine
             .expire_preservation_set_dah(&key, 2000, 288)
-            .expect("expire");
-        assert!(expired, "the due preservation must be expired");
+            .expect("expire")
+            .expect("the due preservation must be expired");
+        assert_eq!(
+            expiry.delete_at_height, 0,
+            "a NON-ELIGIBLE expiry schedules no deletion",
+        );
         let post_meta = engine.read_metadata(&key).unwrap();
         assert_eq!(
             { post_meta.preserve_until },
@@ -27597,8 +27735,11 @@ mod tests {
         assert!(engine.dah_index().range_query(u32::MAX).is_empty());
 
         // Expire at height 5000 with retention 288 -> DAH = 5288.
-        let expired = engine.expire_preservation_set_dah(&key, 5000, 288).unwrap();
-        assert!(expired, "a due preservation must expire");
+        let expiry = engine
+            .expire_preservation_set_dah(&key, 5000, 288)
+            .unwrap()
+            .expect("a due preservation must expire");
+        assert_eq!(expiry.delete_at_height, 5288, "DAH = 5000 + 288");
 
         // Out of the preserve index, into the DAH index.
         assert!(
@@ -27607,6 +27748,116 @@ mod tests {
         );
         assert!(engine.dah_index().range_query(5287).is_empty());
         assert_eq!(engine.dah_index().range_query(5288), vec![key]);
+    }
+
+    /// **R1 — the holder-agreement invariant, at the engine level.**
+    ///
+    /// A master expires a preservation on a SWEEP-ELIGIBLE record; a holder
+    /// whose own copy is NOT eligible (not conflicting, not all-spent — exactly
+    /// the state a lagging `MinedIndex` / un-replayed spend produces) applies
+    /// the transition. The holder must end at the MASTER's `delete_at_height`,
+    /// not at the verdict it would have reached on its own.
+    ///
+    /// This is the property the whole design rests on. The repo's cross-holder
+    /// consistency oracle (`teraslab-tests/client/tests/common::payloads_match`)
+    /// byte-compares two holders' full `FIELD_ALL` payloads masking ONLY
+    /// `updated_at`; `delete_at_height` is compared. And
+    /// `restore_migrated_lifecycle` installs a heal source's DAH
+    /// unconditionally, so a holder carrying a different value can push it onto
+    /// the other holders. If the replica re-derived instead of taking the
+    /// shipped value, both of those break.
+    #[test]
+    fn replicated_expiry_lands_the_masters_dah_on_an_ineligible_holder() {
+        let master = create_engine();
+        let holder = create_engine();
+        let (_, req) = make_create_req(0xB1, 2);
+        let key = req.tx_key();
+
+        // Same record on both nodes. The MASTER's copy is CONFLICTING, which is
+        // the KO-2 sweep-eligibility branch; the HOLDER's is not, so its own
+        // eligibility verdict would be "ineligible → no DAH".
+        master.create(&req).unwrap();
+        holder.create(&req).unwrap();
+        master
+            .set_conflicting(&SetConflictingRequest {
+                tx_key: key,
+                value: true,
+                current_block_height: 1000,
+                block_height_retention: 288,
+            })
+            .unwrap();
+        for e in [&master, &holder] {
+            e.preserve_until(&PreserveUntilRequest {
+                tx_key: key,
+                block_height: 5000,
+            })
+            .unwrap();
+        }
+
+        let expiry = master
+            .expire_preservation_set_dah(&key, 5000, 288)
+            .unwrap()
+            .expect("the master's due preservation expires");
+        assert_eq!(expiry.delete_at_height, 5288, "master schedules 5000 + 288");
+
+        // Non-vacuity: left to itself the holder would schedule NOTHING, so a
+        // matching DAH below can only have come from the master's value.
+        let solo = holder
+            .expire_preservation_set_dah(&key, 5000, 288)
+            .unwrap()
+            .expect("the holder's preservation is due too");
+        assert_eq!(
+            solo.delete_at_height, 0,
+            "the holder's own verdict is INELIGIBLE — that is what makes this test meaningful",
+        );
+
+        // Now apply the master's transition, as the receiver does.
+        holder
+            .apply_replicated_preservation_expiry(&key, expiry.delete_at_height)
+            .expect("holder applies the replicated expiry");
+
+        let m = master.read_metadata(&key).unwrap();
+        let h = holder.read_metadata(&key).unwrap();
+        assert_eq!(
+            { h.delete_at_height },
+            { m.delete_at_height },
+            "holders must agree on delete_at_height after a replicated expiry",
+        );
+        assert_eq!({ h.delete_at_height }, 5288);
+        assert_eq!({ h.preserve_until }, 0);
+        assert_eq!({ m.preserve_until }, 0);
+        // Secondary indexes follow the footer on both sides.
+        assert_eq!(master.dah_index().range_query(5288), vec![key]);
+        assert_eq!(holder.dah_index().range_query(5288), vec![key]);
+        assert!(master.preserve_index().range_query(u32::MAX).is_empty());
+        assert!(holder.preserve_index().range_query(u32::MAX).is_empty());
+
+        // Idempotent: a re-delivery (duplicate batch / recovery re-ship) lands
+        // on the same state rather than disturbing it.
+        holder
+            .apply_replicated_preservation_expiry(&key, expiry.delete_at_height)
+            .expect("re-applying the same expiry is a no-op");
+        let h2 = holder.read_metadata(&key).unwrap();
+        assert_eq!({ h2.delete_at_height }, 5288);
+        assert_eq!({ h2.preserve_until }, 0);
+        assert_eq!(holder.dah_index().range_query(5288), vec![key]);
+    }
+
+    /// A replicated expiry for a record this node does not hold is a
+    /// `TxNotFound`, which the receiver turns into a `MissingRecord` NAK so the
+    /// master re-ships the record rather than silently dropping the transition.
+    #[test]
+    fn replicated_expiry_on_an_absent_record_reports_tx_not_found() {
+        let engine = create_engine();
+        let (_, req) = make_create_req(0xB2, 1);
+        let key = req.tx_key();
+        let err = engine
+            .apply_replicated_preservation_expiry(&key, 5288)
+            .expect_err("an absent record cannot be expired");
+        assert!(
+            matches!(err, SpendError::TxNotFound),
+            "expected TxNotFound so the receiver can NAK for repair, got {err:?}",
+        );
     }
 
     /// #25-followup (P1-A): expiry of a NON-eligible record (unspent outputs,
@@ -27628,8 +27879,14 @@ mod tests {
             .unwrap();
         assert_eq!(engine.preserve_index().range_query(5000), vec![key]);
 
-        let expired = engine.expire_preservation_set_dah(&key, 5000, 288).unwrap();
-        assert!(expired, "the preservation was due and must be cleared");
+        let expiry = engine
+            .expire_preservation_set_dah(&key, 5000, 288)
+            .unwrap()
+            .expect("the preservation was due and must be cleared");
+        assert_eq!(
+            expiry.delete_at_height, 0,
+            "an unspent record is not sweepable, so no DAH is scheduled",
+        );
 
         // preserve cleared on device + index...
         let meta = engine.read_metadata(&key).unwrap();

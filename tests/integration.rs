@@ -2295,8 +2295,14 @@ fn e2e_touched_and_full_boot_agree_on_de_cache_and_dah_incl_expired_preserved() 
 
     // Post-checkpoint redo TAIL (sequences > fence): P expires (non-eligible),
     // M is spent to all-spent (DAH planted). U is left untouched.
-    let expired = engine0.expire_preservation_set_dah(&p, 2000, 288).unwrap();
-    assert!(expired, "P's due preservation must expire");
+    let expiry = engine0
+        .expire_preservation_set_dah(&p, 2000, 288)
+        .unwrap()
+        .expect("P's due preservation must expire");
+    assert_eq!(
+        expiry.delete_at_height, 0,
+        "P is not sweep-eligible, so the expiry schedules no deletion",
+    );
     spend_utxo(&engine0, m, 2, 0);
 
     // Persist the allocator so both boots can recover it, then flush the tail.

@@ -2941,6 +2941,39 @@ fn replay_metadata_op(
             }
             ReplayResult::Applied
         }
+        RedoOp::ExpirePreservation {
+            tx_key,
+            delete_at_height,
+        } => {
+            // R1: replay BOTH halves of the expiry in one footer write. Unlike
+            // `PreserveUntil { block_height: 0 }` (which forces
+            // `delete_at_height = 0` and would erase the schedule), this entry
+            // carries the height the master scheduled and restores it verbatim,
+            // so a replayed master and a replayed replica reach the same footer.
+            let ie = match index.lookup(tx_key) {
+                Some(e) => e,
+                None => return ReplayResult::Failed(ReplayCause::MissingPrimary),
+            };
+            let mut meta = match io::read_metadata(device, ie.record_offset) {
+                Ok(m) => m,
+                Err(_) => return ReplayResult::Failed(ReplayCause::IoError),
+            };
+            // Value-equality idempotency, like `PreserveUntil` above: already in
+            // the target state means a prior replay (or the live apply that
+            // survived the crash) got there first. Ordering against a LATER
+            // mutation of the same record is the log's job — entries replay in
+            // sequence order, so a re-preserve journalled after this one wins.
+            if { meta.preserve_until } == 0 && { meta.delete_at_height } == *delete_at_height {
+                return ReplayResult::Skipped;
+            }
+            meta.preserve_until = 0;
+            meta.delete_at_height = *delete_at_height;
+            // R-013: propagate write failure.
+            if io::write_metadata(device, ie.record_offset, &meta).is_err() {
+                return ReplayResult::Failed(ReplayCause::IoError);
+            }
+            ReplayResult::Applied
+        }
         RedoOp::MarkOnLongestChain {
             tx_key,
             on_longest_chain,
@@ -8124,6 +8157,81 @@ mod tests {
         let meta = io::read_metadata(&*h.data_dev, ie.record_offset).unwrap();
         assert_eq!({ meta.preserve_until }, 5000);
         assert_eq!({ meta.delete_at_height }, 0);
+    }
+
+    /// R1: replaying an expiry restores BOTH halves of the transition — the
+    /// cleared preservation AND the deletion height the master scheduled.
+    ///
+    /// The load-bearing contrast is with `replay_preserve_until` directly
+    /// above: `PreserveUntil { block_height: 0 }` also clears the preservation,
+    /// but forces `delete_at_height = 0`. Journaling THAT for an eligible expiry
+    /// would erase the schedule on replay and leave the record immortal on the
+    /// recovered node while its peers still hold the DAH — which is why this
+    /// entry exists at all.
+    #[test]
+    fn replay_expire_preservation_restores_both_halves() {
+        let mut h = RecoveryTestHarness::new();
+        let key = h.create_record(27, 5);
+        let ie = h.index.lookup(&key).unwrap();
+
+        // Pre-crash footer: preserved, no DAH (the two are mutually exclusive).
+        let mut meta = io::read_metadata(&*h.data_dev, ie.record_offset).unwrap();
+        meta.preserve_until = 5000;
+        meta.delete_at_height = 0;
+        io::write_metadata(&*h.data_dev, ie.record_offset, &meta).unwrap();
+
+        let mut redo = h.redo_log();
+        redo.append_and_flush(RedoOp::ExpirePreservation {
+            tx_key: key,
+            delete_at_height: 5288,
+        })
+        .unwrap();
+
+        let stats = recover(&*h.data_dev, &redo, &h.index).unwrap();
+        assert_eq!(stats.entries_replayed, 1);
+
+        let meta = io::read_metadata(&*h.data_dev, ie.record_offset).unwrap();
+        assert_eq!({ meta.preserve_until }, 0, "replay clears the preservation");
+        assert_eq!(
+            { meta.delete_at_height },
+            5288,
+            "replay restores the master's scheduled deletion height",
+        );
+    }
+
+    /// The ineligible branch replays as "clear the preservation, schedule
+    /// nothing", and a second replay is a skip rather than a rewrite.
+    #[test]
+    fn replay_expire_preservation_ineligible_is_idempotent() {
+        let mut h = RecoveryTestHarness::new();
+        let key = h.create_record(28, 5);
+        let ie = h.index.lookup(&key).unwrap();
+
+        let mut meta = io::read_metadata(&*h.data_dev, ie.record_offset).unwrap();
+        meta.preserve_until = 4000;
+        meta.delete_at_height = 0;
+        io::write_metadata(&*h.data_dev, ie.record_offset, &meta).unwrap();
+
+        let mut redo = h.redo_log();
+        redo.append_and_flush(RedoOp::ExpirePreservation {
+            tx_key: key,
+            delete_at_height: 0,
+        })
+        .unwrap();
+        let stats = recover(&*h.data_dev, &redo, &h.index).unwrap();
+        assert_eq!(stats.entries_replayed, 1);
+
+        let meta = io::read_metadata(&*h.data_dev, ie.record_offset).unwrap();
+        assert_eq!({ meta.preserve_until }, 0);
+        assert_eq!({ meta.delete_at_height }, 0);
+
+        // Already in the target state: the second pass skips rather than
+        // replaying, so a re-run cannot disturb a later legitimate mutation.
+        let stats2 = recover(&*h.data_dev, &redo, &h.index).unwrap();
+        assert_eq!(
+            stats2.entries_replayed, 0,
+            "a replay against the target state must be skipped, not re-applied",
+        );
     }
 
     #[test]

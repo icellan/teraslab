@@ -915,6 +915,56 @@ Point read of a single UTXO slot plus the record's locktime. Used for double-spe
      sweep already declines to delete non-all-spent records — KO-2/KO-3 — so the
      unconditional DAH only ever produced entries Phase 2 rejected.) Eligible
      records are deleted `BlockHeightRetention` blocks later by the Phase 2 sweep.
+   - **The transition is REPLICATED (R1).** Only the key's shard master runs the
+     expiry, and it ships the result to every other holder as
+     `ReplicaOp::ExpirePreservation { tx_key, delete_at_height, master_generation }`.
+     Holders apply it verbatim: `preserve_until = 0`, `delete_at_height =` the
+     master's value, `generation =` the master's value.
+
+     This is the one lifecycle transition that ships its RESULT rather than its
+     INPUTS. Every other op (`Spend`, `SetMined`, `MarkLongestChain`, …) ships
+     the height inputs and lets each holder re-derive, which is safe because
+     those derivations read only replicated per-record state. The expiry's does
+     not: `sweep_eligible_with_mined` consults the node-local MinedIndex, which
+     lags under replication delay, so two holders could legitimately reach
+     OPPOSITE eligibility verdicts and schedule different deletion heights.
+     Holders must agree on `delete_at_height` for two independent reasons —
+     `Engine::restore_migrated_lifecycle` installs a heal/migration source's DAH
+     UNCONDITIONALLY (its only guard is `incoming_generation < existing_generation`,
+     which is inert at equal generations, so a diverged holder can push its value
+     onto the others), and the cross-holder consistency oracle byte-compares full
+     `FIELD_ALL` payloads masking only `updated_at`. Shipping the value makes the
+     agreement structural rather than probabilistic.
+
+     Both branches replicate. The ineligible one (`delete_at_height == 0`) is not
+     optional: a holder whose stale `preserve_until` survives has EVERY
+     DAH-planting path blocked (`evaluate_delete_at_height` early-returns while a
+     preservation stands) and is invisible to its own DAH sweep
+     (`record_due_for_sweep` returns false on the same test), so its copy leaks
+     permanently — and a restart re-derives the preserve index from the device
+     footer, so it comes straight back.
+
+     **Ordering:** apply locally → journal `RedoOp::ExpirePreservation` (WAL-first,
+     inside the engine, so a transient `LogFull` aborts with no device change) →
+     open a replication intent over those entries → release the visibility
+     barrier → fan out → compensate on failure. Unlike a delete this transition is
+     exactly invertible — a preserved record carries no DAH, so writing the prior
+     `preserve_until` back through `preserveUntil` restores the whole pre-expiry
+     footer — so the standard apply-then-compensate shape applies and a failed
+     fan-out rolls the master back for the next pruner pass to retry. A clean
+     rollback does NOT fail the RPC: the Phase-2 sweep is independent per-holder
+     GC and still runs, so degraded replication delays the expiry without
+     stalling reclaim. Only a rollback that did not complete cleanly is surfaced
+     as an error, because only then can holders actually differ.
+
+     **Rolling upgrade:** `ReplicaOp::ExpirePreservation` is a NEW wire tag, so a
+     pre-upgrade peer rejects it as `UnknownOp` and fails the batch (the master
+     retries) rather than mis-decoding it. Every node must therefore understand
+     the op before any node emits it. Widening the existing `PreserveUntil` op
+     instead would have been silently unsafe: op decoding uses a MINIMUM length
+     check and the batch decoder ignores the per-op consumed length, so an old
+     peer would decode the old prefix, drop the appended DAH, and apply
+     `delete_at_height = 0` — undetected divergence.
    - **Wire payload:** `OP_PROCESS_EXPIRED_PRESERVATIONS` takes
      `[current_height:4]` (legacy: expiry pre-pass skipped) or
      `[current_height:4][block_height_retention:4]` (the 8-byte form supplies
@@ -965,6 +1015,14 @@ retention policy has released*, not a transactional client operation:
   its own re-validation (see the held-copy role below). Replicating the sweep
   would re-introduce exactly the cross-node coupling the held-copy role removes.
 
+  **The Phase-3 preservation expiry is on the other side of that line and IS
+  replicated** (R1, §3.18 Phase 3). The two are not in tension: *scheduling* a
+  deletion is a lifecycle decision about the key, which one node must own and
+  every holder must share; *performing* the reclaim once the schedule comes due
+  is a local space decision each holder makes for itself. Keep them distinct —
+  collapsing either into the other reintroduces a leak (replica copies with no
+  schedule) or a coupling (reclaim blocked on replication health).
+
   **Ordering (replicate before removing).** The client path fans the delete out
   *before* it frees the master's own copy — the reverse of every other mutation
   handler. A delete has no compensating rollback: once the record is freed there
@@ -998,7 +1056,7 @@ retention policy has released*, not a transactional client operation:
 | Client `OP_DELETE_BATCH` | shard master only | keys this node masters | **yes** — `ReplicaOp::Delete` to every other holder | authoritative |
 | DAH sweep, master role | shard master | keys this node masters | no | authoritative |
 | DAH sweep, held-copy role | any holder (replica) | replica copies this node stores | no | **none — local space reclaim** |
-| Phase-3 preservation expiry | shard master only | keys this node masters | no (schedules a DAH; the sweep removes) | authoritative |
+| Phase-3 preservation expiry | shard master only | keys this node masters | **yes** — `ReplicaOp::ExpirePreservation` to every other holder (schedules a DAH; each holder's own sweep then removes its copy) | authoritative |
 
 The replica applies `ReplicaOp::Delete` through `Engine::delete`
 (`RemovalAuthority::Authoritative`), so it writes a deletion tombstone of its

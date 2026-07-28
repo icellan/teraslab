@@ -1283,3 +1283,409 @@ fn dah_sweep_removes_the_record_from_every_holder() {
         survivors.join(" | ")
     );
 }
+
+/// Fetch one record's raw `FIELD_ALL` item data from ONE node's local store.
+///
+/// Same read the Docker consistency oracle uses when it compares two holders'
+/// copies byte-for-byte (`teraslab-tests/client/tests/common::payloads_match`):
+/// `OP_GET_BATCH` + `FieldMask::ALL` + `FLAG_LOCAL_READ`, envelope stripped.
+/// Response layout: `[count:4]` then per item `[status:1][data_len:4][data]`.
+fn local_item_payload(node: &TestNode, txid: &[u8; 32]) -> Option<Vec<u8>> {
+    let resp = request_at(
+        node.tcp_port,
+        OP_GET_BATCH,
+        FLAG_LOCAL_READ,
+        encode_get_batch(FieldMask::ALL, std::slice::from_ref(txid)),
+    );
+    if resp.status != STATUS_OK || resp.payload.len() < 9 {
+        return None;
+    }
+    let count = u32::from_le_bytes(resp.payload[0..4].try_into().unwrap());
+    if count < 1 || resp.payload[4] != 0 {
+        return None;
+    }
+    let len = u32::from_le_bytes(resp.payload[5..9].try_into().unwrap()) as usize;
+    resp.payload.get(9..9 + len).map(<[u8]>::to_vec)
+}
+
+/// The repo's own cross-holder consistency oracle, in process: byte-compare two
+/// holders' `FIELD_ALL` payloads masking ONLY `updated_at` (item-data offsets
+/// 61..69, each node stamps its own local clock). `delete_at_height` sits at
+/// 73..77 and IS compared — holders must agree on it.
+///
+/// Mirrors `teraslab-tests/client/tests/common::payloads_match` exactly; if that
+/// mask ever changes, this must change with it (and never the other way around
+/// — widening the oracle would weaken the check this test exists to pin).
+fn holder_payloads_match(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut a_copy = a.to_vec();
+    let mut b_copy = b.to_vec();
+    if a_copy.len() >= 69 {
+        a_copy[61..69].fill(0);
+        b_copy[61..69].fill(0);
+    }
+    a_copy == b_copy
+}
+
+/// **R1 — the preservation-expiry transition must reach every holder.**
+///
+/// A record is preserved (`OP_PRESERVE_UNTIL_BATCH`, which IS replicated), so
+/// both holders carry `preserve_until = P`. When the pruner runs past `P`, the
+/// master's Phase-0 expiry clears `preserve_until` and plants the replacement
+/// `delete_at_height`. Pre-fix that phase was master-gated and replicated
+/// nothing, so the replica's copy kept `preserve_until = P` forever:
+///
+///  * `record_due_for_sweep` returns false on the first line while a
+///    preservation stands, so the copy is invisible to the replica's own DAH
+///    sweep — the F2 held-copy reclaim cannot see it;
+///  * every DAH-planting path (`evaluate_delete_at_height`) also early-returns
+///    while preserved, so no later replicated mutation rescues it;
+///  * a restart re-derives the preserve index from the device footer, so it
+///    comes straight back.
+///
+/// The record therefore leaks on that node forever, and the two holders' DAHs
+/// diverge — which the repo's own consistency oracle (`payloads_match`, which
+/// masks only `updated_at`) treats as a mismatch.
+///
+/// Asserted here, in order: (1) both holders really are preserved first
+/// (non-vacuity), (2) after the pruner every holder carries the SAME
+/// `delete_at_height` and no preservation, (3) the two holders' full `FIELD_ALL`
+/// payloads are byte-identical under the oracle's mask, and (4) the record is
+/// then actually reclaimed everywhere once that shared DAH arrives — the leak is
+/// closed, not merely relabelled.
+#[test]
+fn expired_preservation_transition_reaches_every_holder() {
+    let node1 = create_cluster_node(891, &[]);
+    let seed = [node1.swim_port];
+    let node2 = create_cluster_node(892, &seed);
+    let node3 = create_cluster_node(893, &seed);
+    let nodes = [&node1, &node2, &node3];
+    wait_for_settled_three_node_topology(&nodes);
+
+    const COUNT: usize = 6;
+    const HEIGHT: u32 = 900_000;
+    const RETENTION: u32 = 100;
+    // Preserve well past the DAH the spend plants, so the preservation — not the
+    // spend's DAH — is what governs the record until the pruner expires it.
+    const PRESERVE_TO: u32 = HEIGHT + 500;
+
+    let seeds = owned_seeds(&node1, COUNT);
+    let txids: Vec<[u8; 32]> = seeds.iter().map(|s| make_txid(*s)).collect();
+
+    let resp = request_at(node1.tcp_port, OP_CREATE_BATCH, 0, encode_batch(&seeds));
+    assert_eq!(resp.status, STATUS_OK, "create batch must be accepted");
+
+    // Make each record sweep-ELIGIBLE (mined on the longest chain + all-spent),
+    // so the master's expiry takes the branch that plants a fresh DAH.
+    for s in &seeds {
+        set_mined(node1.tcp_port, *s, HEIGHT, RETENTION);
+        spend_to_all_spent(node1.tcp_port, *s, HEIGHT, RETENTION);
+    }
+
+    let holders_before: Vec<Vec<usize>> = txids.iter().map(|t| local_holders(&nodes, t)).collect();
+    for (s, holders) in seeds.iter().zip(&holders_before) {
+        assert_eq!(
+            holders.len(),
+            2,
+            "seed {s} must be on exactly 2 nodes before the sweep, found {holders:?}"
+        );
+        assert!(holders.contains(&0), "seed {s} must be mastered by node 0");
+    }
+    let replica_idx = holders_before[0]
+        .iter()
+        .copied()
+        .find(|i| *i != 0)
+        .expect("a replica holder must exist");
+    let replica = nodes[replica_idx];
+
+    // Preserve through the CLIENT path so the replica genuinely receives the
+    // preservation (this half is already replicated today).
+    let resp = request_at(
+        node1.tcp_port,
+        OP_PRESERVE_UNTIL_BATCH,
+        0,
+        encode_txid_batch(&txids, &PRESERVE_TO.to_le_bytes()),
+    );
+    assert_eq!(
+        resp.status, STATUS_OK,
+        "client preserve must be accepted (status {})",
+        resp.status
+    );
+
+    // NON-VACUITY: the replica must actually be preserved, otherwise everything
+    // below would pass for the wrong reason.
+    let replica_preserved: Vec<u32> = seeds
+        .iter()
+        .map(|s| {
+            replica
+                .engine
+                .read_metadata(&TxKey {
+                    txid: make_txid(*s),
+                })
+                .map(|m| m.preserve_until)
+                .unwrap_or(0)
+        })
+        .collect();
+    assert!(
+        replica_preserved.iter().all(|p| *p == PRESERVE_TO),
+        "the replica must carry the replicated preservation before the expiry runs, \
+         else this test proves nothing; saw {replica_preserved:?}"
+    );
+
+    // Fire the pruner at EVERY node, at the preservation's expiry height.
+    let expiry_height = PRESERVE_TO;
+    let mut payload = Vec::with_capacity(8);
+    payload.extend_from_slice(&expiry_height.to_le_bytes());
+    payload.extend_from_slice(&RETENTION.to_le_bytes());
+    for node in &nodes {
+        let resp = request_at(
+            node.tcp_port,
+            OP_PROCESS_EXPIRED_PRESERVATIONS,
+            0,
+            payload.clone(),
+        );
+        assert_eq!(
+            resp.status, STATUS_OK,
+            "expiry sweep must succeed (status {})",
+            resp.status
+        );
+    }
+
+    // (2) Every holder agrees on the post-expiry lifecycle state.
+    let mut lifecycle_divergent = Vec::new();
+    let mut still_preserved = Vec::new();
+    for (s, holders) in seeds.iter().zip(&holders_before) {
+        let key = TxKey {
+            txid: make_txid(*s),
+        };
+        let states: Vec<(usize, u32, u32)> = holders
+            .iter()
+            .filter_map(|i| {
+                nodes[*i]
+                    .engine
+                    .read_metadata(&key)
+                    .ok()
+                    .map(|m| (*i, m.preserve_until, m.delete_at_height))
+            })
+            .collect();
+        if states.iter().any(|(_, preserve, _)| *preserve != 0) {
+            still_preserved.push(format!("seed {s}: {states:?}"));
+        }
+        let dahs: Vec<u32> = states.iter().map(|(_, _, dah)| *dah).collect();
+        if dahs.windows(2).any(|w| w[0] != w[1]) || dahs.contains(&0) {
+            lifecycle_divergent.push(format!("seed {s}: (node, preserve, dah) = {states:?}"));
+        }
+    }
+    // (3) The repo's own byte-level oracle over both holders.
+    let mut payload_mismatches = Vec::new();
+    for (s, holders) in seeds.iter().zip(&holders_before) {
+        let txid = make_txid(*s);
+        let images: Vec<(usize, Vec<u8>)> = holders
+            .iter()
+            .filter_map(|i| local_item_payload(nodes[*i], &txid).map(|p| (*i, p)))
+            .collect();
+        if images.len() == 2 && !holder_payloads_match(&images[0].1, &images[1].1) {
+            payload_mismatches.push(format!(
+                "seed {s}: node {} vs node {} differ outside updated_at",
+                images[0].0, images[1].0
+            ));
+        }
+    }
+
+    // (4) The transition must actually lead to a reclaim on every holder once
+    // the fresh DAH arrives.
+    let final_height = PRESERVE_TO + RETENTION + 1;
+    let mut final_payload = Vec::with_capacity(8);
+    final_payload.extend_from_slice(&final_height.to_le_bytes());
+    final_payload.extend_from_slice(&RETENTION.to_le_bytes());
+    for node in &nodes {
+        let resp = request_at(
+            node.tcp_port,
+            OP_PROCESS_EXPIRED_PRESERVATIONS,
+            0,
+            final_payload.clone(),
+        );
+        assert_eq!(resp.status, STATUS_OK, "final sweep must succeed");
+    }
+    let survivors: Vec<String> = seeds
+        .iter()
+        .map(|s| (s, local_holders(&nodes, &make_txid(*s))))
+        .filter(|(_, h)| !h.is_empty())
+        .map(|(s, h)| format!("seed {s}: still on {h:?}"))
+        .collect();
+
+    shutdown_node(&node1);
+    shutdown_node(&node2);
+    shutdown_node(&node3);
+
+    assert!(
+        still_preserved.is_empty(),
+        "a holder still carries `preserve_until` after the pruner expired the preservation. \
+         A stale preservation makes the copy invisible to the DAH sweep AND blocks every \
+         later DAH-planting path, so it leaks on that node forever: {}",
+        still_preserved.join(" | ")
+    );
+    assert!(
+        lifecycle_divergent.is_empty(),
+        "holders disagree on `delete_at_height` after the preservation expired (or one \
+         holder got no DAH at all). Every holder must converge on the master's scheduled \
+         deletion height: {}",
+        lifecycle_divergent.join(" | ")
+    );
+    assert!(
+        payload_mismatches.is_empty(),
+        "two holders' FIELD_ALL payloads differ outside `updated_at` after the expiry — \
+         this is exactly what the Docker consistency oracle (`payloads_match`) fails on: {}",
+        payload_mismatches.join(" | ")
+    );
+    assert!(
+        survivors.is_empty(),
+        "records survive on a holder after their post-expiry DAH came due — the \
+         preservation-expiry leak is still open: {}",
+        survivors.join(" | ")
+    );
+}
+
+/// **R1, the other sub-population: an INELIGIBLE expiry.**
+///
+/// At expiry the master plants a DAH only when the record is sweep-eligible.
+/// A record that is NOT all-spent just has its `preserve_until` cleared and
+/// reverts to the normal lifecycle — it re-acquires a DAH later via the spend /
+/// setMined path. That clear must reach holders too, and for a sharper reason
+/// than the eligible case: a replica whose `preserve_until` is stale has EVERY
+/// later DAH-planting path blocked (`evaluate_delete_at_height` early-returns
+/// while preserved), so its copy can never become sweepable again by any route.
+///
+/// Asserts both holders end at `preserve_until == 0` with no DAH, and that the
+/// replica's copy is genuinely reachable by a later DAH-planting mutation
+/// (spend to all-spent) — i.e. the clear restored the normal lifecycle rather
+/// than just moving the leak.
+#[test]
+fn ineligible_preservation_expiry_clears_the_preservation_on_every_holder() {
+    let node1 = create_cluster_node(894, &[]);
+    let seed = [node1.swim_port];
+    let node2 = create_cluster_node(895, &seed);
+    let node3 = create_cluster_node(896, &seed);
+    let nodes = [&node1, &node2, &node3];
+    wait_for_settled_three_node_topology(&nodes);
+
+    const COUNT: usize = 6;
+    const HEIGHT: u32 = 900_000;
+    const RETENTION: u32 = 100;
+    const PRESERVE_TO: u32 = HEIGHT + 500;
+
+    let seeds = owned_seeds(&node1, COUNT);
+    let txids: Vec<[u8; 32]> = seeds.iter().map(|s| make_txid(*s)).collect();
+
+    let resp = request_at(node1.tcp_port, OP_CREATE_BATCH, 0, encode_batch(&seeds));
+    assert_eq!(resp.status, STATUS_OK, "create batch must be accepted");
+    // Mined but NOT spent → `sweep_eligible_with_mined` is false, so the master
+    // takes the ineligible branch: clear the preservation, plant no DAH.
+    for s in &seeds {
+        set_mined(node1.tcp_port, *s, HEIGHT, RETENTION);
+    }
+
+    let holders_before: Vec<Vec<usize>> = txids.iter().map(|t| local_holders(&nodes, t)).collect();
+    for (s, holders) in seeds.iter().zip(&holders_before) {
+        assert_eq!(
+            holders.len(),
+            2,
+            "seed {s} must be on 2 nodes, saw {holders:?}"
+        );
+        assert!(holders.contains(&0), "seed {s} must be mastered by node 0");
+    }
+
+    let resp = request_at(
+        node1.tcp_port,
+        OP_PRESERVE_UNTIL_BATCH,
+        0,
+        encode_txid_batch(&txids, &PRESERVE_TO.to_le_bytes()),
+    );
+    assert_eq!(resp.status, STATUS_OK, "client preserve must be accepted");
+
+    let mut payload = Vec::with_capacity(8);
+    payload.extend_from_slice(&PRESERVE_TO.to_le_bytes());
+    payload.extend_from_slice(&RETENTION.to_le_bytes());
+    for node in &nodes {
+        let resp = request_at(
+            node.tcp_port,
+            OP_PROCESS_EXPIRED_PRESERVATIONS,
+            0,
+            payload.clone(),
+        );
+        assert_eq!(resp.status, STATUS_OK, "expiry sweep must succeed");
+    }
+
+    let mut still_preserved = Vec::new();
+    let mut unexpected_dah = Vec::new();
+    for (s, holders) in seeds.iter().zip(&holders_before) {
+        let key = TxKey {
+            txid: make_txid(*s),
+        };
+        for i in holders {
+            let Ok(m) = nodes[*i].engine.read_metadata(&key) else {
+                continue;
+            };
+            let (preserve, dah) = ({ m.preserve_until }, { m.delete_at_height });
+            if preserve != 0 {
+                still_preserved.push(format!("seed {s} node {i}: preserve_until = {preserve}"));
+            }
+            if dah != 0 {
+                unexpected_dah.push(format!("seed {s} node {i}: delete_at_height = {dah}"));
+            }
+        }
+    }
+
+    // The clear must restore the normal lifecycle on BOTH holders: a later spend
+    // to all-spent plants a DAH, which a subsequent sweep can act on. If the
+    // replica were still preserved, `evaluate_delete_at_height` would refuse to
+    // plant anything and the copy would be immortal.
+    for s in &seeds {
+        spend_to_all_spent(node1.tcp_port, *s, PRESERVE_TO, RETENTION);
+    }
+    let final_height = PRESERVE_TO + RETENTION + 1;
+    let mut final_payload = Vec::with_capacity(8);
+    final_payload.extend_from_slice(&final_height.to_le_bytes());
+    final_payload.extend_from_slice(&RETENTION.to_le_bytes());
+    for node in &nodes {
+        let resp = request_at(
+            node.tcp_port,
+            OP_PROCESS_EXPIRED_PRESERVATIONS,
+            0,
+            final_payload.clone(),
+        );
+        assert_eq!(resp.status, STATUS_OK, "final sweep must succeed");
+    }
+    let survivors: Vec<String> = seeds
+        .iter()
+        .map(|s| (s, local_holders(&nodes, &make_txid(*s))))
+        .filter(|(_, h)| !h.is_empty())
+        .map(|(s, h)| format!("seed {s}: still on {h:?}"))
+        .collect();
+
+    shutdown_node(&node1);
+    shutdown_node(&node2);
+    shutdown_node(&node3);
+
+    assert!(
+        still_preserved.is_empty(),
+        "an INELIGIBLE expiry left `preserve_until` set on a holder. That copy can never \
+         acquire a DAH again by any route — every DAH-planting path early-returns while a \
+         preservation stands: {}",
+        still_preserved.join(" | ")
+    );
+    assert!(
+        unexpected_dah.is_empty(),
+        "an INELIGIBLE expiry must plant NO DAH (the record is not sweepable yet); a DAH \
+         here is an immortal index entry that starves the per-call sweep cap: {}",
+        unexpected_dah.join(" | ")
+    );
+    assert!(
+        survivors.is_empty(),
+        "after the preservation cleared and the record became all-spent, its fresh DAH \
+         must reclaim it on every holder: {}",
+        survivors.join(" | ")
+    );
+}
