@@ -519,7 +519,13 @@ async fn test_wrong_config_rejected() -> Result<(), ClientError> {
     let wrong_sid: u16 = 99;
     let mut docker_wrong = common::docker_5node(wrong_sid);
     tlog!(t0, "  [wrong] compose_up rogue node4...");
-    let _ = docker_wrong.compose_up_nodes(&["node4"]).await;
+    docker_wrong.compose_up_nodes(&["node4"]).await?;
+    // Prove the rogue node actually came up before trusting "cluster stayed
+    // at 3" as evidence of rejection. Without this, a container that fails
+    // to boot (e.g. a swallowed docker-compose error) looks identical to one
+    // that booted and had its join attempts correctly rejected -- the test
+    // would pass having never exercised the wrong-config path at all.
+    common::wait_node_healthy(&docker_wrong, 4, Duration::from_secs(15)).await?;
     tlog!(
         t0,
         "  [wrong] rogue node up, waiting for discovery attempt..."

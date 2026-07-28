@@ -289,8 +289,13 @@ async fn run_scenario() -> Result<(), ClientError> {
         common::wait_replication_settled(&docker, 3, Duration::from_secs(5)).await?;
 
         // Verify replication on all affected records
-        let (mismatches, _) =
+        let (mismatches, holder_errors) =
             batch_verify_replication(&client, &node_addrs, &affected_txids, true).await?;
+        assert_eq!(
+            holder_errors, 0,
+            "Test 3.4: {holder_errors} records not held by exactly 2 nodes (RF=2) \
+             after freeze/unfreeze/reassign"
+        );
         assert_eq!(
             mismatches, 0,
             "Test 3.4: {mismatches} replication mismatches after freeze/unfreeze/reassign"
@@ -351,6 +356,16 @@ async fn run_scenario() -> Result<(), ClientError> {
                 }
             })
             .collect();
+
+        // Without this, a bug that silently shrinks the sample (e.g. every
+        // `get_record` lookup failing) would leave `batch_verify_replication`
+        // nothing to check, and 0 placement errors would pass vacuously.
+        assert_eq!(
+            sample_txids.len(),
+            200,
+            "Test 3.6: expected 200 sample records for key placement check, got {}",
+            sample_txids.len()
+        );
 
         let (_, placement_errors) =
             batch_verify_replication(&client, &node_addrs, &sample_txids, true).await?;
@@ -436,21 +451,34 @@ async fn run_scenario() -> Result<(), ClientError> {
             // Parse the per-item response to get metadata.
             // Response layout: [count:4][status:1][data_len:4][data...]
             // The metadata is in the data portion.
-            if payload.len() >= 9 {
-                let item_status = payload[4];
-                assert_eq!(item_status, 0, "Test 3.7: item should be found on node {h}");
-                let data_len = u32::from_le_bytes(payload[5..9].try_into().unwrap()) as usize;
-                if payload.len() >= 9 + data_len && data_len >= ALL_METADATA_SIZE {
-                    let (meta, _) = TxMetadata::decode(FIELD_ALL, &payload[9..9 + data_len])?;
-                    assert_eq!(
-                        meta.spent_utxos,
-                        pre_spent + 1,
-                        "Test 3.7: node {h} counter should be {} (incremented once), got {}",
-                        pre_spent + 1,
-                        meta.spent_utxos,
-                    );
-                }
-            }
+            //
+            // These length checks used to be `if` guards around the actual
+            // counter assertion below, which let a malformed/short payload
+            // silently skip the check this test exists to make -- turned
+            // into hard assertions so a bad payload fails loudly instead.
+            assert!(
+                payload.len() >= 9,
+                "Test 3.7: node {h} direct_get response too short ({} bytes) to parse \
+                 status/data_len",
+                payload.len()
+            );
+            let item_status = payload[4];
+            assert_eq!(item_status, 0, "Test 3.7: item should be found on node {h}");
+            let data_len = u32::from_le_bytes(payload[5..9].try_into().unwrap()) as usize;
+            assert!(
+                payload.len() >= 9 + data_len && data_len >= ALL_METADATA_SIZE,
+                "Test 3.7: node {h} payload too short for metadata (data_len={data_len}, \
+                 payload_len={})",
+                payload.len()
+            );
+            let (meta, _) = TxMetadata::decode(FIELD_ALL, &payload[9..9 + data_len])?;
+            assert_eq!(
+                meta.spent_utxos,
+                pre_spent + 1,
+                "Test 3.7: node {h} counter should be {} (incremented once), got {}",
+                pre_spent + 1,
+                meta.spent_utxos,
+            );
         }
     }
     eprintln!("[3.7] OK -- idempotent spend: counter incremented once on both nodes");

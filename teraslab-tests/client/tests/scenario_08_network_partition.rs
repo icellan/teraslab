@@ -29,6 +29,32 @@ fn txid_hex(txid: &[u8; 32]) -> String {
         .collect::<String>()
 }
 
+/// Validates that a sustained workload (8c.2's degraded-network workload,
+/// 8d.2's asymmetric-partition workload) actually created some records,
+/// rather than every single attempt failing while downstream checks over
+/// the resulting (now empty) txid list pass vacuously -- the same
+/// vacuous-pass shape as `validate_workload_progress` in
+/// `scenario_10_sustained_load.rs`, where a total outage produced "0
+/// mismatches" only because there was nothing left to check. `label`
+/// identifies the calling sub-test in the error message (e.g. "8c.2").
+fn validate_workload_made_progress(
+    label: &str,
+    total_ops: u32,
+    records_created: usize,
+) -> Result<(), String> {
+    if total_ops == 0 {
+        return Err(format!("{label}: zero operations were attempted"));
+    }
+    if records_created == 0 {
+        return Err(format!(
+            "{label}: zero records were created ({total_ops} ops attempted, all failed) -- \
+             the downstream read-back/consistency checks over this workload's records would \
+             have nothing to check and cannot be trusted as a pass"
+        ));
+    }
+    Ok(())
+}
+
 /// Note: This test requires iptables inside Docker containers, which works on
 /// Linux but may not work reliably on Docker Desktop for macOS (iptables rules
 /// apply to the Linux VM, not the host's network stack). Skip with `--skip`
@@ -637,6 +663,9 @@ async fn run_scenario() -> Result<(), ClientError> {
             slow_txids.len()
         );
         eprintln!("[8c.2] {}", reporter.format_summary());
+        if let Err(msg) = validate_workload_made_progress("8c.2", total_ops, slow_txids.len()) {
+            panic!("{msg}");
+        }
 
         eprintln!("[8c.3] Clearing network degradation");
         docker.clear_all_networks().await?;
@@ -821,6 +850,10 @@ async fn run_scenario() -> Result<(), ClientError> {
             partition_txids.len()
         );
         eprintln!("[8d.2] {}", reporter.format_summary());
+        if let Err(msg) = validate_workload_made_progress("8d.2", total_ops, partition_txids.len())
+        {
+            panic!("{msg}");
+        }
 
         // Heal the asymmetric partition
         eprintln!("[8d.3] Healing asymmetric partition");
@@ -904,4 +937,50 @@ async fn run_scenario() -> Result<(), ClientError> {
     eprintln!("[scenario_08] All sub-tests passed");
     tlog!(t0, "=== SCENARIO COMPLETE ===");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_workload_made_progress_rejects_zero_ops() {
+        let err = validate_workload_made_progress("8c.2", 0, 0).unwrap_err();
+        assert!(
+            err.contains("zero operations were attempted"),
+            "unexpected message: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_workload_made_progress_rejects_a_total_outage() {
+        // Every attempted op failed: the exact scenario_10-class failure --
+        // downstream checks over an empty records-created list would
+        // otherwise pass vacuously.
+        let err = validate_workload_made_progress("8c.2", 180, 0).unwrap_err();
+        assert!(
+            err.contains("zero records were created"),
+            "unexpected message: {err}"
+        );
+        assert!(
+            err.contains("180 ops attempted"),
+            "unexpected message: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_workload_made_progress_accepts_a_healthy_run() {
+        let result = validate_workload_made_progress("8d.2", 1500, 300);
+        assert!(result.is_ok(), "expected healthy run to pass: {result:?}");
+    }
+
+    /// Exercises the exact `if let Err(msg) = ... { panic!("{msg}") }` shape
+    /// used at both real call sites (8c.2 and 8d.2).
+    #[test]
+    #[should_panic(expected = "8c.2: zero records were created (180 ops attempted, all failed)")]
+    fn total_outage_panics_like_the_real_call_site() {
+        if let Err(msg) = validate_workload_made_progress("8c.2", 180, 0) {
+            panic!("{msg}");
+        }
+    }
 }
