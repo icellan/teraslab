@@ -63,6 +63,27 @@ fn validate_read_pass(
     Ok(())
 }
 
+/// Validates that node4 actually drained (`master_shard_count` reached 0)
+/// before Test 7.2 hands off to forced removal.
+///
+/// This scenario is `scale_down_graceful`: its entire point is to exercise
+/// the quiesce+drain path. If node4 never drained, the downstream generic
+/// checks (cluster reforms to size 3, records readable, `verify_consistency`)
+/// still pass -- but only because they exercised forced removal, a
+/// different scenario, while silently reporting success for the graceful
+/// one. A scenario that cannot exercise its titular feature must fail, not
+/// warn.
+fn validate_node4_drained(node4_drained: bool, drain_timeout_secs: u64) -> Result<(), String> {
+    if !node4_drained {
+        return Err(format!(
+            "Test 7.2: node4 did not fully drain (master_shard_count never reached 0 within \
+             {drain_timeout_secs}s) -- the graceful-quiesce mechanism this scenario is named \
+             for never worked"
+        ));
+    }
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn scenario_07_scale_down_graceful() {
     let result = tokio::time::timeout(Duration::from_secs(300), run_scenario()).await;
@@ -216,11 +237,10 @@ async fn run_scenario() -> Result<(), ClientError> {
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
 
-    if !node4_drained {
-        eprintln!("[7.2] WARNING: node4 did not fully drain — proceeding with forced removal");
-    } else {
-        eprintln!("[7.2] OK -- node4 fully drained");
+    if let Err(msg) = validate_node4_drained(node4_drained, drain_timeout.as_secs()) {
+        panic!("{msg}");
     }
+    eprintln!("[7.2] OK -- node4 fully drained");
 
     tlog!(t0, "test 7.2: done");
 
@@ -463,6 +483,37 @@ mod tests {
     fn total_outage_panics_like_the_real_call_site() {
         if let Err(msg) = validate_read_pass(true, 0, 5000, 0) {
             panic!("Test 7.4: {msg}");
+        }
+    }
+
+    #[test]
+    fn validate_node4_drained_rejects_a_never_drained_node() {
+        // The exact vacuous-pass shape this guard exists for: the poll loop
+        // exhausted its timeout without ever observing
+        // master_shard_count == 0, but the old code only logged a WARNING
+        // and let the scenario continue into forced removal.
+        let err = validate_node4_drained(false, 120).unwrap_err();
+        assert!(err.contains("did not fully drain"), "err was: {err}");
+        assert!(err.contains("120s"), "err was: {err}");
+    }
+
+    #[test]
+    fn validate_node4_drained_accepts_a_drained_node() {
+        let result = validate_node4_drained(true, 120);
+        assert!(
+            result.is_ok(),
+            "expected a drained node to pass: {result:?}"
+        );
+    }
+
+    /// Exercises the exact `if let Err(msg) = ... { panic!("{msg}") }` shape
+    /// used at the real call site, with the actual failure this guard
+    /// exists to catch: node4 never drained within the timeout.
+    #[test]
+    #[should_panic(expected = "Test 7.2: node4 did not fully drain")]
+    fn node4_never_drained_panics_like_the_real_call_site() {
+        if let Err(msg) = validate_node4_drained(false, 120) {
+            panic!("{msg}");
         }
     }
 }
