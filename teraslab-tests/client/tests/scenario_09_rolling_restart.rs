@@ -32,6 +32,44 @@ macro_rules! tlog {
 /// Scenario ID for unique Docker ports and container names.
 const SID: u16 = 9;
 
+/// Checks that the background create/read workload -- run continuously
+/// across all three rolling-restart phases in [`run_scenario`] -- actually
+/// exercised the cluster before the final consistency check
+/// (`final_mismatches.is_empty()`) is trusted.
+///
+/// `verify_consistency` only walks `verifier.non_deleted_txids()`. The
+/// initial 5000-record seed (hard-asserted via `assert_eq!(txids.len(),
+/// 5000)` before the workload starts) guarantees that set is never
+/// literally empty, but a background workload that silently failed every
+/// single create/read across all three restart phases would produce
+/// exactly the same "zero mismatches" result as a healthy run -- the
+/// verifier would simply never learn about anything beyond the initial
+/// seed, and there would be nothing left to diverge. This is the same trap
+/// that let `scenario_10_sustained_load` report "All sub-tests passed" on a
+/// run where every operation failed; see that scenario's
+/// `validate_workload_progress` doc for the full incident.
+///
+/// Spends are deliberately excluded from this guard: the spend loop draws
+/// uniformly at random (with replacement) from every txid ever created,
+/// re-using the same vout each time, so once a txid's first spend succeeds
+/// every subsequent draw of it is expected to fail as "already spent" --
+/// the same shared-draw-pool rationale `scenario_10_sustained_load`
+/// documents for excluding spends from its own strict success-count check.
+fn validate_workload_progress(creates_ok: u64, reads_ok: u64) -> Result<(), String> {
+    if creates_ok == 0 {
+        return Err(
+            "zero successful creates across the entire rolling-restart run -- the \
+             background workload never exercised the cluster while nodes were \
+             cycling, and the final consistency check only covers the initial seed"
+                .to_string(),
+        );
+    }
+    if reads_ok == 0 {
+        return Err("zero successful reads across the entire rolling-restart run".to_string());
+    }
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn scenario_09_rolling_restart() {
     let result = tokio::time::timeout(Duration::from_secs(600), run_scenario()).await;
@@ -357,7 +395,6 @@ async fn run_scenario() -> Result<(), ClientError> {
         } else {
             eprintln!("[9.{node_num}] Zero failures during quiesce+stop of {node_name}");
         }
-        eprintln!("[9.{node_num}] Zero failures during quiesce+stop of {node_name}");
 
         // Step 5: Start the node
         docker.start_node(&node_name).await?;
@@ -414,16 +451,23 @@ async fn run_scenario() -> Result<(), ClientError> {
     let total_write_errors = bg_metrics.total_write_errors();
     let total_read_errors = bg_metrics.total_read_errors();
     let total_creates_ok = bg_metrics.creates_ok.load(Ordering::Relaxed);
+    let total_reads_ok = bg_metrics.reads_ok.load(Ordering::Relaxed);
+    let total_spends_ok = bg_metrics.spends_ok.load(Ordering::Relaxed);
     eprintln!(
         "[9.final] Total: {total_creates_ok} creates OK, {total_write_errors} write errors, {total_read_errors} read errors"
     );
     eprintln!(
-        "[9.4] Zero failures throughout rolling restart. \
-         creates_ok={}, reads_ok={}, spends_ok={}",
-        bg_metrics.creates_ok.load(Ordering::Relaxed),
-        bg_metrics.reads_ok.load(Ordering::Relaxed),
-        bg_metrics.spends_ok.load(Ordering::Relaxed),
+        "[9.4] creates_ok={total_creates_ok}, reads_ok={total_reads_ok}, spends_ok={total_spends_ok}, \
+         write_errors={total_write_errors}, read_errors={total_read_errors}"
     );
+
+    // Sanity: the background workload actually exercised the cluster across
+    // the whole rolling-restart run before the final consistency check
+    // (which only detects a divergence, and stays trivially clean if the
+    // workload never ran) is trusted. See `validate_workload_progress`.
+    if let Err(msg) = validate_workload_progress(total_creates_ok, total_reads_ok) {
+        panic!("9: {msg}");
+    }
 
     // Full consistency check — zero mismatches expected.
     eprintln!("[9.5] Running full consistency check");
@@ -472,4 +516,61 @@ async fn run_scenario() -> Result<(), ClientError> {
     tlog!(t0, "=== SCENARIO COMPLETE ===");
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_workload_progress_rejects_zero_creates() {
+        let err = validate_workload_progress(0, 500).unwrap_err();
+        assert!(
+            err.contains("zero successful creates"),
+            "unexpected message: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_workload_progress_rejects_zero_reads_even_with_creates() {
+        let err = validate_workload_progress(500, 0).unwrap_err();
+        assert!(
+            err.contains("zero successful reads"),
+            "unexpected message: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_workload_progress_accepts_a_healthy_run() {
+        // Representative of a real 600s rolling-restart run: thousands of
+        // creates and reads accumulated across the three restart phases.
+        let result = validate_workload_progress(60_000, 36_000);
+        assert!(result.is_ok(), "expected healthy run to pass: {result:?}");
+    }
+
+    #[test]
+    fn validate_workload_progress_rejects_total_outage() {
+        // Mirrors the scenario_10 nightly-outage shape applied to this
+        // scenario: the background workload attempted ops every tick but
+        // every single one failed, so creates_ok and reads_ok both stay 0
+        // while the final consistency check -- which only walks the
+        // initial 5000-record seed -- would still report zero mismatches.
+        let err = validate_workload_progress(0, 0).unwrap_err();
+        assert!(
+            err.contains("zero successful creates"),
+            "unexpected message: {err}"
+        );
+    }
+
+    /// Exercises the exact `if let Err(msg) = ... { panic!("9: {msg}") }`
+    /// shape used at the real call site in `run_scenario`, so this test
+    /// watches the panic path itself fire rather than just checking the
+    /// `Result` plumbing.
+    #[test]
+    #[should_panic(expected = "9: zero successful creates")]
+    fn total_outage_evidence_panics_like_the_real_call_site() {
+        if let Err(msg) = validate_workload_progress(0, 0) {
+            panic!("9: {msg}");
+        }
+    }
 }
