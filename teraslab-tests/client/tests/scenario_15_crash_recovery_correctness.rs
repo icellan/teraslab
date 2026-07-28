@@ -101,6 +101,117 @@ async fn create_single_record(
     }
 }
 
+/// Checks that test 15.2/15.3's 10-second kill-during-writes workload
+/// actually created something beyond the pre-kill baseline before the
+/// consistency check that follows is trusted.
+///
+/// That check only walks txids the verifier recorded, which only grows on
+/// a successful create. If node1's kill wedged the whole 10s workload
+/// (zero creates beyond baseline), the check would compare the untouched
+/// baseline against itself -- "zero mismatches" for the same reason a
+/// healthy run reports zero -- without this iteration having exercised a
+/// single in-flight write during the kill.
+fn validate_kill_workload_progress(
+    baseline_count: usize,
+    total_confirmed: usize,
+    attempted: u32,
+) -> Result<(), String> {
+    if total_confirmed <= baseline_count {
+        return Err(format!(
+            "zero creates succeeded beyond the {baseline_count} baseline records during \
+             the 10s kill workload ({attempted} attempted) -- the consistency check that \
+             follows has nothing new to verify"
+        ));
+    }
+    Ok(())
+}
+
+/// Checks that test 15.4's post-recovery read-back of the spendMulti target
+/// records actually observed something before the atomicity invariant is
+/// trusted.
+///
+/// The atomicity counter only increments inside the branch that
+/// successfully read and parsed a target record. If every read fell into
+/// the "could not read" fallback (e.g. the cluster never came back
+/// reachable after restart), the atomicity counter would stay at 0 for
+/// having verified nothing, and `assert_eq!(atomicity_violations, 0)`
+/// would pass vacuously.
+fn validate_spend_multi_observations(
+    checked_count: u32,
+    target_count: usize,
+) -> Result<(), String> {
+    if checked_count == 0 {
+        return Err(format!(
+            "none of the {target_count} target records could be read back after recovery \
+             -- the atomicity invariant has nothing to check and cannot be trusted as a pass"
+        ));
+    }
+    Ok(())
+}
+
+/// Checks that test 15.5's post-recovery read-back of the setMined target
+/// records actually observed something before the half-written-block-entry
+/// invariant is trusted.
+///
+/// `mined_count`/`unmined_count`/`half_written` only advance when a target
+/// record is actually read back and its metadata parsed. If every read
+/// fell into the "not found" or "read error" branches (e.g. the cluster
+/// never came back reachable), all three counters -- including
+/// `half_written` -- would stay at 0 for having verified nothing, and
+/// `assert_eq!(half_written, 0)` would pass vacuously.
+fn validate_set_mined_observations(
+    mined_count: u32,
+    unmined_count: u32,
+    half_written: u32,
+    target_count: usize,
+) -> Result<(), String> {
+    let observed = mined_count + unmined_count + half_written;
+    if observed == 0 {
+        return Err(format!(
+            "none of the {target_count} target records could be read back and parsed \
+             after recovery -- the half-written-block-entry invariant has nothing to \
+             check and cannot be trusted as a pass"
+        ));
+    }
+    Ok(())
+}
+
+/// Checks that test 15.6's post-recovery read-back of the create-batch
+/// target records didn't silently mask genuine read failures as
+/// "NotFound" before the partial-write invariant is trusted.
+///
+/// A transport/connection failure (or an empty batch response) doesn't
+/// tell us a record is genuinely absent -- it tells us we couldn't check
+/// at all. Folding both into the same "not found" bucket would let a
+/// broken read path after recovery (as opposed to a crash that genuinely
+/// discarded the write) still leave `partial_records == 0` unchallenged.
+///
+/// Separately: if the create batch was acknowledged successful before the
+/// kill landed, every record it covered must have survived recovery in
+/// full -- `full_records` short of the total is a real regression, not a
+/// legitimate crash outcome.
+fn validate_create_kill_observations(
+    read_errors: u32,
+    create_succeeded: bool,
+    full_records: u32,
+    total: usize,
+) -> Result<(), String> {
+    if read_errors > 0 {
+        return Err(format!(
+            "{read_errors}/{total} reads errored after full recovery -- cannot distinguish \
+             a genuinely absent record from a broken read path, so the partial-write \
+             invariant cannot be trusted"
+        ));
+    }
+    if create_succeeded && full_records != total as u32 {
+        return Err(format!(
+            "create batch was acknowledged successful but only {full_records}/{total} \
+             records are fully present after recovery"
+        ));
+    }
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn scenario_15_crash_recovery_correctness() {
     let result = tokio::time::timeout(Duration::from_secs(1200), run_scenario()).await;
@@ -290,6 +401,12 @@ async fn test_kill_during_writes() -> Result<(), ClientError> {
              out of {attempted} attempts (+ 200 baseline)"
         );
 
+        if let Err(msg) =
+            validate_kill_workload_progress(baseline_txids.len(), total_confirmed, attempted)
+        {
+            panic!("Test 15.3 iteration {iteration}: {msg}");
+        }
+
         eprintln!("[15.2/15.3] Iteration {iteration}: restarting node1");
         docker.start_node("node1").await?;
         common::wait_cluster_ready(&docker, 3, Duration::from_secs(30)).await?;
@@ -397,6 +514,7 @@ async fn test_kill_during_spend_multi() -> Result<(), ClientError> {
     // For each target txid, check the spend count: either all 5 UTXOs are spent or none are.
     // (Atomicity check)
     let mut atomicity_violations = 0u32;
+    let mut checked_count = 0u32;
     for txid in &target_txids {
         match client
             .get_batch(FIELD_ALL_METADATA, std::slice::from_ref(txid))
@@ -406,6 +524,7 @@ async fn test_kill_during_spend_multi() -> Result<(), ClientError> {
                 if let Some((spent_count, _, _, _)) =
                     teraslab_test_client::verifier::parse_metadata_fields(&results.item(0).data)
                 {
+                    checked_count += 1;
                     // Either all 5 spent (batch applied) or 0 spent (batch not applied)
                     if spent_count != 0 && spent_count != 5 {
                         eprintln!(
@@ -422,11 +541,18 @@ async fn test_kill_during_spend_multi() -> Result<(), ClientError> {
         }
     }
 
+    if let Err(msg) = validate_spend_multi_observations(checked_count, target_txids.len()) {
+        panic!("Test 15.4: {msg}");
+    }
     assert_eq!(
         atomicity_violations, 0,
         "Test 15.4: {atomicity_violations} txids have partial spendMulti batches -- atomicity violated"
     );
-    eprintln!("[15.4] OK -- spendMulti atomicity verified (either all or none applied)");
+    eprintln!(
+        "[15.4] OK -- spendMulti atomicity verified on {checked_count}/{} target records \
+         (either all or none applied)",
+        target_txids.len()
+    );
     Ok(())
 }
 
@@ -542,6 +668,14 @@ async fn test_kill_during_set_mined() -> Result<(), ClientError> {
     eprintln!(
         "[15.5] setMined results: {mined_count} mined, {unmined_count} unmined, {half_written} corrupt"
     );
+    if let Err(msg) = validate_set_mined_observations(
+        mined_count,
+        unmined_count,
+        half_written,
+        target_txids.len(),
+    ) {
+        panic!("Test 15.5: {msg}");
+    }
     assert_eq!(
         half_written, 0,
         "Test 15.5: {half_written} records have half-written block entries"
@@ -624,6 +758,14 @@ async fn test_kill_during_create() -> Result<(), ClientError> {
     let mut partial_records = 0u32;
     let mut full_records = 0u32;
     let mut not_found = 0u32;
+    // Distinct from `not_found`: a transport/connection failure (or an
+    // empty batch response) doesn't tell us the record is genuinely
+    // absent -- it tells us we couldn't check at all. Previously these
+    // were folded into `not_found`, so a broken read path after recovery
+    // (as opposed to a crash that genuinely discarded the write) would
+    // still let `partial_records == 0` pass without having verified
+    // anything.
+    let mut read_errors = 0u32;
 
     for txid in &create_txids {
         match client
@@ -656,15 +798,29 @@ async fn test_kill_during_create() -> Result<(), ClientError> {
                     not_found += 1;
                 }
             }
-            _ => {
-                not_found += 1;
+            Ok(_) => {
+                // Empty batch response for a single-item request is a
+                // protocol/read anomaly, not a legitimate NotFound.
+                read_errors += 1;
+            }
+            Err(_) => {
+                read_errors += 1;
             }
         }
     }
 
     eprintln!(
-        "[15.6] Results: {full_records} full, {not_found} not found, {partial_records} partial"
+        "[15.6] Results: {full_records} full, {not_found} not found, \
+         {partial_records} partial, {read_errors} read errors"
     );
+    if let Err(msg) = validate_create_kill_observations(
+        read_errors,
+        create_succeeded,
+        full_records,
+        create_txids.len(),
+    ) {
+        panic!("Test 15.6: {msg}");
+    }
     assert_eq!(
         partial_records, 0,
         "Test 15.6: {partial_records} records are partially written -- crash safety violated"
@@ -849,4 +1005,130 @@ async fn test_cascading_recovery() -> Result<(), ClientError> {
 
     eprintln!("[15.8] OK -- cascading recovery passed ({readable}/{total} readable)");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_kill_workload_progress_rejects_zero_beyond_baseline() {
+        let err = validate_kill_workload_progress(200, 200, 150).unwrap_err();
+        assert!(
+            err.contains("zero creates succeeded beyond the 200 baseline"),
+            "unexpected message: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_kill_workload_progress_accepts_any_progress_beyond_baseline() {
+        let result = validate_kill_workload_progress(200, 201, 150);
+        assert!(result.is_ok(), "expected pass: {result:?}");
+    }
+
+    /// Watches the exact `if let Err(msg) = ... { panic!("Test 15.3 iteration {iteration}: \
+    /// {msg}") }` shape used at the real call site fire on the vacuous input.
+    #[test]
+    #[should_panic(expected = "Test 15.3 iteration 1: zero creates succeeded beyond the 200")]
+    fn validate_kill_workload_progress_panics_like_the_real_call_site() {
+        let iteration = 1;
+        if let Err(msg) = validate_kill_workload_progress(200, 200, 150) {
+            panic!("Test 15.3 iteration {iteration}: {msg}");
+        }
+    }
+
+    #[test]
+    fn validate_spend_multi_observations_rejects_zero_checked() {
+        let err = validate_spend_multi_observations(0, 50).unwrap_err();
+        assert!(
+            err.contains("none of the 50 target records"),
+            "unexpected message: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_spend_multi_observations_accepts_any_positive_count() {
+        let result = validate_spend_multi_observations(1, 50);
+        assert!(result.is_ok(), "expected pass: {result:?}");
+    }
+
+    #[test]
+    #[should_panic(expected = "Test 15.4: none of the 50 target records")]
+    fn validate_spend_multi_observations_panics_like_the_real_call_site() {
+        if let Err(msg) = validate_spend_multi_observations(0, 50) {
+            panic!("Test 15.4: {msg}");
+        }
+    }
+
+    #[test]
+    fn validate_set_mined_observations_rejects_all_zero() {
+        let err = validate_set_mined_observations(0, 0, 0, 100).unwrap_err();
+        assert!(
+            err.contains("none of the 100 target records"),
+            "unexpected message: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_set_mined_observations_accepts_mined_only() {
+        let result = validate_set_mined_observations(5, 0, 0, 100);
+        assert!(result.is_ok(), "expected pass: {result:?}");
+    }
+
+    #[test]
+    fn validate_set_mined_observations_accepts_unmined_only() {
+        let result = validate_set_mined_observations(0, 5, 0, 100);
+        assert!(result.is_ok(), "expected pass: {result:?}");
+    }
+
+    #[test]
+    #[should_panic(expected = "Test 15.5: none of the 100 target records")]
+    fn validate_set_mined_observations_panics_like_the_real_call_site() {
+        if let Err(msg) = validate_set_mined_observations(0, 0, 0, 100) {
+            panic!("Test 15.5: {msg}");
+        }
+    }
+
+    #[test]
+    fn validate_create_kill_observations_rejects_read_errors() {
+        let err = validate_create_kill_observations(3, false, 0, 200).unwrap_err();
+        assert!(
+            err.contains("3/200 reads errored"),
+            "unexpected message: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_create_kill_observations_rejects_incomplete_acked_batch() {
+        // Batch was acknowledged (create_succeeded=true) but only 199/200
+        // records survived recovery -- a real durability regression.
+        let err = validate_create_kill_observations(0, true, 199, 200).unwrap_err();
+        assert!(
+            err.contains("only 199/200 records are fully present"),
+            "unexpected message: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_create_kill_observations_accepts_acked_batch_fully_intact() {
+        let result = validate_create_kill_observations(0, true, 200, 200);
+        assert!(result.is_ok(), "expected pass: {result:?}");
+    }
+
+    #[test]
+    fn validate_create_kill_observations_accepts_aborted_batch_with_zero_full_records() {
+        // create_succeeded=false: the kill genuinely raced the batch, so
+        // zero full_records is a legitimate outcome as long as reads
+        // themselves didn't error.
+        let result = validate_create_kill_observations(0, false, 0, 200);
+        assert!(result.is_ok(), "expected pass: {result:?}");
+    }
+
+    #[test]
+    #[should_panic(expected = "Test 15.6: 200/200 reads errored")]
+    fn validate_create_kill_observations_panics_like_the_real_call_site() {
+        if let Err(msg) = validate_create_kill_observations(200, false, 0, 200) {
+            panic!("Test 15.6: {msg}");
+        }
+    }
 }
