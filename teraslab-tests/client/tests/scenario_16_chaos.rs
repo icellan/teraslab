@@ -767,6 +767,68 @@ async fn verify_replication_sample(
 }
 
 // ---------------------------------------------------------------------------
+// Workload progress validation
+// ---------------------------------------------------------------------------
+
+/// Checks that the chaos workload actually exercised every operation type at
+/// least once across the whole run before the invariant checks in
+/// [`run_scenario`] (zero `NotFound` at every checkpoint, zero mismatches
+/// and exact RF=2 replication at the final check) are trusted.
+///
+/// Those checks only walk txids `verifier` actually recorded, which for
+/// creates/spends/set_mined/deletes only grows on a *successful* op. A
+/// cluster that silently rejects every chaos-workload operation for the
+/// entire run still reports "0 mismatches" at every checkpoint and at the
+/// end -- the 5000 seeded records sit untouched and self-consistent
+/// regardless of whether the concurrent workload does anything at all.
+/// This is the same failure mode documented for scenario_10's
+/// `validate_workload_progress`: zero work vacuously satisfies every
+/// consistency assertion.
+///
+/// Unlike scenario_10, this is a *chaos* scenario -- node kills,
+/// partitions, and pauses are expected to cause a meaningfully elevated
+/// error rate by design (the docstring's own "not implemented" caveats and
+/// the timeout-driven retry paths in `run_workload_tick` assume this). So
+/// this only requires each op type to have succeeded at least once over
+/// the whole run, not a bounded error rate -- an error-rate ceiling here
+/// would be a separate judgement call about how much chaos should
+/// legitimately degrade throughput, not a "did anything work at all" floor.
+fn validate_chaos_workload_progress(
+    creates_ok: u64,
+    reads_ok: u64,
+    spends_ok: u64,
+    set_mined_ok: u64,
+    deletes_ok: u64,
+) -> Result<(), String> {
+    let mut zero_categories: Vec<&str> = Vec::new();
+    if creates_ok == 0 {
+        zero_categories.push("creates");
+    }
+    if reads_ok == 0 {
+        zero_categories.push("reads");
+    }
+    if spends_ok == 0 {
+        zero_categories.push("spends");
+    }
+    if set_mined_ok == 0 {
+        zero_categories.push("set_mined");
+    }
+    if deletes_ok == 0 {
+        zero_categories.push("deletes");
+    }
+    if !zero_categories.is_empty() {
+        return Err(format!(
+            "zero successful ops for: {} -- the consistency/replication checks above only \
+             cover txids the verifier actually recorded, which stays unchanged when an op \
+             type never succeeds; a cluster that rejects that op type for the entire run \
+             would still report the same checkpoints as a healthy one",
+            zero_categories.join(", ")
+        ));
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Main test
 // ---------------------------------------------------------------------------
 
@@ -1146,6 +1208,20 @@ async fn run_scenario() -> Result<(), ClientError> {
     let deletes_err_final = m_deletes_err.load(Ordering::Relaxed);
     let record_count = verifier.record_count();
 
+    // Sanity: the chaos workload actually exercised the cluster throughout
+    // the run. Without this check, a cluster that rejects every workload
+    // operation for the entire chaos window still passes every check below
+    // -- see `validate_chaos_workload_progress` for the full rationale.
+    if let Err(msg) = validate_chaos_workload_progress(
+        creates_ok_final,
+        reads_ok_final,
+        spends_ok_final,
+        set_mined_ok_final,
+        deletes_ok_final,
+    ) {
+        panic!("16: {msg}");
+    }
+
     assert!(
         final_mismatches.is_empty(),
         "Final verification: {} mismatches after chaos recovery. First 10: {:?}",
@@ -1179,4 +1255,75 @@ async fn run_scenario() -> Result<(), ClientError> {
 
     tlog!(t0, "=== SCENARIO COMPLETE ===");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_chaos_workload_progress_rejects_total_outage() {
+        // The exact shape of the scenario_10 nightly-run defect, replayed
+        // for chaos's 5 op categories: everything zero.
+        let err = validate_chaos_workload_progress(0, 0, 0, 0, 0).unwrap_err();
+        assert!(
+            err.contains("creates")
+                && err.contains("reads")
+                && err.contains("spends")
+                && err.contains("set_mined")
+                && err.contains("deletes"),
+            "unexpected message: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_chaos_workload_progress_rejects_zero_creates_only() {
+        let err = validate_chaos_workload_progress(0, 100, 100, 100, 100).unwrap_err();
+        assert!(err.contains("creates"), "unexpected message: {err}");
+        assert!(!err.contains("reads"), "unexpected message: {err}");
+    }
+
+    #[test]
+    fn validate_chaos_workload_progress_rejects_zero_deletes_only() {
+        // Deletes are the smallest workload slice (10%) and, unlike
+        // scenario_10, don't require a pool threshold to be crossed first
+        // -- the seeded 5000 records are eligible from tick one. Zero
+        // successful deletes across a whole chaos run is still a signal
+        // worth catching, not silently accepted as "just unlucky".
+        let err = validate_chaos_workload_progress(100, 100, 100, 100, 0).unwrap_err();
+        assert!(err.contains("deletes"), "unexpected message: {err}");
+        assert!(!err.contains("creates"), "unexpected message: {err}");
+    }
+
+    #[test]
+    fn validate_chaos_workload_progress_rejects_multiple_zero_categories() {
+        let err = validate_chaos_workload_progress(50, 0, 0, 50, 50).unwrap_err();
+        assert!(err.contains("reads"), "unexpected message: {err}");
+        assert!(err.contains("spends"), "unexpected message: {err}");
+        assert!(!err.contains("creates"), "unexpected message: {err}");
+        assert!(!err.contains("set_mined"), "unexpected message: {err}");
+    }
+
+    #[test]
+    fn validate_chaos_workload_progress_accepts_a_healthy_run() {
+        // Representative of a real 300s chaos run: every op category has
+        // succeeded at least a handful of times despite elevated errors
+        // from continuous node kills/partitions/pauses.
+        let result = validate_chaos_workload_progress(4000, 3000, 2500, 1800, 900);
+        assert!(result.is_ok(), "expected healthy run to pass: {result:?}");
+    }
+
+    /// Exercises the exact `if let Err(msg) = ... { panic!("16: {msg}") }`
+    /// shape used at the real call site in `run_scenario`, so this test
+    /// watches the panic path itself fire rather than just the `Result`
+    /// plumbing.
+    #[test]
+    #[should_panic(
+        expected = "16: zero successful ops for: creates, reads, spends, set_mined, deletes"
+    )]
+    fn total_outage_panics_like_the_real_call_site() {
+        if let Err(msg) = validate_chaos_workload_progress(0, 0, 0, 0, 0) {
+            panic!("16: {msg}");
+        }
+    }
 }

@@ -97,6 +97,48 @@ async fn verify_sample_readable(
     Ok(found as u32)
 }
 
+/// Checks that the asymmetric-partition workload (test 14.2) actually got
+/// some writes accepted somewhere before the per-shard split-brain
+/// invariant is trusted.
+///
+/// That invariant only inspects txids recorded in `writes_on_node`, so it
+/// holds vacuously if the 30s workload never got a single write accepted
+/// anywhere -- e.g. the partition never actually took effect, or quorum was
+/// lost cluster-wide instead of being preserved through node2 as designed.
+/// "No shard had two masters" is trivially true if no shard had a master
+/// write anything at all.
+fn validate_partition_writes_observed(total_partition_writes: usize) -> Result<(), String> {
+    if total_partition_writes == 0 {
+        return Err(
+            "zero writes were accepted on any node during the 30s asymmetric partition \
+             window -- the split-brain invariant has nothing to check and cannot be \
+             trusted as a pass"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// Checks that the flapping-partition background workload (test 14.3) made
+/// positive progress before the final full-consistency check is trusted.
+///
+/// That check only walks txids the verifier recorded, which only grows on
+/// a successful create. If the flapping partition wedged the cluster for
+/// the entire 30s window (zero successful creates), the check would
+/// compare the 2000 seeded records against themselves -- unchanged and
+/// therefore "consistent" -- without the flap workload having exercised
+/// anything. This mirrors scenario_10's `validate_workload_progress`.
+fn validate_flap_workload_progress(creates_ok: u64, creates_err: u64) -> Result<(), String> {
+    if creates_ok == 0 {
+        return Err(format!(
+            "zero successful creates during the 30s flapping-partition workload \
+             ({creates_err} errors) -- the consistency check below only covers the 2000 \
+             seeded records and would pass vacuously without any writes made during the flap"
+        ));
+    }
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn scenario_14_split_brain_prevention() {
     let result = tokio::time::timeout(Duration::from_secs(900), run_scenario()).await;
@@ -174,7 +216,18 @@ async fn test_symmetric_isolation() -> Result<(), ClientError> {
     docker.partition_node("node1", &["node2", "node3"]).await?;
     docker.partition_node("node2", &["node3"]).await?;
 
-    tokio::time::sleep(Duration::from_secs(1)).await;
+    // Confirm the partition actually took hold before trusting
+    // "successful_writes == 0" below. `partition_node` applies its iptables
+    // rules with errors silently discarded, so a failed exec (missing
+    // capability, dead container, etc.) would leave the cluster fully
+    // connected while this test still believed it was isolated -- and
+    // "no isolated node accepted a write" is trivially true if isolation
+    // never happened. A fully (3-way) isolated node has no path -- direct
+    // or indirect via SWIM ping-req -- to any peer, so each node's own
+    // cluster_size must converge to 1 (itself alone); this is the same
+    // signal test_docker_pause (14.4) already relies on to prove a fault
+    // was genuinely detected.
+    common::wait_specific_nodes_ready(&docker, &[1, 2, 3], 1, Duration::from_secs(30)).await?;
 
     eprintln!("[14.1] Attempting writes on each isolated node");
     let node_ports: [(u16, &str); 3] = [
@@ -280,6 +333,11 @@ async fn test_asymmetric_partition() -> Result<(), ClientError> {
         writes_on_node[1].len(),
         writes_on_node[2].len()
     );
+
+    let total_partition_writes: usize = writes_on_node.iter().map(|v| v.len()).sum();
+    if let Err(msg) = validate_partition_writes_observed(total_partition_writes) {
+        panic!("Test 14.2: {msg}");
+    }
 
     // Check that no shard has writes accepted on two different masters.
     // With the asymmetric partition, the cluster should still maintain quorum
@@ -469,6 +527,10 @@ async fn test_flapping_partition() -> Result<(), ClientError> {
     let creates_err = bg_creates_err.load(Ordering::Relaxed);
     eprintln!("[14.3] Background workload: {creates_ok} creates ok, {creates_err} errors");
 
+    if let Err(msg) = validate_flap_workload_progress(creates_ok, creates_err) {
+        panic!("Test 14.3: {msg}");
+    }
+
     // Wait for cluster to settle. After a rate-limited flap the backlog is
     // bounded but can still be non-trivial. Use a single long drain with
     // cluster_ready retries (SWIM + proposer reconverge after the final
@@ -610,6 +672,15 @@ async fn test_docker_pause() -> Result<(), ClientError> {
             cs3 <= 2,
             "node3 should detect node2 failure, cluster_size={cs3}"
         );
+    } else {
+        // Don't silently skip: the preceding wait_specific_nodes_ready is
+        // already best-effort (detection timing, not the invariant this
+        // test exists to prove), but a status-fetch failure here should
+        // still be visible rather than quietly dropping the detection
+        // check with no trace in the output.
+        eprintln!(
+            "[14.4] pause-detection status check skipped: node1={status_n1:?}, node3={status_n3:?}"
+        );
     }
 
     eprintln!("[14.4] Unpausing node2");
@@ -635,4 +706,62 @@ async fn test_docker_pause() -> Result<(), ClientError> {
 
     eprintln!("[14.4] OK -- Docker pause test passed, no split-brain detected");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_partition_writes_observed_rejects_zero() {
+        let err = validate_partition_writes_observed(0).unwrap_err();
+        assert!(
+            err.contains("zero writes were accepted"),
+            "unexpected message: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_partition_writes_observed_accepts_any_positive_count() {
+        let result = validate_partition_writes_observed(1);
+        assert!(result.is_ok(), "expected pass: {result:?}");
+    }
+
+    /// Exercises the exact `if let Err(msg) = ... { panic!("Test 14.2: {msg}") }`
+    /// shape used at the real call site, so this watches the panic path
+    /// itself fire on the vacuous input (zero writes accepted anywhere).
+    #[test]
+    #[should_panic(expected = "Test 14.2: zero writes were accepted on any node")]
+    fn validate_partition_writes_observed_panics_like_the_real_call_site() {
+        if let Err(msg) = validate_partition_writes_observed(0) {
+            panic!("Test 14.2: {msg}");
+        }
+    }
+
+    #[test]
+    fn validate_flap_workload_progress_rejects_zero_creates() {
+        let err = validate_flap_workload_progress(0, 500).unwrap_err();
+        assert!(
+            err.contains("zero successful creates"),
+            "unexpected message: {err}"
+        );
+        assert!(err.contains("500 errors"), "unexpected message: {err}");
+    }
+
+    #[test]
+    fn validate_flap_workload_progress_accepts_a_healthy_run() {
+        let result = validate_flap_workload_progress(1200, 40);
+        assert!(result.is_ok(), "expected pass: {result:?}");
+    }
+
+    /// Exercises the exact `if let Err(msg) = ... { panic!("Test 14.3: {msg}") }`
+    /// shape used at the real call site, watching the panic fire on the
+    /// vacuous input (zero successful creates for the whole flap window).
+    #[test]
+    #[should_panic(expected = "Test 14.3: zero successful creates")]
+    fn validate_flap_workload_progress_panics_like_the_real_call_site() {
+        if let Err(msg) = validate_flap_workload_progress(0, 300) {
+            panic!("Test 14.3: {msg}");
+        }
+    }
 }
