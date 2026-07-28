@@ -842,6 +842,46 @@ fn stuck_subset_master_count(table: &ShardTable, mgr: &MigrationManager, self_id
     })
 }
 
+/// Gate for adopting a peer's active routing snapshot during topology
+/// catch-up: the snapshot must be NEWER than the locally active table AND
+/// backed by a quorum-proven commit (version ≤ the durably committed term).
+///
+/// Partition maps carry no voter proof, so a snapshot version above the
+/// proven term is an unverified peer claim; installing it would leave
+/// `table.version > committed_term`, which self-fences every shard
+/// (`is_master` → `Transitioning`) until a proof arrives.
+fn routing_snapshot_installable(
+    snapshot_version: u64,
+    local_active_version: u64,
+    proven_committed_term: u64,
+) -> bool {
+    snapshot_version > local_active_version && snapshot_version <= proven_committed_term
+}
+
+/// RAII slot deduplicating `TopologyStale` catch-up threads.
+///
+/// [`try_begin`](Self::try_begin) claims the slot (`None` when a catch-up
+/// is already in flight); dropping the guard releases it. The release runs
+/// on unwind too, so a panicked catch-up thread can never wedge future
+/// catch-ups.
+struct CatchupInFlight(Arc<std::sync::atomic::AtomicBool>);
+
+impl CatchupInFlight {
+    /// Claim the catch-up slot. Returns `None` when another catch-up
+    /// thread already holds it.
+    fn try_begin(slot: &Arc<std::sync::atomic::AtomicBool>) -> Option<Self> {
+        slot.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()
+            .map(|_| Self(Arc::clone(slot)))
+    }
+}
+
+impl Drop for CatchupInFlight {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn install_active_routing_snapshot(
     routing: &crate::cluster::routing::RoutingInfo,
@@ -904,16 +944,6 @@ fn install_active_routing_snapshot(
         inbound_bm.clear_all();
     }
     true
-}
-
-fn committed_topology_from_routing_snapshot(
-    _routing: &crate::cluster::routing::RoutingInfo,
-) -> Option<crate::cluster::topology::TopologyCommit> {
-    // Partition maps carry the active assignments and committed member list,
-    // but not the voter proof for the advertised term. A higher term learned
-    // through SWIM gossip must be adopted from OP_GET_COMMITTED_TOPOLOGY,
-    // where TopologyAuthority validates the serialized quorum proof.
-    None
 }
 
 fn old_master_available_for_handoff(
@@ -1608,6 +1638,12 @@ impl ClusterCoordinator {
             // `take_due` after an `observe` at the same instant fires.
             let mut topology_debounce =
                 crate::cluster::topology::TopologyDebounce::from_window(topology_debounce_window);
+            // TopologyStale catch-up dedup: gossip piggybacks the committed
+            // term on every SWIM message, so a lagging node can raise
+            // `TopologyStale` once per inbound probe. At most ONE catch-up
+            // thread runs at a time; the guard clears when it exits (panic
+            // included), after which the next stale signal may spawn again.
+            let topology_catchup_inflight = Arc::new(std::sync::atomic::AtomicBool::new(false));
             while !shutdown.load(Ordering::Relaxed) {
                 match event_rx.recv_timeout(Duration::from_millis(100)) {
                     Ok(event) => {
@@ -1658,7 +1694,7 @@ impl ClusterCoordinator {
                                 &active_topology_members_event,
                                 &migration_throttle_event,
                                 &cluster_secret_event,
-                                &swim_membership_event,
+                                &topology_catchup_inflight,
                             );
                             let activated_term = topology_epoch.load(Ordering::Relaxed);
                             if activated_term > last_activated_term {
@@ -1895,7 +1931,7 @@ impl ClusterCoordinator {
                         &active_topology_members_event,
                         &migration_throttle_event,
                         &cluster_secret_event,
-                        &swim_membership_event,
+                        &topology_catchup_inflight,
                     );
                     let activated_term = topology_epoch.load(Ordering::Relaxed);
                     if activated_term > last_activated_term {
@@ -2877,12 +2913,9 @@ impl ClusterCoordinator {
         active_topology_members: &Arc<RwLock<Vec<NodeId>>>,
         migration_throttle: &Arc<crate::cluster::migration::MigrationThrottle>,
         cluster_secret: &Option<Arc<Vec<u8>>>,
-        // G8 stage 3 — the `TopologyStale` catch-up thread's routing-snapshot
-        // adopt path applies a commit via the non-durable `handle_commit`
-        // directly (bypassing `topology_commit_tx`), so it needs its own
-        // handle to react to a just-applied shrink (see
-        // `react_to_committed_shrink`).
-        swim_membership: &Arc<Mutex<crate::cluster::membership::Membership>>,
+        // At most one `TopologyStale` catch-up thread at a time (see
+        // `CatchupInFlight`); the event loop owns the slot.
+        topology_catchup_inflight: &Arc<std::sync::atomic::AtomicBool>,
     ) {
         match event {
             ClusterEvent::NodeJoined(node, addr) => {
@@ -3095,7 +3128,20 @@ impl ClusterCoordinator {
             }
             ClusterEvent::TopologyStale(remote_term) => {
                 let local_term = topology_authority.committed_term();
-                if *remote_term > local_term {
+                let catchup_guard = if *remote_term > local_term {
+                    let guard = CatchupInFlight::try_begin(topology_catchup_inflight);
+                    if guard.is_none() {
+                        tracing::debug!(
+                            remote_term = *remote_term,
+                            local_term,
+                            "cluster: topology catch-up already in flight — not spawning another",
+                        );
+                    }
+                    guard
+                } else {
+                    None
+                };
+                if let Some(catchup_guard) = catchup_guard {
                     // Spawn catch-up in a background thread so the event loop
                     // stays responsive to SWIM probes and suspect expiration.
                     // Previously, synchronous TCP connections to dead peers
@@ -3116,14 +3162,11 @@ impl ClusterCoordinator {
                     let catch_up_peak = peak_size.clone();
                     let catch_up_si = swim_incarnation.clone();
                     let catch_up_secret = cluster_secret.clone();
-                    // G8 stage 3 — this thread's routing-snapshot-adopt path
-                    // below applies a commit via non-durable `handle_commit`
-                    // directly, bypassing `topology_commit_tx` (the event
-                    // loop's shared shrink-reaction choke point), so it needs
-                    // its own handle to react in place.
-                    let catch_up_swim = swim_membership.clone();
                     let remote_term = *remote_term;
                     std::thread::spawn(move || {
+                        // Holds the dedup slot for this thread's lifetime;
+                        // released on exit (unwind included) via Drop.
+                        let _catchup_guard = catchup_guard;
                         tracing::info!(
                             local_term,
                             remote_term,
@@ -3144,7 +3187,6 @@ impl ClusterCoordinator {
                         let peak_size = &catch_up_peak;
                         let swim_incarnation = &catch_up_si;
                         let cluster_secret = &catch_up_secret;
-                        let swim_membership = &catch_up_swim;
                         let committed_members = topology_authority.committed_members();
                         let peers: Vec<SocketAddr> = {
                             let addrs = node_addrs_for_topo.read();
@@ -3158,70 +3200,13 @@ impl ClusterCoordinator {
                                 .collect()
                         };
 
-                        let local_active_version = { shard_table.read().version };
-                        for peer_addr in &peers {
-                            if let Ok(payload) = send_topology_frame(
-                                *peer_addr,
-                                OP_GET_PARTITION_MAP,
-                                &[],
-                                cluster_secret.as_deref().map(Vec::as_slice),
-                            ) && let Some(routing) =
-                                crate::cluster::routing::RoutingInfo::decode(&payload)
-                                && routing.shard_table_version > local_active_version
-                                && !routing.committed_members.is_empty()
-                            {
-                                let mut snapshot_members = routing.committed_members.clone();
-                                snapshot_members.sort();
-                                if routing.shard_table_version > topology_authority.committed_term()
-                                {
-                                    if let Some(commit) =
-                                        committed_topology_from_routing_snapshot(&routing)
-                                    {
-                                        if let Some(applied_term) =
-                                            topology_authority.handle_commit(&commit)
-                                        {
-                                            // G8 stage 3 — this apply bypasses
-                                            // `topology_commit_tx`, so react here
-                                            // in case it was a shrink.
-                                            react_to_committed_shrink(
-                                                topology_authority,
-                                                applied_term,
-                                                swim_membership,
-                                                peak_size,
-                                                topology_state_path.as_deref(),
-                                            );
-                                        }
-                                    } else {
-                                        tracing::debug!(
-                                            term = routing.shard_table_version,
-                                            %peer_addr,
-                                            members = snapshot_members.len(),
-                                            "cluster: catch-up partition map lacks topology quorum proof",
-                                        );
-                                    }
-                                }
-                                if install_active_routing_snapshot(
-                                    &routing,
-                                    rf,
-                                    shard_table,
-                                    migration,
-                                    fenced_bm,
-                                    migrating_bm,
-                                    inbound_bm,
-                                    active_topology_members,
-                                    inbound_state_path.as_ref(),
-                                    outbound_state_path.as_ref(),
-                                ) {
-                                    tracing::info!(
-                                        term = routing.shard_table_version,
-                                        %peer_addr,
-                                        "cluster: catch-up: installed active routing snapshot",
-                                    );
-                                }
-                                break;
-                            }
-                        }
-
+                        // Adopt a PROVEN committed term FIRST. Partition maps
+                        // carry no voter proof, so the routing-snapshot repair
+                        // below must never run ahead of this: installing an
+                        // unproven snapshot used to leave
+                        // `table.version > committed_term`, which self-fences
+                        // every shard (`is_master` → Transitioning) until a
+                        // proof arrived — and never tried the next peer.
                         let local_term = topology_authority.committed_term();
                         let mut caught_up = false;
                         for peer_addr in &peers {
@@ -3287,6 +3272,51 @@ impl ClusterCoordinator {
                                         continue;
                                     }
                                 }
+                            }
+                        }
+
+                        // Repair the ACTIVE routing table only from a snapshot
+                        // that a quorum-proven commit backs (version ≤ the
+                        // durably committed term adopted above). This is the
+                        // recovery path for a term that committed durably but
+                        // whose activation never completed; it must never
+                        // outrun the proof.
+                        let local_active_version = { shard_table.read().version };
+                        let proven_term = topology_authority.committed_term();
+                        for peer_addr in &peers {
+                            if let Ok(payload) = send_topology_frame(
+                                *peer_addr,
+                                OP_GET_PARTITION_MAP,
+                                &[],
+                                cluster_secret.as_deref().map(Vec::as_slice),
+                            ) && let Some(routing) =
+                                crate::cluster::routing::RoutingInfo::decode(&payload)
+                                && routing_snapshot_installable(
+                                    routing.shard_table_version,
+                                    local_active_version,
+                                    proven_term,
+                                )
+                                && !routing.committed_members.is_empty()
+                            {
+                                if install_active_routing_snapshot(
+                                    &routing,
+                                    rf,
+                                    shard_table,
+                                    migration,
+                                    fenced_bm,
+                                    migrating_bm,
+                                    inbound_bm,
+                                    active_topology_members,
+                                    inbound_state_path.as_ref(),
+                                    outbound_state_path.as_ref(),
+                                ) {
+                                    tracing::info!(
+                                        term = routing.shard_table_version,
+                                        %peer_addr,
+                                        "cluster: catch-up: installed active routing snapshot",
+                                    );
+                                }
+                                break;
                             }
                         }
 
@@ -4556,29 +4586,22 @@ fn try_run_topology_proposal(
             .collect()
     });
 
-    // Retry failed broadcasts sequentially (transient failures).
-    let mut still_failed = failed_addrs;
-    for (retry, delay_ms) in [(1u32, 50u64), (2, 200)] {
-        if still_failed.is_empty() {
-            break;
+    // Retry a failed broadcast; returns true when the peer is STILL failed.
+    let retry_send = |addr: &SocketAddr, retry: u32| -> bool {
+        if let Err(e) = send_topology_frame(*addr, OP_TOPOLOGY_COMMIT, &commit_payload, auth_secret)
+        {
+            tracing::warn!(retry, %addr, err = %e, "cluster: topology commit retry failed");
+            true
+        } else {
+            false
         }
-        std::thread::sleep(Duration::from_millis(delay_ms));
-        still_failed.retain(|addr| {
-            if let Err(e) =
-                send_topology_frame(*addr, OP_TOPOLOGY_COMMIT, &commit_payload, auth_secret)
-            {
-                tracing::warn!(retry, %addr, err = %e, "cluster: topology commit retry failed");
-                true
-            } else {
-                false
-            }
-        });
-    }
+    };
+
+    // One quick retry pass for transient failures before the local apply.
+    let mut still_failed = failed_addrs;
     if !still_failed.is_empty() {
-        tracing::warn!(
-            unreachable = still_failed.len(),
-            "cluster: topology commit: nodes unreachable after retries",
-        );
+        std::thread::sleep(Duration::from_millis(50));
+        still_failed.retain(|addr| retry_send(addr, 1));
     }
 
     // G9 — apply the commit locally only AFTER its committed term is durable.
@@ -4589,7 +4612,7 @@ fn try_run_topology_proposal(
     let peak = peak_size.load(Ordering::Relaxed) as u64;
     let inc = swim_incarnation.load(Ordering::Relaxed);
     let path = topology_state_path.as_deref();
-    match topology_authority.handle_commit_durable(&commit, peak, inc, |state| {
+    let applied = match topology_authority.handle_commit_durable(&commit, peak, inc, |state| {
         persist_topology_state_durable(path, state)
     }) {
         crate::cluster::topology::DurableCommitOutcome::Applied(_) => {
@@ -4610,7 +4633,31 @@ fn try_run_topology_proposal(
             // advanced past this term). No local activation needed.
             true
         }
+    };
+
+    // Extended straggler retries run AFTER the local apply so unreachable
+    // peers never delay the proposer's own activation. Bounded exponential
+    // (no jitter: one proposer per term, there is no retry herd). A peer
+    // still unreachable after this converges via the proof-gated
+    // TopologyStale catch-up pull instead of staying behind until the next
+    // proposal — previously the broadcast gave up after two quick retries.
+    for (retry, delay_ms) in [(2u32, 200u64), (3, 800), (4, 1600), (5, 3200)] {
+        if still_failed.is_empty() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(delay_ms));
+        still_failed.retain(|addr| retry_send(addr, retry));
     }
+    if !still_failed.is_empty() {
+        tracing::warn!(
+            unreachable = still_failed.len(),
+            term = commit.term,
+            "cluster: topology commit: nodes unreachable after extended retries — \
+             they will converge via topology catch-up",
+        );
+    }
+
+    applied
 }
 
 /// G8 stage 3 — react to a commit this node just durably applied, in case it
@@ -17845,6 +17892,12 @@ mod tests {
 
     #[test]
     fn synthetic_commit_requires_quorum_proof() {
+        // A peer's partition map advertises a term but carries no voter
+        // proof; the catch-up path must not adopt it as a committed
+        // topology (terms advance only via OP_GET_COMMITTED_TOPOLOGY,
+        // where the serialized quorum proof is validated) and must not
+        // install its routing snapshot ahead of the proven term (the
+        // `routing_snapshot_installable` gate).
         let committed_members = vec![NodeId(1), NodeId(2), NodeId(3)];
         let routing = crate::cluster::routing::RoutingInfo {
             shard_table_version: 7,
@@ -17856,14 +17909,14 @@ mod tests {
         let authority =
             crate::cluster::topology::TopologyAuthority::new(NodeId(2), Duration::from_secs(1));
 
-        let maybe_commit = committed_topology_from_routing_snapshot(&routing);
         assert!(
-            maybe_commit.is_none(),
-            "partition-map committed_members alone must not synthesize a committed topology"
+            !routing_snapshot_installable(
+                routing.shard_table_version,
+                0,
+                authority.committed_term()
+            ),
+            "an unproven partition-map snapshot must not be installable",
         );
-        if let Some(commit) = maybe_commit {
-            let _ = authority.handle_commit(&commit);
-        }
         assert_eq!(
             authority.committed_term(),
             0,
@@ -22904,6 +22957,58 @@ mod tests {
         assert_ne!(
             shipped_unmined, device_unmined,
             "regression guard: the stale device value must never be what ships"
+        );
+    }
+    // ── P5: commit-dissemination hardening ───────────────────────────────
+
+    #[test]
+    fn routing_snapshot_gate_requires_proven_term() {
+        // Newer than active AND covered by the proven committed term → install.
+        assert!(routing_snapshot_installable(5, 3, 5));
+        assert!(routing_snapshot_installable(4, 3, 5));
+        // Ahead of the proven term = unverified peer claim → refuse. This was
+        // the self-fence bug: installing left table.version > committed_term.
+        assert!(
+            !routing_snapshot_installable(6, 3, 5),
+            "a snapshot version above the proven committed term must never install",
+        );
+        // Not newer than the active table → nothing to repair.
+        assert!(!routing_snapshot_installable(3, 3, 5));
+        assert!(!routing_snapshot_installable(2, 3, 5));
+        // Degenerate bootstrap: nothing proven yet → nothing installable.
+        assert!(!routing_snapshot_installable(1, 0, 0));
+    }
+
+    #[test]
+    fn catchup_slot_admits_one_at_a_time() {
+        let slot = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let first = CatchupInFlight::try_begin(&slot);
+        assert!(first.is_some(), "an idle slot must be claimable");
+        assert!(
+            CatchupInFlight::try_begin(&slot).is_none(),
+            "a held slot must refuse a second catch-up",
+        );
+        drop(first);
+        assert!(
+            CatchupInFlight::try_begin(&slot).is_some(),
+            "dropping the guard must release the slot",
+        );
+    }
+
+    #[test]
+    fn catchup_slot_releases_on_panic() {
+        let slot = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let thread_slot = Arc::clone(&slot);
+        let result = std::thread::spawn(move || {
+            let _guard =
+                CatchupInFlight::try_begin(&thread_slot).expect("idle slot must be claimable");
+            panic!("simulated catch-up thread crash");
+        })
+        .join();
+        assert!(result.is_err(), "the catch-up thread must have panicked");
+        assert!(
+            CatchupInFlight::try_begin(&slot).is_some(),
+            "an unwound catch-up thread must release the slot via Drop",
         );
     }
 }
