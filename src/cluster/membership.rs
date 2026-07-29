@@ -48,6 +48,75 @@ pub struct MemberInfo {
     pub incarnation: u64,
     /// When the state last changed.
     pub state_changed_at: Instant,
+    /// P2 — Lifeguard dynamic-suspicion state. `Some` only while the member
+    /// is Suspect; cleared on every transition out of Suspect (refutation or
+    /// death), so a later re-suspicion always starts from a fresh deadline.
+    pub suspicion: Option<SuspicionState>,
+}
+
+/// P2 — maximum number of distinct suspicion confirmers retained per member.
+/// Beyond this many independent confirmations the dynamic deadline has
+/// already collapsed to its floor (`ln(C+1)/ln(K+2)` clamps at 1 well before
+/// 8 with K ≤ 3), so additional entries buy nothing — the cap keeps the
+/// per-member state O(1) even under a confirmation flood.
+pub const SUSPICION_CONFIRMER_CAP: usize = 8;
+
+/// P2 — Lifeguard dynamic-suspicion state for one Suspect member.
+///
+/// Tracks the verified confirmers of the suspicion and the shrinking
+/// per-member deadline. The deadline starts at `armed_at + max` (zero
+/// confirmations = today's fixed timeout) and shrinks toward
+/// `armed_at + min` as confirmations arrive; it never extends and never
+/// drops below the floor.
+#[derive(Debug, Clone)]
+pub struct SuspicionState {
+    /// Verified confirmers, in arrival order (entry 0 is the first verified
+    /// suspector — the local node for locally-originated suspicions).
+    /// SECURITY (P2): the transport guarantees every entry here is the
+    /// HMAC-authenticated *sender* of the datagram that delivered the
+    /// confirmation; relayed third-party suspector claims never land here
+    /// (they go to `reported_suspector`). Dedup by NodeId, capped at
+    /// [`SUSPICION_CONFIRMER_CAP`].
+    confirmers: Vec<NodeId>,
+    /// Relayed original-suspector claim (hearsay), recorded for
+    /// observability and onward gossip only — contributes ZERO to the
+    /// deadline because the claim cannot be authenticated.
+    reported_suspector: Option<NodeId>,
+    /// Arm-time deadline ceiling (the transport's LHM-scaled suspicion
+    /// timeout).
+    max: Duration,
+    /// Arm-time deadline floor.
+    min: Duration,
+    /// Expected number of independent confirmers (K in the Lifeguard
+    /// formula), captured at arm time from the cluster size.
+    k: usize,
+    /// When the suspicion was armed.
+    armed_at: Instant,
+    /// Current absolute deadline. Only ever shrinks, never below
+    /// `armed_at + min`.
+    deadline: Instant,
+}
+
+impl SuspicionState {
+    /// P2 — recompute the deadline from the current confirmer count using
+    /// the Lifeguard formula:
+    ///
+    /// `deadline = armed_at + max(min, max - (max-min) * ln(C+1)/ln(K+2))`
+    ///
+    /// Monotonic: C only grows and the formula decreases in C, so the new
+    /// deadline can only shrink; the explicit `min()` guards against f64
+    /// rounding ever extending it.
+    fn recompute_deadline(&mut self) {
+        let c = self.confirmers.len() as f64;
+        let k = self.k as f64;
+        let frac = ((c + 1.0).ln() / (k + 2.0).ln()).clamp(0.0, 1.0);
+        let span = self.max.saturating_sub(self.min);
+        let timeout = self.max.saturating_sub(span.mul_f64(frac)).max(self.min);
+        let new_deadline = self.armed_at + timeout;
+        if new_deadline < self.deadline {
+            self.deadline = new_deadline;
+        }
+    }
 }
 
 /// SWIM membership state machine.
@@ -152,6 +221,9 @@ impl Membership {
                     info.state = NodeState::Alive;
                     info.incarnation = incarnation;
                     info.addr = addr;
+                    // P2 — a refutation (any transition back to Alive) clears
+                    // the confirmer set; a later re-suspicion starts fresh.
+                    info.suspicion = None;
                     let now = Instant::now();
                     info.state_changed_at = now;
 
@@ -183,6 +255,7 @@ impl Membership {
                         state: NodeState::Alive,
                         incarnation,
                         state_changed_at: Instant::now(),
+                        suspicion: None,
                     },
                 );
                 self.rebuild_alive_cache();
@@ -207,16 +280,61 @@ impl Membership {
     /// The incarnation must be >= the node's current incarnation; a stale
     /// suspect notification (from an old gossip round) is silently ignored
     /// to prevent overriding a newer alive state.
+    ///
+    /// P2 — arms the dynamic suspicion deadline at the fixed configured
+    /// timeout (max = `suspicion_timeout`, min = `max / 8`). The transport
+    /// uses [`Self::mark_suspect_with_timeouts`] to pass LHM-scaled bounds;
+    /// this plain form keeps the historical behavior for direct callers.
     pub fn mark_suspect(&mut self, node: NodeId, incarnation: u64) -> Vec<ClusterEvent> {
+        let max = self.suspicion_timeout;
+        self.mark_suspect_with_timeouts(node, incarnation, max, max / 8)
+    }
+
+    /// P2 — mark a node as suspect with explicit Lifeguard deadline bounds.
+    ///
+    /// Same transition rules as [`Self::mark_suspect`]; additionally arms a
+    /// [`SuspicionState`] whose deadline starts at `now + max` (i.e. with
+    /// zero confirmations the member expires exactly as under the fixed
+    /// timeout) and shrinks toward `now + min` as confirmations arrive via
+    /// [`Self::confirm_suspect`]. `min` is clamped to `max`. K (expected
+    /// confirmers) is captured from the current cluster size:
+    /// `min(INDIRECT_PROBE_K, alive_count - 2)` — everyone except the
+    /// suspect and the local node, bounded by the indirect-probe fan-out.
+    ///
+    /// A no-op (and no deadline reset) when the member is already Suspect —
+    /// this preserves the W3.2 invariant that the suspicion clock runs from
+    /// the FIRST suspicion.
+    pub fn mark_suspect_with_timeouts(
+        &mut self,
+        node: NodeId,
+        incarnation: u64,
+        max: Duration,
+        min: Duration,
+    ) -> Vec<ClusterEvent> {
         let mut events = Vec::new();
+
+        // K depends on the membership size at arm time; compute before
+        // mutably borrowing the member entry.
+        let k = crate::cluster::swim::INDIRECT_PROBE_K.min(self.alive_count().saturating_sub(2));
 
         if let Some(info) = self.members.get_mut(&node)
             && info.state == NodeState::Alive
             && incarnation >= info.incarnation
         {
+            let now = Instant::now();
             info.state = NodeState::Suspect;
             info.incarnation = incarnation;
-            info.state_changed_at = Instant::now();
+            info.state_changed_at = now;
+            let min = min.min(max);
+            info.suspicion = Some(SuspicionState {
+                confirmers: Vec::new(),
+                reported_suspector: None,
+                max,
+                min,
+                k,
+                armed_at: now,
+                deadline: now + max,
+            });
             self.max_seen_incarnation
                 .entry(node)
                 .and_modify(|max| *max = (*max).max(incarnation))
@@ -232,6 +350,88 @@ impl Membership {
         }
 
         events
+    }
+
+    /// P2 — count a verified suspicion confirmation and shrink the deadline.
+    ///
+    /// SECURITY RULE (non-negotiable): callers must pass as `confirmed_by`
+    /// the *authenticated sender* of the datagram that delivered the
+    /// confirmation — the transport only calls this when the extension's
+    /// claimed suspector id equals the HMAC-verified sender. Each sender
+    /// therefore contributes at most one confirmation per suspect (dedup by
+    /// NodeId here enforces the "at most one" half).
+    ///
+    /// Returns `true` when the confirmation was counted; `false` when it was
+    /// a duplicate, the member is not Suspect, the confirmer set is at
+    /// [`SUSPICION_CONFIRMER_CAP`], or `confirmed_by` is the suspect itself
+    /// (a node cannot confirm its own suspicion — it would be refuting it).
+    pub fn confirm_suspect(&mut self, node: NodeId, confirmed_by: NodeId) -> bool {
+        if confirmed_by == node {
+            return false;
+        }
+        let Some(info) = self.members.get_mut(&node) else {
+            return false;
+        };
+        if info.state != NodeState::Suspect {
+            return false;
+        }
+        let Some(st) = info.suspicion.as_mut() else {
+            return false;
+        };
+        if st.confirmers.contains(&confirmed_by) || st.confirmers.len() >= SUSPICION_CONFIRMER_CAP {
+            return false;
+        }
+        st.confirmers.push(confirmed_by);
+        st.recompute_deadline();
+        true
+    }
+
+    /// P2 — record a relayed (unverifiable) original-suspector claim.
+    ///
+    /// Kept for observability and onward gossip only: the claim names who
+    /// originally suspected `node` according to a third party, so it MUST
+    /// NOT shrink the deadline (see [`Self::confirm_suspect`]'s security
+    /// rule). First claim wins; ignored when the member is not Suspect.
+    pub fn note_reported_suspector(&mut self, node: NodeId, suspector: NodeId) {
+        if suspector == node {
+            return;
+        }
+        if let Some(info) = self.members.get_mut(&node)
+            && info.state == NodeState::Suspect
+            && let Some(st) = info.suspicion.as_mut()
+            && st.reported_suspector.is_none()
+        {
+            st.reported_suspector = Some(suspector);
+        }
+    }
+
+    /// P2 — the suspector this node advertises in its suspect gossip.
+    ///
+    /// Prefers first-hand knowledge (the first *verified* confirmer — the
+    /// local node itself for locally-originated suspicions) and falls back
+    /// to the relayed hearsay claim. Preferring the verified entry is what
+    /// lets independent suspectors advertise THEMSELVES: under the
+    /// direct-sender-only counting rule a relayed original-suspector id can
+    /// never be counted by receivers, so gossiping only the relayed
+    /// original would stall every remote confirmer count at one.
+    pub fn original_suspector(&self, node: &NodeId) -> Option<NodeId> {
+        let st = self.members.get(node)?.suspicion.as_ref()?;
+        st.confirmers.first().copied().or(st.reported_suspector)
+    }
+
+    /// P2 — current dynamic suspicion deadline for a Suspect member, if any.
+    pub fn suspicion_deadline(&self, node: &NodeId) -> Option<Instant> {
+        Some(self.members.get(node)?.suspicion.as_ref()?.deadline)
+    }
+
+    /// P2 — number of verified suspicion confirmers for a member (0 when
+    /// not Suspect).
+    pub fn suspicion_confirmer_count(&self, node: &NodeId) -> usize {
+        self.members
+            .get(node)
+            .and_then(|i| i.suspicion.as_ref())
+            .map(|st| st.confirmers.len())
+            .unwrap_or(0)
     }
 
     /// Mark a node as dead. Returns events.
@@ -253,6 +453,8 @@ impl Membership {
             info.state = NodeState::Dead;
             info.incarnation = incarnation;
             info.state_changed_at = now;
+            // P2 — the suspicion is resolved; drop its confirmer state.
+            info.suspicion = None;
             self.max_seen_incarnation
                 .entry(node)
                 .and_modify(|max| *max = (*max).max(incarnation))
@@ -281,6 +483,12 @@ impl Membership {
     /// Uses each suspect's current incarnation so that expiration always
     /// succeeds — the incarnation guard in `mark_dead` is satisfied because
     /// we pass the exact incarnation we already know.
+    ///
+    /// P2 — each suspect expires at its own dynamic (Lifeguard) deadline,
+    /// which starts at the arm-time `max` and shrinks as verified
+    /// confirmations arrive. A Suspect without armed suspicion state (not
+    /// reachable through the public API, but defended against) falls back
+    /// to the fixed configured timeout.
     pub fn expire_suspects(&mut self) -> Vec<ClusterEvent> {
         let now = Instant::now();
         let timeout = self.suspicion_timeout;
@@ -289,7 +497,10 @@ impl Membership {
             .iter()
             .filter(|(_, info)| {
                 info.state == NodeState::Suspect
-                    && now.duration_since(info.state_changed_at) >= timeout
+                    && match info.suspicion.as_ref() {
+                        Some(st) => now >= st.deadline,
+                        None => now.duration_since(info.state_changed_at) >= timeout,
+                    }
             })
             .map(|(&id, info)| (id, info.incarnation))
             .collect();
@@ -1258,5 +1469,191 @@ mod tests {
             );
         }
         assert_eq!(m.alive_members(), vec![NodeId(1), NodeId(2)]);
+    }
+
+    // -----------------------------------------------------------------------
+    // P2: Lifeguard dynamic suspicion deadline
+    // -----------------------------------------------------------------------
+
+    /// Build a membership with `peers` alive peers (NodeIds 2..2+peers) so
+    /// K = min(3, cluster_size - 2) is deterministic in the tests below.
+    fn membership_with_peers(timeout: Duration, peers: u64) -> Membership {
+        let mut m = Membership::new(NodeId(1), timeout);
+        for i in 0..peers {
+            m.mark_alive(NodeId(2 + i), addr(3001 + i as u16), 1, true);
+        }
+        m
+    }
+
+    /// P2 — the same `confirmed_by` twice counts once: the second call is
+    /// rejected and the deadline does not shrink further.
+    #[test]
+    fn confirm_suspect_dedups_same_sender() {
+        let mut m = membership_with_peers(Duration::from_secs(8), 5); // K = 3
+        m.mark_suspect(NodeId(2), 1);
+        let d0 = m.suspicion_deadline(&NodeId(2)).unwrap();
+
+        assert!(m.confirm_suspect(NodeId(2), NodeId(3)));
+        let d1 = m.suspicion_deadline(&NodeId(2)).unwrap();
+        assert!(d1 < d0, "first confirmation must shrink the deadline");
+        assert_eq!(m.suspicion_confirmer_count(&NodeId(2)), 1);
+
+        // Same sender again: rejected, no further shrink.
+        assert!(!m.confirm_suspect(NodeId(2), NodeId(3)));
+        assert_eq!(
+            m.suspicion_deadline(&NodeId(2)).unwrap(),
+            d1,
+            "duplicate confirmer must not shrink the deadline again"
+        );
+        assert_eq!(m.suspicion_confirmer_count(&NodeId(2)), 1);
+    }
+
+    /// P2 — distinct confirmers shrink the deadline monotonically, and the
+    /// suspect itself can never confirm its own suspicion.
+    #[test]
+    fn deadline_shrinks_monotonically_with_distinct_confirmers() {
+        let mut m = membership_with_peers(Duration::from_secs(8), 5); // K = 3
+        m.mark_suspect(NodeId(2), 1);
+        let mut prev = m.suspicion_deadline(&NodeId(2)).unwrap();
+
+        // The suspect confirming itself is rejected outright.
+        assert!(!m.confirm_suspect(NodeId(2), NodeId(2)));
+        assert_eq!(m.suspicion_deadline(&NodeId(2)).unwrap(), prev);
+
+        for confirmer in [NodeId(1), NodeId(3), NodeId(4)] {
+            assert!(m.confirm_suspect(NodeId(2), confirmer));
+            let d = m.suspicion_deadline(&NodeId(2)).unwrap();
+            assert!(
+                d < prev,
+                "each distinct confirmer must strictly shrink the deadline"
+            );
+            prev = d;
+        }
+        assert_eq!(m.suspicion_confirmer_count(&NodeId(2)), 3);
+    }
+
+    /// P2 — the deadline never drops below the arm-time floor, and the
+    /// confirmer set is capped at [`SUSPICION_CONFIRMER_CAP`].
+    #[test]
+    fn deadline_floor_and_confirmer_cap_respected() {
+        let mut m = membership_with_peers(Duration::from_secs(1), 3); // K = 2
+        let max = Duration::from_millis(800);
+        let min = Duration::from_millis(100);
+        m.mark_suspect_with_timeouts(NodeId(2), 1, max, min);
+        let d0 = m.suspicion_deadline(&NodeId(2)).unwrap(); // armed_at + max
+
+        // Flood with distinct confirmers well past the point where the
+        // formula clamps at the floor.
+        let mut counted = 0usize;
+        for i in 0..12u64 {
+            if m.confirm_suspect(NodeId(2), NodeId(100 + i)) {
+                counted += 1;
+            }
+        }
+        assert_eq!(
+            counted, SUSPICION_CONFIRMER_CAP,
+            "confirmers past the cap must be rejected"
+        );
+        assert_eq!(
+            m.suspicion_confirmer_count(&NodeId(2)),
+            SUSPICION_CONFIRMER_CAP
+        );
+
+        // Floor: the deadline collapsed exactly to armed_at + min and no
+        // further (ln(C+1)/ln(K+2) clamps at 1, span shrink is exact).
+        let d_final = m.suspicion_deadline(&NodeId(2)).unwrap();
+        assert_eq!(
+            d_final,
+            d0 - (max - min),
+            "deadline must clamp at the floor (armed_at + min)"
+        );
+    }
+
+    /// P2 — a refutation (Suspect → Alive) clears the confirmer set; a
+    /// later re-suspicion starts from a fresh, un-shrunk deadline.
+    #[test]
+    fn refutation_clears_confirmers() {
+        let mut m = membership_with_peers(Duration::from_secs(8), 5);
+        m.mark_suspect(NodeId(2), 1);
+        assert!(m.confirm_suspect(NodeId(2), NodeId(3)));
+        assert!(m.confirm_suspect(NodeId(2), NodeId(4)));
+        assert_eq!(m.suspicion_confirmer_count(&NodeId(2)), 2);
+
+        // Direct same-incarnation ACK refutes the suspicion.
+        m.mark_alive(NodeId(2), addr(3001), 1, true);
+        assert_eq!(m.member_info(&NodeId(2)).unwrap().state, NodeState::Alive);
+        assert_eq!(m.suspicion_confirmer_count(&NodeId(2)), 0);
+        assert!(
+            m.suspicion_deadline(&NodeId(2)).is_none(),
+            "refutation must drop the suspicion state entirely"
+        );
+
+        // Re-suspect: fresh state, zero confirmers, deadline back at max.
+        m.mark_suspect(NodeId(2), 1);
+        assert_eq!(m.suspicion_confirmer_count(&NodeId(2)), 0);
+        let d = m.suspicion_deadline(&NodeId(2)).unwrap();
+        // With zero confirmers the deadline sits a full `max` out; two
+        // confirmers earlier would have shrunk it well below that.
+        assert!(d >= Instant::now() + Duration::from_secs(7));
+    }
+
+    /// P2 — direct-sender-only rule at the API level: a relayed suspector
+    /// id (`note_reported_suspector`) is recorded for observability but
+    /// contributes zero to the deadline; only `confirm_suspect` (which the
+    /// transport calls exclusively with the authenticated datagram sender)
+    /// shrinks it.
+    #[test]
+    fn relayed_suspector_contributes_zero() {
+        let mut m = membership_with_peers(Duration::from_secs(8), 5);
+        m.mark_suspect(NodeId(2), 1);
+        let d0 = m.suspicion_deadline(&NodeId(2)).unwrap();
+
+        // Relayed claim: "NodeId(9) originally suspected NodeId(2)".
+        m.note_reported_suspector(NodeId(2), NodeId(9));
+        assert_eq!(
+            m.suspicion_deadline(&NodeId(2)).unwrap(),
+            d0,
+            "hearsay suspector must not shrink the deadline"
+        );
+        assert_eq!(m.suspicion_confirmer_count(&NodeId(2)), 0);
+        // ...but it is visible for onward gossip.
+        assert_eq!(m.original_suspector(&NodeId(2)), Some(NodeId(9)));
+
+        // A verified confirmation still counts and takes precedence in the
+        // advertised suspector.
+        assert!(m.confirm_suspect(NodeId(2), NodeId(3)));
+        assert!(m.suspicion_deadline(&NodeId(2)).unwrap() < d0);
+        assert_eq!(m.original_suspector(&NodeId(2)), Some(NodeId(3)));
+    }
+
+    /// P2 — expire_suspects honors the per-member dynamic deadline: with
+    /// enough confirmations the suspect dies at the floor, far before the
+    /// configured suspicion timeout.
+    #[test]
+    fn expire_uses_dynamic_deadline() {
+        // Configured timeout is LONG (10s) so a fixed-timeout expiry can
+        // never fire inside this test; only the shrunk deadline can.
+        let mut m = membership_with_peers(Duration::from_secs(10), 3); // K = 2
+        let max = Duration::from_secs(10);
+        let min = Duration::from_millis(20);
+        m.mark_suspect_with_timeouts(NodeId(2), 1, max, min);
+
+        // Not expired without confirmations.
+        assert!(m.expire_suspects().is_empty());
+
+        // Enough distinct confirmers to clamp the deadline at the floor
+        // (C=7 ⇒ ln(8)/ln(4) > 1 with K=2).
+        for i in 0..7u64 {
+            m.confirm_suspect(NodeId(2), NodeId(100 + i));
+        }
+        std::thread::sleep(min + Duration::from_millis(10));
+        let events = m.expire_suspects();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, ClusterEvent::NodeLeft(NodeId(2)))),
+            "confirmed suspect must expire at the shrunk deadline, events: {events:?}"
+        );
+        assert_eq!(m.member_info(&NodeId(2)).unwrap().state, NodeState::Dead);
     }
 }

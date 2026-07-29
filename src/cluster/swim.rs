@@ -24,6 +24,28 @@ const MSG_PING_REQ: u8 = 4;
 /// Wire layout matches [`SwimRunner::encode_message`] piggyback, then `[probed_target_id:8]`,
 /// then committed term (see [`SwimRunner::handle_message`]).
 const MSG_INDIRECT_ACK: u8 = 5;
+/// P2 — negative result of an indirect probe (Lifeguard NACK): the relay's
+/// forwarded PING to the target got no ACK within the relay's own probe
+/// budget. Wire layout mirrors [`MSG_INDIRECT_ACK`] exactly (same
+/// `[probed_target_id:8]` position, same HMAC envelope). A NACK tells the
+/// requester the RELAY is healthy but the target is unreachable via it —
+/// strong evidence for suspicion — whereas relay silence tells the requester
+/// nothing (and is counted against the requester's own local health, not
+/// against the target). Old nodes drop unknown message types after normal
+/// header/piggyback processing, so mixed-version clusters are safe.
+const MSG_INDIRECT_NACK: u8 = 6;
+
+/// P2 — Lifeguard Local Health Multiplier saturation ceiling. The counter
+/// lives in `[0, LHM_MAX]`; at the ceiling the node's own probe interval
+/// and timeout are maximally relaxed (see [`lhm_scaled_interval`]).
+const LHM_MAX: u8 = 8;
+
+/// P2 — tag byte opening the optional suspector extension trailer appended
+/// AFTER the committed-term trailer: `[tag:1][count:1][(suspect_id:8,
+/// suspector_id:8) × count]`. Placed last precisely because today's parsers
+/// stop reading after the committed term and ignore trailing bytes — that
+/// is what makes the extension version-tolerant for old nodes.
+const EXT_TAG_SUSPECTORS: u8 = 0x53; // 'S'
 
 /// On-wire message format:
 /// [msg_type:1][sender_id:8][sender_incarnation:8][sender_seq:8][sender_addr_len:2][sender_addr:N]
@@ -150,10 +172,33 @@ struct PendingProbe {
     /// backoff in the suspect-timeout path so a transiently slow peer is
     /// not immediately marked suspect on the first ping-req failure.
     indirect_attempts: u32,
+    /// P2 — relays this round's PING_REQs were sent to (≤ INDIRECT_PROBE_K).
+    /// A NACK is only counted when it comes from one of these.
+    relays_pinged: Vec<NodeId>,
+    /// P2 — relays that answered with [`MSG_INDIRECT_NACK`] this round
+    /// (dedup subset of `relays_pinged`). At round end: ≥ 1 NACK means the
+    /// target is unreachable via a provably-healthy relay; 0 NACKs despite
+    /// ≥ 1 relay asked is the Lifeguard "missed NACK" self-health signal.
+    nack_from: Vec<NodeId>,
+}
+
+/// P2 — one in-flight PING_REQ forwarding entry on a relay: where to send
+/// the result, and when the forwarded PING went out (so silence can be
+/// turned into an explicit [`MSG_INDIRECT_NACK`] after the relay's own
+/// probe budget elapses).
+struct PingReqForward {
+    /// The original requester to answer with INDIRECT_ACK / INDIRECT_NACK.
+    requester: SocketAddr,
+    /// When the forwarded PING was sent. NOT refreshed when a duplicate
+    /// PING_REQ for the same target arrives — the FIFO order queue relies
+    /// on insertion order matching age (front = oldest).
+    forwarded_at: Instant,
 }
 
 /// Number of indirect probe peers to ask when direct probe fails.
-const INDIRECT_PROBE_K: usize = 3;
+/// P2 — also reused by `membership` as K (expected confirmers) in the
+/// Lifeguard dynamic suspicion deadline formula.
+pub(crate) const INDIRECT_PROBE_K: usize = 3;
 
 /// Return a jittered probe interval in `[0.75 * base, 1.25 * base]`.
 ///
@@ -200,6 +245,51 @@ fn suspect_backoff_delay(base: Duration, indirect_attempts: u32) -> Duration {
     let nanos = base.as_nanos().saturating_mul(mult as u128);
     let clamped = nanos.min(u64::MAX as u128) as u64;
     Duration::from_nanos(clamped)
+}
+
+/// P2 — scale a base duration by the Lifeguard Local Health Multiplier.
+///
+/// A node with LHM = n waits `(1 + n) × base`, capped at `8 × base`, before
+/// concluding anything from its own probes — a degraded node (one that keeps
+/// timing out its own probes or being suspected by peers) probes less
+/// aggressively and waits longer, so it stops manufacturing suspects out of
+/// its own slowness. Applied to the base BEFORE jitter; at LHM = 0 this is
+/// the identity, i.e. exactly today's behavior.
+fn lhm_scaled_interval(base: Duration, lhm: u8) -> Duration {
+    let mult = (1 + lhm as u128).min(8);
+    let nanos = base.as_nanos().saturating_mul(mult);
+    Duration::from_nanos(nanos.min(u64::MAX as u128) as u64)
+}
+
+/// P2 — compose the indirect-round suspect backoff with the LHM.
+///
+/// Multiplies [`suspect_backoff_delay`] by `(1 + LHM)` while keeping the
+/// existing `16 × base` cap on the TOTAL, so a fully degraded node cannot
+/// stretch the per-round wait beyond what the pre-Lifeguard backoff already
+/// allowed. At LHM = 0 this is exactly [`suspect_backoff_delay`].
+fn lhm_scaled_suspect_delay(base: Duration, indirect_attempts: u32, lhm: u8) -> Duration {
+    let backoff = suspect_backoff_delay(base, indirect_attempts);
+    let scaled = backoff.as_nanos().saturating_mul(1 + lhm as u128);
+    let cap = base.as_nanos().saturating_mul(16);
+    Duration::from_nanos(scaled.min(cap).min(u64::MAX as u128) as u64)
+}
+
+/// P2 — LHM penalty for a probe round that produced no direct ACK and no
+/// indirect ACK.
+///
+/// Every failed round counts one failed-probe event (+1). If we asked ≥ 1
+/// relay and heard NOTHING back — no ACK *and no NACK* — that is the
+/// Lifeguard "missed NACK" signal: healthy relays answer a PING_REQ with an
+/// explicit [`MSG_INDIRECT_NACK`] when the target is down, so total silence
+/// points at OUR receive path, and costs one additional event (+1). A round
+/// with ≥ 1 NACK is strong third-party evidence the target is genuinely
+/// unreachable, so only the base penalty applies.
+fn lhm_penalty_for_failed_round(relays_pinged: usize, nacks_received: usize) -> u8 {
+    if relays_pinged > 0 && nacks_received == 0 {
+        2
+    } else {
+        1
+    }
 }
 
 /// Phase I — exponential backoff for seed-node retry attempts.
@@ -420,13 +510,14 @@ pub struct SwimRunner {
     pending_probe: Option<PendingProbe>,
     /// Index for round-robin peer selection.
     probe_round_robin: usize,
-    /// Tracks PING_REQ forwarding: maps (original_requester_addr) to pending
-    /// indirect probe targets so we can forward ACKs back.
+    /// Tracks PING_REQ forwarding: maps probed target ids to the original
+    /// requester (plus the forward timestamp) so we can forward ACKs back —
+    /// or send an explicit NACK when the target stays silent (P2).
     ///
     /// Capped at [`PING_REQ_FORWARDING_MAX`] entries (F-G8-004); when the
     /// cap is reached, the oldest entry is evicted to make room. The
     /// FIFO order is tracked by `ping_req_forwarding_order`.
-    ping_req_forwarding: HashMap<NodeId, SocketAddr>,
+    ping_req_forwarding: HashMap<NodeId, PingReqForward>,
     /// Insertion-order list parallel to `ping_req_forwarding`, used to
     /// evict the oldest entry when the cap is hit. Front = oldest.
     ping_req_forwarding_order: std::collections::VecDeque<NodeId>,
@@ -451,6 +542,16 @@ pub struct SwimRunner {
     /// to Dead (`NodeLeft`) and again when the reaper forgets the peer
     /// after [`DEAD_MEMBER_FORGET_AFTER`].
     seen_seq: HashMap<NodeId, ReplayWindow>,
+    /// P2 — Lifeguard Local Health Multiplier (LHM), `0..=LHM_MAX`.
+    ///
+    /// A saturating self-health score: +1 when one of our probe rounds
+    /// fails outright, +1 more when relays we asked stayed completely
+    /// silent (missed NACK), +1 when we must refute our own suspicion;
+    /// −1 on every clean direct probe round-trip. The node's OWN probe
+    /// interval and timeouts are scaled by `(1 + LHM)` (see
+    /// [`lhm_scaled_interval`]), so a degraded node slows itself down
+    /// instead of manufacturing suspects.
+    local_health: u8,
 }
 
 impl SwimRunner {
@@ -479,7 +580,52 @@ impl SwimRunner {
             ping_req_forwarding_order: std::collections::VecDeque::new(),
             next_outbound_seq: 1,
             seen_seq: HashMap::new(),
+            local_health: 0,
         }
+    }
+
+    /// P2 — current Lifeguard Local Health Multiplier (0 = healthy,
+    /// [`LHM_MAX`] = maximally degraded). Exposed for tests and admin
+    /// introspection; the live value is also mirrored to the
+    /// `swim_local_health` gauge in [`crate::metrics::SwimMetrics`].
+    pub fn local_health(&self) -> u8 {
+        self.local_health
+    }
+
+    /// P2 — increment the LHM (saturating at [`LHM_MAX`]) and mirror the
+    /// new value to the metrics gauge.
+    fn lhm_bump(&mut self) {
+        self.local_health = self.local_health.saturating_add(1).min(LHM_MAX);
+        if let Some(m) = swim_metrics() {
+            m.swim_local_health.store(
+                self.local_health as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+    }
+
+    /// P2 — decrement the LHM (floor 0) on a clean direct probe round-trip
+    /// and mirror the new value to the metrics gauge.
+    fn lhm_decay(&mut self) {
+        self.local_health = self.local_health.saturating_sub(1);
+        if let Some(m) = swim_metrics() {
+            m.swim_local_health.store(
+                self.local_health as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+    }
+
+    /// P2 — arm-time `(max, min)` bounds for the Lifeguard dynamic
+    /// suspicion deadline, scaled by our current LHM:
+    /// `max = suspicion_timeout × (1 + LHM)` (capped at 8×),
+    /// `min = max(2 × scaled_probe_interval, max / 8)`.
+    fn suspicion_bounds(&self) -> (Duration, Duration) {
+        let max = lhm_scaled_interval(self.config.suspicion_timeout, self.local_health);
+        let min = lhm_scaled_interval(self.config.probe_interval, self.local_health)
+            .saturating_mul(2)
+            .max(max / 8);
+        (max, min)
     }
 
     /// Get the current SWIM incarnation counter.
@@ -578,8 +724,8 @@ impl SwimRunner {
         // `encode_message` takes `&mut self` (it bumps the outbound seq).
         let seeds: Vec<SocketAddr> = self.config.seed_nodes.clone();
         for seed in seeds {
-            let updates = self.collect_member_updates();
-            let msg = self.encode_message(MSG_JOIN, &updates);
+            let (updates, ext) = self.collect_member_updates();
+            let msg = self.encode_message_with_ext(MSG_JOIN, &updates, &ext);
             let _ = socket.send_to(&msg, seed);
         }
 
@@ -629,12 +775,20 @@ impl SwimRunner {
             // not marked suspect on the first hiccup. The initial direct
             // probe still uses the un-jittered `probe_interval` so we
             // don't prolong the normal RTT budget.
+            //
+            // P2 — both budgets are additionally scaled by our own Local
+            // Health Multiplier: a node that keeps failing its own probes
+            // stops trusting its own timers before it stops trusting peers.
             let mut should_suspect = false;
             if let Some(ref pending) = self.pending_probe {
                 let elapsed = pending.started.elapsed();
-                let indirect_timeout =
-                    suspect_backoff_delay(probe_interval, pending.indirect_attempts);
-                if !pending.indirect_sent && elapsed >= probe_interval {
+                let direct_timeout = lhm_scaled_interval(probe_interval, self.local_health);
+                let indirect_timeout = lhm_scaled_suspect_delay(
+                    probe_interval,
+                    pending.indirect_attempts,
+                    self.local_health,
+                );
+                if !pending.indirect_sent && elapsed >= direct_timeout {
                     // Direct probe timed out — send indirect probes
                     self.send_indirect_probes(&socket);
                 } else if pending.indirect_sent && elapsed >= indirect_timeout {
@@ -647,6 +801,15 @@ impl SwimRunner {
                 if let Some(m) = swim_metrics() {
                     m.swim_probe_timeouts_total.inc();
                 }
+                // P2 — count the failed round against our own health: +1
+                // always, +1 more when relays we asked stayed completely
+                // silent (missed NACK — see `lhm_penalty_for_failed_round`).
+                for _ in 0..lhm_penalty_for_failed_round(
+                    pending.relays_pinged.len(),
+                    pending.nack_from.len(),
+                ) {
+                    self.lhm_bump();
+                }
                 // W3.2 — mark suspect AND immediately arm a fresh direct
                 // re-probe of the suspect (a real second chance) instead of
                 // passively waiting out the suspicion timeout.
@@ -656,13 +819,34 @@ impl SwimRunner {
                 }
             }
 
+            // P2 — Lifeguard NACK (relay side): any forwarded PING that has
+            // gone unanswered past our own probe budget becomes an explicit
+            // INDIRECT_NACK back to the requester. Silence from a healthy
+            // relay is thereby eliminated — so silence observed BY a
+            // requester indicts the requester's own receive path.
+            let relay_timeout = lhm_scaled_interval(probe_interval, self.local_health);
+            for (target_id, requester) in self.ping_req_forwarding_expired(relay_timeout) {
+                let (updates, ext) = self.collect_member_updates();
+                let nack = self.encode_indirect_result_message(
+                    MSG_INDIRECT_NACK,
+                    &updates,
+                    &ext,
+                    target_id,
+                );
+                let _ = socket.send_to(&nack, requester);
+            }
+
             // Periodic probe: select one random peer. Each cycle uses a
             // freshly-jittered delay so consecutive probes don't align
             // across peers.
             if last_probe.elapsed() >= next_probe_delay {
                 self.send_probe(&socket);
                 last_probe = Instant::now();
-                next_probe_delay = jittered_probe_interval(probe_interval);
+                // P2 — the LHM scales the base BEFORE jitter, so a degraded
+                // node probes up to 8× less often (cap in
+                // `lhm_scaled_interval`; identity at LHM = 0).
+                next_probe_delay =
+                    jittered_probe_interval(lhm_scaled_interval(probe_interval, self.local_health));
 
                 // Expire suspects
                 let events = self.membership.lock().expire_suspects();
@@ -694,8 +878,8 @@ impl SwimRunner {
                     // Clone seed list so the inner encode_message can take &mut self.
                     let seeds: Vec<SocketAddr> = self.config.seed_nodes.clone();
                     for seed in seeds {
-                        let updates = self.collect_member_updates();
-                        let msg = self.encode_message(MSG_JOIN, &updates);
+                        let (updates, ext) = self.collect_member_updates();
+                        let msg = self.encode_message_with_ext(MSG_JOIN, &updates, &ext);
                         let _ = socket.send_to(&msg, seed);
                     }
                     next_seed_retry_delay = exponential_seed_backoff(
@@ -780,14 +964,60 @@ impl SwimRunner {
         if !self.ping_req_forwarding.contains_key(&target_id) {
             self.ping_req_forwarding_order.push_back(target_id);
         }
-        self.ping_req_forwarding.insert(target_id, from_addr);
+        // P2 — keep the ORIGINAL forwarded_at on replacement: the FIFO order
+        // queue relies on insertion order matching age, and a duplicate
+        // PING_REQ does not make the outstanding forwarded PING younger.
+        let forwarded_at = self
+            .ping_req_forwarding
+            .get(&target_id)
+            .map(|f| f.forwarded_at)
+            .unwrap_or_else(Instant::now);
+        self.ping_req_forwarding.insert(
+            target_id,
+            PingReqForward {
+                requester: from_addr,
+                forwarded_at,
+            },
+        );
+    }
+
+    /// P2 — pop forwarding entries whose forwarded PING has gone unanswered
+    /// for at least `timeout`, returning `(probed_target, requester)` pairs
+    /// the caller must answer with [`MSG_INDIRECT_NACK`].
+    ///
+    /// O(expired): the FIFO order queue's front is always the oldest live
+    /// entry (insertion order == age, see [`Self::ping_req_forwarding_put`]),
+    /// so the scan stops at the first non-expired entry.
+    fn ping_req_forwarding_expired(&mut self, timeout: Duration) -> Vec<(NodeId, SocketAddr)> {
+        let now = Instant::now();
+        let mut expired = Vec::new();
+        while let Some(&oldest) = self.ping_req_forwarding_order.front() {
+            match self.ping_req_forwarding.get(&oldest) {
+                Some(f) if now.saturating_duration_since(f.forwarded_at) < timeout => break,
+                Some(_) => {
+                    self.ping_req_forwarding_order.pop_front();
+                    if let Some(f) = self.ping_req_forwarding.remove(&oldest) {
+                        expired.push((oldest, f.requester));
+                    }
+                }
+                // Defensive: an order-queue entry without a map entry is
+                // stale bookkeeping — drop it and keep scanning.
+                None => {
+                    self.ping_req_forwarding_order.pop_front();
+                }
+            }
+        }
+        expired
     }
 
     /// Remove the entry for `target_id` from the forwarding map and
     /// the parallel order queue. Returns the requester address if the
     /// entry existed.
     fn ping_req_forwarding_take(&mut self, target_id: &NodeId) -> Option<SocketAddr> {
-        let removed = self.ping_req_forwarding.remove(target_id);
+        let removed = self
+            .ping_req_forwarding
+            .remove(target_id)
+            .map(|f| f.requester);
         if removed.is_some() {
             // O(n) but the queue is bounded by PING_REQ_FORWARDING_MAX
             // and removal happens once per matched ACK.
@@ -875,6 +1105,9 @@ impl SwimRunner {
         // Process piggybacked membership updates
         // Wire format per entry:
         // [node_id:8][state:1][incarnation:8][tcp_addr_len:2][tcp_addr:N][swim_addr_len:2][swim_addr:M]
+        // P2 — bounds for any suspicion armed from this datagram's entries,
+        // scaled by OUR current LHM (computed once per datagram).
+        let (suspicion_max, suspicion_min) = self.suspicion_bounds();
         let updates_offset = 27 + addr_len;
         let mut pos = updates_offset;
         if data.len() > updates_offset + 2 {
@@ -948,6 +1181,10 @@ impl SwimRunner {
                             // below peers' max_seen — permanently exiled.
                             self.incarnation_shared
                                 .store(self.incarnation, Ordering::Relaxed);
+                            // P2 — being suspected while demonstrably alive
+                            // means OUR acks/gossip were too slow to prevent
+                            // it: a Lifeguard local-health event.
+                            self.lhm_bump();
                             tracing::debug!(
                                 self_id = self.config.self_id.0,
                                 refuted_incarnation = inc,
@@ -966,7 +1203,12 @@ impl SwimRunner {
                     let mut mem = self.membership.lock();
                     let evts = match state {
                         0 => mem.mark_alive(nid, tcp_addr, inc, false),
-                        1 => mem.mark_suspect(nid, inc),
+                        // P2 — gossip-learned suspicions arm the dynamic
+                        // deadline with our LHM-scaled bounds. With no
+                        // verified confirmation (see the suspector
+                        // extension below) the deadline sits at `max`,
+                        // i.e. exactly the historical fixed timeout.
+                        1 => mem.mark_suspect_with_timeouts(nid, inc, suspicion_max, suspicion_min),
                         2 => mem.mark_dead(nid, inc),
                         _ => vec![],
                     };
@@ -976,25 +1218,63 @@ impl SwimRunner {
         }
 
         // Parse extension + committed topology term (after piggybacked updates).
-        // [`MSG_INDIRECT_ACK`] inserts `[probed_target_id:8]` before the committed term so the
-        // original requester can clear `pending_probe` for the probed node while the message
-        // header still identifies the relay (UDP source matches relay, not the probed target).
-        if msg_type == MSG_INDIRECT_ACK {
+        // [`MSG_INDIRECT_ACK`] / [`MSG_INDIRECT_NACK`] insert `[probed_target_id:8]` before the
+        // committed term so the original requester can attribute the result to the probed node
+        // while the message header still identifies the relay (UDP source matches relay, not the
+        // probed target).
+        if msg_type == MSG_INDIRECT_ACK || msg_type == MSG_INDIRECT_NACK {
             if data.len() < pos + 8 + 8 {
                 return events;
             }
             let probed_target = NodeId(u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap()));
             pos += 8;
-            if let Some(ref pending) = self.pending_probe
-                && pending.target == probed_target
-            {
-                self.pending_probe = None;
+            if msg_type == MSG_INDIRECT_ACK {
+                if let Some(ref pending) = self.pending_probe
+                    && pending.target == probed_target
+                {
+                    self.pending_probe = None;
+                }
+            } else {
+                // P2 — NACK: the relay is provably healthy (it answered) but
+                // the target did not ACK its forwarded probe. Count it once
+                // per relay we actually asked; the round-end logic treats
+                // ≥ 1 NACK as normal target-down evidence and 0 NACKs as
+                // the missed-NACK self-health signal. The pending probe is
+                // NOT cleared — a NACK is evidence against the target, not
+                // an answer from it.
+                if let Some(ref mut pending) = self.pending_probe
+                    && pending.target == probed_target
+                    && pending.relays_pinged.contains(&sender_id)
+                    && !pending.nack_from.contains(&sender_id)
+                {
+                    pending.nack_from.push(sender_id);
+                }
             }
         }
 
-        // Committed topology term (appended after updates, and after indirect-ACK probed id if present).
+        // P2 — [`MSG_PING_REQ`] appends `[target_id:8][addr_len:2][addr:N]`
+        // after the piggybacked updates (see `send_indirect_probes`).
+        // Advance past it before the committed-term / extension trailer
+        // parse; without this the target id was misread as the committed
+        // term (spurious `TopologyStale` for large NodeIds) and the
+        // suspector extension could never be located on PING_REQ datagrams.
+        if msg_type == MSG_PING_REQ {
+            if data.len() < pos + 10 {
+                return events;
+            }
+            let target_addr_len =
+                u16::from_le_bytes(data[pos + 8..pos + 10].try_into().unwrap()) as usize;
+            pos += 10 + target_addr_len;
+            if pos > data.len() {
+                return events;
+            }
+        }
+
+        // Committed topology term (appended after updates, and after the indirect-result probed
+        // id / PING_REQ target info if present).
         if data.len() >= pos + 8 {
             let remote_committed = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
+            pos += 8;
             let local_committed = self
                 .config
                 .committed_term
@@ -1004,10 +1284,41 @@ impl SwimRunner {
             }
         }
 
+        // P2 — optional suspector extension trailer:
+        // `[EXT_TAG_SUSPECTORS:1][count:1][(suspect_id:8, suspector_id:8) × count]`,
+        // appended AFTER the committed term precisely because old parsers
+        // stop reading there and ignore trailing bytes (version tolerance).
+        // The exact-length check rejects accidental tag matches inside
+        // garbled or legacy trailers.
+        if data.len() >= pos + 2
+            && data[pos] == EXT_TAG_SUSPECTORS
+            && data.len() == pos + 2 + data[pos + 1] as usize * 16
+        {
+            let count = data[pos + 1] as usize;
+            let mut p = pos + 2;
+            let mut mem = self.membership.lock();
+            for _ in 0..count {
+                let suspect = NodeId(u64::from_le_bytes(data[p..p + 8].try_into().unwrap()));
+                let suspector = NodeId(u64::from_le_bytes(data[p + 8..p + 16].try_into().unwrap()));
+                p += 16;
+                // Relayed claim: recorded as hearsay for observability and
+                // onward gossip only — never counted toward the deadline.
+                mem.note_reported_suspector(suspect, suspector);
+                // SECURITY (P2, non-negotiable): a confirmation is counted
+                // ONLY when the claimed suspector IS the HMAC-verified
+                // sender of this datagram. `confirm_suspect` dedups by
+                // NodeId, so each sender contributes at most one
+                // confirmation per suspect.
+                if suspector == sender_id && suspect != sender_id {
+                    mem.confirm_suspect(suspect, sender_id);
+                }
+            }
+        }
+
         // Send ACK for PING/JOIN
         if msg_type == MSG_PING || msg_type == MSG_JOIN {
-            let updates = self.collect_member_updates();
-            let ack = self.encode_message(MSG_ACK, &updates);
+            let (updates, ext) = self.collect_member_updates();
+            let ack = self.encode_message_with_ext(MSG_ACK, &updates, &ext);
             let _ = socket.send_to(&ack, from_addr);
         }
 
@@ -1017,14 +1328,22 @@ impl SwimRunner {
                 && pending.target == sender_id
             {
                 self.pending_probe = None;
+                // P2 — a clean direct probe round-trip is evidence our own
+                // timers/receive path are healthy: decay the LHM (floor 0).
+                self.lhm_decay();
             }
             // Check if we should forward this ACK to a requester (PING_REQ flow)
             if let Some(requester_addr) = self.ping_req_forwarding_take(&sender_id) {
                 // Forward using MSG_INDIRECT_ACK: header/sender is this relay (UDP source matches),
                 // probed target id is appended so the requester clears pending_probe for the target
                 // without attributing the relay's address to the target in swim_peer_addrs.
-                let updates = self.collect_member_updates();
-                let ack = self.encode_indirect_ack_message(&updates, sender_id);
+                let (updates, ext) = self.collect_member_updates();
+                let ack = self.encode_indirect_result_message(
+                    MSG_INDIRECT_ACK,
+                    &updates,
+                    &ext,
+                    sender_id,
+                );
                 let _ = socket.send_to(&ack, requester_addr);
             }
         }
@@ -1041,8 +1360,8 @@ impl SwimRunner {
                 // entry (F-G8-004) and increment the dropped counter.
                 self.ping_req_forwarding_put(target_id, from_addr);
                 // Send PING to the target
-                let updates = self.collect_member_updates();
-                let ping = self.encode_message(MSG_PING, &updates);
+                let (updates, ext) = self.collect_member_updates();
+                let ping = self.encode_message_with_ext(MSG_PING, &updates, &ext);
                 let _ = socket.send_to(&ping, target_swim_addr);
             }
         }
@@ -1167,8 +1486,8 @@ impl SwimRunner {
         self.probe_round_robin = self.probe_round_robin.wrapping_add(1);
         let (target_id, target_swim_addr) = peers[idx];
 
-        let updates = self.collect_member_updates();
-        let msg = self.encode_message(MSG_PING, &updates);
+        let (updates, ext) = self.collect_member_updates();
+        let msg = self.encode_message_with_ext(MSG_PING, &updates, &ext);
 
         let _ = socket.send_to(&msg, target_swim_addr);
         if let Some(m) = swim_metrics() {
@@ -1179,6 +1498,8 @@ impl SwimRunner {
             started: Instant::now(),
             indirect_sent: false,
             indirect_attempts: 0,
+            relays_pinged: Vec::new(),
+            nack_from: Vec::new(),
         });
     }
 
@@ -1231,7 +1552,7 @@ impl SwimRunner {
         };
 
         // Build PING_REQ message with target info appended after updates
-        let updates = self.collect_member_updates();
+        let (updates, ext) = self.collect_member_updates();
         let suspect_addr_str = suspect_swim_addr.to_string();
         let suspect_addr_bytes = suspect_addr_str.as_bytes();
 
@@ -1240,16 +1561,25 @@ impl SwimRunner {
         payload.extend_from_slice(&(suspect_addr_bytes.len() as u16).to_le_bytes());
         payload.extend_from_slice(suspect_addr_bytes);
 
-        let msg = self.encode_message(MSG_PING_REQ, &payload);
+        let msg = self.encode_message_with_ext(MSG_PING_REQ, &payload, &ext);
 
         // Send to up to K random other peers using their SWIM addresses.
         // Skip peers whose swim address is unknown.
-        let swim_addrs = self.swim_peer_addrs.lock();
-        let k = INDIRECT_PROBE_K.min(peers.len());
-        for &(peer_id, _tcp_addr) in peers.iter().take(k) {
-            if let Some(&addr) = swim_addrs.get(&peer_id) {
-                let _ = socket.send_to(&msg, addr);
+        // P2 — remember which relays we actually asked: only their NACKs
+        // count, and their collective silence is the missed-NACK signal.
+        let mut relays_pinged = Vec::with_capacity(INDIRECT_PROBE_K);
+        {
+            let swim_addrs = self.swim_peer_addrs.lock();
+            let k = INDIRECT_PROBE_K.min(peers.len());
+            for &(peer_id, _tcp_addr) in peers.iter().take(k) {
+                if let Some(&addr) = swim_addrs.get(&peer_id) {
+                    let _ = socket.send_to(&msg, addr);
+                    relays_pinged.push(peer_id);
+                }
             }
+        }
+        if let Some(ref mut p) = self.pending_probe {
+            p.relays_pinged = relays_pinged;
         }
     }
 
@@ -1284,9 +1614,16 @@ impl SwimRunner {
     ) -> Vec<ClusterEvent> {
         // Mark the target Suspect using its current incarnation (our own
         // probe failure, so the incarnation is known and the guard passes).
+        // P2 — arm the Lifeguard dynamic deadline with OUR LHM-scaled
+        // bounds, and register ourselves as the first verified confirmer
+        // (we ARE the original suspector: our own probe round failed).
+        let (suspicion_max, suspicion_min) = self.suspicion_bounds();
         let mut mem = self.membership.lock();
         let inc = mem.member_info(&target).map(|i| i.incarnation).unwrap_or(0);
-        let events = mem.mark_suspect(target, inc);
+        let events = mem.mark_suspect_with_timeouts(target, inc, suspicion_max, suspicion_min);
+        if !events.is_empty() {
+            mem.confirm_suspect(target, self.config.self_id);
+        }
         drop(mem);
 
         if events.is_empty() {
@@ -1299,8 +1636,8 @@ impl SwimRunner {
         // know its SWIM address (cannot send a direct UDP probe).
         let target_swim = self.swim_peer_addrs.lock().get(&target).copied();
         if let Some(addr) = target_swim {
-            let updates = self.collect_member_updates();
-            let ping = self.encode_message(MSG_PING, &updates);
+            let (updates, ext) = self.collect_member_updates();
+            let ping = self.encode_message_with_ext(MSG_PING, &updates, &ext);
             let _ = socket.send_to(&ping, addr);
             if let Some(m) = swim_metrics() {
                 m.swim_probes_sent_total.inc();
@@ -1310,6 +1647,8 @@ impl SwimRunner {
                 started: Instant::now(),
                 indirect_sent: false,
                 indirect_attempts: 0,
+                relays_pinged: Vec::new(),
+                nack_from: Vec::new(),
             });
         }
 
@@ -1317,13 +1656,30 @@ impl SwimRunner {
     }
 
     fn encode_message(&mut self, msg_type: u8, piggybacked_updates: &[u8]) -> Vec<u8> {
+        self.encode_message_with_ext(msg_type, piggybacked_updates, &[])
+    }
+
+    /// P2 — encode a message with an optional trailing extension block.
+    ///
+    /// The extension bytes are appended AFTER the committed-term trailer
+    /// (inside the HMAC envelope): old parsers stop reading at the committed
+    /// term and ignore trailing bytes, which is what makes the extension
+    /// safe in mixed-version clusters. Pass `&[]` for no extension — the
+    /// resulting bytes are identical to the historical wire format.
+    fn encode_message_with_ext(
+        &mut self,
+        msg_type: u8,
+        piggybacked_updates: &[u8],
+        trailing_ext: &[u8],
+    ) -> Vec<u8> {
         let addr_str = self.config.self_addr.to_string();
         let addr_bytes = addr_str.as_bytes();
         let seq = self.next_outbound_seq;
         self.next_outbound_seq = self.next_outbound_seq.wrapping_add(1);
 
-        let mut buf =
-            Vec::with_capacity(27 + addr_bytes.len() + piggybacked_updates.len() + 8 + 32);
+        let mut buf = Vec::with_capacity(
+            27 + addr_bytes.len() + piggybacked_updates.len() + 8 + trailing_ext.len() + 32,
+        );
         buf.push(msg_type);
         buf.extend_from_slice(&self.config.self_id.0.to_le_bytes());
         buf.extend_from_slice(&self.incarnation.to_le_bytes());
@@ -1341,6 +1697,8 @@ impl SwimRunner {
             .load(std::sync::atomic::Ordering::Relaxed);
         buf.extend_from_slice(&ct.to_le_bytes());
 
+        buf.extend_from_slice(trailing_ext);
+
         // If a cluster secret is configured, append HMAC-SHA256 tag.
         if let Some(ref secret) = self.config.cluster_secret {
             buf = crate::cluster::auth::sign(secret, &buf);
@@ -1352,44 +1710,50 @@ impl SwimRunner {
     /// Encode a relay-forwarded indirect probe result for the original PING_REQ requester.
     ///
     /// The header identifies the **relay** (same as a normal outgoing message from this node).
-    /// `probed_target` is the node that responded to the relay's PING; the requester uses it to
-    /// clear [`SwimRunner::pending_probe`] without mapping `probed_target` to the relay's UDP
-    /// source address.
+    /// `probed_target` is the node the relay probed on the requester's behalf; the requester
+    /// uses it to attribute the result without mapping `probed_target` to the relay's UDP
+    /// source address. `msg_type` selects the polarity: [`MSG_INDIRECT_ACK`] (the target
+    /// answered the relay) or [`MSG_INDIRECT_NACK`] (P2 — the relay's forwarded probe timed
+    /// out); both share this exact wire layout.
+    fn encode_indirect_result_message(
+        &mut self,
+        msg_type: u8,
+        piggybacked_updates: &[u8],
+        trailing_ext: &[u8],
+        probed_target: NodeId,
+    ) -> Vec<u8> {
+        let mut payload = Vec::with_capacity(piggybacked_updates.len() + 8);
+        payload.extend_from_slice(piggybacked_updates);
+        payload.extend_from_slice(&probed_target.0.to_le_bytes());
+        self.encode_message_with_ext(msg_type, &payload, trailing_ext)
+    }
+
+    /// Encode a relay-forwarded indirect ACK (no extension trailer). See
+    /// [`Self::encode_indirect_result_message`] for the wire layout.
+    #[cfg(test)]
     fn encode_indirect_ack_message(
         &mut self,
         piggybacked_updates: &[u8],
         probed_target: NodeId,
     ) -> Vec<u8> {
-        let addr_str = self.config.self_addr.to_string();
-        let addr_bytes = addr_str.as_bytes();
-        let seq = self.next_outbound_seq;
-        self.next_outbound_seq = self.next_outbound_seq.wrapping_add(1);
-
-        let mut buf =
-            Vec::with_capacity(27 + addr_bytes.len() + piggybacked_updates.len() + 8 + 8 + 32);
-        buf.push(MSG_INDIRECT_ACK);
-        buf.extend_from_slice(&self.config.self_id.0.to_le_bytes());
-        buf.extend_from_slice(&self.incarnation.to_le_bytes());
-        buf.extend_from_slice(&seq.to_le_bytes());
-        buf.extend_from_slice(&(addr_bytes.len() as u16).to_le_bytes());
-        buf.extend_from_slice(addr_bytes);
-        buf.extend_from_slice(piggybacked_updates);
-        buf.extend_from_slice(&probed_target.0.to_le_bytes());
-
-        let ct = self
-            .config
-            .committed_term
-            .load(std::sync::atomic::Ordering::Relaxed);
-        buf.extend_from_slice(&ct.to_le_bytes());
-
-        if let Some(ref secret) = self.config.cluster_secret {
-            buf = crate::cluster::auth::sign(secret, &buf);
-        }
-        observe_encoded_message_size(MSG_INDIRECT_ACK, buf.len());
-        buf
+        self.encode_indirect_result_message(
+            MSG_INDIRECT_ACK,
+            piggybacked_updates,
+            &[],
+            probed_target,
+        )
     }
 
-    fn collect_member_updates(&self) -> Vec<u8> {
+    /// Build the piggybacked membership-update block plus the P2 suspector
+    /// extension trailer.
+    ///
+    /// Returns `(updates, suspector_ext)`. The extension carries one
+    /// `(suspect_id, suspector_id)` pair for each Suspect entry actually
+    /// emitted in `updates` whose suspector we know (first verified
+    /// confirmer, falling back to relayed hearsay — see
+    /// [`Membership::original_suspector`]); it is empty when the datagram
+    /// carries no such suspects, producing the historical wire format.
+    fn collect_member_updates(&self) -> (Vec<u8>, Vec<u8>) {
         use crate::cluster::membership::NodeState;
 
         let membership = self.membership.lock();
@@ -1398,6 +1762,8 @@ impl SwimRunner {
 
         let mut buf = Vec::new();
         let mut entries: Vec<(NodeId, u8, u64, String, String)> = Vec::new();
+        // P2 — (suspect, suspector) pairs for the extension trailer.
+        let mut suspector_pairs: Vec<(NodeId, NodeId)> = Vec::new();
 
         // Always include self as alive. Prefer the explicitly configured
         // advertise address (NAT / proxy deployments); otherwise derive
@@ -1444,6 +1810,12 @@ impl SwimRunner {
             } else {
                 continue;
             };
+            // P2 — advertise who suspected each Suspect entry we emit.
+            if state == NodeState::Suspect
+                && let Some(suspector) = membership.original_suspector(&node)
+            {
+                suspector_pairs.push((node, suspector));
+            }
             entries.push((node, state_byte, incarnation, tcp_str, swim_str));
         }
 
@@ -1464,7 +1836,20 @@ impl SwimRunner {
             buf.extend_from_slice(swim_bytes);
         }
 
-        buf
+        // P2 — suspector extension trailer:
+        // [EXT_TAG_SUSPECTORS:1][count:1][(suspect_id:8, suspector_id:8) × count].
+        // Bounded by the 20-entry piggyback cap, so `count` always fits u8.
+        let mut ext = Vec::new();
+        if !suspector_pairs.is_empty() {
+            ext.push(EXT_TAG_SUSPECTORS);
+            ext.push(suspector_pairs.len().min(255) as u8);
+            for (suspect, suspector) in suspector_pairs.iter().take(255) {
+                ext.extend_from_slice(&suspect.0.to_le_bytes());
+                ext.extend_from_slice(&suspector.0.to_le_bytes());
+            }
+        }
+
+        (buf, ext)
     }
 
     /// Signal the SWIM loop to stop.
@@ -1503,17 +1888,32 @@ impl SwimRunner {
 
     #[cfg(test)]
     fn test_set_pending_probe(&mut self, target: NodeId) {
+        self.test_set_pending_probe_with_relays(target, Vec::new());
+    }
+
+    #[cfg(test)]
+    fn test_set_pending_probe_with_relays(&mut self, target: NodeId, relays: Vec<NodeId>) {
         self.pending_probe = Some(PendingProbe {
             target,
             started: Instant::now(),
             indirect_sent: true,
             indirect_attempts: 1,
+            relays_pinged: relays,
+            nack_from: Vec::new(),
         });
     }
 
     #[cfg(test)]
     fn test_pending_probe_target(&self) -> Option<NodeId> {
         self.pending_probe.as_ref().map(|p| p.target)
+    }
+
+    #[cfg(test)]
+    fn test_pending_nack_count(&self) -> usize {
+        self.pending_probe
+            .as_ref()
+            .map(|p| p.nack_from.len())
+            .unwrap_or(0)
     }
 
     #[cfg(test)]
@@ -1579,6 +1979,10 @@ mod tests {
 
     impl SwimRunner {
         pub fn collect_member_updates_for_test(&self) -> Vec<u8> {
+            self.collect_member_updates().0
+        }
+
+        pub fn collect_member_updates_with_ext_for_test(&self) -> (Vec<u8>, Vec<u8>) {
             self.collect_member_updates()
         }
     }
@@ -2406,6 +2810,538 @@ mod tests {
         assert_eq!(
             node.test_member_state(suspect),
             Some(crate::cluster::membership::NodeState::Dead),
+        );
+    }
+
+    // ── P2: Lifeguard Local Health Multiplier ───────────────────────────
+
+    /// P2 — the LHM saturates at [`LHM_MAX`] and floors at 0.
+    #[test]
+    fn lhm_saturates_at_max_and_floors_at_zero() {
+        let addr: SocketAddr = "127.0.0.1:7200".parse().unwrap();
+        let mut node = test_runner(addr, addr);
+        assert_eq!(node.local_health(), 0);
+
+        for _ in 0..12 {
+            node.lhm_bump();
+        }
+        assert_eq!(node.local_health(), LHM_MAX, "LHM must saturate at 8");
+
+        for _ in 0..12 {
+            node.lhm_decay();
+        }
+        assert_eq!(node.local_health(), 0, "LHM must floor at 0");
+    }
+
+    /// P2 — probe interval/timeout scaling: `(1 + LHM) × base`, capped at
+    /// `8 × base`, identity at LHM = 0.
+    #[test]
+    fn lhm_interval_scaling_caps_at_8x() {
+        let base = Duration::from_millis(100);
+        assert_eq!(lhm_scaled_interval(base, 0), base);
+        assert_eq!(lhm_scaled_interval(base, 1), Duration::from_millis(200));
+        assert_eq!(lhm_scaled_interval(base, 7), Duration::from_millis(800));
+        // (1 + 8) = 9× would exceed the 8× cap.
+        assert_eq!(
+            lhm_scaled_interval(base, LHM_MAX),
+            Duration::from_millis(800)
+        );
+    }
+
+    /// P2 — the LHM composes with the indirect-round backoff by
+    /// multiplication, keeping the existing 16× cap on the TOTAL.
+    #[test]
+    fn lhm_suspect_delay_composes_with_backoff_capped_16x() {
+        let base = Duration::from_millis(100);
+        // LHM = 0: exactly the historical backoff.
+        assert_eq!(
+            lhm_scaled_suspect_delay(base, 1, 0),
+            suspect_backoff_delay(base, 1)
+        );
+        assert_eq!(
+            lhm_scaled_suspect_delay(base, 4, 0),
+            Duration::from_millis(1600)
+        );
+        // LHM = 1 doubles the first-round wait: 2×base × 2 = 400ms.
+        assert_eq!(
+            lhm_scaled_suspect_delay(base, 1, 1),
+            Duration::from_millis(400)
+        );
+        // Fully degraded: 2×base × 9 = 1800ms would exceed 16×base = 1600ms.
+        assert_eq!(
+            lhm_scaled_suspect_delay(base, 1, LHM_MAX),
+            Duration::from_millis(1600)
+        );
+        // Backoff already at its own cap: composing must not exceed 16×.
+        assert_eq!(
+            lhm_scaled_suspect_delay(base, 4, LHM_MAX),
+            Duration::from_millis(1600)
+        );
+    }
+
+    /// P2 — failed-round LHM penalty: +1 always; +1 more only when ≥1 relay
+    /// was asked and NONE answered with a NACK (the missed-NACK signal).
+    #[test]
+    fn lhm_penalty_counts_missed_nack() {
+        assert_eq!(lhm_penalty_for_failed_round(0, 0), 1, "no relays asked");
+        assert_eq!(lhm_penalty_for_failed_round(3, 0), 2, "missed NACK");
+        assert_eq!(lhm_penalty_for_failed_round(3, 1), 1, "NACK arrived");
+        assert_eq!(lhm_penalty_for_failed_round(3, 3), 1, "all NACKed");
+    }
+
+    /// P2 — refuting our own suspicion is a local-health event: the node
+    /// was demonstrably alive yet a peer suspected it, so our own
+    /// dissemination was too slow.
+    #[test]
+    fn refuting_self_suspicion_bumps_lhm() {
+        let self_addr: SocketAddr = "127.0.0.1:7201".parse().unwrap();
+        let mut node = test_runner_id(NodeId(1), self_addr, self_addr);
+        let start_inc = node.test_incarnation();
+        assert_eq!(node.local_health(), 0);
+
+        let peer_addr: SocketAddr = "10.0.0.2:5200".parse().unwrap();
+        let mut peer = test_runner_id(NodeId(2), peer_addr, "10.0.0.2:9000".parse().unwrap());
+        let msg = encode_gossip_about(
+            &mut peer,
+            NodeId(1),
+            1, // Suspect
+            start_inc,
+            &self_addr.to_string(),
+            &self_addr.to_string(),
+        );
+
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let _ = node.handle_message(&msg, peer_addr, &socket);
+
+        assert_eq!(node.test_incarnation(), start_inc + 1, "refutation fired");
+        assert_eq!(
+            node.local_health(),
+            1,
+            "refuting self-suspicion must bump LHM"
+        );
+    }
+
+    /// P2 — a clean direct probe round-trip (ACK clears our pending probe)
+    /// decays the LHM by one.
+    #[test]
+    fn direct_ack_roundtrip_decays_lhm() {
+        let self_addr: SocketAddr = "127.0.0.1:7202".parse().unwrap();
+        let mut node = test_runner_id(NodeId(1), self_addr, self_addr);
+        node.lhm_bump();
+        node.lhm_bump();
+        assert_eq!(node.local_health(), 2);
+
+        let target = NodeId(2);
+        let target_swim: SocketAddr = "10.0.0.2:5201".parse().unwrap();
+        node.test_set_pending_probe(target);
+
+        let mut peer = test_runner_id(target, target_swim, "10.0.0.2:9001".parse().unwrap());
+        let updates = peer.collect_member_updates_for_test();
+        let ack = peer.encode_message(MSG_ACK, &updates);
+
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let _ = node.handle_message(&ack, target_swim, &socket);
+
+        assert_eq!(node.test_pending_probe_target(), None, "ACK clears pending");
+        assert_eq!(node.local_health(), 1, "clean round-trip must decay LHM");
+    }
+
+    // ── P2: MSG_INDIRECT_NACK ───────────────────────────────────────────
+
+    fn test_runner_secret(
+        self_id: NodeId,
+        bind: SocketAddr,
+        self_addr: SocketAddr,
+        secret: &[u8],
+    ) -> SwimRunner {
+        SwimRunner::new(SwimConfig {
+            self_id,
+            self_addr,
+            bind_addr: bind,
+            swim_advertise_addr: None,
+            seed_nodes: vec![],
+            probe_interval: Duration::from_millis(100),
+            suspicion_timeout: Duration::from_secs(5),
+            cluster_secret: Some(secret.to_vec()),
+            persisted_incarnation: 0,
+            committed_term: Arc::new(AtomicU64::new(0)),
+        })
+    }
+
+    /// P2 — NACK round-trip over the HMAC envelope: a NACK from a relay we
+    /// actually asked is recorded (once, dedup) WITHOUT clearing the
+    /// pending probe; a tampered NACK is dropped by HMAC verification.
+    #[test]
+    fn indirect_nack_roundtrip_hmac_counts_once_without_clearing_pending() {
+        let secret = b"p2-lifeguard-secret";
+        let requester_addr: SocketAddr = "127.0.0.1:7203".parse().unwrap();
+        let relay_udp: SocketAddr = "10.0.0.2:5202".parse().unwrap();
+        let probed_target = NodeId(3);
+
+        let mut requester = test_runner_secret(NodeId(1), requester_addr, requester_addr, secret);
+        requester.test_set_pending_probe_with_relays(probed_target, vec![NodeId(2)]);
+
+        let mut relay = test_runner_secret(
+            NodeId(2),
+            relay_udp,
+            "10.0.0.2:9002".parse().unwrap(),
+            secret,
+        );
+        let (updates, ext) = relay.collect_member_updates_with_ext_for_test();
+        let nack =
+            relay.encode_indirect_result_message(MSG_INDIRECT_NACK, &updates, &ext, probed_target);
+
+        // Tampered copy: flip one payload byte — HMAC must reject it.
+        let mut tampered = nack.clone();
+        tampered[1] ^= 0xFF;
+
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let _ = requester.handle_message(&tampered, relay_udp, &socket);
+        assert_eq!(
+            requester.test_pending_nack_count(),
+            0,
+            "tampered NACK must be dropped by HMAC verification"
+        );
+
+        let _ = requester.handle_message(&nack, relay_udp, &socket);
+        assert_eq!(
+            requester.test_pending_probe_target(),
+            Some(probed_target),
+            "a NACK is evidence against the target, not an answer from it — \
+             pending must NOT be cleared"
+        );
+        assert_eq!(requester.test_pending_nack_count(), 1);
+
+        // A second NACK from the same relay (fresh message, fresh seq)
+        // must not count twice.
+        let (updates, ext) = relay.collect_member_updates_with_ext_for_test();
+        let nack2 =
+            relay.encode_indirect_result_message(MSG_INDIRECT_NACK, &updates, &ext, probed_target);
+        let _ = requester.handle_message(&nack2, relay_udp, &socket);
+        assert_eq!(
+            requester.test_pending_nack_count(),
+            1,
+            "same relay must count at most once"
+        );
+    }
+
+    /// P2 — a NACK from a node we never sent a PING_REQ to is ignored: only
+    /// relays we actually asked can testify about the target.
+    #[test]
+    fn nack_from_unpinged_relay_is_ignored() {
+        let requester_addr: SocketAddr = "127.0.0.1:7204".parse().unwrap();
+        let stranger_udp: SocketAddr = "10.0.0.9:5203".parse().unwrap();
+        let probed_target = NodeId(3);
+
+        let mut requester = test_runner_id(NodeId(1), requester_addr, requester_addr);
+        // Round in flight, but NodeId(9) is not among the pinged relays.
+        requester.test_set_pending_probe_with_relays(probed_target, vec![NodeId(2)]);
+
+        let mut stranger =
+            test_runner_id(NodeId(9), stranger_udp, "10.0.0.9:9003".parse().unwrap());
+        let (updates, ext) = stranger.collect_member_updates_with_ext_for_test();
+        let nack = stranger.encode_indirect_result_message(
+            MSG_INDIRECT_NACK,
+            &updates,
+            &ext,
+            probed_target,
+        );
+
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let _ = requester.handle_message(&nack, stranger_udp, &socket);
+
+        assert_eq!(requester.test_pending_probe_target(), Some(probed_target));
+        assert_eq!(
+            requester.test_pending_nack_count(),
+            0,
+            "NACK from an unpinged relay must not count"
+        );
+    }
+
+    /// P2 — relay side: a forwarded probe that goes unanswered past the
+    /// timeout is surfaced as an expired `(target, requester)` pair for
+    /// NACKing, and the forwarding entry is consumed; a fresh entry
+    /// survives a long timeout untouched.
+    #[test]
+    fn relay_expires_unanswered_forward_for_nack() {
+        let bind: SocketAddr = "127.0.0.1:7205".parse().unwrap();
+        let mut relay = test_runner(bind, bind);
+        let requester: SocketAddr = "10.0.0.1:5204".parse().unwrap();
+        let target = NodeId(3);
+
+        relay.ping_req_forwarding_put(target, requester);
+        // Fresh entry, generous timeout: nothing expires.
+        assert!(
+            relay
+                .ping_req_forwarding_expired(Duration::from_secs(60))
+                .is_empty()
+        );
+        assert_eq!(relay.ping_req_forwarding_take(&target), Some(requester));
+
+        relay.ping_req_forwarding_put(target, requester);
+        // Zero timeout: expires immediately with the requester to NACK.
+        let expired = relay.ping_req_forwarding_expired(Duration::ZERO);
+        assert_eq!(expired, vec![(target, requester)]);
+        assert_eq!(
+            relay.ping_req_forwarding_take(&target),
+            None,
+            "expired entry must be consumed"
+        );
+    }
+
+    /// P2 — mixed-version safety: an authenticated message with an UNKNOWN
+    /// type byte is processed for its header/piggyback (sender registered)
+    /// and otherwise ignored — no panic, no pending-probe interference, no
+    /// spurious TopologyStale. This is the behavior that protects old nodes
+    /// receiving [`MSG_INDIRECT_NACK`] (type 6) from newer peers.
+    #[test]
+    fn unknown_message_type_is_ignored_gracefully() {
+        let self_addr: SocketAddr = "127.0.0.1:7206".parse().unwrap();
+        let mut node = test_runner_id(NodeId(1), self_addr, self_addr);
+        node.test_set_pending_probe(NodeId(5));
+
+        let peer_addr: SocketAddr = "10.0.0.2:5205".parse().unwrap();
+        let mut peer = test_runner_id(NodeId(2), peer_addr, "10.0.0.2:9004".parse().unwrap());
+        let updates = peer.collect_member_updates_for_test();
+        let msg = peer.encode_message(99, &updates);
+
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let events = node.handle_message(&msg, peer_addr, &socket);
+
+        assert_eq!(
+            node.test_pending_probe_target(),
+            Some(NodeId(5)),
+            "unknown type must not touch the pending probe"
+        );
+        assert!(
+            !events.iter().any(|e| matches!(
+                e,
+                crate::cluster::membership::ClusterEvent::TopologyStale(_)
+            )),
+            "unknown type must not fabricate TopologyStale, events: {events:?}"
+        );
+        // Header processing still ran: the sender is a known peer now.
+        assert!(node.peer_addrs_snapshot().contains_key(&NodeId(2)));
+    }
+
+    // ── P2: suspector extension ─────────────────────────────────────────
+
+    /// P2 — end-to-end ext round-trip: a sender that ITSELF suspects X
+    /// advertises `(X, sender)`; the receiver verifies suspector == sender
+    /// and counts exactly one confirmation for X.
+    #[test]
+    fn suspect_gossip_ext_confirms_direct_sender() {
+        let self_addr: SocketAddr = "127.0.0.1:7207".parse().unwrap();
+        let mut node = test_runner_id(NodeId(1), self_addr, self_addr);
+        let suspect = NodeId(3);
+        let suspect_tcp: SocketAddr = "10.0.0.3:9005".parse().unwrap();
+        node.membership
+            .lock()
+            .mark_alive(suspect, suspect_tcp, 1, true);
+
+        // Sender D(2) independently suspects X(3): first confirmer = D.
+        let sender_udp: SocketAddr = "10.0.0.2:5206".parse().unwrap();
+        let mut sender = test_runner_id(NodeId(2), sender_udp, "10.0.0.2:9006".parse().unwrap());
+        {
+            let mut mem = sender.membership.lock();
+            mem.mark_alive(suspect, suspect_tcp, 1, true);
+            mem.mark_suspect(suspect, 1);
+            assert!(mem.confirm_suspect(suspect, NodeId(2)));
+        }
+        sender.peer_addrs.lock().insert(suspect, suspect_tcp);
+        sender
+            .swim_peer_addrs
+            .lock()
+            .insert(suspect, "10.0.0.3:3301".parse().unwrap());
+
+        let (updates, ext) = sender.collect_member_updates_with_ext_for_test();
+        assert!(
+            !ext.is_empty() && ext[0] == EXT_TAG_SUSPECTORS,
+            "sender must emit the suspector extension for its Suspect entry"
+        );
+        let msg = sender.encode_message_with_ext(MSG_PING, &updates, &ext);
+
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let _ = node.handle_message(&msg, sender_udp, &socket);
+
+        let mem = node.membership.lock();
+        assert_eq!(
+            mem.member_info(&suspect).map(|i| i.state),
+            Some(crate::cluster::membership::NodeState::Suspect),
+        );
+        assert_eq!(
+            mem.suspicion_confirmer_count(&suspect),
+            1,
+            "suspector == authenticated sender must count as one confirmation"
+        );
+        assert_eq!(mem.original_suspector(&suspect), Some(NodeId(2)));
+    }
+
+    /// P2 — SECURITY: a relayed suspector id (≠ the datagram sender) is
+    /// recorded as hearsay but contributes ZERO confirmations.
+    #[test]
+    fn relayed_suspector_id_is_recorded_but_not_counted() {
+        let self_addr: SocketAddr = "127.0.0.1:7208".parse().unwrap();
+        let mut node = test_runner_id(NodeId(1), self_addr, self_addr);
+        let suspect = NodeId(3);
+        let suspect_tcp: SocketAddr = "10.0.0.3:9007".parse().unwrap();
+        node.membership
+            .lock()
+            .mark_alive(suspect, suspect_tcp, 1, true);
+
+        // Sender E(4) merely RELAYS a suspicion originated by D(2).
+        let sender_udp: SocketAddr = "10.0.0.4:5207".parse().unwrap();
+        let mut sender = test_runner_id(NodeId(4), sender_udp, "10.0.0.4:9008".parse().unwrap());
+        {
+            let mut mem = sender.membership.lock();
+            mem.mark_alive(suspect, suspect_tcp, 1, true);
+            mem.mark_suspect(suspect, 1);
+            mem.note_reported_suspector(suspect, NodeId(2));
+            assert_eq!(mem.original_suspector(&suspect), Some(NodeId(2)));
+        }
+        sender.peer_addrs.lock().insert(suspect, suspect_tcp);
+        sender
+            .swim_peer_addrs
+            .lock()
+            .insert(suspect, "10.0.0.3:3302".parse().unwrap());
+
+        let (updates, ext) = sender.collect_member_updates_with_ext_for_test();
+        assert!(!ext.is_empty(), "relayed suspector still rides the ext");
+        let msg = sender.encode_message_with_ext(MSG_PING, &updates, &ext);
+
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let _ = node.handle_message(&msg, sender_udp, &socket);
+
+        let mem = node.membership.lock();
+        assert_eq!(
+            mem.suspicion_confirmer_count(&suspect),
+            0,
+            "a relayed suspector id must contribute zero confirmations"
+        );
+        assert_eq!(
+            mem.original_suspector(&suspect),
+            Some(NodeId(2)),
+            "the hearsay claim is still recorded for observability"
+        );
+    }
+
+    /// P2 — an old-format datagram (no extension trailer) still parses:
+    /// the suspect is armed with zero confirmations, i.e. the historical
+    /// fixed deadline.
+    #[test]
+    fn old_format_datagram_without_ext_still_parses() {
+        let self_addr: SocketAddr = "127.0.0.1:7209".parse().unwrap();
+        let mut node = test_runner_id(NodeId(1), self_addr, self_addr);
+        let suspect = NodeId(3);
+        let suspect_tcp = "10.0.0.3:9009";
+        node.membership
+            .lock()
+            .mark_alive(suspect, suspect_tcp.parse().unwrap(), 1, true);
+
+        let peer_addr: SocketAddr = "10.0.0.2:5208".parse().unwrap();
+        let mut peer = test_runner_id(NodeId(2), peer_addr, "10.0.0.2:9010".parse().unwrap());
+        // encode_gossip_about uses the plain (ext-less) encoder — bytes are
+        // identical to the pre-P2 wire format.
+        let msg = encode_gossip_about(&mut peer, suspect, 1, 1, suspect_tcp, "10.0.0.3:3303");
+
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let _ = node.handle_message(&msg, peer_addr, &socket);
+
+        let mem = node.membership.lock();
+        assert_eq!(
+            mem.member_info(&suspect).map(|i| i.state),
+            Some(crate::cluster::membership::NodeState::Suspect),
+        );
+        assert_eq!(mem.suspicion_confirmer_count(&suspect), 0);
+        assert!(
+            mem.suspicion_deadline(&suspect).is_some(),
+            "ext-less suspicion still arms the (fixed) deadline"
+        );
+    }
+
+    /// P2 — a garbled trailer that happens to start with the ext tag but
+    /// fails the exact-length check is ignored without panicking.
+    #[test]
+    fn malformed_ext_trailer_is_ignored() {
+        let self_addr: SocketAddr = "127.0.0.1:7210".parse().unwrap();
+        let mut node = test_runner_id(NodeId(1), self_addr, self_addr);
+        let suspect = NodeId(3);
+        node.membership
+            .lock()
+            .mark_alive(suspect, "10.0.0.3:9011".parse().unwrap(), 1, true);
+
+        let peer_addr: SocketAddr = "10.0.0.2:5209".parse().unwrap();
+        let mut peer = test_runner_id(NodeId(2), peer_addr, "10.0.0.2:9012".parse().unwrap());
+        let updates = peer.collect_member_updates_for_test();
+        // Claims 5 pairs but carries 3 junk bytes: exact-length check fails.
+        let garbage = [EXT_TAG_SUSPECTORS, 5, 0xAA, 0xBB, 0xCC];
+        let msg = peer.encode_message_with_ext(MSG_PING, &updates, &garbage);
+
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let _ = node.handle_message(&msg, peer_addr, &socket);
+
+        assert_eq!(
+            node.membership.lock().suspicion_confirmer_count(&suspect),
+            0,
+            "malformed trailer must not produce confirmations"
+        );
+    }
+
+    /// P2 — regression: the PING_REQ target info appended after the
+    /// piggyback must be skipped before the committed-term/ext parse. A
+    /// large target NodeId used to be misread as a remote committed term
+    /// (spurious TopologyStale), and the ext trailer was unreachable on
+    /// PING_REQ datagrams.
+    #[test]
+    fn ping_req_target_info_not_misread_as_committed_term() {
+        let self_addr: SocketAddr = "127.0.0.1:7211".parse().unwrap();
+        let mut node = test_runner_id(NodeId(1), self_addr, self_addr);
+        let suspect = NodeId(3);
+        let suspect_tcp: SocketAddr = "10.0.0.3:9013".parse().unwrap();
+        node.membership
+            .lock()
+            .mark_alive(suspect, suspect_tcp, 1, true);
+
+        // Requester D(2) suspects X(3) itself AND asks us to probe a target
+        // with a huge NodeId (the committed-term misparse bait).
+        let sender_udp: SocketAddr = "10.0.0.2:5210".parse().unwrap();
+        let mut sender = test_runner_id(NodeId(2), sender_udp, "10.0.0.2:9014".parse().unwrap());
+        {
+            let mut mem = sender.membership.lock();
+            mem.mark_alive(suspect, suspect_tcp, 1, true);
+            mem.mark_suspect(suspect, 1);
+            assert!(mem.confirm_suspect(suspect, NodeId(2)));
+        }
+        sender.peer_addrs.lock().insert(suspect, suspect_tcp);
+        sender
+            .swim_peer_addrs
+            .lock()
+            .insert(suspect, "10.0.0.3:3304".parse().unwrap());
+
+        let (updates, ext) = sender.collect_member_updates_with_ext_for_test();
+        let big_target = NodeId(u64::MAX - 7);
+        let target_addr = "10.0.0.9:3301";
+        let mut payload = updates;
+        payload.extend_from_slice(&big_target.0.to_le_bytes());
+        payload.extend_from_slice(&(target_addr.len() as u16).to_le_bytes());
+        payload.extend_from_slice(target_addr.as_bytes());
+        let msg = sender.encode_message_with_ext(MSG_PING_REQ, &payload, &ext);
+
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let events = node.handle_message(&msg, sender_udp, &socket);
+
+        assert!(
+            !events.iter().any(|e| matches!(
+                e,
+                crate::cluster::membership::ClusterEvent::TopologyStale(_)
+            )),
+            "PING_REQ target id must not be misread as a committed term, events: {events:?}"
+        );
+        // The ext behind the target info is now reachable and counted.
+        assert_eq!(
+            node.membership.lock().suspicion_confirmer_count(&suspect),
+            1,
+            "suspector ext must be parsed on PING_REQ datagrams too"
         );
     }
 }

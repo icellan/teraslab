@@ -1422,6 +1422,15 @@ pub struct SwimMetrics {
     /// without ACKs at scale, or (b) a peer is flooding PING_REQs for
     /// non-existent NodeIds.
     pub swim_ping_req_dropped_total: PaddedCounter,
+    /// P2 — Lifeguard Local Health Multiplier gauge (0 = healthy, 8 =
+    /// maximally degraded). Mirrored from the SWIM runner's live counter
+    /// on every change: the node's own failed probe rounds, missed relay
+    /// NACKs, and self-suspicion refutations raise it; clean direct probe
+    /// round-trips lower it. A sustained non-zero value means THIS node —
+    /// not its peers — is too slow to run the failure detector at full
+    /// aggression, and its probe interval/timeouts are scaled up by
+    /// `(1 + value)` accordingly.
+    pub swim_local_health: AtomicU64,
 }
 
 /// Number of membership-churn kinds tracked by [`SwimMetrics`].
@@ -1479,6 +1488,7 @@ impl SwimMetrics {
             swim_suspicion_duration_ns: LatencyHistogram::new(),
             swim_membership_churn_total: LabeledCounter::<SWIM_CHURN_CARDINALITY>::new(),
             swim_ping_req_dropped_total: PaddedCounter::new(),
+            swim_local_health: AtomicU64::new(0),
         }
     }
 
