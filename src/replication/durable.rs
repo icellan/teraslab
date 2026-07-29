@@ -18,6 +18,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::Write;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Instant;
 
 use parking_lot::Mutex;
@@ -1503,15 +1504,276 @@ pub fn run_catchup_for_replica(
 }
 
 // ---------------------------------------------------------------------------
+// Catch-up convergence loop (stream-until-converged)
+// ---------------------------------------------------------------------------
+
+/// Result of one bounded catch-up pass, as reported to
+/// [`run_catchup_to_convergence`] by its `run_pass` callback.
+///
+/// The callback owns the actual streaming and bookkeeping (production:
+/// `run_one_catchup_pass` in `bin/server.rs`, which wraps
+/// [`run_catchup_for_replica`], persists the achieved watermark into the
+/// [`AckTracker`], and posts the full-shard resync request on redo
+/// reclaim). This enum carries only what the loop needs for its exit
+/// decisions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CatchupPassOutcome {
+    /// The replica durably ACKed ops through redo sequence `through` (the
+    /// callback has already recorded it against the tracker). Counts as
+    /// progress only when it exceeds the watermark the loop observed
+    /// before the pass.
+    Advanced { through: u64 },
+    /// The pass could not advance the replica (transport failure, or the
+    /// replica did not ACK). Retryable — the loop exits after two
+    /// consecutive non-advancing passes.
+    NoAdvance,
+    /// The redo log no longer covers the replica's resume position and the
+    /// callback has requested (or attempted to request) a full-shard
+    /// resync. Terminal for the loop.
+    NeedsResync,
+}
+
+/// Tuning for [`run_catchup_to_convergence`].
+#[derive(Debug, Clone)]
+pub struct ConvergenceControls {
+    /// Ops per pass — the CHUNK the loop streams and awaits a synchronous
+    /// ACK for before re-evaluating the gap (`catchup_max_ops_per_pass`
+    /// in the shared replication config; production keeps the historical
+    /// 10_000).
+    pub chunk_ops: usize,
+    /// Sleep between admission re-checks while the migration throttle
+    /// refuses a chunk. The brief sleep-poll (rather than a blocking
+    /// admission primitive on the throttle) is deliberate: catch-up is a
+    /// background path where 100 ms of extra latency on a contended chunk
+    /// is irrelevant, and the wait is bounded by
+    /// [`admission_max_retries`](Self::admission_max_retries), with the
+    /// lag monitor re-driving the loop on a later tick if it gives up.
+    pub admission_retry_interval: std::time::Duration,
+    /// Maximum admission re-checks per chunk before the loop exits with
+    /// [`CatchupConvergence::NoProgress`] — the overall no-progress guard
+    /// on the admission wait, so it can never become an unbounded spin.
+    pub admission_max_retries: u32,
+}
+
+impl Default for ConvergenceControls {
+    /// Production defaults: 10_000-op chunks; 100 ms admission re-check
+    /// interval, capped at 300 re-checks (~30 s of bounded waiting per
+    /// chunk).
+    fn default() -> Self {
+        Self {
+            chunk_ops: 10_000,
+            admission_retry_interval: std::time::Duration::from_millis(100),
+            admission_max_retries: 300,
+        }
+    }
+}
+
+/// Terminal state of [`run_catchup_to_convergence`]. Every variant carries
+/// the replica's last-acked redo sequence as observed when the loop exited.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CatchupConvergence {
+    /// The replica has ACKed every redo sequence that exists (gap zero).
+    Converged { last_acked: u64 },
+    /// The remaining gap is smaller than one chunk and the replica has
+    /// proven it is applying and ACKing (at least one successful pass this
+    /// invocation): the steady-state fan-out — which shares the same
+    /// per-address dense stream — owns the tail from here. The lag monitor
+    /// re-enters the loop on a later tick if the replica falls behind
+    /// again.
+    HandedToSteadyState { last_acked: u64, remaining: u64 },
+    /// Two consecutive passes made no progress (replica not ACKing), or
+    /// throttle admission starved past its bounded wait. The same terminal
+    /// state as a failed single pass before the loop existed: the lag
+    /// monitor re-detects the lag on its next tick and retries.
+    NoProgress { last_acked: u64 },
+    /// The redo log was reclaimed past the replica's resume position; the
+    /// pass callback has posted a full-shard resync request.
+    NeedsResync { last_acked: u64 },
+    /// The process shutdown flag was observed.
+    Aborted { last_acked: u64 },
+}
+
+/// Stream catch-up chunks to one replica until it converges.
+///
+/// Replaces the one-bounded-pass-per-tick shape: instead of shipping at
+/// most one `chunk_ops` pass per lag-monitor interval (a replica 1M ops
+/// behind converged at ~10k/30 s ≈ 50 minutes), this loop runs passes
+/// back-to-back — re-reading the live redo head (`current_seq_fn`) and
+/// the replica's persisted watermark (`last_acked_fn`) each iteration —
+/// until one of its exit conditions holds:
+///
+/// - **(a) converged**: no redo sequence is missing
+///   ([`CatchupConvergence::Converged`]).
+/// - **(b) handed off**: the gap is smaller than one chunk and at least
+///   one pass this invocation succeeded — the replica is provably
+///   applying and ACKing, so the steady-state stream owns the tail
+///   ([`CatchupConvergence::HandedToSteadyState`]). A sub-chunk gap on
+///   ENTRY still gets one pass first: the steady-state fan-out only
+///   carries live mutations, so an old-op gap would otherwise never
+///   drain.
+/// - **(c) no progress**: two consecutive passes failed to advance the
+///   watermark, or throttle admission starved past its bounded wait
+///   ([`CatchupConvergence::NoProgress`]) — same handling as a failed
+///   pass today: the lag monitor re-detects and retries next tick.
+/// - **(d) resync**: the redo log wrapped past the replica's resume
+///   position ([`CatchupConvergence::NeedsResync`]; the pass callback is
+///   responsible for posting the resync request).
+/// - shutdown: `should_abort` returned `true`
+///   ([`CatchupConvergence::Aborted`]).
+///
+/// Pacing: before every pass the loop requests admission from the shared
+/// migration throttle via `try_admit_chunk` (catch-up competes with shard
+/// migrations for the same outbound byte budget). The returned RAII token
+/// is held across exactly one pass and dropped before the next admission,
+/// so capacity is returned between chunks. Refused admission is re-checked
+/// on a bounded sleep-poll (see [`ConvergenceControls`]).
+///
+/// The per-chunk synchronous ACK inside `run_pass` is the natural
+/// backpressure: the loop can never run ahead of what the replica has
+/// durably applied. Under sustained write load the loop keeps streaming
+/// for as long as every pass makes progress — this is deliberate (it runs
+/// on a dedicated background thread and aborts promptly on shutdown).
+///
+/// Callers must hold the per-replica [`CatchupInFlight`] slot so two
+/// loops can never interleave passes against one replica.
+pub fn run_catchup_to_convergence(
+    addr: &SocketAddr,
+    controls: &ConvergenceControls,
+    current_seq_fn: &dyn Fn() -> u64,
+    last_acked_fn: &dyn Fn() -> u64,
+    should_abort: &dyn Fn() -> bool,
+    try_admit_chunk: &dyn Fn() -> Option<crate::cluster::migration::MigrationToken>,
+    run_pass: &dyn Fn(u64, u64) -> CatchupPassOutcome,
+) -> CatchupConvergence {
+    let chunk = controls.chunk_ops.max(1) as u64;
+    let mut no_advance_streak: u32 = 0;
+    let mut advanced_once = false;
+
+    loop {
+        let last_acked = last_acked_fn();
+        if should_abort() {
+            return CatchupConvergence::Aborted { last_acked };
+        }
+        let from_seq = last_acked.saturating_add(1);
+        // `current` is the next redo sequence to be assigned, so the
+        // replica is missing exactly the sequences `from_seq..current`.
+        let current = current_seq_fn();
+        let remaining = current.saturating_sub(from_seq);
+        if remaining == 0 {
+            return CatchupConvergence::Converged { last_acked };
+        }
+        if remaining < chunk && advanced_once {
+            return CatchupConvergence::HandedToSteadyState {
+                last_acked,
+                remaining,
+            };
+        }
+
+        // Bounded admission wait against the shared migration throttle.
+        // The token is dropped at the bottom of the loop body — after one
+        // pass — returning capacity between chunks.
+        let mut admission_waits: u32 = 0;
+        let _token = loop {
+            if should_abort() {
+                return CatchupConvergence::Aborted { last_acked };
+            }
+            if let Some(token) = try_admit_chunk() {
+                break token;
+            }
+            if admission_waits >= controls.admission_max_retries {
+                tracing::warn!(
+                    %addr,
+                    waits = admission_waits,
+                    "catchup: migration-throttle admission starved — ending this \
+                     convergence run (lag monitor will retry on a later tick)",
+                );
+                return CatchupConvergence::NoProgress { last_acked };
+            }
+            admission_waits += 1;
+            if !controls.admission_retry_interval.is_zero() {
+                std::thread::sleep(controls.admission_retry_interval);
+            }
+        };
+
+        match run_pass(from_seq, current) {
+            CatchupPassOutcome::Advanced { through } if through > last_acked => {
+                no_advance_streak = 0;
+                advanced_once = true;
+            }
+            CatchupPassOutcome::Advanced { .. } | CatchupPassOutcome::NoAdvance => {
+                no_advance_streak += 1;
+                if no_advance_streak >= 2 {
+                    return CatchupConvergence::NoProgress { last_acked };
+                }
+            }
+            CatchupPassOutcome::NeedsResync => {
+                return CatchupConvergence::NeedsResync { last_acked };
+            }
+        }
+    }
+}
+
+/// Process-wide "at most one convergence loop per replica" registry.
+///
+/// [`run_catchup_to_convergence`] can run for a long time on a badly
+/// lagging replica. Both the startup one-shot pass and every lag-monitor
+/// tick want to drive it, so callers claim a per-address slot here first;
+/// a second caller for the same address gets `None` and must treat its
+/// invocation as a no-op (the running loop already covers the replica).
+/// The slot is released when the returned guard drops — including on
+/// panic or early return — so a crashed loop cannot leak a permanently
+/// "busy" replica.
+#[derive(Default)]
+pub struct CatchupInFlight {
+    inner: Mutex<std::collections::HashSet<SocketAddr>>,
+}
+
+impl CatchupInFlight {
+    /// Empty registry.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Claim the per-replica slot for `addr`. Returns `None` when a
+    /// convergence loop for `addr` is already in flight.
+    pub fn try_begin(self: &Arc<Self>, addr: SocketAddr) -> Option<CatchupInFlightGuard> {
+        if self.inner.lock().insert(addr) {
+            Some(CatchupInFlightGuard {
+                registry: Arc::clone(self),
+                addr,
+            })
+        } else {
+            None
+        }
+    }
+}
+
+/// RAII slot claimed via [`CatchupInFlight::try_begin`]; dropping it
+/// releases the per-replica slot.
+pub struct CatchupInFlightGuard {
+    registry: Arc<CatchupInFlight>,
+    addr: SocketAddr,
+}
+
+impl Drop for CatchupInFlightGuard {
+    fn drop(&mut self) {
+        self.registry.inner.lock().remove(&self.addr);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Background lag monitor
 // ---------------------------------------------------------------------------
 
 /// Callback invoked by the lag monitor for a replica whose lag exceeds the
 /// catch-up threshold. Receives the replica address, its last-acked redo
 /// sequence, and the master's current redo sequence. Implementations should
-/// run one bounded catch-up pass for the replica (e.g. via
-/// [`run_catchup_for_replica`]) and persist the new ACK position; the lag
-/// monitor will re-invoke it on subsequent ticks until the replica converges.
+/// drive the replica all the way to convergence (e.g. spawn
+/// [`run_catchup_to_convergence`] on a background thread; the loop
+/// self-terminates). The monitor invokes the callback on EVERY tick the
+/// replica exceeds the threshold — including while a previous invocation's
+/// loop is still running — so implementations must guard against stacking
+/// via [`CatchupInFlight`] and treat a redundant invocation as a no-op.
 pub type OnLaggingReplica = std::sync::Arc<dyn Fn(SocketAddr, u64, u64) + Send + Sync>;
 
 /// Spawn a background thread that periodically checks replica lag.
@@ -1522,10 +1784,11 @@ pub type OnLaggingReplica = std::sync::Arc<dyn Fn(SocketAddr, u64, u64) + Send +
 ///
 /// D-7/D-8 runtime catch-up: when `on_lagging` is `Some` and a replica's lag
 /// exceeds `catchup_threshold` ops, the callback is invoked for that replica
-/// on this tick. The callback runs one bounded catch-up pass; because the
-/// monitor re-evaluates lag every interval, a replica that fell behind while
-/// the master stayed up converges over successive ticks without any spinning
-/// loop or master restart. Passing `None` preserves the warn-only behavior.
+/// on this tick. The callback drives a stream-until-converged loop (see
+/// [`run_catchup_to_convergence`] and [`OnLaggingReplica`]) so a replica
+/// that fell behind while the master stayed up converges in ONE invocation;
+/// the per-tick re-invocation is only the retry/re-detect mechanism.
+/// Passing `None` preserves the warn-only behavior.
 ///
 /// Returns a join handle. The thread runs until `shutdown` is set to true.
 // Thread-spawn entry point: arguments are independent runtime knobs (tracker,
@@ -1563,10 +1826,11 @@ pub fn spawn_lag_monitor(
                     );
                 }
                 // D-7/D-8: drive runtime catch-up for replicas that have
-                // fallen behind the catch-up threshold. One bounded pass per
-                // tick; the monitor re-checks lag next interval, so the
-                // replica converges across ticks. Re-check `shutdown` so we
-                // do not start a fresh pass while tearing down.
+                // fallen behind the catch-up threshold. The callback runs a
+                // stream-until-converged loop (guarded against stacking by
+                // `CatchupInFlight`); this per-tick invocation only re-detects
+                // lag and retries after a failed run. Re-check `shutdown` so
+                // we do not start a fresh loop while tearing down.
                 if let Some(cb) = on_lagging.as_ref()
                     && lag > catchup_threshold
                     && !shutdown.load(std::sync::atomic::Ordering::Relaxed)
@@ -3296,6 +3560,389 @@ mod tests {
             big_entry_ops,
             "the oversized single entry must ship whole (not split), and the next entry \
              must not be pulled into the same pass",
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // run_catchup_to_convergence — stream-until-converged loop (Part A)
+    // -----------------------------------------------------------------
+
+    use crate::cluster::migration::MigrationThrottle;
+    use std::cell::Cell;
+    use std::sync::Arc;
+
+    /// Controls with a small chunk and no admission sleeping, for tests.
+    fn test_controls(chunk_ops: usize, admission_max_retries: u32) -> ConvergenceControls {
+        ConvergenceControls {
+            chunk_ops,
+            admission_retry_interval: std::time::Duration::ZERO,
+            admission_max_retries,
+        }
+    }
+
+    /// An unconstrained throttle whose admissions always succeed.
+    fn open_throttle() -> Arc<MigrationThrottle> {
+        Arc::new(MigrationThrottle::new(u64::MAX))
+    }
+
+    /// Part A core: a replica many chunks behind converges in a SINGLE
+    /// invocation. The pre-fix shape shipped one bounded pass per 30 s
+    /// lag-monitor tick (1M ops behind ≈ 50 minutes); the convergence
+    /// loop streams chunk after chunk until the gap closes.
+    #[test]
+    fn convergence_streams_all_chunks_in_one_invocation() {
+        let addr: SocketAddr = "127.0.0.1:65529".parse().unwrap();
+        // Redo head (next sequence to assign) = 251 → entries 1..=250 exist.
+        let head = 251u64;
+        let acked = Cell::new(0u64);
+        let passes = Cell::new(0u32);
+        let throttle = open_throttle();
+
+        let outcome = run_catchup_to_convergence(
+            &addr,
+            &test_controls(10, 3),
+            &|| head,
+            &|| acked.get(),
+            &|| false,
+            &|| throttle.try_admit(64),
+            &|from, current| {
+                passes.set(passes.get() + 1);
+                assert_eq!(
+                    from,
+                    acked.get() + 1,
+                    "each pass must resume at last_acked + 1",
+                );
+                // Simulated replica: applies + ACKs up to one 10-op chunk.
+                let through = (from + 9).min(current - 1);
+                acked.set(through);
+                CatchupPassOutcome::Advanced { through }
+            },
+        );
+
+        assert_eq!(outcome, CatchupConvergence::Converged { last_acked: 250 });
+        assert_eq!(
+            passes.get(),
+            25,
+            "250 entries at chunk 10 = 25 passes in ONE invocation",
+        );
+    }
+
+    /// Live writes keep advancing the head while catch-up streams. Once the
+    /// remaining gap is smaller than one chunk AND the replica has proven
+    /// it ACKs (at least one successful pass), the loop hands the tail
+    /// back to steady-state replication instead of chasing the moving head
+    /// forever.
+    #[test]
+    fn convergence_hands_small_tail_to_steady_state_under_live_writes() {
+        let addr: SocketAddr = "127.0.0.1:65528".parse().unwrap();
+        let head = Cell::new(101u64); // entries 1..=100 initially
+        let acked = Cell::new(0u64);
+        let passes = Cell::new(0u32);
+        let throttle = open_throttle();
+
+        let outcome = run_catchup_to_convergence(
+            &addr,
+            &test_controls(10, 3),
+            &|| head.get(),
+            &|| acked.get(),
+            &|| false,
+            &|| throttle.try_admit(64),
+            &|from, current| {
+                passes.set(passes.get() + 1);
+                let through = (from + 9).min(current - 1);
+                acked.set(through);
+                // 3 live writes land during every pass.
+                head.set(head.get() + 3);
+                CatchupPassOutcome::Advanced { through }
+            },
+        );
+
+        // Gap shrinks by 7 per pass (10 streamed - 3 written): after pass
+        // 13 acked = 130, head = 140, remaining = 9 < chunk → handoff.
+        assert_eq!(
+            outcome,
+            CatchupConvergence::HandedToSteadyState {
+                last_acked: 130,
+                remaining: 9,
+            },
+        );
+        assert_eq!(passes.get(), 13);
+    }
+
+    /// A gap smaller than one chunk on ENTRY still gets one pass before
+    /// any handoff: the steady-state fan-out only carries live mutations,
+    /// so a small gap of OLD ops would otherwise never be streamed.
+    #[test]
+    fn convergence_first_invocation_small_gap_still_streams_before_handoff() {
+        let addr: SocketAddr = "127.0.0.1:65527".parse().unwrap();
+        let acked = Cell::new(0u64);
+        let passes = Cell::new(0u32);
+        let throttle = open_throttle();
+
+        let outcome = run_catchup_to_convergence(
+            &addr,
+            &test_controls(10, 3),
+            &|| 6, // entries 1..=5 — less than one chunk behind
+            &|| acked.get(),
+            &|| false,
+            &|| throttle.try_admit(64),
+            &|from, current| {
+                passes.set(passes.get() + 1);
+                let through = (from + 9).min(current - 1);
+                acked.set(through);
+                CatchupPassOutcome::Advanced { through }
+            },
+        );
+
+        assert_eq!(outcome, CatchupConvergence::Converged { last_acked: 5 });
+        assert_eq!(
+            passes.get(),
+            1,
+            "sub-chunk gap must stream (one pass), not hand off unstreamed",
+        );
+    }
+
+    /// Exit condition (c): two CONSECUTIVE non-advancing passes end the
+    /// loop as NoProgress; a successful pass in between resets the streak.
+    #[test]
+    fn convergence_exits_after_two_consecutive_non_advancing_passes() {
+        let addr: SocketAddr = "127.0.0.1:65526".parse().unwrap();
+        let acked = Cell::new(0u64);
+        let passes = Cell::new(0u32);
+        let throttle = open_throttle();
+
+        // Scripted pass outcomes: advance, fail, advance, fail, fail.
+        let outcome = run_catchup_to_convergence(
+            &addr,
+            &test_controls(10, 3),
+            &|| 1001,
+            &|| acked.get(),
+            &|| false,
+            &|| throttle.try_admit(64),
+            &|from, _current| {
+                let n = passes.get() + 1;
+                passes.set(n);
+                match n {
+                    1 | 3 => {
+                        let through = from + 9;
+                        acked.set(through);
+                        CatchupPassOutcome::Advanced { through }
+                    }
+                    _ => CatchupPassOutcome::NoAdvance,
+                }
+            },
+        );
+
+        assert_eq!(outcome, CatchupConvergence::NoProgress { last_acked: 20 });
+        assert_eq!(
+            passes.get(),
+            5,
+            "advance/fail/advance/fail/fail: the mid-loop advance must reset \
+             the no-progress streak; exit on the 2nd CONSECUTIVE failure",
+        );
+    }
+
+    /// Exit condition (d): a pass reporting NeedsResync (redo reclaimed —
+    /// the pass posted the full-shard resync) terminates immediately.
+    #[test]
+    fn convergence_needs_resync_is_terminal_on_first_pass() {
+        let addr: SocketAddr = "127.0.0.1:65525".parse().unwrap();
+        let passes = Cell::new(0u32);
+        let throttle = open_throttle();
+
+        let outcome = run_catchup_to_convergence(
+            &addr,
+            &test_controls(10, 3),
+            &|| 1001,
+            &|| 0,
+            &|| false,
+            &|| throttle.try_admit(64),
+            &|_from, _current| {
+                passes.set(passes.get() + 1);
+                CatchupPassOutcome::NeedsResync
+            },
+        );
+
+        assert_eq!(outcome, CatchupConvergence::NeedsResync { last_acked: 0 });
+        assert_eq!(passes.get(), 1, "resync is terminal — no retry passes");
+    }
+
+    /// Already-converged entry: gap zero means no pass and no admission
+    /// request at all.
+    #[test]
+    fn convergence_zero_gap_is_immediate_noop() {
+        let addr: SocketAddr = "127.0.0.1:65524".parse().unwrap();
+        let admits = Cell::new(0u32);
+        let throttle = open_throttle();
+
+        let outcome = run_catchup_to_convergence(
+            &addr,
+            &test_controls(10, 3),
+            &|| 42, // next-to-assign: entries 1..=41 exist
+            &|| 41, // all acked
+            &|| false,
+            &|| {
+                admits.set(admits.get() + 1);
+                throttle.try_admit(64)
+            },
+            &|_from, _current| panic!("run_pass must not be called at zero gap"),
+        );
+
+        assert_eq!(outcome, CatchupConvergence::Converged { last_acked: 41 });
+        assert_eq!(admits.get(), 0, "no throttle admission at zero gap");
+    }
+
+    /// Admission starvation is BOUNDED: after `admission_max_retries`
+    /// re-checks without a token the loop exits NoProgress without ever
+    /// running a pass (no unbounded spin; the lag monitor re-drives later).
+    #[test]
+    fn convergence_throttle_starvation_exits_before_any_pass() {
+        let addr: SocketAddr = "127.0.0.1:65523".parse().unwrap();
+        let admits = Cell::new(0u32);
+        // Cap of 1 byte: a 10-byte chunk request can never be admitted.
+        let throttle = Arc::new(MigrationThrottle::new(1));
+
+        let outcome = run_catchup_to_convergence(
+            &addr,
+            &test_controls(10, 3),
+            &|| 1001,
+            &|| 0,
+            &|| false,
+            &|| {
+                admits.set(admits.get() + 1);
+                throttle.try_admit(10)
+            },
+            &|_from, _current| panic!("run_pass must not run without admission"),
+        );
+
+        assert_eq!(outcome, CatchupConvergence::NoProgress { last_acked: 0 });
+        assert_eq!(
+            admits.get(),
+            4,
+            "initial attempt + admission_max_retries (3) re-checks, then exit",
+        );
+    }
+
+    /// Transient throttle contention is waited out (bounded), then the
+    /// stream proceeds to convergence.
+    #[test]
+    fn convergence_waits_out_transient_throttle_contention() {
+        let addr: SocketAddr = "127.0.0.1:65522".parse().unwrap();
+        let acked = Cell::new(0u64);
+        let admits = Cell::new(0u32);
+        let throttle = open_throttle();
+
+        let outcome = run_catchup_to_convergence(
+            &addr,
+            &test_controls(10, 5),
+            &|| 6,
+            &|| acked.get(),
+            &|| false,
+            &|| {
+                let n = admits.get() + 1;
+                admits.set(n);
+                if n <= 2 {
+                    None // contended for the first two checks
+                } else {
+                    throttle.try_admit(64)
+                }
+            },
+            &|from, current| {
+                let through = (from + 9).min(current - 1);
+                acked.set(through);
+                CatchupPassOutcome::Advanced { through }
+            },
+        );
+
+        assert_eq!(outcome, CatchupConvergence::Converged { last_acked: 5 });
+        assert_eq!(admits.get(), 3, "two refusals, then admitted");
+    }
+
+    /// The admission token must be RELEASED between chunks: with a cap of
+    /// exactly one chunk's bytes and ZERO retries allowed, a held-across-
+    /// chunks token would fail the second admission instantly. Multi-chunk
+    /// convergence under these constraints proves per-chunk RAII release.
+    #[test]
+    fn convergence_releases_throttle_capacity_between_chunks() {
+        let addr: SocketAddr = "127.0.0.1:65521".parse().unwrap();
+        let acked = Cell::new(0u64);
+        let throttle = Arc::new(MigrationThrottle::new(100));
+
+        let outcome = run_catchup_to_convergence(
+            &addr,
+            &test_controls(10, 0), // zero retries: any refusal = instant exit
+            &|| 31,                // 30 entries = 3 chunks of 10
+            &|| acked.get(),
+            &|| false,
+            &|| throttle.try_admit(100), // each chunk takes the WHOLE cap
+            &|from, current| {
+                let through = (from + 9).min(current - 1);
+                acked.set(through);
+                CatchupPassOutcome::Advanced { through }
+            },
+        );
+
+        assert_eq!(outcome, CatchupConvergence::Converged { last_acked: 30 });
+        assert_eq!(
+            throttle.in_flight_bytes(),
+            0,
+            "all admission tokens must be released when the loop exits",
+        );
+    }
+
+    /// Shutdown aborts the loop promptly between passes.
+    #[test]
+    fn convergence_aborts_promptly_on_shutdown() {
+        let addr: SocketAddr = "127.0.0.1:65520".parse().unwrap();
+        let acked = Cell::new(0u64);
+        let passes = Cell::new(0u32);
+        let stop = Cell::new(false);
+        let throttle = open_throttle();
+
+        let outcome = run_catchup_to_convergence(
+            &addr,
+            &test_controls(10, 3),
+            &|| 1001,
+            &|| acked.get(),
+            &|| stop.get(),
+            &|| throttle.try_admit(64),
+            &|from, _current| {
+                passes.set(passes.get() + 1);
+                let through = from + 9;
+                acked.set(through);
+                stop.set(true); // shutdown lands during the first pass
+                CatchupPassOutcome::Advanced { through }
+            },
+        );
+
+        assert_eq!(outcome, CatchupConvergence::Aborted { last_acked: 10 });
+        assert_eq!(passes.get(), 1, "no further passes after shutdown");
+    }
+
+    /// In-flight guard: one convergence loop per replica. A second
+    /// `try_begin` for the same address is a no-op until the first guard
+    /// drops; other addresses are unaffected.
+    #[test]
+    fn catchup_in_flight_guard_one_loop_per_replica() {
+        let registry = Arc::new(CatchupInFlight::new());
+        let a = test_addr(6001);
+        let b = test_addr(6002);
+
+        let guard_a = registry.try_begin(a);
+        assert!(guard_a.is_some(), "first begin for a free addr must claim");
+        assert!(
+            registry.try_begin(a).is_none(),
+            "second begin for the same addr must be a no-op while in flight",
+        );
+        assert!(
+            registry.try_begin(b).is_some(),
+            "an unrelated addr must be claimable independently",
+        );
+
+        drop(guard_a);
+        assert!(
+            registry.try_begin(a).is_some(),
+            "dropping the guard must release the addr for the next loop",
         );
     }
 }

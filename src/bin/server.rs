@@ -178,7 +178,31 @@ struct CatchupContext {
     /// fan-out (`cluster.replication_timeout()`) instead of using a hardcoded
     /// value (REL-112).
     replication_timeout: std::time::Duration,
+    /// Outbound-bytes admission control SHARED with shard migrations (the
+    /// coordinator's throttle), so concurrent catch-up streams and
+    /// migrations respect one combined byte cap instead of stacking.
+    migration_throttle: Arc<teraslab::cluster::migration::MigrationThrottle>,
+    /// "At most one convergence loop per replica" registry shared by the
+    /// startup pass and the lag monitor, so ticks never stack loops on a
+    /// slow replica.
+    catchup_in_flight: Arc<teraslab::replication::durable::CatchupInFlight>,
+    /// Process shutdown flag — convergence loops abort promptly on shutdown.
+    shutdown: Arc<std::sync::atomic::AtomicBool>,
 }
+
+/// Ops per catch-up pass — the CHUNK size of the convergence loop. This is
+/// the historical `catchup_max_ops_per_pass` value (10_000): it used to be
+/// the hard cap per 30 s lag-monitor tick; under the convergence loop it is
+/// the unit streamed-and-ACKed per pass while the loop runs passes
+/// back-to-back until the replica converges.
+const CATCHUP_CHUNK_OPS: usize = 10_000;
+
+/// Nominal per-op byte estimate used to size a chunk's admission request
+/// against the shared migration throttle (10_000 ops ≈ 2.5 MiB against the
+/// default 32 MiB cap). This is admission-control pacing, not exact
+/// accounting: ops range from 32-byte deletes to multi-KiB creates, and the
+/// synchronous per-chunk ACK already bounds how much data is in flight.
+const CATCHUP_EST_BYTES_PER_OP: u64 = 256;
 
 /// Run one bounded catch-up pass for a single replica and persist the new ACK
 /// position on success.
@@ -194,8 +218,11 @@ struct CatchupContext {
 /// function is idempotent because the replica applies ops idempotently and the
 /// ACK tracker only advances on success.
 ///
-/// Returns `true` if the replica's ACK advanced this pass (i.e. progress was
-/// made), `false` otherwise.
+/// Returns the pass outcome for the convergence loop
+/// ([`teraslab::replication::durable::run_catchup_to_convergence`]):
+/// `Advanced` when the replica's ACK moved, `NeedsResync` when the redo
+/// prefix was reclaimed (the resync request has been posted), `NoAdvance`
+/// on any other failure.
 fn run_one_catchup_pass(
     ctx: &CatchupContext,
     tracker: &teraslab::replication::durable::AckTracker,
@@ -203,11 +230,12 @@ fn run_one_catchup_pass(
     from_seq: u64,
     current_seq: u64,
     max_ops_per_pass: usize,
-) -> bool {
+) -> teraslab::replication::durable::CatchupPassOutcome {
     use std::sync::atomic::Ordering;
+    use teraslab::replication::durable::CatchupPassOutcome;
 
     if from_seq >= current_seq {
-        return false; // already caught up
+        return CatchupPassOutcome::NoAdvance; // already caught up
     }
 
     let eng_ref = ctx.engine.clone();
@@ -225,10 +253,23 @@ fn run_one_catchup_pass(
         1000,
         max_ops_per_pass,
         &|seq| {
-            let entries = match eng_ref.read_redo_from_sequence_merged(seq) {
+            let mut entries = match eng_ref.read_redo_from_sequence_merged(seq) {
                 Ok(e) => e,
                 Err(_) => return Vec::new(),
             };
+            // Cap the CONVERSION work at one pass's worth of entries. The
+            // pass budget (`max_ops_per_pass`, applied at entry granularity
+            // by `run_catchup_for_replica`) can never fully include more
+            // than budget + 1 entries, but the converter below does real
+            // per-entry work (engine record reads for creates). Without
+            // this cap a convergence loop over a deep backlog would convert
+            // the ENTIRE remaining tail on every pass and then discard all
+            // but the first chunk — O(backlog) engine reads per pass.
+            // Trade-off: runs of >1 zero-op entries beyond the cap no
+            // longer ride along "for free" in one pass; they are swept by
+            // the following passes instead (correctness unchanged — the
+            // watermark advances pass by pass).
+            entries.truncate(max_ops_per_pass.saturating_add(1));
             // CRITICAL FIX: `RedoOp::tx_key()` only represents a
             // `SetMinedBatch` of exactly one txid (`None` for 0 or 2+), so a
             // genuine multi-txid batch must be expanded across every shard its
@@ -320,7 +361,7 @@ fn run_one_catchup_pass(
             }
             tracker.record_ack(addr, through);
             tracker.flush();
-            through >= from_seq
+            CatchupPassOutcome::Advanced { through }
         }
         Err(e) => {
             tracing::warn!(%addr, err = %e, "catchup: replica catch-up failed");
@@ -359,9 +400,130 @@ fn run_one_catchup_pass(
                          retried on the next lag-monitor tick",
                     );
                 }
+                // Terminal for the convergence loop either way: streaming
+                // deltas cannot repair a reclaimed prefix. If the queueing
+                // failed, the ACK tracker has not advanced, so the next
+                // lag-monitor tick re-detects the lag and retries the signal.
+                CatchupPassOutcome::NeedsResync
+            } else {
+                CatchupPassOutcome::NoAdvance
             }
-            false
         }
+    }
+}
+
+/// Drive one replica all the way to convergence (blocking).
+///
+/// Claims the per-replica in-flight slot (a second caller for the same
+/// address is a no-op — the running loop already covers it), then runs the
+/// shared stream-until-converged loop: chunks of [`CATCHUP_CHUNK_OPS`] ops,
+/// each pass paced by the coordinator's migration throttle and acknowledged
+/// synchronously by the replica, re-reading the live redo head and the
+/// persisted ACK watermark between passes. Exits on convergence, on a
+/// sub-chunk tail (handed to steady-state replication), on two consecutive
+/// non-advancing passes, on redo reclaim (resync posted), or on shutdown —
+/// see `run_catchup_to_convergence` for the loop contract.
+fn run_replica_convergence(
+    ctx: &CatchupContext,
+    tracker: &teraslab::replication::durable::AckTracker,
+    addr: std::net::SocketAddr,
+) {
+    use teraslab::replication::durable::{
+        CatchupConvergence, ConvergenceControls, run_catchup_to_convergence,
+    };
+
+    let Some(_guard) = ctx.catchup_in_flight.try_begin(addr) else {
+        tracing::debug!(
+            %addr,
+            "catchup: convergence loop already in flight for this replica; skipping",
+        );
+        return;
+    };
+
+    let controls = ConvergenceControls {
+        chunk_ops: CATCHUP_CHUNK_OPS,
+        ..ConvergenceControls::default()
+    };
+    let chunk_est_bytes = (CATCHUP_CHUNK_OPS as u64).saturating_mul(CATCHUP_EST_BYTES_PER_OP);
+    let redo = ctx.redo_log.clone();
+
+    let outcome = run_catchup_to_convergence(
+        &addr,
+        &controls,
+        &move || {
+            redo.as_ref()
+                .map(|rl| rl.lock().current_sequence())
+                .unwrap_or(0)
+        },
+        &|| tracker.last_acked(&addr),
+        &|| ctx.shutdown.load(std::sync::atomic::Ordering::Relaxed),
+        &|| ctx.migration_throttle.try_admit(chunk_est_bytes),
+        &|from_seq, current_seq| {
+            run_one_catchup_pass(ctx, tracker, addr, from_seq, current_seq, CATCHUP_CHUNK_OPS)
+        },
+    );
+
+    match outcome {
+        CatchupConvergence::Converged { last_acked } => {
+            tracing::info!(%addr, last_acked, "catchup: replica converged");
+        }
+        CatchupConvergence::HandedToSteadyState {
+            last_acked,
+            remaining,
+        } => {
+            tracing::info!(
+                %addr,
+                last_acked,
+                remaining,
+                "catchup: sub-chunk tail handed back to steady-state replication",
+            );
+        }
+        CatchupConvergence::NoProgress { last_acked } => {
+            tracing::warn!(
+                %addr,
+                last_acked,
+                "catchup: convergence made no progress; will retry on the next \
+                 lag-monitor tick",
+            );
+        }
+        CatchupConvergence::NeedsResync { last_acked } => {
+            tracing::info!(
+                %addr,
+                last_acked,
+                "catchup: redo reclaimed past replica position — resync path engaged",
+            );
+        }
+        CatchupConvergence::Aborted { last_acked } => {
+            tracing::info!(%addr, last_acked, "catchup: convergence aborted by shutdown");
+        }
+    }
+}
+
+/// Lag-monitor entry point: run the convergence loop for `addr` on a
+/// detached background thread so the monitor keeps ticking (and keeps
+/// serving OTHER lagging replicas) while a slow replica converges.
+///
+/// Stacking is prevented inside `run_replica_convergence` by the
+/// per-replica in-flight slot: a tick that fires while a loop is already
+/// running spawns a thread that exits immediately (at most one redundant
+/// spawn per tick per replica — negligible at the 30 s default interval).
+fn spawn_replica_convergence(ctx: CatchupContext, addr: std::net::SocketAddr) {
+    let spawned = std::thread::Builder::new()
+        .name(format!("catchup-{addr}"))
+        .spawn(move || {
+            // The process-wide tracker is installed before the lag monitor
+            // exists; `None` here means we are tearing down.
+            if let Some(tracker) = teraslab::server::dispatch::ack_tracker_handle() {
+                run_replica_convergence(&ctx, tracker, addr);
+            }
+        });
+    if let Err(e) = spawned {
+        tracing::warn!(
+            %addr,
+            err = %e,
+            "catchup: failed to spawn convergence thread; will retry on the next \
+             lag-monitor tick",
+        );
     }
 }
 
@@ -1720,6 +1882,16 @@ fn main() {
 
     // 5. Start cluster if configured
     //
+    // F-G10-002: the bin's `shutdown_flag` only drives the background tasks
+    // (checkpoint / blob_gc / lag_monitor / catch-up convergence). The
+    // `Server::run` accept loop polls its own private flag — we flip that one
+    // via the public `Server::shutdown()` method from the signal handler
+    // below, AFTER we wrap `Server` in `Arc` so the handler closure can hold
+    // a reference. Created here (before the cluster block) because the
+    // catch-up context captures it so convergence loops abort promptly on
+    // shutdown.
+    let shutdown_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    //
     // D-7/D-8: the catch-up handles built inside the cluster-start block are
     // captured here so the runtime lag monitor (spawned further down) can run
     // the same authenticated catch-up passes the startup pass uses. `None`
@@ -2188,6 +2360,9 @@ fn main() {
                 replication_timeout: std::time::Duration::from_millis(
                     config.replication_timeout_ms.max(1),
                 ),
+                migration_throttle: running.migration_throttle().clone(),
+                catchup_in_flight: Arc::new(teraslab::replication::durable::CatchupInFlight::new()),
+                shutdown: shutdown_flag.clone(),
             };
             // Stash for the runtime lag monitor (spawned after this block).
             catchup_ctx = Some(ctx.clone());
@@ -2220,6 +2395,11 @@ fn main() {
                     &expected_replicas,
                     current_seq,
                 );
+                // Sequential per replica, deliberately: the convergence loop
+                // self-terminates, and the runtime lag monitor (which shares
+                // the in-flight registry) picks up any replica still behind,
+                // so a slow first replica cannot starve the others for more
+                // than one monitor interval.
                 for (addr, last_acked) in targets {
                     tracing::info!(
                         %addr,
@@ -2227,14 +2407,7 @@ fn main() {
                         from_seq = last_acked + 1,
                         "catchup: replica behind, starting catch-up",
                     );
-                    run_one_catchup_pass(
-                        &ctx,
-                        tracker,
-                        addr,
-                        last_acked + 1,
-                        current_seq,
-                        10_000, // max_ops_per_pass
-                    );
+                    run_replica_convergence(&ctx, tracker, addr);
                 }
             });
         }
@@ -2332,12 +2505,8 @@ fn main() {
         server = server.with_redo_log(rl.clone());
     }
     server = server.with_blob_store(blob_store.clone());
-    let shutdown_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    // F-G10-002: the bin's `shutdown_flag` only drives the background
-    // tasks (checkpoint / blob_gc / lag_monitor). The `Server::run` accept
-    // loop polls its own private flag — we flip that one via the public
-    // `Server::shutdown()` method from the signal handler below, AFTER we
-    // wrap `Server` in `Arc` so the handler closure can hold a reference.
+    // (`shutdown_flag` is created above the cluster block — see F-G10-002
+    // note there — so the catch-up context can capture it.)
     let server = Arc::new(server);
 
     // R-003: spawn the redo-log checkpoint task. Without a periodic
@@ -2516,30 +2685,23 @@ fn main() {
                     };
                     // D-7/D-8: drive runtime catch-up from the lag monitor.
                     // When a replica's lag exceeds the warn threshold the
-                    // monitor runs one bounded catch-up pass for it; the next
-                    // tick re-evaluates lag, so the replica converges over
-                    // successive intervals without a master restart. The
-                    // callback is `None` when we have no catch-up context
-                    // (e.g. RF=1), preserving warn-only behavior.
+                    // monitor spawns the stream-until-converged loop for it
+                    // on a background thread (so the monitor keeps ticking
+                    // for other replicas); the per-replica in-flight slot
+                    // makes a tick that fires mid-loop a no-op. The loop
+                    // re-reads the live head and ACK watermark itself, so
+                    // the tick's `last_acked`/`master_seq` snapshot is not
+                    // forwarded. The callback is `None` when we have no
+                    // catch-up context (e.g. RF=1), preserving warn-only
+                    // behavior.
                     let on_lagging: Option<teraslab::replication::durable::OnLaggingReplica> =
                         catchup_ctx.clone().map(|ctx| {
                             let cb: teraslab::replication::durable::OnLaggingReplica =
                                 std::sync::Arc::new(
                                     move |addr: std::net::SocketAddr,
-                                          last_acked: u64,
-                                          master_seq: u64| {
-                                        if let Some(t) =
-                                            teraslab::server::dispatch::ack_tracker_handle()
-                                        {
-                                            run_one_catchup_pass(
-                                                &ctx,
-                                                t,
-                                                addr,
-                                                last_acked + 1,
-                                                master_seq,
-                                                10_000, // max_ops_per_pass
-                                            );
-                                        }
+                                          _last_acked: u64,
+                                          _master_seq: u64| {
+                                        spawn_replica_convergence(ctx.clone(), addr);
                                     },
                                 );
                             cb
