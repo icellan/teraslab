@@ -93,6 +93,30 @@ impl std::fmt::Display for PartialError {
             self.errors.len(),
             self.successes.len() + self.errors.len()
         )?;
+        // Name WHY. Without this the message carries only counts the caller
+        // already knows, and a scenario logging `{e}` reports nothing
+        // actionable. Codes are summarised (distinct code + occurrence count,
+        // first-seen order) so a 1024-item batch stays one readable line.
+        if !self.errors.is_empty() {
+            let mut counts: Vec<(u16, usize)> = Vec::new();
+            for e in &self.errors {
+                match counts.iter_mut().find(|(code, _)| *code == e.code) {
+                    Some((_, n)) => *n += 1,
+                    None => counts.push((e.code, 1)),
+                }
+            }
+            f.write_str(" [")?;
+            for (i, (code, n)) in counts.iter().enumerate() {
+                if i > 0 {
+                    f.write_str(", ")?;
+                }
+                write!(f, "{}({code})", error_code_string(*code))?;
+                if *n > 1 {
+                    write!(f, " x{n}")?;
+                }
+            }
+            f.write_str("]")?;
+        }
         if self.degraded {
             write!(f, " (applied items degraded-durability)")?;
         }
@@ -144,7 +168,7 @@ pub fn error_code_string(code: u16) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::error_code_string;
+    use super::{PartialError, error_code_string};
     use teraslab::protocol::opcodes::*;
 
     /// Every typed server error code must map to its name, not the `UNKNOWN`
@@ -165,5 +189,83 @@ mod tests {
         );
         // A genuinely unknown code still falls back.
         assert_eq!(error_code_string(9999), "UNKNOWN");
+    }
+
+    /// `PartialError`'s Display must name WHY the items failed.
+    ///
+    /// It used to print only "N of M items failed", which is exactly the
+    /// information a caller already has. Test scenarios logging `{e}` on a
+    /// failed batch produced "partial error: partial error: 1 of 1 items
+    /// failed" — a line that cost a full nightly cycle to re-diagnose because
+    /// the per-item code, the one thing that identifies the fault, was
+    /// dropped on the floor.
+    #[test]
+    fn partial_error_display_names_the_failing_codes() {
+        use crate::types::{BatchItemError, BatchItemSuccess};
+
+        let err = PartialError {
+            successes: vec![BatchItemSuccess {
+                item_index: 1,
+                signal: 0,
+                block_ids: vec![],
+            }],
+            errors: vec![
+                BatchItemError {
+                    item_index: 0,
+                    code: ERR_LOCKED,
+                    data: vec![],
+                },
+                BatchItemError {
+                    item_index: 2,
+                    code: ERR_LOCKED,
+                    data: vec![],
+                },
+                BatchItemError {
+                    item_index: 3,
+                    code: ERR_MIGRATION_TARGET_NOT_READY,
+                    data: vec![],
+                },
+            ],
+            degraded: false,
+        };
+
+        let rendered = err.to_string();
+        assert!(
+            rendered.starts_with("partial error: 3 of 4 items failed"),
+            "counts must be preserved, got: {rendered}"
+        );
+        assert!(
+            rendered.contains(&format!("LOCKED({ERR_LOCKED}) x2")),
+            "repeated codes must be named, numbered and counted, got: {rendered}"
+        );
+        assert!(
+            rendered.contains("MIGRATION_TARGET_NOT_READY"),
+            "every distinct code must be named, got: {rendered}"
+        );
+    }
+
+    /// The degraded-durability suffix must survive the code summary.
+    #[test]
+    fn partial_error_display_keeps_degraded_suffix() {
+        use crate::types::BatchItemError;
+
+        let err = PartialError {
+            successes: vec![],
+            errors: vec![BatchItemError {
+                item_index: 0,
+                code: ERR_REPLICATION_FAILED,
+                data: vec![],
+            }],
+            degraded: true,
+        };
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("REPLICATION_FAILED"),
+            "code must be named, got: {rendered}"
+        );
+        assert!(
+            rendered.contains("degraded-durability"),
+            "degraded suffix must be kept, got: {rendered}"
+        );
     }
 }
