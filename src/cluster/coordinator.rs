@@ -1996,6 +1996,39 @@ impl ClusterCoordinator {
                 {
                     let mut mgr = migration.lock();
                     mgr.cleanup_completed();
+                    // Drop pending inbounds for shards this node does not hold.
+                    //
+                    // Nothing else can: the sender never completes a handoff to
+                    // a node it does not consider a holder, and `clear_inbound`
+                    // only runs on a topology CHANGE — so once the cluster
+                    // settles on its final term such an entry waits forever,
+                    // keeping the shard fenced and `inbound_count()` non-zero.
+                    // The pull-based repair cannot rescue it either: the source
+                    // finds no tasks for a non-holder and returns STATUS_OK
+                    // having done nothing (measured: 11 requests accepted, 2
+                    // shards unmoved, 120 s).
+                    //
+                    // Gated on the local table being the COMMITTED one, so a
+                    // mid-transition view can never drop an inbound this node is
+                    // genuinely about to receive.
+                    {
+                        let committed_term = topo_authority_event.committed_term();
+                        let table = shard_table.read();
+                        if committed_term > 0 && table.version == committed_term {
+                            let pruned = mgr.prune_inbound_not_held(|shard| {
+                                let a = table.target_assignment(shard);
+                                a.master == self_id || a.replicas.contains(&self_id)
+                            });
+                            if pruned > 0 {
+                                tracing::info!(
+                                    pruned,
+                                    term = committed_term,
+                                    "cluster: dropped pending inbound migrations for shards this \
+                                     node no longer holds",
+                                );
+                            }
+                        }
+                    }
                     sync_atomic_migration_bitmaps(
                         &mgr,
                         &fenced_bm_event,
@@ -2659,6 +2692,21 @@ impl ClusterCoordinator {
                         });
                     }
                     if resend_tasks.is_empty() && diverged == 0 {
+                        // Say so. This used to `continue` silently while the
+                        // handler had already replied STATUS_OK, so the
+                        // requester saw "transfer request accepted" and waited
+                        // forever for shards this node was never going to send.
+                        // The requester now prunes such inbounds itself, but the
+                        // condition must still be visible — an accepted request
+                        // that moves nothing is the single most misleading
+                        // signal in this subsystem.
+                        tracing::info!(
+                            requester = req.requester.0,
+                            epoch = req.epoch,
+                            shards = req.shards.len(),
+                            "cluster: shard transfer request matched no tasks — requester is \
+                             neither a target holder nor the intended master for these shards",
+                        );
                         continue;
                     }
                     tracing::info!(
