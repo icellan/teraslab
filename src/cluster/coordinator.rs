@@ -250,11 +250,43 @@ fn fail_migration_task_current_epoch(
         if let Some(m) = crate::metrics::migration_metrics() {
             m.topology_epoch_mismatch.inc();
         }
+        // The TABLE must not be rolled back — it has moved to a newer epoch and
+        // this task's view of ownership is superseded. But the task itself is
+        // dead and must still leave the active set. Returning here without
+        // retiring it left a permanently non-terminal entry: the epoch bump
+        // means the target now rejects its batches with ERR_STALE_EPOCH, so it
+        // can never complete, and the only thing that reaps stale actives is the
+        // next topology ACTIVATION — which never comes once the cluster settles.
+        //
+        // Measured in a rolling restart: node2 sat on two empty-shard handoffs
+        // (shards 3506 and 2048, total_records 0) stuck in state `Fenced` with
+        // an EMPTY fenced-shard set, holding `active_migrations` at 2 for the
+        // full 120 s wait after everything else had converged.
+        //
+        // `mark_failed` only touches the migration manager (state, fence bitmap,
+        // dual-write window); the shard-table rollback is the separate `action`
+        // below, which we correctly skip.
+        {
+            let mut mgr = migration.lock();
+            let tracked = mgr.active_migrations().iter().any(|p| {
+                p.shard == task.shard
+                    && p.from_node == task.from_node
+                    && p.to_node == task.to_node
+                    && p.is_master == task.is_master
+            });
+            if tracked {
+                mgr.mark_failed(task);
+                if !mgr.is_shard_fenced(task.shard) {
+                    fenced_bm.clear(task.shard);
+                }
+                migrating_bm.clear(task.shard);
+            }
+        }
         tracing::info!(
             shard = task.shard,
             task_epoch = topology_epoch,
             current_epoch = shard_table.read().version,
-            "cluster: ignoring stale migration failure",
+            "cluster: retiring stale migration task without rolling back the newer table",
         );
         return false;
     }
@@ -17734,6 +17766,70 @@ mod tests {
         let err = result.unwrap_err();
         assert!(err.contains("response too large"), "error: {err}");
         server.join().unwrap();
+    }
+
+    /// A failure reported against a SUPERSEDED epoch must still retire the task.
+    ///
+    /// Skipping the shard-table rollback is correct — the table has moved on and
+    /// this task's ownership view is stale. But the task itself is dead: the
+    /// epoch bump means the target rejects its batches with ERR_STALE_EPOCH, so
+    /// it can never complete. Leaving it in the active set made it permanent,
+    /// because the only thing that reaps stale actives is the next topology
+    /// activation, which never comes once the cluster settles. A rolling restart
+    /// left node2 holding two empty-shard handoffs in state `Fenced` for the
+    /// entire 120s convergence wait.
+    #[test]
+    fn stale_epoch_migration_failure_retires_the_task_without_touching_the_table() {
+        let migration = Arc::new(Mutex::new(MigrationManager::new()));
+        // Table is at version 5; the failing task was planned at epoch 3.
+        let table = ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2)], 2, 5, 1);
+        let shard_table = Arc::new(ShardTableLock::new(table));
+        let fenced = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+        let migrating = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+
+        let task = MigrationTask {
+            shard: 3506,
+            from_node: NodeId(2),
+            to_node: NodeId(1),
+            is_master: true,
+        };
+        migration.lock().start_outbound(
+            std::slice::from_ref(&task),
+            NodeId(2),
+            &Default::default(),
+        );
+        assert_eq!(
+            migration.lock().active_count(),
+            1,
+            "precondition: the task is tracked as active"
+        );
+
+        let version_before = shard_table.read().version;
+        let rolled_back = fail_migration_task_current_epoch(
+            &migration,
+            &shard_table,
+            &fenced,
+            &migrating,
+            &task,
+            /* topology_epoch */ 3,
+            FailedTaskTableAction::Rollback,
+        );
+
+        assert!(
+            !rolled_back,
+            "a stale failure must NOT roll back the newer table"
+        );
+        assert_eq!(
+            shard_table.read().version,
+            version_before,
+            "the newer table is left untouched"
+        );
+        assert_eq!(
+            migration.lock().active_count(),
+            0,
+            "but the dead task must leave the active set — otherwise it is stuck \
+             non-terminal forever once the cluster stops changing topology"
+        );
     }
 
     /// Concurrent `TopologyStale` observations must collapse to ONE catch-up.
