@@ -21,7 +21,7 @@ use crate::ops::unspend::*;
 use crate::protocol::codec::*;
 use crate::protocol::frame::*;
 use crate::protocol::opcodes::*;
-use crate::record::{ExternalRef, METADATA_SIZE};
+use crate::record::{ExternalRef, METADATA_SIZE, TxFlags};
 use crate::redo::{RedoLog, RedoOp};
 use crate::replication::manager::ReplicaTransport;
 use crate::replication::protocol::{ReplicaAck, ReplicaBatch, ReplicaOp};
@@ -10413,10 +10413,22 @@ fn decorate_get_item(
             // device's block-entry region and `unmined_since` (see
             // `apply_set_mined`/`apply_unset`), so this is byte-identical to
             // the former device-backed reads for any live record.
+            //
+            // FLAGS joins them, but only for a record whose device `LOCKED`
+            // bit is actually set: post-16c that bit is an immutable
+            // create-time marker and the EFFECTIVE lock is
+            // `device.LOCKED && MinedIndex.not-mined` (see
+            // `Engine::prepare_spend_multi`), so GET must consult the
+            // MinedIndex to report what the spend path would actually do.
+            // The `contains(LOCKED)` short-circuit keeps the overwhelmingly
+            // common unlocked record on the old zero-lookup path.
+            let needs_mined_for_flags =
+                field_mask.has(FieldMask::FLAGS) && { meta.flags }.contains(TxFlags::LOCKED);
             let mined_state = if field_mask.has(FieldMask::UNMINED_SINCE)
                 || field_mask.has(FieldMask::BLOCK_ENTRY_COUNT)
                 || field_mask.has(FieldMask::BLOCK_ENTRIES)
                 || field_mask.has(FieldMask::BLOCK_ENTRIES_ALL)
+                || needs_mined_for_flags
             {
                 Some(engine.mined_block_entries(&key))
             } else {
@@ -10445,7 +10457,26 @@ fn decorate_get_item(
                     data.extend_from_slice(&{ meta.extended_size }.to_le_bytes());
                 }
                 if field_mask.has(FieldMask::FLAGS) {
-                    data.push({ meta.flags }.bits());
+                    // Report the EFFECTIVE lock, not the raw device bit: a
+                    // mined record is spendable without `ignore_locked`, so
+                    // advertising LOCKED would make clients skip a UTXO the
+                    // server would happily spend. `RAW_METADATA` above is the
+                    // deliberate exception — it is the raw device view.
+                    let mut flags = { meta.flags };
+                    if needs_mined_for_flags {
+                        match mined_state.as_ref() {
+                            Some(Ok((entries, _))) => {
+                                if !entries.is_empty() {
+                                    flags.remove(TxFlags::LOCKED);
+                                }
+                            }
+                            // A failed MinedIndex read cannot be reported as
+                            // either lock state without guessing; surface it
+                            // like every other inner sub-read failure.
+                            _ => inner_read_failed = true,
+                        }
+                    }
+                    data.push(flags.bits());
                 }
                 if field_mask.has(FieldMask::SPENDING_HEIGHT) {
                     data.extend_from_slice(&{ meta.spending_height }.to_le_bytes());
@@ -13005,6 +13036,7 @@ mod tests {
     use crate::index::{DahBackend, DahIndex, Index, PrimaryBackend};
     use crate::locks::StripedLocks;
     use crate::ops::engine::Engine;
+    use crate::record::TxMetadata;
     use std::sync::Arc;
     use tempfile::TempDir;
 
@@ -17671,6 +17703,127 @@ mod tests {
         assert_eq!({ meta.spent_utxos }, 1, "one UTXO was spent");
         assert!(!mined_entries.is_empty(), "record is mined after setMined");
         assert!({ meta.generation } >= 1, "generation bumped by spend");
+    }
+
+    /// GET's `FLAGS` field must report the EFFECTIVE lock, not the raw
+    /// on-device bit.
+    ///
+    /// Task 16c/16d made the device `LOCKED` bit an immutable create-time
+    /// marker: `setMined` performs zero device writes, so it no longer has
+    /// anything to clear it with. The spend path was updated to evaluate the
+    /// effective lock (`device.LOCKED && !ignore_locked &&
+    /// MinedIndex.not-mined`, see `Engine::prepare_spend_multi`), but GET kept
+    /// serving the raw bit — so a client reading `FLAGS` on a mined record saw
+    /// `locked = true` for a transaction the server would spend without
+    /// complaint. The wire contract (spec §2.2 / §3.4: "SetMined clears
+    /// locked") is the effective value.
+    ///
+    /// `RAW_METADATA` is the deliberate exception: it is the raw device view
+    /// and must keep showing the immutable marker.
+    #[test]
+    fn get_flags_reports_effective_lock_not_raw_device_bit() {
+        let h = DispatchTestHarness::new();
+        let txid = DispatchTestHarness::make_txid(0x5a);
+        let key = TxKey { txid };
+
+        // Create with the create-namespace LOCKED flag set.
+        let item = WireCreateItem {
+            txid,
+            tx_version: 1,
+            locktime: 0,
+            fee: 500,
+            size_in_bytes: 250,
+            extended_size: 250,
+            is_coinbase: false,
+            spending_height: 0,
+            created_at: 1700000000000,
+            flags: CREATE_FLAG_LOCKED,
+            utxo_hashes: vec![[0u8; 32]],
+            cold_data: vec![],
+            block_height: 0,
+            mined_block_id: None,
+            mined_block_height: None,
+            mined_subtree_idx: None,
+            parent_txids: vec![],
+        };
+        assert_eq!(
+            h.request(OP_CREATE_BATCH, encode_create_batch(&[item]))
+                .status,
+            STATUS_OK
+        );
+
+        let get_flags = || -> u8 {
+            let r = decode_get_response(
+                &h.request(OP_GET_BATCH, encode_get_batch(FieldMask::FLAGS, &[txid]))
+                    .payload,
+            )
+            .unwrap();
+            assert_eq!(r[0].status, STATUS_OK);
+            r[0].data[0]
+        };
+        let device_locked = || -> bool {
+            h.engine
+                .read_metadata(&key)
+                .expect("record must exist")
+                .flags
+                .contains(TxFlags::LOCKED)
+        };
+
+        // Unmined: effective lock == device lock == set.
+        assert!(
+            get_flags() & TxFlags::LOCKED.bits() != 0,
+            "an unmined locked record must report LOCKED"
+        );
+        assert!(device_locked(), "device bit set at create");
+
+        // Mine it. The device bit is untouched; the effective lock lifts.
+        set_mined_into_blocks(&h, txid, &[7]);
+        assert!(
+            device_locked(),
+            "device LOCKED is an immutable create-time marker — setMined must not clear it"
+        );
+        assert_eq!(
+            get_flags() & TxFlags::LOCKED.bits(),
+            0,
+            "GET must report the EFFECTIVE lock: a mined record is spendable, so LOCKED must \
+             read as clear"
+        );
+
+        // RAW_METADATA keeps the raw device view.
+        let raw = decode_get_response(
+            &h.request(
+                OP_GET_BATCH,
+                encode_get_batch(FieldMask::RAW_METADATA, &[txid]),
+            )
+            .payload,
+        )
+        .unwrap();
+        let raw_meta = TxMetadata::from_bytes(&raw[0].data).expect("raw footer decodes");
+        assert!(
+            { raw_meta.flags }.contains(TxFlags::LOCKED),
+            "RAW_METADATA is the raw device view and must still show the immutable marker"
+        );
+
+        // Un-mine it (reorg): the lock comes back, which the old destructive
+        // clear could never do.
+        let unset = SetMinedBatchParams {
+            block_id: 7,
+            block_height: 1000,
+            subtree_idx: 0,
+            on_longest_chain: true,
+            unset_mined: true,
+            current_block_height: 1000,
+            block_height_retention: 288,
+        };
+        assert_eq!(
+            h.request(OP_SET_MINED_BATCH, encode_set_mined_batch(&unset, &[txid]))
+                .status,
+            STATUS_OK
+        );
+        assert!(
+            get_flags() & TxFlags::LOCKED.bits() != 0,
+            "an un-mined record is locked again — the effective lock is derived, not destroyed"
+        );
     }
 
     // -----------------------------------------------------------------------

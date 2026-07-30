@@ -112,13 +112,29 @@ bitflags! {
     struct TxFlags: u8 {
         const IS_COINBASE       = 0b0000_0001;  // bit 0 — write-once (Create)
         const CONFLICTING       = 0b0000_0010;  // bit 1 — mutable (SetConflicting)
-        const LOCKED            = 0b0000_0100;  // bit 2 — mutable (SetLocked, SetMined clears)
+        const LOCKED            = 0b0000_0100;  // bit 2 — mutable (SetLocked); see effective lock
         const EXTERNAL          = 0b0000_1000;  // bit 3 — write-once (Create, large tx)
         const LAST_SPENT_ALL    = 0b0001_0000;  // bit 4 — mutable (setDeleteAtHeight signaling)
         // bits 5-7 reserved for future use
     }
 }
 ```
+
+**The effective lock.** The on-device `LOCKED` bit is written by Create and
+`SetLocked` and is never cleared by `SetMined` — `SetMined` performs zero
+device writes (its state lives in the in-RAM `MinedIndex`), so it has nothing
+to clear it with. A transaction is locked-for-spend only while it is *also*
+unmined:
+
+```
+effective_locked = device.LOCKED && MinedIndex(txid).block_entries.is_empty()
+```
+
+Both the spend path and `GetBatch`'s `FLAGS` field report this effective
+value, so `SetMined` lifts the lock and a later `UnsetMined` (reorg) restores
+it — information the older destructive clear discarded permanently. The one
+exception is the `RAW_METADATA` field mask, which is the raw device view and
+still shows the immutable marker.
 
 This packs what was 5 separate fields into a single byte. The `CREATING` flag from the original design is eliminated — it only existed to block spending during multi-record 2-phase commit, which is no longer needed since records are single atomic writes. Flag mutations are atomic read-modify-write on the flags byte within the per-txid lock.
 | 19 | `reassignment_count` | (new) | `u8` | 1B | Mutable | Reassign (+1) |
@@ -557,14 +573,15 @@ Operations return signals that drive follow-up actions:
 5. Update `unmined_since`:
    - If `block_entry_count > 0` AND `on_longest_chain`: set to `0` (not unmined)
    - If `block_entry_count == 0`: set to `current_block_height`
-6. Clear `locked` flag if set
+6. (No `locked` write — the effective lock lifts automatically once the record
+   has a live block entry; see "The effective lock" in §2.2)
 7. Evaluate `setDeleteAtHeight`
 9. `pwrite` metadata region only
 10. Release lock
 
 **Batch pattern**: Up to `MaxMinedBatchSize` (default 1024) transactions per batch, with `MaxMinedRoutines` (default 128) concurrent workers.
 
-**Response**: status + per-item errors only. Per the LP-5 decision (§3.4), the per-txid block-ID list is **not** serialized — the engine computes it internally (to clear the LOCKED flag and evaluate DAH) but the dispatcher does not put it on the wire. A client that needs the post-setMined block IDs issues a follow-up `GetBatch` with the block-entry field mask.
+**Response**: status + per-item errors only. Per the LP-5 decision (§3.4), the per-txid block-ID list is **not** serialized — the engine computes it internally (to evaluate DAH) but the dispatcher does not put it on the wire. A client that needs the post-setMined block IDs issues a follow-up `GetBatch` with the block-entry field mask.
 
 **Atomicity**: Per-record.
 **Idempotency**: Setting mined with same block_id is a no-op (detected by scan).
