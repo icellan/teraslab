@@ -371,12 +371,18 @@ impl Drop for PerIpGuard {
 ///
 /// Giving peers an unlimited exemption here would be wrong for exactly the
 /// reason REL-128 states — without authentication, peer identity rests on a
-/// spoofable source IP. So instead the cap becomes the node's own *knowable*
-/// peer demand: the migration pool plus a full client-cap's worth of headroom
-/// for replication, SWIM, topology, completion handshakes and superset probes.
-/// The result stays finite (192 by default, against a 1024 global cap), so an
-/// attacker who does occupy a peer address still cannot exhaust the process.
+/// spoofable source IP. So the peer limit is instead derived from the resource
+/// the cap actually protects: half the node's global `max_connections` budget.
+/// One peer can therefore never starve the rest of the fleet, but it has room
+/// for concurrent migration waves plus the completion handshakes and superset
+/// probes that (per `run_migration_batch`) compete with the pool for the same
+/// cap.
+///
+/// The floor keeps a deliberately small `max_connections` from re-creating the
+/// original bug: a peer is always allowed at least one full migration pool plus
+/// a client-cap's worth of ordinary traffic.
 fn effective_per_ip_limit(
+    max_connections: usize,
     max_connections_per_ip: usize,
     migration_pool_size: usize,
     is_known_peer: bool,
@@ -392,7 +398,8 @@ fn effective_per_ip_limit(
     if cluster_auth_enforced {
         return None;
     }
-    Some(migration_pool_size.saturating_add(max_connections_per_ip))
+    let floor = migration_pool_size.saturating_add(max_connections_per_ip);
+    Some((max_connections / 2).max(floor))
 }
 
 /// Running TeraSlab server instance.
@@ -713,6 +720,7 @@ impl Server {
                             .as_ref()
                             .is_some_and(|c| c.is_known_peer_ip(addr.ip()));
                         let per_ip_limit = effective_per_ip_limit(
+                            self.config.max_connections,
                             self.config.max_connections_per_ip,
                             self.config.migration_pool_size,
                             is_known_peer,
@@ -1886,6 +1894,7 @@ mod tests {
         );
 
         let limit = effective_per_ip_limit(
+            cfg.max_connections,
             cfg.max_connections_per_ip,
             cfg.migration_pool_size,
             /* is_known_peer */ true,
@@ -1904,34 +1913,47 @@ mod tests {
     fn effective_per_ip_limit_separates_clients_peers_and_authenticated_peers() {
         // Untrusted client: the plain client cap.
         assert_eq!(
-            effective_per_ip_limit(64, 128, false, false),
+            effective_per_ip_limit(1024, 64, 128, false, false),
             Some(64),
             "an unknown IP gets the client cap"
         );
         assert_eq!(
-            effective_per_ip_limit(64, 128, false, true),
+            effective_per_ip_limit(1024, 64, 128, false, true),
             Some(64),
             "enforcing cluster auth must not relax the cap for a NON-peer"
         );
 
         // Authenticated peer: exempt (REL-128 behaviour, unchanged).
         assert_eq!(
-            effective_per_ip_limit(64, 128, true, true),
+            effective_per_ip_limit(1024, 64, 128, true, true),
             None,
             "an authenticated peer stays exempt"
         );
 
-        // Trusted-overlay peer: raised, but still finite.
-        let limit = effective_per_ip_limit(64, 128, true, false)
-            .expect("must remain bounded — identity here rests on a spoofable source IP");
+        // Trusted-overlay peer: half the global budget, still finite.
         assert_eq!(
-            limit, 192,
-            "migration pool (128) + client-cap headroom (64)"
+            effective_per_ip_limit(1024, 64, 128, true, false),
+            Some(512),
+            "a peer gets half the global connection budget"
+        );
+
+        // ...but never below one migration pool plus client-cap headroom, so a
+        // deliberately small global cap cannot re-create the original bug.
+        assert_eq!(
+            effective_per_ip_limit(64, 64, 128, true, false),
+            Some(192),
+            "the floor wins when max_connections is small"
+        );
+
+        // A peer still cannot monopolise the whole global budget.
+        assert!(
+            effective_per_ip_limit(1024, 64, 128, true, false).unwrap() < 1024,
+            "one peer must not be able to consume every connection slot"
         );
 
         // Operator opt-out still disables enforcement for everyone.
-        assert_eq!(effective_per_ip_limit(0, 128, false, false), None);
-        assert_eq!(effective_per_ip_limit(0, 128, true, false), None);
+        assert_eq!(effective_per_ip_limit(1024, 0, 128, false, false), None);
+        assert_eq!(effective_per_ip_limit(1024, 0, 128, true, false), None);
     }
 
     #[test]
