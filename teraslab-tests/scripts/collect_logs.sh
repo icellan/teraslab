@@ -20,11 +20,30 @@ for c in $containers; do
     $TIMEOUT_CMD 10 docker inspect "$c" > "$OUTPUT_DIR/${c}.inspect.json" 2>&1 || true
 done
 
-# Collect final metrics snapshot
-for i in 1 2 3 4 5; do
-    port=$((19100 + i - 1))
-    curl --max-time 3 -sf "http://localhost:$port/metrics" \
-        > "$OUTPUT_DIR/node${i}_final_metrics.txt" 2>/dev/null || true
+# Collect final metrics snapshot.
+#
+# The host HTTP port is NOT fixed: `DockerCluster::http_port` maps it to
+# `19000 + scenario_id * 10 + (node_num - 1)`. This loop used to hardcode
+# 19100..19104, which is scenario 10's range — so for every OTHER scenario the
+# curl hit a closed port, and because the redirect creates the file before curl
+# runs, each failure left a 0-byte `nodeN_final_metrics.txt` that looked like a
+# successful collection. Every metrics file in every archived nightly run was
+# empty.
+#
+# Ask Docker for the actual mapping instead of guessing, and only keep a file
+# when the scrape really returned something — an absent file is honest, an empty
+# one is not.
+for c in $containers; do
+    hostport=$($TIMEOUT_CMD 10 docker port "$c" 9100/tcp 2>/dev/null | head -1 | sed 's/.*://')
+    if [ -z "$hostport" ]; then
+        echo "  warning: no host mapping for $c 9100/tcp — metrics not collected"
+        continue
+    fi
+    if ! curl --max-time 3 -sf "http://localhost:$hostport/metrics" \
+        > "$OUTPUT_DIR/${c}_final_metrics.txt" 2>/dev/null; then
+        rm -f "$OUTPUT_DIR/${c}_final_metrics.txt"
+        echo "  warning: metrics scrape failed for $c on host port $hostport"
+    fi
 done
 
 # Docker resource usage — only if we actually have scenario containers; an

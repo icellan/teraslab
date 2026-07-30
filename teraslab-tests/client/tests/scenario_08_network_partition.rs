@@ -861,18 +861,47 @@ async fn run_scenario() -> Result<(), ClientError> {
         while tokio::time::Instant::now() < deadline {
             batch_idx += 1;
 
-            // Create records
+            // Create records.
+            //
+            // Bounded by the REMAINING budget, not left to run unbounded. The
+            // loop condition is only evaluated between iterations, and under an
+            // active partition a single `seed_records` call can run for many
+            // minutes: it retries `MAX_TRANSIENT_ATTEMPTS` (16) times with
+            // backoff, ERR_REPLICATION_FAILED counts as transient so every
+            // attempt retries, each attempt pays a ~5 s connect timeout to the
+            // unreachable peer, and the client retries internally on top of
+            // that. One nightly run entered this loop at 04:15:04, printed its
+            // last line at 04:16:49, and never reached "[8d.2] Workload
+            // complete" before the 900 s scenario timeout killed it.
+            //
+            // A phase that cannot finish inside its stated window must report
+            // that, not silently overrun — so a timed-out create counts as the
+            // error it is.
             let op_start = std::time::Instant::now();
-            match common::seed_records(&client, &verifier, 5, 5).await {
-                Ok(batch) => {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let create = tokio::time::timeout(
+                remaining.max(Duration::from_secs(1)),
+                common::seed_records(&client, &verifier, 5, 5),
+            )
+            .await;
+            match create {
+                Ok(Ok(batch)) => {
                     reporter.record("create", op_start.elapsed());
                     partition_txids.extend_from_slice(&batch);
                     total_ops += 1;
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     errors += 1;
                     total_ops += 1;
                     eprintln!("[8d.2] batch {batch_idx} failed: {e}");
+                }
+                Err(_) => {
+                    errors += 1;
+                    total_ops += 1;
+                    eprintln!(
+                        "[8d.2] batch {batch_idx} exceeded the remaining workload budget \
+                         ({remaining:?}) and was abandoned"
+                    );
                 }
             }
 
