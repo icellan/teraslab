@@ -10599,6 +10599,30 @@ impl RunningCluster {
         }
     }
 
+    /// Like [`Self::mark_inbound_active`], but records the CONCRETE sending
+    /// node instead of the `NodeId(0)` "source unknown" sentinel.
+    ///
+    /// This is what makes an interrupted migration recoverable. The pull-based
+    /// repair loop only sends `OP_MIGRATION_TRANSFER_REQUEST` for entries whose
+    /// source is a concrete peer (`from != self && from != NodeId(0)`), so an
+    /// inbound registered with the sentinel can never be re-requested: if the
+    /// source dies mid-stream the shard is marked LOST, stays fenced, and — as
+    /// the C8 comment puts it — waits for "a future migration or an operator".
+    /// In a rolling restart that is every interrupted shard.
+    ///
+    /// `OP_REPLICA_BATCH` already carries the sender's id, so the identity is
+    /// on the wire; it was simply being discarded at registration time.
+    /// `register_inbound_source` also clears a previous `lost` marking, so a
+    /// re-push revives a stranded shard rather than leaving it unavailable.
+    pub fn register_inbound_source(&self, shard: u16, from_node: NodeId) {
+        let mgr = &mut self.migration.lock();
+        let changed = mgr.register_inbound_source(shard, from_node);
+        self.inbound_atomic.load_from(mgr.inbound_bitmap());
+        if changed && let Some(ref path) = self.inbound_state_path {
+            crate::cluster::migration::persist_inbound_state(path, mgr);
+        }
+    }
+
     /// Reverse-heal Phase 2c — begin the delete-safe reverse-PULL for the shards
     /// this node booted SUSPECTING held a lost acked tail (Phase-1 detection),
     /// each paired with the [`select_heal_source`] quorum-current source (see

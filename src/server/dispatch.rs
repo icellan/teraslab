@@ -913,7 +913,20 @@ pub(crate) fn handle_request(
                     table.shard_handoff_state(shard) != ShardHandoff::ServingNew
                 };
                 if already_expected || should_track_handoff {
-                    cluster.mark_inbound_active(shard);
+                    // Record the CONCRETE sender when the batch stamped its
+                    // identity. Registering the `NodeId(0)` sentinel instead
+                    // makes the entry invisible to the pull-based repair loop
+                    // (it only requests from a concrete peer), so a migration
+                    // interrupted mid-stream is marked LOST and stays fenced
+                    // with nothing able to re-request it — 29 shards stranded
+                    // that way in one rolling-restart run.
+                    match crate::replication::protocol::ReplicaBatch::peek_source_node_id(
+                        &request.payload,
+                    ) {
+                        Some(source) => cluster
+                            .register_inbound_source(shard, crate::cluster::shards::NodeId(source)),
+                        None => cluster.mark_inbound_active(shard),
+                    }
                 }
             }
             // Phase B3: route the receiver's local cluster_key view through

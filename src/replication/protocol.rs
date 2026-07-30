@@ -1289,9 +1289,33 @@ impl ReplicaBatch {
     /// Byte offset of the `span_id` field in the serialized frame.
     pub const SPAN_ID_OFFSET: usize = Self::TRACE_ID_OFFSET + 16;
 
+    /// Byte offset of the `source_node_id` field in a V2 serialized frame.
+    pub const SOURCE_NODE_ID_OFFSET: usize = Self::SPAN_ID_OFFSET + 8;
+
     /// Byte offset of the `cluster_key` field in a V2 serialized frame.
     /// `source_node_id` immediately precedes it (8 bytes wide).
     pub const CLUSTER_KEY_OFFSET: usize = Self::SPAN_ID_OFFSET + 8 + 8;
+
+    /// Read just the `source_node_id` out of a serialized batch, without
+    /// decoding the ops.
+    ///
+    /// The migration receive path needs the sender's identity to record a
+    /// CONCRETE inbound source (see `MigrationManager::register_inbound_source`)
+    /// but runs before — and independently of — the apply-side decode, and must
+    /// not pay for deserializing a full baseline batch to learn one field.
+    ///
+    /// Returns `None` for a truncated buffer, an unrecognised version byte, or
+    /// the on-wire zero that means "sender did not stamp its identity".
+    pub fn peek_source_node_id(payload: &[u8]) -> Option<u64> {
+        if payload.first().copied()? != BATCH_PROTOCOL_V2 {
+            return None;
+        }
+        let end = Self::SOURCE_NODE_ID_OFFSET + 8;
+        if payload.len() < end {
+            return None;
+        }
+        decode_source_node_id(&payload[Self::SOURCE_NODE_ID_OFFSET..end])
+    }
 }
 
 /// Map a raw 8-byte source-node id field to the optional in-memory
@@ -1433,6 +1457,80 @@ impl ReplicaAck {
 
 #[cfg(test)]
 mod tests {
+    /// `peek_source_node_id` must agree with a full deserialize.
+    ///
+    /// The migration receive path uses it to record a CONCRETE inbound source
+    /// instead of the `NodeId(0)` sentinel; the sentinel is filtered out of the
+    /// pull-based repair loop, so getting this wrong strands the shard fenced
+    /// forever with no way to re-request it.
+    #[test]
+    fn peek_source_node_id_matches_full_decode() {
+        use super::*;
+
+        let batch = ReplicaBatch {
+            first_sequence: 42,
+            ops: vec![ReplicaOp::Delete { tx_key: key(3) }],
+            trace_ctx: None,
+            source_node_id: Some(7),
+            cluster_key: 99,
+        };
+        let bytes = batch.serialize();
+        assert_eq!(
+            ReplicaBatch::peek_source_node_id(&bytes),
+            Some(7),
+            "peek must read the stamped source"
+        );
+        assert_eq!(
+            ReplicaBatch::deserialize(&bytes).unwrap().source_node_id,
+            ReplicaBatch::peek_source_node_id(&bytes),
+            "peek must agree with the full decode"
+        );
+
+        // An unstamped sender writes the on-wire zero, which means "absent".
+        let unstamped = ReplicaBatch {
+            source_node_id: None,
+            ..batch
+        };
+        assert_eq!(
+            ReplicaBatch::peek_source_node_id(&unstamped.serialize()),
+            None,
+            "the on-wire zero must not be mistaken for node 0"
+        );
+    }
+
+    /// A truncated or foreign buffer must yield `None`, never a bogus id or a
+    /// panic — this runs on an untrusted inter-node payload.
+    #[test]
+    fn peek_source_node_id_rejects_truncated_and_unknown_version() {
+        use super::*;
+
+        let bytes = ReplicaBatch {
+            first_sequence: 1,
+            ops: vec![],
+            trace_ctx: None,
+            source_node_id: Some(5),
+            cluster_key: 1,
+        }
+        .serialize();
+
+        assert_eq!(ReplicaBatch::peek_source_node_id(&[]), None, "empty");
+        for cut in 1..ReplicaBatch::SOURCE_NODE_ID_OFFSET + 8 {
+            assert_eq!(
+                ReplicaBatch::peek_source_node_id(&bytes[..cut]),
+                None,
+                "a buffer cut at {cut} must not decode a source id"
+            );
+        }
+
+        let mut wrong_version = bytes.clone();
+        wrong_version[0] = BATCH_PROTOCOL_V2.wrapping_add(1);
+        assert_eq!(
+            ReplicaBatch::peek_source_node_id(&wrong_version),
+            None,
+            "an unknown version byte must not be parsed at V2 offsets"
+        );
+    }
+
     // (restored) round-trips every ReplicaOp variant (DeleteV2 removed).
     #[test]
     fn all_variants_round_trip() {
