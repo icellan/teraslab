@@ -8764,6 +8764,25 @@ fn send_delta_ops(
     };
     let response = exchange_frame(stream, &request, auth_secret)?;
 
+    // Check the frame STATUS first — same ordering as the baseline migration
+    // path above, and load-bearing for the same reason. A STATUS_ERROR frame
+    // carries EITHER a `ReplicaAck::Error` payload (a receiver-side apply
+    // failure) OR the `[code:u16][msg_len:u16][msg]` error envelope (e.g.
+    // ERR_STALE_EPOCH from the pre-apply epoch gate). Parsing the envelope as
+    // a `ReplicaAck` reads the error code's low byte as an ack tag, so
+    // ERR_STALE_EPOCH (24) came back as "unknown op type: 24" — which both
+    // hid the real cause and mis-classified a RETRYABLE stale-epoch rejection
+    // as a permanent protocol failure. `decode_migration_batch_error_detail`
+    // tries the ack decode first and falls back to the envelope, so both
+    // shapes report truthfully.
+    if response.status != STATUS_OK {
+        let detail = decode_migration_batch_error_detail(&response.payload);
+        return Err(format!(
+            "delta batch rejected: status {}{detail}",
+            response.status
+        ));
+    }
+
     // Validate ReplicaAck payload
     if !response.payload.is_empty() {
         match ReplicaAck::deserialize(&response.payload) {
@@ -8812,9 +8831,6 @@ fn send_delta_ops(
                 return Err(format!("failed to parse delta ack: {e}"));
             }
         }
-    }
-    if response.status != STATUS_OK {
-        return Err(format!("delta batch rejected: status {}", response.status));
     }
 
     Ok(())
@@ -17537,6 +17553,70 @@ mod tests {
         assert!(result.is_err(), "should reject oversized response");
         let err = result.unwrap_err();
         assert!(err.contains("response too large"), "error: {err}");
+        server.join().unwrap();
+    }
+
+    /// `send_delta_ops` must read the frame STATUS before trying to decode the
+    /// payload as a `ReplicaAck`.
+    ///
+    /// A `STATUS_ERROR` frame carries the `[code:u16][msg_len:u16][msg]` error
+    /// envelope, NOT a `ReplicaAck`. Feeding that envelope to
+    /// `ReplicaAck::deserialize` reads the low byte of the error code as an ack
+    /// tag — so `ERR_STALE_EPOCH` (24) surfaced as the nonsense
+    /// "failed to parse delta ack: unknown op type: 24", and the migration was
+    /// classified as a permanent protocol failure instead of the retryable
+    /// stale-epoch condition it actually is. Observed 130× in one nightly
+    /// rolling-restart run, where it stranded the shard table unconverged.
+    ///
+    /// The baseline (non-delta) migration path already gets this right; this
+    /// test pins the delta path to the same ordering.
+    #[test]
+    fn send_delta_ops_surfaces_stale_epoch_envelope_not_bogus_ack_tag() {
+        use crate::protocol::opcodes::{ERR_STALE_EPOCH, STATUS_ERROR};
+        use std::io::Write as _;
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // Mock target: replies exactly as the receiver's pre-apply epoch gate
+        // does — STATUS_ERROR with a [code][msg_len][msg] envelope.
+        let server = std::thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            let mut discard = [0u8; 8192];
+            let _ = conn.read(&mut discard);
+            let msg = b"stale cluster key";
+            let mut payload = Vec::new();
+            payload.extend_from_slice(&ERR_STALE_EPOCH.to_le_bytes());
+            payload.extend_from_slice(&(msg.len() as u16).to_le_bytes());
+            payload.extend_from_slice(msg);
+            let resp = ResponseFrame {
+                request_id: 7,
+                status: STATUS_ERROR,
+                payload,
+            };
+            conn.write_all(&resp.encode()).unwrap();
+        });
+
+        let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(1)).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let err = send_delta_ops(&mut stream, 7, &[], 99, None)
+            .expect_err("a STATUS_ERROR delta response must fail the send");
+
+        assert!(
+            !err.contains("unknown op type"),
+            "the error envelope must not be mis-parsed as an ack tag, got: {err}"
+        );
+        assert!(
+            err.contains(&format!("code={ERR_STALE_EPOCH}")),
+            "the real error code must be surfaced, got: {err}"
+        );
+        assert!(
+            err.contains("stale cluster key"),
+            "the receiver's message must be surfaced, got: {err}"
+        );
         server.join().unwrap();
     }
 
