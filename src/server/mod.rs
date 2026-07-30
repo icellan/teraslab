@@ -346,6 +346,55 @@ impl Drop for PerIpGuard {
     }
 }
 
+/// Decide the per-IP connection limit to enforce for an incoming connection.
+///
+/// `None` means "do not count this connection against any per-IP cap".
+///
+/// Three populations, three answers:
+///
+/// * **Untrusted clients** get `max_connections_per_ip` (default 64) — the
+///   slow-loris guard, comfortably above a pooled client's 8..32.
+/// * **Known peers, inter-node auth enforced** are exempt outright. This is
+///   REL-128's existing behaviour and is unchanged: every inter-node frame
+///   carries an HMAC, so a spoofed source IP cannot claim peer identity.
+/// * **Known peers, inter-node auth NOT enforced** (the explicit
+///   `strict_auth = false` + no `cluster_secret` trusted-overlay opt-out) get
+///   a *raised but still bounded* cap.
+///
+/// That third case is the bug this function exists to fix. A migration source
+/// opens up to `migration_pool_size` (default **128**) parallel connections to
+/// a single target, while the client cap is **64** — so the target reset every
+/// connection past the 64th and shard migration could not complete at all.
+/// One nightly rolling-restart run logged 3106 `shard baseline failed` errors
+/// against a peer that was rejecting with "per-IP cap reached", leaving 21
+/// inbound migrations permanently stranded and the drain never converging.
+///
+/// Giving peers an unlimited exemption here would be wrong for exactly the
+/// reason REL-128 states — without authentication, peer identity rests on a
+/// spoofable source IP. So instead the cap becomes the node's own *knowable*
+/// peer demand: the migration pool plus a full client-cap's worth of headroom
+/// for replication, SWIM, topology, completion handshakes and superset probes.
+/// The result stays finite (192 by default, against a 1024 global cap), so an
+/// attacker who does occupy a peer address still cannot exhaust the process.
+fn effective_per_ip_limit(
+    max_connections_per_ip: usize,
+    migration_pool_size: usize,
+    is_known_peer: bool,
+    cluster_auth_enforced: bool,
+) -> Option<usize> {
+    if max_connections_per_ip == 0 {
+        // Operator disabled per-IP enforcement entirely.
+        return None;
+    }
+    if !is_known_peer {
+        return Some(max_connections_per_ip);
+    }
+    if cluster_auth_enforced {
+        return None;
+    }
+    Some(migration_pool_size.saturating_add(max_connections_per_ip))
+}
+
 /// Running TeraSlab server instance.
 pub struct Server {
     engine: Arc<Engine>,
@@ -650,26 +699,38 @@ impl Server {
                         // so the gate passes; only a deployment that deliberately
                         // turned auth off loses the exemption, which is correct —
                         // there is nothing to back the exemption in that mode.
+                        //
+                        // REL-128's gate is kept, but losing the exemption can
+                        // no longer mean "fall back to the CLIENT cap": a
+                        // migration source opens `migration_pool_size` (128)
+                        // connections against a 64 cap, so trusted-overlay
+                        // clusters could not migrate a shard at all. See
+                        // `effective_per_ip_limit` for the three populations.
                         let cluster_auth_enforced =
                             self.config.strict_auth || self.config.cluster_secret.is_some();
-                        let peer_exempt = cluster_auth_enforced
-                            && self
-                                .cluster
-                                .as_ref()
-                                .is_some_and(|c| c.is_known_peer_ip(addr.ip()));
-                        let per_ip_guard = if self.config.max_connections_per_ip > 0 && !peer_exempt
-                        {
+                        let is_known_peer = self
+                            .cluster
+                            .as_ref()
+                            .is_some_and(|c| c.is_known_peer_ip(addr.ip()));
+                        let per_ip_limit = effective_per_ip_limit(
+                            self.config.max_connections_per_ip,
+                            self.config.migration_pool_size,
+                            is_known_peer,
+                            cluster_auth_enforced,
+                        );
+                        let per_ip_guard = if let Some(limit) = per_ip_limit {
                             let peer_ip = addr.ip();
                             let mut map = self.connections_per_ip.lock();
                             let count = map.entry(peer_ip).or_insert(0);
-                            if *count >= self.config.max_connections_per_ip {
+                            if *count >= limit {
                                 let observed = *count;
                                 drop(map);
                                 tracing::info!(
                                     peer_addr = %addr,
                                     peer_ip = %peer_ip,
                                     count = observed,
-                                    limit = self.config.max_connections_per_ip,
+                                    limit,
+                                    is_known_peer,
                                     "rejecting connection: per-IP cap reached",
                                 );
                                 drop(stream);
@@ -1808,6 +1869,70 @@ mod tests {
     use crate::device::{BlockDevice, MemoryDevice};
     use crate::index::{DahIndex, Index};
     use crate::locks::StripedLocks;
+
+    /// The shipped defaults must let a peer's migration pool connect.
+    ///
+    /// `migration_pool_size` is 128 and `max_connections_per_ip` is 64, so
+    /// before this fix a trusted-overlay cluster reset every migration
+    /// connection past the 64th — deterministically, on every rebalance.
+    #[test]
+    fn default_config_peer_limit_admits_the_whole_migration_pool() {
+        let cfg = crate::config::ServerConfig::default();
+        assert!(
+            cfg.migration_pool_size > cfg.max_connections_per_ip,
+            "precondition: the defaults really do conflict ({} pool vs {} cap)",
+            cfg.migration_pool_size,
+            cfg.max_connections_per_ip,
+        );
+
+        let limit = effective_per_ip_limit(
+            cfg.max_connections_per_ip,
+            cfg.migration_pool_size,
+            /* is_known_peer */ true,
+            /* cluster_auth_enforced */ false,
+        )
+        .expect("an unauthenticated peer is still counted, just with a higher cap");
+        assert!(
+            limit >= cfg.migration_pool_size,
+            "a peer must be able to open its full migration pool: limit {limit} < pool {}",
+            cfg.migration_pool_size,
+        );
+    }
+
+    /// The three populations get three distinct answers.
+    #[test]
+    fn effective_per_ip_limit_separates_clients_peers_and_authenticated_peers() {
+        // Untrusted client: the plain client cap.
+        assert_eq!(
+            effective_per_ip_limit(64, 128, false, false),
+            Some(64),
+            "an unknown IP gets the client cap"
+        );
+        assert_eq!(
+            effective_per_ip_limit(64, 128, false, true),
+            Some(64),
+            "enforcing cluster auth must not relax the cap for a NON-peer"
+        );
+
+        // Authenticated peer: exempt (REL-128 behaviour, unchanged).
+        assert_eq!(
+            effective_per_ip_limit(64, 128, true, true),
+            None,
+            "an authenticated peer stays exempt"
+        );
+
+        // Trusted-overlay peer: raised, but still finite.
+        let limit = effective_per_ip_limit(64, 128, true, false)
+            .expect("must remain bounded — identity here rests on a spoofable source IP");
+        assert_eq!(
+            limit, 192,
+            "migration pool (128) + client-cap headroom (64)"
+        );
+
+        // Operator opt-out still disables enforcement for everyone.
+        assert_eq!(effective_per_ip_limit(0, 128, false, false), None);
+        assert_eq!(effective_per_ip_limit(0, 128, true, false), None);
+    }
 
     #[test]
     fn unauthenticated_warn_is_rate_limited_per_peer() {
