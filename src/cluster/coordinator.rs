@@ -160,6 +160,54 @@ impl From<bool> for FailedTaskTableAction {
     }
 }
 
+/// Claim the single topology-catch-up slot.
+///
+/// `ClusterEvent::TopologyStale` fires once per gossip observation, so in a
+/// 3-node cluster all peers reporting the same advanced term used to spawn
+/// three catch-up threads within milliseconds of each other. Each one
+/// independently re-proposed, minting a fresh topology term — one nightly
+/// rolling restart burned terms 3, 4 and 5 in 25 ms, and term 4 never even
+/// reached quorum.
+///
+/// Term churn is not cosmetic: an in-flight migration is stamped with the
+/// epoch it was planned at, so every extra term invalidates the migrations
+/// already streaming and the target rejects them with `ERR_STALE_EPOCH`.
+///
+/// Returns `Some(guard)` for the caller that wins the slot and `None` for the
+/// duplicates. Dropping the guard releases the slot, including on panic, so a
+/// failed catch-up can never wedge the mechanism. Skipping is safe rather than
+/// lossy: SWIM re-emits `TopologyStale` on its next probe (200 ms by default)
+/// while the local term is still behind, so a term that arrives DURING a
+/// catch-up is picked up on the following round.
+fn try_begin_topology_catch_up(
+    inflight: &Arc<std::sync::atomic::AtomicBool>,
+) -> Option<TopologyCatchUpGuard> {
+    inflight
+        .compare_exchange(
+            false,
+            true,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        )
+        .ok()
+        .map(|_| TopologyCatchUpGuard {
+            inflight: inflight.clone(),
+        })
+}
+
+/// RAII release for the topology-catch-up slot claimed by
+/// [`try_begin_topology_catch_up`].
+struct TopologyCatchUpGuard {
+    inflight: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Drop for TopologyCatchUpGuard {
+    fn drop(&mut self) {
+        self.inflight
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
 fn fail_migration_task_current_epoch(
     migration: &Arc<Mutex<MigrationManager>>,
     shard_table: &Arc<ShardTableLock<ShardTable>>,
@@ -1550,6 +1598,9 @@ impl ClusterCoordinator {
         let outbound_state_path_event = outbound_state_path.clone();
         let startup_reactivation_needed = Arc::new(AtomicBool::new(false));
         let startup_reactivation_event = startup_reactivation_needed.clone();
+        // One topology catch-up at a time; see `try_begin_topology_catch_up`.
+        let topology_catch_up_inflight = Arc::new(AtomicBool::new(false));
+        let topology_catch_up_event = topology_catch_up_inflight.clone();
 
         // Topology authority and cluster secret for the event loop.
         let topo_authority_event = self.topology_authority.clone();
@@ -1659,6 +1710,7 @@ impl ClusterCoordinator {
                                 &migration_throttle_event,
                                 &cluster_secret_event,
                                 &swim_membership_event,
+                                &topology_catch_up_event,
                             );
                             let activated_term = topology_epoch.load(Ordering::Relaxed);
                             if activated_term > last_activated_term {
@@ -1896,6 +1948,7 @@ impl ClusterCoordinator {
                         &migration_throttle_event,
                         &cluster_secret_event,
                         &swim_membership_event,
+                        &topology_catch_up_event,
                     );
                     let activated_term = topology_epoch.load(Ordering::Relaxed);
                     if activated_term > last_activated_term {
@@ -2883,6 +2936,8 @@ impl ClusterCoordinator {
         // handle to react to a just-applied shrink (see
         // `react_to_committed_shrink`).
         swim_membership: &Arc<Mutex<crate::cluster::membership::Membership>>,
+        // Single-flight guard for topology catch-up (term-churn control).
+        topology_catch_up_inflight: &Arc<AtomicBool>,
     ) {
         match event {
             ClusterEvent::NodeJoined(node, addr) => {
@@ -3095,6 +3150,27 @@ impl ClusterCoordinator {
             }
             ClusterEvent::TopologyStale(remote_term) => {
                 let local_term = topology_authority.committed_term();
+                // Collapse concurrent stale-term observations to ONE catch-up.
+                // Without this every peer gossiping the same advanced term
+                // spawned its own thread, and each re-proposed — inflating the
+                // topology term and invalidating the migrations already
+                // streaming under the previous epoch. See
+                // `try_begin_topology_catch_up`.
+                let catch_up_slot = if *remote_term > local_term {
+                    match try_begin_topology_catch_up(topology_catch_up_inflight) {
+                        Some(guard) => Some(guard),
+                        None => {
+                            tracing::debug!(
+                                local_term,
+                                remote_term = *remote_term,
+                                "cluster: topology catch-up already in flight — skipping duplicate",
+                            );
+                            return;
+                        }
+                    }
+                } else {
+                    None
+                };
                 if *remote_term > local_term {
                     // Spawn catch-up in a background thread so the event loop
                     // stays responsive to SWIM probes and suspect expiration.
@@ -3124,6 +3200,9 @@ impl ClusterCoordinator {
                     let catch_up_swim = swim_membership.clone();
                     let remote_term = *remote_term;
                     std::thread::spawn(move || {
+                        // Held for the whole catch-up; released on return OR
+                        // unwind so a failure cannot wedge the slot.
+                        let _catch_up_slot = catch_up_slot;
                         tracing::info!(
                             local_term,
                             remote_term,
@@ -17554,6 +17633,52 @@ mod tests {
         let err = result.unwrap_err();
         assert!(err.contains("response too large"), "error: {err}");
         server.join().unwrap();
+    }
+
+    /// Concurrent `TopologyStale` observations must collapse to ONE catch-up.
+    ///
+    /// Every duplicate that got through used to re-propose and mint a topology
+    /// term, and each new term invalidates the migrations already streaming
+    /// under the previous one (the target rejects them with `ERR_STALE_EPOCH`).
+    #[test]
+    fn topology_catch_up_slot_admits_one_and_releases_on_drop() {
+        let inflight = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let first = try_begin_topology_catch_up(&inflight);
+        assert!(first.is_some(), "the first observation must win the slot");
+        assert!(
+            try_begin_topology_catch_up(&inflight).is_none(),
+            "a concurrent duplicate must NOT spawn a second catch-up"
+        );
+        assert!(
+            try_begin_topology_catch_up(&inflight).is_none(),
+            "nor a third — a 3-node cluster gossips the same stale term thrice"
+        );
+
+        drop(first);
+        assert!(
+            try_begin_topology_catch_up(&inflight).is_some(),
+            "the slot must be reusable once the catch-up finishes"
+        );
+    }
+
+    /// A panicking catch-up must not wedge the slot forever.
+    #[test]
+    fn topology_catch_up_slot_is_released_when_the_thread_panics() {
+        let inflight = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let for_thread = inflight.clone();
+
+        let handle = std::thread::spawn(move || {
+            let _guard = try_begin_topology_catch_up(&for_thread)
+                .expect("the only claimant must win the slot");
+            panic!("catch-up blew up");
+        });
+        assert!(handle.join().is_err(), "the thread really did panic");
+
+        assert!(
+            try_begin_topology_catch_up(&inflight).is_some(),
+            "the RAII guard must release the slot even on unwind"
+        );
     }
 
     /// `send_delta_ops` must read the frame STATUS before trying to decode the
