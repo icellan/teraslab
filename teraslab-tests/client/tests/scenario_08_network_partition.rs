@@ -180,7 +180,21 @@ async fn run_scenario() -> Result<(), ClientError> {
         // the isolation).
         client.close().await;
         let client = common::create_client_subset(&docker, &[1, 2]).await?;
-        common::wait_client_excludes_nodes(&client, &[3], Duration::from_secs(30)).await?;
+        // 30s was marginal, not generous. Reassigning node3's shards can need a
+        // same-term reactivation round, and that repair is deliberately gated
+        // behind the 30s storm cooldown (`normal_reactivation_due` requires
+        // `last_activation_at.elapsed() >= 30s`). A run whose initial topology
+        // commit happens to reassign everything clears this in ~2s; a run that
+        // needs the repair round cannot, because the budget and the cooldown
+        // are the same number. That is why this failed intermittently at 8a.1
+        // with "client partition map still routes shards to isolated node(s)".
+        //
+        // Budget one full cooldown plus commit and propagation, so the wait is
+        // decided by whether the cluster reassigns at all rather than by
+        // whether it happened to need a second round. `wait_client_excludes_nodes`
+        // refreshes routing every iteration, so this only ever costs real time
+        // when the cluster genuinely has not reassigned yet.
+        common::wait_client_excludes_nodes(&client, &[3], Duration::from_secs(75)).await?;
 
         // Verify that node3 REJECTS writes during partition.
         // Create a single-node client that connects ONLY to the partitioned node3.
