@@ -895,11 +895,26 @@ async fn run_scenario() -> Result<(), ClientError> {
             // error it is.
             let op_start = std::time::Instant::now();
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            let create = tokio::time::timeout(
-                remaining.max(Duration::from_secs(1)),
-                common::seed_records(&client, &verifier, 5, 5),
-            )
-            .await;
+            // Bound each batch by a SLICE of the budget, not the whole thing.
+            // `seed_records` retries a transient batch up to 16 times with
+            // backoff, and under this partition every attempt pays a connect
+            // timeout toward the unreachable peer — so one unlucky batch (any
+            // of its 5 records mapping to an affected shard) consumes the
+            // entire 30s window. Observed exactly that: "batch 1 exceeded the
+            // remaining workload budget (29.99s)", leaving 2 ops and 0 records
+            // created, which then trips the zero-records check.
+            //
+            // This sub-test measures how much work SURVIVES an asymmetric
+            // partition, so it needs many attempts spread across the window
+            // rather than one exhaustive retry chain. Abandon a stuck batch
+            // quickly and move to the next.
+            const PER_BATCH_BUDGET: Duration = Duration::from_secs(3);
+            let batch_budget = PER_BATCH_BUDGET
+                .min(remaining)
+                .max(Duration::from_millis(500));
+            let create =
+                tokio::time::timeout(batch_budget, common::seed_records(&client, &verifier, 5, 5))
+                    .await;
             match create {
                 Ok(Ok(batch)) => {
                     reporter.record("create", op_start.elapsed());
@@ -915,8 +930,8 @@ async fn run_scenario() -> Result<(), ClientError> {
                     errors += 1;
                     total_ops += 1;
                     eprintln!(
-                        "[8d.2] batch {batch_idx} exceeded the remaining workload budget \
-                         ({remaining:?}) and was abandoned"
+                        "[8d.2] batch {batch_idx} exceeded its per-batch budget \
+                         ({batch_budget:?}) and was abandoned"
                     );
                 }
             }
