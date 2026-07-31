@@ -246,6 +246,28 @@ async fn run_scenario() -> Result<(), ClientError> {
          scale-up/migration window -- the error-rate check below has \
          nothing to check and cannot be trusted"
     );
+
+    // A 1% ceiling is not expressible below 100 samples: with 7 operations a
+    // SINGLE error is 14%. The migration window is short and its length varies
+    // with machine speed, so the sample size swings wildly between runs -- this
+    // assertion was observed producing 0%, 2.86%, 10% and 57% across runs of
+    // IDENTICAL code, which makes it useless as a litmus test for replication.
+    //
+    // Too few samples is itself a finding, not something to paper over: the
+    // workload paces at ~300 ops/sec, so a migration window that yields under
+    // 100 operations means writes were being serviced at a small fraction of
+    // the offered rate, which is the very availability problem this sub-test
+    // exists to catch. Report it as such instead of dividing by a number too
+    // small to mean anything.
+    const MIN_SAMPLES_FOR_RATE: u64 = 100;
+    assert!(
+        bg_total_ops >= MIN_SAMPLES_FOR_RATE,
+        "Test 6.5: only {bg_total_ops} operations completed during the migration \
+         window (need >= {MIN_SAMPLES_FOR_RATE} for a 1% ceiling to be meaningful). \
+         The workload offers ~300 ops/sec, so this means writes were serviced at a \
+         small fraction of the offered rate during the scale-up -- an availability \
+         problem, not a measurement artifact"
+    );
     assert!(
         error_rate < 0.01,
         "Test 6.5: error rate {:.2}% exceeds 1% ({bg_total_errors}/{bg_total_ops})",
