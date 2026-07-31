@@ -5634,6 +5634,30 @@ fn check_quorum(cluster: Option<&RunningCluster>, request_id: u64) -> Option<Res
     // split-brain. With 3 nodes, need >= 2. With 5 nodes, need >= 3.
     let quorum_needed = (peak / 2) + 1;
     if alive < quorum_needed {
+        // Refusing writes is a significant event and was completely silent —
+        // the client saw ERR_NO_QUORUM and the server logged nothing, so the
+        // counts that produced the decision were unrecoverable after the fact.
+        // Scenario 06 hit this during a 3->4 scale-up (writes failing with
+        // NO_QUORUM while the workload ran) and the node logs held no trace.
+        //
+        // Note `peak` is a high-water mark, so ADDING a node raises the bar
+        // before the newcomer can contribute liveness: at peak=3 a single
+        // unresponsive node still leaves quorum, at peak=4 it does not. These
+        // counts are what distinguish that from a genuine partition.
+        //
+        // Rate-limited: a rejecting node rejects every mutation, so log the
+        // first and then every 1000th rather than one line per request.
+        static REJECTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = REJECTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if n == 0 || n.is_multiple_of(1000) {
+            tracing::warn!(
+                alive,
+                peak,
+                quorum_needed,
+                rejected_so_far = n + 1,
+                "cluster: refusing mutation — quorum not met",
+            );
+        }
         return Some(error_response(request_id, ERR_NO_QUORUM, "no quorum"));
     }
     None
