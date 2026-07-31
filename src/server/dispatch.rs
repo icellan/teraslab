@@ -348,6 +348,46 @@ pub fn secondary_status() -> SecondaryStatus {
     }
 }
 
+/// True while this node still holds durable pending replication intents that
+/// have not been re-fanned-out to their replicas since the last restart.
+///
+/// The startup barrier in the server binary used to enforce this by holding
+/// back *every* listener until the intents drained. That made startup liveness
+/// depend on peer reachability, and two mutually-replicating nodes restarted
+/// together deadlocked outright: each blocked replicating its intents to a peer
+/// whose listener the very same barrier kept shut, so both spun until the 60s
+/// abort killed them. A correlated crash — power loss, an orchestrator
+/// restarting two pods at once — therefore took the cluster down permanently.
+///
+/// The invariant the barrier actually needs is narrower than "no listener": no
+/// *client* mutation may be accepted while an old local-only mutation is still
+/// unreplicated and uncompensated, because new sequence ranges would advance
+/// past it. Serving a peer's `OP_REPLICA_BATCH` does not create such a
+/// mutation. So the flag below gates exactly the client-facing opcodes
+/// (see [`needs_cluster_readiness`]) and lets inter-node traffic through,
+/// which is what allows two restarting peers to drain through each other.
+///
+/// Defaults to `false` so single-node deployments, test harnesses, and any
+/// path that never arms it keep the historical "serve immediately" behavior.
+static INTENT_RECOVERY_PENDING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Arm or clear the startup intent-recovery gate.
+///
+/// The server binary arms this *before* binding any listener and clears it once
+/// [`recover_pending_replication_intents`] reports success. `Release`/`Acquire`
+/// ordering pairs the clear with the recovery work that precedes it, so a
+/// request thread that observes the cleared flag also observes the completed
+/// fan-out.
+pub fn set_intent_recovery_pending(pending: bool) {
+    INTENT_RECOVERY_PENDING.store(pending, std::sync::atomic::Ordering::Release);
+}
+
+/// Read the startup intent-recovery gate.
+pub fn intent_recovery_pending() -> bool {
+    INTENT_RECOVERY_PENDING.load(std::sync::atomic::Ordering::Acquire)
+}
+
 /// Global metrics reference. Initialized during server startup via
 /// `init_dispatch_metrics()`. Used to increment operation counters
 /// without threading metrics through every handler function.
@@ -607,6 +647,14 @@ pub(crate) fn handle_request(
             ERR_CLUSTER_NOT_READY,
             "node has not yet observed first committed topology",
         );
+    }
+
+    // Startup intent-recovery gate. Same shape as the readiness gate above and
+    // the same narrow exemption for inter-node traffic — a restarting peer must
+    // be able to drain its intents THROUGH this node while this node is still
+    // draining its own, or two nodes restarted together deadlock.
+    if let Some(err_resp) = check_intent_recovery(request.op_code, request.request_id) {
+        return err_resp;
     }
 
     // Gap #5 — secondary-index readiness gate. When a secondary index
@@ -5980,6 +6028,39 @@ fn needs_cluster_readiness(op: u16) -> bool {
 /// when a secondary is degraded — that's what the gap doc required.
 fn check_secondary_readiness(op: u16, request_id: u64) -> Option<ResponseFrame> {
     secondary_readiness_verdict(op, secondary_status(), request_id)
+}
+
+/// Startup intent-recovery gate — reject client-facing traffic while this node
+/// still has pending replication intents to drain. See
+/// [`INTENT_RECOVERY_PENDING`] for why this replaced a listener-wide barrier.
+fn check_intent_recovery(op: u16, request_id: u64) -> Option<ResponseFrame> {
+    intent_recovery_verdict(op, intent_recovery_pending(), request_id)
+}
+
+/// Pure policy function: given an opcode and whether intent recovery is still
+/// pending, return `Some(error_response)` if the op must wait, or `None`.
+///
+/// Deliberately delegates the client-vs-inter-node classification to
+/// [`needs_cluster_readiness`] rather than restating it. The two gates protect
+/// different invariants but partition opcodes identically, and a second
+/// hand-maintained list would eventually drift — gating `OP_REPLICA_BATCH` by
+/// accident is precisely what re-creates the mutual restart deadlock.
+///
+/// Split out from [`check_intent_recovery`] so tests can drive both branches
+/// without mutating the global flag (which would race parallel tests).
+pub(crate) fn intent_recovery_verdict(
+    op: u16,
+    pending: bool,
+    request_id: u64,
+) -> Option<ResponseFrame> {
+    if !pending || !needs_cluster_readiness(op) {
+        return None;
+    }
+    Some(error_response(
+        request_id,
+        ERR_CLUSTER_NOT_READY,
+        "node is replaying pending replication intents from its last restart",
+    ))
 }
 
 /// Pure policy function: given an opcode and a [`SecondaryStatus`] snapshot,
@@ -30803,6 +30884,118 @@ mod tests {
         let resp = secondary_readiness_verdict(OP_DELETE_BATCH, status, 0xDEAD_BEEF)
             .expect("delete must be rejected");
         assert_eq!(resp.request_id, 0xDEAD_BEEF);
+    }
+
+    // ---------------------------------------------------------------------
+    // Startup intent-recovery gate (pure policy)
+    //
+    // The startup barrier used to hold back every listener until pending
+    // replication intents drained. Two mutually-replicating nodes restarted
+    // together therefore deadlocked: each blocked replicating its intents to
+    // a peer whose listener the same barrier kept shut, and both died at the
+    // 60s abort. The gate below replaces the listener-wide block: the node
+    // listens immediately and serves inter-node traffic (so a peer CAN drain
+    // through it) while refusing client reads/writes until its own intents
+    // resolve. That is the invariant the barrier actually needed — no client
+    // mutation may advance past an unreplicated local-only mutation.
+    //
+    // Driven directly with an explicit `pending` argument so these never race
+    // with other tests on the global flag.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn intent_recovery_not_pending_passes_every_op() {
+        for op in &[
+            OP_SPEND_BATCH,
+            OP_CREATE_BATCH,
+            OP_GET_BATCH,
+            OP_DELETE_BATCH,
+            OP_REPLICA_BATCH,
+            OP_TOPOLOGY_COMMIT,
+        ] {
+            assert!(
+                intent_recovery_verdict(*op, false, 1).is_none(),
+                "op={op} must pass once intent recovery has completed",
+            );
+        }
+    }
+
+    #[test]
+    fn intent_recovery_pending_blocks_client_reads_and_writes() {
+        for op in &[
+            OP_SPEND_BATCH,
+            OP_CREATE_BATCH,
+            OP_DELETE_BATCH,
+            OP_GET_BATCH,
+            OP_GET_SPEND_BATCH,
+            OP_QUERY_OLD_UNMINED,
+        ] {
+            let resp = intent_recovery_verdict(*op, true, 1)
+                .unwrap_or_else(|| panic!("op={op} must be refused while intents are pending"));
+            assert_eq!(extract_err(&resp), ERR_CLUSTER_NOT_READY, "op={op}");
+        }
+    }
+
+    /// The deadlock-breaker: a peer's replication and the topology traffic
+    /// that lets both nodes converge MUST pass while this node is still
+    /// draining its own intents. If any of these were gated, two nodes
+    /// restarted together would wedge exactly as they did before.
+    #[test]
+    fn intent_recovery_pending_admits_inter_node_traffic() {
+        for op in &[
+            OP_REPLICA_BATCH,
+            OP_TOPOLOGY_PROPOSE,
+            OP_TOPOLOGY_VOTE,
+            OP_TOPOLOGY_COMMIT,
+            OP_GET_PARTITION_MAP,
+            OP_GET_COMMITTED_TOPOLOGY,
+            OP_MIGRATION_TRANSFER_REQUEST,
+            OP_MIGRATION_COMPLETE,
+            OP_ADMIN_CLUSTER_HEALTH,
+            OP_ADMIN_DIAGNOSE_KEY,
+            OP_PING,
+        ] {
+            assert!(
+                intent_recovery_verdict(*op, true, 1).is_none(),
+                "op={op} must pass while intents are pending — gating it re-creates \
+                 the mutual restart deadlock",
+            );
+        }
+    }
+
+    /// Every opcode the gate refuses must be one the readiness gate already
+    /// classifies as client-facing, so the two gates can never disagree about
+    /// what counts as inter-node traffic.
+    #[test]
+    fn intent_recovery_gate_matches_cluster_readiness_classification() {
+        for op in 0u16..512 {
+            let refused = intent_recovery_verdict(op, true, 1).is_some();
+            assert_eq!(
+                refused,
+                needs_cluster_readiness(op),
+                "op={op}: intent-recovery gate and cluster-readiness gate disagree",
+            );
+        }
+    }
+
+    #[test]
+    fn intent_recovery_request_id_propagates() {
+        let resp = intent_recovery_verdict(OP_SPEND_BATCH, true, 0xFEED_FACE)
+            .expect("spend must be refused while intents are pending");
+        assert_eq!(resp.request_id, 0xFEED_FACE);
+    }
+
+    /// The gate must default to cleared, so single-node deployments and every
+    /// test harness that never arms it keep serving immediately.
+    ///
+    /// Read-only on purpose. Arming the global here would race the parallel
+    /// dispatch tests that call `handle_request` — the same hazard the
+    /// `secondary_readiness_verdict` split exists to avoid — so the armed
+    /// behavior is covered through the pure policy function above instead.
+    #[test]
+    fn intent_recovery_gate_defaults_to_cleared() {
+        assert!(!intent_recovery_pending());
+        assert!(check_intent_recovery(OP_SPEND_BATCH, 1).is_none());
     }
 
     // -----------------------------------------------------------------------

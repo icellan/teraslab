@@ -2109,54 +2109,88 @@ fn main() {
             }
         }
 
+        // Shared from here on so the intent-recovery drain below can hold a
+        // handle while the rest of startup proceeds; `Arc<RunningCluster>`
+        // derefs, so every existing `running.method()` / `&running` use is
+        // unchanged.
+        let running = Arc::new(running);
+
         if config.replication_factor > 1 {
-            // Startup barrier: durable pending replication intents must be
-            // resolved before any HTTP or TCP listener is started below. If a
+            // Startup gate: durable pending replication intents must be
+            // resolved before this node accepts any CLIENT read or write. If a
             // restarted master accepted new writes first, an old local-only
             // mutation could remain neither replicated nor compensated while
             // new sequence ranges advance past it.
-            let start = std::time::Instant::now();
-            loop {
-                match teraslab::server::dispatch::recover_pending_replication_intents(
-                    &running,
-                    redo_log.as_deref(),
-                    &engine,
-                ) {
-                    Ok(()) => break,
-                    // Redo-pressure (`RedoError::LogFull`) on rejoin is
-                    // transient self-healing backpressure, NOT a terminal
-                    // fault: the inbound migration applies that are filling
-                    // the redo log are idempotently re-drivable from their
-                    // source under the persisted inbound fence, so the
-                    // checkpointer/catch-up will drain the log and free space.
-                    // Aborting here would leave the cluster permanently stuck
-                    // at 0/N ready (rejoin-after-quiesce, scenario_09). Keep
-                    // retrying past the 60s window — only the marker re-drive
-                    // is deferred, no client is served yet.
-                    Err(e) if is_redo_pressure(&e) => {
-                        tracing::warn!(
-                            err = %e,
-                            "replication intent recovery deferred by redo backpressure; \
-                             retrying (transient, re-drivable from source)",
-                        );
-                        std::thread::sleep(std::time::Duration::from_millis(500));
-                    }
-                    Err(e) if start.elapsed() < std::time::Duration::from_secs(60) => {
-                        tracing::warn!(
-                            err = %e,
-                            "replication intent recovery pending; retrying before serving",
-                        );
-                        std::thread::sleep(std::time::Duration::from_millis(500));
-                    }
-                    Err(e) => {
-                        tracing::error!(
-                            err = %e,
-                            "replication intent recovery failed — aborting startup",
-                        );
-                        std::process::exit(1);
+            //
+            // This used to hold back every listener, which made startup
+            // liveness depend on peer reachability and deadlocked two
+            // mutually-replicating nodes restarted together: each blocked
+            // replicating its intents to a peer whose listener this very
+            // barrier kept shut, and both died at the 60s abort. A correlated
+            // crash therefore took the cluster down permanently.
+            //
+            // So the listeners now come up immediately and the drain runs here,
+            // in the background, behind `INTENT_RECOVERY_PENDING`: client
+            // reads/writes are refused with a retryable ERR_CLUSTER_NOT_READY
+            // while inter-node traffic is served, which is precisely what lets
+            // two restarting peers drain through each other. The gate is armed
+            // synchronously, BEFORE any listener binds, so no client request can
+            // slip in ahead of it.
+            teraslab::server::dispatch::set_intent_recovery_pending(true);
+            let running_for_intents = running.clone();
+            let redo_log_for_intents = redo_log.clone();
+            let engine_for_intents = engine.clone();
+            std::thread::spawn(move || {
+                let start = std::time::Instant::now();
+                loop {
+                    match teraslab::server::dispatch::recover_pending_replication_intents(
+                        &running_for_intents,
+                        redo_log_for_intents.as_deref(),
+                        &engine_for_intents,
+                    ) {
+                        Ok(()) => break,
+                        // Redo-pressure (`RedoError::LogFull`) on rejoin is
+                        // transient self-healing backpressure, NOT a terminal
+                        // fault: the inbound migration applies that are filling
+                        // the redo log are idempotently re-drivable from their
+                        // source under the persisted inbound fence, so the
+                        // checkpointer/catch-up will drain the log and free space.
+                        // Aborting here would leave the cluster permanently stuck
+                        // at 0/N ready (rejoin-after-quiesce, scenario_09). Keep
+                        // retrying past the 60s window — only the marker re-drive
+                        // is deferred, no client is served yet.
+                        Err(e) if is_redo_pressure(&e) => {
+                            tracing::warn!(
+                                err = %e,
+                                "replication intent recovery deferred by redo backpressure; \
+                                 retrying (transient, re-drivable from source)",
+                            );
+                            std::thread::sleep(std::time::Duration::from_millis(500));
+                        }
+                        Err(e) if start.elapsed() < std::time::Duration::from_secs(60) => {
+                            tracing::warn!(
+                                err = %e,
+                                "replication intent recovery pending; retrying before serving clients",
+                            );
+                            std::thread::sleep(std::time::Duration::from_millis(500));
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                err = %e,
+                                "replication intent recovery failed — aborting startup",
+                            );
+                            std::process::exit(1);
+                        }
                     }
                 }
-            }
+                // Ordered `Release` — a request thread that observes the cleared
+                // gate also observes the completed fan-out above.
+                teraslab::server::dispatch::set_intent_recovery_pending(false);
+                tracing::info!(
+                    elapsed_ms = start.elapsed().as_millis() as u64,
+                    "replication intent recovery complete; now serving client traffic",
+                );
+            });
         }
 
         // Spawn background catch-up for replicas that are behind.
@@ -2244,7 +2278,7 @@ fn main() {
             rf = config.replication_factor,
             "cluster: node started",
         );
-        Some(Arc::new(running))
+        Some(running)
     } else {
         tracing::info!("cluster: single-node mode (node_id=0)");
         None

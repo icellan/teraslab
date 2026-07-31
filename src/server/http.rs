@@ -1650,6 +1650,14 @@ fn compute_health_ready(state: &HttpState) -> ReadyState {
     if !state.ready.load(Ordering::Relaxed) {
         return ReadyState::NotReady("not ready (recovery in progress)");
     }
+    // A node still replaying pending replication intents listens and serves
+    // inter-node traffic (so restarting peers can drain through it) but rejects
+    // every client read/write with `ERR_CLUSTER_NOT_READY`. Same contract as the
+    // degraded-secondary branch below: if dispatch will refuse the traffic, the
+    // load balancer must not be told to send it.
+    if crate::server::dispatch::intent_recovery_pending() {
+        return ReadyState::NotReady("replaying pending replication intents from last restart");
+    }
     // Issue #32: a poisoned redo log rejects every write until a restart, so the
     // node must NOT receive traffic — drain it. Read is lock-free (does not block
     // on the redo writer mutex).
