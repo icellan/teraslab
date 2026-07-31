@@ -6637,6 +6637,37 @@ fn run_migration_batch(
                 // per-shard snapshot sequences (Phase 1) plus late-key and
                 // delta streaming (Phase 3) make each shard's transfer
                 // independent of when its sub-batch starts.
+                // Retire the tasks this worker is abandoning.
+                //
+                // Every abort path below returns from the worker, and anything
+                // it had already FENCED stays fenced and non-terminal forever:
+                // the only other reaper is the next topology activation, which
+                // never comes once the cluster settles. That is how a rolling
+                // restart ended with one empty-shard handoff (shard 76,
+                // total_records 0) stuck in state `Fenced` with an EMPTY
+                // fenced-shard set, holding `active_migrations` at 1 while
+                // masters/handoffs/inbound were all perfectly converged.
+                //
+                // `fail_migration_task_current_epoch` does the right thing in
+                // both cases: on a superseded epoch it retires the task without
+                // touching the newer table, and while the epoch is still
+                // current it rolls the shard back to its old master (the
+                // handoff genuinely did not happen). Any resulting gap is
+                // repaired by `missing_master_shard_count` feeding the
+                // reactivation.
+                let abandon_remaining = |from: usize| {
+                    for task in &chunk[from..] {
+                        fail_migration_task_current_epoch(
+                            &migration,
+                            shard_table,
+                            &fenced_bm,
+                            &migrating_bm,
+                            task,
+                            topology_epoch,
+                            FailedTaskTableAction::Rollback,
+                        );
+                    }
+                };
                 let mut task_idx = 0;
                 while task_idx < chunk.len() {
                     if !migration_epoch_current(shard_table, topology_epoch) {
@@ -6645,6 +6676,7 @@ fn run_migration_batch(
                             current_epoch = shard_table.read().version,
                             "cluster: aborting stale migration worker",
                         );
+                        abandon_remaining(task_idx);
                         return;
                     }
                     let sub_end = (task_idx + MIGRATION_PIPELINE_SUB_BATCH).min(chunk.len());
@@ -6662,7 +6694,8 @@ fn run_migration_batch(
                                 current_epoch = shard_table.read().version,
                                 "cluster: aborting stale migration snapshot",
                             );
-                            return;
+                            abandon_remaining(task_idx);
+                        return;
                         }
                         let snapshot_seq = redo_log.as_ref()
                             .map(|rl| rl.lock().current_sequence())
@@ -6715,6 +6748,7 @@ fn run_migration_batch(
                             current_epoch = shard_table.read().version,
                             "cluster: aborting stale migration before fence",
                         );
+                        abandon_remaining(task_idx);
                         return;
                     }
                     {
