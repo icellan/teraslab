@@ -173,38 +173,66 @@ impl From<bool> for FailedTaskTableAction {
 /// epoch it was planned at, so every extra term invalidates the migrations
 /// already streaming and the target rejects them with `ERR_STALE_EPOCH`.
 ///
-/// Returns `Some(guard)` for the caller that wins the slot and `None` for the
-/// duplicates. Dropping the guard releases the slot, including on panic, so a
-/// failed catch-up can never wedge the mechanism. Skipping is safe rather than
-/// lossy: SWIM re-emits `TopologyStale` on its next probe (200 ms by default)
-/// while the local term is still behind, so a term that arrives DURING a
-/// catch-up is picked up on the following round.
+/// The slot is keyed by the TERM being caught up to, not a plain "busy" flag.
+/// That distinction is load-bearing. A catch-up talks to peers over TCP, so
+/// during a partition it can sit in `connect_timeout` against an unreachable
+/// node for seconds. A boolean guard would let that stalled thread swallow
+/// every later observation — including a genuinely NEWER term — and a majority
+/// that needs to commit a topology excluding the isolated node would never act
+/// on it. (Observed: with a boolean guard, scenario 08 deterministically failed
+/// at 8a.1 with the client partition map still routing to the isolated node
+/// after 30 s.)
+///
+/// So: duplicates of a term already being caught up are dropped — that is the
+/// churn this exists to stop — while a strictly newer term always gets through
+/// and supersedes.
+///
+/// Returns `Some(guard)` for the caller that wins the slot and `None` for a
+/// duplicate. Dropping the guard clears the slot only if it still holds this
+/// caller's term, so a superseding catch-up is never cancelled by the older
+/// one finishing. Release happens on unwind too, so a panicking catch-up cannot
+/// wedge the mechanism.
 fn try_begin_topology_catch_up(
-    inflight: &Arc<std::sync::atomic::AtomicBool>,
+    inflight_term: &Arc<std::sync::atomic::AtomicU64>,
+    remote_term: u64,
 ) -> Option<TopologyCatchUpGuard> {
-    inflight
-        .compare_exchange(
-            false,
-            true,
-            std::sync::atomic::Ordering::AcqRel,
-            std::sync::atomic::Ordering::Acquire,
-        )
-        .ok()
-        .map(|_| TopologyCatchUpGuard {
-            inflight: inflight.clone(),
-        })
+    use std::sync::atomic::Ordering;
+    loop {
+        let current = inflight_term.load(Ordering::Acquire);
+        // `0` means idle. Anything at or above `remote_term` is already being
+        // handled (or superseded) — this observation is a duplicate.
+        if current != 0 && current >= remote_term {
+            return None;
+        }
+        if inflight_term
+            .compare_exchange(current, remote_term, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            return Some(TopologyCatchUpGuard {
+                inflight_term: inflight_term.clone(),
+                term: remote_term,
+            });
+        }
+    }
 }
 
 /// RAII release for the topology-catch-up slot claimed by
 /// [`try_begin_topology_catch_up`].
 struct TopologyCatchUpGuard {
-    inflight: Arc<std::sync::atomic::AtomicBool>,
+    inflight_term: Arc<std::sync::atomic::AtomicU64>,
+    term: u64,
 }
 
 impl Drop for TopologyCatchUpGuard {
     fn drop(&mut self) {
-        self.inflight
-            .store(false, std::sync::atomic::Ordering::Release);
+        // Only clear if we are still the newest claimant; a superseding
+        // catch-up owns the slot now and must keep it.
+        let _ = self.inflight_term.compare_exchange(
+            self.term,
+            0,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        );
     }
 }
 
@@ -1665,7 +1693,7 @@ impl ClusterCoordinator {
         let startup_reactivation_needed = Arc::new(AtomicBool::new(false));
         let startup_reactivation_event = startup_reactivation_needed.clone();
         // One topology catch-up at a time; see `try_begin_topology_catch_up`.
-        let topology_catch_up_inflight = Arc::new(AtomicBool::new(false));
+        let topology_catch_up_inflight = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let topology_catch_up_event = topology_catch_up_inflight.clone();
 
         // Topology authority and cluster secret for the event loop.
@@ -3036,8 +3064,9 @@ impl ClusterCoordinator {
         // handle to react to a just-applied shrink (see
         // `react_to_committed_shrink`).
         swim_membership: &Arc<Mutex<crate::cluster::membership::Membership>>,
-        // Single-flight guard for topology catch-up (term-churn control).
-        topology_catch_up_inflight: &Arc<AtomicBool>,
+        // Single-flight guard for topology catch-up, keyed by the term being
+        // caught up to (term-churn control that a newer term can supersede).
+        topology_catch_up_inflight: &Arc<std::sync::atomic::AtomicU64>,
     ) {
         match event {
             ClusterEvent::NodeJoined(node, addr) => {
@@ -3257,7 +3286,7 @@ impl ClusterCoordinator {
                 // streaming under the previous epoch. See
                 // `try_begin_topology_catch_up`.
                 let catch_up_slot = if *remote_term > local_term {
-                    match try_begin_topology_catch_up(topology_catch_up_inflight) {
+                    match try_begin_topology_catch_up(topology_catch_up_inflight, *remote_term) {
                         Some(guard) => Some(guard),
                         None => {
                             tracing::debug!(
@@ -17954,41 +17983,77 @@ mod tests {
     /// under the previous one (the target rejects them with `ERR_STALE_EPOCH`).
     #[test]
     fn topology_catch_up_slot_admits_one_and_releases_on_drop() {
-        let inflight = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let inflight = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
-        let first = try_begin_topology_catch_up(&inflight);
+        let first = try_begin_topology_catch_up(&inflight, 5);
         assert!(first.is_some(), "the first observation must win the slot");
         assert!(
-            try_begin_topology_catch_up(&inflight).is_none(),
-            "a concurrent duplicate must NOT spawn a second catch-up"
+            try_begin_topology_catch_up(&inflight, 5).is_none(),
+            "a concurrent duplicate of the SAME term must NOT spawn a second catch-up"
         );
         assert!(
-            try_begin_topology_catch_up(&inflight).is_none(),
+            try_begin_topology_catch_up(&inflight, 5).is_none(),
             "nor a third — a 3-node cluster gossips the same stale term thrice"
+        );
+        assert!(
+            try_begin_topology_catch_up(&inflight, 4).is_none(),
+            "an OLDER term is already covered by the in-flight catch-up"
         );
 
         drop(first);
         assert!(
-            try_begin_topology_catch_up(&inflight).is_some(),
+            try_begin_topology_catch_up(&inflight, 5).is_some(),
             "the slot must be reusable once the catch-up finishes"
+        );
+    }
+
+    /// A stalled catch-up must never swallow a strictly NEWER term.
+    ///
+    /// A catch-up talks to peers over TCP and can sit in `connect_timeout`
+    /// against an unreachable node during a partition. With a plain busy-flag
+    /// guard that stalled thread swallowed every later observation, so a
+    /// majority needing to commit a topology that excludes the isolated node
+    /// never acted on it — scenario 08 failed deterministically at 8a.1 with
+    /// the client partition map still routing to the isolated node after 30s.
+    #[test]
+    fn topology_catch_up_slot_lets_a_newer_term_supersede_a_stalled_one() {
+        let inflight = Arc::new(std::sync::atomic::AtomicU64::new(0));
+
+        // Term 5 is in flight and (pretend) stalled on a dead peer.
+        let stalled = try_begin_topology_catch_up(&inflight, 5).expect("term 5 wins the slot");
+
+        let newer = try_begin_topology_catch_up(&inflight, 6)
+            .expect("a strictly newer term must NOT be blocked by a stalled catch-up");
+
+        // The stalled one finishing must not cancel the superseding claim.
+        drop(stalled);
+        assert!(
+            try_begin_topology_catch_up(&inflight, 6).is_none(),
+            "term 6 still owns the slot after the older catch-up unwound"
+        );
+
+        drop(newer);
+        assert!(
+            try_begin_topology_catch_up(&inflight, 7).is_some(),
+            "the slot is free once the newest claimant finishes"
         );
     }
 
     /// A panicking catch-up must not wedge the slot forever.
     #[test]
     fn topology_catch_up_slot_is_released_when_the_thread_panics() {
-        let inflight = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let inflight = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let for_thread = inflight.clone();
 
         let handle = std::thread::spawn(move || {
-            let _guard = try_begin_topology_catch_up(&for_thread)
+            let _guard = try_begin_topology_catch_up(&for_thread, 3)
                 .expect("the only claimant must win the slot");
             panic!("catch-up blew up");
         });
         assert!(handle.join().is_err(), "the thread really did panic");
 
         assert!(
-            try_begin_topology_catch_up(&inflight).is_some(),
+            try_begin_topology_catch_up(&inflight, 3).is_some(),
             "the RAII guard must release the slot even on unwind"
         );
     }
