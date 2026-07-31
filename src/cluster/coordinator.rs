@@ -32,11 +32,13 @@ const MIGRATION_TCP_TIMEOUT_FLOOR: Duration = Duration::from_secs(60);
 /// push (sources stream within ~1 s of activation) is never spammed.
 const TRANSFER_REQUEST_INTERVAL: Duration = Duration::from_secs(10);
 
-/// How long a migration task may sit in `Fenced` with zero bytes and zero
-/// records migrated before the event loop reaps it as stranded. Comfortably
-/// longer than any real fenced phase (delta streaming plus the completion
-/// handshake), so this only ever fires on a task whose worker is gone.
-const STRANDED_FENCED_REAP_AFTER: Duration = Duration::from_secs(45);
+/// How long a migration task may sit in a transient setup/cutover state
+/// (`Preparing` or `Fenced`) with zero bytes and zero records migrated before
+/// the event loop reaps it as stranded. Comfortably longer than either real
+/// phase — baseline preparation, or delta streaming plus the completion
+/// handshake — so this only ever fires on a task whose worker is gone.
+/// See [`task_is_stranded_candidate`].
+const STRANDED_TASK_REAP_AFTER: Duration = Duration::from_secs(45);
 
 /// W5-followup — minimum spacing between consecutive reactivations while a node
 /// is *gracefully draining itself and making progress* (a `quiesce`, committed
@@ -844,6 +846,41 @@ fn phantom_master_shard_count(
 ///
 /// Counting these feeds the reactivation's work metric so the repair fires,
 /// exactly as the phantom counter does for the over-ownership direction.
+/// True when a migration task has made zero progress in a state it should
+/// have left almost immediately — i.e. it is a candidate for the event-loop
+/// reaper once it has also sat there past [`STRANDED_TASK_REAP_AFTER`].
+///
+/// Both `Preparing` and `Fenced` are transient setup/cutover states that a
+/// live worker leaves in well under a second. A task sitting in either for
+/// tens of seconds with `bytes_sent == 0` and `migrated_records == 0` has no
+/// worker behind it: the worker aborted on the epoch fence without retiring
+/// what it carried. The only other reaper is the next topology activation,
+/// which never comes once the cluster settles, so the task pins
+/// `active_migrations` above zero forever and every convergence gate that
+/// waits on "no active migrations" waits forever with it.
+///
+/// Observed both ways: one leftover in `Fenced` (shard 76, empty fenced-shard
+/// set) pinning `active_migrations` at 1, and eight leftovers in `Preparing`
+/// (shards 11/323/324/344/878/887/895/3270, all `total_records == 0`) pinning
+/// it at 8 — the latter with masters, handoffs and inbound all converged
+/// (4096/4096, 0, 0), so nothing else was left to signal the problem.
+///
+/// Progress-carrying tasks are excluded on purpose: a task that has sent bytes
+/// or records is a real in-flight migration whose worker may simply be slow,
+/// and retiring it would abort live work. Retiring a zero-progress task is
+/// recoverable either way — it is not a data operation, and the next
+/// reactivation re-plans the shard if it is still needed.
+fn task_is_stranded_candidate(
+    state: &crate::cluster::migration::MigrationState,
+    bytes_sent: u64,
+    migrated_records: u64,
+) -> bool {
+    use crate::cluster::migration::MigrationState;
+    matches!(*state, MigrationState::Preparing | MigrationState::Fenced)
+        && bytes_sent == 0
+        && migrated_records == 0
+}
+
 fn missing_master_shard_count(
     table: &ShardTable,
     committed_members: &[NodeId],
@@ -2142,16 +2179,17 @@ impl ClusterCoordinator {
                         let mut live: std::collections::HashSet<(u16, NodeId, NodeId, bool)> =
                             std::collections::HashSet::new();
                         for p in mgr.active_migrations() {
-                            if p.state != crate::cluster::migration::MigrationState::Fenced
-                                || p.bytes_sent != 0
-                                || p.migrated_records != 0
-                            {
+                            if !task_is_stranded_candidate(
+                                &p.state,
+                                p.bytes_sent,
+                                p.migrated_records,
+                            ) {
                                 continue;
                             }
                             let key = (p.shard, p.from_node, p.to_node, p.is_master);
                             live.insert(key);
                             let first = *fenced_since.entry(key).or_insert(now);
-                            if now.duration_since(first) >= STRANDED_FENCED_REAP_AFTER {
+                            if now.duration_since(first) >= STRANDED_TASK_REAP_AFTER {
                                 stranded.push(MigrationTask {
                                     shard: p.shard,
                                     from_node: p.from_node,
@@ -18023,6 +18061,60 @@ mod tests {
         let err = result.unwrap_err();
         assert!(err.contains("response too large"), "error: {err}");
         server.join().unwrap();
+    }
+
+    /// The reaper must treat `Preparing` exactly like `Fenced`.
+    ///
+    /// A scenario-05 nightly settled with masters at 4096/4096, handoffs 0 and
+    /// inbound 0 — fully converged — while node1 held eight zero-progress tasks
+    /// stuck in `Preparing` (shards 11/323/324/344/878/887/895/3270, all
+    /// `total_records == 0`), pinning `active_migrations` at 8 forever. The
+    /// reaper only matched `Fenced`, so nothing retired them and every gate
+    /// waiting on "no active migrations" waited forever.
+    #[test]
+    fn stranded_candidate_covers_both_transient_states_with_no_progress() {
+        use crate::cluster::migration::MigrationState;
+        for state in [MigrationState::Preparing, MigrationState::Fenced] {
+            assert!(
+                task_is_stranded_candidate(&state, 0, 0),
+                "{state:?} with zero progress must be reapable",
+            );
+        }
+    }
+
+    /// A task that has moved data has a live worker behind it — reaping it
+    /// would abort a real in-flight migration.
+    #[test]
+    fn stranded_candidate_excludes_tasks_that_made_progress() {
+        use crate::cluster::migration::MigrationState;
+        for state in [MigrationState::Preparing, MigrationState::Fenced] {
+            assert!(
+                !task_is_stranded_candidate(&state, 1, 0),
+                "{state:?} that sent bytes must not be reaped",
+            );
+            assert!(
+                !task_is_stranded_candidate(&state, 0, 1),
+                "{state:?} that migrated records must not be reaped",
+            );
+        }
+    }
+
+    /// `Streaming` is excluded even at zero progress: it is a long-running
+    /// state a healthy worker legitimately occupies before the first byte
+    /// lands. Terminal states are already retired and must not be re-reaped.
+    #[test]
+    fn stranded_candidate_excludes_streaming_and_terminal_states() {
+        use crate::cluster::migration::MigrationState;
+        for state in [
+            MigrationState::Streaming,
+            MigrationState::Complete,
+            MigrationState::Failed,
+        ] {
+            assert!(
+                !task_is_stranded_candidate(&state, 0, 0),
+                "{state:?} must never be reaped as stranded",
+            );
+        }
     }
 
     /// A node holding too FEW masters must be detected as work outstanding.
