@@ -1819,6 +1819,16 @@ fn build_status_json(state: &HttpState) -> serde_json::Value {
             "cluster_size": cluster_size,
             "shard_table_version": cluster.shard_table_version(),
             "topology_term": cluster.committed_topology_term(),
+            // The shard table is a pure function of (members, rf, epoch,
+            // placement_version), so publishing the last two alongside the term
+            // makes a cross-node table divergence directly readable instead of
+            // something to infer from shard counts.
+            "committed_placement_version": cluster.committed_placement_version(),
+            "committed_members": cluster
+                .committed_topology_members()
+                .iter()
+                .map(|n| n.0)
+                .collect::<Vec<_>>(),
             "master_shard_count": master_count,
             "replica_shard_count": replica_count,
             "target_master_shard_count": target_master_count,

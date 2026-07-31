@@ -11515,6 +11515,21 @@ impl RunningCluster {
         self.topology_authority.committed_members()
     }
 
+    /// Placement version of the committed topology term.
+    ///
+    /// Exposed on `/status` alongside the term and member list because those
+    /// three, plus `rf`, are the ENTIRE input to
+    /// [`ShardTable::compute_with_epoch`]. The table is a pure function of
+    /// them, so when two nodes report the same term but different shard
+    /// counts, one of these must differ — and without them on the wire that
+    /// can only be inferred. A scenario-05 failure left node2 reporting
+    /// `target_master_shard_count = 799` against node1's 1366 at a matching
+    /// `shard_table_version = 3`, which is exactly the case this makes
+    /// directly readable.
+    pub fn committed_placement_version(&self) -> u16 {
+        self.topology_authority.committed_placement_version()
+    }
+
     /// Trigger graceful shard drain (quiesce).
     ///
     /// Recomputes the shard table as if this node has left the cluster,
