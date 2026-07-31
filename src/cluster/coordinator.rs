@@ -6574,6 +6574,23 @@ fn run_migration_batch(
                         ) {
                             Ok(_) => true,
                             Err(e) => {
+                                if migration_error_is_stale_epoch(&e) {
+                                    // The peer has activated a newer term than
+                                    // this node has. Its rejection is better
+                                    // evidence than our own fence, which is
+                                    // still comparing against a stale local
+                                    // table — keep going and every remaining
+                                    // task in this worker is rejected too.
+                                    tracing::info!(
+                                        shard = task.shard,
+                                        task_epoch = topology_epoch,
+                                        local_epoch = shard_table.read().version,
+                                        err = %e,
+                                        "cluster: aborting migration worker — peer reports our \
+                                         epoch is superseded",
+                                    );
+                                    return;
+                                }
                                 tracing::warn!(shard = task.shard, err = %e, "cluster: shard baseline failed");
                                 false
                             }
@@ -7344,6 +7361,32 @@ fn cleanup_orphaned_shard_if_settled(
 /// `ReplicaAck::Error` decode and only falls back to the `[code][msg]` envelope
 /// for genuine envelope errors. Returns a leading-space suffix, or an empty
 /// string when no detail can be decoded.
+/// Does a migration send error mean "the PEER says our epoch is superseded"?
+///
+/// The local abort fence (`migration_epoch_current`) compares a worker's epoch
+/// against this node's OWN shard-table version, so a node that has not yet
+/// activated the newest term passes its own fence and keeps streaming. Every
+/// batch is then rejected by peers that HAVE activated it, and the worker walks
+/// its whole task list doing it: a rejoining node produced 2010
+/// `shard baseline failed ... (code=24: )` in one scenario-05 run while node1
+/// and node3 logged the matching `replica rejected batch: stale cluster_key
+/// {batch_cluster_key: 2, local_cluster_key: 3}`.
+///
+/// A peer's `ERR_STALE_EPOCH` is authoritative evidence the local view is
+/// behind — better evidence than the local fence has — so the worker must stop
+/// rather than burn the rest of its list. The superseded plan is re-planned by
+/// the next activation, which is the same outcome the local fence produces.
+///
+/// Matches the exact shape [`decode_migration_batch_error_detail`] emits for the
+/// `[code][msg_len][msg]` envelope; `stale_epoch_detail_is_recognised` pins the
+/// producer and this consumer together so the format cannot drift apart.
+fn migration_error_is_stale_epoch(err: &str) -> bool {
+    err.contains(&format!(
+        "(code={}",
+        crate::protocol::opcodes::ERR_STALE_EPOCH
+    ))
+}
+
 fn decode_migration_batch_error_detail(payload: &[u8]) -> String {
     use crate::replication::protocol::ReplicaAck;
     match ReplicaAck::deserialize(payload) {
@@ -17690,6 +17733,58 @@ mod tests {
         let err = result.unwrap_err();
         assert!(err.contains("response too large"), "error: {err}");
         server.join().unwrap();
+    }
+
+    /// The stale-epoch detector must recognise what the producer actually emits.
+    ///
+    /// `migration_error_is_stale_epoch` reads a string built by
+    /// `decode_migration_batch_error_detail`, so this feeds the real encoder
+    /// output through the real decoder and then the detector — if either side's
+    /// format changes, this fails rather than silently never matching again.
+    #[test]
+    fn stale_epoch_detail_is_recognised() {
+        use crate::protocol::opcodes::{ERR_MIGRATION_IN_PROGRESS, ERR_STALE_EPOCH};
+
+        let envelope = |code: u16, msg: &str| {
+            let mut p = Vec::new();
+            p.extend_from_slice(&code.to_le_bytes());
+            p.extend_from_slice(&(msg.len() as u16).to_le_bytes());
+            p.extend_from_slice(msg.as_bytes());
+            p
+        };
+
+        let stale = format!(
+            "migration batch failed with status 1{}",
+            decode_migration_batch_error_detail(&envelope(ERR_STALE_EPOCH, "stale cluster key"))
+        );
+        assert!(
+            migration_error_is_stale_epoch(&stale),
+            "the real ERR_STALE_EPOCH envelope must be recognised, got: {stale}"
+        );
+
+        // A different code must NOT abort the worker — those are per-shard
+        // failures the worker should carry on past.
+        let other = format!(
+            "migration batch failed with status 1{}",
+            decode_migration_batch_error_detail(&envelope(ERR_MIGRATION_IN_PROGRESS, "fenced"))
+        );
+        assert!(
+            !migration_error_is_stale_epoch(&other),
+            "only stale-epoch may abort the worker, got: {other}"
+        );
+
+        // A ReplicaAck::Error payload decodes down the other branch entirely.
+        let ack_err = format!(
+            "migration batch failed with status 1{}",
+            decode_migration_batch_error_detail(&{
+                let mut p = vec![1u8];
+                p.extend_from_slice(&7u64.to_le_bytes());
+                p.extend_from_slice(&5u32.to_le_bytes());
+                p.extend_from_slice(b"boom!");
+                p
+            })
+        );
+        assert!(!migration_error_is_stale_epoch(&ack_err));
     }
 
     /// Concurrent `TopologyStale` observations must collapse to ONE catch-up.
