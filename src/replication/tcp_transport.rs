@@ -221,6 +221,41 @@ impl ReplicaTransport for TcpReplicaTransport {
         } else {
             encoded
         };
+        // Never put a frame on the wire that the receiver is required to reject.
+        //
+        // `RequestFrame::encode` does not enforce `MAX_FRAME_SIZE` — it just
+        // casts the length — so an over-budget batch used to be written in full.
+        // The receiver's `parse_request_header` then refused it as `TooLarge` and
+        // CLOSED the connection, and the sender saw only
+        // "send_batch write: Connection reset by peer".
+        //
+        // The damage is not limited to the offending record. This connection is
+        // POOLED per replica address, so one oversized batch tears down a link
+        // that unrelated records are replicating over, converting a single
+        // too-big payload into a burst of spurious replication failures. That is
+        // how a 50 MiB external transaction (scenario 11) presents: an opaque
+        // transport error rather than a size problem.
+        //
+        // Failing here keeps the connection healthy and names the real cause.
+        // NOTE: this makes the failure honest, it does not make oversized blobs
+        // replicable — external blobs above MAX_FRAME_SIZE still cannot be
+        // shipped inline at all, which needs a streaming replication path.
+        let budget = MAX_FRAME_SIZE as usize
+            + self
+                .auth_secret
+                .as_ref()
+                .map(|_| crate::cluster::auth::SIGNED_SUFFIX_LEN)
+                .unwrap_or(0);
+        if bytes.len() > budget {
+            return Err(ReplicationError::Transport(format!(
+                "replica batch too large to send: {} bytes exceeds the {} byte frame budget \
+                 ({} op(s)); the receiver would reject the frame and drop this pooled connection",
+                bytes.len(),
+                budget,
+                batch.ops.len(),
+            )));
+        }
+
         self.stream
             .set_write_timeout(Some(self.write_timeout))
             .map_err(|e| ReplicationError::Transport(format!("set write timeout: {e}")))?;
@@ -579,6 +614,71 @@ mod tests {
         assert!(matches!(result, Err(ReplicationError::Transport(_))));
         let err = result.unwrap_err().to_string();
         assert!(err.contains("ACK frame too large"), "error was: {err}");
+
+        handle.join().unwrap();
+    }
+
+    /// An over-budget batch must be refused BEFORE it reaches the socket, and
+    /// the pooled connection must survive.
+    ///
+    /// `RequestFrame::encode` does not enforce `MAX_FRAME_SIZE`, so such a batch
+    /// used to be written in full; the receiver rejected it as `TooLarge` and
+    /// closed the connection, and the sender saw only "Connection reset by
+    /// peer". Because the connection is pooled per replica address, that tore
+    /// down a link unrelated records were replicating over — one 50 MiB external
+    /// transaction turning into a burst of unexplained replication failures
+    /// (scenario 11).
+    #[test]
+    fn send_batch_refuses_an_over_budget_frame_without_touching_the_socket() {
+        use crate::replication::protocol::ReplicaOp;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            // Hold the connection open and read nothing: if send_batch wrote the
+            // frame anyway this would still succeed, so the assertions below are
+            // about the refusal, not about the peer.
+            std::thread::sleep(Duration::from_millis(250));
+            drop(stream);
+        });
+
+        let stream = TcpStream::connect_timeout(&addr, Duration::from_secs(5)).unwrap();
+        let mut transport = TcpReplicaTransport::from_stream(stream);
+
+        // One external create whose blob alone exceeds the frame budget.
+        let oversized = vec![0xABu8; MAX_FRAME_SIZE as usize + 1];
+        let batch = ReplicaBatch {
+            first_sequence: 1,
+            ops: vec![ReplicaOp::Create {
+                tx_key: TxKey { txid: [7u8; 32] },
+                metadata_bytes: vec![0u8; 64],
+                utxo_hashes: vec![[1u8; 32]],
+                cold_data: Some(oversized),
+                is_external: true,
+            }],
+            trace_ctx: None,
+            source_node_id: Some(1),
+            cluster_key: 1,
+        };
+
+        let err = transport
+            .send_batch(&batch)
+            .expect_err("an over-budget batch must not be written");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("too large to send"),
+            "the error must name the size problem, not surface as a socket error: {msg}"
+        );
+        assert!(
+            !msg.contains("Connection reset"),
+            "the connection must not have been disturbed: {msg}"
+        );
+        assert!(
+            transport.is_connected(),
+            "the pooled connection must survive an over-budget batch so unrelated \
+             records keep replicating"
+        );
 
         handle.join().unwrap();
     }
