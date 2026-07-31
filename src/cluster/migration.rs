@@ -1752,6 +1752,49 @@ impl MigrationManager {
         removed
     }
 
+    /// Drop pending inbound entries for shards this node does not hold.
+    ///
+    /// `is_held(shard)` must answer from the node's own COMMITTED shard table:
+    /// is this node the target master or a target replica for `shard`?
+    ///
+    /// # Why this is needed
+    ///
+    /// A pending inbound entry is otherwise only cleared two ways: the sender
+    /// completes the handoff, or a topology change wipes the set wholesale via
+    /// [`Self::clear_inbound`]. Once a cluster SETTLES on its final term neither
+    /// happens again, so an entry for a shard that ended up assigned elsewhere
+    /// waits forever — keeping the shard fenced and `inbound_count()` non-zero.
+    ///
+    /// The pull-based repair cannot rescue it either. The requester keeps asking
+    /// the source every `TRANSFER_REQUEST_INTERVAL`; the source runs
+    /// `split_transfer_request_tasks`, finds the requester is neither a target
+    /// holder nor the intended master, produces no tasks, and returns
+    /// `STATUS_OK`. Measured directly: node3 sent the request 11 times over
+    /// ~110 s, node2 accepted all 11, and the 2 shards never moved.
+    ///
+    /// The requester does not need the source's cooperation to resolve this —
+    /// "am I a holder for this shard" is decidable from its own committed table.
+    /// Callers MUST only invoke this when the local table version equals the
+    /// committed term, so a mid-transition table cannot drop an inbound the node
+    /// is genuinely about to receive.
+    ///
+    /// Returns the number of entries removed.
+    pub fn prune_inbound_not_held(&mut self, is_held: impl Fn(u16) -> bool) -> usize {
+        let before = self.inbound_migrations.len();
+        self.inbound_migrations
+            .retain(|m| m.completed || is_held(m.shard));
+        let removed = before - self.inbound_migrations.len();
+        if removed > 0 {
+            self.inbound_bitmap.clear_all();
+            for m in &self.inbound_migrations {
+                if !m.completed {
+                    self.inbound_bitmap.set(m.shard);
+                }
+            }
+        }
+        removed
+    }
+
     /// Serialize active outbound migration state to bytes.
     ///
     /// Format:
@@ -4075,6 +4118,66 @@ mod tests {
     /// than clearing the fence — so the partial shard is never served as full
     /// authority. Contrast `clear_pending_inbound_for_shards`, which drops the
     /// fence (the unsafe pre-C8 reap).
+    /// An inbound for a shard this node does not hold must be droppable.
+    ///
+    /// Once the cluster settles on its final term nothing else clears it: the
+    /// sender never completes (it does not consider us a holder) and no further
+    /// topology change fires `clear_inbound`. The shard stays fenced and
+    /// `inbound_count()` never reaches zero, which is exactly what left
+    /// scenario 09 reporting `inbound=2` for the full 120s wait while the
+    /// source accepted 11 transfer requests for those shards and moved nothing.
+    #[test]
+    fn prune_inbound_not_held_drops_only_unheld_shards() {
+        let mut mgr = MigrationManager::new();
+        mgr.register_inbound_source(10, NodeId(2));
+        mgr.register_inbound_source(20, NodeId(2));
+        mgr.register_inbound_source(30, NodeId(3));
+        assert_eq!(mgr.inbound_count(), 3);
+
+        // This node holds 10 and 30, but 20 ended up assigned elsewhere.
+        let held = |shard: u16| shard == 10 || shard == 30;
+        let removed = mgr.prune_inbound_not_held(held);
+
+        assert_eq!(removed, 1, "exactly the unheld shard is dropped");
+        assert_eq!(mgr.inbound_count(), 2);
+        assert!(
+            mgr.has_pending_inbound(10) && mgr.has_pending_inbound(30),
+            "held shards keep their pending inbound and stay fenced"
+        );
+        assert!(
+            !mgr.has_pending_inbound(20),
+            "the unheld shard is no longer pending"
+        );
+        assert!(
+            !mgr.inbound_bitmap().test(20),
+            "and its fence bit is cleared, so the shard stops blocking"
+        );
+        assert!(
+            mgr.inbound_bitmap().test(10) && mgr.inbound_bitmap().test(30),
+            "held shards keep their fence bits"
+        );
+    }
+
+    /// A LOST entry for a shard we still hold must survive the prune — it is
+    /// fenced deliberately (C8) and only a real re-acquisition may clear it.
+    #[test]
+    fn prune_inbound_not_held_keeps_lost_entries_for_held_shards() {
+        let mut mgr = MigrationManager::new();
+        mgr.register_inbound_source(7, NodeId(2));
+        mgr.mark_inbound_lost(&std::collections::HashSet::from([7u16]));
+        assert!(mgr.is_shard_lost(7));
+
+        assert_eq!(mgr.prune_inbound_not_held(|_| true), 0);
+        assert!(
+            mgr.is_shard_lost(7) && mgr.inbound_bitmap().test(7),
+            "a held-but-lost shard stays fenced fail-closed"
+        );
+
+        // ...but if the shard is no longer ours, the fence serves no purpose.
+        assert_eq!(mgr.prune_inbound_not_held(|_| false), 1);
+        assert!(!mgr.inbound_bitmap().test(7));
+    }
+
     #[test]
     fn mark_inbound_lost_keeps_fence_for_incomplete_orphan() {
         let mut mgr = MigrationManager::new();
