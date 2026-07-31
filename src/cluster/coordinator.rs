@@ -236,35 +236,6 @@ impl Drop for TopologyCatchUpGuard {
     }
 }
 
-/// Whether a pending inbound entry for `shard` must be KEPT (and the shard left
-/// fenced) on the node identified by `self_id`.
-///
-/// Two reasons to keep it:
-/// 1. This node is a target holder — the inbound is legitimate and the data is
-///    genuinely expected.
-/// 2. This node is NOT a holder but still carries records for the shard. Those
-///    are orphans awaiting cleanup, and dropping the fence would expose them to
-///    local reads. A record readable on a node that does not hold it counts as
-///    an extra holder, so pruning unconditionally turned scenario 17 into
-///    355/2000 records reporting THREE holders at RF=2. Fail closed until orphan
-///    cleanup has removed them — the same posture C8 takes for a LOST shard.
-///
-/// Only a non-holder with zero local records is safe to drop, which is exactly
-/// the stranded-forever case: nothing will ever be sent, and there is nothing
-/// left behind to hide.
-fn inbound_entry_must_be_kept(
-    table: &ShardTable,
-    self_id: NodeId,
-    shard: u16,
-    local_record_count: u64,
-) -> bool {
-    let a = table.target_assignment(shard);
-    if a.master == self_id || a.replicas.contains(&self_id) {
-        return true;
-    }
-    local_record_count > 0
-}
-
 fn fail_migration_task_current_epoch(
     migration: &Arc<Mutex<MigrationManager>>,
     shard_table: &Arc<ShardTableLock<ShardTable>>,
@@ -2043,46 +2014,6 @@ impl ClusterCoordinator {
                 {
                     let mut mgr = migration.lock();
                     mgr.cleanup_completed();
-                    // Drop pending inbounds for shards this node does not hold.
-                    //
-                    // Nothing else can: the sender never completes a handoff to
-                    // a node it does not consider a holder, and `clear_inbound`
-                    // only runs on a topology CHANGE — so once the cluster
-                    // settles on its final term such an entry waits forever,
-                    // keeping the shard fenced and `inbound_count()` non-zero.
-                    // The pull-based repair cannot rescue it either: the source
-                    // finds no tasks for a non-holder and returns STATUS_OK
-                    // having done nothing (measured: 11 requests accepted, 2
-                    // shards unmoved, 120 s).
-                    //
-                    // Gated on the local table being the COMMITTED one, so a
-                    // mid-transition view can never drop an inbound this node is
-                    // genuinely about to receive.
-                    {
-                        let committed_term = topo_authority_event.committed_term();
-                        let table = shard_table.read();
-                        if committed_term > 0
-                            && table.version == committed_term
-                            && mgr.inbound_count() > 0
-                        {
-                            let pruned = mgr.prune_inbound_not_held(|shard| {
-                                inbound_entry_must_be_kept(
-                                    &table,
-                                    self_id,
-                                    shard,
-                                    engine.shard_record_count(shard),
-                                )
-                            });
-                            if pruned > 0 {
-                                tracing::info!(
-                                    pruned,
-                                    term = committed_term,
-                                    "cluster: dropped pending inbound migrations for shards this \
-                                     node no longer holds",
-                                );
-                            }
-                        }
-                    }
                     sync_atomic_migration_bitmaps(
                         &mgr,
                         &fenced_bm_event,
@@ -17788,51 +17719,6 @@ mod tests {
         let err = result.unwrap_err();
         assert!(err.contains("response too large"), "error: {err}");
         server.join().unwrap();
-    }
-
-    /// The stale-inbound prune must be fail-closed on leftover records.
-    ///
-    /// Dropping the fence for a shard this node does not hold is only safe when
-    /// the shard is EMPTY here. Otherwise the leftover records become locally
-    /// readable, and a record readable on a non-holder counts as an extra
-    /// holder: pruning unconditionally turned scenario 17 into 355/2000 records
-    /// reporting THREE holders at RF=2, where the pre-existing failure had been
-    /// UNDER-replication.
-    #[test]
-    fn inbound_entry_kept_unless_node_is_a_non_holder_with_no_records() {
-        let table = ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2), NodeId(3)], 2, 4, 1);
-
-        // Find a shard this node holds and one it does not.
-        let me = NodeId(1);
-        let held = (0..NUM_SHARDS as u16)
-            .find(|&s| {
-                let a = table.target_assignment(s);
-                a.master == me || a.replicas.contains(&me)
-            })
-            .expect("node 1 holds some shard");
-        let unheld = (0..NUM_SHARDS as u16)
-            .find(|&s| {
-                let a = table.target_assignment(s);
-                a.master != me && !a.replicas.contains(&me)
-            })
-            .expect("node 1 does not hold some shard");
-
-        // A holder keeps its entry regardless of local record count.
-        assert!(inbound_entry_must_be_kept(&table, me, held, 0));
-        assert!(inbound_entry_must_be_kept(&table, me, held, 5_000));
-
-        // A non-holder that still carries records stays fenced fail-closed.
-        assert!(
-            inbound_entry_must_be_kept(&table, me, unheld, 1),
-            "leftover orphans must stay fenced until cleanup removes them"
-        );
-
-        // Only a non-holder with nothing left behind may be dropped — exactly
-        // the stranded-forever case.
-        assert!(
-            !inbound_entry_must_be_kept(&table, me, unheld, 0),
-            "an empty shard this node does not hold is safe to unfence"
-        );
     }
 
     /// Concurrent `TopologyStale` observations must collapse to ONE catch-up.
