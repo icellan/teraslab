@@ -4091,6 +4091,28 @@ impl ClusterCoordinator {
             let inbound = all_tasks.iter().filter(|t| t.to_node == self_id).count();
             let master_out = outbound_tasks.iter().filter(|t| t.is_master).count();
             let replica_out = outbound_tasks.iter().filter(|t| !t.is_master).count();
+            // How many shards this node over-owns relative to the committed
+            // placement, and how many of those the plan actually hands away.
+            //
+            // The reactivation repair is driven by `phantom_master_shard_count`,
+            // but nothing recorded whether a detected phantom turns into an
+            // actual handoff. Scenario 17 shows the repair firing with
+            // phantom_masters 441 -> 624 -> 282 across rounds — not decreasing —
+            // and without this pairing there is no way to tell whether the plan
+            // is failing to include those shards or including them and failing
+            // to complete. `phantom_planned < phantom_masters` points at
+            // planning; equal points at execution.
+            let phantom_now =
+                phantom_master_shard_count(&new_table, members, rf, self_id, placement_version);
+            let committed_for_phantom =
+                ShardTable::compute_with_epoch(members, rf, 0, placement_version);
+            let phantom_planned = outbound_tasks
+                .iter()
+                .filter(|t| {
+                    t.is_master
+                        && committed_for_phantom.target_assignment(t.shard).master != self_id
+                })
+                .count();
             tracing::info!(
                 masters = plan.len(),
                 replicas = replica_plan.len(),
@@ -4099,6 +4121,8 @@ impl ClusterCoordinator {
                 master_out,
                 replica_out,
                 inbound,
+                phantom_now,
+                phantom_planned,
                 "cluster: migration plan",
             );
 
