@@ -143,6 +143,7 @@ pub fn error_code_string(code: u16) -> &'static str {
         ERR_ALREADY_EXISTS => "ALREADY_EXISTS",
         ERR_FROZEN_UNTIL => "FROZEN_UNTIL",
         ERR_REDIRECT => "REDIRECT",
+        ERR_NO_QUORUM => "NO_QUORUM",
         ERR_STREAM_NOT_FOUND => "STREAM_NOT_FOUND",
         ERR_BLOB_NOT_FOUND => "BLOB_NOT_FOUND",
         ERR_STREAM_OFFSET_MISMATCH => "STREAM_OFFSET_MISMATCH",
@@ -187,6 +188,9 @@ mod tests {
             error_code_string(ERR_RESPONSE_TOO_LARGE),
             "RESPONSE_TOO_LARGE"
         );
+        // ERR_NO_QUORUM (15) was missing, so a scale-up that transiently lost
+        // quorum reported "UNKNOWN(15)" in every batch error.
+        assert_eq!(error_code_string(ERR_NO_QUORUM), "NO_QUORUM");
         // A genuinely unknown code still falls back.
         assert_eq!(error_code_string(9999), "UNKNOWN");
     }
