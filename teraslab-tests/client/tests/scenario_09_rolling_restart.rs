@@ -76,10 +76,12 @@ async fn scenario_09_rolling_restart() {
     match result {
         Ok(Ok(())) => {}
         Ok(Err(e)) => {
+            common::collect_failure_diagnostics(SID).await;
             common::teardown_all(SID).await;
             panic!("scenario failed: {e}");
         }
         Err(_) => {
+            common::collect_failure_diagnostics(SID).await;
             common::teardown_all(SID).await;
             panic!("scenario timed out after 600s");
         }

@@ -26,10 +26,12 @@ async fn scenario_01_cluster_formation() {
         Ok(Ok(())) => {}
         Ok(Err(e)) => {
             common::collect_failure_diagnostics(SID).await;
+            common::collect_failure_diagnostics(SID).await;
             common::teardown_all(SID).await;
             panic!("scenario failed: {e}");
         }
         Err(_) => {
+            common::collect_failure_diagnostics(SID).await;
             common::collect_failure_diagnostics(SID).await;
             common::teardown_all(SID).await;
             panic!("scenario timed out after 240s");

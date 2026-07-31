@@ -44,10 +44,12 @@ async fn scenario_17_failure_recovery_hardening() {
     match result {
         Ok(Ok(())) => {}
         Ok(Err(e)) => {
+            common::collect_failure_diagnostics(SID).await;
             common::teardown_all(SID).await;
             panic!("scenario failed: {e}");
         }
         Err(_) => {
+            common::collect_failure_diagnostics(SID).await;
             common::teardown_all(SID).await;
             panic!("scenario timed out after 1200s");
         }
