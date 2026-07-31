@@ -850,14 +850,26 @@ fn phantom_master_shard_count(
 /// have left almost immediately — i.e. it is a candidate for the event-loop
 /// reaper once it has also sat there past [`STRANDED_TASK_REAP_AFTER`].
 ///
-/// Both `Preparing` and `Fenced` are transient setup/cutover states that a
-/// live worker leaves in well under a second. A task sitting in either for
-/// tens of seconds with `bytes_sent == 0` and `migrated_records == 0` has no
-/// worker behind it: the worker aborted on the epoch fence without retiring
-/// what it carried. The only other reaper is the next topology activation,
-/// which never comes once the cluster settles, so the task pins
+/// `Fenced` is a brief per-task cutover state entered immediately before the
+/// completion handshake, so a live task never dwells there. A task sitting in
+/// it for tens of seconds with `bytes_sent == 0` and `migrated_records == 0`
+/// has no worker behind it: the worker aborted on the epoch fence without
+/// retiring what it carried. The only other reaper is the next topology
+/// activation, which never comes once the cluster settles, so the task pins
 /// `active_migrations` above zero forever and every convergence gate that
 /// waits on "no active migrations" waits forever with it.
+///
+/// `Preparing` needs the extra `queue_is_being_served` guard, because it is
+/// also the ENQUEUED state and zero progress there is not by itself abnormal:
+/// an EMPTY shard's handoff moves no bytes and no records by definition, and a
+/// large drain queues thousands of them behind a bounded worker pool, so a
+/// perfectly healthy task can dwell well past the timeout waiting for a slot.
+/// Reaping on dwell alone would abort live drain work — scenario 09 had node3
+/// mid-drain with 2904 active tasks (1680 `Preparing`, 1224 `Streaming`), all
+/// `total_records == 0`. Any task in `Streaming` proves the pool is draining
+/// the queue, so `Preparing` is only reapable when nothing is streaming at
+/// all: scenario 05's eight stuck tasks were the entire migration set, with
+/// zero streaming and the cluster otherwise fully converged.
 ///
 /// Observed both ways: one leftover in `Fenced` (shard 76, empty fenced-shard
 /// set) pinning `active_migrations` at 1, and eight leftovers in `Preparing`
@@ -874,11 +886,17 @@ fn task_is_stranded_candidate(
     state: &crate::cluster::migration::MigrationState,
     bytes_sent: u64,
     migrated_records: u64,
+    queue_is_being_served: bool,
 ) -> bool {
     use crate::cluster::migration::MigrationState;
-    matches!(*state, MigrationState::Preparing | MigrationState::Fenced)
-        && bytes_sent == 0
-        && migrated_records == 0
+    if bytes_sent != 0 || migrated_records != 0 {
+        return false;
+    }
+    match *state {
+        MigrationState::Fenced => true,
+        MigrationState::Preparing => !queue_is_being_served,
+        _ => false,
+    }
 }
 
 fn missing_master_shard_count(
@@ -2178,11 +2196,21 @@ impl ClusterCoordinator {
                         let mut stranded: Vec<MigrationTask> = Vec::new();
                         let mut live: std::collections::HashSet<(u16, NodeId, NodeId, bool)> =
                             std::collections::HashSet::new();
+                        // Any task actively streaming proves the worker pool
+                        // is draining the queue, which makes a `Preparing`
+                        // dwell normal backlog rather than a stranded task.
+                        let queue_is_being_served = mgr.active_migrations().iter().any(|p| {
+                            matches!(
+                                p.state,
+                                crate::cluster::migration::MigrationState::Streaming
+                            )
+                        });
                         for p in mgr.active_migrations() {
                             if !task_is_stranded_candidate(
                                 &p.state,
                                 p.bytes_sent,
                                 p.migrated_records,
+                                queue_is_being_served,
                             ) {
                                 continue;
                             }
@@ -18076,10 +18104,36 @@ mod tests {
         use crate::cluster::migration::MigrationState;
         for state in [MigrationState::Preparing, MigrationState::Fenced] {
             assert!(
-                task_is_stranded_candidate(&state, 0, 0),
-                "{state:?} with zero progress must be reapable",
+                task_is_stranded_candidate(&state, 0, 0, false),
+                "{state:?} with zero progress and an unserved queue must be reapable",
             );
         }
+    }
+
+    /// The guard that keeps the `Preparing` reap from eating a live drain.
+    ///
+    /// An EMPTY shard's handoff moves no bytes and no records by definition,
+    /// and `Preparing` doubles as the enqueued state, so a healthy task can sit
+    /// there past the timeout waiting for a worker slot. Scenario 09 had node3
+    /// mid-drain with 2904 active tasks (1680 `Preparing`, 1224 `Streaming`),
+    /// every one of them `total_records == 0` — reaping on dwell alone would
+    /// have aborted the whole drain. Anything streaming means the pool is
+    /// working the queue.
+    ///
+    /// `Fenced` is unaffected: it is entered per task immediately before the
+    /// completion handshake, so a live task never dwells there regardless of
+    /// what the rest of the queue is doing.
+    #[test]
+    fn stranded_candidate_spares_queued_preparing_while_the_pool_is_streaming() {
+        use crate::cluster::migration::MigrationState;
+        assert!(
+            !task_is_stranded_candidate(&MigrationState::Preparing, 0, 0, true),
+            "a queued Preparing task must be spared while other tasks stream",
+        );
+        assert!(
+            task_is_stranded_candidate(&MigrationState::Fenced, 0, 0, true),
+            "Fenced is a per-task cutover state — a live queue does not excuse a stall",
+        );
     }
 
     /// A task that has moved data has a live worker behind it — reaping it
@@ -18088,14 +18142,16 @@ mod tests {
     fn stranded_candidate_excludes_tasks_that_made_progress() {
         use crate::cluster::migration::MigrationState;
         for state in [MigrationState::Preparing, MigrationState::Fenced] {
-            assert!(
-                !task_is_stranded_candidate(&state, 1, 0),
-                "{state:?} that sent bytes must not be reaped",
-            );
-            assert!(
-                !task_is_stranded_candidate(&state, 0, 1),
-                "{state:?} that migrated records must not be reaped",
-            );
+            for served in [false, true] {
+                assert!(
+                    !task_is_stranded_candidate(&state, 1, 0, served),
+                    "{state:?} that sent bytes must not be reaped (served={served})",
+                );
+                assert!(
+                    !task_is_stranded_candidate(&state, 0, 1, served),
+                    "{state:?} that migrated records must not be reaped (served={served})",
+                );
+            }
         }
     }
 
@@ -18110,10 +18166,12 @@ mod tests {
             MigrationState::Complete,
             MigrationState::Failed,
         ] {
-            assert!(
-                !task_is_stranded_candidate(&state, 0, 0),
-                "{state:?} must never be reaped as stranded",
-            );
+            for served in [false, true] {
+                assert!(
+                    !task_is_stranded_candidate(&state, 0, 0, served),
+                    "{state:?} must never be reaped as stranded (served={served})",
+                );
+            }
         }
     }
 
