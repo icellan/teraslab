@@ -742,6 +742,54 @@ fn phantom_master_shard_count(
         .count()
 }
 
+/// Count shards the committed placement assigns to THIS node that its local
+/// table does not master — the mirror image of [`phantom_master_shard_count`].
+///
+/// # The bug this exists for
+///
+/// The settled-state branch of [`committed_topology_reactivation_metrics`]
+/// compares the table against its OWN `intended_master`. That is an internal
+/// self-consistency check, and a table left rolled back by failed handoffs is
+/// perfectly self-consistent — `target_assignment == intended_master` for every
+/// shard — so it reports `mismatched = 0`. Task #22 then added a detector for
+/// the OVER-ownership direction (a node mastering shards the committed
+/// placement gives to someone else). Nothing looked for the opposite.
+///
+/// So a node that fails to acquire shards during a rebalance settles holding
+/// too FEW, reports no work outstanding, and is never re-driven. Captured in a
+/// scenario-05 failure with all three nodes agreeing on term, placement version
+/// and members, and zero migrations anywhere:
+///
+/// ```text
+/// node1 m=1366 tm=1366   node2 m=848 tm=848   node3 m=1365 tm=1365
+/// ```
+///
+/// 517 shards mastered by NOBODY, permanently — the cluster is short a sixth of
+/// its keyspace and considers itself converged.
+///
+/// Counting these feeds the reactivation's work metric so the repair fires,
+/// exactly as the phantom counter does for the over-ownership direction.
+fn missing_master_shard_count(
+    table: &ShardTable,
+    committed_members: &[NodeId],
+    rf: u8,
+    self_id: NodeId,
+    placement_version: u16,
+) -> usize {
+    if committed_members.is_empty() {
+        return 0;
+    }
+    // Same recompute contract as `phantom_master_shard_count`: compare against
+    // the committed term's placement algorithm, never a different version's.
+    let committed = ShardTable::compute_with_epoch(committed_members, rf, 0, placement_version);
+    (0..crate::cluster::shards::NUM_SHARDS as u16)
+        .filter(|&shard| {
+            committed.target_assignment(shard).master == self_id
+                && table.target_assignment(shard).master != self_id
+        })
+        .count()
+}
+
 /// Result of a batched completion handshake (`send_completion_only_handshakes`),
 /// per shard. Distinguishes a delivered commit from the two failure flavours so
 /// the caller can choose between relinquish and rollback (Task #25).
@@ -2202,7 +2250,26 @@ impl ClusterCoordinator {
                                 self_id,
                                 committed_pv,
                             );
-                            (mismatched, pending_handoffs, stuck_subset, phantom_masters)
+                            // The mirror of the phantom counter: shards the
+                            // committed placement gives THIS node that its
+                            // local table does not master. Without it a node
+                            // that failed to acquire during a rebalance settles
+                            // holding too few, reports zero work, and is never
+                            // re-driven — leaving those shards mastered by
+                            // nobody (see `missing_master_shard_count`).
+                            let missing_masters = missing_master_shard_count(
+                                &table,
+                                &committed_members,
+                                rf,
+                                self_id,
+                                committed_pv,
+                            );
+                            (
+                                mismatched,
+                                pending_handoffs,
+                                stuck_subset,
+                                phantom_masters.saturating_add(missing_masters),
+                            )
                         };
 
                         // W5-followup — self-drain fast path. Re-drive on the
@@ -17748,6 +17815,84 @@ mod tests {
         let err = result.unwrap_err();
         assert!(err.contains("response too large"), "error: {err}");
         server.join().unwrap();
+    }
+
+    /// A node holding too FEW masters must be detected as work outstanding.
+    ///
+    /// The settled-state reactivation metric compares the table against its own
+    /// `intended_master`, which a rolled-back table satisfies, so it reports
+    /// zero. Task #22's phantom counter catches only the over-ownership
+    /// direction. A scenario-05 failure settled with every node agreeing on
+    /// term, placement version and members and zero migrations anywhere, yet:
+    /// node1 m=1366, node2 m=848, node3 m=1365 — 517 shards mastered by nobody,
+    /// permanently, with the cluster believing it had converged.
+    #[test]
+    fn missing_master_count_sees_under_ownership_that_the_mismatch_metric_cannot() {
+        let members = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let rf = 2u8;
+        let pv = 1u16;
+        let committed = ShardTable::compute_with_epoch(&members, rf, 4, pv);
+
+        // A converged node has nothing outstanding in either direction.
+        for node in &members {
+            assert_eq!(
+                missing_master_shard_count(&committed, &members, rf, *node, pv),
+                0,
+                "a table equal to the committed placement owes nothing"
+            );
+            assert_eq!(
+                phantom_master_shard_count(&committed, &members, rf, *node, pv),
+                0
+            );
+        }
+
+        // Now model the captured failure: node2 never acquired a set of shards,
+        // so its local table still names node1 as their master. Its table stays
+        // internally self-consistent, which is exactly why the mismatch metric
+        // is blind to it.
+        // `set_master_for_shard` only promotes a node already in the shard's
+        // replica set, so hand each shard to whichever replica it actually has
+        // and count the mutations that really landed.
+        let mut rolled_back = committed.clone();
+        let mut handed_off = 0usize;
+        for shard in 0..NUM_SHARDS as u16 {
+            let a = committed.target_assignment(shard);
+            if a.master != NodeId(2) {
+                continue;
+            }
+            let Some(&replica) = a.replicas.first() else {
+                continue;
+            };
+            rolled_back.set_master_for_shard(shard, replica);
+            if rolled_back.target_assignment(shard).master != NodeId(2) {
+                handed_off += 1;
+            }
+        }
+        assert!(
+            handed_off > 0,
+            "precondition: some of node2's shards were rolled back to a replica"
+        );
+
+        assert_eq!(
+            missing_master_shard_count(&rolled_back, &members, rf, NodeId(2), pv),
+            handed_off,
+            "node2 must be seen to owe every master it failed to acquire"
+        );
+        assert_eq!(
+            phantom_master_shard_count(&rolled_back, &members, rf, NodeId(2), pv),
+            0,
+            "node2 is not OVER-owning — the existing counter cannot see this"
+        );
+
+        // And the settled-state mismatch metric genuinely reports nothing,
+        // which is the reason the repair never fired.
+        let (mismatched, _) =
+            committed_topology_reactivation_metrics(&rolled_back, &members, rf, 4, pv);
+        assert_eq!(
+            mismatched, 0,
+            "the rolled-back table is internally self-consistent, so the existing \
+             metric sees no work — this is the blindness being fixed"
+        );
     }
 
     /// The stale-epoch detector must recognise what the producer actually emits.
