@@ -242,6 +242,33 @@ impl Drop for TopologyCatchUpGuard {
     }
 }
 
+/// Whether a pending inbound entry for `shard` must be KEPT (and the shard left
+/// fenced) on the node identified by `self_id`.
+///
+/// Keep it if this node is a target holder — the inbound is legitimate. Keep it
+/// ALSO if this node is not a holder but still carries records for the shard:
+/// those are orphans awaiting cleanup, and dropping the fence would expose them
+/// to local reads. A record readable on a non-holder counts as an extra holder,
+/// so pruning unconditionally turned scenario 17 into 355/2000 records
+/// reporting THREE holders at RF=2. Fail closed until orphan cleanup has
+/// removed them — the posture C8 takes for a LOST shard.
+///
+/// Only a non-holder with zero local records is safe to drop, which is exactly
+/// the stranded-forever case: nothing will ever be sent, and nothing is left
+/// behind to hide.
+fn inbound_entry_must_be_kept(
+    table: &ShardTable,
+    self_id: NodeId,
+    shard: u16,
+    local_record_count: u64,
+) -> bool {
+    let a = table.target_assignment(shard);
+    if a.master == self_id || a.replicas.contains(&self_id) {
+        return true;
+    }
+    local_record_count > 0
+}
+
 fn fail_migration_task_current_epoch(
     migration: &Arc<Mutex<MigrationManager>>,
     shard_table: &Arc<ShardTableLock<ShardTable>>,
@@ -2152,6 +2179,43 @@ impl ClusterCoordinator {
                             );
                         }
                         mgr = migration.lock();
+                    }
+                    // Drop pending inbounds for shards this node does not hold.
+                    //
+                    // Nothing else can: the sender never completes a handoff to
+                    // a node it does not consider a holder, and `clear_inbound`
+                    // only runs on a topology CHANGE, so once the cluster
+                    // settles such an entry waits forever. The pull-based
+                    // repair cannot rescue it either — the source finds no
+                    // tasks for a non-holder and returns STATUS_OK having done
+                    // nothing (measured: 11 requests accepted, 2 shards
+                    // unmoved). Gated on the local table being the COMMITTED
+                    // one, and fail-closed on leftover records
+                    // (`inbound_entry_must_be_kept`).
+                    {
+                        let committed_term = topo_authority_event.committed_term();
+                        let table = shard_table.read();
+                        if committed_term > 0
+                            && table.version == committed_term
+                            && mgr.inbound_count() > 0
+                        {
+                            let pruned = mgr.prune_inbound_not_held(|shard| {
+                                inbound_entry_must_be_kept(
+                                    &table,
+                                    self_id,
+                                    shard,
+                                    engine.shard_record_count(shard),
+                                )
+                            });
+                            if pruned > 0 {
+                                tracing::info!(
+                                    pruned,
+                                    term = committed_term,
+                                    "cluster: dropped pending inbound migrations for shards this \
+                                     node no longer holds",
+                                );
+                            }
+                        }
                     }
                     sync_atomic_migration_bitmaps(
                         &mgr,
