@@ -32,6 +32,12 @@ const MIGRATION_TCP_TIMEOUT_FLOOR: Duration = Duration::from_secs(60);
 /// push (sources stream within ~1 s of activation) is never spammed.
 const TRANSFER_REQUEST_INTERVAL: Duration = Duration::from_secs(10);
 
+/// How long a migration task may sit in `Fenced` with zero bytes and zero
+/// records migrated before the event loop reaps it as stranded. Comfortably
+/// longer than any real fenced phase (delta streaming plus the completion
+/// handshake), so this only ever fires on a task whose worker is gone.
+const STRANDED_FENCED_REAP_AFTER: Duration = Duration::from_secs(45);
+
 /// W5-followup — minimum spacing between consecutive reactivations while a node
 /// is *gracefully draining itself and making progress* (a `quiesce`, committed
 /// topology excludes `self`). See [`drain_reactivation_due`] for the full
@@ -1735,6 +1741,13 @@ impl ClusterCoordinator {
             let mut last_reactivation_at = std::time::Instant::now();
             let mut last_activation_at = std::time::Instant::now();
             let mut last_inbound_clear = std::time::Instant::now();
+            // When a fenced migration task was FIRST seen stranded, keyed by
+            // (shard, from, to, is_master). Event-loop local: no struct change,
+            // nothing persisted, and it resets naturally on restart.
+            let mut fenced_since: std::collections::HashMap<
+                (u16, NodeId, NodeId, bool),
+                std::time::Instant,
+            > = std::collections::HashMap::new();
             // W1.1 FIX B — last time this node requested missing shard
             // transfers from sources. `None` = never, so the first
             // detection of the stalled-inbound condition fires
@@ -2076,6 +2089,70 @@ impl ClusterCoordinator {
                 {
                     let mut mgr = migration.lock();
                     mgr.cleanup_completed();
+                    // Reap a migration task stranded in `Fenced`.
+                    //
+                    // A worker that aborts on the epoch fence returns without
+                    // retiring what it was carrying, so a task it had already
+                    // fenced stays fenced and non-terminal forever: the only
+                    // other reaper is the next topology activation, which never
+                    // comes once the cluster settles. A rolling restart ended
+                    // with exactly one leftover (shard 76, total_records 0,
+                    // state Fenced, EMPTY fenced-shard set) pinning
+                    // `active_migrations` at 1 while masters (4096/4096),
+                    // handoffs (0) and inbound (0) had all converged.
+                    //
+                    // Deliberately done HERE and not in the worker's abort
+                    // path. Three variants of that were tried and every one
+                    // regressed scenario 05, because acting on task state while
+                    // a worker unwinds and its peers are still running disturbs
+                    // an in-flight rebalance. From the event loop the decision
+                    // is made against a quiesced view instead: the task must
+                    // have sat in `Fenced` making no progress for longer than
+                    // any real handoff takes.
+                    {
+                        let now = std::time::Instant::now();
+                        let mut stranded: Vec<MigrationTask> = Vec::new();
+                        let mut live: std::collections::HashSet<(u16, NodeId, NodeId, bool)> =
+                            std::collections::HashSet::new();
+                        for p in mgr.active_migrations() {
+                            if p.state != crate::cluster::migration::MigrationState::Fenced
+                                || p.bytes_sent != 0
+                                || p.migrated_records != 0
+                            {
+                                continue;
+                            }
+                            let key = (p.shard, p.from_node, p.to_node, p.is_master);
+                            live.insert(key);
+                            let first = *fenced_since.entry(key).or_insert(now);
+                            if now.duration_since(first) >= STRANDED_FENCED_REAP_AFTER {
+                                stranded.push(MigrationTask {
+                                    shard: p.shard,
+                                    from_node: p.from_node,
+                                    to_node: p.to_node,
+                                    is_master: p.is_master,
+                                });
+                            }
+                        }
+                        fenced_since.retain(|k, _| live.contains(k));
+                        drop(mgr);
+                        for task in &stranded {
+                            tracing::warn!(
+                                shard = task.shard,
+                                to = task.to_node.0,
+                                "cluster: reaping migration task stranded in Fenced with no progress",
+                            );
+                            fail_migration_task_current_epoch(
+                                &migration,
+                                &shard_table,
+                                &fenced_bm_event,
+                                &migrating_bm_event,
+                                task,
+                                topology_epoch.load(Ordering::Relaxed),
+                                FailedTaskTableAction::Rollback,
+                            );
+                        }
+                        mgr = migration.lock();
+                    }
                     sync_atomic_migration_bitmaps(
                         &mgr,
                         &fenced_bm_event,
