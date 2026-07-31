@@ -1877,6 +1877,12 @@ fn build_status_json(state: &HttpState) -> serde_json::Value {
         "node_id": cluster_info["node_id"],
         "cluster_size": cluster_info["cluster_size"],
         "shard_table_version": cluster_info["shard_table_version"],
+        // Carried through to the outer payload deliberately: this projection
+        // copies named keys, so anything added to `cluster_info` alone is
+        // silently dropped before it reaches a caller.
+        "topology_term": cluster_info["topology_term"],
+        "committed_placement_version": cluster_info["committed_placement_version"],
+        "committed_members": cluster_info["committed_members"],
         "master_shard_count": cluster_info["master_shard_count"],
         "replica_shard_count": cluster_info["replica_shard_count"],
         "target_master_shard_count": cluster_info["target_master_shard_count"],
