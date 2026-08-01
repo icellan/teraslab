@@ -882,6 +882,45 @@ fn phantom_master_shard_count(
 /// and retiring it would abort live work. Retiring a zero-progress task is
 /// recoverable either way — it is not a data operation, and the next
 /// reactivation re-plans the shard if it is still needed.
+/// Keys that must be streamed to the target after the write fence, because the
+/// target does not have them yet.
+///
+/// # The bug this exists for
+///
+/// The late-key set used to be defined as "in `fenced_keys` but not in the
+/// Phase-1 snapshot". That silently assumed every snapshot key was actually
+/// sent — but `stream_shard_baseline` SKIPS a snapshot key that is already gone
+/// when streaming reaches it (`build_record_replay_ops` returns `Ok(None)` for a
+/// stale key). A concurrent delete-then-recreate therefore slips through the
+/// only gap that matters:
+///
+/// 1. the Phase-1 snapshot lists key K
+/// 2. K is deleted before streaming reaches it, so it is skipped and never sent
+/// 3. K is re-created before the fence
+/// 4. the shard shows churn, so the rescan puts K back into `fenced_keys`
+/// 5. K is in the snapshot, so it is NOT counted as late and is never re-sent
+/// 6. the manifest is built from `fenced_keys`, so it DOES list K
+///
+/// The target never received K and rejects the completion handshake with
+/// `missing exact key ... TxNotFound`. The source then correctly refuses to hand
+/// off (dropping its copy would lose K), so the shard keeps two masters and the
+/// handoff can never complete — observed on shards 19/43/79/127/139/219.
+///
+/// Defining the set against what was actually STREAMED closes it. After the
+/// fence no further deletes can land, so a key present in the rescanned live
+/// index is guaranteed streamable.
+fn late_keys_needing_stream(
+    fenced_keys: &[TxKey],
+    snapshot_keys: &std::collections::HashSet<TxKey>,
+    phase1_skipped: &std::collections::HashSet<TxKey>,
+) -> Vec<TxKey> {
+    fenced_keys
+        .iter()
+        .copied()
+        .filter(|k| !snapshot_keys.contains(k) || phase1_skipped.contains(k))
+        .collect()
+}
+
 fn task_is_stranded_candidate(
     state: &crate::cluster::migration::MigrationState,
     bytes_sent: u64,
@@ -6886,6 +6925,14 @@ fn run_migration_batch(
                     let empty_keys: Vec<&TxKey> = Vec::new();
                     let mut streamed: Vec<bool> = Vec::with_capacity(sub_count);
                     let mut snapshot_seqs: Vec<u64> = Vec::with_capacity(sub_count);
+                    // Per shard, the snapshot keys Phase 1 could NOT stream
+                    // because they were already deleted when it reached them.
+                    // The post-fence pass re-sends any that came back — without
+                    // this the manifest can list a key the target never got.
+                    let mut phase1_skipped_by_shard: std::collections::HashMap<
+                        u16,
+                        std::collections::HashSet<TxKey>,
+                    > = std::collections::HashMap::new();
                     for task in sub_batch {
                         if !migration_epoch_current(shard_table, topology_epoch) {
                             tracing::info!(
@@ -6913,7 +6960,15 @@ fn run_migration_batch(
                             topology_epoch,
                             auth_secret,
                         ) {
-                            Ok(_) => true,
+                            Ok((_, skipped)) => {
+                                if !skipped.is_empty() {
+                                    phase1_skipped_by_shard
+                                        .entry(task.shard)
+                                        .or_default()
+                                        .extend(skipped);
+                                }
+                                true
+                            }
                             Err(e) => {
                                 if migration_error_is_stale_epoch(&e) {
                                     // The peer has activated a newer term than
@@ -7126,11 +7181,16 @@ fn run_migration_batch(
                             .iter()
                             .map(|k| **k)
                             .collect();
-                        let late_keys: Vec<TxKey> = fenced_keys
-                            .iter()
-                            .copied()
-                            .filter(|k| !snapshot_set.contains(k))
-                            .collect();
+                        // NOT `fenced_keys - snapshot_set`: a snapshot key that
+                        // Phase 1 skipped (deleted mid-stream) and that came back
+                        // before the fence is in the snapshot yet was never sent.
+                        // See `late_keys_needing_stream`.
+                        let empty_skipped = std::collections::HashSet::new();
+                        let phase1_skipped = phase1_skipped_by_shard
+                            .get(&task.shard)
+                            .unwrap_or(&empty_skipped);
+                        let late_keys: Vec<TxKey> =
+                            late_keys_needing_stream(&fenced_keys, &snapshot_set, phase1_skipped);
                         if !late_keys.is_empty() {
                             let late_refs: Vec<&TxKey> = late_keys.iter().collect();
                             if let Err(e) = stream_shard_baseline(
@@ -7983,11 +8043,16 @@ fn stream_shard_baseline(
     batch_size: usize,
     cluster_key: u64,
     auth_secret: Option<&[u8]>,
-) -> std::result::Result<ManifestHasher, String> {
+) -> std::result::Result<(ManifestHasher, Vec<TxKey>), String> {
     use crate::replication::protocol::ReplicaBatch;
 
     let batch_size = batch_size.max(1);
     let mut manifest = ManifestHasher::new();
+    // Keys the caller asked for that were already gone when streaming reached
+    // them. The post-fence late-key pass MUST re-send any of these that are
+    // back in the live index, or the manifest lists a key the target never
+    // received. See `late_keys_needing_stream`.
+    let mut skipped: Vec<TxKey> = Vec::new();
     for chunk in shard_keys.chunks(batch_size) {
         let mut ops = Vec::with_capacity(chunk.len() * 2);
         for key in chunk {
@@ -8003,6 +8068,7 @@ fn stream_shard_baseline(
                         key = ?key,
                         "cluster: skipping stale key during baseline stream",
                     );
+                    skipped.push(**key);
                     continue;
                 }
                 Err(e) => {
@@ -8116,7 +8182,7 @@ fn stream_shard_baseline(
         }
     }
 
-    Ok(manifest)
+    Ok((manifest, skipped))
 }
 
 /// Send the OP_MIGRATION_COMPLETE handshake on an existing or new stream.
@@ -18089,6 +18155,65 @@ mod tests {
         let err = result.unwrap_err();
         assert!(err.contains("response too large"), "error: {err}");
         server.join().unwrap();
+    }
+
+    fn tk(b: u8) -> TxKey {
+        let mut txid = [0u8; 32];
+        txid[0] = b;
+        TxKey { txid }
+    }
+
+    /// The regression: a snapshot key that Phase 1 SKIPPED must still be
+    /// streamed after the fence, or the manifest lists a key the target never
+    /// received and the handshake rejects with `TxNotFound`.
+    #[test]
+    fn late_keys_include_snapshot_keys_phase1_skipped() {
+        let snapshot: std::collections::HashSet<TxKey> =
+            [tk(1), tk(2), tk(3)].into_iter().collect();
+        // K=2 was deleted mid-stream (skipped), then re-created before the fence.
+        let skipped: std::collections::HashSet<TxKey> = [tk(2)].into_iter().collect();
+        let fenced = vec![tk(1), tk(2), tk(3)];
+        assert_eq!(
+            late_keys_needing_stream(&fenced, &snapshot, &skipped),
+            vec![tk(2)],
+            "a skipped-then-recreated snapshot key must be re-streamed",
+        );
+    }
+
+    /// The original purpose of the late-key set: keys created after the
+    /// snapshot must still be picked up.
+    #[test]
+    fn late_keys_include_keys_created_after_the_snapshot() {
+        let snapshot: std::collections::HashSet<TxKey> = [tk(1)].into_iter().collect();
+        let skipped = std::collections::HashSet::new();
+        let fenced = vec![tk(1), tk(9)];
+        assert_eq!(
+            late_keys_needing_stream(&fenced, &snapshot, &skipped),
+            vec![tk(9)],
+        );
+    }
+
+    /// Nothing is re-streamed when Phase 1 sent everything it was given —
+    /// the fix must not turn every migration into a full re-send.
+    #[test]
+    fn late_keys_empty_when_phase1_streamed_the_whole_snapshot() {
+        let snapshot: std::collections::HashSet<TxKey> = [tk(1), tk(2)].into_iter().collect();
+        let skipped = std::collections::HashSet::new();
+        let fenced = vec![tk(1), tk(2)];
+        assert!(late_keys_needing_stream(&fenced, &snapshot, &skipped).is_empty(),);
+    }
+
+    /// A key skipped in Phase 1 and still absent at the fence is genuinely
+    /// deleted: it is not in `fenced_keys`, so it must not be resurrected.
+    #[test]
+    fn late_keys_exclude_keys_deleted_for_good() {
+        let snapshot: std::collections::HashSet<TxKey> = [tk(1), tk(2)].into_iter().collect();
+        let skipped: std::collections::HashSet<TxKey> = [tk(2)].into_iter().collect();
+        let fenced = vec![tk(1)];
+        assert!(
+            late_keys_needing_stream(&fenced, &snapshot, &skipped).is_empty(),
+            "a key deleted before the fence must stay deleted",
+        );
     }
 
     /// The reaper must treat `Preparing` exactly like `Fenced`.
