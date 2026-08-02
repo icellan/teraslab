@@ -53,6 +53,25 @@ const STRANDED_TASK_REAP_AFTER: Duration = Duration::from_secs(45);
 /// tick. It is far below the 30 s same-term cooldown (which still governs member
 /// rebalances and the moment drain progress stalls), turning a 7-round drain
 /// from 7×30 s ≈ 210 s of idle waiting into back-to-back ~5 s rounds.
+/// Minimum spacing between consecutive reactivations, and the same-term floor
+/// that follows an activation.
+///
+/// These were 15s and 30s. Cluster convergence needs SEVERAL reactivation
+/// rounds (each round converges partially, and a round whose handoff fails
+/// re-plans on the next one), so the floors — not the work — dominated
+/// convergence latency: 2-3 rounds put it at 60-90s against E2E budgets of
+/// 60-120s. That is why scenarios 05/06/07/08/09 landed non-deterministically;
+/// two CI runs of byte-identical code returned 6/14 and 8/14.
+///
+/// The floors existed because re-driving a member rebalance faster streams
+/// full baselines into the receivers' bounded redo logs faster than the
+/// checkpointer reclaims them (observed: `redo log full`). `redo_log_size`
+/// now defaults to 256 MiB precisely to buy that headroom, which is what
+/// makes shortening these safe — the two changes only work as a pair, so do
+/// not lower these further without re-checking receiver redo pressure.
+const NORMAL_REACTIVATION_COOLDOWN: Duration = Duration::from_secs(5);
+const SAME_TERM_REACTIVATION_COOLDOWN: Duration = Duration::from_secs(10);
+
 const DRAIN_REACTIVATION_INTERVAL: Duration = Duration::from_secs(2);
 
 fn debug_shard_set() -> &'static std::collections::HashSet<u16> {
@@ -2486,8 +2505,8 @@ impl ClusterCoordinator {
                 // this Mutex, so avoid a second per-tick acquisition).
                 let no_active_migrations = migration.lock().active_count() == 0;
                 let normal_reactivation_due = no_active_migrations
-                    && last_reactivation_at.elapsed() >= Duration::from_secs(15)
-                    && last_activation_at.elapsed() >= Duration::from_secs(30);
+                    && last_reactivation_at.elapsed() >= NORMAL_REACTIVATION_COOLDOWN
+                    && last_activation_at.elapsed() >= SAME_TERM_REACTIVATION_COOLDOWN;
                 // W5-followup — prompt self-drain re-drive. When THIS node is
                 // being gracefully drained (committed topology excludes `self`)
                 // its residual outbound handoffs must converge on the short

@@ -1740,7 +1740,15 @@ impl Default for ServerConfig {
             device_size: 1024 * 1024 * 1024, // 1 GiB
             device_alignment: 4096,
             device_split: 1,
-            redo_log_size: 64 * 1024 * 1024, // 64 MiB
+            // 256 MiB. Sized to absorb a full member-rebalance baseline burst
+            // without hitting `RedoError::LogFull` on the RECEIVER: that
+            // overrun is the documented reason the member-rebalance
+            // reactivation cooldown cannot be shortened, which in turn is why
+            // cluster convergence needs several 30s rounds and the E2E
+            // scenarios land non-deterministically against their timeouts.
+            // Giving receivers headroom is the cheaper half of that fix; the
+            // cooldown reduction is the other half.
+            redo_log_size: 256 * 1024 * 1024, // 256 MiB
             redo_log_path: None,
             last_durable_height_path: None,
             index_snapshot_path: PathBuf::from("teraslab-index.snap"),
@@ -3139,15 +3147,24 @@ backend = ""
         // at batch entry against the `redo_log_size / 8` backpressure reserve, so
         // a migration_batch_size whose batch could exceed that reserve must be
         // rejected at startup rather than bricking the node mid-migration.
-        // Default (500 ops, 64 MiB redo) is far under the reserve and must pass.
+        // Whatever the shipped default redo size is, the default batch size
+        // must sit well under its reserve.
         ServerConfig::default()
             .validate_sizes()
             .expect("default migration_batch_size must validate");
 
+        // The boundary cases pin `redo_log_size` explicitly rather than
+        // inheriting the default, so this tests the RELATIONSHIP between batch
+        // size and reserve. Inheriting the default coupled it to that value and
+        // the test broke when the default was raised 64 MiB -> 256 MiB, even
+        // though the rule under test had not changed.
+        const REDO: u64 = 64 * 1024 * 1024;
+
         // A pathological batch size (200k ops × 128 B = 25.6 MB) exceeds the
-        // 8 MiB reserve of the default 64 MiB redo → rejected, naming the field.
+        // 8 MiB reserve of a 64 MiB redo → rejected, naming the field.
         let err = ServerConfig {
             migration_batch_size: 200_000,
+            redo_log_size: REDO,
             ..ServerConfig::default()
         }
         .validate_sizes()
@@ -3160,12 +3177,14 @@ backend = ""
         // Boundary: reserve = 64 MiB / 8 = 8 MiB; 8 MiB / 128 B = 65536 ops max.
         ServerConfig {
             migration_batch_size: 65_536,
+            redo_log_size: REDO,
             ..ServerConfig::default()
         }
         .validate_sizes()
         .expect("migration_batch_size exactly at the reserve boundary must pass");
         ServerConfig {
             migration_batch_size: 65_537,
+            redo_log_size: REDO,
             ..ServerConfig::default()
         }
         .validate_sizes()
