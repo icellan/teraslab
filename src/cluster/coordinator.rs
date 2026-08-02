@@ -56,21 +56,29 @@ const STRANDED_TASK_REAP_AFTER: Duration = Duration::from_secs(45);
 /// Minimum spacing between consecutive reactivations, and the same-term floor
 /// that follows an activation.
 ///
-/// These were 15s and 30s. Cluster convergence needs SEVERAL reactivation
-/// rounds (each round converges partially, and a round whose handoff fails
-/// re-plans on the next one), so the floors — not the work — dominated
-/// convergence latency: 2-3 rounds put it at 60-90s against E2E budgets of
-/// 60-120s. That is why scenarios 05/06/07/08/09 landed non-deterministically;
-/// two CI runs of byte-identical code returned 6/14 and 8/14.
+/// MEASURED: lowering these to 5s/10s made convergence WORSE, and the reason
+/// is structural rather than a tuning miss. `apply_master_election` refines
+/// each freshly-computed table using that node's LOCAL partition view and
+/// LOCAL previous table, with no cluster-wide agreement (see
+/// `phantom_master_shard_count`). Every activation is therefore a fresh
+/// opportunity to DIVERGE, not merely a chance to repair — so raising the
+/// activation rate multiplies divergence instead of converging faster.
+/// Scenario 09 went from a ~40-shard drain residue to `masters=5461/4096` at
+/// `ver=8` (1365 excess, about one node's entire share) on the shortened
+/// cadence.
 ///
-/// The floors existed because re-driving a member rebalance faster streams
-/// full baselines into the receivers' bounded redo logs faster than the
-/// checkpointer reclaims them (observed: `redo log full`). `redo_log_size`
-/// now defaults to 256 MiB precisely to buy that headroom, which is what
-/// makes shortening these safe — the two changes only work as a pair, so do
-/// not lower these further without re-checking receiver redo pressure.
-const NORMAL_REACTIVATION_COOLDOWN: Duration = Duration::from_secs(5);
-const SAME_TERM_REACTIVATION_COOLDOWN: Duration = Duration::from_secs(10);
+/// Redo pressure is a SEPARATE constraint on these floors: re-driving a member
+/// rebalance faster streams full baselines into receivers' bounded redo logs
+/// faster than the checkpointer reclaims them (observed: `redo log full`).
+/// `redo_log_size` now defaults to 256 MiB, and the shortened-cadence run
+/// confirmed that headroom holds — no `redo log full` anywhere. So redo is no
+/// longer the binding limit; per-node election divergence is.
+///
+/// Do not shorten these again without first giving master election
+/// cluster-wide agreement. Faster rounds cannot fix a loop whose rounds can
+/// themselves introduce the mismatch they are meant to repair.
+const NORMAL_REACTIVATION_COOLDOWN: Duration = Duration::from_secs(15);
+const SAME_TERM_REACTIVATION_COOLDOWN: Duration = Duration::from_secs(30);
 
 const DRAIN_REACTIVATION_INTERVAL: Duration = Duration::from_secs(2);
 
