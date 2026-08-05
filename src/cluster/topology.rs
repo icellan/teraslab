@@ -780,6 +780,29 @@ impl PersistedTopologyState {
 /// Both slices are assumed to be sorted ascending by `NodeId` (SWIM emits
 /// them sorted) but the implementation relies only on set semantics, so
 /// duplicate or out-of-order entries are tolerated correctly.
+/// True when `members` is strictly ascending — i.e. sorted AND duplicate-free.
+///
+/// # Why this is a correctness gate, not tidiness
+///
+/// [`TopologyTerm::compute_digest`] hashes `members` **in the order received**,
+/// while [`ShardTable::compute_with_epoch`] sorts a local copy before assigning
+/// shards. Those two disagree the moment a member list arrives unsorted: every
+/// voter recomputes the same digest and votes yes, and then two conforming
+/// implementations derive DIFFERENT shard tables from one agreed commit. That
+/// is a same-term split with every existing gate green — the hardest class of
+/// divergence to detect, because each node's table is internally consistent.
+///
+/// Duplicates are rejected by the same check. They cannot forge a quorum
+/// (`has_quorum_voter_proof_for` dedups voters and requires membership), but
+/// `members.len()` feeds the quorum threshold and `committed_peak`, so a
+/// duplicated entry raises the bar every future term must clear.
+///
+/// The empty list is vacuously ordered; callers reject it separately if they
+/// require a non-empty membership.
+fn members_strictly_ascending(members: &[NodeId]) -> bool {
+    members.windows(2).all(|w| w[0].0 < w[1].0)
+}
+
 fn is_safe_membership_change(committed: &[NodeId], proposed: &[NodeId]) -> bool {
     if committed.is_empty() {
         return true;
@@ -1517,6 +1540,21 @@ impl TopologyAuthority {
         let unsupported_placement =
             propose.placement_version > crate::cluster::shards::MAX_SUPPORTED_PLACEMENT_VERSION;
 
+        // A non-ascending member list makes the digest (hashed as-received) and
+        // the shard table (computed over a sorted copy) disagree, so two
+        // conforming nodes derive different tables from one agreed commit.
+        // Refuse to vote rather than attest to an ambiguous member order.
+        let members_ordered = members_strictly_ascending(&propose.members);
+        if !members_ordered {
+            tracing::warn!(
+                term = propose.term,
+                member_count = propose.members.len(),
+                "topology: refusing proposal — members not strictly ascending \
+                 (unsorted or duplicated); digest hashes as-received while \
+                 placement sorts, so this is a same-term split vector",
+            );
+        }
+
         // F-G8-002: the proposer-side split-brain checks fire in
         // `on_membership_changed`, `retry_proposal`, and `check_timeout`,
         // but the follower-side `handle_propose` previously accepted any
@@ -1562,7 +1600,8 @@ impl TopologyAuthority {
             let voted = self.voted_term.load(Ordering::Relaxed);
 
             // Accept if the term is strictly higher than anything we've seen.
-            let mut accepted = propose.term > committed && propose.term > voted && valid_digest;
+            let mut accepted =
+                propose.term > committed && propose.term > voted && valid_digest && members_ordered;
 
             // Cluster formation recovery: when a node is in a single-node cluster
             // (either from fresh start or after losing all peers), a multi-node
@@ -1696,6 +1735,20 @@ impl TopologyAuthority {
 
         // Validate: term must be strictly higher.
         if commit.term <= committed {
+            return false;
+        }
+
+        // Same gate as the vote path: an ambiguous member order makes the
+        // digest and the derived shard table disagree, so two conforming nodes
+        // install different tables from this one commit. Reject rather than
+        // install an assignment whose meaning depends on wire order.
+        if !members_strictly_ascending(&commit.members) {
+            tracing::error!(
+                term = commit.term,
+                member_count = commit.members.len(),
+                "topology: rejecting commit — members not strictly ascending \
+                 (unsorted or duplicated); this is a same-term split vector",
+            );
             return false;
         }
 
@@ -3921,6 +3974,47 @@ mod tests {
         assert_eq!(auth.committed_members(), mems);
     }
 
+    /// `members` must be strictly ascending on receive.
+    ///
+    /// `TopologyTerm::compute_digest` hashes `members` **as received** while
+    /// `ShardTable::compute_with_epoch` sorts a local copy before assigning.
+    /// So a proposal carrying a non-ascending member list produces a digest
+    /// every voter agrees on, while two conforming implementations derive
+    /// DIFFERENT shard tables from it — a same-term split with every gate
+    /// green. Strictly-ascending also rejects duplicates, which would
+    /// otherwise inflate `members.len()` (that value feeds the quorum
+    /// threshold and `committed_peak`).
+    ///
+    /// This is a latent defect in today's code, independent of committed
+    /// master election; it becomes load-bearing once an assignment is encoded
+    /// as u16 indices into `members`.
+    #[test]
+    fn members_must_be_strictly_ascending() {
+        assert!(
+            members_strictly_ascending(&[]),
+            "empty is vacuously ordered"
+        );
+        assert!(members_strictly_ascending(&[NodeId(1)]));
+        assert!(members_strictly_ascending(&[
+            NodeId(1),
+            NodeId(2),
+            NodeId(3)
+        ]));
+
+        assert!(
+            !members_strictly_ascending(&[NodeId(3), NodeId(1), NodeId(2)]),
+            "unsorted must be rejected: digest hashes as-received, placement sorts",
+        );
+        assert!(
+            !members_strictly_ascending(&[NodeId(1), NodeId(1), NodeId(2)]),
+            "duplicates must be rejected: they inflate members.len()",
+        );
+        assert!(
+            !members_strictly_ascending(&[NodeId(2), NodeId(1)]),
+            "descending must be rejected",
+        );
+    }
+
     #[test]
     fn is_safe_membership_change_classifies_pure_additions_as_safe() {
         // Joining a node is monotonic: committed ⊆ proposed.
@@ -4203,7 +4297,11 @@ mod tests {
                     let proposer = NodeId(100 + t as u64);
                     let propose = TopologyTerm::new(
                         term,
-                        vec![proposer, NodeId(99)],
+                        // Strictly ascending: NodeId(99) < NodeId(100 + t).
+                        // The receive-side gate rejects an unordered member
+                        // list (see `members_strictly_ascending`), and this
+                        // test is about one-vote-per-term, not ordering.
+                        vec![NodeId(99), proposer],
                         proposer,
                         ClusterId::UNSET,
                         1,
