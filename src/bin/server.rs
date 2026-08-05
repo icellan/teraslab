@@ -1793,9 +1793,25 @@ fn main() {
         let probe_interval = std::time::Duration::from_millis(config.swim_probe_interval_ms);
 
         let cluster_state_path = config.resolved_cluster_state_path();
-        // Load topology state (backward-compatible with old format).
-        let topo_state =
-            teraslab::cluster::coordinator::load_startup_topology_state(&cluster_state_path);
+        // Load the durable topology state. Fail-closed: a state file that
+        // exists but cannot be read or decoded aborts startup. Booting past it
+        // would reset `committed_term`/`voted_term` to 0 — licensing a second
+        // vote in a term this node already voted in — and collapse the G8
+        // split-brain floor to 1. Operators repair or remove the file
+        // deliberately; the server never guesses.
+        let topo_state = match teraslab::cluster::coordinator::load_startup_topology_state(
+            &cluster_state_path,
+        ) {
+            Ok(state) => state,
+            Err(e) => {
+                tracing::error!(
+                    err = %e,
+                    "FATAL: durable topology state is unreadable; refusing to start with a \
+                     reset term and quorum floor",
+                );
+                std::process::exit(1);
+            }
+        };
         // G8 final review (finding 1) — seed from the durable ANCHOR
         // (`committed_peak`/`committed_members.len()`), not the vestigial
         // `peak_cluster_size` field. `persisted_state_for_commit`

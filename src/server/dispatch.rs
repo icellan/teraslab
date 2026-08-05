@@ -27943,7 +27943,8 @@ mod tests {
         // The reply has already been returned by handle_request. The
         // safety invariant: by the time the caller observes the reply,
         // the on-disk state MUST contain voted_term=500.
-        let persisted = crate::cluster::coordinator::load_topology_state(&path);
+        let persisted =
+            crate::cluster::coordinator::load_topology_state(&path).expect("state file must load");
         assert_eq!(
             persisted.voted_term, 500,
             "voted_term must be persisted BEFORE the reply is observable; \
@@ -28115,7 +28116,8 @@ mod tests {
         assert_eq!(resp.status, STATUS_OK, "commit must succeed");
 
         // By the time the reply is visible, committed_term=700 must be on disk.
-        let persisted = crate::cluster::coordinator::load_topology_state(&path);
+        let persisted =
+            crate::cluster::coordinator::load_topology_state(&path).expect("state file must load");
         assert_eq!(
             persisted.committed_term, 700,
             "committed_term must be persisted before the commit reply returns"
@@ -28155,7 +28157,8 @@ mod tests {
         std::fs::remove_file(&topology_path).expect("delete persisted topology file");
 
         let restored =
-            crate::cluster::coordinator::load_startup_topology_state(&cluster_state_path);
+            crate::cluster::coordinator::load_startup_topology_state(&cluster_state_path)
+                .expect("state file must load");
         assert!(
             restored.peak_cluster_size >= 2,
             "deleted .topo must not erase local multi-node evidence; restored peak={}",

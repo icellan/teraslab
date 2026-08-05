@@ -9656,23 +9656,57 @@ pub fn topology_state_path_for_cluster_state(
     std::path::PathBuf::from(s)
 }
 
-/// Load the full topology state from disk (backward-compatible).
+/// Why the durable topology state could not be loaded.
+///
+/// Distinct from "absent": a missing file is a fresh node and yields
+/// [`crate::cluster::topology::PersistedTopologyState::fresh`]. A file that
+/// exists but cannot be read or decoded is a HARD failure — defaulting it
+/// would reset `committed_term`/`voted_term` to 0 (licensing a second vote in
+/// a term this node already voted in) and collapse the G8 split-brain floor
+/// to 1.
+#[derive(Debug, thiserror::Error)]
+pub enum TopologyStateLoadError {
+    /// The state file exists but could not be read.
+    #[error("cannot read topology state at {path}: {source}")]
+    Io {
+        path: std::path::PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    /// The state file was read but its contents are not a valid record.
+    #[error("topology state at {path} is corrupt: {source}")]
+    Corrupt {
+        path: std::path::PathBuf,
+        #[source]
+        source: crate::cluster::topology::TopologyStateDecodeError,
+    },
+}
+
+/// Load the full topology state from disk.
+///
+/// # Errors
+///
+/// Returns [`TopologyStateLoadError`] when the file exists but cannot be read
+/// or decoded. A missing file is not an error: it yields the fresh-node state.
 pub fn load_topology_state(
     path: &std::path::Path,
-) -> crate::cluster::topology::PersistedTopologyState {
+) -> Result<crate::cluster::topology::PersistedTopologyState, TopologyStateLoadError> {
     let mut state = match std::fs::read(path) {
-        Ok(data) => crate::cluster::topology::PersistedTopologyState::deserialize(&data),
-        _ => crate::cluster::topology::PersistedTopologyState {
-            peak_cluster_size: 1,
-            committed_term: 0,
-            committed_members: Vec::new(),
-            committed_voters: Vec::new(),
-            voted_term: 0,
-            incarnation: 0,
-            committed_voter_ever_seen: Vec::new(),
-            committed_placement_version: 1,
-            committed_peak: 1,
-        },
+        Ok(data) => crate::cluster::topology::PersistedTopologyState::deserialize(&data).map_err(
+            |source| TopologyStateLoadError::Corrupt {
+                path: path.to_path_buf(),
+                source,
+            },
+        )?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            crate::cluster::topology::PersistedTopologyState::fresh()
+        }
+        Err(source) => {
+            return Err(TopologyStateLoadError::Io {
+                path: path.to_path_buf(),
+                source,
+            });
+        }
     };
     // G8 stage 3 — apply the (now presence-only, fixed-at-2) marker floor to
     // BOTH `peak_cluster_size` (feeds `bin/server.rs`'s `initial_peak`, which
@@ -9703,7 +9737,7 @@ pub fn load_topology_state(
         state.peak_cluster_size = state.peak_cluster_size.max(marker_peak);
         state.committed_peak = state.committed_peak.max(marker_peak);
     }
-    state
+    Ok(state)
 }
 
 /// Load startup topology state from the full `.topo` file, preserving legacy
@@ -9720,17 +9754,23 @@ pub fn load_topology_state(
 /// `load_topology_state`) is now the sole authoritative anchor; the legacy
 /// epoch fallback below is unrelated (term recovery for pre-`.topo` files)
 /// and is kept.
+///
+/// # Errors
+///
+/// Propagates [`TopologyStateLoadError`] from [`load_topology_state`]: a
+/// present-but-unreadable `.topo` file must abort startup, never silently
+/// boot the node with a reset term and a collapsed quorum floor.
 pub fn load_startup_topology_state(
     cluster_state_path: &std::path::Path,
-) -> crate::cluster::topology::PersistedTopologyState {
+) -> Result<crate::cluster::topology::PersistedTopologyState, TopologyStateLoadError> {
     let topology_path = topology_state_path_for_cluster_state(cluster_state_path);
-    let mut state = load_topology_state(&topology_path);
+    let mut state = load_topology_state(&topology_path)?;
     let (_legacy_peak, legacy_epoch) = load_cluster_state(cluster_state_path);
     if state.committed_term == 0 && legacy_epoch > 0 {
         state.committed_term = legacy_epoch;
         state.voted_term = state.voted_term.max(legacy_epoch);
     }
-    state
+    Ok(state)
 }
 
 /// Backward-compatible alias for callers that only persist peak.
@@ -11542,11 +11582,26 @@ impl RunningCluster {
     }
 
     /// Encode the latest quorum-committed topology for catch-up.
+    ///
+    /// E5 — replays the winning `TopologyCommit` verbatim when this node
+    /// holds one for the current term. The fabricated fallback below is
+    /// self-consistent by construction (proposer defaulted to `members[0]`,
+    /// voters defaulted to the member set, digest recomputed from the fields
+    /// it is being checked against), so a receiver's digest check, quorum
+    /// proof and proposer rule are all vacuous against it. Real bytes make
+    /// them mean something. The fallback remains for nodes that reached their
+    /// term without a commit — partition-map catch-up carries none by design.
     pub fn encode_committed_topology(&self) -> Vec<u8> {
         let term = self.topology_authority.committed_term();
         let mut members = self.topology_authority.committed_members();
         if term == 0 || members.is_empty() {
             return Vec::new();
+        }
+        if let Some(bytes) = self.topology_authority.committed_commit_bytes()
+            && crate::cluster::topology::TopologyCommit::deserialize(&bytes)
+                .is_some_and(|c| c.term == term)
+        {
+            return bytes;
         }
         members.sort();
         let cluster_id = self.topology_authority.cluster_id();
@@ -16010,7 +16065,7 @@ mod tests {
             crate::cluster::topology::DurableCommitOutcome::Applied(2)
         );
 
-        let loaded = load_topology_state(&topo_path);
+        let loaded = load_topology_state(&topo_path).expect("state file must load");
         assert_eq!(
             loaded.committed_peak, 3,
             "loaded committed_peak must be the lowered 3, not 5",
@@ -16051,6 +16106,7 @@ mod tests {
             committed_voter_ever_seen: Vec::new(),
             committed_placement_version: 1,
             committed_peak: 5,
+            committed_commit: None,
         };
         persist_topology_state(&path, &five_member).expect("seed persist creates marker");
 
@@ -16069,10 +16125,11 @@ mod tests {
             committed_voter_ever_seen: Vec::new(),
             committed_placement_version: 1,
             committed_peak: 1, // pretend the raw .topo content under-reports
+            committed_commit: None,
         };
         std::fs::write(&path, three_member.serialize()).expect("overwrite .topo directly");
 
-        let loaded = load_topology_state(&path);
+        let loaded = load_topology_state(&path).expect("state file must load");
         assert_eq!(
             loaded.committed_peak, 2,
             "marker floors committed_peak at exactly 2, not the old peak of \
@@ -16108,6 +16165,7 @@ mod tests {
             committed_voter_ever_seen: Vec::new(),
             committed_placement_version: 1,
             committed_peak: 3,
+            committed_commit: None,
         };
         persist_topology_state(&path, &multi).expect("seed persist creates marker");
         assert!(load_topology_multi_node_marker_peak(&path).is_some());
@@ -16126,10 +16184,11 @@ mod tests {
             committed_voter_ever_seen: Vec::new(),
             committed_placement_version: 1,
             committed_peak: 1,
+            committed_commit: None,
         };
         std::fs::write(&path, rf1.serialize()).expect("overwrite with RF=1 state");
 
-        let loaded = load_topology_state(&path);
+        let loaded = load_topology_state(&path).expect("state file must load");
         assert_eq!(
             loaded.committed_peak, 1,
             "a genuine 1-member .topo file must be trusted over a lingering \
@@ -17981,7 +18040,7 @@ mod tests {
             "topology state file must exist after persist"
         );
 
-        let loaded = load_topology_state(&path);
+        let loaded = load_topology_state(&path).expect("state file must load");
         assert_eq!(loaded.peak_cluster_size, 3);
     }
 
@@ -18008,9 +18067,77 @@ mod tests {
         persist_topology_state(&path, &authority.persisted_state(3, 7))
             .expect("persist (with dir fsync) must succeed");
 
-        let loaded = load_topology_state(&path);
+        let loaded = load_topology_state(&path).expect("state file must load");
         assert_eq!(loaded.peak_cluster_size, 3, "peak must round-trip");
         assert_eq!(loaded.incarnation, 7, "incarnation must round-trip");
+    }
+
+    /// A MISSING state file is a fresh node — the one case that may default.
+    #[test]
+    fn load_topology_state_treats_a_missing_file_as_fresh() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("absent.cluster.topo");
+
+        let loaded = load_topology_state(&path).expect("a missing file must not be an error");
+        assert_eq!(loaded.committed_term, 0);
+        assert_eq!(loaded.voted_term, 0);
+        assert_eq!(loaded.peak_cluster_size, 1);
+        assert!(loaded.committed_members.is_empty());
+        assert_eq!(loaded.committed_commit, None);
+    }
+
+    /// A PRESENT but corrupt state file must fail closed. Defaulting it would
+    /// reset `voted_term` (licensing a second vote in a term already voted in)
+    /// and collapse the G8 split-brain floor to 1 — the node would come back
+    /// looking like a legitimate fresh single-node cluster.
+    #[test]
+    fn load_topology_state_fails_closed_on_a_corrupt_file() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("node.cluster.topo");
+
+        let authority = Arc::new(crate::cluster::topology::TopologyAuthority::new(
+            NodeId(1),
+            Duration::from_secs(1),
+        ));
+        persist_topology_state(&path, &authority.persisted_state(5, 3)).expect("persist");
+        assert!(load_topology_state(&path).is_ok(), "baseline must load");
+
+        // Flip one byte in the middle of the record.
+        let mut bytes = std::fs::read(&path).expect("read back");
+        let mid = bytes.len() / 2;
+        bytes[mid] ^= 0xFF;
+        std::fs::write(&path, &bytes).expect("write corrupted");
+
+        match load_topology_state(&path) {
+            Err(TopologyStateLoadError::Corrupt { path: p, .. }) => assert_eq!(p, path),
+            other => panic!("a corrupt state file must fail closed, got {other:?}"),
+        }
+    }
+
+    /// Truncation is the realistic corruption mode, and the one the pre-v2
+    /// format handled worst: it decoded into a SHORTER member list under an
+    /// unchanged committed term.
+    #[test]
+    fn load_topology_state_fails_closed_on_a_truncated_file() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("node.cluster.topo");
+
+        let authority = Arc::new(crate::cluster::topology::TopologyAuthority::new(
+            NodeId(1),
+            Duration::from_secs(1),
+        ));
+        persist_topology_state(&path, &authority.persisted_state(5, 3)).expect("persist");
+
+        let bytes = std::fs::read(&path).expect("read back");
+        std::fs::write(&path, &bytes[..bytes.len() - 9]).expect("write truncated");
+
+        assert!(
+            matches!(
+                load_topology_state(&path),
+                Err(TopologyStateLoadError::Corrupt { .. })
+            ),
+            "a truncated state file must fail closed",
+        );
     }
 
     #[test]
@@ -19084,6 +19211,66 @@ mod tests {
                 (committed_members).len() as u64
             ),
         );
+        // E5 — the catch-up payload is the WINNING commit's own bytes, not a
+        // fabrication. The fabricated form defaults `proposer` to `members[0]`
+        // (NodeId(1) here, which happens to match) and `voters` to the member
+        // set; only the real bytes carry the actual proposer and voter list,
+        // which is what makes a receiver's quorum proof and proposer rule
+        // mean anything.
+        assert_eq!(
+            encoded,
+            next_commit.serialize(),
+            "encode_committed_topology must replay the winning commit verbatim",
+        );
+    }
+
+    /// E5 — a node holding a committed term but NO commit (the partition-map
+    /// catch-up path carries none by design) still serves a usable payload.
+    #[test]
+    fn committed_topology_encoding_falls_back_when_no_commit_is_held() {
+        let members = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let table = ShardTable::compute_with_epoch(&members, 2, 3, 1);
+        let cluster = new_test_running_cluster(
+            NodeId(1),
+            table,
+            &[
+                (NodeId(1), "127.0.0.1:4711".parse().unwrap()),
+                (NodeId(2), "127.0.0.1:4712".parse().unwrap()),
+                (NodeId(3), "127.0.0.1:4713".parse().unwrap()),
+            ],
+            &members,
+            &[],
+            &[],
+            &[],
+            3,
+        );
+        // Restore a committed term WITHOUT a commit blob — exactly the state a
+        // partition-map catch-up leaves behind.
+        cluster
+            .topology_authority()
+            .restore(&crate::cluster::topology::PersistedTopologyState {
+                peak_cluster_size: 3,
+                committed_term: 8,
+                committed_members: members.clone(),
+                committed_voters: members.clone(),
+                voted_term: 8,
+                incarnation: 0,
+                committed_voter_ever_seen: members.clone(),
+                committed_placement_version: 1,
+                committed_peak: 3,
+                committed_commit: None,
+            });
+        assert_eq!(
+            cluster.topology_authority().committed_commit_bytes(),
+            None,
+            "precondition: no commit held"
+        );
+
+        let encoded = cluster.encode_committed_topology();
+        let decoded = crate::cluster::topology::TopologyCommit::deserialize(&encoded)
+            .expect("fallback payload must still decode");
+        assert_eq!(decoded.term, 8);
+        assert_eq!(decoded.members, members);
     }
 
     #[test]
@@ -21087,7 +21274,7 @@ mod tests {
         );
         assert_eq!(cluster.topology_authority.committed_term(), 6);
         // The durable record on disk carries the new term.
-        let loaded = load_topology_state(&path);
+        let loaded = load_topology_state(&path).expect("state file must load");
         assert_eq!(
             loaded.committed_term, 6,
             "the committed term must be durable on disk"

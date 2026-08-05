@@ -504,6 +504,163 @@ impl TopologyCommit {
 // Persisted state
 // ---------------------------------------------------------------------------
 
+/// Magic bytes opening every persisted topology-state record.
+pub const TOPOLOGY_STATE_MAGIC: [u8; 4] = *b"TSTP";
+
+/// Format version of the persisted topology-state record.
+///
+/// Version 1 was the unframed, un-checksummed, trailer-extended layout: it
+/// had no magic, no length, and no CRC, so a truncated file decoded silently
+/// into a *shorter* `committed_members` with an unchanged `committed_term` —
+/// a weakened restart quorum and a lowered split-brain floor, indistinguishable
+/// from a legitimate smaller cluster. Version 2 frames and checksums the whole
+/// record; v1 payloads no longer decode at all.
+pub const TOPOLOGY_STATE_FORMAT_VERSION: u16 = 2;
+
+/// Upper bound on the persisted winning-commit blob. A `TopologyCommit` with
+/// `MAX_TOPOLOGY_MEMBERS` members and the same number of voters is ~16 KiB;
+/// this leaves headroom for the sections the committed-master-election design
+/// adds without letting a malformed length field drive an unbounded
+/// allocation.
+pub const MAX_PERSISTED_COMMIT_BYTES: usize = 64 * 1024;
+
+/// Fixed size of the v2 record framing: magic + version + payload length + CRC.
+const TOPOLOGY_STATE_FRAME_OVERHEAD: usize = 4 + 2 + 4 + 4;
+
+/// Why a persisted topology-state record could not be decoded.
+///
+/// Every variant is fail-closed at the load site: a node that cannot read its
+/// durable term/members/peak must NOT fall back to defaults, because defaults
+/// (`committed_term = 0`, `voted_term = 0`, `peak = 1`) let it vote again in a
+/// term it already voted in and drop the G8 split-brain floor.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum TopologyStateDecodeError {
+    /// Fewer bytes than the fixed framing requires.
+    #[error("persisted topology state is {len} bytes, shorter than the {min}-byte frame")]
+    TooShort { len: usize, min: usize },
+    /// The record does not open with [`TOPOLOGY_STATE_MAGIC`]. Either a
+    /// foreign file or a pre-v2 payload, both of which must not be guessed at.
+    #[error("persisted topology state has bad magic {found:02x?}, expected {expected:02x?}")]
+    BadMagic { found: [u8; 4], expected: [u8; 4] },
+    /// A format version this build does not understand.
+    #[error(
+        "persisted topology state format version {found} is not supported (this build reads {supported})"
+    )]
+    UnsupportedVersion { found: u16, supported: u16 },
+    /// The declared payload length does not match the bytes present.
+    #[error("persisted topology state declares a {declared}-byte payload but carries {actual}")]
+    PayloadLengthMismatch { declared: usize, actual: usize },
+    /// CRC over magic+version+length+payload does not match the stored value.
+    #[error(
+        "persisted topology state CRC mismatch: stored {stored:#010x}, computed {computed:#010x}"
+    )]
+    CrcMismatch { stored: u32, computed: u32 },
+    /// A section ran past the end of the payload.
+    #[error("persisted topology state section `{section}` is truncated")]
+    TruncatedSection { section: &'static str },
+    /// A node-id count exceeded [`MAX_TOPOLOGY_MEMBERS`], or the commit blob
+    /// exceeded [`MAX_PERSISTED_COMMIT_BYTES`]. Rejected before any sizing.
+    #[error(
+        "persisted topology state section `{section}` declares {count}, above the maximum {max}"
+    )]
+    SectionTooLarge {
+        section: &'static str,
+        count: usize,
+        max: usize,
+    },
+    /// Bytes remained after the payload's last section.
+    #[error("persisted topology state has {trailing} unconsumed trailing bytes")]
+    TrailingBytes { trailing: usize },
+}
+
+/// Cursor over a decoded payload that fails closed on every short read.
+struct PayloadReader<'a> {
+    data: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> PayloadReader<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        Self { data, pos: 0 }
+    }
+
+    fn take(
+        &mut self,
+        n: usize,
+        section: &'static str,
+    ) -> Result<&'a [u8], TopologyStateDecodeError> {
+        let end = self
+            .pos
+            .checked_add(n)
+            .ok_or(TopologyStateDecodeError::TruncatedSection { section })?;
+        if end > self.data.len() {
+            return Err(TopologyStateDecodeError::TruncatedSection { section });
+        }
+        let out = &self.data[self.pos..end];
+        self.pos = end;
+        Ok(out)
+    }
+
+    fn u64(&mut self, section: &'static str) -> Result<u64, TopologyStateDecodeError> {
+        let b = self.take(8, section)?;
+        let arr: [u8; 8] = b
+            .try_into()
+            .map_err(|_| TopologyStateDecodeError::TruncatedSection { section })?;
+        Ok(u64::from_le_bytes(arr))
+    }
+
+    fn u32(&mut self, section: &'static str) -> Result<u32, TopologyStateDecodeError> {
+        let b = self.take(4, section)?;
+        let arr: [u8; 4] = b
+            .try_into()
+            .map_err(|_| TopologyStateDecodeError::TruncatedSection { section })?;
+        Ok(u32::from_le_bytes(arr))
+    }
+
+    fn u16(&mut self, section: &'static str) -> Result<u16, TopologyStateDecodeError> {
+        let b = self.take(2, section)?;
+        let arr: [u8; 2] = b
+            .try_into()
+            .map_err(|_| TopologyStateDecodeError::TruncatedSection { section })?;
+        Ok(u16::from_le_bytes(arr))
+    }
+
+    fn u8(&mut self, section: &'static str) -> Result<u8, TopologyStateDecodeError> {
+        Ok(self.take(1, section)?[0])
+    }
+
+    /// `[count:4][ids:8*count]`, with `count` bounded by
+    /// [`MAX_TOPOLOGY_MEMBERS`] BEFORE any allocation, and every id read
+    /// bounds-checked (a short id array is an error, never a shorter list).
+    fn node_ids(&mut self, section: &'static str) -> Result<Vec<NodeId>, TopologyStateDecodeError> {
+        let count = self.u32(section)? as usize;
+        if count > MAX_TOPOLOGY_MEMBERS {
+            return Err(TopologyStateDecodeError::SectionTooLarge {
+                section,
+                count,
+                max: MAX_TOPOLOGY_MEMBERS,
+            });
+        }
+        let bytes = self.take(count * 8, section)?;
+        let mut ids = Vec::with_capacity(count);
+        for chunk in bytes.chunks_exact(8) {
+            let arr: [u8; 8] = chunk
+                .try_into()
+                .map_err(|_| TopologyStateDecodeError::TruncatedSection { section })?;
+            ids.push(NodeId(u64::from_le_bytes(arr)));
+        }
+        Ok(ids)
+    }
+
+    fn finish(self) -> Result<(), TopologyStateDecodeError> {
+        let trailing = self.data.len() - self.pos;
+        if trailing != 0 {
+            return Err(TopologyStateDecodeError::TrailingBytes { trailing });
+        }
+        Ok(())
+    }
+}
+
 /// Persisted topology state for crash recovery.
 #[derive(Debug, Clone)]
 pub struct PersistedTopologyState {
@@ -539,6 +696,18 @@ pub struct PersistedTopologyState {
     /// `peak_cluster_size.max(committed_members.len())`, reproducing
     /// today's restored floor exactly (see `deserialize`).
     pub committed_peak: u64,
+    /// E5 — the serialized [`TopologyCommit`] that won `committed_term`,
+    /// stored verbatim so `OP_GET_COMMITTED_TOPOLOGY` can replay the real
+    /// bytes instead of fabricating a self-consistent commit from local
+    /// state (proposer defaulted to `members[0]`, voters defaulted to the
+    /// member set, digest recomputed — which makes the digest check, the
+    /// quorum proof and the proposer rule all vacuous on that path).
+    ///
+    /// `None` is a STRUCTURAL "this node holds no committed commit", not a
+    /// zero-filled one: a node that reached its committed term via the
+    /// partition-map catch-up path holds no commit by design, and must be
+    /// distinguishable from one whose commit blob was zeroed by corruption.
+    pub committed_commit: Option<Vec<u8>>,
 }
 
 /// G9 — result of [`TopologyAuthority::handle_commit_durable`].
@@ -560,200 +729,186 @@ pub enum DurableCommitOutcome {
 }
 
 impl PersistedTopologyState {
-    /// Serialize to bytes.
+    /// Serialize to a framed, CRC-covered v2 record.
     ///
-    /// Format: `[peak:8][committed_term:8][voted_term:8][member_count:4][member_ids:8*N][incarnation:8][voter_count:4][voter_ids:8*N][ever_seen_count:4][ever_seen_ids:8*N]`
+    /// Layout:
     ///
-    /// `[ever_seen_count][ever_seen_ids]` is appended for F-G8-001's
-    /// split-brain heal fallback. Older payloads without the trailer
-    /// decode with an empty `committed_voter_ever_seen` and the loader
-    /// seeds the set from `committed_voters`.
+    /// ```text
+    /// [magic:4 = "TSTP"][version:2][payload_len:4][payload][crc32:4]
+    /// ```
+    ///
+    /// The CRC covers magic + version + length + payload. The payload is:
+    ///
+    /// ```text
+    /// [peak_cluster_size:8][committed_term:8][voted_term:8][incarnation:8]
+    /// [committed_placement_version:2][committed_peak:8]
+    /// [member_count:4][member_ids:8*N]
+    /// [voter_count:4][voter_ids:8*N]
+    /// [ever_seen_count:4][ever_seen_ids:8*N]
+    /// [commit_present:1]([commit_len:4][commit_bytes])?
+    /// ```
+    ///
+    /// Every count is bounded on decode and every section is length-checked,
+    /// so a truncated or corrupted record is REJECTED rather than decoded
+    /// into a plausible-looking shorter state (see
+    /// [`TopologyStateDecodeError`]). `commit_present` is an explicit flag,
+    /// so "no committed commit" never aliases a zero-filled one.
     pub fn serialize(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(
-            44 + (self.committed_members.len()
+        let commit_len = self.committed_commit.as_ref().map_or(0, Vec::len);
+        let mut payload = Vec::with_capacity(
+            46 + (self.committed_members.len()
                 + self.committed_voters.len()
                 + self.committed_voter_ever_seen.len())
-                * 8,
+                * 8
+                + 5
+                + commit_len,
         );
-        buf.extend_from_slice(&self.peak_cluster_size.to_le_bytes());
-        buf.extend_from_slice(&self.committed_term.to_le_bytes());
-        buf.extend_from_slice(&self.voted_term.to_le_bytes());
-        buf.extend_from_slice(&(self.committed_members.len() as u32).to_le_bytes());
-        for m in &self.committed_members {
-            buf.extend_from_slice(&m.0.to_le_bytes());
+        payload.extend_from_slice(&self.peak_cluster_size.to_le_bytes());
+        payload.extend_from_slice(&self.committed_term.to_le_bytes());
+        payload.extend_from_slice(&self.voted_term.to_le_bytes());
+        payload.extend_from_slice(&self.incarnation.to_le_bytes());
+        payload.extend_from_slice(&self.committed_placement_version.to_le_bytes());
+        payload.extend_from_slice(&self.committed_peak.to_le_bytes());
+        for section in [
+            &self.committed_members,
+            &self.committed_voters,
+            &self.committed_voter_ever_seen,
+        ] {
+            payload.extend_from_slice(&(section.len() as u32).to_le_bytes());
+            for id in section.iter() {
+                payload.extend_from_slice(&id.0.to_le_bytes());
+            }
         }
-        buf.extend_from_slice(&self.incarnation.to_le_bytes());
-        buf.extend_from_slice(&(self.committed_voters.len() as u32).to_le_bytes());
-        for voter in &self.committed_voters {
-            buf.extend_from_slice(&voter.0.to_le_bytes());
+        match &self.committed_commit {
+            Some(bytes) => {
+                payload.push(1);
+                payload.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+                payload.extend_from_slice(bytes);
+            }
+            None => payload.push(0),
         }
-        buf.extend_from_slice(&(self.committed_voter_ever_seen.len() as u32).to_le_bytes());
-        for v in &self.committed_voter_ever_seen {
-            buf.extend_from_slice(&v.0.to_le_bytes());
-        }
-        // W6 — placement_version trailer (after ever_seen). Older payloads
-        // decode without it and default to v1.
-        buf.extend_from_slice(&self.committed_placement_version.to_le_bytes());
-        // G8 stage 1 — committed_peak trailer (after placement_version).
-        // Older payloads decode without it and default to
-        // peak_cluster_size.max(committed_members.len()).
-        buf.extend_from_slice(&self.committed_peak.to_le_bytes());
+
+        let mut buf = Vec::with_capacity(payload.len() + TOPOLOGY_STATE_FRAME_OVERHEAD);
+        buf.extend_from_slice(&TOPOLOGY_STATE_MAGIC);
+        buf.extend_from_slice(&TOPOLOGY_STATE_FORMAT_VERSION.to_le_bytes());
+        buf.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&payload);
+        let crc = crc32fast::hash(&buf);
+        buf.extend_from_slice(&crc.to_le_bytes());
         buf
     }
 
-    /// Deserialize from bytes.
+    /// Decode a v2 record, or explain why it is unusable.
     ///
-    /// Backward compatible with the old 16-byte `[peak:8][epoch:8]` format
-    /// and the pre-incarnation format without the trailing incarnation field.
-    pub fn deserialize(data: &[u8]) -> Self {
-        if data.len() >= 28 {
-            let peak = u64::from_le_bytes(data[0..8].try_into().unwrap_or([0; 8]));
-            let committed_term = u64::from_le_bytes(data[8..16].try_into().unwrap_or([0; 8]));
-            let voted_term = u64::from_le_bytes(data[16..24].try_into().unwrap_or([0; 8]));
-            let count = u32::from_le_bytes(data[24..28].try_into().unwrap_or([0; 4])) as usize;
-            let mut members = Vec::with_capacity(count);
-            for i in 0..count {
-                let off = 28 + i * 8;
-                if off + 8 <= data.len() {
-                    members.push(NodeId(u64::from_le_bytes(
-                        data[off..off + 8].try_into().unwrap_or([0; 8]),
-                    )));
+    /// # Errors
+    ///
+    /// Returns [`TopologyStateDecodeError`] when the record is shorter than
+    /// the frame, carries foreign or pre-v2 bytes ([`TopologyStateDecodeError::BadMagic`]),
+    /// declares an unsupported version, has a payload length that disagrees
+    /// with the bytes present, fails its CRC, truncates a section, declares a
+    /// count above [`MAX_TOPOLOGY_MEMBERS`] (or a commit blob above
+    /// [`MAX_PERSISTED_COMMIT_BYTES`]), or carries unconsumed trailing bytes.
+    ///
+    /// There is deliberately no lenient arm. The pre-v2 format tolerated
+    /// short reads, so a truncated file yielded a shorter `committed_members`
+    /// under an unchanged `committed_term` — a silently weakened restart
+    /// quorum. Callers fail closed instead.
+    pub fn deserialize(data: &[u8]) -> Result<Self, TopologyStateDecodeError> {
+        if data.len() < TOPOLOGY_STATE_FRAME_OVERHEAD {
+            return Err(TopologyStateDecodeError::TooShort {
+                len: data.len(),
+                min: TOPOLOGY_STATE_FRAME_OVERHEAD,
+            });
+        }
+        let mut magic = [0u8; 4];
+        magic.copy_from_slice(&data[0..4]);
+        if magic != TOPOLOGY_STATE_MAGIC {
+            return Err(TopologyStateDecodeError::BadMagic {
+                found: magic,
+                expected: TOPOLOGY_STATE_MAGIC,
+            });
+        }
+        let version = u16::from_le_bytes([data[4], data[5]]);
+        if version != TOPOLOGY_STATE_FORMAT_VERSION {
+            return Err(TopologyStateDecodeError::UnsupportedVersion {
+                found: version,
+                supported: TOPOLOGY_STATE_FORMAT_VERSION,
+            });
+        }
+        let declared = u32::from_le_bytes([data[6], data[7], data[8], data[9]]) as usize;
+        let actual = data.len() - TOPOLOGY_STATE_FRAME_OVERHEAD;
+        if declared != actual {
+            return Err(TopologyStateDecodeError::PayloadLengthMismatch { declared, actual });
+        }
+        let crc_off = data.len() - 4;
+        let stored = u32::from_le_bytes([
+            data[crc_off],
+            data[crc_off + 1],
+            data[crc_off + 2],
+            data[crc_off + 3],
+        ]);
+        let computed = crc32fast::hash(&data[..crc_off]);
+        if stored != computed {
+            return Err(TopologyStateDecodeError::CrcMismatch { stored, computed });
+        }
+
+        let mut r = PayloadReader::new(&data[10..crc_off]);
+        let peak_cluster_size = r.u64("peak_cluster_size")?;
+        let committed_term = r.u64("committed_term")?;
+        let voted_term = r.u64("voted_term")?;
+        let incarnation = r.u64("incarnation")?;
+        let committed_placement_version = r.u16("committed_placement_version")?;
+        let committed_peak = r.u64("committed_peak")?;
+        let committed_members = r.node_ids("committed_members")?;
+        let committed_voters = r.node_ids("committed_voters")?;
+        let committed_voter_ever_seen = r.node_ids("committed_voter_ever_seen")?;
+        let committed_commit = match r.u8("commit_present")? {
+            0 => None,
+            _ => {
+                let len = r.u32("committed_commit")? as usize;
+                if len > MAX_PERSISTED_COMMIT_BYTES {
+                    return Err(TopologyStateDecodeError::SectionTooLarge {
+                        section: "committed_commit",
+                        count: len,
+                        max: MAX_PERSISTED_COMMIT_BYTES,
+                    });
                 }
+                Some(r.take(len, "committed_commit")?.to_vec())
             }
-            // Incarnation lives after the member list. If there aren't
-            // enough bytes (old format without incarnation), default to 0.
-            let incarnation_off = 28 + count * 8;
-            let incarnation = if incarnation_off + 8 <= data.len() {
-                u64::from_le_bytes(
-                    data[incarnation_off..incarnation_off + 8]
-                        .try_into()
-                        .unwrap_or([0; 8]),
-                )
-            } else {
-                0
-            };
-            let voters_off = incarnation_off + 8;
-            let mut voters = Vec::new();
-            let mut voters_end = voters_off;
-            if voters_off + 4 <= data.len() {
-                let voter_count = u32::from_le_bytes(
-                    data[voters_off..voters_off + 4]
-                        .try_into()
-                        .unwrap_or([0; 4]),
-                ) as usize;
-                voters.reserve(voter_count);
-                for i in 0..voter_count {
-                    let off = voters_off + 4 + i * 8;
-                    if off + 8 <= data.len() {
-                        voters.push(NodeId(u64::from_le_bytes(
-                            data[off..off + 8].try_into().unwrap_or([0; 8]),
-                        )));
-                    }
-                }
-                voters_end = voters_off + 4 + voter_count * 8;
-            }
-            // Optional trailer: [ever_seen_count:4][ever_seen_ids:8*N].
-            // Older payloads do not have this; callers seed the runtime
-            // set from `committed_voters` in that case.
-            let mut ever_seen = Vec::new();
-            let mut ever_seen_end = voters_end;
-            if voters_end + 4 <= data.len() {
-                let count = u32::from_le_bytes(
-                    data[voters_end..voters_end + 4]
-                        .try_into()
-                        .unwrap_or([0; 4]),
-                ) as usize;
-                ever_seen.reserve(count);
-                for i in 0..count {
-                    let off = voters_end + 4 + i * 8;
-                    if off + 8 <= data.len() {
-                        ever_seen.push(NodeId(u64::from_le_bytes(
-                            data[off..off + 8].try_into().unwrap_or([0; 8]),
-                        )));
-                    }
-                }
-                ever_seen_end = voters_end + 4 + count * 8;
-            }
-            // W6 — optional [placement_version:2] trailer after ever_seen.
-            // Pre-W6 payloads default to v1.
-            let (committed_placement_version, after_placement_version) =
-                if ever_seen_end + 2 <= data.len() {
-                    (
-                        u16::from_le_bytes(
-                            data[ever_seen_end..ever_seen_end + 2]
-                                .try_into()
-                                .unwrap_or([1, 0]),
-                        ),
-                        ever_seen_end + 2,
-                    )
-                } else {
-                    (1, ever_seen_end)
-                };
-            // G8 stage 1 — optional [committed_peak:8] trailer after
-            // placement_version. A pre-G8 payload decodes to
-            // peak_cluster_size.max(committed_members.len()), reproducing
-            // today's restored floor exactly.
-            let committed_peak = if after_placement_version + 8 <= data.len() {
-                u64::from_le_bytes(
-                    data[after_placement_version..after_placement_version + 8]
-                        .try_into()
-                        .unwrap_or([0; 8]),
-                )
-            } else {
-                peak.max(members.len() as u64)
-            };
-            Self {
-                peak_cluster_size: peak.max(1),
-                committed_term,
-                committed_members: members,
-                committed_voters: voters,
-                voted_term,
-                incarnation,
-                committed_voter_ever_seen: ever_seen,
-                committed_placement_version,
-                committed_peak,
-            }
-        } else if data.len() >= 16 {
-            // Old format: [peak:8][epoch:8]
-            let peak = u64::from_le_bytes(data[0..8].try_into().unwrap_or([0; 8]));
-            let epoch = u64::from_le_bytes(data[8..16].try_into().unwrap_or([0; 8]));
-            Self {
-                peak_cluster_size: peak.max(1),
-                committed_term: epoch,
-                committed_members: Vec::new(),
-                committed_voters: Vec::new(),
-                voted_term: epoch,
-                incarnation: 0,
-                committed_voter_ever_seen: Vec::new(),
-                committed_placement_version: 1,
-                committed_peak: peak.max(1),
-            }
-        } else if data.len() >= 8 {
-            // Oldest format: [peak:8] only
-            let peak = u64::from_le_bytes(data[0..8].try_into().unwrap_or([0; 8]));
-            Self {
-                peak_cluster_size: peak.max(1),
-                committed_term: 0,
-                committed_members: Vec::new(),
-                committed_voters: Vec::new(),
-                voted_term: 0,
-                incarnation: 0,
-                committed_voter_ever_seen: Vec::new(),
-                committed_placement_version: 1,
-                committed_peak: peak.max(1),
-            }
-        } else {
-            Self {
-                peak_cluster_size: 1,
-                committed_term: 0,
-                committed_members: Vec::new(),
-                committed_voters: Vec::new(),
-                voted_term: 0,
-                incarnation: 0,
-                committed_voter_ever_seen: Vec::new(),
-                committed_placement_version: 1,
-                committed_peak: 1,
-            }
+        };
+        r.finish()?;
+
+        Ok(Self {
+            peak_cluster_size: peak_cluster_size.max(1),
+            committed_term,
+            committed_members,
+            committed_voters,
+            voted_term,
+            incarnation,
+            committed_voter_ever_seen,
+            committed_placement_version,
+            committed_peak,
+            committed_commit,
+        })
+    }
+
+    /// The state a node with no persisted record starts from.
+    ///
+    /// Reached ONLY when the state file is absent (a genuinely fresh node).
+    /// A present-but-undecodable file must never land here — that is the
+    /// silent-defaulting hole the v2 framing closes.
+    pub fn fresh() -> Self {
+        Self {
+            peak_cluster_size: 1,
+            committed_term: 0,
+            committed_members: Vec::new(),
+            committed_voters: Vec::new(),
+            voted_term: 0,
+            incarnation: 0,
+            committed_voter_ever_seen: Vec::new(),
+            committed_placement_version: 1,
+            committed_peak: 1,
+            committed_commit: None,
         }
     }
 }
@@ -1011,6 +1166,17 @@ pub struct TopologyAuthority {
     /// returned, no other commit has had a realistic chance to overwrite it
     /// (network round-trips dominate any local read-after-write gap).
     last_shrink: Mutex<Option<(u64, Vec<NodeId>)>>,
+    /// E5 — serialized bytes of the `TopologyCommit` that won
+    /// `committed_term`, kept so the catch-up path can replay the real
+    /// commit (with its real proposer, voters and digest) instead of
+    /// fabricating one. Set in `apply_commit_locked`, persisted alongside
+    /// the term, and restored at boot only when it parses and its term
+    /// matches the restored `committed_term`.
+    ///
+    /// `None` means "no committed commit on this node" — the honest state
+    /// for a node that caught up via the partition map, and the reason the
+    /// persisted form carries an explicit presence flag.
+    committed_commit: RwLock<Option<Vec<u8>>>,
 }
 
 impl TopologyAuthority {
@@ -1044,7 +1210,17 @@ impl TopologyAuthority {
                 m
             }),
             last_shrink: Mutex::new(None),
+            committed_commit: RwLock::new(None),
         }
+    }
+
+    /// E5 — the serialized winning [`TopologyCommit`] for the current
+    /// committed term, if this node holds one.
+    ///
+    /// `None` when the node has committed nothing yet, or reached its term
+    /// via a path that carries no commit (partition-map catch-up).
+    pub fn committed_commit_bytes(&self) -> Option<Vec<u8>> {
+        self.committed_commit.read().unwrap().clone()
     }
 
     /// E-01 — record an observed cluster size. Monotonic: only raises the
@@ -1298,6 +1474,33 @@ impl TopologyAuthority {
             state.committed_placement_version.max(1) as u64,
             Ordering::Relaxed,
         );
+        // E5 — re-verify the persisted commit at load. The CRC proves the
+        // bytes are the ones written; this proves they are the ones that won
+        // the term being restored. A commit that no longer parses, or whose
+        // term disagrees with the restored `committed_term`, is DROPPED (the
+        // catch-up path falls back to deriving one from local state) rather
+        // than replayed as a proof for a term it does not describe.
+        *self.committed_commit.write().unwrap() =
+            state.committed_commit.as_ref().and_then(|bytes| {
+                match TopologyCommit::deserialize(bytes) {
+                    Some(commit) if commit.term == state.committed_term => Some(bytes.clone()),
+                    Some(commit) => {
+                        tracing::warn!(
+                            commit_term = commit.term,
+                            committed_term = state.committed_term,
+                            "cluster: persisted topology commit is for a different term; discarding"
+                        );
+                        None
+                    }
+                    None => {
+                        tracing::warn!(
+                            committed_term = state.committed_term,
+                            "cluster: persisted topology commit does not parse; discarding"
+                        );
+                        None
+                    }
+                }
+            });
     }
 
     /// Current committed term.
@@ -1417,6 +1620,7 @@ impl TopologyAuthority {
             committed_voter_ever_seen: self.committed_voter_ever_seen_snapshot(),
             committed_placement_version: self.committed_placement_version(),
             committed_peak: self.committed_peak(),
+            committed_commit: self.committed_commit_bytes(),
         }
     }
 
@@ -2032,6 +2236,11 @@ impl TopologyAuthority {
         }
 
         *self.committed_voters.write().unwrap() = commit.voters.clone();
+        // E5 — keep the winning commit's exact bytes so the catch-up path
+        // replays a real quorum proof. Written BEFORE `committed_term` is
+        // published, matching the members/placement ordering below: a reader
+        // that sees the new term never sees the previous term's commit.
+        *self.committed_commit.write().unwrap() = Some(commit.serialize());
         *self.observed_membership.lock() = commit.members.clone();
         // F-G8-001 fallback: every member of a committed term is, from
         // now on, a "known" voter. Future proposals that introduce a
@@ -2096,6 +2305,10 @@ impl TopologyAuthority {
             // path allowed to lower once stage 2's Gate B exists; stage 1
             // has no lowering producer so this is always non-lowering).
             committed_peak: commit.committed_peak,
+            // E5 — the winning commit rides the SAME fsync as the term it
+            // installs, so a node can never serve a committed term whose
+            // commit bytes it would lose on reboot.
+            committed_commit: Some(commit.serialize()),
         }
     }
 
@@ -3051,9 +3264,10 @@ mod tests {
             committed_voter_ever_seen: members(&[1, 2, 3, 7]),
             committed_placement_version: 1,
             committed_peak: 5,
+            committed_commit: None,
         };
         let data = state.serialize();
-        let restored = PersistedTopologyState::deserialize(&data);
+        let restored = PersistedTopologyState::deserialize(&data).expect("v2 record must decode");
         assert_eq!(restored.peak_cluster_size, 5);
         assert_eq!(restored.committed_term, 42);
         assert_eq!(restored.voted_term, 43);
@@ -3065,17 +3279,20 @@ mod tests {
     }
 
     #[test]
-    fn persisted_state_backward_compat_16_bytes() {
-        // Old format: [peak:8][epoch:8]
+    fn legacy_16_byte_payload_is_rejected() {
+        // The old `[peak:8][epoch:8]` format decoded into a state carrying a
+        // real `committed_term` and `voted_term` with an EMPTY member list.
+        // Under v2 those 16 bytes are just bytes: they carry no magic, so
+        // they are rejected rather than trusted as a term/vote record.
         let mut data = Vec::new();
         data.extend_from_slice(&3u64.to_le_bytes()); // peak
         data.extend_from_slice(&7u64.to_le_bytes()); // epoch
-        let restored = PersistedTopologyState::deserialize(&data);
-        assert_eq!(restored.peak_cluster_size, 3);
-        assert_eq!(restored.committed_term, 7);
-        assert_eq!(restored.voted_term, 7);
-        assert!(restored.committed_members.is_empty());
-        assert_eq!(restored.incarnation, 0);
+        let err = PersistedTopologyState::deserialize(&data)
+            .expect_err("a legacy 16-byte payload must not decode");
+        assert!(
+            matches!(err, TopologyStateDecodeError::BadMagic { .. }),
+            "expected BadMagic, got {err:?}",
+        );
     }
 
     #[test]
@@ -3149,7 +3366,8 @@ mod tests {
         assert_eq!(persisted.committed_members, mems);
         assert_eq!(persisted.committed_voters, members(&[1, 2]));
 
-        let restored = PersistedTopologyState::deserialize(&persisted.serialize());
+        let restored = PersistedTopologyState::deserialize(&persisted.serialize())
+            .expect("v2 record must decode");
         assert_eq!(restored.committed_voters, members(&[1, 2]));
     }
 
@@ -3918,9 +4136,10 @@ mod tests {
             committed_voter_ever_seen: Vec::new(),
             committed_placement_version: 1,
             committed_peak: 1,
+            committed_commit: None,
         };
         let data = state.serialize();
-        let restored = PersistedTopologyState::deserialize(&data);
+        let restored = PersistedTopologyState::deserialize(&data).expect("v2 record must decode");
         assert_eq!(
             restored.peak_cluster_size, 1,
             "zero peak should be clamped to 1"
@@ -4903,8 +5122,10 @@ mod tests {
             committed_voter_ever_seen: members(&[1, 2, 3]),
             committed_placement_version: 2,
             committed_peak: 3,
+            committed_commit: None,
         };
-        let decoded = PersistedTopologyState::deserialize(&state.serialize());
+        let decoded =
+            PersistedTopologyState::deserialize(&state.serialize()).expect("v2 record must decode");
         assert_eq!(decoded.committed_placement_version, 2);
         assert_eq!(decoded.committed_term, 5);
     }
@@ -5492,6 +5713,7 @@ mod tests {
             committed_voter_ever_seen: projected_ever_seen,
             committed_placement_version: projected_placement,
             committed_peak: projected_committed_peak,
+            committed_commit: projected_commit,
         } = projected;
         let PersistedTopologyState {
             peak_cluster_size: actual_peak,
@@ -5503,6 +5725,7 @@ mod tests {
             committed_voter_ever_seen: actual_ever_seen,
             committed_placement_version: actual_placement,
             committed_peak: actual_committed_peak,
+            committed_commit: actual_commit,
         } = actual;
 
         assert_eq!(projected_term, actual_term);
@@ -5522,6 +5745,15 @@ mod tests {
         a.sort_unstable();
         b.sort_unstable();
         assert_eq!(a, b, "ever-seen set must match post-apply");
+        assert_eq!(
+            projected_commit,
+            Some(commit.serialize()),
+            "E5 — the pre-apply projection must persist the winning commit's own bytes",
+        );
+        assert_eq!(
+            projected_commit, actual_commit,
+            "E5 — persisted commit bytes must match between the projection and post-apply state",
+        );
     }
 
     #[test]
@@ -5708,8 +5940,10 @@ mod tests {
             // coincidental match with the legacy-default formula can't mask
             // a broken round trip.
             committed_peak: 7,
+            committed_commit: None,
         };
-        let decoded = PersistedTopologyState::deserialize(&state.serialize());
+        let decoded =
+            PersistedTopologyState::deserialize(&state.serialize()).expect("v2 record must decode");
         assert_eq!(decoded.committed_peak, 7);
     }
 
@@ -5750,38 +5984,312 @@ mod tests {
     }
 
     #[test]
-    fn legacy_persisted_file_decodes_to_monotonic_floor() {
-        // Hand-craft a pre-G8 persisted blob: has the W6 placement_version
-        // trailer but NOT the new committed_peak trailer.
+    fn legacy_persisted_file_is_rejected_not_silently_decoded() {
+        // Hand-craft a v1 persisted blob (no magic, no CRC, trailer-extended).
+        // v1 tolerated short reads, so a truncated file decoded into a SHORTER
+        // `committed_members` under an UNCHANGED `committed_term` — a silently
+        // weakened restart quorum. v2 refuses to interpret these bytes at all.
         let peak = 4u64;
-        let committed_term = 2u64;
-        let voted_term = 2u64;
-        let committed_members = members(&[1, 2, 3]); // len 3, < peak (4)
-        let incarnation = 0u64;
-        let committed_placement_version = 1u16;
+        let committed_members = members(&[1, 2, 3]);
 
         let mut buf = Vec::new();
         buf.extend_from_slice(&peak.to_le_bytes());
-        buf.extend_from_slice(&committed_term.to_le_bytes());
-        buf.extend_from_slice(&voted_term.to_le_bytes());
+        buf.extend_from_slice(&2u64.to_le_bytes()); // committed_term
+        buf.extend_from_slice(&2u64.to_le_bytes()); // voted_term
         buf.extend_from_slice(&(committed_members.len() as u32).to_le_bytes());
         for m in &committed_members {
             buf.extend_from_slice(&m.0.to_le_bytes());
         }
-        buf.extend_from_slice(&incarnation.to_le_bytes());
-        buf.extend_from_slice(&0u32.to_le_bytes()); // committed_voters count = 0
-        buf.extend_from_slice(&0u32.to_le_bytes()); // ever_seen count = 0
-        buf.extend_from_slice(&committed_placement_version.to_le_bytes());
-        // NOTE: committed_peak trailer intentionally omitted.
+        buf.extend_from_slice(&0u64.to_le_bytes()); // incarnation
+        buf.extend_from_slice(&0u32.to_le_bytes()); // committed_voters count
+        buf.extend_from_slice(&0u32.to_le_bytes()); // ever_seen count
+        buf.extend_from_slice(&1u16.to_le_bytes()); // placement_version
 
-        let decoded = PersistedTopologyState::deserialize(&buf);
-        assert_eq!(
-            decoded.committed_peak,
-            peak.max(committed_members.len() as u64),
-            "absent committed_peak trailer must decode to peak_cluster_size.max(committed_members.len())"
+        match PersistedTopologyState::deserialize(&buf) {
+            Err(TopologyStateDecodeError::BadMagic { found, expected }) => {
+                assert_eq!(expected, TOPOLOGY_STATE_MAGIC);
+                assert_ne!(found, TOPOLOGY_STATE_MAGIC);
+            }
+            other => panic!("a v1 payload must be rejected as BadMagic, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn truncated_record_is_rejected_rather_than_shortening_the_member_list() {
+        // The v1 defect this format exists to close: dropping bytes off the
+        // end yielded a state with FEWER committed members but the SAME
+        // committed term, indistinguishable from a legitimately smaller
+        // cluster — and it fed both the restart quorum and `committed_peak`.
+        let state = PersistedTopologyState {
+            peak_cluster_size: 5,
+            committed_term: 9,
+            committed_members: members(&[1, 2, 3, 4, 5]),
+            committed_voters: members(&[1, 2, 3]),
+            voted_term: 9,
+            incarnation: 4,
+            committed_voter_ever_seen: members(&[1, 2, 3, 4, 5]),
+            committed_placement_version: 1,
+            committed_peak: 5,
+            committed_commit: None,
+        };
+        let full = state.serialize();
+
+        // Every proper prefix must be rejected. None may decode to a state
+        // with a shorter member list.
+        for cut in 1..full.len() {
+            let truncated = &full[..cut];
+            let err = PersistedTopologyState::deserialize(truncated)
+                .expect_err("a truncated record must never decode");
+            // The framing catches it as short/length-mismatch/CRC; the payload
+            // reader catches it as a truncated section. Any of those is a
+            // rejection — what must never happen is a successful decode.
+            match err {
+                TopologyStateDecodeError::TooShort { .. }
+                | TopologyStateDecodeError::PayloadLengthMismatch { .. }
+                | TopologyStateDecodeError::CrcMismatch { .. }
+                | TopologyStateDecodeError::TruncatedSection { .. }
+                | TopologyStateDecodeError::BadMagic { .. } => {}
+                other => panic!("unexpected rejection reason at cut {cut}: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn single_bit_flip_anywhere_in_the_record_fails_the_crc() {
+        let state = PersistedTopologyState {
+            peak_cluster_size: 3,
+            committed_term: 7,
+            committed_members: members(&[1, 2, 3]),
+            committed_voters: members(&[1, 2]),
+            voted_term: 7,
+            incarnation: 1,
+            committed_voter_ever_seen: members(&[1, 2, 3]),
+            committed_placement_version: 2,
+            committed_peak: 3,
+            committed_commit: None,
+        };
+        let good = state.serialize();
+        assert!(
+            PersistedTopologyState::deserialize(&good).is_ok(),
+            "the unmodified record must decode"
         );
-        assert_eq!(decoded.peak_cluster_size, peak);
-        assert_eq!(decoded.committed_placement_version, 1);
+
+        // Flip the low bit of every byte in turn. Nothing may decode.
+        for i in 0..good.len() {
+            let mut bad = good.clone();
+            bad[i] ^= 0x01;
+            assert!(
+                PersistedTopologyState::deserialize(&bad).is_err(),
+                "flipping bit 0 of byte {i} must be detected",
+            );
+        }
+    }
+
+    #[test]
+    fn oversized_counts_are_rejected_before_allocation() {
+        // A `count` field is attacker/corruption controlled and feeds
+        // `Vec::with_capacity`. Every node-id section must be bounded by
+        // MAX_TOPOLOGY_MEMBERS BEFORE any sizing happens.
+        let base = PersistedTopologyState {
+            peak_cluster_size: 1,
+            committed_term: 1,
+            committed_members: Vec::new(),
+            committed_voters: Vec::new(),
+            voted_term: 1,
+            incarnation: 0,
+            committed_voter_ever_seen: Vec::new(),
+            committed_placement_version: 1,
+            committed_peak: 1,
+            committed_commit: None,
+        };
+        let good = base.serialize();
+
+        // Payload starts at offset 10; the member count sits after the six
+        // fixed fields (8+8+8+8+2+8 = 42 bytes).
+        let member_count_off = 10 + 42;
+        for (section, off) in [
+            ("committed_members", member_count_off),
+            ("committed_voters", member_count_off + 4),
+            ("committed_voter_ever_seen", member_count_off + 8),
+        ] {
+            let mut bad = good.clone();
+            let huge = u32::MAX.to_le_bytes();
+            bad[off..off + 4].copy_from_slice(&huge);
+            // Re-frame so the CRC and length still check out — the count bound
+            // must be what rejects this, not the checksum.
+            let payload_len = bad.len() - TOPOLOGY_STATE_FRAME_OVERHEAD;
+            let len_bytes = (payload_len as u32).to_le_bytes();
+            bad[6..10].copy_from_slice(&len_bytes);
+            let crc_off = bad.len() - 4;
+            let crc = crc32fast::hash(&bad[..crc_off]);
+            bad[crc_off..].copy_from_slice(&crc.to_le_bytes());
+
+            match PersistedTopologyState::deserialize(&bad) {
+                Err(TopologyStateDecodeError::SectionTooLarge {
+                    section: got,
+                    count,
+                    max,
+                }) => {
+                    assert_eq!(got, section);
+                    assert_eq!(count, u32::MAX as usize);
+                    assert_eq!(max, MAX_TOPOLOGY_MEMBERS);
+                }
+                other => panic!("{section} count of u32::MAX must be rejected, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn absent_commit_is_structurally_distinct_from_a_zero_filled_one() {
+        // A torn write that zeroed the commit blob must not read as "no
+        // commit": the presence flag, not the content, decides.
+        let mut with_commit = PersistedTopologyState {
+            peak_cluster_size: 3,
+            committed_term: 4,
+            committed_members: members(&[1, 2, 3]),
+            committed_voters: members(&[1, 2, 3]),
+            voted_term: 4,
+            incarnation: 0,
+            committed_voter_ever_seen: members(&[1, 2, 3]),
+            committed_placement_version: 1,
+            committed_peak: 3,
+            committed_commit: Some(vec![0u8; 64]),
+        };
+        let decoded = PersistedTopologyState::deserialize(&with_commit.serialize())
+            .expect("v2 record must decode");
+        assert_eq!(
+            decoded.committed_commit,
+            Some(vec![0u8; 64]),
+            "an all-zero commit blob must still decode as PRESENT",
+        );
+
+        with_commit.committed_commit = None;
+        let decoded_absent = PersistedTopologyState::deserialize(&with_commit.serialize())
+            .expect("v2 record must decode");
+        assert_eq!(
+            decoded_absent.committed_commit, None,
+            "an absent commit must decode as absent",
+        );
+    }
+
+    #[test]
+    fn oversized_commit_blob_is_rejected() {
+        let state = PersistedTopologyState {
+            peak_cluster_size: 1,
+            committed_term: 1,
+            committed_members: members(&[1]),
+            committed_voters: members(&[1]),
+            voted_term: 1,
+            incarnation: 0,
+            committed_voter_ever_seen: members(&[1]),
+            committed_placement_version: 1,
+            committed_peak: 1,
+            committed_commit: Some(vec![7u8; 8]),
+        };
+        let mut bad = state.serialize();
+        // The commit length is the last 4 bytes before the blob, which is the
+        // last 8 bytes of the payload.
+        let crc_off = bad.len() - 4;
+        let len_off = crc_off - 8 - 4;
+        let huge = (MAX_PERSISTED_COMMIT_BYTES as u32 + 1).to_le_bytes();
+        bad[len_off..len_off + 4].copy_from_slice(&huge);
+        let crc = crc32fast::hash(&bad[..crc_off]);
+        bad[crc_off..].copy_from_slice(&crc.to_le_bytes());
+
+        match PersistedTopologyState::deserialize(&bad) {
+            Err(TopologyStateDecodeError::SectionTooLarge { section, max, .. }) => {
+                assert_eq!(section, "committed_commit");
+                assert_eq!(max, MAX_PERSISTED_COMMIT_BYTES);
+            }
+            other => panic!("an oversized commit blob must be rejected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn winning_commit_round_trips_through_persistence_and_restore() {
+        // E5 — the commit that won the term must survive a restart so the
+        // catch-up path can replay a real quorum proof instead of a
+        // self-consistent fabrication.
+        let mems = members(&[1, 2, 3]);
+        let commit = TopologyCommit {
+            term: 6,
+            proposer: NodeId(2),
+            members: mems.clone(),
+            cluster_id: ClusterId::UNSET,
+            placement_version: 1,
+            committed_peak: 3,
+            digest: TopologyTerm::compute_digest(6, &ClusterId::UNSET, &mems, 1, 3),
+            voters: mems.clone(),
+        };
+
+        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+        assert_eq!(auth.handle_commit(&commit), Some(6));
+        assert_eq!(
+            auth.committed_commit_bytes(),
+            Some(commit.serialize()),
+            "applying a commit must retain its exact bytes",
+        );
+
+        let state = auth.persisted_state(3, 1);
+        let reloaded = PersistedTopologyState::deserialize(&state.serialize())
+            .expect("persisted state must decode");
+        let restored = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+        restored.restore(&reloaded);
+        assert_eq!(
+            restored.committed_commit_bytes(),
+            Some(commit.serialize()),
+            "the winning commit must survive a restart verbatim",
+        );
+    }
+
+    #[test]
+    fn restore_discards_a_persisted_commit_for_the_wrong_term() {
+        // The CRC proves the bytes are what was written; it cannot prove they
+        // describe the term being restored. A mismatched commit must be
+        // dropped, not replayed as a proof for a term it does not name.
+        let mems = members(&[1, 2, 3]);
+        let stale = TopologyCommit {
+            term: 4,
+            proposer: NodeId(1),
+            members: mems.clone(),
+            cluster_id: ClusterId::UNSET,
+            placement_version: 1,
+            committed_peak: 3,
+            digest: TopologyTerm::compute_digest(4, &ClusterId::UNSET, &mems, 1, 3),
+            voters: mems.clone(),
+        };
+        let state = PersistedTopologyState {
+            peak_cluster_size: 3,
+            committed_term: 9, // term 9, but the blob describes term 4
+            committed_members: mems.clone(),
+            committed_voters: mems.clone(),
+            voted_term: 9,
+            incarnation: 0,
+            committed_voter_ever_seen: mems.clone(),
+            committed_placement_version: 1,
+            committed_peak: 3,
+            committed_commit: Some(stale.serialize()),
+        };
+
+        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+        auth.restore(&state);
+        assert_eq!(auth.committed_term(), 9);
+        assert_eq!(
+            auth.committed_commit_bytes(),
+            None,
+            "a commit naming a different term must be discarded at load",
+        );
+
+        // Unparseable bytes are dropped the same way.
+        let mut garbage = state.clone();
+        garbage.committed_commit = Some(vec![0xAB; 12]);
+        let auth2 = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+        auth2.restore(&garbage);
+        assert_eq!(
+            auth2.committed_commit_bytes(),
+            None,
+            "a commit that does not parse must be discarded at load",
+        );
     }
 
     #[test]
@@ -5886,6 +6394,7 @@ mod tests {
             committed_voter_ever_seen: members(&[1, 2, 3]),
             committed_placement_version: 1,
             committed_peak: 6,
+            committed_commit: None,
         };
         auth.restore(&state);
         assert_eq!(
@@ -5942,6 +6451,7 @@ mod tests {
             committed_voter_ever_seen: members(&[1, 2, 3, 4, 5]),
             committed_placement_version: 1,
             committed_peak: 3, // the durable, correctly-lowered anchor
+            committed_commit: None,
         };
 
         let config = ClusterConfig {

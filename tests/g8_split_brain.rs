@@ -394,6 +394,7 @@ fn restored_peak_blocks_minority_after_restart() {
         committed_voter_ever_seen: members(&[1, 2, 3]),
         committed_placement_version: 1,
         committed_peak: 3,
+        committed_commit: None,
     });
     assert_eq!(auth.peak_cluster_size(), 3, "restore must reinstate peak");
 

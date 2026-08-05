@@ -1245,27 +1245,30 @@ fn membership_incarnation_advancement_tracked() {
 // Deep edge case analysis: topology persisted state round-trip
 // ===========================================================================
 
-/// Persisted state format backward compat: 8-byte (peak-only) format must
-/// restore safely with all defaults.
+/// A pre-v2 payload (no magic, no CRC, no framing) must be REJECTED, never
+/// interpreted. The old 8-byte peak-only format decoded to a state with
+/// `committed_term = 0` and `voted_term = 0` — which, if it were ever produced
+/// by corruption rather than a genuine old file, licenses a second vote in a
+/// term the node already voted in.
 #[test]
-fn topology_persisted_state_8byte_compat() {
-    use teraslab::cluster::topology::PersistedTopologyState;
+fn topology_persisted_state_rejects_legacy_peak_only_payload() {
+    use teraslab::cluster::topology::{PersistedTopologyState, TopologyStateDecodeError};
 
     let mut data = Vec::new();
-    data.extend_from_slice(&7u64.to_le_bytes()); // peak only
-    let restored = PersistedTopologyState::deserialize(&data);
-    assert_eq!(restored.peak_cluster_size, 7);
-    assert_eq!(restored.committed_term, 0);
-    assert_eq!(restored.voted_term, 0);
-    assert!(restored.committed_members.is_empty());
-    assert_eq!(restored.incarnation, 0);
+    data.extend_from_slice(&7u64.to_le_bytes()); // legacy peak-only
+    let err = PersistedTopologyState::deserialize(&data)
+        .expect_err("a legacy peak-only payload must not decode");
+    assert!(
+        matches!(err, TopologyStateDecodeError::TooShort { .. }),
+        "expected TooShort, got {err:?}",
+    );
 }
 
-/// Persisted state format: pre-incarnation format (without trailing 8 bytes
-/// for incarnation) should restore with incarnation=0.
+/// A pre-v2 payload that is long enough to reach the magic check must fail on
+/// the magic, not decode into a plausible-looking state.
 #[test]
-fn topology_persisted_state_pre_incarnation_compat() {
-    use teraslab::cluster::topology::PersistedTopologyState;
+fn topology_persisted_state_rejects_legacy_member_payload() {
+    use teraslab::cluster::topology::{PersistedTopologyState, TopologyStateDecodeError};
 
     let mut data = Vec::new();
     let members = vec![NodeId(1), NodeId(2), NodeId(3)];
@@ -1277,15 +1280,43 @@ fn topology_persisted_state_pre_incarnation_compat() {
         data.extend_from_slice(&member.0.to_le_bytes());
     }
 
-    let restored = PersistedTopologyState::deserialize(&data);
+    let err = PersistedTopologyState::deserialize(&data)
+        .expect_err("a legacy member payload must not decode");
+    assert!(
+        matches!(err, TopologyStateDecodeError::BadMagic { .. }),
+        "expected BadMagic, got {err:?}",
+    );
+}
+
+/// v2 round-trip: every field survives serialize → deserialize intact.
+#[test]
+fn topology_persisted_state_v2_round_trips() {
+    use teraslab::cluster::topology::PersistedTopologyState;
+
+    let state = PersistedTopologyState {
+        peak_cluster_size: 3,
+        committed_term: 5,
+        committed_members: vec![NodeId(1), NodeId(2), NodeId(3)],
+        committed_voters: vec![NodeId(1), NodeId(2)],
+        voted_term: 6,
+        incarnation: 42,
+        committed_voter_ever_seen: vec![NodeId(1), NodeId(2), NodeId(3), NodeId(4)],
+        committed_placement_version: 2,
+        committed_peak: 3,
+        committed_commit: Some(vec![1, 2, 3, 4, 5]),
+    };
+    let restored =
+        PersistedTopologyState::deserialize(&state.serialize()).expect("v2 record must decode");
     assert_eq!(restored.peak_cluster_size, 3);
     assert_eq!(restored.committed_term, 5);
     assert_eq!(restored.voted_term, 6);
     assert_eq!(restored.committed_members.len(), 3);
-    assert_eq!(
-        restored.incarnation, 0,
-        "missing incarnation should default to 0"
-    );
+    assert_eq!(restored.committed_voters.len(), 2);
+    assert_eq!(restored.incarnation, 42);
+    assert_eq!(restored.committed_voter_ever_seen.len(), 4);
+    assert_eq!(restored.committed_placement_version, 2);
+    assert_eq!(restored.committed_peak, 3);
+    assert_eq!(restored.committed_commit, Some(vec![1, 2, 3, 4, 5]));
 }
 
 /// Restore topology state, then verify the authority rejects stale proposals.
@@ -1303,6 +1334,7 @@ fn topology_restore_then_vote_safety() {
         committed_voter_ever_seen: vec![NodeId(1), NodeId(2), NodeId(3)],
         committed_placement_version: 1,
         committed_peak: 3,
+        committed_commit: None,
     };
 
     let auth = TopologyAuthority::new(NodeId(2), Duration::from_secs(1));
