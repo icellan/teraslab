@@ -799,6 +799,38 @@ impl PersistedTopologyState {
 ///
 /// The empty list is vacuously ordered; callers reject it separately if they
 /// require a non-empty membership.
+/// Maximum members a single commit may add beyond the cluster's established
+/// size. Growth is an operator action taken a node or two at a time; a jump
+/// larger than this is not a real deployment step.
+pub const MAX_MEMBER_GROWTH: usize = 4;
+
+/// True when a proposed membership is a plausible growth step from what this
+/// node already knows.
+///
+/// # The wedge this closes
+///
+/// A commit carrying many DISTINCT fabricated NodeIds is accepted today: it is
+/// a pure superset, so `is_safe_membership_change` calls it safe; with a
+/// matching `cluster_id` the ever-seen check is short-circuited; and enough of
+/// the fabricated ids satisfy the (plaintext, self-declared) voter proof. The
+/// commit then persists `peak_cluster_size >= members.len()`.
+///
+/// `activation_quorum_needed` is derived from that peak, so a single frame
+/// naming 1024 members raises the quorum bar to 513 **permanently** — no
+/// future term can ever be proposed, and G8's Gate B needs a 513-voter proof
+/// to lower the floor again. It survives reboot, because the peak is durable.
+///
+/// One frame, permanent, reboot-surviving cluster wedge. Reachable from any
+/// member, and from any TCP peer when no `cluster_secret` is configured.
+///
+/// The bound is deliberately generous: legitimate growth is one or two nodes
+/// per term, and `alive` is included so a cluster that genuinely scaled up
+/// while this node was partitioned can still catch up.
+fn membership_growth_is_plausible(proposed_len: usize, committed_peak: u64, alive: usize) -> bool {
+    let established = (committed_peak as usize).max(alive);
+    proposed_len <= established.saturating_add(MAX_MEMBER_GROWTH)
+}
+
 fn members_strictly_ascending(members: &[NodeId]) -> bool {
     members.windows(2).all(|w| w[0].0 < w[1].0)
 }
@@ -1774,6 +1806,27 @@ impl TopologyAuthority {
         // committed_peak >= members.len() by construction; this rejects a
         // malformed or forged commit that violates it.
         if commit.committed_peak < commit.members.len() as u64 {
+            return false;
+        }
+
+        // A single frame must not be able to pin the quorum bar forever. The
+        // durable `peak_cluster_size` drives `activation_quorum_needed`, so a
+        // commit naming a flood of fabricated members raises that bar
+        // permanently and across reboots — no later term can gather enough
+        // voters to lower it. `is_safe_membership_change` waves this through
+        // because a flood is a pure superset. See `membership_growth_is_plausible`.
+        if !membership_growth_is_plausible(
+            commit.members.len(),
+            self.peak_cluster_size(),
+            self.committed_members().len(),
+        ) {
+            tracing::error!(
+                term = commit.term,
+                proposed_members = commit.members.len(),
+                committed_peak = self.peak_cluster_size(),
+                "topology: rejecting commit — implausible membership growth; \
+                 accepting it would raise the quorum floor permanently",
+            );
             return false;
         }
 
@@ -3972,6 +4025,46 @@ mod tests {
         };
         auth.handle_commit(&commit);
         assert_eq!(auth.committed_members(), mems);
+    }
+
+    /// A single frame must not be able to raise the quorum bar forever.
+    ///
+    /// `activation_quorum_needed` derives from the durable `peak_cluster_size`,
+    /// so a commit naming 1024 fabricated members pins the quorum at 513 —
+    /// permanently, and across reboots, since no future term can gather 513
+    /// voters to lower it. The growth bound is what stops the peak being
+    /// poisoned in the first place.
+    #[test]
+    fn membership_growth_bound_rejects_a_fabricated_member_flood() {
+        // The attack: 3-node cluster, one frame claiming 1024 members.
+        assert!(
+            !membership_growth_is_plausible(1024, 3, 3),
+            "a fabricated member flood must be rejected before it poisons the peak",
+        );
+
+        // Legitimate growth steps stay accepted.
+        for proposed in 3..=7 {
+            assert!(
+                membership_growth_is_plausible(proposed, 3, 3),
+                "growing to {proposed} from an established 3 must be allowed",
+            );
+        }
+        assert!(
+            !membership_growth_is_plausible(8, 3, 3),
+            "a jump of 5 exceeds MAX_MEMBER_GROWTH",
+        );
+
+        // A node partitioned while the cluster genuinely scaled up catches up
+        // via the peak it already knows, even with few peers alive locally.
+        assert!(
+            membership_growth_is_plausible(12, 10, 1),
+            "an established peak of 10 must admit a 12-member commit",
+        );
+        // ...and via alive count when the peak is behind.
+        assert!(
+            membership_growth_is_plausible(12, 1, 10),
+            "a live view of 10 must admit a 12-member commit",
+        );
     }
 
     /// `members` must be strictly ascending on receive.
