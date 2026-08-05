@@ -3164,9 +3164,11 @@ impl ClusterCoordinator {
                     let catch_up_secret = cluster_secret.clone();
                     let remote_term = *remote_term;
                     std::thread::spawn(move || {
-                        // Holds the dedup slot for this thread's lifetime;
-                        // released on exit (unwind included) via Drop.
-                        let _catchup_guard = catchup_guard;
+                        // Holds the dedup slot across the adopt + install
+                        // phases only; explicitly dropped before the
+                        // re-proposal fallback below (released on unwind
+                        // either way via Drop).
+                        let catchup_guard = catchup_guard;
                         tracing::info!(
                             local_term,
                             remote_term,
@@ -3319,6 +3321,27 @@ impl ClusterCoordinator {
                                 break;
                             }
                         }
+
+                        // Release the dedup slot BEFORE the re-proposal
+                        // fallback. The slot exists to stop per-gossip-probe
+                        // catch-up thread pile-up, and the adopt + install
+                        // phases above are what pile up; the fallback runs
+                        // `run_topology_proposer` inline — 5 attempts with
+                        // 200ms..2s backoffs plus post-commit straggler
+                        // retries, easily tens of seconds against
+                        // partitioned peers — and holding the slot across
+                        // it drops every TopologyStale raised in that
+                        // window. After a partition heals mid-fallback,
+                        // that starvation delayed re-convergence past test
+                        // and operator deadlines; a fresh catch-up must be
+                        // spawnable the moment gossip re-raises staleness.
+                        // Fallback pile-up is separately bounded by
+                        // `on_membership_changed`'s deterministic-proposer
+                        // gate: every node except the lowest NodeId gets
+                        // `None` and exits immediately, and on the proposer
+                        // node concurrent fallbacks mint successive terms
+                        // under the vote lock — the pre-dedup status quo.
+                        drop(catchup_guard);
 
                         // If direct fetch didn't work, fall back to the re-proposal path.
                         // This always converges: the new proposal will collect votes from
