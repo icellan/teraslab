@@ -1452,6 +1452,12 @@ pub(crate) fn render_metrics_text(
             "teraslab_swim_ping_req_dropped_total",
             sw.swim_ping_req_dropped_total.get(),
         );
+        // P2 — Lifeguard Local Health Multiplier (0 = healthy .. 8 = degraded).
+        prom_gauge(
+            &mut out,
+            "teraslab_swim_local_health",
+            sw.swim_local_health.load(Ordering::Relaxed),
+        );
     }
     if let Some(a) = allocator_metrics() {
         prom_counter(&mut out, "teraslab_alloc_total", a.alloc_total.get());
@@ -2926,6 +2932,7 @@ fn swim_metrics_json() -> serde_json::Value {
             "suspicion_duration": histogram_json(&LatencyHistogram::new()),
             "churn": {},
             "ping_req_dropped": 0,
+            "local_health": 0,
         });
     };
     let mut churn = serde_json::Map::new();
@@ -2942,6 +2949,7 @@ fn swim_metrics_json() -> serde_json::Value {
         "suspicion_duration": histogram_json(&sw.swim_suspicion_duration_ns),
         "churn": serde_json::Value::Object(churn),
         "ping_req_dropped": sw.swim_ping_req_dropped_total.get(),
+        "local_health": sw.swim_local_health.load(Ordering::Relaxed),
     })
 }
 
@@ -4854,6 +4862,7 @@ mod tests {
             "teraslab_swim_suspicion_duration_ns",
             "teraslab_swim_membership_churn_total",
             "teraslab_swim_ping_req_dropped_total",
+            "teraslab_swim_local_health",
             "teraslab_alloc_total",
             "teraslab_alloc_bytes_total",
             "teraslab_free_total",
