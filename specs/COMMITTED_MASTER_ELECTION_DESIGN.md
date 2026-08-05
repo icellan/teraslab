@@ -1,521 +1,507 @@
-# Committed Master Election — design (rev 3)
+# Committed Master Election — design (rev 4)
 
-**Status:** draft, revised after two review rounds (bitcoin-expert +
-security-auditor on rev 1 and rev 2). Both rev-2 verdicts were "do not
-implement". Consensus-critical: needs a third review round before code.
+**Status:** draft. Three review rounds (bitcoin-expert + security-auditor on
+rev 1, 2, 3). Rev 3's reviewers both ended with "with these fixes I would sign
+off" and stated a fourth *analysis* round should not be needed — the changes
+below are the stated edit list, not new design.
 
-**Context:** TeraSlab is not in production. On-disk formats and the wire
-protocol may change freely; no migration path is required.
+**Context:** TeraSlab is not in production. Formats and wire protocol may
+change freely; no migration path required.
 
-## 0. What changed from rev 2, and why
+## 0. Rev 3 → rev 4
 
-Rev 2's analysis was right and its mechanisms were wrong. Five blockers:
-
-| # | rev 2 defect | rev 3 |
+| # | rev 3 defect | rev 4 |
 |---|---|---|
-| B1 | `assignment_digest` in the digest does **not** close equivocation — voters store `voted_term` and **no `voted_digest`**, so the commit-side check is a self-consistency checksum, not an attestation | §4 persisted vote attestation |
-| B2 | installing `routing.shard_assignments` makes a peer's local handoff + liveness state durable authority, with no quorum proof | §6 assignment travels **only** on the committed-topology path |
-| B3 | `unproven_master` had **no clearing edge** — a flagged shard with no migration in flight fences forever, and both fallbacks flagged *every* shard | §7 advisory raise-only, locally clearable |
-| B4 | dropping `was_previous_master` made lowest-NodeId win every tie (n=3 RF=2: 2731 / 1365 / **0** shards) and left the election with no anchor, so a stale view silently reverted every prior promotion | §5 anchored on the previous **committed** assignment |
-| B5 | no in-band split detector — I11 was an E2E assertion only | §9 SWIM-gossiped digest + self-fence |
+| E1 | §4.4 fenced on vote-digest mismatch — but term numbers are **not globally reserved**, so an ordinary aborted proposal round bricks honest voters with no attacker present | §4.4 rejects, never fences |
+| E2 | the attestation split lands on **different terms**, which §9 (equal-term only) cannot see, and §6.1 left both halves serving | §9 gains the generalised-C11 arm: persistently refusing a quorum-advertised higher term |
+| E3 | §5's anchor had **no reversion edge** — a named master receives its migration, therefore holds data, therefore is never "proven data-less", so one term of influence is permanent | §5 anchor is **conditional** |
+| E4 | §7 blanket-fenced through `NOT local_holder_check`: any data-derived predicate is false for a legitimately empty shard, and deadlocks | §7 uses **provenance**, not data |
+| E5 | `OP_GET_COMMITTED_TOPOLOGY` **fabricates** the commit, so digest/voters/rule 8 are vacuous on the catch-up path | §10 persists and replays the winning commit verbatim |
+| E6 | §12's table printed `RF/n` while claiming `min(RF,k)/n`; the secret gate did not cover §9; permanence unstated | §12 corrected |
+| E7 | rule 6 `k=1.5` **rejects the honest assignment** on a routine wipe-and-rejoin, and rejection wedges the cluster | rule 6 recalibrated + demoted |
 
-Rev 2 also had to drop rule 7 (move-delta), which rejected the v1→v2 placement
-upgrade outright and was a wedge primitive; and its global self-fence on any
-validation failure was a one-packet cluster kill. Both corrected below.
+Rev 3's B1/B2/B4 substance, §3's two-object split, §6.1's reject≠fence, §8's
+audit table, §10's versioning and §11's swap algorithm are confirmed correct by
+both reviewers and are unchanged.
 
 ---
 
 ## 1. The defect
 
 `apply_master_election` runs *after* commit, per node, from two **per-node**
-inputs: `partition_view` (partial and divergent) and `prev_table` (differs by
-history). Two nodes can elect different masters for the same shard while each
-table stays internally self-consistent, so `mismatched == 0` everywhere and the
-divergence is invisible locally.
+inputs: `partition_view` (partial, divergent) and `prev_table` (differs by
+history). Two nodes can elect different masters for one shard while each table
+stays internally self-consistent, so `mismatched == 0` everywhere.
 
-### 1.1 Why the obvious fixes fail (both measured on CI — do not repeat)
+### 1.1 Fixes already measured and rejected — do not repeat
 
-- **Run convergence faster** (15s/30s → 5s/10s): *worse*. Scenario 09 hit
-  `masters=5461/4096` at `ver=8`. Every activation is a fresh chance to
-  diverge. Reverted in `18c7c07`.
+- **Faster convergence** (15s/30s → 5s/10s): worse. Scenario 09 hit
+  `masters=5461/4096` at `ver=8`. Reverted in `18c7c07`.
 - **Remove the refinement**: breaks failover —
-  `segment_cluster_master_failover_preserves_replicated_record` fails. The
-  refinement is what promotes the replica that *holds the data*.
+  `segment_cluster_master_failover_preserves_replicated_record`.
 
-Election is load-bearing for failover. It cannot be removed or accelerated. It
-must gain cluster-wide agreement.
+### 1.2 The fixed point
 
-### 1.2 The property rev 1 destroyed, and rev 3 restores
-
-Today's round-robin table is a **fixed point**: any confused node converges
-back to it. That is why current divergence is transient and self-healing. Any
-design that replaces it must supply a new fixed point, or transient divergence
-becomes permanent. **§5's anchoring is that fixed point** — an empty or stale
-view now *preserves* the committed assignment instead of reverting to `det`.
+Today's `det` table is a fixed point: the repair path is *view-independent*
+(`activate_topology_with_view` with an empty view makes `apply_master_election`
+return immediately), which is why divergence self-heals. **`det` must remain
+the fixed point** — §5's conditional anchor is what preserves that while still
+allowing failover. Rev 3's absolute anchor replaced the fixed point with
+"whatever was last committed", which is why one bad term became permanent.
 
 ---
 
 ## 2. Requirements
 
-- **R1 Agreement.** For a committed term, every node installs a byte-identical
-  committed assignment.
-- **R2 Failover locality.** The assignment may prefer a master that holds data.
-- **R3 Bounded authority.** No participant may assign mastership outside a
-  bound every node verifies independently.
-- **R4 Durability.** The assignment survives restart and catch-up.
-- **R5 Fail-closed.** A node that cannot obtain or validate the committed
-  assignment withholds authority; it never falls back to a local derivation.
-- **R6 In-band detection.** Divergence is detected in production, within one
-  gossip round — not only by an E2E assertion.
-- **R7 Availability.** No single frame, and no proposer bug, may cause a
-  cluster-wide or unclearable outage.
+R1 agreement · R2 failover locality · R3 bounded authority · R4 durability ·
+R5 fail-closed · R6 in-band detection · R7 **no single frame, and no proposer
+bug, causes a cluster-wide or unclearable outage**.
 
 ---
 
-## 3. Two distinct objects (this was implicit in rev 2 and caused B3/I11 confusion)
+## 3. Two distinct objects
 
-- **Committed assignment** — term-scoped, immutable once committed, digest-bound,
-  persisted, gossiped. `NUM_SHARDS` entries. The answer to *"who is master"*.
-- **Local serving table** — the effective assignment, including handoff state
-  (`Copying`/`ServingNew`), `rollback_shard` after a failed migration, and the
-  per-node `shard_has_data` predicate. **Per-node by design**, and must stay so:
-  `rollback_shard` exists to prevent an unreachable shard.
+- **Committed assignment** — term-scoped, immutable once committed,
+  digest-bound, persisted, gossiped. The answer to *who is master*.
+- **Local serving table** — effective assignment, handoff state,
+  `rollback_shard`, per-node `shard_has_data`. **Per-node by design.**
 
-§8's "must read the committed assignment" applies to the **authority** question
-only. The handoff machinery keeps reading the local table. I11 hashes the
-committed assignment, never the serving table — rev 2's I11 was unsatisfiable
-because it conflated them, and would have driven an implementer to delete
-`rollback_shard`.
+§8's "read the committed assignment" applies to the *authority* question only;
+handoff machinery keeps reading the local table. I11 hashes the committed
+assignment, never the serving table.
 
 ---
 
-## 4. Agreement: vote attestation (B1)
+## 4. Agreement: vote attestation
 
-`compute_digest` covers `(term, cluster_id, members, placement_version,
-committed_peak)` — **verified**. Rev 2 mixed `assignment_digest` in. Necessary,
-but **not sufficient**: `PersistedTopologyState` stores `voted_term` and no
-`voted_digest`, so `commit_passes_gates` recomputes the expected digest *from
-the commit's own fields*. That is a checksum, not an attestation — a proposer
-can still collect votes for term T and commit a different assignment.
-
-Rev 3:
-
-1. **Extend the digest**: mix `assignment_digest = sha256(canonical(assignment))`
-   and `rf` into `compute_digest`, as the last two fields. Pin field order and
-   `rf` width — the Go client and `client/rust` must reproduce it.
+1. Mix `assignment_digest = sha256(canonical(assignment))` and `rf` into
+   `compute_digest` as the last two fields. Pin field order and `rf` width (Go
+   and `client/rust` must reproduce it).
 2. **Every recipient computes `assignment_digest` itself from the received
-   assignment bytes.** No code path may trust a shipped hash. A frame carrying
-   a precomputed `assignment_digest` that disagrees with the payload is
-   rejected. *(Without this the binding is vacuous one indirection deeper: ship
-   `(A, H(B))` and `(A', H(B))` and both match.)*
-3. **Persist `voted_digest` alongside `voted_term`**, written under the same
+   bytes.** No path trusts a shipped hash; a frame whose shipped digest
+   disagrees with its payload is rejected.
+3. Persist `voted_digest` beside `voted_term`, under the existing
    persist-before-vote discipline.
-4. At commit: if `commit.term == voted_term`, require
-   `commit.digest == voted_digest`. **Mismatch is equivocation — a live attack,
-   not a stale frame — so it rejects *and* arms the C11 self-fence.**
-5. A node that never voted at T cannot verify. It **must not silently accept**:
-   it withholds authority (R5) until it obtains the term from a voter, and
-   cross-checks via §9's gossip digest.
-6. `TopologyVote` must carry the assignment digest so `handle_vote`'s match is
-   over the full binding. Its payload is versioned too (§10).
+4. **(E1) On `commit.term == voted_term` with `commit.digest != voted_digest`:
+   reject + metric + ERROR. Never fence.** Term numbers are *not* globally
+   reserved — every producer derives `max(committed, voted) + 1` from local
+   state, so two proposers routinely mint the same term with different content,
+   and today the digest cleanly separates them. Rev 3 fenced on that benign
+   race: a proposer reaching C and D but not A, then crashing, lets A re-mint T
+   with a different assignment and commit on a fresh quorum — bricking C and D
+   with no attacker present. Voting at T is evidence of nothing being
+   committed.
+5. **(P1-8) Also compare against the *committed* digest.** A commit for
+   `term <= committed_term` whose digest differs from the one this node
+   committed at that term is hard proof of a committed-history fork — stronger
+   evidence than any vote mismatch. Today it is discarded before any digest
+   comparison. Note `voted_term != committed_term`: a node that caught up by
+   commit never advances `voted_term`, so §4.4 alone never fires for it.
+6. `TopologyVote` carries the assignment digest; its payload is versioned (§10).
+7. **(P1-6) Ordering.** The digest/equivocation checks run **after** the
+   membership-safety and quorum-proof gates, so a structurally invalid frame
+   can never reach a detector that changes state.
+8. The proposer's self-vote is in-memory with no persist before broadcast.
+   Harmless, but noted so nobody assumes symmetry.
+
+### 4.9 The non-voter path (Q4)
+
+Quorum is a majority, so in any n ≥ 3 cluster a node that misses one propose
+round — a per-peer send failure, a restart, a brief partition — never voted at
+T. That is the **normal** catch-up path, not an edge case, and withholding
+forever is wrong.
+
+**Adopt durably, serve conditionally**: persist the assignment (so it survives
+restart and can anchor later terms), and withhold *authority* only until one
+corroboration arrives — an authenticated peer gossiping the same
+`(committed_term, assignment_digest)`, which lands within ~1 gossip round in a
+healthy cluster. Self-resolving, bounded in practice, fail-closed otherwise.
+
+A sole partition survivor is a **minority** and must not serve regardless; the
+peak-derived quorum already enforces that. The answer there is "restore
+quorum", not "relax the gate".
 
 ---
 
-## 5. The election, anchored (B4)
-
-Rev 2 dropped `was_previous_master` to remove proposer-history dependence. That
-removed the wrong term. Consequences measured by review: with it gone the
-ranking reduces to `(score, Reverse(node_id))`, and since replication ships
-every mutation to master *and* replicas, every candidate ties on score and
-**lowest NodeId always wins** — n=3 RF=2 v1 gives `m[0]` 2731 shards, `m[1]`
-1365, `m[2]` **zero**, with ~2000 migrations per term.
-
-And the real churn source was never `was_previous_master` — it was the **view**,
-which is per-proposer, unshipped, and intermittently available. A term proposed
-on a stale or empty view proposed plain `det`, silently reverting every prior
-failover promotion.
-
-**Rev 3 election, evaluated by the proposer:**
+## 5. The election, conditionally anchored (E3)
 
 ```
 for each shard s:
-    base := prev_committed[s]                 # the anchor
+    base := prev_committed[s]
     if base ∉ det.candidates(s) or base not live:
         base := det.master(s)
+
+    # (E3) A deviation is kept ONLY while its reason still holds.
+    if base != det.master(s):
+        keep base only if base still self-reports full
+                     AND det.master(s) still self-reports data-less
+                     AND that has held for k consecutive terms (hysteresis)
+        else: base := det.master(s)
+
     assignment[s] := base
-    # deviate only on a PROVEN reason:
-    if base is proven data-less and some c ∈ det.candidates(s) is proven full:
-        assignment[s] := c
+
+    if base self-reports data-less and some c ∈ det.candidates(s) self-reports full:
+        assignment[s] := c        # c picked by §5.1 tiebreak order
 ```
 
-Properties this buys:
+Without the conditional clause the anchor has no reversion edge: a named master
+receives its migration, therefore holds the data, therefore is never provably
+data-less — so one term of influence (hostile, or merely a skewed partial view)
+buys **permanent** per-shard mastership, laundered by every honest term
+thereafter. The conditional form keeps `det` as the fixed point (§1.2) while
+preserving failover.
 
-- **An empty or stale view is a true no-op**: it preserves the committed
-  assignment. That is the fixed point §1.2 requires.
-- Deltas per term are small by construction, so a per-node master-count bound
-  becomes meaningful (§6 rule 6) and the migration storm disappears without a
-  move-delta gate.
-- Stability no longer depends on the proposer's local `prev_table` — the anchor
-  is the agreed, persisted, shipped previous committed assignment.
-- Tiebreak order: proven-holder > `was_committed_master` > `was_deterministic_
-  master` > lowest NodeId. Lowest-NodeId survives only as the final tiebreak.
+**Deviation preconditions (restated as MUST, not inherited).** Deviation
+requires `all_candidates_reported` and the existing no-data skip. Without them
+a partial view "proves" a candidate full merely because the real holder did not
+report — and rev 3 would then have anchored that mistake permanently.
 
-**Proposer pre-intersection (required).** Before proposing, the proposer
-intersects its result with the *current* `det` candidate set and replaces any
-entry that falls outside with `det.master(s)` + `unproven_master`. Otherwise a
-stale view names a node that rule 3 rejects, and — under §6's all-or-nothing —
-the proposer wedges the cluster on its own proposal.
+**"Proven" is "self-reported".** The signal is `PartitionVersionEntry.
+last_applied_seq`, a peer's own report. A malicious peer can report `0` for
+shards it holds and `>0` for shards it does not, steering an *honest*
+proposer's deviation inside the rule 4/6 bound. The spec says self-reported
+throughout; the hysteresis above is the mitigation.
 
-**Per-shard fallback.** When `elect_master` would return `None` (every
-candidate evicted), use `det.master(s)` and set `unproven_master`. Never leave
-an entry unset: under §10's u16 encoding a zero-filled section decodes as
-**index 0 = `members[0]`**, handing the whole keyspace to the lowest member.
+**§5.1 Tiebreak order:** self-reported-holder > `was_committed_master` >
+`was_deterministic_master` > lowest NodeId. Lowest-NodeId is the final
+tiebreak only. (Rev 2 dropped `was_previous_master` with nothing in its place,
+which made lowest-NodeId win every tie: n=3 RF=2 gave 2731 / 1365 / **0**.)
+
+**§5.2 Proposer obligations.**
+- Self-validate against **all** of rules 1–9 before proposing, and clamp
+  deterministically on failure. Never fall back to plain `det` — that reverts
+  every prior promotion.
+- **(P1-1) A node holding no committed assignment MUST NOT propose.** A node
+  that caught up via the partition map holds none by design (§10) yet is
+  eligible to be `members[0]`; its anchor would fall through to `det` for all
+  4096 shards, reverting every promotion and firing ~4096 migrations.
+- Per-shard fallback when no candidate qualifies: `det.master(s)` +
+  `unproven_master`. Never leave an entry unset — a zero-filled u16 section
+  decodes as **index 0 = `members[0]`**, handing over the whole keyspace.
 
 ---
 
 ## 6. Validation
 
-Applied by voters before voting and by appliers before installing:
+Voters before voting, appliers before installing:
 
-1. exactly `NUM_SHARDS` entries — never pad, never truncate
-2. `commit.members` is **strictly ascending** (enforces sorted *and*
-   duplicate-free in one check). Rev 2 missed this: `compute_digest` hashes
-   `members` **as received** while `compute_with_epoch` sorts a local copy, so
-   a non-ascending `members` makes two conforming implementations derive
-   different assignments from one digest-matching commit. Duplicates also
-   inflate `members.len()`, which feeds quorum and `committed_peak`.
-   **Worth landing independently of this design.**
+1. exactly `NUM_SHARDS` entries — never pad or truncate
+2. `commit.members` **strictly ascending** (sorted + duplicate-free in one
+   check). `compute_digest` hashes members **as received** while
+   `compute_with_epoch` sorts a local copy, so non-ascending members make two
+   conforming implementations derive different assignments from one
+   digest-matching commit. **Land independently of this design.** *(The
+   rationale is the ordering mismatch — duplicates cannot inflate quorum, since
+   the voter proof dedups and requires membership.)*
 3. every entry is a committed member of this term
-4. **`assignment[s] ∈ {det.master} ∪ det.replicas`** where
-   `det = compute_with_epoch(members, rf, 0, placement_version)` — the
-   wire-level equivalent of `set_master_for_shard`'s refusal, and a pure
-   function of digest-bound inputs so every voter agrees
-5. `commit.members` contains no `NodeId(0)` *(stated against the member list,
-   not the assignment: under u16 indices `NodeId(0)` is inexpressible unless it
-   is a member)*
-6. per-node master count ≤ `k ×` fair share. **Load-bearing, not defence in
-   depth** — see §12. `k = 1.5` is meaningful only because §5 anchoring keeps
-   honest assignments near 1×; under rev 2's election any `k` admitting the
-   honest assignment admitted the maximal hostile one. Exempt `n == 1`.
+4. `assignment[s] ∈ {det.master} ∪ det.replicas` — the wire-level equivalent of
+   `set_master_for_shard`'s refusal; a pure function of digest-bound inputs
+5. `commit.members` contains no `NodeId(0)`
+6. **(E7) per-node master count → metric + ERROR, not a reject.** `k = 1.5`
+   rejects the *honest* assignment on a routine wipe-and-rejoin: n=3 RF=2, node
+   `m[2]` restored empty, all 1365 shards where it is det master deviate to
+   `m[0]`, which then holds 2731 vs a 2048 cap. Under all-or-nothing that
+   wedges permanently, since the deterministic proposer just re-proposes it.
+   Exported as `assignment_master_count_ratio`; alert above 1.1×.
 7. `master ∉ replicas` (§11)
-8. `commit.proposer ∈ commit.members` — a sanity check on a self-declared
-   plaintext field, **not** authorization. See §12.
-9. `commit.term ≤ committed + MAX_TERM_JUMP`, checked **before** hashing.
+8. `commit.proposer ∈ commit.members` — a sanity check on a plaintext field,
+   **not** authorization (§12)
+9. `commit.term <= committed + MAX_TERM_JUMP` (≈16), checked **before** hashing
+10. **(M2) `commit.members.len() <= max(committed_peak, alive) +
+    MAX_MEMBER_GROWTH`.** Today a commit carrying 1024 *distinct fabricated*
+    NodeIds passes the superset check, persists `peak_cluster_size >= 1024`,
+    and permanently wedges the cluster at a 513-voter quorum — reboot-surviving,
+    one frame. Pre-existing; fix here since §6 rewrites this validator anyway.
+11. u16 index `>= members.len()` is malformed → reject.
 
-**Rev 2's move-delta rule is deleted.** It rejected the v1→v2 placement upgrade
-outright (`upgrade_proposal` reshuffles ≈(1−1/n)·4096 shards with `members`
-unchanged), it blocked the very repair this design performs (scenario 09's
-correction moves ~33%), a hostile max-displacement commit made every later
-honest correction exceed the bound, and it was bypassed by changing membership
-by one node. It becomes a **metric + ERROR** (`assignment_move_delta_shards`),
-never a reject. Migration storms are rate-limited where rate limits belong — in
-the migration scheduler.
+The move-delta rule is **deleted** (it rejected the v1→v2 upgrade outright and
+was bypassable by a one-node membership change). It survives as
+`assignment_move_delta_shards`.
 
-### 6.1 Failure handling — reject is not fence (R7)
+### 6.1 Reject is not fence (R7)
 
-Rev 2 routed *every* validation failure into C11, whose own doc says recovery
-is "a BINARY UPGRADE + REBOOT", armed behind a structural check on a plaintext
-`voters` field. One malformed frame would have fenced every node, and rev 2
-added 4096 new triggers — so a proposer *bug* bricks the cluster.
-
-- **Digest mismatch, malformed payload, any rule 1–9 failure** → reject the
-  commit, increment a metric, log ERROR. **No fence.** The node keeps serving
-  under its existing committed term.
-- **Equivocation only** (§4.4: `commit.term == voted_term` but
-  `commit.digest != voted_digest`) → reject **and** arm C11. This is the one
-  case that proves an active attacker.
-- **Same-term digest divergence observed via gossip** (§9) → arm C11.
-
-C11 arming is additionally bounded by `MAX_TERM_JUMP`, so a forged
-`term = u64::MAX` cannot arm a permanent fence.
+- Any rule 1–11 failure, digest mismatch, malformed payload, **and vote-digest
+  mismatch (E1)** → reject + metric + ERROR. **No fence.** The node keeps
+  serving under its existing committed term.
+- **Fencing cases only:** §9's two.
+- **(P1-7)** The existing C11 placement-version refusal is **not** one of rules
+  1–11 and survives unchanged — it is a live v1/v2 dual-authority guard.
 
 ---
 
-## 7. `unproven_master` — advisory, raise-only, clearable (B3)
-
-Rev 2 shipped a bare bit and fenced on it. The serving fence (`inbound_atomic`)
-is cleared **only** by a migration completion handshake, so a flagged shard
-with no migration in flight fences **forever** — and AUDIT M1.5 already warns
-that fencing shards whose migration can never run "would brick the shard
-forever". Rev 2 then scaled it: both fallbacks flagged *every* shard, on the
-failure mode that is normal under load.
-
-Rev 3:
+## 7. `unproven_master` — provenance-based, raise-only (E4)
 
 ```
+local_holder_check(s) :=
+      ( self ∈ prev_committed_holders(s)          # master ∪ replicas, previous committed
+     OR proven completion for s at epoch >= current commit epoch
+     OR no previous committed assignment exists )  # genesis only
+  AND NOT inbound_atomic.test(s)
+
 local_fence(s) := committed_unproven(s) OR NOT local_holder_check(s)
 ```
 
-- **Raise-only.** The committed bit may only *raise* a node's fence, never
-  lower it. A node named master with no local evidence of holding the shard
-  fences regardless of the bit. This closes the under-fence direction, where a
-  hostile or merely stale proposer leaves the bit clear and the named master
-  serves an **empty** shard.
-- **Clearing edge, always.** Cleared by a completion handshake **or** the
-  node's own proof that it holds the shard. Never a bit with no clearing edge.
-- **A committed-unproven fence names its pull source** (the previous committed
-  master). A fence raised with no concrete source registers the `NodeId(0)`
-  sentinel, which the pull-repair loop filters out — the code's own comment
-  says such an inbound "can never be re-requested … stays fenced".
-- **No blanket fallback.** §5's fallbacks flag *individual* shards they could
-  not prove. Nothing in this design may flag all 4096.
+**Provenance, not data.** Any data-derived predicate (`shard_record_count > 0`
+and every variant) is false for a legitimately empty shard, so rev 3 would have
+fenced most of a fresh cluster's keyspace — and deadlocked: fenced ⇒ no writes
+⇒ still empty ⇒ still fenced. Provenance passes empty shards via the first or
+third clause.
 
-This is I0-compatible: I0 forbids a node changing *who is master*. Withholding
-service is not changing the assignment. §14 states that carve-out explicitly.
+`inbound_atomic` alone does **not** close the under-fence direction: a node
+named master of a shard nobody ever sends it has a clear bit and serves it
+empty, because that fence is raised on data *arrival*. The
+`prev_committed_holders` clause is what actually closes it.
 
----
+- **Raise-only.** The committed bit may only raise a fence, never lower it.
+- **Clearing edge, always** — a completion handshake, or the node's own
+  provenance.
+- **(P0-4) Never raise a fence with no concrete source.** The pull source is
+  `prev_committed[s]`, always a real node (rule 5 bans `NodeId(0)` from
+  members). If no source can be named, **alert instead of fencing** — a
+  `NodeId(0)` inbound is filtered out of pull-repair and has no clearing edge,
+  which is on record as having blocked repair in the E2E campaign.
+- **No blanket fallback** in either operand.
 
-## 8. Every path that derives a master must read the committed assignment
-
-The **repair action** is what reverts an election, not the detectors:
-reactivation calls `activate_topology_with_view`, which recomputes and installs
-— and `apply_master_election` with an empty view is a deliberate no-op
-*precisely so reactivation installs round-robin*. `activate_topology_with_view`
-must take the committed assignment as an **input** and stop computing masters.
-
-| # | site | change |
-|---|---|---|
-| 1 | `committed_topology_reactivation_metrics:745,754` | compare vs committed |
-| 2 | `phantom_master_shard_count:836` | compare vs committed |
-| 3 | `missing_master_shard_count:980` | compare vs committed |
-| 4 | `failed_handoff_disposition:1107` | read committed — **drops data** if wrong |
-| 5 | `install_active_routing_snapshot:1172` | **keep recomputing** (§6 of rev 2 was wrong — see B2) |
-| 6 | `restored_committed_shard_table:1610` | load persisted assignment |
-| 7 | `activate_topology_with_view:3976,3998` | take assignment as input |
-| 8 | `phantom_planned:4240` | diagnostic; update or drop |
-| 9 | `http.rs:2338` shrink guard | **unchanged** — see below |
-| 10 | `coordinator.rs:1631` bootstrap | exempt (single-member, stale-table gate covers it) — listed so it is not mistaken for an omission |
-
-`ShardTable::compute` is a `pub` legacy wrapper; include it in I14's audit.
-
-**Row 9 correction.** `shrink_drops_a_shard_holder` computes a *prospective*
-table for membership that is not yet committed, so it has no committed
-assignment to inherit. What keeps the G8 shrink guards valid is that the
-election **preserves the holder set** — the `set_master_for_shard` swap plus
-rule 7 mean `{master} ∪ replicas` is identical to `det`'s. State that as a
-load-bearing invariant of §11 with the G8 guard named as its dependent.
-
-**Keep one independent recompute as a tripwire**, but state honestly what it
-does: it asserts the committed assignment satisfies rule 4 against a local
-`compute_with_epoch`. **It catches malformed assignments only, never a split** —
-a split is by definition two assignments that are each valid, so both pass. It
-is largely redundant with rule 4. The only split detectors are §4's attestation
-(prevention) and §9's gossip (detection).
-
-The stale rationale at `coordinator.rs:787-819` and the comment at `:2448-2455`
-(asserting the prompt path re-runs the exchange "so the resulting master
-assignments match byte-for-byte" — the property §1 disproves) must be rewritten.
+I0-compatible: withholding service does not change who the committed master is
+(§14).
 
 ---
 
-## 9. In-band divergence detection (B5)
+## 8. Every path that derives a master reads the committed assignment
 
-Piggyback `(committed_term, assignment_digest)` on the SWIM heartbeat, which
-already gossips every ~1 s. A node observing a peer advertising the **same
-term** with a **different** assignment digest arms the C11 self-fence
-immediately.
+Unchanged from rev 3 and confirmed accurate against all ten production
+`compute_with_epoch` sites (`coordinator.rs` 745, 836, 980, 1107, 1172, 1610,
+1631, 3976, 3998, 4240 plus `http.rs:2338`). Row 5 keeps recomputing (§10);
+row 9's G8 guard stays valid because §11 preserves the holder set; row 10 is
+the exempt bootstrap. `ShardTable::compute` has no production caller — include
+it in I14's audit anyway.
 
-That converts a silent, permanent dual authority into a loud fail-closed within
-one gossip round, in production, in-band. It is what R6 actually asks for; I11
-on `/metrics` remains as the E2E assertion but is not the mechanism.
+**(B2) R5 needs its own predicate.** "The joining node withholds authority" is
+not implied by anything today: the only gate is `table.version <
+committed_term`, and the partition-map path installs a locally recomputed table
+stamped with the peer's *higher* version, so the gate passes. Add: **no
+committed assignment matching my committed term ⇒ `NodeId(0)` sentinel for
+every shard.**
+
+The tripwire (assert the committed assignment satisfies rule 4 against a local
+recompute) catches **malformed assignments only, never a split** — a split is
+by definition two assignments that are each valid. It is largely redundant with
+rule 4. Prevention is §4; detection is §9.
+
+---
+
+## 9. Fencing and divergence detection (E2)
+
+Two arms, both self-clearing:
+
+1. **(E2) Persistently refusing a quorum-advertised higher term.** This is the
+   condition that is actually diagnostic, and it is the one rev 3 missed: the
+   attestation split lands on *different* terms — voters reject and stay at
+   T-1, non-voters accept T — so an equal-term detector never fires. Generalise
+   C11's existing arming condition beyond "unsupported placement", with
+   hysteresis and the `MAX_TERM_JUMP` bound. Self-clears when `committed_term`
+   catches up.
+2. **Same-term, different digest via gossip** — covers the case where both
+   groups did apply T.
+
+**(P1-4) Arm 2 requires corroboration; never fence on a single gossip frame.**
+SWIM is UDP and verifies only when `cluster_secret` is set, so an unauthenticated
+source could otherwise fence the whole cluster with one datagram — and the node
+that fences is the node that *listens*, not the one that lies. Requirements:
+sender is a committed member of that term; ≥2 independent observations or a
+persistence window; confirm over the HMAC'd TCP path before arming; **§12's
+secret gate covers this arm**; explicit format-byte + length-prefixed trailer
+parsed at a known offset (today's committed-term trailer is positional and a
+truncated datagram would become a fence trigger); and a dedicated latch —
+C11's `unapplicable > committed` cannot express "same term" (arming at T is a
+no-op, at T+1 it auto-clears on the next commit).
+
+**Default posture is alert-and-hold**, with the global fence behind an operator
+policy switch. This repo already made that call once, rejecting auto-escalation
+for the same reason.
+
+**(P1-5) Publication ordering.** The committed assignment is stored **before**
+`committed_term`, and the gossiped digest is read from that record — never from
+the serving table. Otherwise every node briefly advertises `(T, digest(T-1))`
+and they mutually fence.
 
 ---
 
 ## 10. Durability, recovery, wire format
 
-**Durability.** `PersistedTopologyState` gains the committed assignment and
-`voted_digest`. It must ride `persisted_state_for_commit` → the single fsync in
-`handle_commit_durable`, not a second file. The current format has **no
-integrity check** and is maximally lenient (`unwrap_or` defaults, partial member
-reads accepted), so a torn write would decode to a zero-filled assignment —
-i.e. `members[0]` masters everything. **Add a length-prefixed, CRC-covered
-record and persist `assignment_digest` alongside, re-verified at load**;
-otherwise I8's "corrupt" arm is untestable.
+**(E5) Persist the winning `TopologyCommit` verbatim and replay those exact
+bytes on `OP_GET_COMMITTED_TOPOLOGY`.** Today that path *fabricates* the commit
+(proposer = `members[0]`, voters defaulted, digest recomputed), so it is
+self-consistent by construction and rule 8, the digest check and the quorum
+proof are all vacuous there. Replaying real bytes makes digest equality
+meaningful, gives §4.9 an object to corroborate, and — since `rf` is now
+digest-bound — prevents a catch-up commit recomputed from the *serving* node's
+local `rf` from reading as equivocation.
 
-**Recovery (B2).** The assignment travels on propose, on commit, and on
-`OP_GET_COMMITTED_TOPOLOGY` — and **nowhere else**. §3.3 of rev 2 said "carry
-the hash, not the payload" while §3.5 said the opposite; the payload travels,
-only the digest is folded into `compute_digest`.
+**Assignment travels on propose, commit, and `OP_GET_COMMITTED_TOPOLOGY` —
+nowhere else.** `OP_GET_PARTITION_MAP` keeps recomputing;
+`routing.shard_assignments` is `preferred_master_for_shard`, the *effective*
+master during handoff keyed on the serving node's own liveness view, carrying
+no quorum proof.
 
-`OP_GET_PARTITION_MAP` catch-up **keeps recomputing** and installs routing only.
-`routing.shard_assignments` is `preferred_master_for_shard` — the *effective*
-master during handoff, with a fallback keyed on the serving node's *local* SWIM
-liveness — and the code says so: *"only a routing snapshot. Committed-term
-catch-up must use encode_committed_topology()."* The path already logs "lacks
-topology quorum proof" and installs anyway; making that durable would let one
-peer, with no quorum, dictate mastership on a joining node. Under R5 the
-joining node holds no assignment and withholds authority until
-`OP_GET_COMMITTED_TOPOLOGY` supplies one with its proof.
+**Persistence.** `PersistedTopologyState` gains the committed assignment and
+`voted_digest`, riding the single fsync in `handle_commit_durable`. It needs a
+length-prefixed, CRC-covered record with `MAX_TOPOLOGY_MEMBERS` bounds on all
+three counts — today `count` is an unbounded `u32` feeding
+`Vec::with_capacity`, and partial member reads are silently accepted, yielding
+a **shorter `committed_members` with an unchanged `committed_term`** (worse
+than a zero-filled assignment: it feeds quorum and `committed_peak`). Persist
+`assignment_digest` alongside and re-verify at load. **"No assignment" must be
+structurally distinguishable from "zero-filled assignment"** — an explicit
+presence flag — or a torn write reads as a legal anchor giving `members[0]`
+everything (Q1).
 
-Note `encode_committed_topology` **fabricates** a commit locally (proposer =
-`members[0]`, voters defaulted, digest recomputed), so it is self-consistent by
-construction and rules 8 and the digest check provide no assurance on that path
-— another reason §9's gossip cross-check is required.
+**Wire format.** Assignment = fixed-length `NUM_SHARDS` × `u16` index into
+`commit.members` as received (== sorted, by rule 2). 8 KiB, never
+length-prefixed. `unproven_master` = fixed 512-byte bitmap.
 
-The `topology_commit_tx` channel is typed `(Vec<NodeId>, u64)` and must carry
-the assignment.
-
-**Wire format.** Assignment = fixed-length `NUM_SHARDS` entries of `u16`
-**index into `commit.members` as received** (provably == sorted, by rule 2).
-8 KiB. Fixed-length, never length-prefixed — that removes the count-driven
-allocation class F-G5-002 had to fix. `unproven_master` = fixed 512-byte bitmap.
-
-**Four parsers share the exact-length-trailer defect**, not one:
-`TopologyTerm::deserialize`, `TopologyCommit::deserialize`,
-`PersistedTopologyState::deserialize`, `RoutingInfo::decode` — plus
-`TopologyVote::deserialize`, whose payload changes per §4.6. All get explicit
-format-byte versioning with explicit section lengths, in the same change.
-Appending to the current scheme silently decodes `placement_version` as 1 and
-`committed_peak` as `members.len()`, **which drops the G8 split-brain floor**.
+**Versioning.** `TopologyTerm::deserialize` is the one **exact-length**-gated
+parser, and appending to it silently decodes `placement_version = 1` and
+`committed_peak = members.len()`, dropping the G8 split-brain floor.
+`TopologyCommit::deserialize`, `PersistedTopologyState::deserialize`,
+`RoutingInfo::decode` and `TopologyVote::deserialize` use permissive prefix
+parsing — their defect is **silent defaulting**, not exact-length. Same remedy
+(explicit format byte + section lengths), different diagnosis.
 
 ---
 
-## 11. Replica derivation (algorithm, not prose)
-
-Replica *order* is consensus-relevant (`replicas.first()` is used as a
-source/heal pick), so prose is insufficient:
+## 11. Replica derivation
 
 ```
 replicas := det.replicas(s)
 if assignment[s] != det.master(s):
     i := index of assignment[s] in replicas
-    replicas[i] := det.master(s)          # swap: promoted out, old master in
+    replicas[i] := det.master(s)        # swap: promoted out, old master in
 ```
 
-This preserves the holder set `{master} ∪ replicas == det`'s — the invariant
-§8 row 9's G8 guard depends on. Deriving replicas from `compute_with_epoch` and
-overriding only the master would give `master=B, replicas=[B]` for a deviated
-shard: RF effectively 1, and the actual data holder in no role, hence eligible
-for orphan cleanup. Rule 7 (`master ∉ replicas`) enforces it. Include the
-derivation in I9's round-trip test.
+Preserves `{master} ∪ replicas == det`'s holder set — the invariant §8 row 9's
+G8 guard depends on, and confirmed to match `set_master_for_shard` exactly.
+Rule 7 enforces `master ∉ replicas`. Include replica **order** in I9.
 
 ---
 
-## 12. Trust posture (state it, do not imply it)
+## 12. Trust posture (E6)
 
-There is **no proposer authorization**. `handle_propose` never checks the
-sender; `commit_passes_gates` never reads `commit.proposer`; the `members[0]`
-restriction is sender-side only. Rule 8 is a sanity check on a plaintext field.
+There is **no proposer authorization**: `handle_propose` never checks the
+sender, `commit_passes_gates` never reads `commit.proposer`, and the
+`members[0]` restriction is sender-side only. Rule 8 is a sanity check.
 
-**Containment is rules 4 + 6 alone**, and rule 4's bound is weak in small
-clusters. A member is a legal master for `s` iff it is one of the RF
-candidates, so it can seize up to `min(RF, k)/n` of the keyspace:
+**Containment is rules 4 + 6.** With rule 6 as a metric (E7) the ceiling is
+rule 4's alone: a member is a legal master for `s` iff it is one of the RF
+candidates, so it can seize up to **`RF/n`** of the keyspace — 66.7% at n=3
+RF=2, **100% at n=3 RF=3**. *(Rev 3 printed this table while claiming
+`min(RF,k)/n`; with rule 6 demoted the honest number is the larger one. Say
+the larger number.)*
 
-| n | RF=2 | RF=3 |
-|---|---|---|
-| 2 | 100% | 100% |
-| 3 | 66.7% | **100%** |
-| 4 | 50% | 75% |
-| 8 | 25% | 37.5% |
+**(E3/H2) The seizure is sticky unless §5's conditional clause holds.** That
+clause is the only thing that de-anchors a bad assignment. Add an
+operator-triggered, quorum-committed **reset-to-`det`** term so a suspicious
+assignment can be cleared without evicting a node.
 
-**Whenever `n ≤ RF`, rule 4 provides zero containment** — and 3-node RF=3 is an
-ordinary deployment. Being sole committed master of a shard means being the
-authority for those UTXOs, so a compromised member can approve a double-spend
-within its fraction. **Composition attack:** shrink the cluster first, then
-assign against the smaller `n`. I6's no-bundling forces two terms, not one.
+**(E6) `cluster_secret` gate — and it covers §9's gossip fence.** Committed
+master election refuses to arm without a secret; the node keeps today's
+deterministic derivation.
 
-**Gate the feature on authentication.** Committed master election refuses to
-arm when `cluster_secret` is unset: the node keeps today's deterministic
-derivation instead of accepting shipped assignments. The E2E harness runs
-trusted-overlay by design, so CI would otherwise exercise the unauthenticated
-path as the normal path — where an unauthenticated TCP peer gains surgical
-per-shard mastership assignment with `members` byte-identical (invisible to
-every member-set-keyed defence), plus the C11 and fence primitives. Even
-authenticated, the `cluster_secret` is symmetric: it proves cluster membership,
-not correctness, and authorizes every holder equally.
+**(H4) The gate must not disable the feature in CI.** Every scenario config
+omits `cluster_secret` by design, so as stated the feature would never arm in
+scenarios 01–17 — the consensus code justified by scenarios 05–09 would run
+only the legacy path. Two required changes: give the harness a `cluster_secret`
+and sign the test client's frames (`round_trip_signed` exists; the non-scenario
+configs already do this); and make the armed state a **digest-bound,
+quorum-committed, unanimity-gated** property, exactly as `placement_version`
+already solves this — proposer-side unanimity, voter-side refusal, applier-side
+refusal. Otherwise mixed mode is reachable and undetectable (both tables are
+internally consistent, so §8's tripwire cannot see it), and an armed node
+silently downgrades to `det` if the secret is absent on restart.
 
-`docs/DEPLOYMENT_ASSUMPTIONS.md:80-96` must say all of the above in those terms.
+**Per-node signing keys are the real fix for `n <= RF`** (Q3). Each vote signs
+`(term, assignment_digest)`; the commit carries the signed votes. That converts
+`voters` from a forgeable plaintext field into a real quorum proof, makes rule
+8 and `has_quorum_voter_proof` meaningful, makes equivocation *externally
+provable* rather than only self-detectable, and gives §4.9 a verifiable object.
+Cost: one signature per vote per term, over an existing TCP round-trip. If out
+of scope, `DEPLOYMENT_ASSUMPTIONS.md` must say that for `n <= RF` a single
+compromised member has total authority — and §5's conditional anchor must land
+first, because permanence is what makes that residual unacceptable.
+
+`docs/DEPLOYMENT_ASSUMPTIONS.md:80-96` must state: no proposer authorization;
+the `RF/n` bound with the table; that `members` is byte-identical across a
+hostile assignment change so every member-set-keyed defence is blind; that
+detection is alerting-only; the secret requirement; and a recommended
+production minimum of `n >= 4`, `strict_auth = true`, alerting above 1.1× fair
+share.
 
 ---
 
 ## 13. Invariants
 
-- **I1** Two nodes reaching the same term from different histories and views
-  install byte-identical **committed assignments** (not serving tables — §3).
-- **I2** A node that never received a partition view installs the same
-  committed assignment as the proposer.
-- **I3** Failover promotes a data-holding replica —
-  `segment_cluster_master_failover_preserves_replicated_record` passes.
-  Re-verify against §5's anchor + §7's local holder check, which together cover
-  the case where the *replica* moved between the view and the failure (rev 2
-  failed this: the stale view "proved" a node that no longer held the shard).
-- **I5** A rejected or superseded proposal never installs its assignment.
-- **I6** No term carrying a fresh assignment also changes membership/peak.
-- **I8** A node holding a committed term with **no** committed assignment
-  withholds authority; never falls back to a recomputed table. Test: boot with
-  the assignment absent **or corrupt** → `is_master` non-`Yes` for all keys,
-  metric + ERROR.
-- **I9** Durability round-trip: committed assignment **and replica order**
-  byte-identical after restart and after `OP_GET_COMMITTED_TOPOLOGY` catch-up.
-  After `OP_GET_PARTITION_MAP` catch-up: no assignment installed, authority
-  withheld.
-- **I10** Flipping one entry is rejected by the digest check.
-- **I11** Every node exports `(committed_term, sha256(committed_assignment))`;
-  E2E asserts hash equality across nodes. Hashes the **committed assignment**,
-  never the serving table.
-- **I12** No node serves a shard for which it has no data and no proven
-  completion, even when the committed assignment names it master.
-- **I13** An assignment failing any rule 1–9 causes the **commit** to be
-  rejected with a distinct error variant — never a silent per-entry skip, and
-  (except equivocation) **never a fence**.
-- **I14** Architectural: `set_master_for_shard` and `apply_master_election`
-  have exactly one caller each, on the install path; no production path
-  constructs a master assignment by recomputation (§8's table is the audit
-  list, including `ShardTable::compute`).
-- **I15** A committed assignment never fences a shard that has no clearing edge.
-- **I16** For any honest election, no node's master count exceeds `1 + ε ×`
-  fair share. *(Fails under rev 2's election; §5 is what makes it hold.)*
-- **I17** A commit whose digest differs from this node's persisted
-  `voted_digest` for the same term is rejected **and** self-fences.
-- **I18** A peer advertising the same `committed_term` with a different
-  `assignment_digest` causes a self-fence within one gossip round.
-- **I19** A validation failure other than equivocation does **not** fence: the
-  node keeps serving under its existing committed term.
+I1 byte-identical **committed assignments** · I2 non-viewer matches proposer ·
+I3 failover promotes a data-holding replica (re-verify against §5's conditional
+anchor **and** §7's provenance check, which together cover the replica-moved
+case) · I5 rejected/superseded proposals never install · I6 no bundling ·
+I8 no committed assignment ⇒ authority withheld (absent **or corrupt**;
+**bounded** — a deadline after which the node exits rather than sitting in
+permanent `Transitioning`, with its own metric and documented recovery) ·
+I9 durability round-trip incl. **replica order**, after restart and
+`OP_GET_COMMITTED_TOPOLOGY`; after `OP_GET_PARTITION_MAP`, no assignment and
+authority withheld · I10 flipped entry rejected by digest · I11 cross-node
+`sha256(committed_assignment)` equality · I12 never serve without data and
+without proven completion · I13 rule failure ⇒ reject with a distinct variant,
+never a silent skip, **never a fence** · I14 one caller each for
+`set_master_for_shard` / `apply_master_election`; no path builds an assignment
+by recomputation · I15 a committed assignment never fences a shard with no
+clearing edge · **I16 (E7) no honest election is *rejected* for master-count
+skew** — the wipe-and-rejoin case legitimately reaches 2× fair share ·
+I17 **(E1) a vote-digest mismatch rejects and does NOT fence** · I18 gossip
+divergence fences only with corroboration · I19 non-equivocation failures do
+not fence · **I20 (E2) a node persistently refusing a quorum-advertised higher
+term fences, and unfences when it adopts** · **I21 (P1-1) a node with no
+committed assignment does not propose**.
 
-**Not an invariant:** "convergence in one reactivation round". It cannot hold
-when the committed master must receive data (Copying → CommitReady →
-ServingNew). Track as a target: ≤ N rounds / ≤ T seconds for settled membership.
+Not an invariant: "convergence in one round" — it cannot hold when the
+committed master must receive data. Target: ≤ N rounds / ≤ T seconds.
 
 ---
 
 ## 14. Sequencing with #99
 
-**Land this first; the regime-fenced failover spec (#99) after.** This answers
-*who is master*; #99 answers *how a transfer is made safe*. A regime fence is
-meaningless while two nodes disagree about who the master is.
-
-Carried over now: **I0 — no node-local commit-apply gates**, and **I6 — no
-bundling**. I0 forbids a node keeping its own master when the shipped one looks
-wrong; it must be accept-or-reject, cluster-visibly. **Carve-out:** §7's
-raise-only serving fence is *not* an I0 violation — withholding service does not
-change who the committed master is.
+Land this first; #99 (regime-fenced failover) after — this answers *who is
+master*, #99 answers *how a transfer is made safe*, and a regime fence is
+meaningless while nodes disagree about who the master is. Carried over now:
+**I0** (no node-local commit-apply gates) and **I6** (no bundling). **Carve-out:**
+§7's raise-only serving fence is not an I0 violation — withholding service does
+not change who the committed master is.
 
 ---
 
 ## 15. Expected effect on the E2E suite
 
 Scenarios 05–09 are non-deterministic because convergence needs several
-reactivation rounds and lands near their 60–120s budgets; two CI runs of
-byte-identical code returned 6/14 and 8/14. Agreement plus §5's anchor should
-cut the round count.
-
-**Prediction, not a claim**, and weaker than rev 1 implied: the harness has a
-known independent flakiness cause on record (`migration_pool_size 128 >
-max_connections_per_ip 64` starving shard migration). Attributing part of the
-15/17 residue here is speculation. Falsify by running twice at a fixed SHA.
+reactivation rounds near their 60–120s budgets; two CI runs of byte-identical
+code returned 6/14 and 8/14. Agreement plus §5's anchor should cut the round
+count. **Prediction, not a claim**: the harness has a known independent
+flakiness cause on record (`migration_pool_size 128 > max_connections_per_ip
+64`). Falsify by running twice at a fixed SHA.
 
 ---
 
-## 16. Open for the third review round
+## 16. Implementation order
 
-1. §5's anchor makes `prev_committed` an input to the election. On the **first**
-   term after this ships there is none. Is bootstrapping from `det` safe, or
-   does it need its own term?
-2. §7's raise-only fence depends on `local_holder_check`. What exactly proves
-   "holds the shard" — `shard_record_count > 0` is wrong for a legitimately
-   empty shard.
-3. §12 concludes containment is weak for `n ≤ RF` and proposes gating on
-   authentication. Is that sufficient for a 3-node RF=3 deployment, or does
-   small-cluster mastership need a different bound entirely?
-4. §4.5: what should a node that never voted at T do in a cluster where it is
-   the only survivor of a partition — withhold authority forever?
+1. **Rule 2 (strictly-ascending `members`)** — both reviewers say land it
+   independently; it is a latent same-term split vector in today's code.
+2. Rule 10 (member-growth bound) — closes a pre-existing one-frame permanent
+   wedge.
+3. §10 persistence: CRC + bounds + presence flag; persist the winning commit.
+4. §4 attestation (digest, `voted_digest`, recompute-from-bytes).
+5. §5 conditional anchor + §11 replica swap.
+6. §6/§6.1 validation and reject-not-fence.
+7. §7 provenance fence.
+8. §8 the ten sites + R5's authority predicate.
+9. §12 harness secret + armed-state unanimity gate.
+10. §9 detection — **alert-only first**; the fence arms behind the operator
+    switch once 1–9 are green.
