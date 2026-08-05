@@ -61,10 +61,13 @@ pub struct ReplicationConfig {
     pub replication_timeout: Duration,
     /// Entries per catchup batch.
     pub catchup_batch_size: usize,
-    /// Maximum redo-derived operations to send to one replica in one
-    /// catch-up pass. This bounds how long a lagging replica can monopolize
-    /// the catch-up loop before live replication and other replicas get a
-    /// scheduling opportunity.
+    /// Redo-derived operations per catch-up pass — the CHUNK size of the
+    /// stream-until-converged loop (`durable::run_catchup_to_convergence`).
+    /// Each pass streams up to this many ops and waits for the replica's
+    /// synchronous ACK before the next chunk; the loop runs passes
+    /// back-to-back until the replica converges, so this no longer bounds
+    /// per-tick progress — it bounds how much is in flight between ACKs
+    /// and how long one replica holds a migration-throttle admission.
     pub catchup_max_ops_per_pass: usize,
 }
 
