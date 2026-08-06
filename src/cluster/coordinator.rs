@@ -14339,6 +14339,219 @@ mod tests {
         )));
     }
 
+    /// I12 — total sender coverage, migration arm: the migration BASELINE
+    /// and DELTA batches emit V3 wire frames carrying the dispatch-captured
+    /// regime stamps (leaving them on V2 would leave the fence's most
+    /// dangerous paths — the sequence-dedup-bypassing migration frames —
+    /// unfenced, and enabling enforcement would halt all data movement).
+    /// Asserted on the WIRE BYTES: version byte `BATCH_PROTOCOL_V3` and the
+    /// stamp round-tripping through the decode, on a frame flagged
+    /// `FLAG_MIGRATION_BATCH`.
+    #[test]
+    fn i12_migration_baseline_and_delta_emit_v3_with_captured_stamps() {
+        use std::io::{Read, Write};
+
+        let engine = test_engine();
+        let shard = 75u16;
+        let live_key = tx_key_for_shard(shard, 1);
+        create_test_record(&engine, live_key);
+
+        // One accept loop serving two exchanges (baseline, then delta).
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let receiver = std::thread::spawn(move || {
+            let mut captured = Vec::new();
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut header = [0u8; 4];
+                stream.read_exact(&mut header).unwrap();
+                let payload_len = u32::from_le_bytes(header) as usize;
+                let mut body = vec![0u8; payload_len];
+                stream.read_exact(&mut body).unwrap();
+                let mut frame_bytes = header.to_vec();
+                frame_bytes.extend_from_slice(&body);
+                let (request, _) =
+                    crate::protocol::frame::RequestFrame::decode(&frame_bytes).unwrap();
+                let response = crate::protocol::frame::ResponseFrame {
+                    request_id: request.request_id,
+                    status: crate::protocol::opcodes::STATUS_OK,
+                    payload: crate::replication::protocol::ReplicaAck::Ok {
+                        through_sequence: 0,
+                    }
+                    .serialize(),
+                };
+                stream.write_all(&response.encode()).unwrap();
+                captured.push(request);
+            }
+            captured
+        });
+
+        let stamps: Vec<(u16, u64)> = vec![(shard, 6)];
+        let task = MigrationTask {
+            shard,
+            from_node: NodeId(1),
+            to_node: NodeId(2),
+            is_master: true,
+        };
+        let mut stream = std::net::TcpStream::connect(addr).unwrap();
+        stream_shard_baseline(
+            &task,
+            &[&live_key],
+            &engine,
+            &mut stream,
+            64,
+            /* cluster_key */ 6,
+            None,
+            Some(&stamps),
+        )
+        .unwrap();
+        drop(stream);
+        let mut stream = std::net::TcpStream::connect(addr).unwrap();
+        send_delta_ops(
+            &mut stream,
+            shard,
+            &[crate::replication::protocol::ReplicaOp::Spend {
+                tx_key: live_key,
+                offset: 0,
+                spending_data: [0u8; 36],
+                current_block_height: 0,
+                block_height_retention: 0,
+                master_generation: 0,
+            }],
+            /* cluster_key */ 6,
+            None,
+            Some(&stamps),
+        )
+        .unwrap();
+
+        let captured = receiver.join().unwrap();
+        for (name, request) in ["baseline", "delta"].iter().zip(&captured) {
+            assert_eq!(request.op_code, crate::protocol::opcodes::OP_REPLICA_BATCH);
+            assert_eq!(
+                request.flags & crate::protocol::opcodes::FLAG_MIGRATION_BATCH,
+                crate::protocol::opcodes::FLAG_MIGRATION_BATCH,
+                "{name} frame must carry the migration flag",
+            );
+            assert_eq!(
+                request.payload[0],
+                crate::replication::protocol::BATCH_PROTOCOL_V3,
+                "I12: the {name} batch must be a V3 frame on the wire",
+            );
+            let batch =
+                crate::replication::protocol::ReplicaBatch::deserialize(&request.payload).unwrap();
+            assert_eq!(
+                batch.regime_table.as_deref(),
+                Some(stamps.as_slice()),
+                "I12: the {name} batch must carry the dispatch-captured stamps",
+            );
+        }
+    }
+
+    /// I12 — a migration sender receiving `ERR_STALE_REGIME` treats it as
+    /// ABORT-AND-RE-PLAN after topology refresh, never as a data error: a
+    /// heal/migration source is not necessarily the shard's master and may
+    /// legitimately be behind on terms. Pinned for both the baseline and
+    /// the delta sender: the returned error is the re-plan classification,
+    /// not the "migration batch failed with status"/"failed to parse" data
+    /// shapes.
+    #[test]
+    fn i12_migration_sender_stale_regime_nak_aborts_for_replan() {
+        use std::io::{Read, Write};
+
+        let engine = test_engine();
+        let shard = 76u16;
+        let live_key = tx_key_for_shard(shard, 1);
+        create_test_record(&engine, live_key);
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let receiver = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut header = [0u8; 4];
+                stream.read_exact(&mut header).unwrap();
+                let payload_len = u32::from_le_bytes(header) as usize;
+                let mut body = vec![0u8; payload_len];
+                stream.read_exact(&mut body).unwrap();
+                let mut frame_bytes = header.to_vec();
+                frame_bytes.extend_from_slice(&body);
+                let (request, _) =
+                    crate::protocol::frame::RequestFrame::decode(&frame_bytes).unwrap();
+                // The receiver's regime gate fires: STATUS_ERROR with the
+                // ERR_STALE_REGIME NAK envelope naming (shard, local_regime).
+                let response = crate::protocol::frame::ResponseFrame {
+                    request_id: request.request_id,
+                    status: crate::protocol::opcodes::STATUS_ERROR,
+                    payload: crate::replication::protocol::encode_stale_regime_nak(shard, 9),
+                };
+                stream.write_all(&response.encode()).unwrap();
+            }
+        });
+
+        let stamps: Vec<(u16, u64)> = vec![(shard, 6)];
+        let task = MigrationTask {
+            shard,
+            from_node: NodeId(1),
+            to_node: NodeId(2),
+            is_master: true,
+        };
+        let mut stream = std::net::TcpStream::connect(addr).unwrap();
+        let baseline_err = match stream_shard_baseline(
+            &task,
+            &[&live_key],
+            &engine,
+            &mut stream,
+            64,
+            6,
+            None,
+            Some(&stamps),
+        ) {
+            Err(e) => e,
+            Ok(_) => panic!("a stale-regime NAK must abort the baseline"),
+        };
+        assert!(
+            baseline_err.contains("aborting for re-plan after topology refresh"),
+            "I12: the baseline abort must be the re-plan classification, got: {baseline_err}",
+        );
+        assert!(
+            baseline_err.contains("stale regime (shard 76, receiver committed regime 9)"),
+            "the abort must surface the NAK's routing hint, got: {baseline_err}",
+        );
+        assert!(
+            !baseline_err.contains("failed with status"),
+            "must never be classified as a data error, got: {baseline_err}",
+        );
+        drop(stream);
+
+        let mut stream = std::net::TcpStream::connect(addr).unwrap();
+        let delta_err = send_delta_ops(
+            &mut stream,
+            shard,
+            &[crate::replication::protocol::ReplicaOp::Spend {
+                tx_key: live_key,
+                offset: 0,
+                spending_data: [0u8; 36],
+                current_block_height: 0,
+                block_height_retention: 0,
+                master_generation: 0,
+            }],
+            6,
+            None,
+            Some(&stamps),
+        )
+        .expect_err("a stale-regime NAK must abort the delta send");
+        assert!(
+            delta_err.contains("aborting for re-plan after topology refresh"),
+            "I12: the delta abort must be the re-plan classification, got: {delta_err}",
+        );
+        assert!(
+            !delta_err.contains("failed to parse"),
+            "the NAK must be classified BEFORE the ReplicaAck parse, got: {delta_err}",
+        );
+
+        receiver.join().unwrap();
+    }
+
     /// Task 15: the migration baseline's mined-state step must read from the
     /// authoritative in-RAM `MinedIndex` (via `Engine::mined_block_entries`),
     /// not the device's `meta.block_entries_inline` — migration is
@@ -25266,6 +25479,132 @@ mod tests {
         assert_eq!(decoded.digest, expected);
     }
 
+    /// I9 — regime provenance, the anti-entropy channel end-to-end at the
+    /// unit seam: a puller's regime state is updated ONLY by installing the
+    /// proof-carrying pull's validated commit through the SAME install path
+    /// as a live commit (`handle_commit_durable`, persist-before-adopt).
+    ///
+    /// Composes serve → wire → install exactly as the catch-up loop does
+    /// (`handle_event`'s `TopologyStale` arm feeds the fetched payload to
+    /// `TopologyCommit::deserialize` + `handle_commit_durable` with
+    /// `persist_topology_state_durable`): a valid pull installs the peer's
+    /// committed regime block durably; a TAMPERED pull (regime flipped —
+    /// digest mismatch) is rejected without touching regime state; a
+    /// re-pull at an equal term is NotApplied (strict term monotonicity —
+    /// there is no second write channel). The socket transport itself is
+    /// exercised by the cluster e2e suites; what this pins is that the
+    /// bytes a peer serves cannot move a puller's regime state except
+    /// through the validated install.
+    #[test]
+    fn i9_proof_carrying_pull_is_the_only_regime_provenance_channel() {
+        let members: Vec<NodeId> = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let table = ShardTable::compute_with_epoch(&members, 2, 2, 1);
+        let cluster = new_test_running_cluster(
+            NodeId(1),
+            table,
+            &[
+                (NodeId(1), "127.0.0.1:4621".parse().unwrap()),
+                (NodeId(2), "127.0.0.1:4622".parse().unwrap()),
+                (NodeId(3), "127.0.0.1:4623".parse().unwrap()),
+            ],
+            &members,
+            &[],
+            &[],
+            &[],
+            3,
+        );
+        cluster.topology_authority().set_replication_factor(2);
+        let shard = 9u16;
+        let placement = ShardTable::compute_with_epoch(&members, 2, 1, 1);
+        let replica = placement.assignment(shard).replicas[0];
+        let mut block = crate::cluster::topology::RegimeBlock::default();
+        block.override_map.insert(shard, replica);
+        block.regime.set(shard, 4);
+        let commit = lineage_test_commit(cluster.topology_authority(), 4, &members, block.clone());
+        assert_eq!(cluster.topology_authority().handle_commit(&commit), Some(4));
+        // The peer's served catch-up payload.
+        let served = cluster.encode_committed_topology();
+
+        // The puller: a BEHIND member of the same cluster — installed
+        // committed state at an earlier term (2), empty regime state,
+        // durable state on disk. (A genuinely FRESH node cannot apply an
+        // override-carrying commit at all: I10a's holder set needs
+        // installed committed members — the formation-recovery arm pinned
+        // by `p1_formation_recovery_arm_rejects_override_carrying_terms`
+        // in topology.rs.)
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state_path = dir.path().join("puller.cluster.topo");
+        let puller =
+            crate::cluster::topology::TopologyAuthority::new(NodeId(2), Duration::from_secs(1));
+        puller.set_replication_factor(2);
+        let seed = lineage_test_commit(
+            cluster.topology_authority(),
+            2,
+            &members,
+            Default::default(),
+        );
+        assert_eq!(puller.handle_commit(&seed), Some(2));
+        assert_eq!(puller.committed_regime(shard), 0);
+
+        // Tampered pull first: flip the regime value inside the payload's
+        // decoded form and re-serialize WITHOUT fixing the digest — the
+        // validated-commit check must reject it and regime state must not
+        // move. (I9: an unvalidated byte stream is never authority.)
+        let mut forged = crate::cluster::topology::TopologyCommit::deserialize(&served)
+            .expect("served payload decodes");
+        forged.regime_block.regime.set(shard, u32::MAX as u64);
+        let forged_bytes = forged.serialize();
+        let fetched = crate::cluster::topology::TopologyCommit::deserialize(&forged_bytes)
+            .expect("forged payload still decodes structurally");
+        assert!(
+            matches!(
+                puller.handle_commit_durable(&fetched, 3, 1, |state| {
+                    persist_topology_state_durable(Some(&state_path), state)
+                }),
+                crate::cluster::topology::DurableCommitOutcome::NotApplied
+            ),
+            "a digest-mismatched pull must not install",
+        );
+        assert_eq!(
+            puller.committed_regime(shard),
+            0,
+            "I9: rejected pull bytes must never move regime state",
+        );
+        assert!(
+            !state_path.exists(),
+            "nothing may be persisted for a rejected pull",
+        );
+
+        // The genuine pull: installs through the production install path,
+        // persist-before-adopt, and the peer's regime block is now the
+        // puller's — the ONLY way it got there.
+        let fetched = crate::cluster::topology::TopologyCommit::deserialize(&served)
+            .expect("served payload decodes");
+        assert!(matches!(
+            puller.handle_commit_durable(&fetched, 3, 1, |state| {
+                persist_topology_state_durable(Some(&state_path), state)
+            }),
+            crate::cluster::topology::DurableCommitOutcome::Applied(4)
+        ));
+        assert_eq!(puller.committed_term(), 4);
+        assert_eq!(puller.committed_regime(shard), 4);
+        assert_eq!(puller.committed_master(shard), Some(replica));
+        assert!(state_path.exists(), "the adopted pull is durable");
+
+        // Re-pulling the same term is a no-op: strict monotonicity means
+        // an equal-term byte stream — however crafted — has no install
+        // channel left.
+        let refetched = crate::cluster::topology::TopologyCommit::deserialize(&served)
+            .expect("served payload decodes");
+        assert!(matches!(
+            puller.handle_commit_durable(&refetched, 3, 1, |state| {
+                persist_topology_state_durable(Some(&state_path), state)
+            }),
+            crate::cluster::topology::DurableCommitOutcome::NotApplied
+        ));
+        assert_eq!(puller.committed_regime(shard), 4);
+    }
+
     // -----------------------------------------------------------------------
     // P1 stage 3 — lineage commit-install hook (I2 / I13)
     // -----------------------------------------------------------------------
@@ -25504,6 +25843,183 @@ mod tests {
             "the in-memory lineage rolls back with the refused commit",
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// §4.0 named acceptance test (I0, the committed derivation): two nodes
+    /// at the same committed term — one QUIESCENT, one MID-HANDOFF (live
+    /// `ShardTable` mutated by `begin_handoff`, a `MigrationManager` with a
+    /// pending inbound registration) — must accept/reject an
+    /// override-carrying commit IDENTICALLY, and end at identical installed
+    /// committed state.
+    ///
+    /// The adversarial sharpening: the invalid commit's override target is
+    /// chosen to be the mid-handoff node's LIVE `effective_assignment`
+    /// master for the shard (mid-handoff runtime state says "that node is
+    /// serving this shard right now") while being OUTSIDE the shard's
+    /// committed holder set. An applier that consulted runtime state —
+    /// `effective_assignment`, the live table, migration state — would
+    /// accept on the mid-handoff node and reject on the quiescent one:
+    /// dual-serving by construction (the R4/#76 failure mode). I0 requires
+    /// every rejecting clause to be derivable from (the commit) + (the
+    /// node's installed committed state) alone, so both nodes must REJECT.
+    ///
+    /// Both nodes run the FULL production apply path
+    /// (`handle_commit_durable` with the `lineage_apply_committed_state`
+    /// install hook — the only seam through which the live table enters the
+    /// apply at all), not just the bare gate function.
+    #[test]
+    fn i0_mid_handoff_and_quiescent_nodes_decide_override_commit_identically() {
+        let members = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let placement = ShardTable::compute_with_epoch(&members, 2, 1, 1);
+
+        // A shard with exactly one committed outsider Z (3 members, RF=2:
+        // assignment = master + one replica), and its committed replica R.
+        let shard = (0..NUM_SHARDS as u16)
+            .find(|&s| placement.assignment(s).replicas.len() == 1)
+            .expect("RF=2 placement over 3 members has a single-replica shard");
+        let committed_master = placement.assignment(shard).master;
+        let replica = placement.assignment(shard).replicas[0];
+        let outsider = members
+            .iter()
+            .copied()
+            .find(|n| *n != committed_master && *n != replica)
+            .expect("exactly one member is outside the shard's holder set");
+
+        // Build one node: authority + lineage store + live table +
+        // serving-established bitmap, wired through the production
+        // commit-install hook.
+        let build_node = |self_id: NodeId, live_table: ShardTable| {
+            let epoch = [7u8; crate::cluster::lineage::DATA_EPOCH_LEN];
+            let lineage = Arc::new(crate::cluster::lineage::LineageStore::open(
+                None, epoch, self_id,
+            ));
+            let authority = Arc::new(crate::cluster::topology::TopologyAuthority::new(
+                self_id,
+                Duration::from_secs(1),
+            ));
+            authority.set_replication_factor(2);
+            let shard_table = Arc::new(ShardTableLock::new(live_table));
+            let established = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+            established.set_all();
+            {
+                let lineage = lineage.clone();
+                let shard_table = shard_table.clone();
+                let established = established.clone();
+                authority.set_commit_install_hook(Arc::new(move |state, prev| {
+                    lineage_apply_committed_state(
+                        &lineage,
+                        self_id,
+                        2,
+                        state,
+                        prev,
+                        &shard_table,
+                        &established,
+                    )
+                }));
+            }
+            (authority, shard_table)
+        };
+
+        // Node A (quiescent): live table = the committed placement.
+        let (auth_a, _table_a) = build_node(NodeId(2), placement.clone());
+
+        // Node B (mid-handoff): its live table is transitioning FROM a
+        // state where the outsider Z was serving `shard` TO the committed
+        // placement — `begin_handoff` leaves the shard `Copying`, so the
+        // LIVE `effective_assignment(shard).master` is Z while the
+        // committed derivation says otherwise.
+        let mut b_live = placement.clone();
+        b_live.apply_override_master(shard, outsider);
+        b_live.begin_handoff(&placement);
+        let (auth_b, table_b) = build_node(NodeId(1), b_live);
+        assert_eq!(
+            table_b.read().effective_assignment(shard).master,
+            outsider,
+            "precondition: node B's RUNTIME state names the outsider as the \
+             shard's currently-serving master (mid-handoff)",
+        );
+        // ...and a MigrationManager mid-handoff: a pending inbound
+        // registration for the shard, sourced from the outsider.
+        let mut migration = crate::cluster::migration::MigrationManager::new();
+        assert!(migration.mark_inbound_active(shard));
+        assert!(migration.register_inbound_source(shard, outsider));
+
+        // Both nodes install the same baseline committed term.
+        let commit1 = lineage_test_commit(&auth_a, 10, &members, Default::default());
+        for auth in [&auth_a, &auth_b] {
+            assert!(matches!(
+                auth.handle_commit_durable(&commit1, 3, 1, |_| true),
+                crate::cluster::topology::DurableCommitOutcome::Applied(10)
+            ));
+        }
+
+        // INVALID override-carrying commit: target = the outsider — the
+        // node B runtime state says it is serving the shard, the committed
+        // holder set says it holds nothing (I10a).
+        let mut bad_block = crate::cluster::topology::RegimeBlock::default();
+        bad_block.override_map.insert(shard, outsider);
+        bad_block.regime.set(shard, 11);
+        let bad_commit = lineage_test_commit(&auth_a, 11, &members, bad_block);
+        let verdict_a = auth_a.handle_commit_durable(&bad_commit, 3, 1, |_| true);
+        let verdict_b = auth_b.handle_commit_durable(&bad_commit, 3, 1, |_| true);
+        assert!(
+            matches!(
+                verdict_a,
+                crate::cluster::topology::DurableCommitOutcome::NotApplied
+            ),
+            "quiescent node must reject the non-holder override (I10a)",
+        );
+        assert!(
+            matches!(
+                verdict_b,
+                crate::cluster::topology::DurableCommitOutcome::NotApplied
+            ),
+            "I0: the mid-handoff node must reject IDENTICALLY — its live \
+             effective_assignment naming the target as currently serving \
+             must not influence the apply decision",
+        );
+        assert_eq!(auth_a.committed_term(), 10);
+        assert_eq!(auth_b.committed_term(), 10);
+
+        // VALID override-carrying commit at the same term: target = the
+        // committed replica (a pre-override holder, I3). Both must accept.
+        let mut good_block = crate::cluster::topology::RegimeBlock::default();
+        good_block.override_map.insert(shard, replica);
+        good_block.regime.set(shard, 11);
+        let good_commit = lineage_test_commit(&auth_a, 11, &members, good_block.clone());
+        for (name, auth) in [("quiescent", &auth_a), ("mid-handoff", &auth_b)] {
+            assert!(
+                matches!(
+                    auth.handle_commit_durable(&good_commit, 3, 1, |_| true),
+                    crate::cluster::topology::DurableCommitOutcome::Applied(11)
+                ),
+                "the {name} node must accept the holder-swap override",
+            );
+        }
+
+        // Identical resulting installed committed state on both nodes.
+        assert_eq!(auth_a.committed_term(), auth_b.committed_term());
+        assert_eq!(
+            auth_a.committed_regime_block(),
+            auth_b.committed_regime_block(),
+            "identical committed regime state after the same commit",
+        );
+        assert_eq!(auth_a.committed_regime_block(), good_block);
+        assert_eq!(auth_a.committed_members(), auth_b.committed_members());
+        assert_eq!(
+            auth_a.committed_master(shard),
+            auth_b.committed_master(shard),
+        );
+        assert_eq!(auth_a.committed_master(shard), Some(replica));
+
+        // Node B's runtime state was neither consulted nor clobbered by the
+        // apply: still mid-handoff, inbound migration still pending (table
+        // activation for the term is a separate, later step — I1).
+        assert_eq!(table_b.read().effective_assignment(shard).master, outsider);
+        assert!(
+            migration.inbound_bitmap().test(shard),
+            "the pending inbound migration registration survives the applies untouched",
+        );
     }
 
     /// §4.3 triggers (b)/(f) — an inbound migration beginning degrades the

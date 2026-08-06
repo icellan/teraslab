@@ -879,6 +879,90 @@ mod tests {
         ids.iter().map(|&id| NodeId(id)).collect()
     }
 
+    /// I3 — promotion is a holder swap, applier-side post-state: `master
+    /// := R`, `replicas := (pre-override holder set ∖ {R})` — cardinality
+    /// preserved, the demoted master M lands in R's replica slot (so M
+    /// keeps receiving the write fan-out and can re-earn `Full`), and the
+    /// post-override replica set is NEVER empty. Plus the documented
+    /// honest-minimal deviation: a committed override whose target is not
+    /// currently a placement replica installs anyway, with the displaced
+    /// master APPENDED to the replica set (it may exceed rf-1 by one until
+    /// the override retires) — never dropped.
+    #[test]
+    fn i3_override_swap_post_state_preserves_cardinality_and_demotes_master() {
+        let members = nodes(&[1, 2, 3]);
+        let mut table = ShardTable::compute_with_epoch(&members, 2, 1, 1);
+        let shard = (0..NUM_SHARDS as u16)
+            .find(|&s| table.assignment(s).replicas.len() == 1)
+            .expect("RF=2 over 3 members yields master + one replica");
+        let pre = table.assignment(shard).clone();
+        let master = pre.master;
+        let replica = pre.replicas[0];
+        let mut pre_holders: Vec<NodeId> = vec![pre.master];
+        pre_holders.extend_from_slice(&pre.replicas);
+
+        // The I3 swap: promote the replica.
+        table.apply_override_master(shard, replica);
+        let post = table.assignment(shard);
+        assert_eq!(post.master, replica, "master := R");
+        assert_eq!(
+            post.replicas,
+            vec![master],
+            "replicas := pre-override holder set ∖ {{R}} — the demoted master \
+             takes R's slot, so it keeps receiving the write fan-out",
+        );
+        assert!(
+            !post.replicas.is_empty(),
+            "a promoted shard must never degenerate to zero replication targets",
+        );
+        let mut post_holders: Vec<NodeId> = vec![post.master];
+        post_holders.extend_from_slice(&post.replicas);
+        pre_holders.sort_unstable_by_key(|n| n.0);
+        post_holders.sort_unstable_by_key(|n| n.0);
+        assert_eq!(
+            pre_holders, post_holders,
+            "the swap preserves the holder set (and its cardinality) exactly",
+        );
+        assert_eq!(
+            table.intended_master(shard),
+            replica,
+            "the committed derivation, not the placement pick, is the intent",
+        );
+
+        // Idempotent re-apply (the committed map re-installs on every
+        // activation): no growth, no change.
+        table.apply_override_master(shard, replica);
+        assert_eq!(table.assignment(shard).master, replica);
+        assert_eq!(table.assignment(shard).replicas, vec![master]);
+
+        // Deviation arm: a standing override target that is NOT currently
+        // a placement replica (post-membership-change survivor). The
+        // displaced master must be appended, never dropped, and the set
+        // may exceed rf-1 by one.
+        let outsider = members
+            .iter()
+            .copied()
+            .find(|n| *n != master && *n != replica)
+            .expect("one member is outside the pre-override pair");
+        let mut table2 = ShardTable::compute_with_epoch(&members, 2, 1, 1);
+        table2.apply_override_master(shard, outsider);
+        let post2 = table2.assignment(shard);
+        assert_eq!(post2.master, outsider);
+        assert!(
+            post2.replicas.contains(&master),
+            "the displaced placement master is demoted into an appended slot",
+        );
+        assert!(
+            post2.replicas.contains(&replica),
+            "the standing placement replica keeps its slot",
+        );
+        assert_eq!(
+            post2.replicas.len(),
+            2,
+            "the appended-demotion arm exceeds rf-1 by exactly one",
+        );
+    }
+
     /// W1.1 FIX C — `intended_masters` tracks the activation's intent:
     /// set by `compute_with_epoch` and `begin_handoff_with`, kept in sync
     /// by `set_master_for_shard` (master election), and deliberately NOT

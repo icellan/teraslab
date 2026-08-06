@@ -8974,6 +8974,151 @@ mod tests {
         );
     }
 
+    /// I8, first clause — a promotion is only applied via a term STRICTLY
+    /// greater than the previous committed term: an override-carrying
+    /// commit at an equal (or lower) term never installs, and regime state
+    /// does not move. This is what makes the `cluster_key <
+    /// local_cluster_key` replay gate equivalent to "installed the
+    /// promoting commit" in I8's precise form.
+    #[test]
+    fn i8_promotion_commit_at_non_advancing_term_never_applies() {
+        let auth = seed_regime_authority(1);
+        let mems = members(&[1, 2, 3]);
+        let shard = 65u16;
+        let (_, r) = placement_pair(&mems, shard);
+        // Advance to committed term 3 with no overrides.
+        assert_eq!(
+            auth.handle_commit(&commit_with_block(
+                3,
+                mems.clone(),
+                3,
+                RegimeBlock::default()
+            )),
+            Some(3)
+        );
+
+        // An otherwise-valid promotion at the SAME term (3): never applied.
+        let mut block = RegimeBlock::default();
+        block.override_map.insert(shard, r);
+        block.regime.set(shard, 3);
+        assert!(
+            auth.handle_commit(&commit_with_block(3, mems.clone(), 3, block.clone()))
+                .is_none(),
+            "I8: a promotion at a non-advancing (equal) term must not apply",
+        );
+        // ...and at a LOWER term (2): never applied.
+        let mut lower = RegimeBlock::default();
+        lower.override_map.insert(shard, r);
+        lower.regime.set(shard, 2);
+        assert!(
+            auth.handle_commit(&commit_with_block(2, mems.clone(), 3, lower))
+                .is_none(),
+            "I8: a promotion at a lower term must not apply",
+        );
+        assert_eq!(auth.committed_term(), 3);
+        assert_eq!(auth.committed_regime(shard), 0, "regime state untouched");
+        assert_ne!(
+            auth.committed_master(shard),
+            Some(r),
+            "the refused promotion must not surface in the committed derivation",
+        );
+
+        // The identical promotion at term 4 (strictly greater) applies —
+        // the term advance IS what carries a promotion.
+        let mut ok = RegimeBlock::default();
+        ok.override_map.insert(shard, r);
+        ok.regime.set(shard, 4);
+        assert_eq!(
+            auth.handle_commit(&commit_with_block(4, mems, 3, ok)),
+            Some(4)
+        );
+        assert_eq!(auth.committed_master(shard), Some(r));
+        assert_eq!(auth.committed_regime(shard), 4);
+    }
+
+    /// I4 — a later `promotion_enabled = false` does NOT un-promote an
+    /// already-committed override: regimes ratchet (I10d) and un-promoting
+    /// is a new mastership change needing its own term. The disable commit
+    /// (I6-unbundled: same override map, flag change only) installs, and
+    /// the standing override — master, regime, map entry — is untouched.
+    #[test]
+    fn i4_disabling_promotion_does_not_unpromote_standing_override() {
+        let auth = seed_promotion_authority(1); // seeds promotion_enabled at term 2
+        let mems = members(&[1, 2, 3]);
+        let shard = 8u16;
+        let (master, replica) = placement_pair(&mems, shard);
+        // Committed promotion at term 3.
+        let mut block = RegimeBlock::default();
+        block.override_map.insert(shard, replica);
+        block.regime.set(shard, 3);
+        block.promotion_enabled = true; // unchanged from the seeded state (I6)
+        assert_eq!(
+            auth.handle_commit(&commit_with_block(3, mems.clone(), 3, block.clone())),
+            Some(3)
+        );
+        assert_eq!(auth.committed_master(shard), Some(replica));
+
+        // Term 4 flips promotion_enabled OFF — same override map (not
+        // override-carrying, so the flag change is legal under I6).
+        let mut off = block.clone();
+        off.promotion_enabled = false;
+        assert_eq!(
+            auth.handle_commit(&commit_with_block(4, mems, 3, off)),
+            Some(4),
+            "the unbundled disable commit must install",
+        );
+        assert!(!auth.committed_promotion_enabled());
+        assert_eq!(
+            auth.committed_master(shard),
+            Some(replica),
+            "I4: disabling promotion must NOT un-promote the standing override",
+        );
+        assert_eq!(auth.committed_regime(shard), 3, "the regime stands");
+        assert_ne!(auth.committed_master(shard), Some(master));
+    }
+
+    /// §5.5 / I10 — there is NO numeric override cap: a single master death
+    /// legitimately overrides every shard that master held (~NUM_SHARDS/N),
+    /// and clauses (a)–(e) bound forgery damage instead of a count. A
+    /// mass-failover commit overriding EVERY shard mastered by one node
+    /// must clear the apply gates.
+    #[test]
+    fn i10_no_numeric_override_cap_mass_failover_commit_applies() {
+        let auth = seed_regime_authority(1);
+        let mems = members(&[1, 2, 3]);
+        let placement = crate::cluster::shards::ShardTable::compute_with_epoch(&mems, 2, 1, 1);
+        let dead = NodeId(3);
+        let mut block = RegimeBlock::default();
+        let mut count = 0usize;
+        for s in 0..crate::cluster::shards::NUM_SHARDS as u16 {
+            let a = placement.assignment(s);
+            if a.master == dead {
+                // Promote the shard's surviving replica (a pre-override
+                // holder — I3/I10a).
+                let target = a
+                    .replicas
+                    .iter()
+                    .copied()
+                    .find(|n| *n != dead)
+                    .expect("RF=2 placement over 3 members has a surviving replica");
+                block.override_map.insert(s, target);
+                block.regime.set(s, 2);
+                count += 1;
+            }
+        }
+        assert!(
+            count >= crate::cluster::shards::NUM_SHARDS / 4,
+            "the dead node must have mastered a substantial shard count (got {count})",
+        );
+        assert_eq!(
+            auth.handle_commit(&commit_with_block(2, mems, 3, block.clone())),
+            Some(2),
+            "I10/§5.5: a mass-failover override commit ({count} overrides) must apply — \
+             no numeric cap may block the primary use case",
+        );
+        assert_eq!(auth.committed_regime_block().override_map.len(), count);
+    }
+
     #[test]
     fn standing_override_rides_later_commits_without_revalidation() {
         let auth = seed_regime_authority(1);

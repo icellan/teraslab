@@ -8855,6 +8855,192 @@ mod tests {
         assert_eq!(engine.read_slot(&k, 0).unwrap().status, UTXO_SPENT);
     }
 
+    /// I1 — install ordering, pinned at the receiver gate: a batch stamped
+    /// at the old regime is rejected THE INSTANT the promoting commit
+    /// installs (the `handle_commit` call that advances `committed_term`),
+    /// STRICTLY BEFORE any shard table for the term activates.
+    ///
+    /// The receiver's gate reads `TopologyAuthority::committed_regime`
+    /// directly, so the same physical batch flips accept→reject across the
+    /// single `handle_commit` call, while the coordinator-side serving
+    /// surfaces are deliberately left stale: the stand-in live shard table
+    /// is never activated (version unchanged) and the receiver's
+    /// `local_cluster_key` argument still carries the OLD term — exactly
+    /// the gate-closed-but-not-yet-serving skew I1 permits. The reverse
+    /// skew (old-regime batch still accepted after the `committed_term`
+    /// store) is the double-spend window and is what the second delivery
+    /// pins shut. (The intra-`apply_commit_locked` write order — regime
+    /// block before the `committed_term` store, under `commit_apply` — is
+    /// asserted structurally by `apply_installs_regime_block_with_
+    /// committed_term` in topology.rs; this test pins the externally
+    /// observable half.)
+    #[test]
+    fn i1_old_regime_batch_rejected_at_commit_install_before_table_activation() {
+        use crate::cluster::shards::{NodeId, ShardTable};
+        use crate::cluster::topology::{RegimeBlock, TopologyCommit, TopologyTerm};
+
+        let engine = make_engine();
+        let k = key(96);
+        create_record(&engine, k, 4);
+        let shard = ShardTable::shard_for_key(&k);
+        // Live authority at term 10, regime[shard] = 10, enforcement on.
+        let authority = regime_authority(10, &[(shard, 10)], true, true);
+        // RF matters to the apply gates' holder-set computation (I10a).
+        authority.set_replication_factor(2);
+        let members = vec![NodeId(1), NodeId(2)];
+        // Stand-in for the coordinator's LIVE serving table, at the
+        // pre-commit version. Nothing in this test activates it.
+        let live_table =
+            parking_lot::RwLock::new(ShardTable::compute_with_epoch(&members, 2, 10, 1));
+
+        let last_applied = Arc::new(AtomicU64::new(0));
+        let tracker = ReplicaAppliedTracker::in_memory();
+
+        // The old master's batch: current cluster_key, stamped at the
+        // still-current regime 10. Accepted before the install.
+        let batch = batch_with_regime(1, k, 0..1, 10, Some(vec![(shard, 10)]));
+        let resp = handle_replica_batch_regime_gated(
+            &batch_request(&batch, 1),
+            &engine,
+            &last_applied,
+            Some(&tracker),
+            DEFAULT_STREAM_KEY,
+            10,
+            Some(&authority),
+            None,
+        );
+        assert_eq!(resp.status, STATUS_OK, "pre-install, the stamp is current");
+
+        // The promoting commit: term 11, override swaps the shard's master
+        // to the other holder, regime[shard] = 11. Installed through the
+        // production apply path — this is the `committed_term` store.
+        let placement = ShardTable::compute_with_epoch(&members, 2, 1, 1);
+        let promoted = if placement.assignment(shard).master == NodeId(1) {
+            NodeId(2)
+        } else {
+            NodeId(1)
+        };
+        let mut block = RegimeBlock::default();
+        block.override_map.insert(shard, promoted);
+        block.regime.set(shard, 11);
+        block.regime_enforced = true;
+        let cluster_id = authority.cluster_id();
+        let digest =
+            TopologyTerm::compute_digest(11, &cluster_id, &members, 1, 2, NodeId(1), &block);
+        let commit = TopologyCommit {
+            term: 11,
+            proposer: NodeId(1),
+            members: members.clone(),
+            cluster_id,
+            placement_version: 1,
+            committed_peak: 2,
+            digest,
+            voters: members,
+            regime_block: block,
+        };
+        assert_eq!(authority.handle_commit(&commit), Some(11));
+        assert_eq!(authority.committed_term(), 11);
+
+        // THE PIN: the same physical batch — same bytes, same (old)
+        // local_cluster_key, live table still at the pre-commit version —
+        // is now rejected at the regime gate. The fence closed with the
+        // install alone; table activation never ran.
+        let next = batch_with_regime(2, k, 1..2, 10, Some(vec![(shard, 10)]));
+        let resp = handle_replica_batch_regime_gated(
+            &batch_request(&next, 2),
+            &engine,
+            &last_applied,
+            Some(&tracker),
+            DEFAULT_STREAM_KEY,
+            10,
+            Some(&authority),
+            None,
+        );
+        assert_eq!(
+            resp.status, STATUS_ERROR,
+            "I1: the old-regime batch dies the instant committed_term advances",
+        );
+        assert_eq!(decode_error_code(&resp.payload), ERR_STALE_REGIME);
+        assert_eq!(
+            crate::replication::protocol::decode_stale_regime_nak(&resp.payload),
+            Some((shard, 11)),
+            "the gate reads the freshly installed regime",
+        );
+        assert_eq!(
+            live_table.read().version,
+            10,
+            "no table activation occurred — the reject preceded it",
+        );
+        assert_eq!(
+            engine.read_slot(&k, 1).unwrap().status,
+            UTXO_UNSPENT,
+            "the rejected batch's spend must not land",
+        );
+        assert_eq!(
+            tracker.get(DEFAULT_STREAM_KEY),
+            batch.last_sequence(),
+            "the watermark holds at the pre-install batch",
+        );
+    }
+
+    /// I8, precise form, the NOT-installed arm: a receiver that has NOT
+    /// installed the promoting commit takes the accept-newer arm for a
+    /// replayed pre-failover batch — it applies, and neither the regime
+    /// state nor the committed term move (I9). Such a receiver is not
+    /// serving the promoted mastership either (the I13 serving gate,
+    /// pinned by `i13_serving_gate_blocks_new_master_until_full_then_
+    /// latches`), so the replay cannot land beside a new master's writes —
+    /// I8 deliberately claims this conjunction, NOT the stronger "dies
+    /// everywhere". The installed-receiver arm (wholesale rejection at the
+    /// `cluster_key` gate) is pinned by the §4.7 captured-frame test
+    /// `migration_delta_reassign_replay_rejected_wholesale_after_promotion`
+    /// in tests/g8_e4_tcp_frame_replay.rs.
+    #[test]
+    fn i8_uninstalled_receiver_takes_accept_newer_arm_and_learns_nothing() {
+        let engine = make_engine();
+        let k = key(97);
+        create_record(&engine, k, 3);
+        let shard = crate::cluster::shards::ShardTable::shard_for_key(&k);
+        // This receiver is BEHIND: term 4, regime[shard] = 4. The captured
+        // pre-failover frame was stamped at term/regime 5 (the promotion
+        // that superseded it happened at 6, which this node never saw).
+        let authority = regime_authority(4, &[(shard, 4)], true, true);
+
+        let last_applied = Arc::new(AtomicU64::new(0));
+        let tracker = ReplicaAppliedTracker::in_memory();
+
+        let batch = batch_with_regime(1, k, 0..1, 5, Some(vec![(shard, 5)]));
+        let through = batch.last_sequence();
+        let resp = handle_replica_batch_regime_gated(
+            &batch_request(&batch, 1),
+            &engine,
+            &last_applied,
+            Some(&tracker),
+            DEFAULT_STREAM_KEY,
+            4,
+            Some(&authority),
+            None,
+        );
+        assert_eq!(
+            resp.status, STATUS_OK,
+            "I8 precise form: the uninstalled receiver takes the accept-newer arm",
+        );
+        assert_eq!(tracker.get(DEFAULT_STREAM_KEY), through);
+        assert_eq!(engine.read_slot(&k, 0).unwrap().status, UTXO_SPENT);
+        // I9: acceptance teaches the receiver nothing — regime and term
+        // move ONLY via a validated commit install.
+        assert_eq!(
+            authority.committed_regime(shard),
+            4,
+            "the newer stamp must not be learned from the batch",
+        );
+        assert_eq!(
+            authority.committed_term(),
+            4,
+            "the newer cluster_key must not be learned from the batch",
+        );
+    }
+
     /// I12: while enforcement is active, a regime-ABSENT (V2) batch is
     /// rejected with `ERR_STALE_REGIME` — a demoted master cannot evade
     /// the fence by continuing to emit V2. This covers the migration-flag
