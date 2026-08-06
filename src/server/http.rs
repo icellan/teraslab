@@ -1439,6 +1439,26 @@ pub(crate) fn render_metrics_text(
             "teraslab_heal_deadline_alerts_total",
             mm.heal_deadline_alerts.get(),
         );
+        prom_counter(
+            &mut out,
+            "teraslab_converged_signal_refused_total",
+            mm.converged_signal_refused.get(),
+        );
+        prom_gauge(
+            &mut out,
+            "teraslab_lineage_baseline_gap_shards",
+            mm.lineage_baseline_gap_shards.load(Ordering::Relaxed) as u64,
+        );
+        prom_counter(
+            &mut out,
+            "teraslab_regime_lowering_accepted_far_behind_total",
+            mm.regime_lowering_accepted_far_behind.get(),
+        );
+        prom_counter(
+            &mut out,
+            "teraslab_regime_ratchet_rejections_total",
+            mm.regime_ratchet_rejections.get(),
+        );
     }
     if let Some(sw) = swim_metrics() {
         prom_counter(

@@ -536,10 +536,16 @@ fn run_replica_convergence(
             // permanently excluding its shards from promotion eligibility.
             // Best-effort: on failure the next lag-monitor tick's
             // convergence run re-sends.
+            // G-1: carry the sequence the replica durably ACKed on THIS
+            // master's stream. The receiver corroborates it against its own
+            // applied watermark and rejects any frame whose sequence it has
+            // already consumed — the per-opcode dedup guard `auth.rs`
+            // requires of a mutating, non-idempotent inter-node opcode.
             match teraslab::cluster::coordinator::send_replica_converged_signal(
                 addr,
                 &ctx.topology_authority,
                 ctx.source_node_id,
+                last_acked,
                 ctx.auth_secret.as_deref(),
             ) {
                 Ok(0) => {}

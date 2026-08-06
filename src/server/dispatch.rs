@@ -839,7 +839,7 @@ pub(crate) fn handle_request(
         },
         OP_ADMIN_DIAGNOSE_KEY => handle_admin_diagnose_key(request, engine, cluster),
         OP_PARTITION_VERSION_REPORT => handle_partition_version_report(request, engine, cluster),
-        OP_REPLICA_CONVERGED => handle_replica_converged(request, cluster),
+        OP_REPLICA_CONVERGED => handle_replica_converged(request, cluster, conn_state.peer_ip),
         OP_ADMIN_CLUSTER_HEALTH => handle_admin_cluster_health(request, cluster),
         OP_PING => ResponseFrame {
             request_id: request.request_id,
@@ -1017,7 +1017,8 @@ pub(crate) fn handle_request(
                     tracing::info!(
                         shard,
                         cleared,
-                        "OP_MIGRATION_COMPLETE: abort — cleared inbound-pending, source stays authoritative",
+                        "OP_MIGRATION_COMPLETE: abort — cleared inbound-pending and recorded \
+                         a lineage BASELINE GAP (N1); source stays authoritative",
                     );
                 }
                 return ResponseFrame {
@@ -13456,12 +13457,31 @@ fn handle_admin_cluster_health(
 /// completion trigger): a master asserts this node converged on its redo
 /// stream; the cluster re-verifies each `(shard, regime)` entry against
 /// its OWN committed state and local fences before stamping `Full` (see
-/// [`crate::cluster::coordinator::apply_replica_converged_signal`]).
+/// [`crate::cluster::coordinator::apply_replica_converged_signal`] for the
+/// full receiver check-list).
+///
+/// Two inputs come from HERE rather than from the frame:
+///
+/// * **G-1** — the receiver's own durable applied watermark for the
+///   asserting master's stream (`node:{source}`, the key
+///   [`crate::replication::receiver`] labels tracked replica batches
+///   with). It corroborates the master's claim against local durable
+///   state; an uninitialised tracker reads `0` and refuses everything
+///   (fail-closed).
+/// * **G-2** — `peer_ip`, the address the frame actually arrived from.
+///   The payload's `source_node_id` is self-declared and the HMAC proves
+///   only "a cluster-secret holder"; the cluster resolves the claimed id
+///   against its address map and refuses a mismatch.
+///
 /// Response payload: `[stamped:u32]`. Without a cluster the signal is
 /// meaningless and answers `0` (nothing stamped, not an error — the
 /// sender treats the signal as best-effort).
-fn handle_replica_converged(req: &RequestFrame, cluster: Option<&RunningCluster>) -> ResponseFrame {
-    let Some((source, entries)) =
+fn handle_replica_converged(
+    req: &RequestFrame,
+    cluster: Option<&RunningCluster>,
+    peer_ip: Option<std::net::IpAddr>,
+) -> ResponseFrame {
+    let Some((source, asserted_seq, entries)) =
         crate::cluster::coordinator::decode_replica_converged(&req.payload)
     else {
         return error_response(
@@ -13470,8 +13490,14 @@ fn handle_replica_converged(req: &RequestFrame, cluster: Option<&RunningCluster>
             "malformed OP_REPLICA_CONVERGED payload",
         );
     };
+    let applied_seq = REPLICA_APPLIED_TRACKER
+        .get()
+        .map(|t| t.get(&format!("node:{source}")))
+        .unwrap_or(0);
     let stamped = match cluster {
-        Some(c) => c.handle_replica_converged(source, &entries) as u32,
+        Some(c) => {
+            c.handle_replica_converged(source, asserted_seq, &entries, applied_seq, peer_ip) as u32
+        }
         None => 0,
     };
     ResponseFrame {

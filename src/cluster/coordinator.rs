@@ -1722,6 +1722,17 @@ impl ClusterCoordinator {
         // restore-detection belt read back below and at every later boot).
         if let Some(epoch) = current_data_epoch {
             self.topology_authority.set_data_epoch(epoch);
+        } else if topology_state_path.is_some() {
+            // N5 — the belt cannot engage on this node. Say so once, at
+            // startup, rather than letting it be discovered by a silent
+            // non-detection after a restore.
+            tracing::error!(
+                "cluster: no data-epoch identity wired into the topology authority — every \
+                 persisted topology state will record NONE and the F4 epoch-continuity \
+                 gate stays inert. Lineage is also running NON-PERSISTENT (all-Subset), \
+                 so shards re-earn Full through catch-up; fix the data-epoch stamp I/O to \
+                 restore the belt.",
+            );
         }
         // F-6 (I4) — seed the promotion_enabled gauge from the restored
         // committed state (the per-commit refresh keeps it current after).
@@ -1908,6 +1919,7 @@ impl ClusterCoordinator {
                                 &migration_throttle_event,
                                 &cluster_secret_event,
                                 &topology_catchup_inflight,
+                                &lineage_event,
                             );
                             let activated_term = topology_epoch.load(Ordering::Relaxed);
                             if activated_term > last_activated_term {
@@ -2012,6 +2024,7 @@ impl ClusterCoordinator {
                                         &cluster_secret_event,
                                         Some(&topo_authority_event),
                                         None,
+                                        Some(&lineage_event),
                                     );
                                     last_activation_at = std::time::Instant::now();
                                 }
@@ -2154,6 +2167,7 @@ impl ClusterCoordinator {
                         &migration_throttle_event,
                         &cluster_secret_event,
                         &topology_catchup_inflight,
+                        &lineage_event,
                     );
                     let activated_term = topology_epoch.load(Ordering::Relaxed);
                     if activated_term > last_activated_term {
@@ -2563,6 +2577,7 @@ impl ClusterCoordinator {
                                 &cluster_secret_event,
                                 Some(&topo_authority_event),
                                 None,
+                                Some(&lineage_event),
                             );
                         }
                     }
@@ -2672,6 +2687,7 @@ impl ClusterCoordinator {
                         &cluster_secret_event,
                         Some(&topo_authority_event),
                         None,
+                        Some(&lineage_event),
                     );
                     last_activation_at = std::time::Instant::now();
                     if let Some(ref path) = cluster_state_path {
@@ -2755,6 +2771,7 @@ impl ClusterCoordinator {
                         &cluster_secret_event,
                         Some(&topo_authority_event),
                         Some(&serving_established_event),
+                        Some(&lineage_event),
                     );
                     // Reverse-heal Phase 3b — RUNTIME online re-heal. The
                     // partition view just refreshed carries every peer's per-shard
@@ -3086,6 +3103,7 @@ impl ClusterCoordinator {
                                 &cluster_secret_event,
                                 Some(&topo_authority_event),
                                 None,
+                                Some(&lineage_event),
                             );
                         }
                     }
@@ -3223,6 +3241,7 @@ impl ClusterCoordinator {
             stale_suspect_shards: Arc::new(RwLock::new(std::collections::BTreeSet::new())),
             reheal_backoff: reheal_backoff_for_cluster,
             lineage,
+            converged_signal_hwm: Mutex::new(std::collections::HashMap::new()),
             serving_established: serving_established_for_cluster,
             #[cfg(any(test, feature = "fault-injection"))]
             drop_commit_signals: Arc::new(AtomicBool::new(false)),
@@ -3264,6 +3283,10 @@ impl ClusterCoordinator {
         // At most one `TopologyStale` catch-up thread at a time (see
         // `CatchupInFlight`); the event loop owns the slot.
         topology_catchup_inflight: &Arc<std::sync::atomic::AtomicBool>,
+        // §8 review round 2, N1 — the copy-lineage store, threaded into the
+        // activation so a topology supersede that DROPS an in-flight inbound
+        // fence records the resulting partial baseline as a gap.
+        lineage: &Arc<crate::cluster::lineage::LineageStore>,
     ) {
         match event {
             ClusterEvent::NodeJoined(node, addr) => {
@@ -3449,6 +3472,7 @@ impl ClusterCoordinator {
                             cluster_secret,
                             Some(topology_authority),
                             None,
+                            Some(lineage),
                         );
                         // POST-commit persist: the term is already committed +
                         // activated in memory and cannot be rolled back, so this
@@ -3817,6 +3841,11 @@ impl ClusterCoordinator {
         cluster_secret: &Option<Arc<Vec<u8>>>,
         regime_authority: Option<&Arc<crate::cluster::topology::TopologyAuthority>>,
         serving_established: Option<&Arc<crate::cluster::migration::AtomicShardBitmap>>,
+        // §8 review round 2, N1 — the copy-lineage store, so a topology
+        // supersede that DROPS an in-flight inbound fence records the
+        // resulting partial baseline as a gap. `None` (tests / pre-stage-3
+        // paths) simply skips the record.
+        lineage: Option<&Arc<crate::cluster::lineage::LineageStore>>,
     ) {
         let empty_view: std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>> =
             std::collections::HashMap::new();
@@ -3843,6 +3872,7 @@ impl ClusterCoordinator {
             cluster_secret,
             regime_authority,
             serving_established,
+            lineage,
         );
     }
 
@@ -3886,6 +3916,8 @@ impl ClusterCoordinator {
         // masterships (see `ungate_trivially_empty_masterships`). `None`
         // (tests / view-less paths) leaves the gate as installed.
         serving_established: Option<&Arc<crate::cluster::migration::AtomicShardBitmap>>,
+        // §8 review round 2, N1 — see `activate_topology`.
+        lineage: Option<&Arc<crate::cluster::lineage::LineageStore>>,
     ) {
         *active_topology_members.write() = members.to_vec();
 
@@ -4097,13 +4129,35 @@ impl ClusterCoordinator {
                 .collect();
 
             // Phase 3 (short critical section): apply mutations.
-            {
+            let unfenced_by_supersede = {
                 let mut mgr = migration.lock();
                 for t in &stale_tasks {
                     mgr.mark_failed(t);
                 }
-                mgr.clear_inbound();
+                let dropped = mgr.clear_inbound();
                 mgr.cleanup_completed();
+                dropped
+            };
+            // §8 review round 2, N1 — every shard the supersede just
+            // UNFENCED was an in-flight forward inbound: a partially
+            // received baseline whose sole marker of incompleteness was
+            // that fence. Record the gap so the §4.3 catch-up-convergence
+            // trigger cannot certify the partial copy; a shard the fresh
+            // plan re-registers is re-fenced and its completion handshake
+            // clears the gap again.
+            if !unfenced_by_supersede.is_empty()
+                && let Some(lineage) = lineage
+            {
+                lineage.mark_baseline_gap(
+                    &unfenced_by_supersede,
+                    "topology supersede dropped an in-flight inbound fence (§4.3, N1)",
+                );
+                if let Some(m) = crate::metrics::migration_metrics() {
+                    m.lineage_baseline_gap_shards.store(
+                        lineage.baseline_gap_count() as u32,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                }
             }
 
             let preserved_count = preserved_tasks.len();
@@ -6430,11 +6484,22 @@ fn lineage_apply_committed_state(
 /// promotion eligibility reads `lineage_full` from partition reports).
 /// Those shards boot `Subset`, their masterships stay I13-gated, and they
 /// re-earn normally. A topology state with NO recorded epoch (legacy /
-/// first post-upgrade boot) or an unknown current identity is tolerated as
-/// matching — failing closed there would total-outage every healthy master
-/// on upgrade, the exact hazard I13(i) exists to prevent. The `restore()`
-/// tool deletes `.topo` outright (the primary F4 fix); this gate is the
-/// belt for a state file that survives anyway.
+/// first post-upgrade boot) is tolerated as matching — failing closed there
+/// would total-outage every healthy master on upgrade, the exact hazard
+/// I13(i) exists to prevent. The `restore()` tool deletes `.topo` outright
+/// (the primary F4 fix); this gate is the belt for a state file that
+/// survives anyway.
+///
+/// §8 security review round 2, G-4 — a `None` CURRENT epoch is NOT
+/// tolerated when the state file DID record one. `None` here means the
+/// data-epoch stamp could not be read or created (entropy / I/O fault),
+/// which is exactly the condition that also forced a NON-PERSISTENT,
+/// all-`Subset` lineage store. Tolerating it let this re-derivation stamp
+/// `Full` in memory for every committed-master shard, granting serving AND
+/// promotion eligibility to a node whose data identity is unverifiable
+/// against the recorded one. Failing closed costs nothing: the store is
+/// non-persistent anyway, so those shards simply re-earn through
+/// catch-up/heal.
 fn boot_rederive_lineage_and_serving(
     authority: &crate::cluster::topology::TopologyAuthority,
     lineage: &crate::cluster::lineage::LineageStore,
@@ -6450,10 +6515,13 @@ fn boot_rederive_lineage_and_serving(
     }
     let epoch_continuity = match (authority.restored_data_epoch(), current_data_epoch) {
         (Some(recorded), Some(current)) => recorded == current,
-        // No recorded epoch (legacy state) or no current identity
-        // (non-persistent lineage): no mismatch is provable — tolerate
-        // (see the doc comment).
-        _ => true,
+        // G-4 — the state file recorded an identity but this boot has
+        // NONE: the identity cannot be verified, and the same fault made
+        // lineage non-persistent. Fail closed.
+        (Some(_), None) => false,
+        // No recorded epoch (legacy / first post-upgrade boot): no
+        // mismatch is provable — tolerate (see the doc comment).
+        (None, _) => true,
     };
     if !epoch_continuity {
         tracing::warn!(
@@ -7078,10 +7146,21 @@ fn flush_stream_full_candidates(
 // ---------------------------------------------------------------------------
 
 /// F3 — encode the `OP_REPLICA_CONVERGED` payload:
-/// `[source_node_id:8][count:2][(shard:2, regime:8) × count]`.
-pub(crate) fn encode_replica_converged(source_node_id: u64, entries: &[(u16, u64)]) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(8 + 2 + entries.len() * 10);
+/// `[source_node_id:8][asserted_seq:8][count:2][(shard:2, regime:8) × count]`.
+///
+/// §8 security review round 2, G-1: `asserted_seq` is the master's
+/// per-replica stream sequence the convergence loop observed this replica
+/// durably ACK. It is what turns a point-in-time claim into a *checkable,
+/// non-replayable* one — the receiver corroborates it against its own
+/// applied watermark and against a per-source monotonic high-water mark.
+pub(crate) fn encode_replica_converged(
+    source_node_id: u64,
+    asserted_seq: u64,
+    entries: &[(u16, u64)],
+) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(18 + entries.len() * 10);
     buf.extend_from_slice(&source_node_id.to_le_bytes());
+    buf.extend_from_slice(&asserted_seq.to_le_bytes());
     buf.extend_from_slice(&(entries.len() as u16).to_le_bytes());
     for &(shard, regime) in entries {
         buf.extend_from_slice(&shard.to_le_bytes());
@@ -7090,24 +7169,30 @@ pub(crate) fn encode_replica_converged(source_node_id: u64, entries: &[(u16, u64
     buf
 }
 
-/// F3 — decode an `OP_REPLICA_CONVERGED` payload. `None` on any structural
+/// The decoded `OP_REPLICA_CONVERGED` payload:
+/// `(source_node_id, asserted_seq, (shard, regime) entries)`.
+pub(crate) type DecodedReplicaConverged = (u64, u64, Vec<(u16, u64)>);
+
+/// F3 — decode an `OP_REPLICA_CONVERGED` payload into
+/// `(source_node_id, asserted_seq, entries)`. `None` on any structural
 /// fault: truncation, `count > NUM_SHARDS`, out-of-range shard, or
 /// trailing bytes (untrusted-input posture — never a defaulted field).
-pub(crate) fn decode_replica_converged(payload: &[u8]) -> Option<(u64, Vec<(u16, u64)>)> {
-    if payload.len() < 10 {
+pub(crate) fn decode_replica_converged(payload: &[u8]) -> Option<DecodedReplicaConverged> {
+    if payload.len() < 18 {
         return None;
     }
     let source = u64::from_le_bytes(payload[0..8].try_into().ok()?);
-    let count = u16::from_le_bytes(payload[8..10].try_into().ok()?) as usize;
+    let asserted_seq = u64::from_le_bytes(payload[8..16].try_into().ok()?);
+    let count = u16::from_le_bytes(payload[16..18].try_into().ok()?) as usize;
     if count > NUM_SHARDS {
         return None;
     }
-    if payload.len() != 10 + count * 10 {
+    if payload.len() != 18 + count * 10 {
         return None;
     }
     let mut entries = Vec::with_capacity(count);
     for i in 0..count {
-        let off = 10 + i * 10;
+        let off = 18 + i * 10;
         let shard = u16::from_le_bytes(payload[off..off + 2].try_into().ok()?);
         if shard as usize >= NUM_SHARDS {
             return None;
@@ -7115,7 +7200,7 @@ pub(crate) fn decode_replica_converged(payload: &[u8]) -> Option<(u64, Vec<(u16,
         let regime = u64::from_le_bytes(payload[off + 2..off + 10].try_into().ok()?);
         entries.push((shard, regime));
     }
-    Some((source, entries))
+    Some((source, asserted_seq, entries))
 }
 
 /// F3 (sender half) — after a per-replica convergence loop exits
@@ -7126,6 +7211,14 @@ pub(crate) fn decode_replica_converged(payload: &[u8]) -> Option<(u64, Vec<(u16,
 /// regime)` for every shard whose committed-derivation master is
 /// `source_node_id` (self). The replica re-verifies everything against its
 /// OWN state before stamping (see [`apply_replica_converged_signal`]).
+///
+/// `asserted_seq` is the replica's ACK watermark on THIS master's stream
+/// at the moment convergence was observed (`CatchupConvergence::Converged
+/// { last_acked }`). G-1: it is carried so the receiver can (a) corroborate
+/// the claim against its own applied watermark and (b) reject a replayed or
+/// reordered frame through a per-source monotonic high-water mark. A
+/// `asserted_seq == 0` signal asserts nothing checkable and is refused by
+/// the receiver, so it is not sent.
 ///
 /// Returns the number of shard entries sent (`Ok(0)` = nothing to assert,
 /// no frame sent).
@@ -7138,8 +7231,15 @@ pub fn send_replica_converged_signal(
     addr: SocketAddr,
     authority: &crate::cluster::topology::TopologyAuthority,
     source_node_id: u64,
+    asserted_seq: u64,
     auth_secret: Option<&[u8]>,
 ) -> Result<usize, String> {
+    if asserted_seq == 0 {
+        // Nothing was ever streamed on this replica's stream, so there is
+        // no freshness evidence to assert (G-1). The replica re-earns
+        // through its own completion triggers.
+        return Ok(0);
+    }
     let self_node = NodeId(source_node_id);
     let entries: Vec<(u16, u64)> = (0..NUM_SHARDS as u16)
         .filter(|&s| authority.committed_master(s) == Some(self_node))
@@ -7148,7 +7248,7 @@ pub fn send_replica_converged_signal(
     if entries.is_empty() {
         return Ok(0);
     }
-    let payload = encode_replica_converged(source_node_id, &entries);
+    let payload = encode_replica_converged(source_node_id, asserted_seq, &entries);
     send_topology_frame(
         addr,
         crate::protocol::opcodes::OP_REPLICA_CONVERGED,
@@ -7162,30 +7262,63 @@ pub fn send_replica_converged_signal(
 /// `Full{regime}` for every entry that survives LOCAL re-verification.
 /// Returns the number of shards stamped.
 ///
-/// Trust argument (documented per the review): the sender's claim is
-/// "your applied watermark reached my sequence over an intact redo range"
-/// — knowledge only the master-side ACK tracker has. The receiver trusts
-/// that claim exactly as far as it already trusts the same master's
-/// replica stream (the frame is HMAC-authenticated under
-/// `cluster_secret`; in fail-open mode it is forgeable like every other
-/// inter-node frame — the documented trusted-overlay posture). Everything
-/// else is SELF-verified against the receiver's own installed committed
-/// state and local fences, per shard:
+/// # The full receiver check-list (§8 review round 2)
 ///
-/// * the asserting sender IS the shard's committed-derivation master
-///   under MY installed state (only the shard's write authority can
-///   honestly assert my completeness; a demoted/stale master fails here);
-/// * the asserted regime EQUALS my committed regime (a stale signal —
-///   either side behind on terms — stamps nothing, fail-closed);
-/// * self is in the shard's holder set (I2's union: target assignment ∪
-///   live effective master) — a `Full` outside the holder set would
-///   violate I2;
-/// * no inbound/heal fence is up (a mid-fill copy is part baseline and
-///   must complete through its own trigger).
+/// Two FRAME-level checks run first; either one fails the WHOLE signal:
+///
+/// 1. **Freshness / replay (G-1)** — `asserted_seq` must be strictly
+///    greater than this node's per-source high-water mark
+///    (`hwm[source]`). The frame is a point-in-time claim being turned
+///    into a durable one, and `OP_REPLICA_CONVERGED` mutates lineage,
+///    which grants PROMOTION ELIGIBILITY — so per `src/cluster/auth.rs`'s
+///    rule it needs its own dedup guard. A captured (or merely delayed /
+///    reordered) frame re-delivered later asserts a sequence this node has
+///    already consumed and is dropped. *Trust:* the high-water mark is
+///    purely local state; nothing on the wire can lower it.
+/// 2. **Corroboration (G-1)** — this node's OWN applied watermark for the
+///    source's stream (`node:{source}` in the `ReplicaAppliedTracker`)
+///    must be `>= asserted_seq`. The master asserts "you ACKed through
+///    S"; the receiver refuses to take that on faith and checks its own
+///    durable journal. *Trust:* zero — the value is read from local
+///    durable state, so a lying master can only assert a sequence it can
+///    prove was applied, and an uninitialised tracker (`0`) refuses
+///    everything (fail-closed).
+///
+/// Then, PER SHARD (all of these are self-verified against local state —
+/// the sender contributes nothing but the claim):
+///
+/// 3. the asserting sender IS the shard's committed-derivation master
+///    under MY installed committed state (only the shard's write authority
+///    can honestly assert my completeness; a demoted/stale master fails
+///    here). *Trust:* installed committed state, I0-clean.
+/// 4. the asserted regime EQUALS my committed regime (a stale signal —
+///    either side behind on terms — stamps nothing, fail-closed).
+/// 5. self is in the shard's holder set (I2's union: target assignment ∪
+///    live effective master) — a `Full` outside the holder set would
+///    violate I2.
+/// 6. no inbound/heal fence is up (a mid-fill copy is part baseline and
+///    must complete through its own trigger).
+/// 7. **Intact baseline (N1)** — the shard carries no recorded BASELINE
+///    GAP ([`crate::cluster::lineage::LineageStore::has_baseline_gap`]).
+///    §4.3's trigger is "converged over an INTACT BASELINE"; checks 1-6
+///    only establish the converged half. Convergence is evidence about the
+///    REDO STREAM: it repairs a hole caused by missing fan-out for a while
+///    (the writes are still in the master's un-reclaimed redo, which is
+///    why a reclaimed range exits `NeedsResync`, never `Converged`). It is
+///    NO evidence about records that were supposed to arrive OUT OF BAND
+///    as a migration/heal baseline and never did — those were never in the
+///    master's redo range at all. Any path that abandons such a transfer
+///    without a completeness proof records the gap, and only a real
+///    completion trigger clears it.
+///
+/// Caller-enforced, not checkable here: the frame's `source_node_id` must
+/// match the authenticated TCP peer (G-2 — see
+/// [`RunningCluster::handle_replica_converged`]).
 ///
 /// One batched durable lineage write (`mark_full_many`) for the whole
 /// signal. This is a lineage/serving input, never an apply gate — I0 does
 /// not constrain it.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn apply_replica_converged_signal(
     authority: &crate::cluster::topology::TopologyAuthority,
     table: &ShardTable,
@@ -7193,25 +7326,87 @@ pub(crate) fn apply_replica_converged_signal(
     lineage: &crate::cluster::lineage::LineageStore,
     self_id: NodeId,
     source_node_id: u64,
+    asserted_seq: u64,
     entries: &[(u16, u64)],
+    applied_seq: u64,
+    hwm: &Mutex<std::collections::HashMap<NodeId, u64>>,
 ) -> usize {
     let source = NodeId(source_node_id);
+    let refuse_all = |reason: &str| {
+        if let Some(m) = crate::metrics::migration_metrics() {
+            m.converged_signal_refused.inc_by(entries.len() as u64);
+        }
+        tracing::warn!(
+            source = source_node_id,
+            asserted_seq,
+            applied_seq,
+            entries = entries.len(),
+            reason,
+            "cluster: refusing OP_REPLICA_CONVERGED signal (§4.3/G-1)",
+        );
+        0usize
+    };
+    // Check 1 (G-1) — per-source monotonic high-water mark. Claimed and
+    // consumed under one lock so two concurrent deliveries of the same
+    // frame cannot both pass.
+    if asserted_seq == 0 {
+        return refuse_all("asserted sequence is zero — nothing checkable is claimed");
+    }
+    {
+        let mut marks = hwm.lock();
+        let last = marks.entry(source).or_insert(0);
+        if asserted_seq <= *last {
+            let seen = *last;
+            drop(marks);
+            return refuse_all(&format!(
+                "asserted sequence {asserted_seq} <= high-water mark {seen} (replay or reorder)"
+            ));
+        }
+        // Check 2 (G-1) — corroborate against THIS node's own durable
+        // applied watermark before consuming the mark.
+        if applied_seq < asserted_seq {
+            drop(marks);
+            return refuse_all(
+                "this node has not applied through the asserted sequence (uncorroborated claim)",
+            );
+        }
+        *last = asserted_seq;
+    }
     let mut stamps: Vec<(u16, u64)> = Vec::new();
+    let mut refused = 0u64;
     for &(shard, regime) in entries {
+        // Check 3 — the sender is the shard's committed master here.
         if authority.committed_master(shard) != Some(source) {
+            refused += 1;
             continue;
         }
+        // Check 4 — regime currency.
         if authority.committed_regime(shard) != regime {
+            refused += 1;
             continue;
         }
+        // Check 6 — no inbound/heal fence.
         if inbound_bm.test(shard) {
+            refused += 1;
             continue;
         }
+        // Check 7 (N1) — intact baseline.
+        if lineage.has_baseline_gap(shard) {
+            refused += 1;
+            tracing::warn!(
+                shard,
+                source = source_node_id,
+                "cluster: convergence signal refused for a shard with a recorded BASELINE                  GAP — a converged redo stream is no evidence about records that never                  entered the master's redo range (§4.3 'over an intact baseline', N1)",
+            );
+            continue;
+        }
+        // Check 5 — I2 holder-set membership.
         let a = table.target_assignment(shard);
         let holder = a.master == self_id
             || a.replicas.contains(&self_id)
             || table.effective_assignment(shard).master == self_id;
         if !holder {
+            refused += 1;
             continue;
         }
         if matches!(
@@ -7221,6 +7416,11 @@ pub(crate) fn apply_replica_converged_signal(
             continue; // already current — no redundant fsync
         }
         stamps.push((shard, regime));
+    }
+    if refused > 0
+        && let Some(m) = crate::metrics::migration_metrics()
+    {
+        m.converged_signal_refused.inc_by(refused);
     }
     if stamps.is_empty() {
         return 0;
@@ -10617,7 +10817,32 @@ fn persist_topology_state_durable(
     state: &crate::cluster::topology::PersistedTopologyState,
 ) -> bool {
     match path {
-        Some(p) => persist_topology_state(p, state).is_ok(),
+        Some(p) => {
+            // §8 review round 2, N5 — WIRING ASSERTION for the F4
+            // epoch-continuity belt. Every persist path funnels through
+            // here, and every one of them (`persisted_state`,
+            // `persisted_state_for_commit`, the proposer-side persist in
+            // `evaluate_promotion_from_view`) reads the SAME
+            // `TopologyAuthority::data_epoch` field. If that field was never
+            // wired (`RunningCluster::start` calls `set_data_epoch` only
+            // when a data-epoch identity could be resolved), a persisted
+            // state records `None` and the F4 gate silently never engages in
+            // production — while unit tests that construct
+            // `PersistedTopologyState` directly still pass. A `None` epoch
+            // on a node that HAS a state-file path is therefore always
+            // reported, loudly.
+            if state.data_epoch.is_none() {
+                tracing::error!(
+                    path = %p.display(),
+                    "cluster: persisting topology state with NO data_epoch — the F4 \
+                     epoch-continuity gate cannot engage for this and every later boot \
+                     (I13(i) boot re-derivation would trust a restored image). This means \
+                     the data-epoch identity could not be resolved at startup; check the \
+                     preceding 'no trustworthy data-epoch identity' error.",
+                );
+            }
+            persist_topology_state(p, state).is_ok()
+        }
         // Best-effort for a `None` (unconfigured) path — see the doc comment:
         // production clustered nodes always configure a `topology_state_path`,
         // so the misconfigured-clustered-no-path case is a STARTUP-validation
@@ -11677,6 +11902,23 @@ pub struct RunningCluster {
     /// [`RunningCluster::is_lineage_full`]. Test builders get a
     /// non-persistent, all-`Subset` store (the fail-closed default).
     lineage: Arc<crate::cluster::lineage::LineageStore>,
+    /// §8 security review round 2, G-1 — per-source high-water mark of the
+    /// `asserted_seq` carried by accepted `OP_REPLICA_CONVERGED` frames.
+    ///
+    /// This IS the per-opcode dedup guard `src/cluster/auth.rs` demands of
+    /// every mutating inter-node opcode: the auth layer has no nonce /
+    /// sequence, so replay defense is delegated to per-opcode idempotency,
+    /// and opcode 245 is NOT idempotent under replay (it mutates durable
+    /// lineage, which grants promotion eligibility). A frame whose
+    /// `asserted_seq` is `<=` the mark for its source is a replay (or a
+    /// reordered/late delivery) and is dropped whole.
+    ///
+    /// Deliberately NOT persisted: a restart re-derives lineage from the
+    /// persisted sidecar, and the corroboration check (the receiver's own
+    /// durable applied watermark) plus the baseline-gap flag survive the
+    /// restart, so a post-restart replay can only re-assert a claim this
+    /// node's own durable state still supports.
+    converged_signal_hwm: Mutex<std::collections::HashMap<NodeId, u64>>,
     /// P1 stage 4 (I13) — lock-free per-shard "serving as master needs no
     /// Full gate" bitmap, shared with the commit-install hook (which
     /// recomputes it per install) and the boot re-derivation. A CLEAR bit
@@ -12413,7 +12655,45 @@ impl RunningCluster {
     /// committed state and local fences before stamping `Full` (see
     /// [`apply_replica_converged_signal`] for the exact conditions and the
     /// trust argument). Returns the number of shards stamped.
-    pub fn handle_replica_converged(&self, source_node_id: u64, entries: &[(u16, u64)]) -> usize {
+    ///
+    /// `peer_ip` is the address the frame actually arrived FROM.
+    ///
+    /// §8 security review round 2, G-2 — the frame's `source_node_id` is a
+    /// self-declared PAYLOAD field. The HMAC authenticates *a holder of the
+    /// cluster secret*, not *node X*, so without this check any cluster
+    /// member could assert convergence ON BEHALF OF a shard's legitimate
+    /// master and hand a never-converged node promotion eligibility. The
+    /// claimed id must therefore resolve, through this node's `node_addrs`
+    /// map, to the peer that actually sent the frame.
+    ///
+    /// LIMITATION (recorded, not fixed here): the comparison is by IP, not
+    /// by full `SocketAddr` — an inbound connection's source PORT is
+    /// ephemeral and never equals the peer's advertised listen port. Two
+    /// nodes co-located on one IP (single-host test/dev clusters) are
+    /// therefore not distinguishable from each other by this check. It is
+    /// exact for the production one-node-per-host/pod topology, and it is
+    /// strictly stronger than trusting the payload.
+    pub fn handle_replica_converged(
+        &self,
+        source_node_id: u64,
+        asserted_seq: u64,
+        entries: &[(u16, u64)],
+        applied_seq: u64,
+        peer_ip: Option<std::net::IpAddr>,
+    ) -> usize {
+        if !self.converged_signal_peer_matches(source_node_id, peer_ip) {
+            if let Some(m) = crate::metrics::migration_metrics() {
+                m.converged_signal_refused.inc_by(entries.len() as u64);
+            }
+            tracing::warn!(
+                target: "teraslab::security",
+                source = source_node_id,
+                peer = ?peer_ip,
+                "cluster: refusing OP_REPLICA_CONVERGED — the claimed source node does not \
+                 resolve to the sending peer (G-2 impersonation guard)",
+            );
+            return 0;
+        }
         let table = self.shard_table.read();
         apply_replica_converged_signal(
             &self.topology_authority,
@@ -12422,8 +12702,28 @@ impl RunningCluster {
             &self.lineage,
             self.self_id,
             source_node_id,
+            asserted_seq,
             entries,
+            applied_seq,
+            &self.converged_signal_hwm,
         )
+    }
+
+    /// G-2 — does `source_node_id` resolve to `peer_ip` in this node's
+    /// address map? An unknown claimed id, an unknown peer address, or a
+    /// mismatch all answer `false` (fail-closed).
+    fn converged_signal_peer_matches(
+        &self,
+        source_node_id: u64,
+        peer_ip: Option<std::net::IpAddr>,
+    ) -> bool {
+        let Some(peer_ip) = peer_ip else {
+            return false;
+        };
+        self.node_addrs
+            .read()
+            .get(&NodeId(source_node_id))
+            .is_some_and(|a| a.ip() == peer_ip)
     }
 
     /// P1 stage 4 (I4) — propose committing `promotion_enabled = enable`
@@ -12474,19 +12774,56 @@ impl RunningCluster {
     /// recorded — never on an abort. Idempotent: a shard with no matching
     /// pending inbound entry is a no-op (returns `false`).
     ///
+    /// §8 review round 2, N1 — the abort must RECORD its own incompleteness
+    /// rather than leave it to be inferred from the (now cleared) fence.
+    /// Clearing the fence is deliberate and stays, but it also erases the
+    /// only marker that the copy is part-baseline: the shard then keeps
+    /// receiving live fan-out, converges on the master's redo stream, and
+    /// the §4.3 catch-up-convergence trigger would stamp `Full` over a copy
+    /// that is missing an entire baseline segment — a segment no redo range
+    /// can replay, because those records never entered the master's redo.
+    /// So the abort marks the shard `Subset` AND raises the persisted
+    /// BASELINE-GAP flag, which
+    /// [`apply_replica_converged_signal`]'s check 7 refuses and only a
+    /// genuine §4.3 completion trigger clears.
+    ///
     /// Returns `true` if a pending inbound entry was cleared.
     pub fn abort_inbound_migration(&self, shard: u16) -> bool {
-        let mgr = &mut self.migration.lock();
-        let shards = std::collections::HashSet::from([shard]);
-        let removed = mgr.clear_pending_inbound_for_shards(&shards);
-        if removed > 0 {
-            self.inbound_atomic.load_from(mgr.inbound_bitmap());
-            if let Some(ref path) = self.inbound_state_path {
-                crate::cluster::migration::persist_inbound_state(path, mgr);
+        let removed = {
+            let mgr = &mut self.migration.lock();
+            let shards = std::collections::HashSet::from([shard]);
+            let removed = mgr.clear_pending_inbound_for_shards(&shards);
+            if removed > 0 {
+                self.inbound_atomic.load_from(mgr.inbound_bitmap());
+                if let Some(ref path) = self.inbound_state_path {
+                    crate::cluster::migration::persist_inbound_state(path, mgr);
+                }
             }
+            removed
+        };
+        if removed > 0 {
+            // N1: outside the migration lock — the lineage persist is its
+            // own durable write and must not extend the migration critical
+            // section.
+            self.lineage.mark_baseline_gap(
+                &[shard],
+                "inbound migration aborted without a completeness proof (§4.3, N1)",
+            );
+            self.refresh_baseline_gap_gauge();
             true
         } else {
             false
+        }
+    }
+
+    /// N1 — refresh the operator-visible baseline-gap gauge from the
+    /// lineage store. Called wherever the gap set changes.
+    fn refresh_baseline_gap_gauge(&self) {
+        if let Some(m) = crate::metrics::migration_metrics() {
+            m.lineage_baseline_gap_shards.store(
+                self.lineage.baseline_gap_count() as u32,
+                std::sync::atomic::Ordering::Relaxed,
+            );
         }
     }
 
@@ -14362,6 +14699,7 @@ pub(crate) fn new_test_running_cluster(
             [0u8; crate::cluster::lineage::DATA_EPOCH_LEN],
             self_id,
         )),
+        converged_signal_hwm: Mutex::new(std::collections::HashMap::new()),
         // Gate-inactive resting state (all-set); tests that exercise the
         // I13 serving gate clear bits via `test_clear_serving_established`.
         serving_established: {
@@ -22713,6 +23051,7 @@ mod tests {
             &cluster.cluster_secret,
             None,
             None,
+            None,
         );
 
         // The manager retained the unproven lost entry across the supersede (C17).
@@ -22830,6 +23169,7 @@ mod tests {
             &cluster.cluster_secret,
             None,
             None,
+            None,
         );
 
         // The heal entry must survive the supersede (manager + hot-path atomic).
@@ -22929,6 +23269,7 @@ mod tests {
             &view,
             &cluster.migration_throttle,
             &cluster.cluster_secret,
+            None,
             None,
             None,
         );
@@ -25282,6 +25623,127 @@ mod tests {
         }
     }
 
+    /// §8 review round 2, N6 — the sender-side legacy-`Reassign` →
+    /// full-record-image conversion must honour §4.2's CAPTURE-ONCE
+    /// discipline: a conversion that RE-READ regime state at conversion
+    /// time would let a demoted master re-stamp itself past its own
+    /// demotion, which is exactly the hole the capture-once rule closes.
+    ///
+    /// VERDICT (pinned here): it does. The converter
+    /// (`redo_entry_to_replica_ops` → `build_record_replay_ops`) takes no
+    /// `TopologyAuthority` and reads only RECORD state, so it cannot
+    /// consult regime state at all; both of its consumers capture the
+    /// regime table at their own fan-out entry and thread that ONE table
+    /// through every batch (migration: once per dispatch, in
+    /// `run_migration_tasks_with_global_limit`; replica catch-up: once per
+    /// chunk, in the `bin/server.rs` send closure). This test drives the
+    /// exact hazard: a regime bump lands BETWEEN the capture and the
+    /// conversion, and the batch must still carry the CAPTURED stamp.
+    #[test]
+    fn n6_legacy_reassign_conversion_honors_capture_once_regime_table() {
+        use crate::redo::{RedoEntry, RedoOp};
+        use crate::replication::protocol::{ReplicaBatch, ReplicaOp};
+
+        let (engine, _fail) = slot_read_failing_engine();
+        let shard = 9u16;
+        let key = tx_key_for_shard(shard, 3);
+        create_test_record(&engine, key);
+
+        // An authority whose committed regime for `shard` is 2.
+        let mems = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let authority =
+            crate::cluster::topology::TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+        authority.set_replication_factor(2);
+        authority.set_secret_configured(true);
+        let mut block = crate::cluster::topology::RegimeBlock::default();
+        block.regime.set(shard, 2);
+        block.regime_enforced = true;
+        authority.restore(&crate::cluster::topology::PersistedTopologyState {
+            peak_cluster_size: 3,
+            committed_term: 2,
+            committed_members: mems.clone(),
+            committed_voters: mems.clone(),
+            voted_term: 2,
+            incarnation: 1,
+            committed_voter_ever_seen: mems.clone(),
+            committed_placement_version: 1,
+            committed_peak: 3,
+            regime_block: block,
+            data_epoch: None,
+        });
+        assert!(authority.regime_enforcement_active());
+        assert_eq!(authority.committed_regime(shard), 2);
+
+        // §4.2 CAPTURE — once, at fan-out entry, BEFORE any conversion.
+        let captured: Vec<(u16, u64)> = vec![(shard, authority.committed_regime(shard))];
+
+        // The sender is DEMOTED mid-flight: a later term bumps the shard's
+        // regime. A converter that re-read regime state here would stamp 7.
+        let mut bumped = crate::cluster::topology::RegimeBlock::default();
+        bumped.regime.set(shard, 7);
+        bumped.regime_enforced = true;
+        authority.restore(&crate::cluster::topology::PersistedTopologyState {
+            peak_cluster_size: 3,
+            committed_term: 7,
+            committed_members: mems.clone(),
+            committed_voters: mems.clone(),
+            voted_term: 7,
+            incarnation: 1,
+            committed_voter_ever_seen: mems,
+            committed_placement_version: 1,
+            committed_peak: 3,
+            regime_block: bumped,
+            data_epoch: None,
+        });
+        assert_eq!(authority.committed_regime(shard), 7, "the sender moved on");
+
+        // The legacy-Reassign conversion runs AFTER the bump.
+        let entry = RedoEntry {
+            sequence: 1,
+            op: RedoOp::Reassign {
+                tx_key: key,
+                offset: 0,
+                new_hash: [0x5C; 32],
+                block_height: 800_000,
+                spendable_after: 1_000,
+            },
+        };
+        let ops = redo_entry_to_replica_ops(&entry, shard, &engine).expect("converts");
+        assert!(
+            !ops.is_empty(),
+            "a live record converts to its replay image"
+        );
+        assert!(
+            !ops.iter()
+                .any(|op| matches!(op, ReplicaOp::Reassign { .. })),
+            "F-7: the legacy entry is escalated to a full record image, never an \
+             unguarded delta",
+        );
+
+        // The batch the sender emits carries the CAPTURED table, so the
+        // receiver's §4.2 gate sees the pre-demotion regime and NAKs
+        // (ERR_STALE_REGIME) rather than accepting a self-re-stamp.
+        let batch = ReplicaBatch {
+            first_sequence: 0,
+            ops,
+            trace_ctx: crate::observability::WireTraceContext::from_current_span(),
+            source_node_id: Some(1),
+            cluster_key: 1,
+            regime_table: Some(captured.clone()),
+        };
+        assert_eq!(
+            batch.regime_table.as_deref(),
+            Some(&[(shard, 2u64)][..]),
+            "N6: the conversion must NOT re-read regime state — the batch carries the \
+             stamp captured at fan-out entry, not the sender's post-demotion value",
+        );
+        assert_ne!(
+            batch.regime_table.as_deref(),
+            Some(&[(shard, authority.committed_regime(shard))][..]),
+            "a re-reading converter would have stamped the live (bumped) regime here",
+        );
+    }
+
     /// §8 review F-7 (§4.9) — a LEGACY `RedoOp::Reassign` (pre-`ReassignV2`,
     /// no prior slot identity) must never be replayed as an unguarded
     /// delta: the batch converter escalates it to the record's FULL current
@@ -26888,6 +27350,470 @@ mod tests {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // §8 review round 2 — N1 (the converged signal must prove an INTACT
+    // BASELINE, not just a converged stream) and G-1/G-2 (freshness and
+    // sender identity for `OP_REPLICA_CONVERGED`).
+    // -----------------------------------------------------------------------
+
+    /// A two-node fixture whose shard `s` is mastered by node 1 with self
+    /// (node 2) as its committed replica, plus the committed authority
+    /// state both sides agree on. Returns `(cluster, shard)`.
+    fn n1_replica_cluster() -> (RunningCluster, u16) {
+        let members = vec![NodeId(1), NodeId(2)];
+        let table = ShardTable::compute_with_epoch(&members, 2, 1, 1);
+        let shard = (0..NUM_SHARDS as u16)
+            .find(|&s| {
+                table.assignment(s).master == NodeId(1)
+                    && table.assignment(s).replicas.contains(&NodeId(2))
+            })
+            .expect("node 1 masters a shard replicated on node 2");
+        let cluster = new_test_running_cluster(
+            NodeId(2),
+            table,
+            &[
+                (NodeId(1), "10.9.0.1:4700".parse().unwrap()),
+                (NodeId(2), "10.9.0.2:4700".parse().unwrap()),
+            ],
+            &members,
+            &[],
+            &[],
+            &[],
+            2,
+        );
+        (cluster, shard)
+    }
+
+    /// The IP node 1 is registered under in [`n1_replica_cluster`].
+    fn n1_master_ip() -> Option<std::net::IpAddr> {
+        Some("10.9.0.1".parse().expect("valid ip"))
+    }
+
+    /// N1 (P0, BLOCKING) — the exact interleaving the §8 round-2 review
+    /// names, end to end.
+    ///
+    /// 1. shard `s`: master M, replica X (self). An inbound transfer is
+    ///    registered on X → `mark_subset`.
+    /// 2. the transfer SOURCE dies mid-stream and sends
+    ///    `FLAG_MIGRATION_ABORT`; `abort_inbound_migration` clears the
+    ///    inbound-pending fence BY DESIGN and with no record count or
+    ///    manifest — its own contract says the partial copy is RETAINED.
+    /// 3. X is still in `target_assignment`, so it keeps receiving live
+    ///    fan-out: its copy is partial-baseline + complete-deltas.
+    /// 4. the lag monitor converges X on M's stream, and
+    /// 5. M sends `OP_REPLICA_CONVERGED` — a TRUE statement about the redo
+    ///    stream and an irrelevant one about the un-transferred baseline.
+    /// 6. PRE-FIX every receiver check passed (fence DOWN from step 2,
+    ///    holder, regime match, committed master) and `mark_full_many`
+    ///    stamped `Full` over a knowingly-partial copy.
+    /// 7. X was then promotion-eligible, passed I13 and served — every
+    ///    write in the un-transferred baseline GONE.
+    ///
+    /// Post-fix the abort RECORDS the incompleteness (§4.3 "over an intact
+    /// baseline") and the signal's fifth check refuses the shard.
+    #[test]
+    fn n1_aborted_inbound_then_convergence_signal_leaves_shard_subset() {
+        let (cluster, shard) = n1_replica_cluster();
+        let regime = cluster.topology_authority.committed_regime(shard);
+
+        // Step 1 — an inbound transfer begins on X (fence up, Subset).
+        cluster.register_test_inbound_from_source(shard, NodeId(3));
+        cluster
+            .lineage
+            .mark_subset(&[shard], "test: inbound migration begins (§4.3)");
+        assert!(
+            cluster.inbound_atomic.test(shard),
+            "precondition: the inbound fence is up while receiving",
+        );
+
+        // Step 2 — the source dies mid-stream and aborts the transfer.
+        assert!(
+            cluster.abort_inbound_migration(shard),
+            "the abort must clear a pending forward inbound entry",
+        );
+        assert!(
+            !cluster.inbound_atomic.test(shard),
+            "the abort clears the fence BY DESIGN — that is what makes the hole reachable",
+        );
+
+        // Steps 3-5 — X keeps receiving fan-out, converges, and M asserts
+        // completeness for the shards it masters.
+        assert!(
+            cluster
+                .shard_table
+                .read()
+                .target_assignment(shard)
+                .replicas
+                .contains(&NodeId(2)),
+            "precondition: X is still a holder, so it still receives fan-out",
+        );
+        let stamped =
+            cluster.handle_replica_converged(1, 500, &[(shard, regime)], 500, n1_master_ip());
+
+        // Step 6 — the signal must NOT certify a copy with a baseline hole.
+        assert_eq!(
+            stamped, 0,
+            "N1: a converged redo stream is no evidence about a baseline that was \
+             abandoned mid-transfer — the signal must stamp nothing",
+        );
+        assert_eq!(
+            cluster.lineage.lineage(shard),
+            crate::cluster::lineage::Lineage::Subset,
+            "N1: the shard must stay Subset",
+        );
+        assert!(
+            cluster.lineage.has_baseline_gap(shard),
+            "N1: the abandoned transfer must leave a recorded baseline gap",
+        );
+
+        // Step 7 — and it is therefore NOT promotion-eligible.
+        let block = cluster.topology_authority.committed_regime_block();
+        let mut view: std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>> =
+            std::collections::HashMap::new();
+        view.insert(
+            NodeId(2),
+            vec![PartitionVersionEntry {
+                shard,
+                flags: 0,
+                replica_count: 1,
+                last_applied_seq: 500,
+                manifest_digest: 0,
+                max_generation: 0,
+                lineage_full: cluster.lineage.is_full(shard),
+                lineage_regime: regime,
+            }],
+        );
+        assert!(
+            !compute_promotion_overrides(
+                &cluster.topology_authority.committed_members(),
+                1,
+                2,
+                &block,
+                &view,
+            )
+            .contains_key(&shard),
+            "N1: a shard with an un-repaired baseline gap must never become a \
+             promotion target",
+        );
+
+        // The gap is NOT permanent: a genuine completion trigger (a
+        // verified completion handshake) clears it and the shard re-earns.
+        cluster.register_test_inbound_from_source(shard, NodeId(1));
+        cluster.mark_inbound_complete_from_source(shard, NodeId(1));
+        assert!(
+            !cluster.lineage.has_baseline_gap(shard),
+            "a verified completion handshake must clear the gap",
+        );
+    }
+
+    /// N1 — the fifth receiver check in isolation: with everything else
+    /// identical, the ONLY difference between a stamp and a refusal is the
+    /// recorded baseline gap.
+    #[test]
+    fn n1_converged_signal_requires_intact_baseline() {
+        let (cluster, shard) = n1_replica_cluster();
+        let regime = cluster.topology_authority.committed_regime(shard);
+
+        // Control: with no gap the signal stamps.
+        assert_eq!(
+            cluster.handle_replica_converged(1, 10, &[(shard, regime)], 10, n1_master_ip()),
+            1,
+            "control: an intact-baseline replica re-earns Full through convergence",
+        );
+        assert_eq!(
+            cluster.lineage.lineage(shard),
+            crate::cluster::lineage::Lineage::Full { regime },
+        );
+
+        // Same shard, same everything — but now a data-motion abandonment
+        // recorded a baseline gap.
+        cluster
+            .lineage
+            .mark_baseline_gap(&[shard], "test: transfer abandoned");
+        assert_eq!(
+            cluster.lineage.lineage(shard),
+            crate::cluster::lineage::Lineage::Subset,
+            "recording a gap also degrades the stamp",
+        );
+        assert_eq!(
+            cluster.handle_replica_converged(1, 20, &[(shard, regime)], 20, n1_master_ip()),
+            0,
+            "N1: the gap alone must refuse the signal",
+        );
+        assert_eq!(
+            cluster.lineage.lineage(shard),
+            crate::cluster::lineage::Lineage::Subset,
+        );
+    }
+
+    /// N1 — WHY the fifth check is a baseline-gap flag and NOT the
+    /// `stream_origin` bit the review prescribed.
+    ///
+    /// `stream_origin` means "this copy's ENTIRE content arrived via the
+    /// replica stream", which is granted only when a tracked apply found
+    /// the shard EMPTY. The F3 convergence trigger exists precisely for the
+    /// case where that is false: a NON-EMPTY replica degraded by a
+    /// skipped-term commit can never re-earn through the stream-origin
+    /// path, and convergence is its only route back. Gating the signal on
+    /// `stream_origin` would therefore make the trigger a no-op in its own
+    /// motivating case. This test pins that: the skipped-term replica has
+    /// NO stream-origin evidence, yet its baseline is intact and the signal
+    /// must accept it.
+    #[test]
+    fn n1_stream_origin_gate_would_defeat_f3_skipped_term_re_earn() {
+        let (cluster, shard) = n1_replica_cluster();
+        let regime = cluster.topology_authority.committed_regime(shard);
+
+        // A NON-EMPTY replica: its first tracked apply saw records already
+        // present, so no stream-origin evidence is ever granted.
+        cluster.note_replica_stream_applies(&[(shard, false)]);
+        assert!(
+            !cluster.lineage.stream_origin(shard),
+            "a non-empty copy never earns stream-origin evidence",
+        );
+        // Its baseline is nonetheless intact — nothing was ever abandoned.
+        assert!(!cluster.lineage.has_baseline_gap(shard));
+
+        assert_eq!(
+            cluster.handle_replica_converged(1, 30, &[(shard, regime)], 30, n1_master_ip()),
+            1,
+            "a stream_origin gate would refuse here and permanently strand the \
+             skipped-term replica; the intact-baseline gate correctly accepts",
+        );
+    }
+
+    /// N1 (part b) — `abort_inbound_migration` degrades lineage itself
+    /// rather than leaving the incompleteness to be inferred from the fence
+    /// it just cleared.
+    #[test]
+    fn n1_abort_inbound_migration_degrades_lineage() {
+        let (cluster, shard) = n1_replica_cluster();
+        assert!(cluster.lineage.mark_full(shard, 0, "test: complete copy"));
+        cluster.register_test_inbound_from_source(shard, NodeId(3));
+
+        assert!(cluster.abort_inbound_migration(shard));
+        assert_eq!(
+            cluster.lineage.lineage(shard),
+            crate::cluster::lineage::Lineage::Subset,
+            "an aborted transfer must degrade the stamp",
+        );
+        assert!(
+            cluster.lineage.has_baseline_gap(shard),
+            "and must RECORD the incompleteness so no later evidence can infer it away",
+        );
+        assert_eq!(cluster.lineage.baseline_gap_count(), 1);
+
+        // Idempotent: a second abort with no pending entry changes nothing.
+        assert!(!cluster.abort_inbound_migration(shard));
+        assert_eq!(cluster.lineage.baseline_gap_count(), 1);
+    }
+
+    /// N1 (fence-clearing audit) — the SAME shape reached through the
+    /// topology-supersede path: `clear_inbound` drops an in-flight FORWARD
+    /// inbound and its fence with it, again with no completeness proof. It
+    /// must record the gap for exactly the shards it unfenced, and must NOT
+    /// record one for a shard whose fence it preserved (lost / heal).
+    #[test]
+    fn n1_topology_supersede_unfence_records_baseline_gap() {
+        let mut mgr = MigrationManager::new();
+        // Shard 11: an ordinary in-flight forward inbound (fence dropped).
+        assert!(mgr.register_inbound_source(11, NodeId(2)));
+        // Shard 12: a reverse-heal pull (heal_pending — fence PRESERVED).
+        assert!(mgr.register_heal_source(12, NodeId(3)));
+        // Shard 13: an orphaned inbound marked LOST (fence PRESERVED).
+        assert!(mgr.register_inbound_source(13, NodeId(4)));
+        assert_eq!(
+            mgr.mark_inbound_lost(&std::collections::HashSet::from([13])),
+            1
+        );
+
+        let dropped = mgr.clear_inbound();
+        assert_eq!(
+            dropped,
+            vec![11],
+            "only the shard whose fence was actually dropped is reported",
+        );
+        assert!(!mgr.has_pending_inbound(11), "shard 11 is unfenced");
+        assert!(mgr.has_pending_inbound(12), "the heal fence survives");
+        assert!(mgr.has_pending_inbound(13), "the lost fence survives");
+
+        // The coordinator records the gap for the reported shards only.
+        let lineage = crate::cluster::lineage::LineageStore::open(
+            None,
+            [1u8; crate::cluster::lineage::DATA_EPOCH_LEN],
+            NodeId(1),
+        );
+        lineage.mark_baseline_gap(&dropped, "test: supersede");
+        assert!(lineage.has_baseline_gap(11));
+        assert!(!lineage.has_baseline_gap(12));
+        assert!(!lineage.has_baseline_gap(13));
+    }
+
+    /// G-1 (BLOCKING) — replay. A frame captured when the replica genuinely
+    /// converged is re-delivered later (an attacker, or plain delivery
+    /// delay / reorder). Nothing about the four state-SHAPE checks changed:
+    /// no fence is raised for mere lag, the replica is still a holder, and
+    /// the master and regime are unchanged — so pre-fix the replay stamped
+    /// `Full` over an arbitrarily stale copy. The per-source monotonic
+    /// high-water mark drops it.
+    #[test]
+    fn g1_converged_signal_replay_is_rejected() {
+        let (cluster, shard) = n1_replica_cluster();
+        let regime = cluster.topology_authority.committed_regime(shard);
+
+        // T0: genuine convergence at sequence 1000.
+        assert_eq!(
+            cluster.handle_replica_converged(1, 1000, &[(shard, regime)], 1000, n1_master_ip()),
+            1,
+        );
+        // The replica falls behind; it re-degrades for an unrelated reason.
+        cluster
+            .lineage
+            .mark_subset(&[shard], "test: degraded after the signal");
+
+        // T0+4min: the captured frame is replayed verbatim. Every shape
+        // check still passes — only the freshness guard can refuse it.
+        assert_eq!(
+            cluster.handle_replica_converged(1, 1000, &[(shard, regime)], 5000, n1_master_ip()),
+            0,
+            "G-1: a replayed convergence assertion must stamp nothing",
+        );
+        assert_eq!(
+            cluster.lineage.lineage(shard),
+            crate::cluster::lineage::Lineage::Subset,
+        );
+        // A strictly newer, genuinely fresh assertion is still accepted.
+        assert_eq!(
+            cluster.handle_replica_converged(1, 5000, &[(shard, regime)], 5000, n1_master_ip()),
+            1,
+            "the guard must not wedge the legitimate next signal",
+        );
+    }
+
+    /// G-1 — the corroboration half: the receiver refuses a claim its OWN
+    /// durable applied watermark does not support, so a master cannot
+    /// assert a sequence this node never reached.
+    #[test]
+    fn g1_converged_signal_requires_local_applied_watermark() {
+        let (cluster, shard) = n1_replica_cluster();
+        let regime = cluster.topology_authority.committed_regime(shard);
+        assert_eq!(
+            cluster.handle_replica_converged(1, 900, &[(shard, regime)], 899, n1_master_ip()),
+            0,
+            "G-1: an uncorroborated sequence must stamp nothing",
+        );
+        // Refusing must not consume the high-water mark: the same sequence
+        // is accepted once this node has actually applied through it.
+        assert_eq!(
+            cluster.handle_replica_converged(1, 900, &[(shard, regime)], 900, n1_master_ip()),
+            1,
+        );
+        // A zero assertion claims nothing checkable.
+        let (cluster2, shard2) = n1_replica_cluster();
+        let regime2 = cluster2.topology_authority.committed_regime(shard2);
+        assert_eq!(
+            cluster2.handle_replica_converged(1, 0, &[(shard2, regime2)], 100, n1_master_ip()),
+            0,
+            "G-1: a zero asserted sequence must stamp nothing",
+        );
+    }
+
+    /// G-2 (BLOCKING) — the frame's `source_node_id` is a self-declared
+    /// PAYLOAD field; the HMAC authenticates a secret HOLDER, not a node.
+    /// A cluster member asserting convergence ON BEHALF OF a shard's
+    /// legitimate master must be refused.
+    #[test]
+    fn g2_converged_signal_rejects_source_impersonation() {
+        let (cluster, shard) = n1_replica_cluster();
+        let regime = cluster.topology_authority.committed_regime(shard);
+        // Node 2's address claiming to be node 1 (the shard's master).
+        let impostor: Option<std::net::IpAddr> = Some("10.9.0.2".parse().expect("valid ip"));
+        assert_eq!(
+            cluster.handle_replica_converged(1, 100, &[(shard, regime)], 100, impostor),
+            0,
+            "G-2: a peer may not assert convergence on another node's behalf",
+        );
+        // An unknown peer address is refused too (fail-closed).
+        let unknown: Option<std::net::IpAddr> = Some("10.9.9.9".parse().expect("valid ip"));
+        assert_eq!(
+            cluster.handle_replica_converged(1, 101, &[(shard, regime)], 101, unknown),
+            0,
+        );
+        // As is a missing peer address.
+        assert_eq!(
+            cluster.handle_replica_converged(1, 102, &[(shard, regime)], 102, None),
+            0,
+        );
+        assert_eq!(cluster.lineage.full_count(), 0);
+        // The real master's address is accepted.
+        assert_eq!(
+            cluster.handle_replica_converged(1, 103, &[(shard, regime)], 103, n1_master_ip()),
+            1,
+        );
+    }
+
+    /// G-4 (P2) — a recorded epoch with NO current identity must DISABLE
+    /// the I13(i) boot re-derivation. A `None` current epoch means the
+    /// data-epoch stamp could not be read or created, which is the same
+    /// fault that forces a non-persistent all-`Subset` lineage store —
+    /// re-stamping `Full` there would grant serving AND promotion
+    /// eligibility to a node whose data identity is unverifiable.
+    #[test]
+    fn g4_missing_current_epoch_with_recorded_epoch_disables_boot_rederivation() {
+        let members = vec![NodeId(1), NodeId(2)];
+        let table = ShardTable::compute_with_epoch(&members, 2, 1, 1);
+        let shard = (0..NUM_SHARDS as u16)
+            .find(|&s| table.assignment(s).master == NodeId(1))
+            .expect("node 1 masters a shard");
+
+        let build = |current: Option<[u8; crate::cluster::lineage::DATA_EPOCH_LEN]>| {
+            let authority =
+                crate::cluster::topology::TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+            authority.set_replication_factor(2);
+            authority.restore(&crate::cluster::topology::PersistedTopologyState {
+                peak_cluster_size: 2,
+                committed_term: 3,
+                committed_members: members.clone(),
+                committed_voters: members.clone(),
+                voted_term: 3,
+                incarnation: 1,
+                committed_voter_ever_seen: members.clone(),
+                committed_placement_version: 1,
+                committed_peak: 2,
+                regime_block: crate::cluster::topology::RegimeBlock::default(),
+                // The state file DID record an identity.
+                data_epoch: Some([9u8; crate::cluster::lineage::DATA_EPOCH_LEN]),
+            });
+            let lineage = crate::cluster::lineage::LineageStore::open(
+                None,
+                [0u8; crate::cluster::lineage::DATA_EPOCH_LEN],
+                NodeId(1),
+            );
+            let serving = crate::cluster::migration::AtomicShardBitmap::new();
+            serving.set_all();
+            boot_rederive_lineage_and_serving(
+                &authority,
+                &lineage,
+                &serving,
+                &table,
+                NodeId(1),
+                2,
+                current,
+            );
+            lineage.is_full(shard)
+        };
+
+        assert!(
+            build(Some([9u8; crate::cluster::lineage::DATA_EPOCH_LEN])),
+            "control: a MATCHING current epoch re-derives Full for a committed master",
+        );
+        assert!(
+            !build(None),
+            "G-4: a recorded epoch with no verifiable current identity must fail closed \
+             — the node re-earns through catch-up instead",
+        );
+    }
+
     /// §8 review F3 (P0) — the §4.3 FOURTH completion trigger end to end
     /// (unit level): a replica misses a commit (skipped-term degrade →
     /// `Subset`, which the stream-origin trigger can never repair for a
@@ -26984,6 +27910,7 @@ mod tests {
 
         // The master's convergence signal re-earns Full — no resync.
         let inbound = crate::cluster::migration::AtomicShardBitmap::new();
+        let hwm = Mutex::new(std::collections::HashMap::new());
         let stamped = apply_replica_converged_signal(
             &authority,
             &placement,
@@ -26991,7 +27918,12 @@ mod tests {
             &lineage,
             NodeId(2),
             1,
+            // G-1: the master asserts the replica ACKed through seq 100;
+            // this node's own durable watermark corroborates it.
+            100,
             &[(shard, 2)],
+            100,
+            &hwm,
         );
         assert_eq!(stamped, 1, "F3: the convergence signal must stamp Full");
         assert_eq!(
@@ -27059,7 +27991,10 @@ mod tests {
                 &lineage,
                 NodeId(2),
                 3, // node 3 does not master this shard
+                100,
                 &[(shard, 2)],
+                100,
+                &Mutex::new(std::collections::HashMap::new()),
             ),
             0,
             "only the shard's committed master may assert completeness",
@@ -27073,7 +28008,10 @@ mod tests {
                 &lineage,
                 NodeId(2),
                 1,
+                100,
                 &[(shard, 1)],
+                100,
+                &Mutex::new(std::collections::HashMap::new()),
             ),
             0,
             "a regime-stale signal must stamp nothing (fail-closed)",
@@ -27088,7 +28026,10 @@ mod tests {
                 &lineage,
                 NodeId(2),
                 1,
+                100,
                 &[(shard, 2)],
+                100,
+                &Mutex::new(std::collections::HashMap::new()),
             ),
             0,
             "a fenced (mid-fill) shard must complete through its own trigger",
@@ -27109,7 +28050,10 @@ mod tests {
                 &lineage,
                 NodeId(2),
                 placement.assignment(outsider).master.0,
+                100,
                 &[(outsider, authority.committed_regime(outsider))],
+                100,
+                &Mutex::new(std::collections::HashMap::new()),
             ),
             0,
             "Full outside the holder set would violate I2",
@@ -27125,7 +28069,10 @@ mod tests {
                 &lineage,
                 NodeId(2),
                 1,
+                100,
                 &[(shard, 2)],
+                100,
+                &Mutex::new(std::collections::HashMap::new()),
             ),
             1,
         );
@@ -27135,8 +28082,8 @@ mod tests {
     #[test]
     fn f3_replica_converged_codec_roundtrip_and_rejects_malformed() {
         let entries = vec![(3u16, 7u64), (100, 9)];
-        let bytes = encode_replica_converged(42, &entries);
-        assert_eq!(decode_replica_converged(&bytes), Some((42, entries)));
+        let bytes = encode_replica_converged(42, 512, &entries);
+        assert_eq!(decode_replica_converged(&bytes), Some((42, 512, entries)));
         // Trailing byte → reject.
         let mut trailing = bytes.clone();
         trailing.push(0);
@@ -27146,11 +28093,20 @@ mod tests {
         // count > NUM_SHARDS → reject before allocation.
         let mut oversized = Vec::new();
         oversized.extend_from_slice(&1u64.to_le_bytes());
+        oversized.extend_from_slice(&7u64.to_le_bytes());
         oversized.extend_from_slice(&(NUM_SHARDS as u16 + 1).to_le_bytes());
         assert_eq!(decode_replica_converged(&oversized), None);
         // Out-of-range shard → reject.
-        let bad = encode_replica_converged(1, &[(NUM_SHARDS as u16, 1)]);
+        let bad = encode_replica_converged(1, 5, &[(NUM_SHARDS as u16, 1)]);
         assert_eq!(decode_replica_converged(&bad), None);
+        // G-1: a pre-G-1 (no `asserted_seq`) payload is structurally
+        // rejected — the freshness evidence is mandatory, never defaulted.
+        let mut legacy = Vec::new();
+        legacy.extend_from_slice(&42u64.to_le_bytes());
+        legacy.extend_from_slice(&1u16.to_le_bytes());
+        legacy.extend_from_slice(&3u16.to_le_bytes());
+        legacy.extend_from_slice(&7u64.to_le_bytes());
+        assert_eq!(decode_replica_converged(&legacy), None);
     }
 
     /// §4.4 — the promotion candidate matrix (pure proposer computation).

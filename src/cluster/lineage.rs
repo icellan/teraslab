@@ -222,9 +222,9 @@ pub struct LineageStore {
     data_epoch: [u8; DATA_EPOCH_LEN],
     /// The claiming node.
     node_id: NodeId,
-    /// Authoritative per-shard state: `Some(regime)` = `Full{regime}`,
-    /// `None` = `Subset`.
-    state: Mutex<Vec<Option<u64>>>,
+    /// Authoritative per-shard state (stamps + baseline-gap flags) under
+    /// ONE mutex so a transition batch is ONE durable write.
+    state: Mutex<LineageState>,
     /// Lock-free shadow of "is `Full`" per shard for the sweep hot path
     /// and stage 4's serving-gate reads. Refreshed on every transition.
     full_bits: AtomicShardBitmap,
@@ -245,6 +245,41 @@ pub struct LineageStore {
     /// the coordinator event loop, which re-validates every condition at
     /// flush time and stamps `Full` in ONE batched durable write.
     stream_candidates: AtomicShardBitmap,
+    /// §8 review round 2, N1 — lock-free shadow of the persisted
+    /// BASELINE-GAP set (see [`LineageState::gaps`]).
+    baseline_gap_bits: AtomicShardBitmap,
+}
+
+/// The mutex-protected lineage state: per-shard `Full` stamps plus the
+/// per-shard BASELINE-GAP flags. Both live under one lock so a transition
+/// batch persists them in ONE durable write.
+struct LineageState {
+    /// `Some(regime)` = `Full{regime}`, `None` = `Subset`.
+    stamps: Vec<Option<u64>>,
+    /// §8 review round 2, N1 — "this copy is missing records that were
+    /// supposed to arrive OUT OF BAND (a migration/heal baseline) and that
+    /// no redo stream can replay".
+    ///
+    /// §4.3's fourth completion trigger (the catch-up convergence signal)
+    /// proves "the replica durably ACKed every redo sequence the master
+    /// has, over an intact redo range". That is evidence about the REDO
+    /// STREAM domain only: it repairs a hole this node has *because it
+    /// stopped receiving fan-out for a while* (skipped term, holder exit),
+    /// because those writes are still in the master's un-reclaimed redo.
+    /// It says NOTHING about a baseline that was supposed to arrive by
+    /// migration/heal and never did — those records were never in the
+    /// master's redo range at all. §4.3 phrases the trigger as
+    /// "converged **over an intact baseline**"; this flag is the intact-
+    /// baseline half, and the converged signal refuses any shard carrying
+    /// it.
+    ///
+    /// Set by every path that abandons an out-of-band transfer WITHOUT a
+    /// completeness proof (today: the migration-abort fence clear). Cleared
+    /// only by a §4.3 COMPLETION trigger (a verified completion handshake,
+    /// or a stream-origin stamp — a copy that started empty has no baseline
+    /// to be missing), never by the convergence signal itself. Persisted
+    /// alongside the stamps, so a reboot cannot forget the gap.
+    gaps: Vec<bool>,
 }
 
 impl LineageStore {
@@ -254,11 +289,14 @@ impl LineageStore {
     /// re-earn `Full` over its intact baseline) past any lineage-file
     /// fault.
     pub fn open(path: Option<PathBuf>, data_epoch: [u8; DATA_EPOCH_LEN], node_id: NodeId) -> Self {
-        let mut state: Vec<Option<u64>> = vec![None; NUM_SHARDS];
+        let mut state = LineageState {
+            stamps: vec![None; NUM_SHARDS],
+            gaps: vec![false; NUM_SHARDS],
+        };
         if let Some(ref p) = path {
             match std::fs::read(p) {
                 Ok(bytes) => match decode_lineage_file(&bytes) {
-                    Ok((file_epoch, file_node, entries)) => {
+                    Ok((file_epoch, file_node, entries, gap_shards)) => {
                         if file_epoch != data_epoch || file_node != node_id {
                             // §4.3 identity binding: name WHICH identity
                             // mismatched; do NOT invalidate the baseline.
@@ -272,9 +310,20 @@ impl LineageStore {
                                  (fail-closed); the data baseline is NOT invalidated: Full is \
                                  re-earned through catch-up/migration over the intact baseline",
                             );
+                            // N1 — the identity mismatch degrades the STAMPS,
+                            // but a recorded baseline gap is a property of the
+                            // DATA, not of the claiming identity: keep it, so a
+                            // convergence signal cannot certify the hole after a
+                            // node-id/epoch change.
+                            for shard in gap_shards {
+                                state.gaps[shard as usize] = true;
+                            }
                         } else {
                             for (shard, regime) in entries {
-                                state[shard as usize] = Some(regime);
+                                state.stamps[shard as usize] = Some(regime);
+                            }
+                            for shard in gap_shards {
+                                state.gaps[shard as usize] = true;
                             }
                         }
                     }
@@ -300,9 +349,15 @@ impl LineageStore {
             }
         }
         let full_bits = AtomicShardBitmap::new();
-        for (shard, stamp) in state.iter().enumerate() {
+        for (shard, stamp) in state.stamps.iter().enumerate() {
             if stamp.is_some() {
                 full_bits.set(shard as u16);
+            }
+        }
+        let baseline_gap_bits = AtomicShardBitmap::new();
+        for (shard, gap) in state.gaps.iter().enumerate() {
+            if *gap {
+                baseline_gap_bits.set(shard as u16);
             }
         }
         Self {
@@ -313,6 +368,7 @@ impl LineageStore {
             full_bits,
             stream_origin: AtomicShardBitmap::new(),
             stream_candidates: AtomicShardBitmap::new(),
+            baseline_gap_bits,
         }
     }
 
@@ -376,9 +432,93 @@ impl LineageStore {
 
     /// The lineage of `shard`.
     pub fn lineage(&self, shard: u16) -> Lineage {
-        match self.state.lock().get(shard as usize).copied().flatten() {
+        match self
+            .state
+            .lock()
+            .stamps
+            .get(shard as usize)
+            .copied()
+            .flatten()
+        {
             Some(regime) => Lineage::Full { regime },
             None => Lineage::Subset,
+        }
+    }
+
+    /// §8 review round 2, N1 — does `shard` carry an unrepaired
+    /// BASELINE GAP (see [`LineageState::gaps`])?
+    ///
+    /// Lock-free (one atomic word). Out-of-range shards answer `true`
+    /// (fail-closed). A `true` answer means "records that were supposed to
+    /// reach this copy out of band never did, and no redo-stream evidence
+    /// can prove otherwise" — the §4.3 catch-up-convergence completion
+    /// trigger MUST refuse such a shard.
+    pub fn has_baseline_gap(&self, shard: u16) -> bool {
+        (shard as usize) >= NUM_SHARDS || self.baseline_gap_bits.test(shard)
+    }
+
+    /// Number of shards currently carrying a baseline gap (diagnostics).
+    pub fn baseline_gap_count(&self) -> usize {
+        (0..NUM_SHARDS as u16)
+            .filter(|&s| self.baseline_gap_bits.test(s))
+            .count()
+    }
+
+    /// §8 review round 2, N1 — record that `shards` lost (or may have
+    /// lost) part of an OUT-OF-BAND baseline with no completeness proof:
+    /// degrade each to `Subset` AND raise its baseline-gap flag, in ONE
+    /// durable write.
+    ///
+    /// Called by every path that abandons an inbound transfer without
+    /// proving completeness (the migration-abort fence clear). The flag is
+    /// what stops the §4.3 catch-up-convergence trigger from later
+    /// certifying the hole: convergence proves the REDO STREAM is caught
+    /// up, which is no evidence at all about records that never entered
+    /// the master's redo range.
+    ///
+    /// Persistence has the SAME safe polarity as [`Self::mark_subset`]:
+    /// the in-memory state and the atomic shadow degrade immediately; a
+    /// failed durable write is an ERROR log (a crash may resurrect the
+    /// pre-gap state, which the persisted inbound fence re-asserts at
+    /// boot).
+    pub fn mark_baseline_gap(&self, shards: &[u16], reason: &str) {
+        let mut state = self.state.lock();
+        let mut changed = false;
+        for &shard in shards {
+            let idx = shard as usize;
+            if idx >= NUM_SHARDS {
+                continue;
+            }
+            // A data-motion abandonment invalidates the stream-origin
+            // claim exactly as `mark_subset` does.
+            self.revoke_stream_origin(shard);
+            if state.stamps[idx].is_some() {
+                state.stamps[idx] = None;
+                self.full_bits.clear(shard);
+                changed = true;
+            }
+            if !state.gaps[idx] {
+                state.gaps[idx] = true;
+                self.baseline_gap_bits.set(shard);
+                changed = true;
+            }
+        }
+        if changed {
+            tracing::warn!(
+                count = shards.len(),
+                reason,
+                "lineage: recorded BASELINE GAP — shard(s) Subset and barred from re-earning \
+                 Full through catch-up convergence until a completion trigger proves the \
+                 baseline (§4.3)",
+            );
+            if !self.persist_locked(&state) {
+                tracing::error!(
+                    reason,
+                    "lineage: durable write of the baseline-gap transition failed — the \
+                     in-memory state is degraded (fail-closed) but a crash may resurrect the \
+                     pre-gap state until the next successful persist",
+                );
+            }
         }
     }
 
@@ -390,7 +530,12 @@ impl LineageStore {
 
     /// Number of shards currently stamped `Full`.
     pub fn full_count(&self) -> usize {
-        self.state.lock().iter().filter(|s| s.is_some()).count()
+        self.state
+            .lock()
+            .stamps
+            .iter()
+            .filter(|s| s.is_some())
+            .count()
     }
 
     /// Degrade every shard in `shards` to `Subset` in ONE batch with ONE
@@ -414,7 +559,7 @@ impl LineageStore {
                 // Subset (e.g. a fence raised on a never-Full shard).
                 self.revoke_stream_origin(shard);
             }
-            if let Some(slot) = state.get_mut(shard as usize)
+            if let Some(slot) = state.stamps.get_mut(shard as usize)
                 && slot.is_some()
             {
                 *slot = None;
@@ -458,6 +603,17 @@ impl LineageStore {
     /// I2's batched-write note). All-or-nothing: a failed durable write
     /// rolls every stamp in the batch back to `Subset`-as-before and
     /// returns `false`.
+    ///
+    /// §8 review round 2, N1 — a successful stamp also CLEARS the shard's
+    /// baseline-gap flag: every caller of this function is a §4.3
+    /// COMPLETION trigger that has proven the copy complete (a verified
+    /// migration/heal completion handshake, a stream-origin stamp for a
+    /// copy that started empty, or a convergence signal that has ALREADY
+    /// been refused for gapped shards by
+    /// `apply_replica_converged_signal`'s fifth check). The convergence
+    /// path must therefore test [`Self::has_baseline_gap`] BEFORE calling
+    /// here — it is not evidence about the baseline and must not clear the
+    /// flag.
     pub fn mark_full_many(&self, stamps: &[(u16, u64)], reason: &str) -> bool {
         let valid: Vec<(u16, u64)> = stamps
             .iter()
@@ -468,22 +624,31 @@ impl LineageStore {
             return false;
         }
         let mut state = self.state.lock();
-        let snapshot: Vec<(u16, Option<u64>)> = valid
+        let snapshot: Vec<(u16, Option<u64>, bool)> = valid
             .iter()
-            .map(|&(shard, _)| (shard, state[shard as usize]))
+            .map(|&(shard, _)| {
+                (
+                    shard,
+                    state.stamps[shard as usize],
+                    state.gaps[shard as usize],
+                )
+            })
             .collect();
         for &(shard, regime) in &valid {
-            state[shard as usize] = Some(regime);
+            state.stamps[shard as usize] = Some(regime);
+            state.gaps[shard as usize] = false;
         }
         if self.persist_locked(&state) {
             for &(shard, _) in &valid {
                 self.full_bits.set(shard);
+                self.baseline_gap_bits.clear(shard);
             }
             tracing::info!(count = valid.len(), reason, "lineage: stamped Full");
             true
         } else {
-            for (shard, prior) in snapshot {
-                state[shard as usize] = prior;
+            for (shard, prior, prior_gap) in snapshot {
+                state.stamps[shard as usize] = prior;
+                state.gaps[shard as usize] = prior_gap;
             }
             tracing::error!(
                 count = valid.len(),
@@ -520,23 +685,23 @@ impl LineageStore {
         regime_of: &dyn Fn(u16) -> u64,
     ) -> CommitTransitionOutcome {
         let mut state = self.state.lock();
-        let snapshot: Vec<Option<u64>> = state.clone();
+        let snapshot: Vec<Option<u64>> = state.stamps.clone();
         let mut degraded = 0usize;
         let mut refreshed = 0usize;
         let mut changed = false;
         for shard in 0..NUM_SHARDS as u16 {
-            let Some(stamp) = state[shard as usize] else {
+            let Some(stamp) = state.stamps[shard as usize] else {
                 continue;
             };
             if in_holder_set(shard) {
                 let new_regime = regime_of(shard);
                 if stamp != new_regime {
-                    state[shard as usize] = Some(new_regime);
+                    state.stamps[shard as usize] = Some(new_regime);
                     refreshed += 1;
                     changed = true;
                 }
             } else {
-                state[shard as usize] = None;
+                state.stamps[shard as usize] = None;
                 degraded += 1;
                 changed = true;
                 // P1 stage 4 — a holder-exit (or skipped-term) degrade
@@ -549,7 +714,7 @@ impl LineageStore {
             if self.persist_locked(&state) {
                 // Sync the shadow only after the stamps are durable.
                 for shard in 0..NUM_SHARDS as u16 {
-                    if state[shard as usize].is_some() {
+                    if state.stamps[shard as usize].is_some() {
                         self.full_bits.set(shard);
                     } else {
                         self.full_bits.clear(shard);
@@ -559,7 +724,7 @@ impl LineageStore {
             } else {
                 // Fail closed: roll the in-memory state back so a refused
                 // commit leaves lineage exactly as it was.
-                *state = snapshot;
+                state.stamps = snapshot;
                 false
             }
         } else {
@@ -603,17 +768,17 @@ impl LineageStore {
             let idx = shard as usize;
             if committed_master_is_self(shard) {
                 let regime = regime_of(shard);
-                if state[idx] != Some(regime) {
-                    state[idx] = Some(regime);
+                if state.stamps[idx] != Some(regime) {
+                    state.stamps[idx] = Some(regime);
                     rederived += 1;
                     changed = true;
                 }
                 self.full_bits.set(shard);
-            } else if let Some(stamp) = state[idx] {
+            } else if let Some(stamp) = state.stamps[idx] {
                 if in_holder_set(shard) && stamp == regime_of(shard) {
                     self.full_bits.set(shard);
                 } else {
-                    state[idx] = None;
+                    state.stamps[idx] = None;
                     self.full_bits.clear(shard);
                     degraded += 1;
                     changed = true;
@@ -638,7 +803,7 @@ impl LineageStore {
 
     /// Encode + durably write the current state. `true` on success (and
     /// always for a pathless store).
-    fn persist_locked(&self, state: &[Option<u64>]) -> bool {
+    fn persist_locked(&self, state: &LineageState) -> bool {
         let Some(ref path) = self.path else {
             return true;
         };
@@ -666,30 +831,40 @@ impl LineageStore {
 
 /// Encode the lineage file: the shared topology envelope
 /// (`[magic][version:u16][len:u32][body][sha256]`) around
-/// `[data_epoch:16][node_id:8][count:u16][(shard:2, regime:8)...]` with
-/// entries in ascending shard order (only `Full` shards are present — an
-/// absent shard IS `Subset`).
+/// `[data_epoch:16][node_id:8][count:u16][(shard:2, regime:8)...]
+/// [gap_count:u16][gap_shard:2 ...]` with both entry lists in ascending
+/// shard order (only `Full` shards are present in the first list — an
+/// absent shard IS `Subset`; only baseline-GAP shards are present in the
+/// second — §8 review round 2, N1).
 fn encode_lineage_file(
     data_epoch: &[u8; DATA_EPOCH_LEN],
     node_id: NodeId,
-    state: &[Option<u64>],
+    state: &LineageState,
 ) -> Vec<u8> {
-    let count = state.iter().filter(|s| s.is_some()).count();
-    let mut body = Vec::with_capacity(DATA_EPOCH_LEN + 8 + 2 + count * 10);
+    let count = state.stamps.iter().filter(|s| s.is_some()).count();
+    let gap_count = state.gaps.iter().filter(|g| **g).count();
+    let mut body = Vec::with_capacity(DATA_EPOCH_LEN + 8 + 2 + count * 10 + 2 + gap_count * 2);
     body.extend_from_slice(data_epoch);
     body.extend_from_slice(&node_id.0.to_le_bytes());
     body.extend_from_slice(&(count as u16).to_le_bytes());
-    for (shard, stamp) in state.iter().enumerate() {
+    for (shard, stamp) in state.stamps.iter().enumerate() {
         if let Some(regime) = stamp {
             body.extend_from_slice(&(shard as u16).to_le_bytes());
             body.extend_from_slice(&regime.to_le_bytes());
         }
     }
+    body.extend_from_slice(&(gap_count as u16).to_le_bytes());
+    for (shard, gap) in state.gaps.iter().enumerate() {
+        if *gap {
+            body.extend_from_slice(&(shard as u16).to_le_bytes());
+        }
+    }
     encode_envelope(LINEAGE_STATE_ENVELOPE_MAGIC, &body)
 }
 
-/// The decoded lineage file body: `(data_epoch, node_id, Full entries)`.
-type DecodedLineageFile = ([u8; DATA_EPOCH_LEN], NodeId, Vec<(u16, u64)>);
+/// The decoded lineage file body:
+/// `(data_epoch, node_id, Full entries, baseline-gap shards)`.
+type DecodedLineageFile = ([u8; DATA_EPOCH_LEN], NodeId, Vec<(u16, u64)>, Vec<u16>);
 
 /// Decode a lineage file. Every fault is a hard error (the caller maps it
 /// to all-`Subset`): bad envelope/checksum, truncated body, out-of-range
@@ -722,7 +897,7 @@ fn decode_lineage_file(bytes: &[u8]) -> Result<DecodedLineageFile, LineageDecode
     if count > NUM_SHARDS {
         return Err(LineageDecodeError::NonCanonical);
     }
-    if body.len() != pos + count * 10 {
+    if body.len() < pos + count * 10 {
         return Err(LineageDecodeError::Truncated);
     }
     let mut entries = Vec::with_capacity(count);
@@ -751,7 +926,48 @@ fn decode_lineage_file(bytes: &[u8]) -> Result<DecodedLineageFile, LineageDecode
         prev = Some(shard);
         entries.push((shard, regime));
     }
-    Ok((data_epoch, node_id, entries))
+    // §8 review round 2, N1 — the baseline-GAP trailer. A body that ends
+    // here is a pre-N1 sidecar: no gaps were recordable, so an empty set
+    // is the exact (not a defaulted) answer. Anything else must decode
+    // canonically or the whole file is rejected (fail-closed all-Subset).
+    let mut gap_shards = Vec::new();
+    if body.len() != pos {
+        if body.len() < pos + 2 {
+            return Err(LineageDecodeError::Truncated);
+        }
+        let gap_count = u16::from_le_bytes(
+            body[pos..pos + 2]
+                .try_into()
+                .map_err(|_| LineageDecodeError::Truncated)?,
+        ) as usize;
+        pos += 2;
+        if gap_count > NUM_SHARDS {
+            return Err(LineageDecodeError::NonCanonical);
+        }
+        if body.len() != pos + gap_count * 2 {
+            return Err(LineageDecodeError::Truncated);
+        }
+        let mut prev_gap: Option<u16> = None;
+        for _ in 0..gap_count {
+            let shard = u16::from_le_bytes(
+                body[pos..pos + 2]
+                    .try_into()
+                    .map_err(|_| LineageDecodeError::Truncated)?,
+            );
+            pos += 2;
+            if shard as usize >= NUM_SHARDS {
+                return Err(LineageDecodeError::NonCanonical);
+            }
+            if let Some(p) = prev_gap
+                && shard <= p
+            {
+                return Err(LineageDecodeError::NonCanonical);
+            }
+            prev_gap = Some(shard);
+            gap_shards.push(shard);
+        }
+    }
+    Ok((data_epoch, node_id, entries, gap_shards))
 }
 
 /// Decode faults of the lineage sidecar (all mapped to fail-closed
@@ -1003,5 +1219,116 @@ mod tests {
         let restamped = stamp_fresh_data_epoch(&path).unwrap();
         assert_ne!(first, restamped, "restore must mint a FRESH identity");
         assert_eq!(load_or_create_data_epoch(&path).unwrap(), restamped);
+    }
+
+    /// §8 review round 2, N1 — the BASELINE-GAP flag survives a reboot.
+    ///
+    /// The flag records "records that should have arrived out of band never
+    /// did"; forgetting it across a restart would let the very next
+    /// catch-up-convergence signal certify the hole. It is therefore
+    /// persisted alongside the stamps, and a §4.3 completion trigger (a
+    /// `Full` stamp) is the only thing that clears it.
+    #[test]
+    fn n1_baseline_gap_persists_across_reopen_and_clears_on_completion() {
+        let dir = tmpdir("gap");
+        let path = dir.join("cluster.lineage");
+        let epoch = [4u8; DATA_EPOCH_LEN];
+        let node = NodeId(11);
+
+        let store = LineageStore::open(Some(path.clone()), epoch, node);
+        assert!(store.mark_full(5, 3, "complete"));
+        assert!(store.mark_full(6, 3, "complete"));
+        store.mark_baseline_gap(&[5], "transfer abandoned");
+        assert_eq!(
+            store.lineage(5),
+            Lineage::Subset,
+            "the gap degrades the stamp"
+        );
+        assert!(store.has_baseline_gap(5));
+        assert!(!store.has_baseline_gap(6));
+        assert_eq!(store.baseline_gap_count(), 1);
+        drop(store);
+
+        let reopened = LineageStore::open(Some(path.clone()), epoch, node);
+        assert!(
+            reopened.has_baseline_gap(5),
+            "N1: the gap MUST survive a reboot — otherwise the next convergence \
+             signal certifies the hole",
+        );
+        assert_eq!(reopened.lineage(5), Lineage::Subset);
+        assert_eq!(
+            reopened.lineage(6),
+            Lineage::Full { regime: 3 },
+            "an unrelated Full stamp is unaffected",
+        );
+
+        // A §4.3 completion trigger clears it, durably.
+        assert!(reopened.mark_full(5, 3, "verified completion handshake"));
+        assert!(!reopened.has_baseline_gap(5));
+        drop(reopened);
+        let again = LineageStore::open(Some(path), epoch, node);
+        assert!(!again.has_baseline_gap(5));
+        assert_eq!(again.lineage(5), Lineage::Full { regime: 3 });
+    }
+
+    /// N1 — an identity mismatch degrades every STAMP, but must NOT drop a
+    /// recorded baseline gap: the gap is a property of the on-disk DATA,
+    /// not of the claiming identity, so a node-id / epoch change cannot be
+    /// used to launder a known hole into a convergence-certifiable copy.
+    #[test]
+    fn n1_baseline_gap_survives_identity_mismatch() {
+        let dir = tmpdir("gap-identity");
+        let path = dir.join("cluster.lineage");
+        let store = LineageStore::open(Some(path.clone()), [7u8; DATA_EPOCH_LEN], NodeId(1));
+        assert!(store.mark_full(9, 2, "complete"));
+        store.mark_baseline_gap(&[9], "transfer abandoned");
+        drop(store);
+
+        // Same data dir, DIFFERENT node id.
+        let cloned = LineageStore::open(Some(path), [7u8; DATA_EPOCH_LEN], NodeId(2));
+        assert_eq!(cloned.lineage(9), Lineage::Subset);
+        assert!(
+            cloned.has_baseline_gap(9),
+            "N1: the recorded gap must survive the identity-mismatch degrade",
+        );
+    }
+
+    /// N1 — a pre-N1 sidecar (no gap trailer) decodes with an EMPTY gap
+    /// set, exactly (not defaulted): no gap was recordable when it was
+    /// written, so none existed. Every other decode fault stays
+    /// fail-closed.
+    #[test]
+    fn n1_pre_gap_sidecar_decodes_with_empty_gap_set() {
+        let epoch = [2u8; DATA_EPOCH_LEN];
+        let node = NodeId(3);
+        // Hand-build the pre-N1 body: no `[gap_count]` trailer at all.
+        let mut body = Vec::new();
+        body.extend_from_slice(&epoch);
+        body.extend_from_slice(&node.0.to_le_bytes());
+        body.extend_from_slice(&1u16.to_le_bytes());
+        body.extend_from_slice(&12u16.to_le_bytes());
+        body.extend_from_slice(&8u64.to_le_bytes());
+        let bytes = encode_envelope(LINEAGE_STATE_ENVELOPE_MAGIC, &body);
+        let (file_epoch, file_node, entries, gaps) =
+            decode_lineage_file(&bytes).expect("a pre-N1 sidecar must still decode");
+        assert_eq!(file_epoch, epoch);
+        assert_eq!(file_node, node);
+        assert_eq!(entries, vec![(12u16, 8u64)]);
+        assert!(gaps.is_empty());
+
+        // A TRUNCATED gap trailer is a hard error (all-Subset fail-closed).
+        let mut truncated = body.clone();
+        truncated.extend_from_slice(&2u16.to_le_bytes());
+        truncated.extend_from_slice(&1u16.to_le_bytes());
+        let bad = encode_envelope(LINEAGE_STATE_ENVELOPE_MAGIC, &truncated);
+        assert!(decode_lineage_file(&bad).is_err());
+
+        // A non-ascending gap list is non-canonical.
+        let mut unsorted = body;
+        unsorted.extend_from_slice(&2u16.to_le_bytes());
+        unsorted.extend_from_slice(&5u16.to_le_bytes());
+        unsorted.extend_from_slice(&5u16.to_le_bytes());
+        let bad2 = encode_envelope(LINEAGE_STATE_ENVELOPE_MAGIC, &unsorted);
+        assert!(decode_lineage_file(&bad2).is_err());
     }
 }

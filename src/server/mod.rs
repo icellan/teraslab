@@ -216,6 +216,13 @@ pub(crate) struct ConnectionState {
     /// `false` (external client / test double) so the flag is ignored unless the
     /// connection loop explicitly grants it.
     pub(crate) local_read_authorized: bool,
+    /// §8 security review round 2, G-2: the IP the current frame arrived
+    /// from, captured once per connection (and carried per work item on
+    /// the pooled path). `OP_REPLICA_CONVERGED` resolves its self-declared
+    /// `source_node_id` against this so a cluster member cannot assert
+    /// convergence on another node's behalf. `None` (peer address
+    /// unavailable, or a test double) is fail-closed at the consumer.
+    pub(crate) peer_ip: Option<std::net::IpAddr>,
 }
 
 /// An in-progress streaming blob upload for a single txid.
@@ -239,7 +246,14 @@ impl ConnectionState {
                 ServerConfig::DEFAULT_STREAM_IDLE_TIMEOUT_SECS,
             )),
             local_read_authorized: false,
+            peer_ip: None,
         }
+    }
+
+    /// G-2: record the connection's peer IP (see [`Self::peer_ip`]).
+    pub(crate) fn with_peer_ip(mut self, peer_ip: Option<std::net::IpAddr>) -> Self {
+        self.peer_ip = peer_ip;
+        self
     }
 
     pub(crate) fn with_max_stream_total_bytes(mut self, max_stream_total_bytes: u64) -> Self {
@@ -923,10 +937,15 @@ fn handle_connection_inner(
     } else {
         Some(Duration::from_secs(opts.stream_idle_timeout_secs))
     };
+    // G-2: capture the peer IP once, before any frame is read — the
+    // authenticated inter-node identity check for OP_REPLICA_CONVERGED
+    // resolves the frame's self-declared source id against it.
+    let peer_ip = stream.peer_addr().ok().map(|a| a.ip());
     let mut conn_state = ConnectionState::new()
         .with_max_stream_total_bytes(opts.max_stream_total_bytes)
         .with_max_active_streams(opts.max_active_streams)
-        .with_stream_idle_timeout(stream_idle_timeout);
+        .with_stream_idle_timeout(stream_idle_timeout)
+        .with_peer_ip(peer_ip);
 
     let depth = opts.pipeline_depth.max(1);
     // All responses — worker-dispatched, inline-barrier, and read-path error
@@ -1304,6 +1323,7 @@ fn handle_connection_inner(
                     inflight: Arc::clone(&inflight),
                     _permit: _inflight_permit,
                     local_read_authorized,
+                    peer_ip,
                 });
         } else {
             // Barrier / serial path: drain the connection's pooled requests so
@@ -1372,6 +1392,10 @@ struct WorkItem {
     /// connection loop before hand-off (the shared worker pool has no
     /// per-connection state of its own). See [`ConnectionState::local_read_authorized`].
     local_read_authorized: bool,
+    /// G-2: the connection's peer IP, captured on the connection loop
+    /// before hand-off (the shared worker pool has no per-connection state
+    /// of its own). See [`ConnectionState::peer_ip`].
+    peer_ip: Option<std::net::IpAddr>,
 }
 
 /// Per-connection in-flight accounting for pooled dispatch. Bounds a single
@@ -1730,6 +1754,10 @@ fn dispatch_worker(
         // never touch per-connection state), so the per-frame grant travels on
         // the WorkItem rather than the connection.
         conn_state.local_read_authorized = item.local_read_authorized;
+        // G-2: the worker's `conn_state` is a shared throwaway, so the
+        // frame's peer identity travels on the WorkItem alongside the
+        // FLAG_LOCAL_READ grant.
+        conn_state.peer_ip = item.peer_ip;
         let response = dispatch::handle_request(
             &item.request,
             engine,

@@ -1346,6 +1346,35 @@ pub struct MigrationMetrics {
     /// intervention (manual reassign / reboot) — the shard is unavailable but its
     /// data is never lost or served stale, and the reverse-pull keeps retrying.
     pub heal_deadline_alerts: PaddedCounter,
+    /// §8 review round 2, N1/G-1 — number of `OP_REPLICA_CONVERGED`
+    /// (§4.3 fourth completion trigger) shard entries REFUSED by the
+    /// receiver's self-verification. A climbing counter means masters are
+    /// asserting completeness this node will not accept: a stale/forged
+    /// signal, a replayed frame, a shard with an unrepaired baseline gap,
+    /// or a fence still up. Never fatal (the signal is best-effort), but a
+    /// sustained rate on a healthy cluster is worth an alert.
+    pub converged_signal_refused: PaddedCounter,
+    /// §8 review round 2, N1 — number of shards currently carrying an
+    /// unrepaired BASELINE GAP (gauge): an out-of-band transfer was
+    /// abandoned without a completeness proof, so the copy is `Subset` and
+    /// cannot re-earn `Full` through catch-up convergence (only a real
+    /// completion trigger clears it). A persistently non-zero value is the
+    /// operator-visible signal that a shard needs a re-migration.
+    pub lineage_baseline_gap_shards: AtomicU32,
+    /// §8 review round 2, N3 — number of times a commit that LOWERS some
+    /// shard's regime was accepted through the F1 `!holder_evidence`
+    /// (adopt-wholesale) arm instead of being ratcheted. Non-zero means a
+    /// far-behind node adopted the cluster's rebased regime array; it is
+    /// the audit trail for the one place the I10(d) never-lower ratchet is
+    /// deliberately not enforced.
+    pub regime_lowering_accepted_far_behind: PaddedCounter,
+    /// §8 review round 2, N3 — number of commits this node REFUSED on the
+    /// I10(d) never-lower regime ratchet. Consecutive rejections drive the
+    /// C11-style self-fence (see
+    /// [`crate::cluster::topology::RATCHET_SELF_FENCE_THRESHOLD`]); a
+    /// climbing counter is the operator signal that this node's installed
+    /// regime array has diverged from the cluster's.
+    pub regime_ratchet_rejections: PaddedCounter,
 }
 
 /// Number of {direction, role} buckets for migration byte counters.
@@ -1410,6 +1439,10 @@ impl MigrationMetrics {
             topology_epoch_mismatch: PaddedCounter::new(),
             phantom_master_relinquished: PaddedCounter::new(),
             heal_deadline_alerts: PaddedCounter::new(),
+            converged_signal_refused: PaddedCounter::new(),
+            lineage_baseline_gap_shards: AtomicU32::new(0),
+            regime_lowering_accepted_far_behind: PaddedCounter::new(),
+            regime_ratchet_rejections: PaddedCounter::new(),
         }
     }
 
