@@ -301,6 +301,10 @@ struct RelinquishContext {
     /// recomputes the rightful master with the SAME algorithm the cluster
     /// agreed on (round-robin vs HRW).
     placement_version: u16,
+    /// P1 stage 4 — the committed override map at snapshot time: the
+    /// relinquish oracle's "rightful master" is the committed DERIVATION
+    /// (overrides over placement), never bare placement.
+    override_map: std::collections::BTreeMap<u16, NodeId>,
     self_id: NodeId,
     live_members: std::collections::HashSet<NodeId>,
     /// Engine handle to check whether `self` holds any records for a shard
@@ -362,6 +366,7 @@ fn fail_or_relinquish_outbound_task(
                     self_holds_records,
                     target_holds_superset,
                     ctx.placement_version,
+                    &ctx.override_map,
                 )
             };
             match disposition {
@@ -552,13 +557,13 @@ fn complete_migration_task_current_epoch_with_midpoint(
 ///
 /// The loop's purpose (commit b5990b3) is to repair *divergence from the
 /// activation's own intent* — shards rolled back after failed migrations —
-/// never to revert the activation. Master election (`apply_master_election`,
-/// Phase F) deliberately deviates masters from the raw round-robin
-/// `compute_with_epoch` result, so the comparison baseline is the
-/// election-refined intent recorded on the table at activation time
-/// (`ShardTable::intended_master`), NOT a recomputed round-robin table.
-/// A settled cluster therefore yields `mismatched == 0` and the loop is a
-/// no-op (W1.1 FIX C).
+/// never to revert the activation. The activation installs the COMMITTED
+/// DERIVATION (placement refined by the committed override map, P1 stage 4
+/// §4.4 — the retired `apply_master_election` local deviation is gone), so
+/// the comparison baseline is the intent recorded on the table at
+/// activation time (`ShardTable::intended_master`), NOT a recomputed
+/// bare-placement table. A settled cluster therefore yields
+/// `mismatched == 0` and the loop is a no-op (W1.1 FIX C).
 ///
 /// When the table has not activated the committed term at all
 /// (`table.version != committed_term`, e.g. a node that missed the commit
@@ -570,12 +575,17 @@ fn committed_topology_reactivation_metrics(
     rf: u8,
     committed_term: u64,
     placement_version: u16,
+    override_map: &std::collections::BTreeMap<u16, NodeId>,
 ) -> (u32, usize) {
     let mismatched = if table.version != committed_term {
         let expected = ShardTable::compute_with_epoch(committed_members, rf, 0, placement_version);
         let count = (0..crate::cluster::shards::NUM_SHARDS as u16)
             .filter(|&shard| {
-                table.target_assignment(shard).master != expected.target_assignment(shard).master
+                let expected_master = override_map
+                    .get(&shard)
+                    .copied()
+                    .unwrap_or_else(|| expected.target_assignment(shard).master);
+                table.target_assignment(shard).master != expected_master
             })
             .count() as u32;
         // The stale version alone mandates reactivation even if every
@@ -600,37 +610,35 @@ fn committed_topology_reactivation_metrics(
 /// two nodes at runtime, and it never self-corrects — `handoffs == 0`,
 /// `active_migrations == 0`, `inbound == 0`, and the topology term is settled.
 ///
-/// # Root cause
+/// # Root cause (historical) and the stage-4 baseline
 ///
-/// `apply_master_election` (Phase F) refines each freshly-computed
-/// round-robin table using that node's LOCAL `partition_view` (the
-/// exchange-phase result) and its LOCAL `prev_table` stickiness. Both inputs
-/// differ per node — the exchange returns partial/divergent views, and each
-/// node's previous table differs — so the election can promote a DIFFERENT
-/// node to master for the same shard on different nodes. Each node's table is
-/// internally self-consistent (`target_assignment == intended_master`, and the
-/// elected master is always inside the shard's candidate set), so
-/// `committed_topology_reactivation_metrics` reads `mismatched == 0` on every
-/// node. Election is a per-node local optimization with NO cluster-wide
-/// agreement, so it cannot preserve the single-master-per-shard invariant.
+/// The retired `apply_master_election` (Phase F) refined each
+/// freshly-computed round-robin table using that node's LOCAL
+/// `partition_view` and LOCAL `prev_table` stickiness — per-node inputs, so
+/// two nodes could each elect themselves master for the same shard while
+/// every per-node consistency metric read clean. P1 stage 4 (§4.4) retired
+/// that local deviation: the only master deviation that exists now is the
+/// quorum-COMMITTED override map, identical on every node at the same
+/// committed state (I0).
 ///
 /// # The convergence invariant
 ///
-/// The only function that is deterministic and identical on every node is the
-/// round-robin `compute_with_epoch(committed_members)`: each node derives the
-/// exact same master per shard from the same member SET. A same-term
-/// reactivation runs `activate_topology` with an EMPTY partition view, which
-/// makes `apply_master_election` a no-op and installs precisely that
-/// round-robin table — so once reactivation fires on every divergent node the
-/// cluster collapses to a single master per shard (sum == `NUM_SHARDS`) and
-/// STAYS there (the round-robin table is a fixed point of this detector).
+/// The deterministic cluster-wide assignment is therefore the COMMITTED
+/// DERIVATION: `override_map.get(s)` falling back to the placement
+/// `compute_with_epoch(committed_members)` master. A same-term reactivation
+/// installs exactly that derivation, so once reactivation fires on every
+/// divergent node the cluster collapses to a single master per shard (sum
+/// == `NUM_SHARDS`) and STAYS there (the derivation is a fixed point of
+/// this detector).
 ///
-/// This detector therefore counts shards where `self` is the local master but
-/// the round-robin master for that shard under `committed_members` is a
-/// DIFFERENT node — i.e. exactly the election-deviated (or stale) shards a
-/// same-term empty-view reactivation will reassign. A node only knows its own
-/// table, so the check is purely local; every divergent node independently
-/// fires reactivation and relinquishes its deviant masters.
+/// This detector therefore counts shards where `self` is the local master
+/// but the committed-derivation master for that shard is a DIFFERENT node —
+/// stale mastership a reactivation will reassign. A committed override
+/// naming `self` is authoritative and MUST NOT be counted (flagging it
+/// would let the relinquish machinery revert a quorum-committed promotion —
+/// the exact inversion stage 4 exists to prevent). A node only knows its
+/// own table, so the check is purely local; every divergent node
+/// independently fires reactivation and relinquishes its deviant masters.
 ///
 /// # No-loss
 ///
@@ -653,6 +661,7 @@ fn phantom_master_shard_count(
     rf: u8,
     self_id: NodeId,
     placement_version: u16,
+    override_map: &std::collections::BTreeMap<u16, NodeId>,
 ) -> usize {
     // A single-member committed set cannot over-own (every shard is self's
     // by definition); skip the recompute.
@@ -666,12 +675,16 @@ fn phantom_master_shard_count(
     let committed = ShardTable::compute_with_epoch(committed_members, rf, 0, placement_version);
     (0..crate::cluster::shards::NUM_SHARDS as u16)
         .filter(|&shard| {
-            // This node locally masters the shard, but the deterministic
-            // committed-version master for the committed members is a
-            // different node — the exact shard an empty-view reactivation
-            // reassigns.
-            table.target_assignment(shard).master == self_id
-                && committed.target_assignment(shard).master != self_id
+            // This node locally masters the shard, but the COMMITTED
+            // DERIVATION (override map falling back to placement — P1
+            // stage 4) names a different node — the exact shard a
+            // reactivation reassigns. A committed override naming self is
+            // authoritative, never a phantom.
+            let derived = override_map
+                .get(&shard)
+                .copied()
+                .unwrap_or_else(|| committed.target_assignment(shard).master);
+            table.target_assignment(shard).master == self_id && derived != self_id
         })
         .count()
 }
@@ -771,6 +784,7 @@ fn failed_handoff_disposition(
     self_holds_records: bool,
     target_holds_superset: bool,
     placement_version: u16,
+    override_map: &std::collections::BTreeMap<u16, NodeId>,
 ) -> FailedHandoffDisposition {
     // Cond 1: only master handoffs cause the over-count.
     if !task.is_master {
@@ -793,9 +807,15 @@ fn failed_handoff_disposition(
         return FailedHandoffDisposition::RollbackToSelf;
     }
     // Cond 2 + 3: the deterministic committed master must be a DIFFERENT,
-    // live, committed member.
+    // live, committed member. P1 stage 4: "committed master" is the
+    // committed DERIVATION — the override map falls back to placement —
+    // so a quorum-committed promotion target is the rightful master here,
+    // never the superseded placement pick.
     let committed = ShardTable::compute_with_epoch(committed_members, rf, 0, placement_version);
-    let rightful = committed.target_assignment(task.shard).master;
+    let rightful = override_map
+        .get(&task.shard)
+        .copied()
+        .unwrap_or_else(|| committed.target_assignment(task.shard).master);
     if rightful == self_id
         || !committed_members.contains(&rightful)
         || !live_members.contains(&rightful)
@@ -1002,6 +1022,19 @@ pub struct PartitionVersionEntry {
     /// `crate::record::generation_target_ahead`), `0` when the shard holds no
     /// record or when reported by a legacy peer.
     pub max_generation: u32,
+    /// P1 stage 4 (§4.3) — the reporting node's SELF-OBSERVED copy lineage
+    /// for the shard: `true` iff it holds a `Full` stamp. PROPOSER INPUT
+    /// ONLY: feeds the §4.4 promotion proposer and the migration-skip
+    /// refinement, never a serving-eligibility decision (serving is always
+    /// gated on the serving node's own self-observed lineage — I13).
+    /// Additive on the wire; absent from a pre-stage-4 peer's entries and
+    /// decoded as `false` (= not-`Full`, fail-closed).
+    pub lineage_full: bool,
+    /// P1 stage 4 — the committed regime the reporter's `Full` stamp is
+    /// current at (`0` when `lineage_full == false` or from a pre-stage-4
+    /// peer). The §4.4 proposer requires it to EQUAL the shard's current
+    /// committed regime before targeting the reporter.
+    pub lineage_regime: u64,
 }
 
 /// In-progress collection of `PartitionVersionEntry` reports from cluster
@@ -1081,25 +1114,36 @@ pub fn build_plan_from_partition_view(
         return base;
     }
 
-    // Index: (node, shard) -> (last_applied_seq, flags). The `flags`
-    // subset bit ([`PARTITION_FLAG_PENDING_INBOUND`]) marks a holder that has
-    // only PART of the shard (a subset master still receiving inbound data), so
-    // its non-zero record count must NOT be read as "already owns the shard".
-    let mut view_by_node_shard: std::collections::HashMap<(NodeId, u16), (u64, u8)> =
+    // Index: (node, shard) -> (last_applied_seq, flags, lineage_full). The
+    // `flags` subset bit ([`PARTITION_FLAG_PENDING_INBOUND`]) marks a holder
+    // that has only PART of the shard (a subset master still receiving inbound
+    // data), so its non-zero record count must NOT be read as "already owns the
+    // shard".
+    let mut view_by_node_shard: std::collections::HashMap<(NodeId, u16), (u64, u8, bool)> =
         std::collections::HashMap::new();
     for (node, entries) in partition_view {
         for e in entries {
-            view_by_node_shard.insert((*node, e.shard), (e.last_applied_seq, e.flags));
+            view_by_node_shard.insert(
+                (*node, e.shard),
+                (e.last_applied_seq, e.flags, e.lineage_full),
+            );
         }
     }
 
     // A holder "fully owns" a shard only when it reports data AND its
-    // subset/incomplete bit is clear. C9: skipping an outbound to — or rewriting
-    // the source to — a subset holder promotes a PARTIAL master to full master,
-    // silently dropping every record it never received at handoff.
+    // subset/incomplete bit is clear AND its self-observed lineage is `Full`
+    // (P1 stage 4, design §4.3: migration-skip is lineage-aware — a
+    // `Subset`-lineage destination does NOT own the shard, so a fill toward
+    // it is never skipped; a pre-stage-4 peer's entry decodes lineage-absent
+    // = not-Full and is likewise never skipped, the fail-closed direction).
+    // C9: skipping an outbound to — or rewriting the source to — a subset
+    // holder promotes a PARTIAL master to full master, silently dropping
+    // every record it never received at handoff.
     let holder_owns_shard = |node: NodeId, shard: u16| -> bool {
         match view_by_node_shard.get(&(node, shard)) {
-            Some(&(seq, flags)) => seq > 0 && (flags & PARTITION_FLAG_PENDING_INBOUND) == 0,
+            Some(&(seq, flags, lineage_full)) => {
+                seq > 0 && (flags & PARTITION_FLAG_PENDING_INBOUND) == 0 && lineage_full
+            }
             None => false,
         }
     };
@@ -1323,16 +1367,25 @@ pub(crate) fn restored_committed_shard_table(
     replication_factor: u8,
     committed_term: u64,
     placement_version: u16,
+    override_map: &std::collections::BTreeMap<u16, NodeId>,
 ) -> Option<ShardTable> {
     if committed_term == 0 || committed_members.is_empty() {
         return None;
     }
-    Some(ShardTable::compute_with_epoch(
+    let mut table = ShardTable::compute_with_epoch(
         committed_members,
         replication_factor,
         committed_term,
         placement_version.max(1),
-    ))
+    );
+    // P1 stage 4 (§4.0/I0): the restored table is the COMMITTED DERIVATION —
+    // placement plus the committed override map. Without this, a rebooted
+    // node would serve the pre-override placement master for a promoted
+    // shard, diverging from every peer's committed view.
+    for (&shard, &target) in override_map {
+        table.apply_override_master(shard, target);
+    }
+    Some(table)
 }
 
 impl ClusterCoordinator {
@@ -1460,11 +1513,16 @@ impl ClusterCoordinator {
         let committed_term = self.topology_authority.committed_term();
         let members = self.topology_authority.committed_members();
         let placement_version = self.topology_authority.committed_placement_version();
+        let override_map = self
+            .topology_authority
+            .committed_regime_block()
+            .override_map;
         if let Some(table) = restored_committed_shard_table(
             &members,
             self.replication_factor,
             committed_term,
             placement_version,
+            &override_map,
         ) {
             *self.shard_table.write() = table;
         }
@@ -1648,6 +1706,17 @@ impl ClusterCoordinator {
                 self.self_id,
             )),
         };
+        // P1 stage 4 (I13) — the per-shard SERVING-ESTABLISHED bitmap: a set
+        // bit means "self serving this shard as master needs no Full gate"
+        // (bootstrap regime-0 shards, or continuity from the previous
+        // regime). Its RESTING state is all-set (gate-inactive — every
+        // pre-commit fixture and a regime-0 cluster behave exactly as
+        // before); each commit install and the boot re-derivation below
+        // recompute it, fail-closed to gated for newly-acquired masters.
+        // Read lock-free on the `is_master` hot path (the `inbound_atomic`
+        // pattern).
+        let serving_established = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+        serving_established.set_all();
         // I13(i) — boot re-derivation over the LOADED committed state (the
         // authority was restored by the caller before `start()`): the
         // committed master of `s` with an intact, un-reclaimed redo range
@@ -1683,32 +1752,45 @@ impl ClusterCoordinator {
                         || table.effective_assignment(s).master == self_id
                 };
                 lineage.boot_rederive(&master_is_self, &in_holder, &|s| block.regime.get(s));
+                // I13 boot half of the serving-established derivation: this
+                // node's own committed-master shards re-derive Full above
+                // (I13i), so their serving is established; every other
+                // regime-advanced shard is fail-closed to gated.
+                for s in 0..NUM_SHARDS as u16 {
+                    if block.regime.get(s) != 0 && !master_is_self(s) {
+                        serving_established.clear(s);
+                    }
+                }
             }
         }
         // I2 / I13(ii) — install the commit-install hook: per-commit lineage
-        // transitions run INSIDE `handle_commit_durable`'s `commit_apply`
-        // section, after the topology persist and strictly before
-        // `committed_term` advances — one batched durable lineage write per
-        // commit, failing the commit closed on a durability fault.
+        // transitions (+ the stage-4 skipped-term degrade and the I13
+        // serving-established derivation) run INSIDE `handle_commit_durable`'s
+        // `commit_apply` section, after the topology persist and strictly
+        // before `committed_term` advances — one batched durable lineage
+        // write per commit, failing the commit closed on a durability fault.
         {
             let lineage_hook = lineage.clone();
             let shard_table_hook = self.shard_table.clone();
+            let established_hook = serving_established.clone();
             let self_id = self.self_id;
             let rf = self.replication_factor;
             self.topology_authority
-                .set_commit_install_hook(Arc::new(move |state| {
+                .set_commit_install_hook(Arc::new(move |state, prev| {
                     lineage_apply_committed_state(
                         &lineage_hook,
                         self_id,
                         rf,
-                        &state.committed_members,
-                        state.committed_placement_version,
-                        &state.regime_block,
+                        state,
+                        prev,
                         &shard_table_hook,
+                        &established_hook,
                     )
                 }));
         }
         let lineage_event = lineage.clone();
+        let serving_established_event = serving_established.clone();
+        let serving_established_for_cluster = serving_established.clone();
 
         // Topology authority and cluster secret for the event loop.
         let topo_authority_event = self.topology_authority.clone();
@@ -1751,6 +1833,15 @@ impl ClusterCoordinator {
             // exchange on every 100 ms tick while the first exchange is in
             // flight; cleared implicitly by advancing as the term advances.
             let mut prompt_exchange_term: u64 = 0;
+            // P1 stage 4 — §4.4 promotion rails (cooldown = 3× the heal
+            // window per the design) + the proposer's view-poll cadence.
+            let mut promotion_rails = PromotionRails::new(
+                heal_deadline.saturating_mul(PROMOTION_COOLDOWN_HEAL_WINDOWS),
+                self_id.0 ^ 0x9E37_79B9_7F4A_7C15,
+            );
+            let mut last_promotion_poll = std::time::Instant::now();
+            // P1 stage 4 — debounce for the stream-completeness flush.
+            let mut last_lineage_flush = std::time::Instant::now();
             // W5-followup — progress tracker for the fast self-drain
             // reactivation cadence. Holds `(term, work_remaining)` captured the
             // last time the fast path fired. `None` (or a stale term) means the
@@ -1927,6 +2018,7 @@ impl ClusterCoordinator {
                                         &migration_throttle_event,
                                         &cluster_secret_event,
                                         Some(&topo_authority_event),
+                                        None,
                                     );
                                     last_activation_at = std::time::Instant::now();
                                 }
@@ -2165,6 +2257,68 @@ impl ClusterCoordinator {
                 // exchange results). Always false in production.
                 let activation_held = activation_hold_event.load(Ordering::Acquire);
 
+                // P1 stage 4 — flush the master→replica completeness signal
+                // (debounced; one batched durable lineage write per flush
+                // with changes; §4.3 catch-up trigger).
+                if last_lineage_flush.elapsed() >= LINEAGE_STREAM_FLUSH_INTERVAL {
+                    last_lineage_flush = std::time::Instant::now();
+                    let stamped = flush_stream_full_candidates(
+                        &lineage_event,
+                        &engine,
+                        &shard_table,
+                        &inbound_bm_event,
+                        &topo_authority_event,
+                        self_id,
+                    );
+                    if stamped > 0 {
+                        tracing::info!(
+                            stamped,
+                            "lineage: stream-completeness signal earned Full stamp(s)",
+                        );
+                    }
+                }
+
+                // P1 stage 4 (§4.4) — the deterministic proposer refreshes
+                // the partition view on a slow cadence while the committed
+                // promotion_enabled field is true, so a wedged/dead master
+                // or a stuck subset-destination is (re-)observed and the
+                // promotion evaluation can run without waiting for the next
+                // membership commit. The collected view feeds the SAME
+                // exchange-complete handler (its activation half dedups by
+                // term; the promotion evaluation runs on every view).
+                if !activation_held && last_promotion_poll.elapsed() >= PROMOTION_VIEW_POLL_INTERVAL
+                {
+                    last_promotion_poll = std::time::Instant::now();
+                    if topo_authority_event.committed_promotion_enabled() {
+                        let members = topo_authority_event.committed_members();
+                        let term = topo_authority_event.committed_term();
+                        if members.len() > 1 && members.iter().min().copied() == Some(self_id) {
+                            let exchange_tx = exchange_complete_tx.clone();
+                            let node_addrs_x = node_addrs.clone();
+                            let engine_x = engine.clone();
+                            let shard_table_x = shard_table.clone();
+                            let inbound_bm_x = inbound_bm_event.clone();
+                            let secret_x = cluster_secret_event.clone();
+                            let lineage_x = lineage_event.clone();
+                            std::thread::spawn(move || {
+                                let view = Self::run_exchange_phase(
+                                    &members,
+                                    self_id,
+                                    term,
+                                    &node_addrs_x,
+                                    &engine_x,
+                                    &shard_table_x,
+                                    &inbound_bm_x,
+                                    &lineage_x,
+                                    std::time::Duration::from_millis(2000),
+                                    &secret_x,
+                                );
+                                let _ = exchange_tx.send((members, term, view));
+                            });
+                        }
+                    }
+                }
+
                 // W1.5 — PROMPT term catch-up. Root cause of the 3-node
                 // formation deadlock: the late node's authority commits the
                 // 3-member term (its dispatch worker applies OP_TOPOLOGY_COMMIT
@@ -2220,6 +2374,7 @@ impl ClusterCoordinator {
                         let shard_table_x = shard_table.clone();
                         let inbound_bm_x = inbound_bm_event.clone();
                         let secret_x = cluster_secret_event.clone();
+                        let lineage_x = lineage_event.clone();
                         let members_x = committed_members.clone();
                         std::thread::spawn(move || {
                             let view = Self::run_exchange_phase(
@@ -2230,6 +2385,7 @@ impl ClusterCoordinator {
                                 &engine_x,
                                 &shard_table_x,
                                 &inbound_bm_x,
+                                &lineage_x,
                                 std::time::Duration::from_millis(2000),
                                 &secret_x,
                             );
@@ -2280,6 +2436,10 @@ impl ClusterCoordinator {
                         // else a settled v2 cluster false-fires the phantom
                         // detector against a v1 baseline.
                         let committed_pv = topo_authority_event.committed_placement_version();
+                        // P1 stage 4 — both oracles compare against the
+                        // committed DERIVATION (override map over placement).
+                        let committed_overrides =
+                            topo_authority_event.committed_regime_block().override_map;
                         let (mismatched, pending_handoffs, stuck_subset, phantom_masters) = {
                             let mgr = migration.lock();
                             let table = shard_table.read();
@@ -2290,6 +2450,7 @@ impl ClusterCoordinator {
                                     rf,
                                     committed_term,
                                     committed_pv,
+                                    &committed_overrides,
                                 );
                             // W1.1 residual fix (FIX 2) — self-heal backstop.
                             let stuck_subset = stuck_subset_master_count(&table, &mgr, self_id);
@@ -2303,6 +2464,7 @@ impl ClusterCoordinator {
                                 rf,
                                 self_id,
                                 committed_pv,
+                                &committed_overrides,
                             );
                             (mismatched, pending_handoffs, stuck_subset, phantom_masters)
                         };
@@ -2407,6 +2569,7 @@ impl ClusterCoordinator {
                                 &migration_throttle_event,
                                 &cluster_secret_event,
                                 Some(&topo_authority_event),
+                                None,
                             );
                         }
                     }
@@ -2467,6 +2630,7 @@ impl ClusterCoordinator {
                         let cluster_key = term;
                         let members_x = members.clone();
                         let secret_x = cluster_secret_event.clone();
+                        let lineage_x = lineage_event.clone();
                         std::thread::spawn(move || {
                             let view = Self::run_exchange_phase(
                                 &members_x,
@@ -2476,6 +2640,7 @@ impl ClusterCoordinator {
                                 &engine_x,
                                 &shard_table_x,
                                 &inbound_bm_x,
+                                &lineage_x,
                                 std::time::Duration::from_millis(2000),
                                 &secret_x,
                             );
@@ -2513,6 +2678,7 @@ impl ClusterCoordinator {
                         &migration_throttle_event,
                         &cluster_secret_event,
                         Some(&topo_authority_event),
+                        None,
                     );
                     last_activation_at = std::time::Instant::now();
                     if let Some(ref path) = cluster_state_path {
@@ -2543,6 +2709,25 @@ impl ClusterCoordinator {
                             last_activated_term,
                             members = members.len(),
                             "cluster: skipping duplicate exchange-phase activation",
+                        );
+                        // P1 stage 4 (§4.4) — a view refresh for an
+                        // already-activated term (the proposer's promotion
+                        // poll, or a duplicate signal) still feeds the
+                        // promotion evaluation: this is exactly where a
+                        // stuck subset-destination or a dead-in-members
+                        // master becomes observable.
+                        evaluate_promotion_from_view(
+                            &topo_authority_event,
+                            self_id,
+                            rf,
+                            &partition_view,
+                            &mut promotion_rails,
+                            &node_addrs_for_topo,
+                            &topology_commit_tx_event,
+                            &topo_state_path_event,
+                            &peak_size_event,
+                            &swim_incarnation_event,
+                            &cluster_secret_event,
                         );
                         continue;
                     }
@@ -2576,6 +2761,7 @@ impl ClusterCoordinator {
                         &migration_throttle_event,
                         &cluster_secret_event,
                         Some(&topo_authority_event),
+                        Some(&serving_established_event),
                     );
                     // Reverse-heal Phase 3b — RUNTIME online re-heal. The
                     // partition view just refreshed carries every peer's per-shard
@@ -2626,6 +2812,22 @@ impl ClusterCoordinator {
                             );
                         }
                     }
+                    // P1 stage 4 (§4.4) — evaluate committed promotion on
+                    // this freshly-collected view (the same path where the
+                    // heal-deadline/stuck states above are observed).
+                    evaluate_promotion_from_view(
+                        &topo_authority_event,
+                        self_id,
+                        rf,
+                        &partition_view,
+                        &mut promotion_rails,
+                        &node_addrs_for_topo,
+                        &topology_commit_tx_event,
+                        &topo_state_path_event,
+                        &peak_size_event,
+                        &swim_incarnation_event,
+                        &cluster_secret_event,
+                    );
                     last_activation_at = std::time::Instant::now();
                     if let Some(ref path) = cluster_state_path {
                         let peak = peak_size_event.load(Ordering::Relaxed) as u64;
@@ -2824,6 +3026,9 @@ impl ClusterCoordinator {
                                     committed_members,
                                     rf,
                                     placement_version,
+                                    override_map: topo_authority_event
+                                        .committed_regime_block()
+                                        .override_map,
                                     self_id,
                                     live_members,
                                     engine: engine.clone(),
@@ -2887,6 +3092,7 @@ impl ClusterCoordinator {
                                 &migration_throttle_event,
                                 &cluster_secret_event,
                                 Some(&topo_authority_event),
+                                None,
                             );
                         }
                     }
@@ -3024,6 +3230,7 @@ impl ClusterCoordinator {
             stale_suspect_shards: Arc::new(RwLock::new(std::collections::BTreeSet::new())),
             reheal_backoff: reheal_backoff_for_cluster,
             lineage,
+            serving_established: serving_established_for_cluster,
             #[cfg(any(test, feature = "fault-injection"))]
             drop_commit_signals: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
@@ -3127,6 +3334,9 @@ impl ClusterCoordinator {
                                 committed_members,
                                 rf,
                                 placement_version,
+                                override_map: topology_authority
+                                    .committed_regime_block()
+                                    .override_map,
                                 self_id,
                                 live_members,
                                 engine: engine.clone(),
@@ -3245,6 +3455,7 @@ impl ClusterCoordinator {
                             migration_throttle,
                             cluster_secret,
                             Some(topology_authority),
+                            None,
                         );
                         // POST-commit persist: the term is already committed +
                         // activated in memory and cannot be rolled back, so this
@@ -3612,6 +3823,7 @@ impl ClusterCoordinator {
         migration_throttle: &Arc<crate::cluster::migration::MigrationThrottle>,
         cluster_secret: &Option<Arc<Vec<u8>>>,
         regime_authority: Option<&Arc<crate::cluster::topology::TopologyAuthority>>,
+        serving_established: Option<&Arc<crate::cluster::migration::AtomicShardBitmap>>,
     ) {
         let empty_view: std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>> =
             std::collections::HashMap::new();
@@ -3637,6 +3849,7 @@ impl ClusterCoordinator {
             migration_throttle,
             cluster_secret,
             regime_authority,
+            serving_established,
         );
     }
 
@@ -3675,6 +3888,11 @@ impl ClusterCoordinator {
         // stamp capture (see `run_migration_tasks_with_global_limit`).
         // `None` (tests) leaves migration batches on V2.
         regime_authority: Option<&Arc<crate::cluster::topology::TopologyAuthority>>,
+        // P1 stage 4 (I13) — the serving-established bitmap, so a
+        // view-carrying activation can un-gate trivially-empty new
+        // masterships (see `ungate_trivially_empty_masterships`). `None`
+        // (tests / view-less paths) leaves the gate as installed.
+        serving_established: Option<&Arc<crate::cluster::migration::AtomicShardBitmap>>,
     ) {
         *active_topology_members.write() = members.to_vec();
 
@@ -3704,6 +3922,23 @@ impl ClusterCoordinator {
                     members = members.len(),
                     "cluster: empty engine — fast-path shard table install",
                 );
+                // P1 stage 4 (I13 formation liveness) — this is exactly the
+                // fresh-joiner path the serving gate would otherwise strand:
+                // no prior committed mastership means the install left every
+                // regime-advanced new mastership gated, and an EMPTY shard
+                // has no fill/completion to ever earn `Full`. Un-gate the
+                // trivially-empty ones the complete view proves empty.
+                if let Some(established) = serving_established {
+                    ungate_trivially_empty_masterships(
+                        &new_table,
+                        members,
+                        partition_view,
+                        self_id,
+                        engine,
+                        inbound_bm,
+                        established,
+                    );
+                }
                 *shard_table.write() = new_table;
                 {
                     let mut mgr = migration.lock();
@@ -3721,17 +3956,35 @@ impl ClusterCoordinator {
         let old_table_snap = shard_table.read().clone();
         let old_epoch = old_table_snap.version;
         let mut new_table = ShardTable::compute_with_epoch(members, rf, epoch, placement_version);
-        // Phase F: refine the round-robin master picks using the partition
-        // view + previous topology so a peer that already holds the full
-        // data is preferred over an empty (subset) candidate, and so an
-        // evicted node never inherits ownership. Empty partition view (no
-        // exchange data) is a no-op — the round-robin pick is preserved.
-        //
-        // Eviction set is currently always empty pending Phase I wiring;
-        // computing election here still removes ghost-master scenarios
-        // when the partition view is populated.
-        let evicted: std::collections::HashSet<NodeId> = std::collections::HashSet::new();
-        apply_master_election(&mut new_table, &old_table_snap, partition_view, &evicted);
+        // P1 stage 4 (§4.4) — the active table is always the COMMITTED
+        // DERIVATION: placement refined by the quorum-committed override
+        // map, identical on every node at the same committed state (I0).
+        // This replaces the retired Phase-F local master election
+        // (`apply_master_election`), whose per-node partition-view inputs
+        // could elect different masters for the same shard on different
+        // nodes (the R4/#76 class — see `elect_master`'s doc for the
+        // history). `None` authority (test-only paths) installs bare
+        // placement, exactly like an empty committed override map.
+        if let Some(authority) = regime_authority {
+            let override_map = authority.committed_regime_block().override_map;
+            for (&shard, &target) in &override_map {
+                new_table.apply_override_master(shard, target);
+            }
+        }
+        // P1 stage 4 (I13 formation liveness) — un-gate trivially-empty new
+        // masterships the complete view proves cluster-wide empty (see the
+        // helper's doc for the exact conditions and the safety argument).
+        if let Some(established) = serving_established {
+            ungate_trivially_empty_masterships(
+                &new_table,
+                members,
+                partition_view,
+                self_id,
+                engine,
+                inbound_bm,
+                established,
+            );
+        }
         // Phase D: when a partition view is available, use it to skip
         // migrations whose destination already has the data and to redirect
         // the source onto a replica when the planned source has none.
@@ -4072,6 +4325,9 @@ impl ClusterCoordinator {
                     committed_members: members.to_vec(),
                     rf,
                     placement_version,
+                    override_map: regime_authority
+                        .map(|a| a.committed_regime_block().override_map)
+                        .unwrap_or_default(),
                     self_id,
                     live_members,
                     engine: engine.clone(),
@@ -4144,14 +4400,20 @@ impl ClusterCoordinator {
         engine: &Arc<Engine>,
         shard_table: &Arc<ShardTableLock<ShardTable>>,
         inbound_bm: &Arc<crate::cluster::migration::AtomicShardBitmap>,
+        lineage: &crate::cluster::lineage::LineageStore,
         total_timeout: std::time::Duration,
         auth_secret: &Option<Arc<Vec<u8>>>,
     ) -> std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>> {
         let mut phase = ExchangePhase::new(cluster_key, members.len(), total_timeout);
 
         // Self-report (no TCP).
-        let self_entries =
-            build_self_partition_version_entries(self_id, engine.as_ref(), shard_table, inbound_bm);
+        let self_entries = build_self_partition_version_entries(
+            self_id,
+            engine.as_ref(),
+            shard_table,
+            inbound_bm,
+            lineage,
+        );
         phase.record(self_id, self_entries);
 
         // Snapshot peer addresses up front.
@@ -4751,12 +5013,21 @@ fn try_run_topology_proposal(
             .collect()
     });
 
-    // Feed all collected votes to the topology authority.
+    // Feed the collected votes to the topology authority. Votes up to the
+    // quorum point go through `handle_vote` exactly as before; votes AFTER
+    // quorum feed ONLY their (NodeId, incarnation) regime/ack advert (P1
+    // stage 4): the I4 `promotion_enabled` proposal requires EVERY
+    // committed member's advert, and the old break-at-quorum silently
+    // dropped the trailing voters' adverts — but full `handle_vote`
+    // processing for those votes would ALSO record their W6 placement
+    // support, accelerating the v1→v2 unanimity beyond the pre-stage-4
+    // proposer's behavior (see `record_vote_regime_advert`).
     let mut commit_result = None;
     for vote in votes.into_iter().flatten() {
-        if let Some(commit) = topology_authority.handle_vote(&vote) {
-            commit_result = Some(commit);
-            break; // Quorum reached
+        if commit_result.is_some() {
+            topology_authority.record_vote_regime_advert(&vote);
+        } else if let Some(commit) = topology_authority.handle_vote(&vote) {
+            commit_result = Some(commit); // Quorum reached.
         }
     }
 
@@ -5049,6 +5320,7 @@ pub(crate) fn build_self_partition_version_entries(
     engine: &Engine,
     shard_table: &Arc<ShardTableLock<ShardTable>>,
     inbound_bm: &Arc<crate::cluster::migration::AtomicShardBitmap>,
+    lineage: &crate::cluster::lineage::LineageStore,
 ) -> Vec<PartitionVersionEntry> {
     // First pass: decide participation and per-shard record count from the
     // O(1) shard counters, holding the shard-table read lock only briefly.
@@ -5100,6 +5372,12 @@ pub(crate) fn build_self_partition_version_entries(
         .map(|p| {
             let keys = keys_by_shard.get(&p.shard).unwrap_or(&empty);
             let (_scan_count, manifest_digest, max_generation) = engine.recency_for_keys(keys);
+            // P1 stage 4 — report the SELF-OBSERVED lineage (§4.3:
+            // proposer input only, never serving eligibility).
+            let (lineage_full, lineage_regime) = match lineage.lineage(p.shard) {
+                crate::cluster::lineage::Lineage::Full { regime } => (true, regime),
+                crate::cluster::lineage::Lineage::Subset => (false, 0),
+            };
             PartitionVersionEntry {
                 shard: p.shard,
                 flags: p.flags,
@@ -5107,6 +5385,8 @@ pub(crate) fn build_self_partition_version_entries(
                 last_applied_seq: p.count,
                 manifest_digest,
                 max_generation,
+                lineage_full,
+                lineage_regime,
             }
         })
         .collect()
@@ -5120,7 +5400,8 @@ pub(crate) fn build_self_partition_version_entries(
 /// `node_id:u64 | cluster_key:u64 | entry_count:u32 | entries` where each entry
 /// is [`PARTITION_VERSION_ENTRY_SIZE`] bytes. Shared by the in-process
 /// self-report and the dispatch handler so both encode byte-identically,
-/// including the Phase-1 additive `manifest_digest` + `max_generation` tail.
+/// including the Phase-1 additive `manifest_digest` + `max_generation` tail
+/// and the P1 stage-4 additive `lineage_full` + `lineage_regime` tail.
 pub(crate) fn encode_partition_version_response(
     self_id: u64,
     cluster_key: u64,
@@ -5137,6 +5418,8 @@ pub(crate) fn encode_partition_version_response(
         payload.extend_from_slice(&e.last_applied_seq.to_le_bytes());
         payload.extend_from_slice(&e.manifest_digest.to_le_bytes());
         payload.extend_from_slice(&e.max_generation.to_le_bytes());
+        payload.push(u8::from(e.lineage_full));
+        payload.extend_from_slice(&e.lineage_regime.to_le_bytes());
     }
     payload
 }
@@ -5144,15 +5427,17 @@ pub(crate) fn encode_partition_version_response(
 /// Phase D: parse an `OP_PARTITION_VERSION_REPORT` response payload into a
 /// list of [`PartitionVersionEntry`].
 ///
-/// The per-entry stride is ADDITIVE (Phase 1, finding C1): entries are either
-/// the legacy [`PARTITION_VERSION_ENTRY_SIZE_LEGACY`]-byte layout (a
-/// pre-Phase-1 peer that reports no digest) or the current
-/// [`PARTITION_VERSION_ENTRY_SIZE`]-byte layout that appends
-/// `manifest_digest:u64` + `max_generation:u32`. The stride is inferred from
-/// the body length, so a Phase-1 parser reads both; the new fields default to
-/// `0` for a legacy peer. Returns `None` if the payload is truncated or the
-/// trailing bytes match neither stride — callers treat this as "no data" so a
-/// malformed peer does not corrupt the partition view.
+/// The per-entry stride is ADDITIVE (Phase 1 finding C1, then P1 stage 4):
+/// entries are the legacy [`PARTITION_VERSION_ENTRY_SIZE_LEGACY`]-byte layout
+/// (a pre-Phase-1 peer), the pre-stage-4
+/// [`PARTITION_VERSION_ENTRY_SIZE_NO_LINEAGE`]-byte layout (recency fields
+/// but no lineage), or the current [`PARTITION_VERSION_ENTRY_SIZE`]-byte
+/// layout that appends `lineage_full:u8` + `lineage_regime:u64`. The stride
+/// is inferred from the body length; absent fields default to `0`/`false`
+/// (lineage-absent = not-`Full`, the fail-closed direction). Returns `None`
+/// if the payload is truncated or the trailing bytes match no stride —
+/// callers treat this as "no data" so a malformed peer does not corrupt the
+/// partition view.
 fn parse_partition_version_response(payload: &[u8]) -> Option<Vec<PartitionVersionEntry>> {
     if payload.len() < 20 {
         return None;
@@ -5162,9 +5447,11 @@ fn parse_partition_version_response(payload: &[u8]) -> Option<Vec<PartitionVersi
     if entry_count == 0 {
         return if body == 0 { Some(Vec::new()) } else { None };
     }
-    // Prefer the current (wider) stride; fall back to the legacy stride.
+    // Prefer the current (widest) stride; fall back to the older strides.
     let stride = if body == entry_count * PARTITION_VERSION_ENTRY_SIZE {
         PARTITION_VERSION_ENTRY_SIZE
+    } else if body == entry_count * PARTITION_VERSION_ENTRY_SIZE_NO_LINEAGE {
+        PARTITION_VERSION_ENTRY_SIZE_NO_LINEAGE
     } else if body == entry_count * PARTITION_VERSION_ENTRY_SIZE_LEGACY {
         PARTITION_VERSION_ENTRY_SIZE_LEGACY
     } else {
@@ -5177,12 +5464,20 @@ fn parse_partition_version_response(payload: &[u8]) -> Option<Vec<PartitionVersi
         let flags = payload[off + 2];
         let replica_count = payload[off + 3];
         let last_applied_seq = u64::from_le_bytes(payload[off + 4..off + 12].try_into().ok()?);
-        let (manifest_digest, max_generation) = if stride == PARTITION_VERSION_ENTRY_SIZE {
+        let (manifest_digest, max_generation) = if stride >= PARTITION_VERSION_ENTRY_SIZE_NO_LINEAGE
+        {
             let digest = u64::from_le_bytes(payload[off + 12..off + 20].try_into().ok()?);
             let max_gen = u32::from_le_bytes(payload[off + 20..off + 24].try_into().ok()?);
             (digest, max_gen)
         } else {
             (0, 0)
+        };
+        let (lineage_full, lineage_regime) = if stride == PARTITION_VERSION_ENTRY_SIZE {
+            let full = payload[off + 24] != 0;
+            let regime = u64::from_le_bytes(payload[off + 25..off + 33].try_into().ok()?);
+            (full, regime)
+        } else {
+            (false, 0)
         };
         entries.push(PartitionVersionEntry {
             shard,
@@ -5191,6 +5486,8 @@ fn parse_partition_version_response(payload: &[u8]) -> Option<Vec<PartitionVersi
             last_applied_seq,
             manifest_digest,
             max_generation,
+            lineage_full,
+            lineage_regime,
         });
     }
     Some(entries)
@@ -5978,14 +6275,33 @@ pub(crate) fn select_reverse_heal_sources_for(
 /// later re-triggers (its fence has cleared by then). An empty `partition_view`
 /// (no exchange data) is a no-op. Returns the number of shards newly fenced +
 /// queued.
-/// P1 stage 3 (I2 / I13ii) — apply one installed commit's lineage
-/// transitions: for every currently-`Full` shard, degrade to `Subset` when
-/// the node is no longer in the shard's holder set under the NEW committed
-/// state, and refresh the stamp to the new committed regime when it is
-/// (the I13ii promotion re-stamp is the same refresh for a shard whose
-/// override names self as master). Returns `false` only when a stamp
-/// changed AND its batched durable write failed — the commit-install hook
-/// then fails the carrying commit closed.
+/// P1 stage 3/4 (I2 / I13 / stage-3 residual (3)) — apply one installed
+/// commit's transitions:
+///
+/// 1. **Lineage** (stage 3): for every currently-`Full` shard, degrade to
+///    `Subset` when the node is no longer in the shard's holder set under
+///    the NEW committed state, and refresh the stamp to the new committed
+///    regime when it is (the I13ii promotion re-stamp is the same refresh
+///    for a shard whose override names self as master). Returns `false`
+///    only when a stamp changed AND its batched durable write failed — the
+///    commit-install hook then fails the carrying commit closed.
+/// 2. **Skipped-term degrade** (stage 4, residual (3)): when the installing
+///    commit's term skips past `prev.committed_term + 1`, this node missed
+///    at least one committed transition — it cannot prove holder-set
+///    continuity across the gap, so every shard where self is a NON-master
+///    holder degrades to `Subset` (re-earned via the completeness signal /
+///    fill). Master shards keep I13(i) semantics (the committed master's
+///    own copy is the authority). I0-clean: both terms are local committed
+///    state, and this gates lineage/serving, never the apply.
+/// 3. **I13 serving-established derivation** (stage 4): recompute the
+///    per-shard "serving needs no Full gate" bitmap —
+///    `regime_new(s) == 0` (bootstrap, gate-inactive §4.1) OR (self was
+///    the committed-derivation master of `s` under the PREVIOUS installed
+///    state AND its serving was already established). Everything else is
+///    fail-closed to gated: a node BEGINS serving a shard it was not
+///    serving in the previous regime only via self-observed `Full` (the
+///    `is_master` gate). Updated only after the lineage batch persisted,
+///    so a refused commit leaves the bitmap untouched.
 ///
 /// Holder set (I2, the narrowed union): the shard's committed placement
 /// members (`master ∪ replicas` over the commit's member set — invariant
@@ -5998,16 +6314,33 @@ fn lineage_apply_committed_state(
     lineage: &crate::cluster::lineage::LineageStore,
     self_id: NodeId,
     rf: u8,
-    members: &[NodeId],
-    placement_version: u16,
-    regime_block: &crate::cluster::topology::RegimeBlock,
+    state: &crate::cluster::topology::PersistedTopologyState,
+    prev: &crate::cluster::topology::InstalledCommitView,
     shard_table: &Arc<ShardTableLock<ShardTable>>,
+    serving_established: &crate::cluster::migration::AtomicShardBitmap,
 ) -> bool {
+    let members = &state.committed_members;
     if members.is_empty() {
         // Bootstrap / degenerate commit: no holder information to act on.
         return true;
     }
-    let placement = ShardTable::compute_with_epoch(members, rf.max(1), 1, placement_version.max(1));
+    let placement = ShardTable::compute_with_epoch(
+        members,
+        rf.max(1),
+        1,
+        state.committed_placement_version.max(1),
+    );
+    let regime_block = &state.regime_block;
+    let new_master_is_self = |s: u16| {
+        regime_block
+            .override_map
+            .get(&s)
+            .copied()
+            .unwrap_or_else(|| placement.assignment(s).master)
+            == self_id
+    };
+    // Stage 4 residual (3): did this node skip committed terms?
+    let skipped_terms = prev.committed_term > 0 && state.committed_term > prev.committed_term + 1;
     // Snapshot the live effective masters once (a short read lock; the
     // commit_apply lock-order note on `set_commit_install_hook` applies).
     let effective_masters: Vec<NodeId> = {
@@ -6017,6 +6350,11 @@ fn lineage_apply_committed_state(
             .collect()
     };
     let in_holder = |s: u16| {
+        if skipped_terms && !new_master_is_self(s) {
+            // Skipped-term degrade: a non-master holder cannot prove it
+            // received every write across the missed terms.
+            return false;
+        }
         let a = placement.assignment(s);
         a.master == self_id
             || a.replicas.contains(&self_id)
@@ -6028,11 +6366,591 @@ fn lineage_apply_committed_state(
             degraded = outcome.degraded,
             refreshed = outcome.refreshed,
             persisted = outcome.persisted,
+            skipped_terms,
             "lineage: applied commit transitions (I2 holder check + stamp refresh / \
-             I13ii promotion re-stamp)",
+             I13ii promotion re-stamp / skipped-term degrade)",
         );
     }
-    outcome.persisted
+    if !outcome.persisted {
+        return false;
+    }
+    // I13 serving-established derivation (runs only once the lineage batch
+    // is durable, so a refused commit leaves the bitmap untouched).
+    let prev_placement = if prev.members.is_empty() {
+        None
+    } else {
+        Some(ShardTable::compute_with_epoch(
+            &prev.members,
+            rf.max(1),
+            1,
+            prev.placement_version.max(1),
+        ))
+    };
+    for s in 0..NUM_SHARDS as u16 {
+        let gate_inactive = regime_block.regime.get(s) == 0;
+        let prev_master_self = prev_placement.as_ref().is_some_and(|p| {
+            prev.regime_block
+                .override_map
+                .get(&s)
+                .copied()
+                .unwrap_or_else(|| p.assignment(s).master)
+                == self_id
+        });
+        if gate_inactive || (prev_master_self && serving_established.test(s)) {
+            serving_established.set(s);
+        } else {
+            serving_established.clear(s);
+        }
+    }
+    true
+}
+
+/// P1 stage 4 (I13) — un-gate TRIVIALLY-EMPTY new masterships at a
+/// view-carrying activation.
+///
+/// The I13 serving gate holds every newly-acquired mastership
+/// `Transitioning` until self-observed `Full`. For a shard with data, the
+/// fill/heal/handshake completion (or the I13ii re-stamp) earns `Full`
+/// and opens the gate. A shard that is EMPTY cluster-wide has no fill and
+/// no completion — a fresh joiner (no prior committed mastership) would
+/// be stranded gated forever, which bricks empty-cluster formation.
+///
+/// A shard is un-gated (serving established) only when ALL hold, each a
+/// SERVING-side node-local/view input (never an apply gate — I0):
+///
+/// * self is the new table's master and currently gated;
+/// * the collected partition view is COMPLETE — every committed member
+///   reported (a partial view could hide the only data holder: fail
+///   closed and stay gated);
+/// * NO member's report shows data for the shard (`last_applied_seq > 0`)
+///   — the §4.6 placement bullet stays closed: after a death, the dead
+///   master's RF≥2 data survives on a replica whose report keeps the
+///   shard gated;
+/// * self's own copy is empty and carries no inbound/heal fence.
+///
+/// Residual (status-quo-bounded): a write acked by the outgoing master
+/// AFTER its exchange report but BEFORE its install races this decision —
+/// the same window in which the pre-stage-4 code served the new mastership
+/// with no gate at all, so this is never worse than the behavior it
+/// replaces.
+fn ungate_trivially_empty_masterships(
+    new_table: &ShardTable,
+    members: &[NodeId],
+    partition_view: &std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>>,
+    self_id: NodeId,
+    engine: &Engine,
+    inbound_bm: &Arc<crate::cluster::migration::AtomicShardBitmap>,
+    serving_established: &Arc<crate::cluster::migration::AtomicShardBitmap>,
+) {
+    if partition_view.is_empty() || !members.iter().all(|m| partition_view.contains_key(m)) {
+        return;
+    }
+    let mut shards_with_data: std::collections::HashSet<u16> = std::collections::HashSet::new();
+    for entries in partition_view.values() {
+        for e in entries {
+            if e.last_applied_seq > 0 {
+                shards_with_data.insert(e.shard);
+            }
+        }
+    }
+    let mut ungated = 0usize;
+    for shard in 0..NUM_SHARDS as u16 {
+        if new_table.target_assignment(shard).master == self_id
+            && !serving_established.test(shard)
+            && !shards_with_data.contains(&shard)
+            && engine.shard_record_count(shard) == 0
+            && !inbound_bm.test(shard)
+        {
+            serving_established.set(shard);
+            ungated += 1;
+        }
+    }
+    if ungated > 0 {
+        tracing::info!(
+            ungated,
+            "cluster: I13 gate opened for trivially-empty new masterships \
+             (complete view shows no data cluster-wide)",
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// P1 stage 4 — §4.4 committed promotion: proposer-side candidate computation
+// and rails
+// ---------------------------------------------------------------------------
+
+/// §4.4 — how often the deterministic proposer refreshes the partition view
+/// (spawns an exchange) purely to re-evaluate promotion, while the committed
+/// `promotion_enabled` field is true. Bounded cost: one small
+/// `OP_PARTITION_VERSION_REPORT` round per peer per interval, and the
+/// evaluation itself is pure.
+const PROMOTION_VIEW_POLL_INTERVAL: Duration = Duration::from_secs(3);
+
+/// §4.4 rails — minimum interval between two override proposals (a jitter in
+/// `0..=`[`PROMOTION_JITTER_MAX_MS`] ms is added per proposal).
+const PROMOTION_MIN_INTERVAL: Duration = Duration::from_secs(2);
+
+/// §4.4 rails — upper bound of the per-proposal jitter, in milliseconds.
+const PROMOTION_JITTER_MAX_MS: u64 = 1_000;
+
+/// §4.4 rails — cluster-wide promotion budget: at most this many
+/// override-carrying terms per [`PROMOTION_BUDGET_WINDOW`]. Excess
+/// candidates alert-and-hold (§6.3's oscillator guard).
+const PROMOTION_BUDGET_MAX: usize = 8;
+
+/// §4.4 rails — the window the promotion budget is measured over.
+const PROMOTION_BUDGET_WINDOW: Duration = Duration::from_secs(60);
+
+/// §4.4 rails (no-supersede) — an in-flight override proposal blocks further
+/// override proposals until its term commits or this timeout elapses
+/// (covers a proposal that lost quorum and was superseded silently).
+const PROMOTION_INFLIGHT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// §4.4 rails — the per-shard promotion cooldown as a multiple of the
+/// configured heal window (`heal_deadline`), per the design's "cooldown ≥
+/// several heal windows".
+const PROMOTION_COOLDOWN_HEAL_WINDOWS: u32 = 3;
+
+/// P1 stage 4 — §4.4's proposer-side promotion rails: per-shard cooldown, a
+/// cluster-wide budget per unit time, a jittered minimum interval between
+/// override proposals, no-supersede for the in-flight proposal, and the
+/// progress precondition (no second promotion for a shard until the
+/// previous one produced a serving `Full` master, observed from the
+/// exchange view). Pure state over injected `Instant`s — fully
+/// unit-testable.
+pub(crate) struct PromotionRails {
+    /// Per-shard cooldown between promotions of the SAME shard.
+    cooldown: Duration,
+    /// Last time an override proposal covering the shard was emitted.
+    last_shard_promotion: std::collections::HashMap<u16, std::time::Instant>,
+    /// Emission times of recent override proposals (budget window).
+    recent_proposals: std::collections::VecDeque<std::time::Instant>,
+    /// Last override proposal time (minimum-interval rail).
+    last_proposal_at: Option<std::time::Instant>,
+    /// The jittered gap the NEXT proposal must respect.
+    next_min_gap: Duration,
+    /// No-supersede: the in-flight override term, if any.
+    inflight: Option<(u64, std::time::Instant)>,
+    /// Progress precondition: shard → promoted target, cleared once the
+    /// view shows the shard's committed master serving `Full` at the
+    /// current regime.
+    awaiting_progress: std::collections::HashMap<u16, NodeId>,
+    /// xorshift state for the proposal jitter.
+    jitter_state: u64,
+}
+
+impl PromotionRails {
+    /// Build rails with the given per-shard `cooldown` and jitter seed.
+    pub(crate) fn new(cooldown: Duration, jitter_seed: u64) -> Self {
+        Self {
+            cooldown,
+            last_shard_promotion: std::collections::HashMap::new(),
+            recent_proposals: std::collections::VecDeque::new(),
+            last_proposal_at: None,
+            next_min_gap: PROMOTION_MIN_INTERVAL,
+            inflight: None,
+            awaiting_progress: std::collections::HashMap::new(),
+            jitter_state: jitter_seed | 1,
+        }
+    }
+
+    /// Advance the no-supersede state: the in-flight proposal is released
+    /// once the committed term reaches it (committed) or it times out.
+    pub(crate) fn observe_committed_term(&mut self, committed_term: u64, now: std::time::Instant) {
+        if let Some((term, since)) = self.inflight
+            && (committed_term >= term
+                || now.saturating_duration_since(since) >= PROMOTION_INFLIGHT_TIMEOUT)
+        {
+            self.inflight = None;
+        }
+    }
+
+    /// Progress precondition bookkeeping: clear a shard's awaiting-progress
+    /// entry (its committed master now serves `Full`, or the override was
+    /// superseded).
+    pub(crate) fn clear_progress(&mut self, shard: u16) {
+        self.awaiting_progress.remove(&shard);
+    }
+
+    /// The shards currently blocked by the progress precondition
+    /// (diagnostics/tests).
+    pub(crate) fn awaiting_progress(&self) -> &std::collections::HashMap<u16, NodeId> {
+        &self.awaiting_progress
+    }
+
+    /// Drop candidates blocked by the per-shard cooldown or the progress
+    /// precondition.
+    pub(crate) fn filter_candidates(
+        &self,
+        overrides: &mut std::collections::BTreeMap<u16, NodeId>,
+        now: std::time::Instant,
+    ) {
+        overrides.retain(|shard, _| {
+            if self.awaiting_progress.contains_key(shard) {
+                return false;
+            }
+            match self.last_shard_promotion.get(shard) {
+                Some(&at) => now.saturating_duration_since(at) >= self.cooldown,
+                None => true,
+            }
+        });
+    }
+
+    /// Whether a new override proposal may be emitted NOW: no in-flight
+    /// override term (no-supersede), the jittered minimum interval has
+    /// elapsed, and the budget window has headroom.
+    pub(crate) fn may_propose(&mut self, now: std::time::Instant) -> bool {
+        if self.inflight.is_some() {
+            return false;
+        }
+        if let Some(at) = self.last_proposal_at
+            && now.saturating_duration_since(at) < self.next_min_gap
+        {
+            return false;
+        }
+        while let Some(&front) = self.recent_proposals.front() {
+            if now.saturating_duration_since(front) >= PROMOTION_BUDGET_WINDOW {
+                self.recent_proposals.pop_front();
+            } else {
+                break;
+            }
+        }
+        self.recent_proposals.len() < PROMOTION_BUDGET_MAX
+    }
+
+    /// Record an emitted override proposal: stamps the per-shard cooldowns,
+    /// the budget window, the progress precondition, the in-flight term,
+    /// and rolls the next jittered minimum gap.
+    pub(crate) fn record_proposal(
+        &mut self,
+        term: u64,
+        overrides: &std::collections::BTreeMap<u16, NodeId>,
+        now: std::time::Instant,
+    ) {
+        for (&shard, &target) in overrides {
+            self.last_shard_promotion.insert(shard, now);
+            self.awaiting_progress.insert(shard, target);
+        }
+        self.recent_proposals.push_back(now);
+        self.last_proposal_at = Some(now);
+        self.inflight = Some((term, now));
+        // xorshift64* — cheap deterministic jitter, no rand dependency.
+        let mut x = self.jitter_state;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.jitter_state = x;
+        let jitter_ms = x.wrapping_mul(0x2545_F491_4F6C_DD1D) % (PROMOTION_JITTER_MAX_MS + 1);
+        self.next_min_gap = PROMOTION_MIN_INTERVAL + Duration::from_millis(jitter_ms);
+    }
+}
+
+/// P1 stage 4 — §4.4 step 2: compute the override candidates `(s: M → R)`
+/// from the INSTALLED committed state and the collected partition view.
+/// Pure — every §4.4 proposer-side precondition that is derivable from
+/// `(committed state, view)` is enforced here; the rails and the committed
+/// `promotion_enabled` check wrap it at the call site.
+///
+/// Per shard `s` with committed-derivation master `M`:
+///
+/// * **Condition (3)** — one of:
+///   (a) `M` did not report in the collected view (dead/unreachable per
+///   this poll — covers both a master that died before its exclusion
+///   committed and a wedged master; staleness is safe, §4.4: a stale
+///   view at worst proposes a target that self-observes `Subset` and
+///   refuses to serve, fail-closed to availability); or
+///   (c) **availability arm** — `M`'s own report flags `s`
+///   [`PARTITION_FLAG_PENDING_INBOUND`] (a subset DESTINATION: pending
+///   inbound migration or heal fence), never mere holder-exit `Subset`
+///   (a reported entry without the flag never trips this arm).
+/// * **Condition (2)** — the target `R` must be a committed PLACEMENT
+///   REPLICA of `s` (the committed-derivation holder set, I3/I10(a)),
+///   must have reported `s` with `lineage_full` at EXACTLY the shard's
+///   current committed regime, and must not itself be flagged
+///   pending-inbound. A `Full` reporter outside the holder set is never
+///   targeted.
+/// * **Condition (5)** — at RF=2 the sole replica reporting `Subset`
+///   yields no candidate: no override, the shard stays `Transitioning`
+///   (strictly no worse than today).
+///
+/// Ties break to the lowest qualifying `NodeId` (deterministic).
+pub(crate) fn compute_promotion_overrides(
+    committed_members: &[NodeId],
+    placement_version: u16,
+    rf: u8,
+    regime_block: &crate::cluster::topology::RegimeBlock,
+    partition_view: &std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>>,
+) -> std::collections::BTreeMap<u16, NodeId> {
+    let mut out = std::collections::BTreeMap::new();
+    if committed_members.len() < 2 || partition_view.is_empty() {
+        return out;
+    }
+    let placement =
+        ShardTable::compute_with_epoch(committed_members, rf.max(1), 1, placement_version.max(1));
+    // (node, shard) -> (flags, lineage_full, lineage_regime).
+    let mut entry_index: std::collections::HashMap<(NodeId, u16), (u8, bool, u64)> =
+        std::collections::HashMap::new();
+    for (node, entries) in partition_view {
+        for e in entries {
+            entry_index.insert(
+                (*node, e.shard),
+                (e.flags, e.lineage_full, e.lineage_regime),
+            );
+        }
+    }
+    for shard in 0..NUM_SHARDS as u16 {
+        let assignment = placement.assignment(shard);
+        let master = regime_block
+            .override_map
+            .get(&shard)
+            .copied()
+            .unwrap_or(assignment.master);
+        // Condition (3).
+        let master_reported = partition_view.contains_key(&master);
+        let master_subset_destination = entry_index
+            .get(&(master, shard))
+            .is_some_and(|&(flags, _, _)| flags & PARTITION_FLAG_PENDING_INBOUND != 0);
+        if master_reported && !master_subset_destination {
+            continue;
+        }
+        // Condition (2): lowest committed placement replica reporting Full
+        // at the shard's CURRENT committed regime, not pending-inbound.
+        let current_regime = regime_block.regime.get(shard);
+        let target = assignment
+            .replicas
+            .iter()
+            .filter(|&&r| r != master)
+            .filter(|&&r| {
+                entry_index
+                    .get(&(r, shard))
+                    .is_some_and(|&(flags, full, lineage_regime)| {
+                        full && lineage_regime == current_regime
+                            && flags & PARTITION_FLAG_PENDING_INBOUND == 0
+                    })
+            })
+            .min_by_key(|r| r.0)
+            .copied();
+        if let Some(target) = target {
+            out.insert(shard, target);
+        }
+        // else: condition (5) — no qualifying Full holder (e.g. RF=2 with
+        // the sole replica Subset): no promotion, the shard stays
+        // Transitioning.
+    }
+    out
+}
+
+/// P1 stage 4 — §4.4 step 3: the deterministic proposer's promotion
+/// evaluation, run on every collected partition view (the ExchangePhase
+/// result path — the same code path where heal-deadline/stuck states are
+/// observed). Applies the §4.4 rails and, when candidates survive, rides
+/// them through the EXISTING term/vote/commit machinery
+/// (`propose_promotion_overrides` + `run_topology_proposer` — normal
+/// activation quorum over the peak floor, Gate A/B untouched, Stage 1's
+/// I10 gates re-validate at apply on every node).
+///
+/// Non-proposers return immediately and NEVER originate an override term
+/// (enforced structurally a second time by
+/// `TopologyAuthority::propose_promotion_overrides`'s deterministic-
+/// proposer check and by I10(f) at apply).
+#[allow(clippy::too_many_arguments)]
+fn evaluate_promotion_from_view(
+    authority: &Arc<crate::cluster::topology::TopologyAuthority>,
+    self_id: NodeId,
+    rf: u8,
+    partition_view: &std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>>,
+    rails: &mut PromotionRails,
+    node_addrs: &Arc<RwLock<std::collections::HashMap<NodeId, SocketAddr>>>,
+    topology_commit_tx: &std::sync::mpsc::Sender<(Vec<NodeId>, u64)>,
+    topology_state_path: &Option<std::path::PathBuf>,
+    peak_size: &Arc<std::sync::atomic::AtomicUsize>,
+    swim_incarnation: &Arc<std::sync::atomic::AtomicU64>,
+    cluster_secret: &Option<Arc<Vec<u8>>>,
+) {
+    // I4 — the committed field only (I0-clean input to a proposal-side
+    // decision).
+    if !authority.committed_promotion_enabled() {
+        return;
+    }
+    let members = authority.committed_members();
+    if members.len() < 2 {
+        return;
+    }
+    // Deterministic proposer only (lowest committed NodeId).
+    if members.iter().min().copied() != Some(self_id) {
+        return;
+    }
+    let now = std::time::Instant::now();
+    rails.observe_committed_term(authority.committed_term(), now);
+    let block = authority.committed_regime_block();
+    let placement_version = authority.committed_placement_version();
+    // Progress precondition bookkeeping: a shard awaiting progress is
+    // released once the view shows its committed master serving Full at
+    // the current regime (or the override was superseded — the derivation
+    // no longer names the promoted target).
+    let placement =
+        ShardTable::compute_with_epoch(&members, rf.max(1), 1, placement_version.max(1));
+    let awaiting: Vec<(u16, NodeId)> = rails
+        .awaiting_progress()
+        .iter()
+        .map(|(&s, &t)| (s, t))
+        .collect();
+    for (shard, target) in awaiting {
+        let master = block
+            .override_map
+            .get(&shard)
+            .copied()
+            .unwrap_or_else(|| placement.assignment(shard).master);
+        let superseded = master != target;
+        let serving_full = partition_view
+            .get(&master)
+            .and_then(|entries| entries.iter().find(|e| e.shard == shard))
+            .is_some_and(|e| {
+                e.lineage_full
+                    && e.lineage_regime == block.regime.get(shard)
+                    && e.flags & PARTITION_FLAG_PENDING_INBOUND == 0
+            });
+        if superseded || serving_full {
+            rails.clear_progress(shard);
+        }
+    }
+    let mut overrides =
+        compute_promotion_overrides(&members, placement_version, rf, &block, partition_view);
+    if overrides.is_empty() {
+        return;
+    }
+    rails.filter_candidates(&mut overrides, now);
+    if overrides.is_empty() {
+        return;
+    }
+    if !rails.may_propose(now) {
+        tracing::warn!(
+            candidates = overrides.len(),
+            "cluster: §4.4 promotion candidates exist but the rails \
+             (budget/interval/no-supersede) hold them — alert-and-hold",
+        );
+        return;
+    }
+    let term = match authority.propose_promotion_overrides(&overrides) {
+        Ok(term) => term,
+        Err(e) => {
+            tracing::info!(err = %e, "cluster: promotion override proposal refused");
+            return;
+        }
+    };
+    // H10 — persist the proposal's voted_term before broadcasting (mirrors
+    // the upgrade-proposal producer). On failure the proposal is abandoned
+    // (voted_term stays advanced in memory; the next evaluation re-tries).
+    let peak = peak_size.load(Ordering::Relaxed) as u64;
+    let inc = swim_incarnation.load(Ordering::Relaxed);
+    if !persist_topology_state_durable(
+        topology_state_path.as_deref(),
+        &authority.persisted_state(peak, inc),
+    ) {
+        tracing::error!(
+            term = term.term,
+            "cluster: NOT broadcasting promotion override — term persist failed (H10)",
+        );
+        return;
+    }
+    tracing::warn!(
+        term = term.term,
+        overrides = ?overrides.iter().map(|(s, n)| (*s, n.0)).collect::<Vec<_>>(),
+        "cluster: §4.4 committed promotion — proposing master override(s)",
+    );
+    rails.record_proposal(term.term, &overrides, now);
+    let ta = authority.clone();
+    let na = node_addrs.clone();
+    let tx = topology_commit_tx.clone();
+    let tp = topology_state_path.clone();
+    let ps = peak_size.clone();
+    let si = swim_incarnation.clone();
+    let secret = cluster_secret.clone();
+    std::thread::spawn(move || {
+        run_topology_proposer(term, ta, na, self_id, tx, tp, ps, si, secret);
+    });
+}
+
+// ---------------------------------------------------------------------------
+// P1 stage 4 — master→replica completeness signal (§4.3 catch-up trigger)
+// ---------------------------------------------------------------------------
+
+/// Debounce between flushes of the stream-completeness candidates (one
+/// batched durable lineage write per flush with changes — never per-batch
+/// fsyncs).
+const LINEAGE_STREAM_FLUSH_INTERVAL: Duration = Duration::from_millis(500);
+
+/// A recent replica-stream hole (gap NAK / missing-record NAK) within this
+/// window defers the flush — candidates stay queued and re-evaluate once
+/// the stream is quiet.
+const LINEAGE_STREAM_HOLE_QUIET_MS: u64 = 5_000;
+
+/// P1 stage 4 — flush the pending stream-completeness candidates into
+/// `Full` lineage stamps (ONE batched durable write). Re-validates every
+/// condition at flush time:
+///
+/// * a recent stream hole defers the whole flush (candidates retained);
+/// * the shard must still carry stream-origin evidence (not revoked by a
+///   fence/degrade since it was queued);
+/// * no inbound/heal fence may be up;
+/// * self must be in the shard's holder set (I2's union: target
+///   assignment ∪ live effective master);
+/// * an already-current `Full` stamp is skipped (no redundant fsync).
+///
+/// The stamp's regime is the shard's CURRENT committed regime. Marking is
+/// self-observation over data this node itself applied and acked — no
+/// cross-node trust is added. Returns the number of shards stamped.
+fn flush_stream_full_candidates(
+    lineage: &crate::cluster::lineage::LineageStore,
+    engine: &Engine,
+    shard_table: &Arc<ShardTableLock<ShardTable>>,
+    inbound_bm: &Arc<crate::cluster::migration::AtomicShardBitmap>,
+    authority: &Arc<crate::cluster::topology::TopologyAuthority>,
+    self_id: NodeId,
+) -> usize {
+    if !lineage.has_stream_candidates() {
+        return 0;
+    }
+    if engine.replica_stream_hole_within(LINEAGE_STREAM_HOLE_QUIET_MS) {
+        // Defer — do NOT drain: the candidates re-evaluate once quiet.
+        return 0;
+    }
+    let candidates = lineage.take_stream_candidates();
+    let mut stamps: Vec<(u16, u64)> = Vec::new();
+    {
+        let table = shard_table.read();
+        for shard in candidates {
+            if !lineage.stream_origin(shard) || inbound_bm.test(shard) {
+                continue;
+            }
+            let a = table.target_assignment(shard);
+            let holder = a.master == self_id
+                || a.replicas.contains(&self_id)
+                || table.effective_assignment(shard).master == self_id;
+            if !holder {
+                continue;
+            }
+            let regime = authority.committed_regime(shard);
+            if matches!(
+                lineage.lineage(shard),
+                crate::cluster::lineage::Lineage::Full { regime: r } if r == regime
+            ) {
+                continue;
+            }
+            stamps.push((shard, regime));
+        }
+    }
+    if stamps.is_empty() {
+        return 0;
+    }
+    if lineage.mark_full_many(
+        &stamps,
+        "master→replica stream completeness (§4.3 catch-up trigger, stage 4)",
+    ) {
+        stamps.len()
+    } else {
+        0
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -9874,14 +10792,19 @@ pub fn rank_master_candidate(
     if is_subset { 2 } else { 3 }
 }
 
-/// Phase F — a candidate node for master election of a single shard.
+/// Phase F (RETIRED from the activation path — P1 stage 4, design §4.4) —
+/// a candidate node for master election of a single shard.
 ///
-/// Each member of the new topology produces one [`MasterCandidate`] per
-/// shard, derived from:
-/// - the previous shard table (for `was_previous_master`)
-/// - the partition view exchanged during Phase D (for `is_subset` —
-///   indicating the candidate is still expecting inbound data)
-/// - the Phase F evicted-nodes set (for `was_evicted`)
+/// The `apply_master_election` deviation applier that consumed these was
+/// removed in stage 4: master deviation is no longer a per-node local
+/// computation — the active table is always the committed derivation
+/// (placement + the quorum-committed override map), and the serving-side
+/// protection local election provided is replaced by I13's
+/// transition-scoped lineage gate. [`elect_master`] and this descriptor
+/// are retained as the pinned record of the scoring rules and of the
+/// twice-rejected R4/#76 recency hazard documented on `is_subset` and in
+/// [`elect_master`]'s body — design §5.1 records why any successor
+/// mechanism must be quorum-committed, never locally derived.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MasterCandidate {
     /// Identity of this candidate.
@@ -9893,7 +10816,8 @@ pub struct MasterCandidate {
     /// (e.g. a still-in-flight inbound migration). Subset candidates lose
     /// to any non-subset, non-evicted candidate.
     ///
-    /// Classified from raw `last_applied_seq > 0` in `apply_master_election`.
+    /// Was classified from raw `last_applied_seq > 0` by the retired
+    /// `apply_master_election`.
     /// DO NOT classify this off the `PARTITION_FLAG_PENDING_INBOUND` flag
     /// (finding R4, rejected): that flag is the SAME `inbound_atomic` bit the
     /// serving fence reads (`is_master` -> Transitioning), so "an elector sees
@@ -9904,6 +10828,9 @@ pub struct MasterCandidate {
     /// monotone threshold all electors agree on once crossed; the flag is not.
     /// Electing a still-fenced subset holder is already SAFE (it cannot serve),
     /// so this term buys only availability at the cost of a double-spend window.
+    /// (The stage-4 committed path classifies eligibility from self-observed
+    /// `Full` lineage reported in the partition view — proposer input only,
+    /// §4.3 — and fences serving with I13, so neither hazard arises.)
     pub is_subset: bool,
     /// True iff the prior exchange phase classified this node as evicted
     /// (failed to report, persistent suspect). Evicted nodes are never
@@ -9911,9 +10838,10 @@ pub struct MasterCandidate {
     pub was_evicted: bool,
 }
 
-/// Phase F — score every candidate via [`rank_master_candidate`] and return
-/// the highest-scored one, breaking ties by lowest `NodeId` for
-/// deterministic agreement across all peers running the same election.
+/// Phase F (RETIRED from the activation path — P1 stage 4, design §4.4) —
+/// score every candidate via [`rank_master_candidate`] and return the
+/// highest-scored one, breaking ties by lowest `NodeId` for deterministic
+/// agreement across all peers running the same election.
 ///
 /// Returns `None` when every candidate is evicted — the caller must surface
 /// this as an error so the shard is not silently left without a master.
@@ -9922,20 +10850,30 @@ pub struct MasterCandidate {
 /// independent because all per-shard signals are already encoded in the
 /// candidate descriptors.
 pub fn elect_master(_shard: u16, candidates: &[MasterCandidate]) -> Option<NodeId> {
-    // DO NOT re-add max_generation / any recency signal to this ranking.
-    // Reverted twice (PR #76 / commit 3712018, then finding R4): max_generation
-    // is a LIVE-MOVING per-report value (build_self_partition_version_entries ->
-    // engine.recency_for_keys, computed at each responder's poll instant). The
-    // Task #22 gate (all_candidates_reported) only proves each candidate NODE is
-    // PRESENT in the view — it does NOT prove two electors observed the same
-    // max_generation for a live-writing peer. Any recency comparison between two
-    // equal-score candidates is therefore observer-dependent across the ~2000ms
-    // exchange skew -> two electors elect different masters -> dual-SERVING
-    // master (double-spend). "Subordinate to score" does not help: the hazard is
-    // at the score-tie level, which is exactly where recency would decide. A
-    // stale/behind elected master is the reactive online re-heal's job
-    // (trigger_online_reheal: fail-closed self-fence, never a second authority),
-    // NOT the election's.
+    // HISTORY (kept as the institutional record — design §5.1): recency was
+    // rejected here TWICE (PR #76 / commit 3712018, then finding R4):
+    // max_generation is a LIVE-MOVING per-report value
+    // (build_self_partition_version_entries -> engine.recency_for_keys,
+    // computed at each responder's poll instant). The Task #22 gate
+    // (all_candidates_reported) only proves each candidate NODE is PRESENT in
+    // the view — it does NOT prove two electors observed the same
+    // max_generation for a live-writing peer. Any recency comparison between
+    // two equal-score candidates is therefore observer-dependent across the
+    // ~2000ms exchange skew -> two electors elect different masters ->
+    // dual-SERVING master (double-spend). "Subordinate to score" does not
+    // help: the hazard is at the score-tie level, which is exactly where
+    // recency would decide.
+    //
+    // P1 stage 4 resolved the whole class by RETIRING local deviation
+    // entirely (design §4.4/§5.1): mastership deviation is now a
+    // quorum-COMMITTED override — the partition view (including the §4.3
+    // lineage reports) is PROPOSER INPUT to one deterministic proposer whose
+    // output rides the term/vote/commit machinery, is structurally
+    // re-validated by every applier (I10, I0-clean), and is fenced by the
+    // per-shard regime (§4.2) plus the serving node's own self-observed Full
+    // lineage (I13). No local election exists to diverge; this function has
+    // no production caller and is kept, with its tests, as the pinned record
+    // of the rejected design.
     candidates
         .iter()
         .filter(|c| !c.was_evicted)
@@ -10075,151 +11013,6 @@ fn split_transfer_request_tasks(
         }
     }
     (tasks, diverged)
-}
-
-/// Phase F — apply election scoring on top of the round-robin
-/// `compute_with_epoch` result.
-///
-/// For every shard, build the candidate set from the shard's target
-/// assignment (master + replicas), tag each candidate with:
-/// - `was_previous_master`: held the master role for this shard in
-///   `prev_table` and is still in the new member set.
-/// - `is_subset`: not yet observed to hold full data — either the
-///   partition view shows no entries for the candidate or the candidate
-///   reports `last_applied_seq == 0` for the shard.
-/// - `was_evicted`: present in the `evicted` set passed by the caller
-///   (collected from the prior exchange phase).
-///
-/// Run [`elect_master`] over the candidates and, when the elected master
-/// differs from the current round-robin pick, swap it into place via
-/// [`ShardTable::set_master_for_shard`].
-///
-/// # Empty partition views must be a true no-op (Task #22)
-///
-/// When `partition_view` is empty the round-robin pick is left COMPLETELY
-/// unchanged — the function returns before touching any shard. This is
-/// load-bearing for cluster convergence, not just an optimization:
-/// `elect_master` ranks candidates by `(data_score, was_previous_master,
-/// Reverse(node_id))`, and with an empty view every candidate scores equal on
-/// data, so the `was_previous_master` stickiness tiebreaker decides. That
-/// tiebreaker reads each node's OWN `prev_table`, which differs per node — so
-/// running election on an empty view produces a DIFFERENT master per node for
-/// the same shard, breaking the single-master-per-shard invariant. The
-/// same-term reactivation path (`activate_topology`, the convergence
-/// mechanism) always passes an empty view precisely so it installs the
-/// deterministic round-robin table identically on every node; election on an
-/// empty view would defeat that and leave the cluster permanently
-/// over-mastered (the 4626/4096 dual-master state). The previous code
-/// proceeded through the loop for `view_empty`, applying stickiness — that was
-/// the convergence bug.
-pub fn apply_master_election(
-    table: &mut ShardTable,
-    prev_table: &ShardTable,
-    partition_view: &std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>>,
-    evicted: &std::collections::HashSet<NodeId>,
-) {
-    let view_empty = partition_view.is_empty();
-    // Task #22 — an empty view carries no ownership signal. Returning here
-    // (rather than running the stickiness tiebreaker) keeps the round-robin
-    // assignment fully deterministic across nodes, which the same-term
-    // reactivation relies on to converge to one master per shard. Eviction is
-    // the one cross-node-deterministic reason to mutate the table without a
-    // view (remove a known-dead node), so only short-circuit when there is
-    // also nothing to evict. In production the reactivation path passes an
-    // empty view AND an empty eviction set, so it takes this fast return and
-    // installs pure round-robin.
-    if view_empty && evicted.is_empty() {
-        return;
-    }
-
-    // (node, shard) -> last_applied_seq, used to decide is_subset.
-    let mut seq_by_node_shard: std::collections::HashMap<(NodeId, u16), u64> =
-        std::collections::HashMap::new();
-    let mut nodes_with_view: std::collections::HashSet<NodeId> =
-        std::collections::HashSet::with_capacity(partition_view.len());
-    for (node, entries) in partition_view {
-        nodes_with_view.insert(*node);
-        for e in entries {
-            seq_by_node_shard.insert((*node, e.shard), e.last_applied_seq);
-        }
-    }
-
-    for shard in 0..NUM_SHARDS as u16 {
-        let assignment = table.target_assignment(shard);
-        let prev_master = prev_table.target_assignment(shard).master;
-
-        let mut candidate_nodes: Vec<NodeId> = Vec::with_capacity(1 + assignment.replicas.len());
-        candidate_nodes.push(assignment.master);
-        for replica in &assignment.replicas {
-            if !candidate_nodes.contains(replica) {
-                candidate_nodes.push(*replica);
-            }
-        }
-
-        // Task #22 — determinism gate. Election may only DEVIATE the master
-        // from the round-robin pick when the view is complete enough that every
-        // node computes the identical result; otherwise per-node divergence
-        // re-creates the dual-master state on every committed term (worst under
-        // load, when the bounded exchange times out and returns partial views).
-        // Require every candidate for this shard to have REPORTED in the view:
-        // a candidate absent from the view did not respond (it is down or
-        // unreachable), and a down node is absent from EVERY node's view, so
-        // skipping deviation here is a consistent decision cluster-wide. With a
-        // partial view (some candidate missing) preserve the deterministic
-        // round-robin master. (The eviction-only empty-view path bypasses this:
-        // it has no responders by construction.)
-        let all_candidates_reported = view_empty
-            || candidate_nodes
-                .iter()
-                .all(|node_id| nodes_with_view.contains(node_id));
-        if !all_candidates_reported {
-            continue;
-        }
-
-        // Skip shards where no candidate reports data (all `last_applied_seq
-        // == 0`, e.g. a fresh scale-up): the view carries no ownership signal
-        // and `elect_master`'s `was_previous_master` stickiness would silently
-        // un-do the round-robin assignment to a newcomer. The eviction-only
-        // empty-view path treats every candidate as full and must not skip.
-        let any_candidate_has_data = candidate_nodes.iter().any(|&node_id| {
-            seq_by_node_shard
-                .get(&(node_id, shard))
-                .copied()
-                .unwrap_or(0)
-                > 0
-        });
-        if !view_empty && !any_candidate_has_data {
-            continue;
-        }
-
-        let candidates: Vec<MasterCandidate> = candidate_nodes
-            .iter()
-            .map(|&node_id| {
-                // Eviction-only path (empty view): treat every candidate as
-                // full so election runs solely to skip the evicted node. With
-                // a real view, a node is "full" iff it reports a non-zero
-                // last_applied_seq for the shard, else "subset".
-                let has_data = view_empty
-                    || seq_by_node_shard
-                        .get(&(node_id, shard))
-                        .copied()
-                        .unwrap_or(0)
-                        > 0;
-                MasterCandidate {
-                    node_id,
-                    was_previous_master: node_id == prev_master,
-                    is_subset: !has_data,
-                    was_evicted: evicted.contains(&node_id),
-                }
-            })
-            .collect();
-
-        if let Some(elected) = elect_master(shard, &candidates)
-            && elected != assignment.master
-        {
-            table.set_master_for_shard(shard, elected);
-        }
-    }
 }
 
 /// Phase H — `Send`-able handle for posting resync requests from a
@@ -10533,6 +11326,15 @@ pub struct RunningCluster {
     /// [`RunningCluster::is_lineage_full`]. Test builders get a
     /// non-persistent, all-`Subset` store (the fail-closed default).
     lineage: Arc<crate::cluster::lineage::LineageStore>,
+    /// P1 stage 4 (I13) — lock-free per-shard "serving as master needs no
+    /// Full gate" bitmap, shared with the commit-install hook (which
+    /// recomputes it per install) and the boot re-derivation. A CLEAR bit
+    /// on a self-mastered shard makes [`Self::is_master`] answer
+    /// `Transitioning` until self-observed lineage is `Full` (the I13
+    /// transition-scoped gate); the resting/bootstrap state is all-set
+    /// (gate-inactive, regime 0). Test builders (no commit installs) keep
+    /// it all-set, preserving pre-stage-4 behavior.
+    serving_established: Arc<crate::cluster::migration::AtomicShardBitmap>,
     /// Test-only: when set, [`RunningCluster::signal_topology_committed`]
     /// drops the signal instead of queuing it. Models the production race
     /// where a node's authority commits a new term (via the dispatch
@@ -10839,10 +11641,35 @@ impl RunningCluster {
             };
         }
         if auth_master == self.self_id {
+            // P1 stage 4 (I13) — the transition-scoped serving gate: a node
+            // BEGINS serving a shard it was not serving in the previous
+            // regime — override-driven or placement-driven — only once its
+            // self-observed lineage is Full. Both reads are lock-free
+            // bitmaps (the inbound_atomic pattern); passing the gate marks
+            // serving established for the regime, so a LATER mid-regime
+            // Subset degrade (e.g. a reclaimed redo range) does not yank an
+            // already-serving master (I13 gates beginning, not continuing).
+            if !self.serving_established.test(shard) {
+                if self.lineage.is_full(shard) {
+                    self.serving_established.set(shard);
+                } else {
+                    return MasterQueryResult::Transitioning {
+                        last_known_term: committed,
+                    };
+                }
+            }
             MasterQueryResult::Yes
         } else {
             MasterQueryResult::No
         }
+    }
+
+    /// P1 stage 4 test hook — force the I13 serving gate CLOSED for
+    /// `shard` (models a commit-install that named self a new master of a
+    /// regime-advanced shard without the fixture running a real install).
+    #[cfg(test)]
+    pub(crate) fn test_clear_serving_established(&self, shard: u16) {
+        self.serving_established.clear(shard);
     }
 
     /// Capture a batch-scoped [`MasterSnapshot`] of every shard's
@@ -10920,6 +11747,18 @@ impl RunningCluster {
             };
         }
         if auth_master == self.self_id {
+            // P1 stage 4 (I13) — the same lock-free serving gate as
+            // `is_master` (see the doc there); runs per call, exactly like
+            // the other atomic gates this snapshot deliberately re-checks.
+            if !self.serving_established.test(shard) {
+                if self.lineage.is_full(shard) {
+                    self.serving_established.set(shard);
+                } else {
+                    return MasterQueryResult::Transitioning {
+                        last_known_term: committed,
+                    };
+                }
+            }
             MasterQueryResult::Yes
         } else {
             MasterQueryResult::No
@@ -11197,6 +12036,56 @@ impl RunningCluster {
     /// `fenced_shards` precedent — no lock on the sweep path).
     pub fn is_lineage_full(&self, key: &TxKey) -> bool {
         self.lineage.is_full(ShardTable::shard_for_key(key))
+    }
+
+    /// P1 stage 4 — note the touched shards of a successfully applied,
+    /// TRACKED replica batch (the master→replica completeness signal's
+    /// receiver half). `touched` pairs each shard with whether it was
+    /// EMPTY before the apply. Shards with an inbound/heal fence up are
+    /// never noted (a dual-write delta during a fill must not claim
+    /// stream-origin for a copy that is part baseline); the rest feed
+    /// [`crate::cluster::lineage::LineageStore::note_stream_apply`], whose
+    /// candidates the event loop flushes into batched `Full` stamps.
+    /// Lock-free (two atomic bitmap ops per shard).
+    pub fn note_replica_stream_applies(&self, touched: &[(u16, bool)]) {
+        for &(shard, was_empty) in touched {
+            if self.inbound_atomic.test(shard) {
+                continue;
+            }
+            self.lineage.note_stream_apply(shard, was_empty);
+        }
+    }
+
+    /// P1 stage 4 (I4) — propose committing `promotion_enabled = enable`
+    /// through the normal proposer machinery (see
+    /// [`crate::cluster::topology::TopologyAuthority::propose_promotion_enabled`]
+    /// for the proposal-side gates: config opt-in + cluster-wide
+    /// WriteAll-equivalence adverts). Mirrors [`Self::propose_regime_rebase`]:
+    /// the authority validates, this method rides the resulting term
+    /// through `run_topology_proposer` (normal activation quorum).
+    ///
+    /// # Errors
+    /// [`crate::cluster::topology::RegimeProposeError`] when the authority
+    /// refuses the proposal.
+    pub fn propose_promotion_enabled(
+        &self,
+        enable: bool,
+    ) -> Result<crate::cluster::topology::TopologyTerm, crate::cluster::topology::RegimeProposeError>
+    {
+        let term = self.topology_authority.propose_promotion_enabled(enable)?;
+        let ta = self.topology_authority.clone();
+        let na = self.node_addrs.clone();
+        let tx = self.topology_commit_tx.clone();
+        let tp = self.topology_state_path.clone();
+        let ps = self.peak_size.clone();
+        let si = self.swim_incarnation.clone();
+        let secret = self.cluster_secret.clone();
+        let self_id = self.self_id;
+        let proposal = term.clone();
+        std::thread::spawn(move || {
+            run_topology_proposer(proposal, ta, na, self_id, tx, tp, ps, si, secret);
+        });
+        Ok(term)
     }
 
     /// Abort an in-flight inbound migration for `shard` (FLAG_MIGRATION_ABORT).
@@ -13092,6 +13981,13 @@ pub(crate) fn new_test_running_cluster(
             [0u8; crate::cluster::lineage::DATA_EPOCH_LEN],
             self_id,
         )),
+        // Gate-inactive resting state (all-set); tests that exercise the
+        // I13 serving gate clear bits via `test_clear_serving_established`.
+        serving_established: {
+            let bm = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+            bm.set_all();
+            bm
+        },
         #[cfg(any(test, feature = "fault-injection"))]
         drop_commit_signals: Arc::new(AtomicBool::new(false)),
         #[cfg(test)]
@@ -14257,6 +15153,7 @@ mod tests {
             /* self_holds_records */ false,
             /* target_holds_superset */ false,
             1,
+            &std::collections::BTreeMap::new(),
         );
         assert_eq!(
             disposition,
@@ -14374,6 +15271,7 @@ mod tests {
             /* self_holds_records */ true,
             /* target_holds_superset */ false,
             1,
+            &std::collections::BTreeMap::new(),
         );
         assert_eq!(
             disposition,
@@ -14402,6 +15300,7 @@ mod tests {
             /* self_holds_records */ false,
             /* target_holds_superset */ false,
             1,
+            &std::collections::BTreeMap::new(),
         );
         assert_eq!(disposition, FailedHandoffDisposition::RollbackToSelf);
     }
@@ -14426,6 +15325,7 @@ mod tests {
             /* self_holds_records */ false,
             /* target_holds_superset */ false,
             1,
+            &std::collections::BTreeMap::new(),
         );
         assert_eq!(disposition, FailedHandoffDisposition::RollbackToSelf);
     }
@@ -14451,6 +15351,7 @@ mod tests {
             /* self_holds_records */ false,
             /* target_holds_superset */ false,
             1,
+            &std::collections::BTreeMap::new(),
         );
         assert_eq!(disposition, FailedHandoffDisposition::RollbackToSelf);
     }
@@ -15703,6 +16604,7 @@ mod tests {
             /* self_holds_records */ true,
             /* target_holds_superset */ false,
             1,
+            &std::collections::BTreeMap::new(),
         );
         assert_eq!(
             disposition_with_records,
@@ -15723,6 +16625,7 @@ mod tests {
             /* self_holds_records */ false,
             /* target_holds_superset */ false,
             1,
+            &std::collections::BTreeMap::new(),
         );
         assert_eq!(
             disposition_empty,
@@ -15758,6 +16661,7 @@ mod tests {
             /* self_holds_records */ true,
             /* target_holds_superset */ false,
             1,
+            &std::collections::BTreeMap::new(),
         );
         assert_eq!(
             stuck,
@@ -15779,6 +16683,7 @@ mod tests {
             /* self_holds_records */ true,
             /* target_holds_superset */ true,
             1,
+            &std::collections::BTreeMap::new(),
         );
         assert_eq!(
             converged,
@@ -15809,6 +16714,7 @@ mod tests {
             /* self_holds_records */ true,
             /* target_holds_superset */ true,
             1,
+            &std::collections::BTreeMap::new(),
         );
         assert_eq!(
             disposition,
@@ -17451,8 +18357,14 @@ mod tests {
         let committed_term = 4;
         let table = ShardTable::compute_with_epoch(&members, rf, committed_term, 1);
 
-        let (mismatched, pending_handoffs) =
-            committed_topology_reactivation_metrics(&table, &members, rf, committed_term, 1);
+        let (mismatched, pending_handoffs) = committed_topology_reactivation_metrics(
+            &table,
+            &members,
+            rf,
+            committed_term,
+            1,
+            &std::collections::BTreeMap::new(),
+        );
 
         assert_eq!(
             mismatched, 0,
@@ -17461,57 +18373,50 @@ mod tests {
         assert_eq!(pending_handoffs, 0);
     }
 
-    /// W1.1 FIX C — the reactivation mismatch metric must compare the
-    /// active table against the activation's *election-refined* intent,
-    /// not raw round-robin. Repro recipe 3: a partition view in which one
-    /// node holds all the data drives `apply_master_election` away from
-    /// the round-robin picks; a settled cluster must then report
-    /// `mismatched == 0` so the reactivation loop never fires spuriously.
+    /// W1.1 FIX C, rewritten for P1 stage 4 (§4.4) — the reactivation
+    /// mismatch metric must compare the active table against the
+    /// activation's COMMITTED-DERIVATION intent, not raw placement. The
+    /// only legitimate deviation is now the quorum-committed override map:
+    /// a table refined by it (as `activate_topology_with_view` installs)
+    /// must read `mismatched == 0` so the reactivation loop never fires
+    /// spuriously against a promoted shard — and the same override map
+    /// passed to the metric keeps the stale-version branch consistent.
     #[test]
-    fn reactivation_metrics_zero_after_master_election_refinement() {
+    fn i3_reactivation_metrics_zero_after_committed_override_refinement() {
         let members = vec![NodeId(1), NodeId(2), NodeId(3)];
         let rf = 2;
         let term = 7;
-        let prev = ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2)], rf, 6, 1);
         let mut table = ShardTable::compute_with_epoch(&members, rf, term, 1);
 
-        // Node 1 reports full data for every shard; the other candidates
-        // report nothing — the election prefers node 1 wherever it is in
-        // the candidate set, deviating from round-robin.
-        let mut view: std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>> =
-            std::collections::HashMap::new();
-        view.insert(
-            NodeId(1),
-            (0..NUM_SHARDS as u16)
-                .map(|shard| PartitionVersionEntry {
-                    shard,
-                    flags: 0,
-                    replica_count: 1,
-                    last_applied_seq: 5,
-                    manifest_digest: 0,
-                    max_generation: 0,
-                })
-                .collect(),
+        // A committed override promotes a placement replica on one shard.
+        let shard = (0..NUM_SHARDS as u16)
+            .find(|&s| !table.target_assignment(s).replicas.is_empty())
+            .expect("rf=2 over 3 members yields replicas");
+        let target = table.target_assignment(shard).replicas[0];
+        let placement_master = table.target_assignment(shard).master;
+        assert_ne!(target, placement_master);
+        let mut override_map = std::collections::BTreeMap::new();
+        override_map.insert(shard, target);
+        // The activation applies the committed derivation.
+        table.apply_override_master(shard, target);
+        assert_eq!(
+            table.target_assignment(shard).master,
+            target,
+            "the override must deviate the table from placement",
         );
-        view.insert(NodeId(2), Vec::new());
-        view.insert(NodeId(3), Vec::new());
-        apply_master_election(&mut table, &prev, &view, &std::collections::HashSet::new());
-
-        // Sanity: the election actually deviated from round-robin,
-        // otherwise this test would not exercise FIX C at all.
-        let round_robin = ShardTable::compute_with_epoch(&members, rf, term, 1);
-        let deviated = (0..NUM_SHARDS as u16)
-            .any(|s| table.target_assignment(s).master != round_robin.target_assignment(s).master);
         assert!(
-            deviated,
-            "election with a one-node-holds-all view must deviate from round-robin"
+            table
+                .target_assignment(shard)
+                .replicas
+                .contains(&placement_master),
+            "I3 swap: the demoted placement master keeps a replica slot",
         );
 
         let (mismatched, pending_handoffs) =
-            committed_topology_reactivation_metrics(&table, &members, rf, term, 1);
+            committed_topology_reactivation_metrics(&table, &members, rf, term, 1, &override_map);
         assert_eq!(
             mismatched, 0,
-            "an election-refined settled table must never trigger reactivation"
+            "a committed-derivation-refined settled table must never trigger reactivation"
         );
         assert_eq!(pending_handoffs, 0);
     }
@@ -17540,8 +18445,14 @@ mod tests {
             "rollback must leave the shard diverged from the activation intent"
         );
 
-        let (mismatched, _pending) =
-            committed_topology_reactivation_metrics(&table, &new_members, rf, 2, 1);
+        let (mismatched, _pending) = committed_topology_reactivation_metrics(
+            &table,
+            &new_members,
+            rf,
+            2,
+            1,
+            &std::collections::BTreeMap::new(),
+        );
         assert!(
             mismatched >= 1,
             "a rolled-back handoff must keep triggering reactivation (got {mismatched})"
@@ -17558,8 +18469,14 @@ mod tests {
         let committed_members = vec![NodeId(1), NodeId(2), NodeId(3)];
         // Active table is the stale 2-member term-1 table.
         let table = ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2)], rf, 1, 1);
-        let (mismatched, _pending) =
-            committed_topology_reactivation_metrics(&table, &committed_members, rf, 2, 1);
+        let (mismatched, _pending) = committed_topology_reactivation_metrics(
+            &table,
+            &committed_members,
+            rf,
+            2,
+            1,
+            &std::collections::BTreeMap::new(),
+        );
         assert!(
             mismatched >= 1,
             "a table behind the committed term must trigger reactivation"
@@ -17883,6 +18800,8 @@ mod tests {
             last_applied_seq: 10,
             manifest_digest: g as u64,
             max_generation: g,
+            lineage_full: false,
+            lineage_regime: 0,
         };
         let mut view: std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>> =
             std::collections::HashMap::new();
@@ -17920,6 +18839,8 @@ mod tests {
             last_applied_seq: 1,
             manifest_digest: 0,
             max_generation: g,
+            lineage_full: false,
+            lineage_regime: 0,
         };
         let mut view: std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>> =
             std::collections::HashMap::new();
@@ -17992,8 +18913,14 @@ mod tests {
         // The committed term IS activated locally (version == committed_term)
         // and target == intended for node 3's shards, so the steady-state
         // mismatch metric is zero — reactivation would never fire on it.
-        let (mismatched, pending_handoffs) =
-            committed_topology_reactivation_metrics(&table, &committed, rf, committed_term, 1);
+        let (mismatched, pending_handoffs) = committed_topology_reactivation_metrics(
+            &table,
+            &committed,
+            rf,
+            committed_term,
+            1,
+            &std::collections::BTreeMap::new(),
+        );
         assert_eq!(
             mismatched, 0,
             "post-activation mismatch must be zero (the bug: nothing re-fires)"
@@ -18109,6 +19036,7 @@ mod tests {
             rf,
             committed_term,
             1,
+            &std::collections::BTreeMap::new(),
         );
         assert_eq!(
             mismatched, 0,
@@ -18136,7 +19064,14 @@ mod tests {
         );
 
         // The new detector flags exactly the phantom-mastered shards.
-        let phantom = phantom_master_shard_count(&stale_table, &committed, rf, self_id, 1);
+        let phantom = phantom_master_shard_count(
+            &stale_table,
+            &committed,
+            rf,
+            self_id,
+            1,
+            &std::collections::BTreeMap::new(),
+        );
         assert_eq!(
             phantom, over_owned,
             "phantom_master_shard_count must flag every committed-non-owned local master",
@@ -18175,7 +19110,14 @@ mod tests {
         // phantom masters.
         for &node in &committed {
             assert_eq!(
-                phantom_master_shard_count(&table, &committed, rf, node, 1),
+                phantom_master_shard_count(
+                    &table,
+                    &committed,
+                    rf,
+                    node,
+                    1,
+                    &std::collections::BTreeMap::new()
+                ),
                 0,
                 "a node activated on the committed term must report no phantom masters",
             );
@@ -18198,67 +19140,61 @@ mod tests {
         }
     }
 
-    /// Task #22 — the phantom detector must flag *election-deviated* masters,
-    /// because `apply_master_election` runs against each node's LOCAL view and
-    /// reaches NO cluster-wide agreement: two nodes can each elect themselves
-    /// master for the same shard at the same committed term (the real
-    /// 4671/4096 dual-master state). The only cluster-wide deterministic
-    /// assignment is round-robin, which a same-term empty-view reactivation
-    /// installs; so a self-master that differs from the round-robin master is
-    /// exactly what must be relinquished for the cluster to converge. The
-    /// detector must therefore count those shards (a settled election
-    /// deviation is NOT a fixed point — it is reverted to round-robin).
+    /// Task #22, rewritten for P1 stage 4 (§4.4) — the phantom detector
+    /// compares against the COMMITTED DERIVATION, and both directions
+    /// matter with equal force to the assertions the retired
+    /// election-deviation test pinned:
+    ///
+    /// 1. a self-master that deviates from the derivation WITHOUT a
+    ///    committed override is stale over-ownership and MUST be flagged
+    ///    (the 4671/4096 convergence half — reactivation reassigns it);
+    /// 2. a self-master installed by a quorum-COMMITTED override is the
+    ///    derivation and MUST NOT be flagged — flagging it would let the
+    ///    relinquish machinery revert a committed promotion, the exact
+    ///    inversion of the safety stage 4 adds.
     #[test]
-    fn phantom_master_count_flags_election_deviation_from_round_robin() {
+    fn i3_phantom_master_count_respects_committed_override_deviation() {
         let rf = 2;
         let committed = vec![NodeId(1), NodeId(2), NodeId(3)];
         let term = 5u64;
-        let prev = ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2)], rf, 4, 1);
-        let mut table = ShardTable::compute_with_epoch(&committed, rf, term, 1);
+        let placement = ShardTable::compute_with_epoch(&committed, rf, term, 1);
 
-        // Drive election so node 1 (which reports all data) wins every shard
-        // where it is a candidate — deviating from round-robin. On a single
-        // node this looks "legitimate", but nothing guarantees the OTHER
-        // nodes elected node 1 too: each ran election against its own view,
-        // so the same shard can end up self-mastered on two nodes. Round-robin
-        // is the only assignment all nodes agree on.
-        let mut view: std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>> =
-            std::collections::HashMap::new();
-        view.insert(
-            NodeId(1),
-            (0..NUM_SHARDS as u16)
-                .map(|shard| PartitionVersionEntry {
-                    shard,
-                    flags: 0,
-                    replica_count: 1,
-                    last_applied_seq: 9,
-                    manifest_digest: 0,
-                    max_generation: 0,
-                })
-                .collect(),
-        );
-        view.insert(NodeId(2), Vec::new());
-        view.insert(NodeId(3), Vec::new());
-        apply_master_election(&mut table, &prev, &view, &std::collections::HashSet::new());
-
-        // Election must have deviated from round-robin (otherwise the test
-        // does not exercise the convergence path).
-        let round_robin = ShardTable::compute_with_epoch(&committed, rf, term, 1);
-        let deviated: usize = (0..NUM_SHARDS as u16)
-            .filter(|&s| {
-                table.target_assignment(s).master == NodeId(1)
-                    && round_robin.target_assignment(s).master != NodeId(1)
+        // A shard NodeId(1) does NOT master under placement, but where it
+        // IS a placement replica (a legal promotion target).
+        let shard = (0..NUM_SHARDS as u16)
+            .find(|&s| {
+                placement.target_assignment(s).master != NodeId(1)
+                    && placement.target_assignment(s).replicas.contains(&NodeId(1))
             })
-            .count();
-        assert!(deviated > 0, "election must deviate to exercise this path");
+            .expect("some shard has node 1 as a replica");
 
-        // The detector flags exactly node 1's deviated masters — the shards a
-        // same-term empty-view reactivation will hand back to their
-        // round-robin masters, collapsing the cluster to single-mastership.
+        // Half 1 — deviation WITHOUT an override: node 1's table claims the
+        // shard; the detector must flag it (stale over-ownership).
+        let mut table = placement.clone();
+        table.apply_override_master(shard, NodeId(1));
+        let flagged = phantom_master_shard_count(
+            &table,
+            &committed,
+            rf,
+            NodeId(1),
+            1,
+            &std::collections::BTreeMap::new(),
+        );
         assert_eq!(
-            phantom_master_shard_count(&table, &committed, rf, NodeId(1), 1),
-            deviated,
-            "election-deviated self-masters must be flagged for reconciliation",
+            flagged, 1,
+            "an un-committed deviation is a phantom and must be flagged for \
+             reconciliation",
+        );
+
+        // Half 2 — the SAME deviation backed by the committed override map:
+        // the derivation names node 1, so nothing is a phantom.
+        let mut override_map = std::collections::BTreeMap::new();
+        override_map.insert(shard, NodeId(1));
+        assert_eq!(
+            phantom_master_shard_count(&table, &committed, rf, NodeId(1), 1, &override_map),
+            0,
+            "a quorum-committed override is the derivation — flagging it would \
+             revert a committed promotion",
         );
     }
 
@@ -20279,6 +21215,8 @@ mod tests {
                 last_applied_seq: 10,
                 manifest_digest: 1,
                 max_generation: 1,
+                lineage_full: false,
+                lineage_regime: 0,
             }],
         );
 
@@ -20312,6 +21250,8 @@ mod tests {
                 last_applied_seq: 5,
                 manifest_digest: 0xAAAA,
                 max_generation: 100,
+                lineage_full: false,
+                lineage_regime: 0,
             }],
         );
         view.insert(
@@ -20323,6 +21263,8 @@ mod tests {
                 last_applied_seq: 9,
                 manifest_digest: 0xBBBB,
                 max_generation: 105,
+                lineage_full: false,
+                lineage_regime: 0,
             }],
         );
         view
@@ -20353,6 +21295,8 @@ mod tests {
                 last_applied_seq: 9,
                 manifest_digest: 0xAAAA,
                 max_generation: 105,
+                lineage_full: false,
+                lineage_regime: 0,
             }],
         );
         view.insert(
@@ -20364,6 +21308,8 @@ mod tests {
                 last_applied_seq: 5,
                 manifest_digest: 0xBBBB,
                 max_generation: 100,
+                lineage_full: false,
+                lineage_regime: 0,
             }],
         );
         view
@@ -21168,6 +22114,7 @@ mod tests {
             &cluster.migration_throttle,
             &cluster.cluster_secret,
             None,
+            None,
         );
 
         // The manager retained the unproven lost entry across the supersede (C17).
@@ -21284,6 +22231,7 @@ mod tests {
             &cluster.migration_throttle,
             &cluster.cluster_secret,
             None,
+            None,
         );
 
         // The heal entry must survive the supersede (manager + hot-path atomic).
@@ -21383,6 +22331,7 @@ mod tests {
             &view,
             &cluster.migration_throttle,
             &cluster.cluster_secret,
+            None,
             None,
         );
 
@@ -22064,8 +23013,14 @@ mod tests {
 
         // C6 boot: install the RESTORED committed table — not the `[self]`
         // bootstrap table stamped to the committed term (the old bug).
-        let boot_table = restored_committed_shard_table(&committed_members, rf, term, pv)
-            .expect("multi-node committed membership yields a restored table");
+        let boot_table = restored_committed_shard_table(
+            &committed_members,
+            rf,
+            term,
+            pv,
+            &std::collections::BTreeMap::new(),
+        )
+        .expect("multi-node committed membership yields a restored table");
         assert_eq!(
             boot_table.version, term,
             "restored table must carry the committed term so it is not treated as stale",
@@ -22492,36 +23447,34 @@ mod tests {
         );
     }
 
+    /// P1 stage 4 — rewrite of the retired
+    /// `apply_master_election_promotes_full_replica_over_subset_round_robin_pick`
+    /// against the committed path (§4.4): the SAME failover — a `Full`
+    /// replica takes over from a not-serving placement master — now flows
+    /// through the deterministic proposer's candidate computation and the
+    /// committed override map, and yields the SAME I3 post-state: the
+    /// promoted replica is master, the demoted placement pick keeps a
+    /// replica slot (so it stays in the write fan-out and can re-earn
+    /// `Full`).
     #[test]
-    fn apply_master_election_promotes_full_replica_over_subset_round_robin_pick() {
-        // Two members in the new topology. Round-robin picks N1 as master
-        // for some shards even though N2 already holds the full data and
-        // N1 is empty (subset). With a partition view in hand,
-        // apply_master_election must swap so N2 becomes master.
-        let prev_members = [NodeId(1), NodeId(2)];
-        let new_members = [NodeId(1), NodeId(2)];
-        let prev_table = ShardTable::compute_with_epoch(&prev_members, 2, 1, 1);
-        let mut new_table = ShardTable::compute_with_epoch(&new_members, 2, 2, 1);
+    fn i3_committed_override_promotes_full_replica_over_placement_pick() {
+        let members = vec![NodeId(1), NodeId(2)];
+        let mut new_table = ShardTable::compute_with_epoch(&members, 2, 2, 1);
 
-        // Pick a shard where round-robin assigned N1 as the new master.
+        // A shard placement assigns to N1 with N2 as its replica.
         let shard = (0..NUM_SHARDS as u16)
-            .find(|&s| new_table.target_assignment(s).master == NodeId(1))
-            .expect("at least one shard mastered by N1 in 2-member ring");
+            .find(|&s| {
+                new_table.target_assignment(s).master == NodeId(1)
+                    && new_table.target_assignment(s).replicas.contains(&NodeId(2))
+            })
+            .expect("at least one shard mastered by N1 with N2 replica");
 
-        // Partition view says N1 has no data for this shard, N2 has data.
+        // Partition view: N1 (the committed master) did not report — dead
+        // per this poll (§4.4 condition 3a); N2 reports Full at the
+        // shard's current committed regime (condition 2).
+        let block = crate::cluster::topology::RegimeBlock::default();
         let mut view: std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>> =
             std::collections::HashMap::new();
-        view.insert(
-            NodeId(1),
-            vec![PartitionVersionEntry {
-                shard,
-                flags: 0,
-                replica_count: 1,
-                last_applied_seq: 0,
-                manifest_digest: 0,
-                max_generation: 0,
-            }],
-        );
         view.insert(
             NodeId(2),
             vec![PartitionVersionEntry {
@@ -22531,127 +23484,110 @@ mod tests {
                 last_applied_seq: 9_999,
                 manifest_digest: 0,
                 max_generation: 0,
+                lineage_full: true,
+                lineage_regime: block.regime.get(shard),
             }],
         );
 
-        apply_master_election(
-            &mut new_table,
-            &prev_table,
-            &view,
-            &std::collections::HashSet::new(),
+        let overrides = compute_promotion_overrides(&members, 1, 2, &block, &view);
+        assert_eq!(
+            overrides.get(&shard),
+            Some(&NodeId(2)),
+            "the proposer must target the Full replica of a dead master",
         );
 
+        // The commit installs the override; activation applies it.
+        new_table.apply_override_master(shard, NodeId(2));
         assert_eq!(
             new_table.target_assignment(shard).master,
             NodeId(2),
-            "election must promote N2 (full data) over N1 (empty / subset) even when round-robin picked N1",
+            "the committed override must promote N2 (Full) over the placement pick N1",
         );
         assert!(
             new_table
                 .target_assignment(shard)
                 .replicas
                 .contains(&NodeId(1)),
-            "the previously-elected master must remain in the replica set",
+            "I3 swap: the demoted master must remain in the replica set",
         );
     }
 
-    /// Task #22 — determinism gate: when the partition view is PARTIAL (a
-    /// candidate for the shard did not report — e.g. unreachable during a
-    /// load-induced exchange timeout), election must NOT deviate the master.
-    /// Deviating on a partial view produces a different master per node (each
-    /// sees a different subset of responders), which re-creates the dual-master
-    /// state on every committed term. The round-robin pick must be preserved.
+    /// Task #22 / §4.0 named acceptance test, rewritten for P1 stage 4 —
+    /// determinism: the active table's mastership is a pure function of
+    /// COMMITTED state (placement + committed override map). Two nodes at
+    /// the same committed state must derive byte-identical assignments no
+    /// matter how their local partition views differ (partial, empty, or
+    /// one-node-holds-all — the inputs that drove the retired local
+    /// election apart). The view influences mastership ONLY through a
+    /// quorum-committed override.
     #[test]
-    fn apply_master_election_keeps_round_robin_when_candidate_missing_from_view() {
-        let members = [NodeId(1), NodeId(2), NodeId(3)];
-        let prev_table = ShardTable::compute_with_epoch(&members, 2, 1, 1);
-        let mut table = ShardTable::compute_with_epoch(&members, 2, 2, 1);
-
-        // A shard whose round-robin candidate set spans two nodes; report data
-        // for a replica (which would otherwise win) but OMIT the round-robin
-        // master from the view entirely (it did not respond).
-        let shard = (0..NUM_SHARDS as u16)
-            .find(|&s| !table.target_assignment(s).replicas.is_empty())
+    fn i0_committed_derivation_ignores_partition_view_for_mastership() {
+        let members = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let mut override_map = std::collections::BTreeMap::new();
+        let base = ShardTable::compute_with_epoch(&members, 2, 2, 1);
+        let overridden_shard = (0..NUM_SHARDS as u16)
+            .find(|&s| !base.target_assignment(s).replicas.is_empty())
             .expect("some shard has a replica");
-        let rr_master = table.target_assignment(shard).master;
-        let replica = table.target_assignment(shard).replicas[0];
-        let baseline = table.target_assignment(shard).clone();
+        override_map.insert(
+            overridden_shard,
+            base.target_assignment(overridden_shard).replicas[0],
+        );
 
-        // View contains ONLY the replica (full data) — the master is absent.
-        let mut view: std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>> =
-            std::collections::HashMap::new();
-        view.insert(
-            replica,
-            vec![PartitionVersionEntry {
-                shard,
-                flags: 0,
-                replica_count: 1,
-                last_applied_seq: 9_999,
-                manifest_digest: 0,
-                max_generation: 0,
-            }],
-        );
-        apply_master_election(
-            &mut table,
-            &prev_table,
-            &view,
-            &std::collections::HashSet::new(),
-        );
+        // "Node A" and "node B" both derive from the same committed state;
+        // their (hypothetical) local views are irrelevant — no view input
+        // exists on this path at all.
+        let derive = || {
+            let mut t = ShardTable::compute_with_epoch(&members, 2, 2, 1);
+            for (&s, &target) in &override_map {
+                t.apply_override_master(s, target);
+            }
+            t
+        };
+        let a = derive();
+        let b = derive();
+        for s in 0..NUM_SHARDS as u16 {
+            assert_eq!(
+                a.target_assignment(s),
+                b.target_assignment(s),
+                "two nodes at the same committed state must derive identical \
+                 assignments (shard {s})",
+            );
+        }
         assert_eq!(
-            table.target_assignment(shard).master,
-            rr_master,
-            "a partial view (round-robin master {rr_master:?} absent) must NOT deviate the master",
-        );
-        assert_eq!(
-            table.target_assignment(shard),
-            &baseline,
-            "the full round-robin assignment must be preserved under a partial view",
+            a.target_assignment(overridden_shard).master,
+            override_map[&overridden_shard],
+            "the committed override is the only mastership deviation",
         );
     }
 
+    /// Rewrite of the retired `apply_master_election_skips_evicted_master_pick`
+    /// against the committed path: an excluded (dead/evicted) member loses
+    /// every mastership through the MEMBERSHIP term's placement derivation —
+    /// no assignment under the new committed member set may name it.
     #[test]
-    fn apply_master_election_keeps_round_robin_when_view_is_empty() {
-        let members = [NodeId(1), NodeId(2), NodeId(3)];
-        let prev_table = ShardTable::compute_with_epoch(&members, 2, 1, 1);
-        let mut table = ShardTable::compute_with_epoch(&members, 2, 2, 1);
-        let baseline_assignment = table.target_assignment(7).clone();
-        let view: std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>> =
-            std::collections::HashMap::new();
-        apply_master_election(
-            &mut table,
-            &prev_table,
-            &view,
-            &std::collections::HashSet::new(),
-        );
-        assert_eq!(
-            table.target_assignment(7),
-            &baseline_assignment,
-            "with an empty partition view the round-robin assignment must be preserved",
-        );
-    }
-
-    #[test]
-    fn apply_master_election_skips_evicted_master_pick() {
-        let members = [NodeId(1), NodeId(2), NodeId(3)];
-        let prev_table = ShardTable::compute_with_epoch(&members, 2, 1, 1);
-        let mut table = ShardTable::compute_with_epoch(&members, 2, 2, 1);
+    fn i0_excluded_member_loses_mastership_via_membership_derivation() {
+        let old_members = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let old_table = ShardTable::compute_with_epoch(&old_members, 2, 2, 1);
         let shard = (0..NUM_SHARDS as u16)
-            .find(|&s| table.target_assignment(s).master == NodeId(1))
-            .unwrap();
+            .find(|&s| old_table.target_assignment(s).master == NodeId(1))
+            .expect("node 1 masters some shard");
 
-        // Empty view but evict N1 — election must replace N1 with another
-        // candidate from the assigned set.
-        let view: std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>> =
-            std::collections::HashMap::new();
-        let mut evicted = std::collections::HashSet::new();
-        evicted.insert(NodeId(1));
-
-        apply_master_election(&mut table, &prev_table, &view, &evicted);
+        // N1 dies; the membership term excludes it and every node derives
+        // the new placement over the surviving set.
+        let surviving = vec![NodeId(2), NodeId(3)];
+        let new_table = ShardTable::compute_with_epoch(&surviving, 2, 3, 1);
         assert_ne!(
-            table.target_assignment(shard).master,
+            new_table.target_assignment(shard).master,
             NodeId(1),
-            "evicted node must never remain master after election",
+            "an excluded member must never remain master under the new derivation",
         );
+        for s in 0..NUM_SHARDS as u16 {
+            let a = new_table.target_assignment(s);
+            assert!(
+                a.master != NodeId(1) && !a.replicas.contains(&NodeId(1)),
+                "an excluded member must not appear in any assignment (shard {s})",
+            );
+        }
     }
 
     // ── Phase I: cluster startup readiness ───────────────────────────────
@@ -22879,6 +23815,8 @@ mod tests {
                 last_applied_seq: 100,
                 manifest_digest: 0,
                 max_generation: 0,
+                lineage_full: false,
+                lineage_regime: 0,
             },
             PartitionVersionEntry {
                 shard: 1,
@@ -22887,6 +23825,8 @@ mod tests {
                 last_applied_seq: 50,
                 manifest_digest: 0,
                 max_generation: 0,
+                lineage_full: false,
+                lineage_regime: 0,
             },
         ];
         let entries2 = vec![PartitionVersionEntry {
@@ -22896,6 +23836,8 @@ mod tests {
             last_applied_seq: 90,
             manifest_digest: 0,
             max_generation: 0,
+            lineage_full: false,
+            lineage_regime: 0,
         }];
         phase.record(NodeId(10), entries1.clone());
         phase.record(NodeId(20), entries2.clone());
@@ -22904,10 +23846,11 @@ mod tests {
         assert_eq!(view.get(&NodeId(20)).unwrap(), &entries2);
     }
 
-    /// Reverse-heal Phase 1: the additive `manifest_digest` + `max_generation`
-    /// recency fields survive an `OP_PARTITION_VERSION_REPORT` wire round-trip.
+    /// Reverse-heal Phase 1 + P1 stage 4: the additive recency fields AND
+    /// the `lineage_full` + `lineage_regime` tail survive an
+    /// `OP_PARTITION_VERSION_REPORT` wire round-trip.
     #[test]
-    fn partition_version_entry_roundtrips_digest_and_max_gen() {
+    fn partition_version_entry_roundtrips_digest_max_gen_and_lineage() {
         let entries = vec![
             PartitionVersionEntry {
                 shard: 7,
@@ -22916,6 +23859,8 @@ mod tests {
                 last_applied_seq: 42,
                 manifest_digest: 0xDEAD_BEEF_CAFE_F00D,
                 max_generation: 9_999,
+                lineage_full: true,
+                lineage_regime: 0xFEED_FACE_1234_5678,
             },
             PartitionVersionEntry {
                 shard: 4095,
@@ -22924,14 +23869,58 @@ mod tests {
                 last_applied_seq: 0,
                 manifest_digest: 0,
                 max_generation: 0,
+                lineage_full: false,
+                lineage_regime: 0,
             },
         ];
         let payload = encode_partition_version_response(123, 456, &entries);
+        assert_eq!(
+            payload.len(),
+            20 + 2 * PARTITION_VERSION_ENTRY_SIZE,
+            "current entries encode at the stage-4 stride",
+        );
         let parsed =
             parse_partition_version_response(&payload).expect("well-formed payload parses");
         assert_eq!(
             parsed, entries,
-            "digest + max_generation survive the wire round-trip",
+            "digest, max_generation, and the lineage tail survive the wire round-trip",
+        );
+    }
+
+    /// P1 stage 4: a pre-stage-4 peer's 24-byte entries (recency fields,
+    /// no lineage tail) still parse — lineage decodes as ABSENT
+    /// (`lineage_full = false`, the fail-closed not-`Full` direction).
+    #[test]
+    fn partition_version_parser_decodes_lineage_absent_as_not_full() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&7u64.to_le_bytes()); // node_id
+        payload.extend_from_slice(&9u64.to_le_bytes()); // cluster_key
+        payload.extend_from_slice(&1u32.to_le_bytes()); // entry_count
+        payload.extend_from_slice(&3u16.to_le_bytes()); // shard
+        payload.push(0b01); // flags
+        payload.push(1); // replica_count
+        payload.extend_from_slice(&77u64.to_le_bytes()); // last_applied_seq
+        payload.extend_from_slice(&11u64.to_le_bytes()); // manifest_digest
+        payload.extend_from_slice(&5u32.to_le_bytes()); // max_generation
+        assert_eq!(
+            payload.len(),
+            20 + PARTITION_VERSION_ENTRY_SIZE_NO_LINEAGE,
+            "hand-built payload uses the pre-stage-4 stride",
+        );
+        let parsed = parse_partition_version_response(&payload).expect("payload parses");
+        assert_eq!(
+            parsed,
+            vec![PartitionVersionEntry {
+                shard: 3,
+                flags: 0b01,
+                replica_count: 1,
+                last_applied_seq: 77,
+                manifest_digest: 11,
+                max_generation: 5,
+                lineage_full: false,
+                lineage_regime: 0,
+            }],
+            "lineage-absent entries decode as not-Full (fail-closed)",
         );
     }
 
@@ -22966,6 +23955,8 @@ mod tests {
                 last_applied_seq: 77,
                 manifest_digest: 0,
                 max_generation: 0,
+                lineage_full: false,
+                lineage_regime: 0,
             }],
             "legacy entry parses with recency fields defaulted to 0",
         );
@@ -23196,6 +24187,8 @@ mod tests {
                 last_applied_seq: 5,
                 manifest_digest: 0xAAAA,
                 max_generation: 100,
+                lineage_full: false,
+                lineage_regime: 0,
             }],
         );
         // The replica reports a divergent digest AND a strictly-ahead generation.
@@ -23208,6 +24201,8 @@ mod tests {
                 last_applied_seq: 6,
                 manifest_digest: 0xBBBB,
                 max_generation: 101,
+                lineage_full: false,
+                lineage_regime: 0,
             }],
         );
 
@@ -23285,6 +24280,10 @@ mod tests {
                 last_applied_seq: 42,
                 manifest_digest: 0,
                 max_generation: 0,
+                // P1 stage 4: "owns" now additionally requires the holder's
+                // self-observed Full lineage.
+                lineage_full: true,
+                lineage_regime: 0,
             }],
         );
         let tasks =
@@ -23330,6 +24329,8 @@ mod tests {
                 last_applied_seq: 42,
                 manifest_digest: 0,
                 max_generation: 0,
+                lineage_full: true,
+                lineage_regime: 0,
             }],
         );
         let skipped = build_plan_from_partition_view(&old_table, &new_table, &owns_view, NodeId(1));
@@ -23350,6 +24351,8 @@ mod tests {
                 last_applied_seq: 42,
                 manifest_digest: 0,
                 max_generation: 0,
+                lineage_full: true,
+                lineage_regime: 0,
             }],
         );
         let refined =
@@ -23358,6 +24361,48 @@ mod tests {
             refined.iter().any(|t| t.shard == shard),
             "must NOT skip migration for shard {shard}: the new master is a subset \
              holder (pending inbound) and does not fully own the shard",
+        );
+    }
+
+    /// P1 stage 4 (design §4.3) — migration-skip is LINEAGE-AWARE: a
+    /// destination that reports data with a clear pending-inbound flag but
+    /// SELF-OBSERVED `Subset` lineage does NOT own the shard, so a fill
+    /// toward it is never skipped (a pre-stage-4 peer's lineage-absent
+    /// entry decodes exactly the same way — fail-closed).
+    #[test]
+    fn i13_migration_skip_treats_subset_lineage_destination_as_not_owning() {
+        use std::collections::HashMap;
+        let members_a = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let members_b = vec![NodeId(1), NodeId(2), NodeId(3), NodeId(4)];
+        let old_table = ShardTable::compute_with_epoch(&members_a, 2, 1, 1);
+        let new_table = ShardTable::compute_with_epoch(&members_b, 2, 2, 1);
+        let base = ShardTable::migration_plan(&old_table, &new_table);
+        let task = base
+            .first()
+            .expect("topology change must produce a migration task");
+        let shard = task.shard;
+        let new_master = task.to_node;
+
+        // Data present, no pending-inbound flag — but lineage is Subset.
+        let mut view: HashMap<NodeId, Vec<PartitionVersionEntry>> = HashMap::new();
+        view.insert(
+            new_master,
+            vec![PartitionVersionEntry {
+                shard,
+                flags: 0b01,
+                replica_count: 1,
+                last_applied_seq: 42,
+                manifest_digest: 0,
+                max_generation: 0,
+                lineage_full: false,
+                lineage_regime: 0,
+            }],
+        );
+        let refined = build_plan_from_partition_view(&old_table, &new_table, &view, NodeId(1));
+        assert!(
+            refined.iter().any(|t| t.shard == shard),
+            "a Subset-lineage destination must NOT be treated as owning — the fill \
+             for shard {shard} must run",
         );
     }
 
@@ -24286,18 +25331,21 @@ mod tests {
         authority.set_replication_factor(2);
         let placement = ShardTable::compute_with_epoch(&members, 2, 1, 1);
         let shard_table = Arc::new(ShardTableLock::new(placement.clone()));
+        let established = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+        established.set_all();
         {
             let lineage = lineage.clone();
             let shard_table = shard_table.clone();
-            authority.set_commit_install_hook(Arc::new(move |state| {
+            let established = established.clone();
+            authority.set_commit_install_hook(Arc::new(move |state, prev| {
                 lineage_apply_committed_state(
                     &lineage,
                     self_id,
                     2,
-                    &state.committed_members,
-                    state.committed_placement_version,
-                    &state.regime_block,
+                    state,
+                    prev,
                     &shard_table,
+                    &established,
                 )
             }));
         }
@@ -24344,6 +25392,18 @@ mod tests {
             lineage.lineage(untouched),
             crate::cluster::lineage::Lineage::Full { regime: 0 },
             "a non-overridden holder keeps its stamp (regime unchanged)",
+        );
+        // P1 stage 4 (I13) — the install must GATE the newly-acquired
+        // mastership (self was not serving `shard` in the previous regime)
+        // and leave the regime-0 standing mastership ungated.
+        assert!(
+            !established.test(shard),
+            "I13: a promotion-acquired shard is fail-closed to gated at install \
+             (is_master then passes via the Full re-stamp)",
+        );
+        assert!(
+            established.test(untouched),
+            "a regime-0 (bootstrap) shard stays gate-inactive",
         );
         // DURABLY: a fresh store loaded from the file (same identity) must
         // already observe the re-stamp — the persist happened before
@@ -24392,15 +25452,17 @@ mod tests {
         {
             let lineage = lineage.clone();
             let shard_table = shard_table.clone();
-            authority.set_commit_install_hook(Arc::new(move |state| {
+            let established = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+            established.set_all();
+            authority.set_commit_install_hook(Arc::new(move |state, prev| {
                 lineage_apply_committed_state(
                     &lineage,
                     self_id,
                     2,
-                    &state.committed_members,
-                    state.committed_placement_version,
-                    &state.regime_block,
+                    state,
+                    prev,
                     &shard_table,
+                    &established,
                 )
             }));
         }
@@ -24528,14 +25590,34 @@ mod tests {
         let mut block = crate::cluster::topology::RegimeBlock::default();
         block.regime.set(serving, 9);
         block.regime.set(departing, 9);
+        let state = crate::cluster::topology::PersistedTopologyState {
+            peak_cluster_size: 3,
+            committed_term: 9,
+            committed_members: new_members.clone(),
+            committed_voters: new_members.clone(),
+            voted_term: 9,
+            incarnation: 1,
+            committed_voter_ever_seen: new_members.clone(),
+            committed_placement_version: 1,
+            committed_peak: 2,
+            regime_block: block,
+        };
+        let prev = crate::cluster::topology::InstalledCommitView {
+            committed_term: 8,
+            members: vec![NodeId(1), NodeId(2), NodeId(3)],
+            placement_version: 1,
+            regime_block: Default::default(),
+        };
+        let established = crate::cluster::migration::AtomicShardBitmap::new();
+        established.set_all();
         assert!(lineage_apply_committed_state(
             &lineage,
             self_id,
             2,
-            &new_members,
-            1,
-            &block,
+            &state,
+            &prev,
             &shard_table,
+            &established,
         ));
         assert_eq!(
             lineage.lineage(serving),
@@ -24552,5 +25634,490 @@ mod tests {
             !lineage.is_full(departing),
             "the sweep-facing shadow degrades with the stamp",
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // P1 stage 4 — I13 serving gate, skipped-term degrade, §4.4 promotion,
+    // completeness signal
+    // -----------------------------------------------------------------------
+
+    /// Stage-4 residual (3) — a node that SKIPPED committed terms
+    /// (`state.committed_term > prev.committed_term + 1`) degrades every
+    /// shard where it is a NON-master holder to `Subset` (it cannot prove
+    /// it received every write across the gap); its committed-MASTER
+    /// shards keep I13(i) semantics (stamp refreshed, still Full).
+    #[test]
+    fn i13_skipped_term_degrades_non_master_holders_only() {
+        let self_id = NodeId(1);
+        let members = vec![NodeId(1), NodeId(2)];
+        let lineage = Arc::new(crate::cluster::lineage::LineageStore::open(
+            None,
+            [0u8; crate::cluster::lineage::DATA_EPOCH_LEN],
+            self_id,
+        ));
+        let placement = ShardTable::compute_with_epoch(&members, 2, 1, 1);
+        let shard_table = Arc::new(ShardTableLock::new(placement.clone()));
+        let mastered = (0..NUM_SHARDS as u16)
+            .find(|&s| placement.assignment(s).master == self_id)
+            .expect("self masters some shard");
+        let replicated = (0..NUM_SHARDS as u16)
+            .find(|&s| {
+                placement.assignment(s).master != self_id
+                    && placement.assignment(s).replicas.contains(&self_id)
+            })
+            .expect("self replicates some shard");
+        assert!(lineage.mark_full(mastered, 4, "test"));
+        assert!(lineage.mark_full(replicated, 4, "test"));
+
+        let state = crate::cluster::topology::PersistedTopologyState {
+            peak_cluster_size: 2,
+            committed_term: 9, // prev was 4 — terms 5..8 were skipped
+            committed_members: members.clone(),
+            committed_voters: members.clone(),
+            voted_term: 9,
+            incarnation: 1,
+            committed_voter_ever_seen: members.clone(),
+            committed_placement_version: 1,
+            committed_peak: 2,
+            regime_block: {
+                let mut b = crate::cluster::topology::RegimeBlock::default();
+                b.regime.set(mastered, 4);
+                b.regime.set(replicated, 4);
+                b
+            },
+        };
+        let prev = crate::cluster::topology::InstalledCommitView {
+            committed_term: 4,
+            members: members.clone(),
+            placement_version: 1,
+            regime_block: state.regime_block.clone(),
+        };
+        let established = crate::cluster::migration::AtomicShardBitmap::new();
+        established.set_all();
+        assert!(lineage_apply_committed_state(
+            &lineage,
+            self_id,
+            2,
+            &state,
+            &prev,
+            &shard_table,
+            &established,
+        ));
+        assert_eq!(
+            lineage.lineage(replicated),
+            crate::cluster::lineage::Lineage::Subset,
+            "a non-master holder degrades across a term skip (residual (3))",
+        );
+        assert_eq!(
+            lineage.lineage(mastered),
+            crate::cluster::lineage::Lineage::Full { regime: 4 },
+            "a committed-master shard keeps I13(i) semantics across a skip",
+        );
+    }
+
+    /// I13 — the serving gate: a self-mastered shard whose serving is NOT
+    /// established answers `Transitioning` until self-observed lineage is
+    /// `Full`; passing the gate latches serving-established, so a LATER
+    /// mid-regime `Subset` degrade does not yank the already-serving
+    /// master (I13 gates beginning, not continuing).
+    #[test]
+    fn i13_serving_gate_blocks_new_master_until_full_then_latches() {
+        let cluster = single_node_cluster_for_master_query_tests();
+        let key = key_for_shard(0);
+        // Model a commit-install that named self a NEW master of a
+        // regime-advanced shard (the §4.6 placement bullet: HRW naming a
+        // stale-copy node after a death — or an override doing the same).
+        cluster.test_clear_serving_established(0);
+        match cluster.is_master(&key) {
+            MasterQueryResult::Transitioning { .. } => {}
+            other => panic!(
+                "I13: a gated new master with Subset lineage must answer \
+                 Transitioning, got {other:?}"
+            ),
+        }
+        // Self-observed Full opens the gate.
+        assert!(cluster.lineage().mark_full(0, 0, "test: copy complete"));
+        match cluster.is_master(&key) {
+            MasterQueryResult::Yes => {}
+            other => panic!("expected Yes once lineage is Full, got {other:?}"),
+        }
+        // A mid-regime degrade does NOT yank established serving.
+        cluster.lineage().mark_subset(&[0], "test: reclaimed range");
+        match cluster.is_master(&key) {
+            MasterQueryResult::Yes => {}
+            other => panic!(
+                "I13 gates BEGINNING to serve; an established master must keep \
+                 serving through a mid-regime Subset degrade, got {other:?}"
+            ),
+        }
+    }
+
+    /// I13 — the snapshot path applies the identical gate.
+    #[test]
+    fn i13_serving_gate_applies_to_master_snapshot_path() {
+        let cluster = single_node_cluster_for_master_query_tests();
+        let key = key_for_shard(0);
+        cluster.test_clear_serving_established(0);
+        let snap = cluster.master_snapshot();
+        match cluster.is_master_snapshot(&snap, &key) {
+            MasterQueryResult::Transitioning { .. } => {}
+            other => panic!("snapshot path must gate identically, got {other:?}"),
+        }
+        assert!(cluster.lineage().mark_full(0, 0, "test"));
+        match cluster.is_master_snapshot(&snap, &key) {
+            MasterQueryResult::Yes => {}
+            other => panic!("snapshot path must open on Full, got {other:?}"),
+        }
+    }
+
+    /// §4.4 — the promotion candidate matrix (pure proposer computation).
+    #[test]
+    fn s44_promotion_candidates_matrix() {
+        let members = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let rf = 2u8;
+        let placement = ShardTable::compute_with_epoch(&members, rf, 1, 1);
+        // A shard mastered by node 3 with a replica.
+        let shard = (0..NUM_SHARDS as u16)
+            .find(|&s| {
+                placement.assignment(s).master == NodeId(3)
+                    && !placement.assignment(s).replicas.is_empty()
+            })
+            .expect("node 3 masters a replicated shard");
+        let replica = placement.assignment(shard).replicas[0];
+        let mut block = crate::cluster::topology::RegimeBlock::default();
+        block.regime.set(shard, 6);
+
+        let entry = |full: bool, regime: u64, flags: u8| PartitionVersionEntry {
+            shard,
+            flags,
+            replica_count: 1,
+            last_applied_seq: 5,
+            manifest_digest: 0,
+            max_generation: 0,
+            lineage_full: full,
+            lineage_regime: regime,
+        };
+
+        // (a) master absent from the view + replica Full at current regime
+        // → override targeting the replica.
+        let mut view: std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>> =
+            std::collections::HashMap::new();
+        view.insert(replica, vec![entry(true, 6, 0)]);
+        let overrides = compute_promotion_overrides(&members, 1, rf, &block, &view);
+        assert_eq!(
+            overrides.get(&shard),
+            Some(&replica),
+            "dead master + current-regime Full holder must yield the override",
+        );
+
+        // Healthy master (reported, no pending-inbound) → no override even
+        // with a Full replica.
+        let mut view2 = view.clone();
+        view2.insert(NodeId(3), vec![entry(true, 6, 0b01)]);
+        assert!(
+            compute_promotion_overrides(&members, 1, rf, &block, &view2).is_empty(),
+            "a reported, un-fenced master is never overridden",
+        );
+
+        // (c) availability arm: the master reports the shard PENDING_INBOUND
+        // (subset destination) → override.
+        let mut view3 = view.clone();
+        view3.insert(
+            NodeId(3),
+            vec![entry(false, 0, 0b01 | PARTITION_FLAG_PENDING_INBOUND)],
+        );
+        assert_eq!(
+            compute_promotion_overrides(&members, 1, rf, &block, &view3).get(&shard),
+            Some(&replica),
+            "a subset-DESTINATION master trips the availability arm",
+        );
+
+        // A master that is merely Subset by lineage (reported, NO
+        // pending-inbound flag) never trips arm (c).
+        let mut view4 = view.clone();
+        view4.insert(NodeId(3), vec![entry(false, 0, 0b01)]);
+        assert!(
+            compute_promotion_overrides(&members, 1, rf, &block, &view4).is_empty(),
+            "mere holder-exit Subset (no inbound fence) must not trigger promotion",
+        );
+
+        // Replica Full at a STALE regime → no candidate (condition 2).
+        let mut view5: std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>> =
+            std::collections::HashMap::new();
+        view5.insert(replica, vec![entry(true, 5, 0)]);
+        assert!(
+            compute_promotion_overrides(&members, 1, rf, &block, &view5).is_empty(),
+            "a Full stamp at a stale regime is not promotion-eligible",
+        );
+
+        // (5) RF=2 sole replica Subset → no promotion (stays Transitioning).
+        let mut view6: std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>> =
+            std::collections::HashMap::new();
+        view6.insert(replica, vec![entry(false, 0, 0)]);
+        assert!(
+            compute_promotion_overrides(&members, 1, rf, &block, &view6).is_empty(),
+            "RF=2 with the sole replica Subset must not promote",
+        );
+    }
+
+    /// I3 — a `Full` reporter OUTSIDE the shard's committed placement
+    /// holder set is never targeted, however loudly it reports.
+    #[test]
+    fn i3_non_holder_full_reporter_is_never_targeted() {
+        let members = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let rf = 2u8;
+        let placement = ShardTable::compute_with_epoch(&members, rf, 1, 1);
+        // Any shard with a node OUTSIDE its RF-2 holder pair.
+        let (shard, outsider) = (0..NUM_SHARDS as u16)
+            .find_map(|s| {
+                let a = placement.assignment(s);
+                members
+                    .iter()
+                    .copied()
+                    .find(|n| *n != a.master && !a.replicas.contains(n))
+                    .map(|n| (s, n))
+            })
+            .expect("RF=2 over 3 members leaves one non-holder per shard");
+        let block = crate::cluster::topology::RegimeBlock::default();
+        // The outsider (non-holder) reports Full at the current regime;
+        // the master is absent (dead). No holder reports.
+        let mut view: std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>> =
+            std::collections::HashMap::new();
+        view.insert(
+            outsider,
+            vec![PartitionVersionEntry {
+                shard,
+                flags: 0,
+                replica_count: 1,
+                last_applied_seq: 100,
+                manifest_digest: 0,
+                max_generation: 0,
+                lineage_full: true,
+                lineage_regime: 0,
+            }],
+        );
+        let overrides = compute_promotion_overrides(&members, 1, rf, &block, &view);
+        assert!(
+            !overrides.values().any(|&t| t == outsider),
+            "a non-holder Full reporter must never be a promotion target (I3)",
+        );
+        assert!(
+            !overrides.contains_key(&shard),
+            "with no qualifying holder the shard stays un-promoted",
+        );
+    }
+
+    /// §4.4 rails — cooldown, budget, jittered interval, no-supersede, and
+    /// the progress precondition.
+    #[test]
+    fn s44_promotion_rails_enforce_cooldown_budget_interval_and_progress() {
+        use std::time::Instant;
+        let cooldown = Duration::from_secs(900);
+        let mut rails = PromotionRails::new(cooldown, 42);
+        let t0 = Instant::now();
+        let mut overrides = std::collections::BTreeMap::new();
+        overrides.insert(7u16, NodeId(2));
+
+        assert!(rails.may_propose(t0), "fresh rails must allow a proposal");
+        rails.record_proposal(11, &overrides, t0);
+
+        // No-supersede: an in-flight override term blocks until commit or
+        // timeout.
+        assert!(
+            !rails.may_propose(t0 + PROMOTION_MIN_INTERVAL + Duration::from_secs(2)),
+            "an in-flight override term must not be superseded",
+        );
+        rails.observe_committed_term(10, t0 + Duration::from_secs(3));
+        assert!(
+            !rails.may_propose(t0 + Duration::from_secs(3)),
+            "a lower committed term does not release the in-flight proposal",
+        );
+        rails.observe_committed_term(11, t0 + Duration::from_secs(3));
+
+        // Jittered minimum interval: immediately after release, the gap
+        // (>= PROMOTION_MIN_INTERVAL) must still be respected.
+        assert!(
+            !rails.may_propose(t0 + Duration::from_millis(100)),
+            "the jittered minimum interval must gate back-to-back proposals",
+        );
+        let after_gap =
+            t0 + PROMOTION_MIN_INTERVAL + Duration::from_millis(PROMOTION_JITTER_MAX_MS);
+        assert!(rails.may_propose(after_gap));
+
+        // Per-shard cooldown + progress precondition: shard 7 is blocked.
+        let mut again = overrides.clone();
+        rails.filter_candidates(&mut again, after_gap);
+        assert!(
+            again.is_empty(),
+            "cooldown + awaiting-progress must both block a re-promotion of shard 7",
+        );
+        // Progress observed → cleared; cooldown still holds within the window.
+        rails.clear_progress(7);
+        let mut again2 = overrides.clone();
+        rails.filter_candidates(&mut again2, after_gap);
+        assert!(
+            again2.is_empty(),
+            "the per-shard cooldown must hold even after progress clears",
+        );
+        let mut again3 = overrides.clone();
+        rails.filter_candidates(&mut again3, t0 + cooldown + Duration::from_secs(1));
+        assert_eq!(
+            again3.len(),
+            1,
+            "after the cooldown (and with progress cleared) the shard is eligible again",
+        );
+
+        // Cluster-wide budget: exhaust it within one window.
+        let mut rails2 = PromotionRails::new(cooldown, 43);
+        let mut t = Instant::now();
+        for term in 0..PROMOTION_BUDGET_MAX as u64 {
+            assert!(rails2.may_propose(t), "within budget (proposal {term})");
+            let mut o = std::collections::BTreeMap::new();
+            o.insert(term as u16, NodeId(2));
+            rails2.record_proposal(100 + term, &o, t);
+            rails2.observe_committed_term(100 + term, t);
+            t += PROMOTION_MIN_INTERVAL + Duration::from_millis(PROMOTION_JITTER_MAX_MS);
+        }
+        assert!(
+            !rails2.may_propose(t),
+            "the cluster-wide promotion budget must hold the {}th proposal",
+            PROMOTION_BUDGET_MAX + 1,
+        );
+        assert!(
+            rails2.may_propose(t + PROMOTION_BUDGET_WINDOW),
+            "the budget window must roll over",
+        );
+    }
+
+    /// §4.3 catch-up trigger (stage 4) — the completeness signal: a
+    /// stream-origin candidate flushes into a `Full` stamp at the current
+    /// committed regime; a fenced shard, a revoked origin, and a
+    /// non-holder shard are never stamped.
+    #[test]
+    fn i2_stream_completeness_flush_earns_full_with_conditions() {
+        let self_id = NodeId(1);
+        let members = vec![NodeId(1), NodeId(2)];
+        let engine = test_engine();
+        let placement = ShardTable::compute_with_epoch(&members, 2, 1, 1);
+        let shard_table = Arc::new(ShardTableLock::new(placement.clone()));
+        let inbound = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+        let authority = Arc::new(crate::cluster::topology::TopologyAuthority::new(
+            self_id,
+            Duration::from_secs(1),
+        ));
+        let lineage = crate::cluster::lineage::LineageStore::open(
+            None,
+            [0u8; crate::cluster::lineage::DATA_EPOCH_LEN],
+            self_id,
+        );
+
+        let replicated = (0..NUM_SHARDS as u16)
+            .find(|&s| {
+                placement.assignment(s).master != self_id
+                    && placement.assignment(s).replicas.contains(&self_id)
+            })
+            .expect("self replicates some shard");
+        let foreign_shard = (0..NUM_SHARDS as u16).find(|&s| {
+            placement.assignment(s).master != self_id
+                && !placement.assignment(s).replicas.contains(&self_id)
+        });
+
+        // The receiver observed a tracked apply on the previously-empty
+        // shard → origin + candidate.
+        lineage.note_stream_apply(replicated, true);
+        assert!(lineage.stream_origin(replicated));
+        let stamped = flush_stream_full_candidates(
+            &lineage,
+            &engine,
+            &shard_table,
+            &inbound,
+            &authority,
+            self_id,
+        );
+        assert_eq!(stamped, 1, "the steady-state replica earns Full");
+        assert_eq!(
+            lineage.lineage(replicated),
+            crate::cluster::lineage::Lineage::Full { regime: 0 },
+            "the stamp is at the current committed regime",
+        );
+
+        // A fence raised revokes origin; a later flush stamps nothing even
+        // if a stale candidate bit were set.
+        lineage.mark_subset(&[replicated], "test: fence");
+        assert!(
+            !lineage.stream_origin(replicated),
+            "a Subset degrade revokes stream-origin",
+        );
+        lineage.note_stream_apply(replicated, false);
+        assert!(
+            !lineage.stream_origin(replicated),
+            "a NON-empty shard without prior origin evidence must not re-earn \
+             origin (its baseline provenance is unknown)",
+        );
+        assert_eq!(
+            flush_stream_full_candidates(
+                &lineage,
+                &engine,
+                &shard_table,
+                &inbound,
+                &authority,
+                self_id,
+            ),
+            0,
+        );
+
+        // An inbound-fenced candidate is dropped at flush time.
+        let refenced = replicated;
+        lineage.note_stream_apply(refenced, true);
+        inbound.set(refenced);
+        assert_eq!(
+            flush_stream_full_candidates(
+                &lineage,
+                &engine,
+                &shard_table,
+                &inbound,
+                &authority,
+                self_id,
+            ),
+            0,
+            "an inbound fence at flush time must block the stamp",
+        );
+        inbound.clear(refenced);
+
+        // A shard outside the holder set is never stamped (RF=2 over 2
+        // nodes has no such shard; skip when none exists).
+        if let Some(foreign) = foreign_shard {
+            lineage.note_stream_apply(foreign, true);
+            let n = flush_stream_full_candidates(
+                &lineage,
+                &engine,
+                &shard_table,
+                &inbound,
+                &authority,
+                self_id,
+            );
+            assert!(
+                n == 0 || !lineage.is_full(foreign),
+                "a non-holder shard must never be stamped Full by the signal",
+            );
+        }
+    }
+
+    /// P1 stage 4 — `note_replica_stream_applies` drops fenced shards
+    /// before they reach the lineage store's origin tracking.
+    #[test]
+    fn i2_stream_note_skips_inbound_fenced_shards() {
+        let cluster = single_node_cluster_for_master_query_tests();
+        cluster.inbound_bitmap().set(9);
+        cluster.note_replica_stream_applies(&[(9, true), (11, true)]);
+        assert!(
+            !cluster.lineage().stream_origin(9),
+            "a fenced shard's apply is a dual-write delta, not stream-origin",
+        );
+        assert!(
+            cluster.lineage().stream_origin(11),
+            "an un-fenced empty-start apply earns stream-origin",
+        );
+        cluster.inbound_bitmap().clear(9);
     }
 }

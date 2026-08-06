@@ -1675,9 +1675,33 @@ pub struct TopologyAuthority {
     commit_install_hook: RwLock<Option<CommitInstallHook>>,
 }
 
-/// P1 stage 3 — the lineage commit-install hook type (see
-/// [`TopologyAuthority::set_commit_install_hook`]).
-pub type CommitInstallHook = Arc<dyn Fn(&PersistedTopologyState) -> bool + Send + Sync>;
+/// P1 stage 3/4 — the lineage commit-install hook type (see
+/// [`TopologyAuthority::set_commit_install_hook`]). The hook receives the
+/// post-commit [`PersistedTopologyState`] plus an [`InstalledCommitView`]
+/// snapshot of the PREVIOUS installed committed state (captured under
+/// `commit_apply`, before `apply_commit_locked` mutates anything), so the
+/// stage-4 transition logic — the I13 serving-established derivation
+/// ("was this node serving the shard in the previous regime?") and the
+/// skipped-term degrade — can compare both sides without re-entering the
+/// authority.
+pub type CommitInstallHook =
+    Arc<dyn Fn(&PersistedTopologyState, &InstalledCommitView) -> bool + Send + Sync>;
+
+/// P1 stage 4 — the previous INSTALLED committed state, as seen by the
+/// commit-install hook (I0: purely local committed state — both sides of
+/// the transition the hook observes are committed, never live/runtime
+/// views).
+#[derive(Debug, Clone)]
+pub struct InstalledCommitView {
+    /// The previously installed committed term (`0` = none yet).
+    pub committed_term: u64,
+    /// The previously committed member set (empty = bootstrap).
+    pub members: Vec<NodeId>,
+    /// The previously committed placement version.
+    pub placement_version: u16,
+    /// The previously installed regime block (override map + regimes).
+    pub regime_block: RegimeBlock,
+}
 
 /// P1 stage 1 — structured refusals from the same-membership P1 producers
 /// (`propose_regime_enforced`, `propose_promotion_enabled`,
@@ -1728,6 +1752,23 @@ pub enum RegimeProposeError {
         "this node is not configured to propose promotion (enable_automatic_promotion = false)"
     )]
     PromotionProposalNotEnabled,
+    /// I4 (stage 4) — the committed `promotion_enabled` field is false, so
+    /// no override-carrying promotion term may be proposed.
+    #[error("the committed promotion_enabled field is false (I4)")]
+    PromotionNotEnabled,
+    /// I3 / I10(a) (stage 4) — a promotion override's target is not a
+    /// committed placement replica of the shard (outside the
+    /// committed-derivation holder set).
+    #[error(
+        "promotion override target {target} for shard {shard} is not a committed \
+         placement replica (I3)"
+    )]
+    OverrideTargetNotHolder {
+        /// The shard whose override was refused.
+        shard: u16,
+        /// The refused target node.
+        target: u64,
+    },
     /// The requested flag already has the committed value.
     #[error("the committed field already has the requested value")]
     NoChange,
@@ -2022,6 +2063,24 @@ impl TopologyAuthority {
     /// The stored advert for `peer` (tests / diagnostics).
     pub fn peer_regime_advert(&self, peer: NodeId) -> Option<PeerRegimeAdvert> {
         self.peer_regime_adverts.read().unwrap().get(&peer).copied()
+    }
+
+    /// P1 stage 4 — record ONLY the `(NodeId, incarnation)` regime/ack
+    /// advert a vote carries, WITHOUT the rest of `handle_vote`'s
+    /// processing. Used by the proposer for votes that arrive after quorum
+    /// was already reached: the I4 `promotion_enabled` proposal needs
+    /// EVERY committed member's advert, but feeding a post-quorum vote
+    /// through `handle_vote` would also record the voter's PLACEMENT
+    /// support — accelerating the W6 v1→v2 unanimity beyond what the
+    /// pre-stage-4 proposer learned, a placement behavior change stage 4
+    /// must not smuggle in.
+    pub fn record_vote_regime_advert(&self, vote: &TopologyVote) {
+        self.record_peer_regime_advert(
+            vote.voter,
+            vote.voter_incarnation,
+            vote.regime_support,
+            vote.ack_writeall_equiv,
+        );
     }
 
     /// I11/§4.1 enable sequencing — whether EVERY committed member's
@@ -3468,10 +3527,19 @@ impl TopologyAuthority {
         // topology-state-persisted-but-hook-failed crash/refusal window is
         // exactly the I13i regardless-of-stamp boot re-derivation case).
         let hook = self.commit_install_hook.read().unwrap().clone();
-        if let Some(hook) = hook
-            && !hook(&state)
-        {
-            return DurableCommitOutcome::PersistFailed;
+        if let Some(hook) = hook {
+            // P1 stage 4 — snapshot the PREVIOUS installed committed state
+            // for the hook while it is still installed (apply_commit_locked
+            // has not run yet; `commit_apply` is held, so this is stable).
+            let prev = InstalledCommitView {
+                committed_term: self.committed_term.load(Ordering::Relaxed),
+                members: self.committed_members.read().unwrap().clone(),
+                placement_version: self.committed_placement_version(),
+                regime_block: self.committed_regime_block(),
+            };
+            if !hook(&state, &prev) {
+                return DurableCommitOutcome::PersistFailed;
+            }
         }
         if self.apply_commit_locked(commit) {
             DurableCommitOutcome::Applied(commit.term)
@@ -3867,14 +3935,21 @@ impl TopologyAuthority {
 
     /// Shared preconditions + term assembly for the same-membership P1
     /// producers (`propose_regime_enforced`, `propose_promotion_enabled`,
-    /// `propose_regime_rebase`): a committed topology must exist, this
-    /// node must be its deterministic proposer (lowest committed NodeId),
-    /// and no proposal may be pending. The produced term keeps members,
-    /// placement version, and `committed_peak` unchanged (I6: these terms
-    /// bundle nothing else) and carries `block`.
+    /// `propose_regime_rebase`, `propose_promotion_overrides`): a committed
+    /// topology must exist, this node must be its deterministic proposer
+    /// (lowest committed NodeId), and no proposal may be pending. The
+    /// produced term keeps members, placement version, and
+    /// `committed_peak` unchanged (I6: these terms bundle nothing else)
+    /// and carries the block built by `block_for_term`.
+    ///
+    /// `block_for_term` receives the NEW term number so producers that
+    /// must stamp it into the block (I10(b): an override's regime equals
+    /// the carrying term) build against the exact term the proposal will
+    /// carry — computing the term outside would race a concurrent
+    /// `handle_propose` advancing `voted_term`.
     fn propose_same_members_term(
         &self,
-        block: RegimeBlock,
+        block_for_term: impl FnOnce(u64) -> Result<RegimeBlock, RegimeProposeError>,
     ) -> Result<TopologyTerm, RegimeProposeError> {
         let committed_members = self.committed_members.read().unwrap().clone();
         if committed_members.is_empty() {
@@ -3897,6 +3972,7 @@ impl TopologyAuthority {
         let committed = self.committed_term.load(Ordering::Relaxed);
         let voted = self.voted_term.load(Ordering::Relaxed);
         let new_term = committed.max(voted) + 1;
+        let block = block_for_term(new_term)?;
 
         // No peak change (I6): stamp the current effective peak, exactly
         // like `upgrade_proposal` (non-lowering producer).
@@ -3959,7 +4035,7 @@ impl TopologyAuthority {
             return Err(RegimeProposeError::NoChange);
         }
         block.regime_enforced = enable;
-        self.propose_same_members_term(block)
+        self.propose_same_members_term(|_term| Ok(block))
     }
 
     /// I4 — propose committing `promotion_enabled = enable`.
@@ -3989,7 +4065,7 @@ impl TopologyAuthority {
             return Err(RegimeProposeError::NoChange);
         }
         block.promotion_enabled = enable;
-        self.propose_same_members_term(block)
+        self.propose_same_members_term(|_term| Ok(block))
     }
 
     /// I7 — propose a quorum-committed REGIME REBASE (operator repair).
@@ -4016,23 +4092,117 @@ impl TopologyAuthority {
     /// by the normal term/vote/commit machinery this proposal rides.
     pub fn propose_regime_rebase(&self) -> Result<TopologyTerm, RegimeProposeError> {
         let installed = self.committed_regime_block();
-        let committed = self.committed_term.load(Ordering::Relaxed);
-        let voted = self.voted_term.load(Ordering::Relaxed);
-        let new_term = committed.max(voted) + 1;
-        let mut regime = RegimeArray::default();
-        for &shard in installed.override_map.keys() {
-            let kept = installed.regime.get(shard).min(new_term);
-            if kept != 0 {
-                regime.set(shard, kept);
+        self.propose_same_members_term(|new_term| {
+            let mut regime = RegimeArray::default();
+            for &shard in installed.override_map.keys() {
+                let kept = installed.regime.get(shard).min(new_term);
+                if kept != 0 {
+                    regime.set(shard, kept);
+                }
             }
+            Ok(RegimeBlock {
+                override_map: installed.override_map.clone(),
+                regime,
+                regime_enforced: installed.regime_enforced,
+                promotion_enabled: installed.promotion_enabled,
+            })
+        })
+    }
+
+    /// P1 stage 4 (§4.4) — propose a quorum-committed PROMOTION term
+    /// carrying master overrides `(shard → target)`.
+    ///
+    /// Structural proposal-side validation (everything here is a proposer
+    /// precondition, never an apply gate — I0; the I10 clauses re-validate
+    /// at apply on every node):
+    ///
+    /// * the committed `promotion_enabled` field must be true (I4);
+    /// * every target must be a committed PLACEMENT REPLICA of its shard —
+    ///   the I10(a)-clean subset of I3's pre-override holder set (the
+    ///   current committed master is excluded by definition: overriding a
+    ///   shard to its current master is a no-op, and a demoted-but-
+    ///   placement-named master is NOT in the committed-derivation holder
+    ///   set, so it cannot be re-promoted through this path — it re-enters
+    ///   via a membership/placement term after re-earning `Full`);
+    /// * a target that already IS the shard's committed master is skipped;
+    ///   if every entry is skipped the proposal is refused as `NoChange`.
+    ///
+    /// The produced term is I6-clean: same members, same placement
+    /// version, same peak, same committed flags — it changes ONLY the
+    /// override map and the affected shards' regimes (each stamped with
+    /// the carrying term, I10(b)). Deterministic-proposer and
+    /// no-pending-proposal discipline come from the shared same-members
+    /// producer; §4.4's no-supersede / cooldown / budget rails are the
+    /// coordinator's responsibility (`PromotionRails`).
+    ///
+    /// # Errors
+    /// [`RegimeProposeError`] for every refused precondition; see the
+    /// variant docs.
+    pub fn propose_promotion_overrides(
+        &self,
+        overrides: &std::collections::BTreeMap<u16, NodeId>,
+    ) -> Result<TopologyTerm, RegimeProposeError> {
+        if overrides.is_empty() {
+            return Err(RegimeProposeError::NoChange);
         }
-        let block = RegimeBlock {
-            override_map: installed.override_map.clone(),
-            regime,
-            regime_enforced: installed.regime_enforced,
-            promotion_enabled: installed.promotion_enabled,
-        };
-        self.propose_same_members_term(block)
+        if !self.committed_promotion_enabled() {
+            return Err(RegimeProposeError::PromotionNotEnabled);
+        }
+        let members = self.committed_members.read().unwrap().clone();
+        if members.is_empty() {
+            return Err(RegimeProposeError::NoCommittedTopology);
+        }
+        let rf = (self.replication_factor.load(Ordering::Relaxed) as u8).max(1);
+        let placement = crate::cluster::shards::ShardTable::compute_with_epoch(
+            &members,
+            rf,
+            1,
+            self.committed_placement_version().max(1),
+        );
+        let installed = self.committed_regime_block();
+        self.propose_same_members_term(|new_term| {
+            let mut block = installed.clone();
+            let mut changed = false;
+            for (&shard, &target) in overrides {
+                if shard as usize >= crate::cluster::shards::NUM_SHARDS {
+                    return Err(RegimeProposeError::OverrideTargetNotHolder {
+                        shard,
+                        target: target.0,
+                    });
+                }
+                let assignment = placement.assignment(shard);
+                let current = installed
+                    .override_map
+                    .get(&shard)
+                    .copied()
+                    .unwrap_or(assignment.master);
+                if current == target {
+                    continue; // already the committed master — nothing to promote
+                }
+                // I3 / I10(a): the target must be a committed placement
+                // replica (see the doc comment for why the demoted
+                // placement master is deliberately NOT accepted).
+                if !assignment.replicas.contains(&target) {
+                    return Err(RegimeProposeError::OverrideTargetNotHolder {
+                        shard,
+                        target: target.0,
+                    });
+                }
+                // A placement replica by construction deviates from the
+                // placement master, so the entry always lands in the map
+                // (override retirement — the deviation dissolving back to
+                // placement — happens only through membership/placement
+                // terms via `derive_regime_block`, never through promotion).
+                block.override_map.insert(shard, target);
+                // I10(b): a new/retargeted override stamps the carrying term.
+                block.regime.set(shard, new_term);
+                changed = true;
+            }
+            if !changed {
+                return Err(RegimeProposeError::NoChange);
+            }
+            Ok(block)
+        })
     }
 
     /// Check if the proposal timeout has fired for fallback proposer.
@@ -9296,6 +9466,123 @@ mod tests {
         assert_eq!(
             auth.propose_promotion_enabled(true).unwrap_err(),
             RegimeProposeError::MemberLacksWriteAllEquivalence { member: 3 },
+        );
+    }
+
+    /// Seed a promotion-capable authority: committed `{1,2,3}` at RF 2
+    /// with `promotion_enabled = true` committed at term 2.
+    fn seed_promotion_authority(self_id: u64) -> TopologyAuthority {
+        let auth = seed_regime_authority(self_id);
+        let block = RegimeBlock {
+            promotion_enabled: true,
+            ..Default::default()
+        };
+        let commit = commit_with_block(2, members(&[1, 2, 3]), 3, block);
+        assert_eq!(auth.handle_commit(&commit), Some(2));
+        assert!(auth.committed_promotion_enabled());
+        auth
+    }
+
+    /// §4.4 / I3 / I10(b) / I6 — the promotion-override proposer's happy
+    /// path: the produced term keeps members/placement/peak/flags
+    /// unchanged, carries the override in the cumulative map, stamps the
+    /// shard's regime with the carrying term, and the resulting commit
+    /// passes every apply gate (`handle_commit` installs it).
+    #[test]
+    fn i3_propose_promotion_overrides_swaps_master_and_bumps_regime() {
+        let auth = seed_promotion_authority(1);
+        let mems = members(&[1, 2, 3]);
+        let shard = 7u16;
+        let (master, replica) = placement_pair(&mems, shard);
+        let mut overrides = std::collections::BTreeMap::new();
+        overrides.insert(shard, replica);
+        let term = auth
+            .propose_promotion_overrides(&overrides)
+            .expect("a placement replica is a legal I3 target");
+        assert_eq!(term.members, mems, "I6: same members");
+        assert_eq!(term.placement_version, 1, "I6: same placement version");
+        assert_eq!(
+            term.regime_block.override_map.get(&shard),
+            Some(&replica),
+            "the override map carries the promotion",
+        );
+        assert_eq!(
+            term.regime_block.regime.get(shard),
+            term.term,
+            "I10(b): the override's regime equals the carrying term",
+        );
+        assert!(
+            term.regime_block.promotion_enabled && !term.regime_block.regime_enforced,
+            "I6: an override term never changes the committed flags",
+        );
+        assert_ne!(master, replica);
+
+        // The commit built from this term passes every apply gate.
+        let commit = commit_with_block(term.term, mems.clone(), 3, term.regime_block.clone());
+        assert_eq!(
+            auth.handle_commit(&commit),
+            Some(term.term),
+            "the promotion commit must clear I7/I10/I6 and install",
+        );
+        assert_eq!(
+            auth.committed_master(shard),
+            Some(replica),
+            "the committed derivation now names the promoted target",
+        );
+        assert_eq!(auth.committed_regime(shard), term.term);
+    }
+
+    /// §4.4 preconditions at the authority: promotion refused without the
+    /// committed `promotion_enabled` field (I4), for a non-holder target
+    /// (I3/I10a), for the current master (no-op), on a follower
+    /// (deterministic proposer only), and for an empty map.
+    #[test]
+    fn i4_propose_promotion_overrides_precondition_matrix() {
+        let mems = members(&[1, 2, 3]);
+        let shard = 7u16;
+        let (master, replica) = placement_pair(&mems, shard);
+        let outsider = non_holder(&mems, shard);
+
+        // I4 — committed promotion_enabled false.
+        let disabled = seed_regime_authority(1);
+        let mut o = std::collections::BTreeMap::new();
+        o.insert(shard, replica);
+        assert_eq!(
+            disabled.propose_promotion_overrides(&o).unwrap_err(),
+            RegimeProposeError::PromotionNotEnabled,
+        );
+
+        let auth = seed_promotion_authority(1);
+        // Empty map.
+        assert_eq!(
+            auth.propose_promotion_overrides(&std::collections::BTreeMap::new())
+                .unwrap_err(),
+            RegimeProposeError::NoChange,
+        );
+        // I3 — a non-holder target is refused outright.
+        let mut bad = std::collections::BTreeMap::new();
+        bad.insert(shard, outsider);
+        assert_eq!(
+            auth.propose_promotion_overrides(&bad).unwrap_err(),
+            RegimeProposeError::OverrideTargetNotHolder {
+                shard,
+                target: outsider.0,
+            },
+        );
+        // Promoting the current master is a no-op → NoChange.
+        let mut noop = std::collections::BTreeMap::new();
+        noop.insert(shard, master);
+        assert_eq!(
+            auth.propose_promotion_overrides(&noop).unwrap_err(),
+            RegimeProposeError::NoChange,
+        );
+        // Non-proposer nodes never originate an override term.
+        let follower = seed_promotion_authority(2);
+        let mut ok = std::collections::BTreeMap::new();
+        ok.insert(shard, replica);
+        assert_eq!(
+            follower.propose_promotion_overrides(&ok).unwrap_err(),
+            RegimeProposeError::NotProposer { proposer: 1 },
         );
     }
 

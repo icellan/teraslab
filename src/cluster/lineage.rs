@@ -217,6 +217,23 @@ pub struct LineageStore {
     /// Lock-free shadow of "is `Full`" per shard for the sweep hot path
     /// and stage 4's serving-gate reads. Refreshed on every transition.
     full_bits: AtomicShardBitmap,
+    /// P1 stage 4 (§4.3 catch-up trigger) — "stream-origin" evidence: the
+    /// shard's ENTIRE local content arrived via the replica stream (the
+    /// first tracked apply found the shard empty and no data-motion
+    /// trigger has fired since), so the baseline under the streamed ops is
+    /// trivially complete. In-memory only (cleared at boot — fail-closed:
+    /// a rebooted non-empty `Subset` shard cannot re-earn through this
+    /// path and goes through catch-up/heal/migration completion instead).
+    /// Cleared for a shard by EVERY `Subset` degrade (`mark_subset`, the
+    /// per-commit holder-exit/skipped-term degrade) — a fence or holder
+    /// exit invalidates the "nothing but the stream touched this copy"
+    /// claim.
+    stream_origin: AtomicShardBitmap,
+    /// P1 stage 4 — shards with stream-origin evidence touched by a
+    /// tracked replica apply since the last flush. Drained (debounced) by
+    /// the coordinator event loop, which re-validates every condition at
+    /// flush time and stamps `Full` in ONE batched durable write.
+    stream_candidates: AtomicShardBitmap,
 }
 
 impl LineageStore {
@@ -283,7 +300,67 @@ impl LineageStore {
             node_id,
             state: Mutex::new(state),
             full_bits,
+            stream_origin: AtomicShardBitmap::new(),
+            stream_candidates: AtomicShardBitmap::new(),
         }
+    }
+
+    /// P1 stage 4 — note one tracked replica-stream apply touching
+    /// `shard` (the receiver observed the shard's pre-apply record count).
+    ///
+    /// Grants stream-origin evidence when the shard was EMPTY before the
+    /// apply (everything it now holds arrived via the stream) or already
+    /// carried the evidence; a non-empty shard without prior evidence is
+    /// ignored (its baseline provenance is unknown — fail-closed). A
+    /// granted shard is queued as a `Full`-stamp candidate for the
+    /// debounced flush. The CALLER is responsible for never noting a shard
+    /// with an inbound/heal fence up (dual-write during a fill would
+    /// otherwise claim stream-origin for a copy that is part baseline).
+    pub fn note_stream_apply(&self, shard: u16, was_empty: bool) {
+        if shard as usize >= NUM_SHARDS {
+            return;
+        }
+        if was_empty || self.stream_origin.test(shard) {
+            self.stream_origin.set(shard);
+            self.stream_candidates.set(shard);
+        }
+    }
+
+    /// P1 stage 4 — whether `shard` currently carries stream-origin
+    /// evidence (see [`Self::note_stream_apply`]).
+    pub fn stream_origin(&self, shard: u16) -> bool {
+        (shard as usize) < NUM_SHARDS && self.stream_origin.test(shard)
+    }
+
+    /// P1 stage 4 — drain the pending `Full`-stamp candidates (ascending
+    /// shard order), clearing the candidate bits. The flush re-validates
+    /// every condition (origin still granted, no fence, holder-set
+    /// membership) before stamping; a shard dropped here is re-queued by
+    /// its next tracked apply.
+    pub fn take_stream_candidates(&self) -> Vec<u16> {
+        let mut out = Vec::new();
+        for shard in 0..NUM_SHARDS as u16 {
+            if self.stream_candidates.test(shard) {
+                self.stream_candidates.clear(shard);
+                out.push(shard);
+            }
+        }
+        out
+    }
+
+    /// P1 stage 4 — cheap "anything pending?" probe so the event loop
+    /// skips the drain entirely in the common idle case.
+    pub fn has_stream_candidates(&self) -> bool {
+        (0..NUM_SHARDS as u16).any(|s| self.stream_candidates.test(s))
+    }
+
+    /// Revoke stream-origin evidence (and any pending candidate) for
+    /// `shards` — every `Subset` degrade path calls this so the
+    /// "nothing but the stream touched this copy" claim dies with the
+    /// stamp.
+    fn revoke_stream_origin(&self, shard: u16) {
+        self.stream_origin.clear(shard);
+        self.stream_candidates.clear(shard);
     }
 
     /// The lineage of `shard`.
@@ -320,6 +397,12 @@ impl LineageStore {
         let mut state = self.state.lock();
         let mut changed = false;
         for &shard in shards {
+            if (shard as usize) < NUM_SHARDS {
+                // P1 stage 4 — a data-motion degrade invalidates the
+                // stream-origin claim even when the stamp was already
+                // Subset (e.g. a fence raised on a never-Full shard).
+                self.revoke_stream_origin(shard);
+            }
             if let Some(slot) = state.get_mut(shard as usize)
                 && slot.is_some()
             {
@@ -445,6 +528,10 @@ impl LineageStore {
                 state[shard as usize] = None;
                 degraded += 1;
                 changed = true;
+                // P1 stage 4 — a holder-exit (or skipped-term) degrade
+                // kills the stream-origin claim: the node missed the
+                // fan-out for however long it was outside the holder set.
+                self.revoke_stream_origin(shard);
             }
         }
         let persisted = if changed {

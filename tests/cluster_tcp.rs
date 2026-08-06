@@ -1238,8 +1238,15 @@ fn segment_cluster_master_failover_preserves_replicated_record() {
     // Kill the MASTER.
     shutdown_node(node_by_id(master_id));
 
-    // A survivor observes the master leave, then the replica is promoted to master
-    // of the shard and STILL holds the record — the failover lost nothing.
+    // A survivor observes the master leave; the committed derivation (P1
+    // stage 4, §4.4 — placement over the surviving member set; the retired
+    // local election no longer steers mastership toward the data holder)
+    // re-masters the shard to ONE deterministic survivor. If that pick is
+    // the replica it serves straight from its copy (I13ii re-stamp); if it
+    // is the other survivor, the fill from the replica must complete first
+    // (the I13 gate holds it `Transitioning` until its copy is `Full`).
+    // Either way: exactly one survivor ends up serving, and the record
+    // SURVIVES on it — the failover lost nothing.
     wait_until(
         || {
             !replica
@@ -1250,18 +1257,52 @@ fn segment_cluster_master_failover_preserves_replicated_record() {
         Duration::from_secs(20),
     )
     .expect("survivors should drop the killed master after suspicion");
+    let survivors: Vec<u64> = [461u64, 462, 463]
+        .into_iter()
+        .filter(|id| *id != master_id)
+        .collect();
     wait_until(
-        || matches!(replica.cluster.is_master(&key), MasterQueryResult::Yes),
-        // Generous: SWIM suspicion → failover → promotion convergence is slow
+        || {
+            survivors.iter().any(|id| {
+                matches!(
+                    node_by_id(*id).cluster.is_master(&key),
+                    MasterQueryResult::Yes
+                )
+            })
+        },
+        // Generous: SWIM suspicion → failover → fill → I13 unfence is slow
         // on loaded shared CI runners. `wait_until` polls and returns as soon
         // as the condition holds, so this only costs wall time on a genuine
         // failure — a tighter bound flaked under CI contention.
         Duration::from_secs(45),
     )
-    .expect("the replica must be promoted to master of the shard after failover");
+    .expect("a survivor must be serving the shard as master after failover");
+    let new_master = survivors
+        .iter()
+        .copied()
+        .find(|id| {
+            matches!(
+                node_by_id(*id).cluster.is_master(&key),
+                MasterQueryResult::Yes
+            )
+        })
+        .expect("a survivor serves");
+    // No-loss: the serving survivor holds the record (directly-replicated or
+    // filled from the replica before the I13 gate opened).
+    wait_until(
+        || {
+            node_by_id(new_master)
+                .server
+                .engine()
+                .lookup(&key)
+                .is_some()
+        },
+        Duration::from_secs(10),
+    )
+    .expect("the replicated record must survive master failover on the serving node");
     assert!(
         replica.server.engine().lookup(&key).is_some(),
-        "the replicated record must survive master failover on the promoted node"
+        "the original replica copy must also survive the failover"
     );
 
     // Clean up the survivors (the killed master is already down).
@@ -2681,4 +2722,228 @@ fn tcp_strict_replication_failure_returns_replication_failed() {
     assert_status_error_code(&resp, ERR_REPLICATION_FAILED, "strict replication failure");
 
     shutdown_node(&node);
+}
+
+/// P1 stage 4 (§4.4) — COMMITTED PROMOTION, end to end through the real
+/// machinery: enable `promotion_enabled` via its quorum commit (I4 advert
+/// evidence), replicate real writes so the replica earns `Full` through the
+/// stage-4 completeness signal (§4.3 catch-up trigger), wedge the shard's
+/// master behind a heal fence (the §4.4.3(c) subset-DESTINATION availability
+/// arm), and assert that the DETERMINISTIC PROPOSER's view poll emits a
+/// master override that rides the normal term/vote/commit path: every node
+/// installs the same override map, the promoted replica serves ONLY after
+/// its I13(ii) `Full` re-stamp at the new regime, and the demoted master
+/// answers `No` (fenced transitively — never dual-serving).
+///
+/// The dead-master (arm (a)) flavour of the happy path is pinned at the
+/// unit level (`s44_promotion_candidates_matrix`,
+/// `i3_propose_promotion_overrides_swaps_master_and_bumps_regime`) and the
+/// death→placement→fill path by
+/// `segment_cluster_master_failover_preserves_replicated_record`; this
+/// end-to-end uses the wedged-master arm because it is deterministic in
+/// wall-clock terms (a dead master is normally EXCLUDED by the membership
+/// term within the SWIM suspicion window, and placement re-mastering then
+/// covers it before an override could).
+#[test]
+fn s44_promotion_end_to_end_wedged_master_yields_committed_override() {
+    let writeall = ReplicationRuntimeConfig {
+        ack_policy: Some(AckPolicy::WriteAll),
+        best_effort: false,
+        timeout: Duration::from_secs(3),
+        timeout_during_migration: Duration::from_secs(30),
+    };
+    let node1 = create_node_with_replication_runtime(521, 0, 0, &[], 2, writeall);
+    let seed = [node1.swim_port];
+    let node2 = create_node_with_replication_runtime(522, 0, 0, &seed, 2, writeall);
+    let node3 = create_node_with_replication_runtime(523, 0, 0, &seed, 2, writeall);
+    let nodes = [&node1, &node2, &node3];
+    let node_by_id = |id: u64| -> &TestNode {
+        match id {
+            521 => &node1,
+            522 => &node2,
+            523 => &node3,
+            other => panic!("unknown node id {other}"),
+        }
+    };
+
+    wait_until(
+        || {
+            nodes
+                .iter()
+                .all(|n| n.cluster.committed_topology_members().len() == 3)
+        },
+        Duration::from_secs(30),
+    )
+    .expect("3-node topology should commit");
+
+    // I4 — commit `promotion_enabled = true` through the REAL proposer
+    // (node 1 = lowest = deterministic proposer). The opt-in is proposal
+    // capability only; the WriteAll adverts arrive on formation votes, so
+    // retry until the proposal is accepted and the commit lands everywhere.
+    node1
+        .cluster
+        .topology_authority()
+        .set_promotion_proposal_opt_in(true);
+    let last_refusal: std::cell::RefCell<Option<String>> = std::cell::RefCell::new(None);
+    wait_until(
+        || {
+            if nodes
+                .iter()
+                .all(|n| n.cluster.topology_authority().committed_promotion_enabled())
+            {
+                return true;
+            }
+            if let Err(e) = node1.cluster.propose_promotion_enabled(true) {
+                *last_refusal.borrow_mut() = Some(e.to_string());
+            }
+            false
+        },
+        Duration::from_secs(30),
+    )
+    .unwrap_or_else(|_| {
+        panic!(
+            "promotion_enabled must commit cluster-wide (I4); last refusal: {:?}",
+            last_refusal.borrow()
+        )
+    });
+
+    // A key mastered by node 3 (a NON-proposer, so the promotion below also
+    // proves only the deterministic proposer originates override terms).
+    // Poll: the promotion-enable term's activation may still be in flight,
+    // during which `is_master` answers from a lagging table.
+    let found: std::cell::Cell<Option<u32>> = std::cell::Cell::new(None);
+    wait_until(
+        || {
+            for probe in 90_000u32..90_500 {
+                let key = TxKey {
+                    txid: make_txid(probe),
+                };
+                if matches!(node3.cluster.is_master(&key), MasterQueryResult::Yes) {
+                    found.set(Some(probe));
+                    return true;
+                }
+            }
+            false
+        },
+        Duration::from_secs(30),
+    )
+    .expect("node 3 must serve some key as master once the enable term settles");
+    let txid = make_txid(found.get().expect("probe found"));
+    let key = TxKey { txid };
+    let shard = ShardTable::shard_for_key(&key);
+    let replica_id = {
+        let table = node3.cluster.shard_table();
+        let a = table.read().target_assignment(shard).clone();
+        assert_eq!(a.master, NodeId(523));
+        a.replicas[0].0
+    };
+    let replica = node_by_id(replica_id);
+
+    // Write through the master; RF=2 WriteAll replicates it to the replica.
+    let hash = make_txid(90_901);
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", node3.tcp_port)).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    wait_until(
+        || {
+            let resp = send_request(
+                &mut stream,
+                &RequestFrame {
+                    request_id: 1,
+                    op_code: OP_CREATE_BATCH,
+                    flags: 0,
+                    payload: encode_multi_create_payload(&[(txid, hash)]).into(),
+                },
+            );
+            resp.status == STATUS_OK && node3.server.engine().lookup(&key).is_some()
+        },
+        Duration::from_secs(10),
+    )
+    .expect("create on the shard master must land");
+
+    // §4.3 catch-up trigger — the replica earns `Full` through the REAL
+    // completeness signal (tracked replica apply over a stream-origin shard,
+    // flushed by the coordinator into a durable stamp).
+    wait_until(
+        || replica.cluster.lineage().is_full(shard),
+        Duration::from_secs(15),
+    )
+    .expect("the replica must earn Full via the stage-4 completeness signal");
+
+    // Wedge the master: a no-source heal fence for the shard (the reverse-
+    // heal fail-closed state). The master now reports the shard
+    // PENDING_INBOUND (a subset DESTINATION — §4.4.3(c)) and answers
+    // Transitioning; the shard is unavailable until promotion.
+    node3.cluster.mark_inbound_heal_fence(shard);
+    assert!(
+        matches!(
+            node3.cluster.is_master(&key),
+            MasterQueryResult::Transitioning { .. }
+        ),
+        "the wedged master must stop serving (fail-closed)",
+    );
+
+    // The deterministic proposer's §4.4 view poll must observe the wedged
+    // subset-destination, emit the override, and drive it through the
+    // normal term/vote/commit machinery. The promoted replica serves only
+    // after its I13(ii) Full re-stamp at the new regime.
+    wait_until(
+        || matches!(replica.cluster.is_master(&key), MasterQueryResult::Yes),
+        Duration::from_secs(60),
+    )
+    .expect("the Full replica must be promoted via a committed override and serve");
+
+    // The override is COMMITTED state, identical on the survivors' installed
+    // derivations (I0), with the regime stamped to the carrying term (I10b).
+    let block1 = node1.cluster.topology_authority().committed_regime_block();
+    let block2 = node2.cluster.topology_authority().committed_regime_block();
+    assert_eq!(
+        block1.override_map.get(&shard),
+        Some(&NodeId(replica_id)),
+        "the committed override map must name the promoted replica",
+    );
+    assert_eq!(
+        block1.override_map, block2.override_map,
+        "every node installs the SAME committed override map (I0)",
+    );
+    let regime = node1.cluster.topology_authority().committed_regime(shard);
+    assert!(
+        regime > 0,
+        "the promotion must have bumped the shard's regime"
+    );
+
+    // I13(ii): the promoted node's self-observed lineage is Full at the NEW
+    // regime — the re-stamp IS the promotion.
+    assert_eq!(
+        replica.cluster.lineage().lineage(shard),
+        teraslab::cluster::lineage::Lineage::Full { regime },
+        "the promoted node serves only with Full re-stamped at the new regime",
+    );
+
+    // The demoted master answers No once it installs the promoting commit
+    // (its own derivation names the promoted replica). NOTE: this harness
+    // runs FAIL-OPEN (no cluster_secret), so during the commit-propagation
+    // window a not-yet-installed demoted master can transiently claim the
+    // shard — exactly the I11-documented fail-open residual; with a secret,
+    // the committed `regime_enforced` write fence (§4.2/I12) is what closes
+    // that window at write granularity. The invariant this test pins is the
+    // committed-state one: after install, the demotion is unconditional.
+    // Generous deadline: commit-broadcast straggler retries (200 ms → 3.2 s)
+    // plus event-loop activation on a loaded runner.
+    wait_until(
+        || matches!(node3.cluster.is_master(&key), MasterQueryResult::No),
+        Duration::from_secs(45),
+    )
+    .expect("the demoted master must answer No once it installs the committed override");
+
+    // The record survived the whole failover on the promoted node.
+    assert!(
+        replica.server.engine().lookup(&key).is_some(),
+        "the promoted replica holds the record",
+    );
+
+    shutdown_node(&node1);
+    shutdown_node(&node2);
+    shutdown_node(&node3);
 }

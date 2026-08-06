@@ -324,6 +324,7 @@ fn migration_delta_reassign_replay_rejected_wholesale_after_promotion() {
         stream_key,
         5,
         Some(&pre_promotion),
+        None,
     );
     assert_eq!(resp_1.status, STATUS_OK, "pre-promotion delivery applies");
     let slot = engine.read_slot(&k, 0).unwrap();
@@ -353,6 +354,7 @@ fn migration_delta_reassign_replay_rejected_wholesale_after_promotion() {
         stream_key,
         6,
         Some(&post_promotion),
+        None,
     );
     assert_eq!(
         resp_2.status, STATUS_ERROR,

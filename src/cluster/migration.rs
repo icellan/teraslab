@@ -150,6 +150,16 @@ impl AtomicShardBitmap {
         }
     }
 
+    /// Set all bits (`NUM_SHARDS` is a multiple of 64, so whole words).
+    /// Used by the P1 stage-4 serving-established bitmap, whose RESTING
+    /// state is all-set (gate-inactive) until a commit install or boot
+    /// re-derivation clears the gated shards.
+    pub fn set_all(&self) {
+        for w in &self.words {
+            w.store(u64::MAX, std::sync::atomic::Ordering::Release);
+        }
+    }
+
     /// Bulk-copy from a [`ShardBitmap`] snapshot.
     ///
     /// Used to synchronize the atomic bitmap after a batch update

@@ -576,6 +576,9 @@ fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, ctx: Connecti
                 &stream_key,
                 local_cluster_key.load(Ordering::Acquire),
                 regime_view.as_deref(),
+                // The dedicated listener has no coordinator handle; the
+                // stage-4 completeness signal rides the dispatch path.
+                None,
             )
         } else {
             // Unknown opcode for replication receiver
@@ -601,6 +604,12 @@ fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, ctx: Connecti
     }
 }
 
+/// P1 stage 4 — the receiver-side completeness-signal callback type:
+/// invoked once per successfully applied TRACKED batch with the touched
+/// shards paired with their pre-apply emptiness (see
+/// [`handle_replica_batch_regime_gated`]).
+pub type TrackedApplySignal<'a> = &'a dyn Fn(&[(u16, bool)]);
+
 /// Process an `OP_REPLICA_BATCH` request frame against the
 /// [`DEFAULT_STREAM_KEY`] with an in-memory idempotency journal.
 ///
@@ -621,6 +630,7 @@ pub fn handle_replica_batch(
         last_applied,
         /* local_cluster_key */ 0,
         /* regime */ None,
+        /* on_tracked_apply */ None,
     )
 }
 
@@ -640,6 +650,7 @@ pub fn handle_replica_batch_with_cluster_key(
     last_applied: &AtomicU64,
     local_cluster_key: u64,
     regime: Option<&crate::cluster::topology::TopologyAuthority>,
+    on_tracked_apply: Option<TrackedApplySignal<'_>>,
 ) -> ResponseFrame {
     // R-D1/D-3: this fallback runs UNTRACKED — no per-stream watermark,
     // no duplicate skip, no gap NAK. Every op in every batch is applied
@@ -662,6 +673,7 @@ pub fn handle_replica_batch_with_cluster_key(
         DEFAULT_STREAM_KEY,
         local_cluster_key,
         regime,
+        on_tracked_apply,
     )
 }
 
@@ -739,6 +751,7 @@ pub fn handle_replica_batch_with_tracker(
         stream_key,
         local_cluster_key,
         None,
+        None,
     )
 }
 
@@ -765,6 +778,20 @@ pub fn handle_replica_batch_with_tracker(
 /// (acceptance is a binary capability, not committed state — I12) and
 /// their regime table is ignored; V2 batches behave exactly as before.
 ///
+/// # P1 stage 4 — the completeness-signal callback
+///
+/// `on_tracked_apply`, when present, is invoked exactly once per
+/// SUCCESSFULLY applied, TRACKED batch (never for probes, true
+/// duplicates, gap NAKs, migration or out-of-band batches, or any error
+/// path), after the batch is durable and immediately before the OK ack.
+/// It receives the batch's touched shards paired with whether each shard
+/// was EMPTY before the apply — the receiver-side observation feeding the
+/// §4.3 catch-up completeness signal
+/// (`RunningCluster::note_replica_stream_applies`). Under active regime
+/// enforcement a shard whose batch stamp is AHEAD of the local committed
+/// regime (a promoting commit in flight) is withheld from the callback —
+/// its `Full` re-stamp belongs to the commit install, not this signal.
+///
 /// [`TopologyAuthority::regime_enforcement_active`]: crate::cluster::topology::TopologyAuthority::regime_enforcement_active
 #[allow(clippy::too_many_arguments)]
 pub fn handle_replica_batch_regime_gated(
@@ -775,6 +802,7 @@ pub fn handle_replica_batch_regime_gated(
     stream_key: &str,
     local_cluster_key: u64,
     regime: Option<&crate::cluster::topology::TopologyAuthority>,
+    on_tracked_apply: Option<TrackedApplySignal<'_>>,
 ) -> ResponseFrame {
     let batch = match ReplicaBatch::deserialize(&request.payload) {
         Ok(b) => b,
@@ -1088,6 +1116,42 @@ pub fn handle_replica_batch_regime_gated(
         0
     };
 
+    // P1 stage 4 — capture the completeness-signal observation BEFORE the
+    // apply loop mutates anything: the touched shards of the ops that will
+    // actually apply, each paired with "was the shard empty pre-apply".
+    // Only for TRACKED batches with real work (see the doc comment).
+    let stream_signal_touched: Option<Vec<(u16, bool)>> = match on_tracked_apply {
+        Some(_) if tracked && skip_count < batch.ops.len() => {
+            let touched =
+                crate::replication::protocol::touched_shards(batch.ops.iter().skip(skip_count));
+            let signal: Vec<(u16, bool)> = touched
+                .into_iter()
+                .filter(|&shard| {
+                    // Under active enforcement, withhold a shard whose batch
+                    // stamp is AHEAD of the local committed regime (promoting
+                    // commit in flight): the accept-newer arm applies it, but
+                    // the Full re-stamp belongs to the commit install (I13ii).
+                    match regime {
+                        Some(authority) if authority.regime_enforcement_active() => batch
+                            .regime_table
+                            .as_ref()
+                            .and_then(|table| {
+                                table
+                                    .binary_search_by_key(&shard, |&(s, _)| s)
+                                    .ok()
+                                    .map(|idx| table[idx].1)
+                            })
+                            .is_some_and(|stamp| stamp <= authority.committed_regime(shard)),
+                        _ => true,
+                    }
+                })
+                .map(|shard| (shard, engine.shard_record_count(shard) == 0))
+                .collect();
+            Some(signal)
+        }
+        _ => None,
+    };
+
     // Migration-baseline applies suppress the HEAVY per-op engine redo (the
     // single 64 MiB redo log would otherwise fill during a large baseline
     // stream — `redo log full` — stalling scale-down convergence and aborting
@@ -1290,6 +1354,15 @@ pub fn handle_replica_batch_regime_gated(
         // could move last_applied backward if batches complete out of
         // sequence order.
         last_applied.fetch_max(through, Ordering::Relaxed);
+    }
+
+    // P1 stage 4 — the batch is applied and durable; feed the completeness
+    // signal (see the doc comment). Runs only on the success path, after
+    // the tracker flush, before the ack.
+    if let (Some(signal), Some(touched)) = (on_tracked_apply, stream_signal_touched.as_ref())
+        && !touched.is_empty()
+    {
+        signal(touched);
     }
 
     let ack = ReplicaAck::Ok {
@@ -8687,6 +8760,7 @@ mod tests {
             DEFAULT_STREAM_KEY,
             10,
             Some(&authority),
+            None,
         );
 
         assert_eq!(
@@ -8736,6 +8810,7 @@ mod tests {
             DEFAULT_STREAM_KEY,
             10,
             Some(&authority),
+            None,
         );
 
         assert_eq!(resp.status, STATUS_OK, "newer-regime batch must apply");
@@ -8772,6 +8847,7 @@ mod tests {
             DEFAULT_STREAM_KEY,
             10,
             Some(&authority),
+            None,
         );
 
         assert_eq!(resp.status, STATUS_OK, "equal-regime batch must apply");
@@ -8811,6 +8887,7 @@ mod tests {
             DEFAULT_STREAM_KEY,
             10,
             Some(&authority),
+            None,
         );
         assert_eq!(
             resp.status, STATUS_ERROR,
@@ -8839,6 +8916,7 @@ mod tests {
             DEFAULT_STREAM_KEY,
             10,
             Some(&authority),
+            None,
         );
         assert_eq!(
             resp.status, STATUS_ERROR,
@@ -8884,6 +8962,7 @@ mod tests {
                 DEFAULT_STREAM_KEY,
                 10,
                 Some(&authority),
+                None,
             );
             assert_eq!(
                 resp.status, STATUS_OK,
@@ -8902,6 +8981,7 @@ mod tests {
                 DEFAULT_STREAM_KEY,
                 10,
                 Some(&authority),
+                None,
             );
             assert_eq!(resp.status, STATUS_OK, "V2 must keep applying");
         }
@@ -8931,6 +9011,7 @@ mod tests {
             DEFAULT_STREAM_KEY,
             10,
             Some(&authority),
+            None,
         );
         assert_eq!(
             resp.status, STATUS_ERROR,
@@ -8977,6 +9058,7 @@ mod tests {
             DEFAULT_STREAM_KEY,
             10,
             Some(&authority),
+            None,
         );
         assert_eq!(resp.status, STATUS_ERROR);
         assert_eq!(decode_error_code(&resp.payload), ERR_STALE_REGIME);
@@ -10604,6 +10686,100 @@ mod tests {
             { meta.generation },
             2,
             "the re-created record is live at the re-create generation",
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // P1 stage 4 — the completeness-signal callback (§4.3 catch-up trigger)
+    // -----------------------------------------------------------------------
+
+    /// The callback fires exactly once per SUCCESSFULLY applied tracked
+    /// batch with the touched shards and their pre-apply emptiness; it
+    /// never fires for probes, duplicates, gap NAKs, or migration batches.
+    #[test]
+    fn i2_tracked_apply_signal_fires_only_on_successful_tracked_applies() {
+        let engine = make_engine();
+        let k = key(77);
+        create_record(&engine, k, 4);
+        let shard = crate::cluster::shards::ShardTable::shard_for_key(&k);
+        let last_applied = Arc::new(AtomicU64::new(0));
+        let tracker = ReplicaAppliedTracker::in_memory();
+        let captured: std::cell::RefCell<Vec<Vec<(u16, bool)>>> =
+            std::cell::RefCell::new(Vec::new());
+        let signal = |touched: &[(u16, bool)]| {
+            captured.borrow_mut().push(touched.to_vec());
+        };
+        let signal_ref: Option<TrackedApplySignal<'_>> = Some(&signal);
+
+        // 1. A real tracked apply fires the callback: shard touched, and
+        //    the shard was NOT empty pre-apply (the create seeded it).
+        let batch = make_spend_batch(1, k, 0..2, 1);
+        let resp = handle_replica_batch_regime_gated(
+            &batch_request(&batch, 1),
+            &engine,
+            &last_applied,
+            Some(&tracker),
+            DEFAULT_STREAM_KEY,
+            0,
+            None,
+            signal_ref,
+        );
+        assert_eq!(resp.status, STATUS_OK);
+        assert_eq!(
+            captured.borrow().as_slice(),
+            &[vec![(shard, false)]],
+            "one successful tracked apply = one callback with (shard, was_empty=false)",
+        );
+
+        // 2. A true duplicate re-send never fires it.
+        let resp = handle_replica_batch_regime_gated(
+            &batch_request(&batch, 2),
+            &engine,
+            &last_applied,
+            Some(&tracker),
+            DEFAULT_STREAM_KEY,
+            0,
+            None,
+            signal_ref,
+        );
+        assert_eq!(resp.status, STATUS_OK, "duplicate is ACKed");
+        assert_eq!(captured.borrow().len(), 1, "a duplicate must not re-signal");
+
+        // 3. A gap NAK never fires it.
+        let gapped = make_spend_batch(10, k, 2..3, 1);
+        let resp = handle_replica_batch_regime_gated(
+            &batch_request(&gapped, 3),
+            &engine,
+            &last_applied,
+            Some(&tracker),
+            DEFAULT_STREAM_KEY,
+            0,
+            None,
+            signal_ref,
+        );
+        assert_eq!(resp.status, STATUS_ERROR, "sequence gap NAKs");
+        assert_eq!(captured.borrow().len(), 1, "a gap NAK must not signal");
+
+        // 4. A migration-flagged batch (out-of-band baseline) never fires it
+        //    — its completeness authority is the completion handshake.
+        let mig = make_spend_batch(0, k, 3..4, 1);
+        let mut mig_req = batch_request(&mig, u64::from(shard));
+        mig_req.flags |= FLAG_MIGRATION_BATCH;
+        let resp = handle_replica_batch_regime_gated(
+            &mig_req,
+            &engine,
+            &last_applied,
+            Some(&tracker),
+            DEFAULT_STREAM_KEY,
+            0,
+            None,
+            signal_ref,
+        );
+        assert_eq!(resp.status, STATUS_OK, "migration batch applies");
+        assert_eq!(
+            captured.borrow().len(),
+            1,
+            "a migration batch must never feed the stream-completeness signal",
         );
     }
 }

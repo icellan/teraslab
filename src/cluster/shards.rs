@@ -598,11 +598,53 @@ impl ShardTable {
     }
 
     /// The master the most recent activation intended for `shard`
-    /// (election-refined). Diverges from `target_assignment(shard).master`
-    /// only when a handoff was rolled back after a failed migration —
-    /// exactly the condition the topology reactivation loop must repair.
+    /// (committed-derivation-refined). Diverges from
+    /// `target_assignment(shard).master` only when a handoff was rolled
+    /// back after a failed migration — exactly the condition the topology
+    /// reactivation loop must repair.
     pub fn intended_master(&self, shard: u16) -> NodeId {
         self.intended_masters[shard as usize]
+    }
+
+    /// P1 stage 4 (§4.4 / I3) — install a quorum-COMMITTED master
+    /// override on a freshly computed placement table.
+    ///
+    /// When `master` is a placement replica of the shard this performs
+    /// exactly I3's swap post-state: `master := R`, the demoted placement
+    /// pick takes R's replica slot — cardinality preserved, the demoted
+    /// node keeps receiving the write fan-out so it can re-earn `Full`.
+    ///
+    /// Honest-minimal deviation from I3's ideal (reported in the design):
+    /// when a standing override's target survived a membership/placement
+    /// change OUT of the shard's placement assignment (`derive_regime_block`
+    /// keeps an override while its target is a member and still deviates),
+    /// the target is installed as master anyway — the committed derivation
+    /// is authoritative — and the displaced placement master is demoted
+    /// into an APPENDED replica slot (the replica set can then exceed
+    /// `rf - 1` by one until the override retires). Unlike
+    /// [`Self::set_master_for_shard`], this never refuses: a committed
+    /// override outranks the placement pick by construction (I10 validated
+    /// it at apply).
+    pub fn apply_override_master(&mut self, shard: u16, master: NodeId) {
+        let idx = shard as usize;
+        let current = &mut self.assignments[idx];
+        if current.master != master {
+            if let Some(pos) = current.replicas.iter().position(|n| *n == master) {
+                // I3 swap: promote out of the replica slot, demote the
+                // placement pick into it.
+                let demoted = std::mem::replace(&mut current.master, master);
+                current.replicas[pos] = demoted;
+            } else {
+                let demoted = std::mem::replace(&mut current.master, master);
+                if !current.replicas.contains(&demoted) {
+                    current.replicas.push(demoted);
+                }
+            }
+        }
+        // Keep the recorded activation intent in sync so the reactivation
+        // mismatch metric treats the committed derivation (not the raw
+        // placement pick) as authoritative.
+        self.intended_masters[idx] = master;
     }
 
     /// W1.1 residual fix (FIX 2) — shards for which `node` is the assigned

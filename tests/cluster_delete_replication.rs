@@ -333,29 +333,6 @@ fn wait_for_settled_three_node_topology(nodes: &[&TestNode]) {
             match stable_since {
                 Some((v, since)) if v == version => {
                     if since.elapsed() >= Duration::from_millis(500) {
-                        // P1 stage 3 (§4.3): the held-copy sweep is now
-                        // lineage-gated (self-observed Subset fences
-                        // `SweepRole::HeldCopy`). These fixtures form the
-                        // cluster EMPTY and only then write records through
-                        // the replicated path, so every holder's copy is
-                        // genuinely complete — but none of the §4.3
-                        // completion triggers (migration / heal / resync
-                        // completion) ever fires for these shards, and the
-                        // catch-up-watermark completion (transition (i))
-                        // needs the master→replica completeness signal that
-                        // lands with stage 4. Stamp Full explicitly to model
-                        // the steady state these sweep/repair tests assume;
-                        // the tests below then exercise the sweep mechanics,
-                        // not lineage earning.
-                        let stamps: Vec<(u16, u64)> = (0..teraslab::cluster::shards::NUM_SHARDS
-                            as u16)
-                            .map(|s| (s, 0))
-                            .collect();
-                        for node in nodes {
-                            node.cluster
-                                .lineage()
-                                .mark_full_many(&stamps, "test: steady-state complete copies");
-                        }
                         return;
                     }
                 }
@@ -367,6 +344,47 @@ fn wait_for_settled_three_node_topology(nodes: &[&TestNode]) {
         assert!(
             Instant::now() < deadline,
             "3-node topology never settled (committed={all_committed}, counts_ok={counts_ok})"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// P1 stage 4 (§4.3 catch-up trigger) — the held-copy sweep is
+/// lineage-gated, and these empty-formed fixtures earn `Full` through the
+/// REAL master→replica completeness signal: every replicated batch a
+/// replica applies over a stream-origin shard queues a candidate the
+/// coordinator's debounced flush stamps `Full`. Wait (event-driven) until
+/// every NON-master target holder of the seeds' shards self-observes
+/// `Full`, so the sweeps fired below cannot be skipped by the fail-closed
+/// `Subset` default. This replaces the stage-3 explicit-stamp workaround —
+/// the signal itself is now under test.
+fn wait_for_full_replica_lineage(nodes: &[&TestNode], seeds: &[u32]) {
+    let shards: std::collections::BTreeSet<u16> = seeds
+        .iter()
+        .map(|s| {
+            teraslab::cluster::shards::ShardTable::shard_for_key(&TxKey {
+                txid: make_txid(*s),
+            })
+        })
+        .collect();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let all_full = nodes.iter().all(|n| {
+            let self_id = n.cluster.self_id();
+            let table = n.cluster.shard_table();
+            let t = table.read();
+            shards.iter().all(|&shard| {
+                let a = t.target_assignment(shard);
+                let non_master_holder = a.master != self_id && a.replicas.contains(&self_id);
+                !non_master_holder || n.cluster.lineage().is_full(shard)
+            })
+        });
+        if all_full {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "replica lineage never earned Full via the stage-4 completeness signal"
         );
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -789,6 +807,10 @@ fn preserved_on_master_survives_a_replica_sweep_and_is_restorable() {
             .expect("master-side preserve must succeed");
     }
 
+    // Held-copy sweeps are lineage-gated (P1 §4.3): the replicas must earn
+    // Full via the completeness signal before the sweep below can reclaim.
+    wait_for_full_replica_lineage(&nodes, &all_seeds);
+
     let sweep_height = HEIGHT + RETENTION + 1;
     let mut payload = Vec::with_capacity(8);
     payload.extend_from_slice(&sweep_height.to_le_bytes());
@@ -932,6 +954,9 @@ fn preserved_on_master_survives_a_replica_sweep_and_is_restorable() {
 /// must be down to exactly one holder, the master. If that does not hold, the
 /// caller's assertions about the repair would be vacuous.
 fn force_replica_reclaim(nodes: &[&TestNode], seeds: &[u32], sweep_height: u32, retention: u32) {
+    // The held-copy reclaim is lineage-gated (P1 §4.3): wait for the
+    // replicas to earn Full through the real completeness signal first.
+    wait_for_full_replica_lineage(nodes, seeds);
     let mut payload = Vec::with_capacity(8);
     payload.extend_from_slice(&sweep_height.to_le_bytes());
     payload.extend_from_slice(&retention.to_le_bytes());
@@ -1247,6 +1272,9 @@ fn dah_sweep_removes_the_record_from_every_holder() {
                 .count()
         })
         .collect();
+    // Held-copy sweeps are lineage-gated (P1 §4.3): the replicas must have
+    // earned Full via the completeness signal before this single-shot sweep.
+    wait_for_full_replica_lineage(&nodes, &seeds);
     let mut payload = Vec::with_capacity(8);
     payload.extend_from_slice(&sweep_height.to_le_bytes());
     payload.extend_from_slice(&RETENTION.to_le_bytes());
@@ -1458,6 +1486,8 @@ fn expired_preservation_transition_reaches_every_holder() {
     );
 
     // Fire the pruner at EVERY node, at the preservation's expiry height.
+    // (Lineage gate first — P1 §4.3, see wait_for_full_replica_lineage.)
+    wait_for_full_replica_lineage(&nodes, &seeds);
     let expiry_height = PRESERVE_TO;
     let mut payload = Vec::with_capacity(8);
     payload.extend_from_slice(&expiry_height.to_le_bytes());
@@ -1628,6 +1658,8 @@ fn ineligible_preservation_expiry_clears_the_preservation_on_every_holder() {
     );
     assert_eq!(resp.status, STATUS_OK, "client preserve must be accepted");
 
+    // Lineage gate first — P1 §4.3, see wait_for_full_replica_lineage.
+    wait_for_full_replica_lineage(&nodes, &seeds);
     let mut payload = Vec::with_capacity(8);
     payload.extend_from_slice(&PRESERVE_TO.to_le_bytes());
     payload.extend_from_slice(&RETENTION.to_le_bytes());

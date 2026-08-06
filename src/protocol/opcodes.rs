@@ -175,10 +175,10 @@ pub const KEY_DIAGNOSIS_ENCODED_SIZE: usize = 2 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 8;
 ///   node_id:     u64 LE   (8 bytes)
 ///   cluster_key: u64 LE   (8 bytes)
 ///   entry_count: u32 LE   (4 bytes)
-///   entries: PartitionVersionEntry * count    // entry_count entries, each 24 bytes
+///   entries: PartitionVersionEntry * count    // entry_count entries, each 33 bytes
 /// ```
 ///
-/// Each entry layout (24 bytes):
+/// Each entry layout (33 bytes):
 /// ```text
 ///   shard:            u16 LE   (2 bytes)
 ///   flags:            u8       (1 byte; bit0=is_master, bit1=is_subset)
@@ -186,18 +186,30 @@ pub const KEY_DIAGNOSIS_ENCODED_SIZE: usize = 2 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 8;
 ///   last_applied_seq: u64 LE   (8 bytes)
 ///   manifest_digest:  u64 LE   (8 bytes; reverse-heal recency fingerprint)
 ///   max_generation:   u32 LE   (4 bytes; reverse-heal recency signal)
+///   lineage_full:     u8       (1 byte; P1 §4.3 self-observed Full = 1)
+///   lineage_regime:   u64 LE   (8 bytes; the regime the Full stamp is at)
 /// ```
 ///
-/// The trailing `manifest_digest` + `max_generation` are ADDITIVE (finding C1,
-/// reverse-heal Phase 1): the parser infers the per-entry stride from the body
-/// length, so a Phase-1 reader accepts both the 24-byte layout and a legacy
-/// peer's 12-byte ([`PARTITION_VERSION_ENTRY_SIZE_LEGACY`]) entries (new fields
-/// default to 0). No `PROTOCOL_VERSION` bump.
+/// The trailing fields are ADDITIVE: the parser infers the per-entry stride
+/// from the body length, so a stage-4 reader accepts the 33-byte layout, the
+/// pre-lineage 24-byte layout ([`PARTITION_VERSION_ENTRY_SIZE_NO_LINEAGE`],
+/// lineage decodes as absent = not-`Full`), and a legacy peer's 12-byte
+/// ([`PARTITION_VERSION_ENTRY_SIZE_LEGACY`]) entries (all newer fields
+/// default to 0). No `PROTOCOL_VERSION` bump. The lineage fields are
+/// PROPOSER INPUT ONLY (design §4.3): they feed the §4.4 promotion
+/// proposer's partition view and the migration-skip refinement — never a
+/// serving-eligibility decision, which is always self-observed (I13).
 pub const OP_PARTITION_VERSION_REPORT: u16 = 105;
 
 /// Encoded width of a single `PartitionVersionEntry` on the wire (current
-/// layout, including the reverse-heal `manifest_digest` + `max_generation`).
-pub const PARTITION_VERSION_ENTRY_SIZE: usize = 2 + 1 + 1 + 8 + 8 + 4;
+/// layout, including the reverse-heal recency fields and the P1 stage-4
+/// `lineage_full` + `lineage_regime` tail).
+pub const PARTITION_VERSION_ENTRY_SIZE: usize = 2 + 1 + 1 + 8 + 8 + 4 + 1 + 8;
+
+/// Pre-stage-4 encoded width of a `PartitionVersionEntry`: everything up to
+/// and including the reverse-heal recency fields, without the lineage tail.
+/// Accepted by the parser; lineage decodes as absent (= not-`Full`).
+pub const PARTITION_VERSION_ENTRY_SIZE_NO_LINEAGE: usize = 2 + 1 + 1 + 8 + 8 + 4;
 
 /// Legacy (pre-Phase-1) encoded width of a `PartitionVersionEntry`: shard,
 /// flags, replica_count, last_applied_seq only. Accepted by the parser for

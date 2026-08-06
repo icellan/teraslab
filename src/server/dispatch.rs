@@ -927,6 +927,20 @@ pub(crate) fn handle_request(
             // cluster the gate is inactive (enforcement requires a
             // committed flag only a cluster can install).
             let regime = cluster.map(|c| c.topology_authority());
+            // P1 stage 4 — the master→replica completeness signal: note
+            // each successfully applied tracked batch's touched shards on
+            // the coordinator (see
+            // `RunningCluster::note_replica_stream_applies`). Absent
+            // cluster (single-node tests) = no signal.
+            let stream_signal = |touched: &[(u16, bool)]| {
+                if let Some(c) = cluster {
+                    c.note_replica_stream_applies(touched);
+                }
+            };
+            let on_tracked_apply: Option<crate::replication::receiver::TrackedApplySignal<'_>> =
+                cluster
+                    .is_some()
+                    .then_some(&stream_signal as &dyn Fn(&[(u16, bool)]));
             if let Some(applied) = REPLICA_APPLIED_TRACKER.get() {
                 crate::replication::receiver::handle_replica_batch_regime_gated(
                     request,
@@ -936,6 +950,7 @@ pub(crate) fn handle_request(
                     DEFAULT_STREAM_KEY,
                     local_cluster_key,
                     regime,
+                    on_tracked_apply,
                 )
             } else {
                 // Test harness / single-stream path: route through the
@@ -949,6 +964,7 @@ pub(crate) fn handle_request(
                     &DISPATCH_REPLICA_LAST_APPLIED,
                     local_cluster_key,
                     regime,
+                    on_tracked_apply,
                 )
             }
             // NOTE: We do NOT mark inbound shards as complete here.
@@ -13479,6 +13495,7 @@ fn handle_partition_version_report(
             engine,
             &c.shard_table(),
             c.inbound_bitmap(),
+            c.lineage(),
         ),
         None => Vec::new(),
     };
