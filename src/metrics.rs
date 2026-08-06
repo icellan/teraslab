@@ -1354,6 +1354,20 @@ pub struct MigrationMetrics {
     /// or a fence still up. Never fatal (the signal is best-effort), but a
     /// sustained rate on a healthy cluster is worth an alert.
     pub converged_signal_refused: PaddedCounter,
+    /// §8 security review round 3, H-2 — number of `OP_REPLICA_CONVERGED`
+    /// frames accepted while the sending peer's IP resolved to MORE THAN
+    /// ONE committed member (a co-located topology: single-host dev/test
+    /// clusters, host-network pods).
+    ///
+    /// The G-2 impersonation guard maps the claimed source id to an address
+    /// and compares IPs; when two members share an IP they are mutually
+    /// impersonatable for opcode 245 and the guard is weaker than it looks.
+    /// Refusing would kill the §4.3 convergence trigger on every
+    /// single-host test cluster, so the frame is ACCEPTED and this counter
+    /// (plus a `teraslab::security` WARN) makes the weakened guarantee
+    /// visible instead of silently inherited. Non-zero in production means
+    /// the deployment has collapsed several members onto one IP.
+    pub converged_signal_ambiguous_peer: PaddedCounter,
     /// §8 review round 2, N1 — number of shards currently carrying an
     /// unrepaired BASELINE GAP (gauge): an out-of-band transfer was
     /// abandoned without a completeness proof, so the copy is `Subset` and
@@ -1375,6 +1389,18 @@ pub struct MigrationMetrics {
     /// climbing counter is the operator signal that this node's installed
     /// regime array has diverged from the cluster's.
     pub regime_ratchet_rejections: PaddedCounter,
+    /// §8 review round 3, N3 (alert timing) — the CURRENT consecutive
+    /// quorum-proven ratchet-refusal streak (gauge), published from the
+    /// FIRST refusal onward and reset to 0 by any commit that passes the
+    /// regime gates.
+    ///
+    /// The self-fence still trips only at
+    /// [`crate::cluster::topology::RATCHET_SELF_FENCE_THRESHOLD`]; this
+    /// gauge exists so the operator alert fires at streak 1 instead of at
+    /// the fence. Alert on `>= 1` sustained for longer than one proposal
+    /// round: by the time it reaches the threshold the node has already
+    /// stopped serving authority.
+    pub regime_ratchet_rejection_streak: AtomicU32,
 }
 
 /// Number of {direction, role} buckets for migration byte counters.
@@ -1440,9 +1466,11 @@ impl MigrationMetrics {
             phantom_master_relinquished: PaddedCounter::new(),
             heal_deadline_alerts: PaddedCounter::new(),
             converged_signal_refused: PaddedCounter::new(),
+            converged_signal_ambiguous_peer: PaddedCounter::new(),
             lineage_baseline_gap_shards: AtomicU32::new(0),
             regime_lowering_accepted_far_behind: PaddedCounter::new(),
             regime_ratchet_rejections: PaddedCounter::new(),
+            regime_ratchet_rejection_streak: AtomicU32::new(0),
         }
     }
 

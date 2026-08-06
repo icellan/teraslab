@@ -3367,8 +3367,9 @@ impl TopologyAuthority {
         ) {
             RegimeGateOutcome::Pass => {
                 // N3 — a clean install (or any non-ratchet verdict) ends the
-                // consecutive-rejection run.
-                self.ratchet_rejection_streak.store(0, Ordering::Relaxed);
+                // consecutive-rejection run (and clears the streak gauge the
+                // streak-1 alert reads).
+                self.clear_ratchet_rejection_streak();
                 true
             }
             RegimeGateOutcome::RejectRatchet => {
@@ -3397,6 +3398,45 @@ impl TopologyAuthority {
     /// The quorum-proof gate mirrors the placement-version C11 arm: it is a
     /// STRUCTURAL filter (a genuinely sub-quorum commit must not arm a
     /// fence), not forgery resistance — that comes from the frame HMAC.
+    ///
+    /// §8 review round 3, N3 (alert timing) — the operator alert fires on
+    /// the FIRST quorum-proven refusal (WARN + the
+    /// `regime_ratchet_rejection_streak` gauge), not at the threshold. By
+    /// the time the streak reaches the threshold the node has already
+    /// stopped serving authority, which is too late to be an early warning.
+    ///
+    /// §8 review round 3, H-5 — note the AVAILABILITY LEVER this fence is:
+    /// the nodes that refuse on the ratchet are precisely the UP-TO-DATE
+    /// ones, so a malicious or badly-buggy member that can get three
+    /// successive lowered-regime terms COMMITTED fences every correct node.
+    /// The direction is fail-closed (refuse to serve, never dual-serve) and
+    /// the quorum-proof gate above stops sub-quorum forgery, so this is not
+    /// a safety hole — but the threshold-of-3 rationale below was written
+    /// about HONEST staleness, not adversarial repetition, and it does not
+    /// bound the adversarial case. The streak-1 alert is what makes that
+    /// case operator-visible before the third term lands.
+    /// N3 — end the consecutive-refusal run and clear the gauge the
+    /// streak-1 alert reads. Called from every path that proves this node
+    /// is NOT wedged on the ratchet (a passing gate verdict, a commit
+    /// reaching apply).
+    fn clear_ratchet_rejection_streak(&self) {
+        self.ratchet_rejection_streak.store(0, Ordering::Relaxed);
+        if let Some(m) = crate::metrics::migration_metrics() {
+            m.regime_ratchet_rejection_streak
+                .store(0, Ordering::Relaxed);
+        }
+    }
+
+    /// N3 — the current consecutive quorum-proven ratchet-refusal streak.
+    /// Test-only: the operator-facing form is the
+    /// `teraslab_regime_ratchet_rejection_streak` gauge, which is a
+    /// process-global any other test's successful commit resets, so the
+    /// streak semantics are asserted against this per-authority value.
+    #[cfg(test)]
+    fn ratchet_rejection_streak_value(&self) -> u64 {
+        self.ratchet_rejection_streak.load(Ordering::Relaxed)
+    }
+
     fn note_ratchet_rejection(&self, commit: &TopologyCommit) {
         if let Some(m) = crate::metrics::migration_metrics() {
             m.regime_ratchet_rejections.inc();
@@ -3408,6 +3448,26 @@ impl TopologyAuthority {
             .ratchet_rejection_streak
             .fetch_add(1, Ordering::Relaxed)
             + 1;
+        if let Some(m) = crate::metrics::migration_metrics() {
+            m.regime_ratchet_rejection_streak
+                .store(streak.min(u32::MAX as u64) as u32, Ordering::Relaxed);
+        }
+        if streak < RATCHET_SELF_FENCE_THRESHOLD {
+            // N3 (alert timing) — the FIRST refusal is the one the operator
+            // wants; the fence is the deadline, not the notification.
+            tracing::warn!(
+                self_id = self.self_id.0,
+                term = commit.term,
+                streak,
+                threshold = RATCHET_SELF_FENCE_THRESHOLD,
+                "cluster: refused a quorum-committed term on the I10(d) regime ratchet \
+                 (streak {streak} of {RATCHET_SELF_FENCE_THRESHOLD}). One refusal is \
+                 expected from a stale-but-honest proposer and self-corrects on the next \
+                 term; if the streak keeps climbing this node self-fences and stops \
+                 serving authority. Investigate now: compare this node's installed regime \
+                 array against the cluster's.",
+            );
+        }
         if streak >= RATCHET_SELF_FENCE_THRESHOLD {
             tracing::error!(
                 self_id = self.self_id.0,
@@ -3694,6 +3754,44 @@ impl TopologyAuthority {
         // NOT installed the entry still refuses, which is fail-closed:
         // it declines to advance rather than adopting an unjustified
         // mastership.
+        //
+        // §8 review round 3, NEW-4 — READ THIS BEFORE "FIXING" THE
+        // EXEMPTION'S NODE-LOCAL INPUT. `installed.override_map` is
+        // node-local installed state, so appliers at different installed
+        // terms CAN reach different verdicts on the same commit. That is
+        // deliberate and it is NOT an I0 violation IN EFFECT: I0 forbids
+        // appliers INSTALLING DIFFERENT MASTERSHIPS from one commit, and
+        // the two verdicts here are "install this commit" and "install
+        // NOTHING". A refusing node does not adopt a different mastership,
+        // a different regime array, or a different member set — it stays
+        // exactly where it was and votes NO. The split is therefore
+        // LIVENESS-splitting (some nodes advance, some wedge), never
+        // safety-splitting (dual mastership / dual serving), and the wedged
+        // node keeps serving only what it already served, still I13-gated.
+        // Making this clause node-INDEPENDENT by dropping the exemption is
+        // the "correction" to avoid: it converts a rare per-node wedge into
+        // a GUARANTEED cluster-wide one for every legitimate standing
+        // override whose target drifted out of the commit's holder set.
+        // Making it node-independent by trusting the commit instead is
+        // worse still — that is the G-3 bypass this whole clause exists to
+        // close.
+        //
+        // §8 review round 3, H-4 — the exemption requires the entry to be
+        // unchanged in BOTH dimensions: same target AND same regime. On the
+        // F1 vacuity arm clause (e) is skipped, so a byte-identical target
+        // paired with a RAISED regime would otherwise ride through as a
+        // master-change-free regime bump — safe (the ratchet direction is
+        // the safe one, I7 caps the value at the term) but a
+        // write-availability lever: it invalidates every in-flight batch
+        // for the shard, at will. A genuinely standing entry never bumps:
+        // `derive_regime_block` raises a shard's regime only when its
+        // derived master CHANGES, and `propose_regime_overrides` only for
+        // the entries it adds or retargets. The residual cost is bounded
+        // and matches the clause's existing stance: a node that missed a
+        // retarget-and-return sequence (so its installed entry is
+        // byte-identical again but its installed regime lags) refuses, the
+        // same way a node holding a DIFFERENT entry already refuses today —
+        // recovery is the operator regime rebase or a topology-state reset.
         for (&shard, &target) in &block.override_map {
             let in_commit_holder_set = commit_table.as_ref().is_some_and(|t| {
                 let a = t.assignment(shard);
@@ -3702,7 +3800,9 @@ impl TopologyAuthority {
             if in_commit_holder_set {
                 continue;
             }
-            if installed.override_map.get(&shard) == Some(&target) {
+            if installed.override_map.get(&shard) == Some(&target)
+                && block.regime.get(shard) == installed.regime.get(shard)
+            {
                 continue; // standing entry, validated by the term that introduced it
             }
             tracing::error!(
@@ -3710,9 +3810,12 @@ impl TopologyAuthority {
                 term,
                 shard,
                 target = target.0,
+                term_regime = block.regime.get(shard),
+                local_regime = installed.regime.get(shard),
                 "cluster: refusing override-carrying commit — I10(a)/G-3: override target \
                  is outside the holder set derived from the COMMIT'S OWN members and \
-                 placement version, and is not a standing entry this node installed",
+                 placement version, and is not a standing entry this node installed at \
+                 an UNCHANGED regime (H-4)",
             );
             return RegimeGateOutcome::Reject;
         }
@@ -3884,7 +3987,7 @@ impl TopologyAuthority {
         }
         // N3 — a commit reaching apply proves this node is NOT wedged on
         // the regime ratchet; end any consecutive-rejection run.
-        self.ratchet_rejection_streak.store(0, Ordering::Relaxed);
+        self.clear_ratchet_rejection_streak();
         // F7 (I2/I13ii) — run the commit-install hook FIRST, before any
         // mutation: the lineage transition batch must be durable before
         // `committed_term` advances (I1 ordering), and a hook durability
@@ -9904,6 +10007,79 @@ mod tests {
         );
     }
 
+    /// §8 review round 3, N3 (alert timing) — the operator signal must be
+    /// live from the FIRST quorum-proven ratchet refusal, not only once the
+    /// self-fence trips: at the fence the node has already stopped serving
+    /// authority, which is a page, not an early warning. The streak gauge
+    /// therefore publishes 1 on the first refusal, climbs, and is cleared
+    /// by any commit that installs — while the fence itself still holds at
+    /// [`RATCHET_SELF_FENCE_THRESHOLD`].
+    ///
+    /// Asserted against the authority's own streak: the WARN and the
+    /// `teraslab_regime_ratchet_rejection_streak` gauge are stamped from
+    /// this same value on the same branch, but the gauge is a
+    /// process-global that any other test's successful commit resets, so it
+    /// is not a race-free thing to assert on.
+    #[test]
+    fn n3_ratchet_refusal_is_observable_at_streak_one() {
+        let streak_gauge = |auth: &TopologyAuthority| auth.ratchet_rejection_streak_value();
+
+        let auth = seed_regime_authority(1);
+        let survivors = members(&[1, 2]);
+        let honest = auth.derive_regime_block_for(&survivors, 1, 2);
+        assert_eq!(
+            auth.handle_commit(&commit_with_block(2, survivors.clone(), 3, honest.clone())),
+            Some(2)
+        );
+        assert_eq!(
+            streak_gauge(&auth),
+            0,
+            "an installed commit leaves the streak at zero",
+        );
+
+        // ONE quorum-proven refusal at `installed_term + 1` (the ratchet
+        // arm) — well below the fence.
+        assert!(
+            auth.handle_commit(&commit_with_block(
+                3,
+                survivors.clone(),
+                3,
+                Default::default()
+            ))
+            .is_none()
+        );
+        assert_eq!(
+            streak_gauge(&auth),
+            1,
+            "N3: the FIRST quorum-proven ratchet refusal must be operator-visible \
+             (WARN + the streak gauge, both stamped from this value)",
+        );
+        assert!(
+            !auth.is_self_fenced(),
+            "and it must NOT fence — the threshold stays at \
+             {RATCHET_SELF_FENCE_THRESHOLD}",
+        );
+
+        // A commit it CAN install clears the alert.
+        let moved = honest
+            .regime
+            .iter_nonzero()
+            .map(|(s, _)| s)
+            .next()
+            .expect("a membership change moves a master");
+        let mut higher = honest;
+        higher.regime.set(moved, 5);
+        assert_eq!(
+            auth.handle_commit(&commit_with_block(5, survivors, 3, higher)),
+            Some(5)
+        );
+        assert_eq!(
+            streak_gauge(&auth),
+            0,
+            "an installable commit clears the streak (and the alert)",
+        );
+    }
+
     /// N3 — a SUB-QUORUM commit must never arm the self-fence: the proof
     /// gate is a structural correctness filter (mirroring the C11
     /// placement-version arm), so a stream of unproven frames cannot brick
@@ -10025,6 +10201,87 @@ mod tests {
             "G-3: a standing override this node already installed must never wedge \
              later commits",
         );
+    }
+
+    /// H-4 — the standing-entry exemption must be unchanged in BOTH
+    /// dimensions: same target AND same regime.
+    ///
+    /// On the F1 vacuity arm clause (e) (bump-justification) is skipped and
+    /// the exemption skips the holder-set check, so a commit at
+    /// `installed_term + 2` could carry a byte-identical `(shard → target)`
+    /// with `regime[shard]` RAISED. Safety survives (the ratchet direction
+    /// is the safe one and I7 caps the value at the term), but the effect
+    /// is a regime bump with NO master change, which invalidates every
+    /// in-flight batch for that shard — a write-availability lever any
+    /// forged or buggy proposer could pull at will. A genuinely standing
+    /// entry never bumps: `derive_regime_block` raises a shard's regime
+    /// only when its DERIVED MASTER changes, and `propose_regime_overrides`
+    /// only for entries it adds or retargets.
+    #[test]
+    fn h4_standing_entry_exemption_requires_an_unchanged_regime() {
+        let mems4 = members(&[1, 2, 3, 4]);
+        let mems3 = members(&[1, 2, 3]);
+        // A shard whose override target is a holder under the 4-member
+        // placement (so the entry installs legitimately) but NOT under the
+        // 3-member placement of the later commit — the exemption is the
+        // only thing that can carry it, which is exactly the path H-4
+        // tightens.
+        let (drifted, target) = (0..crate::cluster::shards::NUM_SHARDS as u16)
+            .find_map(|s| {
+                let (_, r) = placement_pair(&mems4, s);
+                let (m3, r3) = placement_pair(&mems3, s);
+                (r != m3 && r != r3).then_some((s, r))
+            })
+            .expect("some shard's holder pair drifts when member 4 leaves");
+
+        let install = || {
+            let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+            auth.set_replication_factor(2);
+            seed_committed(&auth, mems4.clone());
+            let mut installed = RegimeBlock::default();
+            installed.override_map.insert(drifted, target);
+            installed.regime.set(drifted, 2);
+            assert_eq!(
+                auth.handle_commit(&commit_with_block(2, mems4.clone(), 4, installed.clone())),
+                Some(2),
+                "the override installs while its target IS a holder",
+            );
+            (auth, installed)
+        };
+
+        // A second, genuinely new entry so the later commit's map DIFFERS
+        // from the installed one (otherwise the gate short-circuits before
+        // the exemption is ever reached).
+        let fresh = (0..crate::cluster::shards::NUM_SHARDS as u16)
+            .find(|&s| s != drifted)
+            .expect("a second shard exists");
+        let (_, fresh_target) = placement_pair(&mems3, fresh);
+
+        // Term 4 skips past `installed_term + 1` → the F1 vacuity arm.
+        let carried = |standing_regime: u64| {
+            let mut block = RegimeBlock::default();
+            block.override_map.insert(drifted, target);
+            block.override_map.insert(fresh, fresh_target);
+            block.regime.set(drifted, standing_regime);
+            block.regime.set(fresh, 4);
+            commit_with_block(4, mems3.clone(), 4, block)
+        };
+
+        let (auth, _) = install();
+        assert_eq!(
+            auth.handle_commit(&carried(2)),
+            Some(4),
+            "no-wedge: a byte-identical standing entry at an UNCHANGED regime must still \
+             ride a later commit",
+        );
+
+        let (auth, _) = install();
+        assert!(
+            auth.handle_commit(&carried(4)).is_none(),
+            "H-4: the exemption must not carry a standing entry whose regime was RAISED \
+             — that is a master-change-free regime bump, i.e. a write-availability lever",
+        );
+        assert_eq!(auth.committed_term(), 2, "and the refusal installs nothing",);
     }
 
     /// N2(ii) — the proposed `voters ⊆ ever_seen ∪ members` tightening is

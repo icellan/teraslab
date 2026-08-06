@@ -6467,11 +6467,24 @@ fn lineage_apply_committed_state(
 /// unit-testable.
 ///
 /// I13(i): the committed master of `s` with an intact, un-reclaimed redo
-/// range re-derives `Full(current regime)` REGARDLESS of the stored stamp
-/// (reaching clustered startup at all required boot recovery over the
-/// node's own redo to succeed — a corrupt/reclaimed-needed tail fails boot
-/// upstream); every non-master stamp that cannot prove holder continuity
-/// across the down window degrades fail-closed.
+/// range re-derives `Full(current regime)` (reaching clustered startup at
+/// all required boot recovery over the node's own redo to succeed — a
+/// corrupt/reclaimed-needed tail fails boot upstream); every non-master
+/// stamp that cannot prove holder continuity across the down window
+/// degrades fail-closed.
+///
+/// NEW-1 — the master arm is scoped to HOLDER CONTINUITY (see
+/// [`crate::cluster::lineage::LineageStore::boot_rederive`] for the exact
+/// test and its two-purpose justification), and THIS FUNCTION'S serving
+/// half must be scoped identically. "Committed master at boot" includes a
+/// mastership acquired at the last commit this node persisted — by
+/// placement after a death, or by override — for a shard whose data it has
+/// never held. The serving-established bit is therefore derived FROM the
+/// re-derivation outcome (`master_is_self && lineage.is_full`) rather than
+/// from mastership alone: an ungated bit on a regime-advanced, never-held
+/// shard opens the I13 gate before the lineage store is ever consulted
+/// (`is_master` tests `serving_established` FIRST), which is the whole
+/// invariant.
 ///
 /// F4 — EPOCH-CONTINUITY GATE on the I13(i) arm: the re-derivation is
 /// honest only when the on-disk data and the loaded topology state belong
@@ -6564,14 +6577,17 @@ fn boot_rederive_lineage_and_serving(
     lineage.boot_rederive(&rederive_master_is_self, &in_holder, &|s| {
         block.regime.get(s)
     });
-    // I13 boot half of the serving-established derivation: this node's own
-    // committed-master shards re-derive Full above (I13i), so their
-    // serving is established; every other regime-advanced shard is
-    // fail-closed to gated. F4: with broken epoch continuity the master
-    // arm did NOT re-derive, so master shards gate too (a Subset master
-    // must re-earn before serving a regime-advanced shard).
+    // I13 boot half of the serving-established derivation. A regime-0
+    // shard's mastership has never moved, so there is no transition to gate
+    // (the online derivation calls this `gate_inactive`); every OTHER shard
+    // keeps its resting set bit only where the master arm above actually
+    // re-derived `Full` — i.e. self is the committed master AND had holder
+    // continuity. This covers all three fail-closed cases in one test:
+    // a non-master shard (as before), a master shard whose epoch continuity
+    // is broken (F4 — the arm did not re-derive), and a master shard the
+    // node acquired without ever holding the data (NEW-1).
     for s in 0..NUM_SHARDS as u16 {
-        if block.regime.get(s) != 0 && (!epoch_continuity || !master_is_self(s)) {
+        if block.regime.get(s) != 0 && !(master_is_self(s) && lineage.is_full(s)) {
             serving_established.clear(s);
         }
     }
@@ -11918,6 +11934,23 @@ pub struct RunningCluster {
     /// durable applied watermark) plus the baseline-gap flag survive the
     /// restart, so a post-restart replay can only re-assert a claim this
     /// node's own durable state still supports.
+    ///
+    /// §8 security review round 3, H-1 — WRITE DOWN WHAT THAT SOUNDNESS
+    /// RESTS ON, because it is not local to this field. After a restart the
+    /// mark resets to 0, so check 1 (the dedup) no longer refuses a
+    /// CAPTURED frame and only corroboration remains; the persisted applied
+    /// watermark still satisfies `applied_seq >= asserted_seq` for any
+    /// frame that was ever valid, so a post-restart replay CAN re-stamp
+    /// `Full` on a node that has since fallen behind. That is bounded only
+    /// because I4 mandates WriteAll-equivalence for promotion: the master
+    /// cannot ack a write the replica did not apply, so a replica at
+    /// watermark `W` is missing only UNACKED writes — the ambiguous-outcome
+    /// class the durability contract already defines, which idempotent
+    /// re-send converges.
+    ///
+    /// **Non-persistence is safe only while I4 guarantees
+    /// WriteAll-equivalence; if promotion is ever enabled under a weaker
+    /// ack policy this mark MUST be persisted.**
     converged_signal_hwm: Mutex<std::collections::HashMap<NodeId, u64>>,
     /// P1 stage 4 (I13) — lock-free per-shard "serving as master needs no
     /// Full gate" bitmap, shared with the commit-install hook (which
@@ -12712,6 +12745,18 @@ impl RunningCluster {
     /// G-2 — does `source_node_id` resolve to `peer_ip` in this node's
     /// address map? An unknown claimed id, an unknown peer address, or a
     /// mismatch all answer `false` (fail-closed).
+    ///
+    /// §8 security review round 3, H-2 — the guard is an IP comparison, so
+    /// it is only as strong as the deployment's address separation. In a
+    /// CO-LOCATED topology (single-host dev/test clusters, host-network
+    /// pods) two committed members share an IP and are mutually
+    /// impersonatable for opcode 245. Refusing there would kill the §4.3
+    /// convergence trigger on every single-host test cluster, so an
+    /// ambiguous match is ACCEPTED and reported instead: a
+    /// `teraslab::security` WARN plus the
+    /// `converged_signal_ambiguous_peer` counter, so a production
+    /// deployment that accidentally collapses members onto one IP surfaces
+    /// the weakened guarantee rather than inheriting it silently.
     fn converged_signal_peer_matches(
         &self,
         source_node_id: u64,
@@ -12720,10 +12765,41 @@ impl RunningCluster {
         let Some(peer_ip) = peer_ip else {
             return false;
         };
-        self.node_addrs
-            .read()
+        let addrs = self.node_addrs.read();
+        if !addrs
             .get(&NodeId(source_node_id))
             .is_some_and(|a| a.ip() == peer_ip)
+        {
+            return false;
+        }
+        // H-2 — how many DISTINCT known members does this peer IP resolve
+        // to? More than one means the id→IP mapping is not injective, so
+        // the check above proves "some member at this address", not "this
+        // member".
+        let sharing: Vec<u64> = addrs
+            .iter()
+            .filter(|(_, a)| a.ip() == peer_ip)
+            .map(|(n, _)| n.0)
+            .collect();
+        if sharing.len() > 1 {
+            if let Some(m) = crate::metrics::migration_metrics() {
+                m.converged_signal_ambiguous_peer.inc();
+            }
+            tracing::warn!(
+                target: "teraslab::security",
+                self_id = self.self_id.0,
+                source = source_node_id,
+                peer = ?peer_ip,
+                sharing = ?sharing,
+                "cluster: OP_REPLICA_CONVERGED accepted with an AMBIGUOUS peer identity — \
+                 {} committed members resolve to this IP, so the G-2 impersonation guard \
+                 cannot distinguish them and any of them could assert this one's \
+                 completeness. Expected on a single-host/dev cluster; in production it \
+                 means members have collapsed onto one address — give them distinct IPs.",
+                sharing.len(),
+            );
+        }
+        true
     }
 
     /// P1 stage 4 (I4) — propose committing `promotion_enabled = enable`
@@ -26254,22 +26330,35 @@ mod tests {
         );
     }
 
-    /// F4 (companion property) — the NON-restored case is unchanged: a
-    /// deleted/lost lineage file with MATCHING epochs still re-derives
-    /// `Full` for the node's committed-master shards (a lost lineage file
-    /// must not total-outage a healthy node — the I13(i) guarantee), and a
-    /// topology state with NO recorded epoch (legacy / first post-upgrade
-    /// boot) is tolerated as matching.
+    /// F4 (companion property) + NEW-1 — the NON-restored case: matching
+    /// epochs ENABLE the I13(i) master re-derivation (and a topology state
+    /// with NO recorded epoch — legacy / first post-upgrade boot — is
+    /// tolerated as matching), but the arm is scoped to HOLDER CONTINUITY.
+    ///
+    /// With the lineage file GONE, the two halves separate:
+    ///
+    /// * a shard whose mastership has never moved (regime 0) still
+    ///   re-derives `Full` and keeps serving — this is what keeps a lost
+    ///   lineage file from total-outaging a healthy node (I13(i) purpose 1);
+    /// * a REGIME-ADVANCED mastership with no stored stamp is
+    ///   indistinguishable from one acquired without ever holding the data,
+    ///   so it fails closed: `Subset` + I13-gated, re-earned through the
+    ///   §4.3 completion triggers.
     #[test]
-    fn f4_normal_boot_with_deleted_lineage_file_same_epoch_rederives_full() {
+    fn f4_normal_boot_with_deleted_lineage_file_same_epoch_rederives_only_standing_shards() {
         let epoch = [9u8; crate::cluster::lineage::DATA_EPOCH_LEN];
+        let table = ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2)], 2, 1, 1);
         for recorded in [Some(epoch), None] {
             let (authority, mastered, other) = f4_boot_fixture(recorded);
+            // A shard self masters whose regime the fixture left at 0 — its
+            // mastership has never moved, so I13 has no transition to gate.
+            let never_moved = (0..NUM_SHARDS as u16)
+                .find(|&s| s != mastered && table.assignment(s).master == NodeId(1))
+                .expect("node 1 masters more than one shard");
             // Fresh non-persistent store = the lineage file is gone.
             let lineage = crate::cluster::lineage::LineageStore::open(None, epoch, NodeId(1));
             let serving = crate::cluster::migration::AtomicShardBitmap::new();
             serving.set_all();
-            let table = ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2)], 2, 1, 1);
             boot_rederive_lineage_and_serving(
                 &authority,
                 &lineage,
@@ -26280,19 +26369,165 @@ mod tests {
                 Some(epoch),
             );
             assert_eq!(
-                lineage.lineage(mastered),
-                crate::cluster::lineage::Lineage::Full { regime: 3 },
-                "I13(i): matching epochs (recorded {recorded:?}) must re-derive Full \
-                 for the committed master even with no lineage file",
+                lineage.lineage(never_moved),
+                crate::cluster::lineage::Lineage::Full { regime: 0 },
+                "I13(i) purpose 1 (recorded {recorded:?}): a lost lineage file must not \
+                 total-outage the shards this node has mastered since formation",
             );
             assert!(
-                serving.test(mastered),
-                "the re-derived master's serving is established",
+                serving.test(never_moved),
+                "a regime-0 mastership is gate-inactive and keeps serving",
+            );
+            assert_eq!(
+                lineage.lineage(mastered),
+                crate::cluster::lineage::Lineage::Subset,
+                "NEW-1 (recorded {recorded:?}): with no stored stamp, a REGIME-ADVANCED \
+                 committed mastership cannot be told apart from one acquired without \
+                 ever holding the data — it must fail closed",
+            );
+            assert!(
+                !serving.test(mastered),
+                "NEW-1: and its serving stays I13-gated",
             );
             assert!(
                 !serving.test(other),
                 "a regime-advanced non-master shard is gated as before",
             );
+        }
+    }
+
+    /// I13(i) purpose 2 — the PERSIST-WINDOW crash still self-heals under
+    /// the NEW-1 narrowing.
+    ///
+    /// `handle_commit_durable` persists the topology state BEFORE running
+    /// the lineage commit-install hook, so a crash in that window comes
+    /// back with the NEW committed regime installed and the lineage stamp
+    /// still at the PREVIOUS one. The install is never replayed, so without
+    /// a boot re-derivation the shard would strand `Transitioning` forever
+    /// with its own committed master unable to serve. Holder continuity
+    /// (a stored stamp at ANY regime) is exactly the evidence I13(ii)
+    /// itself requires, so this case re-derives — which is why the
+    /// continuity test is `Some(_)` and NOT `== regime_of(s)`.
+    #[test]
+    fn i13i_persist_window_crash_still_self_heals_under_the_continuity_arm() {
+        let epoch = [4u8; crate::cluster::lineage::DATA_EPOCH_LEN];
+        let (authority, mastered, _other) = f4_boot_fixture(Some(epoch));
+        let table = ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2)], 2, 1, 1);
+        let lineage = crate::cluster::lineage::LineageStore::open(None, epoch, NodeId(1));
+        // The surviving state of the crash: committed regime 3 (persisted),
+        // lineage stamp still at the PRE-commit regime 1 (hook never ran).
+        assert!(lineage.mark_full(mastered, 1, "test: pre-commit stamp"));
+        let serving = crate::cluster::migration::AtomicShardBitmap::new();
+        serving.set_all();
+        boot_rederive_lineage_and_serving(
+            &authority,
+            &lineage,
+            &serving,
+            &table,
+            NodeId(1),
+            2,
+            Some(epoch),
+        );
+        assert_eq!(
+            lineage.lineage(mastered),
+            crate::cluster::lineage::Lineage::Full { regime: 3 },
+            "I13(i) purpose 2: a stamp at the PREVIOUS regime is holder continuity — \
+             the boot re-derivation must lift it to the current regime, or the \
+             persist-window crash strands the shard forever",
+        );
+        assert!(
+            serving.test(mastered),
+            "and the re-derived master's serving is established",
+        );
+    }
+
+    /// NEW-1 (BLOCKING) — I13's core invariant end to end: a node must
+    /// self-observe `Full` to BEGIN serving a shard it was not serving in
+    /// the previous regime.
+    ///
+    /// The interleaving this kills: a membership term re-masters shard `s`
+    /// to node M by PLACEMENT (a death elsewhere), which advances the
+    /// shard's regime. M persists that commit's topology state and dies in
+    /// the window before the lineage hook runs — or is simply restarted
+    /// before any acquisition completes — so it reboots as `s`'s committed
+    /// master having never held one record of it. At RF=2 its replica is
+    /// equally new, so the pair would serve an EMPTY shard as authority
+    /// while the real data sits on the old holders, and the F4 data_epoch
+    /// belt does not fire (nothing was restored — the epochs match).
+    ///
+    /// Boot must leave the shard `Subset` AND the I13 serving gate CLOSED,
+    /// so the mastership answers `Transitioning` (client-invisible,
+    /// retryable) until a real acquisition earns `Full`.
+    #[test]
+    fn new1_newly_acquired_master_reboots_before_acquisition_answers_transitioning() {
+        let epoch = [7u8; crate::cluster::lineage::DATA_EPOCH_LEN];
+        let members = vec![NodeId(1), NodeId(2)];
+        let table = ShardTable::compute_with_epoch(&members, 2, 1, 1);
+        let addrs = [
+            (NodeId(1), "127.0.0.1:4901".parse().unwrap()),
+            (NodeId(2), "127.0.0.1:4902".parse().unwrap()),
+        ];
+        // `mastered` is regime-advanced (regime 3 == the committed term:
+        // the mastership was acquired at the last commit this node
+        // persisted) and self is its committed master.
+        let (authority, mastered, _other) = f4_boot_fixture(Some(epoch));
+
+        let boot = |seed_prior_stamp: bool| {
+            let cluster = new_test_running_cluster(
+                NodeId(1),
+                table.clone(),
+                &addrs,
+                &members,
+                &[],
+                &[],
+                &[],
+                2,
+            );
+            if seed_prior_stamp {
+                // The control: this node WAS a proven holder of the shard
+                // before the commit (the I13(ii) promotion precondition).
+                assert!(cluster.lineage.mark_full(mastered, 1, "test: prior holder"));
+            }
+            boot_rederive_lineage_and_serving(
+                &authority,
+                &cluster.lineage,
+                &cluster.serving_established,
+                &table,
+                NodeId(1),
+                2,
+                Some(epoch),
+            );
+            cluster
+        };
+
+        let acquired_while_down = boot(false);
+        assert_eq!(
+            acquired_while_down.lineage.lineage(mastered),
+            crate::cluster::lineage::Lineage::Subset,
+            "NEW-1: a mastership acquired without ever holding the shard must not \
+             re-derive Full at boot",
+        );
+        match acquired_while_down.is_master(&key_for_shard(mastered)) {
+            MasterQueryResult::Transitioning { .. } => {}
+            other => panic!(
+                "NEW-1: a newly-acquired master that rebooted before any acquisition \
+                 completed must answer Transitioning — serving an empty shard as \
+                 authority loses every UTXO the old holders still have; got {other:?}"
+            ),
+        }
+
+        // Control — the SAME boot with holder continuity serves, so the
+        // narrowing is scoped to the acquisition case and does not gate a
+        // legitimate promotion/standing master.
+        let held_before = boot(true);
+        assert_eq!(
+            held_before.lineage.lineage(mastered),
+            crate::cluster::lineage::Lineage::Full { regime: 3 },
+            "a proven prior holder re-derives Full at the current regime",
+        );
+        match held_before.is_master(&key_for_shard(mastered)) {
+            MasterQueryResult::Yes => {}
+            other => panic!("a master with holder continuity must serve, got {other:?}"),
         }
     }
 
@@ -27749,6 +27984,76 @@ mod tests {
         assert_eq!(
             cluster.handle_replica_converged(1, 103, &[(shard, regime)], 103, n1_master_ip()),
             1,
+        );
+    }
+
+    /// §8 security review round 3, H-2 — a CO-LOCATED topology (two
+    /// committed members on one IP: single-host dev/test clusters,
+    /// host-network pods) makes those members mutually impersonatable for
+    /// opcode 245, because the G-2 guard can only prove "some member at
+    /// this address".
+    ///
+    /// Refusing would kill the §4.3 convergence trigger on every
+    /// single-host cluster, so the frame is still ACCEPTED — but the
+    /// weakened guarantee must be VISIBLE (counter + `teraslab::security`
+    /// WARN) rather than silently inherited. The distinct-IP fixture must
+    /// stay silent on the same path, or the signal is noise.
+    #[test]
+    fn h2_converged_signal_reports_an_ambiguous_co_located_peer() {
+        use crate::metrics::{MigrationMetrics, init_migration_metrics, migration_metrics};
+        use std::sync::OnceLock;
+        static MIG: OnceLock<MigrationMetrics> = OnceLock::new();
+        init_migration_metrics(MIG.get_or_init(MigrationMetrics::new));
+        let ambiguous = || {
+            migration_metrics()
+                .expect("metrics initialized above")
+                .converged_signal_ambiguous_peer
+                .get()
+        };
+
+        // Control: the DISTINCT-IP fixture accepts and reports nothing.
+        let (distinct, shard) = n1_replica_cluster();
+        let regime = distinct.topology_authority.committed_regime(shard);
+        let before = ambiguous();
+        assert_eq!(
+            distinct.handle_replica_converged(1, 100, &[(shard, regime)], 100, n1_master_ip()),
+            1,
+            "control: a distinct-IP master's signal is accepted",
+        );
+        assert_eq!(
+            ambiguous(),
+            before,
+            "H-2: distinct addresses must NOT raise the ambiguity signal",
+        );
+
+        // Co-located: both members registered on ONE IP.
+        let members = vec![NodeId(1), NodeId(2)];
+        let table = ShardTable::compute_with_epoch(&members, 2, 1, 1);
+        let colocated = new_test_running_cluster(
+            NodeId(2),
+            table,
+            &[
+                (NodeId(1), "10.9.0.1:4700".parse().unwrap()),
+                (NodeId(2), "10.9.0.1:4701".parse().unwrap()),
+            ],
+            &members,
+            &[],
+            &[],
+            &[],
+            2,
+        );
+        let before = ambiguous();
+        assert_eq!(
+            colocated.handle_replica_converged(1, 100, &[(shard, regime)], 100, n1_master_ip()),
+            1,
+            "H-2: the signal must still be ACCEPTED — refusing would break every \
+             single-host cluster's §4.3 convergence trigger",
+        );
+        assert!(
+            ambiguous() > before,
+            "H-2: but an id→IP mapping that is not injective must be reported, so a \
+             production deployment that collapses members onto one IP does not inherit \
+             the weakened G-2 guard silently",
         );
     }
 

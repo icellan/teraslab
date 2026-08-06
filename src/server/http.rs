@@ -1444,6 +1444,11 @@ pub(crate) fn render_metrics_text(
             "teraslab_converged_signal_refused_total",
             mm.converged_signal_refused.get(),
         );
+        prom_counter(
+            &mut out,
+            "teraslab_converged_signal_ambiguous_peer_total",
+            mm.converged_signal_ambiguous_peer.get(),
+        );
         prom_gauge(
             &mut out,
             "teraslab_lineage_baseline_gap_shards",
@@ -1458,6 +1463,11 @@ pub(crate) fn render_metrics_text(
             &mut out,
             "teraslab_regime_ratchet_rejections_total",
             mm.regime_ratchet_rejections.get(),
+        );
+        prom_gauge(
+            &mut out,
+            "teraslab_regime_ratchet_rejection_streak",
+            mm.regime_ratchet_rejection_streak.load(Ordering::Relaxed) as u64,
         );
     }
     if let Some(sw) = swim_metrics() {

@@ -740,16 +740,54 @@ impl LineageStore {
     /// I13(i) + boot fail-closed re-derivation, run once at clustered boot
     /// against the LOADED committed state:
     ///
-    /// * `committed_master_is_self(s)` ⇒ `Full { regime_of(s) }`
-    ///   REGARDLESS of the stored stamp (I13i: the node's own baseline +
-    ///   intact replayed redo tail IS the shard's authoritative copy —
-    ///   reaching clustered startup at all requires boot recovery over the
-    ///   node's own un-reclaimed redo to have succeeded; a corrupt or
+    /// * `committed_master_is_self(s)` AND the node has CONTINUITY for `s`
+    ///   ⇒ `Full { regime_of(s) }` (I13i: the node's own baseline + intact
+    ///   replayed redo tail IS the shard's authoritative copy — reaching
+    ///   clustered startup at all requires boot recovery over the node's
+    ///   own un-reclaimed redo to have succeeded; a corrupt or
     ///   reclaimed-needed-range redo fails boot upstream).
     /// * otherwise a stored `Full { r }` survives ONLY when the node is in
     ///   the shard's holder set AND `r == regime_of(s)` — a reboot cannot
     ///   prove holder-set continuity across the down window, so any regime
     ///   discrepancy degrades (fail-closed).
+    ///
+    /// CONTINUITY (NEW-1) is `regime_of(s) == 0 || stored stamp is Some`,
+    /// and it is what scopes the master arm to the two cases I13(i) names
+    /// — it is NOT a general "the committed master always wins" rule:
+    ///
+    /// * **Why it is needed.** "Committed master at boot" includes a
+    ///   mastership this node ACQUIRED at the last commit it persisted
+    ///   (placement re-mastering after a death, or an override) without
+    ///   ever holding the shard's data. Granting `Full` there re-opens
+    ///   I13's core invariant — the node begins serving, as authority, a
+    ///   shard it never acquired; at RF=2 with an equally-new replica the
+    ///   pair serves an EMPTY shard while the real data sits on the old
+    ///   holders. The F4 epoch belt does not catch it (nothing was
+    ///   restored, so the epochs match).
+    /// * **Why `Some(_)` at ANY regime, not `== regime_of(s)`.** A stored
+    ///   stamp means "this node's copy of `s` was complete as of the last
+    ///   commit it applied, and it has been in the holder set at every
+    ///   commit since" (`apply_commit_transitions` clears the stamp the
+    ///   moment the node leaves the holder set). That is EXACTLY I13(ii)'s
+    ///   own precondition ("lineage at install is `Full` at the
+    ///   pre-override regime"), so this arm re-derives at boot precisely
+    ///   what the online commit-install would have installed — no more
+    ///   permissive. Requiring `== regime_of(s)` would instead BREAK
+    ///   I13(i)'s second stated purpose: `handle_commit_durable` persists
+    ///   the topology state BEFORE running the lineage hook, so a crash in
+    ///   that window comes back with the NEW committed regime and the
+    ///   stamp still at the PREVIOUS one — the very case that must
+    ///   self-heal.
+    /// * **Why `regime_of(s) == 0` grants with no stamp at all.** Regime 0
+    ///   means the shard's mastership has NEVER moved (`derive_regime_block`
+    ///   raises the entry to the carrying term on every master change), so
+    ///   there is no transition for I13 to gate — the online derivation
+    ///   calls exactly this case `gate_inactive`. It is what keeps a LOST
+    ///   lineage file from total-outaging a healthy node on the shards it
+    ///   has mastered since formation. Shards whose mastership HAS moved
+    ///   cannot be told apart from a fresh acquisition once the file is
+    ///   gone, and fail closed (they re-earn through the §4.3 completion
+    ///   triggers).
     ///
     /// One durable write; a persist failure here is logged (the masters'
     /// stamps are re-derived on every boot, so nothing is lost that the
@@ -764,10 +802,13 @@ impl LineageStore {
         let mut changed = false;
         let mut rederived = 0usize;
         let mut degraded = 0usize;
+        let mut gated = 0usize;
         for shard in 0..NUM_SHARDS as u16 {
             let idx = shard as usize;
-            if committed_master_is_self(shard) {
-                let regime = regime_of(shard);
+            let regime = regime_of(shard);
+            // NEW-1 — holder continuity, see the doc comment above.
+            let continuity = regime == 0 || state.stamps[idx].is_some();
+            if committed_master_is_self(shard) && continuity {
                 if state.stamps[idx] != Some(regime) {
                     state.stamps[idx] = Some(regime);
                     rederived += 1;
@@ -775,7 +816,7 @@ impl LineageStore {
                 }
                 self.full_bits.set(shard);
             } else if let Some(stamp) = state.stamps[idx] {
-                if in_holder_set(shard) && stamp == regime_of(shard) {
+                if in_holder_set(shard) && stamp == regime {
                     self.full_bits.set(shard);
                 } else {
                     state.stamps[idx] = None;
@@ -783,16 +824,26 @@ impl LineageStore {
                     degraded += 1;
                     changed = true;
                 }
+            } else if committed_master_is_self(shard) {
+                // Committed master, regime-advanced, no stored stamp: the
+                // mastership was acquired without a proven copy. Already
+                // `Subset` (nothing to change); counted so the boot log
+                // names the shards whose serving stays I13-gated.
+                gated += 1;
             }
         }
-        if changed {
+        if changed || gated > 0 {
             tracing::info!(
                 rederived,
                 degraded,
-                "lineage: boot re-derivation (I13i masters re-stamped; stale non-master \
-                 stamps degraded)",
+                gated,
+                "lineage: boot re-derivation (I13i masters with holder continuity \
+                 re-stamped; stale non-master stamps degraded; committed masterships \
+                 with no proven copy left Subset)",
             );
-            if !self.persist_locked(&state) {
+            // Only a STAMP change needs a durable write; `gated` shards are
+            // already `Subset` on disk and only affect the log line above.
+            if changed && !self.persist_locked(&state) {
                 tracing::error!(
                     "lineage: durable write of boot re-derivation failed — continuing with \
                      the in-memory derivation (re-derived on every boot)",
@@ -836,6 +887,20 @@ impl LineageStore {
 /// shard order (only `Full` shards are present in the first list — an
 /// absent shard IS `Subset`; only baseline-GAP shards are present in the
 /// second — §8 review round 2, N1).
+///
+/// § RUNBOOK — DOWNGRADE (§8 review round 3, NEW-3). The baseline-gap
+/// trailer is OPTIONAL and TRAILING, which makes the format
+/// forward-tolerant but NOT downgrade-safe in effect: a binary from before
+/// N1 emits no trailer at all, so the first time an older build rewrites
+/// this file (any commit install, any `Full`/`Subset` transition) every
+/// RECORDED BASELINE GAP is silently discarded. The shards' `Full`/`Subset`
+/// stamps survive; the "this copy has a hole an out-of-band transfer never
+/// filled" bit does not — and the §4.3 catch-up-convergence signal will
+/// then happily certify such a shard `Full`, because the flag it consults
+/// is gone. **After a downgrade past this build, any shard that carried a
+/// baseline gap needs a full resync** (the operator-visible pre-downgrade
+/// signal is the `lineage_baseline_gap_shards` gauge; a value of zero at
+/// downgrade time means nothing is at risk).
 fn encode_lineage_file(
     data_epoch: &[u8; DATA_EPOCH_LEN],
     node_id: NodeId,
@@ -870,6 +935,22 @@ type DecodedLineageFile = ([u8; DATA_EPOCH_LEN], NodeId, Vec<(u16, u64)>, Vec<u1
 /// to all-`Subset`): bad envelope/checksum, truncated body, out-of-range
 /// shard, non-ascending/duplicate entries, `count > NUM_SHARDS`, or
 /// trailing bytes.
+///
+/// § VERSION SKEW (§8 review round 3, NEW-3/H-3). A body that ends before
+/// the baseline-gap trailer is a PRE-N1 sidecar and decodes as an EMPTY gap
+/// set. That is the exact answer for a file written by a build that could
+/// not record gaps — and it is also indistinguishable from "this build
+/// recorded gaps and there were none", which is why the absent-trailer arm
+/// WARNS: a shard whose out-of-band transfer was aborted under the earlier
+/// binary genuinely HAS a baseline gap that this file cannot express, and
+/// the §4.3 convergence signal would certify it `Full`. See
+/// [`encode_lineage_file`] for the matching downgrade runbook note.
+///
+/// Deliberately NOT handled by bumping the envelope version (which would
+/// make a v1 sidecar decode as an identity mismatch): that turns a
+/// stage-N/CI state file into a refuse-to-start and drags every other
+/// consumer of the shared envelope along. The recovery here is cheap and
+/// operator-chosen — delete the sidecar and let the shards re-earn.
 fn decode_lineage_file(bytes: &[u8]) -> Result<DecodedLineageFile, LineageDecodeError> {
     let (body, end) = decode_envelope(bytes, 0, LINEAGE_STATE_ENVELOPE_MAGIC)
         .map_err(LineageDecodeError::Envelope)?;
@@ -931,7 +1012,23 @@ fn decode_lineage_file(bytes: &[u8]) -> Result<DecodedLineageFile, LineageDecode
     // is the exact (not a defaulted) answer. Anything else must decode
     // canonically or the whole file is rejected (fail-closed all-Subset).
     let mut gap_shards = Vec::new();
-    if body.len() != pos {
+    if body.len() == pos {
+        // §8 review round 3, H-3 — "exactly empty" is the correct decode
+        // and STILL a silent hole: a shard whose out-of-band transfer was
+        // aborted under the earlier binary has a real baseline gap this
+        // file cannot express, and the §4.3 convergence signal will stamp
+        // it `Full`. Applies to every test/CI cluster carried across
+        // stage builds, and to any downgrade-then-upgrade cycle.
+        tracing::warn!(
+            entries = entries.len(),
+            "lineage: sidecar predates the baseline-gap trailer — GAP STATE IS UNKNOWN \
+             for this file's shards. A copy whose out-of-band transfer was aborted under \
+             the older binary carries an unrecorded hole, and the catch-up-convergence \
+             signal will certify it complete. If this node ran a build without the gap \
+             trailer, delete the lineage sidecar and let its shards re-earn Full through \
+             the §4.3 completion triggers.",
+        );
+    } else {
         if body.len() < pos + 2 {
             return Err(LineageDecodeError::Truncated);
         }
@@ -1167,12 +1264,20 @@ mod tests {
         );
     }
 
-    /// I13(i) — boot re-derivation stamps committed-master shards Full at
-    /// the current regime REGARDLESS of the stored stamp, degrades a
-    /// non-master stamp whose regime lags, and keeps a non-master holder
-    /// stamp at the current regime.
+    /// I13(i) — boot re-derivation is scoped to HOLDER CONTINUITY.
+    ///
+    /// The master arm re-stamps `Full { regime_of(s) }` only for a shard
+    /// this node can prove it already held: a stored stamp (at ANY regime
+    /// — see `boot_rederive`'s doc for why equality would break the
+    /// persist-window self-heal), or a regime-0 shard whose mastership has
+    /// never moved. A committed-master shard with a regime-advanced
+    /// mastership and NO stored stamp is a mastership the node acquired
+    /// without ever holding the data — it stays `Subset` (NEW-1).
+    ///
+    /// The non-master arm is unchanged: a stored `Full { r }` survives only
+    /// in the holder set at `r == regime_of(s)`.
     #[test]
-    fn i13_boot_rederivation_regardless_of_stamp() {
+    fn i13i_boot_rederivation_requires_holder_continuity() {
         let dir = tmpdir("boot-rederive");
         let path = dir.join("lineage");
         let store = LineageStore::open(Some(path.clone()), EPOCH_A, NodeId(1));
@@ -1181,18 +1286,26 @@ mod tests {
         assert!(store.mark_full(3, 6, "current replica stamp"));
         drop(store);
         let store = LineageStore::open(Some(path), EPOCH_A, NodeId(1));
-        // Committed state: self masters shards 0 and 1; holder (replica) of
-        // 2 and 3; current regime is 6 everywhere.
-        store.boot_rederive(&|s| s == 0 || s == 1, &|s| (2..=3).contains(&s), &|_| 6);
+        // Committed state: self masters shards 0, 1 and 4; holder (replica)
+        // of 2 and 3; current regime is 6 everywhere EXCEPT shard 4, whose
+        // mastership has never moved (regime 0 — the I13 gate is inactive).
+        store.boot_rederive(
+            &|s| s == 0 || s == 1 || s == 4,
+            &|s| (2..=3).contains(&s),
+            &|s| if s == 4 { 0 } else { 6 },
+        );
         assert_eq!(
             store.lineage(0),
-            Lineage::Full { regime: 6 },
-            "I13i: a committed master re-derives Full even with NO stored stamp",
+            Lineage::Subset,
+            "NEW-1: a committed master with NO stored stamp on a REGIME-ADVANCED shard \
+             acquired the mastership without ever holding the copy — it must NOT \
+             re-derive Full",
         );
         assert_eq!(
             store.lineage(1),
             Lineage::Full { regime: 6 },
-            "I13i: a committed master re-derives Full REGARDLESS of a stale stamp",
+            "I13i: a committed master with a stored stamp (holder continuity) re-derives \
+             Full at the CURRENT regime — this is the persist-window self-heal",
         );
         assert_eq!(
             store.lineage(2),
@@ -1203,6 +1316,12 @@ mod tests {
             store.lineage(3),
             Lineage::Full { regime: 6 },
             "a non-master holder stamp at the current regime survives boot",
+        );
+        assert_eq!(
+            store.lineage(4),
+            Lineage::Full { regime: 0 },
+            "I13i: a regime-0 mastership has never moved, so there is no transition to \
+             gate — it re-derives with no stamp (the lost-lineage-file guarantee)",
         );
     }
 
