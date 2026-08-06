@@ -333,6 +333,29 @@ fn wait_for_settled_three_node_topology(nodes: &[&TestNode]) {
             match stable_since {
                 Some((v, since)) if v == version => {
                     if since.elapsed() >= Duration::from_millis(500) {
+                        // P1 stage 3 (§4.3): the held-copy sweep is now
+                        // lineage-gated (self-observed Subset fences
+                        // `SweepRole::HeldCopy`). These fixtures form the
+                        // cluster EMPTY and only then write records through
+                        // the replicated path, so every holder's copy is
+                        // genuinely complete — but none of the §4.3
+                        // completion triggers (migration / heal / resync
+                        // completion) ever fires for these shards, and the
+                        // catch-up-watermark completion (transition (i))
+                        // needs the master→replica completeness signal that
+                        // lands with stage 4. Stamp Full explicitly to model
+                        // the steady state these sweep/repair tests assume;
+                        // the tests below then exercise the sweep mechanics,
+                        // not lineage earning.
+                        let stamps: Vec<(u16, u64)> = (0..teraslab::cluster::shards::NUM_SHARDS
+                            as u16)
+                            .map(|s| (s, 0))
+                            .collect();
+                        for node in nodes {
+                            node.cluster
+                                .lineage()
+                                .mark_full_many(&stamps, "test: steady-state complete copies");
+                        }
                         return;
                     }
                 }

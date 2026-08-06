@@ -473,3 +473,100 @@ fn restore_refuses_geometry_mismatch() {
         other => panic!("expected GeometryMismatch, got {other:?}"),
     }
 }
+
+/// P1 stage 3 (design §4.3) — `restore()` treats the restored image as a NEW
+/// data lineage: it deletes the per-shard lineage sidecar and the
+/// inbound/outbound migration-fence files OUTRIGHT (fail-closed — the node
+/// boots all-Subset and re-earns Full over the intact baseline) and stamps a
+/// FRESH `data_epoch` identity, so any pre-restore lineage stamps that
+/// somehow survive elsewhere degrade via the identity mismatch.
+#[test]
+fn restore_deletes_lineage_and_migration_fence_state_and_stamps_fresh_epoch() {
+    // --- Source: minimal engine + one record + a backup.
+    let src_dir = TempDir::new().unwrap();
+    let config = source_config(src_dir.path());
+    let dev_path = config.device_paths[0].clone();
+    let dev: Arc<dyn BlockDevice> =
+        Arc::new(DirectDevice::open(&dev_path, DEVICE_SIZE, ALIGN).unwrap());
+    let seg = SegmentAllocator::new(dev.clone(), SEG).unwrap();
+    let engine = Engine::new(
+        dev.clone(),
+        Index::new(256).unwrap(),
+        seg,
+        StripedLocks::new(256),
+        DahIndex::new(),
+    );
+    write_record(&engine, 1);
+    engine.persist_allocator().unwrap();
+    dev.sync().unwrap();
+
+    let backup_root = TempDir::new().unwrap();
+    let target = backup_root.path().join("bk-lineage");
+    let params = BackupParams {
+        throttle_bytes_per_sec: 0,
+        min_headroom_segments: 1,
+        abort_headroom_segments: 0,
+        ..BackupParams::default()
+    };
+    let cancel = AtomicBool::new(false);
+    let progress = Mutex::new(BackupProgress::default());
+    let blob_pause = AtomicBool::new(false);
+    run_backup(
+        &engine,
+        &blob_pause,
+        &config,
+        &params,
+        &target,
+        &cancel,
+        &progress,
+    )
+    .expect("backup should succeed");
+    drop(engine);
+    drop(dev);
+
+    // --- Restore target with PRE-EXISTING cluster sidecar state, as if the
+    //     node had a prior life: lineage + inbound/outbound fences + an old
+    //     data-epoch stamp.
+    let restore_dir = TempDir::new().unwrap();
+    let mut rconfig = config.clone();
+    rconfig.device_paths = vec![restore_dir.path().join("data.dat")];
+    rconfig.redo_log_path = Some(restore_dir.path().join("data.dat.redo"));
+    rconfig.index_snapshot_path = restore_dir.path().join("data.dat.snap");
+
+    let cluster_path = rconfig.resolved_cluster_state_path();
+    let sidecar = |suffix: &str| {
+        let mut s = cluster_path.as_os_str().to_os_string();
+        s.push(suffix);
+        std::path::PathBuf::from(s)
+    };
+    let inbound = sidecar(".inbound");
+    let outbound = sidecar(".outbound");
+    let lineage = teraslab::cluster::lineage::lineage_state_path(&cluster_path);
+    let epoch_path = teraslab::cluster::lineage::data_epoch_path(&cluster_path);
+    for p in [&inbound, &outbound, &lineage] {
+        std::fs::write(p, b"pre-restore cluster state").unwrap();
+    }
+    let old_epoch = teraslab::cluster::lineage::stamp_fresh_data_epoch(&epoch_path)
+        .expect("pre-restore epoch stamps");
+
+    restore(&target, &rconfig).expect("restore should succeed");
+
+    // §4.3: the lineage and inbound/outbound state files are DELETED.
+    assert!(
+        !inbound.exists(),
+        "restore must delete the inbound migration-fence file"
+    );
+    assert!(
+        !outbound.exists(),
+        "restore must delete the outbound migration-state file"
+    );
+    assert!(!lineage.exists(), "restore must delete the lineage sidecar");
+    // §4.3: a FRESH data_epoch is stamped (a different identity from the
+    // pre-restore one), durably readable by the next boot.
+    let new_epoch = teraslab::cluster::lineage::load_or_create_data_epoch(&epoch_path)
+        .expect("restored epoch loads");
+    assert_ne!(
+        old_epoch, new_epoch,
+        "restore must mint a FRESH data-epoch identity"
+    );
+}

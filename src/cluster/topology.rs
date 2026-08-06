@@ -381,7 +381,11 @@ fn expect_tag(data: &[u8], pos: &mut usize, tag: u8) -> Result<(), RegimeDecodeE
 /// Wrap `body` in the versioned, length-prefixed, integrity-checked
 /// envelope `[magic:4][version:u16][len:u32][body][sha256:32]`. The
 /// checksum covers everything before it (magic + version + len + body).
-fn encode_envelope(magic: [u8; 4], body: &[u8]) -> Vec<u8> {
+///
+/// `pub(crate)` so the P1 stage 3 lineage sidecar
+/// (`crate::cluster::lineage`) reuses the exact same envelope framing as
+/// the topology state file instead of growing a second implementation.
+pub(crate) fn encode_envelope(magic: [u8; 4], body: &[u8]) -> Vec<u8> {
     let mut buf = Vec::with_capacity(4 + 2 + 4 + body.len() + 32);
     buf.extend_from_slice(&magic);
     buf.extend_from_slice(&REGIME_ENVELOPE_VERSION.to_le_bytes());
@@ -395,7 +399,9 @@ fn encode_envelope(magic: [u8; 4], body: &[u8]) -> Vec<u8> {
 /// Parse an envelope starting at `data[pos]`. Returns the body slice and
 /// the position just past the trailing checksum. Every failure is a hard
 /// reject — a short read never yields a default.
-fn decode_envelope(
+///
+/// `pub(crate)` for the same reason as [`encode_envelope`].
+pub(crate) fn decode_envelope(
     data: &[u8],
     pos: usize,
     magic: [u8; 4],
@@ -1645,7 +1651,33 @@ pub struct TopologyAuthority {
     /// `peer_placement_support` map, whose forever-monotonic semantics are
     /// deliberately unchanged.
     peer_regime_adverts: RwLock<std::collections::HashMap<NodeId, PeerRegimeAdvert>>,
+    /// P1 stage 3 (I2 / I13ii) — optional lineage install hook, run by
+    /// [`Self::handle_commit_durable`] INSIDE the `commit_apply` critical
+    /// section, after the topology-state persist succeeds and strictly
+    /// BEFORE `apply_commit_locked` advances `committed_term`. The
+    /// coordinator installs a closure that applies the per-commit lineage
+    /// transitions (holder-exit degrade, I2 stamp refresh, I13ii promotion
+    /// re-stamp) and durably persists them as ONE batched write. A `false`
+    /// return fails the commit closed (`PersistFailed`) — the node stays
+    /// on its prior term rather than serve a term whose lineage re-stamp
+    /// it could forget (the I13ii durable-before-serving half; the crash
+    /// window between the topology persist and this hook is self-healed by
+    /// I13i's regardless-of-stamp boot re-derivation).
+    ///
+    /// This is NOT an apply gate in the I0 sense: it never inspects the
+    /// commit's content to decide acceptance — it can only fail on a local
+    /// durability fault, exactly like the topology-state persist itself.
+    ///
+    /// Lock discipline: the hook runs under `commit_apply` (the outermost
+    /// lock) and may take short read locks (e.g. the shard table) but must
+    /// never acquire a lock that is ever held while calling
+    /// `handle_commit_durable`.
+    commit_install_hook: RwLock<Option<CommitInstallHook>>,
 }
+
+/// P1 stage 3 — the lineage commit-install hook type (see
+/// [`TopologyAuthority::set_commit_install_hook`]).
+pub type CommitInstallHook = Arc<dyn Fn(&PersistedTopologyState) -> bool + Send + Sync>;
 
 /// P1 stage 1 — structured refusals from the same-membership P1 producers
 /// (`propose_regime_enforced`, `propose_promotion_enabled`,
@@ -1753,7 +1785,16 @@ impl TopologyAuthority {
             promotion_proposal_opt_in: std::sync::atomic::AtomicBool::new(false),
             self_incarnation: AtomicU64::new(0),
             peer_regime_adverts: RwLock::new(std::collections::HashMap::new()),
+            commit_install_hook: RwLock::new(None),
         }
+    }
+
+    /// P1 stage 3 — install the lineage commit-install hook (see the
+    /// `commit_install_hook` field docs for the exact contract). Installed
+    /// once by the coordinator at wiring time; a second call replaces the
+    /// hook (tests).
+    pub fn set_commit_install_hook(&self, hook: CommitInstallHook) {
+        *self.commit_install_hook.write().unwrap() = Some(hook);
     }
 
     /// E-01 — record an observed cluster size. Monotonic: only raises the
@@ -3417,6 +3458,19 @@ impl TopologyAuthority {
         }
         let state = self.persisted_state_for_commit(commit, peak, incarnation);
         if !persist(&state) {
+            return DurableCommitOutcome::PersistFailed;
+        }
+        // P1 stage 3 (I2 / I13ii) — run the lineage install hook inside the
+        // same `commit_apply` critical section, after the topology persist,
+        // strictly before `apply_commit_locked` advances `committed_term`.
+        // A hook failure is fail-closed: the commit is NOT applied and the
+        // node stays on its prior term (see the field docs; the
+        // topology-state-persisted-but-hook-failed crash/refusal window is
+        // exactly the I13i regardless-of-stamp boot re-derivation case).
+        let hook = self.commit_install_hook.read().unwrap().clone();
+        if let Some(hook) = hook
+            && !hook(&state)
+        {
             return DurableCommitOutcome::PersistFailed;
         }
         if self.apply_commit_locked(commit) {

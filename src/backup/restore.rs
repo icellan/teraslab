@@ -135,6 +135,43 @@ pub fn restore(backup_dir: &Path, config: &ServerConfig) -> Result<(), BackupErr
         std::fs::write(&dst, &bytes).map_err(BackupError::Io)?;
     }
 
+    // 11. Cluster lineage + migration-fence state (P1 stage 3, design §4.3).
+    //     A restored image is a DIFFERENT data lineage from whatever this
+    //     node held before: every per-shard Full/Subset stamp and every
+    //     inbound/outbound migration-fence record refers to the pre-restore
+    //     copy, so they are deleted OUTRIGHT (fail-closed — the restored
+    //     node boots all-`Subset` and re-earns `Full` through the normal
+    //     catch-up / heal machinery), and a FRESH `data_epoch` identity is
+    //     stamped so any surviving stale lineage file elsewhere (or a clone
+    //     of the pre-restore dir) degrades via the identity mismatch. The
+    //     restore runbook documents this.
+    let cluster_state_path = config.resolved_cluster_state_path();
+    for sidecar in [
+        {
+            let mut s = cluster_state_path.as_os_str().to_os_string();
+            s.push(".inbound");
+            PathBuf::from(s)
+        },
+        {
+            let mut s = cluster_state_path.as_os_str().to_os_string();
+            s.push(".outbound");
+            PathBuf::from(s)
+        },
+        crate::cluster::lineage::lineage_state_path(&cluster_state_path),
+    ] {
+        match std::fs::remove_file(&sidecar) {
+            Ok(()) => {
+                crate::fsutil::fsync_parent_dir(&sidecar).map_err(BackupError::Io)?;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(BackupError::Io(e)),
+        }
+    }
+    crate::cluster::lineage::stamp_fresh_data_epoch(&crate::cluster::lineage::data_epoch_path(
+        &cluster_state_path,
+    ))
+    .map_err(BackupError::Io)?;
+
     Ok(())
 }
 

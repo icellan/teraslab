@@ -2301,6 +2301,7 @@ fn valid_redo_range(range: (u64, u64)) -> bool {
 fn begin_replication_intent_with_tracker(
     range: (u64, u64),
     keys: &[TxKey],
+    regime_stamps: &[(u16, u64)],
     tracker: Option<&crate::replication::durable::ReplicationIntentTracker>,
 ) -> std::result::Result<(), String> {
     if !valid_redo_range(range) {
@@ -2308,10 +2309,32 @@ fn begin_replication_intent_with_tracker(
     }
     if let Some(tracker) = tracker {
         tracker
-            .begin(range.0, range.1, keys)
+            .begin_with_regimes(range.0, range.1, keys, regime_stamps)
             .map_err(|e| format!("replication intent begin: {e}"))?;
     }
     Ok(())
+}
+
+/// P1 stage 3 (I5) — the `(shard, committed_regime)` stamps a replication
+/// intent is created under: one entry per distinct shard of `keys`, in
+/// ascending shard order, stamped from the sender's INSTALLED committed
+/// regime state. Empty when unclustered (no regime to record). Recorded
+/// regardless of `regime_enforced` — pre-enforcement both sides are 0 and
+/// the supersession check is a no-op, so behaviour is unchanged until
+/// regimes actually move.
+fn intent_regime_stamps(cluster: Option<&RunningCluster>, keys: &[TxKey]) -> Vec<(u16, u64)> {
+    let Some(cluster) = cluster else {
+        return Vec::new();
+    };
+    let mut shards: std::collections::BTreeSet<u16> = std::collections::BTreeSet::new();
+    for key in keys {
+        shards.insert(ShardTable::shard_for_key(key));
+    }
+    let authority = cluster.topology_authority();
+    shards
+        .into_iter()
+        .map(|shard| (shard, authority.committed_regime(shard)))
+        .collect()
 }
 
 /// Collect the EXACT key set of a batch of redo ops for the replication intent.
@@ -2375,11 +2398,16 @@ fn write_replicated_redo_ops(
     redo_log: Option<&Mutex<RedoLog>>,
     ops: &[RedoOp],
 ) -> std::result::Result<(u64, u64), String> {
+    // I5: pre-compute the (shard, regime) creation stamps from the SAME key
+    // set the intent will record, so recovery can detect supersession.
+    let keys = intent_keys_from_redo_ops(ops);
+    let stamps = intent_regime_stamps(cluster, &keys);
     write_replicated_redo_ops_with_tracker(
         engine,
         replication_active(cluster),
         redo_log,
         ops,
+        &stamps,
         REPLICATION_INTENT_TRACKER.get(),
     )
 }
@@ -2389,6 +2417,7 @@ fn write_replicated_redo_ops_with_tracker(
     replication_applicable: bool,
     redo_log: Option<&Mutex<RedoLog>>,
     ops: &[RedoOp],
+    regime_stamps: &[(u16, u64)],
     tracker: Option<&crate::replication::durable::ReplicationIntentTracker>,
 ) -> std::result::Result<(u64, u64), String> {
     let range = write_redo_ops(engine, redo_log, ops)?;
@@ -2401,9 +2430,10 @@ fn write_replicated_redo_ops_with_tracker(
         // The intent carries THIS RPC's exact key set (derived from the redo
         // ops being written) so startup recovery replays only these keys from
         // the merged redo window — never a foreign op whose global sequence
-        // happened to interleave into [first..last].
+        // happened to interleave into [first..last] — plus the I5
+        // `(shard, regime)` stamps it was created under.
         let keys = intent_keys_from_redo_ops(ops);
-        begin_replication_intent_with_tracker(range, &keys, tracker)?;
+        begin_replication_intent_with_tracker(range, &keys, regime_stamps, tracker)?;
     }
     Ok(range)
 }
@@ -2887,12 +2917,55 @@ fn filter_set_mined_batch_to_owned(
     }
 }
 
+/// P1 stage 3 (I5/§4.9) — a replication fan-out failure carrying the TYPED
+/// stale-regime evidence the compensation escalation needs alongside the
+/// human-readable message. `stale_regime_shards` lists every shard for
+/// which a receiver NAKed a batch of this fan-out with `ERR_STALE_REGIME`
+/// (empty for every other failure class).
+#[derive(Debug)]
+struct ReplicationFanoutError {
+    /// The failure message (what the pre-typed String error carried).
+    message: String,
+    /// Shards a receiver rejected as stale-regime (provably demoted-sender
+    /// evidence — the §4.9 escalation trigger).
+    stale_regime_shards: Vec<u16>,
+}
+
+impl From<String> for ReplicationFanoutError {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            stale_regime_shards: Vec::new(),
+        }
+    }
+}
+
+impl std::fmt::Display for ReplicationFanoutError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
 fn replicate_all_ops(
     cluster: Option<&RunningCluster>,
     ops_by_key: &[(TxKey, Vec<ReplicaOp>)],
     redo_seq_range: (u64, u64),
     intent_ranges: &[(u64, u64)],
 ) -> std::result::Result<ReplicationOutcome, String> {
+    replicate_all_ops_typed(cluster, ops_by_key, redo_seq_range, intent_ranges)
+        .map_err(|e| e.message)
+}
+
+/// [`replicate_all_ops`] with the typed [`ReplicationFanoutError`] — the
+/// compensation path uses this so a stale-regime NAK survives as evidence
+/// for the §4.9 per-class escalation instead of being flattened into a
+/// string.
+fn replicate_all_ops_typed(
+    cluster: Option<&RunningCluster>,
+    ops_by_key: &[(TxKey, Vec<ReplicaOp>)],
+    redo_seq_range: (u64, u64),
+    intent_ranges: &[(u64, u64)],
+) -> std::result::Result<ReplicationOutcome, ReplicationFanoutError> {
     // `engine` is `None`: the recovery / intent-re-replication / compensation
     // callers of this wrapper have ALREADY made their redo durable (that is why
     // they are replaying it), so the C-1 local-durable-before-ack step below is
@@ -3011,7 +3084,7 @@ fn replicate_all_ops_with_barrier(
     intent_ranges: &[(u64, u64)],
     mut barrier: Option<MutationBarrier<'_>>,
     engine: Option<&Engine>,
-) -> std::result::Result<ReplicationOutcome, String> {
+) -> std::result::Result<ReplicationOutcome, ReplicationFanoutError> {
     let cluster = match cluster {
         Some(c) => c,
         None => return Ok(ReplicationOutcome::NotApplicable),
@@ -3045,7 +3118,8 @@ fn replicate_all_ops_with_barrier(
         if rf > 1 {
             return Err(format!(
                 "replication target resolution failed: no replica targets for RF={rf}",
-            ));
+            )
+            .into());
         }
         clear_replication_intents_after_success(intent_ranges);
         return Ok(ReplicationOutcome::NotApplicable);
@@ -3245,7 +3319,7 @@ fn replicate_all_ops_with_barrier(
     // rather than ACK a write a master crash could still silently drop. On a
     // genuine fault the redo flush already poisoned the log (fail-closed).
     if let Err(e) = local_durable {
-        return Err(format!("local durability before ack failed: {e}"));
+        return Err(format!("local durability before ack failed: {e}").into());
     }
 
     // C15 REPAIR. A replica that NAKed because it does not have a record this
@@ -3300,6 +3374,9 @@ fn replicate_all_ops_with_barrier(
     }
 
     let mut last_error: Option<String> = None;
+    // P1 stage 3 (I5/§4.9) — collect the shards receivers NAKed as
+    // stale-regime so the compensation caller can escalate per op class.
+    let mut stale_regime_shards: Vec<u16> = Vec::new();
     // D-6: the set of addresses that ACKed, used for per-key quorum.
     let mut acked: std::collections::HashSet<SocketAddr> = std::collections::HashSet::new();
     for (addr, result, _) in &results {
@@ -3331,6 +3408,9 @@ fn replicate_all_ops_with_barrier(
                         "replication: replica rejected batch with stale regime — raising topology-staleness signal",
                     );
                     cluster.signal_topology_stale(*local_regime);
+                    if !stale_regime_shards.contains(shard) {
+                        stale_regime_shards.push(*shard);
+                    }
                 }
                 tracing::warn!(err = %e, "replication to replica failed");
                 last_error = Some(e.to_string());
@@ -3379,12 +3459,15 @@ fn replicate_all_ops_with_barrier(
                     "replication: shard's new-side handoff target(s) produced 0 ACKs (best_effort — write proceeds, new master may need full resync)",
                 );
             } else {
-                return Err(format!(
-                    "replication: shard {shard} new-side handoff target(s) produced 0 ACKs of {} target(s); \
-                     migration durability requires at least one new-side handoff ACK per migrating shard: {}",
-                    targets.len(),
-                    last_error.clone().unwrap_or_default()
-                ));
+                return Err(ReplicationFanoutError {
+                    message: format!(
+                        "replication: shard {shard} new-side handoff target(s) produced 0 ACKs of {} target(s); \
+                         migration durability requires at least one new-side handoff ACK per migrating shard: {}",
+                        targets.len(),
+                        last_error.clone().unwrap_or_default()
+                    ),
+                    stale_regime_shards,
+                });
             }
         }
     }
@@ -3423,14 +3506,17 @@ fn replicate_all_ops_with_barrier(
         // best-effort is disabled: the whole batch fails so the caller
         // compensates and returns ERR_REPLICATION_FAILED. The key is named
         // in the error for triage but not surfaced to the client.
-        return Err(format!(
-            "replication: key {:02x}{:02x}{:02x}{:02x}.. reached {key_acks}/{targets} of its own replicas, need {required}: {}",
-            key.txid[0],
-            key.txid[1],
-            key.txid[2],
-            key.txid[3],
-            last_error.unwrap_or_default()
-        ));
+        return Err(ReplicationFanoutError {
+            message: format!(
+                "replication: key {:02x}{:02x}{:02x}{:02x}.. reached {key_acks}/{targets} of its own replicas, need {required}: {}",
+                key.txid[0],
+                key.txid[1],
+                key.txid[2],
+                key.txid[3],
+                last_error.unwrap_or_default()
+            ),
+            stale_regime_shards,
+        });
     }
 
     if any_degraded {
@@ -3499,6 +3585,30 @@ pub fn recover_pending_replication_intents(
         None => return Ok(()),
     };
     let resync_handle = cluster.resync_sender_handle();
+    // Shared push-resync (the C2 mechanism): post an explicit full-shard
+    // resync FROM this node to every replica node of the keys' shards.
+    // Correct only where this node is (still) the shard's authority — the
+    // reclaimed-range arm and the self-mastered half of the I5 conversion.
+    let push_resync = |keys: &[TxKey]| {
+        let table = cluster.shard_table();
+        let table = table.read();
+        let mut per_node: std::collections::BTreeMap<NodeId, std::collections::BTreeSet<u16>> =
+            std::collections::BTreeMap::new();
+        for key in keys {
+            let shard = ShardTable::shard_for_key(key);
+            for replica in table.replicas_for_key(key) {
+                per_node.entry(*replica).or_default().insert(shard);
+            }
+        }
+        for (node, shards) in per_node {
+            if !resync_handle.signal_for_node(node, shards.into_iter().collect()) {
+                tracing::warn!(
+                    node_id = node.0,
+                    "intent-recovery: resync could not be queued (coordinator stopped)",
+                );
+            }
+        }
+    };
     recover_pending_replication_intents_from_tracker(
         tracker,
         redo_log,
@@ -3510,27 +3620,60 @@ pub fn recover_pending_replication_intents(
         },
         |keys| {
             // C2: a reclaimed intent can no longer be incrementally replayed —
-            // post an explicit full-shard resync to every replica node of the
-            // reclaimed keys' shards so the divergent prefix is repaired even if
-            // the lag-monitor catch-up loop would otherwise skip a node whose
-            // ACK watermark already caught up.
-            let table = cluster.shard_table();
-            let table = table.read();
-            let mut per_node: std::collections::BTreeMap<NodeId, std::collections::BTreeSet<u16>> =
-                std::collections::BTreeMap::new();
-            for key in keys {
-                let shard = ShardTable::shard_for_key(key);
-                for replica in table.replicas_for_key(key) {
-                    per_node.entry(*replica).or_default().insert(shard);
+            // resync every replica node of the reclaimed keys' shards so the
+            // divergent prefix is repaired even if the lag-monitor catch-up
+            // loop would otherwise skip a node whose ACK watermark already
+            // caught up.
+            push_resync(keys);
+        },
+        &|shard| cluster.topology_authority().committed_regime(shard),
+        &mut |keys, shards| {
+            // I5 — a regime-superseded intent is never re-shipped; it is
+            // converted to a resync against the CURRENT master:
+            //  * shard mastered by ANOTHER node under the installed committed
+            //    state (the demotion case): PULL the shard from that master
+            //    via the reverse-heal machinery (persisted fence + requester
+            //    loop + RULE-DS) — the narrowest existing mechanism that
+            //    re-converges this node's copy. Per-key pull does not exist
+            //    today (reported residual; I5 reserves full-shard for it).
+            //  * shard mastered by SELF again (re-promoted / derivation says
+            //    self): the replicas are the side that may have missed the
+            //    ops — push the C2 full-shard resync to them.
+            let self_id = cluster.self_id();
+            let authority = cluster.topology_authority();
+            let mut pull_pairs: Vec<(u16, NodeId)> = Vec::new();
+            let mut pull_shards: std::collections::BTreeSet<u16> =
+                std::collections::BTreeSet::new();
+            for &shard in shards {
+                match authority.committed_master(shard) {
+                    Some(master) if master != self_id => {
+                        pull_pairs.push((shard, master));
+                        pull_shards.insert(shard);
+                    }
+                    _ => {}
                 }
             }
-            for (node, shards) in per_node {
-                if !resync_handle.signal_for_node(node, shards.into_iter().collect()) {
-                    tracing::warn!(
-                        node_id = node.0,
-                        "intent-recovery: reclaimed-range resync could not be queued (coordinator stopped)",
-                    );
-                }
+            if !pull_pairs.is_empty() {
+                let fenced = cluster.begin_reverse_heal(&pull_pairs);
+                tracing::warn!(
+                    shards = ?pull_pairs,
+                    newly_fenced = fenced,
+                    "intent-recovery: regime-superseded intent converted to heal pull \
+                     from current master (I5)",
+                );
+            }
+            let push_keys: Vec<TxKey> = keys
+                .iter()
+                .copied()
+                .filter(|k| !pull_shards.contains(&ShardTable::shard_for_key(k)))
+                .collect();
+            if !push_keys.is_empty() {
+                tracing::warn!(
+                    keys = push_keys.len(),
+                    "intent-recovery: regime-superseded intent on self-mastered shard(s) \
+                     converted to push resync of the replicas (I5)",
+                );
+                push_resync(&push_keys);
             }
         },
     )
@@ -3542,12 +3685,14 @@ fn recover_pending_replication_intents_from_tracker<F, R>(
     engine: &Engine,
     mut replicate: F,
     mut resync: R,
+    current_regime: &dyn Fn(u16) -> u64,
+    convert_superseded: &mut dyn FnMut(&[TxKey], &[u16]),
 ) -> std::result::Result<(), String>
 where
     F: FnMut(&[(TxKey, Vec<ReplicaOp>)], (u64, u64)) -> std::result::Result<(), String>,
     R: FnMut(&[TxKey]),
 {
-    let pending = tracker.pending_with_keys();
+    let pending = tracker.pending_with_keys_and_regimes();
     if pending.is_empty() {
         return Ok(());
     }
@@ -3558,7 +3703,48 @@ where
         )
     })?;
 
-    for (range, intent_keys) in pending {
+    for (range, mut intent_keys, regime_stamps) in pending {
+        // I5 — fenced replay: a shard whose committed regime has ADVANCED
+        // past the intent's creation stamp is regime-superseded; its ops are
+        // NEVER re-shipped. Convert those keys to the resync path (the
+        // caller's `convert_superseded` — infallible, so startup NEVER fails
+        // on a superseded intent) and re-ship only the still-current shards'
+        // keys below. An intent left fully superseded is committed outright.
+        let superseded_shards: Vec<u16> = {
+            let mut shards: Vec<u16> = regime_stamps
+                .iter()
+                .filter(|(shard, stamp)| current_regime(*shard) > *stamp)
+                .map(|(shard, _)| *shard)
+                .collect();
+            shards.sort_unstable();
+            shards.dedup();
+            shards
+        };
+        if !superseded_shards.is_empty() {
+            let superseded_set: std::collections::BTreeSet<u16> =
+                superseded_shards.iter().copied().collect();
+            let (converted, remaining): (Vec<TxKey>, Vec<TxKey>) = intent_keys
+                .iter()
+                .copied()
+                .partition(|k| superseded_set.contains(&ShardTable::shard_for_key(k)));
+            tracing::warn!(
+                first_sequence = range.first_sequence,
+                last_sequence = range.last_sequence,
+                superseded_shards = ?superseded_shards,
+                converted_keys = converted.len(),
+                remaining_keys = remaining.len(),
+                "pending replication intent is regime-superseded — converting to resync \
+                 instead of re-shipping (I5)",
+            );
+            convert_superseded(&converted, &superseded_shards);
+            if remaining.is_empty() {
+                tracker
+                    .commit(range.first_sequence, range.last_sequence)
+                    .map_err(|e| format!("replication intent commit: {e}"))?;
+                continue;
+            }
+            intent_keys = remaining;
+        }
         // Membership set for this RPC's OWN keys. Recovery replays exactly
         // these — never a foreign op whose global sequence interleaved into
         // [first..last] under per-store redo (the latent wrong-apply vector).
@@ -4924,6 +5110,7 @@ fn replicate_compensation_intent<F>(
     redo_log: Option<&Mutex<RedoLog>>,
     engine: &Engine,
     comp_range: (u64, u64),
+    cluster: Option<&RunningCluster>,
     mut replicate: F,
 ) -> std::result::Result<(), String>
 where
@@ -4984,9 +5171,15 @@ where
 
     // Register the compensation intent durably with its EXACT key set so a
     // crash before the fan-out completes leaves a marker that startup recovery
-    // re-replicates — filtered to exactly these compensating keys.
+    // re-replicates — filtered to exactly these compensating keys — plus the
+    // I5 `(shard, regime)` stamps it is created under.
     let comp_keys: Vec<TxKey> = ops_by_key.iter().map(|(k, _)| *k).collect();
-    begin_replication_intent_with_tracker(comp_range, &comp_keys, Some(tracker))?;
+    begin_replication_intent_with_tracker(
+        comp_range,
+        &comp_keys,
+        &intent_regime_stamps(cluster, &comp_keys),
+        Some(tracker),
+    )?;
 
     if ops_by_key.is_empty() {
         // Nothing replicable in this range (e.g. only Compensate* markers
@@ -5002,6 +5195,106 @@ where
     replicate(&ops_by_key, comp_range)?;
     commit_replication_intent_with_tracker(comp_range, Some(tracker))?;
     Ok(())
+}
+
+/// §4.9 (I5) — op classes of a compensation batch rejected by the regime
+/// gate. `Spend`, `SetMined`/`SetMinedBatch` and `Freeze` are the
+/// idempotent-monotonic classes the design names SAFE TO DROP under a
+/// stale-regime rejection (the shard's new regime has a new authoritative
+/// master whose state governs); every other class — `Unspend`, `Reassign`,
+/// `SetLocked`, `ExpirePreservation` explicitly, and any class the design
+/// does not name, fail-closed — MUST escalate to a resync against the
+/// current master.
+fn compensation_class_must_escalate(op: &ReplicaOp) -> bool {
+    !matches!(
+        op,
+        ReplicaOp::Spend { .. }
+            | ReplicaOp::SetMined { .. }
+            | ReplicaOp::SetMinedBatch { .. }
+            | ReplicaOp::Freeze { .. }
+    )
+}
+
+/// Outcome of [`escalate_stale_regime_compensation`].
+#[derive(Debug, Default)]
+struct StaleCompensationEscalation {
+    /// Must-escalate shards for which a heal pull from a committed holder
+    /// was registered (or was already in flight — idempotent).
+    sourced_shards: Vec<u16>,
+    /// Must-escalate shards for which NO heal source could be selected;
+    /// the compensation intent stays pending for these.
+    unsourced_shards: Vec<u16>,
+    /// Ops in the §4.9 idempotent-monotonic classes on stale shards,
+    /// dropped with a log (design: safe to drop).
+    dropped_monotonic_ops: usize,
+    /// Whether EVERY compensating op was resolved (escalated with a source
+    /// or safely dropped) — only then may the compensation intent be
+    /// committed.
+    all_resolved: bool,
+}
+
+/// §4.9 / I5 — escalate a stale-regime-rejected compensation batch.
+///
+/// For every compensating op whose shard the receiver NAKed as stale
+/// regime: a must-escalate class op triggers a resync of that shard
+/// against the current master — implemented as the reverse-heal PULL from
+/// a committed holder (`begin_reverse_heal`: raises the persisted
+/// no-serve-before-heal fence, degrades the shard's lineage (§4.3 trigger
+/// d) and re-converges this node's copy from the source through RULE-DS +
+/// generation idempotency). Idempotent-monotonic ops are dropped with a
+/// log.
+///
+/// GRANULARITY (I5's reserved case, reported as a residual): the design
+/// asks for a **per-key** resync against the current master; no per-key
+/// PULL mechanism exists in the codebase today (the per-key
+/// `repair_missing_record_target` path is a master→replica PUSH — the
+/// wrong direction for a demoted sender), so this uses the narrowest
+/// existing mechanism that actually re-converges the key: the full-shard
+/// heal pull.
+fn escalate_stale_regime_compensation(
+    cluster: &RunningCluster,
+    ops_by_key: &[(TxKey, Vec<ReplicaOp>)],
+    stale_shards: &[u16],
+) -> StaleCompensationEscalation {
+    let stale: std::collections::BTreeSet<u16> = stale_shards.iter().copied().collect();
+    let mut escalate_shards: std::collections::BTreeSet<u16> = std::collections::BTreeSet::new();
+    let mut dropped_monotonic_ops = 0usize;
+    let mut unresolved_ops = 0usize;
+    for (key, ops) in ops_by_key {
+        let shard = ShardTable::shard_for_key(key);
+        if !stale.contains(&shard) {
+            // Rejected alongside the stale shard(s) but not itself proven
+            // stale: keep the ordinary pending-intent re-drive for it.
+            unresolved_ops += 1;
+            continue;
+        }
+        if ops.iter().any(compensation_class_must_escalate) {
+            escalate_shards.insert(shard);
+        } else {
+            dropped_monotonic_ops += 1;
+        }
+    }
+    let shards: Vec<u16> = escalate_shards.iter().copied().collect();
+    // Source selection: the boot-heal fallback (committed replica set,
+    // preferring live holders) — a stale-regime NAK proves at least one
+    // committed holder is ahead, and the holder set is preserved across
+    // promotions (I3), so a source essentially always resolves.
+    let empty_view = std::collections::HashMap::new();
+    let sources = cluster.select_reverse_heal_sources(&shards, &empty_view);
+    let _newly_fenced = cluster.begin_reverse_heal(&sources);
+    let sourced: std::collections::BTreeSet<u16> = sources.iter().map(|(s, _)| *s).collect();
+    let unsourced_shards: Vec<u16> = shards
+        .iter()
+        .copied()
+        .filter(|s| !sourced.contains(s))
+        .collect();
+    let all_resolved = unresolved_ops == 0 && unsourced_shards.is_empty();
+    StaleCompensationEscalation {
+        sourced_shards: sourced.into_iter().collect(),
+        unsourced_shards,
+        dropped_monotonic_ops,
+        all_resolved,
+    }
 }
 
 fn compensate_replication_failure_or_error(
@@ -5033,22 +5326,85 @@ fn compensate_replication_failure_or_error(
     // outstanding until that reconciliation reaches its durability bar.
     if let Some(comp_range) = comp_range {
         let tracker = REPLICATION_INTENT_TRACKER.get();
-        let replicate_result =
-            replicate_compensation_intent(tracker, redo_log, engine, comp_range, |ops, range| {
-                replicate_all_ops(cluster, ops, range, &[]).map(|_| ())
-            });
+        // §4.9 (I5) — capture the TYPED stale-regime evidence (and the comp
+        // ops it applies to) out of the fan-out so a regime-gate rejection
+        // escalates per op class below instead of dying in the generic
+        // warn+pending arm.
+        let stale_shards: std::cell::RefCell<Vec<u16>> = std::cell::RefCell::new(Vec::new());
+        let rejected_ops: std::cell::RefCell<Vec<(TxKey, Vec<ReplicaOp>)>> =
+            std::cell::RefCell::new(Vec::new());
+        let replicate_result = replicate_compensation_intent(
+            tracker,
+            redo_log,
+            engine,
+            comp_range,
+            cluster,
+            |ops, range| match replicate_all_ops_typed(cluster, ops, range, &[]) {
+                Ok(_) => Ok(()),
+                Err(e) => {
+                    if !e.stale_regime_shards.is_empty() {
+                        *stale_shards.borrow_mut() = e.stale_regime_shards.clone();
+                        *rejected_ops.borrow_mut() = ops.to_vec();
+                    }
+                    Err(e.message)
+                }
+            },
+        );
         if let Err(cause) = replicate_result {
-            // The compensation intent (if registered) is durable and stays
-            // pending; startup / catch-up will re-drive the reconciliation.
-            // We still clear the original intent: the comp intent now carries
-            // the repair obligation (it reverses the same keys). The client
-            // already learns the op failed.
-            tracing::warn!(
-                cause = %cause,
-                comp_first = comp_range.0,
-                comp_last = comp_range.1,
-                "compensation reconciliation to replicas did not complete; intent left pending for catch-up",
-            );
+            let stale = stale_shards.into_inner();
+            let ops = rejected_ops.into_inner();
+            if let (false, false, Some(cluster)) = (stale.is_empty(), ops.is_empty(), cluster) {
+                // §4.9: the regime gate rejected the compensation — the
+                // sender is provably demoted for the stale shard(s).
+                // Escalate must-escalate classes to a resync against the
+                // current master (full-shard heal pull — see
+                // `escalate_stale_regime_compensation` on the per-key
+                // residual); idempotent monotonic classes are dropped.
+                let esc = escalate_stale_regime_compensation(cluster, &ops, &stale);
+                tracing::warn!(
+                    cause = %cause,
+                    comp_first = comp_range.0,
+                    comp_last = comp_range.1,
+                    stale_shards = ?stale,
+                    heal_sourced = ?esc.sourced_shards,
+                    heal_unsourced = ?esc.unsourced_shards,
+                    dropped_monotonic_ops = esc.dropped_monotonic_ops,
+                    "compensation rejected by the regime gate — escalated to \
+                     resync-from-current-master (I5/§4.9)",
+                );
+                if esc.all_resolved {
+                    // The repair obligation moved to the persisted heal
+                    // fences (escalated) / was discharged (§4.9 monotonic
+                    // drop): commit the compensation intent so recovery
+                    // never re-ships regime-superseded compensating ops.
+                    if let Err(e) = commit_replication_intent_with_tracker(comp_range, tracker) {
+                        tracing::warn!(
+                            err = %e,
+                            "compensation intent: failed to commit after stale-regime \
+                             escalation; startup recovery will convert it (I5)",
+                        );
+                    }
+                } else {
+                    tracing::warn!(
+                        comp_first = comp_range.0,
+                        comp_last = comp_range.1,
+                        "stale-regime escalation left op(s) uncovered; compensation intent \
+                         stays pending (startup recovery converts superseded shards — I5)",
+                    );
+                }
+            } else {
+                // The compensation intent (if registered) is durable and stays
+                // pending; startup / catch-up will re-drive the reconciliation.
+                // We still clear the original intent: the comp intent now carries
+                // the repair obligation (it reverses the same keys). The client
+                // already learns the op failed.
+                tracing::warn!(
+                    cause = %cause,
+                    comp_first = comp_range.0,
+                    comp_last = comp_range.1,
+                    "compensation reconciliation to replicas did not complete; intent left pending for catch-up",
+                );
+            }
         }
     }
 
@@ -6285,6 +6641,18 @@ fn sweep_role_snap(
     if cluster.has_pending_inbound(&key) || cluster.is_shard_write_fenced(&key) {
         return None;
     }
+    // P1 stage 3 (§4.3) — self-observed `Subset` lineage fences the held-copy
+    // sweep. The two migration fences above do not fire for a
+    // holder-exit-and-re-entry `Subset` (the copy silently missed the writes
+    // of its out-of-set window), and a sweep against an incomplete copy is a
+    // DELETION decision made from incomplete evidence, not mere staleness.
+    // Lock-free: an atomic bitmap shadow of the lineage store (the
+    // `fenced_shards` precedent). Fail-closed: the all-`Subset` default
+    // fences reclaim until the shard's copy is proven complete (migration /
+    // heal / resync completion, or the boot master re-derivation).
+    if !cluster.is_lineage_full(&key) {
+        return None;
+    }
     // P1-2: both fences above are MIGRATION fences — neither says anything about
     // replication health. A replica catching up after a partition or a restart
     // trips neither, so it would reclaim against a local view that is stale by
@@ -6972,7 +7340,7 @@ fn handle_spend_batch(
             ) {
                 return resp;
             }
-            return error_response(req.request_id, ERR_REPLICATION_FAILED, &e);
+            return error_response(req.request_id, ERR_REPLICATION_FAILED, &e.message);
         }
     };
 
@@ -7205,7 +7573,7 @@ fn handle_unspend_batch(
             ) {
                 return resp;
             }
-            return error_response(req.request_id, ERR_REPLICATION_FAILED, &e);
+            return error_response(req.request_id, ERR_REPLICATION_FAILED, &e.message);
         }
     };
 
@@ -7562,7 +7930,7 @@ fn handle_set_mined_batch(
             ) {
                 return resp;
             }
-            return error_response(req.request_id, ERR_REPLICATION_FAILED, &e);
+            return error_response(req.request_id, ERR_REPLICATION_FAILED, &e.message);
         }
     };
 
@@ -8764,7 +9132,7 @@ fn handle_create_batch(
             ) {
                 return resp;
             }
-            return error_response(req.request_id, ERR_REPLICATION_FAILED, &e);
+            return error_response(req.request_id, ERR_REPLICATION_FAILED, &e.message);
         }
     };
 
@@ -8899,7 +9267,7 @@ fn handle_freeze_batch(
             ) {
                 return resp;
             }
-            return error_response(req.request_id, ERR_REPLICATION_FAILED, &e);
+            return error_response(req.request_id, ERR_REPLICATION_FAILED, &e.message);
         }
     };
 
@@ -9025,7 +9393,7 @@ fn handle_unfreeze_batch(
             ) {
                 return resp;
             }
-            return error_response(req.request_id, ERR_REPLICATION_FAILED, &e);
+            return error_response(req.request_id, ERR_REPLICATION_FAILED, &e.message);
         }
     };
 
@@ -9184,7 +9552,7 @@ fn handle_reassign_batch(
             ) {
                 return resp;
             }
-            return error_response(req.request_id, ERR_REPLICATION_FAILED, &e);
+            return error_response(req.request_id, ERR_REPLICATION_FAILED, &e.message);
         }
     };
 
@@ -9331,7 +9699,7 @@ fn handle_set_conflicting_batch(
             ) {
                 return resp;
             }
-            return error_response(req.request_id, ERR_REPLICATION_FAILED, &e);
+            return error_response(req.request_id, ERR_REPLICATION_FAILED, &e.message);
         }
     };
 
@@ -9457,7 +9825,7 @@ fn handle_remove_conflicting_child_batch(
             ) {
                 return resp;
             }
-            return error_response(req.request_id, ERR_REPLICATION_FAILED, &e);
+            return error_response(req.request_id, ERR_REPLICATION_FAILED, &e.message);
         }
     };
 
@@ -9587,7 +9955,7 @@ fn handle_set_locked_batch(
             ) {
                 return resp;
             }
-            return error_response(req.request_id, ERR_REPLICATION_FAILED, &e);
+            return error_response(req.request_id, ERR_REPLICATION_FAILED, &e.message);
         }
     };
 
@@ -9719,7 +10087,7 @@ fn handle_preserve_until_batch(
             ) {
                 return resp;
             }
-            return error_response(req.request_id, ERR_REPLICATION_FAILED, &e);
+            return error_response(req.request_id, ERR_REPLICATION_FAILED, &e.message);
         }
     };
 
@@ -10034,7 +10402,7 @@ fn handle_delete_batch(
                 );
                 m.deletes_failed.inc_by(total_items);
             }
-            return error_response(req.request_id, ERR_REPLICATION_FAILED, &e);
+            return error_response(req.request_id, ERR_REPLICATION_FAILED, &e.message);
         }
     };
 
@@ -10338,7 +10706,7 @@ fn handle_mark_longest_chain_batch(
             ) {
                 return resp;
             }
-            return error_response(req.request_id, ERR_REPLICATION_FAILED, &e);
+            return error_response(req.request_id, ERR_REPLICATION_FAILED, &e.message);
         }
     };
 
@@ -11357,7 +11725,7 @@ fn handle_preserve_transactions(
             ) {
                 return resp;
             }
-            return error_response(req.request_id, ERR_REPLICATION_FAILED, &e);
+            return error_response(req.request_id, ERR_REPLICATION_FAILED, &e.message);
         }
     };
 
@@ -11572,6 +11940,10 @@ fn handle_process_expired(
                 && let Err(e) = begin_replication_intent_with_tracker(
                     intent_range,
                     &repl_ops_by_key.iter().map(|(k, _)| *k).collect::<Vec<_>>(),
+                    &intent_regime_stamps(
+                        cluster,
+                        &repl_ops_by_key.iter().map(|(k, _)| *k).collect::<Vec<_>>(),
+                    ),
                     REPLICATION_INTENT_TRACKER.get(),
                 )
             {
@@ -20327,11 +20699,24 @@ mod tests {
             Some(SweepRole::ShardMaster),
             "a key this node masters is swept as the authority, exactly as before F2"
         );
+        // P1 stage 3 (§4.3) — the held-copy arm is now lineage-gated: the
+        // fail-closed all-Subset default fences reclaim until the copy is
+        // self-observed Full.
+        assert_eq!(
+            role(replicated),
+            None,
+            "i2: a held copy with Subset lineage (the fail-closed default) must NOT be \
+             reclaimed — a sweep against an incomplete copy is deletion, not staleness"
+        );
+        cluster
+            .lineage()
+            .mark_full(replicated, 0, "test: copy proven complete");
         assert_eq!(
             role(replicated),
             Some(SweepRole::HeldCopy),
-            "a key this node only REPLICATES must still be reclaimable — leaving it \
-             unswept is the F2 defect (the replica half grows without bound)"
+            "a key this node only REPLICATES must still be reclaimable once its lineage \
+             is Full — leaving it unswept is the F2 defect (the replica half grows \
+             without bound)"
         );
         assert_eq!(
             role(foreign),
@@ -20352,6 +20737,9 @@ mod tests {
             &[],
             3,
         );
+        // Stamp Full so the assertion exercises the MIGRATION fence, not the
+        // lineage default.
+        inbound.lineage().mark_full(replicated, 0, "test");
         assert_eq!(
             sweep_role_snap(
                 &txid_for_shard(replicated, 0),
@@ -20374,6 +20762,7 @@ mod tests {
             &[replicated],
             3,
         );
+        fenced.lineage().mark_full(replicated, 0, "test");
         assert_eq!(
             sweep_role_snap(
                 &txid_for_shard(replicated, 0),
@@ -21685,6 +22074,8 @@ mod tests {
             &h.engine,
             |_, _| panic!("replication must not run without redo"),
             |_: &[TxKey]| {},
+            &|_| 0,
+            &mut |_: &[TxKey], _: &[u16]| {},
         )
         .unwrap_err();
 
@@ -21728,6 +22119,8 @@ mod tests {
                 Ok(())
             },
             |_: &[TxKey]| {},
+            &|_| 0,
+            &mut |_: &[TxKey], _: &[u16]| {},
         )
         .expect("pending intent recovery succeeds");
 
@@ -21763,6 +22156,7 @@ mod tests {
                 record_offset: 4096,
                 record_size: 256,
             }],
+            &[],
             Some(&tracker),
         )
         .expect("replicated redo write and intent begin succeed");
@@ -21781,6 +22175,315 @@ mod tests {
             .expect("redo range remains readable");
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].sequence, range.0);
+    }
+
+    /// I5 — a fully regime-superseded intent is NEVER re-shipped: it is
+    /// converted to the resync path, the intent is committed, and startup
+    /// recovery SUCCEEDS (never fails on a superseded intent).
+    #[test]
+    fn i5_superseded_intent_converts_to_resync_and_startup_succeeds() {
+        let redo_dev: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(4 * 1024 * 1024, 4096).unwrap());
+        let redo_log = Mutex::new(
+            RedoLog::open(redo_dev, 0, 4 * 1024 * 1024).expect("redo log opens on memory device"),
+        );
+        let engine = bare_engine_for_redo_tests();
+        let tracker = crate::replication::durable::ReplicationIntentTracker::in_memory();
+        let tx_key = TxKey {
+            txid: txid_for_shard(77, 3),
+        };
+        let range = write_redo_ops(
+            &engine,
+            Some(&redo_log),
+            &[RedoOp::Delete {
+                tx_key,
+                record_offset: 4096,
+                record_size: 256,
+            }],
+        )
+        .expect("redo write succeeds");
+        // Created under regime 3 for shard 77.
+        tracker
+            .begin_with_regimes(range.0, range.1, &[tx_key], &[(77, 3)])
+            .unwrap();
+
+        let mut converted_keys: Vec<TxKey> = Vec::new();
+        let mut converted_shards: Vec<u16> = Vec::new();
+        recover_pending_replication_intents_from_tracker(
+            &tracker,
+            Some(&redo_log),
+            &engine,
+            |_, _| panic!("i5: a regime-superseded intent must NEVER be re-shipped"),
+            |_: &[TxKey]| panic!("the reclaimed-range arm must not fire"),
+            // The committed regime for shard 77 has advanced past the stamp.
+            &|shard| if shard == 77 { 9 } else { 0 },
+            &mut |keys: &[TxKey], shards: &[u16]| {
+                converted_keys = keys.to_vec();
+                converted_shards = shards.to_vec();
+            },
+        )
+        .expect("i5: startup must NEVER fail on a regime-superseded intent");
+
+        assert_eq!(
+            converted_keys,
+            vec![tx_key],
+            "the superseded keys go to resync"
+        );
+        assert_eq!(converted_shards, vec![77]);
+        assert!(
+            tracker.pending().is_empty(),
+            "the superseded intent must be committed after conversion",
+        );
+    }
+
+    /// I5 — a PARTIALLY superseded intent re-ships only the shards whose
+    /// regime is still current; the superseded shard's keys convert to
+    /// resync. No key's repair obligation is dropped.
+    #[test]
+    fn i5_partially_superseded_intent_reships_only_current_shards() {
+        let redo_dev: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(4 * 1024 * 1024, 4096).unwrap());
+        let redo_log = Mutex::new(
+            RedoLog::open(redo_dev, 0, 4 * 1024 * 1024).expect("redo log opens on memory device"),
+        );
+        let engine = bare_engine_for_redo_tests();
+        let tracker = crate::replication::durable::ReplicationIntentTracker::in_memory();
+        let key_superseded = TxKey {
+            txid: txid_for_shard(10, 1),
+        };
+        let key_current = TxKey {
+            txid: txid_for_shard(11, 2),
+        };
+        let range = write_redo_ops(
+            &engine,
+            Some(&redo_log),
+            &[
+                RedoOp::Delete {
+                    tx_key: key_superseded,
+                    record_offset: 4096,
+                    record_size: 256,
+                },
+                RedoOp::Delete {
+                    tx_key: key_current,
+                    record_offset: 8192,
+                    record_size: 256,
+                },
+            ],
+        )
+        .expect("redo write succeeds");
+        tracker
+            .begin_with_regimes(
+                range.0,
+                range.1,
+                &[key_superseded, key_current],
+                &[(10, 4), (11, 4)],
+            )
+            .unwrap();
+
+        let mut replicated: Vec<TxKey> = Vec::new();
+        let mut converted_keys: Vec<TxKey> = Vec::new();
+        let mut converted_shards: Vec<u16> = Vec::new();
+        recover_pending_replication_intents_from_tracker(
+            &tracker,
+            Some(&redo_log),
+            &engine,
+            |ops, _| {
+                replicated.extend(ops.iter().map(|(k, _)| *k));
+                Ok(())
+            },
+            |_: &[TxKey]| {},
+            // Shard 10 advanced (5 > 4); shard 11 is still current (4 == 4).
+            &|shard| if shard == 10 { 5 } else { 4 },
+            &mut |keys: &[TxKey], shards: &[u16]| {
+                converted_keys = keys.to_vec();
+                converted_shards = shards.to_vec();
+            },
+        )
+        .expect("recovery succeeds");
+
+        assert_eq!(converted_shards, vec![10]);
+        assert_eq!(converted_keys, vec![key_superseded]);
+        assert_eq!(
+            replicated,
+            vec![key_current],
+            "only the still-current shard's key is re-shipped",
+        );
+        assert!(tracker.pending().is_empty());
+    }
+
+    /// §4.9 — the compensation-class matrix: `Spend`, `SetMined`(+Batch)
+    /// and `Freeze` are the idempotent-monotonic classes safe to drop on a
+    /// stale-regime rejection; `Unspend`, `Reassign`, `SetLocked`,
+    /// `ExpirePreservation` MUST escalate, and any class the design does
+    /// not name escalates fail-closed (`Unfreeze` pins that).
+    #[test]
+    fn i5_compensation_class_escalation_matrix() {
+        let tx_key = TxKey { txid: [9u8; 32] };
+        let escalate = [
+            ReplicaOp::Unspend {
+                tx_key,
+                offset: 0,
+                spending_data: [0u8; 36],
+                current_block_height: 0,
+                block_height_retention: 0,
+                master_generation: 0,
+            },
+            ReplicaOp::Reassign {
+                tx_key,
+                offset: 0,
+                new_hash: [0u8; 32],
+                block_height: 0,
+                spendable_after: 0,
+                master_generation: 0,
+                prior_utxo_hash: None,
+            },
+            ReplicaOp::SetLocked {
+                tx_key,
+                value: true,
+                master_generation: 0,
+            },
+            ReplicaOp::ExpirePreservation {
+                tx_key,
+                delete_at_height: 1,
+                master_generation: 0,
+            },
+            // Unnamed class — fail-closed escalation.
+            ReplicaOp::Unfreeze {
+                tx_key,
+                offset: 0,
+                master_generation: 0,
+            },
+        ];
+        for op in &escalate {
+            assert!(
+                compensation_class_must_escalate(op),
+                "§4.9: {op:?} must escalate to a resync against the current master",
+            );
+        }
+        let droppable = [
+            ReplicaOp::Spend {
+                tx_key,
+                offset: 0,
+                spending_data: [0u8; 36],
+                current_block_height: 0,
+                block_height_retention: 0,
+                master_generation: 0,
+            },
+            ReplicaOp::Freeze {
+                tx_key,
+                offset: 0,
+                master_generation: 0,
+            },
+        ];
+        for op in &droppable {
+            assert!(
+                !compensation_class_must_escalate(op),
+                "§4.9: {op:?} is idempotent-monotonic and safe to drop",
+            );
+        }
+    }
+
+    /// I5/§4.9 — a stale-regime-rejected compensation with a must-escalate
+    /// op registers a heal PULL for the shard (persisted fence + lineage
+    /// degrade) and reports full resolution; a monotonic-only rejection is
+    /// dropped with no fence.
+    #[test]
+    fn i5_stale_regime_compensation_escalates_to_heal_pull_and_drops_monotonic() {
+        use crate::cluster::shards::{NodeId, ShardTable};
+
+        let members = vec![NodeId(1), NodeId(2)];
+        let table = ShardTable::compute_with_epoch(&members, 2, 3, 1);
+        let self_id = NodeId(1);
+        // A shard this node masters, so the heal-source fallback resolves to
+        // its committed replica (node 2).
+        let shard = (0..crate::cluster::shards::NUM_SHARDS as u16)
+            .find(|&s| table.target_assignment(s).master == self_id)
+            .expect("self masters some shard");
+        let addrs = [
+            (NodeId(1), "127.0.0.1:4711".parse().unwrap()),
+            (NodeId(2), "127.0.0.1:4712".parse().unwrap()),
+        ];
+        let cluster = crate::cluster::coordinator::new_test_running_cluster(
+            self_id,
+            table,
+            &addrs,
+            &members,
+            &[],
+            &[],
+            &[],
+            2,
+        );
+        let tx_key = TxKey {
+            txid: txid_for_shard(shard, 1),
+        };
+        cluster
+            .lineage()
+            .mark_full(shard, 0, "test: pre-escalation Full");
+
+        // Must-escalate class (Unspend) on the stale shard → heal pull.
+        let esc = escalate_stale_regime_compensation(
+            &cluster,
+            &[(
+                tx_key,
+                vec![ReplicaOp::Unspend {
+                    tx_key,
+                    offset: 0,
+                    spending_data: [0u8; 36],
+                    current_block_height: 0,
+                    block_height_retention: 0,
+                    master_generation: 0,
+                }],
+            )],
+            &[shard],
+        );
+        assert_eq!(esc.sourced_shards, vec![shard]);
+        assert!(esc.unsourced_shards.is_empty());
+        assert!(
+            esc.all_resolved,
+            "one sourced escalation resolves the batch"
+        );
+        assert!(
+            cluster.has_pending_inbound_shard(shard),
+            "the escalation must raise the persisted heal fence (the pull)",
+        );
+        assert!(
+            !cluster.is_lineage_full(&tx_key),
+            "§4.3 trigger (d): the heal fence degrades the shard's lineage",
+        );
+
+        // Monotonic-only (Spend) on a different stale shard → dropped, no fence.
+        let table2 = cluster.shard_table();
+        let other_shard = {
+            let t = table2.read();
+            (0..crate::cluster::shards::NUM_SHARDS as u16)
+                .find(|&s| s != shard && t.target_assignment(s).master == self_id)
+                .expect("self masters a second shard")
+        };
+        let other_key = TxKey {
+            txid: txid_for_shard(other_shard, 1),
+        };
+        let esc = escalate_stale_regime_compensation(
+            &cluster,
+            &[(
+                other_key,
+                vec![ReplicaOp::Spend {
+                    tx_key: other_key,
+                    offset: 0,
+                    spending_data: [0u8; 36],
+                    current_block_height: 0,
+                    block_height_retention: 0,
+                    master_generation: 0,
+                }],
+            )],
+            &[other_shard],
+        );
+        assert_eq!(esc.dropped_monotonic_ops, 1);
+        assert!(esc.sourced_shards.is_empty());
+        assert!(esc.all_resolved, "§4.9: monotonic drops resolve the batch");
+        assert!(
+            !cluster.has_pending_inbound_shard(other_shard),
+            "a dropped monotonic compensation must not fence the shard",
+        );
     }
 
     /// Per-key visibility: a client read of key K blocks while a mutation of K
@@ -21874,6 +22577,8 @@ mod tests {
                 Ok(())
             },
             |_: &[TxKey]| {},
+            &|_| 0,
+            &mut |_: &[TxKey], _: &[u16]| {},
         )
         .expect("reclaimed redo range should clear stale intent instead of bricking startup");
 
@@ -22090,6 +22795,8 @@ mod tests {
                 Ok(())
             },
             |_: &[TxKey]| {},
+            &|_| 0,
+            &mut |_: &[TxKey], _: &[u16]| {},
         )
         .expect("merged read must resolve a range spanning both store logs");
 
@@ -22183,6 +22890,8 @@ mod tests {
                 Ok(())
             },
             |keys: &[TxKey]| resync_keys.extend_from_slice(keys),
+            &|_| 0,
+            &mut |_: &[TxKey], _: &[u16]| {},
         )
         .expect("recovery of a satisfiable (non-reclaimed) range must succeed");
 
@@ -22335,6 +23044,8 @@ mod tests {
                 Ok(())
             },
             |_: &[TxKey]| {},
+            &|_| 0,
+            &mut |_: &[TxKey], _: &[u16]| {},
         )
         .expect("pending intent recovery succeeds");
 
@@ -22420,6 +23131,8 @@ mod tests {
                 Ok(())
             },
             |keys: &[TxKey]| resync_keys.extend_from_slice(keys),
+            &|_| 0,
+            &mut |_: &[TxKey], _: &[u16]| {},
         )
         .expect("reclaimed keyed range should clear stale intent, not brick startup");
 
@@ -22513,6 +23226,8 @@ mod tests {
                 Ok(())
             },
             |keys: &[TxKey]| resync_keys.extend_from_slice(keys),
+            &|_| 0,
+            &mut |_: &[TxKey], _: &[u16]| {},
         )
         .expect("empty owned-ops window must clear the stale intent, not brick startup");
 
@@ -24681,6 +25396,8 @@ mod tests {
             &h.engine,
             |ops, r| replicate_all_ops(Some(&cluster), ops, r, &[]).map(|_| ()),
             |_: &[TxKey]| {},
+            &|_| 0,
+            &mut |_: &[TxKey], _: &[u16]| {},
         );
 
         result.expect(
@@ -33692,6 +34409,7 @@ mod tests {
             Some(&h.redo_log),
             &h.engine,
             comp_range,
+            None,
             |ops, _range| {
                 captured.borrow_mut().extend(ops.iter().cloned());
                 Ok(())
@@ -33770,6 +34488,7 @@ mod tests {
             Some(&h.redo_log),
             &h.engine,
             comp_range,
+            None,
             |_ops, _range| Err("simulated replica fan-out failure".to_string()),
         );
         assert!(

@@ -3,6 +3,7 @@
 
 pub mod auth;
 pub mod coordinator;
+pub mod lineage;
 pub mod membership;
 pub mod migration;
 pub mod routing;

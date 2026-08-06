@@ -1612,6 +1612,104 @@ impl ClusterCoordinator {
         let startup_reactivation_needed = Arc::new(AtomicBool::new(false));
         let startup_reactivation_event = startup_reactivation_needed.clone();
 
+        // P1 stage 3 (§4.3) — the per-shard copy-lineage store, bound to the
+        // restore-stamped `(data_epoch, node_id)` identity. No trustworthy
+        // identity (entropy/IO fault) degrades to a NON-persistent
+        // all-`Subset` store — the fail-closed direction: nothing is served
+        // or swept on the strength of an unverifiable `Full` claim.
+        let lineage: Arc<crate::cluster::lineage::LineageStore> = match cluster_state_path.as_ref()
+        {
+            Some(base) => {
+                let epoch_path = crate::cluster::lineage::data_epoch_path(base);
+                match crate::cluster::lineage::load_or_create_data_epoch(&epoch_path) {
+                    Ok(epoch) => Arc::new(crate::cluster::lineage::LineageStore::open(
+                        Some(crate::cluster::lineage::lineage_state_path(base)),
+                        epoch,
+                        self.self_id,
+                    )),
+                    Err(e) => {
+                        tracing::error!(
+                            err = %e,
+                            path = %epoch_path.display(),
+                            "lineage: no trustworthy data-epoch identity — running a \
+                             NON-PERSISTENT all-Subset lineage store (fail-closed)",
+                        );
+                        Arc::new(crate::cluster::lineage::LineageStore::open(
+                            None,
+                            [0u8; crate::cluster::lineage::DATA_EPOCH_LEN],
+                            self.self_id,
+                        ))
+                    }
+                }
+            }
+            None => Arc::new(crate::cluster::lineage::LineageStore::open(
+                None,
+                [0u8; crate::cluster::lineage::DATA_EPOCH_LEN],
+                self.self_id,
+            )),
+        };
+        // I13(i) — boot re-derivation over the LOADED committed state (the
+        // authority was restored by the caller before `start()`): the
+        // committed master of `s` with an intact, un-reclaimed redo range
+        // re-derives `Full(current regime)` REGARDLESS of the stored stamp
+        // (reaching clustered startup at all required boot recovery over the
+        // node's own redo to succeed — a corrupt/reclaimed-needed tail fails
+        // boot upstream); every non-master stamp that cannot prove holder
+        // continuity across the down window degrades fail-closed.
+        {
+            let members = self.topology_authority.committed_members();
+            if !members.is_empty() {
+                let block = self.topology_authority.committed_regime_block();
+                let placement = ShardTable::compute_with_epoch(
+                    &members,
+                    self.replication_factor.max(1),
+                    1,
+                    self.topology_authority.committed_placement_version(),
+                );
+                let table = self.shard_table.read();
+                let self_id = self.self_id;
+                let master_is_self = |s: u16| {
+                    block
+                        .override_map
+                        .get(&s)
+                        .copied()
+                        .unwrap_or_else(|| placement.assignment(s).master)
+                        == self_id
+                };
+                let in_holder = |s: u16| {
+                    let a = placement.assignment(s);
+                    a.master == self_id
+                        || a.replicas.contains(&self_id)
+                        || table.effective_assignment(s).master == self_id
+                };
+                lineage.boot_rederive(&master_is_self, &in_holder, &|s| block.regime.get(s));
+            }
+        }
+        // I2 / I13(ii) — install the commit-install hook: per-commit lineage
+        // transitions run INSIDE `handle_commit_durable`'s `commit_apply`
+        // section, after the topology persist and strictly before
+        // `committed_term` advances — one batched durable lineage write per
+        // commit, failing the commit closed on a durability fault.
+        {
+            let lineage_hook = lineage.clone();
+            let shard_table_hook = self.shard_table.clone();
+            let self_id = self.self_id;
+            let rf = self.replication_factor;
+            self.topology_authority
+                .set_commit_install_hook(Arc::new(move |state| {
+                    lineage_apply_committed_state(
+                        &lineage_hook,
+                        self_id,
+                        rf,
+                        &state.committed_members,
+                        state.committed_placement_version,
+                        &state.regime_block,
+                        &shard_table_hook,
+                    )
+                }));
+        }
+        let lineage_event = lineage.clone();
+
         // Topology authority and cluster secret for the event loop.
         let topo_authority_event = self.topology_authority.clone();
         let node_addrs_for_topo = self.node_addrs.clone();
@@ -2497,6 +2595,7 @@ impl ClusterCoordinator {
                             &inbound_bm_event,
                             &inbound_state_path_event,
                             &reheal_backoff_event,
+                            &lineage_event,
                             &partition_view,
                         );
                         if queued > 0 {
@@ -2924,6 +3023,7 @@ impl ClusterCoordinator {
             startup_reactivation_needed,
             stale_suspect_shards: Arc::new(RwLock::new(std::collections::BTreeSet::new())),
             reheal_backoff: reheal_backoff_for_cluster,
+            lineage,
             #[cfg(any(test, feature = "fault-injection"))]
             drop_commit_signals: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
@@ -5878,6 +5978,64 @@ pub(crate) fn select_reverse_heal_sources_for(
 /// later re-triggers (its fence has cleared by then). An empty `partition_view`
 /// (no exchange data) is a no-op. Returns the number of shards newly fenced +
 /// queued.
+/// P1 stage 3 (I2 / I13ii) — apply one installed commit's lineage
+/// transitions: for every currently-`Full` shard, degrade to `Subset` when
+/// the node is no longer in the shard's holder set under the NEW committed
+/// state, and refresh the stamp to the new committed regime when it is
+/// (the I13ii promotion re-stamp is the same refresh for a shard whose
+/// override names self as master). Returns `false` only when a stamp
+/// changed AND its batched durable write failed — the commit-install hook
+/// then fails the carrying commit closed.
+///
+/// Holder set (I2, the narrowed union): the shard's committed placement
+/// members (`master ∪ replicas` over the commit's member set — invariant
+/// under I3 override swaps, which only rotate master/replica roles inside
+/// the same set) plus the LIVE `effective_assignment(s).master` (the
+/// actively-serving departing master mid-handoff stays a holder; a
+/// departing replica does NOT — the write fan-out reads the target
+/// assignment only).
+fn lineage_apply_committed_state(
+    lineage: &crate::cluster::lineage::LineageStore,
+    self_id: NodeId,
+    rf: u8,
+    members: &[NodeId],
+    placement_version: u16,
+    regime_block: &crate::cluster::topology::RegimeBlock,
+    shard_table: &Arc<ShardTableLock<ShardTable>>,
+) -> bool {
+    if members.is_empty() {
+        // Bootstrap / degenerate commit: no holder information to act on.
+        return true;
+    }
+    let placement = ShardTable::compute_with_epoch(members, rf.max(1), 1, placement_version.max(1));
+    // Snapshot the live effective masters once (a short read lock; the
+    // commit_apply lock-order note on `set_commit_install_hook` applies).
+    let effective_masters: Vec<NodeId> = {
+        let table = shard_table.read();
+        (0..NUM_SHARDS as u16)
+            .map(|s| table.effective_assignment(s).master)
+            .collect()
+    };
+    let in_holder = |s: u16| {
+        let a = placement.assignment(s);
+        a.master == self_id
+            || a.replicas.contains(&self_id)
+            || effective_masters.get(s as usize).copied() == Some(self_id)
+    };
+    let outcome = lineage.apply_commit_transitions(&in_holder, &|s| regime_block.regime.get(s));
+    if outcome.degraded > 0 || outcome.refreshed > 0 {
+        tracing::info!(
+            degraded = outcome.degraded,
+            refreshed = outcome.refreshed,
+            persisted = outcome.persisted,
+            "lineage: applied commit transitions (I2 holder check + stamp refresh / \
+             I13ii promotion re-stamp)",
+        );
+    }
+    outcome.persisted
+}
+
+#[allow(clippy::too_many_arguments)]
 fn trigger_online_reheal(
     self_id: NodeId,
     shard_table: &Arc<ShardTableLock<ShardTable>>,
@@ -5885,6 +6043,7 @@ fn trigger_online_reheal(
     inbound_atomic: &Arc<crate::cluster::migration::AtomicShardBitmap>,
     inbound_state_path: &Option<std::path::PathBuf>,
     reheal_backoff: &Arc<Mutex<std::collections::HashMap<u16, u64>>>,
+    lineage: &crate::cluster::lineage::LineageStore,
     partition_view: &std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>>,
 ) -> usize {
     if partition_view.is_empty() {
@@ -5957,6 +6116,7 @@ fn trigger_online_reheal(
         return 0;
     }
     let mut started = 0usize;
+    let mut fenced: Vec<u16> = Vec::new();
     {
         let mgr = &mut migration.lock();
         for &(shard, source) in &sources {
@@ -5965,12 +6125,17 @@ fn trigger_online_reheal(
             }
             if mgr.register_heal_source(shard, source) {
                 started += 1;
+                fenced.push(shard);
             }
         }
         inbound_atomic.load_from(mgr.inbound_bitmap());
         if let Some(path) = inbound_state_path {
             crate::cluster::migration::persist_inbound_state(path, mgr);
         }
+    }
+    // §4.3 trigger (d): a heal fence raised degrades the shard's lineage.
+    if !fenced.is_empty() {
+        lineage.mark_subset(&fenced, "online re-heal fence raised (§4.3)");
     }
     started
 }
@@ -10361,6 +10526,13 @@ pub struct RunningCluster {
     /// never suppressed; a signature change (the source moved) forces a fresh
     /// evaluation. Empty in the boot path — this gates only the runtime path.
     reheal_backoff: Arc<Mutex<std::collections::HashMap<u16, u64>>>,
+    /// P1 stage 3 (§4.3) — the per-shard Full/Subset copy-lineage store.
+    /// Shared with the topology authority's commit-install hook (I2 / I13ii
+    /// transitions inside the `commit_apply` section) and the event loop's
+    /// online-reheal path; the sweep reads its atomic `Full` shadow via
+    /// [`RunningCluster::is_lineage_full`]. Test builders get a
+    /// non-persistent, all-`Subset` store (the fail-closed default).
+    lineage: Arc<crate::cluster::lineage::LineageStore>,
     /// Test-only: when set, [`RunningCluster::signal_topology_committed`]
     /// drops the signal instead of queuing it. Models the production race
     /// where a node's authority commits a new term (via the dispatch
@@ -10920,42 +11092,111 @@ impl RunningCluster {
     /// completion doesn't resurrect stale pending-inbound entries.
     /// Syncs the atomic bitmap so the hot path sees the change immediately.
     pub fn mark_inbound_complete(&self, shard: u16) {
-        let mgr = &mut self.migration.lock();
-        mgr.mark_inbound_complete(shard);
-        self.inbound_atomic.load_from(mgr.inbound_bitmap());
-        if let Some(ref path) = self.inbound_state_path {
-            crate::cluster::migration::persist_inbound_state(path, mgr);
+        {
+            let mgr = &mut self.migration.lock();
+            mgr.mark_inbound_complete(shard);
+            self.inbound_atomic.load_from(mgr.inbound_bitmap());
+            if let Some(ref path) = self.inbound_state_path {
+                crate::cluster::migration::persist_inbound_state(path, mgr);
+            }
         }
+        self.stamp_lineage_full_if_complete(&[shard], "inbound migration completed (§4.3)");
     }
 
     pub fn mark_inbound_complete_all(&self, shard: u16) {
-        let mgr = &mut self.migration.lock();
-        mgr.mark_inbound_complete_all(shard);
-        self.inbound_atomic.load_from(mgr.inbound_bitmap());
-        if let Some(ref path) = self.inbound_state_path {
-            crate::cluster::migration::persist_inbound_state(path, mgr);
+        {
+            let mgr = &mut self.migration.lock();
+            mgr.mark_inbound_complete_all(shard);
+            self.inbound_atomic.load_from(mgr.inbound_bitmap());
+            if let Some(ref path) = self.inbound_state_path {
+                crate::cluster::migration::persist_inbound_state(path, mgr);
+            }
         }
+        self.stamp_lineage_full_if_complete(&[shard], "inbound migration completed (§4.3)");
     }
 
     pub fn mark_inbound_complete_from_source(&self, shard: u16, from_node: NodeId) {
-        let mgr = &mut self.migration.lock();
-        mgr.mark_inbound_complete_from_source(shard, from_node);
-        self.inbound_atomic.load_from(mgr.inbound_bitmap());
-        if let Some(ref path) = self.inbound_state_path {
-            crate::cluster::migration::persist_inbound_state(path, mgr);
+        {
+            let mgr = &mut self.migration.lock();
+            mgr.mark_inbound_complete_from_source(shard, from_node);
+            self.inbound_atomic.load_from(mgr.inbound_bitmap());
+            if let Some(ref path) = self.inbound_state_path {
+                crate::cluster::migration::persist_inbound_state(path, mgr);
+            }
         }
+        self.stamp_lineage_full_if_complete(
+            &[shard],
+            "inbound migration/heal completed from source (§4.3)",
+        );
     }
 
     pub fn mark_inbound_complete_many_from_source(&self, shards: &[u16], from_node: NodeId) {
         if shards.is_empty() {
             return;
         }
-        let mgr = &mut self.migration.lock();
-        mgr.mark_inbound_complete_many_from_source(shards.iter().copied(), from_node);
-        self.inbound_atomic.load_from(mgr.inbound_bitmap());
-        if let Some(ref path) = self.inbound_state_path {
-            crate::cluster::migration::persist_inbound_state(path, mgr);
+        {
+            let mgr = &mut self.migration.lock();
+            mgr.mark_inbound_complete_many_from_source(shards.iter().copied(), from_node);
+            self.inbound_atomic.load_from(mgr.inbound_bitmap());
+            if let Some(ref path) = self.inbound_state_path {
+                crate::cluster::migration::persist_inbound_state(path, mgr);
+            }
         }
+        self.stamp_lineage_full_if_complete(
+            shards,
+            "bulk inbound migration completion handshake (§4.3)",
+        );
+    }
+
+    /// P1 stage 3 (§4.3 completion triggers f/g/h) — stamp `Full` for every
+    /// completed shard, in ONE batched durable lineage write.
+    ///
+    /// A shard qualifies only when (a) its inbound fence is FULLY clear (a
+    /// multi-source completion stamps on the LAST source's handshake, never
+    /// mid-transfer) and (b) this node is in the shard's holder set (I2's
+    /// union: target assignment ∪ live effective master) — a completion for
+    /// a shard the node was reassigned away from must not mint a `Full`.
+    /// The stamp's regime is the CURRENT committed regime of the shard.
+    fn stamp_lineage_full_if_complete(&self, shards: &[u16], reason: &str) {
+        let mut stamps: Vec<(u16, u64)> = Vec::with_capacity(shards.len());
+        {
+            let table = self.shard_table.read();
+            for &shard in shards {
+                if self.inbound_atomic.test(shard) {
+                    // Another source is still streaming this shard.
+                    continue;
+                }
+                let a = table.target_assignment(shard);
+                let holder = a.master == self.self_id
+                    || a.replicas.contains(&self.self_id)
+                    || table.effective_assignment(shard).master == self.self_id;
+                if !holder {
+                    tracing::debug!(
+                        shard,
+                        "lineage: completion for a shard this node no longer holds — not \
+                         stamping Full (I2)",
+                    );
+                    continue;
+                }
+                stamps.push((shard, self.topology_authority.committed_regime(shard)));
+            }
+        }
+        if !stamps.is_empty() {
+            self.lineage.mark_full_many(&stamps, reason);
+        }
+    }
+
+    /// P1 stage 3 — the copy-lineage store (stage 4 reads promotion
+    /// eligibility through this handle; tests stamp `Full` through it).
+    pub fn lineage(&self) -> &Arc<crate::cluster::lineage::LineageStore> {
+        &self.lineage
+    }
+
+    /// P1 stage 3 (§4.3) — lock-free "is this key's shard self-observed
+    /// `Full`" read for the sweep hot path (an atomic bitmap test, the
+    /// `fenced_shards` precedent — no lock on the sweep path).
+    pub fn is_lineage_full(&self, key: &TxKey) -> bool {
+        self.lineage.is_full(ShardTable::shard_for_key(key))
     }
 
     /// Abort an in-flight inbound migration for `shard` (FLAG_MIGRATION_ABORT).
@@ -11037,13 +11278,23 @@ impl RunningCluster {
     /// Persists to disk so a crash mid-migration blocks the shard on restart.
     /// Syncs the atomic bitmap so the hot path sees the change immediately.
     pub fn mark_inbound_active(&self, shard: u16) {
-        let mgr = &mut self.migration.lock();
-        let changed = mgr.mark_inbound_active(shard);
+        let changed = {
+            let mgr = &mut self.migration.lock();
+            let changed = mgr.mark_inbound_active(shard);
+            if changed {
+                self.inbound_atomic.set(shard);
+            }
+            if changed && let Some(ref path) = self.inbound_state_path {
+                crate::cluster::migration::persist_inbound_state(path, mgr);
+            }
+            changed
+        };
+        // §4.3 triggers (b)/(c): an inbound migration (or full-shard
+        // resync, which arrives through the same migration-batch path)
+        // beginning degrades the shard's lineage.
         if changed {
-            self.inbound_atomic.set(shard);
-        }
-        if changed && let Some(ref path) = self.inbound_state_path {
-            crate::cluster::migration::persist_inbound_state(path, mgr);
+            self.lineage
+                .mark_subset(&[shard], "inbound migration/resync begins (§4.3)");
         }
     }
 
@@ -11078,22 +11329,31 @@ impl RunningCluster {
         if shard_sources.is_empty() {
             return 0;
         }
-        let mgr = &mut self.migration.lock();
         let mut started = 0usize;
-        for &(shard, source) in shard_sources {
-            if source == self.self_id || source == NodeId(0) {
-                continue;
+        let mut fenced: Vec<u16> = Vec::new();
+        {
+            let mgr = &mut self.migration.lock();
+            for &(shard, source) in shard_sources {
+                if source == self.self_id || source == NodeId(0) {
+                    continue;
+                }
+                // P0 — `register_heal_source` (not `register_inbound_source`) raises
+                // the `heal_pending` marker so the no-serve-before-heal fence
+                // SURVIVES a concurrent runtime topology commit's `clear_inbound`.
+                if mgr.register_heal_source(shard, source) {
+                    started += 1;
+                    fenced.push(shard);
+                }
             }
-            // P0 — `register_heal_source` (not `register_inbound_source`) raises
-            // the `heal_pending` marker so the no-serve-before-heal fence
-            // SURVIVES a concurrent runtime topology commit's `clear_inbound`.
-            if mgr.register_heal_source(shard, source) {
-                started += 1;
+            self.inbound_atomic.load_from(mgr.inbound_bitmap());
+            if let Some(ref path) = self.inbound_state_path {
+                crate::cluster::migration::persist_inbound_state(path, mgr);
             }
         }
-        self.inbound_atomic.load_from(mgr.inbound_bitmap());
-        if let Some(ref path) = self.inbound_state_path {
-            crate::cluster::migration::persist_inbound_state(path, mgr);
+        // §4.3 trigger (d): a heal fence raised degrades the shard's lineage.
+        if !fenced.is_empty() {
+            self.lineage
+                .mark_subset(&fenced, "reverse-heal fence raised (§4.3)");
         }
         started
     }
@@ -11108,11 +11368,20 @@ impl RunningCluster {
     /// served un-healed until an operator or a Phase-3 give-up path resolves it.
     /// Persists the fence and syncs the hot-path atomic immediately.
     pub fn mark_inbound_heal_fence(&self, shard: u16) {
-        let mgr = &mut self.migration.lock();
-        let changed = mgr.mark_heal_fence_active(shard);
-        self.inbound_atomic.load_from(mgr.inbound_bitmap());
-        if changed && let Some(ref path) = self.inbound_state_path {
-            crate::cluster::migration::persist_inbound_state(path, mgr);
+        let changed = {
+            let mgr = &mut self.migration.lock();
+            let changed = mgr.mark_heal_fence_active(shard);
+            self.inbound_atomic.load_from(mgr.inbound_bitmap());
+            if changed && let Some(ref path) = self.inbound_state_path {
+                crate::cluster::migration::persist_inbound_state(path, mgr);
+            }
+            changed
+        };
+        // §4.3 trigger (d): the fail-closed no-source heal fence degrades
+        // the shard's lineage exactly like a sourced heal.
+        if changed {
+            self.lineage
+                .mark_subset(&[shard], "no-source heal fence raised (§4.3)");
         }
     }
 
@@ -11176,6 +11445,7 @@ impl RunningCluster {
             &self.inbound_atomic,
             &self.inbound_state_path,
             &self.reheal_backoff,
+            &self.lineage,
             partition_view,
         )
     }
@@ -12230,14 +12500,31 @@ impl RunningCluster {
             // rather than treat an unreadable fence set as no fences.
             let data = crate::cluster::migration::load_inbound_state(path)?;
             if !data.is_empty() {
-                let mut mgr = self.migration.lock();
-                mgr.restore_inbound(&data)?;
-                self.inbound_atomic.load_from(mgr.inbound_bitmap());
-                let count = mgr.inbound_count();
-                if count > 0 {
-                    tracing::info!(
-                        count,
-                        "cluster: restored pending inbound migrations from disk"
+                let pending: Vec<u16> = {
+                    let mut mgr = self.migration.lock();
+                    mgr.restore_inbound(&data)?;
+                    self.inbound_atomic.load_from(mgr.inbound_bitmap());
+                    let count = mgr.inbound_count();
+                    if count > 0 {
+                        tracing::info!(
+                            count,
+                            "cluster: restored pending inbound migrations from disk"
+                        );
+                    }
+                    mgr.pending_inbound_entries()
+                        .into_iter()
+                        .map(|(shard, _)| shard)
+                        .collect()
+                };
+                // P1 stage 3 (§4.3, boot re-assertion of triggers b/d): a
+                // persisted inbound/heal fence proves the transfer was still
+                // in flight at the crash. The matching Subset transition may
+                // itself have missed its (best-effort) persist, so re-degrade
+                // here rather than trust a possibly-stale Full stamp.
+                if !pending.is_empty() {
+                    self.lineage.mark_subset(
+                        &pending,
+                        "boot re-assertion of persisted inbound/heal fences (§4.3)",
                     );
                 }
             }
@@ -12797,6 +13084,14 @@ pub(crate) fn new_test_running_cluster(
         startup_reactivation_needed: Arc::new(AtomicBool::new(false)),
         stale_suspect_shards: Arc::new(RwLock::new(std::collections::BTreeSet::new())),
         reheal_backoff: Arc::new(Mutex::new(std::collections::HashMap::new())),
+        // Fail-closed default: non-persistent, all-Subset. Tests that
+        // exercise Full-gated behaviour stamp shards explicitly via
+        // `RunningCluster::lineage()`.
+        lineage: Arc::new(crate::cluster::lineage::LineageStore::open(
+            None,
+            [0u8; crate::cluster::lineage::DATA_EPOCH_LEN],
+            self_id,
+        )),
         #[cfg(any(test, feature = "fault-injection"))]
         drop_commit_signals: Arc::new(AtomicBool::new(false)),
         #[cfg(test)]
@@ -23924,5 +24219,338 @@ mod tests {
             &decoded.regime_block,
         );
         assert_eq!(decoded.digest, expected);
+    }
+
+    // -----------------------------------------------------------------------
+    // P1 stage 3 — lineage commit-install hook (I2 / I13)
+    // -----------------------------------------------------------------------
+
+    /// Build a valid quorum commit over `members` carrying `block` at `term`.
+    fn lineage_test_commit(
+        authority: &crate::cluster::topology::TopologyAuthority,
+        term: u64,
+        members: &[NodeId],
+        block: crate::cluster::topology::RegimeBlock,
+    ) -> crate::cluster::topology::TopologyCommit {
+        let cluster_id = authority.cluster_id();
+        let proposer = members[0];
+        crate::cluster::topology::TopologyCommit {
+            term,
+            proposer,
+            members: members.to_vec(),
+            cluster_id,
+            placement_version: 1,
+            committed_peak: members.len() as u64,
+            digest: crate::cluster::topology::TopologyTerm::compute_digest(
+                term,
+                &cluster_id,
+                members,
+                1,
+                members.len() as u64,
+                proposer,
+                &block,
+            ),
+            voters: members.to_vec(),
+            regime_block: block,
+        }
+    }
+
+    /// I13(ii) — an installed commit naming SELF master of a shard whose
+    /// lineage is `Full` at the pre-override regime re-stamps
+    /// `Full{new regime}` DURABLY inside the same `handle_commit_durable`
+    /// apply section (the commit's `Applied` return implies the lineage
+    /// file already carries the re-stamp), batched with the I2 refresh in
+    /// one lineage write.
+    #[test]
+    fn i13_promotion_restamp_is_durable_inside_the_commit_apply_section() {
+        let dir = std::env::temp_dir().join(format!(
+            "teraslab-i13-restamp-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id(),
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let lineage_path = dir.join("lineage");
+        let epoch = [3u8; crate::cluster::lineage::DATA_EPOCH_LEN];
+        let self_id = NodeId(1);
+        let members = vec![NodeId(1), NodeId(2)];
+        let lineage = Arc::new(crate::cluster::lineage::LineageStore::open(
+            Some(lineage_path.clone()),
+            epoch,
+            self_id,
+        ));
+        let authority = Arc::new(crate::cluster::topology::TopologyAuthority::new(
+            self_id,
+            Duration::from_secs(1),
+        ));
+        authority.set_replication_factor(2);
+        let placement = ShardTable::compute_with_epoch(&members, 2, 1, 1);
+        let shard_table = Arc::new(ShardTableLock::new(placement.clone()));
+        {
+            let lineage = lineage.clone();
+            let shard_table = shard_table.clone();
+            authority.set_commit_install_hook(Arc::new(move |state| {
+                lineage_apply_committed_state(
+                    &lineage,
+                    self_id,
+                    2,
+                    &state.committed_members,
+                    state.committed_placement_version,
+                    &state.regime_block,
+                    &shard_table,
+                )
+            }));
+        }
+
+        // Baseline commit at term 10 (no overrides).
+        let commit1 = lineage_test_commit(&authority, 10, &members, Default::default());
+        assert!(matches!(
+            authority.handle_commit_durable(&commit1, 2, 1, |_| true),
+            crate::cluster::topology::DurableCommitOutcome::Applied(10)
+        ));
+
+        // A shard whose placement master is node 2; self (node 1) is its
+        // replica-holder and stamps Full at the current (0) regime.
+        let shard = (0..NUM_SHARDS as u16)
+            .find(|&s| placement.assignment(s).master == NodeId(2))
+            .expect("node 2 masters some shard");
+        assert!(lineage.mark_full(shard, 0, "test: replica copy complete"));
+        // A second Full shard with NO override — its stamp must ride the
+        // same batch unchanged (regime stays 0).
+        let untouched = (0..NUM_SHARDS as u16)
+            .find(|&s| s != shard && placement.assignment(s).master == NodeId(1))
+            .expect("node 1 masters some shard");
+        assert!(lineage.mark_full(untouched, 0, "test: mastered copy complete"));
+
+        // Promotion commit at term 11: override names SELF master of `shard`
+        // (I3 holder swap), regime[shard] = 11 (I10b).
+        let mut block = crate::cluster::topology::RegimeBlock::default();
+        block.override_map.insert(shard, self_id);
+        block.regime.set(shard, 11);
+        let commit2 = lineage_test_commit(&authority, 11, &members, block);
+        assert!(
+            matches!(
+                authority.handle_commit_durable(&commit2, 2, 1, |_| true),
+                crate::cluster::topology::DurableCommitOutcome::Applied(11)
+            ),
+            "the promotion commit must apply",
+        );
+        assert_eq!(
+            lineage.lineage(shard),
+            crate::cluster::lineage::Lineage::Full { regime: 11 },
+            "I13ii: the install re-stamps Full at the NEW regime",
+        );
+        assert_eq!(
+            lineage.lineage(untouched),
+            crate::cluster::lineage::Lineage::Full { regime: 0 },
+            "a non-overridden holder keeps its stamp (regime unchanged)",
+        );
+        // DURABLY: a fresh store loaded from the file (same identity) must
+        // already observe the re-stamp — the persist happened before
+        // `Applied` was returned, i.e. inside the apply section.
+        let reloaded =
+            crate::cluster::lineage::LineageStore::open(Some(lineage_path), epoch, self_id);
+        assert_eq!(
+            reloaded.lineage(shard),
+            crate::cluster::lineage::Lineage::Full { regime: 11 },
+            "the promotion re-stamp must be ON DISK by the time the commit reports Applied",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// I13(ii) fail-closed ordering — when the lineage batch cannot be made
+    /// durable, the commit is NOT applied: `handle_commit_durable` reports
+    /// `PersistFailed` and `committed_term` stays on the prior term (the
+    /// lineage persist provably runs INSIDE the apply section, as a
+    /// precondition of the apply).
+    #[test]
+    fn i13_lineage_persist_failure_fails_the_commit_closed() {
+        let dir = std::env::temp_dir().join(format!(
+            "teraslab-i13-persistfail-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id(),
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let sub = dir.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        let lineage_path = sub.join("lineage");
+        let epoch = [4u8; crate::cluster::lineage::DATA_EPOCH_LEN];
+        let self_id = NodeId(1);
+        let members = vec![NodeId(1), NodeId(2)];
+        let lineage = Arc::new(crate::cluster::lineage::LineageStore::open(
+            Some(lineage_path),
+            epoch,
+            self_id,
+        ));
+        let authority = Arc::new(crate::cluster::topology::TopologyAuthority::new(
+            self_id,
+            Duration::from_secs(1),
+        ));
+        authority.set_replication_factor(2);
+        let placement = ShardTable::compute_with_epoch(&members, 2, 1, 1);
+        let shard_table = Arc::new(ShardTableLock::new(placement.clone()));
+        {
+            let lineage = lineage.clone();
+            let shard_table = shard_table.clone();
+            authority.set_commit_install_hook(Arc::new(move |state| {
+                lineage_apply_committed_state(
+                    &lineage,
+                    self_id,
+                    2,
+                    &state.committed_members,
+                    state.committed_placement_version,
+                    &state.regime_block,
+                    &shard_table,
+                )
+            }));
+        }
+        let commit1 = lineage_test_commit(&authority, 10, &members, Default::default());
+        assert!(matches!(
+            authority.handle_commit_durable(&commit1, 2, 1, |_| true),
+            crate::cluster::topology::DurableCommitOutcome::Applied(10)
+        ));
+        let shard = (0..NUM_SHARDS as u16)
+            .find(|&s| placement.assignment(s).master == NodeId(2))
+            .expect("node 2 masters some shard");
+        assert!(lineage.mark_full(shard, 0, "test"));
+
+        // Break the lineage directory: replace it with a FILE so the
+        // batched durable write of the re-stamp must fail.
+        std::fs::remove_dir_all(&sub).unwrap();
+        std::fs::write(&sub, b"not a dir").unwrap();
+
+        let mut block = crate::cluster::topology::RegimeBlock::default();
+        block.override_map.insert(shard, self_id);
+        block.regime.set(shard, 11);
+        let commit2 = lineage_test_commit(&authority, 11, &members, block);
+        assert!(
+            matches!(
+                authority.handle_commit_durable(&commit2, 2, 1, |_| true),
+                crate::cluster::topology::DurableCommitOutcome::PersistFailed
+            ),
+            "a lineage durability fault must fail the commit closed",
+        );
+        assert_eq!(
+            authority.committed_term(),
+            10,
+            "the term must NOT advance past a failed lineage persist — the lineage \
+             write is inside the apply section, before the committed_term store",
+        );
+        assert_eq!(
+            lineage.lineage(shard),
+            crate::cluster::lineage::Lineage::Full { regime: 0 },
+            "the in-memory lineage rolls back with the refused commit",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// §4.3 triggers (b)/(f) — an inbound migration beginning degrades the
+    /// shard to Subset; its completion (last source, holder) stamps Full
+    /// at the CURRENT committed regime; a completion for a shard this node
+    /// does not hold stamps nothing.
+    #[test]
+    fn i2_inbound_completion_stamps_full_only_for_held_shards() {
+        let self_id = NodeId(1);
+        let members = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let table = ShardTable::compute_with_epoch(&members, 2, 3, 1);
+        let addrs = [
+            (NodeId(1), "127.0.0.1:4801".parse().unwrap()),
+            (NodeId(2), "127.0.0.1:4802".parse().unwrap()),
+            (NodeId(3), "127.0.0.1:4803".parse().unwrap()),
+        ];
+        let held = (0..NUM_SHARDS as u16)
+            .find(|&s| {
+                let a = table.target_assignment(s);
+                a.master == self_id || a.replicas.contains(&self_id)
+            })
+            .expect("self holds some shard");
+        let foreign = (0..NUM_SHARDS as u16)
+            .find(|&s| {
+                let a = table.target_assignment(s);
+                a.master != self_id && !a.replicas.contains(&self_id)
+            })
+            .expect("some shard is foreign to self at RF=2 over 3 nodes");
+        let cluster = new_test_running_cluster(self_id, table, &addrs, &members, &[], &[], &[], 3);
+
+        // (b) inbound begins → Subset (from the all-Subset default this is
+        // a no-op value-wise; assert the invariant holds anyway).
+        cluster.mark_inbound_active(held);
+        assert!(!cluster.lineage().is_full(held));
+        // (f) completion clears the fence and stamps Full at the current
+        // committed regime (0 here — no regime commits in this fixture).
+        cluster.mark_inbound_complete(held);
+        assert!(!cluster.has_pending_inbound_shard(held));
+        assert_eq!(
+            cluster.lineage().lineage(held),
+            crate::cluster::lineage::Lineage::Full { regime: 0 },
+            "a verified completion while in the holder set earns Full",
+        );
+
+        // A completion for a shard self does NOT hold must never mint Full.
+        cluster.mark_inbound_active(foreign);
+        cluster.mark_inbound_complete(foreign);
+        assert!(
+            !cluster.lineage().is_full(foreign),
+            "I2: Full implies holder-set membership — a non-holder completion stamps nothing",
+        );
+    }
+
+    /// I2 — the holder-set union pin: a commit that removes self from the
+    /// PLACEMENT of a shard degrades the replica stamp, but the
+    /// actively-serving departing master (`effective_assignment(s).master
+    /// == self` in the LIVE table) stays a holder and keeps (refreshes)
+    /// its Full stamp; a shard held neither way degrades even though its
+    /// regime advanced (regime advance without membership).
+    #[test]
+    fn i2_holder_exit_degrades_replica_but_not_the_serving_effective_master() {
+        let self_id = NodeId(1);
+        let lineage = Arc::new(crate::cluster::lineage::LineageStore::open(
+            None,
+            [0u8; crate::cluster::lineage::DATA_EPOCH_LEN],
+            self_id,
+        ));
+        // LIVE table: computed over [1,2,3] — self still the effective
+        // (serving) master of its round-robin share, mid-handoff.
+        let live = ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2), NodeId(3)], 2, 5, 1);
+        let shard_table = Arc::new(ShardTableLock::new(live.clone()));
+        // NEW committed members exclude self entirely.
+        let new_members = vec![NodeId(2), NodeId(3)];
+
+        let serving = (0..NUM_SHARDS as u16)
+            .find(|&s| live.effective_assignment(s).master == self_id)
+            .expect("self serves some shard in the live table");
+        let departing = (0..NUM_SHARDS as u16)
+            .find(|&s| live.effective_assignment(s).master != self_id)
+            .expect("another node serves some shard");
+        assert!(lineage.mark_full(serving, 5, "test"));
+        assert!(lineage.mark_full(departing, 5, "test"));
+
+        let mut block = crate::cluster::topology::RegimeBlock::default();
+        block.regime.set(serving, 9);
+        block.regime.set(departing, 9);
+        assert!(lineage_apply_committed_state(
+            &lineage,
+            self_id,
+            2,
+            &new_members,
+            1,
+            &block,
+            &shard_table,
+        ));
+        assert_eq!(
+            lineage.lineage(serving),
+            crate::cluster::lineage::Lineage::Full { regime: 9 },
+            "I2 union pin: the actively-serving departing master is still a holder \
+             (it takes and acks the shard's writes mid-handoff) — its stamp refreshes",
+        );
+        assert_eq!(
+            lineage.lineage(departing),
+            crate::cluster::lineage::Lineage::Subset,
+            "I2: the regime advanced while self is not in the new holder set — degrade",
+        );
+        assert!(
+            !lineage.is_full(departing),
+            "the sweep-facing shadow degrades with the stamp",
+        );
     }
 }
