@@ -1453,6 +1453,20 @@ pub(crate) fn render_metrics_text(
             sw.swim_ping_req_dropped_total.get(),
         );
     }
+    // §4.4 / §4.5 — topology attestation counters. Both are process-global
+    // (the authority is a singleton), so they are emitted unconditionally
+    // rather than gated on a cluster handle: a scrape that silently omits a
+    // fork counter reads as "no fork".
+    prom_counter(
+        &mut out,
+        "teraslab_topology_vote_digest_mismatch_total",
+        crate::cluster::topology::vote_digest_mismatch_total(),
+    );
+    prom_counter(
+        &mut out,
+        "teraslab_topology_committed_digest_fork_total",
+        crate::cluster::topology::committed_digest_fork_total(),
+    );
     if let Some(a) = allocator_metrics() {
         prom_counter(&mut out, "teraslab_alloc_total", a.alloc_total.get());
         prom_counter(
@@ -4878,6 +4892,8 @@ mod tests {
             "teraslab_swim_suspicion_duration_ns",
             "teraslab_swim_membership_churn_total",
             "teraslab_swim_ping_req_dropped_total",
+            "teraslab_topology_vote_digest_mismatch_total",
+            "teraslab_topology_committed_digest_fork_total",
             "teraslab_alloc_total",
             "teraslab_alloc_bytes_total",
             "teraslab_free_total",

@@ -16107,6 +16107,7 @@ mod tests {
             committed_placement_version: 1,
             committed_peak: 5,
             committed_commit: None,
+            voted_digest: None,
         };
         persist_topology_state(&path, &five_member).expect("seed persist creates marker");
 
@@ -16126,6 +16127,7 @@ mod tests {
             committed_placement_version: 1,
             committed_peak: 1, // pretend the raw .topo content under-reports
             committed_commit: None,
+            voted_digest: None,
         };
         std::fs::write(&path, three_member.serialize()).expect("overwrite .topo directly");
 
@@ -16166,6 +16168,7 @@ mod tests {
             committed_placement_version: 1,
             committed_peak: 3,
             committed_commit: None,
+            voted_digest: None,
         };
         persist_topology_state(&path, &multi).expect("seed persist creates marker");
         assert!(load_topology_multi_node_marker_peak(&path).is_some());
@@ -16185,6 +16188,7 @@ mod tests {
             committed_placement_version: 1,
             committed_peak: 1,
             committed_commit: None,
+            voted_digest: None,
         };
         std::fs::write(&path, rf1.serialize()).expect("overwrite with RF=1 state");
 
@@ -19259,6 +19263,7 @@ mod tests {
                 committed_placement_version: 1,
                 committed_peak: 3,
                 committed_commit: None,
+                voted_digest: None,
             });
         assert_eq!(
             cluster.topology_authority().committed_commit_bytes(),

@@ -1304,6 +1304,7 @@ fn topology_persisted_state_v2_round_trips() {
         committed_placement_version: 2,
         committed_peak: 3,
         committed_commit: Some(vec![1, 2, 3, 4, 5]),
+        voted_digest: None,
     };
     let restored =
         PersistedTopologyState::deserialize(&state.serialize()).expect("v2 record must decode");
@@ -1335,6 +1336,7 @@ fn topology_restore_then_vote_safety() {
         committed_placement_version: 1,
         committed_peak: 3,
         committed_commit: None,
+        voted_digest: None,
     };
 
     let auth = TopologyAuthority::new(NodeId(2), Duration::from_secs(1));

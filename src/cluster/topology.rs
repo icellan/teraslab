@@ -513,9 +513,12 @@ pub const TOPOLOGY_STATE_MAGIC: [u8; 4] = *b"TSTP";
 /// had no magic, no length, and no CRC, so a truncated file decoded silently
 /// into a *shorter* `committed_members` with an unchanged `committed_term` —
 /// a weakened restart quorum and a lowered split-brain floor, indistinguishable
-/// from a legitimate smaller cluster. Version 2 frames and checksums the whole
-/// record; v1 payloads no longer decode at all.
-pub const TOPOLOGY_STATE_FORMAT_VERSION: u16 = 2;
+/// from a legitimate smaller cluster. Version 2 framed and checksummed the
+/// whole record. Version 3 adds `voted_digest`: without it a vote attests to a
+/// term NUMBER only, so the commit-side digest check (which recomputes the
+/// digest from the commit's own fields) is a self-consistency checksum rather
+/// than an attestation to anything this node agreed to.
+pub const TOPOLOGY_STATE_FORMAT_VERSION: u16 = 3;
 
 /// Upper bound on the persisted winning-commit blob. A `TopologyCommit` with
 /// `MAX_TOPOLOGY_MEMBERS` members and the same number of voters is ~16 KiB;
@@ -708,6 +711,22 @@ pub struct PersistedTopologyState {
     /// partition-map catch-up path holds no commit by design, and must be
     /// distinguishable from one whose commit blob was zeroed by corruption.
     pub committed_commit: Option<Vec<u8>>,
+    /// §4.3 — the digest this node attested to when it voted at
+    /// [`Self::voted_term`], persisted under the same persist-before-vote
+    /// discipline as the term itself.
+    ///
+    /// Without it a vote records only a term NUMBER, and the commit-side
+    /// digest check — which recomputes the expected digest from the commit's
+    /// OWN fields — verifies only that the frame is internally consistent. A
+    /// proposer could then send `commit(T, A)` to one node and `commit(T, B)`
+    /// to another; both recompute their own frame's digest, both match, both
+    /// install, and neither will accept a correcting commit for T. The
+    /// divergence is committed and sticky.
+    ///
+    /// `None` means this node has not voted (or voted before this field
+    /// existed) — a state that must not be confused with "voted for the
+    /// all-zero digest".
+    pub voted_digest: Option<[u8; 32]>,
 }
 
 /// G9 — result of [`TopologyAuthority::handle_commit_durable`].
@@ -746,6 +765,7 @@ impl PersistedTopologyState {
     /// [voter_count:4][voter_ids:8*N]
     /// [ever_seen_count:4][ever_seen_ids:8*N]
     /// [commit_present:1]([commit_len:4][commit_bytes])?
+    /// [voted_digest_present:1]([voted_digest:32])?
     /// ```
     ///
     /// Every count is bounded on decode and every section is length-checked,
@@ -784,6 +804,13 @@ impl PersistedTopologyState {
                 payload.push(1);
                 payload.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
                 payload.extend_from_slice(bytes);
+            }
+            None => payload.push(0),
+        }
+        match &self.voted_digest {
+            Some(digest) => {
+                payload.push(1);
+                payload.extend_from_slice(digest);
             }
             None => payload.push(0),
         }
@@ -876,6 +903,15 @@ impl PersistedTopologyState {
                 Some(r.take(len, "committed_commit")?.to_vec())
             }
         };
+        let voted_digest = match r.u8("voted_digest_present")? {
+            0 => None,
+            _ => {
+                let bytes = r.take(32, "voted_digest")?;
+                let mut digest = [0u8; 32];
+                digest.copy_from_slice(bytes);
+                Some(digest)
+            }
+        };
         r.finish()?;
 
         Ok(Self {
@@ -889,6 +925,7 @@ impl PersistedTopologyState {
             committed_placement_version,
             committed_peak,
             committed_commit,
+            voted_digest,
         })
     }
 
@@ -909,6 +946,7 @@ impl PersistedTopologyState {
             committed_placement_version: 1,
             committed_peak: 1,
             committed_commit: None,
+            voted_digest: None,
         }
     }
 }
@@ -1177,6 +1215,45 @@ pub struct TopologyAuthority {
     /// for a node that caught up via the partition map, and the reason the
     /// persisted form carries an explicit presence flag.
     committed_commit: RwLock<Option<Vec<u8>>>,
+    /// §4.3 — the digest this node attested to at `voted_term`. Written under
+    /// `vote_decision` in the same critical section as `voted_term`, and
+    /// persisted by the caller BEFORE the vote is put on the wire.
+    voted_digest: RwLock<Option<[u8; 32]>>,
+    /// §4.5 — the digest of the commit this node applied at `committed_term`.
+    /// Derived state (it is `commit.digest` of the applied commit, and also
+    /// lives inside `committed_commit`), kept unpacked so the gate path does
+    /// not re-parse the commit blob on every frame.
+    committed_digest: RwLock<Option<[u8; 32]>>,
+}
+
+/// §4.4 — count of commits rejected because their digest disagreed with the
+/// digest this node attested to at the same term. Read via
+/// [`vote_digest_mismatch_total`].
+static VOTE_DIGEST_MISMATCH_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// §4.5 — count of commits naming this node's committed term with a DIFFERENT
+/// digest than the one it committed there. Read via
+/// [`committed_digest_fork_total`].
+static COMMITTED_DIGEST_FORK_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// §4.4 — commits rejected on a vote-attestation mismatch.
+///
+/// A non-zero value means some proposer put two different contents behind one
+/// term number. That is a routine race (term numbers are derived from local
+/// state, so two proposers can mint the same term), not proof of a fork — a
+/// sustained climb is what warrants investigation.
+pub fn vote_digest_mismatch_total() -> u64 {
+    VOTE_DIGEST_MISMATCH_TOTAL.load(Ordering::Relaxed)
+}
+
+/// §4.5 — commits observed for this node's committed term carrying a digest
+/// different from the one it committed.
+///
+/// Unlike [`vote_digest_mismatch_total`] this is hard evidence of a
+/// **committed-history fork**: two different contents were quorum-committed at
+/// one term. Any non-zero value is an incident.
+pub fn committed_digest_fork_total() -> u64 {
+    COMMITTED_DIGEST_FORK_TOTAL.load(Ordering::Relaxed)
 }
 
 impl TopologyAuthority {
@@ -1211,7 +1288,48 @@ impl TopologyAuthority {
             }),
             last_shrink: Mutex::new(None),
             committed_commit: RwLock::new(None),
+            voted_digest: RwLock::new(None),
+            committed_digest: RwLock::new(None),
         }
+    }
+
+    /// §4.3 — record this node's attestation: the term voted for AND the
+    /// digest voted for, together.
+    ///
+    /// EVERY producer of a vote — follower votes and proposer self-votes
+    /// alike — must go through this. Advancing `voted_term` alone leaves the
+    /// PREVIOUS term's digest paired with the new term, and the §4.4 gate then
+    /// rejects the very commit this node proposed.
+    fn record_vote(&self, term: u64, digest: [u8; 32]) {
+        self.voted_term.store(term, Ordering::Relaxed);
+        *self.voted_digest.write().unwrap() = Some(digest);
+    }
+
+    /// §4.3 — reserve a term number under `vote_decision` before the content
+    /// (and therefore the digest) exists.
+    ///
+    /// Clears the attestation rather than leaving a stale one: `None` honestly
+    /// says "voted at this term, content not yet determined", where a stale
+    /// digest would be a false contradiction. The caller completes the vote
+    /// with [`Self::record_vote`] as soon as the proposal is built.
+    fn reserve_vote_term(&self, term: u64) {
+        self.voted_term.store(term, Ordering::Relaxed);
+        *self.voted_digest.write().unwrap() = None;
+    }
+
+    /// The highest term this node has voted for. `0` when it never has.
+    pub fn voted_term(&self) -> u64 {
+        self.voted_term.load(Ordering::Relaxed)
+    }
+
+    /// §4.3 — the digest this node attested to at [`Self::voted_term`].
+    pub fn voted_digest(&self) -> Option<[u8; 32]> {
+        *self.voted_digest.read().unwrap()
+    }
+
+    /// §4.5 — the digest of the commit applied at [`Self::committed_term`].
+    pub fn committed_digest(&self) -> Option<[u8; 32]> {
+        *self.committed_digest.read().unwrap()
     }
 
     /// E5 — the serialized winning [`TopologyCommit`] for the current
@@ -1501,6 +1619,21 @@ impl TopologyAuthority {
                     }
                 }
             });
+        // §4.5 — the committed digest comes from the (already validated)
+        // commit blob, so it is present exactly when that blob is. A node
+        // that caught up without a commit holds none, and the fork detector
+        // simply does not fire for it.
+        *self.committed_digest.write().unwrap() = self
+            .committed_commit
+            .read()
+            .unwrap()
+            .as_ref()
+            .and_then(|bytes| TopologyCommit::deserialize(bytes))
+            .map(|commit| commit.digest);
+        // §4.3 — restore the attested digest alongside the term it belongs
+        // to. Dropping it on restart would silently re-open the equivocation
+        // window across every reboot.
+        *self.voted_digest.write().unwrap() = state.voted_digest;
     }
 
     /// Current committed term.
@@ -1621,6 +1754,7 @@ impl TopologyAuthority {
             committed_placement_version: self.committed_placement_version(),
             committed_peak: self.committed_peak(),
             committed_commit: self.committed_commit_bytes(),
+            voted_digest: self.voted_digest(),
         }
     }
 
@@ -1704,8 +1838,9 @@ impl TopologyAuthority {
             let committed = self.committed_term.load(Ordering::Relaxed);
             let voted = self.voted_term.load(Ordering::Relaxed);
             let new_term = committed.max(voted) + 1;
-            // Self-vote.
-            self.voted_term.store(new_term, Ordering::Relaxed);
+            // Self-vote. Only the term NUMBER is reservable here — the
+            // digest does not exist until the proposal is built below.
+            self.reserve_vote_term(new_term);
             (committed, new_term)
         };
         let _ = committed;
@@ -1736,6 +1871,8 @@ impl TopologyAuthority {
             placement_version,
             committed_peak,
         );
+        // §4.3 — complete the self-vote now that the content exists.
+        self.record_vote(new_term, term.digest);
         let quorum_needed = self.activation_quorum_needed(members.len());
         let mut votes = std::collections::HashMap::new();
         votes.insert(self.self_id, true);
@@ -1868,7 +2005,12 @@ impl TopologyAuthority {
 
             if accepted {
                 // Record vote (must be persisted by caller before sending).
-                self.voted_term.store(propose.term, Ordering::Relaxed);
+                // §4.3 — the DIGEST is recorded with the term, in the same
+                // critical section. A vote that records only the term attests
+                // to nothing about content: the commit-side check recomputes
+                // the digest from the commit's own fields, so it verifies
+                // internal consistency, not agreement.
+                self.record_vote(propose.term, propose.digest);
             }
             accepted
         };
@@ -1971,6 +2113,7 @@ impl TopologyAuthority {
 
         // Validate: term must be strictly higher.
         if commit.term <= committed {
+            self.detect_committed_history_fork(commit, committed);
             return false;
         }
 
@@ -2146,7 +2289,97 @@ impl TopologyAuthority {
             return false;
         }
 
+        // §4.4 (E1) — LAST gate, after every structural one (P1-6): a
+        // malformed or sub-quorum frame must never reach a detector.
+        if !self.vote_attestation_holds(commit) {
+            return false;
+        }
+
         true
+    }
+
+    /// §4.4 (E1) — does this commit agree with what this node attested to?
+    ///
+    /// The digest gate above recomputes the expected digest from the commit's
+    /// OWN fields, so it proves only internal consistency. This is the gate
+    /// that compares the commit against something this node independently
+    /// recorded: the digest it voted for at that term.
+    ///
+    /// Returns `false` (reject) on a mismatch. It deliberately does NOT fence.
+    /// Term numbers are not globally reserved — every producer derives
+    /// `max(committed, voted) + 1` from local state, so two proposers routinely
+    /// mint the same term with different content, and a proposer that reaches
+    /// some voters and then dies lets another re-mint that term legitimately.
+    /// Fencing on that benign race would brick honest nodes with no attacker
+    /// present. Rejecting only means this node stays on its prior term until
+    /// the next one arrives.
+    ///
+    /// A node that never voted at this term (`voted_digest` is `None`, or
+    /// `voted_term` differs) has nothing to contradict, so the gate passes —
+    /// missing a propose round is the NORMAL catch-up path in any n >= 3
+    /// cluster, not an edge case.
+    fn vote_attestation_holds(&self, commit: &TopologyCommit) -> bool {
+        let voted_term = self.voted_term.load(Ordering::Relaxed);
+        if commit.term != voted_term {
+            return true;
+        }
+        let Some(voted_digest) = self.voted_digest() else {
+            return true;
+        };
+        if commit.digest == voted_digest {
+            return true;
+        }
+        VOTE_DIGEST_MISMATCH_TOTAL.fetch_add(1, Ordering::Relaxed);
+        tracing::error!(
+            self_id = self.self_id.0,
+            term = commit.term,
+            proposer = commit.proposer.0,
+            commit_digest = ?&commit.digest[..8],
+            voted_digest = ?&voted_digest[..8],
+            "cluster: rejecting topology commit — its digest differs from the one \
+             this node attested to at the same term. Two different contents were \
+             put behind one term number; this node did not agree to this one.",
+        );
+        false
+    }
+
+    /// §4.5 (P1-8) — a commit naming this node's committed term with a
+    /// DIFFERENT digest is proof that two contents were quorum-committed at
+    /// one term: a committed-history fork.
+    ///
+    /// Stronger evidence than a vote mismatch (which only says a proposer
+    /// re-minted a term), and today it is discarded before any comparison
+    /// happens — the stale-term gate returns first. Detection only: the frame
+    /// is still rejected, nothing is fenced, and the operator gets a counter
+    /// and an ERROR. `voted_term` and `committed_term` are independent (a node
+    /// that caught up by commit never advances `voted_term`), so §4.4 alone
+    /// never fires for a caught-up node — this is its counterpart.
+    ///
+    /// Only the CURRENT committed term's digest is retained, so this fires at
+    /// `commit.term == committed_term`; older terms leave no digest to compare
+    /// against. The quorum-proof precondition keeps a malformed frame from
+    /// reaching the counter.
+    fn detect_committed_history_fork(&self, commit: &TopologyCommit, committed: u64) {
+        if commit.term != committed || committed == 0 {
+            return;
+        }
+        let Some(committed_digest) = self.committed_digest() else {
+            return;
+        };
+        if commit.digest == committed_digest || !commit.has_quorum_voter_proof() {
+            return;
+        }
+        COMMITTED_DIGEST_FORK_TOTAL.fetch_add(1, Ordering::Relaxed);
+        tracing::error!(
+            self_id = self.self_id.0,
+            term = commit.term,
+            proposer = commit.proposer.0,
+            commit_digest = ?&commit.digest[..8],
+            committed_digest = ?&committed_digest[..8],
+            "cluster: COMMITTED-HISTORY FORK — a quorum-backed commit names this \
+             node's committed term with different content. Two topologies were \
+             committed at one term; the cluster's history has diverged.",
+        );
     }
 
     /// Apply a commit that has already passed every validation gate in
@@ -2241,6 +2474,10 @@ impl TopologyAuthority {
         // published, matching the members/placement ordering below: a reader
         // that sees the new term never sees the previous term's commit.
         *self.committed_commit.write().unwrap() = Some(commit.serialize());
+        // §4.5 — remember WHAT was committed at this term, not just that
+        // something was. A later frame naming this term with a different
+        // digest is then hard evidence of a committed-history fork.
+        *self.committed_digest.write().unwrap() = Some(commit.digest);
         *self.observed_membership.lock() = commit.members.clone();
         // F-G8-001 fallback: every member of a committed term is, from
         // now on, a "known" voter. Future proposals that introduce a
@@ -2309,6 +2546,9 @@ impl TopologyAuthority {
             // installs, so a node can never serve a committed term whose
             // commit bytes it would lose on reboot.
             committed_commit: Some(commit.serialize()),
+            // Applying a commit does not cast a vote, so the attested digest
+            // is carried through unchanged — same as `voted_term` above.
+            voted_digest: self.voted_digest(),
         }
     }
 
@@ -2463,7 +2703,7 @@ impl TopologyAuthority {
             placement_version,
             committed_peak,
         );
-        self.voted_term.store(new_term, Ordering::Relaxed);
+        self.record_vote(new_term, term.digest);
 
         let quorum_needed = self.activation_quorum_needed(target_members.len());
         let mut votes = std::collections::HashMap::new();
@@ -2543,7 +2783,7 @@ impl TopologyAuthority {
             achievable,
             committed_peak,
         );
-        self.voted_term.store(new_term, Ordering::Relaxed);
+        self.record_vote(new_term, term.digest);
 
         let quorum_needed = self.activation_quorum_needed(committed_members.len());
         let mut votes = std::collections::HashMap::new();
@@ -2671,7 +2911,7 @@ impl TopologyAuthority {
             placement_version,
             committed_peak,
         );
-        self.voted_term.store(new_term, Ordering::Relaxed);
+        self.record_vote(new_term, term.digest);
 
         // Gate A: quorum is derived from the OLD peak (`peak_cluster_size()`
         // has not been lowered yet at propose time), so a minority can never
@@ -2792,7 +3032,7 @@ impl TopologyAuthority {
             placement_version,
             committed_peak,
         );
-        self.voted_term.store(new_term, Ordering::Relaxed);
+        self.record_vote(new_term, term.digest);
 
         let quorum_needed = self.activation_quorum_needed(target_members.len());
         let mut votes = std::collections::HashMap::new();
@@ -3265,6 +3505,7 @@ mod tests {
             committed_placement_version: 1,
             committed_peak: 5,
             committed_commit: None,
+            voted_digest: None,
         };
         let data = state.serialize();
         let restored = PersistedTopologyState::deserialize(&data).expect("v2 record must decode");
@@ -4137,6 +4378,7 @@ mod tests {
             committed_placement_version: 1,
             committed_peak: 1,
             committed_commit: None,
+            voted_digest: None,
         };
         let data = state.serialize();
         let restored = PersistedTopologyState::deserialize(&data).expect("v2 record must decode");
@@ -5123,6 +5365,7 @@ mod tests {
             committed_placement_version: 2,
             committed_peak: 3,
             committed_commit: None,
+            voted_digest: None,
         };
         let decoded =
             PersistedTopologyState::deserialize(&state.serialize()).expect("v2 record must decode");
@@ -5714,6 +5957,7 @@ mod tests {
             committed_placement_version: projected_placement,
             committed_peak: projected_committed_peak,
             committed_commit: projected_commit,
+            voted_digest: projected_voted_digest,
         } = projected;
         let PersistedTopologyState {
             peak_cluster_size: actual_peak,
@@ -5726,6 +5970,7 @@ mod tests {
             committed_placement_version: actual_placement,
             committed_peak: actual_committed_peak,
             committed_commit: actual_commit,
+            voted_digest: actual_voted_digest,
         } = actual;
 
         assert_eq!(projected_term, actual_term);
@@ -5753,6 +5998,10 @@ mod tests {
         assert_eq!(
             projected_commit, actual_commit,
             "E5 — persisted commit bytes must match between the projection and post-apply state",
+        );
+        assert_eq!(
+            projected_voted_digest, actual_voted_digest,
+            "the attested vote digest must be carried through identically",
         );
     }
 
@@ -5941,6 +6190,7 @@ mod tests {
             // a broken round trip.
             committed_peak: 7,
             committed_commit: None,
+            voted_digest: None,
         };
         let decoded =
             PersistedTopologyState::deserialize(&state.serialize()).expect("v2 record must decode");
@@ -6031,6 +6281,7 @@ mod tests {
             committed_placement_version: 1,
             committed_peak: 5,
             committed_commit: None,
+            voted_digest: None,
         };
         let full = state.serialize();
 
@@ -6067,6 +6318,7 @@ mod tests {
             committed_placement_version: 2,
             committed_peak: 3,
             committed_commit: None,
+            voted_digest: None,
         };
         let good = state.serialize();
         assert!(
@@ -6101,6 +6353,7 @@ mod tests {
             committed_placement_version: 1,
             committed_peak: 1,
             committed_commit: None,
+            voted_digest: None,
         };
         let good = base.serialize();
 
@@ -6154,6 +6407,7 @@ mod tests {
             committed_placement_version: 1,
             committed_peak: 3,
             committed_commit: Some(vec![0u8; 64]),
+            voted_digest: None,
         };
         let decoded = PersistedTopologyState::deserialize(&with_commit.serialize())
             .expect("v2 record must decode");
@@ -6185,6 +6439,7 @@ mod tests {
             committed_placement_version: 1,
             committed_peak: 1,
             committed_commit: Some(vec![7u8; 8]),
+            voted_digest: None,
         };
         let mut bad = state.serialize();
         // The commit length is the last 4 bytes before the blob, which is the
@@ -6242,6 +6497,337 @@ mod tests {
         );
     }
 
+    /// §4.3 — a vote records the DIGEST, not just the term, and both survive
+    /// the persist round-trip.
+    #[test]
+    fn voting_records_the_attested_digest_and_it_survives_restart() {
+        let mems = members(&[1, 2, 3]);
+        let propose = TopologyTerm::new(5, mems.clone(), NodeId(1), ClusterId::UNSET, 1, 3);
+
+        let auth = TopologyAuthority::new(NodeId(2), Duration::from_secs(1));
+        assert_eq!(auth.voted_digest(), None, "no vote cast yet");
+        let vote = auth.handle_propose(&propose);
+        assert!(
+            vote.accepted,
+            "a well-formed first proposal must be accepted"
+        );
+        assert_eq!(auth.voted_term(), 5);
+        assert_eq!(
+            auth.voted_digest(),
+            Some(propose.digest),
+            "the vote must record what was attested to, not just the term",
+        );
+
+        let reloaded = PersistedTopologyState::deserialize(&auth.persisted_state(3, 1).serialize())
+            .expect("persisted state must decode");
+        assert_eq!(reloaded.voted_digest, Some(propose.digest));
+        let restored = TopologyAuthority::new(NodeId(2), Duration::from_secs(1));
+        restored.restore(&reloaded);
+        assert_eq!(
+            restored.voted_digest(),
+            Some(propose.digest),
+            "dropping the attested digest on restart re-opens the equivocation window",
+        );
+    }
+
+    /// §4.4 (E1) — the equivocation attack the whole mechanism exists for.
+    ///
+    /// A proposer gets a vote for term T carrying digest A, then commits term T
+    /// carrying digest B. Every field of the B commit is internally consistent,
+    /// so the recompute-from-own-fields digest check passes. Only the persisted
+    /// vote can tell the two apart.
+    #[test]
+    fn commit_whose_digest_differs_from_the_attested_one_is_rejected() {
+        let voted_members = members(&[1, 2, 3]);
+        let propose =
+            TopologyTerm::new(7, voted_members.clone(), NodeId(1), ClusterId::UNSET, 1, 3);
+
+        let auth = TopologyAuthority::new(NodeId(3), Duration::from_secs(1));
+        assert!(auth.handle_propose(&propose).accepted);
+
+        // Same term, DIFFERENT content — and a digest that is correct for that
+        // content, so the self-consistency check cannot catch it.
+        let other_members = members(&[1, 2, 3, 4]);
+        let equivocating = TopologyCommit {
+            term: 7,
+            proposer: NodeId(1),
+            members: other_members.clone(),
+            cluster_id: ClusterId::UNSET,
+            placement_version: 1,
+            committed_peak: 4,
+            digest: TopologyTerm::compute_digest(7, &ClusterId::UNSET, &other_members, 1, 4),
+            voters: other_members.clone(),
+        };
+        assert_eq!(
+            equivocating.digest,
+            TopologyTerm::compute_digest(
+                equivocating.term,
+                &equivocating.cluster_id,
+                &equivocating.members,
+                equivocating.placement_version,
+                equivocating.committed_peak,
+            ),
+            "precondition: the equivocating commit is internally consistent",
+        );
+        assert_ne!(equivocating.digest, propose.digest);
+
+        let before = vote_digest_mismatch_total();
+        assert_eq!(
+            auth.handle_commit(&equivocating),
+            None,
+            "a commit contradicting this node's own attestation must be rejected",
+        );
+        assert_eq!(
+            vote_digest_mismatch_total(),
+            before + 1,
+            "the rejection must be counted",
+        );
+        assert_eq!(auth.committed_term(), 0, "nothing may have been applied");
+
+        // Reject, never fence: the node keeps serving its prior term and is
+        // still able to accept the NEXT term normally.
+        assert!(
+            !auth.is_self_fenced(),
+            "E1 — a digest mismatch must not fence"
+        );
+        let next_members = members(&[1, 2, 3]);
+        let next = TopologyCommit {
+            term: 8,
+            proposer: NodeId(1),
+            members: next_members.clone(),
+            cluster_id: ClusterId::UNSET,
+            placement_version: 1,
+            committed_peak: 3,
+            digest: TopologyTerm::compute_digest(8, &ClusterId::UNSET, &next_members, 1, 3),
+            voters: next_members.clone(),
+        };
+        assert_eq!(
+            auth.handle_commit(&next),
+            Some(8),
+            "the node must still advance on the next term",
+        );
+    }
+
+    /// §4.4 — the commit this node actually voted for still applies.
+    #[test]
+    fn commit_matching_the_attested_digest_applies() {
+        let mems = members(&[1, 2, 3]);
+        let propose = TopologyTerm::new(4, mems.clone(), NodeId(1), ClusterId::UNSET, 1, 3);
+        let auth = TopologyAuthority::new(NodeId(2), Duration::from_secs(1));
+        assert!(auth.handle_propose(&propose).accepted);
+
+        let commit = TopologyCommit {
+            term: 4,
+            proposer: NodeId(1),
+            members: mems.clone(),
+            cluster_id: ClusterId::UNSET,
+            placement_version: 1,
+            committed_peak: 3,
+            digest: propose.digest,
+            voters: mems.clone(),
+        };
+        assert_eq!(auth.handle_commit(&commit), Some(4));
+        assert_eq!(auth.committed_digest(), Some(propose.digest));
+    }
+
+    /// §4.4 / §4.9 — a node that never voted at the committed term has nothing
+    /// to contradict. Missing a propose round is the normal catch-up path in
+    /// any n >= 3 cluster, so it must not be turned into a rejection.
+    #[test]
+    fn a_node_that_never_voted_at_the_term_still_accepts_the_commit() {
+        let mems = members(&[1, 2, 3]);
+        let auth = TopologyAuthority::new(NodeId(3), Duration::from_secs(1));
+        assert_eq!(auth.voted_term(), 0, "precondition: never voted");
+
+        let commit = TopologyCommit {
+            term: 6,
+            proposer: NodeId(1),
+            members: mems.clone(),
+            cluster_id: ClusterId::UNSET,
+            placement_version: 1,
+            committed_peak: 3,
+            digest: TopologyTerm::compute_digest(6, &ClusterId::UNSET, &mems, 1, 3),
+            voters: mems.clone(),
+        };
+        let before = vote_digest_mismatch_total();
+        assert_eq!(auth.handle_commit(&commit), Some(6));
+        assert_eq!(
+            vote_digest_mismatch_total(),
+            before,
+            "a non-voter must not be counted as a mismatch",
+        );
+    }
+
+    /// §4.3 — a proposer must accept the commit for its OWN proposal.
+    ///
+    /// Regression: the self-vote paths advance `voted_term` without recording
+    /// a digest. Leaving the previous term's digest paired with the new term
+    /// makes the §4.4 gate reject the proposer's own commit, which strands the
+    /// majority side of a partition — it proposes, wins the vote, and then
+    /// refuses to apply the result.
+    #[test]
+    fn a_proposer_accepts_the_commit_for_its_own_proposal() {
+        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+
+        // A prior vote at an earlier term leaves a digest behind.
+        let earlier = TopologyTerm::new(1, members(&[1, 2, 3]), NodeId(2), ClusterId::UNSET, 1, 3);
+        assert!(auth.handle_propose(&earlier).accepted);
+        assert_eq!(auth.voted_digest(), Some(earlier.digest));
+
+        // Now this node proposes a new term itself.
+        let proposal = auth
+            .on_membership_changed(&members(&[1, 2, 3]))
+            .expect("node 1 is the deterministic proposer");
+        assert_eq!(
+            auth.voted_digest(),
+            Some(proposal.digest),
+            "the self-vote must attest to the proposal's OWN digest",
+        );
+
+        // The commit its own quorum produces must apply.
+        let commit = TopologyCommit {
+            term: proposal.term,
+            proposer: NodeId(1),
+            members: proposal.members.clone(),
+            cluster_id: proposal.cluster_id,
+            placement_version: proposal.placement_version,
+            committed_peak: proposal.committed_peak,
+            digest: proposal.digest,
+            voters: members(&[1, 2, 3]),
+        };
+        let before = vote_digest_mismatch_total();
+        assert_eq!(
+            auth.handle_commit(&commit),
+            Some(proposal.term),
+            "a proposer must apply the commit for its own proposal",
+        );
+        assert_eq!(vote_digest_mismatch_total(), before);
+    }
+
+    /// §4.5 (P1-8) — a quorum-backed commit naming the committed term with a
+    /// different digest is a committed-history fork. Detected and counted; the
+    /// frame is still rejected (it is a stale term) and nothing is fenced.
+    #[test]
+    fn commit_contradicting_the_committed_digest_raises_the_fork_alarm() {
+        let mems = members(&[1, 2, 3]);
+        let commit = TopologyCommit {
+            term: 5,
+            proposer: NodeId(1),
+            members: mems.clone(),
+            cluster_id: ClusterId::UNSET,
+            placement_version: 1,
+            committed_peak: 3,
+            digest: TopologyTerm::compute_digest(5, &ClusterId::UNSET, &mems, 1, 3),
+            voters: mems.clone(),
+        };
+        let auth = TopologyAuthority::new(NodeId(2), Duration::from_secs(1));
+        assert_eq!(auth.handle_commit(&commit), Some(5));
+
+        // A different topology, quorum-backed, claiming the SAME term.
+        let forked_members = members(&[1, 2, 3, 4]);
+        let forked = TopologyCommit {
+            term: 5,
+            proposer: NodeId(4),
+            members: forked_members.clone(),
+            cluster_id: ClusterId::UNSET,
+            placement_version: 1,
+            committed_peak: 4,
+            digest: TopologyTerm::compute_digest(5, &ClusterId::UNSET, &forked_members, 1, 4),
+            voters: forked_members.clone(),
+        };
+
+        let before = committed_digest_fork_total();
+        assert_eq!(
+            auth.handle_commit(&forked),
+            None,
+            "a stale-term commit is still rejected",
+        );
+        assert_eq!(
+            committed_digest_fork_total(),
+            before + 1,
+            "the fork must be counted — today it is discarded before any comparison",
+        );
+        assert_eq!(
+            auth.committed_term(),
+            5,
+            "committed state must be untouched"
+        );
+        assert_eq!(auth.committed_digest(), Some(commit.digest));
+    }
+
+    /// §4.5 — a REPLAY of the same commit is not a fork. Duplicate commit
+    /// frames are ordinary (broadcast retries), so the detector must key on
+    /// the digest differing, not on the term repeating.
+    #[test]
+    fn replaying_the_same_commit_does_not_raise_the_fork_alarm() {
+        let mems = members(&[1, 2, 3]);
+        let commit = TopologyCommit {
+            term: 5,
+            proposer: NodeId(1),
+            members: mems.clone(),
+            cluster_id: ClusterId::UNSET,
+            placement_version: 1,
+            committed_peak: 3,
+            digest: TopologyTerm::compute_digest(5, &ClusterId::UNSET, &mems, 1, 3),
+            voters: mems.clone(),
+        };
+        let auth = TopologyAuthority::new(NodeId(2), Duration::from_secs(1));
+        assert_eq!(auth.handle_commit(&commit), Some(5));
+
+        let before = committed_digest_fork_total();
+        assert_eq!(auth.handle_commit(&commit), None, "replay is a stale term");
+        assert_eq!(
+            committed_digest_fork_total(),
+            before,
+            "an identical replay is not a fork",
+        );
+    }
+
+    /// §4.7 (P1-6) — a structurally invalid frame must never reach a detector.
+    /// A commit with a sub-quorum voter list claiming the committed term with a
+    /// different digest proves nothing: the voter list is plaintext and
+    /// self-declared, so anyone can assert a fork that did not happen.
+    #[test]
+    fn a_sub_quorum_frame_cannot_raise_the_fork_alarm() {
+        let mems = members(&[1, 2, 3]);
+        let commit = TopologyCommit {
+            term: 5,
+            proposer: NodeId(1),
+            members: mems.clone(),
+            cluster_id: ClusterId::UNSET,
+            placement_version: 1,
+            committed_peak: 3,
+            digest: TopologyTerm::compute_digest(5, &ClusterId::UNSET, &mems, 1, 3),
+            voters: mems.clone(),
+        };
+        let auth = TopologyAuthority::new(NodeId(2), Duration::from_secs(1));
+        assert_eq!(auth.handle_commit(&commit), Some(5));
+
+        let forked_members = members(&[1, 2, 3, 4]);
+        let sub_quorum = TopologyCommit {
+            term: 5,
+            proposer: NodeId(4),
+            members: forked_members.clone(),
+            cluster_id: ClusterId::UNSET,
+            placement_version: 1,
+            committed_peak: 4,
+            digest: TopologyTerm::compute_digest(5, &ClusterId::UNSET, &forked_members, 1, 4),
+            voters: members(&[4]), // one voter for a 4-member topology
+        };
+        assert!(
+            !sub_quorum.has_quorum_voter_proof(),
+            "precondition: the frame carries no quorum proof",
+        );
+
+        let before = committed_digest_fork_total();
+        assert_eq!(auth.handle_commit(&sub_quorum), None);
+        assert_eq!(
+            committed_digest_fork_total(),
+            before,
+            "an unproven frame must not be able to assert a fork",
+        );
+    }
+
     #[test]
     fn restore_discards_a_persisted_commit_for_the_wrong_term() {
         // The CRC proves the bytes are what was written; it cannot prove they
@@ -6269,6 +6855,7 @@ mod tests {
             committed_placement_version: 1,
             committed_peak: 3,
             committed_commit: Some(stale.serialize()),
+            voted_digest: None,
         };
 
         let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
@@ -6395,6 +6982,7 @@ mod tests {
             committed_placement_version: 1,
             committed_peak: 6,
             committed_commit: None,
+            voted_digest: None,
         };
         auth.restore(&state);
         assert_eq!(
@@ -6452,6 +7040,7 @@ mod tests {
             committed_placement_version: 1,
             committed_peak: 3, // the durable, correctly-lowered anchor
             committed_commit: None,
+            voted_digest: None,
         };
 
         let config = ClusterConfig {
