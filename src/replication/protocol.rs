@@ -1078,6 +1078,16 @@ impl ReplicaOp {
     /// (live-read fallback); a truncated V3 Reassign is a hard
     /// [`ProtocolError::BufferTooShort`], never a silent fallback to the
     /// V2 shape.
+    ///
+    /// Sentinel caveat (§8 review F-7 interaction): `Some([0u8; 32])` is
+    /// UNREPRESENTABLE — it encodes as the `None` sentinel, so a record
+    /// whose utxo hash is genuinely all-zero would have its §4.9 prior
+    /// guard stripped in transit, and under committed regime enforcement
+    /// the receiver's F-7 guard then refuses the prior-less op
+    /// (fail-closed). A real utxo hash is a cryptographic commitment and
+    /// is never all-zero, so this is unreachable in production — but test
+    /// fixtures must use non-zero hashes (see
+    /// `tests/g8_e4_tcp_frame_replay.rs::create_record`).
     pub fn deserialize_v3(data: &[u8]) -> Result<(Self, usize)> {
         if data.is_empty() {
             return Err(ProtocolError::BufferTooShort { need: 1, have: 0 });

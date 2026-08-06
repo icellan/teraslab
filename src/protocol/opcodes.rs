@@ -292,6 +292,20 @@ pub const OP_MIGRATION_BATCH_COMPLETE: u16 = 243;
 /// version and re-runs the normal outbound migration (or re-sends the
 /// completion handshake) for the listed shards. Fully idempotent.
 pub const OP_MIGRATION_TRANSFER_REQUEST: u16 = 244;
+/// §4.3 catch-up-convergence completion trigger (§8 review F3) — a MASTER
+/// whose per-replica convergence loop observed the replica durably ACK
+/// every redo sequence over an intact (un-reclaimed) redo range sends this
+/// to that replica, asserting completeness for the shards the master owns.
+/// Payload: `[source_node_id:8][count:2][(shard:2, regime:8) × count]`.
+/// The receiver STAMPS NOTHING on trust alone: per shard it re-verifies —
+/// against its OWN installed committed state and local fences — that the
+/// asserting sender IS the shard's committed master, the regime matches
+/// its own committed regime, itself is in the shard's holder set, and no
+/// inbound/heal fence is up; only then is `Full{regime}` stamped (one
+/// batched durable lineage write). See
+/// `cluster::coordinator::apply_replica_converged_signal` for the trust
+/// argument.
+pub const OP_REPLICA_CONVERGED: u16 = 245;
 
 // Cluster (inter-node)
 pub const OP_HEARTBEAT: u16 = 250;
@@ -853,6 +867,7 @@ pub fn is_inter_node_auth_opcode(op_code: u16) -> bool {
             | OP_MIGRATION_COMPLETE
             | OP_MIGRATION_BATCH_COMPLETE
             | OP_MIGRATION_TRANSFER_REQUEST
+            | OP_REPLICA_CONVERGED
             | OP_TOPOLOGY_PROPOSE
             | OP_TOPOLOGY_VOTE
             | OP_TOPOLOGY_COMMIT

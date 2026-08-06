@@ -1675,16 +1675,21 @@ impl ClusterCoordinator {
         // identity (entropy/IO fault) degrades to a NON-persistent
         // all-`Subset` store — the fail-closed direction: nothing is served
         // or swept on the strength of an unverifiable `Full` claim.
-        let lineage: Arc<crate::cluster::lineage::LineageStore> = match cluster_state_path.as_ref()
-        {
+        let (lineage, current_data_epoch): (
+            Arc<crate::cluster::lineage::LineageStore>,
+            Option<[u8; crate::cluster::lineage::DATA_EPOCH_LEN]>,
+        ) = match cluster_state_path.as_ref() {
             Some(base) => {
                 let epoch_path = crate::cluster::lineage::data_epoch_path(base);
                 match crate::cluster::lineage::load_or_create_data_epoch(&epoch_path) {
-                    Ok(epoch) => Arc::new(crate::cluster::lineage::LineageStore::open(
-                        Some(crate::cluster::lineage::lineage_state_path(base)),
-                        epoch,
-                        self.self_id,
-                    )),
+                    Ok(epoch) => (
+                        Arc::new(crate::cluster::lineage::LineageStore::open(
+                            Some(crate::cluster::lineage::lineage_state_path(base)),
+                            epoch,
+                            self.self_id,
+                        )),
+                        Some(epoch),
+                    ),
                     Err(e) => {
                         tracing::error!(
                             err = %e,
@@ -1692,20 +1697,40 @@ impl ClusterCoordinator {
                             "lineage: no trustworthy data-epoch identity — running a \
                              NON-PERSISTENT all-Subset lineage store (fail-closed)",
                         );
-                        Arc::new(crate::cluster::lineage::LineageStore::open(
+                        (
+                            Arc::new(crate::cluster::lineage::LineageStore::open(
+                                None,
+                                [0u8; crate::cluster::lineage::DATA_EPOCH_LEN],
+                                self.self_id,
+                            )),
                             None,
-                            [0u8; crate::cluster::lineage::DATA_EPOCH_LEN],
-                            self.self_id,
-                        ))
+                        )
                     }
                 }
             }
-            None => Arc::new(crate::cluster::lineage::LineageStore::open(
+            None => (
+                Arc::new(crate::cluster::lineage::LineageStore::open(
+                    None,
+                    [0u8; crate::cluster::lineage::DATA_EPOCH_LEN],
+                    self.self_id,
+                )),
                 None,
-                [0u8; crate::cluster::lineage::DATA_EPOCH_LEN],
-                self.self_id,
-            )),
+            ),
         };
+        // F4 — wire this boot's data-epoch identity into the topology
+        // authority so every persisted topology state records it (the
+        // restore-detection belt read back below and at every later boot).
+        if let Some(epoch) = current_data_epoch {
+            self.topology_authority.set_data_epoch(epoch);
+        }
+        // F-6 (I4) — seed the promotion_enabled gauge from the restored
+        // committed state (the per-commit refresh keeps it current after).
+        if let Some(m) = crate::metrics::migration_metrics() {
+            m.promotion_enabled.store(
+                u32::from(self.topology_authority.committed_promotion_enabled()),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
         // P1 stage 4 (I13) — the per-shard SERVING-ESTABLISHED bitmap: a set
         // bit means "self serving this shard as master needs no Full gate"
         // (bootstrap regime-0 shards, or continuity from the previous
@@ -1717,52 +1742,20 @@ impl ClusterCoordinator {
         // pattern).
         let serving_established = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
         serving_established.set_all();
-        // I13(i) — boot re-derivation over the LOADED committed state (the
-        // authority was restored by the caller before `start()`): the
-        // committed master of `s` with an intact, un-reclaimed redo range
-        // re-derives `Full(current regime)` REGARDLESS of the stored stamp
-        // (reaching clustered startup at all required boot recovery over the
-        // node's own redo to succeed — a corrupt/reclaimed-needed tail fails
-        // boot upstream); every non-master stamp that cannot prove holder
-        // continuity across the down window degrades fail-closed.
-        {
-            let members = self.topology_authority.committed_members();
-            if !members.is_empty() {
-                let block = self.topology_authority.committed_regime_block();
-                let placement = ShardTable::compute_with_epoch(
-                    &members,
-                    self.replication_factor.max(1),
-                    1,
-                    self.topology_authority.committed_placement_version(),
-                );
-                let table = self.shard_table.read();
-                let self_id = self.self_id;
-                let master_is_self = |s: u16| {
-                    block
-                        .override_map
-                        .get(&s)
-                        .copied()
-                        .unwrap_or_else(|| placement.assignment(s).master)
-                        == self_id
-                };
-                let in_holder = |s: u16| {
-                    let a = placement.assignment(s);
-                    a.master == self_id
-                        || a.replicas.contains(&self_id)
-                        || table.effective_assignment(s).master == self_id
-                };
-                lineage.boot_rederive(&master_is_self, &in_holder, &|s| block.regime.get(s));
-                // I13 boot half of the serving-established derivation: this
-                // node's own committed-master shards re-derive Full above
-                // (I13i), so their serving is established; every other
-                // regime-advanced shard is fail-closed to gated.
-                for s in 0..NUM_SHARDS as u16 {
-                    if block.regime.get(s) != 0 && !master_is_self(s) {
-                        serving_established.clear(s);
-                    }
-                }
-            }
-        }
+        // I13(i) + F4 — boot re-derivation over the LOADED committed state
+        // (the authority was restored by the caller before `start()`),
+        // epoch-continuity-gated; extracted to
+        // `boot_rederive_lineage_and_serving` so the glue is unit-testable
+        // (see that function's contract).
+        boot_rederive_lineage_and_serving(
+            &self.topology_authority,
+            &lineage,
+            &serving_established,
+            &self.shard_table.read(),
+            self.self_id,
+            self.replication_factor,
+            current_data_epoch,
+        );
         // I2 / I13(ii) — install the commit-install hook: per-commit lineage
         // transitions (+ the stage-4 skipped-term degrade and the I13
         // serving-established derivation) run INSIDE `handle_commit_durable`'s
@@ -6360,6 +6353,15 @@ fn lineage_apply_committed_state(
             || a.replicas.contains(&self_id)
             || effective_masters.get(s as usize).copied() == Some(self_id)
     };
+    // F-6 (I4) — refresh the promotion_enabled gauge on every commit
+    // install (this hook runs on EVERY apply path post-F7): failover-off
+    // must never be silent.
+    if let Some(m) = crate::metrics::migration_metrics() {
+        m.promotion_enabled.store(
+            u32::from(regime_block.promotion_enabled),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
     let outcome = lineage.apply_commit_transitions(&in_holder, &|s| regime_block.regime.get(s));
     if outcome.degraded > 0 || outcome.refreshed > 0 {
         tracing::info!(
@@ -6405,6 +6407,108 @@ fn lineage_apply_committed_state(
     true
 }
 
+/// I13(i) + F4 — the boot-time lineage re-derivation and I13
+/// serving-established gating over the LOADED committed state. Called once
+/// from [`ClusterCoordinator::start`]; free-standing so the glue is
+/// unit-testable.
+///
+/// I13(i): the committed master of `s` with an intact, un-reclaimed redo
+/// range re-derives `Full(current regime)` REGARDLESS of the stored stamp
+/// (reaching clustered startup at all required boot recovery over the
+/// node's own redo to succeed — a corrupt/reclaimed-needed tail fails boot
+/// upstream); every non-master stamp that cannot prove holder continuity
+/// across the down window degrades fail-closed.
+///
+/// F4 — EPOCH-CONTINUITY GATE on the I13(i) arm: the re-derivation is
+/// honest only when the on-disk data and the loaded topology state belong
+/// to the same lineage. A restored image's redo replays cleanly, so
+/// "internally consistent" is indistinguishable from "current" — if the
+/// CURRENT `data_epoch` differs from the one the loaded topology state
+/// recorded, the data was restored under a topology state that predates
+/// it, and re-stamping `Full` would let backup-era data serve as
+/// authoritative master (and become a legal promotion target, since
+/// promotion eligibility reads `lineage_full` from partition reports).
+/// Those shards boot `Subset`, their masterships stay I13-gated, and they
+/// re-earn normally. A topology state with NO recorded epoch (legacy /
+/// first post-upgrade boot) or an unknown current identity is tolerated as
+/// matching — failing closed there would total-outage every healthy master
+/// on upgrade, the exact hazard I13(i) exists to prevent. The `restore()`
+/// tool deletes `.topo` outright (the primary F4 fix); this gate is the
+/// belt for a state file that survives anyway.
+fn boot_rederive_lineage_and_serving(
+    authority: &crate::cluster::topology::TopologyAuthority,
+    lineage: &crate::cluster::lineage::LineageStore,
+    serving_established: &crate::cluster::migration::AtomicShardBitmap,
+    table: &ShardTable,
+    self_id: NodeId,
+    rf: u8,
+    current_data_epoch: Option<[u8; crate::cluster::lineage::DATA_EPOCH_LEN]>,
+) {
+    let members = authority.committed_members();
+    if members.is_empty() {
+        return;
+    }
+    let epoch_continuity = match (authority.restored_data_epoch(), current_data_epoch) {
+        (Some(recorded), Some(current)) => recorded == current,
+        // No recorded epoch (legacy state) or no current identity
+        // (non-persistent lineage): no mismatch is provable — tolerate
+        // (see the doc comment).
+        _ => true,
+    };
+    if !epoch_continuity {
+        tracing::warn!(
+            "cluster: F4 — topology state predates this data lineage (data_epoch \
+             mismatch: the image was restored under an older topology state). I13(i) \
+             boot re-derivation is DISABLED; all shards boot Subset and re-earn Full \
+             through catch-up/heal.",
+        );
+    }
+    let block = authority.committed_regime_block();
+    let placement = ShardTable::compute_with_epoch(
+        &members,
+        rf.max(1),
+        1,
+        authority.committed_placement_version(),
+    );
+    let master_is_self = |s: u16| {
+        block
+            .override_map
+            .get(&s)
+            .copied()
+            .unwrap_or_else(|| placement.assignment(s).master)
+            == self_id
+    };
+    // F4 — without epoch continuity NO shard re-derives Full (the master
+    // arm is what would stamp stale data), and the holder-survival arm
+    // degrades too (a stored stamp refers to the pre-restore copy;
+    // `LineageStore::open` usually already degraded it via its own
+    // identity binding).
+    let rederive_master_is_self = |s: u16| epoch_continuity && master_is_self(s);
+    let in_holder = |s: u16| {
+        if !epoch_continuity {
+            return false;
+        }
+        let a = placement.assignment(s);
+        a.master == self_id
+            || a.replicas.contains(&self_id)
+            || table.effective_assignment(s).master == self_id
+    };
+    lineage.boot_rederive(&rederive_master_is_self, &in_holder, &|s| {
+        block.regime.get(s)
+    });
+    // I13 boot half of the serving-established derivation: this node's own
+    // committed-master shards re-derive Full above (I13i), so their
+    // serving is established; every other regime-advanced shard is
+    // fail-closed to gated. F4: with broken epoch continuity the master
+    // arm did NOT re-derive, so master shards gate too (a Subset master
+    // must re-earn before serving a regime-advanced shard).
+    for s in 0..NUM_SHARDS as u16 {
+        if block.regime.get(s) != 0 && (!epoch_continuity || !master_is_self(s)) {
+            serving_established.clear(s);
+        }
+    }
+}
+
 /// P1 stage 4 (I13) — un-gate TRIVIALLY-EMPTY new masterships at a
 /// view-carrying activation.
 ///
@@ -6433,6 +6537,17 @@ fn lineage_apply_committed_state(
 /// the same window in which the pre-stage-4 code served the new mastership
 /// with no gate at all, so this is never worse than the behavior it
 /// replaces.
+///
+/// §8 review F6 (recorded, not fixed): this stale-exchange-report window is
+/// INHERITED, not created — the lineage-aware migration-skip decision reads
+/// the same exchange reports with the same staleness, and both are bounded
+/// by the pre-existing migration-skip defect (a report collected before the
+/// last acked write can under-count a shard). The ungate does not widen it:
+/// it fires only on a COMPLETE view showing zero data cluster-wide, so the
+/// racing write must have landed on a shard every member just reported
+/// empty. Fixing the window means fencing exchange reports against the ack
+/// path — a pre-existing cross-cutting change deliberately out of scope for
+/// the P1 remediation round.
 fn ungate_trivially_empty_masterships(
     new_table: &ShardTable,
     members: &[NodeId],
@@ -6946,6 +7061,173 @@ fn flush_stream_full_candidates(
     if lineage.mark_full_many(
         &stamps,
         "master→replica stream completeness (§4.3 catch-up trigger, stage 4)",
+    ) {
+        stamps.len()
+    } else {
+        0
+    }
+}
+
+// ---------------------------------------------------------------------------
+// §8 review F3 — the §4.3 FOURTH completion trigger: catch-up convergence
+// re-earns Full. (The stream-origin trigger above only covers copies whose
+// ENTIRE content arrived via the stream; a skipped-term-degraded NON-EMPTY
+// replica could otherwise never re-earn — `compute_promotion_overrides`
+// then permanently excluded its shards, so one dropped commit frame per
+// node quietly disabled cluster-wide automatic failover.)
+// ---------------------------------------------------------------------------
+
+/// F3 — encode the `OP_REPLICA_CONVERGED` payload:
+/// `[source_node_id:8][count:2][(shard:2, regime:8) × count]`.
+pub(crate) fn encode_replica_converged(source_node_id: u64, entries: &[(u16, u64)]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(8 + 2 + entries.len() * 10);
+    buf.extend_from_slice(&source_node_id.to_le_bytes());
+    buf.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+    for &(shard, regime) in entries {
+        buf.extend_from_slice(&shard.to_le_bytes());
+        buf.extend_from_slice(&regime.to_le_bytes());
+    }
+    buf
+}
+
+/// F3 — decode an `OP_REPLICA_CONVERGED` payload. `None` on any structural
+/// fault: truncation, `count > NUM_SHARDS`, out-of-range shard, or
+/// trailing bytes (untrusted-input posture — never a defaulted field).
+pub(crate) fn decode_replica_converged(payload: &[u8]) -> Option<(u64, Vec<(u16, u64)>)> {
+    if payload.len() < 10 {
+        return None;
+    }
+    let source = u64::from_le_bytes(payload[0..8].try_into().ok()?);
+    let count = u16::from_le_bytes(payload[8..10].try_into().ok()?) as usize;
+    if count > NUM_SHARDS {
+        return None;
+    }
+    if payload.len() != 10 + count * 10 {
+        return None;
+    }
+    let mut entries = Vec::with_capacity(count);
+    for i in 0..count {
+        let off = 10 + i * 10;
+        let shard = u16::from_le_bytes(payload[off..off + 2].try_into().ok()?);
+        if shard as usize >= NUM_SHARDS {
+            return None;
+        }
+        let regime = u64::from_le_bytes(payload[off + 2..off + 10].try_into().ok()?);
+        entries.push((shard, regime));
+    }
+    Some((source, entries))
+}
+
+/// F3 (sender half) — after a per-replica convergence loop exits
+/// [`crate::replication::durable::CatchupConvergence::Converged`] (the
+/// replica durably ACKed EVERY redo sequence, over an intact redo range —
+/// reclaim exits as `NeedsResync`, never `Converged`), tell that replica
+/// it is complete for the shards this node masters: `(shard, committed
+/// regime)` for every shard whose committed-derivation master is
+/// `source_node_id` (self). The replica re-verifies everything against its
+/// OWN state before stamping (see [`apply_replica_converged_signal`]).
+///
+/// Returns the number of shard entries sent (`Ok(0)` = nothing to assert,
+/// no frame sent).
+///
+/// # Errors
+/// The transport error string when the frame could not be delivered — the
+/// signal is best-effort: the next convergence pass (lag-monitor tick)
+/// re-detects and re-sends.
+pub fn send_replica_converged_signal(
+    addr: SocketAddr,
+    authority: &crate::cluster::topology::TopologyAuthority,
+    source_node_id: u64,
+    auth_secret: Option<&[u8]>,
+) -> Result<usize, String> {
+    let self_node = NodeId(source_node_id);
+    let entries: Vec<(u16, u64)> = (0..NUM_SHARDS as u16)
+        .filter(|&s| authority.committed_master(s) == Some(self_node))
+        .map(|s| (s, authority.committed_regime(s)))
+        .collect();
+    if entries.is_empty() {
+        return Ok(0);
+    }
+    let payload = encode_replica_converged(source_node_id, &entries);
+    send_topology_frame(
+        addr,
+        crate::protocol::opcodes::OP_REPLICA_CONVERGED,
+        &payload,
+        auth_secret,
+    )?;
+    Ok(entries.len())
+}
+
+/// F3 (receiver half) — apply a master's convergence assertion, stamping
+/// `Full{regime}` for every entry that survives LOCAL re-verification.
+/// Returns the number of shards stamped.
+///
+/// Trust argument (documented per the review): the sender's claim is
+/// "your applied watermark reached my sequence over an intact redo range"
+/// — knowledge only the master-side ACK tracker has. The receiver trusts
+/// that claim exactly as far as it already trusts the same master's
+/// replica stream (the frame is HMAC-authenticated under
+/// `cluster_secret`; in fail-open mode it is forgeable like every other
+/// inter-node frame — the documented trusted-overlay posture). Everything
+/// else is SELF-verified against the receiver's own installed committed
+/// state and local fences, per shard:
+///
+/// * the asserting sender IS the shard's committed-derivation master
+///   under MY installed state (only the shard's write authority can
+///   honestly assert my completeness; a demoted/stale master fails here);
+/// * the asserted regime EQUALS my committed regime (a stale signal —
+///   either side behind on terms — stamps nothing, fail-closed);
+/// * self is in the shard's holder set (I2's union: target assignment ∪
+///   live effective master) — a `Full` outside the holder set would
+///   violate I2;
+/// * no inbound/heal fence is up (a mid-fill copy is part baseline and
+///   must complete through its own trigger).
+///
+/// One batched durable lineage write (`mark_full_many`) for the whole
+/// signal. This is a lineage/serving input, never an apply gate — I0 does
+/// not constrain it.
+pub(crate) fn apply_replica_converged_signal(
+    authority: &crate::cluster::topology::TopologyAuthority,
+    table: &ShardTable,
+    inbound_bm: &crate::cluster::migration::AtomicShardBitmap,
+    lineage: &crate::cluster::lineage::LineageStore,
+    self_id: NodeId,
+    source_node_id: u64,
+    entries: &[(u16, u64)],
+) -> usize {
+    let source = NodeId(source_node_id);
+    let mut stamps: Vec<(u16, u64)> = Vec::new();
+    for &(shard, regime) in entries {
+        if authority.committed_master(shard) != Some(source) {
+            continue;
+        }
+        if authority.committed_regime(shard) != regime {
+            continue;
+        }
+        if inbound_bm.test(shard) {
+            continue;
+        }
+        let a = table.target_assignment(shard);
+        let holder = a.master == self_id
+            || a.replicas.contains(&self_id)
+            || table.effective_assignment(shard).master == self_id;
+        if !holder {
+            continue;
+        }
+        if matches!(
+            lineage.lineage(shard),
+            crate::cluster::lineage::Lineage::Full { regime: r } if r == regime
+        ) {
+            continue; // already current — no redundant fsync
+        }
+        stamps.push((shard, regime));
+    }
+    if stamps.is_empty() {
+        return 0;
+    }
+    if lineage.mark_full_many(
+        &stamps,
+        "catch-up convergence (§4.3 fourth completion trigger, F3)",
     ) {
         stamps.len()
     } else {
@@ -9493,27 +9775,19 @@ fn convert_infallible_op(
                 master_generation: gen_for(tx_key),
             })
         }
-        RedoOp::Reassign {
-            tx_key,
-            offset,
-            new_hash,
-            block_height,
-            spendable_after,
-        } => {
-            if ShardTable::shard_for_key(tx_key) != shard {
-                return None;
-            }
-            Some(ReplicaOp::Reassign {
-                tx_key: *tx_key,
-                offset: *offset,
-                new_hash: *new_hash,
-                block_height: *block_height,
-                spendable_after: *spendable_after,
-                master_generation: gen_for(tx_key),
-                // Legacy pre-V2 redo entry: no prior identity was recorded,
-                // so the receiver keeps the live-slot read (§4.9).
-                prior_utxo_hash: None,
-            })
+        RedoOp::Reassign { .. } => {
+            // §8 review F-7 (§4.9) — a legacy pre-`ReassignV2` redo entry
+            // recorded NO prior slot identity, so it CANNOT be replayed as
+            // a guarded transition: the old `prior_utxo_hash: None`
+            // mapping made the receiver fall back to the unguarded
+            // live-slot read — the exact §4.9 behavior being retired
+            // (a replayed frame could re-stamp a superseded reassign).
+            // The batch-level converter (`redo_entry_to_replica_ops`)
+            // intercepts this variant FIRST and escalates it to the §4.9
+            // per-key repair (the record's full current image); this
+            // single-op helper answers `None` so no path can ever emit an
+            // unguarded Reassign delta again.
+            None
         }
         RedoOp::ReassignV2 {
             tx_key,
@@ -9926,6 +10200,35 @@ pub fn redo_entry_to_replica_ops(
             unset: *unset,
             txids: shard_txids,
         }]);
+    }
+    // §8 review F-7 (§4.9) — a LEGACY `RedoOp::Reassign` (pre-`ReassignV2`,
+    // written by a pre-P1 binary; no prior slot identity recorded) is
+    // non-replayable as a guarded delta. Escalate it to the §4.9 per-key
+    // repair instead: ship the record's FULL CURRENT image
+    // (`build_record_replay_ops`, the same primitive the missing-record
+    // repair and migration baseline use), which supersedes the reassign
+    // with the master's authoritative post-state — generation-guarded and
+    // idempotent, where the old `prior_utxo_hash: None` mapping resurrected
+    // the receiver's unguarded live-slot read. A record that no longer
+    // exists yields an empty vec (the delete that removed it rides the same
+    // stream). Applies to BOTH consumers of this converter — replica
+    // catch-up and the migration delta stream — which are exactly §4.9's
+    // "honest replay path" senders.
+    if let RedoOp::Reassign { tx_key, .. } = &entry.op {
+        if ShardTable::shard_for_key(tx_key) != shard {
+            return Ok(Vec::new());
+        }
+        return match build_record_replay_ops(engine, tx_key) {
+            Ok(Some(replay)) => Ok(replay.ops),
+            Ok(None) => Ok(Vec::new()),
+            // Fail closed like the create converter: an unreadable record
+            // must fail the task, never ship a partial image.
+            Err(detail) => Err(ReplicaConvertError::SlotRead {
+                tx_key: *tx_key,
+                offset: 0,
+                detail,
+            }),
+        };
     }
     Ok(redo_entry_to_replica_op(entry, shard, engine)?
         .into_iter()
@@ -10396,8 +10699,10 @@ fn delete_topology_multi_node_marker(path: &std::path::Path) -> std::io::Result<
 
 /// P1 stage 1 — path of the presence-only `.regime-armed` sidecar next to
 /// the topology state file (§4.1 "Armed marker"; the `.multinode`
-/// precedent).
-fn topology_regime_armed_marker_path(path: &std::path::Path) -> std::path::PathBuf {
+/// precedent). `pub(crate)` so `backup::restore` can delete it (F4: a
+/// restored image must not inherit the pre-restore armed/topology
+/// identity).
+pub(crate) fn topology_regime_armed_marker_path(path: &std::path::Path) -> std::path::PathBuf {
     let mut p = path.as_os_str().to_os_string();
     p.push(".regime-armed");
     std::path::PathBuf::from(p)
@@ -10449,6 +10754,18 @@ fn delete_topology_regime_armed_marker(path: &std::path::Path) -> std::io::Resul
 }
 
 /// P1 stage 1 — boot-time `.regime-armed` validation (§4.1):
+///
+/// §8 review F-4 (RESIDUAL, recorded not fixed): the envelope checksum and
+/// this marker check verify INTEGRITY, not RECENCY — a whole-file swap of
+/// an OLDER but internally-valid `.topo` (non-zero regimes, so the armed
+/// check passes too) rolls the node's committed term/regime view back
+/// undetected. The suggested closure is a highest-ever-seen-term sidecar
+/// that WARNS on a loaded term below it — never refuses, because a
+/// refusing recency check recreates exactly the sticky-marker
+/// unrecoverability this function's warn-only arms were shaped to avoid.
+/// Out of scope for the P1 remediation round; the F1/F2 apply gates bound
+/// the blast radius (a rolled-back node cannot vote a lowered regime past
+/// its peers' universal ratchet).
 ///
 /// * marker present + a committed term on disk + all-zero regime state ⇒
 ///   `Err` — the node once committed `regime_enforced = true` with armed
@@ -10614,6 +10931,7 @@ pub fn load_topology_state(
         committed_placement_version: 1,
         committed_peak: 1,
         regime_block: Default::default(),
+        data_epoch: None,
     };
     let mut state = match std::fs::read(path) {
         Ok(data) => {
@@ -11057,6 +11375,39 @@ impl ResyncSenderHandle {
                 shards,
             })
             .is_ok()
+    }
+}
+
+/// F8 — cloneable handle for raising the topology-staleness signal from
+/// OUTSIDE the coordinator (the lag-monitor catch-up path in
+/// `bin/server.rs`). Mirrors [`RunningCluster::signal_topology_stale`]
+/// exactly: a `ERR_STALE_REGIME` NAK proves this node's committed regime
+/// view is behind, so the committed-channel catch-up must refresh it —
+/// the NAK itself stays routing advice only (I9: never authority, never a
+/// regime mutation).
+#[derive(Clone)]
+pub struct TopologyStaleSignalHandle {
+    /// Coordinator event-loop sender (`None` in test builders without an
+    /// event loop — the signal degrades to a no-op, exactly like
+    /// `signal_topology_stale`).
+    tx: Option<std::sync::mpsc::Sender<ClusterEvent>>,
+    /// Shared committed-term atom for the already-caught-up short-circuit.
+    committed_term: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl TopologyStaleSignalHandle {
+    /// Raise the staleness signal for `observed_term` (a receiver's local
+    /// regime from an `ERR_STALE_REGIME` NAK — regimes are terms).
+    /// Returns `true` when queued; `false` when skipped (already
+    /// at-or-past the term, or no event loop wired).
+    pub fn signal(&self, observed_term: u64) -> bool {
+        if observed_term <= self.committed_term.load(Ordering::Relaxed) {
+            return false;
+        }
+        match &self.tx {
+            Some(tx) => tx.send(ClusterEvent::TopologyStale(observed_term)).is_ok(),
+            None => false,
+        }
     }
 }
 
@@ -12054,6 +12405,25 @@ impl RunningCluster {
             }
             self.lineage.note_stream_apply(shard, was_empty);
         }
+    }
+
+    /// F3 — handle an `OP_REPLICA_CONVERGED` assertion from a master whose
+    /// convergence loop observed this node durably ACK its whole redo
+    /// stream. Re-verifies every entry against this node's own installed
+    /// committed state and local fences before stamping `Full` (see
+    /// [`apply_replica_converged_signal`] for the exact conditions and the
+    /// trust argument). Returns the number of shards stamped.
+    pub fn handle_replica_converged(&self, source_node_id: u64, entries: &[(u16, u64)]) -> usize {
+        let table = self.shard_table.read();
+        apply_replica_converged_signal(
+            &self.topology_authority,
+            &table,
+            &self.inbound_atomic,
+            &self.lineage,
+            self.self_id,
+            source_node_id,
+            entries,
+        )
     }
 
     /// P1 stage 4 (I4) — propose committing `promotion_enabled = enable`
@@ -13700,6 +14070,17 @@ impl RunningCluster {
         ResyncSenderHandle {
             tx: self.resync_request_tx.clone(),
             node_addrs: self.node_addrs.clone(),
+        }
+    }
+
+    /// F8 — a cloneable [`TopologyStaleSignalHandle`] so the lag-monitor
+    /// catch-up path can raise the same topology-staleness signal the
+    /// foreground fan-out raises on an `ERR_STALE_REGIME` NAK (see
+    /// [`Self::signal_topology_stale`]).
+    pub fn topology_stale_signal_handle(&self) -> TopologyStaleSignalHandle {
+        TopologyStaleSignalHandle {
+            tx: self.cluster_event_tx.clone(),
+            committed_term: self.topology_authority.committed_term_shared(),
         }
     }
 
@@ -17465,6 +17846,7 @@ mod tests {
             committed_placement_version: 1,
             committed_peak: 5,
             regime_block: Default::default(),
+            data_epoch: None,
         };
         persist_topology_state(&path, &five_member).expect("seed persist creates marker");
 
@@ -17484,6 +17866,7 @@ mod tests {
             committed_placement_version: 1,
             committed_peak: 1, // pretend the raw .topo content under-reports
             regime_block: Default::default(),
+            data_epoch: None,
         };
         std::fs::write(&path, three_member.serialize_envelope()).expect("overwrite .topo directly");
 
@@ -17525,6 +17908,7 @@ mod tests {
             committed_placement_version: 1,
             committed_peak: 3,
             regime_block: Default::default(),
+            data_epoch: None,
         };
         persist_topology_state(&path, &multi).expect("seed persist creates marker");
         assert!(load_topology_multi_node_marker_peak(&path).is_some());
@@ -17544,6 +17928,7 @@ mod tests {
             committed_placement_version: 1,
             committed_peak: 1,
             regime_block: Default::default(),
+            data_epoch: None,
         };
         std::fs::write(&path, rf1.serialize_envelope()).expect("overwrite with RF=1 state");
 
@@ -24897,6 +25282,95 @@ mod tests {
         }
     }
 
+    /// §8 review F-7 (§4.9) — a LEGACY `RedoOp::Reassign` (pre-`ReassignV2`,
+    /// no prior slot identity) must never be replayed as an unguarded
+    /// delta: the batch converter escalates it to the record's FULL current
+    /// image (the §4.9 per-key repair), the single-op converter refuses it
+    /// outright, a record that no longer exists yields nothing, and an
+    /// unreadable record fails closed.
+    #[test]
+    fn f7_legacy_reassign_converts_to_record_image_not_unguarded_delta() {
+        use crate::redo::{RedoEntry, RedoOp};
+        use crate::replication::protocol::ReplicaOp;
+        use std::sync::atomic::Ordering;
+
+        let (engine, fail) = slot_read_failing_engine();
+        let shard = 9u16;
+        let key = tx_key_for_shard(shard, 3);
+        create_test_record(&engine, key); // one UTXO with hash 0x44..
+
+        let entry = RedoEntry {
+            sequence: 1,
+            op: RedoOp::Reassign {
+                tx_key: key,
+                offset: 0,
+                new_hash: [0x5C; 32],
+                block_height: 800_000,
+                spendable_after: 1_000,
+            },
+        };
+
+        // Batch converter: the record's full image, never a Reassign delta.
+        let ops = redo_entry_to_replica_ops(&entry, shard, &engine).unwrap();
+        assert!(
+            !ops.is_empty(),
+            "a live record must convert to its replay image"
+        );
+        assert!(
+            !ops.iter()
+                .any(|op| matches!(op, ReplicaOp::Reassign { .. })),
+            "F-7: no unguarded Reassign delta may be emitted for a legacy entry",
+        );
+        match &ops[0] {
+            ReplicaOp::Create { utxo_hashes, .. } => {
+                assert_eq!(
+                    utxo_hashes,
+                    &vec![[0x44u8; 32]],
+                    "the image must carry the record's CURRENT authoritative identity",
+                );
+            }
+            other => panic!("the image must start with the record's Create, got {other:?}"),
+        }
+
+        // Single-op converter: refuses (None) — no path emits the delta.
+        assert!(
+            redo_entry_to_replica_op(&entry, shard, &engine)
+                .unwrap()
+                .is_none(),
+            "F-7: the single-op converter must never emit a prior-less Reassign",
+        );
+
+        // Wrong shard filters out; a record that no longer exists yields
+        // nothing (its delete rides the same stream).
+        assert!(
+            redo_entry_to_replica_ops(&entry, shard.wrapping_add(1), &engine)
+                .unwrap()
+                .is_empty()
+        );
+        let gone = RedoEntry {
+            sequence: 2,
+            op: RedoOp::Reassign {
+                tx_key: tx_key_for_shard(shard, 4),
+                offset: 0,
+                new_hash: [0x5C; 32],
+                block_height: 800_000,
+                spendable_after: 1_000,
+            },
+        };
+        assert!(
+            redo_entry_to_replica_ops(&gone, shard, &engine)
+                .unwrap()
+                .is_empty()
+        );
+
+        // Unreadable record: fail closed, never a partial image.
+        fail.store(true, Ordering::SeqCst);
+        match redo_entry_to_replica_ops(&entry, shard, &engine) {
+            Err(ReplicaConvertError::SlotRead { tx_key, .. }) => assert_eq!(tx_key, key),
+            other => panic!("expected fail-closed SlotRead, got {other:?}"),
+        }
+    }
+
     /// R1: the crash-recovery re-ship path. A pending replication intent
     /// replays the master's redo window through this converter, so a
     /// `RedoOp::ExpirePreservation` must become the matching `ReplicaOp` —
@@ -25224,6 +25698,7 @@ mod tests {
             committed_placement_version: 1,
             committed_peak: 3,
             regime_block: block,
+            data_epoch: None,
         }
     }
 
@@ -25233,6 +25708,130 @@ mod tests {
         block.regime.set(7, 2);
         block.regime_enforced = enforced;
         block
+    }
+
+    /// F4 fixture: an authority restored from a `.topo` state recording
+    /// `recorded_epoch`, with `self` = node 1 in a 2-node committed
+    /// membership and one regime-advanced shard mastered by self. Returns
+    /// `(authority, mastered_shard, other_regime_shard)` where the second
+    /// shard is regime-advanced but mastered by node 2.
+    fn f4_boot_fixture(
+        recorded_epoch: Option<[u8; crate::cluster::lineage::DATA_EPOCH_LEN]>,
+    ) -> (crate::cluster::topology::TopologyAuthority, u16, u16) {
+        let members = vec![NodeId(1), NodeId(2)];
+        let table = ShardTable::compute_with_epoch(&members, 2, 1, 1);
+        let mastered = (0..NUM_SHARDS as u16)
+            .find(|&s| table.assignment(s).master == NodeId(1))
+            .expect("node 1 masters some shard");
+        let other = (0..NUM_SHARDS as u16)
+            .find(|&s| table.assignment(s).master == NodeId(2))
+            .expect("node 2 masters some shard");
+        let mut block = crate::cluster::topology::RegimeBlock::default();
+        block.regime.set(mastered, 3);
+        block.regime.set(other, 3);
+        let state = crate::cluster::topology::PersistedTopologyState {
+            peak_cluster_size: 2,
+            committed_term: 3,
+            committed_members: members.clone(),
+            committed_voters: members.clone(),
+            voted_term: 3,
+            incarnation: 1,
+            committed_voter_ever_seen: members,
+            committed_placement_version: 1,
+            committed_peak: 2,
+            regime_block: block,
+            data_epoch: recorded_epoch,
+        };
+        let authority = crate::cluster::topology::TopologyAuthority::new(
+            NodeId(1),
+            std::time::Duration::from_secs(1),
+        );
+        authority.set_replication_factor(2);
+        authority.restore(&state);
+        (authority, mastered, other)
+    }
+
+    /// §8 review F4 (P0) — restore-then-boot: when the CURRENT data_epoch
+    /// differs from the one the loaded topology state recorded (the data
+    /// was restored under a topology state that predates it), the I13(i)
+    /// boot re-derivation must NOT re-stamp `Full` over backup-era data.
+    /// The shards boot `Subset` (non-promotable: promotion eligibility
+    /// reads `lineage_full` from partition reports) and their masterships
+    /// stay I13-gated.
+    #[test]
+    fn f4_restored_topology_state_boots_subset_and_gated() {
+        let recorded = [1u8; crate::cluster::lineage::DATA_EPOCH_LEN];
+        let current = [2u8; crate::cluster::lineage::DATA_EPOCH_LEN];
+        let (authority, mastered, other) = f4_boot_fixture(Some(recorded));
+        let lineage = crate::cluster::lineage::LineageStore::open(None, current, NodeId(1));
+        let serving = crate::cluster::migration::AtomicShardBitmap::new();
+        serving.set_all();
+        let table = ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2)], 2, 1, 1);
+        boot_rederive_lineage_and_serving(
+            &authority,
+            &lineage,
+            &serving,
+            &table,
+            NodeId(1),
+            2,
+            Some(current),
+        );
+        assert_eq!(
+            lineage.lineage(mastered),
+            crate::cluster::lineage::Lineage::Subset,
+            "F4: a data_epoch mismatch must disable the I13(i) master re-derivation — \
+             backup-era data must not be re-stamped Full",
+        );
+        assert!(
+            !serving.test(mastered),
+            "F4: the mismatched master's regime-advanced shard must stay I13-gated",
+        );
+        assert!(
+            !serving.test(other),
+            "a regime-advanced non-master shard is gated as before",
+        );
+    }
+
+    /// F4 (companion property) — the NON-restored case is unchanged: a
+    /// deleted/lost lineage file with MATCHING epochs still re-derives
+    /// `Full` for the node's committed-master shards (a lost lineage file
+    /// must not total-outage a healthy node — the I13(i) guarantee), and a
+    /// topology state with NO recorded epoch (legacy / first post-upgrade
+    /// boot) is tolerated as matching.
+    #[test]
+    fn f4_normal_boot_with_deleted_lineage_file_same_epoch_rederives_full() {
+        let epoch = [9u8; crate::cluster::lineage::DATA_EPOCH_LEN];
+        for recorded in [Some(epoch), None] {
+            let (authority, mastered, other) = f4_boot_fixture(recorded);
+            // Fresh non-persistent store = the lineage file is gone.
+            let lineage = crate::cluster::lineage::LineageStore::open(None, epoch, NodeId(1));
+            let serving = crate::cluster::migration::AtomicShardBitmap::new();
+            serving.set_all();
+            let table = ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2)], 2, 1, 1);
+            boot_rederive_lineage_and_serving(
+                &authority,
+                &lineage,
+                &serving,
+                &table,
+                NodeId(1),
+                2,
+                Some(epoch),
+            );
+            assert_eq!(
+                lineage.lineage(mastered),
+                crate::cluster::lineage::Lineage::Full { regime: 3 },
+                "I13(i): matching epochs (recorded {recorded:?}) must re-derive Full \
+                 for the committed master even with no lineage file",
+            );
+            assert!(
+                serving.test(mastered),
+                "the re-derived master's serving is established",
+            );
+            assert!(
+                !serving.test(other),
+                "a regime-advanced non-master shard is gated as before",
+            );
+        }
     }
 
     #[test]
@@ -25382,6 +25981,7 @@ mod tests {
             committed_placement_version: 1,
             committed_peak: 1,
             regime_block: Default::default(),
+            data_epoch: None,
         };
         assert!(
             validate_regime_armed_marker_at_boot(&path, &fresh).is_ok(),
@@ -26117,6 +26717,7 @@ mod tests {
             committed_placement_version: 1,
             committed_peak: 2,
             regime_block: block,
+            data_epoch: None,
         };
         let prev = crate::cluster::topology::InstalledCommitView {
             committed_term: 8,
@@ -26201,6 +26802,7 @@ mod tests {
                 b.regime.set(replicated, 4);
                 b
             },
+            data_epoch: None,
         };
         let prev = crate::cluster::topology::InstalledCommitView {
             committed_term: 4,
@@ -26284,6 +26886,271 @@ mod tests {
             MasterQueryResult::Yes => {}
             other => panic!("snapshot path must open on Full, got {other:?}"),
         }
+    }
+
+    /// §8 review F3 (P0) — the §4.3 FOURTH completion trigger end to end
+    /// (unit level): a replica misses a commit (skipped-term degrade →
+    /// `Subset`, which the stream-origin trigger can never repair for a
+    /// non-empty copy), then re-earns `Full` through the master's
+    /// catch-up-convergence signal WITHOUT an operator resync — and its
+    /// promotion eligibility returns (`compute_promotion_overrides` names
+    /// it again once its report shows `Full` at the current regime).
+    #[test]
+    fn f3_skipped_term_degrade_re_earns_full_via_convergence_signal() {
+        let members = vec![NodeId(1), NodeId(2)];
+        let rf = 2u8;
+        let placement = ShardTable::compute_with_epoch(&members, rf, 1, 1);
+        // A shard mastered by node 1; self (node 2) is its replica.
+        let shard = (0..NUM_SHARDS as u16)
+            .find(|&s| placement.assignment(s).master == NodeId(1))
+            .expect("node 1 masters a shard");
+        let mut block = crate::cluster::topology::RegimeBlock::default();
+        block.regime.set(shard, 2);
+
+        // Self = node 2's installed committed state at term 4.
+        let authority = crate::cluster::topology::TopologyAuthority::new(
+            NodeId(2),
+            std::time::Duration::from_secs(1),
+        );
+        authority.set_replication_factor(rf);
+        authority.restore(&crate::cluster::topology::PersistedTopologyState {
+            peak_cluster_size: 2,
+            committed_term: 4,
+            committed_members: members.clone(),
+            committed_voters: members.clone(),
+            voted_term: 4,
+            incarnation: 1,
+            committed_voter_ever_seen: members.clone(),
+            committed_placement_version: 1,
+            committed_peak: 2,
+            regime_block: block.clone(),
+            data_epoch: None,
+        });
+
+        // The replica held Full{2} before the missed commits.
+        let lineage = crate::cluster::lineage::LineageStore::open(
+            None,
+            [3u8; crate::cluster::lineage::DATA_EPOCH_LEN],
+            NodeId(2),
+        );
+        assert!(lineage.mark_full(shard, 2, "pre-gap Full"));
+
+        // Install a commit that SKIPS terms (prev 1 → state 4): the
+        // skipped-term degrade drops every non-master holder stamp.
+        let shard_table = Arc::new(parking_lot::RwLock::new(placement.clone()));
+        let serving = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+        serving.set_all();
+        let state = authority.persisted_state(2, 1);
+        let prev = crate::cluster::topology::InstalledCommitView {
+            committed_term: 1,
+            members: members.clone(),
+            placement_version: 1,
+            regime_block: block.clone(),
+        };
+        assert!(lineage_apply_committed_state(
+            &lineage,
+            NodeId(2),
+            rf,
+            &state,
+            &prev,
+            &shard_table,
+            &serving,
+        ));
+        assert_eq!(
+            lineage.lineage(shard),
+            crate::cluster::lineage::Lineage::Subset,
+            "a skipped-term install must degrade the non-master holder stamp",
+        );
+
+        // While Subset, the shard is promotion-ineligible: master 1 dead
+        // (absent from the view) but node 2's report shows no Full.
+        let entry = |full: bool| PartitionVersionEntry {
+            shard,
+            flags: 0,
+            replica_count: 1,
+            last_applied_seq: 5,
+            manifest_digest: 0,
+            max_generation: 0,
+            lineage_full: full,
+            lineage_regime: if full { 2 } else { 0 },
+        };
+        let mut view: std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>> =
+            std::collections::HashMap::new();
+        view.insert(NodeId(2), vec![entry(false)]);
+        assert!(
+            compute_promotion_overrides(&members, 1, rf, &block, &view).is_empty(),
+            "a Subset replica must not be promotion-eligible",
+        );
+
+        // The master's convergence signal re-earns Full — no resync.
+        let inbound = crate::cluster::migration::AtomicShardBitmap::new();
+        let stamped = apply_replica_converged_signal(
+            &authority,
+            &placement,
+            &inbound,
+            &lineage,
+            NodeId(2),
+            1,
+            &[(shard, 2)],
+        );
+        assert_eq!(stamped, 1, "F3: the convergence signal must stamp Full");
+        assert_eq!(
+            lineage.lineage(shard),
+            crate::cluster::lineage::Lineage::Full { regime: 2 },
+        );
+
+        // Promotion eligibility returns.
+        view.insert(NodeId(2), vec![entry(true)]);
+        assert_eq!(
+            compute_promotion_overrides(&members, 1, rf, &block, &view).get(&shard),
+            Some(&NodeId(2)),
+            "F3: once Full at the current regime, the shard is promotable again",
+        );
+    }
+
+    /// F3 — the receiver stamps NOTHING it cannot verify itself: a sender
+    /// that is not the shard's committed master, a stale regime, an
+    /// inbound fence, and a non-holder self all refuse the stamp.
+    #[test]
+    fn f3_converged_signal_refuses_unverified_entries() {
+        let members = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let rf = 2u8;
+        let placement = ShardTable::compute_with_epoch(&members, rf, 1, 1);
+        // A shard mastered by 1 whose replica is 2 — evaluated from node 2.
+        let shard = (0..NUM_SHARDS as u16)
+            .find(|&s| {
+                placement.assignment(s).master == NodeId(1)
+                    && placement.assignment(s).replicas.contains(&NodeId(2))
+            })
+            .expect("node 1 masters a shard replicated on node 2");
+        let mut block = crate::cluster::topology::RegimeBlock::default();
+        block.regime.set(shard, 2);
+        let authority = crate::cluster::topology::TopologyAuthority::new(
+            NodeId(2),
+            std::time::Duration::from_secs(1),
+        );
+        authority.set_replication_factor(rf);
+        authority.restore(&crate::cluster::topology::PersistedTopologyState {
+            peak_cluster_size: 3,
+            committed_term: 4,
+            committed_members: members.clone(),
+            committed_voters: members.clone(),
+            voted_term: 4,
+            incarnation: 1,
+            committed_voter_ever_seen: members,
+            committed_placement_version: 1,
+            committed_peak: 3,
+            regime_block: block,
+            data_epoch: None,
+        });
+        let lineage = crate::cluster::lineage::LineageStore::open(
+            None,
+            [3u8; crate::cluster::lineage::DATA_EPOCH_LEN],
+            NodeId(2),
+        );
+        let inbound = crate::cluster::migration::AtomicShardBitmap::new();
+
+        // (1) sender is NOT the shard's committed master.
+        assert_eq!(
+            apply_replica_converged_signal(
+                &authority,
+                &placement,
+                &inbound,
+                &lineage,
+                NodeId(2),
+                3, // node 3 does not master this shard
+                &[(shard, 2)],
+            ),
+            0,
+            "only the shard's committed master may assert completeness",
+        );
+        // (2) stale regime.
+        assert_eq!(
+            apply_replica_converged_signal(
+                &authority,
+                &placement,
+                &inbound,
+                &lineage,
+                NodeId(2),
+                1,
+                &[(shard, 1)],
+            ),
+            0,
+            "a regime-stale signal must stamp nothing (fail-closed)",
+        );
+        // (3) inbound/heal fence up.
+        inbound.set(shard);
+        assert_eq!(
+            apply_replica_converged_signal(
+                &authority,
+                &placement,
+                &inbound,
+                &lineage,
+                NodeId(2),
+                1,
+                &[(shard, 2)],
+            ),
+            0,
+            "a fenced (mid-fill) shard must complete through its own trigger",
+        );
+        inbound.clear(shard);
+        // (4) self outside the holder set.
+        let outsider = (0..NUM_SHARDS as u16)
+            .find(|&s| {
+                let a = placement.assignment(s);
+                a.master != NodeId(2) && !a.replicas.contains(&NodeId(2))
+            })
+            .expect("some shard excludes node 2");
+        assert_eq!(
+            apply_replica_converged_signal(
+                &authority,
+                &placement,
+                &inbound,
+                &lineage,
+                NodeId(2),
+                placement.assignment(outsider).master.0,
+                &[(outsider, authority.committed_regime(outsider))],
+            ),
+            0,
+            "Full outside the holder set would violate I2",
+        );
+        assert_eq!(lineage.full_count(), 0);
+
+        // The verified entry DOES stamp (control).
+        assert_eq!(
+            apply_replica_converged_signal(
+                &authority,
+                &placement,
+                &inbound,
+                &lineage,
+                NodeId(2),
+                1,
+                &[(shard, 2)],
+            ),
+            1,
+        );
+    }
+
+    /// F3 — wire codec: roundtrip, oversized count, and trailing bytes.
+    #[test]
+    fn f3_replica_converged_codec_roundtrip_and_rejects_malformed() {
+        let entries = vec![(3u16, 7u64), (100, 9)];
+        let bytes = encode_replica_converged(42, &entries);
+        assert_eq!(decode_replica_converged(&bytes), Some((42, entries)));
+        // Trailing byte → reject.
+        let mut trailing = bytes.clone();
+        trailing.push(0);
+        assert_eq!(decode_replica_converged(&trailing), None);
+        // Truncated → reject.
+        assert_eq!(decode_replica_converged(&bytes[..bytes.len() - 1]), None);
+        // count > NUM_SHARDS → reject before allocation.
+        let mut oversized = Vec::new();
+        oversized.extend_from_slice(&1u64.to_le_bytes());
+        oversized.extend_from_slice(&(NUM_SHARDS as u16 + 1).to_le_bytes());
+        assert_eq!(decode_replica_converged(&oversized), None);
+        // Out-of-range shard → reject.
+        let bad = encode_replica_converged(1, &[(NUM_SHARDS as u16, 1)]);
+        assert_eq!(decode_replica_converged(&bad), None);
     }
 
     /// §4.4 — the promotion candidate matrix (pure proposer computation).

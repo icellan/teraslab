@@ -41,6 +41,17 @@
 //!   change on device add/resize/reformat (it is deliberately NOT derived
 //!   from device geometry) — only `restore()` stamps a fresh one.
 //!
+//!   §8 review F-3 (RESIDUAL, recorded not fixed): the duplicate-NodeId
+//!   rejection only holds **while the original node is running**. A clone
+//!   of a DEAD node's data directory brought up under the SAME `node_id`
+//!   matches both halves of the binding and inherits its (possibly stale)
+//!   `Full` stamps wholesale — the identity binding cannot distinguish
+//!   "the node came back" from "a copy of the node came back". Closing
+//!   this needs an operator `reset-data-identity` admin action (stamp a
+//!   fresh `data_epoch` on the clone before first boot) plus a
+//!   node-replacement runbook step naming it; both are out of scope for
+//!   the P1 remediation round.
+//!
 //! ## Durability
 //!
 //! Transitions are batched: one durable write (temp + rename + fsync +

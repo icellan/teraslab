@@ -403,6 +403,7 @@ fn restored_peak_blocks_minority_after_restart() {
         committed_placement_version: 1,
         committed_peak: 3,
         regime_block: Default::default(),
+        data_epoch: None,
     });
     assert_eq!(auth.peak_cluster_size(), 3, "restore must reinstate peak");
 

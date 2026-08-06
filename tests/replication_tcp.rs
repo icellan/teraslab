@@ -1829,7 +1829,10 @@ fn tcp_catchup_chunk_boundary_no_skip() {
         &move |_from| entries_for_cb.clone(),
         Some(1),
         &|chunk| {
-            send_replica_ops_to(
+            // F8 — the catch-up closure is typed (`ReplicaSendError`) so a
+            // stale-regime NAK stays classifiable; production uses the
+            // reporting variant for the same reason.
+            teraslab::server::dispatch::send_replica_ops_to_reporting(
                 addr,
                 chunk,
                 Duration::from_secs(5),

@@ -1198,6 +1198,11 @@ pub fn handle_replica_batch_regime_gated(
     // store) instead of appending them inline. The mutations still happen
     // per-op in the loop (mutate-first, journal-second is preserved); only the
     // journaling is deferred to the ONE atomic admission after the loop.
+    //
+    // F-7 (§4.9) — while regime enforcement is active on this node, a
+    // Reassign with no prior identity is refused (any batch that reached
+    // this loop under enforcement already passed the V3/I12 gate above).
+    let reassign_requires_prior = regime.is_some_and(|a| a.regime_enforcement_active());
     let mut redo_entries: Vec<(crate::redo::RedoOp, u8)> = Vec::new();
     for (idx, (seq, op)) in (start_seq..)
         .zip(batch.ops.iter().skip(skip_count))
@@ -1214,6 +1219,7 @@ pub fn handle_replica_batch_regime_gated(
             journal,
             is_migration,
             tracked,
+            reassign_requires_prior,
             &mut redo_entries,
         ) {
             // Route on the TYPE, never on the message. A missing record is the
@@ -1904,8 +1910,19 @@ pub fn apply_op_journal(
     // to steady-state tracked BATCHES, driven from the batch loop below. With
     // `nak_on_missing = false` the `MissingRecord` variant is unreachable here,
     // so flattening to a string loses no routing information.
-    apply_op_journal_inner(engine, op, journal, is_migration, false, &mut collected)
-        .map_err(|e| e.to_string())?;
+    // `reassign_requires_prior = false`: the single-op convenience serves
+    // non-clustered / in-process paths with no enforcement context; the
+    // regime-gated batch handler passes the real enforcement state.
+    apply_op_journal_inner(
+        engine,
+        op,
+        journal,
+        is_migration,
+        false,
+        false,
+        &mut collected,
+    )
+    .map_err(|e| e.to_string())?;
     for (redo_op, device_id) in &collected {
         engine.append_replica_redo_entry_to_store(redo_op, *device_id)?;
     }
@@ -1923,6 +1940,7 @@ fn apply_op_journal_inner(
     journal: bool,
     is_migration: bool,
     nak_on_missing: bool,
+    reassign_requires_prior: bool,
     redo_out: &mut Vec<(crate::redo::RedoOp, u8)>,
 ) -> std::result::Result<(), ReplicaApplyError> {
     // When journalling is disabled (migration-baseline apply), suppress the
@@ -2285,6 +2303,21 @@ fn apply_op_journal_inner(
             prior_utxo_hash,
             ..
         } => {
+            // §8 review F-7 (§4.9) — under committed regime enforcement, a
+            // V3 Reassign carrying NO prior identity is NON-REPLAYABLE:
+            // applying it would resurrect the unguarded live-slot read
+            // (a replayed frame re-stamping a superseded reassign) that
+            // §4.9 retires. Current senders never produce it (the F-7
+            // converter escalates legacy entries to the per-key record
+            // image); this guard fails closed against a pre-fix sender.
+            // The escalation IS the §4.9 per-key repair: on a tracked
+            // batch the `MissingRecord` NAK makes the master re-ship the
+            // record's full current image; a migration/out-of-band batch
+            // takes the tolerant skip and the divergence is caught by the
+            // migration completion's manifest verification.
+            if reassign_requires_prior && prior_utxo_hash.is_none() {
+                return missing_record_apply_outcome("reassign_unguarded", tx_key, nak_on_missing);
+            }
             let live_hash = match engine.read_slot(tx_key, *offset) {
                 Ok(slot) => slot.hash,
                 Err(_) => {
@@ -4455,7 +4488,7 @@ mod tests {
             master_generation: 5,
         };
         let mut redo_out = Vec::new();
-        let r = apply_op_journal_inner(&engine, &op, true, false, false, &mut redo_out);
+        let r = apply_op_journal_inner(&engine, &op, true, false, false, false, &mut redo_out);
         assert!(
             r.is_ok(),
             "out-of-band gen-sync on an absent record must be a benign skip \
@@ -4485,7 +4518,7 @@ mod tests {
             master_generation: 5,
         };
         let mut redo_out = Vec::new();
-        let err = apply_op_journal_inner(&engine, &op, true, false, true, &mut redo_out)
+        let err = apply_op_journal_inner(&engine, &op, true, false, true, false, &mut redo_out)
             .expect_err("tracked-batch gen-sync on an absent record must still hard-error");
         match err {
             ReplicaApplyError::MissingRecord { op_name, tx_key } => {
@@ -4534,7 +4567,7 @@ mod tests {
         let mut redo_out = Vec::new();
         // nak_on_missing = true, is_migration = false: the tracked steady-state
         // batch shape a client OP_DELETE_BATCH fan-out actually produces.
-        let r = apply_op_journal_inner(&engine, &op, true, false, true, &mut redo_out);
+        let r = apply_op_journal_inner(&engine, &op, true, false, true, false, &mut redo_out);
         assert_eq!(
             r,
             Ok(()),
@@ -4580,7 +4613,7 @@ mod tests {
 
         let mut redo_out = Vec::new();
         assert_eq!(
-            apply_op_journal_inner(&engine, &op, true, false, true, &mut redo_out),
+            apply_op_journal_inner(&engine, &op, true, false, true, false, &mut redo_out),
             Ok(()),
             "first delivery must apply"
         );
@@ -4600,7 +4633,7 @@ mod tests {
 
         let mut redo_out2 = Vec::new();
         assert_eq!(
-            apply_op_journal_inner(&engine, &op, true, false, true, &mut redo_out2),
+            apply_op_journal_inner(&engine, &op, true, false, true, false, &mut redo_out2),
             Ok(()),
             "re-delivery of the same delete must be an idempotent success, never a \
              MissingRecord NAK (which would make the master re-ship the record)"
@@ -8700,6 +8733,7 @@ mod tests {
             regime,
             regime_enforced: enforced,
             promotion_enabled: false,
+            rebase: false,
         };
         authority.restore(&PersistedTopologyState {
             peak_cluster_size: 2,
@@ -8712,6 +8746,7 @@ mod tests {
             committed_placement_version: 1,
             committed_peak: 2,
             regime_block: block,
+            data_epoch: None,
         });
         authority.set_secret_configured(secret);
         Arc::new(authority)
@@ -9320,6 +9355,139 @@ mod tests {
         assert_eq!({ engine.read_metadata(&k).unwrap().reassignment_count }, 1);
     }
 
+    /// §8 review F-7 (§4.9) — once `regime_enforced` is committed, a V3
+    /// `Reassign` carrying NO prior identity (the pre-`ReassignV2` legacy
+    /// mapping) is NON-REPLAYABLE: applying it would resurrect the
+    /// unguarded live-slot read §4.9 retires. A tracked batch NAKs
+    /// `MissingRecord` (escalating to the master's per-key record-image
+    /// repair) with the slot untouched and the watermark unmoved; the same
+    /// op WITH a prior identity still applies; and with enforcement
+    /// INACTIVE the legacy live-slot fallback is unchanged (compat).
+    #[test]
+    fn f7_v3_reassign_without_prior_refused_under_enforcement() {
+        let engine = make_engine();
+        let k = key(98);
+        create_record(&engine, k, 2);
+        apply_op(
+            &engine,
+            &ReplicaOp::Freeze {
+                tx_key: k,
+                offset: 0,
+                master_generation: 0,
+            },
+        )
+        .unwrap();
+        let live_hash = engine.read_slot(&k, 0).unwrap().hash;
+        let shard = crate::cluster::shards::ShardTable::shard_for_key(&k);
+        let authority = regime_authority(10, &[(shard, 9)], true, true);
+        assert!(authority.regime_enforcement_active());
+
+        let reassign = |prior: Option<[u8; 32]>| ReplicaOp::Reassign {
+            tx_key: k,
+            offset: 0,
+            new_hash: [0x6C; 32],
+            block_height: 800_000,
+            spendable_after: 1_000,
+            master_generation: 1,
+            prior_utxo_hash: prior,
+        };
+        let batch = |first_sequence: u64, prior: Option<[u8; 32]>| ReplicaBatch {
+            first_sequence,
+            ops: vec![reassign(prior)],
+            trace_ctx: None,
+            source_node_id: None,
+            cluster_key: 10,
+            regime_table: Some(vec![(shard, 9)]),
+        };
+
+        let last_applied = Arc::new(AtomicU64::new(0));
+        let tracker = ReplicaAppliedTracker::in_memory();
+
+        // Prior-less under enforcement: refused, per-key repair NAK.
+        let resp = handle_replica_batch_regime_gated(
+            &batch_request(&batch(1, None), 1),
+            &engine,
+            &last_applied,
+            Some(&tracker),
+            DEFAULT_STREAM_KEY,
+            10,
+            Some(&authority),
+            None,
+        );
+        assert_eq!(
+            resp.status, STATUS_ERROR,
+            "F-7: an unguarded V3 Reassign must not apply under enforcement",
+        );
+        match ReplicaAck::deserialize(&resp.payload).unwrap() {
+            ReplicaAck::MissingRecord {
+                failed_sequence,
+                tx_keys,
+            } => {
+                assert_eq!(failed_sequence, 1);
+                assert_eq!(
+                    tx_keys.first(),
+                    Some(&k),
+                    "the NAK must name the key so the master re-ships its full image",
+                );
+            }
+            other => panic!("expected the per-key-repair MissingRecord NAK, got {other:?}"),
+        }
+        let slot = engine.read_slot(&k, 0).unwrap();
+        assert_eq!(slot.status, UTXO_FROZEN, "the slot must be untouched");
+        assert_eq!(slot.hash, live_hash);
+        assert_eq!(
+            tracker.get(DEFAULT_STREAM_KEY),
+            0,
+            "the watermark must not advance past the refused op",
+        );
+
+        // Guarded (prior present) under enforcement: applies.
+        let resp = handle_replica_batch_regime_gated(
+            &batch_request(&batch(1, Some(live_hash)), 2),
+            &engine,
+            &last_applied,
+            Some(&tracker),
+            DEFAULT_STREAM_KEY,
+            10,
+            Some(&authority),
+            None,
+        );
+        assert_eq!(resp.status, STATUS_OK);
+        assert_eq!(engine.read_slot(&k, 0).unwrap().hash, [0x6C; 32]);
+
+        // Compat control: with enforcement INACTIVE (no authority), the
+        // legacy prior-less op keeps the historical live-slot fallback.
+        let k2 = key(99);
+        create_record(&engine, k2, 1);
+        apply_op(
+            &engine,
+            &ReplicaOp::Freeze {
+                tx_key: k2,
+                offset: 0,
+                master_generation: 0,
+            },
+        )
+        .unwrap();
+        apply_op(
+            &engine,
+            &ReplicaOp::Reassign {
+                tx_key: k2,
+                offset: 0,
+                new_hash: [0x6D; 32],
+                block_height: 800_000,
+                spendable_after: 1_000,
+                master_generation: 1,
+                prior_utxo_hash: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            engine.read_slot(&k2, 0).unwrap().hash,
+            [0x6D; 32],
+            "without enforcement the legacy fallback is unchanged",
+        );
+    }
+
     /// F-G7-005 boundary: a migration batch with cluster_key = 0 must
     /// still be accepted when `local_cluster_key = 0` (the receiver
     /// hasn't observed a quorum-committed cluster term yet, e.g.
@@ -9557,7 +9725,15 @@ mod tests {
         // a message-prefix check; the variant field is the same guard, minus the
         // string matching.)
         let mut redo_out = Vec::new();
-        match apply_op_journal_inner(&engine, &batch.ops[0], true, false, true, &mut redo_out) {
+        match apply_op_journal_inner(
+            &engine,
+            &batch.ops[0],
+            true,
+            false,
+            true,
+            false,
+            &mut redo_out,
+        ) {
             Err(ReplicaApplyError::MissingRecord { op_name, tx_key }) => {
                 assert_eq!(op_name, "set_mined");
                 assert_eq!(tx_key, key(201));
@@ -9753,7 +9929,15 @@ mod tests {
         // generation-sync gate reports the same ack variant, so assert the typed
         // `op_name` to prove this came from the SetConflicting arm itself.
         let mut redo_out = Vec::new();
-        match apply_op_journal_inner(&engine, &batch.ops[0], true, false, true, &mut redo_out) {
+        match apply_op_journal_inner(
+            &engine,
+            &batch.ops[0],
+            true,
+            false,
+            true,
+            false,
+            &mut redo_out,
+        ) {
             Err(ReplicaApplyError::MissingRecord { op_name, tx_key }) => {
                 assert_eq!(op_name, "set_conflicting");
                 assert_eq!(tx_key, key(205));

@@ -1337,6 +1337,7 @@ fn topology_restore_then_vote_safety() {
         committed_placement_version: 1,
         committed_peak: 3,
         regime_block: Default::default(),
+        data_epoch: None,
     };
 
     let auth = TopologyAuthority::new(NodeId(2), Duration::from_secs(1));

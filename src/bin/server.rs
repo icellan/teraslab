@@ -193,6 +193,12 @@ struct CatchupContext {
     catchup_in_flight: Arc<teraslab::replication::durable::CatchupInFlight>,
     /// Process shutdown flag — convergence loops abort promptly on shutdown.
     shutdown: Arc<std::sync::atomic::AtomicBool>,
+    /// F8 (I12) — handle for raising the topology-staleness signal when a
+    /// replica NAKs a catch-up chunk with `ERR_STALE_REGIME`: the catch-up
+    /// path applies the same abort-and-re-plan classification as the
+    /// foreground fan-out (refresh topology, retry on a later tick)
+    /// instead of re-shipping the same stale chunk every tick.
+    stale_signal: teraslab::cluster::coordinator::TopologyStaleSignalHandle,
 }
 
 /// Ops per catch-up pass — the CHUNK size of the convergence loop. This is
@@ -323,11 +329,13 @@ fn run_one_catchup_pass(
                         } else if let Some(tx_key) = e.op.tx_key() {
                             let shard =
                                 teraslab::cluster::shards::ShardTable::shard_for_key(tx_key);
-                            teraslab::cluster::coordinator::redo_entry_to_replica_op(
+                            // F-7: the PLURAL converter — it escalates a
+                            // legacy Reassign (no prior identity) to the
+                            // §4.9 per-key record-image repair instead of
+                            // an unguarded delta.
+                            teraslab::cluster::coordinator::redo_entry_to_replica_ops(
                                 e, shard, &eng_ref,
                             )?
-                            .into_iter()
-                            .collect()
                         } else {
                             Vec::new()
                         };
@@ -363,7 +371,10 @@ fn run_one_catchup_pass(
                 } else {
                     None
                 };
-            teraslab::server::dispatch::send_replica_ops_to(
+            // F8 — the REPORTING variant: a stale-regime NAK must stay
+            // typed so the pass can abort-and-re-plan (I12) instead of
+            // being flattened into an opaque transport string.
+            teraslab::server::dispatch::send_replica_ops_to_reporting(
                 addr,
                 chunk,
                 ctx.replication_timeout,
@@ -384,6 +395,31 @@ fn run_one_catchup_pass(
             tracker.record_ack(addr, through);
             tracker.flush();
             CatchupPassOutcome::Advanced { through }
+        }
+        Err(teraslab::replication::durable::CatchupError::StaleRegime {
+            shard,
+            local_regime,
+            ..
+        }) => {
+            // F8 (I12) — abort-and-re-plan, never a data error: this
+            // node's committed regime view is provably behind, so raise
+            // the same topology-staleness signal the foreground fan-out
+            // raises (the committed-channel catch-up refreshes it) and
+            // abort the pass. Without this, the lag monitor re-shipped
+            // the SAME stale chunk every tick forever while the replica
+            // NAKed each one. The NAK stays routing advice only (I9).
+            if let Some(m) = teraslab::metrics::replication_metrics() {
+                m.replica_send_stale_regime.inc();
+            }
+            tracing::warn!(
+                %addr,
+                shard,
+                receiver_regime = local_regime,
+                "catchup: replica rejected chunk with stale regime — raising \
+                 topology-staleness signal and aborting the pass (I12)",
+            );
+            ctx.stale_signal.signal(local_regime);
+            CatchupPassOutcome::NoAdvance
         }
         Err(e) => {
             tracing::warn!(%addr, err = %e, "catchup: replica catch-up failed");
@@ -488,6 +524,41 @@ fn run_replica_convergence(
     match outcome {
         CatchupConvergence::Converged { last_acked } => {
             tracing::info!(%addr, last_acked, "catchup: replica converged");
+            // F3 — the §4.3 FOURTH completion trigger: the replica just
+            // durably ACKed EVERY redo sequence over an intact redo range
+            // (a reclaimed range exits as NeedsResync, never Converged).
+            // Tell it so it can re-earn `Full` for the shards this node
+            // masters — the replica re-verifies holder-set membership,
+            // fences, and regime currency against its OWN state before
+            // stamping (see `apply_replica_converged_signal`). Without
+            // this, a skipped-term-degraded NON-EMPTY replica could never
+            // re-earn (the stream-origin trigger needs an empty start),
+            // permanently excluding its shards from promotion eligibility.
+            // Best-effort: on failure the next lag-monitor tick's
+            // convergence run re-sends.
+            match teraslab::cluster::coordinator::send_replica_converged_signal(
+                addr,
+                &ctx.topology_authority,
+                ctx.source_node_id,
+                ctx.auth_secret.as_deref(),
+            ) {
+                Ok(0) => {}
+                Ok(entries) => {
+                    tracing::info!(
+                        %addr,
+                        entries,
+                        "catchup: sent convergence completeness signal (F3/§4.3)",
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        %addr,
+                        err = %e,
+                        "catchup: convergence completeness signal failed; the next \
+                         lag-monitor convergence run will re-send",
+                    );
+                }
+            }
         }
         CatchupConvergence::HandedToSteadyState {
             last_acked,
@@ -2442,6 +2513,7 @@ fn main() {
                 migration_throttle: running.migration_throttle().clone(),
                 catchup_in_flight: Arc::new(teraslab::replication::durable::CatchupInFlight::new()),
                 shutdown: shutdown_flag.clone(),
+                stale_signal: running.topology_stale_signal_handle(),
             };
             // Stash for the runtime lag monitor (spawned after this block).
             catchup_ctx = Some(ctx.clone());

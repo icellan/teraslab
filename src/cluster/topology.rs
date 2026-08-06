@@ -143,6 +143,17 @@ pub struct RegimeBlock {
     pub regime_enforced: bool,
     /// I4 — committed automatic-promotion flag.
     pub promotion_enabled: bool,
+    /// F2 (I7/I10d) — digest-covered REBASE marker: `true` only on the
+    /// term produced by [`TopologyAuthority::propose_regime_rebase`]. A
+    /// rebase term is the SOLE commit exempt from the UNIVERSAL I10(d)
+    /// never-lower ratchet (every other commit — override-carrying or not
+    /// — may never lower any shard's installed regime); structurally it
+    /// must carry no override-map change and no committed-flag change
+    /// (validated in `commit_passes_regime_gates`). TRANSIENT: the applier
+    /// installs the block with this flag CLEARED (`apply_commit_locked`),
+    /// so it never leaks into the installed state a later proposal derives
+    /// from.
+    pub rebase: bool,
 }
 
 /// Envelope tag for the `placement_version` field (wire envelope only).
@@ -155,11 +166,25 @@ const ENV_TAG_OVERRIDES: u8 = 0x03;
 const ENV_TAG_REGIMES: u8 = 0x04;
 /// Envelope tag for the committed boolean flags.
 const ENV_TAG_FLAGS: u8 = 0x05;
+/// F4 — envelope tag for the topology state file's recorded `data_epoch`
+/// (state-file envelope only, never the wire envelope). Optional and
+/// trailing: a body ending before it decodes `data_epoch: None`
+/// (version-tolerant with pre-F4 stage builds).
+const ENV_TAG_DATA_EPOCH: u8 = 0x06;
+
+/// F4 — length of the restore-stamped data-epoch identity recorded in the
+/// topology state envelope (mirrors `cluster::lineage::DATA_EPOCH_LEN`;
+/// kept as a local constant so `topology` does not depend on `lineage`,
+/// which itself uses this module's envelope framing).
+pub const TOPOLOGY_DATA_EPOCH_LEN: usize = 16;
 
 /// Bit 0 of the flags byte: `regime_enforced`.
 const ENV_FLAG_REGIME_ENFORCED: u8 = 0b0000_0001;
 /// Bit 1 of the flags byte: `promotion_enabled`.
 const ENV_FLAG_PROMOTION_ENABLED: u8 = 0b0000_0010;
+/// Bit 2 of the flags byte: `rebase` (F2 — the digest-covered rebase
+/// marker; see [`RegimeBlock::rebase`]).
+const ENV_FLAG_REBASE: u8 = 0b0000_0100;
 
 /// Magic prefix of the versioned wire envelope appended to NEW
 /// [`TopologyTerm`] / [`TopologyCommit`] payloads.
@@ -253,6 +278,9 @@ impl RegimeBlock {
         if self.promotion_enabled {
             flags |= ENV_FLAG_PROMOTION_ENABLED;
         }
+        if self.rebase {
+            flags |= ENV_FLAG_REBASE;
+        }
         buf.push(flags);
         buf
     }
@@ -318,7 +346,7 @@ impl RegimeBlock {
         // --- flags ---
         expect_tag(data, &mut pos, ENV_TAG_FLAGS)?;
         let flags = read_u8(data, &mut pos)?;
-        if flags & !(ENV_FLAG_REGIME_ENFORCED | ENV_FLAG_PROMOTION_ENABLED) != 0 {
+        if flags & !(ENV_FLAG_REGIME_ENFORCED | ENV_FLAG_PROMOTION_ENABLED | ENV_FLAG_REBASE) != 0 {
             // Unknown flag bits are a hard reject: a v1 decoder must not
             // silently drop committed safety state it cannot represent.
             return Err(RegimeDecodeError::MalformedTag(ENV_TAG_FLAGS));
@@ -329,6 +357,7 @@ impl RegimeBlock {
                 regime,
                 regime_enforced: flags & ENV_FLAG_REGIME_ENFORCED != 0,
                 promotion_enabled: flags & ENV_FLAG_PROMOTION_ENABLED != 0,
+                rebase: flags & ENV_FLAG_REBASE != 0,
             },
             pos,
         ))
@@ -1133,6 +1162,36 @@ pub struct PersistedTopologyState {
     /// state-file envelope; a legacy file decodes with the bootstrap
     /// default (empty map, all-zero regimes, flags false).
     pub regime_block: RegimeBlock,
+    /// F4 — the node's `data_epoch` identity (see
+    /// `cluster::lineage::data_epoch_path`) AT THE TIME this state was
+    /// persisted. `backup::restore::restore()` stamps a FRESH epoch (and
+    /// deletes this state file outright — the primary F4 fix); this
+    /// recorded copy is the belt: at boot, an I13(i) master re-derivation
+    /// is refused when the CURRENT epoch differs from the one recorded
+    /// here — the on-disk data was restored under a topology state that
+    /// predates it, so "committed master with an intact redo" no longer
+    /// proves the copy is current. `None` = not recorded (legacy /
+    /// pre-F4-stage file, or an authority that never learned its epoch):
+    /// tolerated as matching, because failing closed on every upgraded
+    /// node's first boot would total-outage healthy masters — exactly the
+    /// hazard I13(i) exists to prevent.
+    pub data_epoch: Option<[u8; TOPOLOGY_DATA_EPOCH_LEN]>,
+}
+
+/// F7 — outcome of `TopologyAuthority::apply_commit_locked`, so the two
+/// non-apply cases stay distinguishable to `handle_commit_durable`
+/// (superseded → `NotApplied`; a refusing install hook → `PersistFailed`,
+/// the fail-closed durability verdict).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommitApplyVerdict {
+    /// The commit was applied; `committed_term` advanced.
+    Applied,
+    /// A higher (or equal) term was already applied; nothing was mutated.
+    Superseded,
+    /// The commit-install hook (lineage transition batch) refused —
+    /// a local durability fault. Nothing was mutated; the node stays on
+    /// its prior term (fail-closed).
+    HookRefused,
 }
 
 /// G9 — result of [`TopologyAuthority::handle_commit_durable`].
@@ -1210,10 +1269,18 @@ impl PersistedTopologyState {
     pub fn serialize_envelope(&self) -> Vec<u8> {
         let legacy = self.serialize();
         let block = self.regime_block.encode_canonical();
-        let mut body = Vec::with_capacity(4 + legacy.len() + block.len());
+        let mut body =
+            Vec::with_capacity(4 + legacy.len() + block.len() + 1 + TOPOLOGY_DATA_EPOCH_LEN);
         body.extend_from_slice(&(legacy.len() as u32).to_le_bytes());
         body.extend_from_slice(&legacy);
         body.extend_from_slice(&block);
+        // F4 — trailing tagged data-epoch record (additive: absent when
+        // the epoch is unknown, and a pre-F4 reader of such a body simply
+        // never sees the tag).
+        if let Some(epoch) = &self.data_epoch {
+            body.push(ENV_TAG_DATA_EPOCH);
+            body.extend_from_slice(epoch);
+        }
         encode_envelope(TOPOLOGY_STATE_ENVELOPE_MAGIC, &body)
     }
 
@@ -1242,11 +1309,26 @@ impl PersistedTopologyState {
             .ok_or(RegimeDecodeError::Truncated)?;
         pos = legacy_end;
         let mut state = Self::deserialize(legacy);
-        let (block, pos) = RegimeBlock::decode_canonical(body, pos)?;
+        let (block, mut pos) = RegimeBlock::decode_canonical(body, pos)?;
+        state.regime_block = block;
+        // F4 — optional trailing data-epoch record. Absent (body ends at
+        // the regime block) decodes `None` — version-tolerant with files
+        // written by earlier stage builds. Present-but-malformed is a hard
+        // reject like every other envelope fault.
+        if pos < body.len() {
+            expect_tag(body, &mut pos, ENV_TAG_DATA_EPOCH)?;
+            let end = pos
+                .checked_add(TOPOLOGY_DATA_EPOCH_LEN)
+                .ok_or(RegimeDecodeError::Truncated)?;
+            let bytes = body.get(pos..end).ok_or(RegimeDecodeError::Truncated)?;
+            let mut epoch = [0u8; TOPOLOGY_DATA_EPOCH_LEN];
+            epoch.copy_from_slice(bytes);
+            state.data_epoch = Some(epoch);
+            pos = end;
+        }
         if pos != body.len() {
             return Err(RegimeDecodeError::TrailingBytes);
         }
-        state.regime_block = block;
         Ok(state)
     }
 
@@ -1366,6 +1448,7 @@ impl PersistedTopologyState {
                 committed_placement_version,
                 committed_peak,
                 regime_block: RegimeBlock::default(),
+                data_epoch: None,
             }
         } else if data.len() >= 16 {
             // Old format: [peak:8][epoch:8]
@@ -1382,6 +1465,7 @@ impl PersistedTopologyState {
                 committed_placement_version: 1,
                 committed_peak: peak.max(1),
                 regime_block: RegimeBlock::default(),
+                data_epoch: None,
             }
         } else if data.len() >= 8 {
             // Oldest format: [peak:8] only
@@ -1397,6 +1481,7 @@ impl PersistedTopologyState {
                 committed_placement_version: 1,
                 committed_peak: peak.max(1),
                 regime_block: RegimeBlock::default(),
+                data_epoch: None,
             }
         } else {
             Self {
@@ -1410,6 +1495,7 @@ impl PersistedTopologyState {
                 committed_placement_version: 1,
                 committed_peak: 1,
                 regime_block: RegimeBlock::default(),
+                data_epoch: None,
             }
         }
     }
@@ -1651,10 +1737,13 @@ pub struct TopologyAuthority {
     /// `peer_placement_support` map, whose forever-monotonic semantics are
     /// deliberately unchanged.
     peer_regime_adverts: RwLock<std::collections::HashMap<NodeId, PeerRegimeAdvert>>,
-    /// P1 stage 3 (I2 / I13ii) — optional lineage install hook, run by
-    /// [`Self::handle_commit_durable`] INSIDE the `commit_apply` critical
-    /// section, after the topology-state persist succeeds and strictly
-    /// BEFORE `apply_commit_locked` advances `committed_term`. The
+    /// P1 stage 3 (I2 / I13ii) — optional lineage install hook, run
+    /// INSIDE `apply_commit_locked` (F7: so BOTH `handle_commit_durable`
+    /// and the non-durable `handle_commit` runtime paths invoke it —
+    /// no apply path can install a regime block without the lineage
+    /// transitions), within the `commit_apply` critical section, after
+    /// the durable path's topology-state persist and strictly BEFORE
+    /// `committed_term` advances. The
     /// coordinator installs a closure that applies the per-commit lineage
     /// transitions (holder-exit degrade, I2 stamp refresh, I13ii promotion
     /// re-stamp) and durably persists them as ONE batched write. A `false`
@@ -1673,6 +1762,20 @@ pub struct TopologyAuthority {
     /// never acquire a lock that is ever held while calling
     /// `handle_commit_durable`.
     commit_install_hook: RwLock<Option<CommitInstallHook>>,
+    /// F4 — this boot's `data_epoch` identity (the lineage store's
+    /// restore-stamped 16-byte stamp), wired by the coordinator at startup
+    /// via [`Self::set_data_epoch`]. Stamped into every persisted topology
+    /// state so a later boot can detect a state file that predates a
+    /// restore. `None` = unknown (non-clustered / tests / identity load
+    /// failure) — persisted states then simply omit the record.
+    data_epoch: RwLock<Option<[u8; TOPOLOGY_DATA_EPOCH_LEN]>>,
+    /// F4 — the `data_epoch` recorded in the state file [`Self::restore`]
+    /// loaded at boot, if any. Compared by the coordinator's I13(i) boot
+    /// re-derivation against the CURRENT epoch: a mismatch means the
+    /// on-disk data was restored under a topology state that predates it,
+    /// so master shards boot `Subset` and re-earn instead of re-stamping
+    /// `Full` over backup-era data.
+    restored_data_epoch: RwLock<Option<[u8; TOPOLOGY_DATA_EPOCH_LEN]>>,
 }
 
 /// P1 stage 3/4 — the lineage commit-install hook type (see
@@ -1827,7 +1930,25 @@ impl TopologyAuthority {
             self_incarnation: AtomicU64::new(0),
             peer_regime_adverts: RwLock::new(std::collections::HashMap::new()),
             commit_install_hook: RwLock::new(None),
+            data_epoch: RwLock::new(None),
+            restored_data_epoch: RwLock::new(None),
         }
+    }
+
+    /// F4 — wire this boot's `data_epoch` identity (see the field docs).
+    /// Called once by the coordinator at startup, after the lineage
+    /// identity is loaded/created; every subsequently persisted topology
+    /// state records it.
+    pub fn set_data_epoch(&self, epoch: [u8; TOPOLOGY_DATA_EPOCH_LEN]) {
+        *self.data_epoch.write().unwrap() = Some(epoch);
+    }
+
+    /// F4 — the `data_epoch` recorded in the topology state file this
+    /// authority was [`Self::restore`]d from (`None`: no state restored,
+    /// or the file predates the record). See the field docs for how the
+    /// coordinator's I13(i) boot re-derivation consumes it.
+    pub fn restored_data_epoch(&self) -> Option<[u8; TOPOLOGY_DATA_EPOCH_LEN]> {
+        *self.restored_data_epoch.read().unwrap()
     }
 
     /// P1 stage 3 — install the lineage commit-install hook (see the
@@ -2203,7 +2324,14 @@ impl TopologyAuthority {
                 .copied()
                 .unwrap_or_else(|| old_table.assignment(shard).master);
             if new_master != old_master {
-                regime.set(shard, new_term);
+                // F2 (iii) — MAX-MERGE, never a plain copy: a master change
+                // raises the entry to the carrying term, but an installed
+                // entry that is somehow already higher (a stale-proposer /
+                // corrupt-state edge the universal I10(d) ratchet exists
+                // for) is preserved rather than lowered. `new_term` exceeds
+                // every legitimately installed regime (regimes are terms,
+                // I7), so this is a no-op on the honest path.
+                regime.set(shard, installed.regime.get(shard).max(new_term));
             }
         }
         RegimeBlock {
@@ -2211,6 +2339,8 @@ impl TopologyAuthority {
             regime,
             regime_enforced: installed.regime_enforced,
             promotion_enabled: installed.promotion_enabled,
+            // Never a rebase: only `propose_regime_rebase` produces one.
+            rebase: false,
         }
     }
 
@@ -2427,6 +2557,11 @@ impl TopologyAuthority {
         // boot check (coordinator) is what refuses to start when that
         // default contradicts a previously-armed enforcement state.
         *self.committed_regime_block.write().unwrap() = state.regime_block.clone();
+        // F4 — remember the epoch the loaded state file recorded so the
+        // boot-time I13(i) re-derivation can compare it against the
+        // CURRENT data-epoch identity (a mismatch = the data was restored
+        // under a topology state that predates it).
+        *self.restored_data_epoch.write().unwrap() = state.data_epoch;
     }
 
     /// Current committed term.
@@ -2547,6 +2682,9 @@ impl TopologyAuthority {
             committed_placement_version: self.committed_placement_version(),
             committed_peak: self.committed_peak(),
             regime_block: self.committed_regime_block(),
+            // F4 — record the node's current data-epoch identity (None
+            // until the coordinator wires it at startup).
+            data_epoch: *self.data_epoch.read().unwrap(),
         }
     }
 
@@ -2710,6 +2848,27 @@ impl TopologyAuthority {
         let unsupported_placement =
             propose.placement_version > crate::cluster::shards::MAX_SUPPORTED_PLACEMENT_VERSION;
 
+        // F1 (vote/apply symmetry) + F2 (proposer-side ratchet catch) —
+        // run the EXACT apply-side regime gate at vote time: a node must
+        // never vote for a term it would reject at apply (the F1
+        // divergence let a fresh node vote yes, reject at apply, and keep
+        // serving its own bootstrap term — dual-serving via scale-out),
+        // and a stale proposer's regime-lowering array is refused before
+        // any vote is granted (F2 iii). This is a VOTE gate, so node-local
+        // knowledge would be permitted here — but the shared gate is
+        // I0-clean anyway, which is what guarantees the two sides can
+        // never split. Only evaluated on a digest-valid proposal (a forged
+        // digest is rejected below regardless).
+        let regime_reject = valid_digest
+            && !self.regime_gates_pass(
+                propose.term,
+                propose.proposer,
+                &propose.members,
+                propose.placement_version,
+                propose.committed_peak,
+                &propose.regime_block,
+            );
+
         // F-G8-002: the proposer-side split-brain checks fire in
         // `on_membership_changed`, `retry_proposal`, and `check_timeout`,
         // but the follower-side `handle_propose` previously accepted any
@@ -2719,6 +2878,7 @@ impl TopologyAuthority {
         // round cannot launder a merged membership through the quorum.
         if !valid_digest
             || unsupported_placement
+            || regime_reject
             || !self.membership_change_is_safe(&propose.members, Some(propose.cluster_id))
         {
             // Even when `voted_term` would normally advance, we refuse to
@@ -2731,7 +2891,8 @@ impl TopologyAuthority {
                 term = propose.term,
                 placement_version = propose.placement_version,
                 unsupported_placement,
-                "cluster: rejecting topology propose — split-brain heal signature, bad digest, or unsupported placement version",
+                regime_reject,
+                "cluster: rejecting topology propose — split-brain heal signature, bad digest, regime-gate violation, or unsupported placement version",
             );
             return TopologyVote {
                 term: propose.term,
@@ -2891,6 +3052,14 @@ impl TopologyAuthority {
     /// a crash use [`TopologyAuthority::handle_commit_durable`] instead; this
     /// remains for tests and single-node paths where a crash cannot produce a
     /// peer holding a term this node forgot.
+    ///
+    /// F7 — the commit-install hook (lineage transitions) now runs inside
+    /// `apply_commit_locked`, so THIS path refreshes lineage stamps exactly
+    /// like the durable one: a runtime commit through here can no longer
+    /// freeze a node's `Full` stamps at an old regime. Multi-node runtime
+    /// commits should still use `handle_commit_durable` for the G9
+    /// durability ordering; the hook parity is defense-in-depth, not an
+    /// invitation.
     pub fn handle_commit(&self, commit: &TopologyCommit) -> Option<u64> {
         // Item 1 — hold the commit critical section across gate + apply so a
         // concurrent commit cannot interleave and regress the served term.
@@ -2898,13 +3067,13 @@ impl TopologyAuthority {
         if !self.commit_passes_gates(commit) {
             return None;
         }
-        if self.apply_commit_locked(commit) {
-            Some(commit.term)
-        } else {
-            // Superseded under the lock (a higher term already applied). The
-            // gate above should have caught it, but the apply-time re-check is
-            // the authoritative guard — report "not applied".
-            None
+        match self.apply_commit_locked(commit) {
+            CommitApplyVerdict::Applied => Some(commit.term),
+            // Superseded under the lock (a higher term already applied — the
+            // gate above should have caught it, but the apply-time re-check
+            // is the authoritative guard) or the install hook failed a local
+            // durable write (fail-closed) — either way, "not applied".
+            CommitApplyVerdict::Superseded | CommitApplyVerdict::HookRefused => None,
         }
     }
 
@@ -3074,39 +3243,97 @@ impl TopologyAuthority {
 
     /// P1 stage 1 — the I7/I10/I6 structural regime gate.
     ///
-    /// Clause scoping (per the spec's own definitions):
+    /// Clause scoping (per the spec's own definitions, amended by the §8
+    /// review findings F1/F2):
     ///
     /// * **I7 (`regime[s] ≤ commit.term`)** runs on EVERY commit — it is
     ///   pure over the commit alone (no installed state, so no applier can
     ///   split on it) and defends against forged/corrupted regime state.
-    /// * **I10(a)/(b)/(d)/(e)/(f) and the I6 apply-half** run only on an
+    /// * **I10(d) never-lower** is UNIVERSAL (F2): it runs on EVERY commit,
+    ///   override-carrying or not — a stale-but-honest proposer's
+    ///   NON-override commit adopting its old absolute array wholesale was
+    ///   a regime rollback / fence-disarm primitive (a placement-driven
+    ///   bump needs no override entry, so `carries_overrides` never saw
+    ///   it). The SOLE exemption is a commit whose digest-covered
+    ///   [`RegimeBlock::rebase`] flag is set (the I7 operator-repair verb);
+    ///   a rebase commit is structurally confined here to carrying no
+    ///   override-map change and no committed-flag change. Consequence,
+    ///   stated honestly: the old "a forged bump self-heals on the next
+    ///   legitimate higher-term commit" property is GONE — a forged bump
+    ///   is now repaired ONLY by a rebase. A long-down node that slept
+    ///   through a rebase can also wedge on the ratchet (its installed
+    ///   regimes exceed the rebased array); recovery is operator-driven:
+    ///   re-run the rebase once the node's installed map matches, or reset
+    ///   the node's topology state so it re-joins through the fresh-node
+    ///   arm below.
+    /// * **I10(f), the I6 apply-half, and (b)/(e)/(a)** run only on an
     ///   **override-carrying** commit, defined as one whose override map
-    ///   differs from the INSTALLED map (I10's preamble scope: "re-validates
-    ///   an override-carrying commit"). This scoping is load-bearing twice
-    ///   over: (1) the map is full + cumulative, so a STANDING override
-    ///   rides every later commit with its original regime — clause (b)
-    ///   applied to unchanged entries would reject every such commit;
-    ///   (2) a regime REBASE (I7) and the "forged bump self-heals on the
-    ///   next legitimate higher-term commit" property both require a
-    ///   non-override-carrying commit to install its absolute regime array
-    ///   wholesale — a universally-scoped never-lower ratchet would make
-    ///   both impossible.
+    ///   differs from the INSTALLED map (I10's preamble scope). The map is
+    ///   full + cumulative, so a STANDING override rides every later
+    ///   commit with its original regime — clause (b) applied to unchanged
+    ///   entries would reject every such commit.
+    /// * **F1 (holder-evidence vacuity)** — clauses (a) and (e), and (b)'s
+    ///   carrying-term equality, all *classify entries against the
+    ///   installed pre-override state* (standing vs added; pre-override
+    ///   holder set; master-change justification). An applier with NO
+    ///   installed members (fresh node joining an established cluster) or
+    ///   one applying a term that SKIPS past `installed_term + 1` (the
+    ///   §4.8 catch-up / adopt-wholesale arm — the commit's quorum proof
+    ///   is the only available evidence) cannot perform that
+    ///   classification: evaluating the clauses anyway rejects every
+    ///   standing override, permanently — a node that can never install
+    ///   an override-carrying commit while believing itself sole member
+    ///   is dual-serving via scale-out, and the cluster is un-growable
+    ///   after its first promotion. Those clauses are therefore VACUOUS
+    ///   exactly when `installed_members.is_empty() || commit.term >
+    ///   installed_term + 1`; what remains always-on for the override map
+    ///   in that arm is (b)'s sound residue (every override entry carries
+    ///   a NON-ZERO regime; `≤ term` is I7), plus (c)/(d)/(f) and I6 in
+    ///   full. Both vacuity conditions are pure over installed committed
+    ///   state — I0-clean, and evaluated identically at vote time
+    ///   (`handle_propose`) so a node never votes for a commit it would
+    ///   reject at apply (F1's vote/apply divergence).
     /// * Within an override-carrying commit, clauses (a)/(b) examine only
     ///   the entries this commit ADDS or RETARGETS (an entry equal to the
     ///   installed one is a standing override, validated by the term that
     ///   introduced it).
     fn commit_passes_regime_gates(&self, commit: &TopologyCommit) -> bool {
-        let block = &commit.regime_block;
+        self.regime_gates_pass(
+            commit.term,
+            commit.proposer,
+            &commit.members,
+            commit.placement_version,
+            commit.committed_peak,
+            &commit.regime_block,
+        )
+    }
 
+    /// The shared I7/I10/I6 structural regime gate over term-shaped data —
+    /// used verbatim by BOTH [`Self::commit_passes_regime_gates`] (apply,
+    /// I0-clean: every clause is pure over the payload + installed
+    /// committed state) and [`Self::handle_propose`] (vote — F1: a node
+    /// must not vote for a term it would reject at apply; running the
+    /// exact same function on both sides makes vote/apply divergence
+    /// structurally impossible). See `commit_passes_regime_gates` for the
+    /// clause-scoping contract.
+    fn regime_gates_pass(
+        &self,
+        term: u64,
+        proposer: NodeId,
+        members: &[NodeId],
+        placement_version: u16,
+        committed_peak: u64,
+        block: &RegimeBlock,
+    ) -> bool {
         // I7 / I10(c) — regime values are terms; none may exceed the
-        // carrying term. Pure over the commit; runs unconditionally.
-        if let Some((shard, regime)) = block.regime.iter_nonzero().find(|&(_, r)| r > commit.term) {
+        // carrying term. Pure over the payload; runs unconditionally.
+        if let Some((shard, regime)) = block.regime.iter_nonzero().find(|&(_, r)| r > term) {
             tracing::error!(
                 self_id = self.self_id.0,
-                term = commit.term,
+                term,
                 shard,
                 regime,
-                "cluster: refusing topology commit — I7 violation (regime exceeds carrying term)",
+                "cluster: refusing topology term — I7 violation (regime exceeds carrying term)",
             );
             return false;
         }
@@ -3118,13 +3345,15 @@ impl TopologyAuthority {
         // Gate B can legitimately split appliers on a shrink term, and a
         // split on the committed enforcement flags is a split on which
         // nodes accept V2 batches (I12) — the same class of hazard I6
-        // exists to prevent for mastership.
+        // exists to prevent for mastership. (`rebase` is deliberately NOT
+        // part of `flags_change`: it is a transient term marker, not
+        // committed state — the installed block always has it cleared.)
         let flags_change = block.regime_enforced != installed.regime_enforced
             || block.promotion_enabled != installed.promotion_enabled;
-        if flags_change && commit.committed_peak < self.committed_peak() {
+        if flags_change && committed_peak < self.committed_peak() {
             tracing::error!(
                 self_id = self.self_id.0,
-                term = commit.term,
+                term,
                 "cluster: refusing commit — I6: shrink term bundles a \
                  regime_enforced/promotion_enabled change",
             );
@@ -3132,6 +3361,48 @@ impl TopologyAuthority {
         }
 
         let carries_overrides = block.override_map != installed.override_map;
+
+        // F2 — structural rebase confinement (I6/I7): a rebase term
+        // carries neither an override-map change nor a committed-flag
+        // change. Without this, the rebase flag would be a general-purpose
+        // ratchet bypass instead of the narrow operator-repair verb §4.1
+        // scopes it to.
+        if block.rebase && (carries_overrides || flags_change) {
+            tracing::error!(
+                self_id = self.self_id.0,
+                term,
+                carries_overrides,
+                flags_change,
+                "cluster: refusing rebase term — F2/I6: a rebase must not change the \
+                 override map or the committed flags",
+            );
+            return false;
+        }
+
+        // F2 — I10(d) never-lower ratchet, UNIVERSAL: NO commit may lower
+        // ANY shard's regime below the installed value (removes the
+        // fence-disarm primitive — including a stale-but-honest proposer's
+        // NON-override commit re-installing its old absolute array, the
+        // reachable no-attacker path: a placement-driven bump has no
+        // override entry, so the old override-carrying-only scoping never
+        // saw it). Sole exemption: the digest-covered rebase verb above.
+        if !block.rebase {
+            for shard in 0..crate::cluster::shards::NUM_SHARDS as u16 {
+                if block.regime.get(shard) < installed.regime.get(shard) {
+                    tracing::error!(
+                        self_id = self.self_id.0,
+                        term,
+                        shard,
+                        term_regime = block.regime.get(shard),
+                        local_regime = installed.regime.get(shard),
+                        "cluster: refusing topology term — I10(d): universal regime ratchet \
+                         (only a rebase term may lower)",
+                    );
+                    return false;
+                }
+            }
+        }
+
         if !carries_overrides {
             return true;
         }
@@ -3145,11 +3416,11 @@ impl TopologyAuthority {
         // legitimately has `proposer ∉ members` — I6 keeps that disjoint
         // (a shrink term never carries override changes), so this clause
         // fires only where §4.4 scopes it: override-carrying terms.
-        if !commit.members.contains(&commit.proposer) {
+        if !members.contains(&proposer) {
             tracing::error!(
                 self_id = self.self_id.0,
-                term = commit.term,
-                proposer = commit.proposer.0,
+                term,
+                proposer = proposer.0,
                 "cluster: refusing override-carrying commit — I10(f): proposer not in members",
             );
             return false;
@@ -3163,10 +3434,10 @@ impl TopologyAuthority {
         // back door; and Gate B can legitimately split appliers on a
         // shrink term, and only I6 guarantees such a split never splits
         // mastership).
-        if commit.committed_peak < self.committed_peak() {
+        if committed_peak < self.committed_peak() {
             tracing::error!(
                 self_id = self.self_id.0,
-                term = commit.term,
+                term,
                 "cluster: refusing commit — I6: override-carrying term bundles a shrink",
             );
             return false;
@@ -3174,29 +3445,51 @@ impl TopologyAuthority {
         if flags_change {
             tracing::error!(
                 self_id = self.self_id.0,
-                term = commit.term,
+                term,
                 "cluster: refusing commit — I6: override-carrying term changes \
                  regime_enforced/promotion_enabled",
             );
             return false;
         }
 
-        // I10(d) — never-lower ratchet: an override-carrying commit may
-        // not lower ANY shard's regime below the installed value (removes
-        // the fence-disarm primitive, including from a stale-but-honest
-        // proposer).
-        for shard in 0..crate::cluster::shards::NUM_SHARDS as u16 {
-            if block.regime.get(shard) < installed.regime.get(shard) {
-                tracing::error!(
-                    self_id = self.self_id.0,
-                    term = commit.term,
-                    shard,
-                    commit_regime = block.regime.get(shard),
-                    local_regime = installed.regime.get(shard),
-                    "cluster: refusing override-carrying commit — I10(d): regime ratchet",
-                );
-                return false;
+        // F1 — holder-evidence vacuity (see the clause-scoping doc above):
+        // with no installed members, or a term that skips past
+        // `installed_term + 1`, this applier cannot reconstruct the
+        // pre-override state that clauses (a)/(e) and (b)'s carrying-term
+        // equality classify against — the commit's quorum proof is the
+        // only available evidence (§4.8's adopt-wholesale arm). Both
+        // conditions are installed committed state (I0-clean).
+        let installed_members = self.committed_members.read().unwrap().clone();
+        let installed_term = self.committed_term.load(Ordering::Relaxed);
+        let holder_evidence = !installed_members.is_empty() && term <= installed_term + 1;
+
+        if !holder_evidence {
+            // (b)'s sound residue, always-on: every override entry must
+            // carry a NON-ZERO regime (an override introduced at term T is
+            // stamped T; zero means a forged/corrupt map entry). The upper
+            // bound (`≤ term`) is I7 above.
+            for &shard in block.override_map.keys() {
+                if block.regime.get(shard) == 0 {
+                    tracing::error!(
+                        self_id = self.self_id.0,
+                        term,
+                        shard,
+                        "cluster: refusing override-carrying commit — I10(b) residue: \
+                         override entry with zero regime",
+                    );
+                    return false;
+                }
             }
+            tracing::info!(
+                self_id = self.self_id.0,
+                term,
+                installed_term,
+                fresh = installed_members.is_empty(),
+                "cluster: override-carrying term accepted through the F1 adopt-wholesale \
+                 arm (I10 a/e and b's carrying-term equality vacuous — no pre-override \
+                 evidence installed); serving is still gated by I13 lineage",
+            );
+            return true;
         }
 
         // The committed-derivation masters for (e) and (a). BOTH sides are
@@ -3204,26 +3497,21 @@ impl TopologyAuthority {
         // this node's INSTALLED committed state — never
         // `effective_assignment` or the live ShardTable (I0).
         let rf = self.replication_factor.load(Ordering::Relaxed) as u8;
-        let installed_members = self.committed_members.read().unwrap().clone();
         let installed_pv = self.committed_placement_version().max(1);
-        let installed_table = if installed_members.is_empty() {
+        let installed_table = Some(crate::cluster::shards::ShardTable::compute_with_epoch(
+            &installed_members,
+            rf,
+            1,
+            installed_pv,
+        ));
+        let commit_table = if members.is_empty() {
             None
         } else {
             Some(crate::cluster::shards::ShardTable::compute_with_epoch(
-                &installed_members,
+                members,
                 rf,
                 1,
-                installed_pv,
-            ))
-        };
-        let commit_table = if commit.members.is_empty() {
-            None
-        } else {
-            Some(crate::cluster::shards::ShardTable::compute_with_epoch(
-                &commit.members,
-                rf,
-                1,
-                commit.placement_version.max(1),
+                placement_version.max(1),
             ))
         };
         let local_master = |shard: u16| -> Option<NodeId> {
@@ -3253,7 +3541,7 @@ impl TopologyAuthority {
             {
                 tracing::error!(
                     self_id = self.self_id.0,
-                    term = commit.term,
+                    term,
                     shard,
                     "cluster: refusing override-carrying commit — I10(e): regime bump \
                      without a master change",
@@ -3268,10 +3556,10 @@ impl TopologyAuthority {
                 continue; // standing override, validated by its own term
             }
             // (b) — a new/retargeted override stamps the carrying term.
-            if block.regime.get(shard) != commit.term {
+            if block.regime.get(shard) != term {
                 tracing::error!(
                     self_id = self.self_id.0,
-                    term = commit.term,
+                    term,
                     shard,
                     regime = block.regime.get(shard),
                     "cluster: refusing override-carrying commit — I10(b): override regime \
@@ -3293,7 +3581,7 @@ impl TopologyAuthority {
             if !in_holder_set {
                 tracing::error!(
                     self_id = self.self_id.0,
-                    term = commit.term,
+                    term,
                     shard,
                     target = target.0,
                     "cluster: refusing override-carrying commit — I10(a): override target \
@@ -3323,13 +3611,49 @@ impl TopologyAuthority {
     /// superseded, abandons the apply ENTIRELY (mutates nothing — not the term,
     /// not members, not placement). A bare `fetch_max` on `committed_term` alone
     /// would still write this commit's members/placement, leaving the higher
-    /// term paired with a lower term's members. Returns `true` if the commit was
-    /// applied, `false` if it was abandoned as superseded.
-    fn apply_commit_locked(&self, commit: &TopologyCommit) -> bool {
+    /// term paired with a lower term's members.
+    ///
+    /// F7 — the commit-install hook (lineage transitions, I2/I13ii, the
+    /// serving-established derivation) runs HERE, before any mutation, so
+    /// it CANNOT be bypassed: every apply path — `handle_commit_durable`
+    /// AND the non-durable `handle_commit` the runtime single-node paths
+    /// use — funnels through this function. (Previously the hook lived
+    /// only in `handle_commit_durable`; a runtime `handle_commit` install
+    /// froze a long-lived process's `Full` stamps at an old regime,
+    /// permanently disqualifying it as a promotion target.) A refusing
+    /// hook fails the commit closed with [`CommitApplyVerdict::HookRefused`]
+    /// and mutates nothing.
+    fn apply_commit_locked(&self, commit: &TopologyCommit) -> CommitApplyVerdict {
         // Item 1 — abandon a superseded lower term outright. Under
         // `commit_apply` this load is stable for the rest of the function.
         if commit.term <= self.committed_term.load(Ordering::Relaxed) {
-            return false;
+            return CommitApplyVerdict::Superseded;
+        }
+        // F7 (I2/I13ii) — run the commit-install hook FIRST, before any
+        // mutation: the lineage transition batch must be durable before
+        // `committed_term` advances (I1 ordering), and a hook durability
+        // fault must leave the authority exactly as it was. The hook's
+        // `state` is the post-commit persisted view recomputed here (its
+        // consumers read only commit-derived fields: term, members,
+        // placement version, regime block); `prev` snapshots the still-
+        // installed previous committed state — both stable under
+        // `commit_apply`.
+        let hook = self.commit_install_hook.read().unwrap().clone();
+        if let Some(hook) = hook {
+            let state = self.persisted_state_for_commit(
+                commit,
+                self.peak_cluster_size(),
+                self.self_incarnation.load(Ordering::Relaxed),
+            );
+            let prev = InstalledCommitView {
+                committed_term: self.committed_term.load(Ordering::Relaxed),
+                members: self.committed_members.read().unwrap().clone(),
+                placement_version: self.committed_placement_version(),
+                regime_block: self.committed_regime_block(),
+            };
+            if !hook(&state, &prev) {
+                return CommitApplyVerdict::HookRefused;
+            }
         }
         // E-01: a committed term with N members is direct evidence the
         // cluster reached size N — raise the peak so any later
@@ -3376,8 +3700,14 @@ impl TopologyAuthority {
         // double-spend window and is structurally impossible under this
         // ordering. The absolute array/map are adopted WHOLESALE — a pure
         // function of the installed commit (§5.4), already validated by
-        // `commit_passes_regime_gates`.
-        *self.committed_regime_block.write().unwrap() = commit.regime_block.clone();
+        // `commit_passes_regime_gates`. F2: the transient `rebase` term
+        // marker is CLEARED on install — it authorizes THIS term's
+        // lowering only and must never leak into the installed state a
+        // later proposal derives its block (or an applier its
+        // `flags_change`) from.
+        let mut installed_block = commit.regime_block.clone();
+        installed_block.rebase = false;
+        *self.committed_regime_block.write().unwrap() = installed_block;
 
         // G8 stage 1 — adopt the committed_peak carried by this commit. Gate
         // B (upstream, in `commit_passes_gates`) is what makes this
@@ -3436,7 +3766,7 @@ impl TopologyAuthority {
 
         // Clear any pending proposal (superseded by this commit).
         *self.pending_proposal.lock() = None;
-        true
+        CommitApplyVerdict::Applied
     }
 
     /// G9 — the `PersistedTopologyState` this authority WOULD hold after
@@ -3476,8 +3806,16 @@ impl TopologyAuthority {
             // P1 stage 1 — the regime state this node WOULD hold after
             // applying `commit` is the commit's own block verbatim (the
             // absolute representation: a pure function of the installed
-            // commit, §5.4).
-            regime_block: commit.regime_block.clone(),
+            // commit, §5.4), with the transient F2 rebase marker CLEARED
+            // exactly as `apply_commit_locked` installs it.
+            regime_block: {
+                let mut block = commit.regime_block.clone();
+                block.rebase = false;
+                block
+            },
+            // F4 — record the node's current data-epoch identity so boot
+            // can detect a topology state that predates a restore.
+            data_epoch: *self.data_epoch.read().unwrap(),
         }
     }
 
@@ -3519,37 +3857,27 @@ impl TopologyAuthority {
         if !persist(&state) {
             return DurableCommitOutcome::PersistFailed;
         }
-        // P1 stage 3 (I2 / I13ii) — run the lineage install hook inside the
-        // same `commit_apply` critical section, after the topology persist,
-        // strictly before `apply_commit_locked` advances `committed_term`.
-        // A hook failure is fail-closed: the commit is NOT applied and the
-        // node stays on its prior term (see the field docs; the
-        // topology-state-persisted-but-hook-failed crash/refusal window is
-        // exactly the I13i regardless-of-stamp boot re-derivation case).
-        let hook = self.commit_install_hook.read().unwrap().clone();
-        if let Some(hook) = hook {
-            // P1 stage 4 — snapshot the PREVIOUS installed committed state
-            // for the hook while it is still installed (apply_commit_locked
-            // has not run yet; `commit_apply` is held, so this is stable).
-            let prev = InstalledCommitView {
-                committed_term: self.committed_term.load(Ordering::Relaxed),
-                members: self.committed_members.read().unwrap().clone(),
-                placement_version: self.committed_placement_version(),
-                regime_block: self.committed_regime_block(),
-            };
-            if !hook(&state, &prev) {
-                return DurableCommitOutcome::PersistFailed;
-            }
-        }
-        if self.apply_commit_locked(commit) {
-            DurableCommitOutcome::Applied(commit.term)
-        } else {
+        // P1 stage 3 (I2 / I13ii) / F7 — the lineage install hook now runs
+        // INSIDE `apply_commit_locked` (so the non-durable `handle_commit`
+        // path cannot bypass it), still within this same `commit_apply`
+        // critical section, after the topology persist above and strictly
+        // before `committed_term` advances. A hook failure is fail-closed:
+        // the commit is NOT applied and the node stays on its prior term
+        // (the topology-state-persisted-but-hook-failed crash/refusal
+        // window is exactly the I13i regardless-of-stamp boot
+        // re-derivation case).
+        match self.apply_commit_locked(commit) {
+            CommitApplyVerdict::Applied => DurableCommitOutcome::Applied(commit.term),
             // Superseded under the lock. Cannot happen while the guard is held
             // (the gate already required `commit.term > committed_term` and
             // nothing else advances the term without this lock), but the
             // apply-time re-check is the authoritative guard: report NotApplied
             // rather than a phantom `Applied` for a term we did not install.
-            DurableCommitOutcome::NotApplied
+            CommitApplyVerdict::Superseded => DurableCommitOutcome::NotApplied,
+            // F7 — the install hook failed its batched durable lineage
+            // write: surface the same fail-closed verdict the pre-F7 code
+            // used for a hook refusal.
+            CommitApplyVerdict::HookRefused => DurableCommitOutcome::PersistFailed,
         }
     }
 
@@ -4018,6 +4346,18 @@ impl TopologyAuthority {
     /// operational precondition enforced by the operator surface, not a
     /// structural one; the marker deletion ordering on the apply path is
     /// handled by the coordinator's persist site.
+    ///
+    /// §8 review F-5 (RESIDUAL, recorded not fixed): the unanimity check
+    /// here gates only the ENABLE proposal. A pre-P1 binary that joins (or
+    /// is downgraded in) an ALREADY-enforced cluster is never detected: it
+    /// emits V2 batches (every one rejected by I12's receivers) and its
+    /// own receiver dies on the P1 digest break as a sender-side exclusion
+    /// — a silent BIDIRECTIONAL blackout of the ~2/N of the keyspace that
+    /// node holds, with no `regime_unsupported_member` alert naming it.
+    /// Closing this needs a standing per-member advert check (alert when a
+    /// committed member's current-incarnation advert lacks regime support
+    /// while `regime_enforced` is committed) surfaced via /status + a
+    /// metric; out of scope for the P1 remediation round.
     pub fn propose_regime_enforced(
         &self,
         enable: bool,
@@ -4105,6 +4445,11 @@ impl TopologyAuthority {
                 regime,
                 regime_enforced: installed.regime_enforced,
                 promotion_enabled: installed.promotion_enabled,
+                // F2 (ii) — the digest-covered rebase marker: this term is
+                // the SOLE commit the universal I10(d) never-lower ratchet
+                // exempts. Appliers install the block with the flag
+                // cleared, so it cannot leak into later proposals.
+                rebase: true,
             })
         })
     }
@@ -4793,6 +5138,7 @@ mod tests {
             committed_placement_version: 1,
             committed_peak: 5,
             regime_block: Default::default(),
+            data_epoch: None,
         };
         let data = state.serialize();
         let restored = PersistedTopologyState::deserialize(&data);
@@ -5733,6 +6079,7 @@ mod tests {
             committed_placement_version: 1,
             committed_peak: 1,
             regime_block: Default::default(),
+            data_epoch: None,
         };
         let data = state.serialize();
         let restored = PersistedTopologyState::deserialize(&data);
@@ -6687,6 +7034,7 @@ mod tests {
             committed_placement_version: 2,
             committed_peak: 3,
             regime_block: Default::default(),
+            data_epoch: None,
         };
         let decoded = PersistedTopologyState::deserialize(&state.serialize());
         assert_eq!(decoded.committed_placement_version, 2);
@@ -7347,6 +7695,7 @@ mod tests {
             committed_placement_version: projected_placement,
             committed_peak: projected_committed_peak,
             regime_block: projected_regime_block,
+            data_epoch: projected_data_epoch,
         } = projected;
         let PersistedTopologyState {
             peak_cluster_size: actual_peak,
@@ -7359,6 +7708,7 @@ mod tests {
             committed_placement_version: actual_placement,
             committed_peak: actual_committed_peak,
             regime_block: actual_regime_block,
+            data_epoch: actual_data_epoch,
         } = actual;
 
         assert_eq!(projected_term, actual_term);
@@ -7383,6 +7733,10 @@ mod tests {
         a.sort_unstable();
         b.sort_unstable();
         assert_eq!(a, b, "ever-seen set must match post-apply");
+        assert_eq!(
+            projected_data_epoch, actual_data_epoch,
+            "F4 — the projected data-epoch record must match post-apply",
+        );
     }
 
     #[test]
@@ -7592,6 +7946,7 @@ mod tests {
             // a broken round trip.
             committed_peak: 7,
             regime_block: Default::default(),
+            data_epoch: None,
         };
         let decoded = PersistedTopologyState::deserialize(&state.serialize());
         assert_eq!(decoded.committed_peak, 7);
@@ -7804,6 +8159,7 @@ mod tests {
             committed_placement_version: 1,
             committed_peak: 6,
             regime_block: Default::default(),
+            data_epoch: None,
         };
         auth.restore(&state);
         assert_eq!(
@@ -7861,6 +8217,7 @@ mod tests {
             committed_placement_version: 1,
             committed_peak: 3, // the durable, correctly-lowered anchor
             regime_block: Default::default(),
+            data_epoch: None,
         };
 
         let config = ClusterConfig {
@@ -8649,7 +9006,8 @@ mod tests {
     fn regime_block_decode_rejects_unknown_flag_bits() {
         let mut bytes = RegimeBlock::default().encode_canonical();
         let n = bytes.len();
-        bytes[n - 1] = 0b0000_0100; // unknown bit
+        // Bit 2 became the F2 `rebase` flag; bit 3 is the lowest unknown.
+        bytes[n - 1] = 0b0000_1000; // unknown bit
         assert_eq!(
             RegimeBlock::decode_canonical(&bytes, 0).unwrap_err(),
             RegimeDecodeError::MalformedTag(0x05),
@@ -8789,6 +9147,7 @@ mod tests {
             committed_placement_version: 1,
             committed_peak: 3,
             regime_block: block.clone(),
+            data_epoch: None,
         };
         let bytes = state.serialize_envelope();
         let decoded = PersistedTopologyState::deserialize_envelope(&bytes).expect("decode");
@@ -8922,6 +9281,371 @@ mod tests {
              the ratchet removes the fence-disarm primitive)",
         );
         assert_eq!(auth.committed_regime(shard), 2);
+    }
+
+    /// F1 (CRITICAL) — a FRESH node (no installed members) joining an
+    /// established cluster must be able to install an override-carrying
+    /// commit whose map holds a STANDING override: with no pre-override
+    /// evidence, I10(a)/(e) and (b)'s carrying-term equality are vacuous
+    /// (the commit's quorum proof is the only available evidence — the
+    /// §4.8 adopt-wholesale arm). Pre-fix, (a) rejected every such commit
+    /// (`local_master` is `None` on an empty table), the node kept its
+    /// bootstrap committed state, and — with `serving_established` resting
+    /// all-set — dual-served via scale-out; the cluster was un-growable
+    /// after its first promotion.
+    #[test]
+    fn f1_fresh_node_installs_standing_override_commit() {
+        let mems = members(&[1, 2, 3, 4]);
+        let shard = 70u16;
+        // The standing override was introduced at term 2; the joining
+        // commit carries it verbatim at term 5.
+        let (_, r) = placement_pair(&members(&[1, 2, 3]), shard);
+        let mut block = RegimeBlock::default();
+        block.override_map.insert(shard, r);
+        block.regime.set(shard, 2);
+        let commit = commit_with_block(5, mems.clone(), 4, block);
+
+        // Node 4 is brand new: empty committed members, term 0.
+        let auth = TopologyAuthority::new(NodeId(4), Duration::from_secs(1));
+        auth.set_replication_factor(2);
+        assert_eq!(
+            auth.handle_commit(&commit),
+            Some(5),
+            "F1: a fresh node must install a standing-override commit (adopt-wholesale arm)",
+        );
+        assert_eq!(auth.committed_master(shard), Some(r));
+        assert_eq!(auth.committed_regime(shard), 2);
+    }
+
+    /// F1 — the long-down-node half: a node whose installed term is far
+    /// behind (the commit SKIPS past `installed_term + 1`) installs a
+    /// commit carrying a standing override it never saw introduced. Its
+    /// installed pre-override state cannot classify the entry (it looks
+    /// "added" with a regime ≠ the carrying term), so (a)/(e)/(b)-equality
+    /// are vacuous; (c)/(d)/(f)/I6 still ran.
+    #[test]
+    fn f1_long_down_node_catchup_installs_standing_override_commit() {
+        let auth = seed_regime_authority(1); // installed term 1, {1,2,3}
+        let mems = members(&[1, 2, 3]);
+        let shard = 71u16;
+        let (_, r) = placement_pair(&mems, shard);
+        let mut block = RegimeBlock::default();
+        block.override_map.insert(shard, r);
+        block.regime.set(shard, 3); // introduced at term 3, standing since
+        let commit = commit_with_block(5, mems, 3, block); // 5 > 1 + 1: catch-up
+        assert_eq!(
+            auth.handle_commit(&commit),
+            Some(5),
+            "F1: a catch-up commit carrying a standing override must install",
+        );
+        assert_eq!(auth.committed_master(shard), Some(r));
+        assert_eq!(auth.committed_regime(shard), 3);
+    }
+
+    /// F1 — the adopt-wholesale arm keeps (b)'s sound residue: an override
+    /// entry with a ZERO regime is structurally forged (every override is
+    /// stamped with its introducing term) and is rejected even by an
+    /// applier with no pre-override evidence.
+    #[test]
+    fn f1_adopt_wholesale_arm_still_rejects_zero_regime_override() {
+        let mems = members(&[1, 2, 3, 4]);
+        let shard = 72u16;
+        let (_, r) = placement_pair(&members(&[1, 2, 3]), shard);
+        let mut block = RegimeBlock::default();
+        block.override_map.insert(shard, r);
+        // regime[shard] deliberately left 0.
+        let commit = commit_with_block(5, mems, 4, block);
+        let auth = TopologyAuthority::new(NodeId(4), Duration::from_secs(1));
+        auth.set_replication_factor(2);
+        assert!(
+            auth.handle_commit(&commit).is_none(),
+            "F1 residue: an override entry with zero regime is forged/corrupt state",
+        );
+    }
+
+    /// F1 (vote/apply symmetry) — a node must not VOTE for a term it would
+    /// reject at apply: the identical regime gate now runs in
+    /// `handle_propose`. An override targeting a non-holder (an I10(a)
+    /// violation with full evidence installed) is refused a vote AND
+    /// refused at apply.
+    #[test]
+    fn f1_node_that_would_reject_at_apply_does_not_vote_yes() {
+        let auth = seed_regime_authority(2); // voter, installed term 1
+        let mems = members(&[1, 2, 3]);
+        let shard = 73u16;
+        let outsider = non_holder(&mems, shard);
+        let mut block = RegimeBlock::default();
+        block.override_map.insert(shard, outsider);
+        block.regime.set(shard, 2);
+        let term = TopologyTerm::new_with_block(
+            2,
+            mems.clone(),
+            NodeId(1),
+            ClusterId::UNSET,
+            1,
+            3,
+            block.clone(),
+        );
+        let vote = auth.handle_propose(&term);
+        assert!(
+            !vote.accepted,
+            "F1: the vote-time regime gate must refuse a term the apply gate would refuse",
+        );
+        // Symmetry: the same payload as a commit is rejected at apply too.
+        assert!(
+            auth.handle_commit(&commit_with_block(2, mems, 3, block))
+                .is_none()
+        );
+    }
+
+    /// F2 (P0) — the reachable no-attacker regime rollback: a PLACEMENT-
+    /// driven master change (no override entry at all) bumps regimes; a
+    /// stale proposer that missed the commit then proposes a higher term
+    /// from its old array. The override map is unchanged on every receiver
+    /// (`carries_overrides == false`), so pre-fix the gate returned true
+    /// and `apply_commit_locked` adopted the LOWERED array wholesale —
+    /// disarming the §4.2 write fence and inverting I5's fenced replay.
+    /// The universal I10(d) ratchet must reject it at apply AND at vote.
+    #[test]
+    fn f2_stale_proposer_non_override_commit_lowering_regime_rejected() {
+        let auth = seed_regime_authority(1); // {1,2,3} at term 1
+        // Honest term 2: node 3 leaves; every shard whose master moves gets
+        // a placement-driven regime bump (derived exactly like a real
+        // proposer would).
+        let survivors = members(&[1, 2]);
+        let honest = auth.derive_regime_block_for(&survivors, 1, 2);
+        let bumped: Vec<u16> = honest.regime.iter_nonzero().map(|(s, _)| s).collect();
+        assert!(
+            !bumped.is_empty(),
+            "a 3→2 membership change must move at least one master",
+        );
+        assert_eq!(
+            auth.handle_commit(&commit_with_block(2, survivors.clone(), 3, honest)),
+            Some(2)
+        );
+        let shard = bumped[0];
+        assert_eq!(auth.committed_regime(shard), 2);
+
+        // Stale proposer: same members, HIGHER term, but its regime array
+        // predates the bump (all zero) — a non-override-carrying commit.
+        let stale = commit_with_block(3, survivors.clone(), 3, RegimeBlock::default());
+        assert!(
+            auth.handle_commit(&stale).is_none(),
+            "F2: a non-override commit lowering any installed regime must be rejected \
+             (universal I10d ratchet)",
+        );
+        assert_eq!(
+            auth.committed_regime(shard),
+            2,
+            "the installed regime must be untouched"
+        );
+        assert_eq!(auth.committed_term(), 2, "the stale term must not install");
+
+        // Vote side: the same stale payload is refused a vote (F2 iii —
+        // the proposer-side catch happens before any vote is granted).
+        let stale_term = TopologyTerm::new_with_block(
+            3,
+            survivors,
+            NodeId(1),
+            ClusterId::UNSET,
+            1,
+            3,
+            RegimeBlock::default(),
+        );
+        assert!(
+            !auth.handle_propose(&stale_term).accepted,
+            "F2: a regime-lowering proposal must not gather votes",
+        );
+    }
+
+    /// F2 — the sole ratchet exemption: a genuine REBASE commit (digest-
+    /// covered `rebase` flag, map/flags unchanged) still lowers, and the
+    /// transient flag is CLEARED on install so it cannot leak into the
+    /// installed state later proposals derive from.
+    #[test]
+    fn f2_rebase_commit_still_lowers_and_flag_clears_on_install() {
+        let auth = seed_regime_authority(1);
+        let survivors = members(&[1, 2]);
+        let honest = auth.derive_regime_block_for(&survivors, 1, 2);
+        let shard = honest
+            .regime
+            .iter_nonzero()
+            .map(|(s, _)| s)
+            .next()
+            .expect("membership change bumps at least one shard");
+        assert_eq!(
+            auth.handle_commit(&commit_with_block(2, survivors.clone(), 3, honest)),
+            Some(2)
+        );
+        assert_eq!(auth.committed_regime(shard), 2);
+
+        let rebase_block = RegimeBlock {
+            rebase: true,
+            ..Default::default()
+        };
+        let rebase = commit_with_block(3, survivors, 3, rebase_block);
+        assert_eq!(
+            auth.handle_commit(&rebase),
+            Some(3),
+            "F2: the rebase verb must remain able to lower regime state",
+        );
+        assert_eq!(auth.committed_regime(shard), 0, "rebased to zero");
+        assert!(
+            !auth.committed_regime_block().rebase,
+            "F2: the transient rebase marker must be cleared on install",
+        );
+    }
+
+    /// F2 — structural rebase confinement: a rebase term that ALSO changes
+    /// the override map (or the committed flags) is rejected — the flag is
+    /// the narrow I7 repair verb, not a general ratchet bypass.
+    #[test]
+    fn f2_rebase_bundling_override_change_rejected() {
+        let auth = seed_regime_authority(1);
+        let mems = members(&[1, 2, 3]);
+        let shard = 74u16;
+        let (_, r) = placement_pair(&mems, shard);
+        let mut block = RegimeBlock {
+            rebase: true,
+            ..Default::default()
+        };
+        block.override_map.insert(shard, r);
+        block.regime.set(shard, 2);
+        assert!(
+            auth.handle_commit(&commit_with_block(2, mems.clone(), 3, block))
+                .is_none(),
+            "F2: a rebase term must not carry an override-map change",
+        );
+        let flags = RegimeBlock {
+            rebase: true,
+            promotion_enabled: true,
+            ..Default::default()
+        };
+        assert!(
+            auth.handle_commit(&commit_with_block(2, mems, 3, flags))
+                .is_none(),
+            "F2: a rebase term must not carry a committed-flag change",
+        );
+    }
+
+    /// F2 (iii) — `derive_regime_block` MAX-MERGES: an installed entry
+    /// higher than the derivation's carrying term is preserved, never
+    /// copied over with a lower value.
+    #[test]
+    fn f2_derive_regime_block_max_merges_preserves_higher_installed_entry() {
+        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+        auth.set_replication_factor(2);
+        // Plant an installed state whose regime for a moved shard exceeds
+        // the new_term a (stale) deriver would stamp.
+        let mut planted = RegimeBlock::default();
+        let mems = members(&[1, 2, 3]);
+        let survivors = members(&[1, 2]);
+        let old_table = crate::cluster::shards::ShardTable::compute_with_epoch(&mems, 2, 1, 1);
+        let new_table = crate::cluster::shards::ShardTable::compute_with_epoch(&survivors, 2, 1, 1);
+        let moved = (0..crate::cluster::shards::NUM_SHARDS as u16)
+            .find(|&s| old_table.assignment(s).master != new_table.assignment(s).master)
+            .expect("a 3→2 change moves at least one master");
+        planted.regime.set(moved, 9);
+        auth.restore(&PersistedTopologyState {
+            peak_cluster_size: 3,
+            committed_term: 9,
+            committed_members: mems,
+            committed_voters: members(&[1, 2, 3]),
+            voted_term: 9,
+            incarnation: 0,
+            committed_voter_ever_seen: members(&[1, 2, 3]),
+            committed_placement_version: 1,
+            committed_peak: 3,
+            regime_block: planted,
+            data_epoch: None,
+        });
+        // A (hypothetically stale) derivation at new_term 5 must keep 9.
+        let derived = auth.derive_regime_block_for(&survivors, 1, 5);
+        assert_eq!(
+            derived.regime.get(moved),
+            9,
+            "F2 iii: max-merge must preserve the higher installed entry",
+        );
+    }
+
+    /// F7 (P1) — the commit-install hook runs on the NON-durable
+    /// `handle_commit` path too (it now lives inside `apply_commit_locked`
+    /// where no apply path can bypass it). Pre-fix, only
+    /// `handle_commit_durable` invoked it, so a runtime `handle_commit`
+    /// installed regime blocks with no lineage transitions — a long-lived
+    /// process's Full stamps froze at an old regime.
+    #[test]
+    fn f7_runtime_handle_commit_runs_commit_install_hook() {
+        let auth = seed_regime_authority(1);
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen: Arc<Mutex<Vec<(u64, u64)>>> = Arc::new(Mutex::new(Vec::new()));
+        {
+            let calls = calls.clone();
+            let seen = seen.clone();
+            auth.set_commit_install_hook(Arc::new(move |state, prev| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                seen.lock()
+                    .push((prev.committed_term, state.committed_term));
+                true
+            }));
+        }
+        let mems = members(&[1, 2, 3]);
+        assert_eq!(
+            auth.handle_commit(&commit_with_block(
+                2,
+                mems.clone(),
+                3,
+                RegimeBlock::default()
+            )),
+            Some(2)
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "F7: handle_commit must run the commit-install hook",
+        );
+        assert_eq!(
+            seen.lock().as_slice(),
+            &[(1, 2)],
+            "the hook must see prev=installed term and state=the committing term",
+        );
+
+        // A refusing hook fails the commit closed on this path too.
+        auth.set_commit_install_hook(Arc::new(move |_, _| false));
+        assert!(
+            auth.handle_commit(&commit_with_block(3, mems, 3, RegimeBlock::default()))
+                .is_none(),
+            "F7: a refusing hook must fail the non-durable commit closed",
+        );
+        assert_eq!(auth.committed_term(), 2, "nothing was mutated");
+    }
+
+    /// F4 — the topology state envelope records the node's `data_epoch`,
+    /// round-trips it, `restore()` exposes it, and a pre-F4 body (no
+    /// trailing record) decodes `None` (version tolerance).
+    #[test]
+    fn f4_topology_state_envelope_records_data_epoch() {
+        let auth = seed_regime_authority(1);
+        let epoch = [7u8; TOPOLOGY_DATA_EPOCH_LEN];
+        auth.set_data_epoch(epoch);
+        let state = auth.persisted_state(3, 1);
+        assert_eq!(state.data_epoch, Some(epoch));
+        let bytes = state.serialize_envelope();
+        let decoded = PersistedTopologyState::deserialize_envelope(&bytes).expect("decode");
+        assert_eq!(decoded.data_epoch, Some(epoch));
+
+        let restored = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+        assert_eq!(restored.restored_data_epoch(), None);
+        restored.restore(&decoded);
+        assert_eq!(restored.restored_data_epoch(), Some(epoch));
+
+        // Pre-F4 body: same state without the record decodes None.
+        let mut legacy_state = auth.persisted_state(3, 1);
+        legacy_state.data_epoch = None;
+        let legacy_bytes = legacy_state.serialize_envelope();
+        let legacy_decoded =
+            PersistedTopologyState::deserialize_envelope(&legacy_bytes).expect("decode");
+        assert_eq!(legacy_decoded.data_epoch, None);
     }
 
     #[test]

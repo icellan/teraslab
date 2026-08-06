@@ -1552,10 +1552,33 @@ pub enum CatchupError {
     RedoReclaimed { from: u64, available: Option<u64> },
 
     /// Sending a catch-up chunk to the replica failed (transport error,
-    /// replica-side error ack, or sequence renegotiation failure — the
-    /// `send_chunk` callback flattens these into one detail string).
+    /// replica-side error ack, or sequence renegotiation failure — every
+    /// non-stale-regime [`crate::server::dispatch::ReplicaSendError`] is
+    /// flattened into one detail string here).
     #[error("transport to {addr}: {detail}")]
     Transport { addr: SocketAddr, detail: String },
+
+    /// F8 (I12) — the replica NAKed a catch-up chunk with
+    /// `ERR_STALE_REGIME`: this node's committed regime view is provably
+    /// behind for `shard`. Kept TYPED (never flattened into
+    /// [`CatchupError::Transport`]'s string) so the caller can apply
+    /// I12's abort-and-re-plan classification: raise the topology-
+    /// staleness signal and abort the pass instead of re-shipping the
+    /// same stale chunk every lag-monitor tick forever.
+    #[error(
+        "replica {addr} rejected catch-up chunk: stale regime on shard {shard} \
+         (receiver committed regime {local_regime}) — abort and re-plan after \
+         topology refresh (I12)"
+    )]
+    StaleRegime {
+        /// The NAKing replica.
+        addr: SocketAddr,
+        /// The first shard the receiver reported stale.
+        shard: u16,
+        /// The receiver's committed regime for that shard (a term — feeds
+        /// the topology-staleness signal).
+        local_regime: u64,
+    },
 }
 
 /// Check whether the redo log has been truncated past a requested sequence.
@@ -1643,7 +1666,9 @@ pub fn run_catchup_for_replica(
     max_ops_per_pass: usize,
     ops_from_seq: &dyn Fn(u64) -> Vec<(u64, Vec<ReplicaOp>)>,
     first_available_seq: Option<u64>,
-    send_chunk: &dyn Fn(&[ReplicaOp]) -> std::result::Result<(), String>,
+    send_chunk: &dyn Fn(
+        &[ReplicaOp],
+    ) -> std::result::Result<(), crate::server::dispatch::ReplicaSendError>,
 ) -> std::result::Result<u64, CatchupError> {
     if from_seq >= current_seq {
         return Ok(from_seq); // already caught up
@@ -1701,9 +1726,23 @@ pub fn run_catchup_for_replica(
 
     let batch_size = batch_size.max(1);
     for chunk in ops.chunks(batch_size) {
-        send_chunk(chunk).map_err(|detail| CatchupError::Transport {
-            addr: *addr,
-            detail,
+        send_chunk(chunk).map_err(|e| match e {
+            // F8 (I12) — keep the stale-regime NAK typed so the caller can
+            // abort-and-re-plan (topology refresh) instead of retrying the
+            // same stale chunk on every tick.
+            crate::server::dispatch::ReplicaSendError::StaleRegime {
+                shard,
+                local_regime,
+                ..
+            } => CatchupError::StaleRegime {
+                addr: *addr,
+                shard,
+                local_regime,
+            },
+            other => CatchupError::Transport {
+                addr: *addr,
+                detail: other.to_string(),
+            },
         })?;
     }
 
@@ -3590,7 +3629,9 @@ mod tests {
             &|_chunk| {
                 let n = calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 if n == 1 {
-                    Err("replica error: boom".to_string())
+                    Err(crate::server::dispatch::ReplicaSendError::Failed(
+                        "replica error: boom".to_string(),
+                    ))
                 } else {
                     assert!(n < 2, "no chunk may be sent after a failure");
                     Ok(())
@@ -3605,6 +3646,66 @@ mod tests {
                 assert_eq!(detail, "replica error: boom");
             }
             other => panic!("expected CatchupError::Transport, got {other:?}"),
+        }
+    }
+
+    /// §8 review F8 (P2) — a stale-regime NAK on the catch-up path must
+    /// stay TYPED (`CatchupError::StaleRegime`, carrying the shard and the
+    /// receiver's regime) and abort the pass at that chunk. Pre-fix the
+    /// closure flattened it to a string inside `Transport`, losing I12's
+    /// abort-and-re-plan classification — the lag monitor then re-shipped
+    /// the same stale chunk every tick and never refreshed topology.
+    #[test]
+    fn f8_stale_regime_nak_on_catchup_stays_typed_and_aborts_pass() {
+        use crate::index::TxKey;
+
+        let addr: SocketAddr = "127.0.0.1:65531".parse().unwrap();
+        let ops: Vec<ReplicaOp> = (0..6u8)
+            .map(|i| ReplicaOp::Delete {
+                tx_key: TxKey::from_bytes([i + 1; 32]),
+            })
+            .collect();
+        let calls = std::sync::atomic::AtomicU64::new(0);
+
+        let err = run_catchup_for_replica(
+            &addr,
+            1,
+            7,
+            2,
+            10_000,
+            &move |_from| vec![(1u64, ops.clone())],
+            Some(1),
+            &|_chunk| {
+                let n = calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                assert!(n < 2, "F8: no chunk may be sent after the stale-regime NAK");
+                if n == 1 {
+                    Err(crate::server::dispatch::ReplicaSendError::StaleRegime {
+                        shard: 42,
+                        local_regime: 9,
+                        detail: "stale regime".to_string(),
+                    })
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .expect_err("the stale-regime NAK must abort the pass");
+
+        match err {
+            CatchupError::StaleRegime {
+                addr: a,
+                shard,
+                local_regime,
+            } => {
+                assert_eq!(a, addr);
+                assert_eq!(shard, 42, "the NAK's shard must survive typed");
+                assert_eq!(
+                    local_regime, 9,
+                    "the receiver regime must survive typed (it feeds the \
+                     topology-staleness signal)",
+                );
+            }
+            other => panic!("expected CatchupError::StaleRegime, got {other:?}"),
         }
     }
 
@@ -3625,7 +3726,10 @@ mod tests {
     fn run_catchup_returns_typed_redo_reclaimed_when_log_wrapped() {
         let addr: SocketAddr = "127.0.0.1:65535".parse().unwrap();
         let no_ops: &dyn Fn(u64) -> Vec<(u64, Vec<ReplicaOp>)> = &|_| Vec::new();
-        let no_send: &dyn Fn(&[ReplicaOp]) -> std::result::Result<(), String> =
+        let no_send: &dyn Fn(
+            &[ReplicaOp],
+        )
+            -> std::result::Result<(), crate::server::dispatch::ReplicaSendError> =
             &|_| panic!("send_chunk must not be called when redo wrapped");
 
         // Path 1: explicit truncation signal — `first_available_seq` is
@@ -3683,7 +3787,10 @@ mod tests {
     fn run_catchup_already_caught_up_returns_ok() {
         let addr: SocketAddr = "127.0.0.1:65534".parse().unwrap();
         let no_ops: &dyn Fn(u64) -> Vec<(u64, Vec<ReplicaOp>)> = &|_| Vec::new();
-        let no_send: &dyn Fn(&[ReplicaOp]) -> std::result::Result<(), String> =
+        let no_send: &dyn Fn(
+            &[ReplicaOp],
+        )
+            -> std::result::Result<(), crate::server::dispatch::ReplicaSendError> =
             &|_| panic!("send_chunk must not be called when already caught up");
 
         let result = run_catchup_for_replica(&addr, 100, 100, 16, 100, no_ops, Some(50), no_send);
@@ -3743,7 +3850,10 @@ mod tests {
         };
 
         let delivered: std::sync::Mutex<Vec<ReplicaOp>> = std::sync::Mutex::new(Vec::new());
-        let send = |chunk: &[ReplicaOp]| -> std::result::Result<(), String> {
+        let send = |chunk: &[ReplicaOp]| -> std::result::Result<
+            (),
+            crate::server::dispatch::ReplicaSendError,
+        > {
             delivered.lock().unwrap().extend_from_slice(chunk);
             Ok(())
         };

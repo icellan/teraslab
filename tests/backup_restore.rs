@@ -570,3 +570,116 @@ fn restore_deletes_lineage_and_migration_fence_state_and_stamps_fresh_epoch() {
         "restore must mint a FRESH data-epoch identity"
     );
 }
+
+/// §8 review F4 (P0) — `restore()` must ALSO delete the `.topo` topology
+/// state and its `.regime-armed` sidecar (while KEEPING `.multinode`, which
+/// only pins a peak floor of 2). With `.topo` intact, the restored node
+/// boots as committed master of its pre-restore shards and I13(i) re-stamps
+/// `Full` over BACKUP-ERA data — serving stale data as authoritative master
+/// and advertising itself as a legal promotion target. Deleting `.topo`
+/// makes it rejoin, learn topology from peers, master nothing until a
+/// commit says so, and re-earn `Full` via catch-up.
+#[test]
+fn f4_restore_deletes_topology_state_and_armed_marker_keeps_multinode() {
+    // --- Source: minimal engine + one record + a backup.
+    let src_dir = TempDir::new().unwrap();
+    let config = source_config(src_dir.path());
+    let dev_path = config.device_paths[0].clone();
+    let dev: Arc<dyn BlockDevice> =
+        Arc::new(DirectDevice::open(&dev_path, DEVICE_SIZE, ALIGN).unwrap());
+    let seg = SegmentAllocator::new(dev.clone(), SEG).unwrap();
+    let engine = Engine::new(
+        dev.clone(),
+        Index::new(256).unwrap(),
+        seg,
+        StripedLocks::new(256),
+        DahIndex::new(),
+    );
+    write_record(&engine, 1);
+    engine.persist_allocator().unwrap();
+    dev.sync().unwrap();
+
+    let backup_root = TempDir::new().unwrap();
+    let target = backup_root.path().join("bk-topo");
+    let params = BackupParams {
+        throttle_bytes_per_sec: 0,
+        min_headroom_segments: 1,
+        abort_headroom_segments: 0,
+        ..BackupParams::default()
+    };
+    let cancel = AtomicBool::new(false);
+    let progress = Mutex::new(BackupProgress::default());
+    let blob_pause = AtomicBool::new(false);
+    run_backup(
+        &engine,
+        &blob_pause,
+        &config,
+        &params,
+        &target,
+        &cancel,
+        &progress,
+    )
+    .expect("backup should succeed");
+    drop(engine);
+    drop(dev);
+
+    // --- Restore target with a PRE-EXISTING topology identity, as if the
+    //     node had a prior clustered life: a valid `.topo` envelope, its
+    //     `.regime-armed` marker, and a `.multinode` marker.
+    let restore_dir = TempDir::new().unwrap();
+    let mut rconfig = config.clone();
+    rconfig.device_paths = vec![restore_dir.path().join("data.dat")];
+    rconfig.redo_log_path = Some(restore_dir.path().join("data.dat.redo"));
+    rconfig.index_snapshot_path = restore_dir.path().join("data.dat.snap");
+
+    let cluster_path = rconfig.resolved_cluster_state_path();
+    let topo_path =
+        teraslab::cluster::coordinator::topology_state_path_for_cluster_state(&cluster_path);
+    let armed_path = {
+        let mut s = topo_path.as_os_str().to_os_string();
+        s.push(".regime-armed");
+        std::path::PathBuf::from(s)
+    };
+    let multinode_path = {
+        let mut s = cluster_path.as_os_str().to_os_string();
+        s.push(".multinode");
+        std::path::PathBuf::from(s)
+    };
+    let pre_state = teraslab::cluster::topology::PersistedTopologyState {
+        peak_cluster_size: 3,
+        committed_term: 7,
+        committed_members: vec![
+            teraslab::cluster::shards::NodeId(1),
+            teraslab::cluster::shards::NodeId(2),
+            teraslab::cluster::shards::NodeId(3),
+        ],
+        committed_voters: vec![teraslab::cluster::shards::NodeId(1)],
+        voted_term: 7,
+        incarnation: 1,
+        committed_voter_ever_seen: vec![teraslab::cluster::shards::NodeId(1)],
+        committed_placement_version: 1,
+        committed_peak: 3,
+        regime_block: Default::default(),
+        data_epoch: None,
+    };
+    std::fs::write(&topo_path, pre_state.serialize_envelope()).unwrap();
+    std::fs::write(&armed_path, 1u64.to_le_bytes()).unwrap();
+    std::fs::write(&multinode_path, 2u64.to_le_bytes()).unwrap();
+
+    restore(&target, &rconfig).expect("restore should succeed");
+
+    assert!(
+        !topo_path.exists(),
+        "F4: restore must delete the .topo topology state — an intact one makes the \
+         restored node boot as committed master and re-stamp Full over backup-era data",
+    );
+    assert!(
+        !armed_path.exists(),
+        "F4: restore must delete the .regime-armed sidecar with the state it guards",
+    );
+    assert!(
+        multinode_path.exists(),
+        "F4: restore must KEEP .multinode — it only pins the peak floor of 2, which \
+         remains true of the cluster this node rejoins",
+    );
+}

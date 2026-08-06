@@ -839,6 +839,7 @@ pub(crate) fn handle_request(
         },
         OP_ADMIN_DIAGNOSE_KEY => handle_admin_diagnose_key(request, engine, cluster),
         OP_PARTITION_VERSION_REPORT => handle_partition_version_report(request, engine, cluster),
+        OP_REPLICA_CONVERGED => handle_replica_converged(request, cluster),
         OP_ADMIN_CLUSTER_HEALTH => handle_admin_cluster_health(request, cluster),
         OP_PING => ResponseFrame {
             request_id: request.request_id,
@@ -13451,6 +13452,35 @@ fn handle_admin_cluster_health(
 /// and `max_generation`, finding C1), computed by the shared
 /// `build_self_partition_version_entries` so the wire response is
 /// byte-identical to this node's in-process self-report.
+/// F3 — handle `OP_REPLICA_CONVERGED` (the §4.3 catch-up-convergence
+/// completion trigger): a master asserts this node converged on its redo
+/// stream; the cluster re-verifies each `(shard, regime)` entry against
+/// its OWN committed state and local fences before stamping `Full` (see
+/// [`crate::cluster::coordinator::apply_replica_converged_signal`]).
+/// Response payload: `[stamped:u32]`. Without a cluster the signal is
+/// meaningless and answers `0` (nothing stamped, not an error — the
+/// sender treats the signal as best-effort).
+fn handle_replica_converged(req: &RequestFrame, cluster: Option<&RunningCluster>) -> ResponseFrame {
+    let Some((source, entries)) =
+        crate::cluster::coordinator::decode_replica_converged(&req.payload)
+    else {
+        return error_response(
+            req.request_id,
+            ERR_PAYLOAD_MALFORMED,
+            "malformed OP_REPLICA_CONVERGED payload",
+        );
+    };
+    let stamped = match cluster {
+        Some(c) => c.handle_replica_converged(source, &entries) as u32,
+        None => 0,
+    };
+    ResponseFrame {
+        request_id: req.request_id,
+        status: STATUS_OK,
+        payload: stamped.to_le_bytes().to_vec(),
+    }
+}
+
 fn handle_partition_version_report(
     req: &RequestFrame,
     engine: &Engine,
@@ -13885,7 +13915,9 @@ mod tests {
                     regime,
                     regime_enforced: true,
                     promotion_enabled: false,
+                    rebase: false,
                 },
+                data_epoch: None,
             });
         cluster.topology_authority().set_secret_configured(true);
 

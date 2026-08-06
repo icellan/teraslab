@@ -58,8 +58,16 @@ fn key(n: u64) -> TxKey {
 fn create_record(engine: &Engine, k: TxKey, utxo_count: u32) {
     let hashes: Vec<[u8; 32]> = (0..utxo_count)
         .map(|v| {
+            // Production-shaped NON-ZERO hashes (marker byte + index). The
+            // V3 wire encodes `prior_utxo_hash: None` as the all-zero
+            // sentinel, so a fixture record whose offset-0 hash is all
+            // zeroes (the old `0u32` pattern) had its §4.9 prior guard
+            // silently stripped in transit — and under F-7's enforcement
+            // guard such a prior-less Reassign is refused. Real utxo
+            // hashes are never all-zero; keep the fixture realistic.
             let mut h = [0u8; 32];
-            h[0..4].copy_from_slice(&v.to_le_bytes());
+            h[0] = 0xE4;
+            h[4..8].copy_from_slice(&v.to_le_bytes());
             h
         })
         .collect();
@@ -257,7 +265,9 @@ fn migration_delta_reassign_replay_rejected_wholesale_after_promotion() {
                 regime,
                 regime_enforced: true,
                 promotion_enabled: false,
+                rebase: false,
             },
+            data_epoch: None,
         });
         authority.set_secret_configured(true);
         authority

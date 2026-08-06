@@ -1317,6 +1317,13 @@ pub struct MigrationMetrics {
     /// operator-visible signal that a node booted with a gap versus its
     /// replicas.
     pub stale_suspect_shards: AtomicU32,
+    /// §8 review F-6 (I4) — the committed `promotion_enabled` flag as a
+    /// gauge (`1` = automatic promotion armed, `0` = off). I4 requires
+    /// that "failover-off must never be silent": the flag defaults to
+    /// `false` (fail-safe) and this gauge is the scrape-visible signal.
+    /// Updated on every commit install and at boot from the restored
+    /// committed state.
+    pub promotion_enabled: AtomicU32,
     /// Number of times a migration completion or failure was rejected because
     /// the bookkeeping task's `topology_epoch` did not match the live
     /// epoch on the coordinator.
@@ -1399,6 +1406,7 @@ impl MigrationMetrics {
             migration_phase_serving_new: AtomicU32::new(0),
             migration_lost: AtomicU32::new(0),
             stale_suspect_shards: AtomicU32::new(0),
+            promotion_enabled: AtomicU32::new(0),
             topology_epoch_mismatch: PaddedCounter::new(),
             phantom_master_relinquished: PaddedCounter::new(),
             heal_deadline_alerts: PaddedCounter::new(),
