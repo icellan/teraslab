@@ -2641,7 +2641,10 @@ fn tcp_strict_replication_failure_returns_replication_failed() {
             &members,
             1,
             (members).len() as u64,
+            NodeId(322),
+            &Default::default(),
         ),
+        regime_block: Default::default(),
     };
     let resp = send_request(
         &mut stream,

@@ -518,6 +518,26 @@ pub const ERR_MIGRATION_TARGET_NOT_READY: u16 = 37;
 /// streaming read path is a documented follow-up.
 pub const ERR_RESPONSE_TOO_LARGE: u16 = 38;
 
+/// P1 §4.2 — returned by a replica when an incoming `ReplicaBatch` fails
+/// the per-shard REGIME gate while regime enforcement is active: a touched
+/// shard's stamped regime is BEHIND the receiver's committed regime for
+/// that shard (a demoted/stale master writing past its own demotion), or
+/// the batch carries no regime stamp at all for a touched shard — V2
+/// frames and incomplete V3 tables both reject this way under enforcement
+/// (I12: no sender opt-out). The whole batch is rejected before any
+/// tracker or engine work; the receiver's applied watermark does not
+/// advance. Payload:
+/// `[code:u16][msg_len:u16 = 0][shard:u16][local_regime:u64]` — the hint
+/// names one stale shard and the receiver's committed regime for it, as
+/// ROUTING ADVICE only (I9: a NAK is never regime authority — the sender
+/// refreshes topology through the committed channel and retries). Distinct
+/// from `ERR_STALE_EPOCH` (24): that gate compares the whole-batch
+/// `cluster_key` against the receiver's committed term; this gate fences
+/// per shard, so a sender current on the term but demoted on one shard
+/// still rejects. Client-visible only as `ERR_REPLICATION_FAILED` (the
+/// master fails and compensates the whole mutation batch).
+pub const ERR_STALE_REGIME: u16 = 39;
+
 /// P3.10 / F-G5-017 — wire protocol revision.
 ///
 /// `1` is the historical implicit version: legacy clients and servers do

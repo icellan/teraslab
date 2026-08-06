@@ -167,6 +167,11 @@ struct CatchupContext {
     engine: Arc<Engine>,
     /// Live cluster topology epoch (shared atomic; re-read per chunk).
     cluster_key_handle: Arc<std::sync::atomic::AtomicU64>,
+    /// P1 §4.2/I12: read handle onto the committed regime state so every
+    /// catch-up chunk is stamped (V3) while regime enforcement is active.
+    /// Captured per chunk at that chunk's fan-out entry, alongside the
+    /// `cluster_key_handle` read.
+    topology_authority: Arc<teraslab::cluster::topology::TopologyAuthority>,
     /// Channel handle for posting a full-shard resync when the redo log has
     /// wrapped past the replica's last-acked position.
     resync_handle: teraslab::cluster::coordinator::ResyncSenderHandle,
@@ -244,6 +249,7 @@ fn run_one_catchup_pass(
     // and catch-up must read the merged, sequence-ordered view — not a single log.
     let first_avail_seq = eng_ref.earliest_redo_sequence_merged().ok().flatten();
     let cluster_key_handle = ctx.cluster_key_handle.clone();
+    let regime_authority = ctx.topology_authority.clone();
     let auth_secret = ctx.auth_secret.clone();
 
     let result = teraslab::replication::durable::run_catchup_for_replica(
@@ -342,12 +348,28 @@ fn run_one_catchup_pass(
         },
         first_avail_seq,
         &move |chunk| {
+            // P1 §4.2/I12: capture the regime stamps at THIS chunk's
+            // fan-out entry, alongside the cluster_key read; the same
+            // table then rides every resend inside the send loop.
+            // `None` (emit V2) while enforcement is not active.
+            let regime_table: Option<Vec<(u16, u64)>> =
+                if regime_authority.regime_enforcement_active() {
+                    Some(
+                        teraslab::replication::protocol::touched_shards(chunk.iter())
+                            .into_iter()
+                            .map(|s| (s, regime_authority.committed_regime(s)))
+                            .collect(),
+                    )
+                } else {
+                    None
+                };
             teraslab::server::dispatch::send_replica_ops_to(
                 addr,
                 chunk,
                 ctx.replication_timeout,
                 auth_secret.as_deref(),
                 cluster_key_handle.load(Ordering::Acquire),
+                regime_table.as_deref(),
                 ctx.source_node_id,
                 0,
             )
@@ -549,6 +571,15 @@ fn main() {
         .find(|w| w[0] == "--cluster-id")
         .map(|w| w[1].clone());
 
+    // P1 stage 1 (§4.1 "Persistence") — CLI-ONLY (deliberately never a
+    // TOML field: a config file would make the tolerant legacy decoder a
+    // standing setting; the flag is a one-shot migration verb),
+    // SELF-CONSUMING upgrade switch for a legacy topology state file. The
+    // first legacy decode rewrites the file in the new checksummed
+    // envelope, and passing the flag when the file is already new-format
+    // is a hard startup error.
+    let allow_legacy_topology_state = args.iter().any(|a| a == "--allow-legacy-topology-state");
+
     let mut config = if args.len() > 1 && args[1] == "--config" {
         if args.len() < 3 {
             // CLI usage message goes to stderr before the subscriber is
@@ -556,7 +587,10 @@ fn main() {
             // operators always see it on bad invocation.
             #[allow(clippy::disallowed_macros)]
             {
-                eprintln!("Usage: teraslab-server --config <path.toml> [--strict-auth]");
+                eprintln!(
+                    "Usage: teraslab-server --config <path.toml> [--strict-auth] \
+                     [--allow-legacy-topology-state]"
+                );
             }
             std::process::exit(1);
         }
@@ -1965,9 +1999,45 @@ fn main() {
         let probe_interval = std::time::Duration::from_millis(config.swim_probe_interval_ms);
 
         let cluster_state_path = config.resolved_cluster_state_path();
-        // Load topology state (backward-compatible with old format).
-        let topo_state =
-            teraslab::cluster::coordinator::load_startup_topology_state(&cluster_state_path);
+        // P1 stage 1 — load the topology state FAIL-CLOSED: a corrupt or
+        // integrity-failed new-format file, an unreadable existing file,
+        // or a legacy-format file without the one-shot
+        // `--allow-legacy-topology-state` upgrade flag all refuse startup
+        // (the StrictAuthRequiresSecret posture — a clustered node must
+        // never boot on silently-defaulted topology safety state).
+        let legacy_mode = if allow_legacy_topology_state {
+            teraslab::cluster::coordinator::LegacyTopologyDecode::AllowAndUpgradeOnce
+        } else {
+            teraslab::cluster::coordinator::LegacyTopologyDecode::Refuse
+        };
+        let topo_state = match teraslab::cluster::coordinator::load_startup_topology_state(
+            &cluster_state_path,
+            legacy_mode,
+        ) {
+            Ok(state) => state,
+            Err(e) => {
+                tracing::error!(err = %e, "FATAL: topology state file failed to load (fail-closed)");
+                std::process::exit(1);
+            }
+        };
+        // P1 stage 1 (§4.1 "Armed marker") — refuse to start when the
+        // `.regime-armed` marker is present but the persisted regime state
+        // is absent/zeroed (lost state while enforcement was armed); a
+        // marker with no committed term ever observed is a loud warning
+        // only (a stray file must not be a boot-DoS).
+        {
+            let topology_path =
+                teraslab::cluster::coordinator::topology_state_path_for_cluster_state(
+                    &cluster_state_path,
+                );
+            if let Err(e) = teraslab::cluster::coordinator::validate_regime_armed_marker_at_boot(
+                &topology_path,
+                &topo_state,
+            ) {
+                tracing::error!(err = %e, "FATAL: .regime-armed marker check failed (fail-closed)");
+                std::process::exit(1);
+            }
+        }
         // G8 final review (finding 1) — seed from the durable ANCHOR
         // (`committed_peak`/`committed_members.len()`), not the vestigial
         // `peak_cluster_size` field. `persisted_state_for_commit`
@@ -2038,6 +2108,14 @@ fn main() {
             .topology_epoch
             .store(initial_epoch, std::sync::atomic::Ordering::Relaxed);
         coordinator.topology_authority.restore(&topo_state);
+        // P1 stage 1 (I4) — promotion-PROPOSAL opt-in
+        // (`enable_automatic_promotion`, default false; already validated
+        // against the resolved ack policy by `validate_cluster_safety`).
+        // Gates only whether this node will ever PROPOSE
+        // `promotion_enabled = true` — never what it applies (I0).
+        coordinator
+            .topology_authority
+            .set_promotion_proposal_opt_in(config.enable_automatic_promotion);
         // C6 — reconstruct and install the committed topology's shard table so
         // a restarting node masters ONLY the shards it actually owns. The
         // bootstrap table is the single-member `[self]` table (self masters
@@ -2354,6 +2432,7 @@ fn main() {
                 redo_log: redo_log.clone(),
                 engine: engine.clone(),
                 cluster_key_handle: running.cluster_key_handle(),
+                topology_authority: running.topology_authority_handle(),
                 resync_handle: running.resync_sender_handle(),
                 auth_secret: running.cluster_secret().map(|s| s.to_vec()),
                 source_node_id: config.node_id,

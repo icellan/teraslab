@@ -1666,6 +1666,23 @@ pub struct ServerConfig {
     /// failure, keep the default `"reject"`.
     pub replication_degraded_mode: String,
 
+    /// P1 stage 1 (I4) — opt-in for this node to ever PROPOSE committing
+    /// `promotion_enabled = true` (quorum-committed automatic master
+    /// promotion). Default: `false`.
+    ///
+    /// Gates only the PROPOSAL capability — never what a node applies
+    /// (I0), and never what it advertises: the WriteAll-equivalence advert
+    /// is always computed from the real resolved ack policy. With this
+    /// flag set, `validate_cluster_safety` refuses startup unless the
+    /// resolved configuration is WriteAll-equivalent
+    /// (`required_replica_acks(targets, policy) == targets`, RF > 1) with
+    /// `replication_degraded_mode != "best_effort"` — so a node can never
+    /// hold promotion-proposal capability on a config whose advert would
+    /// have to claim WriteAll-equivalence falsely. Note `ack_policy =
+    /// "auto"` resolves to WriteMajority at RF >= 3, so an RF=3 stock
+    /// config refuses; RF=2 + `"auto"` (WriteAll) is the validated shape.
+    pub enable_automatic_promotion: bool,
+
     // -- Migration performance settings --
     /// Number of parallel TCP connections per migration target.
     /// More connections = higher throughput for large migrations, up to the
@@ -1801,6 +1818,7 @@ impl Default for ServerConfig {
             replication_timeout_ms: 3000,
             replication_timeout_during_migration_ms: 30000,
             replication_degraded_mode: "reject".to_string(),
+            enable_automatic_promotion: false,
             migration_pool_size: 128,
             migration_batch_size: 500,
             replica_lag_check_interval_secs: 30,
@@ -2058,6 +2076,31 @@ impl ServerConfig {
         self.replication_degraded_mode == "best_effort"
     }
 
+    /// P1 stage 1 (I4) — whether this node's RESOLVED replication posture
+    /// is WriteAll-equivalent: replicas exist (`replication_factor > 1`),
+    /// the resolved ack policy requires EVERY replica target to ack
+    /// (`required_replica_acks(targets, policy) == targets`), and
+    /// `replication_degraded_mode` is not `"best_effort"`.
+    ///
+    /// This is the value the topology-authority advert channel carries on
+    /// every vote — computed from the real resolved policy, never from
+    /// intent, so the advert can never claim WriteAll-equivalence falsely.
+    /// Note `"auto"` resolves to WriteMajority at RF >= 3, which is NOT
+    /// equivalent (a lost replica ack could still be a client-acked
+    /// write); RF=2 (`"auto"` == WriteAll) and explicit `"write_all"` are.
+    pub fn ack_policy_writeall_equivalent(&self) -> bool {
+        if self.replication_factor <= 1 || self.is_replication_best_effort() {
+            return false;
+        }
+        let targets = (self.replication_factor as usize).saturating_sub(1);
+        match self.resolved_ack_policy() {
+            Some(policy) => {
+                crate::replication::manager::required_replica_acks(targets, policy) == targets
+            }
+            None => false,
+        }
+    }
+
     /// A startup durability warning when the operator has opted into a
     /// best-effort replication posture at a replication factor that implies
     /// replicas (`RF > 1`), and `None` under the safe default.
@@ -2208,6 +2251,33 @@ impl ServerConfig {
                  replicas. Use \"auto\", \"write_all\", or \"write_majority\", or lower \
                  replication_factor to 1.",
                 self.replication_factor,
+            ));
+        }
+        // P1 stage 1 (I4) — a node opting into promotion-PROPOSAL
+        // capability must run a WriteAll-equivalent, non-best-effort
+        // resolved posture, or its advert would have to claim
+        // WriteAll-equivalence falsely for promotion to ever be proposed.
+        // §4.6's safety argument (the promoted replica was a required-ACK
+        // holder for every client-acked write) holds ONLY under that
+        // posture. RF=2 + "auto" (WriteAll) is the validated
+        // configuration; "auto" at RF >= 3 resolves to WriteMajority and
+        // refuses here.
+        if self.enable_automatic_promotion && !self.ack_policy_writeall_equivalent() {
+            return Err(format!(
+                "enable_automatic_promotion = true requires a WriteAll-equivalent replication \
+                 posture: replication_factor > 1 (found {rf}), a resolved ack policy under \
+                 which every replica target must ack (ack_policy = {ack:?} resolves to \
+                 {resolved}), and replication_degraded_mode = \"reject\" (found {degraded:?}). \
+                 Automatic promotion is only safe when the promoted replica provably holds \
+                 every client-acked write (I4); fix the replication settings or drop \
+                 enable_automatic_promotion.",
+                rf = self.replication_factor,
+                ack = self.ack_policy,
+                resolved = match self.resolved_ack_policy() {
+                    Some(p) => format!("{p:?}"),
+                    None => "best-effort (no replica-ack requirement)".to_string(),
+                },
+                degraded = self.replication_degraded_mode,
             ));
         }
         Ok(())
@@ -2977,6 +3047,90 @@ backend = ""
         assert!(err.contains("ack_policy"), "error was: {err}");
         assert!(err.contains("best_effort"), "error was: {err}");
         assert!(err.contains("replication_factor = 3"), "error was: {err}");
+    }
+
+    // -- P1 stage 1 (I4): enable_automatic_promotion gating ---------------
+
+    #[test]
+    fn enable_automatic_promotion_defaults_off() {
+        assert!(
+            !ServerConfig::default().enable_automatic_promotion,
+            "promotion-proposal capability must be an explicit opt-in",
+        );
+    }
+
+    #[test]
+    fn ack_policy_writeall_equivalent_matrix() {
+        let mk = |rf: u8, ack: &str, degraded: &str| ServerConfig {
+            replication_factor: rf,
+            ack_policy: ack.to_string(),
+            replication_degraded_mode: degraded.to_string(),
+            ..ServerConfig::default()
+        };
+        // RF=2 auto resolves to WriteAll -> equivalent.
+        assert!(mk(2, "auto", "reject").ack_policy_writeall_equivalent());
+        // RF=2 write_majority: targets=1, required=1 -> equivalent.
+        assert!(mk(2, "write_majority", "reject").ack_policy_writeall_equivalent());
+        // RF=3 auto resolves to WriteMajority (required 1 of 2) -> NOT.
+        assert!(!mk(3, "auto", "reject").ack_policy_writeall_equivalent());
+        // RF=3 write_all -> equivalent.
+        assert!(mk(3, "write_all", "reject").ack_policy_writeall_equivalent());
+        // best_effort degraded mode disqualifies regardless of policy.
+        assert!(!mk(2, "auto", "best_effort").ack_policy_writeall_equivalent());
+        // RF=1 has no replicas -> never equivalent.
+        assert!(!mk(1, "write_all", "reject").ack_policy_writeall_equivalent());
+    }
+
+    #[test]
+    fn i4_automatic_promotion_refused_on_non_writeall_equivalent_config() {
+        // RF=3 stock ("auto" -> WriteMajority) must refuse the opt-in.
+        let mut cfg = ServerConfig {
+            replication_factor: 3,
+            ack_policy: "auto".to_string(),
+            replication_degraded_mode: "reject".to_string(),
+            enable_automatic_promotion: true,
+            ..ServerConfig::default()
+        };
+        cfg.storage.engine = StorageEngine::InPlace;
+        let err = cfg.validate_cluster_safety().unwrap_err();
+        assert!(
+            err.contains("enable_automatic_promotion"),
+            "error must name the opt-in, was: {err}"
+        );
+        assert!(
+            err.contains("WriteAll-equivalent"),
+            "error must name the requirement, was: {err}"
+        );
+
+        // RF=1 (no replicas) must refuse too.
+        let mut cfg = ServerConfig {
+            replication_factor: 1,
+            ack_policy: "write_all".to_string(),
+            replication_degraded_mode: "reject".to_string(),
+            enable_automatic_promotion: true,
+            ..ServerConfig::default()
+        };
+        cfg.storage.engine = StorageEngine::InPlace;
+        let err = cfg.validate_cluster_safety().unwrap_err();
+        assert!(
+            err.contains("enable_automatic_promotion"),
+            "error was: {err}"
+        );
+    }
+
+    #[test]
+    fn i4_automatic_promotion_allowed_on_rf2_writeall() {
+        // RF=2 + auto (WriteAll) + reject is the validated shape.
+        let mut cfg = ServerConfig {
+            replication_factor: 2,
+            ack_policy: "auto".to_string(),
+            replication_degraded_mode: "reject".to_string(),
+            enable_automatic_promotion: true,
+            ..ServerConfig::default()
+        };
+        cfg.storage.engine = StorageEngine::InPlace;
+        cfg.validate_cluster_safety()
+            .expect("RF=2 auto/reject with the opt-in must validate");
     }
 
     #[test]

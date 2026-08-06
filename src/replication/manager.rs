@@ -36,6 +36,21 @@ pub enum ReplicationError {
     #[error("replica error at sequence {sequence}: {message}")]
     ReplicaError { sequence: u64, message: String },
 
+    /// P1 §4.2 — the replica rejected the batch at its regime gate
+    /// (`ERR_STALE_REGIME`). Carried TYPED (not as a `Transport` string)
+    /// so the dispatch fan-out can raise the topology-staleness signal;
+    /// the hint is routing advice only (I9), never adopted as regime
+    /// state.
+    #[error(
+        "replica rejected batch: stale regime (shard {shard}, receiver committed regime {local_regime})"
+    )]
+    StaleRegime {
+        /// The stale shard named by the NAK hint.
+        shard: u16,
+        /// The receiver's committed regime for that shard.
+        local_regime: u64,
+    },
+
     /// Transport error.
     #[error("transport error: {0}")]
     Transport(String),
@@ -344,6 +359,13 @@ fn clone_replication_error(e: &ReplicationError) -> ReplicationError {
             sequence: *sequence,
             message: message.clone(),
         },
+        ReplicationError::StaleRegime {
+            shard,
+            local_regime,
+        } => ReplicationError::StaleRegime {
+            shard: *shard,
+            local_regime: *local_regime,
+        },
         ReplicationError::Transport(s) => ReplicationError::Transport(s.clone()),
     }
 }
@@ -526,6 +548,9 @@ impl ReplicationManager {
             // from the shared coordinator-owned atomic so the receiver
             // can fence stale-epoch masters.
             cluster_key: self.current_cluster_key.load(Ordering::Acquire),
+            // D-10 test-only module: the P1 regime table is a production
+            // dispatch concern; this reference implementation stays on V2.
+            regime_table: None,
         };
         // F-G7-007: `next_sequence` advances BEFORE the fan-out
         // result is reconciled. A retry of the same logical ops
@@ -1092,6 +1117,8 @@ impl ReplicationManager {
                     // over to a new epoch must not silently apply old
                     // chunks from a stale leader.
                     cluster_key: self.current_cluster_key.load(Ordering::Acquire),
+                    // D-10 test-only module: stays on V2 (see above).
+                    regime_table: None,
                 };
                 // After `drain_stragglers()` at the top of `run_catchup`,
                 // every sender's transport is restored (or `None` only
@@ -1670,6 +1697,7 @@ mod tests {
             block_height: 1000,
             spendable_after: 100,
             master_generation: 0,
+            prior_utxo_hash: None,
         }];
         mgr.replicate_batch(&ops).unwrap();
 

@@ -984,6 +984,19 @@ pub struct ReplicationMetrics {
     /// stale-epoch gate). A non-zero value means a master is sending
     /// from a stale epoch and should re-discover the cluster topology.
     pub replica_rejected_stale_cluster_key: PaddedCounter,
+    /// P1 §4.2 — receiver-side counter: incremented every time the local
+    /// node rejects an inbound `OP_REPLICA_BATCH` at the regime gate with
+    /// `ERR_STALE_REGIME` (a touched shard's stamp behind the local
+    /// committed regime, or a regime-absent batch under enforcement —
+    /// I12). Sustained growth means a demoted or pre-P1 master keeps
+    /// writing past a committed master change.
+    pub replica_rejected_stale_regime: PaddedCounter,
+    /// P1 §4.2 — master-side counter: incremented once per fan-out send
+    /// that a replica NAKed with `ERR_STALE_REGIME`. Each increment also
+    /// raised the topology-staleness signal (the committed-channel
+    /// catch-up); the client mutation failed with
+    /// `ERR_REPLICATION_FAILED` and was compensated.
+    pub replica_send_stale_regime: PaddedCounter,
     /// F-G7-006: receiver-side counter — incremented every time
     /// `apply_op` gracefully skips a non-Create/non-Delete op because
     /// the target TX or slot was not found. A non-zero value means
@@ -1123,6 +1136,8 @@ impl ReplicationMetrics {
             per_replica: [ZERO_CELL; MAX_REPLICAS],
             leader_sequence: AtomicU64::new(0),
             replica_rejected_stale_cluster_key: PaddedCounter::new(),
+            replica_rejected_stale_regime: PaddedCounter::new(),
+            replica_send_stale_regime: PaddedCounter::new(),
             replica_apply_skipped_missing_tx: PaddedCounter::new(),
             replica_apply_divergence_total: PaddedCounter::new(),
             replica_missing_record_repaired: PaddedCounter::new(),

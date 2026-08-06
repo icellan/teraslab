@@ -404,6 +404,7 @@ pub(crate) fn build_http_router(
         .route("/admin/rebalance", put(handle_admin_rebalance))
         .route("/admin/drain/{node_id}", put(handle_admin_drain))
         .route("/admin/shrink", put(handle_admin_shrink))
+        .route("/admin/regime_rebase", put(handle_admin_regime_rebase))
         // Online backup: start (POST), poll status (GET), abort (DELETE).
         .route(
             "/admin/backup",
@@ -1218,6 +1219,16 @@ pub(crate) fn render_metrics_text(
             &mut out,
             "teraslab_replica_rejected_stale_cluster_key_total",
             r.replica_rejected_stale_cluster_key.get(),
+        );
+        prom_counter(
+            &mut out,
+            "teraslab_replica_rejected_stale_regime_total",
+            r.replica_rejected_stale_regime.get(),
+        );
+        prom_counter(
+            &mut out,
+            "teraslab_replica_send_stale_regime_total",
+            r.replica_send_stale_regime.get(),
         );
         prom_counter(
             &mut out,
@@ -2578,6 +2589,90 @@ async fn handle_admin_shrink(
             "shrink_proposal_failed",
             "TopologyAuthority::propose_shrink refused the proposal (a proposal may already \
              be pending, or the membership changed underneath this request); retry",
+        ),
+    }
+}
+
+/// `PUT /admin/regime_rebase` — propose a quorum-committed REGIME REBASE
+/// (P1 stage 1, invariant I7: operator repair of inconsistent or
+/// operator-unwanted regime state).
+///
+/// Authorization mirrors `/admin/shrink` and adds the I7 requirement: the
+/// route lives on the bearer-token-gated sub-router (`admin_token`), and
+/// the handler additionally REQUIRES a configured `cluster_secret` — a
+/// rebase lowers regime fencing state, and in fail-open mode the quorum
+/// gates it rides are structural, not cryptographic, so the verb refuses
+/// outright rather than pretending the commit path can authenticate it.
+///
+/// Every refusal is checked up front with a named error (the
+/// `handle_admin_shrink` posture): wrong node → `rebase_wrong_proposer`
+/// (re-issue against the deterministic proposer), missing secret →
+/// `rebase_requires_cluster_secret`, authority refusal (pending proposal,
+/// no committed topology) → `rebase_proposal_failed`. On success the
+/// proposal rides the NORMAL term/vote/commit machinery (activation
+/// quorum over the peak floor, Gate A/B untouched) and the response is
+/// `202 Accepted` with the proposed term.
+async fn handle_admin_regime_rebase(
+    State(state): State<Arc<HttpState>>,
+) -> axum::response::Response {
+    let cluster = match state.cluster {
+        Some(ref c) => c,
+        None => {
+            return http_error(
+                StatusCode::BAD_REQUEST,
+                "not_in_cluster_mode",
+                "not in cluster mode",
+            );
+        }
+    };
+
+    // I7 — admin_token (the bearer middleware on this router) PLUS
+    // cluster_secret. Checked before anything else: without a secret the
+    // verb must not exist in any useful form.
+    if cluster.cluster_secret().is_none() {
+        return http_error(
+            StatusCode::CONFLICT,
+            "rebase_requires_cluster_secret",
+            "a regime rebase requires a configured cluster_secret (I7): in fail-open mode \
+             the quorum gates are structural, not cryptographic, and a rebase lowers \
+             regime fencing state",
+        );
+    }
+
+    let committed = cluster.committed_topology_members();
+    let proposer = committed.iter().copied().min();
+    if proposer != Some(cluster.self_id()) {
+        return http_error_with_details(
+            StatusCode::BAD_REQUEST,
+            "rebase_wrong_proposer",
+            match proposer {
+                Some(p) => format!(
+                    "this node ({}) is not the deterministic proposer of the current \
+                     committed topology; re-issue against node {}",
+                    cluster.self_id().0,
+                    p.0,
+                ),
+                None => "no committed topology yet; there is no deterministic proposer".to_string(),
+            },
+            proposer.map(|p| serde_json::json!({ "proposer_node_id": p.0 })),
+        );
+    }
+
+    match cluster.propose_regime_rebase() {
+        Ok(term) => (
+            StatusCode::ACCEPTED,
+            format!(
+                "regime rebase proposed at term {}; it commits through the normal \
+                 activation quorum",
+                term.term,
+            ),
+        )
+            .into_response(),
+        Err(e) => http_error_with_details(
+            StatusCode::CONFLICT,
+            "rebase_proposal_failed",
+            format!("TopologyAuthority::propose_regime_rebase refused the proposal: {e}"),
+            None,
         ),
     }
 }
@@ -4833,6 +4928,8 @@ mod tests {
             "teraslab_repl_batch_latency_ns",
             "teraslab_repl_lag_sequences",
             "teraslab_replica_rejected_stale_cluster_key_total",
+            "teraslab_replica_rejected_stale_regime_total",
+            "teraslab_replica_send_stale_regime_total",
             "teraslab_replica_apply_skipped_missing_tx_total",
             "teraslab_replica_apply_divergence_total",
             "teraslab_replica_missing_record_repaired_total",
@@ -5770,6 +5867,106 @@ mod tests {
             .await
             .expect("body bytes");
         String::from_utf8(body.to_vec()).expect("utf8 body")
+    }
+
+    // ------------------------------------------------------------------
+    // P1 stage 1 — `/admin/regime_rebase` operator verb (I7). Mirrors the
+    // `/admin/shrink` test style: drive the handler directly, refusals
+    // fire UP FRONT with named errors.
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn admin_regime_rebase_returns_bad_request_when_not_clustered() {
+        let state = build_ready_test_state(true, None);
+        let resp = handle_admin_regime_rebase(State(state))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = body_string(resp).await;
+        assert!(body.contains("not_in_cluster_mode"), "got: {body:?}");
+    }
+
+    /// I7 — the rebase requires admin_token (router middleware) AND a
+    /// configured cluster_secret; a fail-open cluster gets a named refusal
+    /// BEFORE any proposer check.
+    #[tokio::test]
+    async fn admin_regime_rebase_requires_cluster_secret() {
+        let members = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let cluster = shrink_test_cluster(&members, NodeId(1), 3, 2);
+        let state = build_ready_test_state(true, Some(cluster));
+        let resp = handle_admin_regime_rebase(State(state))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let body = body_string(resp).await;
+        assert!(
+            body.contains("rebase_requires_cluster_secret"),
+            "got: {body:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_regime_rebase_wrong_proposer_refused() {
+        use crate::cluster::coordinator::new_test_running_cluster;
+        let members = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let table = ShardTable::compute_with_epoch(&members, 2, 1, 1);
+        let live: Vec<(NodeId, std::net::SocketAddr)> = members
+            .iter()
+            .enumerate()
+            .map(|(i, &n)| (n, format!("127.0.0.1:{}", 16400 + i).parse().unwrap()))
+            .collect();
+        let cluster = Arc::new(
+            new_test_running_cluster(NodeId(2), table, &live, &members, &[], &[], &[], 3)
+                .test_with_cluster_secret(b"test-secret".to_vec()),
+        );
+        let state = build_ready_test_state(true, Some(cluster));
+        let resp = handle_admin_regime_rebase(State(state))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = body_string(resp).await;
+        assert!(body.contains("rebase_wrong_proposer"), "got: {body:?}");
+        assert!(
+            body.contains("\"proposer_node_id\":1"),
+            "must name the deterministic proposer; got: {body:?}",
+        );
+    }
+
+    /// The happy path: deterministic proposer + secret -> 202 with the
+    /// proposed term, riding the normal proposer machinery.
+    #[tokio::test]
+    async fn admin_regime_rebase_proposes_through_normal_machinery() {
+        use crate::cluster::coordinator::new_test_running_cluster;
+        let members = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let table = ShardTable::compute_with_epoch(&members, 2, 1, 1);
+        let live: Vec<(NodeId, std::net::SocketAddr)> = members
+            .iter()
+            .enumerate()
+            .map(|(i, &n)| (n, format!("127.0.0.1:{}", 16410 + i).parse().unwrap()))
+            .collect();
+        let cluster = Arc::new(
+            new_test_running_cluster(NodeId(1), table, &live, &members, &[], &[], &[], 3)
+                .test_with_cluster_secret(b"test-secret".to_vec()),
+        );
+        let state = build_ready_test_state(true, Some(cluster.clone()));
+        let resp = handle_admin_regime_rebase(State(state))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        let body = body_string(resp).await;
+        assert!(
+            body.contains("regime rebase proposed at term 2"),
+            "committed term is 1, so the rebase proposes term 2; got: {body:?}",
+        );
+        // A second call while the proposal is pending gets the named
+        // authority refusal.
+        let state = build_ready_test_state(true, Some(cluster));
+        let resp = handle_admin_regime_rebase(State(state))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let body = body_string(resp).await;
+        assert!(body.contains("rebase_proposal_failed"), "got: {body:?}");
     }
 
     /// G8 final review (finding 2, minor) — `wait_for_shrink_commit` used to

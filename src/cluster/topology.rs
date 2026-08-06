@@ -56,6 +56,382 @@ impl ClusterId {
 }
 
 // ---------------------------------------------------------------------------
+// P1 stage 1 — per-shard regime state (committed derivation substrate)
+// ---------------------------------------------------------------------------
+
+/// P1 §4.1 — the absolute per-shard regime array.
+///
+/// `regime[s]` is the committed term in which shard `s`'s master last
+/// changed. Carried **absolutely in every commit** (never delta-encoded —
+/// §5.4: term-skipping nodes would diverge and the fence would fail open).
+/// All-zeros is the bootstrap / gate-inactive state.
+#[derive(Clone, PartialEq, Eq)]
+pub struct RegimeArray(Box<[u64; crate::cluster::shards::NUM_SHARDS]>);
+
+impl Default for RegimeArray {
+    fn default() -> Self {
+        Self(Box::new([0u64; crate::cluster::shards::NUM_SHARDS]))
+    }
+}
+
+impl std::fmt::Debug for RegimeArray {
+    /// Summarized: never dump 4096 values into a log line.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let nonzero = self.0.iter().filter(|&&r| r != 0).count();
+        let max = self.0.iter().copied().max().unwrap_or(0);
+        write!(f, "RegimeArray{{nonzero: {nonzero}, max: {max}}}")
+    }
+}
+
+impl RegimeArray {
+    /// Regime of `shard`. Out-of-range shards read as `0` (never panics —
+    /// library code; every producer only writes shards `< NUM_SHARDS`).
+    pub fn get(&self, shard: u16) -> u64 {
+        self.0.get(shard as usize).copied().unwrap_or(0)
+    }
+
+    /// Set the regime of `shard`. Out-of-range shards are ignored.
+    pub fn set(&mut self, shard: u16, regime: u64) {
+        if let Some(slot) = self.0.get_mut(shard as usize) {
+            *slot = regime;
+        }
+    }
+
+    /// True when every shard's regime is zero (bootstrap / gate-inactive —
+    /// §4.1: this is also the state whose persistence deletes the
+    /// `.regime-armed` marker).
+    pub fn is_all_zero(&self) -> bool {
+        self.0.iter().all(|&r| r == 0)
+    }
+
+    /// Iterate `(shard, regime)` over the non-zero entries in ascending
+    /// shard order (the canonical wire order).
+    pub fn iter_nonzero(&self) -> impl Iterator<Item = (u16, u64)> + '_ {
+        self.0
+            .iter()
+            .enumerate()
+            .filter(|&(_, &r)| r != 0)
+            .map(|(s, &r)| (s as u16, r))
+    }
+}
+
+/// P1 stage 1 — the new committed state block carried by every
+/// [`TopologyTerm`] / [`TopologyCommit`] and persisted in the topology
+/// state file.
+///
+/// * `override_map` — **full and cumulative** (§4.0/I0): every shard whose
+///   committed master deviates from placement appears; a shard absent from
+///   the map is placement-derived; the proposer recomputes the whole map
+///   each term; retiring an override is itself a master change and bumps
+///   that shard's regime.
+/// * `regime` — the absolute per-shard regime array (§4.1).
+/// * `regime_enforced` / `promotion_enabled` — committed, digest-covered
+///   cluster-wide flags (I4/I11/I12 substrate). Default `false`.
+///
+/// `Default` is the bootstrap state: empty map, all-zero regimes, both
+/// flags false (gate-inactive semantics per §4.1).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RegimeBlock {
+    /// Cumulative master-override map, canonical `BTreeMap` (sorted by
+    /// shard by construction).
+    pub override_map: std::collections::BTreeMap<u16, NodeId>,
+    /// Absolute per-shard regime array.
+    pub regime: RegimeArray,
+    /// I11/I12 — committed regime-enforcement flag. Secret-less nodes
+    /// store it but never act on it (see
+    /// [`TopologyAuthority::regime_enforcement_active`]).
+    pub regime_enforced: bool,
+    /// I4 — committed automatic-promotion flag.
+    pub promotion_enabled: bool,
+}
+
+/// Envelope tag for the `placement_version` field (wire envelope only).
+const ENV_TAG_PLACEMENT_VERSION: u8 = 0x01;
+/// Envelope tag for the `committed_peak` field (wire envelope only).
+const ENV_TAG_COMMITTED_PEAK: u8 = 0x02;
+/// Envelope tag for the override map.
+const ENV_TAG_OVERRIDES: u8 = 0x03;
+/// Envelope tag for the regime array.
+const ENV_TAG_REGIMES: u8 = 0x04;
+/// Envelope tag for the committed boolean flags.
+const ENV_TAG_FLAGS: u8 = 0x05;
+
+/// Bit 0 of the flags byte: `regime_enforced`.
+const ENV_FLAG_REGIME_ENFORCED: u8 = 0b0000_0001;
+/// Bit 1 of the flags byte: `promotion_enabled`.
+const ENV_FLAG_PROMOTION_ENABLED: u8 = 0b0000_0010;
+
+/// Magic prefix of the versioned wire envelope appended to NEW
+/// [`TopologyTerm`] / [`TopologyCommit`] payloads.
+///
+/// Chosen so its first four bytes, read as a LE `u32`, exceed
+/// [`MAX_TOPOLOGY_MEMBERS`] — a legacy `TopologyCommit` voter-count can
+/// therefore never alias the magic, and the decoders can distinguish
+/// "new envelope follows" from "legacy voter list follows" without
+/// positional length inference.
+pub const REGIME_WIRE_ENVELOPE_MAGIC: [u8; 4] = *b"TSRB";
+
+/// Magic prefix of the versioned, checksummed topology STATE FILE
+/// envelope (`[magic][version:u16][len:u32][body][sha256:32]`, §4.1
+/// "Persistence").
+pub const TOPOLOGY_STATE_ENVELOPE_MAGIC: [u8; 4] = *b"TSTS";
+
+/// Envelope format version for both the wire block and the state file.
+pub const REGIME_ENVELOPE_VERSION: u16 = 1;
+
+/// Hard cap on an envelope's declared body length. The worst legitimate
+/// body (full override map + full regime array) is ~82 KiB; this bounds a
+/// forged `len` field before any allocation (the `decode_ops`
+/// untrusted-count posture applied to the topology envelope).
+pub const MAX_REGIME_ENVELOPE_BODY: usize = 256 * 1024;
+
+/// Errors decoding a regime block / envelope. Decode failures on the wire
+/// surface as a rejected payload (`None` from the deserializers — hard
+/// reject, never a defaulted field); the state-file loader maps them into
+/// its own fail-closed error.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum RegimeDecodeError {
+    /// The bytes do not start with the expected envelope magic.
+    #[error("missing envelope magic (legacy payload?)")]
+    NotAnEnvelope,
+    /// The envelope declares a version this build does not support.
+    #[error("unsupported envelope version {0}")]
+    UnsupportedVersion(u16),
+    /// The payload is shorter than the envelope frame requires.
+    #[error("envelope truncated")]
+    Truncated,
+    /// The declared body length exceeds [`MAX_REGIME_ENVELOPE_BODY`].
+    #[error("envelope body length {0} exceeds cap")]
+    BodyTooLarge(usize),
+    /// The SHA-256 integrity checksum does not match.
+    #[error("envelope integrity checksum mismatch")]
+    IntegrityMismatch,
+    /// A required tag is missing, out of order, duplicated, or unknown.
+    #[error("malformed envelope body (tag {0:#04x})")]
+    MalformedTag(u8),
+    /// An entry list violates canonical form (unsorted, duplicate,
+    /// shard >= NUM_SHARDS, zero-regime entry, or count > NUM_SHARDS).
+    #[error("non-canonical envelope entry list")]
+    NonCanonical,
+    /// Trailing bytes after the last expected field.
+    #[error("trailing bytes after envelope body")]
+    TrailingBytes,
+}
+
+impl RegimeBlock {
+    /// Canonical encoding of the block (tags `0x03..=0x05`), used both as
+    /// the digest input and as the tail of the wire/state envelopes.
+    ///
+    /// Canonical form: override entries sorted ascending by shard (a
+    /// `BTreeMap` guarantees it), regime entries sorted ascending with
+    /// **only non-zero regimes present** (an absent shard decodes as 0 —
+    /// the array is still absolute: the full state is a pure function of
+    /// the encoded commit), flags packed into one byte with all unknown
+    /// bits zero.
+    pub fn encode_canonical(&self) -> Vec<u8> {
+        let regime_count = self.regime.iter_nonzero().count();
+        let mut buf = Vec::with_capacity(
+            1 + 2 + self.override_map.len() * 10 + 1 + 2 + regime_count * 10 + 2,
+        );
+        buf.push(ENV_TAG_OVERRIDES);
+        buf.extend_from_slice(&(self.override_map.len() as u16).to_le_bytes());
+        for (shard, node) in &self.override_map {
+            buf.extend_from_slice(&shard.to_le_bytes());
+            buf.extend_from_slice(&node.0.to_le_bytes());
+        }
+        buf.push(ENV_TAG_REGIMES);
+        buf.extend_from_slice(&(regime_count as u16).to_le_bytes());
+        for (shard, regime) in self.regime.iter_nonzero() {
+            buf.extend_from_slice(&shard.to_le_bytes());
+            buf.extend_from_slice(&regime.to_le_bytes());
+        }
+        buf.push(ENV_TAG_FLAGS);
+        let mut flags = 0u8;
+        if self.regime_enforced {
+            flags |= ENV_FLAG_REGIME_ENFORCED;
+        }
+        if self.promotion_enabled {
+            flags |= ENV_FLAG_PROMOTION_ENABLED;
+        }
+        buf.push(flags);
+        buf
+    }
+
+    /// Decode the canonical block encoding starting at `data[pos]`.
+    ///
+    /// Enforces canonical order at decode (reject unsorted / duplicate /
+    /// `count > NUM_SHARDS` / shard out of range / explicit zero-regime
+    /// entries), clamps reservations to what the payload can back, and
+    /// hard-rejects any shortfall. Returns the block and the position just
+    /// past it.
+    pub fn decode_canonical(data: &[u8], pos: usize) -> Result<(Self, usize), RegimeDecodeError> {
+        let mut pos = pos;
+        // --- overrides ---
+        expect_tag(data, &mut pos, ENV_TAG_OVERRIDES)?;
+        let override_count = read_u16(data, &mut pos)? as usize;
+        if override_count > crate::cluster::shards::NUM_SHARDS {
+            return Err(RegimeDecodeError::NonCanonical);
+        }
+        // Reservation clamp (decode_ops posture): never reserve more than
+        // the remaining payload can back (10 bytes per entry).
+        let max_backed = data.len().saturating_sub(pos) / 10;
+        let mut override_map = std::collections::BTreeMap::new();
+        let mut prev_shard: Option<u16> = None;
+        let _ = max_backed; // BTreeMap has no with_capacity; clamp retained for the regime vec below.
+        for _ in 0..override_count {
+            let shard = read_u16(data, &mut pos)?;
+            let node = NodeId(read_u64(data, &mut pos)?);
+            if shard as usize >= crate::cluster::shards::NUM_SHARDS {
+                return Err(RegimeDecodeError::NonCanonical);
+            }
+            if let Some(prev) = prev_shard
+                && shard <= prev
+            {
+                return Err(RegimeDecodeError::NonCanonical);
+            }
+            prev_shard = Some(shard);
+            override_map.insert(shard, node);
+        }
+        // --- regimes ---
+        expect_tag(data, &mut pos, ENV_TAG_REGIMES)?;
+        let regime_count = read_u16(data, &mut pos)? as usize;
+        if regime_count > crate::cluster::shards::NUM_SHARDS {
+            return Err(RegimeDecodeError::NonCanonical);
+        }
+        let mut regime = RegimeArray::default();
+        let mut prev_shard: Option<u16> = None;
+        for _ in 0..regime_count {
+            let shard = read_u16(data, &mut pos)?;
+            let value = read_u64(data, &mut pos)?;
+            if shard as usize >= crate::cluster::shards::NUM_SHARDS || value == 0 {
+                // An explicit zero entry is non-canonical (absent == 0).
+                return Err(RegimeDecodeError::NonCanonical);
+            }
+            if let Some(prev) = prev_shard
+                && shard <= prev
+            {
+                return Err(RegimeDecodeError::NonCanonical);
+            }
+            prev_shard = Some(shard);
+            regime.set(shard, value);
+        }
+        // --- flags ---
+        expect_tag(data, &mut pos, ENV_TAG_FLAGS)?;
+        let flags = read_u8(data, &mut pos)?;
+        if flags & !(ENV_FLAG_REGIME_ENFORCED | ENV_FLAG_PROMOTION_ENABLED) != 0 {
+            // Unknown flag bits are a hard reject: a v1 decoder must not
+            // silently drop committed safety state it cannot represent.
+            return Err(RegimeDecodeError::MalformedTag(ENV_TAG_FLAGS));
+        }
+        Ok((
+            Self {
+                override_map,
+                regime,
+                regime_enforced: flags & ENV_FLAG_REGIME_ENFORCED != 0,
+                promotion_enabled: flags & ENV_FLAG_PROMOTION_ENABLED != 0,
+            },
+            pos,
+        ))
+    }
+}
+
+/// Read one byte at `*pos`, advancing it. Hard reject on shortfall.
+fn read_u8(data: &[u8], pos: &mut usize) -> Result<u8, RegimeDecodeError> {
+    let b = *data.get(*pos).ok_or(RegimeDecodeError::Truncated)?;
+    *pos += 1;
+    Ok(b)
+}
+
+/// Read a LE `u16` at `*pos`, advancing it. Hard reject on shortfall.
+fn read_u16(data: &[u8], pos: &mut usize) -> Result<u16, RegimeDecodeError> {
+    let end = pos.checked_add(2).ok_or(RegimeDecodeError::Truncated)?;
+    let bytes = data.get(*pos..end).ok_or(RegimeDecodeError::Truncated)?;
+    *pos = end;
+    Ok(u16::from_le_bytes([bytes[0], bytes[1]]))
+}
+
+/// Read a LE `u32` at `*pos`, advancing it. Hard reject on shortfall.
+fn read_u32(data: &[u8], pos: &mut usize) -> Result<u32, RegimeDecodeError> {
+    let end = pos.checked_add(4).ok_or(RegimeDecodeError::Truncated)?;
+    let bytes = data.get(*pos..end).ok_or(RegimeDecodeError::Truncated)?;
+    *pos = end;
+    Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+}
+
+/// Read a LE `u64` at `*pos`, advancing it. Hard reject on shortfall.
+fn read_u64(data: &[u8], pos: &mut usize) -> Result<u64, RegimeDecodeError> {
+    let end = pos.checked_add(8).ok_or(RegimeDecodeError::Truncated)?;
+    let bytes = data.get(*pos..end).ok_or(RegimeDecodeError::Truncated)?;
+    *pos = end;
+    let mut arr = [0u8; 8];
+    arr.copy_from_slice(bytes);
+    Ok(u64::from_le_bytes(arr))
+}
+
+/// Consume the expected `tag` byte at `*pos`. Tagged presence, not
+/// positional inference: a missing/misordered tag is a hard reject.
+fn expect_tag(data: &[u8], pos: &mut usize, tag: u8) -> Result<(), RegimeDecodeError> {
+    let got = read_u8(data, pos)?;
+    if got != tag {
+        return Err(RegimeDecodeError::MalformedTag(got));
+    }
+    Ok(())
+}
+
+/// Wrap `body` in the versioned, length-prefixed, integrity-checked
+/// envelope `[magic:4][version:u16][len:u32][body][sha256:32]`. The
+/// checksum covers everything before it (magic + version + len + body).
+fn encode_envelope(magic: [u8; 4], body: &[u8]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(4 + 2 + 4 + body.len() + 32);
+    buf.extend_from_slice(&magic);
+    buf.extend_from_slice(&REGIME_ENVELOPE_VERSION.to_le_bytes());
+    buf.extend_from_slice(&(body.len() as u32).to_le_bytes());
+    buf.extend_from_slice(body);
+    let digest = auth::sha256(&buf);
+    buf.extend_from_slice(&digest);
+    buf
+}
+
+/// Parse an envelope starting at `data[pos]`. Returns the body slice and
+/// the position just past the trailing checksum. Every failure is a hard
+/// reject — a short read never yields a default.
+fn decode_envelope(
+    data: &[u8],
+    pos: usize,
+    magic: [u8; 4],
+) -> Result<(&[u8], usize), RegimeDecodeError> {
+    let header_end = pos.checked_add(10).ok_or(RegimeDecodeError::Truncated)?;
+    let header = data
+        .get(pos..header_end)
+        .ok_or(RegimeDecodeError::NotAnEnvelope)?;
+    if header[0..4] != magic {
+        return Err(RegimeDecodeError::NotAnEnvelope);
+    }
+    let version = u16::from_le_bytes([header[4], header[5]]);
+    if version != REGIME_ENVELOPE_VERSION {
+        return Err(RegimeDecodeError::UnsupportedVersion(version));
+    }
+    let len = u32::from_le_bytes([header[6], header[7], header[8], header[9]]) as usize;
+    if len > MAX_REGIME_ENVELOPE_BODY {
+        return Err(RegimeDecodeError::BodyTooLarge(len));
+    }
+    let body_end = header_end
+        .checked_add(len)
+        .ok_or(RegimeDecodeError::Truncated)?;
+    let sum_end = body_end
+        .checked_add(32)
+        .ok_or(RegimeDecodeError::Truncated)?;
+    if data.len() < sum_end {
+        return Err(RegimeDecodeError::Truncated);
+    }
+    let expected = auth::sha256(&data[pos..body_end]);
+    if expected != data[body_end..sum_end] {
+        return Err(RegimeDecodeError::IntegrityMismatch);
+    }
+    Ok((&data[header_end..body_end], sum_end))
+}
+
+// ---------------------------------------------------------------------------
 // Wire structures
 // ---------------------------------------------------------------------------
 
@@ -94,17 +470,27 @@ pub struct TopologyTerm {
     /// matching.
     pub committed_peak: u64,
     /// SHA-256 digest of (term || cluster_id || members || placement_version
-    /// || committed_peak), used for vote matching. Mixing `cluster_id`,
-    /// `placement_version`, and `committed_peak` in means a tampered id, a
-    /// divergent placement version, or a divergent floor claim all change
-    /// the digest, so the digest check itself rejects a forged
-    /// matching-cluster claim, a placement-version disagreement, or a
-    /// mismatched committed_peak.
+    /// || committed_peak || proposer || regime block), used for vote
+    /// matching. Mixing `cluster_id`, `placement_version`, and
+    /// `committed_peak` in means a tampered id, a divergent placement
+    /// version, or a divergent floor claim all change the digest, so the
+    /// digest check itself rejects a forged matching-cluster claim, a
+    /// placement-version disagreement, or a mismatched committed_peak.
+    /// P1 stage 1 (I10f / §4.1) additionally mixes in `proposer` and the
+    /// canonical [`RegimeBlock`] encoding — a DELIBERATE digest break vs
+    /// pre-P1 builds (repo posture: coordinated upgrade; a pre-P1 node's
+    /// votes and commits no longer digest-match and are excluded).
     pub digest: [u8; 32],
+    /// P1 stage 1 — the committed regime state carried by this term
+    /// (override map + absolute regime array + committed flags).
+    /// Digest-covered. Legacy payloads decode with the bootstrap default.
+    pub regime_block: RegimeBlock,
 }
 
 impl TopologyTerm {
-    /// Create a new term with auto-computed digest.
+    /// Create a new term with auto-computed digest and the bootstrap
+    /// (default) regime block. Producers that carry real regime state use
+    /// [`TopologyTerm::new_with_block`].
     pub fn new(
         term: u64,
         members: Vec<NodeId>,
@@ -113,12 +499,35 @@ impl TopologyTerm {
         placement_version: u16,
         committed_peak: u64,
     ) -> Self {
+        Self::new_with_block(
+            term,
+            members,
+            proposer,
+            cluster_id,
+            placement_version,
+            committed_peak,
+            RegimeBlock::default(),
+        )
+    }
+
+    /// Create a new term carrying `regime_block`, with auto-computed digest.
+    pub fn new_with_block(
+        term: u64,
+        members: Vec<NodeId>,
+        proposer: NodeId,
+        cluster_id: ClusterId,
+        placement_version: u16,
+        committed_peak: u64,
+        regime_block: RegimeBlock,
+    ) -> Self {
         let digest = Self::compute_digest(
             term,
             &cluster_id,
             &members,
             placement_version,
             committed_peak,
+            proposer,
+            &regime_block,
         );
         Self {
             term,
@@ -128,26 +537,38 @@ impl TopologyTerm {
             placement_version,
             committed_peak,
             digest,
+            regime_block,
         }
     }
 
     /// Compute the canonical digest for a (term, cluster_id, members,
-    /// placement_version, committed_peak) tuple. `cluster_id` is mixed in so
-    /// a forged-but-matching id changes the digest; `placement_version` is
-    /// mixed in (INVARIANT i) so two terms that differ only in placement
-    /// version produce DIFFERENT digests and cannot be conflated.
-    /// `committed_peak` (G8 stage 1) is mixed in last so a divergent
-    /// split-brain floor claim also changes the digest — an intentional
-    /// cross-version digest break requiring a coordinated upgrade, matching
-    /// the repo's deliberate-format-break posture.
+    /// placement_version, committed_peak, proposer, regime_block) tuple.
+    /// `cluster_id` is mixed in so a forged-but-matching id changes the
+    /// digest; `placement_version` is mixed in (INVARIANT i) so two terms
+    /// that differ only in placement version produce DIFFERENT digests and
+    /// cannot be conflated. `committed_peak` (G8 stage 1) is mixed in so a
+    /// divergent split-brain floor claim also changes the digest.
+    ///
+    /// P1 stage 1 — `proposer` (I10f: the proposer becomes digest-covered
+    /// so appliers can structurally enforce `proposer ∈ members` on
+    /// override-carrying commits) and the canonical [`RegimeBlock`]
+    /// encoding (override map in sorted-by-shard order, non-zero regime
+    /// entries in sorted order, committed flags) join the digest LAST.
+    /// This is an intentional cross-version digest break requiring a
+    /// coordinated upgrade, matching the repo's deliberate-format-break
+    /// posture (§4.1: "the digest break also excludes its votes").
     pub fn compute_digest(
         term: u64,
         cluster_id: &ClusterId,
         members: &[NodeId],
         placement_version: u16,
         committed_peak: u64,
+        proposer: NodeId,
+        regime_block: &RegimeBlock,
     ) -> [u8; 32] {
-        let mut buf = Vec::with_capacity(8 + 16 + 4 + members.len() * 8 + 2 + 8);
+        let block_bytes = regime_block.encode_canonical();
+        let mut buf =
+            Vec::with_capacity(8 + 16 + 4 + members.len() * 8 + 2 + 8 + 8 + block_bytes.len());
         buf.extend_from_slice(&term.to_le_bytes());
         buf.extend_from_slice(&cluster_id.0);
         buf.extend_from_slice(&(members.len() as u32).to_le_bytes());
@@ -156,20 +577,73 @@ impl TopologyTerm {
         }
         buf.extend_from_slice(&placement_version.to_le_bytes());
         buf.extend_from_slice(&committed_peak.to_le_bytes());
+        buf.extend_from_slice(&proposer.0.to_le_bytes());
+        buf.extend_from_slice(&block_bytes);
         auth::sha256(&buf)
+    }
+
+    /// Encode the wire envelope carried by NEW payloads: the legacy
+    /// trailers (`placement_version`, `committed_peak`) as tagged fields,
+    /// followed by the canonical regime block, wrapped in
+    /// `[magic][version][len][body][sha256]`. Every field is
+    /// present/absent-TAGGED (never positional), any decode shortfall is a
+    /// hard reject (never a default) — the §4.1 answer to the legacy
+    /// silently-defaulting tail-read trailers.
+    fn encode_wire_envelope(
+        placement_version: u16,
+        committed_peak: u64,
+        regime_block: &RegimeBlock,
+    ) -> Vec<u8> {
+        let block = regime_block.encode_canonical();
+        let mut body = Vec::with_capacity(1 + 2 + 1 + 8 + block.len());
+        body.push(ENV_TAG_PLACEMENT_VERSION);
+        body.extend_from_slice(&placement_version.to_le_bytes());
+        body.push(ENV_TAG_COMMITTED_PEAK);
+        body.extend_from_slice(&committed_peak.to_le_bytes());
+        body.extend_from_slice(&block);
+        encode_envelope(REGIME_WIRE_ENVELOPE_MAGIC, &body)
+    }
+
+    /// Decode the wire envelope at `data[pos]` (which must hold the magic).
+    /// Returns `(placement_version, committed_peak, block, end)`. Trailing
+    /// bytes inside the body are a hard reject.
+    fn decode_wire_envelope(
+        data: &[u8],
+        pos: usize,
+    ) -> Result<(u16, u64, RegimeBlock, usize), RegimeDecodeError> {
+        let (body, end) = decode_envelope(data, pos, REGIME_WIRE_ENVELOPE_MAGIC)?;
+        let mut p = 0usize;
+        expect_tag(body, &mut p, ENV_TAG_PLACEMENT_VERSION)?;
+        let placement_version = read_u16(body, &mut p)?;
+        expect_tag(body, &mut p, ENV_TAG_COMMITTED_PEAK)?;
+        let committed_peak = read_u64(body, &mut p)?;
+        let (block, p) = RegimeBlock::decode_canonical(body, p)?;
+        if p != body.len() {
+            return Err(RegimeDecodeError::TrailingBytes);
+        }
+        Ok((placement_version, committed_peak, block, end))
     }
 
     /// Serialize for the wire.
     ///
-    /// Format: `[term:8][proposer:8][cluster_id:16][member_count:4][member_id:8 * count][digest:32][placement_version:2][committed_peak:8]`
+    /// P1 format: `[term:8][proposer:8][cluster_id:16][member_count:4][member_id:8 * count][digest:32][ENVELOPE]`
     ///
-    /// `placement_version` and `committed_peak` (G8 stage 1) are appended
-    /// LAST so a node running the pre-W6 reader (which stops after the
-    /// digest) ignores them, and a W6-but-pre-G8 reader treats a standalone
-    /// term's absent `committed_peak` trailer as `members.len()` for
-    /// rolling-upgrade back-compat (see `deserialize`).
+    /// The legacy positional trailers (`[placement_version:2]
+    /// [committed_peak:8]`) are NO LONGER emitted: NEW payloads carry
+    /// everything in the versioned, length-prefixed, integrity-checked
+    /// envelope (§4.1 "Wire" — the legacy trailers silently defaulted on a
+    /// short read, which for `committed_peak` would silently disarm the
+    /// split-brain floor; adding a variable-length block there was
+    /// unacceptable). `deserialize` still accepts legacy payloads — their
+    /// recomputed digest no longer matches (deliberate break), so they are
+    /// rejected by the digest gates downstream, not by the parser.
     pub fn serialize(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(78 + self.members.len() * 8);
+        let envelope = Self::encode_wire_envelope(
+            self.placement_version,
+            self.committed_peak,
+            &self.regime_block,
+        );
+        let mut buf = Vec::with_capacity(68 + self.members.len() * 8 + envelope.len());
         buf.extend_from_slice(&self.term.to_le_bytes());
         buf.extend_from_slice(&self.proposer.0.to_le_bytes());
         buf.extend_from_slice(&self.cluster_id.0);
@@ -178,8 +652,7 @@ impl TopologyTerm {
             buf.extend_from_slice(&m.0.to_le_bytes());
         }
         buf.extend_from_slice(&self.digest);
-        buf.extend_from_slice(&self.placement_version.to_le_bytes());
-        buf.extend_from_slice(&self.committed_peak.to_le_bytes());
+        buf.extend_from_slice(&envelope);
         buf
     }
 
@@ -227,22 +700,41 @@ impl TopologyTerm {
         }
         let mut digest = [0u8; 32];
         digest.copy_from_slice(&data[members_end..members_end + 32]);
-        // W6/G8 — `[placement_version:2][committed_peak:8]` are trailers
-        // appended ONLY by a standalone `TopologyTerm` payload (exact
-        // length match below). A `TopologyCommit` payload reuses this
-        // parser but has its own voter list immediately after the digest,
-        // so we must NOT read either trailer here —
-        // `TopologyCommit::deserialize` reads its own placement_version and
-        // committed_peak from its own tail. A pre-W6 standalone term has no
-        // trailer (length == members_end + 32) and decodes as v1 /
-        // committed_peak = members.len(); a W6-but-pre-G8 term has only the
-        // placement_version trailer and decodes committed_peak the same
-        // legacy way.
+        // W6/G8 — `[placement_version:2][committed_peak:8]` are LEGACY
+        // trailers appended ONLY by a standalone pre-P1 `TopologyTerm`
+        // payload (exact length match below). A `TopologyCommit` payload
+        // reuses this parser but has its own voter list immediately after
+        // the digest, so we must NOT read either trailer here —
+        // `TopologyCommit::deserialize` reads its own tail. A pre-W6
+        // standalone term has no trailer (length == members_end + 32) and
+        // decodes as v1 / committed_peak = members.len(); a W6-but-pre-G8
+        // term has only the placement_version trailer and decodes
+        // committed_peak the same legacy way.
+        //
+        // P1 stage 1 — a NEW standalone term instead carries the tagged
+        // wire envelope at `digest_end` (its magic can never alias a
+        // legacy trailer or a commit's voter count — see
+        // [`REGIME_WIRE_ENVELOPE_MAGIC`]). When the magic is present the
+        // envelope MUST parse fully: any shortfall is a hard reject
+        // (`None`), never a defaulted field.
         let digest_end = members_end.checked_add(32)?;
         let mut placement_version = 1u16;
         let mut committed_peak = members.len() as u64;
-        if data.len() == digest_end.checked_add(10)? {
-            // G8 — full trailer: [placement_version:2][committed_peak:8].
+        let mut regime_block = RegimeBlock::default();
+        if data.len() >= digest_end + 4
+            && data[digest_end..digest_end + 4] == REGIME_WIRE_ENVELOPE_MAGIC
+        {
+            let (pv, peak, block, env_end) = Self::decode_wire_envelope(data, digest_end).ok()?;
+            // A standalone term ends exactly at the envelope; trailing
+            // bytes are a hard reject (tagged presence, not inference).
+            if env_end != data.len() {
+                return None;
+            }
+            placement_version = pv;
+            committed_peak = peak;
+            regime_block = block;
+        } else if data.len() == digest_end.checked_add(10)? {
+            // G8 legacy — full trailer: [placement_version:2][committed_peak:8].
             placement_version =
                 u16::from_le_bytes(data[digest_end..digest_end + 2].try_into().ok()?);
             let peak_off = digest_end.checked_add(2)?;
@@ -261,6 +753,7 @@ impl TopologyTerm {
             placement_version,
             committed_peak,
             digest,
+            regime_block,
         })
     }
 }
@@ -293,23 +786,58 @@ pub struct TopologyVote {
     /// be agreed per-shard by all). A pre-W6 vote without this trailer
     /// decodes as `1`, keeping the cluster on v1 until every node upgrades.
     pub voter_placement_support: u16,
+    /// P1 stage 1 — the voter's SWIM incarnation at vote time. Keys the
+    /// regime advert (`(NodeId, incarnation)` — I11: a same-id binary
+    /// downgrade resets adverts because a restart bumps the incarnation).
+    /// Absent on pre-P1 votes (decodes as `0`).
+    pub voter_incarnation: u64,
+    /// P1 stage 1 / I11 — the voter advertises regime support (binary
+    /// capability + configured `cluster_secret`). Absent decodes as
+    /// `false` — the conservative direction: an un-advertised member
+    /// blocks `regime_enforced` from ever being proposed.
+    pub regime_support: bool,
+    /// P1 stage 1 / I4 — the voter's RESOLVED ack policy is
+    /// WriteAll-equivalent (`required_replica_acks(targets, policy) ==
+    /// targets`) with a non-best-effort degraded mode. Absent decodes as
+    /// `false` (conservative: blocks `promotion_enabled`).
+    pub ack_writeall_equiv: bool,
 }
+
+/// Bit 0 of the vote advert byte: regime support.
+const VOTE_ADVERT_REGIME_SUPPORT: u8 = 0b0000_0001;
+/// Bit 1 of the vote advert byte: WriteAll-equivalent ack policy.
+const VOTE_ADVERT_ACK_WRITEALL_EQUIV: u8 = 0b0000_0010;
 
 impl TopologyVote {
     /// Serialize for the wire.
     ///
-    /// Format: `[term:8][voter:8][digest:32][accepted:1][voter_current_term:8][voter_placement_support:2]`
+    /// Format: `[term:8][voter:8][digest:32][accepted:1][voter_current_term:8][voter_placement_support:2][voter_incarnation:8][advert_flags:1]`
     ///
-    /// `voter_placement_support` is appended LAST so a pre-W6 reader ignores
-    /// it and a W6 reader treats its absence as `1`.
+    /// `voter_placement_support` is appended after the fixed body so a
+    /// pre-W6 reader ignores it and a W6 reader treats its absence as `1`.
+    /// P1 stage 1 appends `[voter_incarnation:8][advert_flags:1]` LAST; a
+    /// vote without the trailer decodes with NO advert (incarnation 0,
+    /// both capabilities false) — the conservative, fail-closed direction
+    /// for the I4/I11 proposal gates, so positional absence can only
+    /// UNDER-claim a capability (unlike the legacy commit trailers, whose
+    /// absence silently disarmed a safety floor).
     pub fn serialize(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(59);
+        let mut buf = Vec::with_capacity(68);
         buf.extend_from_slice(&self.term.to_le_bytes());
         buf.extend_from_slice(&self.voter.0.to_le_bytes());
         buf.extend_from_slice(&self.digest);
         buf.push(if self.accepted { 1 } else { 0 });
         buf.extend_from_slice(&self.voter_current_term.to_le_bytes());
         buf.extend_from_slice(&self.voter_placement_support.to_le_bytes());
+        buf.extend_from_slice(&self.voter_incarnation.to_le_bytes());
+        let mut advert = 0u8;
+        if self.regime_support {
+            advert |= VOTE_ADVERT_REGIME_SUPPORT;
+        }
+        if self.ack_writeall_equiv {
+            advert |= VOTE_ADVERT_ACK_WRITEALL_EQUIV;
+        }
+        buf.push(advert);
         buf
     }
 
@@ -330,6 +858,22 @@ impl TopologyVote {
         } else {
             1
         };
+        // P1 stage 1 — optional [voter_incarnation:8][advert_flags:1]
+        // trailer. Absent = no advert (fail-closed for the I4/I11 gates).
+        // Unknown advert bits are ignored (adverts are capability claims,
+        // read bit-by-bit — an unknown bit can only be a capability this
+        // build does not consult).
+        let (voter_incarnation, regime_support, ack_writeall_equiv) = if data.len() >= 68 {
+            let incarnation = u64::from_le_bytes(data[59..67].try_into().ok()?);
+            let advert = data[67];
+            (
+                incarnation,
+                advert & VOTE_ADVERT_REGIME_SUPPORT != 0,
+                advert & VOTE_ADVERT_ACK_WRITEALL_EQUIV != 0,
+            )
+        } else {
+            (0, false, false)
+        };
         Some(Self {
             term,
             digest,
@@ -337,6 +881,9 @@ impl TopologyVote {
             accepted,
             voter_current_term,
             voter_placement_support,
+            voter_incarnation,
+            regime_support,
+            ack_writeall_equiv,
         })
     }
 }
@@ -362,6 +909,11 @@ pub struct TopologyCommit {
     pub digest: [u8; 32],
     /// Nodes whose accepted votes formed the quorum for this commit.
     pub voters: Vec<NodeId>,
+    /// P1 stage 1 — the committed regime state carried by this commit,
+    /// copied from the `TopologyTerm` that reached quorum. Digest-covered.
+    /// Legacy payloads decode with the bootstrap default (and then fail
+    /// the recomputed-digest gate — deliberate format break).
+    pub regime_block: RegimeBlock,
 }
 
 impl TopologyCommit {
@@ -396,15 +948,22 @@ impl TopologyCommit {
 
     /// Serialize for the wire.
     ///
-    /// Format: `[term:8][proposer:8][cluster_id:16][member_count:4][member_id:8 * count][digest:32][voter_count:4][voter_id:8 * count][placement_version:2][committed_peak:8]`
+    /// P1 format: `[term:8][proposer:8][cluster_id:16][member_count:4][member_id:8 * count][digest:32][voter_count:4][voter_id:8 * count][ENVELOPE]`
     ///
-    /// `placement_version` and `committed_peak` (G8 stage 1) are appended
-    /// LAST (after the voter list) so a pre-W6 reader ignores both, a W6
-    /// reader treats their absence as `1`/`members.len()`, and a
-    /// W6-but-pre-G8 reader treats the absent `committed_peak` trailer as
-    /// `members.len()`.
+    /// The legacy positional trailers (`[placement_version:2]
+    /// [committed_peak:8]`) are replaced by the tagged, checksummed wire
+    /// envelope after the voter list — see [`TopologyTerm::serialize`] for
+    /// the rationale (§4.1 "Wire": no more silently-defaulting tail
+    /// reads). `deserialize` still accepts legacy payloads; they fail the
+    /// recomputed-digest gates downstream (deliberate format break).
     pub fn serialize(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(82 + (self.members.len() + self.voters.len()) * 8);
+        let envelope = TopologyTerm::encode_wire_envelope(
+            self.placement_version,
+            self.committed_peak,
+            &self.regime_block,
+        );
+        let mut buf =
+            Vec::with_capacity(72 + (self.members.len() + self.voters.len()) * 8 + envelope.len());
         buf.extend_from_slice(&self.term.to_le_bytes());
         buf.extend_from_slice(&self.proposer.0.to_le_bytes());
         buf.extend_from_slice(&self.cluster_id.0);
@@ -417,8 +976,7 @@ impl TopologyCommit {
         for voter in &self.voters {
             buf.extend_from_slice(&voter.0.to_le_bytes());
         }
-        buf.extend_from_slice(&self.placement_version.to_le_bytes());
-        buf.extend_from_slice(&self.committed_peak.to_le_bytes());
+        buf.extend_from_slice(&envelope);
         buf
     }
 
@@ -464,8 +1022,32 @@ impl TopologyCommit {
         } else {
             Vec::new()
         };
-        // W6 — optional 2-byte `placement_version` trailer after the voter
-        // list. Absent on pre-W6 commits (decode as v1).
+        // P1 stage 1 — a NEW commit carries the tagged wire envelope after
+        // the voter list. When the magic is present the envelope MUST
+        // parse fully and end exactly at the payload's end: any shortfall
+        // or trailing bytes are a hard reject (never a default).
+        if data.len() >= voters_tail + 4
+            && data[voters_tail..voters_tail + 4] == REGIME_WIRE_ENVELOPE_MAGIC
+        {
+            let (placement_version, committed_peak, regime_block, env_end) =
+                TopologyTerm::decode_wire_envelope(data, voters_tail).ok()?;
+            if env_end != data.len() {
+                return None;
+            }
+            return Some(Self {
+                term: term.term,
+                proposer: term.proposer,
+                members: term.members,
+                cluster_id: term.cluster_id,
+                placement_version,
+                committed_peak,
+                digest: term.digest,
+                voters,
+                regime_block,
+            });
+        }
+        // W6 — optional 2-byte `placement_version` LEGACY trailer after the
+        // voter list. Absent on pre-W6 commits (decode as v1).
         let (placement_version, after_placement_version) =
             if data.len() >= voters_tail.checked_add(2)? {
                 (
@@ -475,9 +1057,9 @@ impl TopologyCommit {
             } else {
                 (1, voters_tail)
             };
-        // G8 stage 1 — optional 8-byte `committed_peak` trailer after
-        // placement_version. Absent on pre-G8 commits (legacy default:
-        // members.len(), reproducing today's floor exactly).
+        // G8 stage 1 — optional 8-byte `committed_peak` LEGACY trailer
+        // after placement_version. Absent on pre-G8 commits (legacy
+        // default: members.len(), reproducing today's floor exactly).
         let committed_peak = if data.len() >= after_placement_version.checked_add(8)? {
             u64::from_le_bytes(
                 data[after_placement_version..after_placement_version + 8]
@@ -496,6 +1078,7 @@ impl TopologyCommit {
             committed_peak,
             digest: term.digest,
             voters,
+            regime_block: RegimeBlock::default(),
         })
     }
 }
@@ -539,6 +1122,11 @@ pub struct PersistedTopologyState {
     /// `peak_cluster_size.max(committed_members.len())`, reproducing
     /// today's restored floor exactly (see `deserialize`).
     pub committed_peak: u64,
+    /// P1 stage 1 — the committed regime state (override map + regime
+    /// array + committed flags). Only representable in the NEW checksummed
+    /// state-file envelope; a legacy file decodes with the bootstrap
+    /// default (empty map, all-zero regimes, flags false).
+    pub regime_block: RegimeBlock,
 }
 
 /// G9 — result of [`TopologyAuthority::handle_commit_durable`].
@@ -601,10 +1189,69 @@ impl PersistedTopologyState {
         buf
     }
 
-    /// Deserialize from bytes.
+    /// P1 stage 1 — serialize into the versioned, length-prefixed,
+    /// CHECKSUMMED state-file envelope (§4.1 "Persistence"):
+    ///
+    /// `[magic:4][version:u16][len:u32][body][sha256:32]` with
+    /// `body = [legacy_len:u32][legacy serialize() bytes][canonical regime block]`.
+    ///
+    /// The legacy positional layout survives as the body's first section so
+    /// the tolerant legacy decoder can be reused verbatim; the envelope's
+    /// SHA-256 is what turns "tolerant" into safe — a truncated or
+    /// bit-flipped file fails the checksum and the loader fails CLOSED
+    /// (clustered node refuses to start) instead of silently decoding
+    /// defaults.
+    pub fn serialize_envelope(&self) -> Vec<u8> {
+        let legacy = self.serialize();
+        let block = self.regime_block.encode_canonical();
+        let mut body = Vec::with_capacity(4 + legacy.len() + block.len());
+        body.extend_from_slice(&(legacy.len() as u32).to_le_bytes());
+        body.extend_from_slice(&legacy);
+        body.extend_from_slice(&block);
+        encode_envelope(TOPOLOGY_STATE_ENVELOPE_MAGIC, &body)
+    }
+
+    /// P1 stage 1 — decode the new-format state-file envelope.
+    ///
+    /// Errors:
+    /// * [`RegimeDecodeError::NotAnEnvelope`] — the bytes do not start
+    ///   with the state-file magic (candidate legacy file; the caller
+    ///   decides whether the legacy tolerant decoder may run — CLI-gated,
+    ///   see the coordinator's loader).
+    /// * [`RegimeDecodeError::IntegrityMismatch`] and friends — the file
+    ///   claims the new format but fails validation. FAIL-CLOSED: never
+    ///   fall back to the tolerant legacy decoder for these.
+    pub fn deserialize_envelope(data: &[u8]) -> Result<Self, RegimeDecodeError> {
+        let (body, end) = decode_envelope(data, 0, TOPOLOGY_STATE_ENVELOPE_MAGIC)?;
+        if end != data.len() {
+            return Err(RegimeDecodeError::TrailingBytes);
+        }
+        let mut pos = 0usize;
+        let legacy_len = read_u32(body, &mut pos)? as usize;
+        let legacy_end = pos
+            .checked_add(legacy_len)
+            .ok_or(RegimeDecodeError::Truncated)?;
+        let legacy = body
+            .get(pos..legacy_end)
+            .ok_or(RegimeDecodeError::Truncated)?;
+        pos = legacy_end;
+        let mut state = Self::deserialize(legacy);
+        let (block, pos) = RegimeBlock::decode_canonical(body, pos)?;
+        if pos != body.len() {
+            return Err(RegimeDecodeError::TrailingBytes);
+        }
+        state.regime_block = block;
+        Ok(state)
+    }
+
+    /// Deserialize from bytes (LEGACY tolerant decoder).
     ///
     /// Backward compatible with the old 16-byte `[peak:8][epoch:8]` format
     /// and the pre-incarnation format without the trailing incarnation field.
+    /// P1 stage 1: only reachable for the body of a checksummed envelope
+    /// ([`Self::deserialize_envelope`]) or through the CLI-gated legacy
+    /// upgrade path — never as a silent fallback for a corrupt new-format
+    /// file.
     pub fn deserialize(data: &[u8]) -> Self {
         if data.len() >= 28 {
             let peak = u64::from_le_bytes(data[0..8].try_into().unwrap_or([0; 8]));
@@ -712,6 +1359,7 @@ impl PersistedTopologyState {
                 committed_voter_ever_seen: ever_seen,
                 committed_placement_version,
                 committed_peak,
+                regime_block: RegimeBlock::default(),
             }
         } else if data.len() >= 16 {
             // Old format: [peak:8][epoch:8]
@@ -727,6 +1375,7 @@ impl PersistedTopologyState {
                 committed_voter_ever_seen: Vec::new(),
                 committed_placement_version: 1,
                 committed_peak: peak.max(1),
+                regime_block: RegimeBlock::default(),
             }
         } else if data.len() >= 8 {
             // Oldest format: [peak:8] only
@@ -741,6 +1390,7 @@ impl PersistedTopologyState {
                 committed_voter_ever_seen: Vec::new(),
                 committed_placement_version: 1,
                 committed_peak: peak.max(1),
+                regime_block: RegimeBlock::default(),
             }
         } else {
             Self {
@@ -753,6 +1403,7 @@ impl PersistedTopologyState {
                 committed_voter_ever_seen: Vec::new(),
                 committed_placement_version: 1,
                 committed_peak: 1,
+                regime_block: RegimeBlock::default(),
             }
         }
     }
@@ -956,6 +1607,112 @@ pub struct TopologyAuthority {
     /// returned, no other commit has had a realistic chance to overwrite it
     /// (network round-trips dominate any local read-after-write gap).
     last_shrink: Mutex<Option<(u64, Vec<NodeId>)>>,
+    /// P1 stage 1 — the INSTALLED committed regime state (I0's "installed
+    /// committed state"): full cumulative override map, absolute regime
+    /// array, and the committed `regime_enforced` / `promotion_enabled`
+    /// flags. Installed only inside `apply_commit_locked` (under
+    /// `commit_apply`, before the `committed_term` store — the I1 install
+    /// ordering substrate) and by `restore`.
+    committed_regime_block: RwLock<RegimeBlock>,
+    /// P1 stage 1 — the replication factor used to derive placement
+    /// REPLICAS for the committed-derivation holder set (I10a). Set by the
+    /// coordinator at wiring time; defaults to 1 (no replicas), which is
+    /// FAIL-CLOSED: with an empty replica set every override target is
+    /// structurally rejected until the real RF is wired.
+    replication_factor: AtomicU64,
+    /// I11 — whether a `cluster_secret` is configured on this node. A
+    /// secret-less node never advertises regime support, never proposes
+    /// `regime_enforced`, and IGNORES a committed `regime_enforced`
+    /// (stored, not acted on — see `regime_enforcement_active`).
+    secret_configured: std::sync::atomic::AtomicBool,
+    /// I4 — whether this node's RESOLVED ack policy is WriteAll-equivalent
+    /// (`required_replica_acks(targets, policy) == targets`) AND
+    /// `replication_degraded_mode != "best_effort"`. Computed from the real
+    /// resolved policy by the coordinator wiring; advertised on every vote.
+    self_ack_writeall_equiv: std::sync::atomic::AtomicBool,
+    /// I4 — the `enable_automatic_promotion` config opt-in. Gates ONLY
+    /// whether this node will ever PROPOSE `promotion_enabled = true`;
+    /// never an apply gate (I0).
+    promotion_proposal_opt_in: std::sync::atomic::AtomicBool,
+    /// This node's current SWIM incarnation, stamped on outgoing votes so
+    /// peers key regime adverts by `(NodeId, incarnation)` (I11: a same-id
+    /// binary downgrade bumps the incarnation and resets the advert).
+    self_incarnation: AtomicU64,
+    /// P1 stage 1 — per-peer regime/ack-policy adverts learned from votes,
+    /// keyed by `(NodeId, incarnation)`: a higher incarnation REPLACES the
+    /// stored advert (reset-on-restart semantics), a lower one is ignored,
+    /// an equal one merges monotonically. Kept separate from the W6
+    /// `peer_placement_support` map, whose forever-monotonic semantics are
+    /// deliberately unchanged.
+    peer_regime_adverts: RwLock<std::collections::HashMap<NodeId, PeerRegimeAdvert>>,
+}
+
+/// P1 stage 1 — structured refusals from the same-membership P1 producers
+/// (`propose_regime_enforced`, `propose_promotion_enabled`,
+/// `propose_regime_rebase`). Every variant is a PROPOSAL-side condition
+/// (I0: node-local knowledge may gate what a node proposes, never what it
+/// applies).
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum RegimeProposeError {
+    /// No topology has been committed yet — there is nothing to amend.
+    #[error("no committed topology yet")]
+    NoCommittedTopology,
+    /// This node is not the deterministic proposer of the committed
+    /// membership; re-issue against `proposer`.
+    #[error("not the deterministic proposer (node {proposer} is)")]
+    NotProposer {
+        /// The deterministic proposer's NodeId.
+        proposer: u64,
+    },
+    /// A topology proposal is already in flight; retry once it settles.
+    #[error("a topology proposal is already pending")]
+    ProposalPending,
+    /// I11 — `regime_enforced = true` may not be proposed without a
+    /// configured `cluster_secret`.
+    #[error("regime enforcement requires a configured cluster_secret (I11)")]
+    SecretRequired,
+    /// §4.1 enable sequencing — a committed member's current-incarnation
+    /// advert does not show regime support.
+    #[error(
+        "committed member {member} has not advertised regime support at its current incarnation"
+    )]
+    MemberLacksRegimeSupport {
+        /// The non-supporting member.
+        member: u64,
+    },
+    /// I4 — a committed member's advert does not show WriteAll-equivalence
+    /// with a non-best-effort degraded mode.
+    #[error(
+        "committed member {member} has not advertised a WriteAll-equivalent, \
+         non-best-effort ack policy (I4)"
+    )]
+    MemberLacksWriteAllEquivalence {
+        /// The non-qualifying member.
+        member: u64,
+    },
+    /// I4 — this node is not configured to propose promotion
+    /// (`enable_automatic_promotion = false`).
+    #[error(
+        "this node is not configured to propose promotion (enable_automatic_promotion = false)"
+    )]
+    PromotionProposalNotEnabled,
+    /// The requested flag already has the committed value.
+    #[error("the committed field already has the requested value")]
+    NoChange,
+}
+
+/// P1 stage 1 — a peer's advertised regime/ack-policy capabilities at a
+/// given incarnation (see `TopologyAuthority::peer_regime_adverts`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PeerRegimeAdvert {
+    /// The peer incarnation this advert was made at.
+    pub incarnation: u64,
+    /// The peer advertises regime support (binary capability + configured
+    /// `cluster_secret` — I11).
+    pub regime_support: bool,
+    /// The peer's resolved ack policy is WriteAll-equivalent and its
+    /// degraded mode is not best-effort (I4).
+    pub ack_writeall_equiv: bool,
 }
 
 impl TopologyAuthority {
@@ -989,6 +1746,13 @@ impl TopologyAuthority {
                 m
             }),
             last_shrink: Mutex::new(None),
+            committed_regime_block: RwLock::new(RegimeBlock::default()),
+            replication_factor: AtomicU64::new(1),
+            secret_configured: std::sync::atomic::AtomicBool::new(false),
+            self_ack_writeall_equiv: std::sync::atomic::AtomicBool::new(false),
+            promotion_proposal_opt_in: std::sync::atomic::AtomicBool::new(false),
+            self_incarnation: AtomicU64::new(0),
+            peer_regime_adverts: RwLock::new(std::collections::HashMap::new()),
         }
     }
 
@@ -1034,6 +1798,320 @@ impl TopologyAuthority {
     /// just applied before acting on `removed`.
     pub fn last_shrink(&self) -> Option<(u64, Vec<NodeId>)> {
         self.last_shrink.lock().clone()
+    }
+
+    // -----------------------------------------------------------------------
+    // P1 stage 1 — committed regime state: wiring, derivation, adverts
+    // -----------------------------------------------------------------------
+
+    /// Wire the replication factor used to derive placement replicas for
+    /// the committed-derivation holder set (I10a). Called once by the
+    /// coordinator at construction; the default of 1 (no replicas) is
+    /// fail-closed.
+    pub fn set_replication_factor(&self, rf: u8) {
+        self.replication_factor
+            .store(rf.max(1) as u64, Ordering::Relaxed);
+    }
+
+    /// I11 — record whether a `cluster_secret` is configured. Controls the
+    /// regime-support advert, the `regime_enforced` proposal gate, and
+    /// [`Self::regime_enforcement_active`].
+    pub fn set_secret_configured(&self, configured: bool) {
+        self.secret_configured.store(configured, Ordering::Relaxed);
+    }
+
+    /// I4 — record whether this node's RESOLVED ack policy is
+    /// WriteAll-equivalent with a non-best-effort degraded mode. The value
+    /// MUST be computed from the real resolved policy (never from intent),
+    /// so the advert can never claim WriteAll-equivalence falsely.
+    pub fn set_self_ack_writeall_equiv(&self, equiv: bool) {
+        self.self_ack_writeall_equiv.store(equiv, Ordering::Relaxed);
+    }
+
+    /// I4 — record the `enable_automatic_promotion` config opt-in (gates
+    /// only whether this node will ever PROPOSE `promotion_enabled=true`).
+    pub fn set_promotion_proposal_opt_in(&self, opt_in: bool) {
+        self.promotion_proposal_opt_in
+            .store(opt_in, Ordering::Relaxed);
+    }
+
+    /// Record this node's current SWIM incarnation, stamped on votes so
+    /// peers key regime adverts by `(NodeId, incarnation)`.
+    pub fn set_self_incarnation(&self, incarnation: u64) {
+        self.self_incarnation
+            .fetch_max(incarnation, Ordering::Relaxed);
+    }
+
+    /// P1 §4.0 — the committed derivation, as a pure function over
+    /// `(override_map, committed_members, placement_version)` and nothing
+    /// else — never `effective_assignment`, never the live `ShardTable`,
+    /// never a local timer.
+    ///
+    /// Returns `None` when `committed_members` is empty (bootstrap: no
+    /// committed master exists yet).
+    pub fn committed_master_derivation(
+        override_map: &std::collections::BTreeMap<u16, NodeId>,
+        committed_members: &[NodeId],
+        placement_version: u16,
+        shard: u16,
+    ) -> Option<NodeId> {
+        if let Some(&master) = override_map.get(&shard) {
+            return Some(master);
+        }
+        if committed_members.is_empty() {
+            return None;
+        }
+        let table = crate::cluster::shards::ShardTable::compute_with_epoch(
+            committed_members,
+            1, // replicas are irrelevant to the master derivation
+            1,
+            placement_version.max(1),
+        );
+        Some(table.assignment(shard).master)
+    }
+
+    /// The committed master of `shard` under this node's INSTALLED
+    /// committed state (the I0 committed derivation). `None` at bootstrap.
+    pub fn committed_master(&self, shard: u16) -> Option<NodeId> {
+        let block = self.committed_regime_block.read().unwrap();
+        if let Some(&master) = block.override_map.get(&shard) {
+            return Some(master);
+        }
+        drop(block);
+        let members = self.committed_members.read().unwrap().clone();
+        Self::committed_master_derivation(
+            &std::collections::BTreeMap::new(),
+            &members,
+            self.committed_placement_version(),
+            shard,
+        )
+    }
+
+    /// The committed regime of `shard` (the committed term in which its
+    /// master last changed; `0` = never changed / bootstrap).
+    pub fn committed_regime(&self, shard: u16) -> u64 {
+        self.committed_regime_block
+            .read()
+            .unwrap()
+            .regime
+            .get(shard)
+    }
+
+    /// Snapshot of the installed committed regime block (tests, persist,
+    /// dissemination).
+    pub fn committed_regime_block(&self) -> RegimeBlock {
+        self.committed_regime_block.read().unwrap().clone()
+    }
+
+    /// The committed `regime_enforced` flag as STORED (I11: a secret-less
+    /// node stores it but never acts on it — see
+    /// [`Self::regime_enforcement_active`]).
+    pub fn committed_regime_enforced(&self) -> bool {
+        self.committed_regime_block.read().unwrap().regime_enforced
+    }
+
+    /// The committed `promotion_enabled` flag (I4).
+    pub fn committed_promotion_enabled(&self) -> bool {
+        self.committed_regime_block
+            .read()
+            .unwrap()
+            .promotion_enabled
+    }
+
+    /// I11 — whether regime enforcement is ACTIVE on this node: the
+    /// committed `regime_enforced` flag is true AND a `cluster_secret` is
+    /// configured. A secret-less (fail-open) node ignores the committed
+    /// flag entirely: in fail-open, commits are forgeable, and a
+    /// C11-style permanent self-fence armed by one forged frame would be a
+    /// reboot-resistant cluster-wide kill. Ignoring keeps the fail-open
+    /// blast radius exactly where it is today. Consumers (the
+    /// replica-batch gate, stage 2) MUST use this predicate, never the raw
+    /// committed flag.
+    pub fn regime_enforcement_active(&self) -> bool {
+        self.committed_regime_enforced() && self.secret_configured.load(Ordering::Relaxed)
+    }
+
+    /// P1 stage 1 — record a peer's regime/ack-policy advert from a vote,
+    /// keyed by `(NodeId, incarnation)`:
+    ///
+    /// * higher incarnation than stored → REPLACE (a restarted/downgraded
+    ///   binary re-advertises from scratch — I11's reset semantics),
+    /// * equal incarnation → monotonic merge (OR) — a node's capabilities
+    ///   are stable within one incarnation,
+    /// * lower incarnation → ignore (stale/replayed).
+    pub fn record_peer_regime_advert(
+        &self,
+        peer: NodeId,
+        incarnation: u64,
+        regime_support: bool,
+        ack_writeall_equiv: bool,
+    ) {
+        if peer == self.self_id {
+            return;
+        }
+        let mut map = self.peer_regime_adverts.write().unwrap();
+        match map.entry(peer) {
+            std::collections::hash_map::Entry::Vacant(v) => {
+                v.insert(PeerRegimeAdvert {
+                    incarnation,
+                    regime_support,
+                    ack_writeall_equiv,
+                });
+            }
+            std::collections::hash_map::Entry::Occupied(mut o) => {
+                let cur = o.get_mut();
+                match incarnation.cmp(&cur.incarnation) {
+                    std::cmp::Ordering::Greater => {
+                        *cur = PeerRegimeAdvert {
+                            incarnation,
+                            regime_support,
+                            ack_writeall_equiv,
+                        };
+                    }
+                    std::cmp::Ordering::Equal => {
+                        cur.regime_support |= regime_support;
+                        cur.ack_writeall_equiv |= ack_writeall_equiv;
+                    }
+                    std::cmp::Ordering::Less => {}
+                }
+            }
+        }
+    }
+
+    /// The stored advert for `peer` (tests / diagnostics).
+    pub fn peer_regime_advert(&self, peer: NodeId) -> Option<PeerRegimeAdvert> {
+        self.peer_regime_adverts.read().unwrap().get(&peer).copied()
+    }
+
+    /// I11/§4.1 enable sequencing — whether EVERY committed member's
+    /// current-incarnation advert shows regime support (self counts as
+    /// supporting iff its secret is configured). Returns the first
+    /// non-supporting member on failure.
+    fn regime_support_unanimous(&self) -> Result<(), NodeId> {
+        let members = self.committed_members.read().unwrap().clone();
+        let adverts = self.peer_regime_adverts.read().unwrap();
+        for m in &members {
+            let supported = if *m == self.self_id {
+                self.secret_configured.load(Ordering::Relaxed)
+            } else {
+                adverts.get(m).map(|a| a.regime_support).unwrap_or(false)
+            };
+            if !supported {
+                return Err(*m);
+            }
+        }
+        Ok(())
+    }
+
+    /// I4 — whether EVERY committed member's current-incarnation advert
+    /// shows WriteAll-equivalence + non-best-effort. Returns the first
+    /// non-qualifying member on failure.
+    fn writeall_equiv_unanimous(&self) -> Result<(), NodeId> {
+        let members = self.committed_members.read().unwrap().clone();
+        let adverts = self.peer_regime_adverts.read().unwrap();
+        for m in &members {
+            let equiv = if *m == self.self_id {
+                self.self_ack_writeall_equiv.load(Ordering::Relaxed)
+            } else {
+                adverts
+                    .get(m)
+                    .map(|a| a.ack_writeall_equiv)
+                    .unwrap_or(false)
+            };
+            if !equiv {
+                return Err(*m);
+            }
+        }
+        Ok(())
+    }
+
+    /// P1 stage 1 — derive the regime block a new term targeting
+    /// `(members, placement_version)` must carry, from the INSTALLED
+    /// committed state (§4.0):
+    ///
+    /// * the override map is recomputed whole (full + cumulative): an
+    ///   installed override survives only while its target is still a
+    ///   member AND still deviates from placement — a retired entry is a
+    ///   master change and bumps that shard's regime below;
+    /// * `regime[s] = new_term` for every shard whose committed-derivation
+    ///   master CHANGES under the new term (placement-driven re-mastering
+    ///   included — §4.1's definition makes no mechanism distinction),
+    ///   otherwise the installed regime is carried unchanged (absolute
+    ///   array, §5.4);
+    /// * the committed flags are carried unchanged (I6: membership terms
+    ///   never bundle flag changes).
+    ///
+    /// At bootstrap (no committed members) the installed (default) block
+    /// is returned unchanged: the first commit installs all-zero regimes
+    /// (gate-inactive semantics, §4.1).
+    /// Crate-visible wrapper around the private derivation for the
+    /// coordinator's graceful-drain commit producer (which fabricates a
+    /// commit outside the propose/vote machinery and must still carry an
+    /// honestly derived regime block).
+    pub(crate) fn derive_regime_block_for(
+        &self,
+        members: &[NodeId],
+        placement_version: u16,
+        new_term: u64,
+    ) -> RegimeBlock {
+        self.derive_regime_block(members, placement_version, new_term)
+    }
+
+    fn derive_regime_block(
+        &self,
+        members: &[NodeId],
+        placement_version: u16,
+        new_term: u64,
+    ) -> RegimeBlock {
+        let installed = self.committed_regime_block.read().unwrap().clone();
+        let installed_members = self.committed_members.read().unwrap().clone();
+        if installed_members.is_empty() || members.is_empty() {
+            return installed;
+        }
+        let rf = self.replication_factor.load(Ordering::Relaxed) as u8;
+        let new_table = crate::cluster::shards::ShardTable::compute_with_epoch(
+            members,
+            rf,
+            1,
+            placement_version.max(1),
+        );
+        let old_table = crate::cluster::shards::ShardTable::compute_with_epoch(
+            &installed_members,
+            rf,
+            1,
+            self.committed_placement_version().max(1),
+        );
+        let mut override_map = std::collections::BTreeMap::new();
+        for (&shard, &target) in &installed.override_map {
+            if members.contains(&target) && new_table.assignment(shard).master != target {
+                override_map.insert(shard, target);
+            }
+            // else: retired — target left the membership, or placement now
+            // names the target anyway (the deviation dissolved). Either way
+            // the shard's master derivation may change; the regime loop
+            // below bumps it iff it actually does.
+        }
+        let mut regime = installed.regime.clone();
+        for shard in 0..crate::cluster::shards::NUM_SHARDS as u16 {
+            let new_master = override_map
+                .get(&shard)
+                .copied()
+                .unwrap_or_else(|| new_table.assignment(shard).master);
+            let old_master = installed
+                .override_map
+                .get(&shard)
+                .copied()
+                .unwrap_or_else(|| old_table.assignment(shard).master);
+            if new_master != old_master {
+                regime.set(shard, new_term);
+            }
+        }
+        RegimeBlock {
+            override_map,
+            regime,
+            regime_enforced: installed.regime_enforced,
+            promotion_enabled: installed.promotion_enabled,
+        }
     }
 
     /// E-01 — votes needed to activate a proposal with `proposal_len`
@@ -1243,6 +2321,12 @@ impl TopologyAuthority {
             state.committed_placement_version.max(1) as u64,
             Ordering::Relaxed,
         );
+        // P1 stage 1 — restore the committed regime state (override map,
+        // absolute regime array, committed flags). A legacy state file
+        // decodes the bootstrap default here; the `.regime-armed` marker
+        // boot check (coordinator) is what refuses to start when that
+        // default contradicts a previously-armed enforcement state.
+        *self.committed_regime_block.write().unwrap() = state.regime_block.clone();
     }
 
     /// Current committed term.
@@ -1362,6 +2446,7 @@ impl TopologyAuthority {
             committed_voter_ever_seen: self.committed_voter_ever_seen_snapshot(),
             committed_placement_version: self.committed_placement_version(),
             committed_peak: self.committed_peak(),
+            regime_block: self.committed_regime_block(),
         }
     }
 
@@ -1469,13 +2554,19 @@ impl TopologyAuthority {
         // newly-raised peak (`members.len()`), not the pre-grow one.
         self.observe_peak_cluster_size(members.len() as u64);
         let committed_peak = self.peak_cluster_size();
-        let term = TopologyTerm::new(
+        // P1 stage 1 — derive the regime block: overrides recomputed whole
+        // (cumulative map), regimes bumped to this term for every shard
+        // whose committed-derivation master changes under the new
+        // membership (placement-driven changes included), flags carried.
+        let regime_block = self.derive_regime_block(members, placement_version, new_term);
+        let term = TopologyTerm::new_with_block(
             new_term,
             members.to_vec(),
             self.self_id,
             self.cluster_id(),
             placement_version,
             committed_peak,
+            regime_block,
         );
         let quorum_needed = self.activation_quorum_needed(members.len());
         let mut votes = std::collections::HashMap::new();
@@ -1505,6 +2596,8 @@ impl TopologyAuthority {
                 &propose.members,
                 propose.placement_version,
                 propose.committed_peak,
+                propose.proposer,
+                &propose.regime_block,
             );
 
         // W6 (INVARIANT ii) — REFUSE, do not fall back. A voter that cannot
@@ -1547,6 +2640,9 @@ impl TopologyAuthority {
                 accepted: false,
                 voter_current_term: committed,
                 voter_placement_support: crate::cluster::shards::MAX_SUPPORTED_PLACEMENT_VERSION,
+                voter_incarnation: self.self_incarnation.load(Ordering::Relaxed),
+                regime_support: self.secret_configured.load(Ordering::Relaxed),
+                ack_writeall_equiv: self.self_ack_writeall_equiv.load(Ordering::Relaxed),
             };
         }
 
@@ -1586,7 +2682,19 @@ impl TopologyAuthority {
                 let committed_members = self.committed_members.read().unwrap();
                 let our_cluster_is_single_node = committed > 0 && committed_members.len() <= 1;
                 let proposal_subsumes_us = propose.members.contains(&self.self_id);
-                if our_cluster_is_single_node && proposal_subsumes_us && propose.term > voted {
+                // P1 stage 1 (§4.4 formation-recovery exception) — this
+                // relaxed arm MUST NOT apply to an override-carrying
+                // proposal: a double-vote at one term could otherwise
+                // produce two same-term commits with different masters.
+                // Override-carrying proposals require the strict
+                // `term > committed && term > voted` path above.
+                let carries_overrides = propose.regime_block.override_map
+                    != self.committed_regime_block.read().unwrap().override_map;
+                if our_cluster_is_single_node
+                    && proposal_subsumes_us
+                    && propose.term > voted
+                    && !carries_overrides
+                {
                     accepted = true;
                 }
             }
@@ -1607,6 +2715,12 @@ impl TopologyAuthority {
             // W6 — advertise this node's max placement support so the
             // proposer can learn when a v2 upgrade becomes unanimous.
             voter_placement_support: crate::cluster::shards::MAX_SUPPORTED_PLACEMENT_VERSION,
+            // P1 stage 1 — the (NodeId, incarnation)-keyed regime advert
+            // (I11: never advertised without a secret; I4: computed from
+            // the REAL resolved ack policy).
+            voter_incarnation: self.self_incarnation.load(Ordering::Relaxed),
+            regime_support: self.secret_configured.load(Ordering::Relaxed),
+            ack_writeall_equiv: self.self_ack_writeall_equiv.load(Ordering::Relaxed),
         }
     }
 
@@ -1619,6 +2733,15 @@ impl TopologyAuthority {
         // property, and recording it from every vote lets the upgrade path
         // converge even when an earlier proposal was superseded.
         self.record_peer_placement_support(vote.voter, vote.voter_placement_support);
+        // P1 stage 1 — record the (NodeId, incarnation)-keyed regime/ack
+        // advert from every vote (like placement support: recorded even
+        // when the vote does not match the pending proposal).
+        self.record_peer_regime_advert(
+            vote.voter,
+            vote.voter_incarnation,
+            vote.regime_support,
+            vote.ack_writeall_equiv,
+        );
 
         let mut pending = self.pending_proposal.lock();
         let proposal = pending.as_mut()?;
@@ -1647,6 +2770,7 @@ impl TopologyAuthority {
                 committed_peak: proposal.term.committed_peak,
                 digest: proposal.term.digest,
                 voters,
+                regime_block: proposal.term.regime_block.clone(),
             };
             // Clear pending proposal
             *pending = None;
@@ -1709,6 +2833,8 @@ impl TopologyAuthority {
             &commit.members,
             commit.placement_version,
             commit.committed_peak,
+            commit.proposer,
+            &commit.regime_block,
         );
         if commit.digest != expected_digest {
             return false;
@@ -1836,6 +2962,250 @@ impl TopologyAuthority {
             return false;
         }
 
+        // P1 stage 1 — I7/I10/I6 structural regime validation (sibling gate
+        // on the same path; every clause pure over commit + installed
+        // committed state, I0-clean).
+        if !self.commit_passes_regime_gates(commit) {
+            return false;
+        }
+
+        true
+    }
+
+    /// P1 stage 1 — the I7/I10/I6 structural regime gate.
+    ///
+    /// Clause scoping (per the spec's own definitions):
+    ///
+    /// * **I7 (`regime[s] ≤ commit.term`)** runs on EVERY commit — it is
+    ///   pure over the commit alone (no installed state, so no applier can
+    ///   split on it) and defends against forged/corrupted regime state.
+    /// * **I10(a)/(b)/(d)/(e)/(f) and the I6 apply-half** run only on an
+    ///   **override-carrying** commit, defined as one whose override map
+    ///   differs from the INSTALLED map (I10's preamble scope: "re-validates
+    ///   an override-carrying commit"). This scoping is load-bearing twice
+    ///   over: (1) the map is full + cumulative, so a STANDING override
+    ///   rides every later commit with its original regime — clause (b)
+    ///   applied to unchanged entries would reject every such commit;
+    ///   (2) a regime REBASE (I7) and the "forged bump self-heals on the
+    ///   next legitimate higher-term commit" property both require a
+    ///   non-override-carrying commit to install its absolute regime array
+    ///   wholesale — a universally-scoped never-lower ratchet would make
+    ///   both impossible.
+    /// * Within an override-carrying commit, clauses (a)/(b) examine only
+    ///   the entries this commit ADDS or RETARGETS (an entry equal to the
+    ///   installed one is a standing override, validated by the term that
+    ///   introduced it).
+    fn commit_passes_regime_gates(&self, commit: &TopologyCommit) -> bool {
+        let block = &commit.regime_block;
+
+        // I7 / I10(c) — regime values are terms; none may exceed the
+        // carrying term. Pure over the commit; runs unconditionally.
+        if let Some((shard, regime)) = block.regime.iter_nonzero().find(|&(_, r)| r > commit.term) {
+            tracing::error!(
+                self_id = self.self_id.0,
+                term = commit.term,
+                shard,
+                regime,
+                "cluster: refusing topology commit — I7 violation (regime exceeds carrying term)",
+            );
+            return false;
+        }
+
+        let installed = self.committed_regime_block.read().unwrap().clone();
+
+        // I6 (shrink half, runs on EVERY commit) — a shrink term must not
+        // bundle a `regime_enforced` / `promotion_enabled` change either:
+        // Gate B can legitimately split appliers on a shrink term, and a
+        // split on the committed enforcement flags is a split on which
+        // nodes accept V2 batches (I12) — the same class of hazard I6
+        // exists to prevent for mastership.
+        let flags_change = block.regime_enforced != installed.regime_enforced
+            || block.promotion_enabled != installed.promotion_enabled;
+        if flags_change && commit.committed_peak < self.committed_peak() {
+            tracing::error!(
+                self_id = self.self_id.0,
+                term = commit.term,
+                "cluster: refusing commit — I6: shrink term bundles a \
+                 regime_enforced/promotion_enabled change",
+            );
+            return false;
+        }
+
+        let carries_overrides = block.override_map != installed.override_map;
+        if !carries_overrides {
+            return true;
+        }
+
+        // I10(f) — the (digest-covered) proposer of an override-carrying
+        // commit must be a member of the commit's own member set. This is
+        // the only I0-clean form (§4.4): "is the deterministic proposer"
+        // would be derivable too, but a `check_timeout` fallback proposer
+        // is a local-timer artifact, and a timer-split on a mastership
+        // commit is dual-serving. NOTE: G8's self-excluding shrink
+        // legitimately has `proposer ∉ members` — I6 keeps that disjoint
+        // (a shrink term never carries override changes), so this clause
+        // fires only where §4.4 scopes it: override-carrying terms.
+        if !commit.members.contains(&commit.proposer) {
+            tracing::error!(
+                self_id = self.self_id.0,
+                term = commit.term,
+                proposer = commit.proposer.0,
+                "cluster: refusing override-carrying commit — I10(f): proposer not in members",
+            );
+            return false;
+        }
+
+        // I6 apply-half (structural — the commit carries both sides):
+        // an override-carrying term must not also lower the committed
+        // floor (shrink), and must not change `promotion_enabled` /
+        // `regime_enforced` (bundling would make I4's check
+        // order-dependent within one commit — an I0 violation through the
+        // back door; and Gate B can legitimately split appliers on a
+        // shrink term, and only I6 guarantees such a split never splits
+        // mastership).
+        if commit.committed_peak < self.committed_peak() {
+            tracing::error!(
+                self_id = self.self_id.0,
+                term = commit.term,
+                "cluster: refusing commit — I6: override-carrying term bundles a shrink",
+            );
+            return false;
+        }
+        if flags_change {
+            tracing::error!(
+                self_id = self.self_id.0,
+                term = commit.term,
+                "cluster: refusing commit — I6: override-carrying term changes \
+                 regime_enforced/promotion_enabled",
+            );
+            return false;
+        }
+
+        // I10(d) — never-lower ratchet: an override-carrying commit may
+        // not lower ANY shard's regime below the installed value (removes
+        // the fence-disarm primitive, including from a stale-but-honest
+        // proposer).
+        for shard in 0..crate::cluster::shards::NUM_SHARDS as u16 {
+            if block.regime.get(shard) < installed.regime.get(shard) {
+                tracing::error!(
+                    self_id = self.self_id.0,
+                    term = commit.term,
+                    shard,
+                    commit_regime = block.regime.get(shard),
+                    local_regime = installed.regime.get(shard),
+                    "cluster: refusing override-carrying commit — I10(d): regime ratchet",
+                );
+                return false;
+            }
+        }
+
+        // The committed-derivation masters for (e) and (a). BOTH sides are
+        // computed from committed state only — the commit's own fields and
+        // this node's INSTALLED committed state — never
+        // `effective_assignment` or the live ShardTable (I0).
+        let rf = self.replication_factor.load(Ordering::Relaxed) as u8;
+        let installed_members = self.committed_members.read().unwrap().clone();
+        let installed_pv = self.committed_placement_version().max(1);
+        let installed_table = if installed_members.is_empty() {
+            None
+        } else {
+            Some(crate::cluster::shards::ShardTable::compute_with_epoch(
+                &installed_members,
+                rf,
+                1,
+                installed_pv,
+            ))
+        };
+        let commit_table = if commit.members.is_empty() {
+            None
+        } else {
+            Some(crate::cluster::shards::ShardTable::compute_with_epoch(
+                &commit.members,
+                rf,
+                1,
+                commit.placement_version.max(1),
+            ))
+        };
+        let local_master = |shard: u16| -> Option<NodeId> {
+            installed
+                .override_map
+                .get(&shard)
+                .copied()
+                .or_else(|| installed_table.as_ref().map(|t| t.assignment(shard).master))
+        };
+        let commit_master = |shard: u16| -> Option<NodeId> {
+            block
+                .override_map
+                .get(&shard)
+                .copied()
+                .or_else(|| commit_table.as_ref().map(|t| t.assignment(shard).master))
+        };
+
+        // I10(e) — bump-justification: a regime bump on a shard whose
+        // master under this commit EQUALS the locally installed committed
+        // master is unjustified (a legitimate bump always coincides with a
+        // master change; with absolute arrays every installer at the same
+        // installed state agrees).
+        for shard in 0..crate::cluster::shards::NUM_SHARDS as u16 {
+            if block.regime.get(shard) > installed.regime.get(shard)
+                && commit_master(shard).is_some()
+                && commit_master(shard) == local_master(shard)
+            {
+                tracing::error!(
+                    self_id = self.self_id.0,
+                    term = commit.term,
+                    shard,
+                    "cluster: refusing override-carrying commit — I10(e): regime bump \
+                     without a master change",
+                );
+                return false;
+            }
+        }
+
+        // I10(a)/(b) — the entries this commit ADDS or RETARGETS.
+        for (&shard, &target) in &block.override_map {
+            if installed.override_map.get(&shard) == Some(&target) {
+                continue; // standing override, validated by its own term
+            }
+            // (b) — a new/retargeted override stamps the carrying term.
+            if block.regime.get(shard) != commit.term {
+                tracing::error!(
+                    self_id = self.self_id.0,
+                    term = commit.term,
+                    shard,
+                    regime = block.regime.get(shard),
+                    "cluster: refusing override-carrying commit — I10(b): override regime \
+                     must equal the carrying term",
+                );
+                return false;
+            }
+            // (a) — I3 membership in the PRE-override holder set, computed
+            // from the committed derivation: committed_master(shard) plus
+            // the committed replicas from placement. NEVER I2's
+            // serving-side holder set (that contains effective_assignment
+            // runtime state — node-local, I0-unclean).
+            let holder_master = local_master(shard);
+            let in_holder_set = holder_master == Some(target)
+                || installed_table
+                    .as_ref()
+                    .map(|t| t.assignment(shard).replicas.contains(&target))
+                    .unwrap_or(false);
+            if !in_holder_set {
+                tracing::error!(
+                    self_id = self.self_id.0,
+                    term = commit.term,
+                    shard,
+                    target = target.0,
+                    "cluster: refusing override-carrying commit — I10(a): override target \
+                     outside the committed-derivation holder set",
+                );
+                return false;
+            }
+        }
+
+        // NO numeric override cap (§5.5): a single master death
+        // legitimately overrides up to ~NUM_SHARDS/N shards; clauses
+        // (a)-(e) bound forgery damage more tightly than any count.
         true
     }
 
@@ -1895,6 +3265,19 @@ impl TopologyAuthority {
             drop(old_members);
             *self.last_shrink.lock() = Some((commit.term, removed));
         }
+
+        // P1 stage 1 (I1 install ordering) — install the committed regime
+        // state FIRST among the mutations: inside `apply_commit_locked`,
+        // under the `commit_apply` mutex, strictly BEFORE the
+        // `committed_term` store below (and therefore before any shard
+        // table for this term can activate). The permitted skew is
+        // gate-closed-but-not-yet-serving (fail-closed); the reverse skew
+        // (serving the new term with the old regime state) would be a
+        // double-spend window and is structurally impossible under this
+        // ordering. The absolute array/map are adopted WHOLESALE — a pure
+        // function of the installed commit (§5.4), already validated by
+        // `commit_passes_regime_gates`.
+        *self.committed_regime_block.write().unwrap() = commit.regime_block.clone();
 
         // G8 stage 1 — adopt the committed_peak carried by this commit. Gate
         // B (upstream, in `commit_passes_gates`) is what makes this
@@ -1990,6 +3373,11 @@ impl TopologyAuthority {
             // path allowed to lower once stage 2's Gate B exists; stage 1
             // has no lowering producer so this is always non-lowering).
             committed_peak: commit.committed_peak,
+            // P1 stage 1 — the regime state this node WOULD hold after
+            // applying `commit` is the commit's own block verbatim (the
+            // absolute representation: a pure function of the installed
+            // commit, §5.4).
+            regime_block: commit.regime_block.clone(),
         }
     }
 
@@ -2136,13 +3524,16 @@ impl TopologyAuthority {
         // G8 stage 1: raise the peak BEFORE stamping committed_peak below.
         self.observe_peak_cluster_size(target_members.len() as u64);
         let committed_peak = self.peak_cluster_size();
-        let term = TopologyTerm::new(
+        // P1 stage 1 — derive the regime block (see on_membership_changed).
+        let regime_block = self.derive_regime_block(&target_members, placement_version, new_term);
+        let term = TopologyTerm::new_with_block(
             new_term,
             target_members.clone(),
             self.self_id,
             self.cluster_id(),
             placement_version,
             committed_peak,
+            regime_block,
         );
         self.voted_term.store(new_term, Ordering::Relaxed);
 
@@ -2216,13 +3607,20 @@ impl TopologyAuthority {
         // no-op in practice — kept for symmetry with the other producers.)
         self.observe_peak_cluster_size(committed_members.len() as u64);
         let committed_peak = self.peak_cluster_size();
-        let term = TopologyTerm::new(
+        // P1 stage 1 — a placement-version upgrade re-masters shards
+        // wholesale (v1 -> v2 reshuffle); the derived block bumps the
+        // regime of every re-placed shard to this term (§4.1: regime[s] =
+        // the committed term in which s's master last changed, with no
+        // mechanism distinction).
+        let regime_block = self.derive_regime_block(&committed_members, achievable, new_term);
+        let term = TopologyTerm::new_with_block(
             new_term,
             committed_members.clone(),
             self.self_id,
             self.cluster_id(),
             achievable,
             committed_peak,
+            regime_block,
         );
         self.voted_term.store(new_term, Ordering::Relaxed);
 
@@ -2340,17 +3738,39 @@ impl TopologyAuthority {
 
         let placement_version = self.achievable_placement_version(&surviving);
 
+        // P1 stage 1 (I6) — a shrink term MUST NOT carry overrides: if the
+        // derived cumulative map differs from the installed one (an
+        // override's target is being removed, or a deviation dissolves
+        // under the shrunken placement), refuse the shrink outright. The
+        // operator retires the override first (a regime rebase or an
+        // explicit non-shrink term), then shrinks. Bundling them would let
+        // a Gate-B applier split double as a mastership split (I6's
+        // second load-bearing role for I0).
+        let regime_block = self.derive_regime_block(&surviving, placement_version, new_term);
+        {
+            let installed = self.committed_regime_block.read().unwrap();
+            if regime_block.override_map != installed.override_map {
+                tracing::error!(
+                    self_id = self.self_id.0,
+                    "cluster: refusing shrink proposal — I6: the shrink would change the \
+                     committed override map (retire the affected overrides first, then shrink)",
+                );
+                return None;
+            }
+        }
+
         // THE lowering stamp — `surviving.len()`, NOT `self.peak_cluster_size()`.
         // This is the one and only place in the authority that stamps a
         // `committed_peak` below the current effective peak.
         let committed_peak = surviving.len() as u64;
-        let term = TopologyTerm::new(
+        let term = TopologyTerm::new_with_block(
             new_term,
             surviving.clone(),
             self.self_id,
             self.cluster_id(),
             placement_version,
             committed_peak,
+            regime_block,
         );
         self.voted_term.store(new_term, Ordering::Relaxed);
 
@@ -2385,6 +3805,180 @@ impl TopologyAuthority {
         );
 
         Some(term)
+    }
+
+    // -----------------------------------------------------------------------
+    // P1 stage 1 — committed-flag proposers and the I7 regime rebase
+    // -----------------------------------------------------------------------
+
+    /// Shared preconditions + term assembly for the same-membership P1
+    /// producers (`propose_regime_enforced`, `propose_promotion_enabled`,
+    /// `propose_regime_rebase`): a committed topology must exist, this
+    /// node must be its deterministic proposer (lowest committed NodeId),
+    /// and no proposal may be pending. The produced term keeps members,
+    /// placement version, and `committed_peak` unchanged (I6: these terms
+    /// bundle nothing else) and carries `block`.
+    fn propose_same_members_term(
+        &self,
+        block: RegimeBlock,
+    ) -> Result<TopologyTerm, RegimeProposeError> {
+        let committed_members = self.committed_members.read().unwrap().clone();
+        if committed_members.is_empty() {
+            return Err(RegimeProposeError::NoCommittedTopology);
+        }
+        let proposer = committed_members
+            .iter()
+            .copied()
+            .min()
+            .ok_or(RegimeProposeError::NoCommittedTopology)?;
+        if proposer != self.self_id {
+            return Err(RegimeProposeError::NotProposer {
+                proposer: proposer.0,
+            });
+        }
+        if self.pending_proposal.lock().is_some() {
+            return Err(RegimeProposeError::ProposalPending);
+        }
+
+        let committed = self.committed_term.load(Ordering::Relaxed);
+        let voted = self.voted_term.load(Ordering::Relaxed);
+        let new_term = committed.max(voted) + 1;
+
+        // No peak change (I6): stamp the current effective peak, exactly
+        // like `upgrade_proposal` (non-lowering producer).
+        self.observe_peak_cluster_size(committed_members.len() as u64);
+        let committed_peak = self.peak_cluster_size();
+        let placement_version = self.committed_placement_version().max(1);
+
+        let term = TopologyTerm::new_with_block(
+            new_term,
+            committed_members.clone(),
+            self.self_id,
+            self.cluster_id(),
+            placement_version,
+            committed_peak,
+            block,
+        );
+        self.voted_term.store(new_term, Ordering::Relaxed);
+
+        let quorum_needed = self.activation_quorum_needed(committed_members.len());
+        let mut votes = std::collections::HashMap::new();
+        votes.insert(self.self_id, true);
+        *self.pending_proposal.lock() = Some(PendingProposal {
+            term: term.clone(),
+            votes,
+            quorum_needed,
+            _started_at: Instant::now(),
+        });
+        Ok(term)
+    }
+
+    /// I11/I4 — propose committing `regime_enforced = enable`.
+    ///
+    /// Enabling is gated on (a) a configured `cluster_secret` (I11 — a
+    /// secret-less node never proposes enforcement) and (b) EVERY
+    /// committed member's `(NodeId, incarnation)` advert showing regime
+    /// support (§4.1 enable sequencing: advertise → verify → commit).
+    /// The produced term changes NOTHING else (I6): same members, same
+    /// placement version, same peak, same override map, same regimes,
+    /// same `promotion_enabled`.
+    ///
+    /// Disabling carries no advert gate here — §4.1's disarm quiescence
+    /// (every committed member alive + operator confirmation) is an
+    /// operational precondition enforced by the operator surface, not a
+    /// structural one; the marker deletion ordering on the apply path is
+    /// handled by the coordinator's persist site.
+    pub fn propose_regime_enforced(
+        &self,
+        enable: bool,
+    ) -> Result<TopologyTerm, RegimeProposeError> {
+        if enable {
+            if !self.secret_configured.load(Ordering::Relaxed) {
+                return Err(RegimeProposeError::SecretRequired);
+            }
+            if let Err(member) = self.regime_support_unanimous() {
+                return Err(RegimeProposeError::MemberLacksRegimeSupport { member: member.0 });
+            }
+        }
+        let mut block = self.committed_regime_block();
+        if block.regime_enforced == enable {
+            return Err(RegimeProposeError::NoChange);
+        }
+        block.regime_enforced = enable;
+        self.propose_same_members_term(block)
+    }
+
+    /// I4 — propose committing `promotion_enabled = enable`.
+    ///
+    /// Enabling requires (a) this node's `enable_automatic_promotion`
+    /// config opt-in (proposal capability only — never an apply gate) and
+    /// (b) EVERY committed member's advert showing WriteAll-equivalence
+    /// with a non-best-effort degraded mode (cluster-wide evidence, not
+    /// one node's config — a heterogeneous cluster with one
+    /// `auto`-at-RF>=3 member would break §4.6 on that member's shards).
+    pub fn propose_promotion_enabled(
+        &self,
+        enable: bool,
+    ) -> Result<TopologyTerm, RegimeProposeError> {
+        if enable {
+            if !self.promotion_proposal_opt_in.load(Ordering::Relaxed) {
+                return Err(RegimeProposeError::PromotionProposalNotEnabled);
+            }
+            if let Err(member) = self.writeall_equiv_unanimous() {
+                return Err(RegimeProposeError::MemberLacksWriteAllEquivalence {
+                    member: member.0,
+                });
+            }
+        }
+        let mut block = self.committed_regime_block();
+        if block.promotion_enabled == enable {
+            return Err(RegimeProposeError::NoChange);
+        }
+        block.promotion_enabled = enable;
+        self.propose_same_members_term(block)
+    }
+
+    /// I7 — propose a quorum-committed REGIME REBASE (operator repair).
+    ///
+    /// The rebase term carries neither overrides (map unchanged — changing
+    /// mastership is exactly what a rebase must not do), nor a peak
+    /// change, nor an enforcement-flag change (I6). It sets the regime
+    /// array to the minimum the installed override map justifies:
+    ///
+    /// * a shard WITH a standing override keeps its installed regime
+    ///   (clamped to the new term per I7's definitional bound);
+    /// * every other shard's regime is CLEARED to zero.
+    ///
+    /// Honest scope (I7): under the absolute representation a forged bump
+    /// self-heals on the next legitimate higher-term commit anyway; the
+    /// rebase exists for operator repair of inconsistent or
+    /// operator-unwanted regime state (it deliberately also clears
+    /// legitimate placement-driven regimes — it is a repair verb, quorum-
+    /// committed and admin-gated, not an automatic path). Forged near-max
+    /// TERMS remain the pre-existing fail-open residual, out of scope.
+    ///
+    /// Authorization (admin_token + cluster_secret) is enforced by the
+    /// `/admin/regime_rebase` HTTP surface; quorum (Gate A/B untouched)
+    /// by the normal term/vote/commit machinery this proposal rides.
+    pub fn propose_regime_rebase(&self) -> Result<TopologyTerm, RegimeProposeError> {
+        let installed = self.committed_regime_block();
+        let committed = self.committed_term.load(Ordering::Relaxed);
+        let voted = self.voted_term.load(Ordering::Relaxed);
+        let new_term = committed.max(voted) + 1;
+        let mut regime = RegimeArray::default();
+        for &shard in installed.override_map.keys() {
+            let kept = installed.regime.get(shard).min(new_term);
+            if kept != 0 {
+                regime.set(shard, kept);
+            }
+        }
+        let block = RegimeBlock {
+            override_map: installed.override_map.clone(),
+            regime,
+            regime_enforced: installed.regime_enforced,
+            promotion_enabled: installed.promotion_enabled,
+        };
+        self.propose_same_members_term(block)
     }
 
     /// Check if the proposal timeout has fired for fallback proposer.
@@ -2465,13 +4059,16 @@ impl TopologyAuthority {
         // G8 stage 1: raise the peak BEFORE stamping committed_peak below.
         self.observe_peak_cluster_size(target_members.len() as u64);
         let committed_peak = self.peak_cluster_size();
-        let term = TopologyTerm::new(
+        // P1 stage 1 — derive the regime block (see on_membership_changed).
+        let regime_block = self.derive_regime_block(&target_members, placement_version, new_term);
+        let term = TopologyTerm::new_with_block(
             new_term,
             target_members.clone(),
             self.self_id,
             self.cluster_id(),
             placement_version,
             committed_peak,
+            regime_block,
         );
         self.voted_term.store(new_term, Ordering::Relaxed);
 
@@ -2726,6 +4323,9 @@ mod tests {
             accepted: true,
             voter_current_term: 0,
             voter_placement_support: 1,
+            voter_incarnation: 0,
+            regime_support: false,
+            ack_writeall_equiv: false,
         };
         let commit = auth.handle_vote(&vote);
         assert!(commit.is_some());
@@ -2750,11 +4350,16 @@ mod tests {
                 &members(&[1, 2, 3, 4, 5]),
                 1,
                 (members(&[1, 2, 3, 4, 5])).len() as u64,
+                NodeId(1),
+                &Default::default(),
             ),
             voter: NodeId(2),
             accepted: true,
             voter_current_term: 0,
             voter_placement_support: 1,
+            voter_incarnation: 0,
+            regime_support: false,
+            ack_writeall_equiv: false,
         };
         let commit = auth.handle_vote(&vote1);
         assert!(commit.is_none()); // Only 2 votes, need 3
@@ -2767,11 +4372,16 @@ mod tests {
                 &members(&[1, 2, 3, 4, 5]),
                 1,
                 (members(&[1, 2, 3, 4, 5])).len() as u64,
+                NodeId(1),
+                &Default::default(),
             ),
             voter: NodeId(3),
             accepted: true,
             voter_current_term: 0,
             voter_placement_support: 1,
+            voter_incarnation: 0,
+            regime_support: false,
+            ack_writeall_equiv: false,
         };
         let commit = auth.handle_vote(&vote2);
         assert!(commit.is_some()); // Now 3 votes
@@ -2794,8 +4404,11 @@ mod tests {
                 &mems,
                 1,
                 (mems).len() as u64,
+                NodeId(1),
+                &Default::default(),
             ),
             voters: mems.clone(),
+            regime_block: Default::default(),
         };
         let result = auth.handle_commit(&commit);
         assert_eq!(result, Some(5));
@@ -2837,8 +4450,11 @@ mod tests {
                 &mems,
                 1,
                 (mems).len() as u64,
+                NodeId(1),
+                &Default::default(),
             ),
             voters: mems.clone(),
+            regime_block: Default::default(),
         };
         assert_eq!(auth.handle_commit(&commit), Some(7));
         assert!(
@@ -2871,8 +4487,11 @@ mod tests {
                 &mems,
                 1,
                 (mems).len() as u64,
+                NodeId(1),
+                &Default::default(),
             ),
             voters: mems.clone(),
+            regime_block: Default::default(),
         };
         assert!(auth.handle_commit(&commit).is_none());
     }
@@ -2897,8 +4516,11 @@ mod tests {
                 &mems,
                 1,
                 (mems).len() as u64,
+                NodeId(1),
+                &Default::default(),
             ),
             voters: mems.clone(),
+            regime_block: Default::default(),
         };
 
         // First commit succeeds
@@ -2929,6 +4551,7 @@ mod tests {
             committed_peak: (mems.clone()).len() as u64,
             digest: [0xFF; 32], // corrupt
             voters: mems.clone(),
+            regime_block: Default::default(),
         };
         assert!(auth.handle_commit(&commit).is_none());
     }
@@ -2945,6 +4568,7 @@ mod tests {
             committed_voter_ever_seen: members(&[1, 2, 3, 7]),
             committed_placement_version: 1,
             committed_peak: 5,
+            regime_block: Default::default(),
         };
         let data = state.serialize();
         let restored = PersistedTopologyState::deserialize(&data);
@@ -2996,6 +4620,9 @@ mod tests {
             accepted: true,
             voter_current_term: 41,
             voter_placement_support: 1,
+            voter_incarnation: 0,
+            regime_support: false,
+            ack_writeall_equiv: false,
         };
         let vdata = vote.serialize();
         let rv = TopologyVote::deserialize(&vdata).unwrap();
@@ -3013,6 +4640,7 @@ mod tests {
             committed_peak: (term.members.clone()).len() as u64,
             digest: term.digest,
             voters: members(&[1, 2]),
+            regime_block: Default::default(),
         };
         let cdata = commit.serialize();
         let rc = TopologyCommit::deserialize(&cdata).unwrap();
@@ -3034,6 +4662,9 @@ mod tests {
             accepted: true,
             voter_current_term: 0,
             voter_placement_support: 1,
+            voter_incarnation: 0,
+            regime_support: false,
+            ack_writeall_equiv: false,
         };
         let commit = auth.handle_vote(&vote).expect("2/3 reaches quorum");
 
@@ -3092,6 +4723,7 @@ mod tests {
             committed_peak: (members(&[1, 2, 3])).len() as u64,
             digest: t1.digest,
             voters: members(&[1, 2, 3]),
+            regime_block: Default::default(),
         });
 
         // New membership change → term 2
@@ -3123,8 +4755,11 @@ mod tests {
                 &remote_members,
                 1,
                 (remote_members).len() as u64,
+                NodeId(1),
+                &Default::default(),
             ),
             voters: remote_members.clone(),
+            regime_block: Default::default(),
         };
         let result = auth.handle_commit(&commit);
         assert_eq!(result, Some(5));
@@ -3152,8 +4787,11 @@ mod tests {
                 &remote_members,
                 1,
                 (remote_members).len() as u64,
+                NodeId(1),
+                &Default::default(),
             ),
             voters: remote_members.clone(),
+            regime_block: Default::default(),
         };
         let result = auth.handle_commit(&commit);
         assert!(result.is_none());
@@ -3173,6 +4811,7 @@ mod tests {
             committed_peak: (members(&[1, 2, 3])).len() as u64,
             digest: [0xFF; 32], // corrupt
             voters: members(&[1, 2, 3]),
+            regime_block: Default::default(),
         };
         assert!(auth.handle_commit(&commit).is_none());
         assert_eq!(auth.committed_term(), 0); // unchanged
@@ -3199,8 +4838,11 @@ mod tests {
                 &mems,
                 1,
                 (mems).len() as u64,
+                NodeId(1),
+                &Default::default(),
             ),
             voters: mems.clone(),
+            regime_block: Default::default(),
         };
         auth.handle_commit(&commit);
         assert_eq!(auth.committed_term(), 5);
@@ -3227,6 +4869,8 @@ mod tests {
             &original_members,
             1,
             (original_members).len() as u64,
+            NodeId(1),
+            &Default::default(),
         );
 
         // Synthetic commit with wrong members [1, 2, 3] (SWIM-alive view).
@@ -3237,6 +4881,8 @@ mod tests {
             &wrong_members,
             1,
             (wrong_members).len() as u64,
+            NodeId(1),
+            &Default::default(),
         );
 
         // The digests MUST differ.
@@ -3255,6 +4901,7 @@ mod tests {
             committed_peak: (wrong_members.clone()).len() as u64,
             digest: wrong_digest,
             voters: wrong_members,
+            regime_block: Default::default(),
         };
         // This succeeds because the digest matches (term, wrong_members).
         // But the point is: if you use the WRONG members to compute the
@@ -3279,6 +4926,7 @@ mod tests {
             committed_peak: (original_members.clone()).len() as u64,
             digest: original_digest,
             voters: original_members.clone(),
+            regime_block: Default::default(),
         };
         let result2 = auth2.handle_commit(&correct_commit);
         assert!(result2.is_some());
@@ -3314,6 +4962,9 @@ mod tests {
             accepted: true,
             voter_current_term: 0,
             voter_placement_support: 1,
+            voter_incarnation: 0,
+            regime_support: false,
+            ack_writeall_equiv: false,
         };
         let commit = auth.handle_vote(&stale_vote);
         assert!(
@@ -3341,8 +4992,11 @@ mod tests {
                 &members(&[1, 2, 3, 4]),
                 1,
                 (members(&[1, 2, 3, 4])).len() as u64,
+                NodeId(2),
+                &Default::default(),
             ),
             voters: members(&[1, 2, 3, 4]),
+            regime_block: Default::default(),
         };
         auth.handle_commit(&commit);
 
@@ -3354,6 +5008,9 @@ mod tests {
             accepted: true,
             voter_current_term: 0,
             voter_placement_support: 1,
+            voter_incarnation: 0,
+            regime_support: false,
+            ack_writeall_equiv: false,
         };
         let result = auth.handle_vote(&stale_vote);
         assert!(
@@ -3402,6 +5059,9 @@ mod tests {
             accepted: true,
             voter_current_term: 0,
             voter_placement_support: 1,
+            voter_incarnation: 0,
+            regime_support: false,
+            ack_writeall_equiv: false,
         };
         let commit = auth.handle_vote(&vote);
         assert!(commit.is_none(), "2/5 is not quorum");
@@ -3414,6 +5074,9 @@ mod tests {
             accepted: false,
             voter_current_term: 0,
             voter_placement_support: 1,
+            voter_incarnation: 0,
+            regime_support: false,
+            ack_writeall_equiv: false,
         };
         let commit = auth.handle_vote(&reject_vote);
         assert!(commit.is_none(), "reject doesn't count toward quorum");
@@ -3426,6 +5089,9 @@ mod tests {
             accepted: true,
             voter_current_term: 0,
             voter_placement_support: 1,
+            voter_incarnation: 0,
+            regime_support: false,
+            ack_writeall_equiv: false,
         };
         let commit = auth.handle_vote(&vote3);
         assert!(commit.is_some(), "3/5 is quorum → should commit");
@@ -3450,8 +5116,11 @@ mod tests {
                 &mems,
                 1,
                 (mems).len() as u64,
+                NodeId(1),
+                &Default::default(),
             ),
             voters: mems.clone(),
+            regime_block: Default::default(),
         };
         auth.handle_commit(&commit);
 
@@ -3484,8 +5153,11 @@ mod tests {
                 &original,
                 1,
                 (original).len() as u64,
+                NodeId(1),
+                &Default::default(),
             ),
             voters: original.clone(),
+            regime_block: Default::default(),
         });
         auth.handle_commit(&TopologyCommit {
             term: 5,
@@ -3500,8 +5172,11 @@ mod tests {
                 &drained,
                 1,
                 (drained).len() as u64,
+                NodeId(1),
+                &Default::default(),
             ),
             voters: drained.clone(),
+            regime_block: Default::default(),
         });
 
         std::thread::sleep(Duration::from_millis(15));
@@ -3541,8 +5216,11 @@ mod tests {
                 &members(&[1, 2, 3]),
                 1,
                 (members(&[1, 2, 3])).len() as u64,
+                NodeId(1),
+                &Default::default(),
             ),
             voters: members(&[1, 2, 3]),
+            regime_block: Default::default(),
         };
 
         // The commit applies (digest is internally consistent), but it
@@ -3565,8 +5243,11 @@ mod tests {
                 &original_members,
                 1,
                 (original_members).len() as u64,
+                NodeId(1),
+                &Default::default(),
             ),
             voters: original_members.clone(),
+            regime_block: Default::default(),
         };
         let result = auth.handle_commit(&good_commit);
         assert_eq!(result, Some(5));
@@ -3612,8 +5293,11 @@ mod tests {
                 &mems,
                 1,
                 (mems).len() as u64,
+                NodeId(1),
+                &Default::default(),
             ),
             voters: mems.clone(),
+            regime_block: Default::default(),
         };
         auth.handle_commit(&commit);
         assert_eq!(auth.committed_term(), 10);
@@ -3676,8 +5360,11 @@ mod tests {
                 &mems,
                 1,
                 (mems).len() as u64,
+                NodeId(1),
+                &Default::default(),
             ),
             voters: mems.clone(),
+            regime_block: Default::default(),
         });
         *auth.observed_membership.lock() = mems;
         assert!(
@@ -3727,8 +5414,11 @@ mod tests {
                 &old_mems,
                 1,
                 (old_mems).len() as u64,
+                NodeId(1),
+                &Default::default(),
             ),
             voters: old_mems.clone(),
+            regime_block: Default::default(),
         });
         // F-G8-001: pre-seed the ever-seen set with node 3 so the
         // membership-change-safety check accepts the [1,2,3] proposal.
@@ -3757,6 +5447,9 @@ mod tests {
             accepted: true,
             voter_current_term: 0,
             voter_placement_support: 1,
+            voter_incarnation: 0,
+            regime_support: false,
+            ack_writeall_equiv: false,
         };
         assert!(auth.handle_vote(&v1).is_none());
 
@@ -3768,6 +5461,9 @@ mod tests {
             accepted: true,
             voter_current_term: 0,
             voter_placement_support: 1,
+            voter_incarnation: 0,
+            regime_support: false,
+            ack_writeall_equiv: false,
         };
         assert!(auth.handle_vote(&v2).is_some());
     }
@@ -3812,6 +5508,7 @@ mod tests {
             committed_voter_ever_seen: Vec::new(),
             committed_placement_version: 1,
             committed_peak: 1,
+            regime_block: Default::default(),
         };
         let data = state.serialize();
         let restored = PersistedTopologyState::deserialize(&data);
@@ -3861,8 +5558,11 @@ mod tests {
                 &single,
                 1,
                 (single).len() as u64,
+                NodeId(2),
+                &Default::default(),
             ),
             voters: single.clone(),
+            regime_block: Default::default(),
         });
         // F-G8-001: the proposal introduces nodes 1 and 3 that were
         // never committed voters on this node, so the split-brain
@@ -3914,8 +5614,11 @@ mod tests {
                 &mems,
                 1,
                 (mems).len() as u64,
+                NodeId(1),
+                &Default::default(),
             ),
             voters: mems.clone(),
+            regime_block: Default::default(),
         };
         auth.handle_commit(&commit);
         assert_eq!(auth.committed_members(), mems);
@@ -4266,8 +5969,11 @@ mod tests {
                 &local_members,
                 1,
                 (local_members).len() as u64,
+                NodeId(1),
+                &Default::default(),
             ),
             voters: local_members.clone(),
+            regime_block: Default::default(),
         };
         assert_eq!(auth.handle_commit(&local_commit), Some(5));
 
@@ -4288,8 +5994,11 @@ mod tests {
                 &foreign_members,
                 1,
                 (foreign_members).len() as u64,
+                NodeId(4),
+                &Default::default(),
             ),
             voters: foreign_members.clone(),
+            regime_block: Default::default(),
         };
 
         assert!(
@@ -4325,8 +6034,11 @@ mod tests {
                 &local_members,
                 1,
                 (local_members).len() as u64,
+                NodeId(1),
+                &Default::default(),
             ),
             voters: local_members.clone(),
+            regime_block: Default::default(),
         };
         assert_eq!(auth.handle_commit(&local_commit), Some(5));
 
@@ -4347,8 +6059,11 @@ mod tests {
                 &merged_members,
                 1,
                 (merged_members).len() as u64,
+                NodeId(3),
+                &Default::default(),
             ),
             voters: merged_members.clone(),
+            regime_block: Default::default(),
         };
 
         assert!(
@@ -4381,8 +6096,11 @@ mod tests {
                 &local_members,
                 1,
                 (local_members).len() as u64,
+                NodeId(1),
+                &Default::default(),
             ),
             voters: local_members.clone(),
+            regime_block: Default::default(),
         };
         assert_eq!(auth.handle_commit(&local_commit), Some(5));
 
@@ -4401,8 +6119,11 @@ mod tests {
                 &grown_members,
                 1,
                 (grown_members).len() as u64,
+                NodeId(1),
+                &Default::default(),
             ),
             voters: grown_members.clone(),
+            regime_block: Default::default(),
         };
         assert_eq!(
             auth.handle_commit(&grown_commit),
@@ -4435,8 +6156,11 @@ mod tests {
                 &local_members,
                 1,
                 (local_members).len() as u64,
+                NodeId(1),
+                &Default::default(),
             ),
             voters: local_members.clone(),
+            regime_block: Default::default(),
         };
         assert_eq!(auth.handle_commit(&local_commit), Some(5));
 
@@ -4456,8 +6180,11 @@ mod tests {
                 &foreign_members,
                 1,
                 (foreign_members).len() as u64,
+                NodeId(7),
+                &Default::default(),
             ),
             voters: foreign_members.clone(),
+            regime_block: Default::default(),
         };
         assert!(
             auth.handle_commit(&foreign_commit).is_none(),
@@ -4562,6 +6289,7 @@ mod tests {
             committed_peak: (term.members.clone()).len() as u64,
             digest: term.digest,
             voters: term.members.clone(),
+            regime_block: Default::default(),
         };
         assert!(auth.handle_commit(&commit).is_some());
         assert_eq!(auth.committed_members(), members(&[1, 2, 3]));
@@ -4641,8 +6369,24 @@ mod tests {
         // produce different digests, so a v1 node and a v2 node can never
         // agree they committed "the same term".
         let mems = members(&[1, 2, 3]);
-        let d1 = TopologyTerm::compute_digest(7, &ClusterId::UNSET, &mems, 1, (mems).len() as u64);
-        let d2 = TopologyTerm::compute_digest(7, &ClusterId::UNSET, &mems, 2, (mems).len() as u64);
+        let d1 = TopologyTerm::compute_digest(
+            7,
+            &ClusterId::UNSET,
+            &mems,
+            1,
+            (mems).len() as u64,
+            NodeId(1),
+            &Default::default(),
+        );
+        let d2 = TopologyTerm::compute_digest(
+            7,
+            &ClusterId::UNSET,
+            &mems,
+            2,
+            (mems).len() as u64,
+            NodeId(1),
+            &Default::default(),
+        );
         assert_ne!(d1, d2, "placement_version must be mixed into the digest");
     }
 
@@ -4676,8 +6420,11 @@ mod tests {
                 &members(&[1, 2, 3]),
                 2,
                 (members(&[1, 2, 3])).len() as u64,
+                NodeId(1),
+                &Default::default(),
             ),
             voters: members(&[1, 2, 3]),
+            regime_block: Default::default(),
         };
         let decoded = TopologyCommit::deserialize(&commit.serialize()).expect("decode");
         assert_eq!(decoded.placement_version, 2);
@@ -4694,6 +6441,9 @@ mod tests {
             accepted: true,
             voter_current_term: 2,
             voter_placement_support: 2,
+            voter_incarnation: 0,
+            regime_support: false,
+            ack_writeall_equiv: false,
         };
         let decoded = TopologyVote::deserialize(&v.serialize()).expect("decode");
         assert_eq!(decoded.voter_placement_support, 2);
@@ -4712,6 +6462,7 @@ mod tests {
             committed_voter_ever_seen: members(&[1, 2, 3]),
             committed_placement_version: 2,
             committed_peak: 3,
+            regime_block: Default::default(),
         };
         let decoded = PersistedTopologyState::deserialize(&state.serialize());
         assert_eq!(decoded.committed_placement_version, 2);
@@ -4720,8 +6471,11 @@ mod tests {
 
     #[test]
     fn pre_w6_term_payload_decodes_as_placement_version_one() {
-        // A term payload truncated before the placement trailer (the pre-W6
-        // wire shape) must decode as v1, not garbage.
+        // A pre-W6 legacy payload (header + members + digest, NO trailer,
+        // NO P1 envelope) must decode as v1, not garbage. Built by hand:
+        // `serialize()` now emits the P1 envelope, so truncation can no
+        // longer produce the legacy shape (a truncated envelope is a hard
+        // reject by design).
         let t = TopologyTerm::new(
             2,
             members(&[1, 2]),
@@ -4730,10 +6484,22 @@ mod tests {
             1,
             (members(&[1, 2])).len() as u64,
         );
-        let mut bytes = t.serialize();
-        bytes.truncate(bytes.len() - 2); // drop the 2-byte placement trailer
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&t.term.to_le_bytes());
+        bytes.extend_from_slice(&t.proposer.0.to_le_bytes());
+        bytes.extend_from_slice(&t.cluster_id.0);
+        bytes.extend_from_slice(&(t.members.len() as u32).to_le_bytes());
+        for m in &t.members {
+            bytes.extend_from_slice(&m.0.to_le_bytes());
+        }
+        bytes.extend_from_slice(&t.digest);
         let decoded = TopologyTerm::deserialize(&bytes).expect("decode");
         assert_eq!(decoded.placement_version, 1);
+        assert_eq!(
+            decoded.regime_block,
+            RegimeBlock::default(),
+            "a legacy payload decodes the bootstrap default block",
+        );
     }
 
     #[test]
@@ -4778,8 +6544,11 @@ mod tests {
                 &mems,
                 too_high,
                 (mems).len() as u64,
+                NodeId(1),
+                &Default::default(),
             ),
             voters: mems.clone(),
+            regime_block: Default::default(),
         };
         assert_eq!(auth.handle_commit(&commit), None);
         assert_eq!(
@@ -4810,8 +6579,11 @@ mod tests {
                 &mems,
                 too_high,
                 (mems).len() as u64,
+                NodeId(1),
+                &Default::default(),
             ),
             voters: mems.clone(),
+            regime_block: Default::default(),
         };
         assert_eq!(auth.handle_commit(&commit), None);
         assert_eq!(auth.unapplicable_committed_term(), 4);
@@ -4842,9 +6614,12 @@ mod tests {
                 &mems,
                 too_high,
                 (mems).len() as u64,
+                NodeId(1),
+                &Default::default(),
             ),
             // No quorum: a single voter cannot prove a 3-member commit.
             voters: members(&[1]),
+            regime_block: Default::default(),
         };
         assert_eq!(auth.handle_commit(&forged), None);
         assert_eq!(
@@ -4874,8 +6649,11 @@ mod tests {
                 &mems,
                 1,
                 (mems).len() as u64,
+                NodeId(1),
+                &Default::default(),
             ),
             voters: mems.clone(),
+            regime_block: Default::default(),
         };
         assert_eq!(auth.handle_commit(&commit), Some(4));
         assert_eq!(auth.committed_term(), 4);
@@ -4907,8 +6685,11 @@ mod tests {
                 &mems,
                 too_high,
                 (mems).len() as u64,
+                NodeId(1),
+                &Default::default(),
             ),
             voters: mems.clone(),
+            regime_block: Default::default(),
         };
         assert_eq!(auth.handle_commit(&bad), None);
         assert!(auth.is_self_fenced());
@@ -4927,8 +6708,11 @@ mod tests {
                 &mems,
                 1,
                 (mems).len() as u64,
+                NodeId(1),
+                &Default::default(),
             ),
             voters: mems.clone(),
+            regime_block: Default::default(),
         };
         assert_eq!(auth.handle_commit(&good), Some(5));
         assert!(
@@ -4959,8 +6743,11 @@ mod tests {
                 &mems,
                 1,
                 (mems).len() as u64,
+                NodeId(1),
+                &Default::default(),
             ),
             voters: mems.clone(),
+            regime_block: Default::default(),
         };
         // Persist reports failure.
         let outcome = auth.handle_commit_durable(&commit, 3, 1, |_state| false);
@@ -4997,8 +6784,11 @@ mod tests {
                 &mems,
                 1,
                 (mems).len() as u64,
+                NodeId(1),
+                &Default::default(),
             ),
             voters: mems.clone(),
+            regime_block: Default::default(),
         };
         let persisted_term = std::cell::Cell::new(u64::MAX);
         let served_term_at_persist = std::cell::Cell::new(u64::MAX);
@@ -5042,6 +6832,7 @@ mod tests {
             committed_peak: (mems.clone()).len() as u64,
             digest: [0u8; 32],
             voters: mems.clone(),
+            regime_block: Default::default(),
         };
         let persist_called = std::cell::Cell::new(false);
         let outcome = auth.handle_commit_durable(&commit, 3, 1, |_state| {
@@ -5103,8 +6894,11 @@ mod tests {
                 &base_members,
                 1,
                 (base_members).len() as u64,
+                NodeId(1),
+                &Default::default(),
             ),
             voters: base_members.clone(),
+            regime_block: Default::default(),
         };
         assert_eq!(auth.handle_commit(&baseline), Some(5));
         assert_eq!(auth.committed_term(), 5);
@@ -5124,8 +6918,11 @@ mod tests {
                 &lo_members,
                 1,
                 (lo_members).len() as u64,
+                NodeId(1),
+                &Default::default(),
             ),
             voters: lo_members.clone(),
+            regime_block: Default::default(),
         };
         // Higher term 7, full member set {1,2,3,4}.
         let hi_members = members(&[1, 2, 3, 4]);
@@ -5142,8 +6939,11 @@ mod tests {
                 &hi_members,
                 1,
                 (hi_members).len() as u64,
+                NodeId(1),
+                &Default::default(),
             ),
             voters: hi_members.clone(),
+            regime_block: Default::default(),
         };
 
         let (lo_in_persist_tx, lo_in_persist_rx) = mpsc::channel::<()>();
@@ -5225,8 +7025,17 @@ mod tests {
             cluster_id: ClusterId::UNSET,
             placement_version: 1,
             committed_peak: (m1.clone()).len() as u64,
-            digest: TopologyTerm::compute_digest(1, &ClusterId::UNSET, &m1, 1, (m1).len() as u64),
+            digest: TopologyTerm::compute_digest(
+                1,
+                &ClusterId::UNSET,
+                &m1,
+                1,
+                (m1).len() as u64,
+                NodeId(1),
+                &Default::default(),
+            ),
             voters: m1.clone(),
+            regime_block: Default::default(),
         };
         assert_eq!(
             auth.handle_commit_durable(&c1, 4, 1, |_s| true),
@@ -5244,8 +7053,17 @@ mod tests {
             cluster_id: ClusterId::UNSET,
             placement_version: 1,
             committed_peak: (m2.clone()).len() as u64,
-            digest: TopologyTerm::compute_digest(2, &ClusterId::UNSET, &m2, 1, (m2).len() as u64),
+            digest: TopologyTerm::compute_digest(
+                2,
+                &ClusterId::UNSET,
+                &m2,
+                1,
+                (m2).len() as u64,
+                NodeId(1),
+                &Default::default(),
+            ),
             voters: m2.clone(),
+            regime_block: Default::default(),
         };
         assert_eq!(
             auth.handle_commit_durable(&c2, 4, 1, |_s| true),
@@ -5274,8 +7092,11 @@ mod tests {
                 &mems,
                 1,
                 (mems).len() as u64,
+                NodeId(1),
+                &Default::default(),
             ),
             voters: mems.clone(),
+            regime_block: Default::default(),
         };
 
         // Pre-apply projection.
@@ -5301,6 +7122,7 @@ mod tests {
             committed_voter_ever_seen: projected_ever_seen,
             committed_placement_version: projected_placement,
             committed_peak: projected_committed_peak,
+            regime_block: projected_regime_block,
         } = projected;
         let PersistedTopologyState {
             peak_cluster_size: actual_peak,
@@ -5312,6 +7134,7 @@ mod tests {
             committed_voter_ever_seen: actual_ever_seen,
             committed_placement_version: actual_placement,
             committed_peak: actual_committed_peak,
+            regime_block: actual_regime_block,
         } = actual;
 
         assert_eq!(projected_term, actual_term);
@@ -5326,6 +7149,11 @@ mod tests {
         );
         assert_eq!(projected_voted_term, actual_voted_term);
         assert_eq!(projected_incarnation, actual_incarnation);
+        assert_eq!(
+            projected_regime_block, actual_regime_block,
+            "P1 stage 1 — the projected regime block must match the post-apply \
+             installed block exactly (both are the commit's block verbatim)",
+        );
         let mut a: Vec<u64> = projected_ever_seen.iter().map(|n| n.0).collect();
         let mut b: Vec<u64> = actual_ever_seen.iter().map(|n| n.0).collect();
         a.sort_unstable();
@@ -5386,8 +7214,11 @@ mod tests {
                 &mems,
                 1,
                 (mems).len() as u64,
+                NodeId(1),
+                &Default::default(),
             ),
             voters: mems.clone(),
+            regime_block: Default::default(),
         };
         assert_eq!(auth.handle_commit(&commit), Some(1));
         assert_eq!(auth.committed_placement_version(), 1);
@@ -5419,8 +7250,11 @@ mod tests {
                 &mems,
                 1,
                 (mems).len() as u64,
+                NodeId(1),
+                &Default::default(),
             ),
             voters: mems.clone(),
+            regime_block: Default::default(),
         };
         assert_eq!(auth.handle_commit(&commit), Some(1));
         auth.record_peer_placement_support(NodeId(1), 2);
@@ -5446,8 +7280,11 @@ mod tests {
                 &mems,
                 1,
                 (mems).len() as u64,
+                NodeId(1),
+                &Default::default(),
             ),
             voters: mems.clone(),
+            regime_block: Default::default(),
         };
         auth.handle_commit(&commit_v1);
         auth.record_peer_placement_support(NodeId(2), 2);
@@ -5462,6 +7299,10 @@ mod tests {
             committed_peak: (mems.clone()).len() as u64,
             digest: upgrade.digest,
             voters: mems.clone(),
+            // P1 — the digest covers the proposal's DERIVED block (the
+            // v1->v2 reshuffle bumps re-placed shards' regimes), so the
+            // commit must carry the same block.
+            regime_block: upgrade.regime_block.clone(),
         };
         assert_eq!(auth.handle_commit(&commit_v2), Some(upgrade.term));
         assert_eq!(auth.committed_placement_version(), 2);
@@ -5494,8 +7335,17 @@ mod tests {
             cluster_id: ClusterId::UNSET,
             placement_version: 1,
             committed_peak: 5,
-            digest: TopologyTerm::compute_digest(9, &ClusterId::UNSET, &mems, 1, 5),
+            digest: TopologyTerm::compute_digest(
+                9,
+                &ClusterId::UNSET,
+                &mems,
+                1,
+                5,
+                NodeId(1),
+                &Default::default(),
+            ),
             voters: mems.clone(),
+            regime_block: Default::default(),
         };
         let decoded = TopologyCommit::deserialize(&commit.serialize()).expect("decode");
         assert_eq!(decoded.committed_peak, 5);
@@ -5517,6 +7367,7 @@ mod tests {
             // coincidental match with the legacy-default formula can't mask
             // a broken round trip.
             committed_peak: 7,
+            regime_block: Default::default(),
         };
         let decoded = PersistedTopologyState::deserialize(&state.serialize());
         assert_eq!(decoded.committed_peak, 7);
@@ -5596,11 +7447,35 @@ mod tests {
     #[test]
     fn compute_digest_changes_with_committed_peak() {
         let mems = members(&[1, 2, 3]);
-        let d1 = TopologyTerm::compute_digest(5, &ClusterId::UNSET, &mems, 1, 3);
-        let d2 = TopologyTerm::compute_digest(5, &ClusterId::UNSET, &mems, 1, 4);
+        let d1 = TopologyTerm::compute_digest(
+            5,
+            &ClusterId::UNSET,
+            &mems,
+            1,
+            3,
+            NodeId(1),
+            &Default::default(),
+        );
+        let d2 = TopologyTerm::compute_digest(
+            5,
+            &ClusterId::UNSET,
+            &mems,
+            1,
+            4,
+            NodeId(1),
+            &Default::default(),
+        );
         assert_ne!(d1, d2, "committed_peak must be mixed into the digest");
 
-        let d3 = TopologyTerm::compute_digest(5, &ClusterId::UNSET, &mems, 1, 3);
+        let d3 = TopologyTerm::compute_digest(
+            5,
+            &ClusterId::UNSET,
+            &mems,
+            1,
+            3,
+            NodeId(1),
+            &Default::default(),
+        );
         assert_eq!(
             d1, d3,
             "identical committed_peak must produce an identical digest"
@@ -5659,8 +7534,17 @@ mod tests {
             cluster_id: ClusterId::UNSET,
             placement_version: 1,
             committed_peak: bad_peak,
-            digest: TopologyTerm::compute_digest(1, &ClusterId::UNSET, &mems, 1, bad_peak),
+            digest: TopologyTerm::compute_digest(
+                1,
+                &ClusterId::UNSET,
+                &mems,
+                1,
+                bad_peak,
+                NodeId(1),
+                &Default::default(),
+            ),
             voters: mems.clone(),
+            regime_block: Default::default(),
         };
         assert!(
             auth.handle_commit(&commit).is_none(),
@@ -5695,6 +7579,7 @@ mod tests {
             committed_voter_ever_seen: members(&[1, 2, 3]),
             committed_placement_version: 1,
             committed_peak: 6,
+            regime_block: Default::default(),
         };
         auth.restore(&state);
         assert_eq!(
@@ -5751,6 +7636,7 @@ mod tests {
             committed_voter_ever_seen: members(&[1, 2, 3, 4, 5]),
             committed_placement_version: 1,
             committed_peak: 3, // the durable, correctly-lowered anchor
+            regime_block: Default::default(),
         };
 
         let config = ClusterConfig {
@@ -5819,6 +7705,7 @@ mod tests {
             committed_peak: term1.committed_peak,
             digest: term1.digest,
             voters: small.clone(),
+            regime_block: Default::default(),
         };
         assert_eq!(auth.handle_commit(&commit1), Some(term1.term));
 
@@ -5855,8 +7742,17 @@ mod tests {
             cluster_id: ClusterId::UNSET,
             placement_version: 1,
             committed_peak: full.len() as u64,
-            digest: TopologyTerm::compute_digest(1, &ClusterId::UNSET, &full, 1, full.len() as u64),
+            digest: TopologyTerm::compute_digest(
+                1,
+                &ClusterId::UNSET,
+                &full,
+                1,
+                full.len() as u64,
+                NodeId(1),
+                &Default::default(),
+            ),
             voters: full.clone(),
+            regime_block: Default::default(),
         };
         assert_eq!(auth.handle_commit(&commit), Some(1));
         assert_eq!(auth.peak_cluster_size(), 5);
@@ -5901,8 +7797,15 @@ mod tests {
         committed_peak: u64,
         voters: Vec<NodeId>,
     ) -> TopologyCommit {
-        let digest =
-            TopologyTerm::compute_digest(term, &ClusterId::UNSET, &members, 1, committed_peak);
+        let digest = TopologyTerm::compute_digest(
+            term,
+            &ClusterId::UNSET,
+            &members,
+            1,
+            committed_peak,
+            proposer,
+            &Default::default(),
+        );
         TopologyCommit {
             term,
             proposer,
@@ -5912,6 +7815,7 @@ mod tests {
             committed_peak,
             digest,
             voters,
+            regime_block: Default::default(),
         }
     }
 
@@ -6012,6 +7916,9 @@ mod tests {
             accepted: true,
             voter_current_term: 0,
             voter_placement_support: 1,
+            voter_incarnation: 0,
+            regime_support: false,
+            ack_writeall_equiv: false,
         };
         let commit = auth.handle_vote(&vote2);
         assert!(
@@ -6057,6 +7964,9 @@ mod tests {
             accepted: true,
             voter_current_term: 0,
             voter_placement_support: 1,
+            voter_incarnation: 0,
+            regime_support: false,
+            ack_writeall_equiv: false,
         });
         assert!(
             commit_after_first.is_none(),
@@ -6071,6 +7981,9 @@ mod tests {
                 accepted: true,
                 voter_current_term: 0,
                 voter_placement_support: 1,
+                voter_incarnation: 0,
+                regime_support: false,
+                ack_writeall_equiv: false,
             })
             .expect("3rd accepting vote reaches the peak-derived quorum of 3");
         assert_eq!(commit.voters.len(), 3);
@@ -6130,6 +8043,9 @@ mod tests {
                 accepted: true,
                 voter_current_term: 0,
                 voter_placement_support: 1,
+                voter_incarnation: 0,
+                regime_support: false,
+                ack_writeall_equiv: false,
             });
             assert!(c.is_none(), "quorum not yet reached without self-vote");
             commit_opt = c;
@@ -6142,6 +8058,9 @@ mod tests {
                 accepted: true,
                 voter_current_term: 0,
                 voter_placement_support: 1,
+                voter_incarnation: 0,
+                regime_support: false,
+                ack_writeall_equiv: false,
             })
             .expect("3rd external vote (2,3,4) reaches quorum without a self-vote");
         assert!(commit_opt.is_none());
@@ -6185,6 +8104,9 @@ mod tests {
             accepted: true,
             voter_current_term: 0,
             voter_placement_support: 1,
+            voter_incarnation: 0,
+            regime_support: false,
+            ack_writeall_equiv: false,
         });
         let commit_3_side = side_a
             .handle_vote(&TopologyVote {
@@ -6194,6 +8116,9 @@ mod tests {
                 accepted: true,
                 voter_current_term: 0,
                 voter_placement_support: 1,
+                voter_incarnation: 0,
+                regime_support: false,
+                ack_writeall_equiv: false,
             })
             .expect("3-side reaches quorum (3 of old peak 5)");
         assert_eq!(side_a.handle_commit(&commit_3_side), Some(term.term));
@@ -6340,5 +8265,1144 @@ mod tests {
             3,
             "the combined getter must also reflect the lowered floor (no re-inflation from the stale 10)"
         );
+    }
+    // -----------------------------------------------------------------------
+    // P1 stage 1 — regime substrate: canonical encoding, envelopes, digest
+    // coverage, committed derivation, I6/I7/I10 structural gates, producers,
+    // flag proposers, rebase, adverts, and the I11 predicate.
+    // -----------------------------------------------------------------------
+
+    /// Build a valid commit carrying `block` (digest computed over every
+    /// covered field, proposer = members[0], voters = members).
+    fn commit_with_block(
+        term: u64,
+        mems: Vec<NodeId>,
+        committed_peak: u64,
+        block: RegimeBlock,
+    ) -> TopologyCommit {
+        let proposer = mems[0];
+        let digest = TopologyTerm::compute_digest(
+            term,
+            &ClusterId::UNSET,
+            &mems,
+            1,
+            committed_peak,
+            proposer,
+            &block,
+        );
+        TopologyCommit {
+            term,
+            proposer,
+            members: mems.clone(),
+            cluster_id: ClusterId::UNSET,
+            placement_version: 1,
+            committed_peak,
+            digest,
+            voters: mems,
+            regime_block: block,
+        }
+    }
+
+    /// The v1 placement assignment for `shard` over `mems` at RF 2:
+    /// `(master, replica)` — the committed-derivation holder pair.
+    fn placement_pair(mems: &[NodeId], shard: u16) -> (NodeId, NodeId) {
+        let table = crate::cluster::shards::ShardTable::compute_with_epoch(mems, 2, 1, 1);
+        let a = table.assignment(shard);
+        (a.master, a.replicas[0])
+    }
+
+    /// A member of `mems` outside `shard`'s RF-2 holder pair.
+    fn non_holder(mems: &[NodeId], shard: u16) -> NodeId {
+        let (m, r) = placement_pair(mems, shard);
+        mems.iter()
+            .copied()
+            .find(|n| *n != m && *n != r)
+            .expect("3-member cluster at RF 2 leaves one non-holder per shard")
+    }
+
+    /// Seed an authority (RF 2) with committed members `{1,2,3}` at term 1
+    /// and an all-default regime block.
+    fn seed_regime_authority(self_id: u64) -> TopologyAuthority {
+        let auth = TopologyAuthority::new(NodeId(self_id), Duration::from_secs(1));
+        auth.set_replication_factor(2);
+        seed_committed(&auth, members(&[1, 2, 3]));
+        auth
+    }
+
+    #[test]
+    fn regime_array_defaults_to_all_zero_and_roundtrips_accessors() {
+        let mut a = RegimeArray::default();
+        assert!(a.is_all_zero());
+        assert_eq!(a.get(0), 0);
+        assert_eq!(a.get(4095), 0);
+        a.set(7, 42);
+        a.set(4095, 9);
+        assert!(!a.is_all_zero());
+        assert_eq!(a.get(7), 42);
+        assert_eq!(a.get(4095), 9);
+        // Out-of-range shards read 0 and are never written (no panic).
+        a.set(u16::MAX, 1);
+        assert_eq!(a.get(u16::MAX), 0);
+        let nonzero: Vec<(u16, u64)> = a.iter_nonzero().collect();
+        assert_eq!(nonzero, vec![(7, 42), (4095, 9)]);
+    }
+
+    #[test]
+    fn regime_block_canonical_roundtrip() {
+        let mut block = RegimeBlock::default();
+        block.override_map.insert(9, NodeId(3));
+        block.override_map.insert(2, NodeId(7));
+        block.regime.set(2, 5);
+        block.regime.set(9, 6);
+        block.regime_enforced = true;
+        block.promotion_enabled = true;
+        let bytes = block.encode_canonical();
+        let (decoded, end) = RegimeBlock::decode_canonical(&bytes, 0).expect("decode");
+        assert_eq!(end, bytes.len());
+        assert_eq!(decoded, block);
+    }
+
+    #[test]
+    fn regime_block_decode_rejects_unsorted_duplicate_and_out_of_range() {
+        let mut block = RegimeBlock::default();
+        block.override_map.insert(2, NodeId(7));
+        block.override_map.insert(9, NodeId(3));
+        let good = block.encode_canonical();
+        // Overrides start at [tag:1][count:2]; entries are 10 bytes each.
+        // Swap the two override entries -> unsorted -> NonCanonical.
+        let mut unsorted = good.clone();
+        let (e0, e1) = (3usize, 13usize);
+        let tmp: Vec<u8> = unsorted[e0..e0 + 10].to_vec();
+        unsorted.copy_within(e1..e1 + 10, e0);
+        unsorted[e1..e1 + 10].copy_from_slice(&tmp);
+        assert_eq!(
+            RegimeBlock::decode_canonical(&unsorted, 0).unwrap_err(),
+            RegimeDecodeError::NonCanonical,
+        );
+        // Duplicate shard (copy entry 0 over entry 1).
+        let mut dup = good.clone();
+        dup.copy_within(e0..e0 + 10, e1);
+        assert_eq!(
+            RegimeBlock::decode_canonical(&dup, 0).unwrap_err(),
+            RegimeDecodeError::NonCanonical,
+        );
+        // Shard out of range.
+        let mut oor = good.clone();
+        oor[e0..e0 + 2].copy_from_slice(&(crate::cluster::shards::NUM_SHARDS as u16).to_le_bytes());
+        assert_eq!(
+            RegimeBlock::decode_canonical(&oor, 0).unwrap_err(),
+            RegimeDecodeError::NonCanonical,
+        );
+        // A count that overruns the payload is a hard Truncated reject.
+        let mut short = good.clone();
+        short[1..3].copy_from_slice(&100u16.to_le_bytes());
+        assert_eq!(
+            RegimeBlock::decode_canonical(&short, 0).unwrap_err(),
+            RegimeDecodeError::Truncated,
+        );
+    }
+
+    #[test]
+    fn regime_block_decode_rejects_explicit_zero_regime_entry() {
+        // An explicit zero-regime entry is non-canonical (absent == 0):
+        // hand-build a regimes list containing one.
+        let mut bytes = Vec::new();
+        bytes.push(0x03); // overrides tag
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+        bytes.push(0x04); // regimes tag
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        bytes.extend_from_slice(&5u16.to_le_bytes()); // shard 5
+        bytes.extend_from_slice(&0u64.to_le_bytes()); // regime 0 (non-canonical)
+        bytes.push(0x05); // flags tag
+        bytes.push(0);
+        assert_eq!(
+            RegimeBlock::decode_canonical(&bytes, 0).unwrap_err(),
+            RegimeDecodeError::NonCanonical,
+        );
+    }
+
+    #[test]
+    fn regime_block_decode_rejects_unknown_flag_bits() {
+        let mut bytes = RegimeBlock::default().encode_canonical();
+        let n = bytes.len();
+        bytes[n - 1] = 0b0000_0100; // unknown bit
+        assert_eq!(
+            RegimeBlock::decode_canonical(&bytes, 0).unwrap_err(),
+            RegimeDecodeError::MalformedTag(0x05),
+        );
+    }
+
+    #[test]
+    fn term_wire_roundtrips_regime_block() {
+        let mut block = RegimeBlock::default();
+        block.override_map.insert(11, NodeId(2));
+        block.regime.set(11, 4);
+        block.regime_enforced = true;
+        let term = TopologyTerm::new_with_block(
+            4,
+            members(&[1, 2, 3]),
+            NodeId(1),
+            ClusterId::UNSET,
+            1,
+            3,
+            block.clone(),
+        );
+        let decoded = TopologyTerm::deserialize(&term.serialize()).expect("decode");
+        assert_eq!(decoded.regime_block, block);
+        assert_eq!(decoded.placement_version, 1);
+        assert_eq!(decoded.committed_peak, 3);
+        assert_eq!(decoded.digest, term.digest);
+    }
+
+    #[test]
+    fn commit_wire_roundtrips_regime_block() {
+        let mut block = RegimeBlock::default();
+        block.override_map.insert(11, NodeId(2));
+        block.regime.set(11, 4);
+        block.promotion_enabled = true;
+        let commit = commit_with_block(4, members(&[1, 2, 3]), 3, block.clone());
+        let decoded = TopologyCommit::deserialize(&commit.serialize()).expect("decode");
+        assert_eq!(decoded.regime_block, block);
+        assert_eq!(decoded.voters, members(&[1, 2, 3]));
+        assert_eq!(decoded.committed_peak, 3);
+    }
+
+    #[test]
+    fn wire_envelope_integrity_mismatch_is_hard_reject() {
+        let term = TopologyTerm::new(4, members(&[1, 2, 3]), NodeId(1), ClusterId::UNSET, 1, 3);
+        let good = term.serialize();
+        assert!(TopologyTerm::deserialize(&good).is_some());
+        // Flip one byte inside the envelope body (past the legacy digest).
+        let mut corrupt = good.clone();
+        let n = corrupt.len();
+        corrupt[n - 40] ^= 0x01;
+        assert!(
+            TopologyTerm::deserialize(&corrupt).is_none(),
+            "an integrity-failed envelope must be a hard reject, never a defaulted decode",
+        );
+        // Truncation inside the envelope is likewise a hard reject.
+        let mut short = good.clone();
+        short.truncate(n - 1);
+        assert!(TopologyTerm::deserialize(&short).is_none());
+        // Trailing bytes after the envelope are a hard reject.
+        let mut long = good;
+        long.push(0);
+        assert!(TopologyTerm::deserialize(&long).is_none());
+    }
+
+    #[test]
+    fn legacy_commit_payload_decodes_default_block() {
+        // Hand-build a LEGACY commit payload (G8 shape: positional
+        // trailers) and confirm it still parses — with the bootstrap
+        // default block. The digest gates reject it downstream (deliberate
+        // break); the PARSER must not.
+        let mems = members(&[1, 2, 3]);
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&5u64.to_le_bytes());
+        bytes.extend_from_slice(&NodeId(1).0.to_le_bytes());
+        bytes.extend_from_slice(&[0u8; 16]); // cluster_id UNSET
+        bytes.extend_from_slice(&(mems.len() as u32).to_le_bytes());
+        for m in &mems {
+            bytes.extend_from_slice(&m.0.to_le_bytes());
+        }
+        bytes.extend_from_slice(&[0xAB; 32]); // digest (unchecked at parse)
+        bytes.extend_from_slice(&(mems.len() as u32).to_le_bytes());
+        for m in &mems {
+            bytes.extend_from_slice(&m.0.to_le_bytes());
+        }
+        bytes.extend_from_slice(&2u16.to_le_bytes()); // placement_version
+        bytes.extend_from_slice(&7u64.to_le_bytes()); // committed_peak
+        let decoded = TopologyCommit::deserialize(&bytes).expect("legacy parse");
+        assert_eq!(decoded.placement_version, 2);
+        assert_eq!(decoded.committed_peak, 7);
+        assert_eq!(decoded.regime_block, RegimeBlock::default());
+    }
+
+    #[test]
+    fn digest_covers_proposer_and_every_block_field() {
+        let mems = members(&[1, 2, 3]);
+        let base = RegimeBlock::default();
+        let d0 = TopologyTerm::compute_digest(4, &ClusterId::UNSET, &mems, 1, 3, NodeId(1), &base);
+        // proposer
+        let d1 = TopologyTerm::compute_digest(4, &ClusterId::UNSET, &mems, 1, 3, NodeId(2), &base);
+        assert_ne!(d0, d1, "proposer must be digest-covered (I10f)");
+        // override map
+        let mut b = base.clone();
+        b.override_map.insert(3, NodeId(2));
+        let d2 = TopologyTerm::compute_digest(4, &ClusterId::UNSET, &mems, 1, 3, NodeId(1), &b);
+        assert_ne!(d0, d2, "override map must be digest-covered");
+        // regime array
+        let mut b = base.clone();
+        b.regime.set(3, 4);
+        let d3 = TopologyTerm::compute_digest(4, &ClusterId::UNSET, &mems, 1, 3, NodeId(1), &b);
+        assert_ne!(d0, d3, "regime array must be digest-covered");
+        // regime_enforced
+        let mut b = base.clone();
+        b.regime_enforced = true;
+        let d4 = TopologyTerm::compute_digest(4, &ClusterId::UNSET, &mems, 1, 3, NodeId(1), &b);
+        assert_ne!(d0, d4, "regime_enforced must be digest-covered");
+        // promotion_enabled
+        let mut b = base.clone();
+        b.promotion_enabled = true;
+        let d5 = TopologyTerm::compute_digest(4, &ClusterId::UNSET, &mems, 1, 3, NodeId(1), &b);
+        assert_ne!(d0, d5, "promotion_enabled must be digest-covered");
+    }
+
+    #[test]
+    fn persisted_state_envelope_roundtrips_block_and_fails_closed() {
+        let mut block = RegimeBlock::default();
+        block.override_map.insert(100, NodeId(2));
+        block.regime.set(100, 3);
+        block.regime_enforced = true;
+        let state = PersistedTopologyState {
+            peak_cluster_size: 3,
+            committed_term: 3,
+            committed_members: members(&[1, 2, 3]),
+            committed_voters: members(&[1, 2]),
+            voted_term: 3,
+            incarnation: 9,
+            committed_voter_ever_seen: members(&[1, 2, 3]),
+            committed_placement_version: 1,
+            committed_peak: 3,
+            regime_block: block.clone(),
+        };
+        let bytes = state.serialize_envelope();
+        let decoded = PersistedTopologyState::deserialize_envelope(&bytes).expect("decode");
+        assert_eq!(decoded.regime_block, block);
+        assert_eq!(decoded.committed_term, 3);
+        assert_eq!(decoded.committed_peak, 3);
+        // Integrity mismatch is fail-closed.
+        let mut corrupt = bytes.clone();
+        let n = corrupt.len();
+        corrupt[n / 2] ^= 0x40;
+        assert_eq!(
+            PersistedTopologyState::deserialize_envelope(&corrupt).unwrap_err(),
+            RegimeDecodeError::IntegrityMismatch,
+        );
+        // A legacy (positional) payload is NOT an envelope.
+        assert_eq!(
+            PersistedTopologyState::deserialize_envelope(&state.serialize()).unwrap_err(),
+            RegimeDecodeError::NotAnEnvelope,
+        );
+    }
+
+    #[test]
+    fn committed_master_is_pure_over_map_members_and_placement() {
+        let auth = seed_regime_authority(1);
+        let mems = members(&[1, 2, 3]);
+        let shard = 17u16;
+        let (m, r) = placement_pair(&mems, shard);
+        assert_eq!(
+            auth.committed_master(shard),
+            Some(m),
+            "no override -> placement-derived committed master",
+        );
+        assert_eq!(auth.committed_regime(shard), 0, "bootstrap regime is 0");
+        // Install an override via a valid commit; the derivation flips.
+        let mut block = RegimeBlock::default();
+        block.override_map.insert(shard, r);
+        block.regime.set(shard, 2);
+        let commit = commit_with_block(2, mems.clone(), 3, block);
+        assert_eq!(auth.handle_commit(&commit), Some(2));
+        assert_eq!(auth.committed_master(shard), Some(r));
+        assert_eq!(auth.committed_regime(shard), 2);
+        // Bootstrap (no committed members) has no committed master.
+        let fresh = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+        assert_eq!(fresh.committed_master(shard), None);
+    }
+
+    #[test]
+    fn i10a_override_target_outside_committed_holder_set_rejected() {
+        let auth = seed_regime_authority(1);
+        let mems = members(&[1, 2, 3]);
+        let shard = 21u16;
+        let outsider = non_holder(&mems, shard);
+        let mut block = RegimeBlock::default();
+        block.override_map.insert(shard, outsider);
+        block.regime.set(shard, 2);
+        let commit = commit_with_block(2, mems.clone(), 3, block);
+        assert!(
+            auth.handle_commit(&commit).is_none(),
+            "an override target outside {{committed_master}} + placement replicas must be \
+             rejected (I10a / I3)",
+        );
+        assert_eq!(auth.committed_term(), 1, "rejected commit must not apply");
+        // The same override targeting the placement REPLICA is accepted.
+        let (_, r) = placement_pair(&mems, shard);
+        let mut block = RegimeBlock::default();
+        block.override_map.insert(shard, r);
+        block.regime.set(shard, 2);
+        let commit = commit_with_block(2, mems, 3, block);
+        assert_eq!(auth.handle_commit(&commit), Some(2));
+    }
+
+    #[test]
+    fn i10b_new_override_regime_must_equal_carrying_term() {
+        let auth = seed_regime_authority(1);
+        let mems = members(&[1, 2, 3]);
+        let shard = 33u16;
+        let (_, r) = placement_pair(&mems, shard);
+        let mut block = RegimeBlock::default();
+        block.override_map.insert(shard, r);
+        block.regime.set(shard, 1); // != carrying term 2
+        let commit = commit_with_block(2, mems, 3, block);
+        assert!(
+            auth.handle_commit(&commit).is_none(),
+            "a new override stamping a regime other than the carrying term must be rejected \
+             (I10b — it would slot under an already-superseded fence)",
+        );
+    }
+
+    #[test]
+    fn i7_regime_never_exceeds_term() {
+        let auth = seed_regime_authority(1);
+        let mems = members(&[1, 2, 3]);
+        // Even a NON-override-carrying commit is rejected when any regime
+        // exceeds the carrying term (I7 is pure over the commit alone).
+        let mut block = RegimeBlock::default();
+        block.regime.set(5, 99);
+        let commit = commit_with_block(2, mems, 3, block);
+        assert!(
+            auth.handle_commit(&commit).is_none(),
+            "regime[s] > commit.term is forged/corrupted state (I7)",
+        );
+    }
+
+    #[test]
+    fn i10d_never_lower_ratchet_rejects() {
+        let auth = seed_regime_authority(1);
+        let mems = members(&[1, 2, 3]);
+        let shard = 40u16;
+        let (_, r) = placement_pair(&mems, shard);
+        // Install a legitimate override at term 2 (regime[40] = 2).
+        let mut block = RegimeBlock::default();
+        block.override_map.insert(shard, r);
+        block.regime.set(shard, 2);
+        assert_eq!(
+            auth.handle_commit(&commit_with_block(2, mems.clone(), 3, block.clone())),
+            Some(2)
+        );
+        // A later override-carrying commit (adds another override) that
+        // LOWERS shard 40's regime back to 0 must be rejected.
+        let shard2 = 41u16;
+        let (_, r2) = placement_pair(&mems, shard2);
+        let mut lowered = RegimeBlock::default();
+        lowered.override_map.insert(shard, r); // standing
+        lowered.override_map.insert(shard2, r2); // new -> override-carrying
+        lowered.regime.set(shard2, 3);
+        // regime[shard] deliberately left 0 = LOWER than installed 2.
+        let commit = commit_with_block(3, mems, 3, lowered);
+        assert!(
+            auth.handle_commit(&commit).is_none(),
+            "an override-carrying commit lowering any regime must be rejected (I10d — \
+             the ratchet removes the fence-disarm primitive)",
+        );
+        assert_eq!(auth.committed_regime(shard), 2);
+    }
+
+    #[test]
+    fn i10e_bump_without_master_change_rejected() {
+        let auth = seed_regime_authority(1);
+        let mems = members(&[1, 2, 3]);
+        let shard = 50u16;
+        let (_, r) = placement_pair(&mems, shard);
+        let bystander = 51u16;
+        let mut block = RegimeBlock::default();
+        block.override_map.insert(shard, r);
+        block.regime.set(shard, 2);
+        // Unjustified bump: bystander's master is unchanged.
+        block.regime.set(bystander, 2);
+        let commit = commit_with_block(2, mems, 3, block);
+        assert!(
+            auth.handle_commit(&commit).is_none(),
+            "a regime bump on a shard whose master does not change must be rejected (I10e)",
+        );
+    }
+
+    #[test]
+    fn i10f_proposer_outside_members_rejected_for_override_commits() {
+        let auth = seed_regime_authority(1);
+        let mems = members(&[1, 2, 3]);
+        let shard = 60u16;
+        let (_, r) = placement_pair(&mems, shard);
+        let mut block = RegimeBlock::default();
+        block.override_map.insert(shard, r);
+        block.regime.set(shard, 2);
+        // Digest computed over the OUTSIDE proposer, so the digest gate
+        // passes and I10(f) is what rejects.
+        let digest =
+            TopologyTerm::compute_digest(2, &ClusterId::UNSET, &mems, 1, 3, NodeId(9), &block);
+        let commit = TopologyCommit {
+            term: 2,
+            proposer: NodeId(9),
+            members: mems.clone(),
+            cluster_id: ClusterId::UNSET,
+            placement_version: 1,
+            committed_peak: 3,
+            digest,
+            voters: mems,
+            regime_block: block,
+        };
+        assert!(
+            auth.handle_commit(&commit).is_none(),
+            "an override-carrying commit whose proposer is not in its own member set must \
+             be rejected (I10f)",
+        );
+    }
+
+    #[test]
+    fn standing_override_rides_later_commits_without_revalidation() {
+        let auth = seed_regime_authority(1);
+        let mems = members(&[1, 2, 3]);
+        let shard = 70u16;
+        let (_, r) = placement_pair(&mems, shard);
+        let mut block = RegimeBlock::default();
+        block.override_map.insert(shard, r);
+        block.regime.set(shard, 2);
+        assert_eq!(
+            auth.handle_commit(&commit_with_block(2, mems.clone(), 3, block.clone())),
+            Some(2)
+        );
+        // Term 3 carries the SAME map (cumulative, regime still 2 != 3):
+        // not override-carrying, applies cleanly.
+        let commit = commit_with_block(3, mems, 3, block);
+        assert_eq!(
+            auth.handle_commit(&commit),
+            Some(3),
+            "a standing override (regime < carrying term) must ride later commits — \
+             clause (b) only examines entries the term CHANGES",
+        );
+        assert_eq!(auth.committed_regime(shard), 2);
+        assert_eq!(auth.committed_master(shard), Some(r));
+    }
+
+    #[test]
+    fn override_retirement_is_a_master_change_and_bumps_regime() {
+        let auth = seed_regime_authority(1);
+        let mems = members(&[1, 2, 3]);
+        let shard = 80u16;
+        let (m, r) = placement_pair(&mems, shard);
+        let mut block = RegimeBlock::default();
+        block.override_map.insert(shard, r);
+        block.regime.set(shard, 2);
+        assert_eq!(
+            auth.handle_commit(&commit_with_block(2, mems.clone(), 3, block)),
+            Some(2)
+        );
+        // Retire the override at term 3: map empty again, regime bumps to
+        // 3 (master changes back to placement).
+        let mut retired = RegimeBlock::default();
+        retired.regime.set(shard, 3);
+        let commit = commit_with_block(3, mems, 3, retired);
+        assert_eq!(auth.handle_commit(&commit), Some(3));
+        assert_eq!(
+            auth.committed_master(shard),
+            Some(m),
+            "retiring the override returns the shard to placement derivation",
+        );
+        assert_eq!(
+            auth.committed_regime(shard),
+            3,
+            "retirement is a master change and bumps the regime (§4.0)",
+        );
+    }
+
+    #[test]
+    fn i6_override_commit_changing_flags_rejected_at_apply() {
+        let auth = seed_regime_authority(1);
+        let mems = members(&[1, 2, 3]);
+        let shard = 90u16;
+        let (_, r) = placement_pair(&mems, shard);
+        let mut block = RegimeBlock::default();
+        block.override_map.insert(shard, r);
+        block.regime.set(shard, 2);
+        block.regime_enforced = true; // bundled flag change
+        let commit = commit_with_block(2, mems.clone(), 3, block.clone());
+        assert!(
+            auth.handle_commit(&commit).is_none(),
+            "an override-carrying commit changing regime_enforced must be rejected (I6)",
+        );
+        block.regime_enforced = false;
+        block.promotion_enabled = true;
+        let commit = commit_with_block(2, mems, 3, block);
+        assert!(
+            auth.handle_commit(&commit).is_none(),
+            "an override-carrying commit changing promotion_enabled must be rejected (I6)",
+        );
+    }
+
+    #[test]
+    fn i6_shrink_bundling_overrides_rejected_at_apply() {
+        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+        auth.set_replication_factor(2);
+        seed_committed(&auth, members(&[1, 2, 3]));
+        let survivors = members(&[1, 2]);
+        // Overrides are computed against the INSTALLED (3-member) state.
+        let shard = 95u16;
+        let (_, r) = placement_pair(&members(&[1, 2, 3]), shard);
+        // Only bundle when the target survives the shrink, so the failure
+        // is attributable to I6, not to I10(a).
+        let target = if survivors.contains(&r) { r } else { NodeId(1) };
+        let mut block = RegimeBlock::default();
+        block.override_map.insert(shard, target);
+        block.regime.set(shard, 2);
+        // A shrink: committed_peak 2 < installed 3, with a full old-peak
+        // quorum (both survivors) — Gate B alone would pass.
+        let mut commit = commit_with_block(2, survivors.clone(), 2, block);
+        commit.voters = survivors;
+        assert!(
+            auth.handle_commit(&commit).is_none(),
+            "a term bundling a shrink with override changes must be rejected (I6)",
+        );
+    }
+
+    #[test]
+    fn i6_shrink_bundling_flag_change_rejected_at_apply() {
+        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+        auth.set_replication_factor(2);
+        seed_committed(&auth, members(&[1, 2, 3]));
+        // A shrink (peak 3 -> 2, full old-peak quorum) that ALSO flips
+        // regime_enforced: I6 rejects even with no override change.
+        let block = RegimeBlock {
+            regime_enforced: true,
+            ..RegimeBlock::default()
+        };
+        let commit = commit_with_block(2, members(&[1, 2]), 2, block);
+        assert!(
+            auth.handle_commit(&commit).is_none(),
+            "a shrink term bundling an enforcement-flag change must be rejected (I6)",
+        );
+        // The same shrink WITHOUT the flag change applies.
+        let commit = commit_with_block(2, members(&[1, 2]), 2, RegimeBlock::default());
+        assert_eq!(auth.handle_commit(&commit), Some(2));
+    }
+
+    #[test]
+    fn rebase_style_commit_lowers_regimes_when_not_override_carrying() {
+        let auth = seed_regime_authority(1);
+        let mems = members(&[1, 2, 3]);
+        let shard = 101u16;
+        let (_, r) = placement_pair(&mems, shard);
+        let mut block = RegimeBlock::default();
+        block.override_map.insert(shard, r);
+        block.regime.set(shard, 2);
+        assert_eq!(
+            auth.handle_commit(&commit_with_block(2, mems.clone(), 3, block.clone())),
+            Some(2)
+        );
+        // A non-override-carrying commit (same map) may LOWER regimes:
+        // this is the rebase/self-heal path (I7) — the absolute array is
+        // installed wholesale.
+        let mut rebased = block.clone();
+        rebased.regime = RegimeArray::default();
+        rebased.regime.set(shard, 2); // override shard keeps its regime
+        let commit = commit_with_block(3, mems, 3, rebased);
+        assert_eq!(auth.handle_commit(&commit), Some(3));
+        assert_eq!(auth.committed_regime(shard), 2);
+    }
+
+    #[test]
+    fn same_installed_state_appliers_decide_identically() {
+        // §4.0 named acceptance test (authority half): two nodes at the
+        // same committed term must accept/reject an override-carrying
+        // commit identically — mid-handoff runtime state lives outside the
+        // authority, so equality of INSTALLED committed state is the whole
+        // input space (I0).
+        let a = seed_regime_authority(1);
+        let b = seed_regime_authority(2);
+        let mems = members(&[1, 2, 3]);
+        let shard = 111u16;
+        let (_, r) = placement_pair(&mems, shard);
+        let outsider = non_holder(&mems, shard);
+        let mut good = RegimeBlock::default();
+        good.override_map.insert(shard, r);
+        good.regime.set(shard, 2);
+        let good_commit = commit_with_block(2, mems.clone(), 3, good);
+        let mut bad = RegimeBlock::default();
+        bad.override_map.insert(shard, outsider);
+        bad.regime.set(shard, 2);
+        let bad_commit = commit_with_block(2, mems, 3, bad);
+        assert_eq!(
+            a.handle_commit(&bad_commit).is_none(),
+            b.handle_commit(&bad_commit).is_none(),
+            "same installed state must produce the same reject verdict",
+        );
+        assert_eq!(a.handle_commit(&good_commit), b.handle_commit(&good_commit));
+    }
+
+    #[test]
+    fn apply_installs_regime_block_with_committed_term() {
+        // I1 substrate: after apply, the committed regime state and the
+        // committed term are BOTH installed (the block install precedes
+        // the term store inside apply_commit_locked; a reader that sees
+        // the new term must see the new block).
+        let auth = seed_regime_authority(1);
+        let mems = members(&[1, 2, 3]);
+        let shard = 120u16;
+        let (_, r) = placement_pair(&mems, shard);
+        let mut block = RegimeBlock::default();
+        block.override_map.insert(shard, r);
+        block.regime.set(shard, 2);
+        assert_eq!(
+            auth.handle_commit(&commit_with_block(2, mems, 3, block.clone())),
+            Some(2)
+        );
+        assert_eq!(auth.committed_term(), 2);
+        assert_eq!(auth.committed_regime_block(), block);
+    }
+
+    #[test]
+    fn restore_roundtrips_regime_block() {
+        let auth = seed_regime_authority(1);
+        let mems = members(&[1, 2, 3]);
+        let shard = 130u16;
+        let (_, r) = placement_pair(&mems, shard);
+        let mut block = RegimeBlock::default();
+        block.override_map.insert(shard, r);
+        block.regime.set(shard, 2);
+        assert_eq!(
+            auth.handle_commit(&commit_with_block(2, mems, 3, block.clone())),
+            Some(2)
+        );
+        let state = auth.persisted_state(3, 1);
+        assert_eq!(state.regime_block, block);
+        let restored = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+        restored.restore(&state);
+        assert_eq!(restored.committed_regime_block(), block);
+        assert_eq!(restored.committed_regime(shard), 2);
+    }
+
+    // -- producers ---------------------------------------------------------
+
+    #[test]
+    fn membership_change_bumps_regimes_of_replaced_masters_only() {
+        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+        auth.set_replication_factor(2);
+        // A configured cluster_id lets the {1,2} -> {1,2,3} grow pass the
+        // ever-seen split-brain fallback (P1.1: matching ids skip it).
+        auth.set_cluster_id(ClusterId([0x11; 16]));
+        seed_committed(&auth, members(&[1, 2]));
+        // Grow to {1,2,3}: placement masters move for some shards.
+        let term = auth
+            .on_membership_changed(&members(&[1, 2, 3]))
+            .expect("proposer 1 proposes the grow");
+        let old_table =
+            crate::cluster::shards::ShardTable::compute_with_epoch(&members(&[1, 2]), 2, 1, 1);
+        let new_table =
+            crate::cluster::shards::ShardTable::compute_with_epoch(&members(&[1, 2, 3]), 2, 1, 1);
+        let mut bumped = 0usize;
+        for shard in 0..crate::cluster::shards::NUM_SHARDS as u16 {
+            let changed = old_table.assignment(shard).master != new_table.assignment(shard).master;
+            let regime = term.regime_block.regime.get(shard);
+            if changed {
+                assert_eq!(
+                    regime, term.term,
+                    "shard {shard}: a placement-driven master change must bump the regime \
+                     to the carrying term (§4.1 makes no mechanism distinction)",
+                );
+                bumped += 1;
+            } else {
+                assert_eq!(
+                    regime, 0,
+                    "shard {shard}: unchanged master carries regime 0"
+                );
+            }
+        }
+        assert!(bumped > 0, "a 2->3 grow must re-master some shards");
+        assert!(term.regime_block.override_map.is_empty());
+    }
+
+    #[test]
+    fn propose_shrink_refuses_when_override_map_would_change() {
+        let auth = seed_regime_authority(1);
+        let mems = members(&[1, 2, 3]);
+        // Install an override targeting node 3 on some shard.
+        let shard = (0..crate::cluster::shards::NUM_SHARDS as u16)
+            .find(|&s| {
+                let (m, r) = placement_pair(&mems, s);
+                r == NodeId(3) && m != NodeId(3)
+            })
+            .expect("some shard has node 3 as its placement replica");
+        let mut block = RegimeBlock::default();
+        block.override_map.insert(shard, NodeId(3));
+        block.regime.set(shard, 2);
+        assert_eq!(
+            auth.handle_commit(&commit_with_block(2, mems, 3, block)),
+            Some(2)
+        );
+        // Shrinking node 3 away would retire the override -> I6 refusal.
+        assert!(
+            auth.propose_shrink(members(&[1, 2])).is_none(),
+            "a shrink that would change the override map must be refused (I6)",
+        );
+    }
+
+    #[test]
+    fn p1_formation_recovery_arm_rejects_override_carrying_terms() {
+        // §4.4 — the single-node formation-recovery arm must not accept an
+        // override-carrying proposal at a non-strictly-higher term.
+        let cid = ClusterId([0x22; 16]);
+        let auth = TopologyAuthority::new(NodeId(3), Duration::from_secs(1));
+        auth.set_replication_factor(2);
+        auth.set_cluster_id(cid);
+        // Committed single-node state at term 5, voted_term still 0.
+        let single = commit_with_block(5, members(&[3]), 1, RegimeBlock::default());
+        assert_eq!(auth.handle_commit(&single), Some(5));
+
+        let mems = members(&[1, 3]);
+        // A benign (no-override) recovery proposal at term 4 (> voted 0,
+        // <= committed 5) IS accepted by the arm.
+        let benign = TopologyTerm::new_with_block(
+            4,
+            mems.clone(),
+            NodeId(1),
+            cid,
+            1,
+            2,
+            RegimeBlock::default(),
+        );
+        assert!(
+            auth.handle_propose(&benign).accepted,
+            "the formation-recovery arm accepts a benign multi-node proposal",
+        );
+
+        // The SAME shape carrying an override change must be refused.
+        let auth2 = TopologyAuthority::new(NodeId(3), Duration::from_secs(1));
+        auth2.set_replication_factor(2);
+        auth2.set_cluster_id(cid);
+        assert_eq!(auth2.handle_commit(&single), Some(5));
+        let (_, r) = placement_pair(&mems, 7);
+        let mut block = RegimeBlock::default();
+        block.override_map.insert(7, r);
+        block.regime.set(7, 4);
+        let override_carrying = TopologyTerm::new_with_block(4, mems, NodeId(1), cid, 1, 2, block);
+        assert!(
+            !auth2.handle_propose(&override_carrying).accepted,
+            "the formation-recovery arm must NOT apply to override-carrying proposals \
+             (double-vote at one term = two same-term commits with different masters)",
+        );
+    }
+
+    // -- committed flags, adverts, I11 -------------------------------------
+
+    /// Record a full-capability advert for `peer` at `incarnation`.
+    fn advertise(auth: &TopologyAuthority, peer: u64, incarnation: u64) {
+        auth.record_peer_regime_advert(NodeId(peer), incarnation, true, true);
+    }
+
+    #[test]
+    fn vote_wire_roundtrips_advert_and_legacy_votes_decode_conservative() {
+        let vote = TopologyVote {
+            term: 3,
+            digest: [7u8; 32],
+            voter: NodeId(2),
+            accepted: true,
+            voter_current_term: 2,
+            voter_placement_support: 2,
+            voter_incarnation: 11,
+            regime_support: true,
+            ack_writeall_equiv: true,
+        };
+        let decoded = TopologyVote::deserialize(&vote.serialize()).expect("decode");
+        assert_eq!(decoded.voter_incarnation, 11);
+        assert!(decoded.regime_support);
+        assert!(decoded.ack_writeall_equiv);
+        // A pre-P1 (59-byte) vote decodes with NO advert.
+        let mut legacy = vote.serialize();
+        legacy.truncate(59);
+        let decoded = TopologyVote::deserialize(&legacy).expect("legacy decode");
+        assert_eq!(decoded.voter_incarnation, 0);
+        assert!(!decoded.regime_support, "absent advert must decode false");
+        assert!(!decoded.ack_writeall_equiv);
+        // A pre-W6 (57-byte) vote still decodes too.
+        let mut older = vote.serialize();
+        older.truncate(57);
+        let decoded = TopologyVote::deserialize(&older).expect("pre-W6 decode");
+        assert_eq!(decoded.voter_placement_support, 1);
+        assert!(!decoded.regime_support);
+    }
+
+    #[test]
+    fn handle_propose_advertises_only_with_secret_and_real_ack_policy() {
+        let auth = TopologyAuthority::new(NodeId(2), Duration::from_secs(1));
+        auth.set_self_incarnation(4);
+        let propose = TopologyTerm::new(1, members(&[1, 2, 3]), NodeId(1), ClusterId::UNSET, 1, 3);
+        let vote = auth.handle_propose(&propose);
+        assert!(!vote.regime_support, "no secret -> never advertise (I11)");
+        assert!(!vote.ack_writeall_equiv);
+        assert_eq!(vote.voter_incarnation, 4);
+        auth.set_secret_configured(true);
+        auth.set_self_ack_writeall_equiv(true);
+        let vote = auth.handle_propose(&propose);
+        assert!(vote.regime_support);
+        assert!(vote.ack_writeall_equiv);
+    }
+
+    #[test]
+    fn i11_advert_keyed_by_incarnation_resets_on_higher_incarnation() {
+        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+        auth.record_peer_regime_advert(NodeId(2), 3, true, true);
+        let a = auth.peer_regime_advert(NodeId(2)).expect("stored");
+        assert!(a.regime_support && a.ack_writeall_equiv);
+        // A LOWER incarnation (stale/replayed) is ignored.
+        auth.record_peer_regime_advert(NodeId(2), 2, false, false);
+        let a = auth.peer_regime_advert(NodeId(2)).expect("stored");
+        assert!(
+            a.regime_support,
+            "stale lower-incarnation advert must be ignored"
+        );
+        // The SAME incarnation merges monotonically (OR).
+        auth.record_peer_regime_advert(NodeId(2), 3, false, false);
+        let a = auth.peer_regime_advert(NodeId(2)).expect("stored");
+        assert!(a.regime_support, "same-incarnation merge is monotonic");
+        // A HIGHER incarnation REPLACES: a restarted (possibly downgraded)
+        // binary starts from its fresh advert (I11 reset semantics).
+        auth.record_peer_regime_advert(NodeId(2), 4, false, false);
+        let a = auth.peer_regime_advert(NodeId(2)).expect("stored");
+        assert!(
+            !a.regime_support,
+            "a higher incarnation must RESET the advert (same-id binary downgrade)",
+        );
+        assert_eq!(a.incarnation, 4);
+    }
+
+    #[test]
+    fn propose_regime_enforced_requires_secret_and_unanimous_adverts() {
+        let auth = seed_regime_authority(1);
+        assert_eq!(
+            auth.propose_regime_enforced(true).unwrap_err(),
+            RegimeProposeError::SecretRequired,
+            "I11: a secret-less node never proposes enforcement",
+        );
+        auth.set_secret_configured(true);
+        match auth.propose_regime_enforced(true).unwrap_err() {
+            RegimeProposeError::MemberLacksRegimeSupport { member } => {
+                assert!(member == 2 || member == 3, "an un-advertised member blocks");
+            }
+            other => panic!("expected MemberLacksRegimeSupport, got {other:?}"),
+        }
+        advertise(&auth, 2, 1);
+        advertise(&auth, 3, 1);
+        let term = auth
+            .propose_regime_enforced(true)
+            .expect("unanimous adverts");
+        assert!(term.regime_block.regime_enforced);
+        assert!(!term.regime_block.promotion_enabled);
+        assert_eq!(
+            term.regime_block.override_map,
+            std::collections::BTreeMap::new(),
+            "a flag term carries no override change (I6)",
+        );
+        assert_eq!(term.members, members(&[1, 2, 3]));
+        assert_eq!(term.committed_peak, 3, "no peak change (I6)");
+    }
+
+    #[test]
+    fn propose_regime_enforced_blocked_after_incarnation_reset() {
+        let auth = seed_regime_authority(1);
+        auth.set_secret_configured(true);
+        advertise(&auth, 2, 1);
+        advertise(&auth, 3, 1);
+        // Node 3 restarts into a build/config without regime support.
+        auth.record_peer_regime_advert(NodeId(3), 2, false, false);
+        assert_eq!(
+            auth.propose_regime_enforced(true).unwrap_err(),
+            RegimeProposeError::MemberLacksRegimeSupport { member: 3 },
+        );
+    }
+
+    #[test]
+    fn propose_promotion_enabled_requires_opt_in_and_unanimous_writeall() {
+        let auth = seed_regime_authority(1);
+        auth.set_self_ack_writeall_equiv(true);
+        advertise(&auth, 2, 1);
+        advertise(&auth, 3, 1);
+        assert_eq!(
+            auth.propose_promotion_enabled(true).unwrap_err(),
+            RegimeProposeError::PromotionProposalNotEnabled,
+            "the enable_automatic_promotion opt-in gates the proposal capability",
+        );
+        auth.set_promotion_proposal_opt_in(true);
+        let term = auth
+            .propose_promotion_enabled(true)
+            .expect("opt-in + unanimous WriteAll adverts");
+        assert!(term.regime_block.promotion_enabled);
+        assert!(!term.regime_block.regime_enforced);
+    }
+
+    #[test]
+    fn i4_promotion_blocked_by_member_without_writeall_equivalence() {
+        let auth = seed_regime_authority(1);
+        auth.set_promotion_proposal_opt_in(true);
+        auth.set_self_ack_writeall_equiv(true);
+        advertise(&auth, 2, 1);
+        // Node 3 advertises regime support but NOT WriteAll-equivalence
+        // (e.g. an auto-at-RF>=3 member).
+        auth.record_peer_regime_advert(NodeId(3), 1, true, false);
+        assert_eq!(
+            auth.propose_promotion_enabled(true).unwrap_err(),
+            RegimeProposeError::MemberLacksWriteAllEquivalence { member: 3 },
+        );
+    }
+
+    #[test]
+    fn flag_proposers_refuse_no_change_wrong_proposer_and_pending() {
+        let auth = seed_regime_authority(1);
+        auth.set_secret_configured(true);
+        advertise(&auth, 2, 1);
+        advertise(&auth, 3, 1);
+        assert_eq!(
+            auth.propose_regime_enforced(false).unwrap_err(),
+            RegimeProposeError::NoChange,
+        );
+        // Not the deterministic proposer.
+        let follower = seed_regime_authority(2);
+        follower.set_secret_configured(true);
+        assert_eq!(
+            follower.propose_regime_rebase().unwrap_err(),
+            RegimeProposeError::NotProposer { proposer: 1 },
+        );
+        // A pending proposal blocks a second one.
+        let _pending = auth.propose_regime_enforced(true).expect("first proposes");
+        assert_eq!(
+            auth.propose_regime_rebase().unwrap_err(),
+            RegimeProposeError::ProposalPending,
+        );
+        // No committed topology at all.
+        let fresh = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+        assert_eq!(
+            fresh.propose_regime_rebase().unwrap_err(),
+            RegimeProposeError::NoCommittedTopology,
+        );
+    }
+
+    #[test]
+    fn committed_regime_enforced_roundtrip_and_i11_secretless_ignores_it() {
+        let proposer = seed_regime_authority(1);
+        proposer.set_secret_configured(true);
+        advertise(&proposer, 2, 1);
+        advertise(&proposer, 3, 1);
+        let term = proposer.propose_regime_enforced(true).expect("proposes");
+        let commit = TopologyCommit {
+            term: term.term,
+            proposer: term.proposer,
+            members: term.members.clone(),
+            cluster_id: term.cluster_id,
+            placement_version: term.placement_version,
+            committed_peak: term.committed_peak,
+            digest: term.digest,
+            voters: term.members.clone(),
+            regime_block: term.regime_block.clone(),
+        };
+        assert_eq!(proposer.handle_commit(&commit), Some(term.term));
+        assert!(proposer.committed_regime_enforced());
+        assert!(
+            proposer.regime_enforcement_active(),
+            "committed true + secret configured = active",
+        );
+
+        // A secret-less node STORES the committed flag but never acts on
+        // it (I11: in fail-open, commits are forgeable; a forged
+        // enforcement frame must not become a reboot-resistant kill).
+        let secretless = seed_regime_authority(2);
+        assert_eq!(secretless.handle_commit(&commit), Some(term.term));
+        assert!(secretless.committed_regime_enforced(), "stored");
+        assert!(
+            !secretless.regime_enforcement_active(),
+            "I11: never acted on without a cluster_secret",
+        );
+    }
+
+    #[test]
+    fn i7_rebase_clears_unjustified_regimes_and_keeps_override_regimes() {
+        let auth = seed_regime_authority(1);
+        let mems = members(&[1, 2, 3]);
+        let shard = 140u16;
+        let (_, r) = placement_pair(&mems, shard);
+        // Term 2: an override (regime 2) plus a placement-driven-style bump
+        // on another shard (master changes are simulated via a retirement
+        // pattern — here we simply install the override then bump another
+        // shard legitimately through a retirement term).
+        let mut block = RegimeBlock::default();
+        block.override_map.insert(shard, r);
+        block.regime.set(shard, 2);
+        assert_eq!(
+            auth.handle_commit(&commit_with_block(2, mems.clone(), 3, block.clone())),
+            Some(2)
+        );
+        // Term 3: retire ANOTHER shard's fresh override to leave a
+        // non-override regime standing. (Install at 3, retire at 4.)
+        let shard2 = 141u16;
+        let (_, r2) = placement_pair(&mems, shard2);
+        let mut b3 = block.clone();
+        b3.override_map.insert(shard2, r2);
+        b3.regime.set(shard2, 3);
+        assert_eq!(
+            auth.handle_commit(&commit_with_block(3, mems.clone(), 3, b3)),
+            Some(3)
+        );
+        let mut b4 = block.clone();
+        b4.regime.set(shard2, 4); // retirement bump: shard2 back to placement
+        assert_eq!(
+            auth.handle_commit(&commit_with_block(4, mems.clone(), 3, b4)),
+            Some(4)
+        );
+        assert_eq!(auth.committed_regime(shard2), 4);
+
+        // The rebase clears shard2's regime (not justified by the map) and
+        // keeps the standing override's regime.
+        let rebase = auth.propose_regime_rebase().expect("proposer 1 rebases");
+        assert_eq!(rebase.regime_block.override_map, block.override_map);
+        assert_eq!(
+            rebase.regime_block.regime.get(shard),
+            2,
+            "override regime kept"
+        );
+        assert_eq!(
+            rebase.regime_block.regime.get(shard2),
+            0,
+            "non-override regime cleared"
+        );
+        assert_eq!(rebase.committed_peak, 3, "no peak change (I6)");
+        assert!(!rebase.regime_block.regime_enforced, "no flag change (I6)");
+
+        // The rebase commit APPLIES on a same-state peer (lowering is legal
+        // for a non-override-carrying commit).
+        let peer = seed_regime_authority(2);
+        assert_eq!(
+            peer.handle_commit(&commit_with_block(2, mems.clone(), 3, block.clone())),
+            Some(2)
+        );
+        let mut b3p = block.clone();
+        b3p.override_map.insert(shard2, r2);
+        b3p.regime.set(shard2, 3);
+        assert_eq!(
+            peer.handle_commit(&commit_with_block(3, mems.clone(), 3, b3p)),
+            Some(3)
+        );
+        let mut b4p = block.clone();
+        b4p.regime.set(shard2, 4);
+        assert_eq!(
+            peer.handle_commit(&commit_with_block(4, mems.clone(), 3, b4p)),
+            Some(4)
+        );
+        let rebase_commit = TopologyCommit {
+            term: rebase.term,
+            proposer: rebase.proposer,
+            members: rebase.members.clone(),
+            cluster_id: rebase.cluster_id,
+            placement_version: rebase.placement_version,
+            committed_peak: rebase.committed_peak,
+            digest: rebase.digest,
+            voters: rebase.members.clone(),
+            regime_block: rebase.regime_block.clone(),
+        };
+        assert_eq!(peer.handle_commit(&rebase_commit), Some(rebase.term));
+        assert_eq!(
+            peer.committed_regime(shard2),
+            0,
+            "rebase lowered the regime"
+        );
+        assert_eq!(peer.committed_regime(shard), 2, "override regime survived");
     }
 }

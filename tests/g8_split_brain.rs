@@ -39,8 +39,11 @@ fn commit_membership(auth: &TopologyAuthority, term: u64, ids: &[u64]) {
             &mems,
             1,
             (mems).len() as u64,
+            NodeId(1),
+            &Default::default(),
         ),
         voters: mems.clone(),
+        regime_block: Default::default(),
     };
     let applied = auth.handle_commit(&commit);
     assert_eq!(applied, Some(term), "test setup: commit must apply");
@@ -106,6 +109,8 @@ fn handle_propose_rejects_unseen_member_superset() {
         &propose.members,
         1,
         (propose.members).len() as u64,
+        NodeId(1),
+        &Default::default(),
     );
 
     let vote = auth.handle_propose(&propose);
@@ -266,6 +271,9 @@ fn vote_for(term: &TopologyTerm, voter: u64) -> teraslab::cluster::topology::Top
         accepted: true,
         voter_current_term: 0,
         voter_placement_support: 1,
+        voter_incarnation: 0,
+        regime_support: false,
+        ack_writeall_equiv: false,
     }
 }
 
@@ -394,6 +402,7 @@ fn restored_peak_blocks_minority_after_restart() {
         committed_voter_ever_seen: members(&[1, 2, 3]),
         committed_placement_version: 1,
         committed_peak: 3,
+        regime_block: Default::default(),
     });
     assert_eq!(auth.peak_cluster_size(), 3, "restore must reinstate peak");
 

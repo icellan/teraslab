@@ -25,7 +25,7 @@ use crate::record::{ExternalRef, METADATA_SIZE};
 use crate::redo::{RedoLog, RedoOp};
 use crate::replication::manager::ReplicaTransport;
 use crate::replication::protocol::{ReplicaAck, ReplicaBatch, ReplicaOp};
-use crate::replication::receiver::{DEFAULT_STREAM_KEY, handle_replica_batch_with_tracker};
+use crate::replication::receiver::DEFAULT_STREAM_KEY;
 use crate::replication::tcp_transport::TcpReplicaTransport;
 use crate::storage::blobstore::BlobStore;
 use parking_lot::Mutex;
@@ -922,14 +922,20 @@ pub(crate) fn handle_request(
             // (single-node tests, non-clustered mode) the gate falls back to
             // `0` which preserves the V1-compat "accept all" behavior.
             let local_cluster_key = cluster.map(|c| c.local_cluster_key()).unwrap_or(0);
+            // P1 §4.2: the regime gate reads the committed regime state
+            // through the coordinator's topology authority; without a
+            // cluster the gate is inactive (enforcement requires a
+            // committed flag only a cluster can install).
+            let regime = cluster.map(|c| c.topology_authority());
             if let Some(applied) = REPLICA_APPLIED_TRACKER.get() {
-                handle_replica_batch_with_tracker(
+                crate::replication::receiver::handle_replica_batch_regime_gated(
                     request,
                     engine,
                     &DISPATCH_REPLICA_LAST_APPLIED,
                     Some(applied),
                     DEFAULT_STREAM_KEY,
                     local_cluster_key,
+                    regime,
                 )
             } else {
                 // Test harness / single-stream path: route through the
@@ -942,6 +948,7 @@ pub(crate) fn handle_request(
                     engine,
                     &DISPATCH_REPLICA_LAST_APPLIED,
                     local_cluster_key,
+                    regime,
                 )
             }
             // NOTE: We do NOT mark inbound shards as complete here.
@@ -2937,6 +2944,37 @@ fn ensure_local_write_durable(engine: &Engine) -> std::result::Result<(), String
     Ok(())
 }
 
+/// P1 §4.2 — capture the sender's committed regime stamps for every shard
+/// `ops` touch, ONCE, at fan-out entry.
+///
+/// Returns `None` (emit V2) when [`TopologyAuthority::regime_enforcement_active`]
+/// is false — V3 is sent only from the enabling commit (I12's
+/// acceptance-is-a-capability rule covers the propagation window).
+/// Otherwise returns the canonical (ascending, deduplicated) table of
+/// `(shard, committed_regime(shard))` over the union of touched shards —
+/// the same [`crate::replication::protocol::touched_shards`] derivation the
+/// receiver's gate uses, so a stamp can never be missing for a shard the
+/// receiver checks.
+///
+/// The returned table must be threaded UNCHANGED through every resend
+/// path of the fan-out that captured it (capture-once — a demoted master
+/// must never re-stamp itself past its own demotion mid-repair).
+fn capture_regime_table<'a>(
+    cluster: &RunningCluster,
+    ops: impl IntoIterator<Item = &'a ReplicaOp>,
+) -> Option<Vec<(u16, u64)>> {
+    let authority = cluster.topology_authority();
+    if !authority.regime_enforcement_active() {
+        return None;
+    }
+    Some(
+        crate::replication::protocol::touched_shards(ops)
+            .into_iter()
+            .map(|shard| (shard, authority.committed_regime(shard)))
+            .collect(),
+    )
+}
+
 /// Replication fan-out with C-1 barrier handoff.
 ///
 /// `barrier` is the exclusive visibility barrier held by the mutation
@@ -3090,6 +3128,15 @@ fn replicate_all_ops_with_barrier(
     // Phase B3: stamp every outbound batch with the live coordinator
     // epoch so the receiver's gate can reject stale-cluster writes.
     let cluster_key = cluster.local_cluster_key();
+    // P1 §4.2: capture the regime stamps ONCE, here at fan-out entry,
+    // alongside the cluster_key capture — the union of every shard this
+    // fan-out's ops touch, stamped from the sender's committed regime
+    // state. The SAME captured table is threaded through every resend
+    // path below (including `repair_missing_record_target`), so a demoted
+    // master can never re-stamp itself past its own demotion mid-repair.
+    // `None` (emit V2) whenever regime enforcement is not active.
+    let regime_table =
+        capture_regime_table(cluster, ops_by_key.iter().flat_map(|(_, ops)| ops.iter()));
     let auth_secret = cluster.cluster_secret().map(|s| s.to_vec());
     // C-1 / G3 strict-fsync-before-ack: under active replication in buffered
     // durability, force this write's local redo tail + data devices durable
@@ -3138,6 +3185,11 @@ fn replicate_all_ops_with_barrier(
             let mut handles = Vec::with_capacity(by_addr.len());
             for (addr, ops) in by_addr {
                 let auth_secret = auth_secret.clone();
+                // §4.2: every per-address batch carries the ONE table
+                // captured at fan-out entry (the union covers each
+                // address's op subset; extra entries are ignored by the
+                // receiver's per-touched-shard check).
+                let regime_table = regime_table.clone();
                 let ack_timeout = ack_timeouts.get(&addr).copied().unwrap_or(base_timeout);
                 handles.push(tokio::task::spawn_blocking(move || {
                     if ops.is_empty() {
@@ -3155,6 +3207,7 @@ fn replicate_all_ops_with_barrier(
                         ack_timeout,
                         auth_secret.as_deref(),
                         cluster_key,
+                        regime_table.as_deref(),
                         source_node_id,
                         redo_seq_range.1,
                     );
@@ -3235,6 +3288,10 @@ fn replicate_all_ops_with_barrier(
                 ack_timeout,
                 auth_secret.as_deref(),
                 cluster_key,
+                // §4.2 capture-once: the repair resend carries the SAME
+                // stamps captured at fan-out entry — never a re-read of
+                // the live regime state.
+                regime_table.as_deref(),
                 source_node_id,
                 redo_seq_range.1,
             );
@@ -3251,6 +3308,30 @@ fn replicate_all_ops_with_barrier(
                 acked.insert(*addr);
             }
             Err(e) => {
+                // §4.2: a stale-regime NAK means this node's committed
+                // regime view is provably behind — raise the topology-
+                // staleness signal so the committed-channel catch-up
+                // refreshes it before the client's retry. The hint is
+                // routing advice only (I9): it never demotes this node
+                // and never mutates regime state; the batch still fails
+                // below exactly like any other replication failure.
+                if let ReplicaSendError::StaleRegime {
+                    shard,
+                    local_regime,
+                    ..
+                } = e
+                {
+                    if let Some(m) = crate::metrics::replication_metrics() {
+                        m.replica_send_stale_regime.inc();
+                    }
+                    tracing::warn!(
+                        %addr,
+                        shard = *shard,
+                        receiver_regime = *local_regime,
+                        "replication: replica rejected batch with stale regime — raising topology-staleness signal",
+                    );
+                    cluster.signal_topology_stale(*local_regime);
+                }
                 tracing::warn!(err = %e, "replication to replica failed");
                 last_error = Some(e.to_string());
             }
@@ -5049,7 +5130,7 @@ fn exchange_replica_batch(
     batch: &ReplicaBatch,
     ack_timeout: Duration,
     auth_secret: Option<&[u8]>,
-) -> std::result::Result<ReplicaAck, String> {
+) -> std::result::Result<ReplicaAck, ReplicaSendError> {
     let mut transport = match connection.take() {
         Some(t) if t.is_connected() && t.auth_secret_matches(auth_secret) => t,
         _ => TcpReplicaTransport::connect_with_auth(
@@ -5057,7 +5138,7 @@ fn exchange_replica_batch(
             Duration::from_secs(5),
             auth_secret.map(|s| s.to_vec()),
         )
-        .map_err(|e| format!("connect: {e}"))?,
+        .map_err(|e| ReplicaSendError::Failed(format!("connect: {e}")))?,
     };
 
     if let Err(e) = transport.send_batch(batch) {
@@ -5069,9 +5150,11 @@ fn exchange_replica_batch(
             Duration::from_secs(5),
             auth_secret.map(|s| s.to_vec()),
         )
-        .map_err(|e2| format!("send: {e}; reconnect: {e2}"))?;
+        .map_err(|e2| ReplicaSendError::Failed(format!("send: {e}; reconnect: {e2}")))?;
         if let Err(e2) = retry_transport.send_batch(batch) {
-            return Err(format!("send after reconnect: {e2}"));
+            return Err(ReplicaSendError::Failed(format!(
+                "send after reconnect: {e2}"
+            )));
         }
         transport = retry_transport;
     }
@@ -5081,7 +5164,21 @@ fn exchange_replica_batch(
             *connection = Some(transport);
             Ok(ack)
         }
-        Err(e) => Err(format!("recv_ack: {e}")),
+        // §4.2: the receiver's regime gate NAKs with an error payload (not
+        // a ReplicaAck); the transport surfaces it TYPED so the fan-out can
+        // raise the topology-staleness signal instead of parsing messages.
+        Err(crate::replication::manager::ReplicationError::StaleRegime {
+            shard,
+            local_regime,
+        }) => Err(ReplicaSendError::StaleRegime {
+            shard,
+            local_regime,
+            detail: format!(
+                "replica {addr} rejected batch: stale regime for shard {shard} \
+                 (receiver committed regime {local_regime})"
+            ),
+        }),
+        Err(e) => Err(ReplicaSendError::Failed(format!("recv_ack: {e}"))),
     }
 }
 
@@ -5147,6 +5244,7 @@ fn repair_missing_record_target(
     ack_timeout: Duration,
     auth_secret: Option<&[u8]>,
     cluster_key: u64,
+    regime_table: Option<&[(u16, u64)]>,
     source_node_id: u64,
     redo_high: u64,
 ) -> std::result::Result<(), ReplicaSendError> {
@@ -5208,6 +5306,10 @@ fn repair_missing_record_target(
             ack_timeout,
             auth_secret,
             cluster_key,
+            // §4.2 capture-once: the repair re-send carries the SAME stamps
+            // the fan-out captured at entry — a regime change mid-repair
+            // must never be picked up here.
+            regime_table,
             source_node_id,
             redo_high,
         ) {
@@ -5225,6 +5327,15 @@ fn repair_missing_record_target(
             }) => {
                 missing = tx_keys;
                 detail = next;
+            }
+            // §4.2: the repair resend hit the regime gate — propagate TYPED
+            // so the fan-out raises the topology-staleness signal; the
+            // batch fails exactly like any other repair failure.
+            Err(e @ ReplicaSendError::StaleRegime { .. }) => {
+                if let Some(m) = crate::metrics::replication_metrics() {
+                    m.replica_missing_record_repair_failed.inc();
+                }
+                return Err(e);
             }
             Err(ReplicaSendError::Failed(e)) => {
                 if let Some(m) = crate::metrics::replication_metrics() {
@@ -5266,6 +5377,23 @@ pub enum ReplicaSendError {
         /// Every record of this batch the replica reported absent (the aborting
         /// one first). The master re-ships all of them in one round.
         tx_keys: Vec<TxKey>,
+        /// Operator-facing detail, for logs and the client-visible error.
+        detail: String,
+    },
+    /// P1 §4.2 — the replica rejected the batch at its regime gate
+    /// (`ERR_STALE_REGIME`): a touched shard's stamp is behind the
+    /// receiver's committed regime, or the batch carried no stamp for it
+    /// under enforcement (I12). The batch fails exactly like
+    /// [`Self::Failed`] (whole-batch, compensated, never salvaged); the
+    /// TYPE exists so the fan-out can additionally raise the
+    /// topology-staleness signal. The carried hint is routing advice only
+    /// (I9) — it is never adopted as regime state.
+    #[error("{detail}")]
+    StaleRegime {
+        /// The stale shard named by the replica's NAK hint.
+        shard: u16,
+        /// The replica's committed regime for that shard.
+        local_regime: u64,
         /// Operator-facing detail, for logs and the client-visible error.
         detail: String,
     },
@@ -5328,12 +5456,19 @@ const MAX_SEQUENCE_RENEGOTIATIONS: usize = 2;
 /// This is the flattened-error entry point kept for callers that cannot act on
 /// WHY the send failed. The fan-out uses [`send_replica_ops_to_reporting`],
 /// which preserves the repairable [`ReplicaSendError::MissingRecord`] case.
+///
+/// `regime_table` is the sender's captured regime stamp table (P1 §4.2):
+/// `Some` makes every batch (probe included) a V3 frame carrying it;
+/// `None` emits V2. Callers capture it once at their own fan-out entry
+/// (see [`capture_regime_table`]).
+#[allow(clippy::too_many_arguments)]
 pub fn send_replica_ops_to(
     addr: SocketAddr,
     ops: &[ReplicaOp],
     ack_timeout: Duration,
     auth_secret: Option<&[u8]>,
     cluster_key: u64,
+    regime_table: Option<&[(u16, u64)]>,
     source_node_id: u64,
     redo_high: u64,
 ) -> std::result::Result<(), String> {
@@ -5343,6 +5478,7 @@ pub fn send_replica_ops_to(
         ack_timeout,
         auth_secret,
         cluster_key,
+        regime_table,
         source_node_id,
         redo_high,
     )
@@ -5361,6 +5497,7 @@ pub fn send_replica_ops_to_reporting(
     ack_timeout: Duration,
     auth_secret: Option<&[u8]>,
     cluster_key: u64,
+    regime_table: Option<&[(u16, u64)]>,
     source_node_id: u64,
     redo_high: u64,
 ) -> std::result::Result<(), ReplicaSendError> {
@@ -5381,6 +5518,7 @@ pub fn send_replica_ops_to_reporting(
         addr,
         ops,
         cluster_key,
+        regime_table,
         source_node_id,
         redo_high,
         next_sequence,
@@ -5413,11 +5551,12 @@ fn send_replica_ops_loop(
     addr: SocketAddr,
     ops: &[ReplicaOp],
     cluster_key: u64,
+    regime_table: Option<&[(u16, u64)]>,
     source_node_id: u64,
     redo_high: u64,
     next_sequence: &mut Option<u64>,
     last_acked: &mut u64,
-    mut exchange: impl FnMut(&ReplicaBatch) -> std::result::Result<ReplicaAck, String>,
+    mut exchange: impl FnMut(&ReplicaBatch) -> std::result::Result<ReplicaAck, ReplicaSendError>,
 ) -> std::result::Result<(), ReplicaSendError> {
     // Sync the stream cursor on first contact: adopt the replica's
     // authoritative applied watermark via an empty-batch probe. Initializing
@@ -5433,8 +5572,12 @@ fn send_replica_ops_loop(
                 trace_ctx: None,
                 source_node_id: Some(source_node_id),
                 cluster_key,
+                // §4.2/I12: the probe rides the same wire version as the
+                // batch — a V2 probe under enforcement would be rejected
+                // before the cursor could sync.
+                regime_table: regime_table.map(|t| t.to_vec()),
             };
-            match exchange(&probe).map_err(ReplicaSendError::Failed)? {
+            match exchange(&probe)? {
                 ReplicaAck::Ok { through_sequence } => {
                     let n = through_sequence + 1;
                     *next_sequence = Some(n);
@@ -5462,6 +5605,9 @@ fn send_replica_ops_loop(
             trace_ctx: crate::observability::WireTraceContext::from_current_span(),
             source_node_id: Some(source_node_id),
             cluster_key,
+            // §4.2 capture-once: every (re)send in this loop carries the
+            // SAME table the caller captured at fan-out entry.
+            regime_table: regime_table.map(|t| t.to_vec()),
         };
         let last = batch.last_sequence();
 
@@ -5471,9 +5617,11 @@ fn send_replica_ops_loop(
                 // Burn the assigned positions: the frame may have been applied
                 // with the ACK lost in flight. Reusing the positions for
                 // different content could be dedup-skipped by the receiver; a
-                // hole heals via Gap/relabel instead.
+                // hole heals via Gap/relabel instead. A typed stale-regime
+                // rejection propagates as-is so the fan-out can raise the
+                // topology-staleness signal.
                 *next_sequence = Some(last + 1);
-                return Err(ReplicaSendError::Failed(e));
+                return Err(e);
             }
         };
 
@@ -8993,6 +9141,10 @@ fn handle_reassign_batch(
                         block_height: params.block_height,
                         spendable_after: params.spendable_after,
                         master_generation: mgen,
+                        // §4.9: engine.reassign validated the slot against
+                        // this exact prior identity, so the replica applies
+                        // the same guarded transition (V3 wire only).
+                        prior_utxo_hash: Some(v.item.utxo_hash),
                     }],
                 ));
                 before_images_by_key.push((
@@ -13045,9 +13197,10 @@ mod tests {
         let res = send_replica_ops_loop(
             addr,
             &ops,
-            0, // cluster_key
-            1, // source_node_id
-            0, // redo_high (skip the ACK_TRACKER side effect)
+            0,    // cluster_key
+            None, // regime_table
+            1,    // source_node_id
+            0,    // redo_high (skip the ACK_TRACKER side effect)
             &mut next_sequence,
             &mut last_acked,
             |batch: &ReplicaBatch| {
@@ -13105,6 +13258,7 @@ mod tests {
             addr,
             &ops,
             0,
+            None,
             1,
             0,
             &mut next_sequence,
@@ -13144,6 +13298,217 @@ mod tests {
         assert_eq!(
             last_acked, 0,
             "a failed send never records a through_sequence"
+        );
+    }
+
+    /// §4.2 capture-once pin: EVERY frame the send loop emits — the
+    /// cursor-sync probe, the first labeled send, and a Gap-relabeled
+    /// resend — carries the ONE regime table captured at fan-out entry,
+    /// byte-for-byte. The loop has no access to any live regime source, so
+    /// a regime change mid-fan-out (including mid-repair, which re-enters
+    /// this same loop with the same captured slice) can never be picked up
+    /// by a resend.
+    #[test]
+    fn send_loop_threads_captured_regime_table_through_probe_and_resends() {
+        let addr: SocketAddr = "127.0.0.1:9002".parse().unwrap();
+        let ops = vec![ReplicaOp::Spend {
+            tx_key: crate::index::TxKey { txid: [8u8; 32] },
+            offset: 0,
+            spending_data: [0u8; 36],
+            current_block_height: 0,
+            block_height_retention: 0,
+            master_generation: 0,
+        }];
+        let captured: Vec<(u16, u64)> = vec![(3, 7), (9, 11)];
+        // Cursor UNSYNCED so the loop sends a probe first.
+        let mut next_sequence = None;
+        let mut last_acked = 0u64;
+
+        let mut calls = 0usize;
+        let mut seen_tables: Vec<Option<Vec<(u16, u64)>>> = Vec::new();
+        let res = send_replica_ops_loop(
+            addr,
+            &ops,
+            10,              // cluster_key
+            Some(&captured), // the fan-out's captured table
+            1,               // source_node_id
+            0,               // redo_high
+            &mut next_sequence,
+            &mut last_acked,
+            |batch: &ReplicaBatch| {
+                calls += 1;
+                seen_tables.push(batch.regime_table.clone());
+                match calls {
+                    // Probe → replica watermark 4, so the batch labels at 5.
+                    1 => Ok(ReplicaAck::Ok {
+                        through_sequence: 4,
+                    }),
+                    // First labeled send → Gap NAK forces a relabeled resend.
+                    2 => Ok(ReplicaAck::Gap {
+                        expected_sequence: 3,
+                        received_first_sequence: batch.first_sequence,
+                    }),
+                    _ => Ok(ReplicaAck::Ok {
+                        through_sequence: batch.last_sequence(),
+                    }),
+                }
+            },
+        );
+        res.expect("relabelled resend must succeed");
+        assert_eq!(calls, 3, "probe + send + relabeled resend");
+        for (i, table) in seen_tables.iter().enumerate() {
+            assert_eq!(
+                table.as_deref(),
+                Some(captured.as_slice()),
+                "frame {i} must carry the captured table unchanged (capture-once)",
+            );
+        }
+    }
+
+    /// §4.2: a stale-regime NAK from the exchange propagates TYPED
+    /// (`ReplicaSendError::StaleRegime`, never flattened to a string) so
+    /// the fan-out can raise the topology-staleness signal — and it burns
+    /// the batch's positions exactly like any other terminal send failure.
+    #[test]
+    fn stale_regime_nak_propagates_typed_and_burns_positions() {
+        let addr: SocketAddr = "127.0.0.1:9003".parse().unwrap();
+        let ops = vec![ReplicaOp::Spend {
+            tx_key: crate::index::TxKey { txid: [9u8; 32] },
+            offset: 0,
+            spending_data: [0u8; 36],
+            current_block_height: 0,
+            block_height_retention: 0,
+            master_generation: 0,
+        }];
+        let mut next_sequence = Some(5u64);
+        let mut last_acked = 0u64;
+
+        let res = send_replica_ops_loop(
+            addr,
+            &ops,
+            10,
+            Some(&[(3, 7)]),
+            1,
+            0,
+            &mut next_sequence,
+            &mut last_acked,
+            |_batch: &ReplicaBatch| {
+                Err(ReplicaSendError::StaleRegime {
+                    shard: 3,
+                    local_regime: 12,
+                    detail: "replica rejected batch: stale regime".to_string(),
+                })
+            },
+        );
+        match res {
+            Err(ReplicaSendError::StaleRegime {
+                shard,
+                local_regime,
+                ..
+            }) => {
+                assert_eq!(shard, 3);
+                assert_eq!(local_regime, 12);
+            }
+            other => panic!("stale-regime NAK must stay typed, got {other:?}"),
+        }
+        assert_eq!(
+            next_sequence,
+            Some(6),
+            "a stale-regime reject burns the batch's positions (last=5 → 6)",
+        );
+        assert_eq!(last_acked, 0);
+    }
+
+    /// §4.2: `capture_regime_table` returns `None` (emit V2) while
+    /// enforcement is inactive, and — once the committed `regime_enforced`
+    /// flag and secret are installed — the canonical (ascending,
+    /// deduplicated) union of the ops' touched shards stamped with the
+    /// sender's committed regimes, including every txid of a
+    /// `SetMinedBatch`.
+    #[test]
+    fn capture_regime_table_stamps_touched_shards_when_enforced() {
+        use crate::cluster::shards::{NodeId, ShardTable};
+        use crate::cluster::topology::{PersistedTopologyState, RegimeArray, RegimeBlock};
+
+        let members = [NodeId(1), NodeId(2)];
+        let table = ShardTable::compute_with_epoch(&members, 2, 10, 1);
+        let cluster = crate::cluster::coordinator::new_test_running_cluster(
+            NodeId(1),
+            table,
+            &[
+                (NodeId(1), "127.0.0.1:4491".parse().unwrap()),
+                (NodeId(2), "127.0.0.1:4492".parse().unwrap()),
+            ],
+            &members,
+            &[],
+            &[],
+            &[],
+            2,
+        );
+
+        let k1 = TxKey { txid: [1u8; 32] };
+        let k2 = TxKey { txid: [2u8; 32] };
+        let ops = [
+            (k1, vec![ReplicaOp::Delete { tx_key: k1 }]),
+            (
+                k2,
+                vec![ReplicaOp::SetMinedBatch {
+                    block_id: 1,
+                    block_height: 1,
+                    subtree_idx: 0,
+                    on_longest_chain: true,
+                    current_block_height: 1,
+                    block_height_retention: 1,
+                    unset: false,
+                    txids: vec![k2],
+                }],
+            ),
+        ];
+        let all_ops = || ops.iter().flat_map(|(_, o)| o.iter());
+
+        // Enforcement inactive (bootstrap state): V2.
+        assert_eq!(
+            capture_regime_table(&cluster, all_ops()),
+            None,
+            "no committed regime_enforced → emit V2",
+        );
+
+        // Install committed regime state + secret (I11) on the authority.
+        let s1 = ShardTable::shard_for_key(&k1);
+        let s2 = ShardTable::shard_for_key(&k2);
+        let mut regime = RegimeArray::default();
+        regime.set(s1, 9);
+        regime.set(s2, 4);
+        cluster
+            .topology_authority()
+            .restore(&PersistedTopologyState {
+                peak_cluster_size: 2,
+                committed_term: 10,
+                committed_members: members.to_vec(),
+                committed_voters: members.to_vec(),
+                voted_term: 10,
+                incarnation: 1,
+                committed_voter_ever_seen: members.to_vec(),
+                committed_placement_version: 1,
+                committed_peak: 2,
+                regime_block: RegimeBlock {
+                    override_map: std::collections::BTreeMap::new(),
+                    regime,
+                    regime_enforced: true,
+                    promotion_enabled: false,
+                },
+            });
+        cluster.topology_authority().set_secret_configured(true);
+
+        let captured = capture_regime_table(&cluster, all_ops())
+            .expect("enforcement active → capture the table");
+        let mut expected: Vec<(u16, u64)> = vec![(s1, 9), (s2, 4)];
+        expected.sort_unstable();
+        expected.dedup();
+        assert_eq!(
+            captured, expected,
+            "the captured table must be the canonical union of touched shards \
+             stamped with the sender's committed regimes",
         );
     }
 
@@ -20667,6 +21032,7 @@ mod tests {
                 trace_ctx: None,
                 source_node_id: None,
                 cluster_key: cluster.local_cluster_key(),
+                regime_table: None,
             }
             .serialize()
             .into(),
@@ -27672,7 +28038,11 @@ mod tests {
         // The reply has already been returned by handle_request. The
         // safety invariant: by the time the caller observes the reply,
         // the on-disk state MUST contain voted_term=500.
-        let persisted = crate::cluster::coordinator::load_topology_state(&path);
+        let persisted = crate::cluster::coordinator::load_topology_state(
+            &path,
+            crate::cluster::coordinator::LegacyTopologyDecode::Refuse,
+        )
+        .expect("new-format state file loads");
         assert_eq!(
             persisted.voted_term, 500,
             "voted_term must be persisted BEFORE the reply is observable; \
@@ -27823,8 +28193,11 @@ mod tests {
                 &members,
                 1,
                 (members).len() as u64,
+                proposer,
+                &Default::default(),
             ),
             voters: members.clone(),
+            regime_block: Default::default(),
         };
         let req = RequestFrame {
             request_id: 2,
@@ -27844,7 +28217,11 @@ mod tests {
         assert_eq!(resp.status, STATUS_OK, "commit must succeed");
 
         // By the time the reply is visible, committed_term=700 must be on disk.
-        let persisted = crate::cluster::coordinator::load_topology_state(&path);
+        let persisted = crate::cluster::coordinator::load_topology_state(
+            &path,
+            crate::cluster::coordinator::LegacyTopologyDecode::Refuse,
+        )
+        .expect("new-format state file loads");
         assert_eq!(
             persisted.committed_term, 700,
             "committed_term must be persisted before the commit reply returns"
@@ -27883,8 +28260,11 @@ mod tests {
             .expect("multi-node topology marker should persist");
         std::fs::remove_file(&topology_path).expect("delete persisted topology file");
 
-        let restored =
-            crate::cluster::coordinator::load_startup_topology_state(&cluster_state_path);
+        let restored = crate::cluster::coordinator::load_startup_topology_state(
+            &cluster_state_path,
+            crate::cluster::coordinator::LegacyTopologyDecode::Refuse,
+        )
+        .expect("missing .topo file loads the fresh-boot default");
         assert!(
             restored.peak_cluster_size >= 2,
             "deleted .topo must not erase local multi-node evidence; restored peak={}",
@@ -32212,6 +32592,7 @@ mod tests {
                 block_height,
                 spendable_after,
                 master_generation: 0,
+                prior_utxo_hash: None,
             }],
         )];
         let before_images = vec![(
@@ -32281,6 +32662,7 @@ mod tests {
                 block_height: 700_001,
                 spendable_after: 100,
                 master_generation: 0,
+                prior_utxo_hash: None,
             }],
         )];
         let before_images = Vec::new();
@@ -32604,6 +32986,7 @@ mod tests {
                 block_height: 750_000,
                 spendable_after: 100,
                 master_generation: 0,
+                prior_utxo_hash: None,
             }],
         )];
         let before_images = vec![(
@@ -32690,6 +33073,7 @@ mod tests {
                 block_height: 750_100,
                 spendable_after: 100,
                 master_generation: 0,
+                prior_utxo_hash: None,
             }],
         )];
         let before_images = vec![(
@@ -32869,6 +33253,7 @@ mod tests {
                 block_height: 700_000,
                 spendable_after: 100,
                 master_generation: 0,
+                prior_utxo_hash: None,
             }],
         )];
         let before_images = vec![(

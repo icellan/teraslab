@@ -1357,6 +1357,20 @@ impl ClusterCoordinator {
         // P1.1: stamp the configured cluster_id before SWIM / the event
         // loop starts so the very first proposal already carries it.
         topology_authority.set_cluster_id(config.cluster_id);
+        // P1 stage 1 — wire the regime substrate before anything can vote
+        // or validate a commit: the secret presence (I11: a secret-less
+        // node never advertises regime support and ignores committed
+        // enforcement), the replication factor (I10a holder-set replicas),
+        // and the persisted incarnation (keys this node's own adverts).
+        topology_authority.set_secret_configured(
+            config
+                .cluster_secret
+                .as_ref()
+                .map(|s| !s.is_empty())
+                .unwrap_or(false),
+        );
+        topology_authority.set_replication_factor(config.replication_factor);
+        topology_authority.set_self_incarnation(config.persisted_incarnation);
         // E-01: seed the authority's peak from the persisted value so a
         // node that restarts into a partition derives its activation
         // quorum from the cluster size it once belonged to. (The server
@@ -1483,6 +1497,23 @@ impl ClusterCoordinator {
         replication: ReplicationRuntimeConfig,
     ) -> RunningCluster {
         let swim = self.swim.take().expect("swim already started");
+        // P1 stage 1 (I4) — advertise WriteAll-equivalence from the REAL
+        // resolved runtime policy, never from config intent: equivalence
+        // requires replicas to exist (RF > 1), a policy under which every
+        // replica target must ack (`required_replica_acks(targets, policy)
+        // == targets`), and a non-best-effort degraded mode. This value
+        // rides every vote this node casts (the `(NodeId, incarnation)`
+        // advert channel) and is what peers verify before proposing
+        // `promotion_enabled = true`.
+        let targets = (self.replication_factor as usize).saturating_sub(1);
+        let ack_writeall_equiv = self.replication_factor > 1
+            && !replication.best_effort
+            && replication
+                .ack_policy
+                .map(|p| crate::replication::manager::required_replica_acks(targets, p) == targets)
+                .unwrap_or(false);
+        self.topology_authority
+            .set_self_ack_writeall_equiv(ack_writeall_equiv);
         // G1 — grab the shared SWIM membership handle BEFORE `start()` consumes
         // the runner, so `alive_node_count` can exclude Suspect/Dead peers from
         // the mutation-quorum count.
@@ -1491,7 +1522,7 @@ impl ClusterCoordinator {
         // removed NodeIds from the local SWIM view right after activating a
         // quorum-gated shrink (see `react_to_committed_shrink`).
         let swim_membership_event = swim_membership.clone();
-        let (swim_shutdown, swim_handle, event_rx) = swim.start();
+        let (swim_shutdown, swim_handle, event_rx, cluster_event_tx) = swim.start();
 
         let shard_table = self.shard_table.clone();
         let migration = self.migration.clone();
@@ -1750,6 +1781,13 @@ impl ClusterCoordinator {
                                 voter_current_term: topo_authority_event.committed_term(),
                                 voter_placement_support:
                                     crate::cluster::shards::MAX_SUPPORTED_PLACEMENT_VERSION,
+                                // P1 stage 1 — inert on a SELF-vote:
+                                // `record_peer_regime_advert` ignores self, and
+                                // the unanimity gates read self capabilities
+                                // from authority state directly.
+                                voter_incarnation: inc,
+                                regime_support: false,
+                                ack_writeall_equiv: false,
                             };
                             if persisted_ok
                                 && let Some(commit) = topo_authority_event.handle_vote(&self_vote)
@@ -1790,6 +1828,7 @@ impl ClusterCoordinator {
                                         &active_topology_members_event,
                                         &migration_throttle_event,
                                         &cluster_secret_event,
+                                        Some(&topo_authority_event),
                                     );
                                     last_activation_at = std::time::Instant::now();
                                 }
@@ -2269,6 +2308,7 @@ impl ClusterCoordinator {
                                 &active_topology_members_event,
                                 &migration_throttle_event,
                                 &cluster_secret_event,
+                                Some(&topo_authority_event),
                             );
                         }
                     }
@@ -2374,6 +2414,7 @@ impl ClusterCoordinator {
                         &active_topology_members_event,
                         &migration_throttle_event,
                         &cluster_secret_event,
+                        Some(&topo_authority_event),
                     );
                     last_activation_at = std::time::Instant::now();
                     if let Some(ref path) = cluster_state_path {
@@ -2436,6 +2477,7 @@ impl ClusterCoordinator {
                         &partition_view,
                         &migration_throttle_event,
                         &cluster_secret_event,
+                        Some(&topo_authority_event),
                     );
                     // Reverse-heal Phase 3b — RUNTIME online re-heal. The
                     // partition view just refreshed carries every peer's per-shard
@@ -2550,6 +2592,7 @@ impl ClusterCoordinator {
                     let ib = inbound_bm_event.clone();
                     let throttle_ref = migration_throttle_event.clone();
                     let secret_ref = cluster_secret_event.clone();
+                    let regime_authority_ref = topo_authority_event.clone();
                     std::thread::spawn(move || {
                         Self::run_migration_tasks_with_global_limit(
                             tasks,
@@ -2572,6 +2615,7 @@ impl ClusterCoordinator {
                             // Replica resync backfill — never a master handoff,
                             // so relinquish never applies here.
                             None,
+                            Some(regime_authority_ref),
                         );
                     });
                 }
@@ -2661,6 +2705,7 @@ impl ClusterCoordinator {
                             let ib = inbound_bm_event.clone();
                             let throttle_ref = migration_throttle_event.clone();
                             let secret_ref = cluster_secret_event.clone();
+                            let regime_authority_ref = topo_authority_event.clone();
                             // Task #25 — relinquish context for the transfer-request
                             // resend path: a peer is asking us to re-run an outbound
                             // handoff. If the handoff hard-fails because that peer is
@@ -2705,6 +2750,7 @@ impl ClusterCoordinator {
                                     throttle_ref,
                                     secret_ref,
                                     Some(relinquish_ctx),
+                                    Some(regime_authority_ref),
                                 );
                             });
                         }
@@ -2741,6 +2787,7 @@ impl ClusterCoordinator {
                                 &active_topology_members_event,
                                 &migration_throttle_event,
                                 &cluster_secret_event,
+                                Some(&topo_authority_event),
                             );
                         }
                     }
@@ -2871,6 +2918,7 @@ impl ClusterCoordinator {
             topology_commit_tx,
             resync_request_tx: resync_request_tx_for_cluster,
             transfer_request_tx: transfer_request_tx_for_cluster,
+            cluster_event_tx: Some(cluster_event_tx),
             topology_state_path,
             swim_incarnation: swim_incarnation_for_cluster,
             startup_reactivation_needed,
@@ -2961,6 +3009,7 @@ impl ClusterCoordinator {
                         let ib = inbound_bm.clone();
                         let throttle_ref = migration_throttle.clone();
                         let secret_ref = cluster_secret.clone();
+                        let regime_authority_ref = topology_authority.clone();
                         // Task #25 — relinquish context for the rejoin retry path,
                         // built from the committed (active) topology members + RF
                         // and the live-member snapshot (peers we have addresses for,
@@ -3003,6 +3052,7 @@ impl ClusterCoordinator {
                                 throttle_ref,
                                 secret_ref,
                                 Some(relinquish_ctx),
+                                Some(regime_authority_ref),
                             );
                         });
                     }
@@ -3059,6 +3109,11 @@ impl ClusterCoordinator {
                         voter_current_term: topology_authority.committed_term(),
                         voter_placement_support:
                             crate::cluster::shards::MAX_SUPPORTED_PLACEMENT_VERSION,
+                        // P1 stage 1 — inert on a SELF-vote (see the fallback
+                        // proposer site).
+                        voter_incarnation: inc,
+                        regime_support: false,
+                        ack_writeall_equiv: false,
                     };
                     if persisted_ok && let Some(commit) = topology_authority.handle_vote(&self_vote)
                     {
@@ -3089,6 +3144,7 @@ impl ClusterCoordinator {
                             active_topology_members,
                             migration_throttle,
                             cluster_secret,
+                            Some(topology_authority),
                         );
                         // POST-commit persist: the term is already committed +
                         // activated in memory and cannot be rolled back, so this
@@ -3385,6 +3441,11 @@ impl ClusterCoordinator {
                                     voter_current_term: topology_authority.committed_term(),
                                     voter_placement_support:
                                         crate::cluster::shards::MAX_SUPPORTED_PLACEMENT_VERSION,
+                                    // P1 stage 1 — inert on a SELF-vote (see
+                                    // the fallback proposer site).
+                                    voter_incarnation: inc,
+                                    regime_support: false,
+                                    ack_writeall_equiv: false,
                                 };
                                 if persisted_ok
                                     && let Some(commit) = topology_authority.handle_vote(&self_vote)
@@ -3450,6 +3511,7 @@ impl ClusterCoordinator {
         active_topology_members: &Arc<RwLock<Vec<NodeId>>>,
         migration_throttle: &Arc<crate::cluster::migration::MigrationThrottle>,
         cluster_secret: &Option<Arc<Vec<u8>>>,
+        regime_authority: Option<&Arc<crate::cluster::topology::TopologyAuthority>>,
     ) {
         let empty_view: std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>> =
             std::collections::HashMap::new();
@@ -3474,6 +3536,7 @@ impl ClusterCoordinator {
             &empty_view,
             migration_throttle,
             cluster_secret,
+            regime_authority,
         );
     }
 
@@ -3508,6 +3571,10 @@ impl ClusterCoordinator {
         partition_view: &std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>>,
         migration_throttle: &Arc<crate::cluster::migration::MigrationThrottle>,
         cluster_secret: &Option<Arc<Vec<u8>>>,
+        // P1 §4.2/I12: read handle for the migration dispatch's regime
+        // stamp capture (see `run_migration_tasks_with_global_limit`).
+        // `None` (tests) leaves migration batches on V2.
+        regime_authority: Option<&Arc<crate::cluster::topology::TopologyAuthority>>,
     ) {
         *active_topology_members.write() = members.to_vec();
 
@@ -3889,6 +3956,7 @@ impl ClusterCoordinator {
             let inbound_bm_w = inbound_bm.clone();
             let throttle_w = migration_throttle.clone();
             let secret_w = cluster_secret.clone();
+            let regime_authority_w = regime_authority.cloned();
 
             // Task #25 — relinquish context: snapshot the committed member set,
             // RF, and the currently-live members so a failed outbound master
@@ -3954,6 +4022,7 @@ impl ClusterCoordinator {
                     throttle_w,
                     secret_w,
                     Some(relinquish_ctx),
+                    regime_authority_w,
                 );
             });
         }
@@ -4062,10 +4131,35 @@ impl ClusterCoordinator {
         throttle: Arc<crate::cluster::migration::MigrationThrottle>,
         cluster_secret: Option<Arc<Vec<u8>>>,
         relinquish_ctx: Option<Arc<RelinquishContext>>,
+        // P1 §4.2/I12: read handle onto the committed regime state, used
+        // ONLY to capture the dispatch's regime stamp table below. `None`
+        // (tests / pre-cluster paths) leaves migration batches on V2.
+        regime_authority: Option<Arc<crate::cluster::topology::TopologyAuthority>>,
     ) {
         if tasks.is_empty() {
             return;
         }
+
+        // P1 §4.2/I12: capture the regime stamps ONCE at migration
+        // dispatch — the union of the dispatched tasks' shards, stamped
+        // from the sender's committed regime state — and thread the SAME
+        // table through every baseline / late-key / delta batch of every
+        // worker this dispatch spawns. `None` (emit V2) when enforcement
+        // is not active. A regime change mid-migration deliberately
+        // surfaces as the receiver's `ERR_STALE_REGIME` abort (re-plan
+        // after topology refresh) rather than a live re-stamp.
+        let regime_table: Option<Arc<Vec<(u16, u64)>>> = regime_authority
+            .filter(|a| a.regime_enforcement_active())
+            .map(|a| {
+                let shards: std::collections::BTreeSet<u16> =
+                    tasks.iter().map(|t| t.shard).collect();
+                Arc::new(
+                    shards
+                        .into_iter()
+                        .map(|s| (s, a.committed_regime(s)))
+                        .collect(),
+                )
+            });
 
         // Pre-group keys by shard once (O(keys) total).
         let mut keys_by_shard: std::collections::HashMap<u16, Vec<TxKey>> =
@@ -4136,6 +4230,7 @@ impl ClusterCoordinator {
                     let inbound_bm = inbound_bm.clone();
                     let secret = cluster_secret.clone();
                     let relinquish_ctx = relinquish_ctx.clone();
+                    let regime_table = regime_table.clone();
 
                     // Collect all keys for shards going to this target.
                     let mut target_keys: Vec<TxKey> = Vec::new();
@@ -4163,6 +4258,7 @@ impl ClusterCoordinator {
                             self_id,
                             secret,
                             relinquish_ctx.as_deref(),
+                            regime_table,
                         );
                     });
                 }
@@ -5379,6 +5475,8 @@ pub fn run_migration_chaos_test_batch(
         task.from_node,
         None,
         None,
+        // Chaos harness runs without a topology authority: emit V2.
+        None,
     );
 
     let table = shard_table.read();
@@ -6064,6 +6162,15 @@ fn run_migration_batch(
     self_id: NodeId,
     cluster_secret: Option<Arc<Vec<u8>>>,
     relinquish_ctx: Option<&RelinquishContext>,
+    // P1 §4.2/I12: the regime stamp table captured ONCE at migration
+    // dispatch (see `run_migration_tasks_with_global_limit`) for the
+    // dispatched tasks' shards, threaded into every baseline / late-key /
+    // delta batch this worker sends. `None` when regime enforcement is
+    // not active at dispatch (emit V2). Deliberately NOT re-captured
+    // per batch: a regime change mid-migration must surface as the
+    // receiver's `ERR_STALE_REGIME` abort (re-plan after topology
+    // refresh), never be papered over by a live re-stamp.
+    regime_table: Option<Arc<Vec<(u16, u64)>>>,
 ) {
     let auth_secret = cluster_secret.as_deref().map(Vec::as_slice);
     let addr = match target_addr {
@@ -6394,6 +6501,7 @@ fn run_migration_batch(
             let fenced_bm = fenced_bm.clone();
             let migrating_bm = migrating_bm.clone();
             let engine = engine.clone();
+            let regime_table = regime_table.clone();
 
             scope.spawn(move || {
                 // Exponential backoff delays for connection retries.
@@ -6522,6 +6630,7 @@ fn run_migration_batch(
                             batch_size,
                             topology_epoch,
                             auth_secret,
+                            regime_table.as_deref().map(Vec::as_slice),
                         ) {
                             Ok(_) => true,
                             Err(e) => {
@@ -6727,8 +6836,14 @@ fn run_migration_batch(
                         if !late_keys.is_empty() {
                             let late_refs: Vec<&TxKey> = late_keys.iter().collect();
                             if let Err(e) = stream_shard_baseline(
-                                task, &late_refs, &engine, &mut stream, batch_size, topology_epoch,
+                                task,
+                                &late_refs,
+                                &engine,
+                                &mut stream,
+                                batch_size,
+                                topology_epoch,
                                 auth_secret,
+                                regime_table.as_deref().map(Vec::as_slice),
                             ) {
                                 tracing::warn!(
                                     shard = task.shard,
@@ -6773,6 +6888,7 @@ fn run_migration_batch(
                                         &delta_ops,
                                         topology_epoch,
                                         auth_secret,
+                                        regime_table.as_deref().map(Vec::as_slice),
                                     )
                                 {
                                     tracing::warn!(
@@ -7550,6 +7666,9 @@ fn stream_shard_baseline(
     batch_size: usize,
     cluster_key: u64,
     auth_secret: Option<&[u8]>,
+    // P1 §4.2/I12: the migration dispatch's captured regime stamps
+    // (`None` → emit V2; enforcement not active at dispatch).
+    regime_table: Option<&[(u16, u64)]>,
 ) -> std::result::Result<ManifestHasher, String> {
     use crate::replication::protocol::ReplicaBatch;
 
@@ -7594,6 +7713,9 @@ fn stream_shard_baseline(
             // so a topology-change race aborts the migration via the
             // receiver's stale-epoch gate instead of corrupting state.
             cluster_key,
+            // P1 §4.2: the dispatch-captured regime stamps (V3) — or V2
+            // when enforcement was not active at dispatch.
+            regime_table: regime_table.map(|t| t.to_vec()),
         };
 
         // Send as OP_REPLICA_BATCH with FLAG_MIGRATION_BATCH so the
@@ -7614,6 +7736,23 @@ fn stream_shard_baseline(
         // ERR_STALE_EPOCH from the pre-apply epoch gate). The success path (this
         // status == STATUS_OK) parses the payload as a ReplicaAck.
         if response.status != STATUS_OK {
+            // P1 §4.2/I12: the receiver's regime gate rejected this batch —
+            // the source's committed regime view is stale (or the source
+            // emitted V2 under enforcement). This is abort-and-re-plan
+            // after topology refresh, NEVER a data error: a heal/migration
+            // source is not necessarily the shard's master and may
+            // legitimately be behind on terms. The Err(String) lands on the
+            // existing migration-failure path (abort completion +
+            // `fail_migration_task_current_epoch`), and the re-drive after
+            // the next topology activation re-plans with a fresh capture.
+            if let Some((shard, local_regime)) =
+                crate::replication::protocol::decode_stale_regime_nak(&response.payload)
+            {
+                return Err(format!(
+                    "migration batch rejected: stale regime (shard {shard}, receiver committed \
+                     regime {local_regime}) — aborting for re-plan after topology refresh"
+                ));
+            }
             // Fix D: a migration-batch apply failure on the receiver is sent as a
             // STATUS_ERROR frame whose payload is a `ReplicaAck::Error`
             // ([tag=1][failed_sequence:u64][msg_len:u32][msg]), NOT the
@@ -8277,14 +8416,6 @@ fn convert_infallible_op(
             new_hash,
             block_height,
             spendable_after,
-        }
-        | RedoOp::ReassignV2 {
-            tx_key,
-            offset,
-            new_hash,
-            block_height,
-            spendable_after,
-            ..
         } => {
             if ShardTable::shard_for_key(tx_key) != shard {
                 return None;
@@ -8296,6 +8427,33 @@ fn convert_infallible_op(
                 block_height: *block_height,
                 spendable_after: *spendable_after,
                 master_generation: gen_for(tx_key),
+                // Legacy pre-V2 redo entry: no prior identity was recorded,
+                // so the receiver keeps the live-slot read (§4.9).
+                prior_utxo_hash: None,
+            })
+        }
+        RedoOp::ReassignV2 {
+            tx_key,
+            offset,
+            new_hash,
+            block_height,
+            spendable_after,
+            prior_utxo_hash,
+        } => {
+            if ShardTable::shard_for_key(tx_key) != shard {
+                return None;
+            }
+            Some(ReplicaOp::Reassign {
+                tx_key: *tx_key,
+                offset: *offset,
+                new_hash: *new_hash,
+                block_height: *block_height,
+                spendable_after: *spendable_after,
+                master_generation: gen_for(tx_key),
+                // §4.9: carry the redo entry's guard identity so a
+                // re-emitted delta / recovery batch replays as the SAME
+                // guarded transition on the receiver (V3 wire only).
+                prior_utxo_hash: Some(*prior_utxo_hash),
             })
         }
         RedoOp::SetConflicting {
@@ -8808,6 +8966,9 @@ fn send_delta_ops(
     ops: &[crate::replication::protocol::ReplicaOp],
     cluster_key: u64,
     auth_secret: Option<&[u8]>,
+    // P1 §4.2/I12: the migration dispatch's captured regime stamps
+    // (`None` → emit V2; enforcement not active at dispatch).
+    regime_table: Option<&[(u16, u64)]>,
 ) -> std::result::Result<(), String> {
     use crate::replication::protocol::{ReplicaAck, ReplicaBatch};
 
@@ -8818,6 +8979,9 @@ fn send_delta_ops(
         source_node_id: None,
         // Phase B3: stamped with the source's live coordinator epoch.
         cluster_key,
+        // P1 §4.2: the dispatch-captured regime stamps (V3) — or V2 when
+        // enforcement was not active at dispatch.
+        regime_table: regime_table.map(|t| t.to_vec()),
     };
     let request = RequestFrame {
         request_id: shard as u64,
@@ -8826,6 +8990,21 @@ fn send_delta_ops(
         payload: batch.serialize().into(),
     };
     let response = exchange_frame(stream, &request, auth_secret)?;
+
+    // P1 §4.2/I12: a stale-regime NAK is abort-and-re-plan after topology
+    // refresh, never a data error (see the same classification in
+    // `stream_shard_baseline`). Checked before the ReplicaAck parse — the
+    // NAK is an error envelope, not an ack, and would otherwise surface as
+    // an unclassified "failed to parse delta ack".
+    if response.status != STATUS_OK
+        && let Some((nak_shard, local_regime)) =
+            crate::replication::protocol::decode_stale_regime_nak(&response.payload)
+    {
+        return Err(format!(
+            "delta batch rejected: stale regime (shard {nak_shard}, receiver committed regime \
+             {local_regime}) — aborting for re-plan after topology refresh"
+        ));
+    }
 
     // Validate ReplicaAck payload
     if !response.payload.is_empty() {
@@ -8950,8 +9129,28 @@ fn persist_topology_state(
 ) -> std::io::Result<()> {
     use std::io::Write as _;
     let tmp = path.with_extension("cluster.tmp");
-    let data = state.serialize();
+    // P1 stage 1 — the state file is now the versioned, checksummed
+    // envelope (§4.1 "Persistence"): integrity mismatch at load is
+    // fail-closed, never a silent tolerant decode.
+    let data = state.serialize_envelope();
+    // P1 stage 1 — `.regime-armed` marker maintenance (§4.1 "Armed
+    // marker"). DISARM ORDERING IS LOAD-BEARING: when this persist
+    // disarms (`regime_enforced` false) or zeroes the regime state, the
+    // marker is deleted — with its parent-dir fsync — BEFORE the state
+    // file is rewritten. A crash between the two leaves marker-absent +
+    // old-armed-state, which boots fine (the marker is re-created below /
+    // at load); the reverse order could leave marker-present +
+    // zeroed-state = refuse-to-start (the sticky-marker boot-DoS this
+    // repo already shipped once with `.multinode`).
+    let regime_armed =
+        state.regime_block.regime_enforced && !state.regime_block.regime.is_all_zero();
     let attempt = || -> std::io::Result<()> {
+        // P1 stage 1 — a disarming/zeroing persist deletes the marker
+        // FIRST (delete + parent fsync are idempotent, so the retry path
+        // re-runs it safely).
+        if !regime_armed {
+            delete_topology_regime_armed_marker(path)?;
+        }
         // W1.1 FIX D: the first persist can race data-dir creation at
         // boot (the vote handler persists as soon as a proposal arrives,
         // which can precede the server's directory setup). A missing
@@ -8969,6 +9168,13 @@ fn persist_topology_state(
         crate::fsutil::fsync_parent_dir(path)?;
         if topology_multi_node_evidence_peak(state).is_some() {
             persist_topology_multi_node_marker(path)?;
+        }
+        // P1 stage 1 — arm the marker AFTER the state file is durable, so
+        // a crash between the two leaves state-armed + marker-absent
+        // (self-healed by the next persist or the boot path) rather than
+        // marker-present + state-unarmed.
+        if regime_armed {
+            persist_topology_regime_armed_marker(path)?;
         }
         Ok(())
     };
@@ -9105,6 +9311,118 @@ fn delete_topology_multi_node_marker(path: &std::path::Path) -> std::io::Result<
     }
 }
 
+/// P1 stage 1 — path of the presence-only `.regime-armed` sidecar next to
+/// the topology state file (§4.1 "Armed marker"; the `.multinode`
+/// precedent).
+fn topology_regime_armed_marker_path(path: &std::path::Path) -> std::path::PathBuf {
+    let mut p = path.as_os_str().to_os_string();
+    p.push(".regime-armed");
+    std::path::PathBuf::from(p)
+}
+
+/// P1 stage 1 — whether the `.regime-armed` marker is present. Mirrors the
+/// `.multinode` fail-safe: an UNREADABLE (not merely absent) marker counts
+/// as present — an I/O error must err toward the safer (refuse-to-start)
+/// verdict, never silently disarm.
+pub fn topology_regime_armed_marker_present(topology_state_path: &std::path::Path) -> bool {
+    match std::fs::metadata(topology_regime_armed_marker_path(topology_state_path)) {
+        Ok(_) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(_) => true,
+    }
+}
+
+/// P1 stage 1 — write (or refresh) the presence-only `.regime-armed`
+/// marker. Content is a fixed 8-byte sentinel kept only for layout
+/// symmetry with `.multinode`; presence is the only signal.
+fn persist_topology_regime_armed_marker(path: &std::path::Path) -> std::io::Result<()> {
+    use std::io::Write as _;
+
+    let marker = topology_regime_armed_marker_path(path);
+    let tmp = marker.with_extension("regime-armed.tmp");
+    let mut f = std::fs::File::create(&tmp)?;
+    f.write_all(&1u64.to_le_bytes())?;
+    f.sync_all()?;
+    std::fs::rename(&tmp, &marker)?;
+    // Make the rename's directory entry durable — see persist_cluster_state.
+    crate::fsutil::fsync_parent_dir(&marker)?;
+    Ok(())
+}
+
+/// P1 stage 1 — delete the `.regime-armed` marker (the apply path of a
+/// committed `regime_enforced = false`, and a rebase that zeroes regime
+/// state). Deletion is followed by a parent-dir fsync (the
+/// `delete_topology_multi_node_marker` precedent) and MUST run before the
+/// zeroed/disarmed state file is rewritten — see `persist_topology_state`
+/// for the crash-ordering rationale. A missing marker is not an error
+/// (idempotent).
+fn delete_topology_regime_armed_marker(path: &std::path::Path) -> std::io::Result<()> {
+    let marker = topology_regime_armed_marker_path(path);
+    match std::fs::remove_file(&marker) {
+        Ok(()) => crate::fsutil::fsync_parent_dir(&marker),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// P1 stage 1 — boot-time `.regime-armed` validation (§4.1):
+///
+/// * marker present + a committed term on disk + all-zero regime state ⇒
+///   `Err` — the node once committed `regime_enforced = true` with armed
+///   regimes, and the regime state has since been lost/zeroed out-of-band
+///   (a lost/replaced state file). Starting would serve with the fence
+///   silently disarmed; the clustered node must refuse to start.
+/// * marker present + no committed term ever observed (missing/blank
+///   state) ⇒ loud warning only — a stray zero-byte file dropped in the
+///   data dir must not be a boot-DoS.
+/// * marker absent ⇒ `Ok` (and if the loaded state is armed, the next
+///   persist re-creates the marker).
+pub fn validate_regime_armed_marker_at_boot(
+    topology_state_path: &std::path::Path,
+    state: &crate::cluster::topology::PersistedTopologyState,
+) -> Result<(), String> {
+    if !topology_regime_armed_marker_present(topology_state_path) {
+        // Self-heal the create-side crash window: the marker is armed
+        // AFTER the state file (see `persist_topology_state`), so a crash
+        // between the two leaves armed-state + marker-absent. Re-create it
+        // here (best-effort — the next persist re-creates it too).
+        if state.regime_block.regime_enforced
+            && !state.regime_block.regime.is_all_zero()
+            && let Err(e) = persist_topology_regime_armed_marker(topology_state_path)
+        {
+            tracing::warn!(
+                err = %e,
+                path = %topology_state_path.display(),
+                "cluster: failed to re-create the .regime-armed marker for an armed \
+                 persisted state; the next topology persist will retry",
+            );
+        }
+        return Ok(());
+    }
+    if state.committed_term == 0 {
+        tracing::warn!(
+            path = %topology_state_path.display(),
+            "cluster: .regime-armed marker present but no committed topology term was ever \
+             observed on this node — treating the marker as stray (loud warning, not a \
+             refusal). If this node previously ran with regime enforcement armed, its \
+             topology state file has been lost; restore it before serving.",
+        );
+        return Ok(());
+    }
+    if state.regime_block.regime.is_all_zero() {
+        return Err(format!(
+            ".regime-armed marker is present at {} but the persisted regime state is \
+             absent/zeroed (committed_term {}): regime enforcement was committed on this \
+             node and its regime state has since been lost. Refusing to start (serving \
+             would silently disarm the write fence). Restore the topology state file, or \
+             remove the marker ONLY after confirming the cluster's enforcement state.",
+            topology_regime_armed_marker_path(topology_state_path).display(),
+            state.committed_term,
+        ));
+    }
+    Ok(())
+}
+
 /// Derive the full topology-state path from the legacy cluster-state path.
 pub fn topology_state_path_for_cluster_state(
     cluster_state_path: &std::path::Path,
@@ -9114,23 +9432,166 @@ pub fn topology_state_path_for_cluster_state(
     std::path::PathBuf::from(s)
 }
 
-/// Load the full topology state from disk (backward-compatible).
+/// P1 stage 1 — how [`load_topology_state`] treats a LEGACY
+/// (pre-envelope) topology state file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LegacyTopologyDecode {
+    /// Refuse to load a legacy file (the production default): a clustered
+    /// node must not silently run the tolerant positional decoder, whose
+    /// short-read defaults can disarm safety state (§4.1).
+    Refuse,
+    /// CLI-gated (`--allow-legacy-topology-state`, never TOML),
+    /// SELF-CONSUMING upgrade: the first legacy decode immediately
+    /// rewrites the file in the new envelope, and passing this mode when
+    /// the file is ALREADY new-format is a hard error — otherwise the
+    /// flag would be a standing downgrade switch back to
+    /// silent-truncation parsing.
+    AllowAndUpgradeOnce,
+}
+
+/// P1 stage 1 — fail-closed topology state load errors. A clustered node
+/// receiving any of these must refuse to start (the
+/// `StrictAuthRequiresSecret` posture: a config/state problem is a
+/// startup refusal, never a silent degrade).
+#[derive(Debug, thiserror::Error)]
+pub enum TopologyStateLoadError {
+    /// The file claims the new envelope format but fails validation
+    /// (integrity mismatch, truncation, unsupported version, malformed
+    /// body). NEVER falls back to the tolerant legacy decoder.
+    #[error("topology state file {path} is corrupt or fails its integrity check: {source}")]
+    Corrupt {
+        /// The state file path.
+        path: std::path::PathBuf,
+        /// The underlying envelope decode failure.
+        source: crate::cluster::topology::RegimeDecodeError,
+    },
+    /// The file is in the legacy (pre-envelope) format and legacy decode
+    /// was not authorized. Pass `--allow-legacy-topology-state` ONCE to
+    /// upgrade it in place.
+    #[error(
+        "topology state file {path} is in the legacy format; restart once with \
+         --allow-legacy-topology-state to upgrade it in place"
+    )]
+    LegacyFormatRefused {
+        /// The state file path.
+        path: std::path::PathBuf,
+    },
+    /// `--allow-legacy-topology-state` was passed but the file is already
+    /// new-format (the flag is self-consuming; leaving it in place would
+    /// be a standing downgrade switch).
+    #[error(
+        "--allow-legacy-topology-state was passed but the topology state file {path} is \
+         already in the new format; remove the flag"
+    )]
+    UpgradeFlagOnNewFormat {
+        /// The state file path.
+        path: std::path::PathBuf,
+    },
+    /// The state file exists but could not be read at all.
+    #[error("topology state file {path} exists but could not be read: {source}")]
+    Unreadable {
+        /// The state file path.
+        path: std::path::PathBuf,
+        /// The underlying I/O error.
+        source: std::io::Error,
+    },
+    /// The self-consuming legacy upgrade decoded the file but could not
+    /// rewrite it in the new envelope.
+    #[error("failed to rewrite legacy topology state file {path} in the new format: {source}")]
+    UpgradeRewriteFailed {
+        /// The state file path.
+        path: std::path::PathBuf,
+        /// The underlying I/O error.
+        source: std::io::Error,
+    },
+}
+
+/// Load the full topology state from disk.
+///
+/// P1 stage 1 — the file is a versioned, checksummed envelope; any
+/// integrity failure is FAIL-CLOSED (`Err`, clustered node refuses to
+/// start). A missing file is a fresh boot (`Ok(default)`). A legacy
+/// (pre-envelope) file loads only under
+/// [`LegacyTopologyDecode::AllowAndUpgradeOnce`], which immediately
+/// rewrites it in the new envelope (self-consuming upgrade).
 pub fn load_topology_state(
     path: &std::path::Path,
-) -> crate::cluster::topology::PersistedTopologyState {
+    legacy: LegacyTopologyDecode,
+) -> Result<crate::cluster::topology::PersistedTopologyState, TopologyStateLoadError> {
+    use crate::cluster::topology::RegimeDecodeError;
+
+    let default_state = || crate::cluster::topology::PersistedTopologyState {
+        peak_cluster_size: 1,
+        committed_term: 0,
+        committed_members: Vec::new(),
+        committed_voters: Vec::new(),
+        voted_term: 0,
+        incarnation: 0,
+        committed_voter_ever_seen: Vec::new(),
+        committed_placement_version: 1,
+        committed_peak: 1,
+        regime_block: Default::default(),
+    };
     let mut state = match std::fs::read(path) {
-        Ok(data) => crate::cluster::topology::PersistedTopologyState::deserialize(&data),
-        _ => crate::cluster::topology::PersistedTopologyState {
-            peak_cluster_size: 1,
-            committed_term: 0,
-            committed_members: Vec::new(),
-            committed_voters: Vec::new(),
-            voted_term: 0,
-            incarnation: 0,
-            committed_voter_ever_seen: Vec::new(),
-            committed_placement_version: 1,
-            committed_peak: 1,
-        },
+        Ok(data) => {
+            match crate::cluster::topology::PersistedTopologyState::deserialize_envelope(&data) {
+                Ok(state) => {
+                    if legacy == LegacyTopologyDecode::AllowAndUpgradeOnce {
+                        // Self-consuming flag: a new-format file + the flag
+                        // is a hard error, never a tolerated no-op.
+                        return Err(TopologyStateLoadError::UpgradeFlagOnNewFormat {
+                            path: path.to_path_buf(),
+                        });
+                    }
+                    state
+                }
+                Err(RegimeDecodeError::NotAnEnvelope) => match legacy {
+                    LegacyTopologyDecode::Refuse => {
+                        return Err(TopologyStateLoadError::LegacyFormatRefused {
+                            path: path.to_path_buf(),
+                        });
+                    }
+                    LegacyTopologyDecode::AllowAndUpgradeOnce => {
+                        let state =
+                            crate::cluster::topology::PersistedTopologyState::deserialize(&data);
+                        // Self-consuming: rewrite in the new envelope NOW,
+                        // so the next boot needs no flag. A rewrite
+                        // failure is fail-closed — booting would leave the
+                        // legacy file in place with the flag "spent".
+                        persist_topology_state(path, &state).map_err(|source| {
+                            TopologyStateLoadError::UpgradeRewriteFailed {
+                                path: path.to_path_buf(),
+                                source,
+                            }
+                        })?;
+                        tracing::warn!(
+                            path = %path.display(),
+                            "cluster: legacy topology state file upgraded in place to the \
+                             checksummed envelope format (self-consuming \
+                             --allow-legacy-topology-state); remove the flag for future starts",
+                        );
+                        state
+                    }
+                },
+                Err(source) => {
+                    return Err(TopologyStateLoadError::Corrupt {
+                        path: path.to_path_buf(),
+                        source,
+                    });
+                }
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => default_state(),
+        Err(source) => {
+            // FAIL-CLOSED: an EXISTING but unreadable state file is
+            // indistinguishable from lost safety state. (The legacy
+            // loader silently defaulted here — exactly the tolerant
+            // posture §4.1 retires.)
+            return Err(TopologyStateLoadError::Unreadable {
+                path: path.to_path_buf(),
+                source,
+            });
+        }
     };
     // G8 stage 3 — apply the (now presence-only, fixed-at-2) marker floor to
     // BOTH `peak_cluster_size` (feeds `bin/server.rs`'s `initial_peak`, which
@@ -9161,7 +9622,7 @@ pub fn load_topology_state(
         state.peak_cluster_size = state.peak_cluster_size.max(marker_peak);
         state.committed_peak = state.committed_peak.max(marker_peak);
     }
-    state
+    Ok(state)
 }
 
 /// Load startup topology state from the full `.topo` file, preserving legacy
@@ -9180,15 +9641,16 @@ pub fn load_topology_state(
 /// and is kept.
 pub fn load_startup_topology_state(
     cluster_state_path: &std::path::Path,
-) -> crate::cluster::topology::PersistedTopologyState {
+    legacy: LegacyTopologyDecode,
+) -> Result<crate::cluster::topology::PersistedTopologyState, TopologyStateLoadError> {
     let topology_path = topology_state_path_for_cluster_state(cluster_state_path);
-    let mut state = load_topology_state(&topology_path);
+    let mut state = load_topology_state(&topology_path, legacy)?;
     let (_legacy_peak, legacy_epoch) = load_cluster_state(cluster_state_path);
     if state.committed_term == 0 && legacy_epoch > 0 {
         state.committed_term = legacy_epoch;
         state.voted_term = state.voted_term.max(legacy_epoch);
     }
-    state
+    Ok(state)
 }
 
 /// Backward-compatible alias for callers that only persist peak.
@@ -9869,6 +10331,14 @@ pub struct RunningCluster {
     /// completed its outbound plan; the event loop drains them and
     /// re-runs the outbound migration for the requested shards.
     transfer_request_tx: std::sync::mpsc::Sender<ShardTransferRequest>,
+    /// P1 §4.2 — clone of the coordinator event-loop's SWIM event sender.
+    /// [`Self::signal_topology_stale`] injects `ClusterEvent::TopologyStale`
+    /// through it when a replica NAKs a batch with `ERR_STALE_REGIME`, so
+    /// the same deduplicated catch-up machinery that serves gossip-observed
+    /// staleness refreshes the committed regime state. `None` in test
+    /// builders that run without an event loop (the signal degrades to a
+    /// no-op).
+    cluster_event_tx: Option<std::sync::mpsc::Sender<ClusterEvent>>,
     /// Path for persisting full topology state (voted_term, committed_members).
     topology_state_path: Option<std::path::PathBuf>,
     /// SWIM incarnation counter shared with the event loop for persistence.
@@ -10031,6 +10501,16 @@ impl RunningCluster {
     }
 
     /// Shared HMAC secret for authenticated inter-node TCP frames.
+    /// Test-only — install a cluster secret on an already-built test
+    /// fixture (the P1 `/admin/regime_rebase` handler requires one; the
+    /// standard fixture is secret-less).
+    #[cfg(test)]
+    pub(crate) fn test_with_cluster_secret(mut self, secret: Vec<u8>) -> Self {
+        self.topology_authority.set_secret_configured(true);
+        self.cluster_secret = Some(Arc::new(secret));
+        self
+    }
+
     pub fn cluster_secret(&self) -> Option<&[u8]> {
         self.cluster_secret.as_deref().map(Vec::as_slice)
     }
@@ -10986,6 +11466,14 @@ impl RunningCluster {
         let cluster_id = self.topology_authority.cluster_id();
         let placement_version = self.topology_authority.committed_placement_version();
         let committed_peak = self.topology_authority.committed_peak();
+        // P1 stage 1 — the reconstructed catch-up commit CARRIES the
+        // committed regime state (override map + absolute regime array +
+        // committed flags): the proof-carrying pull is the second regime
+        // provenance channel (I9), and dropping the block here would strip
+        // regime state from every catch-up. The digest is recomputed over
+        // the reconstruction (proposer is not persisted; `members[0]` is
+        // the deterministic stand-in, which also satisfies I10(f)).
+        let regime_block = self.topology_authority.committed_regime_block();
         crate::cluster::topology::TopologyCommit {
             term,
             proposer: members[0],
@@ -10999,6 +11487,8 @@ impl RunningCluster {
                 &members,
                 placement_version,
                 committed_peak,
+                members[0],
+                &regime_block,
             ),
             voters: {
                 let voters = self.topology_authority.committed_voters();
@@ -11008,6 +11498,7 @@ impl RunningCluster {
                     voters
                 }
             },
+            regime_block,
         }
         .serialize()
     }
@@ -11373,6 +11864,14 @@ impl RunningCluster {
         &self.topology_authority
     }
 
+    /// Shared `Arc` handle to the topology authority, for subsystems that
+    /// outlive a borrow of this cluster (P1 §4.2: the catch-up context in
+    /// `bin/server.rs` captures it to stamp catch-up chunks with the
+    /// committed regime view).
+    pub fn topology_authority_handle(&self) -> Arc<crate::cluster::topology::TopologyAuthority> {
+        self.topology_authority.clone()
+    }
+
     /// Committed topology term number.
     pub fn committed_topology_term(&self) -> u64 {
         self.topology_authority.committed_term()
@@ -11445,6 +11944,15 @@ impl RunningCluster {
         // above): stamp the CURRENT effective peak, not `new_members.len()`,
         // so the drained cluster's floor is unaffected by who left.
         let committed_peak = self.topology_authority.peak_cluster_size();
+        // P1 stage 1 — a graceful drain is a membership change like any
+        // other: derive the regime block honestly (retire overrides whose
+        // target is the departing node, bump the regime of every shard
+        // whose committed-derivation master changes).
+        let regime_block = self.topology_authority.derive_regime_block_for(
+            &new_members,
+            placement_version,
+            new_term,
+        );
         let commit = crate::cluster::topology::TopologyCommit {
             term: new_term,
             proposer: new_members[0],
@@ -11458,6 +11966,8 @@ impl RunningCluster {
                 &new_members,
                 placement_version,
                 committed_peak,
+                new_members[0],
+                &regime_block,
             ),
             // E-4 — THREAT-MODEL DECISION (trust authenticated peers by design):
             //
@@ -11489,6 +11999,7 @@ impl RunningCluster {
             // not unilaterally remove others. Until then, authenticated peers are
             // trusted to drain themselves.
             voters: new_members.clone(),
+            regime_block,
         };
         // Apply locally first.
         self.topology_authority.handle_commit(&commit);
@@ -11559,6 +12070,36 @@ impl RunningCluster {
             run_topology_proposer(proposal, ta, na, self_id, tx, tp, ps, si, secret);
         });
         Some(term)
+    }
+
+    /// P1 stage 1 (I7) — propose a quorum-committed REGIME REBASE through
+    /// the normal proposer machinery (see
+    /// [`crate::cluster::topology::TopologyAuthority::propose_regime_rebase`]).
+    ///
+    /// Mirrors [`Self::propose_shrink`]: the authority validates the
+    /// proposal-side preconditions (committed topology, deterministic
+    /// proposer, no pending proposal) and this method rides the resulting
+    /// term through `run_topology_proposer` (normal activation quorum,
+    /// Gate A/B untouched). Authorization (admin_token + cluster_secret)
+    /// is enforced by the `/admin/regime_rebase` HTTP surface.
+    pub fn propose_regime_rebase(
+        &self,
+    ) -> Result<crate::cluster::topology::TopologyTerm, crate::cluster::topology::RegimeProposeError>
+    {
+        let term = self.topology_authority.propose_regime_rebase()?;
+        let ta = self.topology_authority.clone();
+        let na = self.node_addrs.clone();
+        let tx = self.topology_commit_tx.clone();
+        let tp = self.topology_state_path.clone();
+        let ps = self.peak_size.clone();
+        let si = self.swim_incarnation.clone();
+        let secret = self.cluster_secret.clone();
+        let self_id = self.self_id;
+        let proposal = term.clone();
+        std::thread::spawn(move || {
+            run_topology_proposer(proposal, ta, na, self_id, tx, tp, ps, si, secret);
+        });
+        Ok(term)
     }
 
     /// Get a snapshot of active migration progress.
@@ -11863,6 +12404,33 @@ impl RunningCluster {
         let _ = self.topology_commit_tx.send((members, term));
     }
 
+    /// P1 §4.2 — raise the topology-staleness signal after a replica NAKed
+    /// a batch with `ERR_STALE_REGIME`: inject
+    /// `ClusterEvent::TopologyStale(observed_term)` into the coordinator
+    /// event loop, reusing the SAME deduplicated catch-up machinery that
+    /// serves gossip-observed staleness (at most one catch-up thread; the
+    /// handler re-checks `observed_term > committed_term`).
+    ///
+    /// `observed_term` is the NAK hint's `local_regime` — a committed term
+    /// the receiver has installed and this node provably has not (a regime
+    /// value is always `<=` its carrier commit's term, I7). The hint is
+    /// ROUTING ADVICE only (I9): this method never demotes this node and
+    /// never mutates regime state — the catch-up pulls the committed
+    /// topology through the validated proof-carrying channel.
+    ///
+    /// Returns `true` when the signal was queued; `false` when it was
+    /// skipped (already at-or-past `observed_term`, or no event loop is
+    /// wired — test builders).
+    pub fn signal_topology_stale(&self, observed_term: u64) -> bool {
+        if observed_term <= self.topology_authority.committed_term() {
+            return false;
+        }
+        match &self.cluster_event_tx {
+            Some(tx) => tx.send(ClusterEvent::TopologyStale(observed_term)).is_ok(),
+            None => false,
+        }
+    }
+
     /// Test-only handle to the "drop commit signals" fault-injection gate.
     ///
     /// While set, [`Self::signal_topology_committed`] silently drops every
@@ -12157,8 +12725,11 @@ pub(crate) fn new_test_running_cluster(
                 committed_members,
                 placement_version,
                 (committed_members).len() as u64,
+                self_id,
+                &Default::default(),
             ),
             voters: committed_members.to_vec(),
+            regime_block: Default::default(),
         };
         let _ = topology_authority.handle_commit(&commit);
     }
@@ -12220,6 +12791,7 @@ pub(crate) fn new_test_running_cluster(
         topology_commit_tx,
         resync_request_tx,
         transfer_request_tx,
+        cluster_event_tx: None,
         topology_state_path: None,
         swim_incarnation: Arc::new(std::sync::atomic::AtomicU64::new(1)),
         startup_reactivation_needed: Arc::new(AtomicBool::new(false)),
@@ -12556,6 +13128,7 @@ mod tests {
             64,
             /* cluster_key */ 0,
             None,
+            None,
         )
         .unwrap();
 
@@ -12665,6 +13238,7 @@ mod tests {
             &mut stream,
             64,
             /* cluster_key */ 0,
+            None,
             None,
         )
         .unwrap();
@@ -12828,6 +13402,7 @@ mod tests {
             64,
             /* cluster_key */ 0,
             None,
+            None,
         )
         .unwrap();
 
@@ -12933,6 +13508,7 @@ mod tests {
             64,
             /* cluster_key */ 0,
             None,
+            None,
         );
 
         match result {
@@ -13030,7 +13606,7 @@ mod tests {
             to_node: NodeId(2),
             is_master: true,
         };
-        stream_shard_baseline(&task, &[&key], &source, &mut stream, 64, 0, None).unwrap();
+        stream_shard_baseline(&task, &[&key], &source, &mut stream, 64, 0, None, None).unwrap();
 
         let batch = receiver.join().unwrap();
         for op in &batch.ops {
@@ -15296,8 +15872,11 @@ mod tests {
                 &surviving,
                 1,
                 surviving.len() as u64,
+                NodeId(1),
+                &Default::default(),
             ),
             voters: surviving,
+            regime_block: Default::default(),
         };
         (cluster, commit)
     }
@@ -15429,7 +16008,8 @@ mod tests {
             crate::cluster::topology::DurableCommitOutcome::Applied(2)
         );
 
-        let loaded = load_topology_state(&topo_path);
+        let loaded = load_topology_state(&topo_path, LegacyTopologyDecode::Refuse)
+            .expect("new-format state file loads");
         assert_eq!(
             loaded.committed_peak, 3,
             "loaded committed_peak must be the lowered 3, not 5",
@@ -15470,6 +16050,7 @@ mod tests {
             committed_voter_ever_seen: Vec::new(),
             committed_placement_version: 1,
             committed_peak: 5,
+            regime_block: Default::default(),
         };
         persist_topology_state(&path, &five_member).expect("seed persist creates marker");
 
@@ -15488,10 +16069,12 @@ mod tests {
             committed_voter_ever_seen: Vec::new(),
             committed_placement_version: 1,
             committed_peak: 1, // pretend the raw .topo content under-reports
+            regime_block: Default::default(),
         };
-        std::fs::write(&path, three_member.serialize()).expect("overwrite .topo directly");
+        std::fs::write(&path, three_member.serialize_envelope()).expect("overwrite .topo directly");
 
-        let loaded = load_topology_state(&path);
+        let loaded = load_topology_state(&path, LegacyTopologyDecode::Refuse)
+            .expect("new-format state file loads");
         assert_eq!(
             loaded.committed_peak, 2,
             "marker floors committed_peak at exactly 2, not the old peak of \
@@ -15527,6 +16110,7 @@ mod tests {
             committed_voter_ever_seen: Vec::new(),
             committed_placement_version: 1,
             committed_peak: 3,
+            regime_block: Default::default(),
         };
         persist_topology_state(&path, &multi).expect("seed persist creates marker");
         assert!(load_topology_multi_node_marker_peak(&path).is_some());
@@ -15545,10 +16129,12 @@ mod tests {
             committed_voter_ever_seen: Vec::new(),
             committed_placement_version: 1,
             committed_peak: 1,
+            regime_block: Default::default(),
         };
-        std::fs::write(&path, rf1.serialize()).expect("overwrite with RF=1 state");
+        std::fs::write(&path, rf1.serialize_envelope()).expect("overwrite with RF=1 state");
 
-        let loaded = load_topology_state(&path);
+        let loaded = load_topology_state(&path, LegacyTopologyDecode::Refuse)
+            .expect("new-format state file loads");
         assert_eq!(
             loaded.committed_peak, 1,
             "a genuine 1-member .topo file must be trusted over a lingering \
@@ -15623,6 +16209,7 @@ mod tests {
             migrating_bm,
             inbound_bm,
             old_master,
+            None,
             None,
             None,
         );
@@ -15737,6 +16324,7 @@ mod tests {
             migrating_bm,
             inbound_bm,
             old_master,
+            None,
             None,
             None,
         );
@@ -15932,6 +16520,7 @@ mod tests {
             migrating_bm.clone(),
             inbound_bm,
             old_master,
+            None,
             None,
             None,
         );
@@ -16131,6 +16720,7 @@ mod tests {
             old_master,
             None,
             None,
+            None,
         );
 
         // Silent-drop variant of the pipelined failure contract. The
@@ -16317,6 +16907,7 @@ mod tests {
             old_master,
             None,
             None,
+            None,
         );
 
         let mut seen = Vec::new();
@@ -16441,6 +17032,7 @@ mod tests {
             migrating_bm,
             inbound_bm,
             old_master,
+            None,
             None,
             None,
         );
@@ -17400,7 +17992,8 @@ mod tests {
             "topology state file must exist after persist"
         );
 
-        let loaded = load_topology_state(&path);
+        let loaded = load_topology_state(&path, LegacyTopologyDecode::Refuse)
+            .expect("new-format state file loads");
         assert_eq!(loaded.peak_cluster_size, 3);
     }
 
@@ -17427,7 +18020,8 @@ mod tests {
         persist_topology_state(&path, &authority.persisted_state(3, 7))
             .expect("persist (with dir fsync) must succeed");
 
-        let loaded = load_topology_state(&path);
+        let loaded = load_topology_state(&path, LegacyTopologyDecode::Refuse)
+            .expect("new-format state file loads");
         assert_eq!(loaded.peak_cluster_size, 3, "peak must round-trip");
         assert_eq!(loaded.incarnation, 7, "incarnation must round-trip");
     }
@@ -17891,8 +18485,11 @@ mod tests {
                 &next_members,
                 1,
                 (next_members).len() as u64,
+                NodeId(1),
+                &Default::default(),
             ),
             voters: next_members.clone(),
+            regime_block: Default::default(),
         };
         assert_eq!(
             cluster.topology_authority().handle_commit(&next_commit),
@@ -17952,8 +18549,11 @@ mod tests {
                 &committed_members,
                 1,
                 (committed_members).len() as u64,
+                NodeId(1),
+                &Default::default(),
             ),
             voters: vec![NodeId(1), NodeId(2)],
+            regime_block: Default::default(),
         };
         assert_eq!(
             authority.handle_commit(&proof),
@@ -18002,8 +18602,11 @@ mod tests {
                 &committed_members,
                 1,
                 (committed_members).len() as u64,
+                NodeId(1),
+                &Default::default(),
             ),
             voters: committed_members.clone(),
+            regime_block: Default::default(),
         };
         assert_eq!(
             cluster.topology_authority().handle_commit(&next_commit),
@@ -18023,7 +18626,9 @@ mod tests {
                 &cid,
                 &committed_members,
                 1,
-                (committed_members).len() as u64
+                (committed_members).len() as u64,
+                NodeId(1),
+                &Default::default(),
             ),
         );
     }
@@ -18524,6 +19129,7 @@ mod tests {
             trace_ctx: None,
             source_node_id: None,
             cluster_key: 5,
+            regime_table: None,
         };
         let req = RequestFrame {
             request_id: 1,
@@ -19875,8 +20481,11 @@ mod tests {
                 &members,
                 too_high,
                 (members).len() as u64,
+                NodeId(1),
+                &Default::default(),
             ),
             voters: members.clone(),
+            regime_block: Default::default(),
         };
         assert_eq!(
             cluster.topology_authority.handle_commit(&bad),
@@ -19952,8 +20561,11 @@ mod tests {
                 &members,
                 1,
                 (members).len() as u64,
+                NodeId(1),
+                &Default::default(),
             ),
             voters: members.clone(),
+            regime_block: Default::default(),
         };
 
         let outcome = cluster.apply_committed_topology_durable(&commit);
@@ -20017,8 +20629,11 @@ mod tests {
                 &members,
                 1,
                 (members).len() as u64,
+                NodeId(1),
+                &Default::default(),
             ),
             voters: members.clone(),
+            regime_block: Default::default(),
         };
 
         let outcome = cluster.apply_committed_topology_durable(&commit);
@@ -20029,7 +20644,8 @@ mod tests {
         );
         assert_eq!(cluster.topology_authority.committed_term(), 6);
         // The durable record on disk carries the new term.
-        let loaded = load_topology_state(&path);
+        let loaded = load_topology_state(&path, LegacyTopologyDecode::Refuse)
+            .expect("new-format state file loads");
         assert_eq!(
             loaded.committed_term, 6,
             "the committed term must be durable on disk"
@@ -20256,6 +20872,7 @@ mod tests {
             &view,
             &cluster.migration_throttle,
             &cluster.cluster_secret,
+            None,
         );
 
         // The manager retained the unproven lost entry across the supersede (C17).
@@ -20371,6 +20988,7 @@ mod tests {
             &view,
             &cluster.migration_throttle,
             &cluster.cluster_secret,
+            None,
         );
 
         // The heal entry must survive the supersede (manager + hot-path atomic).
@@ -20470,6 +21088,7 @@ mod tests {
             &view,
             &cluster.migration_throttle,
             &cluster.cluster_secret,
+            None,
         );
 
         assert!(
@@ -21369,8 +21988,11 @@ mod tests {
                 &commit_members,
                 1,
                 (commit_members).len() as u64,
+                NodeId(1),
+                &Default::default(),
             ),
             voters: commit_members.clone(),
+            regime_block: Default::default(),
         };
         let applied = cluster.topology_authority.handle_commit(&commit);
         assert_eq!(applied, Some(5), "commit must be accepted");
@@ -23026,5 +23648,281 @@ mod tests {
             CatchupInFlight::try_begin(&slot).is_some(),
             "an unwound catch-up thread must release the slot via Drop",
         );
+    }
+    // -----------------------------------------------------------------------
+    // P1 stage 1 — state-file envelope (fail-closed load, CLI-gated legacy
+    // upgrade), the `.regime-armed` marker lifecycle, boot validation, and
+    // committed-topology dissemination of the regime block.
+    // -----------------------------------------------------------------------
+
+    /// A populated persisted state with `block` (3 committed members).
+    fn p1_state_with_block(
+        term: u64,
+        block: crate::cluster::topology::RegimeBlock,
+    ) -> crate::cluster::topology::PersistedTopologyState {
+        crate::cluster::topology::PersistedTopologyState {
+            peak_cluster_size: 3,
+            committed_term: term,
+            committed_members: vec![NodeId(1), NodeId(2), NodeId(3)],
+            committed_voters: vec![NodeId(1), NodeId(2), NodeId(3)],
+            voted_term: term,
+            incarnation: 1,
+            committed_voter_ever_seen: Vec::new(),
+            committed_placement_version: 1,
+            committed_peak: 3,
+            regime_block: block,
+        }
+    }
+
+    /// A block with one non-zero regime and `regime_enforced = enforced`.
+    fn p1_armed_block(enforced: bool) -> crate::cluster::topology::RegimeBlock {
+        let mut block = crate::cluster::topology::RegimeBlock::default();
+        block.regime.set(7, 2);
+        block.regime_enforced = enforced;
+        block
+    }
+
+    #[test]
+    fn topology_state_file_roundtrips_envelope_and_fails_closed_on_corruption() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("node.cluster.topo");
+        let state = p1_state_with_block(2, p1_armed_block(false));
+        persist_topology_state(&path, &state).expect("persist");
+
+        let loaded = load_topology_state(&path, LegacyTopologyDecode::Refuse)
+            .expect("new-format load succeeds");
+        assert_eq!(loaded.committed_term, 2);
+        assert_eq!(loaded.regime_block, state.regime_block);
+
+        // Flip one byte -> integrity mismatch -> fail-closed Corrupt error,
+        // NEVER a silent tolerant decode.
+        let mut bytes = std::fs::read(&path).expect("read");
+        let mid = bytes.len() / 2;
+        bytes[mid] ^= 0x20;
+        std::fs::write(&path, &bytes).expect("write corrupt");
+        match load_topology_state(&path, LegacyTopologyDecode::Refuse) {
+            Err(TopologyStateLoadError::Corrupt { .. }) => {}
+            other => panic!("expected Corrupt, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn missing_topology_state_file_is_a_fresh_boot() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("node.cluster.topo");
+        let loaded = load_topology_state(&path, LegacyTopologyDecode::Refuse)
+            .expect("missing file is a fresh boot");
+        assert_eq!(loaded.committed_term, 0);
+        assert!(loaded.regime_block.regime.is_all_zero());
+    }
+
+    #[test]
+    fn legacy_topology_state_refused_without_flag_and_upgraded_with_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("node.cluster.topo");
+        let state = p1_state_with_block(3, Default::default());
+        // Write the LEGACY (pre-envelope) format directly.
+        std::fs::write(&path, state.serialize()).expect("write legacy");
+
+        // Without the CLI flag: hard refusal.
+        match load_topology_state(&path, LegacyTopologyDecode::Refuse) {
+            Err(TopologyStateLoadError::LegacyFormatRefused { .. }) => {}
+            other => panic!("expected LegacyFormatRefused, got {other:?}"),
+        }
+
+        // With the flag: loads AND self-consumes (rewrites new-format).
+        let loaded = load_topology_state(&path, LegacyTopologyDecode::AllowAndUpgradeOnce)
+            .expect("legacy upgrade");
+        assert_eq!(loaded.committed_term, 3);
+        assert_eq!(loaded.committed_members.len(), 3);
+        // The file is now new-format: a flag-less load succeeds...
+        let reloaded = load_topology_state(&path, LegacyTopologyDecode::Refuse)
+            .expect("upgraded file loads without the flag");
+        assert_eq!(reloaded.committed_term, 3);
+        // ...and passing the flag AGAIN is a hard error (self-consuming,
+        // never a standing downgrade switch).
+        match load_topology_state(&path, LegacyTopologyDecode::AllowAndUpgradeOnce) {
+            Err(TopologyStateLoadError::UpgradeFlagOnNewFormat { .. }) => {}
+            other => panic!("expected UpgradeFlagOnNewFormat, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn regime_armed_marker_created_when_enforcement_persists_true() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("node.cluster.topo");
+        assert!(!topology_regime_armed_marker_present(&path));
+        persist_topology_state(&path, &p1_state_with_block(2, p1_armed_block(true)))
+            .expect("persist armed");
+        assert!(
+            topology_regime_armed_marker_present(&path),
+            "committing regime_enforced=true with non-zero regimes must create the marker",
+        );
+    }
+
+    #[test]
+    fn regime_armed_marker_deleted_on_disarm_and_on_zeroed_state() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("node.cluster.topo");
+        persist_topology_state(&path, &p1_state_with_block(2, p1_armed_block(true)))
+            .expect("persist armed");
+        assert!(topology_regime_armed_marker_present(&path));
+
+        // Disarm (regime_enforced=false): the apply-path persist deletes
+        // the marker (before rewriting the state — crash ordering).
+        persist_topology_state(&path, &p1_state_with_block(3, p1_armed_block(false)))
+            .expect("persist disarmed");
+        assert!(
+            !topology_regime_armed_marker_present(&path),
+            "a committed regime_enforced=false must delete the marker",
+        );
+
+        // Re-arm, then a rebase that ZEROES regime state also deletes it.
+        persist_topology_state(&path, &p1_state_with_block(4, p1_armed_block(true)))
+            .expect("persist re-armed");
+        assert!(topology_regime_armed_marker_present(&path));
+        let zeroed = crate::cluster::topology::RegimeBlock {
+            regime_enforced: true, // still enforced, but state zeroed
+            ..Default::default()
+        };
+        persist_topology_state(&path, &p1_state_with_block(5, zeroed)).expect("persist zeroed");
+        assert!(
+            !topology_regime_armed_marker_present(&path),
+            "a rebase that zeroes regime state must delete the marker",
+        );
+    }
+
+    #[test]
+    fn regime_armed_boot_check_refuses_zeroed_state_and_warns_on_fresh_node() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("node.cluster.topo");
+        // No marker: always fine.
+        let armed = p1_state_with_block(2, p1_armed_block(true));
+        assert!(validate_regime_armed_marker_at_boot(&path, &armed).is_ok());
+
+        // Arm the marker for real.
+        persist_topology_state(&path, &armed).expect("persist armed");
+        assert!(topology_regime_armed_marker_present(&path));
+        // Marker + intact regime state: fine.
+        assert!(validate_regime_armed_marker_at_boot(&path, &armed).is_ok());
+
+        // Marker + committed term + ZEROED regime state: refuse to start
+        // (lost regime state while enforcement was armed).
+        let zeroed = p1_state_with_block(2, Default::default());
+        let err = validate_regime_armed_marker_at_boot(&path, &zeroed)
+            .expect_err("zeroed regime state under an armed marker must refuse startup");
+        assert!(
+            err.contains("regime state is absent/zeroed"),
+            "refusal must name the cause; got: {err}",
+        );
+
+        // Marker + NO committed term ever observed: loud warn only (a
+        // stray file must not be a boot-DoS).
+        let fresh = crate::cluster::topology::PersistedTopologyState {
+            peak_cluster_size: 1,
+            committed_term: 0,
+            committed_members: Vec::new(),
+            committed_voters: Vec::new(),
+            voted_term: 0,
+            incarnation: 0,
+            committed_voter_ever_seen: Vec::new(),
+            committed_placement_version: 1,
+            committed_peak: 1,
+            regime_block: Default::default(),
+        };
+        assert!(
+            validate_regime_armed_marker_at_boot(&path, &fresh).is_ok(),
+            "marker with no committed term is a warning, not a refusal",
+        );
+    }
+
+    #[test]
+    fn regime_armed_boot_check_recreates_marker_for_armed_state() {
+        // Crash window: state persisted armed, crash before the marker
+        // create landed. Boot must self-heal the marker.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("node.cluster.topo");
+        let armed = p1_state_with_block(2, p1_armed_block(true));
+        std::fs::write(&path, armed.serialize_envelope()).expect("write state only");
+        assert!(!topology_regime_armed_marker_present(&path));
+        assert!(validate_regime_armed_marker_at_boot(&path, &armed).is_ok());
+        assert!(
+            topology_regime_armed_marker_present(&path),
+            "boot must re-create the marker for an armed persisted state",
+        );
+    }
+
+    #[test]
+    fn encode_committed_topology_carries_regime_block() {
+        let members: Vec<NodeId> = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let table = ShardTable::compute_with_epoch(&members, 2, 2, 1);
+        let cluster = new_test_running_cluster(
+            NodeId(1),
+            table,
+            &[
+                (NodeId(1), "127.0.0.1:4601".parse().unwrap()),
+                (NodeId(2), "127.0.0.1:4602".parse().unwrap()),
+                (NodeId(3), "127.0.0.1:4603".parse().unwrap()),
+            ],
+            &members,
+            &[],
+            &[],
+            &[],
+            3,
+        );
+        cluster.topology_authority().set_replication_factor(2);
+        // Install an override so the committed block is non-default.
+        let shard = 7u16;
+        let placement = ShardTable::compute_with_epoch(&members, 2, 1, 1);
+        let replica = placement.assignment(shard).replicas[0];
+        let mut block = crate::cluster::topology::RegimeBlock::default();
+        block.override_map.insert(shard, replica);
+        block.regime.set(shard, 3);
+        let term = 3u64;
+        let digest = crate::cluster::topology::TopologyTerm::compute_digest(
+            term,
+            &cluster.topology_authority().cluster_id(),
+            &members,
+            1,
+            3,
+            NodeId(1),
+            &block,
+        );
+        let commit = crate::cluster::topology::TopologyCommit {
+            term,
+            proposer: NodeId(1),
+            members: members.clone(),
+            cluster_id: cluster.topology_authority().cluster_id(),
+            placement_version: 1,
+            committed_peak: 3,
+            digest,
+            voters: members.clone(),
+            regime_block: block.clone(),
+        };
+        assert_eq!(
+            cluster.topology_authority().handle_commit(&commit),
+            Some(term)
+        );
+
+        // I9/dissemination — the proof-carrying catch-up payload must
+        // carry the committed regime state, and must re-validate on a
+        // same-state receiver.
+        let encoded = cluster.encode_committed_topology();
+        let decoded =
+            crate::cluster::topology::TopologyCommit::deserialize(&encoded).expect("decode");
+        assert_eq!(decoded.term, term);
+        assert_eq!(decoded.regime_block, block);
+        assert!(decoded.has_quorum_voter_proof());
+        // Digest self-consistency of the reconstruction.
+        let expected = crate::cluster::topology::TopologyTerm::compute_digest(
+            decoded.term,
+            &decoded.cluster_id,
+            &decoded.members,
+            decoded.placement_version,
+            decoded.committed_peak,
+            decoded.proposer,
+            &decoded.regime_block,
+        );
+        assert_eq!(decoded.digest, expected);
     }
 }

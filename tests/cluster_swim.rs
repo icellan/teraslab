@@ -138,7 +138,7 @@ fn start_swim_with_config_and_secret(
         persisted_incarnation: 0,
         committed_term: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
     });
-    let (shutdown, handle, rx) = runner.start();
+    let (shutdown, handle, rx, _event_tx) = runner.start();
     SwimNode {
         shutdown,
         handle: Some(handle),
