@@ -6704,6 +6704,107 @@ mod tests {
         assert_eq!(vote_digest_mismatch_total(), before);
     }
 
+    /// §6.1 (R7) — reject is not fence. Every structural rejection leaves the
+    /// node serving its existing term, so one malformed frame — or one
+    /// proposer bug — cannot take the cluster out. The ONE fence-arming path
+    /// is the placement-version refusal (P1-7), which is a live v1/v2
+    /// dual-authority guard and stays.
+    #[test]
+    fn structural_rejections_never_arm_the_self_fence() {
+        let mems = members(&[1, 2, 3]);
+        let good_digest = TopologyTerm::compute_digest(4, &ClusterId::UNSET, &mems, 1, 3);
+
+        // Non-ascending members, a wrong digest, an implausible member flood,
+        // and a nonsensical peak — every one is a reject.
+        let unsorted = members(&[3, 1, 2]);
+        let flood: Vec<NodeId> = (100..1124).map(NodeId).collect();
+        let cases = vec![
+            (
+                "members not strictly ascending",
+                TopologyCommit {
+                    term: 4,
+                    proposer: NodeId(1),
+                    members: unsorted.clone(),
+                    cluster_id: ClusterId::UNSET,
+                    placement_version: 1,
+                    committed_peak: 3,
+                    digest: TopologyTerm::compute_digest(4, &ClusterId::UNSET, &unsorted, 1, 3),
+                    voters: unsorted.clone(),
+                },
+            ),
+            (
+                "digest does not match its own fields",
+                TopologyCommit {
+                    term: 4,
+                    proposer: NodeId(1),
+                    members: mems.clone(),
+                    cluster_id: ClusterId::UNSET,
+                    placement_version: 1,
+                    committed_peak: 3,
+                    digest: [0xAB; 32],
+                    voters: mems.clone(),
+                },
+            ),
+            (
+                "implausible membership growth",
+                TopologyCommit {
+                    term: 4,
+                    proposer: NodeId(100),
+                    members: flood.clone(),
+                    cluster_id: ClusterId::UNSET,
+                    placement_version: 1,
+                    committed_peak: flood.len() as u64,
+                    digest: TopologyTerm::compute_digest(
+                        4,
+                        &ClusterId::UNSET,
+                        &flood,
+                        1,
+                        flood.len() as u64,
+                    ),
+                    voters: flood.clone(),
+                },
+            ),
+            (
+                "peak below the member count",
+                TopologyCommit {
+                    term: 4,
+                    proposer: NodeId(1),
+                    members: mems.clone(),
+                    cluster_id: ClusterId::UNSET,
+                    placement_version: 1,
+                    committed_peak: 1,
+                    digest: TopologyTerm::compute_digest(4, &ClusterId::UNSET, &mems, 1, 1),
+                    voters: mems.clone(),
+                },
+            ),
+        ];
+
+        for (why, commit) in cases {
+            let auth = TopologyAuthority::new(NodeId(2), Duration::from_secs(1));
+            assert_eq!(auth.handle_commit(&commit), None, "{why}: must be rejected");
+            assert!(
+                !auth.is_self_fenced(),
+                "{why}: a structural rejection must not fence",
+            );
+            assert_eq!(auth.unapplicable_committed_term(), 0, "{why}");
+            assert_eq!(auth.committed_term(), 0, "{why}: nothing may be applied");
+
+            // Still able to accept a good commit afterwards — the node was
+            // held back, not bricked.
+            let good = TopologyCommit {
+                term: 4,
+                proposer: NodeId(1),
+                members: mems.clone(),
+                cluster_id: ClusterId::UNSET,
+                placement_version: 1,
+                committed_peak: 3,
+                digest: good_digest,
+                voters: mems.clone(),
+            };
+            assert_eq!(auth.handle_commit(&good), Some(4), "{why}: must recover");
+        }
+    }
+
     /// §4.5 (P1-8) — a quorum-backed commit naming the committed term with a
     /// different digest is a committed-history fork. Detected and counted; the
     /// frame is still rejected (it is a stale term) and nothing is fenced.

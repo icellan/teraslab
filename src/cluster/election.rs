@@ -387,6 +387,331 @@ pub fn install_assignment(det: &mut ShardTable, assignment: &[NodeId]) {
     }
 }
 
+/// Rule 9 — how far ahead of this node's committed term a commit may claim to
+/// be. A cluster advances one term per topology change; a jump of 16 is far
+/// beyond any real burst and bounds how far a single frame can drag the term
+/// space forward.
+pub const MAX_TERM_JUMP: u64 = 16;
+
+/// (E7) Rule 6's alert threshold as a ratio of fair share. NOT a rejection
+/// bound: `k = 1.5` rejects the HONEST assignment on a routine
+/// wipe-and-rejoin (n=3 RF=2, one node restored empty, all 1365 shards where
+/// it is deterministic master deviate onto one peer, which then holds 2731
+/// against a 2048 cap). Under all-or-nothing validation that wedges
+/// permanently, because the deterministic proposer just re-proposes it.
+pub const MASTER_COUNT_ALERT_RATIO: f64 = 1.1;
+
+/// Why an assignment was refused.
+///
+/// (§6.1) Every one of these is a REJECT: metric + ERROR, and the node keeps
+/// serving under its existing committed term. None of them fences. A
+/// validation failure routed into a global, reboot-to-clear fence turns one
+/// malformed frame — or one proposer bug — into a cluster-wide outage.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum AssignmentRejection {
+    /// Rule 1 — the assignment must carry exactly [`NUM_SHARDS`] entries.
+    /// Never pad and never truncate: a padded tail encodes as index 0, which
+    /// decodes as `members[0]` and hands that node the missing keyspace.
+    #[error("assignment has {found} entries, expected {expected}")]
+    WrongLength { found: usize, expected: usize },
+    /// Rule 11 — a u16 index at or beyond `members.len()` names nobody.
+    #[error("assignment entry for shard {shard} indexes member {index}, out of {member_count}")]
+    IndexOutOfRange {
+        shard: u16,
+        index: u16,
+        member_count: usize,
+    },
+    /// Rule 2 — `members` must be strictly ascending. The digest hashes
+    /// members as received while the placement sorts a local copy, so an
+    /// ambiguous order lets two conforming nodes derive different assignments
+    /// from one digest-matching commit.
+    #[error("members are not strictly ascending")]
+    MembersNotAscending,
+    /// Rule 5 — `NodeId(0)` collides with three live sentinels (stale-table
+    /// marker, inbound-fence wildcard, filtered out of migration-source
+    /// selection), so a shard assigned to it is masterless AND unrepairable.
+    #[error("members contain NodeId(0)")]
+    MemberIsNodeZero,
+    /// Rule 3 — every entry must be a committed member of this term.
+    #[error("shard {shard} is assigned to {node:?}, not a member of this term")]
+    EntryNotAMember { shard: u16, node: NodeId },
+    /// Rule 4 — the load-bearing containment: an entry must be one of the
+    /// shard's RF candidates under the deterministic placement. This is the
+    /// wire-level equivalent of `set_master_for_shard`'s refusal, and it is a
+    /// pure function of digest-bound inputs, so every voter agrees on it.
+    #[error("shard {shard} is assigned to {node:?}, not one of its candidates")]
+    EntryNotACandidate { shard: u16, node: NodeId },
+    /// Rule 7 — the derived replica set must not contain the master.
+    #[error("shard {shard} lists its master {node:?} as a replica")]
+    MasterInReplicas { shard: u16, node: NodeId },
+    /// Rule 8 — a sanity check on a plaintext, self-declared field. NOT
+    /// authorization: nothing verifies the sender.
+    #[error("proposer {proposer:?} is not a member of this term")]
+    ProposerNotAMember { proposer: NodeId },
+    /// Rule 9 — checked BEFORE hashing, so a wild term cannot make a node do
+    /// the digest work.
+    #[error("term {term} exceeds committed term {committed} by more than {max}")]
+    TermJumpTooLarge { term: u64, committed: u64, max: u64 },
+}
+
+/// What a valid assignment looks like, quantified. Rule 6 and the deleted
+/// move-delta rule both live here as measurements rather than gates.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AssignmentStats {
+    /// Highest per-node master count divided by fair share
+    /// (`NUM_SHARDS / members`). Exported as
+    /// `assignment_master_count_ratio`; alert above
+    /// [`MASTER_COUNT_ALERT_RATIO`].
+    pub master_count_ratio: f64,
+    /// Shards whose master differs from the previous committed assignment —
+    /// i.e. migrations this assignment triggers. Exported as
+    /// `assignment_move_delta_shards`.
+    ///
+    /// The move-delta RULE is deliberately deleted: it rejected the v1→v2
+    /// placement upgrade outright (which reshuffles every shard with
+    /// `members` unchanged), blocked the very repair this design exists to
+    /// perform, and was bypassable by changing membership by one node. It
+    /// survives only as this number.
+    pub move_delta_shards: usize,
+}
+
+/// Rejected assignments, by rule. Read via [`assignment_rejected_total`].
+static ASSIGNMENT_REJECTED_TOTAL: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Valid assignments whose worst per-node master count exceeded
+/// [`MASTER_COUNT_ALERT_RATIO`]. Read via [`assignment_master_count_alerts_total`].
+static ASSIGNMENT_MASTER_COUNT_ALERTS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Assignments refused by [`validate_assignment`].
+///
+/// Every increment is a reject, never a fence: a climbing counter means a peer
+/// is producing assignments this node will not install, and the node carries
+/// on serving its existing committed term.
+pub fn assignment_rejected_total() -> u64 {
+    ASSIGNMENT_REJECTED_TOTAL.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Valid assignments that concentrated mastership above the alert ratio.
+///
+/// (E7) Deliberately not a rejection — the honest assignment exceeds a hard
+/// bound on a routine wipe-and-rejoin, and rejecting it wedges the cluster.
+pub fn assignment_master_count_alerts_total() -> u64 {
+    ASSIGNMENT_MASTER_COUNT_ALERTS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The canonical assignment encoding: a fixed [`NUM_SHARDS`] array of u16
+/// indices into `members` **as received**, little-endian. 8 KiB exactly,
+/// never length-prefixed — a length field is one more thing a sender can lie
+/// about, and the length is already implied.
+///
+/// Returns `None` when an entry is not a member (it has no index) or when
+/// `members` exceeds what a u16 index can address.
+pub fn encode_assignment(assignment: &[NodeId], members: &[NodeId]) -> Option<Vec<u8>> {
+    if assignment.len() != NUM_SHARDS || members.len() > u16::MAX as usize {
+        return None;
+    }
+    let mut index_of: HashMap<NodeId, u16> = HashMap::with_capacity(members.len());
+    for (index, member) in members.iter().enumerate() {
+        index_of.entry(*member).or_insert(index as u16);
+    }
+    let mut buf = Vec::with_capacity(NUM_SHARDS * 2);
+    for master in assignment {
+        buf.extend_from_slice(&index_of.get(master)?.to_le_bytes());
+    }
+    Some(buf)
+}
+
+/// Decode the canonical encoding, enforcing rules 1 and 11.
+///
+/// # Errors
+///
+/// [`AssignmentRejection::WrongLength`] when the payload is not exactly
+/// `NUM_SHARDS * 2` bytes, and [`AssignmentRejection::IndexOutOfRange`] when
+/// an index names no member. Both are rejections, never fences.
+pub fn decode_assignment(
+    bytes: &[u8],
+    members: &[NodeId],
+) -> Result<Vec<NodeId>, AssignmentRejection> {
+    if bytes.len() != NUM_SHARDS * 2 {
+        return Err(AssignmentRejection::WrongLength {
+            found: bytes.len(),
+            expected: NUM_SHARDS * 2,
+        });
+    }
+    let mut out = Vec::with_capacity(NUM_SHARDS);
+    for (shard, chunk) in bytes.chunks_exact(2).enumerate() {
+        let index = u16::from_le_bytes([chunk[0], chunk[1]]);
+        let member = members
+            .get(index as usize)
+            .ok_or(AssignmentRejection::IndexOutOfRange {
+                shard: shard as u16,
+                index,
+                member_count: members.len(),
+            })?;
+        out.push(*member);
+    }
+    Ok(out)
+}
+
+/// Digest over the canonical encoding. Recipients compute this from the bytes
+/// they RECEIVED — no path may trust a shipped hash, or the binding is
+/// vacuous: ship `(A, H(B))` to one node and `(A', H(B))` to another and both
+/// match their own advertised digest.
+pub fn assignment_digest(encoded: &[u8]) -> [u8; 32] {
+    crate::cluster::auth::sha256(encoded)
+}
+
+/// Everything rules 3–9 need, all of it digest-bound or locally committed.
+pub struct AssignmentProposal<'a> {
+    /// Decoded assignment, `NUM_SHARDS` entries.
+    pub assignment: &'a [NodeId],
+    /// `commit.members`, as received (NOT sorted locally — rule 2 requires
+    /// the received order to already be strictly ascending).
+    pub members: &'a [NodeId],
+    /// The deterministic table for this term, built from the same digest-bound
+    /// `(members, rf, placement_version)` the commit carries.
+    pub det: &'a ShardTable,
+    /// `commit.proposer`.
+    pub proposer: NodeId,
+    /// `commit.term`.
+    pub term: u64,
+}
+
+/// Run rules 1–9 and 11 over a decoded assignment (rule 10, the membership
+/// growth bound, is enforced on `commit.members` by the commit gate).
+///
+/// # Errors
+///
+/// Any [`AssignmentRejection`]. Every one is reject-and-count: the caller must
+/// refuse the commit and keep serving its existing term. No path here fences.
+///
+/// On success returns [`AssignmentStats`]; a master-count ratio above
+/// [`MASTER_COUNT_ALERT_RATIO`] logs and counts but does NOT fail (E7).
+pub fn validate_assignment(
+    proposal: &AssignmentProposal<'_>,
+    committed_term: u64,
+    prev_committed: Option<&[NodeId]>,
+) -> Result<AssignmentStats, AssignmentRejection> {
+    let reject = |rejection: AssignmentRejection| -> AssignmentRejection {
+        ASSIGNMENT_REJECTED_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        tracing::error!(
+            term = proposal.term,
+            proposer = proposal.proposer.0,
+            reason = %rejection,
+            "cluster: rejecting committed assignment — the node keeps serving its \
+             existing term (reject, not fence)",
+        );
+        rejection
+    };
+
+    // Rule 9 FIRST — before any hashing or per-shard work, so a wild term
+    // cannot make this node do the expensive part.
+    if proposal.term > committed_term.saturating_add(MAX_TERM_JUMP) {
+        return Err(reject(AssignmentRejection::TermJumpTooLarge {
+            term: proposal.term,
+            committed: committed_term,
+            max: MAX_TERM_JUMP,
+        }));
+    }
+
+    // Rule 2 — strictly ascending members (sorted and duplicate-free in one
+    // check). Re-checked here so the validator is self-contained rather than
+    // inheriting a guarantee from its caller.
+    if proposal.members.windows(2).any(|w| w[0].0 >= w[1].0) {
+        return Err(reject(AssignmentRejection::MembersNotAscending));
+    }
+
+    // Rule 5 — NodeId(0) anywhere in the member set.
+    if proposal.members.contains(&NodeId(0)) {
+        return Err(reject(AssignmentRejection::MemberIsNodeZero));
+    }
+
+    // Rule 8 — sanity only; the sender is never verified.
+    if !proposal.members.contains(&proposal.proposer) {
+        return Err(reject(AssignmentRejection::ProposerNotAMember {
+            proposer: proposal.proposer,
+        }));
+    }
+
+    // Rule 1 — exactly NUM_SHARDS entries.
+    if proposal.assignment.len() != NUM_SHARDS {
+        return Err(reject(AssignmentRejection::WrongLength {
+            found: proposal.assignment.len(),
+            expected: NUM_SHARDS,
+        }));
+    }
+
+    let member_set: HashSet<NodeId> = proposal.members.iter().copied().collect();
+    let mut master_counts: HashMap<NodeId, usize> = HashMap::with_capacity(proposal.members.len());
+
+    for (shard, master) in proposal.assignment.iter().enumerate() {
+        let shard = shard as u16;
+
+        // Rule 3 — a committed member of this term.
+        if !member_set.contains(master) {
+            return Err(reject(AssignmentRejection::EntryNotAMember {
+                shard,
+                node: *master,
+            }));
+        }
+
+        // Rule 4 — one of the shard's RF candidates. This is the entire
+        // containment: without it a proposer can name any member for any
+        // shard, including one holding none of that shard's data.
+        if !candidates(proposal.det, shard).contains(master) {
+            return Err(reject(AssignmentRejection::EntryNotACandidate {
+                shard,
+                node: *master,
+            }));
+        }
+
+        // Rule 7 — the derived replica set must not contain the master.
+        if derive_replicas(proposal.det, shard, *master).contains(master) {
+            return Err(reject(AssignmentRejection::MasterInReplicas {
+                shard,
+                node: *master,
+            }));
+        }
+
+        *master_counts.entry(*master).or_insert(0) += 1;
+    }
+
+    // Rule 6 (E7) — measure, alert, do NOT reject.
+    let fair_share = NUM_SHARDS as f64 / proposal.members.len().max(1) as f64;
+    let worst = master_counts.values().copied().max().unwrap_or(0);
+    let master_count_ratio = worst as f64 / fair_share;
+    if master_count_ratio > MASTER_COUNT_ALERT_RATIO {
+        ASSIGNMENT_MASTER_COUNT_ALERTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        tracing::error!(
+            term = proposal.term,
+            proposer = proposal.proposer.0,
+            master_count_ratio,
+            worst_node_shards = worst,
+            fair_share,
+            "cluster: committed assignment concentrates mastership above the alert \
+             ratio — accepted (rejecting it would wedge a legitimate rejoin)",
+        );
+    }
+
+    let move_delta_shards = prev_committed
+        .map(|prev| {
+            proposal
+                .assignment
+                .iter()
+                .zip(prev.iter())
+                .filter(|(next, previous)| next != previous)
+                .count()
+        })
+        .unwrap_or(0);
+
+    Ok(AssignmentStats {
+        master_count_ratio,
+        move_delta_shards,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -804,6 +1129,298 @@ mod tests {
             plain_rank(NodeId(4)) > plain_rank(NodeId(5)),
             "with all else equal the lowest NodeId wins",
         );
+    }
+
+    fn proposal<'a>(
+        assignment: &'a [NodeId],
+        members: &'a [NodeId],
+        det: &'a ShardTable,
+    ) -> AssignmentProposal<'a> {
+        AssignmentProposal {
+            assignment,
+            members,
+            det,
+            proposer: members[0],
+            term: 5,
+        }
+    }
+
+    /// The election's own output must pass its own validator — the two must
+    /// never drift apart.
+    #[test]
+    fn an_elected_assignment_validates() {
+        let ids = [1u64, 2, 3, 4];
+        let det = det_table(&ids, 3);
+        let reports = everyone_full(&det, &ids);
+        let prev = det_assignment(&det);
+        let mut history = DeviationHistory::new();
+        let election = elect_committed_assignment(
+            &ElectionInputs {
+                det: &det,
+                prev_committed: Some(&prev),
+                reports: &reports,
+                live: &live(&ids),
+            },
+            &mut history,
+        );
+        let member_list = members(&ids);
+        let stats = validate_assignment(
+            &proposal(&election.assignment, &member_list, &det),
+            4,
+            Some(&prev),
+        )
+        .expect("the election's own output must validate");
+        assert!(stats.master_count_ratio <= MASTER_COUNT_ALERT_RATIO);
+        assert_eq!(stats.move_delta_shards, 0);
+    }
+
+    /// Rule 4 — the containment rule. A member that is not one of the shard's
+    /// candidates cannot be its master, however well-formed the frame is.
+    #[test]
+    fn rule_4_rejects_an_entry_outside_the_candidate_set() {
+        let ids = [1u64, 2, 3, 4, 5];
+        let det = det_table(&ids, 2);
+        let member_list = members(&ids);
+        let mut assignment = det_assignment(&det);
+
+        let shard = 0u16;
+        let outsider = member_list
+            .iter()
+            .copied()
+            .find(|node| !candidates(&det, shard).contains(node))
+            .expect("with RF=2 of 5 members some member is not a candidate");
+        assignment[shard as usize] = outsider;
+
+        let before = assignment_rejected_total();
+        let err = validate_assignment(&proposal(&assignment, &member_list, &det), 4, None)
+            .expect_err("a non-candidate master must be rejected");
+        assert_eq!(
+            err,
+            AssignmentRejection::EntryNotACandidate {
+                shard,
+                node: outsider
+            }
+        );
+        assert_eq!(assignment_rejected_total(), before + 1);
+    }
+
+    /// Rule 3 — a node outside the member set entirely.
+    #[test]
+    fn rule_3_rejects_a_non_member() {
+        let ids = [1u64, 2, 3];
+        let det = det_table(&ids, 2);
+        let member_list = members(&ids);
+        let mut assignment = det_assignment(&det);
+        assignment[0] = NodeId(99);
+        let err = validate_assignment(&proposal(&assignment, &member_list, &det), 4, None)
+            .expect_err("a non-member master must be rejected");
+        assert_eq!(
+            err,
+            AssignmentRejection::EntryNotAMember {
+                shard: 0,
+                node: NodeId(99)
+            }
+        );
+    }
+
+    /// Rule 1 — never pad, never truncate. A short assignment used to be
+    /// padded with zeros, and index 0 decodes as `members[0]`.
+    #[test]
+    fn rule_1_rejects_a_short_assignment() {
+        let ids = [1u64, 2, 3];
+        let det = det_table(&ids, 2);
+        let member_list = members(&ids);
+        let short = det_assignment(&det)[..NUM_SHARDS - 1].to_vec();
+        let err = validate_assignment(&proposal(&short, &member_list, &det), 4, None)
+            .expect_err("a short assignment must be rejected");
+        assert_eq!(
+            err,
+            AssignmentRejection::WrongLength {
+                found: NUM_SHARDS - 1,
+                expected: NUM_SHARDS
+            }
+        );
+    }
+
+    /// Rules 2, 5, 8, 9 — the cheap structural gates.
+    #[test]
+    fn structural_rules_reject_their_own_violations() {
+        let ids = [1u64, 2, 3];
+        let det = det_table(&ids, 2);
+        let assignment = det_assignment(&det);
+
+        // Rule 2 — not strictly ascending (duplicate).
+        let unsorted = members(&[1, 1, 2]);
+        assert_eq!(
+            validate_assignment(&proposal(&assignment, &unsorted, &det), 4, None).unwrap_err(),
+            AssignmentRejection::MembersNotAscending,
+        );
+
+        // Rule 5 — NodeId(0).
+        let with_zero = members(&[0, 1, 2]);
+        assert_eq!(
+            validate_assignment(&proposal(&assignment, &with_zero, &det), 4, None).unwrap_err(),
+            AssignmentRejection::MemberIsNodeZero,
+        );
+
+        // Rule 8 — proposer outside the member set.
+        let member_list = members(&ids);
+        let foreign = AssignmentProposal {
+            assignment: &assignment,
+            members: &member_list,
+            det: &det,
+            proposer: NodeId(42),
+            term: 5,
+        };
+        assert_eq!(
+            validate_assignment(&foreign, 4, None).unwrap_err(),
+            AssignmentRejection::ProposerNotAMember {
+                proposer: NodeId(42)
+            },
+        );
+
+        // Rule 9 — a wild term jump, checked before any per-shard work.
+        let far = AssignmentProposal {
+            assignment: &assignment,
+            members: &member_list,
+            det: &det,
+            proposer: member_list[0],
+            term: 4 + MAX_TERM_JUMP + 1,
+        };
+        assert_eq!(
+            validate_assignment(&far, 4, None).unwrap_err(),
+            AssignmentRejection::TermJumpTooLarge {
+                term: 4 + MAX_TERM_JUMP + 1,
+                committed: 4,
+                max: MAX_TERM_JUMP,
+            },
+        );
+    }
+
+    /// (E7) Rule 6 measures and alerts; it must NOT reject. The honest
+    /// assignment after a wipe-and-rejoin concentrates mastership, and
+    /// rejecting it wedges the cluster permanently — the deterministic
+    /// proposer simply re-proposes the same thing.
+    #[test]
+    fn rule_6_alerts_on_concentration_but_still_accepts() {
+        let ids = [1u64, 2, 3];
+        let det = det_table(&ids, 2);
+        let member_list = members(&ids);
+
+        // Every shard whose candidates include member[0] goes to member[0].
+        let mut assignment = det_assignment(&det);
+        for shard in 0..NUM_SHARDS as u16 {
+            if candidates(&det, shard).contains(&member_list[0]) {
+                assignment[shard as usize] = member_list[0];
+            }
+        }
+
+        let alerts_before = assignment_master_count_alerts_total();
+        let rejects_before = assignment_rejected_total();
+        let stats = validate_assignment(&proposal(&assignment, &member_list, &det), 4, None)
+            .expect("concentration must NOT be a rejection");
+        assert!(
+            stats.master_count_ratio > MASTER_COUNT_ALERT_RATIO,
+            "precondition: this assignment is concentrated, ratio {}",
+            stats.master_count_ratio,
+        );
+        assert_eq!(
+            assignment_master_count_alerts_total(),
+            alerts_before + 1,
+            "concentration must raise the alert counter",
+        );
+        assert_eq!(
+            assignment_rejected_total(),
+            rejects_before,
+            "concentration must not count as a rejection",
+        );
+    }
+
+    /// The move delta is reported, never enforced. The rule that enforced it
+    /// rejected the v1→v2 placement upgrade outright.
+    #[test]
+    fn move_delta_is_reported_not_enforced() {
+        let ids = [1u64, 2, 3];
+        let det = det_table(&ids, 2);
+        let member_list = members(&ids);
+        let prev = det_assignment(&det);
+
+        // Move every shard that can move onto its first replica.
+        let mut assignment = prev.clone();
+        for shard in 0..NUM_SHARDS as u16 {
+            let shard_candidates = candidates(&det, shard);
+            if shard_candidates.len() > 1 {
+                assignment[shard as usize] = shard_candidates[1];
+            }
+        }
+
+        let stats = validate_assignment(&proposal(&assignment, &member_list, &det), 4, Some(&prev))
+            .expect("a large move delta must not be a rejection");
+        assert!(
+            stats.move_delta_shards > NUM_SHARDS / 2,
+            "precondition: this assignment moves most shards",
+        );
+    }
+
+    /// The canonical encoding round-trips, and rule 11 rejects an index that
+    /// names nobody.
+    #[test]
+    fn assignment_encoding_round_trips_and_bounds_its_indices() {
+        let ids = [1u64, 2, 3];
+        let det = det_table(&ids, 2);
+        let member_list = members(&ids);
+        let assignment = det_assignment(&det);
+
+        let encoded = encode_assignment(&assignment, &member_list).expect("must encode");
+        assert_eq!(
+            encoded.len(),
+            NUM_SHARDS * 2,
+            "8 KiB, never length-prefixed"
+        );
+        assert_eq!(
+            decode_assignment(&encoded, &member_list).expect("must decode"),
+            assignment,
+        );
+
+        // Rule 11 — an index at members.len() names nobody.
+        let mut bad = encoded.clone();
+        bad[0..2].copy_from_slice(&(member_list.len() as u16).to_le_bytes());
+        assert_eq!(
+            decode_assignment(&bad, &member_list).unwrap_err(),
+            AssignmentRejection::IndexOutOfRange {
+                shard: 0,
+                index: member_list.len() as u16,
+                member_count: member_list.len(),
+            },
+        );
+
+        // Rule 1 at the decode layer — a truncated payload is not padded.
+        assert_eq!(
+            decode_assignment(&encoded[..encoded.len() - 2], &member_list).unwrap_err(),
+            AssignmentRejection::WrongLength {
+                found: NUM_SHARDS * 2 - 2,
+                expected: NUM_SHARDS * 2,
+            },
+        );
+    }
+
+    /// The digest is computed from the bytes, so two different assignments
+    /// cannot share one. Recipients must recompute it from what they received
+    /// rather than trusting a shipped hash.
+    #[test]
+    fn the_assignment_digest_distinguishes_different_assignments() {
+        let ids = [1u64, 2, 3];
+        let det = det_table(&ids, 2);
+        let member_list = members(&ids);
+        let a = det_assignment(&det);
+        let mut b = a.clone();
+        b[0] = candidates(&det, 0)[1];
+
+        let encoded_a = encode_assignment(&a, &member_list).expect("encode a");
+        let encoded_b = encode_assignment(&b, &member_list).expect("encode b");
+        assert_ne!(encoded_a, encoded_b);
+        assert_ne!(assignment_digest(&encoded_a), assignment_digest(&encoded_b));
+        assert_eq!(assignment_digest(&encoded_a), assignment_digest(&encoded_a));
     }
 
     /// §11 — the swap preserves the deterministic holder set and never leaves

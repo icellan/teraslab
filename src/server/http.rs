@@ -1467,6 +1467,19 @@ pub(crate) fn render_metrics_text(
         "teraslab_topology_committed_digest_fork_total",
         crate::cluster::topology::committed_digest_fork_total(),
     );
+    // §6 — assignment validation outcomes. Rejections are refusals to
+    // install, never fences; the alert counter is the E7 concentration
+    // signal, which is deliberately not a rejection.
+    prom_counter(
+        &mut out,
+        "teraslab_assignment_rejected_total",
+        crate::cluster::election::assignment_rejected_total(),
+    );
+    prom_counter(
+        &mut out,
+        "teraslab_assignment_master_count_alerts_total",
+        crate::cluster::election::assignment_master_count_alerts_total(),
+    );
     if let Some(a) = allocator_metrics() {
         prom_counter(&mut out, "teraslab_alloc_total", a.alloc_total.get());
         prom_counter(
@@ -4894,6 +4907,8 @@ mod tests {
             "teraslab_swim_ping_req_dropped_total",
             "teraslab_topology_vote_digest_mismatch_total",
             "teraslab_topology_committed_digest_fork_total",
+            "teraslab_assignment_rejected_total",
+            "teraslab_assignment_master_count_alerts_total",
             "teraslab_alloc_total",
             "teraslab_alloc_bytes_total",
             "teraslab_free_total",
