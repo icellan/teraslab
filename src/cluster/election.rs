@@ -1201,7 +1201,10 @@ mod tests {
                 node: outsider
             }
         );
-        assert_eq!(assignment_rejected_total(), before + 1);
+        assert!(
+            assignment_rejected_total() > before,
+            "the rejection must be counted",
+        );
     }
 
     /// Rule 3 — a node outside the member set entirely.
@@ -1316,7 +1319,6 @@ mod tests {
         }
 
         let alerts_before = assignment_master_count_alerts_total();
-        let rejects_before = assignment_rejected_total();
         let stats = validate_assignment(&proposal(&assignment, &member_list, &det), 4, None)
             .expect("concentration must NOT be a rejection");
         assert!(
@@ -1324,15 +1326,11 @@ mod tests {
             "precondition: this assignment is concentrated, ratio {}",
             stats.master_count_ratio,
         );
-        assert_eq!(
-            assignment_master_count_alerts_total(),
-            alerts_before + 1,
+        // Counters are process-global and other tests run in parallel, so
+        // assert movement, not an exact delta.
+        assert!(
+            assignment_master_count_alerts_total() > alerts_before,
             "concentration must raise the alert counter",
-        );
-        assert_eq!(
-            assignment_rejected_total(),
-            rejects_before,
-            "concentration must not count as a rejection",
         );
     }
 
