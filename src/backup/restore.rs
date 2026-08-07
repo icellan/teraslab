@@ -135,6 +135,73 @@ pub fn restore(backup_dir: &Path, config: &ServerConfig) -> Result<(), BackupErr
         std::fs::write(&dst, &bytes).map_err(BackupError::Io)?;
     }
 
+    // 11. Cluster lineage + migration-fence + topology state (P1 stage 3,
+    //     design §4.3; §8 review F4).
+    //     A restored image is a DIFFERENT data lineage from whatever this
+    //     node held before: every per-shard Full/Subset stamp and every
+    //     inbound/outbound migration-fence record refers to the pre-restore
+    //     copy, so they are deleted OUTRIGHT (fail-closed — the restored
+    //     node boots all-`Subset` and re-earns `Full` through the normal
+    //     catch-up / heal machinery), and a FRESH `data_epoch` identity is
+    //     stamped so any surviving stale lineage file elsewhere (or a clone
+    //     of the pre-restore dir) degrades via the identity mismatch.
+    //
+    //     F4 (primary fix): the `.topo` topology state and its
+    //     `.regime-armed` sidecar are deleted too. With `.topo` intact the
+    //     restored node boots believing itself the committed master of its
+    //     old shards, I13(i)'s boot re-derivation re-stamps `Full` over the
+    //     BACKUP-ERA data (a restored redo tail replays cleanly, so
+    //     "internally consistent" is indistinguishable from "current"),
+    //     and the node serves stale data as authoritative master AND
+    //     reports `lineage_full = true` — a legal promotion target.
+    //     Deleting `.topo` makes it rejoin, learn topology from its peers,
+    //     master nothing until a commit says so, and re-earn `Full`
+    //     through catch-up. `.multinode` is deliberately KEPT: it only
+    //     pins a peak floor of 2, which remains true of the cluster the
+    //     node rejoins. The data_epoch recorded inside the topology state
+    //     envelope is the belt for a `.topo` that survives anyway (see
+    //     `RunningCluster::start`'s I13(i) epoch-continuity gate).
+    //     The restore runbook documents this.
+    let cluster_state_path = config.resolved_cluster_state_path();
+    let topology_state_path =
+        crate::cluster::coordinator::topology_state_path_for_cluster_state(&cluster_state_path);
+    for sidecar in [
+        {
+            let mut s = cluster_state_path.as_os_str().to_os_string();
+            s.push(".inbound");
+            PathBuf::from(s)
+        },
+        {
+            let mut s = cluster_state_path.as_os_str().to_os_string();
+            s.push(".outbound");
+            PathBuf::from(s)
+        },
+        crate::cluster::lineage::lineage_state_path(&cluster_state_path),
+        // F4 — the STATE FILE strictly before its armed marker: a crash
+        // between the two leaves `.topo`-absent + marker-present, which
+        // boots as a LOUD "stray marker" warning over fresh (empty)
+        // topology state — the fail-safe direction. The reverse order's
+        // crash window (marker-absent + stale armed `.topo`) would boot
+        // the pre-restore topology, self-heal the marker, and reopen the
+        // exact F4 stale-master hazard this deletion exists to close.
+        // (A crashed restore must be re-run regardless — device ranges
+        // may be partial — but the ordering keeps even that window safe.)
+        topology_state_path.clone(),
+        crate::cluster::coordinator::topology_regime_armed_marker_path(&topology_state_path),
+    ] {
+        match std::fs::remove_file(&sidecar) {
+            Ok(()) => {
+                crate::fsutil::fsync_parent_dir(&sidecar).map_err(BackupError::Io)?;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(BackupError::Io(e)),
+        }
+    }
+    crate::cluster::lineage::stamp_fresh_data_epoch(&crate::cluster::lineage::data_epoch_path(
+        &cluster_state_path,
+    ))
+    .map_err(BackupError::Io)?;
+
     Ok(())
 }
 

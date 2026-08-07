@@ -221,6 +221,7 @@ fn tcp_replicate_spend() {
         trace_ctx: None,
         source_node_id: None,
         cluster_key: 0,
+        regime_table: None,
     };
     let ack = send_replica_batch_tcp(replica_port, &batch);
     assert_eq!(
@@ -274,6 +275,7 @@ fn tcp_replicate_spend_uses_replicated_dah_context() {
         trace_ctx: None,
         source_node_id: None,
         cluster_key: 0,
+        regime_table: None,
     };
 
     let ack = send_replica_batch_tcp(replica_port, &batch);
@@ -319,6 +321,7 @@ fn tcp_replicate_create_and_spend_lifecycle() {
         trace_ctx: None,
         source_node_id: None,
         cluster_key: 0,
+        regime_table: None,
     };
     let ack = send_replica_batch_tcp(replica_port, &create_batch);
     assert_eq!(
@@ -361,6 +364,7 @@ fn tcp_replicate_create_and_spend_lifecycle() {
         trace_ctx: None,
         source_node_id: None,
         cluster_key: 0,
+        regime_table: None,
     };
     let ack = send_replica_batch_tcp(replica_port, &spend_batch);
     assert_eq!(
@@ -426,6 +430,7 @@ fn tcp_replicate_batch_50_ops() {
         trace_ctx: None,
         source_node_id: None,
         cluster_key: 0,
+        regime_table: None,
     };
     let ack = send_replica_batch_tcp(replica_port, &batch);
     assert_eq!(
@@ -541,6 +546,7 @@ fn tcp_replicate_mixed_ops() {
         trace_ctx: None,
         source_node_id: None,
         cluster_key: 0,
+        regime_table: None,
     };
 
     let ack = send_replica_batch_tcp(replica_port, &batch);
@@ -625,6 +631,7 @@ fn tcp_catchup_missed_ops() {
         trace_ctx: None,
         source_node_id: None,
         cluster_key: 0,
+        regime_table: None,
     };
     let ack = send_replica_batch_tcp(replica_port, &batch1);
     assert_eq!(
@@ -641,6 +648,7 @@ fn tcp_catchup_missed_ops() {
         trace_ctx: None,
         source_node_id: None,
         cluster_key: 0,
+        regime_table: None,
     };
     let ack = send_replica_batch_tcp(replica_port, &catchup_batch);
     assert_eq!(
@@ -751,6 +759,7 @@ fn tcp_concurrent_replicate_and_client() {
             trace_ctx: None,
             source_node_id: None,
             cluster_key: 0,
+            regime_table: None,
         };
         transport.send_batch(&batch).unwrap();
         let ack = transport.recv_ack(Duration::from_secs(5)).unwrap();
@@ -813,6 +822,7 @@ fn tcp_replica_timeout() {
         trace_ctx: None,
         source_node_id: None,
         cluster_key: 0,
+        regime_table: None,
     };
     transport.send_batch(&batch).unwrap();
 
@@ -943,6 +953,7 @@ fn tcp_consistency_verification() {
         trace_ctx: None,
         source_node_id: None,
         cluster_key: 0,
+        regime_table: None,
     };
     let ack = send_replica_batch_tcp(replica_port, &batch);
     let expected_through = ops.len() as u64;
@@ -1092,6 +1103,7 @@ fn cluster_mark_longest_chain_replicates_dah_unmined() {
         trace_ctx: None,
         source_node_id: None,
         cluster_key: 0,
+        regime_table: None,
     };
     let ack = send_replica_batch_tcp(replica_port, &batch);
     assert_eq!(
@@ -1165,6 +1177,7 @@ fn mark_longest_chain_replay_idempotent() {
             trace_ctx: None,
             source_node_id: None,
             cluster_key: 0,
+            regime_table: None,
         },
     );
     assert_eq!(
@@ -1201,6 +1214,7 @@ fn mark_longest_chain_replay_idempotent() {
             trace_ctx: None,
             source_node_id: None,
             cluster_key: 0,
+            regime_table: None,
         },
     );
     assert_eq!(
@@ -1245,6 +1259,7 @@ fn mark_longest_chain_replay_idempotent() {
             trace_ctx: None,
             source_node_id: None,
             cluster_key: 0,
+            regime_table: None,
         },
     );
     assert_eq!(
@@ -1499,6 +1514,7 @@ fn tcp_out_of_order_batch_naks_gap_then_heals_in_order() {
         trace_ctx: None,
         source_node_id: Some(21),
         cluster_key: 0,
+        regime_table: None,
     };
 
     let mut transport =
@@ -1563,6 +1579,7 @@ fn tcp_duplicate_resend_acked_applied_once() {
         trace_ctx: None,
         source_node_id: Some(22),
         cluster_key: 0,
+        regime_table: None,
     };
 
     let mut transport =
@@ -1625,10 +1642,10 @@ fn tcp_multi_replica_dense_streams_and_slow_replica_isolation() {
     // Different (filtered) subsets per replica, interleaved sends:
     // A gets ops 1..2 and 3..5 (5 ops), B gets ops 6..6 and 7..10 (5 ops
     // in differently shaped batches).
-    send_replica_ops_to(addr_a, &ops_n(1, 2), timeout, None, 0, node_id, 0).unwrap();
-    send_replica_ops_to(addr_b, &ops_n(6, 6), timeout, None, 0, node_id, 0).unwrap();
-    send_replica_ops_to(addr_a, &ops_n(3, 5), timeout, None, 0, node_id, 0).unwrap();
-    send_replica_ops_to(addr_b, &ops_n(7, 10), timeout, None, 0, node_id, 0).unwrap();
+    send_replica_ops_to(addr_a, &ops_n(1, 2), timeout, None, 0, None, node_id, 0).unwrap();
+    send_replica_ops_to(addr_b, &ops_n(6, 6), timeout, None, 0, None, node_id, 0).unwrap();
+    send_replica_ops_to(addr_a, &ops_n(3, 5), timeout, None, 0, None, node_id, 0).unwrap();
+    send_replica_ops_to(addr_b, &ops_n(7, 10), timeout, None, 0, None, node_id, 0).unwrap();
 
     // Each stream is dense: watermark == number of ops that replica
     // received, with no holes from the other replica's traffic.
@@ -1646,6 +1663,7 @@ fn tcp_multi_replica_dense_streams_and_slow_replica_isolation() {
         Duration::from_millis(500),
         None,
         0,
+        None,
         node_id,
         0,
     );
@@ -1654,7 +1672,7 @@ fn tcp_multi_replica_dense_streams_and_slow_replica_isolation() {
         "send to a dead replica must fail, not fake-ACK"
     );
 
-    send_replica_ops_to(addr_a, &ops_n(6, 8), timeout, None, 0, node_id, 0).unwrap();
+    send_replica_ops_to(addr_a, &ops_n(6, 8), timeout, None, 0, None, node_id, 0).unwrap();
     assert_eq!(
         receiver_a.applied_tracker().get(&stream),
         8,
@@ -1707,11 +1725,11 @@ fn tcp_burned_positions_heal_via_gap_nak_relabel() {
     };
 
     // 1. Healthy send (epoch 5): probe syncs cursor, seqs 1..2 apply.
-    send_replica_ops_to(addr, &ops_n(1, 2), timeout, None, 5, node_id, 0).unwrap();
+    send_replica_ops_to(addr, &ops_n(1, 2), timeout, None, 5, None, node_id, 0).unwrap();
     assert_eq!(receiver.applied_tracker().get("node:24"), 2);
 
     // 2. Stale-epoch send: receiver rejects, master burns positions 3..4.
-    let err = send_replica_ops_to(addr, &ops_n(3, 4), timeout, None, 3, node_id, 0);
+    let err = send_replica_ops_to(addr, &ops_n(3, 4), timeout, None, 3, None, node_id, 0);
     assert!(err.is_err(), "stale-epoch batch must fail");
     assert_eq!(
         receiver.applied_tracker().get("node:24"),
@@ -1722,7 +1740,7 @@ fn tcp_burned_positions_heal_via_gap_nak_relabel() {
     // 3. Next healthy send: labeled with burned positions → receiver
     //    NAKs Gap → master relabels at 3 and re-sends → applied.
     let gaps_before = metrics.replica_rejected_sequence_gap.get();
-    send_replica_ops_to(addr, &ops_n(5, 6), timeout, None, 5, node_id, 0).unwrap();
+    send_replica_ops_to(addr, &ops_n(5, 6), timeout, None, 5, None, node_id, 0).unwrap();
     let gaps_after = metrics.replica_rejected_sequence_gap.get();
     assert!(
         gaps_after > gaps_before,
@@ -1810,7 +1828,21 @@ fn tcp_catchup_chunk_boundary_no_skip() {
         10_000,
         &move |_from| entries_for_cb.clone(),
         Some(1),
-        &|chunk| send_replica_ops_to(addr, chunk, Duration::from_secs(5), None, 0, node_id, 0),
+        &|chunk| {
+            // F8 — the catch-up closure is typed (`ReplicaSendError`) so a
+            // stale-regime NAK stays classifiable; production uses the
+            // reporting variant for the same reason.
+            teraslab::server::dispatch::send_replica_ops_to_reporting(
+                addr,
+                chunk,
+                Duration::from_secs(5),
+                None,
+                0,
+                None,
+                node_id,
+                0,
+            )
+        },
     );
     assert_eq!(result.unwrap(), 12, "catch-up must cover redo seqs 1..=12");
 
@@ -1872,8 +1904,8 @@ fn tcp_restart_resumes_watermark_no_double_apply_no_gap() {
     receiver1.start(&addr.to_string()).unwrap();
     std::thread::sleep(Duration::from_millis(100));
 
-    send_replica_ops_to(addr, &ops_n(1, 2), timeout, None, 0, node_id, 0).unwrap();
-    send_replica_ops_to(addr, &ops_n(3, 4), timeout, None, 0, node_id, 0).unwrap();
+    send_replica_ops_to(addr, &ops_n(1, 2), timeout, None, 0, None, node_id, 0).unwrap();
+    send_replica_ops_to(addr, &ops_n(3, 4), timeout, None, 0, None, node_id, 0).unwrap();
     assert_eq!(receiver1.applied_tracker().get(&stream), 4);
 
     // --- Receiver restarts mid-stream.
@@ -1913,12 +1945,12 @@ fn tcp_restart_resumes_watermark_no_double_apply_no_gap() {
     );
 
     // First post-restart batch: exact next-expected match — applied.
-    send_replica_ops_to(addr, &ops_n(5, 6), timeout, None, 0, node_id, 0).unwrap();
+    send_replica_ops_to(addr, &ops_n(5, 6), timeout, None, 0, None, node_id, 0).unwrap();
     assert_eq!(receiver2.applied_tracker().get(&stream), 6);
 
     // --- Master "restart": stream state wiped → probe re-adopts 6.
     reset_replica_stream(addr);
-    send_replica_ops_to(addr, &ops_n(7, 8), timeout, None, 0, node_id, 0).unwrap();
+    send_replica_ops_to(addr, &ops_n(7, 8), timeout, None, 0, None, node_id, 0).unwrap();
     assert_eq!(
         receiver2.applied_tracker().get(&stream),
         8,
@@ -1994,6 +2026,7 @@ fn tcp_acked_replica_reconciled_by_compensating_op() {
         trace_ctx: None,
         source_node_id: None,
         cluster_key: 0,
+        regime_table: None,
     };
     let ack = send_replica_batch_tcp(replica_port, &spend_batch);
     assert_eq!(
@@ -2035,6 +2068,7 @@ fn tcp_acked_replica_reconciled_by_compensating_op() {
         trace_ctx: None,
         source_node_id: None,
         cluster_key: 0,
+        regime_table: None,
     };
     let ack = send_replica_batch_tcp(replica_port, &comp_batch);
     assert_eq!(

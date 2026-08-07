@@ -654,6 +654,7 @@ fn migration_batch_frame(source: &Engine, keys: &[TxKey], shard: u16) -> Request
         trace_ctx: None,
         source_node_id: None,
         cluster_key: 0,
+        regime_table: None,
     };
     RequestFrame {
         request_id: shard as u64,

@@ -495,6 +495,9 @@ fn topology_quorum_sizes() {
                     accepted: true,
                     voter_current_term: 0,
                     voter_placement_support: 1,
+                    voter_incarnation: 0,
+                    regime_support: false,
+                    ack_writeall_equiv: false,
                 };
                 commit = auth.handle_vote(&vote);
                 if commit.is_some() {
@@ -609,7 +612,16 @@ fn topology_catchup_does_not_leave_voted_term_gap() {
         cluster_id: ClusterId::UNSET,
         placement_version: 1,
         committed_peak: (mems.clone()).len() as u64,
-        digest: TopologyTerm::compute_digest(10, &ClusterId::UNSET, &mems, 1, (mems).len() as u64),
+        digest: TopologyTerm::compute_digest(
+            10,
+            &ClusterId::UNSET,
+            &mems,
+            1,
+            (mems).len() as u64,
+            NodeId(1),
+            &Default::default(),
+        ),
+        regime_block: Default::default(),
     };
     assert_eq!(auth.handle_commit(&commit), Some(10));
 
@@ -668,7 +680,10 @@ fn topology_fallback_proposer_superseded_by_second_timeout() {
             &old_mems,
             1,
             (old_mems).len() as u64,
+            NodeId(1),
+            &Default::default(),
         ),
+        regime_block: Default::default(),
     };
     auth.handle_commit(&old_commit);
 
@@ -708,6 +723,9 @@ fn topology_fallback_proposer_superseded_by_second_timeout() {
         accepted: true,
         voter_current_term: 1,
         voter_placement_support: 1,
+        voter_incarnation: 0,
+        regime_support: false,
+        ack_writeall_equiv: false,
     };
     let commit = auth.handle_vote(&vote_for_t1);
     assert!(
@@ -723,6 +741,9 @@ fn topology_fallback_proposer_superseded_by_second_timeout() {
         accepted: true,
         voter_current_term: 1,
         voter_placement_support: 1,
+        voter_incarnation: 0,
+        regime_support: false,
+        ack_writeall_equiv: false,
     };
     let commit = auth.handle_vote(&vote_for_t2);
     assert!(
@@ -759,7 +780,10 @@ fn topology_cluster_formation_three_simultaneous_starts() {
                 &mems,
                 1,
                 (mems).len() as u64,
+                NodeId(id),
+                &Default::default(),
             ),
+            regime_block: Default::default(),
         };
         auth.handle_commit(&commit);
         assert_eq!(auth.committed_term(), 1);
@@ -817,7 +841,16 @@ fn topology_formation_recovery_blocked_by_outstanding_vote() {
         cluster_id: ClusterId::UNSET,
         placement_version: 1,
         committed_peak: (mems.clone()).len() as u64,
-        digest: TopologyTerm::compute_digest(1, &ClusterId::UNSET, &mems, 1, (mems).len() as u64),
+        digest: TopologyTerm::compute_digest(
+            1,
+            &ClusterId::UNSET,
+            &mems,
+            1,
+            (mems).len() as u64,
+            NodeId(2),
+            &Default::default(),
+        ),
+        regime_block: Default::default(),
     };
     auth.handle_commit(&commit);
 
@@ -1303,6 +1336,8 @@ fn topology_restore_then_vote_safety() {
         committed_voter_ever_seen: vec![NodeId(1), NodeId(2), NodeId(3)],
         committed_placement_version: 1,
         committed_peak: 3,
+        regime_block: Default::default(),
+        data_epoch: None,
     };
 
     let auth = TopologyAuthority::new(NodeId(2), Duration::from_secs(1));
@@ -1663,6 +1698,7 @@ fn topology_full_5_node_quorum_cycle() {
         placement_version: 1,
         committed_peak: (commit.members.clone()).len() as u64,
         digest: commit.digest,
+        regime_block: Default::default(),
     };
     for node in &nodes {
         // Node 1 already applied via handle_vote → handle_commit should
@@ -1706,6 +1742,9 @@ fn topology_rejected_votes_dont_count() {
             accepted: false,
             voter_current_term: 0,
             voter_placement_support: 1,
+            voter_incarnation: 0,
+            regime_support: false,
+            ack_writeall_equiv: false,
         };
         let commit = auth.handle_vote(&vote);
         assert!(commit.is_none(), "rejected votes should not produce commit");
@@ -1719,6 +1758,9 @@ fn topology_rejected_votes_dont_count() {
         accepted: true,
         voter_current_term: 0,
         voter_placement_support: 1,
+        voter_incarnation: 0,
+        regime_support: false,
+        ack_writeall_equiv: false,
     };
     let commit = auth.handle_vote(&vote);
     assert!(commit.is_none(), "2 accepts out of 5 is not quorum");
@@ -1743,6 +1785,9 @@ fn topology_duplicate_votes_not_inflated() {
         accepted: true,
         voter_current_term: 0,
         voter_placement_support: 1,
+        voter_incarnation: 0,
+        regime_support: false,
+        ack_writeall_equiv: false,
     };
 
     let commit1 = auth.handle_vote(&vote);
@@ -1763,6 +1808,9 @@ fn topology_duplicate_votes_not_inflated() {
         accepted: true,
         voter_current_term: 0,
         voter_placement_support: 1,
+        voter_incarnation: 0,
+        regime_support: false,
+        ack_writeall_equiv: false,
     };
     auth2.handle_vote(&vote2); // count: self(1) + node2(1) = 2
     auth2.handle_vote(&vote2); // duplicate: still 2
@@ -1780,6 +1828,9 @@ fn topology_duplicate_votes_not_inflated() {
         accepted: true,
         voter_current_term: 0,
         voter_placement_support: 1,
+        voter_incarnation: 0,
+        regime_support: false,
+        ack_writeall_equiv: false,
     };
     let commit3 = auth2.handle_vote(&vote3);
     assert!(commit3.is_some(), "genuine third vote should reach quorum");
@@ -1831,7 +1882,10 @@ fn split_brain_heal_detects_independent_clusters() {
             &a_members,
             1,
             (a_members).len() as u64,
+            NodeId(1),
+            &Default::default(),
         ),
+        regime_block: Default::default(),
     });
     assert_eq!(a_proposer.committed_term(), 5);
     assert_eq!(a_proposer.committed_members(), a_members);
@@ -1853,7 +1907,10 @@ fn split_brain_heal_detects_independent_clusters() {
             &b_members,
             1,
             (b_members).len() as u64,
+            NodeId(4),
+            &Default::default(),
         ),
+        regime_block: Default::default(),
     });
     assert_eq!(b_proposer.committed_term(), 7);
     assert_eq!(b_proposer.committed_members(), b_members);
@@ -1965,7 +2022,10 @@ fn split_brain_heal_detects_independent_clusters() {
             &a_members,
             1,
             (a_members).len() as u64,
+            NodeId(1),
+            &Default::default(),
         ),
+        regime_block: Default::default(),
     });
 
     // -- Final verification: the regression test would FAIL without R-042

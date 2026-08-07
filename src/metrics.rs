@@ -984,6 +984,19 @@ pub struct ReplicationMetrics {
     /// stale-epoch gate). A non-zero value means a master is sending
     /// from a stale epoch and should re-discover the cluster topology.
     pub replica_rejected_stale_cluster_key: PaddedCounter,
+    /// P1 §4.2 — receiver-side counter: incremented every time the local
+    /// node rejects an inbound `OP_REPLICA_BATCH` at the regime gate with
+    /// `ERR_STALE_REGIME` (a touched shard's stamp behind the local
+    /// committed regime, or a regime-absent batch under enforcement —
+    /// I12). Sustained growth means a demoted or pre-P1 master keeps
+    /// writing past a committed master change.
+    pub replica_rejected_stale_regime: PaddedCounter,
+    /// P1 §4.2 — master-side counter: incremented once per fan-out send
+    /// that a replica NAKed with `ERR_STALE_REGIME`. Each increment also
+    /// raised the topology-staleness signal (the committed-channel
+    /// catch-up); the client mutation failed with
+    /// `ERR_REPLICATION_FAILED` and was compensated.
+    pub replica_send_stale_regime: PaddedCounter,
     /// F-G7-006: receiver-side counter — incremented every time
     /// `apply_op` gracefully skips a non-Create/non-Delete op because
     /// the target TX or slot was not found. A non-zero value means
@@ -1123,6 +1136,8 @@ impl ReplicationMetrics {
             per_replica: [ZERO_CELL; MAX_REPLICAS],
             leader_sequence: AtomicU64::new(0),
             replica_rejected_stale_cluster_key: PaddedCounter::new(),
+            replica_rejected_stale_regime: PaddedCounter::new(),
+            replica_send_stale_regime: PaddedCounter::new(),
             replica_apply_skipped_missing_tx: PaddedCounter::new(),
             replica_apply_divergence_total: PaddedCounter::new(),
             replica_missing_record_repaired: PaddedCounter::new(),
@@ -1302,6 +1317,13 @@ pub struct MigrationMetrics {
     /// operator-visible signal that a node booted with a gap versus its
     /// replicas.
     pub stale_suspect_shards: AtomicU32,
+    /// §8 review F-6 (I4) — the committed `promotion_enabled` flag as a
+    /// gauge (`1` = automatic promotion armed, `0` = off). I4 requires
+    /// that "failover-off must never be silent": the flag defaults to
+    /// `false` (fail-safe) and this gauge is the scrape-visible signal.
+    /// Updated on every commit install and at boot from the restored
+    /// committed state.
+    pub promotion_enabled: AtomicU32,
     /// Number of times a migration completion or failure was rejected because
     /// the bookkeeping task's `topology_epoch` did not match the live
     /// epoch on the coordinator.
@@ -1324,6 +1346,61 @@ pub struct MigrationMetrics {
     /// intervention (manual reassign / reboot) — the shard is unavailable but its
     /// data is never lost or served stale, and the reverse-pull keeps retrying.
     pub heal_deadline_alerts: PaddedCounter,
+    /// §8 review round 2, N1/G-1 — number of `OP_REPLICA_CONVERGED`
+    /// (§4.3 fourth completion trigger) shard entries REFUSED by the
+    /// receiver's self-verification. A climbing counter means masters are
+    /// asserting completeness this node will not accept: a stale/forged
+    /// signal, a replayed frame, a shard with an unrepaired baseline gap,
+    /// or a fence still up. Never fatal (the signal is best-effort), but a
+    /// sustained rate on a healthy cluster is worth an alert.
+    pub converged_signal_refused: PaddedCounter,
+    /// §8 security review round 3, H-2 — number of `OP_REPLICA_CONVERGED`
+    /// frames accepted while the sending peer's IP resolved to MORE THAN
+    /// ONE committed member (a co-located topology: single-host dev/test
+    /// clusters, host-network pods).
+    ///
+    /// The G-2 impersonation guard maps the claimed source id to an address
+    /// and compares IPs; when two members share an IP they are mutually
+    /// impersonatable for opcode 245 and the guard is weaker than it looks.
+    /// Refusing would kill the §4.3 convergence trigger on every
+    /// single-host test cluster, so the frame is ACCEPTED and this counter
+    /// (plus a `teraslab::security` WARN) makes the weakened guarantee
+    /// visible instead of silently inherited. Non-zero in production means
+    /// the deployment has collapsed several members onto one IP.
+    pub converged_signal_ambiguous_peer: PaddedCounter,
+    /// §8 review round 2, N1 — number of shards currently carrying an
+    /// unrepaired BASELINE GAP (gauge): an out-of-band transfer was
+    /// abandoned without a completeness proof, so the copy is `Subset` and
+    /// cannot re-earn `Full` through catch-up convergence (only a real
+    /// completion trigger clears it). A persistently non-zero value is the
+    /// operator-visible signal that a shard needs a re-migration.
+    pub lineage_baseline_gap_shards: AtomicU32,
+    /// §8 review round 2, N3 — number of times a commit that LOWERS some
+    /// shard's regime was accepted through the F1 `!holder_evidence`
+    /// (adopt-wholesale) arm instead of being ratcheted. Non-zero means a
+    /// far-behind node adopted the cluster's rebased regime array; it is
+    /// the audit trail for the one place the I10(d) never-lower ratchet is
+    /// deliberately not enforced.
+    pub regime_lowering_accepted_far_behind: PaddedCounter,
+    /// §8 review round 2, N3 — number of commits this node REFUSED on the
+    /// I10(d) never-lower regime ratchet. Consecutive rejections drive the
+    /// C11-style self-fence (see
+    /// [`crate::cluster::topology::RATCHET_SELF_FENCE_THRESHOLD`]); a
+    /// climbing counter is the operator signal that this node's installed
+    /// regime array has diverged from the cluster's.
+    pub regime_ratchet_rejections: PaddedCounter,
+    /// §8 review round 3, N3 (alert timing) — the CURRENT consecutive
+    /// quorum-proven ratchet-refusal streak (gauge), published from the
+    /// FIRST refusal onward and reset to 0 by any commit that passes the
+    /// regime gates.
+    ///
+    /// The self-fence still trips only at
+    /// [`crate::cluster::topology::RATCHET_SELF_FENCE_THRESHOLD`]; this
+    /// gauge exists so the operator alert fires at streak 1 instead of at
+    /// the fence. Alert on `>= 1` sustained for longer than one proposal
+    /// round: by the time it reaches the threshold the node has already
+    /// stopped serving authority.
+    pub regime_ratchet_rejection_streak: AtomicU32,
 }
 
 /// Number of {direction, role} buckets for migration byte counters.
@@ -1384,9 +1461,16 @@ impl MigrationMetrics {
             migration_phase_serving_new: AtomicU32::new(0),
             migration_lost: AtomicU32::new(0),
             stale_suspect_shards: AtomicU32::new(0),
+            promotion_enabled: AtomicU32::new(0),
             topology_epoch_mismatch: PaddedCounter::new(),
             phantom_master_relinquished: PaddedCounter::new(),
             heal_deadline_alerts: PaddedCounter::new(),
+            converged_signal_refused: PaddedCounter::new(),
+            converged_signal_ambiguous_peer: PaddedCounter::new(),
+            lineage_baseline_gap_shards: AtomicU32::new(0),
+            regime_lowering_accepted_far_behind: PaddedCounter::new(),
+            regime_ratchet_rejections: PaddedCounter::new(),
+            regime_ratchet_rejection_streak: AtomicU32::new(0),
         }
     }
 

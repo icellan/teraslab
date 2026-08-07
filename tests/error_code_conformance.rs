@@ -713,7 +713,8 @@ fn t6_reserved_spending_data_returns_invalid_spend_with_empty_payload() {
 //                                   contents; not cluster-gated.
 //   - 23 ERR_TOPOLOGY_PERSIST_FAILED, 24 ERR_STALE_EPOCH,
 //     25 ERR_CLUSTER_NOT_READY, 26 ERR_INDEX_DEGRADED, 37
-//     ERR_MIGRATION_TARGET_NOT_READY, and STATUS_DEGRADED_DURABILITY are
+//     ERR_MIGRATION_TARGET_NOT_READY, 39 ERR_STALE_REGIME, and
+//     STATUS_DEGRADED_DURABILITY are
 //     produced ONLY behind RunningCluster / degraded-backend / RF=1
 //     best-effort state that a single-node test server never enters, so they
 //     are not wire-reachable here without standing up a real multi-node
@@ -730,6 +731,10 @@ fn t6_reserved_spending_data_returns_invalid_spend_with_empty_payload() {
 //       - 25 → src/server/dispatch.rs cluster-not-ready unit test (Joining node).
 //       - 37 → src/server/dispatch.rs migration-target-not-ready unit tests +
 //             tests/cluster_delayed_activation.rs (convergence behaviour).
+//       - 39 → src/replication/receiver.rs regime-gate unit tests (P1 §4.2:
+//             produced only while a committed `regime_enforced = true` +
+//             cluster_secret is active on the receiving node; clients only
+//             ever observe the resulting ERR_REPLICATION_FAILED).
 //     The numeric values themselves are pinned by their `pub const`
 //     definitions in src/protocol/opcodes.rs. F-G2 below adds a real on-wire
 //     proof for 26 (corrupt secondary redb → degraded over TCP).

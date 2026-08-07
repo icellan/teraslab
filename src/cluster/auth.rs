@@ -47,17 +47,20 @@
 //! a captured frame therefore produces the same observable state as the
 //! original delivery — a replay is indistinguishable from a benign retry.
 //! The audit below lists each mutating inter-node opcode and the
-//! mechanism that makes it idempotent under replay; the integration test
-//! `tests/g8_swim_replay::replica_batch_replay_is_idempotent` exercises
-//! the representative `OP_REPLICA_BATCH` path end-to-end.
+//! mechanism that makes it idempotent under replay; the integration tests
+//! `tests/g8_e4_tcp_frame_replay::replica_batch_replay_is_idempotent` and
+//! `tests/g8_e4_tcp_frame_replay::migration_delta_reassign_replay_rejected_wholesale_after_promotion`
+//! exercise the representative `OP_REPLICA_BATCH` paths end-to-end.
 //!
 //! | Opcode | Idempotency mechanism (replay ⇒ no-op) |
 //! |---|---|
-//! | `OP_REPLICA_BATCH` (240) | Per-stream applied-sequence journal (`ReplicaAppliedTracker`) skips any batch whose sequence ≤ `last_applied_seq`; below that, the per-record generation guard + create-payload dedup absorb re-deliveries. |
+//! | `OP_REPLICA_BATCH` (240), tracked stream | Per-stream applied-sequence journal (`ReplicaAppliedTracker`) skips any batch whose sequence ≤ `last_applied_seq`; below that, the per-record generation guard + create-payload dedup absorb re-deliveries. |
+//! | `OP_REPLICA_BATCH` (240) with `FLAG_MIGRATION_BATCH` or `first_sequence == 0` | **Sequence dedup does NOT cover these** — migration and out-of-band batches deliberately bypass the applied-sequence journal (§4.7). The defenses here are the `cluster_key` gate in I8's precise form (any receiver that has installed a promoting commit rejects a replayed pre-failover frame wholesale at `cluster_key < local_cluster_key`; a receiver that has NOT installed it accepts, but is then not serving the promoted mastership either), the per-record generation guard, the prior-hash-guarded `Reassign` (V3 carries `prior_utxo_hash`, so a replayed reassign of a moved-on slot no-ops structurally — §4.9), and the per-shard regime gate (`ERR_STALE_REGIME`, §4.2) while enforcement is active. |
 //! | `OP_MIGRATION_COMPLETE` (242) | `cluster_key` epoch gate discards stale completions; the shard-manifest hash check rejects content that does not match the committed shard; a second completion for an already-migrated shard is a skip. |
 //! | `OP_MIGRATION_BATCH_COMPLETE` (243) | Same gates as `OP_MIGRATION_COMPLETE`, applied per shard in the batch. |
 //! | `OP_TOPOLOGY_PROPOSE` (251) / `OP_TOPOLOGY_VOTE` (252) / `OP_TOPOLOGY_COMMIT` (253) | Strictly-monotonic `term`: a replayed proposal/vote/commit for a term `≤` the node's current term is rejected (`commit.term <= local_term`), and `topology_commit_already_activated` makes re-committing an active term a no-op. |
 //! | `OP_INCREMENT_SPENT_EXTRA_RECS` (255) | Operates through the same per-record generation-guarded mutation path as the spend ops; a replay re-asserts an already-recorded count rather than double-incrementing. |
+//! | `OP_REPLICA_CONVERGED` (245) | **Own dedup guard (§8 review round 2, G-1).** The frame carries the master's asserted per-replica stream sequence; the receiver keeps a per-source monotonic high-water mark (`RunningCluster::converged_signal_hwm`) and drops any frame whose `asserted_seq` is `<=` the mark, so a replayed or reordered delivery is a no-op. It additionally refuses any claim its OWN durable `ReplicaAppliedTracker` watermark for `node:{source}` does not corroborate, and resolves the payload's self-declared `source_node_id` against the sending peer's address (G-2). Not idempotent without these: it mutates durable lineage, which grants promotion eligibility. |
 //! | `OP_HEARTBEAT` (250) / SWIM gossip (`MSG_*`) | Non-mutating w.r.t. durable UTXO state — they update soft liveness/membership. The SWIM UDP path additionally has its OWN replay defense (F-G8-003): a per-peer monotonic seq + sliding window rejects a replayed signed datagram before processing, keyed by `(NodeId, incarnation)` so a legitimate restart resets cleanly. That seq layer lives in `src/cluster/swim.rs`, not here. |
 //!
 //! If a future change introduces a mutating inter-node opcode that is

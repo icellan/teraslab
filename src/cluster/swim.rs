@@ -665,24 +665,31 @@ impl SwimRunner {
 
     /// Start the SWIM protocol loop in a background thread.
     ///
-    /// Returns a handle to the thread and a channel that receives cluster events.
+    /// Returns a handle to the thread, a channel that receives cluster
+    /// events, and a clone of the event SENDER so other subsystems can
+    /// inject events into the same coordinator event loop (P1 §4.2: the
+    /// replication fan-out raises `ClusterEvent::TopologyStale` on a
+    /// stale-regime NAK through it — see
+    /// `RunningCluster::signal_topology_stale`).
     pub fn start(
         self,
     ) -> (
         Arc<AtomicBool>,
         std::thread::JoinHandle<()>,
         std::sync::mpsc::Receiver<ClusterEvent>,
+        std::sync::mpsc::Sender<ClusterEvent>,
     ) {
         let (event_tx, event_rx) = std::sync::mpsc::channel();
         let shutdown = self.shutdown.clone();
 
+        let loop_tx = event_tx.clone();
         let handle = std::thread::spawn(move || {
-            if let Err(e) = self.run_loop(event_tx) {
+            if let Err(e) = self.run_loop(loop_tx) {
                 tracing::error!(err = %e, "SWIM loop error");
             }
         });
 
-        (shutdown, handle, event_rx)
+        (shutdown, handle, event_rx, event_tx)
     }
 
     fn run_loop(mut self, event_tx: std::sync::mpsc::Sender<ClusterEvent>) -> Result<(), String> {

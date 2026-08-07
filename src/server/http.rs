@@ -404,6 +404,14 @@ pub(crate) fn build_http_router(
         .route("/admin/rebalance", put(handle_admin_rebalance))
         .route("/admin/drain/{node_id}", put(handle_admin_drain))
         .route("/admin/shrink", put(handle_admin_shrink))
+        .route("/admin/regime_rebase", put(handle_admin_regime_rebase))
+        // F-6 (I4) — the operator surface for committed automatic
+        // promotion; without it P1 ships with `propose_promotion_enabled`
+        // unreachable and failover permanently (silently) off.
+        .route(
+            "/admin/promotion_enabled",
+            axum::routing::post(handle_admin_promotion_enabled),
+        )
         // Online backup: start (POST), poll status (GET), abort (DELETE).
         .route(
             "/admin/backup",
@@ -1221,6 +1229,16 @@ pub(crate) fn render_metrics_text(
         );
         prom_counter(
             &mut out,
+            "teraslab_replica_rejected_stale_regime_total",
+            r.replica_rejected_stale_regime.get(),
+        );
+        prom_counter(
+            &mut out,
+            "teraslab_replica_send_stale_regime_total",
+            r.replica_send_stale_regime.get(),
+        );
+        prom_counter(
+            &mut out,
             "teraslab_replica_apply_skipped_missing_tx_total",
             r.replica_apply_skipped_missing_tx.get(),
         );
@@ -1379,6 +1397,13 @@ pub(crate) fn render_metrics_text(
             "teraslab_stale_suspect_shards",
             mm.stale_suspect_shards.load(Ordering::Relaxed) as u64,
         );
+        // F-6 (I4) — failover-off must never be silent: the committed
+        // `promotion_enabled` flag as a scrapable gauge.
+        prom_gauge(
+            &mut out,
+            "teraslab_promotion_enabled",
+            mm.promotion_enabled.load(Ordering::Relaxed) as u64,
+        );
         prom_gauge(
             &mut out,
             "teraslab_migration_phase_preparing",
@@ -1413,6 +1438,36 @@ pub(crate) fn render_metrics_text(
             &mut out,
             "teraslab_heal_deadline_alerts_total",
             mm.heal_deadline_alerts.get(),
+        );
+        prom_counter(
+            &mut out,
+            "teraslab_converged_signal_refused_total",
+            mm.converged_signal_refused.get(),
+        );
+        prom_counter(
+            &mut out,
+            "teraslab_converged_signal_ambiguous_peer_total",
+            mm.converged_signal_ambiguous_peer.get(),
+        );
+        prom_gauge(
+            &mut out,
+            "teraslab_lineage_baseline_gap_shards",
+            mm.lineage_baseline_gap_shards.load(Ordering::Relaxed) as u64,
+        );
+        prom_counter(
+            &mut out,
+            "teraslab_regime_lowering_accepted_far_behind_total",
+            mm.regime_lowering_accepted_far_behind.get(),
+        );
+        prom_counter(
+            &mut out,
+            "teraslab_regime_ratchet_rejections_total",
+            mm.regime_ratchet_rejections.get(),
+        );
+        prom_gauge(
+            &mut out,
+            "teraslab_regime_ratchet_rejection_streak",
+            mm.regime_ratchet_rejection_streak.load(Ordering::Relaxed) as u64,
         );
     }
     if let Some(sw) = swim_metrics() {
@@ -1831,6 +1886,9 @@ fn build_status_json(state: &HttpState) -> serde_json::Value {
             "target_replica_shard_count": target_replica_count,
             "pending_handoff_shards": pending_handoff_shards,
             "active_migrations": cluster.active_migrations(),
+            // F-6 (I4) — the committed automatic-promotion flag; I4:
+            // failover-off must never be silent.
+            "promotion_enabled": cluster.topology_authority().committed_promotion_enabled(),
         })
     } else {
         serde_json::json!({
@@ -1843,6 +1901,7 @@ fn build_status_json(state: &HttpState) -> serde_json::Value {
             "target_replica_shard_count": 0,
             "pending_handoff_shards": 0,
             "active_migrations": 0,
+            "promotion_enabled": false,
         })
     };
 
@@ -1873,6 +1932,7 @@ fn build_status_json(state: &HttpState) -> serde_json::Value {
         "node_id": cluster_info["node_id"],
         "cluster_size": cluster_info["cluster_size"],
         "shard_table_version": cluster_info["shard_table_version"],
+        "promotion_enabled": cluster_info["promotion_enabled"],
         "master_shard_count": cluster_info["master_shard_count"],
         "replica_shard_count": cluster_info["replica_shard_count"],
         "target_master_shard_count": cluster_info["target_master_shard_count"],
@@ -2578,6 +2638,177 @@ async fn handle_admin_shrink(
             "shrink_proposal_failed",
             "TopologyAuthority::propose_shrink refused the proposal (a proposal may already \
              be pending, or the membership changed underneath this request); retry",
+        ),
+    }
+}
+
+/// `PUT /admin/regime_rebase` — propose a quorum-committed REGIME REBASE
+/// (P1 stage 1, invariant I7: operator repair of inconsistent or
+/// operator-unwanted regime state).
+///
+/// Authorization mirrors `/admin/shrink` and adds the I7 requirement: the
+/// route lives on the bearer-token-gated sub-router (`admin_token`), and
+/// the handler additionally REQUIRES a configured `cluster_secret` — a
+/// rebase lowers regime fencing state, and in fail-open mode the quorum
+/// gates it rides are structural, not cryptographic, so the verb refuses
+/// outright rather than pretending the commit path can authenticate it.
+///
+/// Every refusal is checked up front with a named error (the
+/// `handle_admin_shrink` posture): wrong node → `rebase_wrong_proposer`
+/// (re-issue against the deterministic proposer), missing secret →
+/// `rebase_requires_cluster_secret`, authority refusal (pending proposal,
+/// no committed topology) → `rebase_proposal_failed`. On success the
+/// proposal rides the NORMAL term/vote/commit machinery (activation
+/// quorum over the peak floor, Gate A/B untouched) and the response is
+/// `202 Accepted` with the proposed term.
+async fn handle_admin_regime_rebase(
+    State(state): State<Arc<HttpState>>,
+) -> axum::response::Response {
+    let cluster = match state.cluster {
+        Some(ref c) => c,
+        None => {
+            return http_error(
+                StatusCode::BAD_REQUEST,
+                "not_in_cluster_mode",
+                "not in cluster mode",
+            );
+        }
+    };
+
+    // I7 — admin_token (the bearer middleware on this router) PLUS
+    // cluster_secret. Checked before anything else: without a secret the
+    // verb must not exist in any useful form.
+    if cluster.cluster_secret().is_none() {
+        return http_error(
+            StatusCode::CONFLICT,
+            "rebase_requires_cluster_secret",
+            "a regime rebase requires a configured cluster_secret (I7): in fail-open mode \
+             the quorum gates are structural, not cryptographic, and a rebase lowers \
+             regime fencing state",
+        );
+    }
+
+    let committed = cluster.committed_topology_members();
+    let proposer = committed.iter().copied().min();
+    if proposer != Some(cluster.self_id()) {
+        return http_error_with_details(
+            StatusCode::BAD_REQUEST,
+            "rebase_wrong_proposer",
+            match proposer {
+                Some(p) => format!(
+                    "this node ({}) is not the deterministic proposer of the current \
+                     committed topology; re-issue against node {}",
+                    cluster.self_id().0,
+                    p.0,
+                ),
+                None => "no committed topology yet; there is no deterministic proposer".to_string(),
+            },
+            proposer.map(|p| serde_json::json!({ "proposer_node_id": p.0 })),
+        );
+    }
+
+    match cluster.propose_regime_rebase() {
+        Ok(term) => (
+            StatusCode::ACCEPTED,
+            format!(
+                "regime rebase proposed at term {}; it commits through the normal \
+                 activation quorum",
+                term.term,
+            ),
+        )
+            .into_response(),
+        Err(e) => http_error_with_details(
+            StatusCode::CONFLICT,
+            "rebase_proposal_failed",
+            format!("TopologyAuthority::propose_regime_rebase refused the proposal: {e}"),
+            None,
+        ),
+    }
+}
+
+/// F-6 — query parameters for `POST /admin/promotion_enabled`.
+#[derive(serde::Deserialize)]
+struct PromotionEnabledQuery {
+    /// The requested committed value of `promotion_enabled`.
+    enable: bool,
+}
+
+/// `POST /admin/promotion_enabled?enable=<bool>` — propose committing the
+/// I4 `promotion_enabled` flag (§8 review F-6: `propose_promotion_enabled`
+/// existed with no operator route, so P1's automatic promotion shipped
+/// inert — and "failover is off" was silent, which I4 forbids).
+///
+/// Gated EXACTLY like `/admin/regime_rebase`: the route lives on the
+/// bearer-token sub-router (`admin_token`), the handler requires a
+/// configured `cluster_secret` (I4's governance names admin_token +
+/// cluster_secret for flipping the flag — both directions), and only the
+/// deterministic proposer accepts the verb. The proposal rides the NORMAL
+/// term/vote/commit machinery, so every structural gate applies unchanged:
+/// enabling still requires the cluster-wide WriteAll-equivalence adverts
+/// AND this node's `enable_automatic_promotion` config opt-in (I4), the
+/// term is I6-unbundled, and appliers check only the committed field (I0).
+/// The default (`false`) is fail-safe and this route is the only way to
+/// raise it.
+async fn handle_admin_promotion_enabled(
+    State(state): State<Arc<HttpState>>,
+    Query(query): Query<PromotionEnabledQuery>,
+) -> axum::response::Response {
+    let cluster = match state.cluster {
+        Some(ref c) => c,
+        None => {
+            return http_error(
+                StatusCode::BAD_REQUEST,
+                "not_in_cluster_mode",
+                "not in cluster mode",
+            );
+        }
+    };
+
+    // I4 governance — admin_token (the bearer middleware on this router)
+    // PLUS cluster_secret, for BOTH enable and disable.
+    if cluster.cluster_secret().is_none() {
+        return http_error(
+            StatusCode::CONFLICT,
+            "promotion_requires_cluster_secret",
+            "changing the committed promotion_enabled flag requires a configured \
+             cluster_secret (I4 governance: admin_token + cluster_secret)",
+        );
+    }
+
+    let committed = cluster.committed_topology_members();
+    let proposer = committed.iter().copied().min();
+    if proposer != Some(cluster.self_id()) {
+        return http_error_with_details(
+            StatusCode::BAD_REQUEST,
+            "promotion_wrong_proposer",
+            match proposer {
+                Some(p) => format!(
+                    "this node ({}) is not the deterministic proposer of the current \
+                     committed topology; re-issue against node {}",
+                    cluster.self_id().0,
+                    p.0,
+                ),
+                None => "no committed topology yet; there is no deterministic proposer".to_string(),
+            },
+            proposer.map(|p| serde_json::json!({ "proposer_node_id": p.0 })),
+        );
+    }
+
+    match cluster.propose_promotion_enabled(query.enable) {
+        Ok(term) => (
+            StatusCode::ACCEPTED,
+            format!(
+                "promotion_enabled = {} proposed at term {}; it commits through the \
+                 normal activation quorum",
+                query.enable, term.term,
+            ),
+        )
+            .into_response(),
+        Err(e) => http_error_with_details(
+            StatusCode::CONFLICT,
+            "promotion_proposal_failed",
+            format!("TopologyAuthority::propose_promotion_enabled refused the proposal: {e}"),
+            None,
         ),
     }
 }
@@ -4833,6 +5064,8 @@ mod tests {
             "teraslab_repl_batch_latency_ns",
             "teraslab_repl_lag_sequences",
             "teraslab_replica_rejected_stale_cluster_key_total",
+            "teraslab_replica_rejected_stale_regime_total",
+            "teraslab_replica_send_stale_regime_total",
             "teraslab_replica_apply_skipped_missing_tx_total",
             "teraslab_replica_apply_divergence_total",
             "teraslab_replica_missing_record_repaired_total",
@@ -5770,6 +6003,216 @@ mod tests {
             .await
             .expect("body bytes");
         String::from_utf8(body.to_vec()).expect("utf8 body")
+    }
+
+    // ------------------------------------------------------------------
+    // P1 stage 1 — `/admin/regime_rebase` operator verb (I7). Mirrors the
+    // `/admin/shrink` test style: drive the handler directly, refusals
+    // fire UP FRONT with named errors.
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn admin_regime_rebase_returns_bad_request_when_not_clustered() {
+        let state = build_ready_test_state(true, None);
+        let resp = handle_admin_regime_rebase(State(state))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = body_string(resp).await;
+        assert!(body.contains("not_in_cluster_mode"), "got: {body:?}");
+    }
+
+    /// I7 — the rebase requires admin_token (router middleware) AND a
+    /// configured cluster_secret; a fail-open cluster gets a named refusal
+    /// BEFORE any proposer check.
+    #[tokio::test]
+    async fn admin_regime_rebase_requires_cluster_secret() {
+        let members = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let cluster = shrink_test_cluster(&members, NodeId(1), 3, 2);
+        let state = build_ready_test_state(true, Some(cluster));
+        let resp = handle_admin_regime_rebase(State(state))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let body = body_string(resp).await;
+        assert!(
+            body.contains("rebase_requires_cluster_secret"),
+            "got: {body:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_regime_rebase_wrong_proposer_refused() {
+        use crate::cluster::coordinator::new_test_running_cluster;
+        let members = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let table = ShardTable::compute_with_epoch(&members, 2, 1, 1);
+        let live: Vec<(NodeId, std::net::SocketAddr)> = members
+            .iter()
+            .enumerate()
+            .map(|(i, &n)| (n, format!("127.0.0.1:{}", 16400 + i).parse().unwrap()))
+            .collect();
+        let cluster = Arc::new(
+            new_test_running_cluster(NodeId(2), table, &live, &members, &[], &[], &[], 3)
+                .test_with_cluster_secret(b"test-secret".to_vec()),
+        );
+        let state = build_ready_test_state(true, Some(cluster));
+        let resp = handle_admin_regime_rebase(State(state))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = body_string(resp).await;
+        assert!(body.contains("rebase_wrong_proposer"), "got: {body:?}");
+        assert!(
+            body.contains("\"proposer_node_id\":1"),
+            "must name the deterministic proposer; got: {body:?}",
+        );
+    }
+
+    /// The happy path: deterministic proposer + secret -> 202 with the
+    /// proposed term, riding the normal proposer machinery.
+    #[tokio::test]
+    async fn admin_regime_rebase_proposes_through_normal_machinery() {
+        use crate::cluster::coordinator::new_test_running_cluster;
+        let members = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let table = ShardTable::compute_with_epoch(&members, 2, 1, 1);
+        let live: Vec<(NodeId, std::net::SocketAddr)> = members
+            .iter()
+            .enumerate()
+            .map(|(i, &n)| (n, format!("127.0.0.1:{}", 16410 + i).parse().unwrap()))
+            .collect();
+        let cluster = Arc::new(
+            new_test_running_cluster(NodeId(1), table, &live, &members, &[], &[], &[], 3)
+                .test_with_cluster_secret(b"test-secret".to_vec()),
+        );
+        let state = build_ready_test_state(true, Some(cluster.clone()));
+        let resp = handle_admin_regime_rebase(State(state))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        let body = body_string(resp).await;
+        assert!(
+            body.contains("regime rebase proposed at term 2"),
+            "committed term is 1, so the rebase proposes term 2; got: {body:?}",
+        );
+        // A second call while the proposal is pending gets the named
+        // authority refusal.
+        let state = build_ready_test_state(true, Some(cluster));
+        let resp = handle_admin_regime_rebase(State(state))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let body = body_string(resp).await;
+        assert!(body.contains("rebase_proposal_failed"), "got: {body:?}");
+    }
+
+    /// §8 review F-6 (I4) — `/admin/promotion_enabled` is gated exactly
+    /// like `/admin/regime_rebase`: not-clustered → 400; no
+    /// `cluster_secret` → named 409 BEFORE any proposer check; wrong node
+    /// → named 400 with the deterministic proposer.
+    #[tokio::test]
+    async fn f6_admin_promotion_enabled_gating_matches_regime_rebase() {
+        use crate::cluster::coordinator::new_test_running_cluster;
+        // Not clustered.
+        let state = build_ready_test_state(true, None);
+        let resp = handle_admin_promotion_enabled(
+            State(state),
+            Query(PromotionEnabledQuery { enable: true }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = body_string(resp).await;
+        assert!(body.contains("not_in_cluster_mode"), "got: {body:?}");
+
+        // No cluster_secret (I4 governance) — both directions refused.
+        let members = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let cluster = shrink_test_cluster(&members, NodeId(1), 3, 2);
+        for enable in [true, false] {
+            let state = build_ready_test_state(true, Some(cluster.clone()));
+            let resp = handle_admin_promotion_enabled(
+                State(state),
+                Query(PromotionEnabledQuery { enable }),
+            )
+            .await
+            .into_response();
+            assert_eq!(resp.status(), StatusCode::CONFLICT);
+            let body = body_string(resp).await;
+            assert!(
+                body.contains("promotion_requires_cluster_secret"),
+                "enable={enable}: got: {body:?}"
+            );
+        }
+
+        // Wrong proposer (node 2 of {1,2,3}).
+        let table = ShardTable::compute_with_epoch(&members, 2, 1, 1);
+        let live: Vec<(NodeId, std::net::SocketAddr)> = members
+            .iter()
+            .enumerate()
+            .map(|(i, &n)| (n, format!("127.0.0.1:{}", 16420 + i).parse().unwrap()))
+            .collect();
+        let cluster = Arc::new(
+            new_test_running_cluster(NodeId(2), table, &live, &members, &[], &[], &[], 3)
+                .test_with_cluster_secret(b"test-secret".to_vec()),
+        );
+        let state = build_ready_test_state(true, Some(cluster));
+        let resp = handle_admin_promotion_enabled(
+            State(state),
+            Query(PromotionEnabledQuery { enable: true }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = body_string(resp).await;
+        assert!(body.contains("promotion_wrong_proposer"), "got: {body:?}");
+        assert!(
+            body.contains("\"proposer_node_id\":1"),
+            "must name the deterministic proposer; got: {body:?}",
+        );
+    }
+
+    /// F-6 — the route rides `propose_promotion_enabled`, so every I4
+    /// proposal gate still applies: enabling on a node WITHOUT the
+    /// `enable_automatic_promotion` config opt-in is refused with the
+    /// authority's named error (the route adds transport + auth, never a
+    /// bypass), and `/status` surfaces the committed flag.
+    #[tokio::test]
+    async fn f6_admin_promotion_enabled_rides_i4_proposal_gates_and_status_reports() {
+        use crate::cluster::coordinator::new_test_running_cluster;
+        let members = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let table = ShardTable::compute_with_epoch(&members, 2, 1, 1);
+        let live: Vec<(NodeId, std::net::SocketAddr)> = members
+            .iter()
+            .enumerate()
+            .map(|(i, &n)| (n, format!("127.0.0.1:{}", 16430 + i).parse().unwrap()))
+            .collect();
+        let cluster = Arc::new(
+            new_test_running_cluster(NodeId(1), table, &live, &members, &[], &[], &[], 3)
+                .test_with_cluster_secret(b"test-secret".to_vec()),
+        );
+        let state = build_ready_test_state(true, Some(cluster.clone()));
+
+        // /status reports the (default false, fail-safe) committed flag.
+        let status = build_status_json(&state);
+        assert_eq!(
+            status["promotion_enabled"],
+            serde_json::json!(false),
+            "I4: failover-off must never be silent — /status carries the flag",
+        );
+
+        // Enabling without the config opt-in / adverts is refused by the
+        // authority's own I4 gate, surfaced as the named proposal failure.
+        let resp = handle_admin_promotion_enabled(
+            State(state),
+            Query(PromotionEnabledQuery { enable: true }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let body = body_string(resp).await;
+        assert!(
+            body.contains("promotion_proposal_failed"),
+            "the I4 proposal gates must ride through unchanged; got: {body:?}"
+        );
     }
 
     /// G8 final review (finding 2, minor) — `wait_for_shrink_commit` used to

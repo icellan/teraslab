@@ -350,6 +350,16 @@ impl AckTracker {
 const INTENT_RECORD_SNAPSHOT: u8 = 0;
 const INTENT_RECORD_BEGIN: u8 = 1;
 const INTENT_RECORD_COMMIT: u8 = 2;
+/// P1 stage 3 (I5) — `BEGIN` with a trailing `(shard, regime)` stamp table
+/// recording the committed regimes the intent was created under:
+/// `[first:8][last:8][key_count:4][txid:32]{key_count}`
+/// `[stamp_count:2][(shard:2)(regime:8)]{stamp_count}`. Legacy V1 records
+/// decode with an EMPTY stamp table (pre-upgrade intents keep pre-upgrade
+/// re-ship behaviour — the tracker's format contract allows this: nodes
+/// reset the intent file on upgrade). All new writes emit V2.
+const INTENT_RECORD_BEGIN_V2: u8 = 3;
+/// P1 stage 3 (I5) — `SNAPSHOT` whose entries are the V2 begin shape.
+const INTENT_RECORD_SNAPSHOT_V2: u8 = 4;
 
 /// Guards [`intent_log_parse_frames`] against an implausible/garbage length
 /// field (a torn write can leave any 4 bytes at a length-field offset). No
@@ -477,13 +487,31 @@ enum AppendState {
     Poisoned(String),
 }
 
+/// One pending intent's payload: the RPC's exact key set plus the I5
+/// `(shard, regime)` stamps it was created under (empty for pre-stamp /
+/// unclustered records).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingIntent {
+    keys: Vec<TxKey>,
+    regime_stamps: Vec<(u16, u64)>,
+}
+
+/// One entry of
+/// [`ReplicationIntentTracker::pending_with_keys_and_regimes`]:
+/// `(range, keys, (shard, regime) creation stamps)`.
+pub type PendingIntentWithRegimes = (ReplicationIntentRange, Vec<TxKey>, Vec<(u16, u64)>);
+
 #[derive(Debug)]
 struct ReplicationIntentInner {
     /// Each pending range carries the EXACT key set of the RPC that recorded
     /// it. Recovery replays only those keys from the merged redo window, so a
     /// foreign op whose sequence interleaved into the range is never re-shipped
     /// (the latent wrong-apply vector when a `ReplicaOp` is non-idempotent).
-    pending: BTreeMap<ReplicationIntentRange, Vec<TxKey>>,
+    /// P1 stage 3 (I5): the value additionally carries the `(shard, regime)`
+    /// stamps the intent was created under, so recovery can detect a
+    /// regime-superseded intent and convert it to a resync instead of
+    /// re-shipping it.
+    pending: BTreeMap<ReplicationIntentRange, PendingIntent>,
     commit_dirty: bool,
     last_flush: Instant,
     dirty_commit_count: u32,
@@ -559,39 +587,126 @@ fn intent_log_parse_frames(data: &[u8]) -> Vec<(u8, Vec<u8>)> {
     records
 }
 
-/// Encode a `[first:8][last:8][key_count:4][txid:32]{key_count}` body —
-/// shared by the `BEGIN` record payload and each entry of a `SNAPSHOT`
+/// Encode a V2 `[first:8][last:8][key_count:4][txid:32]{key_count}`
+/// `[stamp_count:2][(shard:2)(regime:8)]{stamp_count}` body — shared by
+/// the `BEGIN_V2` record payload and each entry of a `SNAPSHOT_V2`
 /// payload.
-fn intent_log_encode_range_and_keys(range: &ReplicationIntentRange, keys: &[TxKey]) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(20 + keys.len() * 32);
+fn intent_log_encode_range_and_keys(
+    range: &ReplicationIntentRange,
+    keys: &[TxKey],
+    regime_stamps: &[(u16, u64)],
+) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(20 + keys.len() * 32 + 2 + regime_stamps.len() * 10);
     buf.extend_from_slice(&range.first_sequence.to_le_bytes());
     buf.extend_from_slice(&range.last_sequence.to_le_bytes());
     buf.extend_from_slice(&(keys.len() as u32).to_le_bytes());
     for key in keys {
         buf.extend_from_slice(&key.txid);
     }
-    buf
-}
-
-/// Encode a `SNAPSHOT` record payload: `[range_count:4]
-/// ( [first:8][last:8][key_count:4][txid:32]{key_count} )*`.
-fn intent_log_encode_snapshot_payload(
-    pending: &BTreeMap<ReplicationIntentRange, Vec<TxKey>>,
-) -> Vec<u8> {
-    let total_keys: usize = pending.values().map(Vec::len).sum();
-    let mut buf = Vec::with_capacity(4 + pending.len() * 20 + total_keys * 32);
-    buf.extend_from_slice(&(pending.len() as u32).to_le_bytes());
-    for (range, keys) in pending {
-        buf.extend_from_slice(&intent_log_encode_range_and_keys(range, keys));
+    buf.extend_from_slice(&(regime_stamps.len() as u16).to_le_bytes());
+    for (shard, regime) in regime_stamps {
+        buf.extend_from_slice(&shard.to_le_bytes());
+        buf.extend_from_slice(&regime.to_le_bytes());
     }
     buf
 }
 
-/// Decode a `BEGIN` (or one `SNAPSHOT` entry's) `[first:8][last:8]
-/// [key_count:4][txid:32]{key_count}` body. A structurally invalid decode
-/// (bad range, or a key section whose length disagrees with its declared
-/// count) is a hard error — the frame's CRC already validated these exact
-/// bytes, so this cannot be a torn-tail write.
+/// Encode a `SNAPSHOT_V2` record payload: `[range_count:4]` followed by
+/// one V2 entry per pending range.
+fn intent_log_encode_snapshot_payload(
+    pending: &BTreeMap<ReplicationIntentRange, PendingIntent>,
+) -> Vec<u8> {
+    let total_keys: usize = pending.values().map(|p| p.keys.len()).sum();
+    let mut buf = Vec::with_capacity(4 + pending.len() * 22 + total_keys * 32);
+    buf.extend_from_slice(&(pending.len() as u32).to_le_bytes());
+    for (range, intent) in pending {
+        buf.extend_from_slice(&intent_log_encode_range_and_keys(
+            range,
+            &intent.keys,
+            &intent.regime_stamps,
+        ));
+    }
+    buf
+}
+
+/// Decode one V2 entry (`BEGIN_V2` payload / one `SNAPSHOT_V2` entry)
+/// starting at `pos`: the V1 range+keys shape followed by the I5
+/// `[stamp_count:2][(shard:2)(regime:8)]*` stamp table. Returns the entry
+/// and the position just past it. Structurally invalid bytes are a hard
+/// error, exactly as for V1 (the CRC already validated them).
+fn intent_log_decode_v2_entry_at(
+    payload: &[u8],
+    pos: usize,
+) -> std::result::Result<(ReplicationIntentRange, PendingIntent, usize), ReplicationIntentError> {
+    if payload.len() < pos + 20 {
+        return Err(ReplicationIntentError::Corrupt(
+            "truncated v2 intent entry".into(),
+        ));
+    }
+    let first_sequence = u64::from_le_bytes(payload[pos..pos + 8].try_into().unwrap());
+    let last_sequence = u64::from_le_bytes(payload[pos + 8..pos + 16].try_into().unwrap());
+    if first_sequence == 0 || last_sequence < first_sequence {
+        return Err(ReplicationIntentError::Corrupt(format!(
+            "invalid range {first_sequence}..{last_sequence}",
+        )));
+    }
+    let key_count = u32::from_le_bytes(payload[pos + 16..pos + 20].try_into().unwrap()) as usize;
+    let mut cursor = pos + 20;
+    let keys_bytes = key_count
+        .checked_mul(32)
+        .ok_or_else(|| ReplicationIntentError::Corrupt("key count overflow".into()))?;
+    if payload.len() < cursor + keys_bytes {
+        return Err(ReplicationIntentError::Corrupt(
+            "truncated intent keys".into(),
+        ));
+    }
+    let mut keys = Vec::with_capacity(key_count);
+    for _ in 0..key_count {
+        let mut txid = [0u8; 32];
+        txid.copy_from_slice(&payload[cursor..cursor + 32]);
+        cursor += 32;
+        keys.push(TxKey { txid });
+    }
+    if payload.len() < cursor + 2 {
+        return Err(ReplicationIntentError::Corrupt(
+            "truncated intent stamp count".into(),
+        ));
+    }
+    let stamp_count = u16::from_le_bytes(payload[cursor..cursor + 2].try_into().unwrap()) as usize;
+    cursor += 2;
+    let stamp_bytes = stamp_count
+        .checked_mul(10)
+        .ok_or_else(|| ReplicationIntentError::Corrupt("stamp count overflow".into()))?;
+    if payload.len() < cursor + stamp_bytes {
+        return Err(ReplicationIntentError::Corrupt(
+            "truncated intent stamps".into(),
+        ));
+    }
+    let mut regime_stamps = Vec::with_capacity(stamp_count);
+    for _ in 0..stamp_count {
+        let shard = u16::from_le_bytes(payload[cursor..cursor + 2].try_into().unwrap());
+        let regime = u64::from_le_bytes(payload[cursor + 2..cursor + 10].try_into().unwrap());
+        cursor += 10;
+        regime_stamps.push((shard, regime));
+    }
+    Ok((
+        ReplicationIntentRange {
+            first_sequence,
+            last_sequence,
+        },
+        PendingIntent {
+            keys,
+            regime_stamps,
+        },
+        cursor,
+    ))
+}
+
+/// Decode a legacy V1 `BEGIN` (or one V1 `SNAPSHOT` entry's) `[first:8]
+/// [last:8][key_count:4][txid:32]{key_count}` body. A structurally invalid
+/// decode (bad range, or a key section whose length disagrees with its
+/// declared count) is a hard error — the frame's CRC already validated
+/// these exact bytes, so this cannot be a torn-tail write.
 fn intent_log_decode_range_and_keys(
     payload: &[u8],
 ) -> std::result::Result<(ReplicationIntentRange, Vec<TxKey>), ReplicationIntentError> {
@@ -633,8 +748,30 @@ fn intent_log_decode_range_and_keys(
     ))
 }
 
-/// Decode a `SNAPSHOT` record payload. On replay the caller REPLACES its
-/// whole reconstructed map with the result (reset semantics).
+/// Decode a `SNAPSHOT_V2` record payload. On replay the caller REPLACES
+/// its whole reconstructed map with the result (reset semantics).
+fn intent_log_decode_snapshot_v2_payload(
+    payload: &[u8],
+) -> std::result::Result<BTreeMap<ReplicationIntentRange, PendingIntent>, ReplicationIntentError> {
+    if payload.len() < 4 {
+        return Err(ReplicationIntentError::Corrupt(
+            "truncated snapshot header".into(),
+        ));
+    }
+    let count = u32::from_le_bytes(payload[0..4].try_into().unwrap()) as usize;
+    let mut pending = BTreeMap::new();
+    let mut pos = 4;
+    for _ in 0..count {
+        let (range, intent, next) = intent_log_decode_v2_entry_at(payload, pos)?;
+        pending.insert(range, intent);
+        pos = next;
+    }
+    Ok(pending)
+}
+
+/// Decode a legacy V1 `SNAPSHOT` record payload (no stamp tables). On
+/// replay the caller REPLACES its whole reconstructed map with the result
+/// (reset semantics).
 fn intent_log_decode_snapshot_payload(
     payload: &[u8],
 ) -> std::result::Result<BTreeMap<ReplicationIntentRange, Vec<TxKey>>, ReplicationIntentError> {
@@ -706,19 +843,50 @@ fn intent_log_decode_commit_payload(
 }
 
 /// Apply one decoded record to the in-progress reconstructed map:
-/// `SNAPSHOT` resets it, `BEGIN` inserts/overwrites, `COMMIT` removes.
+/// `SNAPSHOT`/`SNAPSHOT_V2` resets it, `BEGIN`/`BEGIN_V2`
+/// inserts/overwrites, `COMMIT` removes. Legacy V1 records decode with an
+/// EMPTY regime-stamp table (pre-stamp behaviour preserved).
 fn intent_log_apply_record(
-    pending: &mut BTreeMap<ReplicationIntentRange, Vec<TxKey>>,
+    pending: &mut BTreeMap<ReplicationIntentRange, PendingIntent>,
     record_type: u8,
     payload: &[u8],
 ) -> std::result::Result<(), ReplicationIntentError> {
     match record_type {
         INTENT_RECORD_SNAPSHOT => {
-            *pending = intent_log_decode_snapshot_payload(payload)?;
+            *pending = intent_log_decode_snapshot_payload(payload)?
+                .into_iter()
+                .map(|(range, keys)| {
+                    (
+                        range,
+                        PendingIntent {
+                            keys,
+                            regime_stamps: Vec::new(),
+                        },
+                    )
+                })
+                .collect();
+        }
+        INTENT_RECORD_SNAPSHOT_V2 => {
+            *pending = intent_log_decode_snapshot_v2_payload(payload)?;
         }
         INTENT_RECORD_BEGIN => {
             let (range, keys) = intent_log_decode_range_and_keys(payload)?;
-            pending.insert(range, keys);
+            pending.insert(
+                range,
+                PendingIntent {
+                    keys,
+                    regime_stamps: Vec::new(),
+                },
+            );
+        }
+        INTENT_RECORD_BEGIN_V2 => {
+            let (range, intent, end) = intent_log_decode_v2_entry_at(payload, 0)?;
+            if end != payload.len() {
+                return Err(ReplicationIntentError::Corrupt(
+                    "trailing bytes after v2 begin record".into(),
+                ));
+            }
+            pending.insert(range, intent);
         }
         INTENT_RECORD_COMMIT => {
             let range = intent_log_decode_commit_payload(payload)?;
@@ -795,6 +963,27 @@ impl ReplicationIntentTracker {
         last_sequence: u64,
         keys: &[TxKey],
     ) -> std::result::Result<(), ReplicationIntentError> {
+        self.begin_with_regimes(first_sequence, last_sequence, keys, &[])
+    }
+
+    /// [`Self::begin`] carrying the I5 `(shard, regime)` stamps the intent
+    /// was created under (the committed regime of each touched shard at
+    /// creation time). Recovery compares the stamps against the CURRENT
+    /// committed regimes: a shard whose regime has advanced makes the
+    /// intent regime-superseded for that shard — it is converted to a
+    /// resync instead of re-shipped (I5's fenced replay). An empty stamp
+    /// table (unclustered / legacy) preserves the pre-stamp behaviour.
+    ///
+    /// # Errors
+    /// I/O failures of the durable `BEGIN` append/sync, as for
+    /// [`Self::begin`].
+    pub fn begin_with_regimes(
+        &self,
+        first_sequence: u64,
+        last_sequence: u64,
+        keys: &[TxKey],
+        regime_stamps: &[(u16, u64)],
+    ) -> std::result::Result<(), ReplicationIntentError> {
         if first_sequence == 0 || last_sequence < first_sequence {
             return Ok(());
         }
@@ -809,25 +998,30 @@ impl ReplicationIntentTracker {
                 deduped.push(*key);
             }
         }
+        let record = PendingIntent {
+            keys: deduped,
+            regime_stamps: regime_stamps.to_vec(),
+        };
         let mut inner = self.inner.lock();
         // Re-recording an identical range overwrites its key set: a begin for a
         // range already pending is idempotent in identity but the caller's key
         // set is authoritative. (Ranges are globally-unique per RPC in
         // practice; this keeps semantics defined if a range ever repeats.)
         let changed = match inner.pending.get(&range) {
-            Some(existing) => existing != &deduped,
+            Some(existing) => existing != &record,
             None => true,
         };
         if changed {
-            let payload = intent_log_encode_range_and_keys(&range, &deduped);
-            inner.pending.insert(range, deduped);
+            let payload =
+                intent_log_encode_range_and_keys(&range, &record.keys, &record.regime_stamps);
+            inner.pending.insert(range, record);
             // Drain any buffered (not-yet-written) COMMIT frames first: the
             // old full-rewrite always incorporated committed-away ranges on
             // every begin, so the append-only equivalent is to write those
             // out before this BEGIN record, then fdatasync everything
             // together as one durability barrier.
             Self::drain_unflushed_commits_locked(&mut inner)?;
-            self.append_record_locked(&mut inner, INTENT_RECORD_BEGIN, &payload)?;
+            self.append_record_locked(&mut inner, INTENT_RECORD_BEGIN_V2, &payload)?;
             Self::sync_locked(&mut inner)?;
             inner.commit_dirty = false;
             inner.dirty_commit_count = 0;
@@ -895,7 +1089,20 @@ impl ReplicationIntentTracker {
         inner
             .pending
             .iter()
-            .map(|(range, keys)| (*range, keys.clone()))
+            .map(|(range, intent)| (*range, intent.keys.clone()))
+            .collect()
+    }
+
+    /// [`Self::pending_with_keys`] additionally carrying each intent's I5
+    /// `(shard, regime)` creation stamps (empty for legacy / unclustered
+    /// records). Recovery uses the stamps to detect regime-superseded
+    /// intents and convert them to resyncs instead of re-shipping (I5).
+    pub fn pending_with_keys_and_regimes(&self) -> Vec<PendingIntentWithRegimes> {
+        let inner = self.inner.lock();
+        inner
+            .pending
+            .iter()
+            .map(|(range, intent)| (*range, intent.keys.clone(), intent.regime_stamps.clone()))
             .collect()
     }
 
@@ -1038,7 +1245,7 @@ impl ReplicationIntentTracker {
         inner: &mut ReplicationIntentInner,
     ) -> std::result::Result<(), ReplicationIntentError> {
         let payload = intent_log_encode_snapshot_payload(&inner.pending);
-        let frame = intent_log_encode_frame(INTENT_RECORD_SNAPSHOT, &payload);
+        let frame = intent_log_encode_frame(INTENT_RECORD_SNAPSHOT_V2, &payload);
         write_durable_file(&self.path, &frame).map_err(ReplicationIntentError::Io)?;
         // `rename` (inside `write_durable_file`) does not redirect an
         // already-open append fd to the new inode — reopen on `self.path` so
@@ -1103,7 +1310,7 @@ impl ReplicationIntentTracker {
     fn read_from_disk(
         path: &Path,
     ) -> std::result::Result<
-        (BTreeMap<ReplicationIntentRange, Vec<TxKey>>, u32),
+        (BTreeMap<ReplicationIntentRange, PendingIntent>, u32),
         ReplicationIntentError,
     > {
         let data = match std::fs::read(path) {
@@ -1345,10 +1552,33 @@ pub enum CatchupError {
     RedoReclaimed { from: u64, available: Option<u64> },
 
     /// Sending a catch-up chunk to the replica failed (transport error,
-    /// replica-side error ack, or sequence renegotiation failure — the
-    /// `send_chunk` callback flattens these into one detail string).
+    /// replica-side error ack, or sequence renegotiation failure — every
+    /// non-stale-regime [`crate::server::dispatch::ReplicaSendError`] is
+    /// flattened into one detail string here).
     #[error("transport to {addr}: {detail}")]
     Transport { addr: SocketAddr, detail: String },
+
+    /// F8 (I12) — the replica NAKed a catch-up chunk with
+    /// `ERR_STALE_REGIME`: this node's committed regime view is provably
+    /// behind for `shard`. Kept TYPED (never flattened into
+    /// [`CatchupError::Transport`]'s string) so the caller can apply
+    /// I12's abort-and-re-plan classification: raise the topology-
+    /// staleness signal and abort the pass instead of re-shipping the
+    /// same stale chunk every lag-monitor tick forever.
+    #[error(
+        "replica {addr} rejected catch-up chunk: stale regime on shard {shard} \
+         (receiver committed regime {local_regime}) — abort and re-plan after \
+         topology refresh (I12)"
+    )]
+    StaleRegime {
+        /// The NAKing replica.
+        addr: SocketAddr,
+        /// The first shard the receiver reported stale.
+        shard: u16,
+        /// The receiver's committed regime for that shard (a term — feeds
+        /// the topology-staleness signal).
+        local_regime: u64,
+    },
 }
 
 /// Check whether the redo log has been truncated past a requested sequence.
@@ -1436,7 +1666,9 @@ pub fn run_catchup_for_replica(
     max_ops_per_pass: usize,
     ops_from_seq: &dyn Fn(u64) -> Vec<(u64, Vec<ReplicaOp>)>,
     first_available_seq: Option<u64>,
-    send_chunk: &dyn Fn(&[ReplicaOp]) -> std::result::Result<(), String>,
+    send_chunk: &dyn Fn(
+        &[ReplicaOp],
+    ) -> std::result::Result<(), crate::server::dispatch::ReplicaSendError>,
 ) -> std::result::Result<u64, CatchupError> {
     if from_seq >= current_seq {
         return Ok(from_seq); // already caught up
@@ -1494,9 +1726,23 @@ pub fn run_catchup_for_replica(
 
     let batch_size = batch_size.max(1);
     for chunk in ops.chunks(batch_size) {
-        send_chunk(chunk).map_err(|detail| CatchupError::Transport {
-            addr: *addr,
-            detail,
+        send_chunk(chunk).map_err(|e| match e {
+            // F8 (I12) — keep the stale-regime NAK typed so the caller can
+            // abort-and-re-plan (topology refresh) instead of retrying the
+            // same stale chunk on every tick.
+            crate::server::dispatch::ReplicaSendError::StaleRegime {
+                shard,
+                local_regime,
+                ..
+            } => CatchupError::StaleRegime {
+                addr: *addr,
+                shard,
+                local_regime,
+            },
+            other => CatchupError::Transport {
+                addr: *addr,
+                detail: other.to_string(),
+            },
         })?;
     }
 
@@ -1849,6 +2095,33 @@ mod tests {
 
     fn test_addr(port: u16) -> SocketAddr {
         format!("127.0.0.1:{port}").parse().unwrap()
+    }
+
+    /// Encode the LEGACY V1 `[first:8][last:8][key_count:4][txid:32]*`
+    /// entry body (no I5 stamp table) — the tests below that pin the
+    /// legacy-decode path must feed it genuine V1 bytes, since the
+    /// production encoder now always appends the V2 stamp table.
+    fn encode_v1_range_and_keys(range: &ReplicationIntentRange, keys: &[TxKey]) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(20 + keys.len() * 32);
+        buf.extend_from_slice(&range.first_sequence.to_le_bytes());
+        buf.extend_from_slice(&range.last_sequence.to_le_bytes());
+        buf.extend_from_slice(&(keys.len() as u32).to_le_bytes());
+        for key in keys {
+            buf.extend_from_slice(&key.txid);
+        }
+        buf
+    }
+
+    /// Encode a LEGACY V1 `SNAPSHOT` payload over V1 entries.
+    fn encode_v1_snapshot_payload(
+        pending: &BTreeMap<ReplicationIntentRange, Vec<TxKey>>,
+    ) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&(pending.len() as u32).to_le_bytes());
+        for (range, keys) in pending {
+            buf.extend_from_slice(&encode_v1_range_and_keys(range, keys));
+        }
+        buf
     }
 
     /// The tests below read counters off the process-global
@@ -2763,6 +3036,54 @@ mod tests {
         );
     }
 
+    /// I5 — the `(shard, regime)` creation stamps ride the durable BEGIN
+    /// record and survive a reload; a LEGACY V1 record reloads with an
+    /// EMPTY stamp table (pre-upgrade intents keep pre-upgrade re-ship
+    /// behaviour).
+    #[test]
+    fn i5_intent_regime_stamps_survive_reload_and_legacy_records_decode_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("intent.dat");
+        let key = TxKey { txid: [5u8; 32] };
+        {
+            let tracker = ReplicationIntentTracker::load(path.clone()).unwrap();
+            tracker
+                .begin_with_regimes(10, 12, &[key], &[(7, 3), (9, 4)])
+                .unwrap();
+        }
+        // Append a LEGACY V1 BEGIN alongside it.
+        let v1_range = ReplicationIntentRange {
+            first_sequence: 20,
+            last_sequence: 20,
+        };
+        let v1 = intent_log_encode_frame(
+            INTENT_RECORD_BEGIN,
+            &encode_v1_range_and_keys(&v1_range, &[key]),
+        );
+        {
+            use std::io::Write as _;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            f.write_all(&v1).unwrap();
+        }
+        let reloaded = ReplicationIntentTracker::load(path).unwrap();
+        let pending = reloaded.pending_with_keys_and_regimes();
+        assert_eq!(pending.len(), 2);
+        assert_eq!(
+            pending[0].2,
+            vec![(7, 3), (9, 4)],
+            "V2 stamps must survive the reload verbatim",
+        );
+        assert_eq!(pending[0].1, vec![key]);
+        assert!(
+            pending[1].2.is_empty(),
+            "a legacy V1 record decodes with an EMPTY stamp table",
+        );
+        assert_eq!(pending[1].0, v1_range);
+    }
+
     #[test]
     fn intent_log_torn_tail_record_is_discarded_prefix_recovered() {
         let dir = tempfile::tempdir().unwrap();
@@ -2788,7 +3109,7 @@ mod tests {
         // frame leaves only part of its bytes on disk.
         let extra_frame = intent_log_encode_frame(
             INTENT_RECORD_BEGIN,
-            &intent_log_encode_range_and_keys(
+            &encode_v1_range_and_keys(
                 &ReplicationIntentRange {
                     first_sequence: 30,
                     last_sequence: 30,
@@ -2887,8 +3208,8 @@ mod tests {
             frames_after.len(),
         );
         assert_eq!(
-            frames_after[0].0, INTENT_RECORD_SNAPSHOT,
-            "the compacted file's base record must be a SNAPSHOT",
+            frames_after[0].0, INTENT_RECORD_SNAPSHOT_V2,
+            "the compacted file's base record must be a (V2) SNAPSHOT",
         );
 
         // Correctness: exactly the odd sequences remain pending.
@@ -3094,11 +3415,11 @@ mod tests {
         let mut data = Vec::new();
         data.extend_from_slice(&intent_log_encode_frame(
             INTENT_RECORD_SNAPSHOT,
-            &intent_log_encode_snapshot_payload(&snapshot_pending),
+            &encode_v1_snapshot_payload(&snapshot_pending),
         ));
         data.extend_from_slice(&intent_log_encode_frame(
             INTENT_RECORD_BEGIN,
-            &intent_log_encode_range_and_keys(&range_c, &[key_c]),
+            &encode_v1_range_and_keys(&range_c, &[key_c]),
         ));
         let mut commit_payload = Vec::new();
         commit_payload.extend_from_slice(&range_a.first_sequence.to_le_bytes());
@@ -3308,7 +3629,9 @@ mod tests {
             &|_chunk| {
                 let n = calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 if n == 1 {
-                    Err("replica error: boom".to_string())
+                    Err(crate::server::dispatch::ReplicaSendError::Failed(
+                        "replica error: boom".to_string(),
+                    ))
                 } else {
                     assert!(n < 2, "no chunk may be sent after a failure");
                     Ok(())
@@ -3323,6 +3646,66 @@ mod tests {
                 assert_eq!(detail, "replica error: boom");
             }
             other => panic!("expected CatchupError::Transport, got {other:?}"),
+        }
+    }
+
+    /// §8 review F8 (P2) — a stale-regime NAK on the catch-up path must
+    /// stay TYPED (`CatchupError::StaleRegime`, carrying the shard and the
+    /// receiver's regime) and abort the pass at that chunk. Pre-fix the
+    /// closure flattened it to a string inside `Transport`, losing I12's
+    /// abort-and-re-plan classification — the lag monitor then re-shipped
+    /// the same stale chunk every tick and never refreshed topology.
+    #[test]
+    fn f8_stale_regime_nak_on_catchup_stays_typed_and_aborts_pass() {
+        use crate::index::TxKey;
+
+        let addr: SocketAddr = "127.0.0.1:65531".parse().unwrap();
+        let ops: Vec<ReplicaOp> = (0..6u8)
+            .map(|i| ReplicaOp::Delete {
+                tx_key: TxKey::from_bytes([i + 1; 32]),
+            })
+            .collect();
+        let calls = std::sync::atomic::AtomicU64::new(0);
+
+        let err = run_catchup_for_replica(
+            &addr,
+            1,
+            7,
+            2,
+            10_000,
+            &move |_from| vec![(1u64, ops.clone())],
+            Some(1),
+            &|_chunk| {
+                let n = calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                assert!(n < 2, "F8: no chunk may be sent after the stale-regime NAK");
+                if n == 1 {
+                    Err(crate::server::dispatch::ReplicaSendError::StaleRegime {
+                        shard: 42,
+                        local_regime: 9,
+                        detail: "stale regime".to_string(),
+                    })
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .expect_err("the stale-regime NAK must abort the pass");
+
+        match err {
+            CatchupError::StaleRegime {
+                addr: a,
+                shard,
+                local_regime,
+            } => {
+                assert_eq!(a, addr);
+                assert_eq!(shard, 42, "the NAK's shard must survive typed");
+                assert_eq!(
+                    local_regime, 9,
+                    "the receiver regime must survive typed (it feeds the \
+                     topology-staleness signal)",
+                );
+            }
+            other => panic!("expected CatchupError::StaleRegime, got {other:?}"),
         }
     }
 
@@ -3343,7 +3726,10 @@ mod tests {
     fn run_catchup_returns_typed_redo_reclaimed_when_log_wrapped() {
         let addr: SocketAddr = "127.0.0.1:65535".parse().unwrap();
         let no_ops: &dyn Fn(u64) -> Vec<(u64, Vec<ReplicaOp>)> = &|_| Vec::new();
-        let no_send: &dyn Fn(&[ReplicaOp]) -> std::result::Result<(), String> =
+        let no_send: &dyn Fn(
+            &[ReplicaOp],
+        )
+            -> std::result::Result<(), crate::server::dispatch::ReplicaSendError> =
             &|_| panic!("send_chunk must not be called when redo wrapped");
 
         // Path 1: explicit truncation signal — `first_available_seq` is
@@ -3401,7 +3787,10 @@ mod tests {
     fn run_catchup_already_caught_up_returns_ok() {
         let addr: SocketAddr = "127.0.0.1:65534".parse().unwrap();
         let no_ops: &dyn Fn(u64) -> Vec<(u64, Vec<ReplicaOp>)> = &|_| Vec::new();
-        let no_send: &dyn Fn(&[ReplicaOp]) -> std::result::Result<(), String> =
+        let no_send: &dyn Fn(
+            &[ReplicaOp],
+        )
+            -> std::result::Result<(), crate::server::dispatch::ReplicaSendError> =
             &|_| panic!("send_chunk must not be called when already caught up");
 
         let result = run_catchup_for_replica(&addr, 100, 100, 16, 100, no_ops, Some(50), no_send);
@@ -3461,7 +3850,10 @@ mod tests {
         };
 
         let delivered: std::sync::Mutex<Vec<ReplicaOp>> = std::sync::Mutex::new(Vec::new());
-        let send = |chunk: &[ReplicaOp]| -> std::result::Result<(), String> {
+        let send = |chunk: &[ReplicaOp]| -> std::result::Result<
+            (),
+            crate::server::dispatch::ReplicaSendError,
+        > {
             delivered.lock().unwrap().extend_from_slice(chunk);
             Ok(())
         };

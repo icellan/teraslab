@@ -175,10 +175,10 @@ pub const KEY_DIAGNOSIS_ENCODED_SIZE: usize = 2 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 8;
 ///   node_id:     u64 LE   (8 bytes)
 ///   cluster_key: u64 LE   (8 bytes)
 ///   entry_count: u32 LE   (4 bytes)
-///   entries: PartitionVersionEntry * count    // entry_count entries, each 24 bytes
+///   entries: PartitionVersionEntry * count    // entry_count entries, each 33 bytes
 /// ```
 ///
-/// Each entry layout (24 bytes):
+/// Each entry layout (33 bytes):
 /// ```text
 ///   shard:            u16 LE   (2 bytes)
 ///   flags:            u8       (1 byte; bit0=is_master, bit1=is_subset)
@@ -186,18 +186,30 @@ pub const KEY_DIAGNOSIS_ENCODED_SIZE: usize = 2 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 8;
 ///   last_applied_seq: u64 LE   (8 bytes)
 ///   manifest_digest:  u64 LE   (8 bytes; reverse-heal recency fingerprint)
 ///   max_generation:   u32 LE   (4 bytes; reverse-heal recency signal)
+///   lineage_full:     u8       (1 byte; P1 §4.3 self-observed Full = 1)
+///   lineage_regime:   u64 LE   (8 bytes; the regime the Full stamp is at)
 /// ```
 ///
-/// The trailing `manifest_digest` + `max_generation` are ADDITIVE (finding C1,
-/// reverse-heal Phase 1): the parser infers the per-entry stride from the body
-/// length, so a Phase-1 reader accepts both the 24-byte layout and a legacy
-/// peer's 12-byte ([`PARTITION_VERSION_ENTRY_SIZE_LEGACY`]) entries (new fields
-/// default to 0). No `PROTOCOL_VERSION` bump.
+/// The trailing fields are ADDITIVE: the parser infers the per-entry stride
+/// from the body length, so a stage-4 reader accepts the 33-byte layout, the
+/// pre-lineage 24-byte layout ([`PARTITION_VERSION_ENTRY_SIZE_NO_LINEAGE`],
+/// lineage decodes as absent = not-`Full`), and a legacy peer's 12-byte
+/// ([`PARTITION_VERSION_ENTRY_SIZE_LEGACY`]) entries (all newer fields
+/// default to 0). No `PROTOCOL_VERSION` bump. The lineage fields are
+/// PROPOSER INPUT ONLY (design §4.3): they feed the §4.4 promotion
+/// proposer's partition view and the migration-skip refinement — never a
+/// serving-eligibility decision, which is always self-observed (I13).
 pub const OP_PARTITION_VERSION_REPORT: u16 = 105;
 
 /// Encoded width of a single `PartitionVersionEntry` on the wire (current
-/// layout, including the reverse-heal `manifest_digest` + `max_generation`).
-pub const PARTITION_VERSION_ENTRY_SIZE: usize = 2 + 1 + 1 + 8 + 8 + 4;
+/// layout, including the reverse-heal recency fields and the P1 stage-4
+/// `lineage_full` + `lineage_regime` tail).
+pub const PARTITION_VERSION_ENTRY_SIZE: usize = 2 + 1 + 1 + 8 + 8 + 4 + 1 + 8;
+
+/// Pre-stage-4 encoded width of a `PartitionVersionEntry`: everything up to
+/// and including the reverse-heal recency fields, without the lineage tail.
+/// Accepted by the parser; lineage decodes as absent (= not-`Full`).
+pub const PARTITION_VERSION_ENTRY_SIZE_NO_LINEAGE: usize = 2 + 1 + 1 + 8 + 8 + 4;
 
 /// Legacy (pre-Phase-1) encoded width of a `PartitionVersionEntry`: shard,
 /// flags, replica_count, last_applied_seq only. Accepted by the parser for
@@ -280,6 +292,20 @@ pub const OP_MIGRATION_BATCH_COMPLETE: u16 = 243;
 /// version and re-runs the normal outbound migration (or re-sends the
 /// completion handshake) for the listed shards. Fully idempotent.
 pub const OP_MIGRATION_TRANSFER_REQUEST: u16 = 244;
+/// §4.3 catch-up-convergence completion trigger (§8 review F3) — a MASTER
+/// whose per-replica convergence loop observed the replica durably ACK
+/// every redo sequence over an intact (un-reclaimed) redo range sends this
+/// to that replica, asserting completeness for the shards the master owns.
+/// Payload: `[source_node_id:8][count:2][(shard:2, regime:8) × count]`.
+/// The receiver STAMPS NOTHING on trust alone: per shard it re-verifies —
+/// against its OWN installed committed state and local fences — that the
+/// asserting sender IS the shard's committed master, the regime matches
+/// its own committed regime, itself is in the shard's holder set, and no
+/// inbound/heal fence is up; only then is `Full{regime}` stamped (one
+/// batched durable lineage write). See
+/// `cluster::coordinator::apply_replica_converged_signal` for the trust
+/// argument.
+pub const OP_REPLICA_CONVERGED: u16 = 245;
 
 // Cluster (inter-node)
 pub const OP_HEARTBEAT: u16 = 250;
@@ -517,6 +543,26 @@ pub const ERR_MIGRATION_TARGET_NOT_READY: u16 = 37;
 /// EXTERNAL blob (>16 MiB) is not currently serveable in one frame — a
 /// streaming read path is a documented follow-up.
 pub const ERR_RESPONSE_TOO_LARGE: u16 = 38;
+
+/// P1 §4.2 — returned by a replica when an incoming `ReplicaBatch` fails
+/// the per-shard REGIME gate while regime enforcement is active: a touched
+/// shard's stamped regime is BEHIND the receiver's committed regime for
+/// that shard (a demoted/stale master writing past its own demotion), or
+/// the batch carries no regime stamp at all for a touched shard — V2
+/// frames and incomplete V3 tables both reject this way under enforcement
+/// (I12: no sender opt-out). The whole batch is rejected before any
+/// tracker or engine work; the receiver's applied watermark does not
+/// advance. Payload:
+/// `[code:u16][msg_len:u16 = 0][shard:u16][local_regime:u64]` — the hint
+/// names one stale shard and the receiver's committed regime for it, as
+/// ROUTING ADVICE only (I9: a NAK is never regime authority — the sender
+/// refreshes topology through the committed channel and retries). Distinct
+/// from `ERR_STALE_EPOCH` (24): that gate compares the whole-batch
+/// `cluster_key` against the receiver's committed term; this gate fences
+/// per shard, so a sender current on the term but demoted on one shard
+/// still rejects. Client-visible only as `ERR_REPLICATION_FAILED` (the
+/// master fails and compensates the whole mutation batch).
+pub const ERR_STALE_REGIME: u16 = 39;
 
 /// P3.10 / F-G5-017 — wire protocol revision.
 ///
@@ -821,6 +867,7 @@ pub fn is_inter_node_auth_opcode(op_code: u16) -> bool {
             | OP_MIGRATION_COMPLETE
             | OP_MIGRATION_BATCH_COMPLETE
             | OP_MIGRATION_TRANSFER_REQUEST
+            | OP_REPLICA_CONVERGED
             | OP_TOPOLOGY_PROPOSE
             | OP_TOPOLOGY_VOTE
             | OP_TOPOLOGY_COMMIT

@@ -354,6 +354,7 @@ fn replication_receiver_inherits_wire_trace_context() {
         trace_ctx: Some(wire_ctx),
         source_node_id: None,
         cluster_key: 0,
+        regime_table: None,
     };
     let req = RequestFrame {
         op_code: OP_REPLICA_BATCH,

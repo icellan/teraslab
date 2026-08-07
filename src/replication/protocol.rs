@@ -6,7 +6,24 @@
 //!
 //! Each `ReplicaBatch` frame begins with a 1-byte protocol version tag.
 //!
-//! ## V2 (current — produced by [`ReplicaBatch::serialize`])
+//! ## V3 (regime-stamped — P1 §4.2, produced when the sender's regime
+//! enforcement is active)
+//!
+//! `[version=3:1][V2 header fields][op0_len:4][op0]…[touched_count:2][(shard:2, regime:8)…]`
+//!
+//! Identical to V2 except: the version byte is 3, the op stream uses the
+//! V3 op encoding (only [`ReplicaOp::Reassign`] differs — it appends
+//! `prior_utxo_hash: [u8; 32]`, §4.9), and a per-shard regime table is
+//! appended AFTER the op stream (inside the V2 header a V2 decoder would
+//! misparse it as an op length; as trailing bytes under the V2 byte it
+//! would be silently ignored — half-enforcement). The table is canonical:
+//! sorted strictly ascending by shard, no duplicates,
+//! `touched_count <= NUM_SHARDS`, every shard `< NUM_SHARDS`; any
+//! violation is a hard decode reject, and the reservation is clamped to
+//! what the payload can back (the `decode_ops` untrusted-count posture).
+//!
+//! ## V2 (produced by [`ReplicaBatch::serialize`] when `regime_table` is
+//! `None`)
 //!
 //! `[version=2:1][first_seq:8][count:4][trace_id:16][span_id:8][source_node_id:8][cluster_key:8][op0_len:4][op0]…`
 //!
@@ -39,13 +56,24 @@ use crate::index::TxKey;
 use crate::observability::WireTraceContext;
 use thiserror::Error;
 
-/// Current batch wire layout. F-G7-012 removed the legacy V1 decoder;
-/// receivers reject any other version byte with
-/// [`ProtocolError::UnknownVersion`]. Senders always produce V2.
+/// Regime-absent batch wire layout. F-G7-012 removed the legacy V1
+/// decoder; receivers reject any version byte other than V2/V3 with
+/// [`ProtocolError::UnknownVersion`]. Senders produce V2 whenever the
+/// batch carries no regime table ([`ReplicaBatch::regime_table`] is
+/// `None` — i.e. regime enforcement is not active on the sender).
 ///
 /// Full wire layout:
 /// `[version=2:1][first_seq:8][count:4][trace_id:16][span_id:8][source_node_id:8][cluster_key:8][op0_len:4][op0]…`
 pub const BATCH_PROTOCOL_V2: u8 = 2;
+
+/// Regime-stamped batch wire layout (P1 §4.2). Produced whenever
+/// [`ReplicaBatch::regime_table`] is `Some` — the sender captured its
+/// committed per-shard regime view at fan-out entry. Layout is the V2
+/// header + a V3 op stream (V2 op encoding except [`ReplicaOp::Reassign`]
+/// gains a trailing `prior_utxo_hash`, §4.9) + a canonical
+/// `[touched_count:u16][(shard:u16, regime:u64)…]` table AFTER the op
+/// stream.
+pub const BATCH_PROTOCOL_V3: u8 = 3;
 
 #[derive(Error, Debug)]
 pub enum ProtocolError {
@@ -55,6 +83,12 @@ pub enum ProtocolError {
     UnknownOp(u8),
     #[error("unknown batch protocol version: {0}")]
     UnknownVersion(u8),
+    /// P1 §4.2 — the V3 regime table violated canonical form: unsorted or
+    /// duplicate shard entries, a shard `>= NUM_SHARDS`, or
+    /// `touched_count > NUM_SHARDS`. A hard reject, never a defaulted or
+    /// partially-read table.
+    #[error("non-canonical V3 regime table")]
+    NonCanonicalRegimeTable,
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -231,6 +265,19 @@ pub enum ReplicaOp {
         block_height: u32,
         spendable_after: u32,
         master_generation: u32,
+        /// P1 §4.9 — the slot's utxo_hash BEFORE the reassign (the identity
+        /// the master's `engine.reassign` validated against). Carried on the
+        /// wire in the V3 op encoding ONLY; V2 frames decode it as `None`.
+        ///
+        /// `Some`: the receiver passes it as the expected hash, so a replay
+        /// against a slot whose identity has moved on no-ops structurally
+        /// (mirrors [`crate::redo::RedoOp::ReassignV2`]'s recovery guard).
+        /// `None`: prior identity unknown — the op was converted from a
+        /// legacy pre-V2 redo entry — and the receiver falls back to the
+        /// historical live-slot read. On the V3 wire `None` is encoded as
+        /// the all-zero hash (no real UTXO identity is all-zero: hashes are
+        /// SHA-256 outputs), and an all-zero hash decodes back to `None`.
+        prior_utxo_hash: Option<[u8; 32]>,
     },
     SetConflicting {
         tx_key: TxKey,
@@ -559,6 +606,10 @@ impl ReplicaOp {
                 block_height,
                 spendable_after,
                 master_generation,
+                // V2 encoding is byte-identical to the pre-§4.9 wire: the
+                // prior hash is carried in the V3 op encoding only (see
+                // `serialize_v3`).
+                prior_utxo_hash: _,
             } => {
                 buf.push(OP_REASSIGN);
                 buf.extend_from_slice(&tx_key.txid);
@@ -827,6 +878,9 @@ impl ReplicaOp {
                         block_height: r_u32(rest, 68),
                         spendable_after: r_u32(rest, 72),
                         master_generation: r_u32(rest, 76),
+                        // V2 wire carries no prior identity (§4.9): the
+                        // receiver keeps the historical live-slot read.
+                        prior_utxo_hash: None,
                     },
                     81,
                 ))
@@ -997,6 +1051,73 @@ impl ReplicaOp {
             _ => Err(ProtocolError::UnknownOp(op_type)),
         }
     }
+
+    /// Serialize this op in the V3 op encoding (P1 §4.9).
+    ///
+    /// Identical to [`Self::serialize`] for every variant except
+    /// [`Self::Reassign`], which appends `prior_utxo_hash` (32 bytes) after
+    /// `master_generation`. `None` encodes as the all-zero hash ("prior
+    /// identity unknown" — see the field doc).
+    pub fn serialize_v3(&self) -> Vec<u8> {
+        let mut buf = self.serialize();
+        if let ReplicaOp::Reassign {
+            prior_utxo_hash, ..
+        } = self
+        {
+            buf.extend_from_slice(&prior_utxo_hash.unwrap_or([0u8; 32]));
+        }
+        buf
+    }
+
+    /// Deserialize from bytes in the V3 op encoding. Returns
+    /// `(op, bytes_consumed)`.
+    ///
+    /// Identical to [`Self::deserialize`] for every variant except
+    /// [`Self::Reassign`], whose V3 body is 112 bytes (the 80-byte V2 body
+    /// plus `prior_utxo_hash`). An all-zero prior hash decodes as `None`
+    /// (live-read fallback); a truncated V3 Reassign is a hard
+    /// [`ProtocolError::BufferTooShort`], never a silent fallback to the
+    /// V2 shape.
+    ///
+    /// Sentinel caveat (§8 review F-7 interaction): `Some([0u8; 32])` is
+    /// UNREPRESENTABLE — it encodes as the `None` sentinel, so a record
+    /// whose utxo hash is genuinely all-zero would have its §4.9 prior
+    /// guard stripped in transit, and under committed regime enforcement
+    /// the receiver's F-7 guard then refuses the prior-less op
+    /// (fail-closed). A real utxo hash is a cryptographic commitment and
+    /// is never all-zero, so this is unreachable in production — but test
+    /// fixtures must use non-zero hashes (see
+    /// `tests/g8_e4_tcp_frame_replay.rs::create_record`).
+    pub fn deserialize_v3(data: &[u8]) -> Result<(Self, usize)> {
+        if data.is_empty() {
+            return Err(ProtocolError::BufferTooShort { need: 1, have: 0 });
+        }
+        if data[0] != OP_REASSIGN {
+            return Self::deserialize(data);
+        }
+        let rest = &data[1..];
+        need(rest, 112)?; // 32 + 4 + 32 + 4 + 4 + 4(gen) + 32(prior)
+        let mut nh = [0u8; 32];
+        nh.copy_from_slice(&rest[36..68]);
+        let mut prior = [0u8; 32];
+        prior.copy_from_slice(&rest[80..112]);
+        Ok((
+            ReplicaOp::Reassign {
+                tx_key: read_key(rest),
+                offset: r_u32(rest, 32),
+                new_hash: nh,
+                block_height: r_u32(rest, 68),
+                spendable_after: r_u32(rest, 72),
+                master_generation: r_u32(rest, 76),
+                prior_utxo_hash: if prior == [0u8; 32] {
+                    None
+                } else {
+                    Some(prior)
+                },
+            },
+            113,
+        ))
+    }
 }
 
 fn need(data: &[u8], n: usize) -> Result<()> {
@@ -1053,6 +1174,23 @@ pub struct ReplicaBatch {
     /// `cluster_key == 0`. Receivers treating `0` as a wildcard SHOULD
     /// only do so when they themselves have no current cluster epoch.
     pub cluster_key: u64,
+    /// P1 §4.2 — the sender's committed per-shard regime stamps for the
+    /// shards this batch touches, captured ONCE at fan-out entry alongside
+    /// `cluster_key` and threaded through every resend path.
+    ///
+    /// * `None` — regime-absent: the batch serializes as V2 (byte-identical
+    ///   to the pre-P1 wire). Senders emit this whenever regime enforcement
+    ///   is not active. Under an enforcement-active receiver a regime-absent
+    ///   batch is rejected with `ERR_STALE_REGIME` (I12).
+    /// * `Some(table)` — the batch serializes as V3 with the table appended
+    ///   after the op stream. MUST be sorted strictly ascending by shard
+    ///   with no duplicates and `len() <= NUM_SHARDS`; the decoder enforces
+    ///   this canonical form and hard-rejects violations. Entries for
+    ///   shards the ops do not touch are permitted (senders may stamp the
+    ///   fan-out's union table into every per-address batch); a TOUCHED
+    ///   shard missing from the table is treated as regime-absent by an
+    ///   enforcing receiver (fail-closed).
+    pub regime_table: Option<Vec<(u16, u64)>>,
 }
 
 /// Acknowledgment from a replica.
@@ -1174,17 +1312,31 @@ impl CatchupRequest {
 }
 
 impl ReplicaBatch {
-    /// Serialize to bytes using the V2 wire format.
+    /// Serialize to bytes.
     ///
-    /// Layout:
+    /// `regime_table == None` → V2 layout (byte-identical to the pre-P1
+    /// wire):
     /// `[version=2:1][first_seq:8][count:4][trace_id:16][span_id:8][source_node_id:8][cluster_key:8][op0_len:4][op0]…`
+    ///
+    /// `regime_table == Some(table)` → V3 layout: the same header with
+    /// version byte 3, the V3 op encoding, and the regime table appended
+    /// after the op stream (P1 §4.2). The caller supplies the table in
+    /// canonical form (sorted strictly ascending, no duplicates); it is
+    /// encoded verbatim.
     ///
     /// When `trace_ctx` is `None`, the 24 trace-context bytes are zero.
     /// When `source_node_id` is `None`, the source field is zero.
     /// `cluster_key` is encoded verbatim (0 means "unknown / not set").
     pub fn serialize(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(Self::HEADER_SIZE + self.ops.len() * 64);
-        buf.push(BATCH_PROTOCOL_V2);
+        let mut buf = Vec::with_capacity(
+            Self::HEADER_SIZE
+                + self.ops.len() * 64
+                + self.regime_table.as_ref().map_or(0, |t| 2 + t.len() * 10),
+        );
+        buf.push(match self.regime_table {
+            None => BATCH_PROTOCOL_V2,
+            Some(_) => BATCH_PROTOCOL_V3,
+        });
         buf.extend_from_slice(&self.first_sequence.to_le_bytes());
         buf.extend_from_slice(&(self.ops.len() as u32).to_le_bytes());
         let mut tc = [0u8; WireTraceContext::SIZE];
@@ -1195,9 +1347,19 @@ impl ReplicaBatch {
         buf.extend_from_slice(&self.source_node_id.unwrap_or(0).to_le_bytes());
         buf.extend_from_slice(&self.cluster_key.to_le_bytes());
         for op in &self.ops {
-            let ob = op.serialize();
+            let ob = match self.regime_table {
+                None => op.serialize(),
+                Some(_) => op.serialize_v3(),
+            };
             buf.extend_from_slice(&(ob.len() as u32).to_le_bytes());
             buf.extend_from_slice(&ob);
+        }
+        if let Some(table) = &self.regime_table {
+            buf.extend_from_slice(&(table.len() as u16).to_le_bytes());
+            for (shard, regime) in table {
+                buf.extend_from_slice(&shard.to_le_bytes());
+                buf.extend_from_slice(&regime.to_le_bytes());
+            }
         }
         buf
     }
@@ -1206,23 +1368,41 @@ impl ReplicaBatch {
     ///
     /// * Leading byte == [`BATCH_PROTOCOL_V2`]: parse V2 layout
     ///   (53-byte header including `cluster_key`).
-    /// * Anything else: [`ProtocolError::UnknownVersion`].
-    ///
-    /// F-G7-012 removed the legacy V1 decoder: V1 frames decoded with
-    /// `cluster_key = 0`, which the Phase B2 stale-epoch gate treats
-    /// as a wildcard. Accepting V1 in clustered mode therefore
-    /// silently bypassed the epoch invariant. Senders have always
-    /// produced V2, so removing the decoder is the cheapest fix.
+    /// * Leading byte == [`BATCH_PROTOCOL_V3`]: parse the V3 layout —
+    ///   V2 header, V3 op encoding, then the canonical regime table
+    ///   after the op stream (P1 §4.2).
+    /// * Anything else: [`ProtocolError::UnknownVersion`] — the posture
+    ///   that already removed V1 (F-G7-012): V1 frames decoded with
+    ///   `cluster_key = 0`, which the Phase B2 stale-epoch gate treats
+    ///   as a wildcard. Accepting V1 in clustered mode therefore
+    ///   silently bypassed the epoch invariant.
     pub fn deserialize(data: &[u8]) -> Result<Self> {
         need(data, 1)?;
         match data[0] {
             BATCH_PROTOCOL_V2 => Self::decode_v2(data),
+            BATCH_PROTOCOL_V3 => Self::decode_v3(data),
             other => Err(ProtocolError::UnknownVersion(other)),
         }
     }
 
     /// Decode a V2 frame (53-byte header, includes `cluster_key`).
     fn decode_v2(data: &[u8]) -> Result<Self> {
+        let (header, count) = Self::decode_header(data)?;
+        let (ops, _) = Self::decode_ops(data, Self::HEADER_SIZE, count, false)?;
+        Ok(header.into_batch(ops, None))
+    }
+
+    /// Decode a V3 frame: V2 header + V3 op stream + regime table.
+    fn decode_v3(data: &[u8]) -> Result<Self> {
+        let (header, count) = Self::decode_header(data)?;
+        let (ops, pos) = Self::decode_ops(data, Self::HEADER_SIZE, count, true)?;
+        let table = Self::decode_regime_table(data, pos)?;
+        Ok(header.into_batch(ops, Some(table)))
+    }
+
+    /// Decode the common (V2/V3) 53-byte header. Returns the parsed
+    /// fields and the untrusted op `count`.
+    fn decode_header(data: &[u8]) -> Result<(BatchHeader, usize)> {
         need(data, Self::HEADER_SIZE)?;
         let first_sequence = u64::from_le_bytes(data[1..9].try_into().unwrap());
         let count = u32::from_le_bytes(data[9..13].try_into().unwrap()) as usize;
@@ -1232,21 +1412,27 @@ impl ReplicaBatch {
         let cluster_off = source_off + 8;
         let cluster_key =
             u64::from_le_bytes(data[cluster_off..cluster_off + 8].try_into().unwrap());
-        let ops = Self::decode_ops(data, Self::HEADER_SIZE, count)?;
-        Ok(ReplicaBatch {
-            first_sequence,
-            ops,
-            trace_ctx,
-            source_node_id,
-            cluster_key,
-        })
+        Ok((
+            BatchHeader {
+                first_sequence,
+                trace_ctx,
+                source_node_id,
+                cluster_key,
+            },
+            count,
+        ))
     }
 
     /// Op-stream decoder. `header_size` is the byte offset at which
-    /// the length-prefixed op stream begins. Kept as a separate helper
-    /// in case a future version of the wire format reuses the same
-    /// length-prefixed op layout with a different header size.
-    fn decode_ops(data: &[u8], header_size: usize, count: usize) -> Result<Vec<ReplicaOp>> {
+    /// the length-prefixed op stream begins; `v3_ops` selects the V3 op
+    /// encoding. Returns the ops and the byte offset just past the op
+    /// stream (where the V3 regime table begins).
+    fn decode_ops(
+        data: &[u8],
+        header_size: usize,
+        count: usize,
+        v3_ops: bool,
+    ) -> Result<(Vec<ReplicaOp>, usize)> {
         let mut pos = header_size;
         // SECURITY: `count` is an untrusted wire field independent of the
         // payload length. Reserving `Vec::with_capacity(count)` directly lets a
@@ -1265,11 +1451,51 @@ impl ReplicaBatch {
             let op_len = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
             pos += 4;
             need(&data[pos..], op_len)?;
-            let (op, _) = ReplicaOp::deserialize(&data[pos..pos + op_len])?;
+            let (op, _) = if v3_ops {
+                ReplicaOp::deserialize_v3(&data[pos..pos + op_len])?
+            } else {
+                ReplicaOp::deserialize(&data[pos..pos + op_len])?
+            };
             ops.push(op);
             pos += op_len;
         }
-        Ok(ops)
+        Ok((ops, pos))
+    }
+
+    /// Decode the V3 regime table starting at `pos`, enforcing canonical
+    /// form (P1 §4.2): `touched_count <= NUM_SHARDS`, shards sorted
+    /// strictly ascending (duplicates rejected), every shard
+    /// `< NUM_SHARDS`, reservation clamped to what the payload can back
+    /// (the `decode_ops` untrusted-count posture). Any shortfall or
+    /// violation is a hard reject.
+    fn decode_regime_table(data: &[u8], mut pos: usize) -> Result<Vec<(u16, u64)>> {
+        need(&data[pos..], 2)?;
+        let touched_count = u16::from_le_bytes(data[pos..pos + 2].try_into().unwrap()) as usize;
+        pos += 2;
+        if touched_count > crate::cluster::shards::NUM_SHARDS {
+            return Err(ProtocolError::NonCanonicalRegimeTable);
+        }
+        // Reservation clamp: 10 bytes per entry.
+        let max_backed = data.len().saturating_sub(pos) / 10;
+        let mut table = Vec::with_capacity(touched_count.min(max_backed));
+        let mut prev_shard: Option<u16> = None;
+        for _ in 0..touched_count {
+            need(&data[pos..], 10)?;
+            let shard = u16::from_le_bytes(data[pos..pos + 2].try_into().unwrap());
+            let regime = u64::from_le_bytes(data[pos + 2..pos + 10].try_into().unwrap());
+            pos += 10;
+            if shard as usize >= crate::cluster::shards::NUM_SHARDS {
+                return Err(ProtocolError::NonCanonicalRegimeTable);
+            }
+            if let Some(prev) = prev_shard
+                && shard <= prev
+            {
+                return Err(ProtocolError::NonCanonicalRegimeTable);
+            }
+            prev_shard = Some(shard);
+            table.push((shard, regime));
+        }
+        Ok(table)
     }
 
     /// The last sequence number in this batch.
@@ -1292,6 +1518,33 @@ impl ReplicaBatch {
     /// Byte offset of the `cluster_key` field in a V2 serialized frame.
     /// `source_node_id` immediately precedes it (8 bytes wide).
     pub const CLUSTER_KEY_OFFSET: usize = Self::SPAN_ID_OFFSET + 8 + 8;
+}
+
+/// Parsed common (V2/V3) batch-header fields, shared by both decoders.
+struct BatchHeader {
+    first_sequence: u64,
+    trace_ctx: Option<WireTraceContext>,
+    source_node_id: Option<u64>,
+    cluster_key: u64,
+}
+
+impl BatchHeader {
+    /// Assemble the decoded batch from the header fields, ops, and
+    /// (V3 only) regime table.
+    fn into_batch(
+        self,
+        ops: Vec<ReplicaOp>,
+        regime_table: Option<Vec<(u16, u64)>>,
+    ) -> ReplicaBatch {
+        ReplicaBatch {
+            first_sequence: self.first_sequence,
+            ops,
+            trace_ctx: self.trace_ctx,
+            source_node_id: self.source_node_id,
+            cluster_key: self.cluster_key,
+            regime_table,
+        }
+    }
 }
 
 /// Map a raw 8-byte source-node id field to the optional in-memory
@@ -1428,6 +1681,77 @@ impl ReplicaAck {
 }
 
 // ---------------------------------------------------------------------------
+// P1 §4.2 — regime-gate wire helpers
+// ---------------------------------------------------------------------------
+
+/// The set of shards a batch's ops touch, in ascending order.
+///
+/// This is the SHARED derivation both sides of the regime gate use: the
+/// receiver checks exactly these shards against the batch's regime table,
+/// and senders must stamp at least these shards. [`ReplicaOp::SetMinedBatch`]
+/// is matched directly (its `tx_key()` accessor fail-closes to `None` for
+/// anything but a batch of exactly one — see its doc), so every carried txid
+/// contributes its shard.
+pub fn touched_shards<'a>(
+    ops: impl IntoIterator<Item = &'a ReplicaOp>,
+) -> std::collections::BTreeSet<u16> {
+    use crate::cluster::shards::ShardTable;
+    let mut shards = std::collections::BTreeSet::new();
+    for op in ops {
+        match op {
+            ReplicaOp::SetMinedBatch { txids, .. } => {
+                for tx_key in txids {
+                    shards.insert(ShardTable::shard_for_key(tx_key));
+                }
+            }
+            other => {
+                if let Some(tx_key) = other.tx_key() {
+                    shards.insert(ShardTable::shard_for_key(&tx_key));
+                }
+            }
+        }
+    }
+    shards
+}
+
+/// Encode the `ERR_STALE_REGIME` NAK payload (P1 §4.2).
+///
+/// Shape mirrors the stale-cluster_key reject's error envelope with a
+/// structured routing hint appended:
+/// `[ERR_STALE_REGIME:u16][msg_len:u16 = 0][shard:u16][local_regime:u64]`.
+/// The hint names ONE stale shard and the receiver's committed regime for
+/// it. Per I9 the hint is routing advice only — a sender must never adopt
+/// it as regime state; it refreshes topology through the committed
+/// (proof-carrying) channel instead.
+pub fn encode_stale_regime_nak(shard: u16, local_regime: u64) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(14);
+    payload.extend_from_slice(&crate::protocol::opcodes::ERR_STALE_REGIME.to_le_bytes());
+    payload.extend_from_slice(&0u16.to_le_bytes());
+    payload.extend_from_slice(&shard.to_le_bytes());
+    payload.extend_from_slice(&local_regime.to_le_bytes());
+    payload
+}
+
+/// Decode an `ERR_STALE_REGIME` NAK payload produced by
+/// [`encode_stale_regime_nak`]. Returns `Some((shard, local_regime))` when
+/// the payload carries that error code with a well-formed hint, `None` for
+/// anything else (callers fall back to their generic error handling).
+pub fn decode_stale_regime_nak(payload: &[u8]) -> Option<(u16, u64)> {
+    if payload.len() < 4 {
+        return None;
+    }
+    let code = u16::from_le_bytes(payload[0..2].try_into().ok()?);
+    if code != crate::protocol::opcodes::ERR_STALE_REGIME {
+        return None;
+    }
+    let msg_len = u16::from_le_bytes(payload[2..4].try_into().ok()?) as usize;
+    let hint = payload.get(4 + msg_len..4 + msg_len + 10)?;
+    let shard = u16::from_le_bytes(hint[0..2].try_into().ok()?);
+    let local_regime = u64::from_le_bytes(hint[2..10].try_into().ok()?);
+    Some((shard, local_regime))
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1497,6 +1821,7 @@ mod tests {
                 block_height: 1000,
                 spendable_after: 100,
                 master_generation: 0,
+                prior_utxo_hash: None,
             },
             ReplicaOp::SetConflicting {
                 tx_key: key(8),
@@ -1943,6 +2268,7 @@ mod tests {
             trace_ctx: None,
             source_node_id: None,
             cluster_key: 0,
+            regime_table: None,
         };
         let bytes = batch.serialize();
         let decoded = ReplicaBatch::deserialize(&bytes).unwrap();
@@ -1968,6 +2294,7 @@ mod tests {
             trace_ctx: None,
             source_node_id: None,
             cluster_key: 0,
+            regime_table: None,
         };
         let bytes = batch.serialize();
         let decoded = ReplicaBatch::deserialize(&bytes).unwrap();
@@ -2006,6 +2333,7 @@ mod tests {
             trace_ctx: Some(ctx),
             source_node_id: Some(9),
             cluster_key: 0,
+            regime_table: None,
         };
         let bytes = batch.serialize();
         // Version byte (current = V2).
@@ -2033,6 +2361,7 @@ mod tests {
             trace_ctx: None,
             source_node_id: Some(42),
             cluster_key: 0,
+            regime_table: None,
         };
         let bytes = batch.serialize();
         let source_offset = ReplicaBatch::SPAN_ID_OFFSET + 8;
@@ -2054,6 +2383,7 @@ mod tests {
             trace_ctx: None,
             source_node_id: None,
             cluster_key: 0,
+            regime_table: None,
         };
         let bytes = batch.serialize();
         // 24 bytes at the trace_ctx offset must be all zero.
@@ -2069,9 +2399,9 @@ mod tests {
 
     #[test]
     fn replication_batch_rejects_unknown_version_byte() {
-        // Any leading byte other than BATCH_PROTOCOL_V2 must error. We
-        // construct a frame whose body would otherwise be valid for the
-        // current layout.
+        // Any leading byte other than BATCH_PROTOCOL_V2 / BATCH_PROTOCOL_V3
+        // must error. We construct a frame whose body would otherwise be
+        // valid for the current layout.
         let op = ReplicaOp::Delete { tx_key: key(4) };
         let ob = op.serialize();
         let mut frame = Vec::new();
@@ -2135,6 +2465,7 @@ mod tests {
             trace_ctx: None,
             source_node_id: Some(123_456_789),
             cluster_key: 0xDEAD_BEEF_CAFE_BABE,
+            regime_table: None,
         };
         let bytes = batch.serialize();
         // Default-encode is V2; leading byte must be V2.
@@ -2363,5 +2694,275 @@ mod tests {
         assert_eq!(bytes.len(), 8);
         let decoded = CatchupRequest::deserialize(&bytes).unwrap();
         assert_eq!(decoded.last_ack_sequence, 12345);
+    }
+
+    // -----------------------------------------------------------------------
+    // P1 §4.2/§4.9 — V3 wire tests
+    // -----------------------------------------------------------------------
+
+    fn v3_batch(ops: Vec<ReplicaOp>, table: Vec<(u16, u64)>) -> ReplicaBatch {
+        ReplicaBatch {
+            first_sequence: 42,
+            ops,
+            trace_ctx: None,
+            source_node_id: Some(11),
+            cluster_key: 7,
+            regime_table: Some(table),
+        }
+    }
+
+    fn reassign_op(prior: Option<[u8; 32]>) -> ReplicaOp {
+        ReplicaOp::Reassign {
+            tx_key: key(0x21),
+            offset: 3,
+            new_hash: [0xAB; 32],
+            block_height: 800_000,
+            spendable_after: 1_000,
+            master_generation: 5,
+            prior_utxo_hash: prior,
+        }
+    }
+
+    /// §4.2: a V3 batch round-trips its regime table AND the §4.9 Reassign
+    /// prior hash. The version byte must be [`BATCH_PROTOCOL_V3`].
+    #[test]
+    fn v3_batch_round_trips_regime_table_and_reassign_prior_hash() {
+        let table = vec![(3u16, 9u64), (100, 12), (4095, 900)];
+        let batch = v3_batch(
+            vec![
+                ReplicaOp::Delete { tx_key: key(1) },
+                reassign_op(Some([0x77; 32])),
+            ],
+            table.clone(),
+        );
+        let bytes = batch.serialize();
+        assert_eq!(bytes[0], BATCH_PROTOCOL_V3, "V3 batch must lead with 3");
+        let decoded = ReplicaBatch::deserialize(&bytes).unwrap();
+        assert_eq!(decoded, batch, "V3 round-trip must preserve every field");
+        assert_eq!(decoded.regime_table.as_deref(), Some(table.as_slice()));
+        match &decoded.ops[1] {
+            ReplicaOp::Reassign {
+                prior_utxo_hash, ..
+            } => assert_eq!(
+                *prior_utxo_hash,
+                Some([0x77; 32]),
+                "V3 Reassign must carry the prior identity across the wire"
+            ),
+            other => panic!("expected Reassign, got {other:?}"),
+        }
+    }
+
+    /// §4.2: an EMPTY regime table still round-trips as V3 (regime-present),
+    /// never silently degrades to V2 — the receiver's I12 arm distinguishes
+    /// "V3 with no stamps for the touched shards" from a V2 frame.
+    #[test]
+    fn v3_batch_with_empty_table_stays_v3() {
+        let batch = v3_batch(vec![ReplicaOp::Delete { tx_key: key(2) }], vec![]);
+        let bytes = batch.serialize();
+        assert_eq!(bytes[0], BATCH_PROTOCOL_V3);
+        let decoded = ReplicaBatch::deserialize(&bytes).unwrap();
+        assert_eq!(decoded.regime_table.as_deref(), Some(&[][..]));
+    }
+
+    /// V2 regression: with `regime_table: None` the serialized frame is
+    /// BYTE-IDENTICAL to the pre-P1 V2 wire — version byte 2, 53-byte
+    /// header, V2 op encoding (a Reassign's in-memory prior hash is
+    /// dropped, keeping the 81-byte body).
+    #[test]
+    fn v2_wire_bytes_unchanged_by_v3_support() {
+        let op = reassign_op(Some([0x55; 32]));
+        let batch = ReplicaBatch {
+            first_sequence: 9,
+            ops: vec![op.clone()],
+            trace_ctx: None,
+            source_node_id: Some(4),
+            cluster_key: 6,
+            regime_table: None,
+        };
+        let bytes = batch.serialize();
+
+        // Hand-assembled pre-P1 V2 frame.
+        let mut expected = Vec::new();
+        expected.push(BATCH_PROTOCOL_V2);
+        expected.extend_from_slice(&9u64.to_le_bytes());
+        expected.extend_from_slice(&1u32.to_le_bytes());
+        expected.extend_from_slice(&[0u8; WireTraceContext::SIZE]);
+        expected.extend_from_slice(&4u64.to_le_bytes());
+        expected.extend_from_slice(&6u64.to_le_bytes());
+        let mut ob = Vec::new();
+        ob.push(7u8); // OP_REASSIGN
+        ob.extend_from_slice(&key(0x21).txid);
+        ob.extend_from_slice(&3u32.to_le_bytes());
+        ob.extend_from_slice(&[0xAB; 32]);
+        ob.extend_from_slice(&800_000u32.to_le_bytes());
+        ob.extend_from_slice(&1_000u32.to_le_bytes());
+        ob.extend_from_slice(&5u32.to_le_bytes());
+        assert_eq!(ob.len(), 81, "V2 Reassign wire body must stay 81 bytes");
+        expected.extend_from_slice(&(ob.len() as u32).to_le_bytes());
+        expected.extend_from_slice(&ob);
+
+        assert_eq!(
+            bytes, expected,
+            "regime_table: None must serialize byte-identical to the pre-P1 V2 wire"
+        );
+
+        // And the V2 decode maps the absent prior hash back to None.
+        let decoded = ReplicaBatch::deserialize(&bytes).unwrap();
+        assert_eq!(decoded.regime_table, None);
+        match &decoded.ops[0] {
+            ReplicaOp::Reassign {
+                prior_utxo_hash, ..
+            } => assert_eq!(
+                *prior_utxo_hash, None,
+                "V2 wire carries no prior identity — decode must be None (live-read)"
+            ),
+            other => panic!("expected Reassign, got {other:?}"),
+        }
+    }
+
+    /// §4.9: the V3 op encoding maps `prior_utxo_hash: None` to the
+    /// all-zero hash on the wire, and an all-zero hash decodes back to
+    /// `None` (live-read fallback) — while any non-zero hash survives as
+    /// `Some`.
+    #[test]
+    fn v3_reassign_zero_prior_hash_is_none() {
+        let none_bytes = reassign_op(None).serialize_v3();
+        assert_eq!(none_bytes.len(), 113, "V3 Reassign body must be 112+tag");
+        assert_eq!(&none_bytes[81..113], &[0u8; 32]);
+        let (decoded, consumed) = ReplicaOp::deserialize_v3(&none_bytes).unwrap();
+        assert_eq!(consumed, 113);
+        assert_eq!(decoded, reassign_op(None));
+
+        let some_bytes = reassign_op(Some([1u8; 32])).serialize_v3();
+        let (decoded, _) = ReplicaOp::deserialize_v3(&some_bytes).unwrap();
+        assert_eq!(decoded, reassign_op(Some([1u8; 32])));
+
+        // A truncated V3 Reassign (V2-sized body) is a hard reject, never a
+        // silent fallback to the V2 shape.
+        let v2_sized = reassign_op(Some([1u8; 32])).serialize();
+        let err = ReplicaOp::deserialize_v3(&v2_sized)
+            .expect_err("V2-sized Reassign must not decode under the V3 op decoder");
+        assert!(matches!(err, ProtocolError::BufferTooShort { .. }));
+    }
+
+    /// §4.2 canonical-form enforcement: unsorted, duplicate, out-of-range
+    /// shard, and over-count regime tables are hard decode rejects.
+    #[test]
+    fn v3_regime_table_rejects_non_canonical() {
+        let base = v3_batch(vec![ReplicaOp::Delete { tx_key: key(3) }], vec![]);
+
+        let encode_with_table = |table: &[(u16, u64)]| {
+            let mut b = base.clone();
+            b.regime_table = Some(table.to_vec());
+            b.serialize()
+        };
+
+        // Unsorted.
+        let err = ReplicaBatch::deserialize(&encode_with_table(&[(5, 1), (3, 1)]))
+            .expect_err("unsorted table must reject");
+        assert!(matches!(err, ProtocolError::NonCanonicalRegimeTable));
+
+        // Duplicate.
+        let err = ReplicaBatch::deserialize(&encode_with_table(&[(5, 1), (5, 2)]))
+            .expect_err("duplicate shard must reject");
+        assert!(matches!(err, ProtocolError::NonCanonicalRegimeTable));
+
+        // Shard out of range.
+        let err = ReplicaBatch::deserialize(&encode_with_table(&[(4096, 1)]))
+            .expect_err("shard >= NUM_SHARDS must reject");
+        assert!(matches!(err, ProtocolError::NonCanonicalRegimeTable));
+
+        // touched_count > NUM_SHARDS: splice a hostile count after a valid
+        // empty-table frame's op stream.
+        let mut bytes = encode_with_table(&[]);
+        let count_off = bytes.len() - 2;
+        bytes[count_off..].copy_from_slice(&4097u16.to_le_bytes());
+        let err =
+            ReplicaBatch::deserialize(&bytes).expect_err("touched_count > NUM_SHARDS must reject");
+        assert!(matches!(err, ProtocolError::NonCanonicalRegimeTable));
+
+        // Truncated table: count says 2, payload backs 1 entry.
+        let mut bytes = encode_with_table(&[(9, 4)]);
+        let count_off = bytes.len() - 10 - 2;
+        bytes[count_off..count_off + 2].copy_from_slice(&2u16.to_le_bytes());
+        let err = ReplicaBatch::deserialize(&bytes).expect_err("truncated table must reject");
+        assert!(matches!(err, ProtocolError::BufferTooShort { .. }));
+
+        // A V3 frame with NO table bytes at all (missing touched_count) is
+        // a hard reject — never defaulted to "empty table".
+        let ok_bytes = encode_with_table(&[]);
+        let missing_count = &ok_bytes[..ok_bytes.len() - 2];
+        let err = ReplicaBatch::deserialize(missing_count)
+            .expect_err("missing touched_count must reject");
+        assert!(matches!(err, ProtocolError::BufferTooShort { .. }));
+    }
+
+    /// §4.2 reservation clamp: a hostile `touched_count` with no backing
+    /// bytes must fail cleanly, never pre-allocate `count` entries
+    /// (mirrors `replica_batch_huge_count_does_not_over_allocate`).
+    #[test]
+    fn v3_regime_table_huge_count_does_not_over_allocate() {
+        let mut bytes = v3_batch(vec![], vec![]).serialize();
+        let count_off = bytes.len() - 2;
+        // 4096 is <= NUM_SHARDS so it passes the count cap, but the payload
+        // backs zero entries — the clamp bounds the reservation and the
+        // per-entry need() rejects.
+        bytes[count_off..].copy_from_slice(&4096u16.to_le_bytes());
+        let err = ReplicaBatch::deserialize(&bytes)
+            .expect_err("unbacked touched_count must error, not allocate");
+        assert!(matches!(err, ProtocolError::BufferTooShort { .. }));
+    }
+
+    /// The shared touched-shards derivation covers every txid a
+    /// `SetMinedBatch` carries — not just single-key ops.
+    #[test]
+    fn touched_shards_covers_set_mined_batch_txids() {
+        use crate::cluster::shards::ShardTable;
+        let k1 = key(1);
+        let k2 = key(2);
+        let k3 = key(3);
+        let ops = [
+            ReplicaOp::Delete { tx_key: k1 },
+            ReplicaOp::SetMinedBatch {
+                block_id: 1,
+                block_height: 1,
+                subtree_idx: 0,
+                on_longest_chain: true,
+                current_block_height: 1,
+                block_height_retention: 1,
+                unset: false,
+                txids: vec![k2, k3],
+            },
+        ];
+        let shards = touched_shards(ops.iter());
+        for k in [k1, k2, k3] {
+            assert!(
+                shards.contains(&ShardTable::shard_for_key(&k)),
+                "touched_shards must include every carried txid's shard"
+            );
+        }
+    }
+
+    /// §4.2: the ERR_STALE_REGIME NAK hint round-trips, and the decoder
+    /// returns `None` for foreign payloads (other codes, truncation).
+    #[test]
+    fn stale_regime_nak_round_trip_and_foreign_payload_rejection() {
+        let payload = encode_stale_regime_nak(1234, 987_654_321);
+        assert_eq!(
+            decode_stale_regime_nak(&payload),
+            Some((1234, 987_654_321)),
+            "NAK hint must round-trip"
+        );
+
+        // Other error code (ERR_STALE_EPOCH shape) → None.
+        let mut foreign = Vec::new();
+        foreign.extend_from_slice(&crate::protocol::opcodes::ERR_STALE_EPOCH.to_le_bytes());
+        foreign.extend_from_slice(&0u16.to_le_bytes());
+        assert_eq!(decode_stale_regime_nak(&foreign), None);
+
+        // Truncated hint → None.
+        assert_eq!(decode_stale_regime_nak(&payload[..payload.len() - 1]), None);
+        // Empty → None.
+        assert_eq!(decode_stale_regime_nak(&[]), None);
     }
 }

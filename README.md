@@ -605,6 +605,8 @@ All operations are batch-oriented. Single-item operations are batches of size 1.
 | 35 | `DELETED_CHILDREN` | Idempotent re-spend rejected: the child txid is present in the parent's deleted-children audit list (error data: 1-byte child_count) |
 | 36 | `NOT_DUE` | A guarded DAH-sweep delete re-validated the record under lock and found it no longer due (e.g. a concurrent `PreserveUntilBatch`); the record is kept, not deleted. Produced only by the internal `ProcessExpiredPreservations` sweep — a direct client `DeleteBatch` is unconditional and never returns this |
 | 37 | `MIGRATION_TARGET_NOT_READY` | A migration completion/transfer handshake arrived stamped with a topology epoch the receiver has not yet activated; retryable (the target will activate the term shortly — never treat as a completed handoff) |
+| 38 | `RESPONSE_TOO_LARGE` | The assembled response frame would exceed the 16 MiB wire limit; re-request the offending record alone or with a narrower field mask |
+| 39 | `STALE_REGIME` | Inter-node only: a replica's per-shard regime gate rejected a replication batch (stale or absent regime stamp under enforcement); the sending master refreshes topology and the client sees `REPLICATION_FAILED` |
 | 255 | `INTERNAL` | Unexpected server error |
 
 ### Response status codes

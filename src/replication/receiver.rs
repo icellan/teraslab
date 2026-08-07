@@ -116,6 +116,16 @@ pub struct ReplicationReceiver {
     /// non-zero) to fence stale-epoch masters before any engine work.
     /// `0` means "unknown" — accept unconditionally (V1-compat).
     local_cluster_key: Arc<AtomicU64>,
+    /// P1 §4.2 — narrow read handle onto the node's committed regime
+    /// state (the [`TopologyAuthority`] the coordinator installs commits
+    /// into), following the `local_cluster_key` sharing pattern. The
+    /// per-batch regime gate reads
+    /// [`TopologyAuthority::regime_enforcement_active`] and
+    /// [`TopologyAuthority::committed_regime`] through it; it NEVER
+    /// writes (I9 — a receiver's regime state is updated only by
+    /// installing a commit). `None` (non-clustered / tests) leaves the
+    /// gate permanently inactive.
+    regime_view: Option<Arc<crate::cluster::topology::TopologyAuthority>>,
     /// Shared HMAC secret for authenticated inter-node TCP frames.
     auth_secret: Option<Arc<Vec<u8>>>,
 }
@@ -146,6 +156,7 @@ impl ReplicationReceiver {
             running: Arc::new(AtomicBool::new(true)),
             applied: Arc::new(ReplicaAppliedTracker::in_memory()),
             local_cluster_key,
+            regime_view: None,
             auth_secret: None,
         }
     }
@@ -153,6 +164,16 @@ impl ReplicationReceiver {
     /// Require HMAC-framed request/response traffic on this receiver.
     pub fn with_auth_secret(mut self, secret: Vec<u8>) -> Self {
         self.auth_secret = Some(Arc::new(secret));
+        self
+    }
+
+    /// P1 §4.2 — wire the committed-regime read handle so this receiver's
+    /// per-batch regime gate is honored (see the `regime_view` field doc).
+    pub fn with_regime_view(
+        mut self,
+        authority: Arc<crate::cluster::topology::TopologyAuthority>,
+    ) -> Self {
+        self.regime_view = Some(authority);
         self
     }
 
@@ -179,6 +200,7 @@ impl ReplicationReceiver {
             running: Arc::new(AtomicBool::new(true)),
             applied: Arc::new(tracker),
             local_cluster_key: Arc::new(AtomicU64::new(0)),
+            regime_view: None,
             auth_secret: None,
         })
     }
@@ -223,6 +245,7 @@ impl ReplicationReceiver {
         let last_applied = self.last_applied_sequence.clone();
         let applied = self.applied.clone();
         let cluster_key = self.local_cluster_key.clone();
+        let regime_view = self.regime_view.clone();
         let auth_secret = self.auth_secret.clone();
 
         std::thread::spawn(move || {
@@ -234,6 +257,7 @@ impl ReplicationReceiver {
                         let la = last_applied.clone();
                         let ap = applied.clone();
                         let ck = cluster_key.clone();
+                        let rv = regime_view.clone();
                         let secret = auth_secret.clone();
                         std::thread::spawn(move || {
                             let ctx = ConnectionContext {
@@ -242,6 +266,7 @@ impl ReplicationReceiver {
                                 last_applied: &la,
                                 applied: ap,
                                 local_cluster_key: ck,
+                                regime_view: rv,
                                 auth_secret: secret,
                                 frame_deadline: FRAME_ASSEMBLY_TIMEOUT,
                             };
@@ -293,6 +318,9 @@ struct ConnectionContext<'a> {
     last_applied: &'a AtomicU64,
     applied: Arc<ReplicaAppliedTracker>,
     local_cluster_key: Arc<AtomicU64>,
+    /// P1 §4.2 — read handle for the per-batch regime gate (see the
+    /// [`ReplicationReceiver::regime_view`] field doc).
+    regime_view: Option<Arc<crate::cluster::topology::TopologyAuthority>>,
     auth_secret: Option<Arc<Vec<u8>>>,
     /// E-1: whole-frame assembly deadline applied to all post-length-prefix
     /// reads (see [`FRAME_ASSEMBLY_TIMEOUT`]). Injectable so tests can drive
@@ -308,6 +336,7 @@ fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, ctx: Connecti
         last_applied,
         applied,
         local_cluster_key,
+        regime_view,
         auth_secret,
         frame_deadline,
     } = ctx;
@@ -539,13 +568,17 @@ fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, ctx: Connecti
         };
 
         let response = if request.op_code == OP_REPLICA_BATCH {
-            handle_replica_batch_with_tracker(
+            handle_replica_batch_regime_gated(
                 &request,
                 engine,
                 last_applied,
                 Some(applied.as_ref()),
                 &stream_key,
                 local_cluster_key.load(Ordering::Acquire),
+                regime_view.as_deref(),
+                // The dedicated listener has no coordinator handle; the
+                // stage-4 completeness signal rides the dispatch path.
+                None,
             )
         } else {
             // Unknown opcode for replication receiver
@@ -571,6 +604,12 @@ fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, ctx: Connecti
     }
 }
 
+/// P1 stage 4 — the receiver-side completeness-signal callback type:
+/// invoked once per successfully applied TRACKED batch with the touched
+/// shards paired with their pre-apply emptiness (see
+/// [`handle_replica_batch_regime_gated`]).
+pub type TrackedApplySignal<'a> = &'a dyn Fn(&[(u16, bool)]);
+
 /// Process an `OP_REPLICA_BATCH` request frame against the
 /// [`DEFAULT_STREAM_KEY`] with an in-memory idempotency journal.
 ///
@@ -590,6 +629,8 @@ pub fn handle_replica_batch(
         engine,
         last_applied,
         /* local_cluster_key */ 0,
+        /* regime */ None,
+        /* on_tracked_apply */ None,
     )
 }
 
@@ -608,6 +649,8 @@ pub fn handle_replica_batch_with_cluster_key(
     engine: &Engine,
     last_applied: &AtomicU64,
     local_cluster_key: u64,
+    regime: Option<&crate::cluster::topology::TopologyAuthority>,
+    on_tracked_apply: Option<TrackedApplySignal<'_>>,
 ) -> ResponseFrame {
     // R-D1/D-3: this fallback runs UNTRACKED — no per-stream watermark,
     // no duplicate skip, no gap NAK. Every op in every batch is applied
@@ -622,13 +665,15 @@ pub fn handle_replica_batch_with_cluster_key(
     // `init_replica_applied_tracker` and get the real per-stream
     // tracker; this entry point is reserved for tests, single-stream
     // harnesses, and the in-process compensation path.
-    handle_replica_batch_with_tracker(
+    handle_replica_batch_regime_gated(
         request,
         engine,
         last_applied,
         None,
         DEFAULT_STREAM_KEY,
         local_cluster_key,
+        regime,
+        on_tracked_apply,
     )
 }
 
@@ -683,6 +728,13 @@ pub fn handle_replica_batch_with_cluster_key(
 /// epoch (typically loaded from the coordinator-owned atomic shared
 /// with the local
 /// [`ReplicationManager`](crate::replication::manager::ReplicationManager)).
+///
+/// This entry point runs with the P1 §4.2 regime gate INACTIVE
+/// (`regime = None`) — kept for the many call sites and tests that
+/// predate the gate. Production paths (the dedicated receiver listener
+/// and `server::dispatch`'s `OP_REPLICA_BATCH` arm) route through
+/// [`handle_replica_batch_regime_gated`] with the node's
+/// [`TopologyAuthority`](crate::cluster::topology::TopologyAuthority).
 pub fn handle_replica_batch_with_tracker(
     request: &RequestFrame,
     engine: &Engine,
@@ -690,6 +742,67 @@ pub fn handle_replica_batch_with_tracker(
     applied: Option<&ReplicaAppliedTracker>,
     stream_key: &str,
     local_cluster_key: u64,
+) -> ResponseFrame {
+    handle_replica_batch_regime_gated(
+        request,
+        engine,
+        last_applied,
+        applied,
+        stream_key,
+        local_cluster_key,
+        None,
+        None,
+    )
+}
+
+/// [`handle_replica_batch_with_tracker`] plus the P1 §4.2 per-shard
+/// regime gate.
+///
+/// `regime` is a read handle onto this node's committed regime state
+/// (I9: read-only — the gate never updates regime state from a batch).
+/// While [`TopologyAuthority::regime_enforcement_active`] is true, each
+/// shard the batch's ops touch is checked against the batch's V3 regime
+/// table BEFORE any tracker or engine work, alongside the cluster_key
+/// gates:
+///
+/// * stamp `<` local committed regime → reject the WHOLE batch with
+///   `ERR_STALE_REGIME(shard, local_regime)`; the applied watermark does
+///   not advance.
+/// * stamp `>` local → accept (the promoting commit is in flight here);
+///   the local regime state is NOT updated (I9).
+/// * stamp `==` local → accept.
+/// * regime-absent — a V2 frame, or a V3 table missing a touched shard —
+///   → reject with `ERR_STALE_REGIME` (I12: no sender opt-out).
+///
+/// While enforcement is NOT active, V3 batches are still accepted
+/// (acceptance is a binary capability, not committed state — I12) and
+/// their regime table is ignored; V2 batches behave exactly as before.
+///
+/// # P1 stage 4 — the completeness-signal callback
+///
+/// `on_tracked_apply`, when present, is invoked exactly once per
+/// SUCCESSFULLY applied, TRACKED batch (never for probes, true
+/// duplicates, gap NAKs, migration or out-of-band batches, or any error
+/// path), after the batch is durable and immediately before the OK ack.
+/// It receives the batch's touched shards paired with whether each shard
+/// was EMPTY before the apply — the receiver-side observation feeding the
+/// §4.3 catch-up completeness signal
+/// (`RunningCluster::note_replica_stream_applies`). Under active regime
+/// enforcement a shard whose batch stamp is AHEAD of the local committed
+/// regime (a promoting commit in flight) is withheld from the callback —
+/// its `Full` re-stamp belongs to the commit install, not this signal.
+///
+/// [`TopologyAuthority::regime_enforcement_active`]: crate::cluster::topology::TopologyAuthority::regime_enforcement_active
+#[allow(clippy::too_many_arguments)]
+pub fn handle_replica_batch_regime_gated(
+    request: &RequestFrame,
+    engine: &Engine,
+    last_applied: &AtomicU64,
+    applied: Option<&ReplicaAppliedTracker>,
+    stream_key: &str,
+    local_cluster_key: u64,
+    regime: Option<&crate::cluster::topology::TopologyAuthority>,
+    on_tracked_apply: Option<TrackedApplySignal<'_>>,
 ) -> ResponseFrame {
     let batch = match ReplicaBatch::deserialize(&request.payload) {
         Ok(b) => b,
@@ -789,6 +902,66 @@ pub fn handle_replica_batch_with_tracker(
             status: STATUS_ERROR,
             payload,
         };
+    }
+
+    // P1 §4.2 — per-shard regime gate, evaluated alongside the cluster_key
+    // gates above and ONLY while regime enforcement is active on this node
+    // (committed `regime_enforced` AND a configured secret — I11; consumers
+    // must use the predicate, never the raw committed flag). Placement
+    // mirrors the stale-cluster_key rejects: BEFORE the migration-batch
+    // bypass and BEFORE any tracker/engine work, so a rejected batch
+    // leaves the applied watermark unmoved and nothing is applied.
+    //
+    // Per touched shard s (the same `touched_shards` derivation senders
+    // stamp from): stamp < local committed regime → reject the WHOLE
+    // batch; stamp > local → accept (the promoting commit is in flight
+    // here; the local regime state is NEVER updated from a batch — I9);
+    // equal → accept. A regime-ABSENT batch — a V2 frame, or a V3 table
+    // missing a touched shard — is rejected outright (I12: no sender
+    // opt-out; mirrors the C24 zero-wildcard closure). When enforcement
+    // is NOT active, V3 batches are accepted (capability, not committed
+    // state — I12) and the table is ignored.
+    if let Some(authority) = regime
+        && authority.regime_enforcement_active()
+    {
+        let touched = crate::replication::protocol::touched_shards(batch.ops.iter());
+        let stale_shard = match &batch.regime_table {
+            // Regime-absent (V2) frame under enforcement: reject. The hint
+            // names the first touched shard (shard 0 for an op-less probe);
+            // it is routing advice only (I9).
+            None => Some(touched.first().copied().unwrap_or(0)),
+            Some(table) => touched.iter().copied().find(|shard| {
+                match table.binary_search_by_key(shard, |&(s, _)| s) {
+                    // Stamped: stale only when strictly behind the local
+                    // committed regime.
+                    Ok(idx) => table[idx].1 < authority.committed_regime(*shard),
+                    // Touched shard missing from the table: regime-absent
+                    // for that shard — fail closed (I12).
+                    Err(_) => true,
+                }
+            }),
+        };
+        if let Some(shard) = stale_shard {
+            let local_regime = authority.committed_regime(shard);
+            if let Some(m) = crate::metrics::replication_metrics() {
+                m.replica_rejected_stale_regime.inc();
+            }
+            tracing::warn!(
+                shard,
+                local_regime,
+                batch_cluster_key = batch.cluster_key,
+                regime_absent = batch.regime_table.is_none(),
+                first_sequence = batch.first_sequence,
+                ops_len = batch.ops.len(),
+                is_migration = request.flags & FLAG_MIGRATION_BATCH != 0,
+                "replica rejected batch: stale regime (P1 §4.2 gate)"
+            );
+            return ResponseFrame {
+                request_id: request.request_id,
+                status: STATUS_ERROR,
+                payload: crate::replication::protocol::encode_stale_regime_nak(shard, local_regime),
+            };
+        }
     }
 
     let effective_stream_key = batch
@@ -943,6 +1116,42 @@ pub fn handle_replica_batch_with_tracker(
         0
     };
 
+    // P1 stage 4 — capture the completeness-signal observation BEFORE the
+    // apply loop mutates anything: the touched shards of the ops that will
+    // actually apply, each paired with "was the shard empty pre-apply".
+    // Only for TRACKED batches with real work (see the doc comment).
+    let stream_signal_touched: Option<Vec<(u16, bool)>> = match on_tracked_apply {
+        Some(_) if tracked && skip_count < batch.ops.len() => {
+            let touched =
+                crate::replication::protocol::touched_shards(batch.ops.iter().skip(skip_count));
+            let signal: Vec<(u16, bool)> = touched
+                .into_iter()
+                .filter(|&shard| {
+                    // Under active enforcement, withhold a shard whose batch
+                    // stamp is AHEAD of the local committed regime (promoting
+                    // commit in flight): the accept-newer arm applies it, but
+                    // the Full re-stamp belongs to the commit install (I13ii).
+                    match regime {
+                        Some(authority) if authority.regime_enforcement_active() => batch
+                            .regime_table
+                            .as_ref()
+                            .and_then(|table| {
+                                table
+                                    .binary_search_by_key(&shard, |&(s, _)| s)
+                                    .ok()
+                                    .map(|idx| table[idx].1)
+                            })
+                            .is_some_and(|stamp| stamp <= authority.committed_regime(shard)),
+                        _ => true,
+                    }
+                })
+                .map(|shard| (shard, engine.shard_record_count(shard) == 0))
+                .collect();
+            Some(signal)
+        }
+        _ => None,
+    };
+
     // Migration-baseline applies suppress the HEAVY per-op engine redo (the
     // single 64 MiB redo log would otherwise fill during a large baseline
     // stream — `redo log full` — stalling scale-down convergence and aborting
@@ -989,6 +1198,11 @@ pub fn handle_replica_batch_with_tracker(
     // store) instead of appending them inline. The mutations still happen
     // per-op in the loop (mutate-first, journal-second is preserved); only the
     // journaling is deferred to the ONE atomic admission after the loop.
+    //
+    // F-7 (§4.9) — while regime enforcement is active on this node, a
+    // Reassign with no prior identity is refused (any batch that reached
+    // this loop under enforcement already passed the V3/I12 gate above).
+    let reassign_requires_prior = regime.is_some_and(|a| a.regime_enforcement_active());
     let mut redo_entries: Vec<(crate::redo::RedoOp, u8)> = Vec::new();
     for (idx, (seq, op)) in (start_seq..)
         .zip(batch.ops.iter().skip(skip_count))
@@ -1005,6 +1219,7 @@ pub fn handle_replica_batch_with_tracker(
             journal,
             is_migration,
             tracked,
+            reassign_requires_prior,
             &mut redo_entries,
         ) {
             // Route on the TYPE, never on the message. A missing record is the
@@ -1145,6 +1360,15 @@ pub fn handle_replica_batch_with_tracker(
         // could move last_applied backward if batches complete out of
         // sequence order.
         last_applied.fetch_max(through, Ordering::Relaxed);
+    }
+
+    // P1 stage 4 — the batch is applied and durable; feed the completeness
+    // signal (see the doc comment). Runs only on the success path, after
+    // the tracker flush, before the ack.
+    if let (Some(signal), Some(touched)) = (on_tracked_apply, stream_signal_touched.as_ref())
+        && !touched.is_empty()
+    {
+        signal(touched);
     }
 
     let ack = ReplicaAck::Ok {
@@ -1686,8 +1910,19 @@ pub fn apply_op_journal(
     // to steady-state tracked BATCHES, driven from the batch loop below. With
     // `nak_on_missing = false` the `MissingRecord` variant is unreachable here,
     // so flattening to a string loses no routing information.
-    apply_op_journal_inner(engine, op, journal, is_migration, false, &mut collected)
-        .map_err(|e| e.to_string())?;
+    // `reassign_requires_prior = false`: the single-op convenience serves
+    // non-clustered / in-process paths with no enforcement context; the
+    // regime-gated batch handler passes the real enforcement state.
+    apply_op_journal_inner(
+        engine,
+        op,
+        journal,
+        is_migration,
+        false,
+        false,
+        &mut collected,
+    )
+    .map_err(|e| e.to_string())?;
     for (redo_op, device_id) in &collected {
         engine.append_replica_redo_entry_to_store(redo_op, *device_id)?;
     }
@@ -1705,6 +1940,7 @@ fn apply_op_journal_inner(
     journal: bool,
     is_migration: bool,
     nak_on_missing: bool,
+    reassign_requires_prior: bool,
     redo_out: &mut Vec<(crate::redo::RedoOp, u8)>,
 ) -> std::result::Result<(), ReplicaApplyError> {
     // When journalling is disabled (migration-baseline apply), suppress the
@@ -2064,21 +2300,44 @@ fn apply_op_journal_inner(
             new_hash,
             block_height,
             spendable_after,
+            prior_utxo_hash,
             ..
         } => {
-            let old_hash = match engine.read_slot(tx_key, *offset) {
+            // §8 review F-7 (§4.9) — under committed regime enforcement, a
+            // V3 Reassign carrying NO prior identity is NON-REPLAYABLE:
+            // applying it would resurrect the unguarded live-slot read
+            // (a replayed frame re-stamping a superseded reassign) that
+            // §4.9 retires. Current senders never produce it (the F-7
+            // converter escalates legacy entries to the per-key record
+            // image); this guard fails closed against a pre-fix sender.
+            // The escalation IS the §4.9 per-key repair: on a tracked
+            // batch the `MissingRecord` NAK makes the master re-ship the
+            // record's full current image; a migration/out-of-band batch
+            // takes the tolerant skip and the divergence is caught by the
+            // migration completion's manifest verification.
+            if reassign_requires_prior && prior_utxo_hash.is_none() {
+                return missing_record_apply_outcome("reassign_unguarded", tx_key, nak_on_missing);
+            }
+            let live_hash = match engine.read_slot(tx_key, *offset) {
                 Ok(slot) => slot.hash,
                 Err(_) => {
                     return missing_record_apply_outcome("reassign", tx_key, nak_on_missing);
                 }
             };
-            // C28: stash the pre-apply hash for the post-apply `ReassignV2`
-            // redo (the guard identity the slot will no longer carry).
-            reassign_prior_hash = Some(old_hash);
+            // §4.9: a V3 op carries the master's pre-apply slot identity —
+            // pass IT as the expected hash so a replayed frame reasserting
+            // a superseded reassign no-ops structurally instead of
+            // re-stamping whatever is there now. A V2 op (None) keeps the
+            // historical live-slot read.
+            let expected_hash = prior_utxo_hash.unwrap_or(live_hash);
+            // C28: stash the pre-apply guard identity for the post-apply
+            // `ReassignV2` redo (the identity the slot will no longer
+            // carry).
+            reassign_prior_hash = Some(expected_hash);
             let req = ReassignRequest {
                 tx_key: *tx_key,
                 offset: *offset,
-                utxo_hash: old_hash,
+                utxo_hash: expected_hash,
                 new_utxo_hash: *new_hash,
                 block_height: *block_height,
                 spendable_after: *spendable_after,
@@ -2086,6 +2345,17 @@ fn apply_op_journal_inner(
             match engine.reassign(&req) {
                 Ok(_) => Ok(()),
                 Err(crate::ops::error::SpendError::NotFrozen { .. }) => Ok(()),
+                // §4.9: the carried prior identity no longer matches the
+                // live slot — this op is a replay of an operation the slot
+                // has moved past. Idempotent no-op, mirroring
+                // `RedoOp::ReassignV2`'s recovery guard (`ReplayResult::
+                // Skipped` on `slot.hash != prior_utxo_hash`). Unreachable
+                // for V2 ops: `expected_hash` IS the live hash there.
+                Err(crate::ops::error::SpendError::UtxoHashMismatch { .. })
+                    if prior_utxo_hash.is_some() =>
+                {
+                    Ok(())
+                }
                 Err(crate::ops::error::SpendError::TxNotFound) => {
                     record_apply_skipped_missing_tx("reassign", tx_key);
                     Ok(())
@@ -3166,6 +3436,7 @@ mod tests {
             trace_ctx: None,
             source_node_id: None,
             cluster_key: 0,
+            regime_table: None,
         };
         RequestFrame {
             request_id,
@@ -3199,6 +3470,7 @@ mod tests {
                 last_applied: &last_applied,
                 applied,
                 local_cluster_key,
+                regime_view: None,
                 auth_secret: None,
                 frame_deadline,
             };
@@ -3357,6 +3629,7 @@ mod tests {
                 last_applied: &last_applied,
                 applied,
                 local_cluster_key,
+                regime_view: None,
                 auth_secret: Some(Arc::new(secret)),
                 frame_deadline,
             };
@@ -4215,7 +4488,7 @@ mod tests {
             master_generation: 5,
         };
         let mut redo_out = Vec::new();
-        let r = apply_op_journal_inner(&engine, &op, true, false, false, &mut redo_out);
+        let r = apply_op_journal_inner(&engine, &op, true, false, false, false, &mut redo_out);
         assert!(
             r.is_ok(),
             "out-of-band gen-sync on an absent record must be a benign skip \
@@ -4245,7 +4518,7 @@ mod tests {
             master_generation: 5,
         };
         let mut redo_out = Vec::new();
-        let err = apply_op_journal_inner(&engine, &op, true, false, true, &mut redo_out)
+        let err = apply_op_journal_inner(&engine, &op, true, false, true, false, &mut redo_out)
             .expect_err("tracked-batch gen-sync on an absent record must still hard-error");
         match err {
             ReplicaApplyError::MissingRecord { op_name, tx_key } => {
@@ -4294,7 +4567,7 @@ mod tests {
         let mut redo_out = Vec::new();
         // nak_on_missing = true, is_migration = false: the tracked steady-state
         // batch shape a client OP_DELETE_BATCH fan-out actually produces.
-        let r = apply_op_journal_inner(&engine, &op, true, false, true, &mut redo_out);
+        let r = apply_op_journal_inner(&engine, &op, true, false, true, false, &mut redo_out);
         assert_eq!(
             r,
             Ok(()),
@@ -4340,7 +4613,7 @@ mod tests {
 
         let mut redo_out = Vec::new();
         assert_eq!(
-            apply_op_journal_inner(&engine, &op, true, false, true, &mut redo_out),
+            apply_op_journal_inner(&engine, &op, true, false, true, false, &mut redo_out),
             Ok(()),
             "first delivery must apply"
         );
@@ -4360,7 +4633,7 @@ mod tests {
 
         let mut redo_out2 = Vec::new();
         assert_eq!(
-            apply_op_journal_inner(&engine, &op, true, false, true, &mut redo_out2),
+            apply_op_journal_inner(&engine, &op, true, false, true, false, &mut redo_out2),
             Ok(()),
             "re-delivery of the same delete must be an idempotent success, never a \
              MissingRecord NAK (which would make the master re-ship the record)"
@@ -5136,6 +5409,7 @@ mod tests {
             block_height: 800_000,
             spendable_after: 1_000,
             master_generation: 1,
+            prior_utxo_hash: None,
         };
         apply_op(&engine, &reassign).unwrap();
 
@@ -5196,6 +5470,7 @@ mod tests {
                 block_height: 800_000,
                 spendable_after: 1_000,
                 master_generation: 1,
+                prior_utxo_hash: None,
             },
         )
         .unwrap();
@@ -6342,6 +6617,7 @@ mod tests {
             trace_ctx: None,
             source_node_id: None,
             cluster_key: 0,
+            regime_table: None,
         };
 
         // Batch B: sequence range 5..6 (lower)
@@ -6358,6 +6634,7 @@ mod tests {
             trace_ctx: None,
             source_node_id: None,
             cluster_key: 0,
+            regime_table: None,
         };
 
         // Simulate: batch A completes first, then batch B completes.
@@ -6413,6 +6690,7 @@ mod tests {
             trace_ctx: None,
             source_node_id: None,
             cluster_key: 0,
+            regime_table: None,
         };
         let req_1 = RequestFrame {
             op_code: OP_REPLICA_BATCH,
@@ -6437,6 +6715,7 @@ mod tests {
             trace_ctx: None,
             source_node_id: None,
             cluster_key: 0,
+            regime_table: None,
         };
         let req_2 = RequestFrame {
             op_code: OP_REPLICA_BATCH,
@@ -6477,6 +6756,7 @@ mod tests {
             trace_ctx: None,
             source_node_id: None,
             cluster_key: 0,
+            regime_table: None,
         }
     }
 
@@ -6700,6 +6980,7 @@ mod tests {
             trace_ctx: None,
             source_node_id: None,
             cluster_key: 0,
+            regime_table: None,
         };
         let tracker = ReplicaAppliedTracker::in_memory();
         let stream_key = "peer-bp:5000";
@@ -6814,6 +7095,7 @@ mod tests {
             trace_ctx: None,
             source_node_id: None,
             cluster_key: 0,
+            regime_table: None,
         }
     }
 
@@ -7111,6 +7393,7 @@ mod tests {
             trace_ctx: None,
             source_node_id: None,
             cluster_key: 0,
+            regime_table: None,
         };
 
         // Fill the redo so the batch's atomic admission returns LogFull.
@@ -7645,6 +7928,7 @@ mod tests {
             trace_ctx: None,
             source_node_id: None,
             cluster_key: 0,
+            regime_table: None,
         };
 
         // Fresh stream → watermark 0.
@@ -7961,6 +8245,7 @@ mod tests {
             trace_ctx: Some(wire_ctx),
             source_node_id: None,
             cluster_key: 0,
+            regime_table: None,
         };
         let req = RequestFrame {
             op_code: OP_REPLICA_BATCH,
@@ -8420,6 +8705,789 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------------
+    // P1 §4.2 — per-shard regime gate
+    // -----------------------------------------------------------------------
+
+    /// Build a [`TopologyAuthority`] with an installed committed state:
+    /// `committed_term = term`, the given per-shard regimes, the committed
+    /// `regime_enforced` flag, and a configured secret (I11) unless
+    /// `secret` is false.
+    fn regime_authority(
+        term: u64,
+        shard_regimes: &[(u16, u64)],
+        enforced: bool,
+        secret: bool,
+    ) -> Arc<crate::cluster::topology::TopologyAuthority> {
+        use crate::cluster::shards::NodeId;
+        use crate::cluster::topology::{
+            PersistedTopologyState, RegimeArray, RegimeBlock, TopologyAuthority,
+        };
+        let authority = TopologyAuthority::new(NodeId(1), std::time::Duration::from_secs(1));
+        let mut regime = RegimeArray::default();
+        for &(s, r) in shard_regimes {
+            regime.set(s, r);
+        }
+        let block = RegimeBlock {
+            override_map: std::collections::BTreeMap::new(),
+            regime,
+            regime_enforced: enforced,
+            promotion_enabled: false,
+            rebase: false,
+        };
+        authority.restore(&PersistedTopologyState {
+            peak_cluster_size: 2,
+            committed_term: term,
+            committed_members: vec![NodeId(1), NodeId(2)],
+            committed_voters: vec![NodeId(1), NodeId(2)],
+            voted_term: term,
+            incarnation: 1,
+            committed_voter_ever_seen: vec![NodeId(1), NodeId(2)],
+            committed_placement_version: 1,
+            committed_peak: 2,
+            regime_block: block,
+            data_epoch: None,
+        });
+        authority.set_secret_configured(secret);
+        Arc::new(authority)
+    }
+
+    /// Spend batch stamped with a specific `(cluster_key, regime_table)`.
+    fn batch_with_regime(
+        first_sequence: u64,
+        tx_key: TxKey,
+        offsets: std::ops::Range<u32>,
+        cluster_key: u64,
+        regime_table: Option<Vec<(u16, u64)>>,
+    ) -> ReplicaBatch {
+        let mut b = make_spend_batch(first_sequence, tx_key, offsets, 1);
+        b.cluster_key = cluster_key;
+        b.regime_table = regime_table;
+        b
+    }
+
+    /// §4.2 gate matrix, stale arm: `batch_regime[s] < local_regime[s]`
+    /// rejects the WHOLE batch with `ERR_STALE_REGIME(shard, local)` and
+    /// the applied watermark does not advance.
+    #[test]
+    fn stale_regime_batch_rejected_watermark_unmoved() {
+        let engine = make_engine();
+        let k = key(90);
+        create_record(&engine, k, 4);
+        let shard = crate::cluster::shards::ShardTable::shard_for_key(&k);
+        let authority = regime_authority(10, &[(shard, 9)], true, true);
+        assert!(authority.regime_enforcement_active());
+
+        let last_applied = Arc::new(AtomicU64::new(0));
+        let tracker = ReplicaAppliedTracker::in_memory();
+
+        let gen_before = { engine.read_metadata(&k).unwrap().generation };
+        let slot0_before = engine.read_slot(&k, 0).unwrap().status;
+
+        // Current cluster_key (10), stale regime stamp (5 < 9).
+        let batch = batch_with_regime(1, k, 0..2, 10, Some(vec![(shard, 5)]));
+        let req = batch_request(&batch, 1);
+        let resp = handle_replica_batch_regime_gated(
+            &req,
+            &engine,
+            &last_applied,
+            Some(&tracker),
+            DEFAULT_STREAM_KEY,
+            10,
+            Some(&authority),
+            None,
+        );
+
+        assert_eq!(
+            resp.status, STATUS_ERROR,
+            "stale-regime batch must be rejected with STATUS_ERROR",
+        );
+        assert_eq!(decode_error_code(&resp.payload), ERR_STALE_REGIME);
+        assert_eq!(
+            crate::replication::protocol::decode_stale_regime_nak(&resp.payload),
+            Some((shard, 9)),
+            "the NAK hint must name the stale shard and the receiver's committed regime",
+        );
+
+        // Witnesses: engine untouched, watermark unmoved.
+        assert_eq!(gen_before, { engine.read_metadata(&k).unwrap().generation });
+        assert_eq!(slot0_before, engine.read_slot(&k, 0).unwrap().status);
+        assert_eq!(
+            tracker.get(DEFAULT_STREAM_KEY),
+            0,
+            "rejected batch must not advance the applied watermark",
+        );
+        assert_eq!(last_applied.load(Ordering::Relaxed), 0);
+    }
+
+    /// §4.2 gate matrix, newer arm: `batch_regime[s] > local_regime[s]`
+    /// is accepted (the promoting commit is in flight here) and — I9 —
+    /// the receiver's regime state is NEVER updated from the batch.
+    #[test]
+    fn newer_regime_batch_accepted_local_regime_unchanged() {
+        let engine = make_engine();
+        let k = key(91);
+        create_record(&engine, k, 3);
+        let shard = crate::cluster::shards::ShardTable::shard_for_key(&k);
+        let authority = regime_authority(10, &[(shard, 9)], true, true);
+
+        let last_applied = Arc::new(AtomicU64::new(0));
+        let tracker = ReplicaAppliedTracker::in_memory();
+
+        let batch = batch_with_regime(1, k, 0..1, 10, Some(vec![(shard, 12)]));
+        let through = batch.last_sequence();
+        let req = batch_request(&batch, 1);
+        let resp = handle_replica_batch_regime_gated(
+            &req,
+            &engine,
+            &last_applied,
+            Some(&tracker),
+            DEFAULT_STREAM_KEY,
+            10,
+            Some(&authority),
+            None,
+        );
+
+        assert_eq!(resp.status, STATUS_OK, "newer-regime batch must apply");
+        assert_eq!(tracker.get(DEFAULT_STREAM_KEY), through);
+        assert_eq!(engine.read_slot(&k, 0).unwrap().status, UTXO_SPENT);
+        assert_eq!(
+            authority.committed_regime(shard),
+            9,
+            "I9: the receiver's regime state must NEVER be learned from a batch",
+        );
+    }
+
+    /// §4.2 gate matrix, equal arm: `batch_regime[s] == local_regime[s]`
+    /// is accepted.
+    #[test]
+    fn equal_regime_batch_accepted() {
+        let engine = make_engine();
+        let k = key(92);
+        create_record(&engine, k, 3);
+        let shard = crate::cluster::shards::ShardTable::shard_for_key(&k);
+        let authority = regime_authority(10, &[(shard, 9)], true, true);
+
+        let last_applied = Arc::new(AtomicU64::new(0));
+        let tracker = ReplicaAppliedTracker::in_memory();
+
+        let batch = batch_with_regime(1, k, 0..1, 10, Some(vec![(shard, 9)]));
+        let through = batch.last_sequence();
+        let req = batch_request(&batch, 1);
+        let resp = handle_replica_batch_regime_gated(
+            &req,
+            &engine,
+            &last_applied,
+            Some(&tracker),
+            DEFAULT_STREAM_KEY,
+            10,
+            Some(&authority),
+            None,
+        );
+
+        assert_eq!(resp.status, STATUS_OK, "equal-regime batch must apply");
+        assert_eq!(tracker.get(DEFAULT_STREAM_KEY), through);
+        assert_eq!(engine.read_slot(&k, 0).unwrap().status, UTXO_SPENT);
+    }
+
+    /// I1 — install ordering, pinned at the receiver gate: a batch stamped
+    /// at the old regime is rejected THE INSTANT the promoting commit
+    /// installs (the `handle_commit` call that advances `committed_term`),
+    /// STRICTLY BEFORE any shard table for the term activates.
+    ///
+    /// The receiver's gate reads `TopologyAuthority::committed_regime`
+    /// directly, so the same physical batch flips accept→reject across the
+    /// single `handle_commit` call, while the coordinator-side serving
+    /// surfaces are deliberately left stale: the stand-in live shard table
+    /// is never activated (version unchanged) and the receiver's
+    /// `local_cluster_key` argument still carries the OLD term — exactly
+    /// the gate-closed-but-not-yet-serving skew I1 permits. The reverse
+    /// skew (old-regime batch still accepted after the `committed_term`
+    /// store) is the double-spend window and is what the second delivery
+    /// pins shut. (The intra-`apply_commit_locked` write order — regime
+    /// block before the `committed_term` store, under `commit_apply` — is
+    /// asserted structurally by `apply_installs_regime_block_with_
+    /// committed_term` in topology.rs; this test pins the externally
+    /// observable half.)
+    #[test]
+    fn i1_old_regime_batch_rejected_at_commit_install_before_table_activation() {
+        use crate::cluster::shards::{NodeId, ShardTable};
+        use crate::cluster::topology::{RegimeBlock, TopologyCommit, TopologyTerm};
+
+        let engine = make_engine();
+        let k = key(96);
+        create_record(&engine, k, 4);
+        let shard = ShardTable::shard_for_key(&k);
+        // Live authority at term 10, regime[shard] = 10, enforcement on.
+        let authority = regime_authority(10, &[(shard, 10)], true, true);
+        // RF matters to the apply gates' holder-set computation (I10a).
+        authority.set_replication_factor(2);
+        let members = vec![NodeId(1), NodeId(2)];
+        // Stand-in for the coordinator's LIVE serving table, at the
+        // pre-commit version. Nothing in this test activates it.
+        let live_table =
+            parking_lot::RwLock::new(ShardTable::compute_with_epoch(&members, 2, 10, 1));
+
+        let last_applied = Arc::new(AtomicU64::new(0));
+        let tracker = ReplicaAppliedTracker::in_memory();
+
+        // The old master's batch: current cluster_key, stamped at the
+        // still-current regime 10. Accepted before the install.
+        let batch = batch_with_regime(1, k, 0..1, 10, Some(vec![(shard, 10)]));
+        let resp = handle_replica_batch_regime_gated(
+            &batch_request(&batch, 1),
+            &engine,
+            &last_applied,
+            Some(&tracker),
+            DEFAULT_STREAM_KEY,
+            10,
+            Some(&authority),
+            None,
+        );
+        assert_eq!(resp.status, STATUS_OK, "pre-install, the stamp is current");
+
+        // The promoting commit: term 11, override swaps the shard's master
+        // to the other holder, regime[shard] = 11. Installed through the
+        // production apply path — this is the `committed_term` store.
+        let placement = ShardTable::compute_with_epoch(&members, 2, 1, 1);
+        let promoted = if placement.assignment(shard).master == NodeId(1) {
+            NodeId(2)
+        } else {
+            NodeId(1)
+        };
+        let mut block = RegimeBlock::default();
+        block.override_map.insert(shard, promoted);
+        block.regime.set(shard, 11);
+        block.regime_enforced = true;
+        let cluster_id = authority.cluster_id();
+        let digest =
+            TopologyTerm::compute_digest(11, &cluster_id, &members, 1, 2, NodeId(1), &block);
+        let commit = TopologyCommit {
+            term: 11,
+            proposer: NodeId(1),
+            members: members.clone(),
+            cluster_id,
+            placement_version: 1,
+            committed_peak: 2,
+            digest,
+            voters: members,
+            regime_block: block,
+        };
+        assert_eq!(authority.handle_commit(&commit), Some(11));
+        assert_eq!(authority.committed_term(), 11);
+
+        // THE PIN: the same physical batch — same bytes, same (old)
+        // local_cluster_key, live table still at the pre-commit version —
+        // is now rejected at the regime gate. The fence closed with the
+        // install alone; table activation never ran.
+        let next = batch_with_regime(2, k, 1..2, 10, Some(vec![(shard, 10)]));
+        let resp = handle_replica_batch_regime_gated(
+            &batch_request(&next, 2),
+            &engine,
+            &last_applied,
+            Some(&tracker),
+            DEFAULT_STREAM_KEY,
+            10,
+            Some(&authority),
+            None,
+        );
+        assert_eq!(
+            resp.status, STATUS_ERROR,
+            "I1: the old-regime batch dies the instant committed_term advances",
+        );
+        assert_eq!(decode_error_code(&resp.payload), ERR_STALE_REGIME);
+        assert_eq!(
+            crate::replication::protocol::decode_stale_regime_nak(&resp.payload),
+            Some((shard, 11)),
+            "the gate reads the freshly installed regime",
+        );
+        assert_eq!(
+            live_table.read().version,
+            10,
+            "no table activation occurred — the reject preceded it",
+        );
+        assert_eq!(
+            engine.read_slot(&k, 1).unwrap().status,
+            UTXO_UNSPENT,
+            "the rejected batch's spend must not land",
+        );
+        assert_eq!(
+            tracker.get(DEFAULT_STREAM_KEY),
+            batch.last_sequence(),
+            "the watermark holds at the pre-install batch",
+        );
+    }
+
+    /// I8, precise form, the NOT-installed arm: a receiver that has NOT
+    /// installed the promoting commit takes the accept-newer arm for a
+    /// replayed pre-failover batch — it applies, and neither the regime
+    /// state nor the committed term move (I9). Such a receiver is not
+    /// serving the promoted mastership either (the I13 serving gate,
+    /// pinned by `i13_serving_gate_blocks_new_master_until_full_then_
+    /// latches`), so the replay cannot land beside a new master's writes —
+    /// I8 deliberately claims this conjunction, NOT the stronger "dies
+    /// everywhere". The installed-receiver arm (wholesale rejection at the
+    /// `cluster_key` gate) is pinned by the §4.7 captured-frame test
+    /// `migration_delta_reassign_replay_rejected_wholesale_after_promotion`
+    /// in tests/g8_e4_tcp_frame_replay.rs.
+    #[test]
+    fn i8_uninstalled_receiver_takes_accept_newer_arm_and_learns_nothing() {
+        let engine = make_engine();
+        let k = key(97);
+        create_record(&engine, k, 3);
+        let shard = crate::cluster::shards::ShardTable::shard_for_key(&k);
+        // This receiver is BEHIND: term 4, regime[shard] = 4. The captured
+        // pre-failover frame was stamped at term/regime 5 (the promotion
+        // that superseded it happened at 6, which this node never saw).
+        let authority = regime_authority(4, &[(shard, 4)], true, true);
+
+        let last_applied = Arc::new(AtomicU64::new(0));
+        let tracker = ReplicaAppliedTracker::in_memory();
+
+        let batch = batch_with_regime(1, k, 0..1, 5, Some(vec![(shard, 5)]));
+        let through = batch.last_sequence();
+        let resp = handle_replica_batch_regime_gated(
+            &batch_request(&batch, 1),
+            &engine,
+            &last_applied,
+            Some(&tracker),
+            DEFAULT_STREAM_KEY,
+            4,
+            Some(&authority),
+            None,
+        );
+        assert_eq!(
+            resp.status, STATUS_OK,
+            "I8 precise form: the uninstalled receiver takes the accept-newer arm",
+        );
+        assert_eq!(tracker.get(DEFAULT_STREAM_KEY), through);
+        assert_eq!(engine.read_slot(&k, 0).unwrap().status, UTXO_SPENT);
+        // I9: acceptance teaches the receiver nothing — regime and term
+        // move ONLY via a validated commit install.
+        assert_eq!(
+            authority.committed_regime(shard),
+            4,
+            "the newer stamp must not be learned from the batch",
+        );
+        assert_eq!(
+            authority.committed_term(),
+            4,
+            "the newer cluster_key must not be learned from the batch",
+        );
+    }
+
+    /// I12: while enforcement is active, a regime-ABSENT (V2) batch is
+    /// rejected with `ERR_STALE_REGIME` — a demoted master cannot evade
+    /// the fence by continuing to emit V2. This covers the migration-flag
+    /// path too (the gate runs before the bypass).
+    #[test]
+    fn regime_absent_v2_batch_rejected_when_enforced() {
+        let engine = make_engine();
+        let k = key(93);
+        create_record(&engine, k, 4);
+        let shard = crate::cluster::shards::ShardTable::shard_for_key(&k);
+        let authority = regime_authority(10, &[(shard, 9)], true, true);
+
+        let last_applied = Arc::new(AtomicU64::new(0));
+        let tracker = ReplicaAppliedTracker::in_memory();
+        let slot0_before = engine.read_slot(&k, 0).unwrap().status;
+
+        // Current cluster_key, but V2 (no regime table).
+        let batch = batch_with_regime(1, k, 0..1, 10, None);
+        assert_eq!(
+            batch.serialize()[0],
+            crate::replication::protocol::BATCH_PROTOCOL_V2
+        );
+
+        // Normal batch...
+        let resp = handle_replica_batch_regime_gated(
+            &batch_request(&batch, 1),
+            &engine,
+            &last_applied,
+            Some(&tracker),
+            DEFAULT_STREAM_KEY,
+            10,
+            Some(&authority),
+            None,
+        );
+        assert_eq!(
+            resp.status, STATUS_ERROR,
+            "V2 under enforcement must reject"
+        );
+        assert_eq!(decode_error_code(&resp.payload), ERR_STALE_REGIME);
+        assert_eq!(
+            crate::replication::protocol::decode_stale_regime_nak(&resp.payload),
+            Some((shard, 9)),
+        );
+
+        // ...and a FLAG_MIGRATION_BATCH V2 frame rejects identically.
+        let mut migration = batch_with_regime(0, k, 0..1, 10, None);
+        migration.source_node_id = None;
+        let req = RequestFrame {
+            op_code: OP_REPLICA_BATCH,
+            request_id: 9,
+            flags: FLAG_MIGRATION_BATCH,
+            payload: migration.serialize().into(),
+        };
+        let resp = handle_replica_batch_regime_gated(
+            &req,
+            &engine,
+            &last_applied,
+            Some(&tracker),
+            DEFAULT_STREAM_KEY,
+            10,
+            Some(&authority),
+            None,
+        );
+        assert_eq!(
+            resp.status, STATUS_ERROR,
+            "V2 migration batch under enforcement must reject before the bypass",
+        );
+        assert_eq!(decode_error_code(&resp.payload), ERR_STALE_REGIME);
+
+        assert_eq!(slot0_before, engine.read_slot(&k, 0).unwrap().status);
+        assert_eq!(tracker.get(DEFAULT_STREAM_KEY), 0);
+    }
+
+    /// I12 flip side: while enforcement is NOT active (committed flag
+    /// false, or no secret — I11, or no authority wired), V2 batches apply
+    /// exactly as before AND V3 batches are still accepted (acceptance is
+    /// a binary capability, not committed state) with their regime table
+    /// IGNORED — even a stale stamp.
+    #[test]
+    fn v3_accepted_and_table_ignored_when_enforcement_inactive() {
+        for (enforced, secret) in [(false, true), (true, false)] {
+            let engine = make_engine();
+            let k = key(94);
+            create_record(&engine, k, 4);
+            let shard = crate::cluster::shards::ShardTable::shard_for_key(&k);
+            let authority = regime_authority(10, &[(shard, 9)], enforced, secret);
+            assert!(!authority.regime_enforcement_active());
+
+            let last_applied = Arc::new(AtomicU64::new(0));
+            let tracker = ReplicaAppliedTracker::in_memory();
+
+            // V3 with a STALE stamp (5 < 9): accepted — the table is
+            // ignored while enforcement is inactive.
+            let batch = batch_with_regime(1, k, 0..1, 10, Some(vec![(shard, 5)]));
+            assert_eq!(
+                batch.serialize()[0],
+                crate::replication::protocol::BATCH_PROTOCOL_V3
+            );
+            let through = batch.last_sequence();
+            let resp = handle_replica_batch_regime_gated(
+                &batch_request(&batch, 1),
+                &engine,
+                &last_applied,
+                Some(&tracker),
+                DEFAULT_STREAM_KEY,
+                10,
+                Some(&authority),
+                None,
+            );
+            assert_eq!(
+                resp.status, STATUS_OK,
+                "V3 must be accepted while enforcement is inactive \
+                 (enforced={enforced}, secret={secret})",
+            );
+            assert_eq!(tracker.get(DEFAULT_STREAM_KEY), through);
+
+            // V2 keeps applying too.
+            let v2 = batch_with_regime(through + 1, k, 1..2, 10, None);
+            let resp = handle_replica_batch_regime_gated(
+                &batch_request(&v2, 2),
+                &engine,
+                &last_applied,
+                Some(&tracker),
+                DEFAULT_STREAM_KEY,
+                10,
+                Some(&authority),
+                None,
+            );
+            assert_eq!(resp.status, STATUS_OK, "V2 must keep applying");
+        }
+    }
+
+    /// §4.2 fail-closed: a V3 table that does not stamp a TOUCHED shard is
+    /// regime-absent for that shard — rejected under enforcement.
+    #[test]
+    fn v3_table_missing_touched_shard_rejected() {
+        let engine = make_engine();
+        let k = key(95);
+        create_record(&engine, k, 4);
+        let shard = crate::cluster::shards::ShardTable::shard_for_key(&k);
+        let authority = regime_authority(10, &[(shard, 9)], true, true);
+
+        let last_applied = Arc::new(AtomicU64::new(0));
+        let tracker = ReplicaAppliedTracker::in_memory();
+
+        // Table stamps a DIFFERENT shard, not the touched one.
+        let other_shard = if shard == 0 { 1 } else { shard - 1 };
+        let batch = batch_with_regime(1, k, 0..1, 10, Some(vec![(other_shard, 99)]));
+        let resp = handle_replica_batch_regime_gated(
+            &batch_request(&batch, 1),
+            &engine,
+            &last_applied,
+            Some(&tracker),
+            DEFAULT_STREAM_KEY,
+            10,
+            Some(&authority),
+            None,
+        );
+        assert_eq!(
+            resp.status, STATUS_ERROR,
+            "an unstamped touched shard must fail closed",
+        );
+        assert_eq!(decode_error_code(&resp.payload), ERR_STALE_REGIME);
+        assert_eq!(
+            crate::replication::protocol::decode_stale_regime_nak(&resp.payload),
+            Some((shard, 9)),
+        );
+        assert_eq!(tracker.get(DEFAULT_STREAM_KEY), 0);
+    }
+
+    /// P1 §4.2 metric: the receiver-side stale-regime reject increments
+    /// `replica_rejected_stale_regime` (mirrors the stale-cluster_key
+    /// metric test — the `>=` slack and OnceLock install follow the same
+    /// process-wide-counter reasoning documented there).
+    #[test]
+    fn replica_rejected_stale_regime_metric_increments() {
+        static TEST_METRICS: std::sync::OnceLock<&'static crate::metrics::ReplicationMetrics> =
+            std::sync::OnceLock::new();
+        let metrics_ref = *TEST_METRICS
+            .get_or_init(|| Box::leak(Box::new(crate::metrics::ReplicationMetrics::new())));
+        crate::metrics::init_replication_metrics(metrics_ref);
+        let metrics =
+            crate::metrics::replication_metrics().expect("replication metrics installed for test");
+
+        let engine = make_engine();
+        let k = key(96);
+        create_record(&engine, k, 2);
+        let shard = crate::cluster::shards::ShardTable::shard_for_key(&k);
+        let authority = regime_authority(10, &[(shard, 9)], true, true);
+
+        let last_applied = Arc::new(AtomicU64::new(0));
+        let tracker = ReplicaAppliedTracker::in_memory();
+        let before = metrics.replica_rejected_stale_regime.get();
+
+        let batch = batch_with_regime(1, k, 0..1, 10, Some(vec![(shard, 5)]));
+        let resp = handle_replica_batch_regime_gated(
+            &batch_request(&batch, 1),
+            &engine,
+            &last_applied,
+            Some(&tracker),
+            DEFAULT_STREAM_KEY,
+            10,
+            Some(&authority),
+            None,
+        );
+        assert_eq!(resp.status, STATUS_ERROR);
+        assert_eq!(decode_error_code(&resp.payload), ERR_STALE_REGIME);
+        let after = metrics.replica_rejected_stale_regime.get();
+        assert!(
+            after > before,
+            "replica_rejected_stale_regime must increment on a regime-gate reject \
+             (before {before}, after {after})",
+        );
+    }
+
+    /// §4.9: a V3 Reassign carrying a prior identity that no longer
+    /// matches the live slot is an idempotent NO-OP (mirroring
+    /// `RedoOp::ReassignV2`'s recovery guard), while a MATCHING prior
+    /// identity applies the guarded transition. The V2 (None) live-read
+    /// semantics are pinned by `apply_reassign_op_and_idempotent_reapply`.
+    #[test]
+    fn v3_reassign_prior_hash_mismatch_noops_and_match_applies() {
+        let engine = make_engine();
+        let k = key(97);
+        create_record(&engine, k, 2);
+        apply_op(
+            &engine,
+            &ReplicaOp::Freeze {
+                tx_key: k,
+                offset: 0,
+                master_generation: 0,
+            },
+        )
+        .unwrap();
+        let live_hash = engine.read_slot(&k, 0).unwrap().hash;
+        let mut wrong_prior = live_hash;
+        wrong_prior[0] ^= 0xFF;
+
+        // Mismatched prior → structural no-op: still FROZEN, hash and
+        // reassignment_count unchanged, batch-level Ok.
+        let mismatch = ReplicaOp::Reassign {
+            tx_key: k,
+            offset: 0,
+            new_hash: [0x5B; 32],
+            block_height: 800_000,
+            spendable_after: 1_000,
+            master_generation: 1,
+            prior_utxo_hash: Some(wrong_prior),
+        };
+        apply_op(&engine, &mismatch).unwrap();
+        let slot = engine.read_slot(&k, 0).unwrap();
+        assert_eq!(
+            slot.status, UTXO_FROZEN,
+            "a prior-hash mismatch must not mutate the slot",
+        );
+        assert_eq!(slot.hash, live_hash);
+        assert_eq!(
+            { engine.read_metadata(&k).unwrap().reassignment_count },
+            0,
+            "a prior-hash mismatch must not count as a reassignment",
+        );
+
+        // Matching prior → the guarded transition applies.
+        let matching = ReplicaOp::Reassign {
+            tx_key: k,
+            offset: 0,
+            new_hash: [0x5B; 32],
+            block_height: 800_000,
+            spendable_after: 1_000,
+            master_generation: 1,
+            prior_utxo_hash: Some(live_hash),
+        };
+        apply_op(&engine, &matching).unwrap();
+        let slot = engine.read_slot(&k, 0).unwrap();
+        assert_eq!(slot.status, UTXO_UNSPENT);
+        assert_eq!(slot.hash, [0x5B; 32]);
+        assert_eq!({ engine.read_metadata(&k).unwrap().reassignment_count }, 1);
+    }
+
+    /// §8 review F-7 (§4.9) — once `regime_enforced` is committed, a V3
+    /// `Reassign` carrying NO prior identity (the pre-`ReassignV2` legacy
+    /// mapping) is NON-REPLAYABLE: applying it would resurrect the
+    /// unguarded live-slot read §4.9 retires. A tracked batch NAKs
+    /// `MissingRecord` (escalating to the master's per-key record-image
+    /// repair) with the slot untouched and the watermark unmoved; the same
+    /// op WITH a prior identity still applies; and with enforcement
+    /// INACTIVE the legacy live-slot fallback is unchanged (compat).
+    #[test]
+    fn f7_v3_reassign_without_prior_refused_under_enforcement() {
+        let engine = make_engine();
+        let k = key(98);
+        create_record(&engine, k, 2);
+        apply_op(
+            &engine,
+            &ReplicaOp::Freeze {
+                tx_key: k,
+                offset: 0,
+                master_generation: 0,
+            },
+        )
+        .unwrap();
+        let live_hash = engine.read_slot(&k, 0).unwrap().hash;
+        let shard = crate::cluster::shards::ShardTable::shard_for_key(&k);
+        let authority = regime_authority(10, &[(shard, 9)], true, true);
+        assert!(authority.regime_enforcement_active());
+
+        let reassign = |prior: Option<[u8; 32]>| ReplicaOp::Reassign {
+            tx_key: k,
+            offset: 0,
+            new_hash: [0x6C; 32],
+            block_height: 800_000,
+            spendable_after: 1_000,
+            master_generation: 1,
+            prior_utxo_hash: prior,
+        };
+        let batch = |first_sequence: u64, prior: Option<[u8; 32]>| ReplicaBatch {
+            first_sequence,
+            ops: vec![reassign(prior)],
+            trace_ctx: None,
+            source_node_id: None,
+            cluster_key: 10,
+            regime_table: Some(vec![(shard, 9)]),
+        };
+
+        let last_applied = Arc::new(AtomicU64::new(0));
+        let tracker = ReplicaAppliedTracker::in_memory();
+
+        // Prior-less under enforcement: refused, per-key repair NAK.
+        let resp = handle_replica_batch_regime_gated(
+            &batch_request(&batch(1, None), 1),
+            &engine,
+            &last_applied,
+            Some(&tracker),
+            DEFAULT_STREAM_KEY,
+            10,
+            Some(&authority),
+            None,
+        );
+        assert_eq!(
+            resp.status, STATUS_ERROR,
+            "F-7: an unguarded V3 Reassign must not apply under enforcement",
+        );
+        match ReplicaAck::deserialize(&resp.payload).unwrap() {
+            ReplicaAck::MissingRecord {
+                failed_sequence,
+                tx_keys,
+            } => {
+                assert_eq!(failed_sequence, 1);
+                assert_eq!(
+                    tx_keys.first(),
+                    Some(&k),
+                    "the NAK must name the key so the master re-ships its full image",
+                );
+            }
+            other => panic!("expected the per-key-repair MissingRecord NAK, got {other:?}"),
+        }
+        let slot = engine.read_slot(&k, 0).unwrap();
+        assert_eq!(slot.status, UTXO_FROZEN, "the slot must be untouched");
+        assert_eq!(slot.hash, live_hash);
+        assert_eq!(
+            tracker.get(DEFAULT_STREAM_KEY),
+            0,
+            "the watermark must not advance past the refused op",
+        );
+
+        // Guarded (prior present) under enforcement: applies.
+        let resp = handle_replica_batch_regime_gated(
+            &batch_request(&batch(1, Some(live_hash)), 2),
+            &engine,
+            &last_applied,
+            Some(&tracker),
+            DEFAULT_STREAM_KEY,
+            10,
+            Some(&authority),
+            None,
+        );
+        assert_eq!(resp.status, STATUS_OK);
+        assert_eq!(engine.read_slot(&k, 0).unwrap().hash, [0x6C; 32]);
+
+        // Compat control: with enforcement INACTIVE (no authority), the
+        // legacy prior-less op keeps the historical live-slot fallback.
+        let k2 = key(99);
+        create_record(&engine, k2, 1);
+        apply_op(
+            &engine,
+            &ReplicaOp::Freeze {
+                tx_key: k2,
+                offset: 0,
+                master_generation: 0,
+            },
+        )
+        .unwrap();
+        apply_op(
+            &engine,
+            &ReplicaOp::Reassign {
+                tx_key: k2,
+                offset: 0,
+                new_hash: [0x6D; 32],
+                block_height: 800_000,
+                spendable_after: 1_000,
+                master_generation: 1,
+                prior_utxo_hash: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            engine.read_slot(&k2, 0).unwrap().hash,
+            [0x6D; 32],
+            "without enforcement the legacy fallback is unchanged",
+        );
+    }
+
     /// F-G7-005 boundary: a migration batch with cluster_key = 0 must
     /// still be accepted when `local_cluster_key = 0` (the receiver
     /// hasn't observed a quorum-committed cluster term yet, e.g.
@@ -8615,6 +9683,7 @@ mod tests {
             trace_ctx: None,
             source_node_id: None,
             cluster_key: 0,
+            regime_table: None,
         };
         let resp = handle_replica_batch_with_tracker(
             &batch_request(&batch, 1),
@@ -8656,7 +9725,15 @@ mod tests {
         // a message-prefix check; the variant field is the same guard, minus the
         // string matching.)
         let mut redo_out = Vec::new();
-        match apply_op_journal_inner(&engine, &batch.ops[0], true, false, true, &mut redo_out) {
+        match apply_op_journal_inner(
+            &engine,
+            &batch.ops[0],
+            true,
+            false,
+            true,
+            false,
+            &mut redo_out,
+        ) {
             Err(ReplicaApplyError::MissingRecord { op_name, tx_key }) => {
                 assert_eq!(op_name, "set_mined");
                 assert_eq!(tx_key, key(201));
@@ -8700,6 +9777,7 @@ mod tests {
             trace_ctx: None,
             source_node_id: None,
             cluster_key: 0,
+            regime_table: None,
         };
         let mut req = batch_request(&batch, 1);
         req.flags = FLAG_MIGRATION_BATCH;
@@ -8748,6 +9826,7 @@ mod tests {
             trace_ctx: None,
             source_node_id: None,
             cluster_key: 0,
+            regime_table: None,
         };
         let resp = handle_replica_batch_with_tracker(
             &batch_request(&batch, 1),
@@ -8813,6 +9892,7 @@ mod tests {
             trace_ctx: None,
             source_node_id: None,
             cluster_key: 0,
+            regime_table: None,
         };
         let resp = handle_replica_batch_with_tracker(
             &batch_request(&batch, 1),
@@ -8849,7 +9929,15 @@ mod tests {
         // generation-sync gate reports the same ack variant, so assert the typed
         // `op_name` to prove this came from the SetConflicting arm itself.
         let mut redo_out = Vec::new();
-        match apply_op_journal_inner(&engine, &batch.ops[0], true, false, true, &mut redo_out) {
+        match apply_op_journal_inner(
+            &engine,
+            &batch.ops[0],
+            true,
+            false,
+            true,
+            false,
+            &mut redo_out,
+        ) {
             Err(ReplicaApplyError::MissingRecord { op_name, tx_key }) => {
                 assert_eq!(op_name, "set_conflicting");
                 assert_eq!(tx_key, key(205));
@@ -8887,6 +9975,7 @@ mod tests {
             trace_ctx: None,
             source_node_id: None,
             cluster_key: 0,
+            regime_table: None,
         };
         let resp = handle_replica_batch_with_tracker(
             &batch_request(&batch, 1),
@@ -9108,6 +10197,7 @@ mod tests {
             ops: vec![op.clone()],
             source_node_id: None,
             trace_ctx: None,
+            regime_table: None,
         };
         let req = RequestFrame {
             request_id: 7,
@@ -9966,6 +11056,100 @@ mod tests {
             { meta.generation },
             2,
             "the re-created record is live at the re-create generation",
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // P1 stage 4 — the completeness-signal callback (§4.3 catch-up trigger)
+    // -----------------------------------------------------------------------
+
+    /// The callback fires exactly once per SUCCESSFULLY applied tracked
+    /// batch with the touched shards and their pre-apply emptiness; it
+    /// never fires for probes, duplicates, gap NAKs, or migration batches.
+    #[test]
+    fn i2_tracked_apply_signal_fires_only_on_successful_tracked_applies() {
+        let engine = make_engine();
+        let k = key(77);
+        create_record(&engine, k, 4);
+        let shard = crate::cluster::shards::ShardTable::shard_for_key(&k);
+        let last_applied = Arc::new(AtomicU64::new(0));
+        let tracker = ReplicaAppliedTracker::in_memory();
+        let captured: std::cell::RefCell<Vec<Vec<(u16, bool)>>> =
+            std::cell::RefCell::new(Vec::new());
+        let signal = |touched: &[(u16, bool)]| {
+            captured.borrow_mut().push(touched.to_vec());
+        };
+        let signal_ref: Option<TrackedApplySignal<'_>> = Some(&signal);
+
+        // 1. A real tracked apply fires the callback: shard touched, and
+        //    the shard was NOT empty pre-apply (the create seeded it).
+        let batch = make_spend_batch(1, k, 0..2, 1);
+        let resp = handle_replica_batch_regime_gated(
+            &batch_request(&batch, 1),
+            &engine,
+            &last_applied,
+            Some(&tracker),
+            DEFAULT_STREAM_KEY,
+            0,
+            None,
+            signal_ref,
+        );
+        assert_eq!(resp.status, STATUS_OK);
+        assert_eq!(
+            captured.borrow().as_slice(),
+            &[vec![(shard, false)]],
+            "one successful tracked apply = one callback with (shard, was_empty=false)",
+        );
+
+        // 2. A true duplicate re-send never fires it.
+        let resp = handle_replica_batch_regime_gated(
+            &batch_request(&batch, 2),
+            &engine,
+            &last_applied,
+            Some(&tracker),
+            DEFAULT_STREAM_KEY,
+            0,
+            None,
+            signal_ref,
+        );
+        assert_eq!(resp.status, STATUS_OK, "duplicate is ACKed");
+        assert_eq!(captured.borrow().len(), 1, "a duplicate must not re-signal");
+
+        // 3. A gap NAK never fires it.
+        let gapped = make_spend_batch(10, k, 2..3, 1);
+        let resp = handle_replica_batch_regime_gated(
+            &batch_request(&gapped, 3),
+            &engine,
+            &last_applied,
+            Some(&tracker),
+            DEFAULT_STREAM_KEY,
+            0,
+            None,
+            signal_ref,
+        );
+        assert_eq!(resp.status, STATUS_ERROR, "sequence gap NAKs");
+        assert_eq!(captured.borrow().len(), 1, "a gap NAK must not signal");
+
+        // 4. A migration-flagged batch (out-of-band baseline) never fires it
+        //    — its completeness authority is the completion handshake.
+        let mig = make_spend_batch(0, k, 3..4, 1);
+        let mut mig_req = batch_request(&mig, u64::from(shard));
+        mig_req.flags |= FLAG_MIGRATION_BATCH;
+        let resp = handle_replica_batch_regime_gated(
+            &mig_req,
+            &engine,
+            &last_applied,
+            Some(&tracker),
+            DEFAULT_STREAM_KEY,
+            0,
+            None,
+            signal_ref,
+        );
+        assert_eq!(resp.status, STATUS_OK, "migration batch applies");
+        assert_eq!(
+            captured.borrow().len(),
+            1,
+            "a migration batch must never feed the stream-completeness signal",
         );
     }
 }

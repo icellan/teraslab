@@ -3228,6 +3228,8 @@ mod tests {
         assert_eq!(ERR_STREAM_INVARIANT, 34);
         // P1-13: response-too-large guard on the GET read-back path.
         assert_eq!(ERR_RESPONSE_TOO_LARGE, 38);
+        // P1 §4.2: per-shard regime gate on the replication receiver.
+        assert_eq!(ERR_STALE_REGIME, 39);
         // ERR_INTERNAL stays at 255 — sentinel for genuinely unclassified
         // failures so old clients matching on 255 still receive a value.
         assert_eq!(ERR_INTERNAL, 255);

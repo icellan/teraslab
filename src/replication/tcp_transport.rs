@@ -310,6 +310,19 @@ impl ReplicaTransport for TcpReplicaTransport {
             if let Ok(ack) = ReplicaAck::deserialize(&resp.payload) {
                 return Ok(ack);
             }
+            // P1 §4.2: the receiver's regime gate rejects with an error
+            // payload (`[ERR_STALE_REGIME][msg_len][shard][regime]`), not a
+            // ReplicaAck — surface it TYPED so the sender can classify it
+            // without parsing message strings (the hint is routing advice
+            // only, I9).
+            if let Some((shard, local_regime)) =
+                crate::replication::protocol::decode_stale_regime_nak(&resp.payload)
+            {
+                return Err(ReplicationError::StaleRegime {
+                    shard,
+                    local_regime,
+                });
+            }
             return Err(ReplicationError::Transport(format!(
                 "replica returned status {}",
                 resp.status
@@ -372,6 +385,7 @@ mod tests {
             trace_ctx: None,
             source_node_id: None,
             cluster_key: 0,
+            regime_table: None,
         };
 
         let batch_clone = batch.clone();
@@ -504,6 +518,7 @@ mod tests {
             trace_ctx: None,
             source_node_id: None,
             cluster_key: 0,
+            regime_table: None,
         };
         transport.send_batch(&batch).unwrap();
         let err = transport
@@ -547,6 +562,7 @@ mod tests {
             trace_ctx: None,
             source_node_id: None,
             cluster_key: 0,
+            regime_table: None,
         };
         transport.send_batch(&batch).unwrap();
 
@@ -744,6 +760,7 @@ mod tests {
             trace_ctx: None,
             source_node_id: None,
             cluster_key: 0,
+            regime_table: None,
         };
         transport.send_batch(&batch).unwrap();
 
@@ -874,6 +891,7 @@ mod tests {
                 trace_ctx: None,
                 source_node_id: None,
                 cluster_key: 0,
+                regime_table: None,
             };
             transport.send_batch(&batch).unwrap();
         });

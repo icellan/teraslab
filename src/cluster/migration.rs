@@ -150,6 +150,16 @@ impl AtomicShardBitmap {
         }
     }
 
+    /// Set all bits (`NUM_SHARDS` is a multiple of 64, so whole words).
+    /// Used by the P1 stage-4 serving-established bitmap, whose RESTING
+    /// state is all-set (gate-inactive) until a commit install or boot
+    /// re-derivation clears the gated shards.
+    pub fn set_all(&self) {
+        for w in &self.words {
+            w.store(u64::MAX, std::sync::atomic::Ordering::Release);
+        }
+    }
+
     /// Bulk-copy from a [`ShardBitmap`] snapshot.
     ///
     /// Used to synchronize the atomic bitmap after a batch update
@@ -1730,7 +1740,25 @@ impl MigrationManager {
     /// clear the no-serve-before-heal fence and let `is_master` serve an
     /// un-healed (lost/resurrected) tail as full authority — the P0
     /// double-spend. So the retain preserves BOTH `lost` and `heal_pending`.
-    pub fn clear_inbound(&mut self) {
+    ///
+    /// §8 review round 2, N1 — RETURNS the shards whose fence this drop
+    /// actually cleared (ascending, deduplicated). Each of those was an
+    /// in-flight FORWARD inbound: a partially-received baseline whose only
+    /// marker of incompleteness was the fence being dropped here. The
+    /// caller records a lineage BASELINE GAP for them so the §4.3
+    /// catch-up-convergence trigger cannot later certify the partial copy
+    /// (a converged redo stream is no evidence about a baseline that never
+    /// entered the master's redo). A shard the fresh plan re-registers is
+    /// re-fenced and re-completes normally, which clears the gap.
+    pub fn clear_inbound(&mut self) -> Vec<u16> {
+        let mut dropped: Vec<u16> = self
+            .inbound_migrations
+            .iter()
+            .filter(|m| !m.completed && !m.lost && !m.heal_pending)
+            .map(|m| m.shard)
+            .collect();
+        dropped.sort_unstable();
+        dropped.dedup();
         self.inbound_migrations
             .retain(|m| !m.completed && (m.lost || m.heal_pending));
         self.inbound_bitmap.clear_all();
@@ -1739,8 +1767,13 @@ impl MigrationManager {
             // keep it fenced.
             self.inbound_bitmap.set(m.shard);
         }
+        // A shard that still has a surviving (lost/heal) entry keeps its
+        // fence, so it is not "unfenced without proof" — drop it from the
+        // reported set.
+        dropped.retain(|s| !self.inbound_bitmap.test(*s));
         // BUG4 (b): no non-lost shard is pending after this clear → drop the
         // whole accumulator (no-op off-path).
+        dropped
     }
 
     /// Remove pending inbound entries for the selected shards.
