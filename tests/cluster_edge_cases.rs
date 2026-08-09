@@ -478,7 +478,7 @@ fn topology_quorum_sizes() {
         let members: Vec<NodeId> = (1..=n).map(NodeId).collect();
         let expected_quorum = (n as usize / 2) + 1;
 
-        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1), 2);
         if let Some(term) = auth.on_membership_changed(&members) {
             // Self-vote counts as 1. Need quorum-1 more votes.
             let additional_needed = expected_quorum - 1;
@@ -585,7 +585,7 @@ fn replication_initial_sequence_boundary() {
 fn topology_catchup_does_not_leave_voted_term_gap() {
     use teraslab::cluster::topology::*;
 
-    let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+    let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1), 2);
 
     // Vote for term 3 (via handle_propose from another node's proposal).
     let propose = TopologyTerm::new(
@@ -595,6 +595,7 @@ fn topology_catchup_does_not_leave_voted_term_gap() {
         ClusterId::UNSET,
         1,
         (vec![NodeId(1), NodeId(2), NodeId(3)]).len() as u64,
+        2,
     );
     let vote = auth.handle_propose(&propose);
     assert!(vote.accepted);
@@ -603,13 +604,23 @@ fn topology_catchup_does_not_leave_voted_term_gap() {
     let mems = vec![NodeId(1), NodeId(2), NodeId(3), NodeId(4)];
     let commit = TopologyCommit {
         term: 10,
+        rf: 2,
+        assignment: None,
         proposer: NodeId(1),
         members: mems.clone(),
         voters: mems.clone(),
         cluster_id: ClusterId::UNSET,
         placement_version: 1,
         committed_peak: (mems.clone()).len() as u64,
-        digest: TopologyTerm::compute_digest(10, &ClusterId::UNSET, &mems, 1, (mems).len() as u64),
+        digest: TopologyTerm::compute_digest(
+            10,
+            &ClusterId::UNSET,
+            &mems,
+            1,
+            (mems).len() as u64,
+            2,
+            teraslab::cluster::topology::ASSIGNMENT_ABSENT_DIGEST,
+        ),
     };
     assert_eq!(auth.handle_commit(&commit), Some(10));
 
@@ -622,6 +633,7 @@ fn topology_catchup_does_not_leave_voted_term_gap() {
         ClusterId::UNSET,
         1,
         (vec![NodeId(1), NodeId(2)]).len() as u64,
+        2,
     );
     let v = auth.handle_propose(&stale);
     assert!(
@@ -637,6 +649,7 @@ fn topology_catchup_does_not_leave_voted_term_gap() {
         ClusterId::UNSET,
         1,
         (vec![NodeId(1), NodeId(2), NodeId(3)]).len() as u64,
+        2,
     );
     let v2 = auth.handle_propose(&fresh);
     assert!(v2.accepted, "proposal for term 11 should be accepted");
@@ -649,13 +662,15 @@ fn topology_catchup_does_not_leave_voted_term_gap() {
 fn topology_fallback_proposer_superseded_by_second_timeout() {
     use teraslab::cluster::topology::*;
 
-    let auth = TopologyAuthority::new(NodeId(2), Duration::from_millis(1));
+    let auth = TopologyAuthority::new(NodeId(2), Duration::from_millis(1), 2);
     let mems = vec![NodeId(1), NodeId(2), NodeId(3)];
 
     // Commit a different membership so check_timeout fires.
     let old_mems = vec![NodeId(1), NodeId(2)];
     let old_commit = TopologyCommit {
         term: 1,
+        rf: 2,
+        assignment: None,
         proposer: NodeId(1),
         members: old_mems.clone(),
         voters: old_mems.clone(),
@@ -668,6 +683,8 @@ fn topology_fallback_proposer_superseded_by_second_timeout() {
             &old_mems,
             1,
             (old_mems).len() as u64,
+            2,
+            teraslab::cluster::topology::ASSIGNMENT_ABSENT_DIGEST,
         ),
     };
     auth.handle_commit(&old_commit);
@@ -738,15 +755,17 @@ fn topology_fallback_proposer_superseded_by_second_timeout() {
 fn topology_cluster_formation_three_simultaneous_starts() {
     use teraslab::cluster::topology::*;
 
-    let a1 = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
-    let a2 = TopologyAuthority::new(NodeId(2), Duration::from_secs(1));
-    let a3 = TopologyAuthority::new(NodeId(3), Duration::from_secs(1));
+    let a1 = TopologyAuthority::new(NodeId(1), Duration::from_secs(1), 2);
+    let a2 = TopologyAuthority::new(NodeId(2), Duration::from_secs(1), 2);
+    let a3 = TopologyAuthority::new(NodeId(3), Duration::from_secs(1), 2);
 
     // Each node independently commits term 1 as single-node.
     for (auth, id) in [(&a1, 1u64), (&a2, 2), (&a3, 3)] {
         let mems = vec![NodeId(id)];
         let commit = TopologyCommit {
             term: 1,
+            rf: 2,
+            assignment: None,
             proposer: NodeId(id),
             members: mems.clone(),
             voters: mems.clone(),
@@ -759,6 +778,8 @@ fn topology_cluster_formation_three_simultaneous_starts() {
                 &mems,
                 1,
                 (mems).len() as u64,
+                2,
+                teraslab::cluster::topology::ASSIGNMENT_ABSENT_DIGEST,
             ),
         };
         auth.handle_commit(&commit);
@@ -805,19 +826,29 @@ fn topology_cluster_formation_three_simultaneous_starts() {
 fn topology_formation_recovery_blocked_by_outstanding_vote() {
     use teraslab::cluster::topology::*;
 
-    let auth = TopologyAuthority::new(NodeId(2), Duration::from_secs(1));
+    let auth = TopologyAuthority::new(NodeId(2), Duration::from_secs(1), 2);
 
     // Commit single-node term 1.
     let mems = vec![NodeId(2)];
     let commit = TopologyCommit {
         term: 1,
+        rf: 2,
+        assignment: None,
         proposer: NodeId(2),
         members: mems.clone(),
         voters: mems.clone(),
         cluster_id: ClusterId::UNSET,
         placement_version: 1,
         committed_peak: (mems.clone()).len() as u64,
-        digest: TopologyTerm::compute_digest(1, &ClusterId::UNSET, &mems, 1, (mems).len() as u64),
+        digest: TopologyTerm::compute_digest(
+            1,
+            &ClusterId::UNSET,
+            &mems,
+            1,
+            (mems).len() as u64,
+            2,
+            teraslab::cluster::topology::ASSIGNMENT_ABSENT_DIGEST,
+        ),
     };
     auth.handle_commit(&commit);
 
@@ -837,6 +868,7 @@ fn topology_formation_recovery_blocked_by_outstanding_vote() {
         ClusterId::UNSET,
         1,
         (vec![NodeId(1), NodeId(2)]).len() as u64,
+        2,
     );
     let v = auth.handle_propose(&proposal_2);
     assert!(v.accepted);
@@ -850,6 +882,7 @@ fn topology_formation_recovery_blocked_by_outstanding_vote() {
         ClusterId::UNSET,
         1,
         (vec![NodeId(1), NodeId(2), NodeId(3)]).len() as u64,
+        2,
     );
     let v2 = auth.handle_propose(&recovery_proposal);
     assert!(
@@ -1339,7 +1372,7 @@ fn topology_restore_then_vote_safety() {
         voted_digest: None,
     };
 
-    let auth = TopologyAuthority::new(NodeId(2), Duration::from_secs(1));
+    let auth = TopologyAuthority::new(NodeId(2), Duration::from_secs(1), 2);
     auth.restore(&state);
 
     // Proposal for term 11: > committed(10) but NOT > voted(12) → reject.
@@ -1350,6 +1383,7 @@ fn topology_restore_then_vote_safety() {
         ClusterId::UNSET,
         1,
         (vec![NodeId(1), NodeId(2), NodeId(3)]).len() as u64,
+        2,
     );
     let v1 = auth.handle_propose(&p1);
     assert!(
@@ -1365,6 +1399,7 @@ fn topology_restore_then_vote_safety() {
         ClusterId::UNSET,
         1,
         (vec![NodeId(1), NodeId(2), NodeId(3)]).len() as u64,
+        2,
     );
     let v2 = auth.handle_propose(&p2);
     assert!(v2.accepted, "term 13 should be accepted");
@@ -1661,7 +1696,7 @@ fn topology_full_5_node_quorum_cycle() {
     use teraslab::cluster::topology::*;
 
     let nodes: Vec<TopologyAuthority> = (1..=5u64)
-        .map(|id| TopologyAuthority::new(NodeId(id), Duration::from_secs(1)))
+        .map(|id| TopologyAuthority::new(NodeId(id), Duration::from_secs(1), 2))
         .collect();
     let members: Vec<NodeId> = (1..=5u64).map(NodeId).collect();
 
@@ -1690,6 +1725,8 @@ fn topology_full_5_node_quorum_cycle() {
     // Broadcast commit to all 5 nodes.
     let commit_msg = TopologyCommit {
         term: commit.term,
+        rf: 2,
+        assignment: None,
         proposer: commit.proposer,
         members: commit.members.clone(),
         voters: commit.voters.clone(),
@@ -1726,7 +1763,7 @@ fn topology_full_5_node_quorum_cycle() {
 fn topology_rejected_votes_dont_count() {
     use teraslab::cluster::topology::*;
 
-    let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+    let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1), 2);
     let members = vec![NodeId(1), NodeId(2), NodeId(3), NodeId(4), NodeId(5)];
     let proposal = auth.on_membership_changed(&members).unwrap();
 
@@ -1764,7 +1801,7 @@ fn topology_rejected_votes_dont_count() {
 fn topology_duplicate_votes_not_inflated() {
     use teraslab::cluster::topology::*;
 
-    let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+    let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1), 2);
     let members = vec![NodeId(1), NodeId(2), NodeId(3)];
     let proposal = auth.on_membership_changed(&members).unwrap();
 
@@ -1784,7 +1821,7 @@ fn topology_duplicate_votes_not_inflated() {
     assert!(commit1.is_some(), "first vote should reach quorum");
 
     // But if we simulate duplicate arrival BEFORE quorum...
-    let auth2 = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+    let auth2 = TopologyAuthority::new(NodeId(1), Duration::from_secs(1), 2);
     let members5 = vec![NodeId(1), NodeId(2), NodeId(3), NodeId(4), NodeId(5)];
     let proposal2 = auth2.on_membership_changed(&members5).unwrap();
 
@@ -1849,10 +1886,12 @@ fn split_brain_heal_detects_independent_clusters() {
     // TopologyAuthority that has already absorbed its own commit.
 
     // -- Cluster A: {1, 2, 3}, deterministic proposer = node 1 ---------
-    let a_proposer = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+    let a_proposer = TopologyAuthority::new(NodeId(1), Duration::from_secs(1), 2);
     let a_members = vec![NodeId(1), NodeId(2), NodeId(3)];
     a_proposer.handle_commit(&TopologyCommit {
         term: 5,
+        rf: 2,
+        assignment: None,
         proposer: NodeId(1),
         members: a_members.clone(),
         voters: a_members.clone(),
@@ -1865,16 +1904,20 @@ fn split_brain_heal_detects_independent_clusters() {
             &a_members,
             1,
             (a_members).len() as u64,
+            2,
+            teraslab::cluster::topology::ASSIGNMENT_ABSENT_DIGEST,
         ),
     });
     assert_eq!(a_proposer.committed_term(), 5);
     assert_eq!(a_proposer.committed_members(), a_members);
 
     // -- Cluster B: {4, 5, 6}, deterministic proposer = node 4 ---------
-    let b_proposer = TopologyAuthority::new(NodeId(4), Duration::from_secs(1));
+    let b_proposer = TopologyAuthority::new(NodeId(4), Duration::from_secs(1), 2);
     let b_members = vec![NodeId(4), NodeId(5), NodeId(6)];
     b_proposer.handle_commit(&TopologyCommit {
         term: 7,
+        rf: 2,
+        assignment: None,
         proposer: NodeId(4),
         members: b_members.clone(),
         voters: b_members.clone(),
@@ -1887,6 +1930,8 @@ fn split_brain_heal_detects_independent_clusters() {
             &b_members,
             1,
             (b_members).len() as u64,
+            2,
+            teraslab::cluster::topology::ASSIGNMENT_ABSENT_DIGEST,
         ),
     });
     assert_eq!(b_proposer.committed_term(), 7);
@@ -1984,9 +2029,11 @@ fn split_brain_heal_detects_independent_clusters() {
     );
 
     // Reset A back to its committed state so the assertion below is meaningful.
-    let a_proposer = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+    let a_proposer = TopologyAuthority::new(NodeId(1), Duration::from_secs(1), 2);
     a_proposer.handle_commit(&TopologyCommit {
         term: 5,
+        rf: 2,
+        assignment: None,
         proposer: NodeId(1),
         members: a_members.clone(),
         voters: a_members.clone(),
@@ -1999,6 +2046,8 @@ fn split_brain_heal_detects_independent_clusters() {
             &a_members,
             1,
             (a_members).len() as u64,
+            2,
+            teraslab::cluster::topology::ASSIGNMENT_ABSENT_DIGEST,
         ),
     });
 

@@ -101,10 +101,46 @@ pub struct TopologyTerm {
     /// matching-cluster claim, a placement-version disagreement, or a
     /// mismatched committed_peak.
     pub digest: [u8; 32],
+    /// Replication factor this term's placement is derived with. Digest-bound:
+    /// the candidate set — the entire containment on who may master a shard —
+    /// is a function of `(members, rf, placement_version)`, so an unbound `rf`
+    /// lets two differently-configured nodes reach different verdicts on one
+    /// agreed assignment.
+    pub rf: u8,
+    /// The committed master assignment: one entry per shard, in shard order.
+    ///
+    /// `None` means this term carries none — the pre-assignment path, and the
+    /// state of any term produced before a proposer had a committed
+    /// assignment to anchor on. Structurally distinct from an all-zero
+    /// assignment, which would name `members[0]` for every shard.
+    pub assignment: Option<Vec<NodeId>>,
 }
 
+/// The `assignment_digest` mixed into [`TopologyTerm::compute_digest`] when a
+/// term carries no assignment.
+///
+/// A distinct value from any real assignment digest: sha256 never returns all
+/// zeroes in practice, so "no assignment" and "some assignment" can never
+/// collide in the digest.
+pub const ASSIGNMENT_ABSENT_DIGEST: [u8; 32] = [0u8; 32];
+
+/// Wire format byte opening every v2 topology frame (term, commit, vote).
+///
+/// v1 had no format byte and dispatched optional fields by exact total
+/// length, which made every extension silently decode as defaults on the
+/// other side. Any frame not opening with this byte is rejected outright —
+/// the break is deliberate; nothing is deployed.
+pub const TOPOLOGY_WIRE_FORMAT_V2: u8 = 2;
+
 impl TopologyTerm {
-    /// Create a new term with auto-computed digest.
+    /// Create a new term with auto-computed digest and no assignment.
+    ///
+    /// `rf` is the replication factor this term's placement is derived with.
+    /// It is digest-bound because the candidate set — the entire containment
+    /// on who may master a shard — is a function of `(members, rf,
+    /// placement_version)`. With `rf` unbound, two nodes configured
+    /// differently derive different candidate sets from one agreed commit and
+    /// reach different verdicts on the same assignment.
     pub fn new(
         term: u64,
         members: Vec<NodeId>,
@@ -112,6 +148,7 @@ impl TopologyTerm {
         cluster_id: ClusterId,
         placement_version: u16,
         committed_peak: u64,
+        rf: u8,
     ) -> Self {
         let digest = Self::compute_digest(
             term,
@@ -119,6 +156,8 @@ impl TopologyTerm {
             &members,
             placement_version,
             committed_peak,
+            rf,
+            ASSIGNMENT_ABSENT_DIGEST,
         );
         Self {
             term,
@@ -127,8 +166,59 @@ impl TopologyTerm {
             cluster_id,
             placement_version,
             committed_peak,
+            rf,
+            assignment: None,
             digest,
         }
+    }
+
+    /// Attach a committed assignment, re-deriving the digest so it binds the
+    /// assignment's actual bytes.
+    ///
+    /// The digest covers the CANONICAL ENCODING, and every recipient
+    /// recomputes it from the bytes it received. Nothing anywhere trusts a
+    /// shipped hash: if it did, `(A, H(B))` sent to one node and `(A', H(B))`
+    /// to another would both match their own advertised digest, and the
+    /// binding would be vacuous.
+    pub fn with_assignment(mut self, assignment: Vec<NodeId>) -> Option<Self> {
+        let encoded = crate::cluster::election::encode_assignment(&assignment, &self.members)?;
+        self.digest = Self::compute_digest(
+            self.term,
+            &self.cluster_id,
+            &self.members,
+            self.placement_version,
+            self.committed_peak,
+            self.rf,
+            crate::cluster::election::assignment_digest(&encoded),
+        );
+        self.assignment = Some(assignment);
+        Some(self)
+    }
+
+    /// The digest this term's OWN fields imply. A frame whose advertised
+    /// digest disagrees with this is rejected — the recompute is over the
+    /// received bytes, never over anything the sender asserted.
+    pub fn recompute_digest(&self) -> [u8; 32] {
+        let assignment_digest = match &self.assignment {
+            Some(assignment) => {
+                match crate::cluster::election::encode_assignment(assignment, &self.members) {
+                    Some(encoded) => crate::cluster::election::assignment_digest(&encoded),
+                    // An assignment that cannot be encoded names a non-member;
+                    // it can never match a well-formed digest.
+                    None => return [0xFF; 32],
+                }
+            }
+            None => ASSIGNMENT_ABSENT_DIGEST,
+        };
+        Self::compute_digest(
+            self.term,
+            &self.cluster_id,
+            &self.members,
+            self.placement_version,
+            self.committed_peak,
+            self.rf,
+            assignment_digest,
+        )
     }
 
     /// Compute the canonical digest for a (term, cluster_id, members,
@@ -146,6 +236,8 @@ impl TopologyTerm {
         members: &[NodeId],
         placement_version: u16,
         committed_peak: u64,
+        rf: u8,
+        assignment_digest: [u8; 32],
     ) -> [u8; 32] {
         let mut buf = Vec::with_capacity(8 + 16 + 4 + members.len() * 8 + 2 + 8);
         buf.extend_from_slice(&term.to_le_bytes());
@@ -156,112 +248,153 @@ impl TopologyTerm {
         }
         buf.extend_from_slice(&placement_version.to_le_bytes());
         buf.extend_from_slice(&committed_peak.to_le_bytes());
+        // Pinned field order and widths — the Go and Rust clients must
+        // reproduce this byte-for-byte. `rf` is a single byte; the assignment
+        // digest is 32 bytes and comes LAST.
+        buf.push(rf);
+        buf.extend_from_slice(&assignment_digest);
         auth::sha256(&buf)
     }
 
-    /// Serialize for the wire.
+    /// Serialize for the wire (format v2).
     ///
-    /// Format: `[term:8][proposer:8][cluster_id:16][member_count:4][member_id:8 * count][digest:32][placement_version:2][committed_peak:8]`
+    /// ```text
+    /// [fmt:1 = 2][term:8][proposer:8][cluster_id:16]
+    /// [placement_version:2][committed_peak:8][rf:1]
+    /// [member_count:4][members:8*N]
+    /// [assignment_present:1]([assignment: NUM_SHARDS*2])?
+    /// [digest:32]
+    /// ```
     ///
-    /// `placement_version` and `committed_peak` (G8 stage 1) are appended
-    /// LAST so a node running the pre-W6 reader (which stops after the
-    /// digest) ignores them, and a W6-but-pre-G8 reader treats a standalone
-    /// term's absent `committed_peak` trailer as `members.len()` for
-    /// rolling-upgrade back-compat (see `deserialize`).
+    /// v2 is a CLEAN BREAK from the trailer-sniffed v1 layout: v1 dispatched
+    /// optional fields by exact total length, so appending a section silently
+    /// decoded `placement_version = 1` and `committed_peak = members.len()` —
+    /// dropping the G8 split-brain floor. v2 leads with a format byte, and
+    /// `deserialize` enforces the EXACT total length. There is no v1 reader:
+    /// the format break is deliberate (nothing is deployed).
+    ///
+    /// The assignment travels as the canonical encoding — a fixed
+    /// `NUM_SHARDS` array of u16 indices into `members` as received, never
+    /// length-prefixed. Entries naming a non-member cannot be encoded; such a
+    /// term is unserializable by construction.
     pub fn serialize(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(78 + self.members.len() * 8);
+        let assignment_bytes = self.assignment.as_ref().map(|assignment| {
+            crate::cluster::election::encode_assignment(assignment, &self.members)
+                .unwrap_or_default()
+        });
+        let assignment_len = assignment_bytes.as_ref().map_or(0, Vec::len);
+        let mut buf = Vec::with_capacity(81 + self.members.len() * 8 + assignment_len);
+        buf.push(TOPOLOGY_WIRE_FORMAT_V2);
         buf.extend_from_slice(&self.term.to_le_bytes());
         buf.extend_from_slice(&self.proposer.0.to_le_bytes());
         buf.extend_from_slice(&self.cluster_id.0);
+        buf.extend_from_slice(&self.placement_version.to_le_bytes());
+        buf.extend_from_slice(&self.committed_peak.to_le_bytes());
+        buf.push(self.rf);
         buf.extend_from_slice(&(self.members.len() as u32).to_le_bytes());
         for m in &self.members {
             buf.extend_from_slice(&m.0.to_le_bytes());
         }
+        match assignment_bytes {
+            Some(bytes) if bytes.len() == crate::cluster::shards::NUM_SHARDS * 2 => {
+                buf.push(1);
+                buf.extend_from_slice(&bytes);
+            }
+            // Either no assignment, or one that failed to encode (names a
+            // non-member). Serializing the latter as "absent" is safe: the
+            // digest was derived over the assignment, so the frame can never
+            // verify — and such a term is only constructible by hand, since
+            // `with_assignment` refuses it.
+            _ => buf.push(0),
+        }
         buf.extend_from_slice(&self.digest);
-        buf.extend_from_slice(&self.placement_version.to_le_bytes());
-        buf.extend_from_slice(&self.committed_peak.to_le_bytes());
         buf
     }
 
-    /// Deserialize from the wire.
+    /// Shared v2 header/section parser for [`TopologyTerm`] and
+    /// [`TopologyCommit`].
     ///
-    /// F-G5-002: bound the topology member list before allocation.
-    ///
-    /// The `count` field is a client-supplied `u32` and the subsequent
-    /// `count * 8` multiplication previously ran without `checked_mul`.
-    /// The downstream size check bounded the practical maximum to roughly
-    /// `MAX_FRAME_SIZE / 8` — about 2M members, far above any legitimate
-    /// production cluster of dozens of nodes. Combined with F-G5-001's
-    /// no-secret auth bypass, an unauthenticated peer could drive a 16
-    /// MiB pre-allocation per connection. Two defences:
-    ///
-    /// 1. `MAX_TOPOLOGY_MEMBERS` named cap rejected before any sizing
-    ///    arithmetic.
-    /// 2. `checked_mul` on `count * 8` so 32-bit targets do not
-    ///    silently overflow into a tiny `members_end` that bypasses
-    ///    the size check.
-    pub fn deserialize(data: &[u8]) -> Option<Self> {
-        // Header: [term:8][proposer:8][cluster_id:16][count:4] = 36 bytes.
-        if data.len() < 36 {
+    /// Returns the decoded term fields and the byte offset just past the
+    /// digest, where a commit's voter section begins. Bounds every count
+    /// before allocating (F-G5-002) and never infers a field from the total
+    /// length.
+    fn deserialize_v2_prefix(data: &[u8]) -> Option<(Self, usize)> {
+        // Fixed head: [fmt:1][term:8][proposer:8][cluster_id:16][pv:2][peak:8][rf:1][count:4] = 48.
+        if data.len() < 48 || data[0] != TOPOLOGY_WIRE_FORMAT_V2 {
             return None;
         }
-        let term = u64::from_le_bytes(data[0..8].try_into().ok()?);
-        let proposer = NodeId(u64::from_le_bytes(data[8..16].try_into().ok()?));
+        let term = u64::from_le_bytes(data[1..9].try_into().ok()?);
+        let proposer = NodeId(u64::from_le_bytes(data[9..17].try_into().ok()?));
         let mut cid = [0u8; 16];
-        cid.copy_from_slice(&data[16..32]);
+        cid.copy_from_slice(&data[17..33]);
         let cluster_id = ClusterId(cid);
-        let count = u32::from_le_bytes(data[32..36].try_into().ok()?) as usize;
+        let placement_version = u16::from_le_bytes(data[33..35].try_into().ok()?);
+        let committed_peak = u64::from_le_bytes(data[35..43].try_into().ok()?);
+        let rf = data[43];
+        let count = u32::from_le_bytes(data[44..48].try_into().ok()?) as usize;
         if count > MAX_TOPOLOGY_MEMBERS {
             return None;
         }
-        let members_end = 36usize.checked_add(count.checked_mul(8)?)?;
-        if data.len() < members_end.checked_add(32)? {
+        let members_end = 48usize.checked_add(count.checked_mul(8)?)?;
+        if data.len() < members_end.checked_add(1)? {
             return None;
         }
         let mut members = Vec::with_capacity(count);
         for i in 0..count {
-            let off = 36 + i * 8;
+            let off = 48 + i * 8;
             members.push(NodeId(u64::from_le_bytes(
                 data[off..off + 8].try_into().ok()?,
             )));
         }
-        let mut digest = [0u8; 32];
-        digest.copy_from_slice(&data[members_end..members_end + 32]);
-        // W6/G8 — `[placement_version:2][committed_peak:8]` are trailers
-        // appended ONLY by a standalone `TopologyTerm` payload (exact
-        // length match below). A `TopologyCommit` payload reuses this
-        // parser but has its own voter list immediately after the digest,
-        // so we must NOT read either trailer here —
-        // `TopologyCommit::deserialize` reads its own placement_version and
-        // committed_peak from its own tail. A pre-W6 standalone term has no
-        // trailer (length == members_end + 32) and decodes as v1 /
-        // committed_peak = members.len(); a W6-but-pre-G8 term has only the
-        // placement_version trailer and decodes committed_peak the same
-        // legacy way.
-        let digest_end = members_end.checked_add(32)?;
-        let mut placement_version = 1u16;
-        let mut committed_peak = members.len() as u64;
-        if data.len() == digest_end.checked_add(10)? {
-            // G8 — full trailer: [placement_version:2][committed_peak:8].
-            placement_version =
-                u16::from_le_bytes(data[digest_end..digest_end + 2].try_into().ok()?);
-            let peak_off = digest_end.checked_add(2)?;
-            committed_peak = u64::from_le_bytes(data[peak_off..peak_off + 8].try_into().ok()?);
-        } else if data.len() == digest_end.checked_add(2)? {
-            // W6-only trailer (pre-G8): placement_version present,
-            // committed_peak absent — legacy default applies.
-            placement_version =
-                u16::from_le_bytes(data[digest_end..digest_end + 2].try_into().ok()?);
+        let (assignment, digest_pos) = match data[members_end] {
+            0 => (None, members_end + 1),
+            1 => {
+                let bytes_end = members_end
+                    .checked_add(1)?
+                    .checked_add(crate::cluster::shards::NUM_SHARDS * 2)?;
+                if data.len() < bytes_end {
+                    return None;
+                }
+                // Rule 11 enforced here: an index >= members.len() is
+                // malformed and the whole frame is rejected.
+                let decoded = crate::cluster::election::decode_assignment(
+                    &data[members_end + 1..bytes_end],
+                    &members,
+                )
+                .ok()?;
+                (Some(decoded), bytes_end)
+            }
+            _ => return None,
+        };
+        let digest_end = digest_pos.checked_add(32)?;
+        if data.len() < digest_end {
+            return None;
         }
-        Some(Self {
-            term,
-            members,
-            proposer,
-            cluster_id,
-            placement_version,
-            committed_peak,
-            digest,
-        })
+        let mut digest = [0u8; 32];
+        digest.copy_from_slice(&data[digest_pos..digest_end]);
+        Some((
+            Self {
+                term,
+                members,
+                proposer,
+                cluster_id,
+                placement_version,
+                committed_peak,
+                rf,
+                assignment,
+                digest,
+            },
+            digest_end,
+        ))
+    }
+
+    /// Deserialize a standalone term from the wire (format v2, exact length).
+    pub fn deserialize(data: &[u8]) -> Option<Self> {
+        let (term, end) = Self::deserialize_v2_prefix(data)?;
+        // Exact length: a standalone term ends at its digest. Trailing bytes
+        // are a malformed frame, not a future extension point — extensions
+        // bump the format byte.
+        (data.len() == end).then_some(term)
     }
 }
 
@@ -296,14 +429,18 @@ pub struct TopologyVote {
 }
 
 impl TopologyVote {
-    /// Serialize for the wire.
+    /// Serialize for the wire (format v2).
     ///
-    /// Format: `[term:8][voter:8][digest:32][accepted:1][voter_current_term:8][voter_placement_support:2]`
+    /// Format: `[fmt:1 = 2][term:8][voter:8][digest:32][accepted:1][voter_current_term:8][voter_placement_support:2]`
     ///
-    /// `voter_placement_support` is appended LAST so a pre-W6 reader ignores
-    /// it and a W6 reader treats its absence as `1`.
+    /// §4.6 — the vote's `digest` is the full term digest, which binds the
+    /// assignment's bytes (via the embedded assignment digest), so a vote is
+    /// an attestation to WHAT was proposed, not just the term number. §10 —
+    /// the payload leads with the shared format byte and decodes at exact
+    /// length; the length-sniffed trailer is gone.
     pub fn serialize(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(59);
+        let mut buf = Vec::with_capacity(60);
+        buf.push(TOPOLOGY_WIRE_FORMAT_V2);
         buf.extend_from_slice(&self.term.to_le_bytes());
         buf.extend_from_slice(&self.voter.0.to_le_bytes());
         buf.extend_from_slice(&self.digest);
@@ -313,23 +450,19 @@ impl TopologyVote {
         buf
     }
 
-    /// Deserialize from the wire.
+    /// Deserialize from the wire (format v2, exact length).
     pub fn deserialize(data: &[u8]) -> Option<Self> {
-        if data.len() < 57 {
+        if data.len() != 60 || data[0] != TOPOLOGY_WIRE_FORMAT_V2 {
             return None;
         }
+        let data = &data[1..];
         let term = u64::from_le_bytes(data[0..8].try_into().ok()?);
         let voter = NodeId(u64::from_le_bytes(data[8..16].try_into().ok()?));
         let mut digest = [0u8; 32];
         digest.copy_from_slice(&data[16..48]);
         let accepted = data[48] != 0;
         let voter_current_term = u64::from_le_bytes(data[49..57].try_into().ok()?);
-        // W6 — optional 2-byte trailer; absent on pre-W6 votes (decode v1).
-        let voter_placement_support = if data.len() >= 59 {
-            u16::from_le_bytes(data[57..59].try_into().ok()?)
-        } else {
-            1
-        };
+        let voter_placement_support = u16::from_le_bytes(data[57..59].try_into().ok()?);
         Some(Self {
             term,
             digest,
@@ -362,9 +495,42 @@ pub struct TopologyCommit {
     pub digest: [u8; 32],
     /// Nodes whose accepted votes formed the quorum for this commit.
     pub voters: Vec<NodeId>,
+    /// Replication factor of the committed term (copied from the
+    /// `TopologyTerm` that reached quorum; mixed into the digest). See
+    /// [`TopologyTerm::rf`].
+    pub rf: u8,
+    /// The committed master assignment, if this term carried one. Copied from
+    /// the winning proposal; its canonical encoding is digest-bound, and every
+    /// recipient re-derives that encoding from THESE received entries.
+    pub assignment: Option<Vec<NodeId>>,
 }
 
 impl TopologyCommit {
+    /// The digest this commit's OWN received fields imply — assignment bytes
+    /// included. Mirrors [`TopologyTerm::recompute_digest`]; nothing trusts a
+    /// shipped hash.
+    pub fn recompute_digest(&self) -> [u8; 32] {
+        let assignment_digest = match &self.assignment {
+            Some(assignment) => {
+                match crate::cluster::election::encode_assignment(assignment, &self.members) {
+                    Some(encoded) => crate::cluster::election::assignment_digest(&encoded),
+                    // Names a non-member — can never match a well-formed digest.
+                    None => return [0xFF; 32],
+                }
+            }
+            None => ASSIGNMENT_ABSENT_DIGEST,
+        };
+        TopologyTerm::compute_digest(
+            self.term,
+            &self.cluster_id,
+            &self.members,
+            self.placement_version,
+            self.committed_peak,
+            self.rf,
+            assignment_digest,
+        )
+    }
+
     /// Check that the embedded voter list is a quorum proof for `members`,
     /// requiring at least `n` distinct, in-`members` voters.
     ///
@@ -394,108 +560,69 @@ impl TopologyCommit {
         self.has_quorum_voter_proof_for((self.members.len() / 2) + 1)
     }
 
-    /// Serialize for the wire.
+    /// Serialize for the wire (format v2).
     ///
-    /// Format: `[term:8][proposer:8][cluster_id:16][member_count:4][member_id:8 * count][digest:32][voter_count:4][voter_id:8 * count][placement_version:2][committed_peak:8]`
-    ///
-    /// `placement_version` and `committed_peak` (G8 stage 1) are appended
-    /// LAST (after the voter list) so a pre-W6 reader ignores both, a W6
-    /// reader treats their absence as `1`/`members.len()`, and a
-    /// W6-but-pre-G8 reader treats the absent `committed_peak` trailer as
-    /// `members.len()`.
+    /// The commit is the term-v2 layout (see [`TopologyTerm::serialize`])
+    /// followed by `[voter_count:4][voters:8*N]`. Exact length enforced on
+    /// decode; no trailer sniffing.
     pub fn serialize(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(82 + (self.members.len() + self.voters.len()) * 8);
-        buf.extend_from_slice(&self.term.to_le_bytes());
-        buf.extend_from_slice(&self.proposer.0.to_le_bytes());
-        buf.extend_from_slice(&self.cluster_id.0);
-        buf.extend_from_slice(&(self.members.len() as u32).to_le_bytes());
-        for m in &self.members {
-            buf.extend_from_slice(&m.0.to_le_bytes());
-        }
-        buf.extend_from_slice(&self.digest);
+        let term = TopologyTerm {
+            term: self.term,
+            members: self.members.clone(),
+            proposer: self.proposer,
+            cluster_id: self.cluster_id,
+            placement_version: self.placement_version,
+            committed_peak: self.committed_peak,
+            rf: self.rf,
+            assignment: self.assignment.clone(),
+            digest: self.digest,
+        };
+        let mut buf = term.serialize();
         buf.extend_from_slice(&(self.voters.len() as u32).to_le_bytes());
         for voter in &self.voters {
             buf.extend_from_slice(&voter.0.to_le_bytes());
         }
-        buf.extend_from_slice(&self.placement_version.to_le_bytes());
-        buf.extend_from_slice(&self.committed_peak.to_le_bytes());
         buf
     }
 
-    /// Deserialize from the wire.
+    /// Deserialize from the wire (format v2, exact length).
     ///
-    /// F-G5-002: bound voter count via `MAX_TOPOLOGY_MEMBERS` and use
-    /// `checked_mul` / `checked_add` arithmetic so a client-supplied
-    /// `count` cannot drive unbounded `Vec::with_capacity` or wrap
-    /// `usize` on 32-bit targets. The same defence is applied to
-    /// `TopologyTerm::deserialize` above.
+    /// F-G5-002: voter count bounded by `MAX_TOPOLOGY_MEMBERS` before any
+    /// allocation, `checked_mul`/`checked_add` throughout.
     pub fn deserialize(data: &[u8]) -> Option<Self> {
-        let term = TopologyTerm::deserialize(data)?;
-        // Header is 36 bytes ([term:8][proposer:8][cluster_id:16][count:4]),
-        // followed by members (count * 8) and the digest (32). Voter list
-        // starts after the digest.
-        let voters_pos = 36usize
-            .checked_add(term.members.len().checked_mul(8)?)?
-            .checked_add(32)?;
-        // Track the byte offset just past the voter list so the optional
-        // W6 `placement_version` trailer can be read from the very tail.
-        let mut voters_tail = voters_pos;
-        let voters = if data.len() >= voters_pos.checked_add(4)? {
-            let count =
-                u32::from_le_bytes(data[voters_pos..voters_pos + 4].try_into().ok()?) as usize;
-            if count > MAX_TOPOLOGY_MEMBERS {
-                return None;
-            }
-            let voters_end = voters_pos
-                .checked_add(4)?
-                .checked_add(count.checked_mul(8)?)?;
-            if data.len() < voters_end {
-                return None;
-            }
-            let mut voters = Vec::with_capacity(count);
-            for i in 0..count {
-                let off = voters_pos + 4 + i * 8;
-                voters.push(NodeId(u64::from_le_bytes(
-                    data[off..off + 8].try_into().ok()?,
-                )));
-            }
-            voters_tail = voters_end;
-            voters
-        } else {
-            Vec::new()
-        };
-        // W6 — optional 2-byte `placement_version` trailer after the voter
-        // list. Absent on pre-W6 commits (decode as v1).
-        let (placement_version, after_placement_version) =
-            if data.len() >= voters_tail.checked_add(2)? {
-                (
-                    u16::from_le_bytes(data[voters_tail..voters_tail + 2].try_into().ok()?),
-                    voters_tail.checked_add(2)?,
-                )
-            } else {
-                (1, voters_tail)
-            };
-        // G8 stage 1 — optional 8-byte `committed_peak` trailer after
-        // placement_version. Absent on pre-G8 commits (legacy default:
-        // members.len(), reproducing today's floor exactly).
-        let committed_peak = if data.len() >= after_placement_version.checked_add(8)? {
-            u64::from_le_bytes(
-                data[after_placement_version..after_placement_version + 8]
-                    .try_into()
-                    .ok()?,
-            )
-        } else {
-            term.members.len() as u64
-        };
+        let (term, voters_pos) = TopologyTerm::deserialize_v2_prefix(data)?;
+        if data.len() < voters_pos.checked_add(4)? {
+            return None;
+        }
+        let count = u32::from_le_bytes(data[voters_pos..voters_pos + 4].try_into().ok()?) as usize;
+        if count > MAX_TOPOLOGY_MEMBERS {
+            return None;
+        }
+        let voters_end = voters_pos
+            .checked_add(4)?
+            .checked_add(count.checked_mul(8)?)?;
+        // Exact length — trailing bytes are a malformed frame.
+        if data.len() != voters_end {
+            return None;
+        }
+        let mut voters = Vec::with_capacity(count);
+        for i in 0..count {
+            let off = voters_pos + 4 + i * 8;
+            voters.push(NodeId(u64::from_le_bytes(
+                data[off..off + 8].try_into().ok()?,
+            )));
+        }
         Some(Self {
             term: term.term,
             proposer: term.proposer,
             members: term.members,
             cluster_id: term.cluster_id,
-            placement_version,
-            committed_peak,
+            placement_version: term.placement_version,
+            committed_peak: term.committed_peak,
             digest: term.digest,
             voters,
+            rf: term.rf,
+            assignment: term.assignment,
         })
     }
 }
@@ -1056,6 +1183,9 @@ struct PendingProposal {
 /// Thread-safe: all mutable state is behind a Mutex.
 pub struct TopologyAuthority {
     self_id: NodeId,
+    /// Configured replication factor, digest-bound into every term this
+    /// authority produces or validates. See [`TopologyAuthority::new`].
+    rf: u8,
     /// Per-cluster UUID — used to reject merges between independently
     /// bootstrapped clusters that happen to share a `cluster_secret`.
     /// `ClusterId::UNSET` means "not configured" (pre-orchestrator code
@@ -1258,9 +1388,19 @@ pub fn committed_digest_fork_total() -> u64 {
 
 impl TopologyAuthority {
     /// Create a new authority with default state.
-    pub fn new(self_id: NodeId, propose_timeout: Duration) -> Self {
+    ///
+    /// `rf` is the configured replication factor. It is a constructor
+    /// parameter — not a setter — so an authority that does not know its
+    /// replication factor cannot exist. The candidate set (the entire
+    /// containment on who may master a shard) derives from
+    /// `(members, rf, placement_version)`, and `rf` is mixed into every
+    /// term digest: an authority guessing at it would compute digests that
+    /// disagree with its peers', which is exactly the cross-node divergence
+    /// this design exists to kill.
+    pub fn new(self_id: NodeId, propose_timeout: Duration, rf: u8) -> Self {
         Self {
             self_id,
+            rf: rf.max(1),
             cluster_id: RwLock::new(ClusterId::UNSET),
             committed_term: Arc::new(AtomicU64::new(0)),
             committed_members: Arc::new(RwLock::new(Vec::new())),
@@ -1315,6 +1455,12 @@ impl TopologyAuthority {
     fn reserve_vote_term(&self, term: u64) {
         self.voted_term.store(term, Ordering::Relaxed);
         *self.voted_digest.write().unwrap() = None;
+    }
+
+    /// The configured replication factor this authority derives placements
+    /// and digests with.
+    pub fn rf(&self) -> u8 {
+        self.rf
     }
 
     /// The highest term this node has voted for. `0` when it never has.
@@ -1870,6 +2016,7 @@ impl TopologyAuthority {
             self.cluster_id(),
             placement_version,
             committed_peak,
+            self.rf,
         );
         // §4.3 — complete the self-vote now that the content exists.
         self.record_vote(new_term, term.digest);
@@ -1894,14 +2041,19 @@ impl TopologyAuthority {
     pub fn handle_propose(&self, propose: &TopologyTerm) -> TopologyVote {
         let committed = self.committed_term.load(Ordering::Relaxed);
 
-        let valid_digest = propose.digest
-            == TopologyTerm::compute_digest(
-                propose.term,
-                &propose.cluster_id,
-                &propose.members,
-                propose.placement_version,
-                propose.committed_peak,
-            );
+        // §4.2 — recompute from the RECEIVED bytes, assignment included. A
+        // frame whose advertised digest disagrees with its own payload is
+        // rejected; nothing ever trusts a shipped hash.
+        let valid_digest = propose.digest == propose.recompute_digest();
+
+        // rf mismatch — same REFUSE-not-fallback posture as the placement
+        // gate below. The candidate set derives from `(members, rf,
+        // placement_version)`; a voter configured with a different rf would
+        // attest to a term whose containment rule it computes differently,
+        // splitting the rule-4 verdict across the cluster. The digest binds
+        // the PROPOSAL's rf (self-consistently), so only this explicit
+        // comparison against local config catches the disagreement.
+        let rf_mismatch = propose.rf != self.rf;
 
         // W6 (INVARIANT ii) — REFUSE, do not fall back. A voter that cannot
         // run the proposed placement algorithm must reject the proposal (so
@@ -1937,6 +2089,7 @@ impl TopologyAuthority {
         // round cannot launder a merged membership through the quorum.
         if !valid_digest
             || unsupported_placement
+            || rf_mismatch
             || !self.membership_change_is_safe(&propose.members, Some(propose.cluster_id))
         {
             // Even when `voted_term` would normally advance, we refuse to
@@ -1949,7 +2102,10 @@ impl TopologyAuthority {
                 term = propose.term,
                 placement_version = propose.placement_version,
                 unsupported_placement,
-                "cluster: rejecting topology propose — split-brain heal signature, bad digest, or unsupported placement version",
+                propose_rf = propose.rf,
+                local_rf = self.rf,
+                rf_mismatch,
+                "cluster: rejecting topology propose — split-brain heal signature, bad digest, rf mismatch, or unsupported placement version",
             );
             return TopologyVote {
                 term: propose.term,
@@ -2064,6 +2220,11 @@ impl TopologyAuthority {
                 committed_peak: proposal.term.committed_peak,
                 digest: proposal.term.digest,
                 voters,
+                rf: proposal.term.rf,
+                // The commit carries the EXACT assignment the quorum voted
+                // on — the digest binds its bytes, so substituting anything
+                // else here would fail every receiver's recompute.
+                assignment: proposal.term.assignment.clone(),
             };
             // Clear pending proposal
             *pending = None;
@@ -2131,18 +2292,39 @@ impl TopologyAuthority {
             return false;
         }
 
-        // Validate digest. The digest is computed over
-        // (term || cluster_id || members || placement_version ||
-        // committed_peak) so a forged cluster_id, a divergent placement
-        // version, or a divergent committed_peak claim still mismatches.
-        let expected_digest = TopologyTerm::compute_digest(
-            commit.term,
-            &commit.cluster_id,
-            &commit.members,
-            commit.placement_version,
-            commit.committed_peak,
-        );
-        if commit.digest != expected_digest {
+        // Validate digest. Recomputed from the commit's RECEIVED fields —
+        // term, cluster_id, members, placement_version, committed_peak, rf,
+        // and the assignment's actual bytes — so a forged cluster_id, a
+        // divergent placement version, a divergent committed_peak claim, a
+        // different rf, or a swapped assignment all still mismatch. §4.2:
+        // the assignment digest is recomputed from the received assignment,
+        // never taken from the frame.
+        if commit.digest != commit.recompute_digest() {
+            return false;
+        }
+
+        // rf mismatch — the commit is self-consistent (the digest above binds
+        // ITS rf) but this node is configured differently, so it would derive
+        // a different candidate set and a different placement from the same
+        // commit: a live dual-authority split, same class as the placement-
+        // version case below (P1-7), and handled identically — refuse, and
+        // when the commit carries a structurally valid quorum proof, record
+        // it so the node self-fences rather than serving a stale term
+        // alongside a cluster that moved on. Recovery is a config fix +
+        // reboot, exactly like a downgraded binary.
+        if commit.rf != self.rf {
+            tracing::error!(
+                self_id = self.self_id.0,
+                term = commit.term,
+                commit_rf = commit.rf,
+                local_rf = self.rf,
+                "cluster: refusing topology commit — rf mismatch; this node cannot \
+                 derive this term's candidate set",
+            );
+            if commit.has_quorum_voter_proof() {
+                self.unapplicable_committed_term
+                    .fetch_max(commit.term, Ordering::Relaxed);
+            }
             return false;
         }
 
@@ -2702,6 +2884,7 @@ impl TopologyAuthority {
             self.cluster_id(),
             placement_version,
             committed_peak,
+            self.rf,
         );
         self.record_vote(new_term, term.digest);
 
@@ -2782,6 +2965,7 @@ impl TopologyAuthority {
             self.cluster_id(),
             achievable,
             committed_peak,
+            self.rf,
         );
         self.record_vote(new_term, term.digest);
 
@@ -2910,6 +3094,7 @@ impl TopologyAuthority {
             self.cluster_id(),
             placement_version,
             committed_peak,
+            self.rf,
         );
         self.record_vote(new_term, term.digest);
 
@@ -3031,6 +3216,7 @@ impl TopologyAuthority {
             self.cluster_id(),
             placement_version,
             committed_peak,
+            self.rf,
         );
         self.record_vote(new_term, term.digest);
 
@@ -3204,7 +3390,7 @@ mod tests {
 
     #[test]
     fn deterministic_proposer_is_lowest_id() {
-        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1), 2);
         // Node 1 is the lowest → should propose
         let term = auth.on_membership_changed(&members(&[1, 2, 3]));
         assert!(term.is_some());
@@ -3216,14 +3402,14 @@ mod tests {
 
     #[test]
     fn non_proposer_returns_none() {
-        let auth = TopologyAuthority::new(NodeId(2), Duration::from_secs(1));
+        let auth = TopologyAuthority::new(NodeId(2), Duration::from_secs(1), 2);
         let term = auth.on_membership_changed(&members(&[1, 2, 3]));
         assert!(term.is_none());
     }
 
     #[test]
     fn vote_accept_valid_proposal() {
-        let auth = TopologyAuthority::new(NodeId(2), Duration::from_secs(1));
+        let auth = TopologyAuthority::new(NodeId(2), Duration::from_secs(1), 2);
         let propose = TopologyTerm::new(
             1,
             members(&[1, 2, 3]),
@@ -3231,6 +3417,7 @@ mod tests {
             ClusterId::UNSET,
             1,
             (members(&[1, 2, 3])).len() as u64,
+            2,
         );
         let vote = auth.handle_propose(&propose);
         assert!(vote.accepted);
@@ -3240,7 +3427,7 @@ mod tests {
 
     #[test]
     fn vote_reject_stale_proposal() {
-        let auth = TopologyAuthority::new(NodeId(2), Duration::from_secs(1));
+        let auth = TopologyAuthority::new(NodeId(2), Duration::from_secs(1), 2);
         // Simulate already having voted for term 5
         auth.voted_term.store(5, Ordering::Relaxed);
 
@@ -3251,6 +3438,7 @@ mod tests {
             ClusterId::UNSET,
             1,
             (members(&[1, 2, 3])).len() as u64,
+            2,
         );
         let vote = auth.handle_propose(&propose);
         assert!(!vote.accepted);
@@ -3258,7 +3446,7 @@ mod tests {
 
     #[test]
     fn vote_reject_bad_digest() {
-        let auth = TopologyAuthority::new(NodeId(2), Duration::from_secs(1));
+        let auth = TopologyAuthority::new(NodeId(2), Duration::from_secs(1), 2);
         let mut propose = TopologyTerm::new(
             1,
             members(&[1, 2, 3]),
@@ -3266,6 +3454,7 @@ mod tests {
             ClusterId::UNSET,
             1,
             (members(&[1, 2, 3])).len() as u64,
+            2,
         );
         propose.digest = [0xFF; 32]; // corrupt
         let vote = auth.handle_propose(&propose);
@@ -3274,7 +3463,7 @@ mod tests {
 
     #[test]
     fn quorum_reached_produces_commit() {
-        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1), 2);
         let term = auth.on_membership_changed(&members(&[1, 2, 3])).unwrap();
 
         // Self-vote already recorded. Need 1 more for quorum (2 of 3).
@@ -3295,7 +3484,7 @@ mod tests {
 
     #[test]
     fn quorum_not_reached_without_enough_votes() {
-        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1), 2);
         let _term = auth
             .on_membership_changed(&members(&[1, 2, 3, 4, 5]))
             .unwrap();
@@ -3309,6 +3498,8 @@ mod tests {
                 &members(&[1, 2, 3, 4, 5]),
                 1,
                 (members(&[1, 2, 3, 4, 5])).len() as u64,
+                2,
+                ASSIGNMENT_ABSENT_DIGEST,
             ),
             voter: NodeId(2),
             accepted: true,
@@ -3326,6 +3517,8 @@ mod tests {
                 &members(&[1, 2, 3, 4, 5]),
                 1,
                 (members(&[1, 2, 3, 4, 5])).len() as u64,
+                2,
+                ASSIGNMENT_ABSENT_DIGEST,
             ),
             voter: NodeId(3),
             accepted: true,
@@ -3338,10 +3531,12 @@ mod tests {
 
     #[test]
     fn handle_commit_activates_term() {
-        let auth = TopologyAuthority::new(NodeId(2), Duration::from_secs(1));
+        let auth = TopologyAuthority::new(NodeId(2), Duration::from_secs(1), 2);
         let mems = members(&[1, 2, 3]);
         let commit = TopologyCommit {
             term: 5,
+            rf: 2,
+            assignment: None,
             proposer: NodeId(1),
             members: mems.clone(),
             cluster_id: ClusterId::UNSET,
@@ -3353,6 +3548,8 @@ mod tests {
                 &mems,
                 1,
                 (mems).len() as u64,
+                2,
+                ASSIGNMENT_ABSENT_DIGEST,
             ),
             voters: mems.clone(),
         };
@@ -3366,7 +3563,7 @@ mod tests {
 
     #[test]
     fn last_commit_age_is_max_before_first_commit() {
-        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1), 2);
         assert_eq!(
             auth.last_commit_at_unix_ms(),
             0,
@@ -3381,10 +3578,12 @@ mod tests {
 
     #[test]
     fn last_commit_age_advances_after_handle_commit() {
-        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1), 2);
         let mems = members(&[1, 2, 3]);
         let commit = TopologyCommit {
             term: 7,
+            rf: 2,
+            assignment: None,
             proposer: NodeId(1),
             members: mems.clone(),
             cluster_id: ClusterId::UNSET,
@@ -3396,6 +3595,8 @@ mod tests {
                 &mems,
                 1,
                 (mems).len() as u64,
+                2,
+                ASSIGNMENT_ABSENT_DIGEST,
             ),
             voters: mems.clone(),
         };
@@ -3413,12 +3614,14 @@ mod tests {
 
     #[test]
     fn handle_commit_rejects_stale_term() {
-        let auth = TopologyAuthority::new(NodeId(2), Duration::from_secs(1));
+        let auth = TopologyAuthority::new(NodeId(2), Duration::from_secs(1), 2);
         auth.committed_term.store(10, Ordering::Relaxed);
 
         let mems = members(&[1, 2, 3]);
         let commit = TopologyCommit {
             term: 5, // stale
+            rf: 2,
+            assignment: None,
             proposer: NodeId(1),
             members: mems.clone(),
             cluster_id: ClusterId::UNSET,
@@ -3430,6 +3633,8 @@ mod tests {
                 &mems,
                 1,
                 (mems).len() as u64,
+                2,
+                ASSIGNMENT_ABSENT_DIGEST,
             ),
             voters: mems.clone(),
         };
@@ -3441,10 +3646,12 @@ mod tests {
         // Regression: duplicate commit for the same term must be rejected.
         // This prevents double-mastered shards when two commit signals
         // arrive close together (e.g., deterministic + fallback proposer).
-        let auth = TopologyAuthority::new(NodeId(2), Duration::from_secs(1));
+        let auth = TopologyAuthority::new(NodeId(2), Duration::from_secs(1), 2);
         let mems = members(&[1, 2, 3]);
         let commit = TopologyCommit {
             term: 5,
+            rf: 2,
+            assignment: None,
             proposer: NodeId(1),
             members: mems.clone(),
             cluster_id: ClusterId::UNSET,
@@ -3456,6 +3663,8 @@ mod tests {
                 &mems,
                 1,
                 (mems).len() as u64,
+                2,
+                ASSIGNMENT_ABSENT_DIGEST,
             ),
             voters: mems.clone(),
         };
@@ -3477,10 +3686,12 @@ mod tests {
 
     #[test]
     fn handle_commit_rejects_bad_digest() {
-        let auth = TopologyAuthority::new(NodeId(2), Duration::from_secs(1));
+        let auth = TopologyAuthority::new(NodeId(2), Duration::from_secs(1), 2);
         let mems = members(&[1, 2, 3]);
         let commit = TopologyCommit {
             term: 1,
+            rf: 2,
+            assignment: None,
             proposer: NodeId(1),
             members: mems.clone(),
             cluster_id: ClusterId::UNSET,
@@ -3545,6 +3756,7 @@ mod tests {
             ClusterId::UNSET,
             1,
             (members(&[1, 2, 3])).len() as u64,
+            2,
         );
         let data = term.serialize();
         let restored = TopologyTerm::deserialize(&data).unwrap();
@@ -3570,6 +3782,8 @@ mod tests {
 
         let commit = TopologyCommit {
             term: 42,
+            rf: 2,
+            assignment: None,
             proposer: NodeId(1),
             members: term.members.clone(),
             cluster_id: ClusterId::UNSET,
@@ -3588,7 +3802,7 @@ mod tests {
 
     #[test]
     fn topology_commit_persists_voter_list() {
-        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1), 2);
         let mems = members(&[1, 2, 3]);
         let term = auth.on_membership_changed(&mems).unwrap();
         let vote = TopologyVote {
@@ -3614,7 +3828,7 @@ mod tests {
 
     #[test]
     fn cannot_vote_twice_for_same_term() {
-        let auth = TopologyAuthority::new(NodeId(2), Duration::from_secs(1));
+        let auth = TopologyAuthority::new(NodeId(2), Duration::from_secs(1), 2);
 
         let p1 = TopologyTerm::new(
             1,
@@ -3623,6 +3837,7 @@ mod tests {
             ClusterId::UNSET,
             1,
             (members(&[1, 2, 3])).len() as u64,
+            2,
         );
         let v1 = auth.handle_propose(&p1);
         assert!(v1.accepted);
@@ -3635,6 +3850,7 @@ mod tests {
             ClusterId::UNSET,
             1,
             (members(&[1, 2, 3])).len() as u64,
+            2,
         );
         let v2 = auth.handle_propose(&p2);
         assert!(!v2.accepted); // Already voted for term 1
@@ -3642,7 +3858,7 @@ mod tests {
 
     #[test]
     fn sequential_terms_advance() {
-        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1), 2);
 
         let t1 = auth.on_membership_changed(&members(&[1, 2, 3])).unwrap();
         assert_eq!(t1.term, 1);
@@ -3650,6 +3866,8 @@ mod tests {
         // Simulate commit
         auth.handle_commit(&TopologyCommit {
             term: 1,
+            rf: 2,
+            assignment: None,
             proposer: NodeId(1),
             members: members(&[1, 2, 3]),
             cluster_id: ClusterId::UNSET,
@@ -3670,13 +3888,15 @@ mod tests {
     fn catchup_via_synthetic_commit() {
         // Simulate a lagging node (term=0) catching up to term=5
         // by receiving a synthetic commit from a peer.
-        let auth = TopologyAuthority::new(NodeId(2), Duration::from_secs(1));
+        let auth = TopologyAuthority::new(NodeId(2), Duration::from_secs(1), 2);
         assert_eq!(auth.committed_term(), 0);
 
         // Construct a synthetic commit as if fetched from a peer
         let remote_members = members(&[1, 2, 3]);
         let commit = TopologyCommit {
             term: 5,
+            rf: 2,
+            assignment: None,
             proposer: NodeId(1),
             members: remote_members.clone(),
             cluster_id: ClusterId::UNSET,
@@ -3688,6 +3908,8 @@ mod tests {
                 &remote_members,
                 1,
                 (remote_members).len() as u64,
+                2,
+                ASSIGNMENT_ABSENT_DIGEST,
             ),
             voters: remote_members.clone(),
         };
@@ -3700,12 +3922,14 @@ mod tests {
     #[test]
     fn catchup_rejects_stale_synthetic_commit() {
         // A node already at term=10 must reject a synthetic commit for term=5.
-        let auth = TopologyAuthority::new(NodeId(2), Duration::from_secs(1));
+        let auth = TopologyAuthority::new(NodeId(2), Duration::from_secs(1), 2);
         auth.committed_term.store(10, Ordering::Relaxed);
 
         let remote_members = members(&[1, 2, 3]);
         let commit = TopologyCommit {
             term: 5,
+            rf: 2,
+            assignment: None,
             proposer: NodeId(1),
             members: remote_members.clone(),
             cluster_id: ClusterId::UNSET,
@@ -3717,6 +3941,8 @@ mod tests {
                 &remote_members,
                 1,
                 (remote_members).len() as u64,
+                2,
+                ASSIGNMENT_ABSENT_DIGEST,
             ),
             voters: remote_members.clone(),
         };
@@ -3727,10 +3953,12 @@ mod tests {
 
     #[test]
     fn catchup_rejects_bad_digest_synthetic_commit() {
-        let auth = TopologyAuthority::new(NodeId(2), Duration::from_secs(1));
+        let auth = TopologyAuthority::new(NodeId(2), Duration::from_secs(1), 2);
 
         let commit = TopologyCommit {
             term: 5,
+            rf: 2,
+            assignment: None,
             proposer: NodeId(1),
             members: members(&[1, 2, 3]),
             cluster_id: ClusterId::UNSET,
@@ -3747,12 +3975,14 @@ mod tests {
     fn catchup_advances_and_then_normal_proposal_works() {
         // After catching up via synthetic commit, normal proposal flow
         // should still work with higher term numbers.
-        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1), 2);
 
         // Catch up to term 5
         let mems = members(&[1, 2, 3]);
         let commit = TopologyCommit {
             term: 5,
+            rf: 2,
+            assignment: None,
             proposer: NodeId(1),
             members: mems.clone(),
             cluster_id: ClusterId::UNSET,
@@ -3764,6 +3994,8 @@ mod tests {
                 &mems,
                 1,
                 (mems).len() as u64,
+                2,
+                ASSIGNMENT_ABSENT_DIGEST,
             ),
             voters: mems.clone(),
         };
@@ -3782,7 +4014,7 @@ mod tests {
         // Regression test: a synthetic commit constructed with the wrong
         // member list (e.g., SWIM-alive nodes instead of committed members)
         // produces a mismatched digest and MUST be rejected.
-        let auth = TopologyAuthority::new(NodeId(2), Duration::from_secs(1));
+        let auth = TopologyAuthority::new(NodeId(2), Duration::from_secs(1), 2);
 
         // The original term 5 was committed with members [1, 3].
         let original_members = members(&[1, 3]);
@@ -3792,6 +4024,8 @@ mod tests {
             &original_members,
             1,
             (original_members).len() as u64,
+            2,
+            ASSIGNMENT_ABSENT_DIGEST,
         );
 
         // Synthetic commit with wrong members [1, 2, 3] (SWIM-alive view).
@@ -3802,6 +4036,8 @@ mod tests {
             &wrong_members,
             1,
             (wrong_members).len() as u64,
+            2,
+            ASSIGNMENT_ABSENT_DIGEST,
         );
 
         // The digests MUST differ.
@@ -3813,6 +4049,8 @@ mod tests {
         // Applying the wrong-members commit should fail.
         let wrong_commit = TopologyCommit {
             term: 5,
+            rf: 2,
+            assignment: None,
             proposer: NodeId(1),
             members: wrong_members.clone(),
             cluster_id: ClusterId::UNSET,
@@ -3834,9 +4072,11 @@ mod tests {
         assert_eq!(auth.committed_members(), members(&[1, 2, 3]));
 
         // The correct commit uses the ORIGINAL members.
-        let auth2 = TopologyAuthority::new(NodeId(2), Duration::from_secs(1));
+        let auth2 = TopologyAuthority::new(NodeId(2), Duration::from_secs(1), 2);
         let correct_commit = TopologyCommit {
             term: 5,
+            rf: 2,
+            assignment: None,
             proposer: NodeId(1),
             members: original_members.clone(),
             cluster_id: ClusterId::UNSET,
@@ -3860,7 +4100,7 @@ mod tests {
 
     #[test]
     fn pending_proposal_superseded_by_new_membership_change() {
-        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1), 2);
 
         // First membership change → propose term 1
         let t1 = auth.on_membership_changed(&members(&[1, 2, 3])).unwrap();
@@ -3889,12 +4129,14 @@ mod tests {
 
     #[test]
     fn commit_clears_pending_proposal() {
-        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1), 2);
         let t = auth.on_membership_changed(&members(&[1, 2, 3])).unwrap();
 
         // Simulate external commit (e.g., from another proposer)
         let commit = TopologyCommit {
             term: 5,
+            rf: 2,
+            assignment: None,
             proposer: NodeId(2),
             members: members(&[1, 2, 3, 4]),
             cluster_id: ClusterId::UNSET,
@@ -3906,6 +4148,8 @@ mod tests {
                 &members(&[1, 2, 3, 4]),
                 1,
                 (members(&[1, 2, 3, 4])).len() as u64,
+                2,
+                ASSIGNMENT_ABSENT_DIGEST,
             ),
             voters: members(&[1, 2, 3, 4]),
         };
@@ -3933,8 +4177,8 @@ mod tests {
 
     #[test]
     fn two_authorities_same_proposal_same_digest() {
-        let a1 = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
-        let a2 = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+        let a1 = TopologyAuthority::new(NodeId(1), Duration::from_secs(1), 2);
+        let a2 = TopologyAuthority::new(NodeId(1), Duration::from_secs(1), 2);
 
         let t1 = a1.on_membership_changed(&members(&[1, 2, 3])).unwrap();
         let t2 = a2.on_membership_changed(&members(&[1, 2, 3])).unwrap();
@@ -3953,7 +4197,7 @@ mod tests {
     #[test]
     fn minority_cannot_commit_independently() {
         // In a 5-node cluster, 2 nodes can't reach quorum (need 3)
-        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1), 2);
         let t = auth
             .on_membership_changed(&members(&[1, 2, 3, 4, 5]))
             .unwrap();
@@ -3998,12 +4242,14 @@ mod tests {
 
     #[test]
     fn fallback_proposer_skips_when_already_committed() {
-        let auth = TopologyAuthority::new(NodeId(2), Duration::from_millis(10));
+        let auth = TopologyAuthority::new(NodeId(2), Duration::from_millis(10), 2);
         let mems = members(&[1, 2, 3]);
 
         // Commit the current membership
         let commit = TopologyCommit {
             term: 5,
+            rf: 2,
+            assignment: None,
             proposer: NodeId(1),
             members: mems.clone(),
             cluster_id: ClusterId::UNSET,
@@ -4015,6 +4261,8 @@ mod tests {
                 &mems,
                 1,
                 (mems).len() as u64,
+                2,
+                ASSIGNMENT_ABSENT_DIGEST,
             ),
             voters: mems.clone(),
         };
@@ -4032,12 +4280,14 @@ mod tests {
 
     #[test]
     fn fallback_proposer_does_not_resurrect_gracefully_removed_node() {
-        let auth = TopologyAuthority::new(NodeId(4), Duration::from_millis(10));
+        let auth = TopologyAuthority::new(NodeId(4), Duration::from_millis(10), 2);
         let original = members(&[1, 2, 3, 4]);
         let drained = members(&[1, 2, 3]);
 
         auth.handle_commit(&TopologyCommit {
             term: 4,
+            rf: 2,
+            assignment: None,
             proposer: NodeId(1),
             members: original.clone(),
             cluster_id: ClusterId::UNSET,
@@ -4049,11 +4299,15 @@ mod tests {
                 &original,
                 1,
                 (original).len() as u64,
+                2,
+                ASSIGNMENT_ABSENT_DIGEST,
             ),
             voters: original.clone(),
         });
         auth.handle_commit(&TopologyCommit {
             term: 5,
+            rf: 2,
+            assignment: None,
             proposer: NodeId(1),
             members: drained.clone(),
             cluster_id: ClusterId::UNSET,
@@ -4065,6 +4319,8 @@ mod tests {
                 &drained,
                 1,
                 (drained).len() as u64,
+                2,
+                ASSIGNMENT_ABSENT_DIGEST,
             ),
             voters: drained.clone(),
         });
@@ -4084,7 +4340,7 @@ mod tests {
         // remote_term from SWIM gossip but members from current routing
         // info (SWIM-alive nodes). The digest won't match the original
         // commit because the original had different members.
-        let auth = TopologyAuthority::new(NodeId(2), Duration::from_secs(1));
+        let auth = TopologyAuthority::new(NodeId(2), Duration::from_secs(1), 2);
 
         // Original term 5 committed with members [1, 3] (node2 was down).
         let original_members = members(&[1, 3]);
@@ -4093,10 +4349,12 @@ mod tests {
         // uses remote_term=5 with current members=[1, 2, 3].
         let _bad_commit = TopologyCommit {
             term: 5,
+            rf: 2,
+            assignment: None,
             proposer: NodeId(1),
             members: members(&[1, 2, 3]),
-            // This digest is compute_digest(5, [1,2,3]) which differs
-            // from the original compute_digest(5, [1,3]).
+            // This digest is compute_digest(5, [1,2,3], 2, ASSIGNMENT_ABSENT_DIGEST) which differs
+            // from the original compute_digest(5, [1,3], 2, ASSIGNMENT_ABSENT_DIGEST).
             cluster_id: ClusterId::UNSET,
             placement_version: 1,
             committed_peak: (members(&[1, 2, 3])).len() as u64,
@@ -4106,6 +4364,8 @@ mod tests {
                 &members(&[1, 2, 3]),
                 1,
                 (members(&[1, 2, 3])).len() as u64,
+                2,
+                ASSIGNMENT_ABSENT_DIGEST,
             ),
             voters: members(&[1, 2, 3]),
         };
@@ -4119,6 +4379,8 @@ mod tests {
         // from the partition map and constructs:
         let good_commit = TopologyCommit {
             term: 5,
+            rf: 2,
+            assignment: None,
             proposer: NodeId(1),
             members: original_members.clone(),
             cluster_id: ClusterId::UNSET,
@@ -4130,6 +4392,8 @@ mod tests {
                 &original_members,
                 1,
                 (original_members).len() as u64,
+                2,
+                ASSIGNMENT_ABSENT_DIGEST,
             ),
             voters: original_members.clone(),
         };
@@ -4147,7 +4411,7 @@ mod tests {
     /// not allow re-voting for a term between the two.
     #[test]
     fn handle_commit_leaves_voted_term_unchanged() {
-        let auth = TopologyAuthority::new(NodeId(2), Duration::from_secs(1));
+        let auth = TopologyAuthority::new(NodeId(2), Duration::from_secs(1), 2);
 
         // Vote for term 3
         let p = TopologyTerm::new(
@@ -4157,6 +4421,7 @@ mod tests {
             ClusterId::UNSET,
             1,
             (members(&[1, 2, 3])).len() as u64,
+            2,
         );
         let v = auth.handle_propose(&p);
         assert!(v.accepted);
@@ -4166,6 +4431,8 @@ mod tests {
         let mems = members(&[1, 2, 3, 4]);
         let commit = TopologyCommit {
             term: 10,
+            rf: 2,
+            assignment: None,
             proposer: NodeId(1),
             members: mems.clone(),
             cluster_id: ClusterId::UNSET,
@@ -4177,6 +4444,8 @@ mod tests {
                 &mems,
                 1,
                 (mems).len() as u64,
+                2,
+                ASSIGNMENT_ABSENT_DIGEST,
             ),
             voters: mems.clone(),
         };
@@ -4193,6 +4462,7 @@ mod tests {
             ClusterId::UNSET,
             1,
             (members(&[1, 2, 3])).len() as u64,
+            2,
         );
         let v2 = auth.handle_propose(&p2);
         assert!(!v2.accepted, "term 8 < committed_term 10 → must reject");
@@ -4203,7 +4473,7 @@ mod tests {
     /// the next proposal skips past the voted term.
     #[test]
     fn retry_proposal_advances_term_and_keeps_membership() {
-        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1), 2);
         let mems = members(&[1, 2, 3]);
 
         let t1 = auth.on_membership_changed(&mems).unwrap();
@@ -4218,7 +4488,7 @@ mod tests {
 
     #[test]
     fn retry_proposal_returns_none_when_not_deterministic_proposer() {
-        let auth = TopologyAuthority::new(NodeId(3), Duration::from_secs(1));
+        let auth = TopologyAuthority::new(NodeId(3), Duration::from_secs(1), 2);
         // Observed membership: [1,2,3] — proposer would be node 1, not self.
         *auth.observed_membership.lock() = members(&[1, 2, 3]);
         assert!(auth.retry_proposal().is_none());
@@ -4226,10 +4496,12 @@ mod tests {
 
     #[test]
     fn retry_proposal_returns_none_when_membership_already_committed() {
-        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1), 2);
         let mems = members(&[1, 2]);
         auth.handle_commit(&TopologyCommit {
             term: 1,
+            rf: 2,
+            assignment: None,
             proposer: NodeId(1),
             members: mems.clone(),
             cluster_id: ClusterId::UNSET,
@@ -4241,6 +4513,8 @@ mod tests {
                 &mems,
                 1,
                 (mems).len() as u64,
+                2,
+                ASSIGNMENT_ABSENT_DIGEST,
             ),
             voters: mems.clone(),
         });
@@ -4253,7 +4527,7 @@ mod tests {
 
     #[test]
     fn on_membership_changed_skips_past_voted_term() {
-        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1), 2);
 
         // Propose and self-vote for term 1
         let t1 = auth.on_membership_changed(&members(&[1, 2, 3])).unwrap();
@@ -4274,13 +4548,15 @@ mod tests {
     /// the pending proposal. Votes for the first term are ignored.
     #[test]
     fn check_timeout_overwrite_pending() {
-        let auth = TopologyAuthority::new(NodeId(2), Duration::from_millis(1));
+        let auth = TopologyAuthority::new(NodeId(2), Duration::from_millis(1), 2);
         let mems = members(&[1, 2, 3]);
 
         // Commit a different membership so check_timeout fires.
         let old_mems = members(&[1, 2]);
         auth.handle_commit(&TopologyCommit {
             term: 1,
+            rf: 2,
+            assignment: None,
             proposer: NodeId(1),
             members: old_mems.clone(),
             cluster_id: ClusterId::UNSET,
@@ -4292,6 +4568,8 @@ mod tests {
                 &old_mems,
                 1,
                 (old_mems).len() as u64,
+                2,
+                ASSIGNMENT_ABSENT_DIGEST,
             ),
             voters: old_mems.clone(),
         });
@@ -4347,6 +4625,7 @@ mod tests {
             ClusterId::UNSET,
             1,
             (members(&[1, 2, 3])).len() as u64,
+            2,
         );
         let data = term.serialize();
 
@@ -4395,7 +4674,7 @@ mod tests {
     /// `on_membership_changed` alone must leave it unchanged.
     #[test]
     fn cluster_key_unchanged_during_exchange() {
-        let ta = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+        let ta = TopologyAuthority::new(NodeId(1), Duration::from_secs(1), 2);
         let mems = vec![NodeId(1), NodeId(2)];
         let initial_term = ta.committed_term();
         let proposal = ta.on_membership_changed(&mems);
@@ -4411,12 +4690,14 @@ mod tests {
     /// to committed term (not just greater). This is the boundary condition.
     #[test]
     fn formation_recovery_equal_term_accepted() {
-        let auth = TopologyAuthority::new(NodeId(2), Duration::from_secs(1));
+        let auth = TopologyAuthority::new(NodeId(2), Duration::from_secs(1), 2);
 
         // Single-node commit at term 1
         let single = members(&[2]);
         auth.handle_commit(&TopologyCommit {
             term: 1,
+            rf: 2,
+            assignment: None,
             proposer: NodeId(2),
             members: single.clone(),
             cluster_id: ClusterId::UNSET,
@@ -4428,6 +4709,8 @@ mod tests {
                 &single,
                 1,
                 (single).len() as u64,
+                2,
+                ASSIGNMENT_ABSENT_DIGEST,
             ),
             voters: single.clone(),
         });
@@ -4452,6 +4735,7 @@ mod tests {
             ClusterId::UNSET,
             1,
             (members(&[1, 2, 3])).len() as u64,
+            2,
         );
         let v = auth.handle_propose(&proposal);
         assert!(
@@ -4470,6 +4754,8 @@ mod tests {
         let mems = members(ids);
         let commit = TopologyCommit {
             term,
+            rf: 2,
+            assignment: None,
             proposer: NodeId(1),
             members: mems.clone(),
             cluster_id: ClusterId::UNSET,
@@ -4481,6 +4767,8 @@ mod tests {
                 &mems,
                 1,
                 (mems).len() as u64,
+                2,
+                ASSIGNMENT_ABSENT_DIGEST,
             ),
             voters: mems.clone(),
         };
@@ -4626,7 +4914,7 @@ mod tests {
     #[test]
     fn topology_proposer_refuses_non_superset_membership_change() {
         // Node 1 is the deterministic proposer (lowest id).
-        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1), 2);
         // Cluster A committed: [1, 2, 3].
         commit_membership(&auth, 1, &[1, 2, 3]);
         // F-G8-001: the ever-seen split-brain fallback rejects any
@@ -4645,7 +4933,7 @@ mod tests {
         assert_eq!(pure_add.unwrap().members, members(&[1, 2, 3, 4]));
 
         // Reset to the original commit so the next assertion starts clean.
-        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1), 2);
         commit_membership(&auth, 1, &[1, 2, 3]);
 
         // Sanity: a pure removal (graceful drain) is accepted. The
@@ -4659,7 +4947,7 @@ mod tests {
 
         // Real test: SWIM reports [1, 2, 5] — node 3 disappeared AND node 5
         // showed up, the unmistakable two-clusters-merging pattern.
-        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1), 2);
         commit_membership(&auth, 1, &[1, 2, 3]);
         // Pre-seed node 5 so the rejection below is attributable to the
         // monotonicity check (the test's headline invariant) rather
@@ -4717,7 +5005,7 @@ mod tests {
     fn check_timeout_refuses_non_superset_membership_change() {
         // Node 2 is NOT the deterministic proposer for [1, 3, 5]; it would
         // become the fallback proposer after the timeout fires.
-        let auth = TopologyAuthority::new(NodeId(2), Duration::from_millis(1));
+        let auth = TopologyAuthority::new(NodeId(2), Duration::from_millis(1), 2);
         commit_membership(&auth, 1, &[1, 2, 3]);
 
         // Wait past the timeout window so check_timeout proceeds past the
@@ -4737,7 +5025,7 @@ mod tests {
     /// observed_membership too.
     #[test]
     fn retry_proposal_refuses_non_superset_membership_change() {
-        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1), 2);
         commit_membership(&auth, 1, &[1, 2, 3]);
 
         // Bypass on_membership_changed to install a poisoned observation
@@ -4784,6 +5072,7 @@ mod tests {
             ClusterId::UNSET,
             1,
             (members(&ids)).len() as u64,
+            2,
         );
         let bytes = term.serialize();
         let decoded = TopologyTerm::deserialize(&bytes).expect("at-cap term should decode");
@@ -4802,6 +5091,7 @@ mod tests {
             ClusterId::UNSET,
             1,
             (members(&[1, 2, 3])).len() as u64,
+            2,
         );
         let mut bytes = term.serialize();
         // Append voter section claiming MAX_TOPOLOGY_MEMBERS + 1 voters
@@ -4831,7 +5121,11 @@ mod tests {
         const ROUNDS: usize = 2_000;
 
         for round in 0..ROUNDS {
-            let auth = Arc::new(TopologyAuthority::new(NodeId(99), Duration::from_secs(1)));
+            let auth = Arc::new(TopologyAuthority::new(
+                NodeId(99),
+                Duration::from_secs(1),
+                2,
+            ));
             // A fresh, strictly-higher term each round so the proposal is a
             // genuine candidate (term > committed && term > voted == 0).
             let term = (round as u64) + 1;
@@ -4860,6 +5154,7 @@ mod tests {
                         ClusterId::UNSET,
                         1,
                         (vec![proposer, NodeId(99)]).len() as u64,
+                        2,
                     );
                     barrier.wait();
                     let vote = auth.handle_propose(&propose);
@@ -4900,13 +5195,15 @@ mod tests {
         let cluster_a = ClusterId([0xAA; 16]);
         let cluster_b = ClusterId([0xBB; 16]);
 
-        let auth = TopologyAuthority::new(NodeId(2), Duration::from_secs(1));
+        let auth = TopologyAuthority::new(NodeId(2), Duration::from_secs(1), 2);
         auth.set_cluster_id(cluster_a);
 
         // Establish a local cluster-A topology at term 5.
         let local_members = members(&[1, 2, 3]);
         let local_commit = TopologyCommit {
             term: 5,
+            rf: 2,
+            assignment: None,
             proposer: NodeId(1),
             members: local_members.clone(),
             cluster_id: cluster_a,
@@ -4918,6 +5215,8 @@ mod tests {
                 &local_members,
                 1,
                 (local_members).len() as u64,
+                2,
+                ASSIGNMENT_ABSENT_DIGEST,
             ),
             voters: local_members.clone(),
         };
@@ -4929,6 +5228,8 @@ mod tests {
         let foreign_members = members(&[4, 5, 6]);
         let foreign_commit = TopologyCommit {
             term: 7,
+            rf: 2,
+            assignment: None,
             proposer: NodeId(4),
             members: foreign_members.clone(),
             cluster_id: cluster_b,
@@ -4940,6 +5241,8 @@ mod tests {
                 &foreign_members,
                 1,
                 (foreign_members).len() as u64,
+                2,
+                ASSIGNMENT_ABSENT_DIGEST,
             ),
             voters: foreign_members.clone(),
         };
@@ -4960,12 +5263,14 @@ mod tests {
     #[test]
     fn handle_commit_rejects_unsafe_membership_change() {
         let cid = ClusterId([0xCC; 16]);
-        let auth = TopologyAuthority::new(NodeId(2), Duration::from_secs(1));
+        let auth = TopologyAuthority::new(NodeId(2), Duration::from_secs(1), 2);
         auth.set_cluster_id(cid);
 
         let local_members = members(&[1, 2, 3]);
         let local_commit = TopologyCommit {
             term: 5,
+            rf: 2,
+            assignment: None,
             proposer: NodeId(1),
             members: local_members.clone(),
             cluster_id: cid,
@@ -4977,6 +5282,8 @@ mod tests {
                 &local_members,
                 1,
                 (local_members).len() as u64,
+                2,
+                ASSIGNMENT_ABSENT_DIGEST,
             ),
             voters: local_members.clone(),
         };
@@ -4988,6 +5295,8 @@ mod tests {
         let merged_members = members(&[3, 4, 5]);
         let merged_commit = TopologyCommit {
             term: 7,
+            rf: 2,
+            assignment: None,
             proposer: NodeId(3),
             members: merged_members.clone(),
             cluster_id: cid,
@@ -4999,6 +5308,8 @@ mod tests {
                 &merged_members,
                 1,
                 (merged_members).len() as u64,
+                2,
+                ASSIGNMENT_ABSENT_DIGEST,
             ),
             voters: merged_members.clone(),
         };
@@ -5016,12 +5327,14 @@ mod tests {
     #[test]
     fn handle_commit_accepts_valid_same_cluster_growth() {
         let cid = ClusterId([0xDD; 16]);
-        let auth = TopologyAuthority::new(NodeId(2), Duration::from_secs(1));
+        let auth = TopologyAuthority::new(NodeId(2), Duration::from_secs(1), 2);
         auth.set_cluster_id(cid);
 
         let local_members = members(&[1, 2, 3]);
         let local_commit = TopologyCommit {
             term: 5,
+            rf: 2,
+            assignment: None,
             proposer: NodeId(1),
             members: local_members.clone(),
             cluster_id: cid,
@@ -5033,6 +5346,8 @@ mod tests {
                 &local_members,
                 1,
                 (local_members).len() as u64,
+                2,
+                ASSIGNMENT_ABSENT_DIGEST,
             ),
             voters: local_members.clone(),
         };
@@ -5042,6 +5357,8 @@ mod tests {
         let grown_members = members(&[1, 2, 3, 4, 5]);
         let grown_commit = TopologyCommit {
             term: 7,
+            rf: 2,
+            assignment: None,
             proposer: NodeId(1),
             members: grown_members.clone(),
             cluster_id: cid,
@@ -5053,6 +5370,8 @@ mod tests {
                 &grown_members,
                 1,
                 (grown_members).len() as u64,
+                2,
+                ASSIGNMENT_ABSENT_DIGEST,
             ),
             voters: grown_members.clone(),
         };
@@ -5070,12 +5389,14 @@ mod tests {
     /// reject a foreign commit that introduces never-before-seen members.
     #[test]
     fn handle_commit_rejects_unseen_members_when_cluster_id_unset() {
-        let auth = TopologyAuthority::new(NodeId(2), Duration::from_secs(1));
+        let auth = TopologyAuthority::new(NodeId(2), Duration::from_secs(1), 2);
         // cluster_id stays UNSET on both sides.
 
         let local_members = members(&[1, 2, 3]);
         let local_commit = TopologyCommit {
             term: 5,
+            rf: 2,
+            assignment: None,
             proposer: NodeId(1),
             members: local_members.clone(),
             cluster_id: ClusterId::UNSET,
@@ -5087,6 +5408,8 @@ mod tests {
                 &local_members,
                 1,
                 (local_members).len() as u64,
+                2,
+                ASSIGNMENT_ABSENT_DIGEST,
             ),
             voters: local_members.clone(),
         };
@@ -5097,6 +5420,8 @@ mod tests {
         let foreign_members = members(&[1, 2, 3, 7, 8]);
         let foreign_commit = TopologyCommit {
             term: 7,
+            rf: 2,
+            assignment: None,
             proposer: NodeId(7),
             members: foreign_members.clone(),
             cluster_id: ClusterId::UNSET,
@@ -5108,6 +5433,8 @@ mod tests {
                 &foreign_members,
                 1,
                 (foreign_members).len() as u64,
+                2,
+                ASSIGNMENT_ABSENT_DIGEST,
             ),
             voters: foreign_members.clone(),
         };
@@ -5197,7 +5524,7 @@ mod tests {
 
         // Prove the net-zero property end-to-end: feeding this to an
         // authority already committed on {1,2,3} produces NO proposal.
-        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1), 2);
         // Establish committed {1,2,3} (single observe + self/quorum commit
         // via the test commit helper would be heavier; instead drive the
         // on_membership_changed identical-skip directly after a first
@@ -5207,6 +5534,8 @@ mod tests {
             .expect("proposer proposes first term");
         let commit = TopologyCommit {
             term: term.term,
+            rf: 2,
+            assignment: None,
             proposer: NodeId(1),
             members: term.members.clone(),
             cluster_id: term.cluster_id,
@@ -5293,8 +5622,24 @@ mod tests {
         // produce different digests, so a v1 node and a v2 node can never
         // agree they committed "the same term".
         let mems = members(&[1, 2, 3]);
-        let d1 = TopologyTerm::compute_digest(7, &ClusterId::UNSET, &mems, 1, (mems).len() as u64);
-        let d2 = TopologyTerm::compute_digest(7, &ClusterId::UNSET, &mems, 2, (mems).len() as u64);
+        let d1 = TopologyTerm::compute_digest(
+            7,
+            &ClusterId::UNSET,
+            &mems,
+            1,
+            (mems).len() as u64,
+            2,
+            ASSIGNMENT_ABSENT_DIGEST,
+        );
+        let d2 = TopologyTerm::compute_digest(
+            7,
+            &ClusterId::UNSET,
+            &mems,
+            2,
+            (mems).len() as u64,
+            2,
+            ASSIGNMENT_ABSENT_DIGEST,
+        );
         assert_ne!(d1, d2, "placement_version must be mixed into the digest");
     }
 
@@ -5307,6 +5652,7 @@ mod tests {
             ClusterId::UNSET,
             2,
             (members(&[1, 2, 3])).len() as u64,
+            2,
         );
         let decoded = TopologyTerm::deserialize(&t.serialize()).expect("decode");
         assert_eq!(decoded.placement_version, 2);
@@ -5317,6 +5663,8 @@ mod tests {
     fn commit_serialize_round_trip_preserves_placement_version() {
         let commit = TopologyCommit {
             term: 5,
+            rf: 2,
+            assignment: None,
             proposer: NodeId(1),
             members: members(&[1, 2, 3]),
             cluster_id: ClusterId::UNSET,
@@ -5328,6 +5676,8 @@ mod tests {
                 &members(&[1, 2, 3]),
                 2,
                 (members(&[1, 2, 3])).len() as u64,
+                2,
+                ASSIGNMENT_ABSENT_DIGEST,
             ),
             voters: members(&[1, 2, 3]),
         };
@@ -5374,9 +5724,144 @@ mod tests {
     }
 
     #[test]
-    fn pre_w6_term_payload_decodes_as_placement_version_one() {
-        // A term payload truncated before the placement trailer (the pre-W6
-        // wire shape) must decode as v1, not garbage.
+    fn term_with_assignment_round_trips_and_binds_its_bytes() {
+        // §4.1/§4.2 end-to-end: the assignment travels in the frame, survives
+        // the round-trip, and the digest binds its BYTES — swapping the
+        // assignment (or rf) after signing makes the recompute mismatch.
+        let mems = members(&[1, 2, 3]);
+        let assignment = vec![NodeId(1); crate::cluster::shards::NUM_SHARDS]
+            .iter()
+            .enumerate()
+            .map(|(shard, _)| mems[shard % mems.len()])
+            .collect::<Vec<_>>();
+        let term = TopologyTerm::new(7, mems.clone(), NodeId(1), ClusterId::UNSET, 1, 3, 2)
+            .with_assignment(assignment.clone())
+            .expect("every entry is a member");
+
+        assert_eq!(
+            term.digest,
+            term.recompute_digest(),
+            "with_assignment must re-derive a digest that matches the payload",
+        );
+
+        let decoded = TopologyTerm::deserialize(&term.serialize()).expect("round-trip");
+        assert_eq!(decoded.assignment.as_deref(), Some(assignment.as_slice()));
+        assert_eq!(decoded.rf, 2);
+        assert_eq!(
+            decoded.digest,
+            decoded.recompute_digest(),
+            "the received frame must verify from its own bytes",
+        );
+
+        // Swap one assignment entry after signing → recompute mismatches.
+        let mut tampered = decoded.clone();
+        if let Some(a) = tampered.assignment.as_mut() {
+            a[0] = mems[1];
+        }
+        assert_ne!(
+            tampered.digest,
+            tampered.recompute_digest(),
+            "a swapped assignment must break the digest binding",
+        );
+
+        // Same for rf.
+        let mut wrong_rf = TopologyTerm::deserialize(&term.serialize()).expect("round-trip");
+        wrong_rf.rf = 3;
+        assert_ne!(wrong_rf.digest, wrong_rf.recompute_digest());
+    }
+
+    #[test]
+    fn commit_with_assignment_round_trips_and_is_applied() {
+        // The full path: a quorum'd commit carrying an assignment survives the
+        // wire, passes every gate, applies, and is retained verbatim for the
+        // E5 catch-up replay.
+        let mems = members(&[1, 2, 3]);
+        let assignment = (0..crate::cluster::shards::NUM_SHARDS)
+            .map(|shard| mems[shard % mems.len()])
+            .collect::<Vec<_>>();
+        let term = TopologyTerm::new(4, mems.clone(), NodeId(1), ClusterId::UNSET, 1, 3, 2)
+            .with_assignment(assignment.clone())
+            .expect("every entry is a member");
+        let commit = TopologyCommit {
+            term: term.term,
+            proposer: term.proposer,
+            members: term.members.clone(),
+            cluster_id: term.cluster_id,
+            placement_version: term.placement_version,
+            committed_peak: term.committed_peak,
+            digest: term.digest,
+            voters: mems.clone(),
+            rf: term.rf,
+            assignment: term.assignment.clone(),
+        };
+
+        let decoded = TopologyCommit::deserialize(&commit.serialize()).expect("commit round-trip");
+        assert_eq!(decoded.assignment.as_deref(), Some(assignment.as_slice()));
+        assert_eq!(decoded.digest, decoded.recompute_digest());
+
+        let auth = TopologyAuthority::new(NodeId(2), Duration::from_secs(1), 2);
+        assert_eq!(auth.handle_commit(&decoded), Some(4));
+        assert_eq!(
+            auth.committed_commit_bytes(),
+            Some(commit.serialize()),
+            "the applied commit (assignment included) must be retained verbatim",
+        );
+    }
+
+    #[test]
+    fn rf_mismatch_refuses_vote_and_commit() {
+        // A voter or applier configured with a different rf derives a
+        // different candidate set from the same commit, so the rule-4
+        // containment would split across the cluster. REFUSE, like the
+        // placement-version gate; commit-side it arms the C11 fence when the
+        // frame carries a structurally valid quorum proof.
+        let mems = members(&[1, 2, 3]);
+        let propose = TopologyTerm::new(
+            1,
+            mems.clone(),
+            NodeId(1),
+            ClusterId::UNSET,
+            1,
+            3,
+            3, // proposal says rf=3
+        );
+        let auth = TopologyAuthority::new(NodeId(2), Duration::from_secs(1), 2); // local rf=2
+        assert!(
+            !auth.handle_propose(&propose).accepted,
+            "a voter must refuse a proposal whose rf differs from its config",
+        );
+
+        let commit = TopologyCommit {
+            term: 1,
+            proposer: NodeId(1),
+            members: mems.clone(),
+            cluster_id: ClusterId::UNSET,
+            placement_version: 1,
+            committed_peak: 3,
+            digest: propose.digest,
+            voters: mems.clone(),
+            rf: 3,
+            assignment: None,
+        };
+        assert_eq!(
+            auth.handle_commit(&commit),
+            None,
+            "an applier must refuse a commit whose rf differs from its config",
+        );
+        assert_eq!(
+            auth.unapplicable_committed_term(),
+            1,
+            "a quorum-backed rf-mismatched commit must arm the C11 fence — the              cluster moved to an authority this node cannot serve",
+        );
+        assert_eq!(auth.committed_term(), 0);
+    }
+
+    #[test]
+    fn truncated_term_frame_is_rejected_not_decoded_to_defaults() {
+        // v1 dispatched optional fields by exact total length, so a truncated
+        // frame silently decoded `placement_version = 1` — the trailer-sniff
+        // defect. v2 enforces the exact length: EVERY proper prefix of a
+        // well-formed frame is rejected outright.
         let t = TopologyTerm::new(
             2,
             members(&[1, 2]),
@@ -5384,18 +5869,28 @@ mod tests {
             ClusterId::UNSET,
             1,
             (members(&[1, 2])).len() as u64,
+            2,
         );
-        let mut bytes = t.serialize();
-        bytes.truncate(bytes.len() - 2); // drop the 2-byte placement trailer
-        let decoded = TopologyTerm::deserialize(&bytes).expect("decode");
-        assert_eq!(decoded.placement_version, 1);
+        let bytes = t.serialize();
+        assert!(TopologyTerm::deserialize(&bytes).is_some(), "baseline");
+        for cut in 0..bytes.len() {
+            assert!(
+                TopologyTerm::deserialize(&bytes[..cut]).is_none(),
+                "a {cut}-byte prefix must be rejected, never decoded to defaults",
+            );
+        }
+        // Trailing bytes are equally malformed — extensions bump the format
+        // byte instead of appending sniffable trailers.
+        let mut extended = bytes.clone();
+        extended.push(0);
+        assert!(TopologyTerm::deserialize(&extended).is_none());
     }
 
     #[test]
     fn voter_rejects_unsupported_placement_version() {
         // INVARIANT (ii): a node refuses (does NOT silently accept) a
         // proposal whose placement_version exceeds its build support.
-        let auth = TopologyAuthority::new(NodeId(2), Duration::from_secs(1));
+        let auth = TopologyAuthority::new(NodeId(2), Duration::from_secs(1), 2);
         let too_high = crate::cluster::shards::MAX_SUPPORTED_PLACEMENT_VERSION + 1;
         let propose = TopologyTerm::new(
             1,
@@ -5404,6 +5899,7 @@ mod tests {
             ClusterId::UNSET,
             too_high,
             (members(&[1, 2, 3])).len() as u64,
+            2,
         );
         let vote = auth.handle_propose(&propose);
         assert!(
@@ -5417,11 +5913,13 @@ mod tests {
         // INVARIANT (ii) activation gate: handle_commit must REFUSE (return
         // None) a committed term whose placement_version exceeds support,
         // rather than applying it with a fallback algorithm.
-        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1), 2);
         let too_high = crate::cluster::shards::MAX_SUPPORTED_PLACEMENT_VERSION + 1;
         let mems = members(&[1, 2, 3]);
         let commit = TopologyCommit {
             term: 1,
+            rf: 2,
+            assignment: None,
             proposer: NodeId(1),
             members: mems.clone(),
             cluster_id: ClusterId::UNSET,
@@ -5433,6 +5931,8 @@ mod tests {
                 &mems,
                 too_high,
                 (mems).len() as u64,
+                2,
+                ASSIGNMENT_ABSENT_DIGEST,
             ),
             voters: mems.clone(),
         };
@@ -5448,12 +5948,14 @@ mod tests {
     /// self-fence flag so the coordinator stops serving stale authority.
     #[test]
     fn unapplicable_committed_term_arms_self_fence() {
-        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1), 2);
         assert!(!auth.is_self_fenced(), "fresh authority is not fenced");
         let too_high = crate::cluster::shards::MAX_SUPPORTED_PLACEMENT_VERSION + 1;
         let mems = members(&[1, 2, 3]);
         let commit = TopologyCommit {
             term: 4,
+            rf: 2,
+            assignment: None,
             proposer: NodeId(1),
             members: mems.clone(),
             cluster_id: ClusterId::UNSET,
@@ -5465,6 +5967,8 @@ mod tests {
                 &mems,
                 too_high,
                 (mems).len() as u64,
+                2,
+                ASSIGNMENT_ABSENT_DIGEST,
             ),
             voters: mems.clone(),
         };
@@ -5481,11 +5985,13 @@ mod tests {
     /// forgeable; only a quorum-proven commit is proof the cluster advanced).
     #[test]
     fn unapplicable_committed_term_without_quorum_proof_does_not_fence() {
-        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1), 2);
         let too_high = crate::cluster::shards::MAX_SUPPORTED_PLACEMENT_VERSION + 1;
         let mems = members(&[1, 2, 3]);
         let forged = TopologyCommit {
             term: 4,
+            rf: 2,
+            assignment: None,
             proposer: NodeId(1),
             members: mems.clone(),
             cluster_id: ClusterId::UNSET,
@@ -5497,6 +6003,8 @@ mod tests {
                 &mems,
                 too_high,
                 (mems).len() as u64,
+                2,
+                ASSIGNMENT_ABSENT_DIGEST,
             ),
             // No quorum: a single voter cannot prove a 3-member commit.
             voters: members(&[1]),
@@ -5514,10 +6022,12 @@ mod tests {
     /// NOT self-fenced (don't over-fence a node that keeps up).
     #[test]
     fn applicable_committed_term_does_not_fence() {
-        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1), 2);
         let mems = members(&[1, 2, 3]);
         let commit = TopologyCommit {
             term: 4,
+            rf: 2,
+            assignment: None,
             proposer: NodeId(1),
             members: mems.clone(),
             cluster_id: ClusterId::UNSET,
@@ -5529,6 +6039,8 @@ mod tests {
                 &mems,
                 1,
                 (mems).len() as u64,
+                2,
+                ASSIGNMENT_ABSENT_DIGEST,
             ),
             voters: mems.clone(),
         };
@@ -5545,12 +6057,14 @@ mod tests {
     /// term it CAN apply is not permanently bricked.
     #[test]
     fn self_fence_clears_when_committed_term_catches_up() {
-        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1), 2);
         let mems = members(&[1, 2, 3]);
         let too_high = crate::cluster::shards::MAX_SUPPORTED_PLACEMENT_VERSION + 1;
         // Observe an unsupported term 4 → fenced (committed still 0).
         let bad = TopologyCommit {
             term: 4,
+            rf: 2,
+            assignment: None,
             proposer: NodeId(1),
             members: mems.clone(),
             cluster_id: ClusterId::UNSET,
@@ -5562,6 +6076,8 @@ mod tests {
                 &mems,
                 too_high,
                 (mems).len() as u64,
+                2,
+                ASSIGNMENT_ABSENT_DIGEST,
             ),
             voters: mems.clone(),
         };
@@ -5571,6 +6087,8 @@ mod tests {
         // A later supported commit at term 5 applies and clears the fence.
         let good = TopologyCommit {
             term: 5,
+            rf: 2,
+            assignment: None,
             proposer: NodeId(1),
             members: mems.clone(),
             cluster_id: ClusterId::UNSET,
@@ -5582,6 +6100,8 @@ mod tests {
                 &mems,
                 1,
                 (mems).len() as u64,
+                2,
+                ASSIGNMENT_ABSENT_DIGEST,
             ),
             voters: mems.clone(),
         };
@@ -5599,10 +6119,12 @@ mod tests {
     /// it had no durable record of. `handle_commit_durable` must fail closed.
     #[test]
     fn handle_commit_durable_fails_closed_when_persist_fails() {
-        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1), 2);
         let mems = members(&[1, 2, 3]);
         let commit = TopologyCommit {
             term: 4,
+            rf: 2,
+            assignment: None,
             proposer: NodeId(1),
             members: mems.clone(),
             cluster_id: ClusterId::UNSET,
@@ -5614,6 +6136,8 @@ mod tests {
                 &mems,
                 1,
                 (mems).len() as u64,
+                2,
+                ASSIGNMENT_ABSENT_DIGEST,
             ),
             voters: mems.clone(),
         };
@@ -5637,10 +6161,12 @@ mod tests {
     /// served advance).
     #[test]
     fn handle_commit_durable_persists_before_serving() {
-        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1), 2);
         let mems = members(&[1, 2, 3]);
         let commit = TopologyCommit {
             term: 4,
+            rf: 2,
+            assignment: None,
             proposer: NodeId(1),
             members: mems.clone(),
             cluster_id: ClusterId::UNSET,
@@ -5652,6 +6178,8 @@ mod tests {
                 &mems,
                 1,
                 (mems).len() as u64,
+                2,
+                ASSIGNMENT_ABSENT_DIGEST,
             ),
             voters: mems.clone(),
         };
@@ -5685,11 +6213,13 @@ mod tests {
     /// G9 — an invalid/stale commit is neither persisted nor applied.
     #[test]
     fn handle_commit_durable_rejects_invalid_without_persisting() {
-        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1), 2);
         let mems = members(&[1, 2, 3]);
         // Bad digest → gate rejects before any persist.
         let commit = TopologyCommit {
             term: 4,
+            rf: 2,
+            assignment: None,
             proposer: NodeId(1),
             members: mems.clone(),
             cluster_id: ClusterId::UNSET,
@@ -5743,10 +6273,12 @@ mod tests {
         // Baseline: commit term 5 with members {1,2,3,4} so BOTH later member
         // sets are already "ever seen" (the split-brain fallback would else
         // reject re-introducing node 4). `committed_term` starts at 5 = T-1.
-        let auth = Arc::new(TopologyAuthority::new(NodeId(1), Duration::from_secs(1)));
+        let auth = Arc::new(TopologyAuthority::new(NodeId(1), Duration::from_secs(1), 2));
         let base_members = members(&[1, 2, 3, 4]);
         let baseline = TopologyCommit {
             term: 5,
+            rf: 2,
+            assignment: None,
             proposer: NodeId(1),
             members: base_members.clone(),
             cluster_id: ClusterId::UNSET,
@@ -5758,6 +6290,8 @@ mod tests {
                 &base_members,
                 1,
                 (base_members).len() as u64,
+                2,
+                ASSIGNMENT_ABSENT_DIGEST,
             ),
             voters: base_members.clone(),
         };
@@ -5768,6 +6302,8 @@ mod tests {
         let lo_members = members(&[1, 2, 3]);
         let commit_lo = TopologyCommit {
             term: 6,
+            rf: 2,
+            assignment: None,
             proposer: NodeId(1),
             members: lo_members.clone(),
             cluster_id: ClusterId::UNSET,
@@ -5779,6 +6315,8 @@ mod tests {
                 &lo_members,
                 1,
                 (lo_members).len() as u64,
+                2,
+                ASSIGNMENT_ABSENT_DIGEST,
             ),
             voters: lo_members.clone(),
         };
@@ -5786,6 +6324,8 @@ mod tests {
         let hi_members = members(&[1, 2, 3, 4]);
         let commit_hi = TopologyCommit {
             term: 7,
+            rf: 2,
+            assignment: None,
             proposer: NodeId(1),
             members: hi_members.clone(),
             cluster_id: ClusterId::UNSET,
@@ -5797,6 +6337,8 @@ mod tests {
                 &hi_members,
                 1,
                 (hi_members).len() as u64,
+                2,
+                ASSIGNMENT_ABSENT_DIGEST,
             ),
             voters: hi_members.clone(),
         };
@@ -5870,17 +6412,27 @@ mod tests {
     /// apply and advance `committed_term` monotonically.
     #[test]
     fn handle_commit_durable_sequential_terms_both_apply() {
-        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1), 2);
 
         let m1 = members(&[1, 2, 3, 4]);
         let c1 = TopologyCommit {
             term: 1,
+            rf: 2,
+            assignment: None,
             proposer: NodeId(1),
             members: m1.clone(),
             cluster_id: ClusterId::UNSET,
             placement_version: 1,
             committed_peak: (m1.clone()).len() as u64,
-            digest: TopologyTerm::compute_digest(1, &ClusterId::UNSET, &m1, 1, (m1).len() as u64),
+            digest: TopologyTerm::compute_digest(
+                1,
+                &ClusterId::UNSET,
+                &m1,
+                1,
+                (m1).len() as u64,
+                2,
+                ASSIGNMENT_ABSENT_DIGEST,
+            ),
             voters: m1.clone(),
         };
         assert_eq!(
@@ -5894,12 +6446,22 @@ mod tests {
         let m2 = members(&[1, 2, 3]);
         let c2 = TopologyCommit {
             term: 2,
+            rf: 2,
+            assignment: None,
             proposer: NodeId(1),
             members: m2.clone(),
             cluster_id: ClusterId::UNSET,
             placement_version: 1,
             committed_peak: (m2.clone()).len() as u64,
-            digest: TopologyTerm::compute_digest(2, &ClusterId::UNSET, &m2, 1, (m2).len() as u64),
+            digest: TopologyTerm::compute_digest(
+                2,
+                &ClusterId::UNSET,
+                &m2,
+                1,
+                (m2).len() as u64,
+                2,
+                ASSIGNMENT_ABSENT_DIGEST,
+            ),
             voters: m2.clone(),
         };
         assert_eq!(
@@ -5918,6 +6480,8 @@ mod tests {
         let mems = members(&[1, 2, 3]);
         let commit = TopologyCommit {
             term: 4,
+            rf: 2,
+            assignment: None,
             proposer: NodeId(1),
             members: mems.clone(),
             cluster_id: ClusterId::UNSET,
@@ -5929,16 +6493,18 @@ mod tests {
                 &mems,
                 1,
                 (mems).len() as u64,
+                2,
+                ASSIGNMENT_ABSENT_DIGEST,
             ),
             voters: mems.clone(),
         };
 
         // Pre-apply projection.
-        let auth_a = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+        let auth_a = TopologyAuthority::new(NodeId(1), Duration::from_secs(1), 2);
         let projected = auth_a.persisted_state_for_commit(&commit, 3, 7);
 
         // Real apply, then read the actual persisted state.
-        let auth_b = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+        let auth_b = TopologyAuthority::new(NodeId(1), Duration::from_secs(1), 2);
         assert_eq!(auth_b.handle_commit(&commit), Some(4));
         let actual = auth_b.persisted_state(3, 7);
 
@@ -6009,7 +6575,7 @@ mod tests {
     fn proposal_stays_v1_until_unanimous_support() {
         // A proposer that has NOT learned peer support proposes v1 even
         // though it itself supports v2 (peers default to v1 = conservative).
-        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1), 2);
         let proposal = auth
             .on_membership_changed(&members(&[1, 2, 3]))
             .expect("node 1 is the proposer");
@@ -6021,7 +6587,7 @@ mod tests {
 
     #[test]
     fn achievable_version_reaches_v2_when_all_peers_support_it() {
-        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1), 2);
         let mems = members(&[1, 2, 3]);
         assert_eq!(auth.achievable_placement_version(&mems), 1);
         auth.record_peer_placement_support(NodeId(2), 2);
@@ -6034,7 +6600,7 @@ mod tests {
     fn one_v1_member_keeps_cluster_v1() {
         // A single member stuck at v1 holds the whole cluster at v1
         // (unanimity, not quorum).
-        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1), 2);
         let mems = members(&[1, 2, 3]);
         auth.record_peer_placement_support(NodeId(2), 2);
         auth.record_peer_placement_support(NodeId(3), 1); // legacy node
@@ -6043,10 +6609,12 @@ mod tests {
 
     #[test]
     fn upgrade_proposal_fires_once_support_is_unanimous() {
-        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1), 2);
         let mems = members(&[1, 2, 3]);
         let commit = TopologyCommit {
             term: 1,
+            rf: 2,
+            assignment: None,
             proposer: NodeId(1),
             members: mems.clone(),
             cluster_id: ClusterId::UNSET,
@@ -6058,6 +6626,8 @@ mod tests {
                 &mems,
                 1,
                 (mems).len() as u64,
+                2,
+                ASSIGNMENT_ABSENT_DIGEST,
             ),
             voters: mems.clone(),
         };
@@ -6076,10 +6646,12 @@ mod tests {
 
     #[test]
     fn non_proposer_does_not_issue_upgrade() {
-        let auth = TopologyAuthority::new(NodeId(2), Duration::from_secs(1));
+        let auth = TopologyAuthority::new(NodeId(2), Duration::from_secs(1), 2);
         let mems = members(&[1, 2, 3]);
         let commit = TopologyCommit {
             term: 1,
+            rf: 2,
+            assignment: None,
             proposer: NodeId(1),
             members: mems.clone(),
             cluster_id: ClusterId::UNSET,
@@ -6091,6 +6663,8 @@ mod tests {
                 &mems,
                 1,
                 (mems).len() as u64,
+                2,
+                ASSIGNMENT_ABSENT_DIGEST,
             ),
             voters: mems.clone(),
         };
@@ -6103,10 +6677,12 @@ mod tests {
 
     #[test]
     fn homogeneous_cluster_upgrades_exactly_once() {
-        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1), 2);
         let mems = members(&[1, 2, 3]);
         let commit_v1 = TopologyCommit {
             term: 1,
+            rf: 2,
+            assignment: None,
             proposer: NodeId(1),
             members: mems.clone(),
             cluster_id: ClusterId::UNSET,
@@ -6118,6 +6694,8 @@ mod tests {
                 &mems,
                 1,
                 (mems).len() as u64,
+                2,
+                ASSIGNMENT_ABSENT_DIGEST,
             ),
             voters: mems.clone(),
         };
@@ -6127,6 +6705,8 @@ mod tests {
         let upgrade = auth.upgrade_proposal().expect("first upgrade");
         let commit_v2 = TopologyCommit {
             term: upgrade.term,
+            rf: 2,
+            assignment: None,
             proposer: NodeId(1),
             members: mems.clone(),
             cluster_id: ClusterId::UNSET,
@@ -6149,7 +6729,7 @@ mod tests {
 
     #[test]
     fn topology_term_serde_roundtrips_committed_peak() {
-        let term = TopologyTerm::new(9, members(&[1, 2, 3]), NodeId(1), ClusterId::UNSET, 1, 5);
+        let term = TopologyTerm::new(9, members(&[1, 2, 3]), NodeId(1), ClusterId::UNSET, 1, 5, 2);
         let data = term.serialize();
         let decoded = TopologyTerm::deserialize(&data).expect("decode");
         assert_eq!(decoded.committed_peak, 5);
@@ -6161,12 +6741,22 @@ mod tests {
         let mems = members(&[1, 2, 3]);
         let commit = TopologyCommit {
             term: 9,
+            rf: 2,
+            assignment: None,
             proposer: NodeId(1),
             members: mems.clone(),
             cluster_id: ClusterId::UNSET,
             placement_version: 1,
             committed_peak: 5,
-            digest: TopologyTerm::compute_digest(9, &ClusterId::UNSET, &mems, 1, 5),
+            digest: TopologyTerm::compute_digest(
+                9,
+                &ClusterId::UNSET,
+                &mems,
+                1,
+                5,
+                2,
+                ASSIGNMENT_ABSENT_DIGEST,
+            ),
             voters: mems.clone(),
         };
         let decoded = TopologyCommit::deserialize(&commit.serialize()).expect("decode");
@@ -6198,12 +6788,13 @@ mod tests {
     }
 
     #[test]
-    fn legacy_wire_frame_without_committed_peak_decodes_to_members_len() {
-        // Hand-craft a pre-G8 (W6-only) standalone TopologyTerm frame that
-        // carries the placement_version trailer but NOT the new
-        // committed_peak trailer — exactly what a pre-G8 binary would have
-        // written: [term:8][proposer:8][cluster_id:16][count:4][members:8*N]
-        // [digest:32][placement_version:2].
+    fn legacy_v1_wire_frame_is_rejected() {
+        // Hand-craft a v1 standalone TopologyTerm frame (no format byte;
+        // trailer-extended layout). v2 readers must reject it outright —
+        // the first byte of a v1 frame is the low byte of `term`, which for
+        // this term (9) is not the v2 format byte. The break is deliberate:
+        // v1's length-sniffed trailers silently decoded absent fields to
+        // defaults, dropping the G8 split-brain floor.
         let mems = members(&[1, 2, 3, 4]);
         let mut buf = Vec::new();
         buf.extend_from_slice(&9u64.to_le_bytes()); // term
@@ -6213,24 +6804,14 @@ mod tests {
         for m in &mems {
             buf.extend_from_slice(&m.0.to_le_bytes());
         }
-        buf.extend_from_slice(&[0xAB; 32]); // digest (opaque for this test)
-        buf.extend_from_slice(&1u16.to_le_bytes()); // placement_version trailer only
+        buf.extend_from_slice(&[0xAB; 32]); // digest
+        buf.extend_from_slice(&1u16.to_le_bytes()); // placement_version trailer
 
-        let decoded = TopologyTerm::deserialize(&buf).expect("legacy W6 frame must still decode");
-        assert_eq!(
-            decoded.committed_peak,
-            mems.len() as u64,
-            "absent committed_peak trailer must default to members.len()"
+        assert!(
+            TopologyTerm::deserialize(&buf).is_none(),
+            "a v1 frame must not decode under the v2 reader",
         );
-        assert_eq!(decoded.placement_version, 1);
-        assert_eq!(decoded.digest, [0xAB; 32]);
-
-        // Even older: no trailer at all (pre-W6). Must decode the same way.
-        let pre_w6_len = buf.len() - 2;
-        let pre_w6 = &buf[..pre_w6_len];
-        let decoded_pre_w6 = TopologyTerm::deserialize(pre_w6).expect("pre-W6 frame must decode");
-        assert_eq!(decoded_pre_w6.committed_peak, mems.len() as u64);
-        assert_eq!(decoded_pre_w6.placement_version, 1);
+        assert!(TopologyCommit::deserialize(&buf).is_none());
     }
 
     #[test]
@@ -6468,16 +7049,26 @@ mod tests {
         let mems = members(&[1, 2, 3]);
         let commit = TopologyCommit {
             term: 6,
+            rf: 2,
+            assignment: None,
             proposer: NodeId(2),
             members: mems.clone(),
             cluster_id: ClusterId::UNSET,
             placement_version: 1,
             committed_peak: 3,
-            digest: TopologyTerm::compute_digest(6, &ClusterId::UNSET, &mems, 1, 3),
+            digest: TopologyTerm::compute_digest(
+                6,
+                &ClusterId::UNSET,
+                &mems,
+                1,
+                3,
+                2,
+                ASSIGNMENT_ABSENT_DIGEST,
+            ),
             voters: mems.clone(),
         };
 
-        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1), 2);
         assert_eq!(auth.handle_commit(&commit), Some(6));
         assert_eq!(
             auth.committed_commit_bytes(),
@@ -6488,7 +7079,7 @@ mod tests {
         let state = auth.persisted_state(3, 1);
         let reloaded = PersistedTopologyState::deserialize(&state.serialize())
             .expect("persisted state must decode");
-        let restored = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+        let restored = TopologyAuthority::new(NodeId(1), Duration::from_secs(1), 2);
         restored.restore(&reloaded);
         assert_eq!(
             restored.committed_commit_bytes(),
@@ -6502,9 +7093,9 @@ mod tests {
     #[test]
     fn voting_records_the_attested_digest_and_it_survives_restart() {
         let mems = members(&[1, 2, 3]);
-        let propose = TopologyTerm::new(5, mems.clone(), NodeId(1), ClusterId::UNSET, 1, 3);
+        let propose = TopologyTerm::new(5, mems.clone(), NodeId(1), ClusterId::UNSET, 1, 3, 2);
 
-        let auth = TopologyAuthority::new(NodeId(2), Duration::from_secs(1));
+        let auth = TopologyAuthority::new(NodeId(2), Duration::from_secs(1), 2);
         assert_eq!(auth.voted_digest(), None, "no vote cast yet");
         let vote = auth.handle_propose(&propose);
         assert!(
@@ -6521,7 +7112,7 @@ mod tests {
         let reloaded = PersistedTopologyState::deserialize(&auth.persisted_state(3, 1).serialize())
             .expect("persisted state must decode");
         assert_eq!(reloaded.voted_digest, Some(propose.digest));
-        let restored = TopologyAuthority::new(NodeId(2), Duration::from_secs(1));
+        let restored = TopologyAuthority::new(NodeId(2), Duration::from_secs(1), 2);
         restored.restore(&reloaded);
         assert_eq!(
             restored.voted_digest(),
@@ -6539,10 +7130,17 @@ mod tests {
     #[test]
     fn commit_whose_digest_differs_from_the_attested_one_is_rejected() {
         let voted_members = members(&[1, 2, 3]);
-        let propose =
-            TopologyTerm::new(7, voted_members.clone(), NodeId(1), ClusterId::UNSET, 1, 3);
+        let propose = TopologyTerm::new(
+            7,
+            voted_members.clone(),
+            NodeId(1),
+            ClusterId::UNSET,
+            1,
+            3,
+            2,
+        );
 
-        let auth = TopologyAuthority::new(NodeId(3), Duration::from_secs(1));
+        let auth = TopologyAuthority::new(NodeId(3), Duration::from_secs(1), 2);
         assert!(auth.handle_propose(&propose).accepted);
 
         // Same term, DIFFERENT content — and a digest that is correct for that
@@ -6550,12 +7148,22 @@ mod tests {
         let other_members = members(&[1, 2, 3, 4]);
         let equivocating = TopologyCommit {
             term: 7,
+            rf: 2,
+            assignment: None,
             proposer: NodeId(1),
             members: other_members.clone(),
             cluster_id: ClusterId::UNSET,
             placement_version: 1,
             committed_peak: 4,
-            digest: TopologyTerm::compute_digest(7, &ClusterId::UNSET, &other_members, 1, 4),
+            digest: TopologyTerm::compute_digest(
+                7,
+                &ClusterId::UNSET,
+                &other_members,
+                1,
+                4,
+                2,
+                ASSIGNMENT_ABSENT_DIGEST,
+            ),
             voters: other_members.clone(),
         };
         assert_eq!(
@@ -6566,6 +7174,8 @@ mod tests {
                 &equivocating.members,
                 equivocating.placement_version,
                 equivocating.committed_peak,
+                2,
+                ASSIGNMENT_ABSENT_DIGEST
             ),
             "precondition: the equivocating commit is internally consistent",
         );
@@ -6593,12 +7203,22 @@ mod tests {
         let next_members = members(&[1, 2, 3]);
         let next = TopologyCommit {
             term: 8,
+            rf: 2,
+            assignment: None,
             proposer: NodeId(1),
             members: next_members.clone(),
             cluster_id: ClusterId::UNSET,
             placement_version: 1,
             committed_peak: 3,
-            digest: TopologyTerm::compute_digest(8, &ClusterId::UNSET, &next_members, 1, 3),
+            digest: TopologyTerm::compute_digest(
+                8,
+                &ClusterId::UNSET,
+                &next_members,
+                1,
+                3,
+                2,
+                ASSIGNMENT_ABSENT_DIGEST,
+            ),
             voters: next_members.clone(),
         };
         assert_eq!(
@@ -6612,12 +7232,14 @@ mod tests {
     #[test]
     fn commit_matching_the_attested_digest_applies() {
         let mems = members(&[1, 2, 3]);
-        let propose = TopologyTerm::new(4, mems.clone(), NodeId(1), ClusterId::UNSET, 1, 3);
-        let auth = TopologyAuthority::new(NodeId(2), Duration::from_secs(1));
+        let propose = TopologyTerm::new(4, mems.clone(), NodeId(1), ClusterId::UNSET, 1, 3, 2);
+        let auth = TopologyAuthority::new(NodeId(2), Duration::from_secs(1), 2);
         assert!(auth.handle_propose(&propose).accepted);
 
         let commit = TopologyCommit {
             term: 4,
+            rf: 2,
+            assignment: None,
             proposer: NodeId(1),
             members: mems.clone(),
             cluster_id: ClusterId::UNSET,
@@ -6636,17 +7258,27 @@ mod tests {
     #[test]
     fn a_node_that_never_voted_at_the_term_still_accepts_the_commit() {
         let mems = members(&[1, 2, 3]);
-        let auth = TopologyAuthority::new(NodeId(3), Duration::from_secs(1));
+        let auth = TopologyAuthority::new(NodeId(3), Duration::from_secs(1), 2);
         assert_eq!(auth.voted_term(), 0, "precondition: never voted");
 
         let commit = TopologyCommit {
             term: 6,
+            rf: 2,
+            assignment: None,
             proposer: NodeId(1),
             members: mems.clone(),
             cluster_id: ClusterId::UNSET,
             placement_version: 1,
             committed_peak: 3,
-            digest: TopologyTerm::compute_digest(6, &ClusterId::UNSET, &mems, 1, 3),
+            digest: TopologyTerm::compute_digest(
+                6,
+                &ClusterId::UNSET,
+                &mems,
+                1,
+                3,
+                2,
+                ASSIGNMENT_ABSENT_DIGEST,
+            ),
             voters: mems.clone(),
         };
         let before = vote_digest_mismatch_total();
@@ -6667,10 +7299,11 @@ mod tests {
     /// refuses to apply the result.
     #[test]
     fn a_proposer_accepts_the_commit_for_its_own_proposal() {
-        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1), 2);
 
         // A prior vote at an earlier term leaves a digest behind.
-        let earlier = TopologyTerm::new(1, members(&[1, 2, 3]), NodeId(2), ClusterId::UNSET, 1, 3);
+        let earlier =
+            TopologyTerm::new(1, members(&[1, 2, 3]), NodeId(2), ClusterId::UNSET, 1, 3, 2);
         assert!(auth.handle_propose(&earlier).accepted);
         assert_eq!(auth.voted_digest(), Some(earlier.digest));
 
@@ -6687,6 +7320,8 @@ mod tests {
         // The commit its own quorum produces must apply.
         let commit = TopologyCommit {
             term: proposal.term,
+            rf: 2,
+            assignment: None,
             proposer: NodeId(1),
             members: proposal.members.clone(),
             cluster_id: proposal.cluster_id,
@@ -6712,7 +7347,15 @@ mod tests {
     #[test]
     fn structural_rejections_never_arm_the_self_fence() {
         let mems = members(&[1, 2, 3]);
-        let good_digest = TopologyTerm::compute_digest(4, &ClusterId::UNSET, &mems, 1, 3);
+        let good_digest = TopologyTerm::compute_digest(
+            4,
+            &ClusterId::UNSET,
+            &mems,
+            1,
+            3,
+            2,
+            ASSIGNMENT_ABSENT_DIGEST,
+        );
 
         // Non-ascending members, a wrong digest, an implausible member flood,
         // and a nonsensical peak — every one is a reject.
@@ -6723,12 +7366,22 @@ mod tests {
                 "members not strictly ascending",
                 TopologyCommit {
                     term: 4,
+                    rf: 2,
+                    assignment: None,
                     proposer: NodeId(1),
                     members: unsorted.clone(),
                     cluster_id: ClusterId::UNSET,
                     placement_version: 1,
                     committed_peak: 3,
-                    digest: TopologyTerm::compute_digest(4, &ClusterId::UNSET, &unsorted, 1, 3),
+                    digest: TopologyTerm::compute_digest(
+                        4,
+                        &ClusterId::UNSET,
+                        &unsorted,
+                        1,
+                        3,
+                        2,
+                        ASSIGNMENT_ABSENT_DIGEST,
+                    ),
                     voters: unsorted.clone(),
                 },
             ),
@@ -6736,6 +7389,8 @@ mod tests {
                 "digest does not match its own fields",
                 TopologyCommit {
                     term: 4,
+                    rf: 2,
+                    assignment: None,
                     proposer: NodeId(1),
                     members: mems.clone(),
                     cluster_id: ClusterId::UNSET,
@@ -6749,6 +7404,8 @@ mod tests {
                 "implausible membership growth",
                 TopologyCommit {
                     term: 4,
+                    rf: 2,
+                    assignment: None,
                     proposer: NodeId(100),
                     members: flood.clone(),
                     cluster_id: ClusterId::UNSET,
@@ -6760,6 +7417,8 @@ mod tests {
                         &flood,
                         1,
                         flood.len() as u64,
+                        2,
+                        ASSIGNMENT_ABSENT_DIGEST,
                     ),
                     voters: flood.clone(),
                 },
@@ -6768,19 +7427,29 @@ mod tests {
                 "peak below the member count",
                 TopologyCommit {
                     term: 4,
+                    rf: 2,
+                    assignment: None,
                     proposer: NodeId(1),
                     members: mems.clone(),
                     cluster_id: ClusterId::UNSET,
                     placement_version: 1,
                     committed_peak: 1,
-                    digest: TopologyTerm::compute_digest(4, &ClusterId::UNSET, &mems, 1, 1),
+                    digest: TopologyTerm::compute_digest(
+                        4,
+                        &ClusterId::UNSET,
+                        &mems,
+                        1,
+                        1,
+                        2,
+                        ASSIGNMENT_ABSENT_DIGEST,
+                    ),
                     voters: mems.clone(),
                 },
             ),
         ];
 
         for (why, commit) in cases {
-            let auth = TopologyAuthority::new(NodeId(2), Duration::from_secs(1));
+            let auth = TopologyAuthority::new(NodeId(2), Duration::from_secs(1), 2);
             assert_eq!(auth.handle_commit(&commit), None, "{why}: must be rejected");
             assert!(
                 !auth.is_self_fenced(),
@@ -6793,6 +7462,8 @@ mod tests {
             // held back, not bricked.
             let good = TopologyCommit {
                 term: 4,
+                rf: 2,
+                assignment: None,
                 proposer: NodeId(1),
                 members: mems.clone(),
                 cluster_id: ClusterId::UNSET,
@@ -6813,27 +7484,47 @@ mod tests {
         let mems = members(&[1, 2, 3]);
         let commit = TopologyCommit {
             term: 5,
+            rf: 2,
+            assignment: None,
             proposer: NodeId(1),
             members: mems.clone(),
             cluster_id: ClusterId::UNSET,
             placement_version: 1,
             committed_peak: 3,
-            digest: TopologyTerm::compute_digest(5, &ClusterId::UNSET, &mems, 1, 3),
+            digest: TopologyTerm::compute_digest(
+                5,
+                &ClusterId::UNSET,
+                &mems,
+                1,
+                3,
+                2,
+                ASSIGNMENT_ABSENT_DIGEST,
+            ),
             voters: mems.clone(),
         };
-        let auth = TopologyAuthority::new(NodeId(2), Duration::from_secs(1));
+        let auth = TopologyAuthority::new(NodeId(2), Duration::from_secs(1), 2);
         assert_eq!(auth.handle_commit(&commit), Some(5));
 
         // A different topology, quorum-backed, claiming the SAME term.
         let forked_members = members(&[1, 2, 3, 4]);
         let forked = TopologyCommit {
             term: 5,
+            rf: 2,
+            assignment: None,
             proposer: NodeId(4),
             members: forked_members.clone(),
             cluster_id: ClusterId::UNSET,
             placement_version: 1,
             committed_peak: 4,
-            digest: TopologyTerm::compute_digest(5, &ClusterId::UNSET, &forked_members, 1, 4),
+            digest: TopologyTerm::compute_digest(
+                5,
+                &ClusterId::UNSET,
+                &forked_members,
+                1,
+                4,
+                2,
+                ASSIGNMENT_ABSENT_DIGEST,
+            ),
             voters: forked_members.clone(),
         };
 
@@ -6864,15 +7555,25 @@ mod tests {
         let mems = members(&[1, 2, 3]);
         let commit = TopologyCommit {
             term: 5,
+            rf: 2,
+            assignment: None,
             proposer: NodeId(1),
             members: mems.clone(),
             cluster_id: ClusterId::UNSET,
             placement_version: 1,
             committed_peak: 3,
-            digest: TopologyTerm::compute_digest(5, &ClusterId::UNSET, &mems, 1, 3),
+            digest: TopologyTerm::compute_digest(
+                5,
+                &ClusterId::UNSET,
+                &mems,
+                1,
+                3,
+                2,
+                ASSIGNMENT_ABSENT_DIGEST,
+            ),
             voters: mems.clone(),
         };
-        let auth = TopologyAuthority::new(NodeId(2), Duration::from_secs(1));
+        let auth = TopologyAuthority::new(NodeId(2), Duration::from_secs(1), 2);
         assert_eq!(auth.handle_commit(&commit), Some(5));
 
         let before = committed_digest_fork_total();
@@ -6893,26 +7594,46 @@ mod tests {
         let mems = members(&[1, 2, 3]);
         let commit = TopologyCommit {
             term: 5,
+            rf: 2,
+            assignment: None,
             proposer: NodeId(1),
             members: mems.clone(),
             cluster_id: ClusterId::UNSET,
             placement_version: 1,
             committed_peak: 3,
-            digest: TopologyTerm::compute_digest(5, &ClusterId::UNSET, &mems, 1, 3),
+            digest: TopologyTerm::compute_digest(
+                5,
+                &ClusterId::UNSET,
+                &mems,
+                1,
+                3,
+                2,
+                ASSIGNMENT_ABSENT_DIGEST,
+            ),
             voters: mems.clone(),
         };
-        let auth = TopologyAuthority::new(NodeId(2), Duration::from_secs(1));
+        let auth = TopologyAuthority::new(NodeId(2), Duration::from_secs(1), 2);
         assert_eq!(auth.handle_commit(&commit), Some(5));
 
         let forked_members = members(&[1, 2, 3, 4]);
         let sub_quorum = TopologyCommit {
             term: 5,
+            rf: 2,
+            assignment: None,
             proposer: NodeId(4),
             members: forked_members.clone(),
             cluster_id: ClusterId::UNSET,
             placement_version: 1,
             committed_peak: 4,
-            digest: TopologyTerm::compute_digest(5, &ClusterId::UNSET, &forked_members, 1, 4),
+            digest: TopologyTerm::compute_digest(
+                5,
+                &ClusterId::UNSET,
+                &forked_members,
+                1,
+                4,
+                2,
+                ASSIGNMENT_ABSENT_DIGEST,
+            ),
             voters: members(&[4]), // one voter for a 4-member topology
         };
         assert!(
@@ -6937,12 +7658,22 @@ mod tests {
         let mems = members(&[1, 2, 3]);
         let stale = TopologyCommit {
             term: 4,
+            rf: 2,
+            assignment: None,
             proposer: NodeId(1),
             members: mems.clone(),
             cluster_id: ClusterId::UNSET,
             placement_version: 1,
             committed_peak: 3,
-            digest: TopologyTerm::compute_digest(4, &ClusterId::UNSET, &mems, 1, 3),
+            digest: TopologyTerm::compute_digest(
+                4,
+                &ClusterId::UNSET,
+                &mems,
+                1,
+                3,
+                2,
+                ASSIGNMENT_ABSENT_DIGEST,
+            ),
             voters: mems.clone(),
         };
         let state = PersistedTopologyState {
@@ -6959,7 +7690,7 @@ mod tests {
             voted_digest: None,
         };
 
-        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1), 2);
         auth.restore(&state);
         assert_eq!(auth.committed_term(), 9);
         assert_eq!(
@@ -6971,7 +7702,7 @@ mod tests {
         // Unparseable bytes are dropped the same way.
         let mut garbage = state.clone();
         garbage.committed_commit = Some(vec![0xAB; 12]);
-        let auth2 = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+        let auth2 = TopologyAuthority::new(NodeId(1), Duration::from_secs(1), 2);
         auth2.restore(&garbage);
         assert_eq!(
             auth2.committed_commit_bytes(),
@@ -6983,11 +7714,35 @@ mod tests {
     #[test]
     fn compute_digest_changes_with_committed_peak() {
         let mems = members(&[1, 2, 3]);
-        let d1 = TopologyTerm::compute_digest(5, &ClusterId::UNSET, &mems, 1, 3);
-        let d2 = TopologyTerm::compute_digest(5, &ClusterId::UNSET, &mems, 1, 4);
+        let d1 = TopologyTerm::compute_digest(
+            5,
+            &ClusterId::UNSET,
+            &mems,
+            1,
+            3,
+            2,
+            ASSIGNMENT_ABSENT_DIGEST,
+        );
+        let d2 = TopologyTerm::compute_digest(
+            5,
+            &ClusterId::UNSET,
+            &mems,
+            1,
+            4,
+            2,
+            ASSIGNMENT_ABSENT_DIGEST,
+        );
         assert_ne!(d1, d2, "committed_peak must be mixed into the digest");
 
-        let d3 = TopologyTerm::compute_digest(5, &ClusterId::UNSET, &mems, 1, 3);
+        let d3 = TopologyTerm::compute_digest(
+            5,
+            &ClusterId::UNSET,
+            &mems,
+            1,
+            3,
+            2,
+            ASSIGNMENT_ABSENT_DIGEST,
+        );
         assert_eq!(
             d1, d3,
             "identical committed_peak must produce an identical digest"
@@ -6996,7 +7751,7 @@ mod tests {
 
     #[test]
     fn peak_floor_is_max_committed_and_observed() {
-        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1), 2);
         // Directly manipulate the two underlying atomics to prove the
         // getter returns their max, independent of how each was populated.
         auth.committed_peak.store(3, Ordering::Relaxed);
@@ -7019,7 +7774,7 @@ mod tests {
         // itself, so committed_peak never exceeds observed_peak in
         // practice and the floor equals exactly what observed_peak alone
         // would have reported before this field existed.
-        let auth2 = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+        let auth2 = TopologyAuthority::new(NodeId(1), Duration::from_secs(1), 2);
         let term = auth2
             .on_membership_changed(&members(&[1, 2, 3]))
             .expect("proposer");
@@ -7033,7 +7788,7 @@ mod tests {
 
     #[test]
     fn commit_rejected_when_committed_peak_below_members_len() {
-        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1), 2);
         let mems = members(&[1, 2, 3, 4]);
         // committed_peak (3) < members.len() (4) — nonsensical, must be
         // rejected by the gate invariant even though the commit otherwise
@@ -7041,12 +7796,22 @@ mod tests {
         let bad_peak = 3u64;
         let commit = TopologyCommit {
             term: 1,
+            rf: 2,
+            assignment: None,
             proposer: NodeId(1),
             members: mems.clone(),
             cluster_id: ClusterId::UNSET,
             placement_version: 1,
             committed_peak: bad_peak,
-            digest: TopologyTerm::compute_digest(1, &ClusterId::UNSET, &mems, 1, bad_peak),
+            digest: TopologyTerm::compute_digest(
+                1,
+                &ClusterId::UNSET,
+                &mems,
+                1,
+                bad_peak,
+                2,
+                ASSIGNMENT_ABSENT_DIGEST,
+            ),
             voters: mems.clone(),
         };
         assert!(
@@ -7058,7 +7823,7 @@ mod tests {
 
     #[test]
     fn restore_seeds_observed_from_committed_peak() {
-        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1), 2);
         let state = PersistedTopologyState {
             // Deliberately HIGHER than committed_peak, to prove restore()
             // no longer separately re-observes this raw field: the
@@ -7194,7 +7959,7 @@ mod tests {
 
     #[test]
     fn grow_carries_new_members_len_in_committed_peak() {
-        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1), 2);
         let small = members(&[1, 2, 3]);
         let term1 = auth
             .on_membership_changed(&small)
@@ -7203,6 +7968,8 @@ mod tests {
 
         let commit1 = TopologyCommit {
             term: term1.term,
+            rf: 2,
+            assignment: None,
             proposer: term1.proposer,
             members: term1.members.clone(),
             cluster_id: term1.cluster_id,
@@ -7236,17 +8003,27 @@ mod tests {
 
     #[test]
     fn graceful_leave_subset_carries_old_higher_peak_in_committed_peak() {
-        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1), 2);
         // Establish a committed 5-node cluster (peak raised to 5).
         let full = members(&[1, 2, 3, 4, 5]);
         let commit = TopologyCommit {
             term: 1,
+            rf: 2,
+            assignment: None,
             proposer: NodeId(1),
             members: full.clone(),
             cluster_id: ClusterId::UNSET,
             placement_version: 1,
             committed_peak: full.len() as u64,
-            digest: TopologyTerm::compute_digest(1, &ClusterId::UNSET, &full, 1, full.len() as u64),
+            digest: TopologyTerm::compute_digest(
+                1,
+                &ClusterId::UNSET,
+                &full,
+                1,
+                full.len() as u64,
+                2,
+                ASSIGNMENT_ABSENT_DIGEST,
+            ),
             voters: full.clone(),
         };
         assert_eq!(auth.handle_commit(&commit), Some(1));
@@ -7292,10 +8069,19 @@ mod tests {
         committed_peak: u64,
         voters: Vec<NodeId>,
     ) -> TopologyCommit {
-        let digest =
-            TopologyTerm::compute_digest(term, &ClusterId::UNSET, &members, 1, committed_peak);
+        let digest = TopologyTerm::compute_digest(
+            term,
+            &ClusterId::UNSET,
+            &members,
+            1,
+            committed_peak,
+            2,
+            ASSIGNMENT_ABSENT_DIGEST,
+        );
         TopologyCommit {
             term,
+            rf: 2,
+            assignment: None,
             proposer,
             members,
             cluster_id: ClusterId::UNSET,
@@ -7343,7 +8129,7 @@ mod tests {
     /// (higher) local peak is accepted.
     #[test]
     fn gate_b_rejects_shrink_without_old_peak_quorum_voters() {
-        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1), 2);
         seed_committed(&auth, members(&[1, 2, 3, 4, 5]));
         assert_eq!(auth.committed_peak(), 5, "local peak established at 5");
 
@@ -7386,7 +8172,7 @@ mod tests {
     /// itself, at either gate.
     #[test]
     fn minority_cannot_shrink() {
-        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1), 2);
         seed_committed(&auth, members(&[1, 2, 3, 4, 5]));
 
         // Gate A: node 1 (the deterministic proposer) attempts to shrink to
@@ -7420,7 +8206,7 @@ mod tests {
         );
         assert_eq!(auth.committed_peak(), 5, "floor must remain unlowered");
 
-        let other = TopologyAuthority::new(NodeId(3), Duration::from_secs(1));
+        let other = TopologyAuthority::new(NodeId(3), Duration::from_secs(1), 2);
         seed_committed(&other, members(&[1, 2, 3, 4, 5]));
         assert!(
             other.handle_commit(&forged).is_none(),
@@ -7432,7 +8218,7 @@ mod tests {
     /// 3, and the new floor is then used for subsequent quorum math.
     #[test]
     fn majority_can_shrink_5_to_3() {
-        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1), 2);
         seed_committed(&auth, members(&[1, 2, 3, 4, 5]));
 
         let term = auth
@@ -7497,7 +8283,7 @@ mod tests {
     /// proposer's own eventual view of the commit.
     #[test]
     fn propose_shrink_self_omit_excludes_self_from_voters() {
-        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1), 2);
         seed_committed(&auth, members(&[1, 2, 3, 4, 5]));
 
         let term = auth
@@ -7546,7 +8332,7 @@ mod tests {
         // committed_peak is also 5 — proves the commit passes both the
         // unmodified has_quorum_voter_proof (voters subset of members) and
         // Gate B (quorum of the old peak).
-        let peer = TopologyAuthority::new(NodeId(2), Duration::from_secs(1));
+        let peer = TopologyAuthority::new(NodeId(2), Duration::from_secs(1), 2);
         seed_committed(&peer, members(&[1, 2, 3, 4, 5]));
         assert_eq!(peer.handle_commit(&commit), Some(term.term));
         assert_eq!(peer.committed_members(), members(&[2, 3, 4]));
@@ -7564,7 +8350,7 @@ mod tests {
     fn split_then_shrink_both_sides() {
         // 3-side: node 1 (global deterministic proposer) shrinks to {1,2,3}
         // and reaches a real quorum of the old peak (3 of 5).
-        let side_a = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+        let side_a = TopologyAuthority::new(NodeId(1), Duration::from_secs(1), 2);
         seed_committed(&side_a, members(&[1, 2, 3, 4, 5]));
         let term = side_a
             .propose_shrink(members(&[1, 2, 3]))
@@ -7593,7 +8379,7 @@ mod tests {
         // 2-side: nodes 4/5 cannot drive propose_shrink (they are not the
         // global deterministic proposer), so simulate their best-effort
         // minority attempt as a forged 2-voter commit at the SAME term.
-        let side_b = TopologyAuthority::new(NodeId(4), Duration::from_secs(1));
+        let side_b = TopologyAuthority::new(NodeId(4), Duration::from_secs(1), 2);
         seed_committed(&side_b, members(&[1, 2, 3, 4, 5]));
         let forged_2_side =
             quorum_commit(term.term, NodeId(4), members(&[4, 5]), 2, members(&[4, 5]));
@@ -7629,7 +8415,7 @@ mod tests {
     /// tracks whichever commit actually won.
     #[test]
     fn shrink_racing_grow_serialized() {
-        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1), 2);
         seed_committed(&auth, members(&[1, 2, 3, 4, 5]));
         auth.set_committed_voter_ever_seen(&[
             NodeId(1),
@@ -7687,7 +8473,7 @@ mod tests {
     /// Gate-B-passed shrink; every other path stays monotonic (`fetch_max`).
     #[test]
     fn observed_peak_lowered_only_on_shrink() {
-        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1), 2);
         seed_committed(&auth, members(&[1, 2, 3, 4, 5]));
 
         // Simulate some other SWIM-driven observation bumping the raw

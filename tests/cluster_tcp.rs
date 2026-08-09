@@ -2629,6 +2629,8 @@ fn tcp_strict_replication_failure_returns_replication_failed() {
     let members = vec![NodeId(322)];
     let commit = TopologyCommit {
         term: 1,
+        rf: 2,
+        assignment: None,
         proposer: NodeId(322),
         members: members.clone(),
         voters: members.clone(),
@@ -2641,6 +2643,8 @@ fn tcp_strict_replication_failure_returns_replication_failed() {
             &members,
             1,
             (members).len() as u64,
+            2,
+            teraslab::cluster::topology::ASSIGNMENT_ABSENT_DIGEST,
         ),
     };
     let resp = send_request(

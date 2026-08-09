@@ -288,6 +288,7 @@ fn two_distinct_cluster_ids_refuse_superset() {
         CLUSTER_B,
         1,
         (merged_members.clone()).len() as u64,
+        2,
     );
     let vote = node_a1
         .cluster
@@ -307,6 +308,7 @@ fn two_distinct_cluster_ids_refuse_superset() {
         CLUSTER_A,
         1,
         merged_members_len,
+        2,
     );
     let vote_reverse = node_b1
         .cluster

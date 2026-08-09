@@ -1633,6 +1633,7 @@ impl ClusterCoordinator {
         let topology_authority = Arc::new(crate::cluster::topology::TopologyAuthority::new(
             config.self_id,
             config.topology_propose_timeout,
+            config.replication_factor,
         ));
         // P1.1: stamp the configured cluster_id before SWIM / the event
         // loop starts so the very first proposal already carries it.
@@ -11607,6 +11608,7 @@ impl RunningCluster {
         let cluster_id = self.topology_authority.cluster_id();
         let placement_version = self.topology_authority.committed_placement_version();
         let committed_peak = self.topology_authority.committed_peak();
+        let rf = self.topology_authority.rf();
         crate::cluster::topology::TopologyCommit {
             term,
             proposer: members[0],
@@ -11620,6 +11622,8 @@ impl RunningCluster {
                 &members,
                 placement_version,
                 committed_peak,
+                rf,
+                crate::cluster::topology::ASSIGNMENT_ABSENT_DIGEST,
             ),
             voters: {
                 let voters = self.topology_authority.committed_voters();
@@ -11629,6 +11633,12 @@ impl RunningCluster {
                     voters
                 }
             },
+            rf,
+            // The fabricated fallback carries no assignment — a node that
+            // caught up without the winning commit cannot attest to one, and
+            // fabricating one here would defeat the digest binding E5 exists
+            // to make meaningful.
+            assignment: None,
         }
         .serialize()
     }
@@ -12081,6 +12091,7 @@ impl RunningCluster {
         // above): stamp the CURRENT effective peak, not `new_members.len()`,
         // so the drained cluster's floor is unaffected by who left.
         let committed_peak = self.topology_authority.peak_cluster_size();
+        let rf = self.topology_authority.rf();
         let commit = crate::cluster::topology::TopologyCommit {
             term: new_term,
             proposer: new_members[0],
@@ -12088,12 +12099,18 @@ impl RunningCluster {
             cluster_id,
             placement_version,
             committed_peak,
+            rf,
+            // Graceful-drain commits carry no assignment: the drain changes
+            // MEMBERSHIP, and the next elected term re-derives mastership.
+            assignment: None,
             digest: crate::cluster::topology::TopologyTerm::compute_digest(
                 new_term,
                 &cluster_id,
                 &new_members,
                 placement_version,
                 committed_peak,
+                rf,
+                crate::cluster::topology::ASSIGNMENT_ABSENT_DIGEST,
             ),
             // E-4 — THREAT-MODEL DECISION (trust authenticated peers by design):
             //
@@ -12763,6 +12780,7 @@ pub(crate) fn new_test_running_cluster(
     let topology_authority = Arc::new(crate::cluster::topology::TopologyAuthority::new(
         self_id,
         Duration::from_secs(1),
+        table.replication_factor(),
     ));
     // G8 stage 3 — `RunningCluster::peak_cluster_size()` now reads ONLY the
     // authority's own `peak_cluster_size()` (the `peak_size` atom below is no
@@ -12782,6 +12800,11 @@ pub(crate) fn new_test_running_cluster(
         let placement_version = table.placement_version();
         let commit = crate::cluster::topology::TopologyCommit {
             term: table.version,
+            // The fixture's authority is constructed with the TABLE's rf, so
+            // the seeded commit must carry the same rf or the rf-mismatch
+            // gate rejects it and `committed_members` silently stays empty.
+            rf: table.replication_factor(),
+            assignment: None,
             proposer: self_id,
             members: committed_members.to_vec(),
             committed_peak: (committed_members.to_vec()).len() as u64,
@@ -12793,10 +12816,16 @@ pub(crate) fn new_test_running_cluster(
                 committed_members,
                 placement_version,
                 (committed_members).len() as u64,
+                table.replication_factor(),
+                crate::cluster::topology::ASSIGNMENT_ABSENT_DIGEST,
             ),
             voters: committed_members.to_vec(),
         };
-        let _ = topology_authority.handle_commit(&commit);
+        let applied = topology_authority.handle_commit(&commit);
+        assert!(
+            applied.is_some(),
+            "fixture: seeded topology commit must apply (rf/digest mismatch?)",
+        );
     }
 
     let mut node_addrs = std::collections::HashMap::new();
@@ -15921,6 +15950,10 @@ mod tests {
         let surviving = vec![NodeId(1), NodeId(2), NodeId(3)];
         let commit = crate::cluster::topology::TopologyCommit {
             term: 2,
+            // Matches the fixture table's rf (1) — the rf-mismatch gate
+            // rejects a commit whose rf differs from the authority's.
+            rf: 1,
+            assignment: None,
             proposer: NodeId(1),
             members: surviving.clone(),
             cluster_id: cid,
@@ -15932,6 +15965,8 @@ mod tests {
                 &surviving,
                 1,
                 surviving.len() as u64,
+                1,
+                crate::cluster::topology::ASSIGNMENT_ABSENT_DIGEST,
             ),
             voters: surviving,
         };
@@ -16075,7 +16110,7 @@ mod tests {
         // authority (a brand-new process would never see the in-memory
         // cluster from `shrink_5_to_3_fixture` above).
         let fresh =
-            crate::cluster::topology::TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+            crate::cluster::topology::TopologyAuthority::new(NodeId(1), Duration::from_secs(1), 2);
         fresh.restore(&loaded);
         assert_eq!(
             fresh.peak_cluster_size(),
@@ -18036,6 +18071,7 @@ mod tests {
         let authority = Arc::new(crate::cluster::topology::TopologyAuthority::new(
             NodeId(1),
             Duration::from_secs(1),
+            2,
         ));
         let state = authority.persisted_state(3, 1);
         persist_topology_state(&path, &state).expect("persist must create missing parent dirs");
@@ -18064,6 +18100,7 @@ mod tests {
         let authority = Arc::new(crate::cluster::topology::TopologyAuthority::new(
             NodeId(1),
             Duration::from_secs(1),
+            2,
         ));
         // Persist into an existing directory; the added post-rename
         // `fsync_parent_dir` call must not error on a normal path, and the
@@ -18102,6 +18139,7 @@ mod tests {
         let authority = Arc::new(crate::cluster::topology::TopologyAuthority::new(
             NodeId(1),
             Duration::from_secs(1),
+            2,
         ));
         persist_topology_state(&path, &authority.persisted_state(5, 3)).expect("persist");
         assert!(load_topology_state(&path).is_ok(), "baseline must load");
@@ -18129,6 +18167,7 @@ mod tests {
         let authority = Arc::new(crate::cluster::topology::TopologyAuthority::new(
             NodeId(1),
             Duration::from_secs(1),
+            2,
         ));
         persist_topology_state(&path, &authority.persisted_state(5, 3)).expect("persist");
 
@@ -19075,6 +19114,8 @@ mod tests {
         let next_members = vec![NodeId(1), NodeId(2), NodeId(3)];
         let next_commit = crate::cluster::topology::TopologyCommit {
             term: 4,
+            rf: 2,
+            assignment: None,
             proposer: NodeId(1),
             members: next_members.clone(),
             cluster_id: cid,
@@ -19086,6 +19127,8 @@ mod tests {
                 &next_members,
                 1,
                 (next_members).len() as u64,
+                2,
+                crate::cluster::topology::ASSIGNMENT_ABSENT_DIGEST,
             ),
             voters: next_members.clone(),
         };
@@ -19112,7 +19155,7 @@ mod tests {
             placement_version: 1,
         };
         let authority =
-            crate::cluster::topology::TopologyAuthority::new(NodeId(2), Duration::from_secs(1));
+            crate::cluster::topology::TopologyAuthority::new(NodeId(2), Duration::from_secs(1), 2);
 
         let maybe_commit = committed_topology_from_routing_snapshot(&routing);
         assert!(
@@ -19130,6 +19173,8 @@ mod tests {
 
         let proof = crate::cluster::topology::TopologyCommit {
             term: routing.shard_table_version,
+            rf: 2,
+            assignment: None,
             proposer: NodeId(1),
             members: committed_members.clone(),
             cluster_id: crate::cluster::topology::ClusterId::UNSET,
@@ -19141,6 +19186,8 @@ mod tests {
                 &committed_members,
                 1,
                 (committed_members).len() as u64,
+                2,
+                crate::cluster::topology::ASSIGNMENT_ABSENT_DIGEST,
             ),
             voters: vec![NodeId(1), NodeId(2)],
         };
@@ -19180,6 +19227,8 @@ mod tests {
         let committed_members = vec![NodeId(1), NodeId(2), NodeId(3)];
         let next_commit = crate::cluster::topology::TopologyCommit {
             term: 4,
+            rf: 2,
+            assignment: None,
             proposer: NodeId(1),
             members: committed_members.clone(),
             cluster_id: cid,
@@ -19191,6 +19240,8 @@ mod tests {
                 &committed_members,
                 1,
                 (committed_members).len() as u64,
+                2,
+                crate::cluster::topology::ASSIGNMENT_ABSENT_DIGEST,
             ),
             voters: committed_members.clone(),
         };
@@ -19212,7 +19263,9 @@ mod tests {
                 &cid,
                 &committed_members,
                 1,
-                (committed_members).len() as u64
+                (committed_members).len() as u64,
+                2,
+                crate::cluster::topology::ASSIGNMENT_ABSENT_DIGEST
             ),
         );
         // E5 — the catch-up payload is the WINNING commit's own bytes, not a
@@ -21114,6 +21167,8 @@ mod tests {
         let too_high = crate::cluster::shards::MAX_SUPPORTED_PLACEMENT_VERSION + 1;
         let bad = crate::cluster::topology::TopologyCommit {
             term: 6,
+            rf: 2,
+            assignment: None,
             proposer: NodeId(1),
             members: members.clone(),
             cluster_id: cid,
@@ -21125,6 +21180,8 @@ mod tests {
                 &members,
                 too_high,
                 (members).len() as u64,
+                2,
+                crate::cluster::topology::ASSIGNMENT_ABSENT_DIGEST,
             ),
             voters: members.clone(),
         };
@@ -21191,6 +21248,8 @@ mod tests {
         let cid = cluster.topology_authority.cluster_id();
         let commit = crate::cluster::topology::TopologyCommit {
             term: 6,
+            rf: 2,
+            assignment: None,
             proposer: NodeId(1),
             members: members.clone(),
             cluster_id: cid,
@@ -21202,6 +21261,8 @@ mod tests {
                 &members,
                 1,
                 (members).len() as u64,
+                2,
+                crate::cluster::topology::ASSIGNMENT_ABSENT_DIGEST,
             ),
             voters: members.clone(),
         };
@@ -21256,6 +21317,8 @@ mod tests {
         let cid = cluster.topology_authority.cluster_id();
         let commit = crate::cluster::topology::TopologyCommit {
             term: 6,
+            rf: 2,
+            assignment: None,
             proposer: NodeId(1),
             members: members.clone(),
             cluster_id: cid,
@@ -21267,6 +21330,8 @@ mod tests {
                 &members,
                 1,
                 (members).len() as u64,
+                2,
+                crate::cluster::topology::ASSIGNMENT_ABSENT_DIGEST,
             ),
             voters: members.clone(),
         };
@@ -22608,6 +22673,9 @@ mod tests {
         let commit_members = vec![NodeId(1), NodeId(2)];
         let commit = crate::cluster::topology::TopologyCommit {
             term: 5,
+            // Matches the rf=1 table this test builds its cluster with.
+            rf: 1,
+            assignment: None,
             proposer: NodeId(1),
             members: commit_members.clone(),
             cluster_id: crate::cluster::topology::ClusterId::UNSET,
@@ -22619,6 +22687,8 @@ mod tests {
                 &commit_members,
                 1,
                 (commit_members).len() as u64,
+                1,
+                crate::cluster::topology::ASSIGNMENT_ABSENT_DIGEST,
             ),
             voters: commit_members.clone(),
         };

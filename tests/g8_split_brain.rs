@@ -28,6 +28,8 @@ fn commit_membership(auth: &TopologyAuthority, term: u64, ids: &[u64]) {
     let mems = members(ids);
     let commit = TopologyCommit {
         term,
+        rf: 2,
+        assignment: None,
         proposer: NodeId(1),
         members: mems.clone(),
         cluster_id: ClusterId::UNSET,
@@ -39,6 +41,8 @@ fn commit_membership(auth: &TopologyAuthority, term: u64, ids: &[u64]) {
             &mems,
             1,
             (mems).len() as u64,
+            2,
+            teraslab::cluster::topology::ASSIGNMENT_ABSENT_DIGEST,
         ),
         voters: mems.clone(),
     };
@@ -59,7 +63,7 @@ fn commit_membership(auth: &TopologyAuthority, term: u64, ids: &[u64]) {
 /// must reject the proposal.
 #[test]
 fn ever_seen_check_rejects_pure_superset_merge() {
-    let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+    let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1), 2);
     commit_membership(&auth, 1, &[1, 2]);
 
     // Sanity: the legacy `is_safe_membership_change` heuristic alone
@@ -85,7 +89,7 @@ fn ever_seen_check_rejects_pure_superset_merge() {
 /// reject the same merge.
 #[test]
 fn handle_propose_rejects_unseen_member_superset() {
-    let auth = TopologyAuthority::new(NodeId(2), Duration::from_secs(1));
+    let auth = TopologyAuthority::new(NodeId(2), Duration::from_secs(1), 2);
     // Voter side committed members [1, 2] at term 1 — never saw node 3 or 4.
     commit_membership(&auth, 1, &[1, 2]);
 
@@ -98,6 +102,7 @@ fn handle_propose_rejects_unseen_member_superset() {
         ClusterId::UNSET,
         1,
         (members(&[1, 2, 3, 4])).len() as u64,
+        2,
     );
     // Digest is valid by construction. Voter must still reject.
     propose.digest = TopologyTerm::compute_digest(
@@ -106,6 +111,8 @@ fn handle_propose_rejects_unseen_member_superset() {
         &propose.members,
         1,
         (propose.members).len() as u64,
+        2,
+        teraslab::cluster::topology::ASSIGNMENT_ABSENT_DIGEST,
     );
 
     let vote = auth.handle_propose(&propose);
@@ -122,7 +129,7 @@ fn handle_propose_rejects_unseen_member_superset() {
 /// has been a voter in any earlier committed term is "known" forever.
 #[test]
 fn ever_seen_check_accumulates_across_terms() {
-    let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+    let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1), 2);
     commit_membership(&auth, 1, &[1, 2, 3]);
     commit_membership(&auth, 2, &[1, 2]); // drop node 3 (graceful drain)
 
@@ -146,7 +153,7 @@ fn ever_seen_check_accumulates_across_terms() {
 /// fallback ever-seen heuristic is bypassed (cluster_id is authoritative).
 #[test]
 fn membership_change_rejected_when_cluster_id_differs() {
-    let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+    let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1), 2);
     commit_membership(&auth, 1, &[1, 2]);
 
     // Configure local cluster_id.
@@ -185,7 +192,7 @@ fn membership_change_rejected_when_cluster_id_differs() {
 /// the orchestrator hasn't yet wired UUID persistence on this node.)
 #[test]
 fn local_unset_cluster_id_falls_back_to_ever_seen() {
-    let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+    let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1), 2);
     commit_membership(&auth, 1, &[1, 2]);
     // Local cluster_id is UNSET (default).
     assert!(auth.cluster_id().is_unset());
@@ -212,7 +219,7 @@ fn local_unset_cluster_id_falls_back_to_ever_seen() {
 /// expected. (Sanity check on the storage API exposed for the orchestrator.)
 #[test]
 fn cluster_id_set_and_get_round_trip() {
-    let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+    let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1), 2);
     assert!(auth.cluster_id().is_unset());
 
     let id = ClusterId([0xAB; 16]);
@@ -229,7 +236,7 @@ fn cluster_id_set_and_get_round_trip() {
 /// so restart code can restore it cleanly.
 #[test]
 fn committed_voter_ever_seen_persistence_round_trip() {
-    let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+    let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1), 2);
     commit_membership(&auth, 1, &[1, 2, 3]);
     let snap = auth.committed_voter_ever_seen_snapshot();
     assert!(snap.contains(&NodeId(1)));
@@ -238,7 +245,7 @@ fn committed_voter_ever_seen_persistence_round_trip() {
 
     // Restore into a fresh authority via the explicit setter — this is
     // the orchestrator's loader path.
-    let restored = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+    let restored = TopologyAuthority::new(NodeId(1), Duration::from_secs(1), 2);
     restored.set_committed_voter_ever_seen(&snap);
     let after = restored.committed_voter_ever_seen_snapshot();
     assert_eq!(after, snap, "persistence must round-trip exactly");
@@ -275,7 +282,7 @@ fn vote_for(term: &TopologyTerm, voter: u64) -> teraslab::cluster::topology::Top
 /// must remain unchanged.
 #[test]
 fn minority_remnant_cannot_self_activate_after_partition() {
-    let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+    let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1), 2);
     commit_membership(&auth, 1, &[1, 2, 3]); // peak observed: 3
     assert_eq!(auth.peak_cluster_size(), 3);
 
@@ -302,7 +309,7 @@ fn minority_remnant_cannot_self_activate_after_partition() {
 /// two surviving voters reach it.
 #[test]
 fn majority_remnant_still_activates() {
-    let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+    let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1), 2);
     commit_membership(&auth, 1, &[1, 2, 3]);
 
     let term = auth
@@ -323,7 +330,7 @@ fn majority_remnant_still_activates() {
 /// Single-node bootstrap (peak=1) still activates on the self-vote alone.
 #[test]
 fn single_node_bootstrap_still_activates() {
-    let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+    let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1), 2);
     assert_eq!(auth.peak_cluster_size(), 1);
 
     let term = auth
@@ -341,7 +348,7 @@ fn single_node_bootstrap_still_activates() {
 /// proposal needs 2 votes — obtainable because all 3 nodes are alive.
 #[test]
 fn growth_one_to_three_activates_as_peak_grows() {
-    let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+    let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1), 2);
     // Production sets a cluster_id, which lets brand-new (never-seen)
     // members join; mirror that here so the F-G8-001 fallback does not
     // reject the legitimate scale-up.
@@ -383,7 +390,7 @@ fn growth_one_to_three_activates_as_peak_grows() {
 fn restored_peak_blocks_minority_after_restart() {
     use teraslab::cluster::topology::PersistedTopologyState;
 
-    let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+    let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1), 2);
     auth.restore(&PersistedTopologyState {
         peak_cluster_size: 3,
         committed_term: 7,
@@ -413,7 +420,7 @@ fn restored_peak_blocks_minority_after_restart() {
 /// peak-derived quorum: a 2-of-4 remnant cannot commit with 2 votes.
 #[test]
 fn fallback_proposer_minority_blocked_by_peak() {
-    let auth = TopologyAuthority::new(NodeId(2), Duration::from_millis(1));
+    let auth = TopologyAuthority::new(NodeId(2), Duration::from_millis(1), 2);
     commit_membership(&auth, 1, &[1, 2, 3, 4]); // peak observed: 4
 
     // SWIM reports the shrink; node 2 is not the deterministic proposer.
@@ -438,7 +445,7 @@ fn fallback_proposer_minority_blocked_by_peak() {
 /// The retry path (`retry_proposal`) uses the same peak-derived quorum.
 #[test]
 fn retry_proposal_minority_blocked_by_peak() {
-    let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+    let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1), 2);
     commit_membership(&auth, 1, &[1, 2, 3, 4]); // peak observed: 4
 
     let first = auth

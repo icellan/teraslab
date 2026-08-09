@@ -27843,6 +27843,7 @@ mod tests {
             crate::cluster::topology::ClusterId::UNSET,
             1,
             (members.clone()).len() as u64,
+            1, // rf matches the rf=1 fixture table
         );
         let req = RequestFrame {
             request_id: 1,
@@ -27911,6 +27912,7 @@ mod tests {
             crate::cluster::topology::ClusterId::UNSET,
             1,
             (members.clone()).len() as u64,
+            1, // rf matches the rf=1 fixture table
         );
 
         let req = RequestFrame {
@@ -27991,6 +27993,7 @@ mod tests {
             crate::cluster::topology::ClusterId::UNSET,
             1,
             (members.clone()).len() as u64,
+            1, // rf matches the rf=1 fixture table
         );
 
         let req = RequestFrame {
@@ -28062,6 +28065,7 @@ mod tests {
             cid,
             1,
             (members.clone()).len() as u64,
+            1, // rf matches the rf=1 fixture table
         );
         let req = RequestFrame {
             request_id: 1,
@@ -28084,6 +28088,8 @@ mod tests {
         // Step 2: commit that term.
         let commit = crate::cluster::topology::TopologyCommit {
             term: 700,
+            rf: 1, // matches the rf=1 fixture table
+            assignment: None,
             proposer,
             members: members.clone(),
             cluster_id: cid,
@@ -28095,6 +28101,8 @@ mod tests {
                 &members,
                 1,
                 (members).len() as u64,
+                1,
+                crate::cluster::topology::ASSIGNMENT_ABSENT_DIGEST,
             ),
             voters: members.clone(),
         };
