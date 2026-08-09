@@ -1371,6 +1371,13 @@ pub struct TopologyAuthority {
     /// lives inside `committed_commit`), kept unpacked so the gate path does
     /// not re-parse the commit blob on every frame.
     committed_digest: RwLock<Option<[u8; 32]>>,
+    /// §8 — the committed master assignment of the applied term, unpacked
+    /// from the winning commit (it also lives inside `committed_commit`).
+    /// `None` when the committed term carried none, or when this node
+    /// reached its term via a path that carries no commit — the R5 state in
+    /// which it must not treat any locally derived assignment as
+    /// authoritative.
+    committed_assignment: RwLock<Option<crate::cluster::election::CommittedAssignment>>,
 }
 
 /// §4.4 — count of commits rejected because their digest disagreed with the
@@ -1447,8 +1454,24 @@ impl TopologyAuthority {
             committed_commit: RwLock::new(None),
             voted_digest: RwLock::new(None),
             committed_digest: RwLock::new(None),
+            committed_assignment: RwLock::new(None),
             peer_term_hint: AtomicU64::new(0),
         }
+    }
+
+    /// §8 — the committed master assignment of the current committed term,
+    /// if this node holds one.
+    pub fn committed_assignment(&self) -> Option<crate::cluster::election::CommittedAssignment> {
+        self.committed_assignment.read().unwrap().clone()
+    }
+
+    /// R5 — does this node hold a committed assignment for its committed
+    /// term? A node that caught up via a path carrying no commit holds a
+    /// TERM but no assignment; every consumer that would otherwise fall back
+    /// to a locally recomputed table must treat that state as
+    /// "authority unknown", never as round-robin.
+    pub fn holds_committed_assignment(&self) -> bool {
+        self.committed_assignment.read().unwrap().is_some()
     }
 
     /// Mint the next proposal term: one past everything this node knows —
@@ -1785,13 +1808,20 @@ impl TopologyAuthority {
         // commit blob, so it is present exactly when that blob is. A node
         // that caught up without a commit holds none, and the fork detector
         // simply does not fire for it.
-        *self.committed_digest.write().unwrap() = self
-            .committed_commit
-            .read()
-            .unwrap()
-            .as_ref()
-            .and_then(|bytes| TopologyCommit::deserialize(bytes))
-            .map(|commit| commit.digest);
+        {
+            let parsed = self
+                .committed_commit
+                .read()
+                .unwrap()
+                .as_ref()
+                .and_then(|bytes| TopologyCommit::deserialize(bytes));
+            *self.committed_digest.write().unwrap() = parsed.as_ref().map(|commit| commit.digest);
+            // §8 — the committed assignment survives restart exactly as far
+            // as the commit blob does: dropped blob (wrong term, unparseable)
+            // means no assignment, which is the honest R5 state.
+            *self.committed_assignment.write().unwrap() =
+                parsed.and_then(|commit| commit.assignment);
+        }
         // §4.3 — restore the attested digest alongside the term it belongs
         // to. Dropping it on restart would silently re-open the equivocation
         // window across every reboot.
@@ -2564,6 +2594,38 @@ impl TopologyAuthority {
             return false;
         }
 
+        // §8/§6 — a commit CARRYING an assignment must pass the full
+        // assignment validator before anything may install it. The det table
+        // is derived from the commit's own digest-bound fields, so every
+        // node reaches the same verdict. Reject-not-fence: the validator
+        // counts and logs; this node keeps serving its existing term.
+        if let Some(assignment) = &commit.assignment {
+            let det = crate::cluster::shards::ShardTable::compute_with_epoch(
+                &commit.members,
+                commit.rf,
+                0,
+                commit.placement_version.max(1),
+            );
+            let proposal = crate::cluster::election::AssignmentProposal {
+                assignment: &assignment.masters,
+                members: &commit.members,
+                det: &det,
+                proposer: commit.proposer,
+                term: commit.term,
+            };
+            let prev = self.committed_assignment.read().unwrap();
+            if crate::cluster::election::validate_assignment(
+                &proposal,
+                committed,
+                prev.as_ref().map(|a| a.masters.as_slice()),
+            )
+            .is_err()
+            {
+                // Already counted + ERROR-logged by the validator.
+                return false;
+            }
+        }
+
         // §4.4 (E1) — LAST gate, after every structural one (P1-6): a
         // malformed or sub-quorum frame must never reach a detector.
         if !self.vote_attestation_holds(commit) {
@@ -2753,6 +2815,10 @@ impl TopologyAuthority {
         // something was. A later frame naming this term with a different
         // digest is then hard evidence of a committed-history fork.
         *self.committed_digest.write().unwrap() = Some(commit.digest);
+        // §8 — unpack the committed assignment (validated by the gate before
+        // this apply ran). `None` overwrites too: a term that carries no
+        // assignment must not leave a stale one behind.
+        *self.committed_assignment.write().unwrap() = commit.assignment.clone();
         *self.observed_membership.lock() = commit.members.clone();
         // F-G8-001 fallback: every member of a committed term is, from
         // now on, a "known" voter. Future proposals that introduce a
@@ -3284,11 +3350,8 @@ impl TopologyAuthority {
                     // Monotonic superset: committed ∪ new joiners. A member
                     // that ALSO died stays in this target (keeping the step
                     // monotonic); the subset rule above drops it next tick.
-                    let mut union: Vec<NodeId> = committed
-                        .iter()
-                        .copied()
-                        .chain(tick_additions)
-                        .collect();
+                    let mut union: Vec<NodeId> =
+                        committed.iter().copied().chain(tick_additions).collect();
                     union.sort_unstable_by_key(|node| node.0);
                     union.dedup();
                     union
@@ -7658,6 +7721,128 @@ mod tests {
             };
             assert_eq!(auth.handle_commit(&good), Some(4), "{why}: must recover");
         }
+    }
+
+    /// §8 — a commit carrying an assignment runs the full validator inside
+    /// the commit gate: a rule-4 violation (master outside the shard's
+    /// candidate set) is rejected on the REAL path, the committed assignment
+    /// survives apply + restart, and a valid one round-trips.
+    #[test]
+    fn commit_gate_validates_and_stores_a_carried_assignment() {
+        use crate::cluster::shards::{NUM_SHARDS, ShardTable};
+
+        let mems = members(&[1, 2, 3]);
+        let det = ShardTable::compute_with_epoch(&mems, 2, 0, 1);
+        // The deterministic masters form a trivially valid assignment.
+        let valid: Vec<NodeId> = (0..NUM_SHARDS as u16)
+            .map(|shard| det.target_assignment(shard).master)
+            .collect();
+        let pair = crate::cluster::election::CommittedAssignment::new(
+            valid.clone(),
+            &vec![false; NUM_SHARDS],
+        );
+        let term = TopologyTerm::new(3, mems.clone(), NodeId(1), ClusterId::UNSET, 1, 3, 2)
+            .with_assignment(pair.clone())
+            .expect("valid assignment must attach");
+        let commit = TopologyCommit {
+            term: term.term,
+            proposer: term.proposer,
+            members: term.members.clone(),
+            cluster_id: term.cluster_id,
+            placement_version: term.placement_version,
+            committed_peak: term.committed_peak,
+            digest: term.digest,
+            voters: mems.clone(),
+            rf: term.rf,
+            assignment: term.assignment.clone(),
+        };
+
+        let auth = TopologyAuthority::new(NodeId(2), Duration::from_secs(1), 2);
+        assert!(!auth.holds_committed_assignment(), "R5: nothing held yet");
+        assert_eq!(auth.handle_commit(&commit), Some(3));
+        assert!(auth.holds_committed_assignment());
+        assert_eq!(
+            auth.committed_assignment().map(|a| a.masters),
+            Some(valid.clone()),
+        );
+
+        // Restart: the assignment survives exactly as far as the commit blob.
+        let state = auth.persisted_state(3, 1);
+        let reloaded =
+            PersistedTopologyState::deserialize(&state.serialize()).expect("state decodes");
+        let restored = TopologyAuthority::new(NodeId(2), Duration::from_secs(1), 2);
+        restored.restore(&reloaded);
+        assert!(
+            restored.holds_committed_assignment(),
+            "the committed assignment must survive a restart",
+        );
+        assert_eq!(
+            restored.committed_assignment().map(|a| a.masters),
+            Some(valid),
+        );
+
+        // A rule-4 violation on the real path: shard 0's master swapped to a
+        // member OUTSIDE its candidate set. Rebuild the digest so ONLY the
+        // validator can reject it.
+        let outsider = mems.iter().copied().find(|node| {
+            let a = det.target_assignment(0);
+            *node != a.master && !a.replicas.contains(node)
+        });
+        if let Some(outsider) = outsider {
+            let mut bad_masters: Vec<NodeId> = (0..NUM_SHARDS as u16)
+                .map(|shard| det.target_assignment(shard).master)
+                .collect();
+            bad_masters[0] = outsider;
+            let bad_pair = crate::cluster::election::CommittedAssignment::new(
+                bad_masters,
+                &vec![false; NUM_SHARDS],
+            );
+            let bad_term = TopologyTerm::new(4, mems.clone(), NodeId(1), ClusterId::UNSET, 1, 3, 2)
+                .with_assignment(bad_pair)
+                .expect("encodes (validity is the gate's job)");
+            let bad_commit = TopologyCommit {
+                term: bad_term.term,
+                proposer: bad_term.proposer,
+                members: bad_term.members.clone(),
+                cluster_id: bad_term.cluster_id,
+                placement_version: bad_term.placement_version,
+                committed_peak: bad_term.committed_peak,
+                digest: bad_term.digest,
+                voters: mems.clone(),
+                rf: bad_term.rf,
+                assignment: bad_term.assignment.clone(),
+            };
+            let fresh = TopologyAuthority::new(NodeId(2), Duration::from_secs(1), 2);
+            assert_eq!(
+                fresh.handle_commit(&bad_commit),
+                None,
+                "a rule-4 violation must be rejected by the commit gate",
+            );
+            assert!(!fresh.is_self_fenced(), "reject, never fence");
+            assert_eq!(fresh.committed_term(), 0);
+        }
+
+        // A fallback commit with NO assignment still applies — and clears
+        // nothing it shouldn't: applying over a held assignment OVERWRITES
+        // it with None (a term that carried none must not leave a stale one).
+        let none_term = TopologyTerm::new(5, mems.clone(), NodeId(1), ClusterId::UNSET, 1, 3, 2);
+        let none_commit = TopologyCommit {
+            term: 5,
+            proposer: NodeId(1),
+            members: mems.clone(),
+            cluster_id: ClusterId::UNSET,
+            placement_version: 1,
+            committed_peak: 3,
+            digest: none_term.digest,
+            voters: mems.clone(),
+            rf: 2,
+            assignment: None,
+        };
+        assert_eq!(auth.handle_commit(&none_commit), Some(5));
+        assert!(
+            !auth.holds_committed_assignment(),
+            "a term carrying no assignment must not leave a stale one behind",
+        );
     }
 
     /// Liveness (add direction) — a brand-new joiner whose one-shot SWIM
