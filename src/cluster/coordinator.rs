@@ -1781,6 +1781,18 @@ impl ClusterCoordinator {
         // the runner, so `alive_node_count` can exclude Suspect/Dead peers from
         // the mutation-quorum count.
         let swim_membership = swim.membership();
+        // §8 — the most recent exchange-phase partition view, retained so the
+        // assignment provider can elect from it at propose time. The exchange
+        // runs post-commit; by the NEXT term's proposal this holds the
+        // freshest cluster-wide self-reported holder data available.
+        let retained_exchange_view: Arc<
+            Mutex<std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>>>,
+        > = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        // §5 — the proposer-local deviation-hysteresis streaks. Proposer
+        // changes reset naturally (each node keeps its own).
+        let deviation_history =
+            Arc::new(Mutex::new(crate::cluster::election::DeviationHistory::new()));
+
         // Vote-side drop gate: a voter refuses a proposal that removes a
         // member its OWN SWIM still reports alive. This closes the
         // asymmetric-partition race where a soon-to-be-minority node
@@ -1805,10 +1817,75 @@ impl ClusterCoordinator {
                     alive
                 }));
         }
+
+        // §8 — the election provider: every proposal this node produces
+        // carries a committed assignment elected over the retained exchange
+        // view, anchored on the previous committed assignment. Runs under
+        // the authority's vote_decision lock — pure CPU, no I/O.
+        {
+            use crate::cluster::election::{
+                ElectionInputs, HolderReports, elect_committed_assignment,
+            };
+            let provider_view = retained_exchange_view.clone();
+            let provider_history = deviation_history.clone();
+            let provider_swim = swim_membership.clone();
+            let provider_self = self.self_id;
+            self.topology_authority
+                .set_assignment_provider(Box::new(move |request| {
+                    use crate::cluster::membership::NodeState;
+                    let det = ShardTable::compute_with_epoch(
+                        request.members,
+                        request.rf,
+                        0,
+                        request.placement_version.max(1),
+                    );
+                    let view = provider_view.lock().clone();
+                    // Pre-propose signal gate: the exchange runs POST-commit,
+                    // so the FIRST term has neither a retained view nor a
+                    // previous committed assignment. Electing there would
+                    // produce blind det and installing it verbatim would
+                    // discard the exchange-view refinement activation applies
+                    // to plain terms. Stay plain until real signals exist;
+                    // elections arm from the second term on.
+                    if view.is_empty() && request.prev_committed.is_none() {
+                        return None;
+                    }
+                    let reports = HolderReports::from_entries(
+                        view.keys().copied(),
+                        view.iter().flat_map(|(node, entries)| {
+                            entries
+                                .iter()
+                                .map(|entry| (*node, entry.shard, entry.last_applied_seq))
+                        }),
+                    );
+                    let mut live: std::collections::HashSet<NodeId> = provider_swim
+                        .lock()
+                        .all_member_states()
+                        .into_iter()
+                        .filter(|(_, state, _, _)| *state == NodeState::Alive)
+                        .map(|(id, _, _, _)| id)
+                        .collect();
+                    live.insert(provider_self);
+                    let mut history = provider_history.lock();
+                    let election = elect_committed_assignment(
+                        &ElectionInputs {
+                            det: &det,
+                            prev_committed: request
+                                .prev_committed
+                                .map(|assignment| assignment.masters.as_slice()),
+                            reports: &reports,
+                            live: &live,
+                        },
+                        &mut history,
+                    );
+                    Some(election.committed())
+                }));
+        }
         // G8 stage 3 — the event loop needs its own handle to force-evict
         // removed NodeIds from the local SWIM view right after activating a
         // quorum-gated shrink (see `react_to_committed_shrink`).
         let swim_membership_event = swim_membership.clone();
+        let retained_exchange_view_event = retained_exchange_view.clone();
         let (swim_shutdown, swim_handle, event_rx) = swim.start();
 
         let shard_table = self.shard_table.clone();
@@ -2873,6 +2950,9 @@ impl ClusterCoordinator {
                     }
                     last_activated_term = term;
                     topology_epoch.store(term, Ordering::Relaxed);
+                    // §8 — retain the freshest cluster-wide holder view for
+                    // the assignment provider's next election.
+                    *retained_exchange_view_event.lock() = partition_view.clone();
                     tracing::info!(
                         term,
                         epoch = term,
