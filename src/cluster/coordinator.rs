@@ -1216,6 +1216,19 @@ fn install_active_routing_snapshot(
     true
 }
 
+/// §8 — the committed assignment to install for an activation of `epoch`,
+/// or `None` when the authority holds none for that exact term. Gating on
+/// the term match keeps a stale assignment (an older term's) from being
+/// installed under a newer epoch.
+fn committed_assignment_for_activation(
+    authority: &crate::cluster::topology::TopologyAuthority,
+    epoch: u64,
+) -> Option<crate::cluster::election::CommittedAssignment> {
+    (authority.committed_term() == epoch)
+        .then(|| authority.committed_assignment())
+        .flatten()
+}
+
 fn committed_topology_from_routing_snapshot(
     _routing: &crate::cluster::routing::RoutingInfo,
 ) -> Option<crate::cluster::topology::TopologyCommit> {
@@ -1768,6 +1781,30 @@ impl ClusterCoordinator {
         // the runner, so `alive_node_count` can exclude Suspect/Dead peers from
         // the mutation-quorum count.
         let swim_membership = swim.membership();
+        // Vote-side drop gate: a voter refuses a proposal that removes a
+        // member its OWN SWIM still reports alive. This closes the
+        // asymmetric-partition race where a soon-to-be-minority node
+        // assembles a transient quorum for a shrunken member set before the
+        // voter's own failure detector has caught up — the voter would
+        // otherwise endorse the proposer's view against its own evidence.
+        // Self is implicitly alive (SWIM never tracks the local node).
+        {
+            let liveness_swim = swim_membership.clone();
+            let liveness_self = self.self_id;
+            self.topology_authority
+                .set_liveness_provider(Box::new(move || {
+                    use crate::cluster::membership::NodeState;
+                    let mut alive: std::collections::HashSet<NodeId> = liveness_swim
+                        .lock()
+                        .all_member_states()
+                        .into_iter()
+                        .filter(|(_, state, _, _)| *state == NodeState::Alive)
+                        .map(|(id, _, _, _)| id)
+                        .collect();
+                    alive.insert(liveness_self);
+                    alive
+                }));
+        }
         // G8 stage 3 — the event loop needs its own handle to force-evict
         // removed NodeIds from the local SWIM view right after activating a
         // quorum-gated shrink (see `react_to_committed_shrink`).
@@ -2076,6 +2113,10 @@ impl ClusterCoordinator {
                                         &active_topology_members_event,
                                         &migration_throttle_event,
                                         &cluster_secret_event,
+                                        committed_assignment_for_activation(
+                                            &topo_authority_event,
+                                            commit.term,
+                                        ),
                                     );
                                     last_activation_at = std::time::Instant::now();
                                 }
@@ -2687,6 +2728,10 @@ impl ClusterCoordinator {
                                 &active_topology_members_event,
                                 &migration_throttle_event,
                                 &cluster_secret_event,
+                                committed_assignment_for_activation(
+                                    &topo_authority_event,
+                                    committed_term,
+                                ),
                             );
                         }
                     }
@@ -2792,6 +2837,7 @@ impl ClusterCoordinator {
                         &active_topology_members_event,
                         &migration_throttle_event,
                         &cluster_secret_event,
+                        committed_assignment_for_activation(&topo_authority_event, term),
                     );
                     last_activation_at = std::time::Instant::now();
                     if let Some(ref path) = cluster_state_path {
@@ -2854,6 +2900,7 @@ impl ClusterCoordinator {
                         &partition_view,
                         &migration_throttle_event,
                         &cluster_secret_event,
+                        committed_assignment_for_activation(&topo_authority_event, term),
                     );
                     // Reverse-heal Phase 3b — RUNTIME online re-heal. The
                     // partition view just refreshed carries every peer's per-shard
@@ -3174,6 +3221,10 @@ impl ClusterCoordinator {
                                 &active_topology_members_event,
                                 &migration_throttle_event,
                                 &cluster_secret_event,
+                                committed_assignment_for_activation(
+                                    &topo_authority_event,
+                                    committed_term,
+                                ),
                             );
                         }
                     }
@@ -3528,6 +3579,7 @@ impl ClusterCoordinator {
                             active_topology_members,
                             migration_throttle,
                             cluster_secret,
+                            committed_assignment_for_activation(topology_authority, commit.term),
                         );
                         // POST-commit persist: the term is already committed +
                         // activated in memory and cannot be rolled back, so this
@@ -3893,6 +3945,7 @@ impl ClusterCoordinator {
         active_topology_members: &Arc<RwLock<Vec<NodeId>>>,
         migration_throttle: &Arc<crate::cluster::migration::MigrationThrottle>,
         cluster_secret: &Option<Arc<Vec<u8>>>,
+        committed_assignment: Option<crate::cluster::election::CommittedAssignment>,
     ) {
         let empty_view: std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>> =
             std::collections::HashMap::new();
@@ -3917,6 +3970,7 @@ impl ClusterCoordinator {
             &empty_view,
             migration_throttle,
             cluster_secret,
+            committed_assignment,
         );
     }
 
@@ -3951,6 +4005,7 @@ impl ClusterCoordinator {
         partition_view: &std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>>,
         migration_throttle: &Arc<crate::cluster::migration::MigrationThrottle>,
         cluster_secret: &Option<Arc<Vec<u8>>>,
+        committed_assignment: Option<crate::cluster::election::CommittedAssignment>,
     ) {
         *active_topology_members.write() = members.to_vec();
 
@@ -4007,7 +4062,25 @@ impl ClusterCoordinator {
         // computing election here still removes ghost-master scenarios
         // when the partition view is populated.
         let evicted: std::collections::HashSet<NodeId> = std::collections::HashSet::new();
-        apply_master_election(&mut new_table, &old_table_snap, partition_view, &evicted);
+        match &committed_assignment {
+            // §8 — a committed assignment IS the authority on mastership:
+            // install it verbatim (through set_master_for_shard, which
+            // performs the §11 replica swap and keeps intended_masters in
+            // step). It was validated by the commit gate before it could be
+            // committed, and installing the SAME assignment on every node is
+            // what the per-node election below could never guarantee — its
+            // ranking reads each node's own previous table, so identical
+            // inputs still produced divergent masters across nodes.
+            Some(assignment) => {
+                crate::cluster::election::install_assignment(&mut new_table, &assignment.masters);
+            }
+            // No committed assignment (plain term, pre-election world, or a
+            // catch-up that carried none): the per-node refinement, exactly
+            // as before.
+            None => {
+                apply_master_election(&mut new_table, &old_table_snap, partition_view, &evicted);
+            }
+        }
         // Phase D: when a partition view is available, use it to skip
         // migrations whose destination already has the data and to redirect
         // the source onto a replica when the planned source has none.
@@ -21571,6 +21644,7 @@ mod tests {
             &view,
             &cluster.migration_throttle,
             &cluster.cluster_secret,
+            None,
         );
 
         // The manager retained the unproven lost entry across the supersede (C17).
@@ -21686,6 +21760,7 @@ mod tests {
             &view,
             &cluster.migration_throttle,
             &cluster.cluster_secret,
+            None,
         );
 
         // The heal entry must survive the supersede (manager + hot-path atomic).
@@ -21785,6 +21860,7 @@ mod tests {
             &view,
             &cluster.migration_throttle,
             &cluster.cluster_secret,
+            None,
         );
 
         assert!(

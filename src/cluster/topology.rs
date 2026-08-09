@@ -863,6 +863,44 @@ pub struct PersistedTopologyState {
     pub voted_digest: Option<[u8; 32]>,
 }
 
+/// §8 — what a proposal producer asks the assignment provider for.
+///
+/// Everything digest-bound about the term being minted, plus the previous
+/// committed assignment (the election's anchor). The provider returns the
+/// elected `CommittedAssignment` — or `None` when it cannot produce one, in
+/// which case the proposal goes out plain (pre-election behavior) if no
+/// assignment was ever committed, and is WITHHELD (§5.2 P1-1) if one was:
+/// anchoring on plain `det` would silently revert every prior promotion and
+/// fire a migration storm.
+pub struct AssignmentRequest<'a> {
+    /// The member set of the term being minted (strictly ascending).
+    pub members: &'a [NodeId],
+    /// Replication factor of the term being minted.
+    pub rf: u8,
+    /// Placement version of the term being minted.
+    pub placement_version: u16,
+    /// The previous committed assignment — the election anchor. `None` at
+    /// genesis or when this node holds no committed assignment.
+    pub prev_committed: Option<&'a crate::cluster::election::CommittedAssignment>,
+}
+
+/// §8 — callback the coordinator registers so proposal producers can attach
+/// an elected assignment. Runs under the `vote_decision` lock: it must be
+/// pure CPU over coordinator-retained state (the exchange view, liveness),
+/// never I/O.
+pub type AssignmentProvider = Box<
+    dyn Fn(&AssignmentRequest<'_>) -> Option<crate::cluster::election::CommittedAssignment>
+        + Send
+        + Sync,
+>;
+
+/// Liveness supplier the coordinator registers: the set of members SWIM
+/// currently reports alive (self included). Consulted by the vote gate so a
+/// voter refuses to DROP a member it still sees alive — the guard that
+/// closes the asymmetric-partition race where a minority node assembles a
+/// transient quorum for a member set the voter's own view contradicts.
+pub type LivenessProvider = Box<dyn Fn() -> std::collections::HashSet<NodeId> + Send + Sync>;
+
 /// G9 — result of [`TopologyAuthority::handle_commit_durable`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DurableCommitOutcome {
@@ -1371,6 +1409,15 @@ pub struct TopologyAuthority {
     /// lives inside `committed_commit`), kept unpacked so the gate path does
     /// not re-parse the commit blob on every frame.
     committed_digest: RwLock<Option<[u8; 32]>>,
+    /// Liveness supplier for the vote-side drop gate. `None` (unregistered,
+    /// e.g. unit tests) disables the gate.
+    liveness_provider: RwLock<Option<LivenessProvider>>,
+    /// §8 — provider the coordinator registers; consulted by every proposal
+    /// producer to attach the elected assignment BEFORE the self-vote is
+    /// recorded (the digest must bind the assignment, and §4.4 compares the
+    /// commit against the recorded digest — attaching after the vote would
+    /// make a proposer reject its own commit).
+    assignment_provider: RwLock<Option<AssignmentProvider>>,
     /// §8 — the committed master assignment of the applied term, unpacked
     /// from the winning commit (it also lives inside `committed_commit`).
     /// `None` when the committed term carried none, or when this node
@@ -1455,7 +1502,92 @@ impl TopologyAuthority {
             voted_digest: RwLock::new(None),
             committed_digest: RwLock::new(None),
             committed_assignment: RwLock::new(None),
+            assignment_provider: RwLock::new(None),
+            liveness_provider: RwLock::new(None),
             peer_term_hint: AtomicU64::new(0),
+        }
+    }
+
+    /// §8 — register the election provider. One caller (coordinator boot).
+    pub fn set_assignment_provider(&self, provider: AssignmentProvider) {
+        *self.assignment_provider.write().unwrap() = Some(provider);
+    }
+
+    /// Register the liveness supplier for the vote-side drop gate. One
+    /// caller (coordinator boot).
+    pub fn set_liveness_provider(&self, provider: LivenessProvider) {
+        *self.liveness_provider.write().unwrap() = Some(provider);
+    }
+
+    /// The vote-side drop gate: does this proposal DROP (relative to the
+    /// committed set) a member this node currently sees alive?
+    ///
+    /// A vote is the one place a node's own observations enter the quorum,
+    /// and voting to remove a member it can still see is how an
+    /// asymmetric partition lets a minority assemble a transient quorum:
+    /// the proposer's view says the member is gone, the voter's does not —
+    /// and without this gate the voter endorses the proposer's view against
+    /// its own evidence. Refusing is self-healing: when the member really
+    /// dies, the voter's own SWIM catches up within a suspicion timeout and
+    /// the retried proposal passes. Graceful drains are unaffected — they
+    /// travel as direct commits (E-4), not proposals.
+    fn drops_a_live_member(&self, proposed: &[NodeId]) -> bool {
+        let provider = self.liveness_provider.read().unwrap();
+        let Some(provide) = provider.as_ref() else {
+            return false;
+        };
+        let committed = self.committed_members.read().unwrap();
+        if committed.is_empty() {
+            return false;
+        }
+        let alive = provide();
+        committed
+            .iter()
+            .any(|member| !proposed.contains(member) && alive.contains(member))
+    }
+
+    /// §8 — attach the elected assignment to a freshly minted term.
+    ///
+    /// Returns `None` when the proposal must be WITHHELD (§5.2 P1-1): this
+    /// node holds a committed assignment but the provider cannot produce an
+    /// election (or produced one that does not encode against the members).
+    /// Proposing plain `det` in that state silently reverts every prior
+    /// promotion. When NO assignment was ever committed — genesis, or the
+    /// pre-election world — a plain term is returned unchanged.
+    fn attach_assignment(&self, term: TopologyTerm) -> Option<TopologyTerm> {
+        let provider = self.assignment_provider.read().unwrap();
+        let prev = self.committed_assignment.read().unwrap();
+        let elected = provider.as_ref().and_then(|provide| {
+            provide(&AssignmentRequest {
+                members: &term.members,
+                rf: term.rf,
+                placement_version: term.placement_version,
+                prev_committed: prev.as_ref(),
+            })
+        });
+        match (elected, prev.is_some()) {
+            (Some(assignment), _) => match term.clone().with_assignment(assignment) {
+                Some(with) => Some(with),
+                None => {
+                    tracing::error!(
+                        term = term.term,
+                        "cluster: elected assignment does not encode against the                          proposed members; withholding the proposal",
+                    );
+                    None
+                }
+            },
+            // No election available and none ever committed: plain term,
+            // today's behavior.
+            (None, false) => Some(term),
+            // P1-1 — an assignment exists but this proposal cannot carry
+            // one. Withhold rather than revert every promotion to det.
+            (None, true) => {
+                tracing::warn!(
+                    term = term.term,
+                    "cluster: holding a committed assignment but no election is                      available; withholding the proposal (P1-1)",
+                );
+                None
+            }
         }
     }
 
@@ -2129,6 +2261,9 @@ impl TopologyAuthority {
                 committed_peak,
                 self.rf,
             );
+            // §8 — attach the elected assignment BEFORE the self-vote so the
+            // recorded digest binds it. `None` = withhold (P1-1).
+            let term = self.attach_assignment(term)?;
             // §4.3 — self-vote: term and digest recorded atomically.
             self.record_vote(new_term, term.digest);
             term
@@ -2158,6 +2293,9 @@ impl TopologyAuthority {
         // frame whose advertised digest disagrees with its own payload is
         // rejected; nothing ever trusts a shipped hash.
         let valid_digest = propose.digest == propose.recompute_digest();
+
+        // The drop gate — see `drops_a_live_member`.
+        let drops_live_member = self.drops_a_live_member(&propose.members);
 
         // rf mismatch — same REFUSE-not-fallback posture as the placement
         // gate below. The candidate set derives from `(members, rf,
@@ -2203,6 +2341,7 @@ impl TopologyAuthority {
         if !valid_digest
             || unsupported_placement
             || rf_mismatch
+            || drops_live_member
             || !self.membership_change_is_safe(&propose.members, Some(propose.cluster_id))
         {
             // Even when `voted_term` would normally advance, we refuse to
@@ -2218,7 +2357,8 @@ impl TopologyAuthority {
                 propose_rf = propose.rf,
                 local_rf = self.rf,
                 rf_mismatch,
-                "cluster: rejecting topology propose — split-brain heal signature, bad digest, rf mismatch, or unsupported placement version",
+                drops_live_member,
+                "cluster: rejecting topology propose — split-brain heal signature, bad digest, rf mismatch, live-member drop, or unsupported placement version",
             );
             return TopologyVote {
                 term: propose.term,
@@ -3045,6 +3185,9 @@ impl TopologyAuthority {
             committed_peak,
             self.rf,
         );
+        // §8 — attach the elected assignment BEFORE the self-vote (see
+        // on_membership_changed). `None` = withhold the proposal (P1-1).
+        let term = self.attach_assignment(term)?;
         self.record_vote(new_term, term.digest);
 
         let quorum_needed = self.activation_quorum_needed(target_members.len());
@@ -3126,6 +3269,9 @@ impl TopologyAuthority {
             committed_peak,
             self.rf,
         );
+        // §8 — attach the elected assignment BEFORE the self-vote (see
+        // on_membership_changed). `None` = withhold the proposal (P1-1).
+        let term = self.attach_assignment(term)?;
         self.record_vote(new_term, term.digest);
 
         let quorum_needed = self.activation_quorum_needed(committed_members.len());
@@ -3255,6 +3401,9 @@ impl TopologyAuthority {
             committed_peak,
             self.rf,
         );
+        // §8 — attach the elected assignment BEFORE the self-vote (see
+        // on_membership_changed). `None` = withhold the proposal (P1-1).
+        let term = self.attach_assignment(term)?;
         self.record_vote(new_term, term.digest);
 
         // Gate A: quorum is derived from the OLD peak (`peak_cluster_size()`
@@ -3426,6 +3575,9 @@ impl TopologyAuthority {
             committed_peak,
             self.rf,
         );
+        // §8 — attach the elected assignment BEFORE the self-vote (see
+        // on_membership_changed). `None` = withhold the proposal (P1-1).
+        let term = self.attach_assignment(term)?;
         self.record_vote(new_term, term.digest);
 
         let quorum_needed = self.activation_quorum_needed(target_members.len());
@@ -7842,6 +7994,59 @@ mod tests {
         assert!(
             !auth.holds_committed_assignment(),
             "a term carrying no assignment must not leave a stale one behind",
+        );
+    }
+
+    /// The vote-side drop gate: a voter refuses to remove a member its own
+    /// liveness provider still reports alive, and accepts the same drop once
+    /// its own view agrees. Without a provider the gate is inert.
+    #[test]
+    fn a_voter_refuses_to_drop_a_member_it_still_sees_alive() {
+        use std::sync::atomic::{AtomicBool, Ordering as AOrd};
+
+        let auth = TopologyAuthority::new(NodeId(2), Duration::from_secs(1), 2);
+        commit_membership(&auth, 1, &[1, 2, 3]);
+
+        // Node 3's liveness flips when the "SWIM view" catches up.
+        let three_alive = Arc::new(AtomicBool::new(true));
+        let flag = three_alive.clone();
+        auth.set_liveness_provider(Box::new(move || {
+            let mut alive: std::collections::HashSet<NodeId> =
+                [NodeId(1), NodeId(2)].into_iter().collect();
+            if flag.load(AOrd::Relaxed) {
+                alive.insert(NodeId(3));
+            }
+            alive
+        }));
+
+        // A proposal dropping node 3 while this voter still sees it alive:
+        // refused — the voter must not endorse the proposer's view against
+        // its own evidence.
+        let drop3 = TopologyTerm::new(2, members(&[1, 2]), NodeId(1), ClusterId::UNSET, 1, 3, 2);
+        assert!(
+            !auth.handle_propose(&drop3).accepted,
+            "a voter must refuse to drop a member it still sees alive",
+        );
+
+        // Its own view catches up (node 3 dead) → the retried proposal for a
+        // HIGHER term passes.
+        three_alive.store(false, AOrd::Relaxed);
+        let retry = TopologyTerm::new(3, members(&[1, 2]), NodeId(1), ClusterId::UNSET, 1, 3, 2);
+        assert!(
+            auth.handle_propose(&retry).accepted,
+            "once the voter's own view agrees, the drop must pass",
+        );
+
+        // Additions are never gated on liveness (a joiner may be unknown to
+        // this voter's SWIM for a round).
+        let auth2 = TopologyAuthority::new(NodeId(2), Duration::from_secs(1), 2);
+        commit_membership(&auth2, 1, &[1, 2]);
+        auth2.set_committed_voter_ever_seen(&[NodeId(1), NodeId(2), NodeId(4)]);
+        auth2.set_liveness_provider(Box::new(|| [NodeId(1), NodeId(2)].into_iter().collect()));
+        let add4 = TopologyTerm::new(2, members(&[1, 2, 4]), NodeId(1), ClusterId::UNSET, 1, 3, 2);
+        assert!(
+            auth2.handle_propose(&add4).accepted,
+            "the gate guards drops only — adds pass regardless of liveness",
         );
     }
 
