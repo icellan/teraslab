@@ -167,9 +167,20 @@ pub struct Election {
     pub assignment: Vec<NodeId>,
     /// Per-shard outcome, same indexing as `assignment`.
     pub outcomes: Vec<ShardOutcome>,
+    /// §7 — per-shard "the proposer could not prove the named master is a
+    /// full holder": there WAS usable evidence for the shard and the named
+    /// master did not self-report full. Deliberately false when evidence was
+    /// unusable (empty or partial view) — a proposer that saw nothing has no
+    /// business flagging the whole keyspace unproven.
+    pub unproven: Vec<bool>,
 }
 
 impl Election {
+    /// The wire-ready `(masters, unproven)` pair this election produced.
+    pub fn committed(&self) -> CommittedAssignment {
+        CommittedAssignment::new(self.assignment.clone(), &self.unproven)
+    }
+
     /// Shards whose master differs from the deterministic pick.
     pub fn deviation_count(&self, det: &ShardTable) -> usize {
         self.assignment
@@ -248,6 +259,7 @@ pub fn elect_committed_assignment(
 ) -> Election {
     let mut assignment = Vec::with_capacity(NUM_SHARDS);
     let mut outcomes = Vec::with_capacity(NUM_SHARDS);
+    let mut unproven = Vec::with_capacity(NUM_SHARDS);
 
     for shard in 0..NUM_SHARDS as u16 {
         let det_master = inputs.det.target_assignment(shard).master;
@@ -289,6 +301,8 @@ pub fn elect_committed_assignment(
             };
             assignment.push(base);
             outcomes.push(outcome);
+            // No usable evidence — nothing can be called unproven.
+            unproven.push(false);
             continue;
         }
 
@@ -334,11 +348,16 @@ pub fn elect_committed_assignment(
 
         assignment.push(base);
         outcomes.push(outcome);
+        // Usable evidence existed for this shard; the named master either
+        // self-reported full (proven) or did not (unproven — §7's advisory
+        // raise bit).
+        unproven.push(!inputs.reports.is_full(base, shard));
     }
 
     Election {
         assignment,
         outcomes,
+        unproven,
     }
 }
 
@@ -384,6 +403,181 @@ pub fn derive_replicas(det: &ShardTable, shard: u16, master: NodeId) -> Vec<Node
 pub fn install_assignment(det: &mut ShardTable, assignment: &[NodeId]) {
     for (shard, master) in assignment.iter().enumerate() {
         det.set_master_for_shard(shard as u16, *master);
+    }
+}
+
+/// Bytes in the per-shard `unproven` bitmap: one bit per shard.
+pub const UNPROVEN_BITMAP_BYTES: usize = NUM_SHARDS / 8;
+
+/// A committed assignment and its per-shard `unproven` bits, always carried
+/// and digest-bound TOGETHER — a bitmap that could travel separately from the
+/// assignment it annotates is a desync waiting to happen.
+///
+/// `unproven[s]` set means the PROPOSER could not prove the named master is a
+/// full holder for `s` (it had usable evidence and the master did not
+/// self-report full). §7: the bit is advisory and RAISE-ONLY on the receiving
+/// side — it may raise a local fence, never lower one, and never overrides a
+/// node's own provenance.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommittedAssignment {
+    /// One master per shard, `NUM_SHARDS` entries.
+    pub masters: Vec<NodeId>,
+    /// Fixed [`UNPROVEN_BITMAP_BYTES`] bitmap, bit `s` = shard `s` unproven.
+    pub unproven: Vec<u8>,
+}
+
+impl CommittedAssignment {
+    /// Build from per-shard masters and per-shard unproven flags.
+    pub fn new(masters: Vec<NodeId>, unproven_flags: &[bool]) -> Self {
+        let mut unproven = vec![0u8; UNPROVEN_BITMAP_BYTES];
+        for (shard, flag) in unproven_flags.iter().enumerate() {
+            if *flag {
+                unproven[shard / 8] |= 1 << (shard % 8);
+            }
+        }
+        Self { masters, unproven }
+    }
+
+    /// Is shard `s` flagged unproven by the proposer?
+    pub fn is_unproven(&self, shard: u16) -> bool {
+        let index = shard as usize / 8;
+        self.unproven
+            .get(index)
+            .is_some_and(|byte| byte & (1 << (shard as usize % 8)) != 0)
+    }
+
+    /// Canonical wire encoding: the assignment's u16-index encoding followed
+    /// by the unproven bitmap. This is the byte string the assignment digest
+    /// covers, so the bitmap is digest-bound exactly like the masters.
+    pub fn encode(&self, members: &[NodeId]) -> Option<Vec<u8>> {
+        if self.unproven.len() != UNPROVEN_BITMAP_BYTES {
+            return None;
+        }
+        let mut bytes = encode_assignment(&self.masters, members)?;
+        bytes.extend_from_slice(&self.unproven);
+        Some(bytes)
+    }
+
+    /// Decode the canonical encoding (assignment indices + bitmap).
+    ///
+    /// # Errors
+    ///
+    /// [`AssignmentRejection::WrongLength`] when the payload is not exactly
+    /// `NUM_SHARDS * 2 + UNPROVEN_BITMAP_BYTES` bytes, or any error from
+    /// [`decode_assignment`].
+    pub fn decode(bytes: &[u8], members: &[NodeId]) -> Result<Self, AssignmentRejection> {
+        let expected = NUM_SHARDS * 2 + UNPROVEN_BITMAP_BYTES;
+        if bytes.len() != expected {
+            return Err(AssignmentRejection::WrongLength {
+                found: bytes.len(),
+                expected,
+            });
+        }
+        let masters = decode_assignment(&bytes[..NUM_SHARDS * 2], members)?;
+        Ok(Self {
+            masters,
+            unproven: bytes[NUM_SHARDS * 2..].to_vec(),
+        })
+    }
+}
+
+/// §7 — the provenance inputs to [`local_fence`], all knowable locally.
+///
+/// Provenance, NOT data: any data-derived predicate (`record_count > 0` and
+/// every variant) is false for a legitimately empty shard, so a data check
+/// would fence most of a fresh cluster's keyspace — and deadlock: fenced
+/// means no writes, means still empty, means still fenced.
+pub struct HolderProvenance<'a> {
+    /// The previous COMMITTED assignment's masters (`NUM_SHARDS` entries),
+    /// or `None` at genesis. Holdership is `master ∪ derive_replicas` under
+    /// the previous committed term.
+    pub prev_committed: Option<&'a [NodeId]>,
+    /// The deterministic table OF THE PREVIOUS committed term — replica
+    /// derivation needs it to expand a master entry into the full holder set.
+    pub prev_det: Option<&'a ShardTable>,
+    /// Does this node hold a proven migration completion for the shard at an
+    /// epoch >= the current commit's epoch? (The completion-handshake record.)
+    pub proven_completion: &'a dyn Fn(u16) -> bool,
+    /// The live inbound fence — raised while a migration into this node for
+    /// the shard is incomplete.
+    pub inbound_fenced: &'a dyn Fn(u16) -> bool,
+}
+
+/// §7 — `local_holder_check(s)`: may this node serve `s` on its own
+/// provenance?
+///
+/// ```text
+/// ( self ∈ prev_committed_holders(s)
+///   OR proven completion for s at epoch >= current commit epoch
+///   OR no previous committed assignment exists )       # genesis only
+/// AND NOT inbound_fenced(s)
+/// ```
+///
+/// `inbound_fenced` alone does not close the under-fence direction: a node
+/// named master of a shard nobody ever sends it has a CLEAR bit and would
+/// serve it empty, because that fence raises on data ARRIVAL. The
+/// prev-committed-holders clause is what actually closes it.
+pub fn local_holder_check(self_id: NodeId, shard: u16, provenance: &HolderProvenance<'_>) -> bool {
+    let provenance_ok = match (provenance.prev_committed, provenance.prev_det) {
+        (Some(prev), Some(prev_det)) => {
+            let prev_master = prev.get(shard as usize).copied();
+            prev_master == Some(self_id)
+                || prev_master.is_some_and(|master| {
+                    derive_replicas(prev_det, shard, master).contains(&self_id)
+                })
+                || (provenance.proven_completion)(shard)
+        }
+        // Genesis: no previous committed assignment exists. Every member
+        // passes — an empty cluster has nothing to serve stale.
+        _ => true,
+    };
+    provenance_ok && !(provenance.inbound_fenced)(shard)
+}
+
+/// §7 — what to do about shard `s` under the new committed assignment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FenceDecision {
+    /// Serve: this node's provenance covers the shard and no advisory bit or
+    /// inbound fence contradicts it.
+    Serve,
+    /// Withhold service and pull from `source` — the previous committed
+    /// master, a concrete, real node. The clearing edge is the completion
+    /// handshake of that pull, or the node's own provenance next term.
+    FenceWithSource { source: NodeId },
+    /// (P0-4) The fence condition holds but NO concrete pull source can be
+    /// named. Alert instead of fencing: a fence with no source has no
+    /// clearing edge — a `NodeId(0)` inbound is filtered out of pull-repair,
+    /// and that exact shape is on record as having blocked repair.
+    AlertNoSource,
+}
+
+/// §7 — `local_fence(s) := committed_unproven(s) OR NOT local_holder_check(s)`,
+/// with the P0-4 no-source carve-out.
+///
+/// Raise-only composition: the committed bit can RAISE the fence for a node
+/// whose provenance would otherwise pass, but a clear committed bit never
+/// overrides a failing local check. I0-compatible — withholding service does
+/// not change who the committed master is.
+pub fn local_fence(
+    self_id: NodeId,
+    shard: u16,
+    assignment: &CommittedAssignment,
+    provenance: &HolderProvenance<'_>,
+) -> FenceDecision {
+    let fence = assignment.is_unproven(shard) || !local_holder_check(self_id, shard, provenance);
+    if !fence {
+        return FenceDecision::Serve;
+    }
+    // The pull source is the PREVIOUS committed master — always a real node
+    // when one exists (rule 5 bans NodeId(0) from members). Pulling from
+    // self is meaningless; treat it as no source.
+    let source = provenance
+        .prev_committed
+        .and_then(|prev| prev.get(shard as usize).copied())
+        .filter(|node| *node != self_id && *node != NodeId(0));
+    match source {
+        Some(source) => FenceDecision::FenceWithSource { source },
+        None => FenceDecision::AlertNoSource,
     }
 }
 
@@ -1419,6 +1613,257 @@ mod tests {
         assert_ne!(encoded_a, encoded_b);
         assert_ne!(assignment_digest(&encoded_a), assignment_digest(&encoded_b));
         assert_eq!(assignment_digest(&encoded_a), assignment_digest(&encoded_a));
+    }
+
+    /// §7 — genesis passes: no previous committed assignment means every
+    /// member serves on its own provenance. Empty shards pass the same way —
+    /// provenance, not data.
+    #[test]
+    fn genesis_and_prior_holders_pass_the_holder_check() {
+        let det = det_table(&[1, 2, 3], 2);
+        let never = |_shard: u16| false;
+
+        // Genesis: no previous committed assignment.
+        let genesis = HolderProvenance {
+            prev_committed: None,
+            prev_det: None,
+            proven_completion: &never,
+            inbound_fenced: &never,
+        };
+        assert!(local_holder_check(NodeId(1), 0, &genesis));
+
+        // Post-genesis: only the previous committed holders pass.
+        let prev = det_assignment(&det);
+        let with_history = HolderProvenance {
+            prev_committed: Some(&prev),
+            prev_det: Some(&det),
+            proven_completion: &never,
+            inbound_fenced: &never,
+        };
+        let shard = 0u16;
+        let holders: Vec<NodeId> = std::iter::once(prev[0])
+            .chain(derive_replicas(&det, shard, prev[0]))
+            .collect();
+        for id in [1u64, 2, 3] {
+            let node = NodeId(id);
+            assert_eq!(
+                local_holder_check(node, shard, &with_history),
+                holders.contains(&node),
+                "node {id}: exactly the previous committed holders pass",
+            );
+        }
+    }
+
+    /// §7 — the under-fence direction. A node named master of a shard nobody
+    /// ever sent it has a CLEAR inbound bit (that fence raises on data
+    /// arrival), so only the prev-committed-holders clause stops it serving
+    /// the shard empty.
+    #[test]
+    fn a_non_holder_named_master_is_fenced_with_a_concrete_source() {
+        let det = det_table(&[1, 2, 3], 2);
+        let prev = det_assignment(&det);
+        let shard = 0u16;
+        let prev_master = prev[shard as usize];
+        let outsider = members(&[1, 2, 3])
+            .into_iter()
+            .find(|node| {
+                *node != prev_master && !derive_replicas(&det, shard, prev_master).contains(node)
+            })
+            .expect("rf=2 of 3 leaves one non-holder");
+
+        let never = |_shard: u16| false;
+        let provenance = HolderProvenance {
+            prev_committed: Some(&prev),
+            prev_det: Some(&det),
+            proven_completion: &never,
+            inbound_fenced: &never,
+        };
+        let assignment = CommittedAssignment::new(det_assignment(&det), &vec![false; NUM_SHARDS]);
+        assert_eq!(
+            local_fence(outsider, shard, &assignment, &provenance),
+            FenceDecision::FenceWithSource {
+                source: prev_master
+            },
+            "a data-less named master must fence AND get a real pull source",
+        );
+
+        // A proven completion at the current epoch clears it — that is the
+        // clearing edge the fence must always have.
+        let proven = |_shard: u16| true;
+        let with_completion = HolderProvenance {
+            prev_committed: Some(&prev),
+            prev_det: Some(&det),
+            proven_completion: &proven,
+            inbound_fenced: &never,
+        };
+        assert_eq!(
+            local_fence(outsider, shard, &assignment, &with_completion),
+            FenceDecision::Serve,
+        );
+    }
+
+    /// §7 — the committed unproven bit is raise-only: it fences a node whose
+    /// own provenance would pass, and the fence still names a concrete source.
+    #[test]
+    fn the_committed_unproven_bit_raises_but_never_lowers() {
+        let det = det_table(&[1, 2, 3], 2);
+        let prev = det_assignment(&det);
+        let shard = 0u16;
+        let master = prev[shard as usize];
+
+        let never = |_shard: u16| false;
+        let provenance = HolderProvenance {
+            prev_committed: Some(&prev),
+            prev_det: Some(&det),
+            proven_completion: &never,
+            inbound_fenced: &never,
+        };
+
+        // Bit set for this shard → even the previous committed master fences.
+        let mut flags = vec![false; NUM_SHARDS];
+        flags[shard as usize] = true;
+        let flagged = CommittedAssignment::new(det_assignment(&det), &flags);
+        match local_fence(master, shard, &flagged, &provenance) {
+            FenceDecision::FenceWithSource { .. } | FenceDecision::AlertNoSource => {}
+            FenceDecision::Serve => {
+                panic!("the committed unproven bit must raise the fence")
+            }
+        }
+
+        // Bit clear → provenance decides; the inbound fence still raises.
+        let clear = CommittedAssignment::new(det_assignment(&det), &vec![false; NUM_SHARDS]);
+        assert_eq!(
+            local_fence(master, shard, &clear, &provenance),
+            FenceDecision::Serve,
+        );
+        let inbound = |s: u16| s == shard;
+        let inbound_fenced = HolderProvenance {
+            prev_committed: Some(&prev),
+            prev_det: Some(&det),
+            proven_completion: &never,
+            inbound_fenced: &inbound,
+        };
+        assert_ne!(
+            local_fence(master, shard, &clear, &inbound_fenced),
+            FenceDecision::Serve,
+            "a raised inbound fence must never be overridden by a clear committed bit",
+        );
+    }
+
+    /// §7 (P0-4) — a fence with no concrete source has no clearing edge, so
+    /// the decision must be an ALERT, never a fence. The genesis case (no
+    /// previous committed assignment at all) is exactly that shape.
+    #[test]
+    fn a_fence_with_no_source_becomes_an_alert() {
+        let det = det_table(&[1, 2, 3], 2);
+        let shard = 0u16;
+        let never = |_shard: u16| false;
+        let inbound = |_shard: u16| true; // inbound fence raised, no history
+        let provenance = HolderProvenance {
+            prev_committed: None,
+            prev_det: None,
+            proven_completion: &never,
+            inbound_fenced: &inbound,
+        };
+        let assignment = CommittedAssignment::new(det_assignment(&det), &vec![false; NUM_SHARDS]);
+        assert_eq!(
+            local_fence(NodeId(1), shard, &assignment, &provenance),
+            FenceDecision::AlertNoSource,
+            "no previous committed master exists, so nothing can be pulled from — alert",
+        );
+
+        // A previous master that IS this node is equally unusable as a source.
+        let prev = vec![NodeId(1); NUM_SHARDS];
+        let self_prev = HolderProvenance {
+            prev_committed: Some(&prev),
+            prev_det: Some(&det),
+            proven_completion: &never,
+            inbound_fenced: &inbound,
+        };
+        assert_eq!(
+            local_fence(NodeId(1), shard, &assignment, &self_prev),
+            FenceDecision::AlertNoSource,
+            "pulling from self is meaningless — alert, do not fence",
+        );
+    }
+
+    /// The election's unproven flags: set only where usable evidence existed
+    /// and the named master did not self-report full. An empty view flags
+    /// NOTHING — a proposer that saw nothing must not flag the keyspace.
+    #[test]
+    fn unproven_flags_require_usable_evidence() {
+        let ids = [1u64, 2, 3];
+        let det = det_table(&ids, 2);
+        let prev = det_assignment(&det);
+
+        // Empty view → no flags at all.
+        let empty = HolderReports::default();
+        let mut history = DeviationHistory::new();
+        let election = elect_committed_assignment(
+            &ElectionInputs {
+                det: &det,
+                prev_committed: Some(&prev),
+                reports: &empty,
+                live: &live(&ids),
+            },
+            &mut history,
+        );
+        assert!(
+            election.unproven.iter().all(|flag| !flag),
+            "an empty view proves nothing and must flag nothing",
+        );
+
+        // Full evidence, one shard's master data-less while a replica is full
+        // → exactly the shards whose FINAL master is not proven full flag.
+        let shard = 0u16;
+        let shard_candidates: Vec<NodeId> = {
+            let a = det.target_assignment(shard);
+            std::iter::once(a.master)
+                .chain(a.replicas.iter().copied())
+                .collect()
+        };
+        let reports = {
+            let mut entries = Vec::new();
+            for s in 0..NUM_SHARDS as u16 {
+                let a = det.target_assignment(s);
+                for node in std::iter::once(a.master).chain(a.replicas.iter().copied()) {
+                    let seq = if s == shard && node == a.master { 0 } else { 1 };
+                    entries.push((node, s, seq));
+                }
+            }
+            HolderReports::from_entries(members(&ids), entries)
+        };
+        let mut history = DeviationHistory::new();
+        let election = elect_committed_assignment(
+            &ElectionInputs {
+                det: &det,
+                prev_committed: Some(&prev),
+                reports: &reports,
+                live: &live(&ids),
+            },
+            &mut history,
+        );
+        // First term: hysteresis keeps det.master in place, and det.master is
+        // not proven full → that one shard is flagged.
+        assert!(
+            election.unproven[shard as usize],
+            "a master that could not be proven full must be flagged",
+        );
+        let flagged: usize = election.unproven.iter().filter(|f| **f).count();
+        assert_eq!(flagged, 1, "only that shard may be flagged");
+        assert_eq!(
+            election.assignment[shard as usize],
+            det.target_assignment(shard).master,
+            "hysteresis holds the deterministic master on one term of evidence",
+        );
+        let _ = shard_candidates;
+
+        // The committed() pair round-trips the flags bit-exactly.
+        let pair = election.committed();
+        assert!(pair.is_unproven(shard));
+        let encoded = pair.encode(&members(&ids)).expect("encode");
+        let decoded = CommittedAssignment::decode(&encoded, &members(&ids)).expect("decode");
+        assert_eq!(decoded, pair);
     }
 
     /// §11 — the swap preserves the deterministic holder set and never leaves

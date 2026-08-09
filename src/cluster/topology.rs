@@ -112,8 +112,10 @@ pub struct TopologyTerm {
     /// `None` means this term carries none — the pre-assignment path, and the
     /// state of any term produced before a proposer had a committed
     /// assignment to anchor on. Structurally distinct from an all-zero
-    /// assignment, which would name `members[0]` for every shard.
-    pub assignment: Option<Vec<NodeId>>,
+    /// assignment, which would name `members[0]` for every shard. The
+    /// unproven bitmap travels INSIDE the pair, digest-bound with the
+    /// masters it annotates.
+    pub assignment: Option<crate::cluster::election::CommittedAssignment>,
 }
 
 /// The `assignment_digest` mixed into [`TopologyTerm::compute_digest`] when a
@@ -180,8 +182,11 @@ impl TopologyTerm {
     /// shipped hash: if it did, `(A, H(B))` sent to one node and `(A', H(B))`
     /// to another would both match their own advertised digest, and the
     /// binding would be vacuous.
-    pub fn with_assignment(mut self, assignment: Vec<NodeId>) -> Option<Self> {
-        let encoded = crate::cluster::election::encode_assignment(&assignment, &self.members)?;
+    pub fn with_assignment(
+        mut self,
+        assignment: crate::cluster::election::CommittedAssignment,
+    ) -> Option<Self> {
+        let encoded = assignment.encode(&self.members)?;
         self.digest = Self::compute_digest(
             self.term,
             &self.cluster_id,
@@ -200,14 +205,12 @@ impl TopologyTerm {
     /// received bytes, never over anything the sender asserted.
     pub fn recompute_digest(&self) -> [u8; 32] {
         let assignment_digest = match &self.assignment {
-            Some(assignment) => {
-                match crate::cluster::election::encode_assignment(assignment, &self.members) {
-                    Some(encoded) => crate::cluster::election::assignment_digest(&encoded),
-                    // An assignment that cannot be encoded names a non-member;
-                    // it can never match a well-formed digest.
-                    None => return [0xFF; 32],
-                }
-            }
+            Some(assignment) => match assignment.encode(&self.members) {
+                Some(encoded) => crate::cluster::election::assignment_digest(&encoded),
+                // An assignment that cannot be encoded names a non-member;
+                // it can never match a well-formed digest.
+                None => return [0xFF; 32],
+            },
             None => ASSIGNMENT_ABSENT_DIGEST,
         };
         Self::compute_digest(
@@ -278,10 +281,10 @@ impl TopologyTerm {
     /// length-prefixed. Entries naming a non-member cannot be encoded; such a
     /// term is unserializable by construction.
     pub fn serialize(&self) -> Vec<u8> {
-        let assignment_bytes = self.assignment.as_ref().map(|assignment| {
-            crate::cluster::election::encode_assignment(assignment, &self.members)
-                .unwrap_or_default()
-        });
+        let assignment_bytes = self
+            .assignment
+            .as_ref()
+            .map(|assignment| assignment.encode(&self.members).unwrap_or_default());
         let assignment_len = assignment_bytes.as_ref().map_or(0, Vec::len);
         let mut buf = Vec::with_capacity(81 + self.members.len() * 8 + assignment_len);
         buf.push(TOPOLOGY_WIRE_FORMAT_V2);
@@ -296,7 +299,11 @@ impl TopologyTerm {
             buf.extend_from_slice(&m.0.to_le_bytes());
         }
         match assignment_bytes {
-            Some(bytes) if bytes.len() == crate::cluster::shards::NUM_SHARDS * 2 => {
+            Some(bytes)
+                if bytes.len()
+                    == crate::cluster::shards::NUM_SHARDS * 2
+                        + crate::cluster::election::UNPROVEN_BITMAP_BYTES =>
+            {
                 buf.push(1);
                 buf.extend_from_slice(&bytes);
             }
@@ -349,15 +356,16 @@ impl TopologyTerm {
         let (assignment, digest_pos) = match data[members_end] {
             0 => (None, members_end + 1),
             1 => {
-                let bytes_end = members_end
-                    .checked_add(1)?
-                    .checked_add(crate::cluster::shards::NUM_SHARDS * 2)?;
+                let bytes_end = members_end.checked_add(1)?.checked_add(
+                    crate::cluster::shards::NUM_SHARDS * 2
+                        + crate::cluster::election::UNPROVEN_BITMAP_BYTES,
+                )?;
                 if data.len() < bytes_end {
                     return None;
                 }
                 // Rule 11 enforced here: an index >= members.len() is
                 // malformed and the whole frame is rejected.
-                let decoded = crate::cluster::election::decode_assignment(
+                let decoded = crate::cluster::election::CommittedAssignment::decode(
                     &data[members_end + 1..bytes_end],
                     &members,
                 )
@@ -499,10 +507,11 @@ pub struct TopologyCommit {
     /// `TopologyTerm` that reached quorum; mixed into the digest). See
     /// [`TopologyTerm::rf`].
     pub rf: u8,
-    /// The committed master assignment, if this term carried one. Copied from
-    /// the winning proposal; its canonical encoding is digest-bound, and every
-    /// recipient re-derives that encoding from THESE received entries.
-    pub assignment: Option<Vec<NodeId>>,
+    /// The committed master assignment (masters + unproven bitmap), if this
+    /// term carried one. Copied from the winning proposal; its canonical
+    /// encoding is digest-bound, and every recipient re-derives that encoding
+    /// from THESE received entries.
+    pub assignment: Option<crate::cluster::election::CommittedAssignment>,
 }
 
 impl TopologyCommit {
@@ -511,13 +520,11 @@ impl TopologyCommit {
     /// shipped hash.
     pub fn recompute_digest(&self) -> [u8; 32] {
         let assignment_digest = match &self.assignment {
-            Some(assignment) => {
-                match crate::cluster::election::encode_assignment(assignment, &self.members) {
-                    Some(encoded) => crate::cluster::election::assignment_digest(&encoded),
-                    // Names a non-member — can never match a well-formed digest.
-                    None => return [0xFF; 32],
-                }
-            }
+            Some(assignment) => match assignment.encode(&self.members) {
+                Some(encoded) => crate::cluster::election::assignment_digest(&encoded),
+                // Names a non-member — can never match a well-formed digest.
+                None => return [0xFF; 32],
+            },
             None => ASSIGNMENT_ABSENT_DIGEST,
         };
         TopologyTerm::compute_digest(
@@ -1349,6 +1356,16 @@ pub struct TopologyAuthority {
     /// `vote_decision` in the same critical section as `voted_term`, and
     /// persisted by the caller BEFORE the vote is put on the wire.
     voted_digest: RwLock<Option<[u8; 32]>>,
+    /// Liveness — highest term any peer has ADVERTISED in a vote reply
+    /// (`voter_current_term`, fetch_max). Consulted (clamped) when minting a
+    /// new proposal term so a proposer whose peers sprinted ahead (their
+    /// `voted_term` inflated by refused retry rounds) fast-forwards in ONE
+    /// round instead of crawling +1 per tick — the crawl left a wedged
+    /// cluster stalled for `propose_timeout × gap` while every proposal was
+    /// refused as stale. Advisory only: it never feeds `voted_term`, never
+    /// persists, and is clamped to `committed.max(voted) + MAX_TERM_JUMP` at
+    /// read time so a rogue reply cannot fling the term space to u64::MAX.
+    peer_term_hint: AtomicU64,
     /// §4.5 — the digest of the commit this node applied at `committed_term`.
     /// Derived state (it is `commit.digest` of the applied commit, and also
     /// lives inside `committed_commit`), kept unpacked so the gate path does
@@ -1430,7 +1447,18 @@ impl TopologyAuthority {
             committed_commit: RwLock::new(None),
             voted_digest: RwLock::new(None),
             committed_digest: RwLock::new(None),
+            peer_term_hint: AtomicU64::new(0),
         }
+    }
+
+    /// Mint the next proposal term: one past everything this node knows —
+    /// its committed term, its own highest vote, and the (clamped) highest
+    /// term any peer has advertised in a vote reply.
+    fn next_proposal_term(&self, committed: u64, voted: u64) -> u64 {
+        let base = committed.max(voted);
+        let cap = base.saturating_add(crate::cluster::election::MAX_TERM_JUMP);
+        let hint = self.peer_term_hint.load(Ordering::Relaxed).min(cap);
+        base.max(hint).saturating_add(1)
     }
 
     /// §4.3 — record this node's attestation: the term voted for AND the
@@ -1443,18 +1471,6 @@ impl TopologyAuthority {
     fn record_vote(&self, term: u64, digest: [u8; 32]) {
         self.voted_term.store(term, Ordering::Relaxed);
         *self.voted_digest.write().unwrap() = Some(digest);
-    }
-
-    /// §4.3 — reserve a term number under `vote_decision` before the content
-    /// (and therefore the digest) exists.
-    ///
-    /// Clears the attestation rather than leaving a stale one: `None` honestly
-    /// says "voted at this term, content not yet determined", where a stale
-    /// digest would be a false contradiction. The caller completes the vote
-    /// with [`Self::record_vote`] as soon as the proposal is built.
-    fn reserve_vote_term(&self, term: u64) {
-        self.voted_term.store(term, Ordering::Relaxed);
-        *self.voted_digest.write().unwrap() = None;
     }
 
     /// The configured replication factor this authority derives placements
@@ -1904,6 +1920,52 @@ impl TopologyAuthority {
         }
     }
 
+    /// Two-step monotonic repair (liveness): when the LIVE member set is
+    /// non-monotonic against this node's committed set — it both adds a
+    /// member the committed set lacks AND drops one it has — a direct
+    /// proposal is indistinguishable from a split-brain merge and every node
+    /// refuses it, wedging the cluster until the dropped node returns.
+    ///
+    /// That shape arises WITHOUT any split brain: commit T3 = {a, b, c},
+    /// then a flap commits T4 = {a, c} (b missed the broadcast), then `a`
+    /// dies. The live set {b, c} is a compressed but legitimate sequence
+    /// (drop `a`, re-add `b`) that the merge guard cannot tell apart from a
+    /// foreign merge.
+    ///
+    /// The repair: propose `committed ∪ live` FIRST — a pure superset, so
+    /// the merge guard passes it everywhere, and the dead member in the
+    /// list is harmless (membership is not liveness; quorum over the union
+    /// is achievable by the live majority). The NEXT round then proposes
+    /// the live set as a clean subset. Both steps are individually
+    /// monotonic, so the guard stays fully armed against real merges — a
+    /// union containing genuinely foreign members still fails the ever-seen
+    /// / cluster_id checks and is refused.
+    ///
+    /// Returns the union ONLY when (a) the live set itself is unsafe, and
+    /// (b) the union passes the full safety check. `None` means no repair
+    /// applies (the live set is fine, or the union is a real merge).
+    fn monotonic_repair_target(&self, live: &[NodeId]) -> Option<Vec<NodeId>> {
+        if self.membership_change_is_safe(live, Some(self.cluster_id())) {
+            return None;
+        }
+        let committed = self.committed_members.read().unwrap().clone();
+        if committed.is_empty() {
+            return None;
+        }
+        let mut union: Vec<NodeId> = committed
+            .iter()
+            .copied()
+            .chain(live.iter().copied())
+            .collect();
+        union.sort_unstable_by_key(|node| node.0);
+        union.dedup();
+        if union == committed || union.len() > MAX_TOPOLOGY_MEMBERS {
+            return None;
+        }
+        self.membership_change_is_safe(&union, Some(self.cluster_id()))
+            .then_some(union)
+    }
+
     /// Called when SWIM reports a membership change.
     ///
     /// Returns `Some(TopologyTerm)` if this node should propose
@@ -1940,6 +2002,26 @@ impl TopologyAuthority {
         // "proposal cluster_id" is our own — pass it explicitly so that
         // a configured cluster_id participates in the safety check
         // (cluster_id match skips the ever-seen heuristic).
+        //
+        // LIVENESS: a live set that is non-monotonic only because it
+        // compresses a legitimate two-step sequence (a member missed a
+        // commit, then another member died) is repaired by proposing the
+        // monotonic UNION first — see `monotonic_repair_target`. A genuine
+        // foreign merge fails the union check too and is still refused.
+        let members: Vec<NodeId> = match self.monotonic_repair_target(members) {
+            Some(union) => {
+                tracing::warn!(
+                    self_id = self.self_id.0,
+                    live = ?members.iter().map(|n| n.0).collect::<Vec<_>>(),
+                    union = ?union.iter().map(|n| n.0).collect::<Vec<_>>(),
+                    "cluster: live set is non-monotonic against the committed set; \
+                     proposing the monotonic union first (two-step repair)",
+                );
+                union
+            }
+            None => members.to_vec(),
+        };
+        let members: &[NodeId] = &members;
         if !self.membership_change_is_safe(members, Some(self.cluster_id())) {
             let committed_members = self.committed_members.read().unwrap();
             tracing::error!(
@@ -1975,51 +2057,52 @@ impl TopologyAuthority {
             return None; // Not our turn to propose
         }
 
-        // C-2: derive the new term and record the self-vote under the
-        // same `vote_decision` lock that `handle_propose` holds, so a
-        // proposer self-vote cannot interleave a concurrent follower vote
-        // and let this node back two different proposals at the same term.
-        let (committed, new_term) = {
+        // C-2: derive the new term, BUILD the proposal, and record the
+        // self-vote (term + digest together) in ONE `vote_decision` critical
+        // section — the same lock `handle_propose` holds. A two-phase
+        // reserve-then-complete is a voted_term REGRESSION hazard: a follower
+        // vote for a higher term T+1 can land between the phases, and the
+        // late completion store would clobber `voted_term` back down to T,
+        // licensing a second vote at T+1 — the exact double-vote the C-2
+        // lock exists to prevent. Only CPU work runs under the lock (a
+        // ~100-byte sha256; no I/O).
+        let term = {
             let _vote_guard = self.vote_decision.lock();
             let committed = self.committed_term.load(Ordering::Relaxed);
             let voted = self.voted_term.load(Ordering::Relaxed);
-            let new_term = committed.max(voted) + 1;
-            // Self-vote. Only the term NUMBER is reservable here — the
-            // digest does not exist until the proposal is built below.
-            self.reserve_vote_term(new_term);
-            (committed, new_term)
+            let new_term = self.next_proposal_term(committed, voted);
+
+            // W6 (INVARIANT ii) — stamp the placement version on the
+            // proposal. v2 ONLY when EVERY proposed member is known to
+            // support it (unanimity); otherwise v1. A not-yet-heard-from
+            // peer counts as v1, so a freshly forming cluster proposes v1
+            // first and upgrades later (via `upgrade_proposal`) once every
+            // member's v2 support is learned from its votes.
+            let placement_version = self.achievable_placement_version(members);
+
+            // E-01: raise the peak from the proposed set BEFORE deriving the
+            // quorum, so growth (1 → N) is gated on the majority of the new,
+            // larger cluster, and a later shrink is gated on the majority of
+            // the peak — never on the shrunken set alone.
+            //
+            // G8 stage 1: this must also happen BEFORE stamping the term's
+            // committed_peak below, so a grow's stamped floor reflects the
+            // newly-raised peak (`members.len()`), not the pre-grow one.
+            self.observe_peak_cluster_size(members.len() as u64);
+            let committed_peak = self.peak_cluster_size();
+            let term = TopologyTerm::new(
+                new_term,
+                members.to_vec(),
+                self.self_id,
+                self.cluster_id(),
+                placement_version,
+                committed_peak,
+                self.rf,
+            );
+            // §4.3 — self-vote: term and digest recorded atomically.
+            self.record_vote(new_term, term.digest);
+            term
         };
-        let _ = committed;
-
-        // W6 (INVARIANT ii) — stamp the placement version on the proposal.
-        // v2 ONLY when EVERY proposed member is known to support it
-        // (unanimity); otherwise v1. A not-yet-heard-from peer counts as v1,
-        // so a freshly forming cluster proposes v1 first and upgrades later
-        // (via `upgrade_proposal`) once every member's v2 support is learned
-        // from its votes.
-        let placement_version = self.achievable_placement_version(members);
-
-        // E-01: raise the peak from the proposed set BEFORE deriving the
-        // quorum, so growth (1 → N) is gated on the majority of the new,
-        // larger cluster, and a later shrink is gated on the majority of
-        // the peak — never on the shrunken set alone.
-        //
-        // G8 stage 1: this must also happen BEFORE stamping the term's
-        // committed_peak below, so a grow's stamped floor reflects the
-        // newly-raised peak (`members.len()`), not the pre-grow one.
-        self.observe_peak_cluster_size(members.len() as u64);
-        let committed_peak = self.peak_cluster_size();
-        let term = TopologyTerm::new(
-            new_term,
-            members.to_vec(),
-            self.self_id,
-            self.cluster_id(),
-            placement_version,
-            committed_peak,
-            self.rf,
-        );
-        // §4.3 — complete the self-vote now that the content exists.
-        self.record_vote(new_term, term.digest);
         let quorum_needed = self.activation_quorum_needed(members.len());
         let mut votes = std::collections::HashMap::new();
         votes.insert(self.self_id, true);
@@ -2112,7 +2195,10 @@ impl TopologyAuthority {
                 digest: propose.digest,
                 voter: self.self_id,
                 accepted: false,
-                voter_current_term: committed,
+                // The voter's HIGHEST KNOWN term, vote included — a proposer
+                // stuck behind this node's retry-inflated `voted_term` reads
+                // it and fast-forwards instead of crawling +1 per round.
+                voter_current_term: committed.max(self.voted_term.load(Ordering::Relaxed)),
                 voter_placement_support: crate::cluster::shards::MAX_SUPPORTED_PLACEMENT_VERSION,
             };
         }
@@ -2176,7 +2262,8 @@ impl TopologyAuthority {
             digest: propose.digest,
             voter: self.self_id,
             accepted,
-            voter_current_term: committed,
+            // Highest known term (see the refusal arm above).
+            voter_current_term: committed.max(self.voted_term.load(Ordering::Relaxed)),
             // W6 — advertise this node's max placement support so the
             // proposer can learn when a v2 upgrade becomes unanimous.
             voter_placement_support: crate::cluster::shards::MAX_SUPPORTED_PLACEMENT_VERSION,
@@ -2192,6 +2279,12 @@ impl TopologyAuthority {
         // property, and recording it from every vote lets the upgrade path
         // converge even when an earlier proposal was superseded.
         self.record_peer_placement_support(vote.voter, vote.voter_placement_support);
+        // Liveness — learn the voter's highest known term from EVERY reply,
+        // refusals included: a refusal carrying a higher term is exactly the
+        // evidence the next mint must clear. Advisory fetch_max; clamped at
+        // the consumer (`next_proposal_term`).
+        self.peer_term_hint
+            .fetch_max(vote.voter_current_term, Ordering::Relaxed);
 
         let mut pending = self.pending_proposal.lock();
         let proposal = pending.as_mut()?;
@@ -2867,7 +2960,7 @@ impl TopologyAuthority {
 
         let committed = self.committed_term.load(Ordering::Relaxed);
         let voted = self.voted_term.load(Ordering::Relaxed);
-        let new_term = committed.max(voted) + 1;
+        let new_term = self.next_proposal_term(committed, voted);
 
         // W6 — stamp the achievable placement version (unanimity, see
         // on_membership_changed).
@@ -2951,7 +3044,7 @@ impl TopologyAuthority {
 
         let committed_term = self.committed_term.load(Ordering::Relaxed);
         let voted = self.voted_term.load(Ordering::Relaxed);
-        let new_term = committed_term.max(voted) + 1;
+        let new_term = self.next_proposal_term(committed_term, voted);
 
         // G8 stage 1: raise the peak BEFORE stamping committed_peak below.
         // (Already >= peak_cluster_size() per the guard above, so this is a
@@ -3079,7 +3172,7 @@ impl TopologyAuthority {
 
         let committed = self.committed_term.load(Ordering::Relaxed);
         let voted = self.voted_term.load(Ordering::Relaxed);
-        let new_term = committed.max(voted) + 1;
+        let new_term = self.next_proposal_term(committed, voted);
 
         let placement_version = self.achievable_placement_version(&surviving);
 
@@ -3149,7 +3242,59 @@ impl TopologyAuthority {
             if observed.is_empty() {
                 members.to_vec()
             } else {
-                observed.clone()
+                // Liveness (two-step repair, step 2): when the observed set
+                // has converged onto the committed set but the LIVE set is a
+                // strict SUBSET of it, a committed member is dead and no new
+                // SWIM transition will re-fire `on_membership_changed` (the
+                // death was already consumed — e.g. by the union proposal of
+                // step 1). Drive the drop from this periodic tick. STRICT
+                // SUBSET ONLY: preferring the live map for any other shape
+                // would re-add a gracefully-drained node that is still
+                // reachable — the exact drain-undo bug `observed_membership`
+                // exists to prevent (an addition is never a subset).
+                let committed = self.committed_members.read().unwrap();
+                let observed_is_committed = *observed == *committed;
+                let live_is_strict_subset = !members.is_empty()
+                    && members.len() < committed.len()
+                    && members.iter().all(|m| committed.contains(m));
+                // Liveness (add direction): a brand-new joiner whose one-shot
+                // SWIM join event was consumed — e.g. it fired before a
+                // racing commit applied — leaves the cluster with a live,
+                // never-committed node that nothing will ever propose. Drive
+                // the ADD from this tick, but ONLY for nodes never seen in
+                // any committed term: an ever-seen node's absence from the
+                // committed set is a committed REMOVAL (graceful drain or
+                // death-drop), and re-adding it while it lingers reachable
+                // in the address book would undo that removal. A genuine
+                // rejoin of a removed node arrives as a fresh SWIM join
+                // EVENT and takes the normal `on_membership_changed` path.
+                let tick_additions: Vec<NodeId> = if observed_is_committed {
+                    let ever_seen = self.committed_voter_ever_seen.read().unwrap();
+                    members
+                        .iter()
+                        .copied()
+                        .filter(|node| !committed.contains(node) && !ever_seen.contains(node))
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                if observed_is_committed && live_is_strict_subset {
+                    members.to_vec()
+                } else if observed_is_committed && !tick_additions.is_empty() {
+                    // Monotonic superset: committed ∪ new joiners. A member
+                    // that ALSO died stays in this target (keeping the step
+                    // monotonic); the subset rule above drops it next tick.
+                    let mut union: Vec<NodeId> = committed
+                        .iter()
+                        .copied()
+                        .chain(tick_additions)
+                        .collect();
+                    union.sort_unstable_by_key(|node| node.0);
+                    union.dedup();
+                    union
+                } else {
+                    observed.clone()
+                }
             }
         };
 
@@ -3200,7 +3345,7 @@ impl TopologyAuthority {
 
         // Only propose if we haven't already voted for a higher term
         // (which would mean another proposer is active).
-        let new_term = committed.max(voted) + 1;
+        let new_term = self.next_proposal_term(committed, voted);
 
         // W6 — stamp the achievable placement version (unanimity).
         let placement_version = self.achievable_placement_version(&target_members);
@@ -4945,17 +5090,27 @@ mod tests {
             "monotonic remove (drain) must still be accepted",
         );
 
-        // Real test: SWIM reports [1, 2, 5] — node 3 disappeared AND node 5
-        // showed up, the unmistakable two-clusters-merging pattern.
+        // SWIM reports [1, 2, 5] — node 3 disappeared AND node 5 showed up.
+        // With node 5 EVER-SEEN (a previous committed voter of THIS
+        // cluster), this is the compressed drop+rejoin sequence, not a
+        // foreign merge: the two-step repair proposes the monotonic UNION
+        // {1,2,3,5} instead of wedging until node 3 returns.
         let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1), 2);
         commit_membership(&auth, 1, &[1, 2, 3]);
-        // Pre-seed node 5 so the rejection below is attributable to the
-        // monotonicity check (the test's headline invariant) rather
-        // than the F-G8-001 ever-seen layer, which has its own tests.
         auth.set_committed_voter_ever_seen(&[NodeId(1), NodeId(2), NodeId(3), NodeId(5)]);
-        // After commit, both committed_members AND observed_membership are
-        // pinned to [1,2,3] (handle_commit sets both). Capture the
-        // baseline so we can pin it across the refusal.
+
+        let proposal = auth.on_membership_changed(&members(&[1, 2, 5]));
+        assert_eq!(
+            proposal.as_ref().map(|p| p.members.clone()),
+            Some(members(&[1, 2, 3, 5])),
+            "an ever-seen rejoin + death must repair via the monotonic union",
+        );
+
+        // The FOREIGN variant of the same shape stays refused: node 9 was
+        // never a committed voter here, so the union {1,2,3,9} fails the
+        // ever-seen check and no repair applies.
+        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1), 2);
+        commit_membership(&auth, 1, &[1, 2, 3]);
         let observed_before = auth.observed_membership.lock().clone();
         assert_eq!(
             observed_before,
@@ -4963,10 +5118,10 @@ mod tests {
             "handle_commit pins observed_membership to the committed set",
         );
 
-        let proposal = auth.on_membership_changed(&members(&[1, 2, 5]));
+        let proposal = auth.on_membership_changed(&members(&[1, 2, 9]));
         assert!(
             proposal.is_none(),
-            "proposer must refuse non-monotonic membership change (split-brain heal)",
+            "proposer must refuse a non-monotonic change with an unseen member",
         );
 
         // The proposer's view of the cluster must NOT be poisoned by the
@@ -5729,13 +5884,16 @@ mod tests {
         // the round-trip, and the digest binds its BYTES — swapping the
         // assignment (or rf) after signing makes the recompute mismatch.
         let mems = members(&[1, 2, 3]);
-        let assignment = vec![NodeId(1); crate::cluster::shards::NUM_SHARDS]
-            .iter()
-            .enumerate()
-            .map(|(shard, _)| mems[shard % mems.len()])
+        let masters = (0..crate::cluster::shards::NUM_SHARDS)
+            .map(|shard| mems[shard % mems.len()])
             .collect::<Vec<_>>();
+        // Flag shard 3 (only) unproven so the bitmap has a set bit to verify.
+        let mut unproven_flags = vec![false; crate::cluster::shards::NUM_SHARDS];
+        unproven_flags[3] = true;
+        let pair =
+            crate::cluster::election::CommittedAssignment::new(masters.clone(), &unproven_flags);
         let term = TopologyTerm::new(7, mems.clone(), NodeId(1), ClusterId::UNSET, 1, 3, 2)
-            .with_assignment(assignment.clone())
+            .with_assignment(pair)
             .expect("every entry is a member");
 
         assert_eq!(
@@ -5745,7 +5903,15 @@ mod tests {
         );
 
         let decoded = TopologyTerm::deserialize(&term.serialize()).expect("round-trip");
-        assert_eq!(decoded.assignment.as_deref(), Some(assignment.as_slice()));
+        let carried = decoded
+            .assignment
+            .as_ref()
+            .expect("assignment must survive");
+        assert_eq!(carried.masters, masters);
+        assert!(
+            carried.is_unproven(3) && !carried.is_unproven(4),
+            "the unproven bitmap must survive the round-trip bit-exactly",
+        );
         assert_eq!(decoded.rf, 2);
         assert_eq!(
             decoded.digest,
@@ -5756,12 +5922,24 @@ mod tests {
         // Swap one assignment entry after signing → recompute mismatches.
         let mut tampered = decoded.clone();
         if let Some(a) = tampered.assignment.as_mut() {
-            a[0] = mems[1];
+            a.masters[0] = mems[1];
         }
         assert_ne!(
             tampered.digest,
             tampered.recompute_digest(),
             "a swapped assignment must break the digest binding",
+        );
+
+        // Flip one UNPROVEN bit after signing — the bitmap is digest-bound
+        // exactly like the masters, so this must also break the binding.
+        let mut flipped = TopologyTerm::deserialize(&term.serialize()).expect("round-trip");
+        if let Some(a) = flipped.assignment.as_mut() {
+            a.unproven[0] ^= 0x01;
+        }
+        assert_ne!(
+            flipped.digest,
+            flipped.recompute_digest(),
+            "a flipped unproven bit must break the digest binding",
         );
 
         // Same for rf.
@@ -5780,7 +5958,10 @@ mod tests {
             .map(|shard| mems[shard % mems.len()])
             .collect::<Vec<_>>();
         let term = TopologyTerm::new(4, mems.clone(), NodeId(1), ClusterId::UNSET, 1, 3, 2)
-            .with_assignment(assignment.clone())
+            .with_assignment(crate::cluster::election::CommittedAssignment::new(
+                assignment.clone(),
+                &vec![false; crate::cluster::shards::NUM_SHARDS],
+            ))
             .expect("every entry is a member");
         let commit = TopologyCommit {
             term: term.term,
@@ -5796,7 +5977,10 @@ mod tests {
         };
 
         let decoded = TopologyCommit::deserialize(&commit.serialize()).expect("commit round-trip");
-        assert_eq!(decoded.assignment.as_deref(), Some(assignment.as_slice()));
+        assert_eq!(
+            decoded.assignment.as_ref().map(|a| a.masters.clone()),
+            Some(assignment.clone()),
+        );
         assert_eq!(decoded.digest, decoded.recompute_digest());
 
         let auth = TopologyAuthority::new(NodeId(2), Duration::from_secs(1), 2);
@@ -7474,6 +7658,226 @@ mod tests {
             };
             assert_eq!(auth.handle_commit(&good), Some(4), "{why}: must recover");
         }
+    }
+
+    /// Liveness (add direction) — a brand-new joiner whose one-shot SWIM
+    /// join event was consumed must still get proposed, driven by the
+    /// periodic tick. The guard: only NEVER-SEEN nodes may be tick-added; an
+    /// ever-seen node's absence is a committed removal, and re-adding it
+    /// from the (laggy) address book would undo a drain.
+    #[test]
+    fn tick_drives_a_missed_join_but_never_a_drain_undo() {
+        // Committed {1,3} on node 3; node 2 is alive but has NEVER appeared
+        // in a committed term here — its join event was consumed. The tick
+        // must propose the union {1,2,3}. cluster_id is configured, as in
+        // any orchestrated deployment — that is what admits a never-seen
+        // JOINER through the safety check (the ever-seen fallback only
+        // gates clusters with no cluster_id).
+        let auth = TopologyAuthority::new(NodeId(3), Duration::from_millis(1), 2);
+        auth.set_cluster_id(ClusterId([7u8; 16]));
+        commit_membership(&auth, 1, &[1, 3]);
+        std::thread::sleep(Duration::from_millis(5));
+        let join = auth
+            .check_timeout(&members(&[1, 2, 3]))
+            .expect("the tick must drive a missed join of a never-seen node");
+        assert_eq!(
+            join.members,
+            members(&[1, 2, 3]),
+            "the tick target must be committed ∪ the new joiner",
+        );
+
+        // Drain-undo protection: node 2 was drained out of {1,2,3} by a
+        // committed transition (so it IS ever-seen) but still lingers in the
+        // address book. The tick must NOT re-add it — this guard is the
+        // never-seen filter itself, independent of the cluster_id-gated
+        // safety check.
+        let auth = TopologyAuthority::new(NodeId(3), Duration::from_millis(1), 2);
+        auth.set_cluster_id(ClusterId([7u8; 16]));
+        commit_membership(&auth, 1, &[1, 2, 3]);
+        commit_membership(&auth, 2, &[1, 3]); // graceful drain of 2
+        assert_eq!(auth.committed_members(), members(&[1, 3]));
+        std::thread::sleep(Duration::from_millis(5));
+        assert!(
+            auth.check_timeout(&members(&[1, 2, 3])).is_none(),
+            "an ever-seen removed node must not be re-added by the tick",
+        );
+    }
+
+    /// Liveness — a refused proposal round must fast-forward, not crawl. The
+    /// refusal reply advertises the voter's HIGHEST known term (vote
+    /// included), the proposer records it, and the next mint clears it in
+    /// one step. The hint is advisory and clamped, so a rogue reply cannot
+    /// fling the term space forward.
+    #[test]
+    fn a_refusal_reply_fast_forwards_the_next_mint() {
+        // Voter whose voted_term sprinted ahead (e.g. a retry burst).
+        let voter = TopologyAuthority::new(NodeId(2), Duration::from_millis(1), 2);
+        commit_membership(&voter, 1, &[1, 2, 3]);
+        let sprint =
+            TopologyTerm::new(7, members(&[1, 2, 3]), NodeId(1), ClusterId::UNSET, 1, 3, 2);
+        assert!(voter.handle_propose(&sprint).accepted);
+        assert_eq!(voter.voted_term(), 7);
+
+        // A stale proposal (term 2 <= voted 7) is refused, and the refusal
+        // advertises the voter's highest known term: 7, not committed (1).
+        let stale = TopologyTerm::new(2, members(&[1, 2, 3]), NodeId(3), ClusterId::UNSET, 1, 3, 2);
+        let refusal = voter.handle_propose(&stale);
+        assert!(!refusal.accepted);
+        assert_eq!(
+            refusal.voter_current_term, 7,
+            "a refusal must advertise the voter's highest KNOWN term, vote included",
+        );
+
+        // The refused proposer folds the hint into its next mint: one round,
+        // not five.
+        let proposer = TopologyAuthority::new(NodeId(3), Duration::from_millis(1), 2);
+        commit_membership(&proposer, 1, &[1, 2, 3]);
+        proposer.handle_vote(&refusal);
+        std::thread::sleep(Duration::from_millis(5));
+        let next = proposer
+            .check_timeout(&members(&[2, 3]))
+            .expect("fallback proposer must step up");
+        assert_eq!(
+            next.term, 8,
+            "the next mint must clear the advertised term in one step",
+        );
+
+        // Clamp: a rogue reply advertising u64::MAX must not fling the term
+        // space — the mint stays within MAX_TERM_JUMP of local knowledge.
+        let rogue = TopologyVote {
+            term: 2,
+            digest: [0u8; 32],
+            voter: NodeId(9),
+            accepted: false,
+            voter_current_term: u64::MAX,
+            voter_placement_support: 1,
+        };
+        proposer.handle_vote(&rogue);
+        std::thread::sleep(Duration::from_millis(5));
+        let capped = proposer
+            .check_timeout(&members(&[2, 3]))
+            .expect("fallback proposer must step up");
+        assert!(
+            capped.term <= 8 + crate::cluster::election::MAX_TERM_JUMP + 1,
+            "a rogue hint must be clamped near local knowledge, got {}",
+            capped.term,
+        );
+    }
+
+    /// The flap-wedge repair, end to end at the authority level. Sequence:
+    /// commit {a,b,c}, then a flap commits {a,c} (b missed it), then `a`
+    /// dies. The live set {b,c} is non-monotonic against {a,c} and every
+    /// direct proposal is refused — the pre-repair code wedged here until
+    /// `a` returned. The repair proposes the UNION {a,b,c} first (step 1),
+    /// and once it commits, the periodic fallback tick drives the {b,c}
+    /// subset drop (step 2).
+    #[test]
+    fn non_monotonic_live_set_recovers_via_two_step_union_repair() {
+        let a = 1u64;
+        let b = 2u64;
+        let c = 3u64;
+
+        // Node c's authority: committed {a,c} at term 2, but it has seen b
+        // as a committed voter (term 1 committed {a,b,c}).
+        let auth = TopologyAuthority::new(NodeId(c), Duration::from_millis(1), 2);
+        commit_membership(&auth, 1, &[a, b, c]);
+        commit_membership(&auth, 2, &[a, c]);
+        assert_eq!(auth.committed_members(), members(&[a, c]));
+
+        // `a` dies; SWIM reports live {b, c}. Direct proposal would be
+        // non-monotonic (adds b, drops a). Step 1: the repair proposes the
+        // union {a,b,c} instead. Node c is not the union's deterministic
+        // proposer (that is dead `a`), so on_membership_changed returns None
+        // — but it must have installed the union as the observed target for
+        // the fallback path, NOT refused it.
+        assert!(
+            auth.on_membership_changed(&members(&[b, c])).is_none(),
+            "node c is not the union's deterministic proposer",
+        );
+
+        // Step 1 via fallback: after the propose timeout the fallback
+        // proposer steps up with the union.
+        std::thread::sleep(Duration::from_millis(5));
+        let union_proposal = auth
+            .check_timeout(&members(&[b, c]))
+            .expect("fallback must propose the monotonic union");
+        assert_eq!(
+            union_proposal.members,
+            members(&[a, b, c]),
+            "step 1 must propose committed ∪ live",
+        );
+
+        // The union commits (quorum of the live majority).
+        let commit = TopologyCommit {
+            term: union_proposal.term,
+            proposer: union_proposal.proposer,
+            members: union_proposal.members.clone(),
+            cluster_id: union_proposal.cluster_id,
+            placement_version: union_proposal.placement_version,
+            committed_peak: union_proposal.committed_peak,
+            digest: union_proposal.digest,
+            voters: members(&[b, c]),
+            rf: union_proposal.rf,
+            assignment: union_proposal.assignment.clone(),
+        };
+        assert_eq!(auth.handle_commit(&commit), Some(union_proposal.term));
+        assert_eq!(auth.committed_members(), members(&[a, b, c]));
+
+        // Step 2: no SWIM transition re-fires (the death was already
+        // consumed), so the periodic tick must drive the subset drop.
+        std::thread::sleep(Duration::from_millis(5));
+        let drop_proposal = auth
+            .check_timeout(&members(&[b, c]))
+            .expect("the periodic tick must drive the dead-member drop");
+        assert_eq!(
+            drop_proposal.members,
+            members(&[b, c]),
+            "step 2 must propose the live subset",
+        );
+    }
+
+    /// The repair must NOT open the split-brain door: a live set containing
+    /// a genuinely foreign member (never a committed voter here, no
+    /// cluster_id) still fails — its union fails the ever-seen check too.
+    #[test]
+    fn union_repair_still_refuses_a_genuine_foreign_merge() {
+        // Committed {1,2}, live {1,9}: node 9 was NEVER a committed voter
+        // here, so its union {1,2,9} fails the ever-seen check — no repair
+        // may launder a genuine foreign merge into a proposal.
+        let auth = TopologyAuthority::new(NodeId(1), Duration::from_millis(1), 2);
+        commit_membership(&auth, 1, &[1, 2]);
+        assert!(
+            auth.on_membership_changed(&members(&[1, 9])).is_none(),
+            "a foreign merge must still be refused",
+        );
+        // And the fallback path refuses it too.
+        std::thread::sleep(Duration::from_millis(5));
+        assert!(
+            auth.check_timeout(&members(&[1, 9])).is_none(),
+            "the fallback must not launder a foreign merge either",
+        );
+    }
+
+    /// The drain-undo protection survives the step-2 rule: after a graceful
+    /// drain commits, the drained node may still be REACHABLE (in the live
+    /// socket map). The periodic tick must not propose re-adding it — only a
+    /// strict SUBSET of committed may be driven from the live map.
+    #[test]
+    fn step_2_rule_never_readds_a_reachable_drained_node() {
+        let auth = TopologyAuthority::new(NodeId(1), Duration::from_millis(1), 2);
+        commit_membership(&auth, 1, &[1, 2, 3]);
+        // Graceful drain of 3 committed: {1,2}.
+        commit_membership(&auth, 2, &[1, 2]);
+        assert_eq!(auth.committed_members(), members(&[1, 2]));
+
+        // The drained node 3 is still reachable, so the live map says
+        // {1,2,3} — NOT a subset of committed {1,2}. The tick must not
+        // propose it (re-adding 3 would undo the drain).
+        std::thread::sleep(Duration::from_millis(5));
+        assert!(
+            auth.check_timeout(&members(&[1, 2, 3])).is_none(),
+            "a reachable drained node must not be re-added by the tick",
+        );
     }
 
     /// §4.5 (P1-8) — a quorum-backed commit naming the committed term with a

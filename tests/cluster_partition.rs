@@ -1001,8 +1001,10 @@ fn partition_then_crash_then_on_disk_boot_recovers_consistently() {
                 },
             );
             assert_eq!(
-                resp.status, STATUS_OK,
-                "pre-partition create for a node1-mastered key must be acked"
+                resp.status,
+                STATUS_OK,
+                "pre-partition create for a node1-mastered key must be acked; error payload: {}",
+                String::from_utf8_lossy(&resp.payload),
             );
             (txid, hash)
         })
