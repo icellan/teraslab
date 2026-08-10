@@ -1418,6 +1418,10 @@ pub struct TopologyAuthority {
     /// commit against the recorded digest — attaching after the vote would
     /// make a proposer reject its own commit).
     assignment_provider: RwLock<Option<AssignmentProvider>>,
+    /// §9 arm 1 — consecutive quorum-backed higher-term commits THIS
+    /// authority refused since it last applied one (see
+    /// [`refused_higher_term_streak`] for the process-wide metric mirror).
+    refused_higher_term: AtomicU64,
     /// §8 — the committed master assignment of the applied term, unpacked
     /// from the winning commit (it also lives inside `committed_commit`).
     /// `None` when the committed term carried none, or when this node
@@ -1436,6 +1440,29 @@ static VOTE_DIGEST_MISMATCH_TOTAL: AtomicU64 = AtomicU64::new(0);
 /// digest than the one it committed there. Read via
 /// [`committed_digest_fork_total`].
 static COMMITTED_DIGEST_FORK_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// §9 arm 1 — consecutive quorum-backed HIGHER-term commits this node
+/// refused while its own committed term stood still. Read via
+/// [`refused_higher_term_streak`]. Reset to zero by every successful apply.
+static REFUSED_HIGHER_TERM_STREAK: AtomicU64 = AtomicU64::new(0);
+
+/// §9 arm 1 — alert threshold: this many consecutive refusals of
+/// quorum-backed higher terms is persistent divergence, not a transient
+/// race (a healthy node accepts the retry within a round or two).
+pub const REFUSED_HIGHER_TERM_ALERT_AFTER: u64 = 8;
+
+/// §9 arm 1 — how many consecutive quorum-backed higher-term commits this
+/// node has refused since it last applied one.
+///
+/// A rising streak is the diagnostic divergence signal the equal-term
+/// detectors cannot see: an attestation split lands on DIFFERENT terms —
+/// voters reject and stay at T-1 while non-voters accept T — so only the
+/// stagnating side's refusal pattern shows it. Alert-only: the node keeps
+/// serving its committed term, and the streak self-clears the moment any
+/// commit applies.
+pub fn refused_higher_term_streak() -> u64 {
+    REFUSED_HIGHER_TERM_STREAK.load(Ordering::Relaxed)
+}
 
 /// §4.4 — commits rejected on a vote-attestation mismatch.
 ///
@@ -1504,6 +1531,7 @@ impl TopologyAuthority {
             committed_assignment: RwLock::new(None),
             assignment_provider: RwLock::new(None),
             liveness_provider: RwLock::new(None),
+            refused_higher_term: AtomicU64::new(0),
             peer_term_hint: AtomicU64::new(0),
         }
     }
@@ -1632,6 +1660,13 @@ impl TopologyAuthority {
     /// and digests with.
     pub fn rf(&self) -> u8 {
         self.rf
+    }
+
+    /// §9 arm 1 — this authority's persistent-refusal streak (see the free
+    /// function [`refused_higher_term_streak`] for semantics; that one reads
+    /// the process-wide mirror the metrics endpoint scrapes).
+    pub fn refused_higher_term_streak(&self) -> u64 {
+        self.refused_higher_term.load(Ordering::Relaxed)
     }
 
     /// The highest term this node has voted for. `0` when it never has.
@@ -2534,7 +2569,39 @@ impl TopologyAuthority {
     /// those fire on rejection exactly as before.
     fn commit_passes_gates(&self, commit: &TopologyCommit) -> bool {
         let committed = self.committed_term.load(Ordering::Relaxed);
+        let verdict = self.commit_passes_gates_inner(commit, committed);
+        // §9 arm 1 — track persistent refusal of quorum-advertised higher
+        // terms (alert-only; see `refused_higher_term_streak`). Bounded by
+        // MAX_TERM_JUMP so one wild frame cannot count, and gated on a
+        // structurally valid quorum proof so an unproven frame cannot
+        // manufacture divergence evidence.
+        if !verdict
+            && commit.term > committed
+            && commit.term <= committed.saturating_add(crate::cluster::election::MAX_TERM_JUMP)
+            && commit.has_quorum_voter_proof()
+        {
+            let streak = self
+                .refused_higher_term
+                .fetch_add(1, Ordering::Relaxed)
+                .saturating_add(1);
+            // Process-wide mirror for /metrics (one authority per process in
+            // production; test authorities racing on it only affects the
+            // metric, which nothing asserts).
+            REFUSED_HIGHER_TERM_STREAK.store(streak, Ordering::Relaxed);
+            if streak == REFUSED_HIGHER_TERM_ALERT_AFTER {
+                tracing::error!(
+                    self_id = self.self_id.0,
+                    committed_term = committed,
+                    refused_term = commit.term,
+                    streak,
+                    "cluster: PERSISTENT DIVERGENCE — this node keeps refusing                      quorum-backed commits for higher terms while its own term                      stands still. It is likely on the losing side of an                      attestation split; it keeps serving its committed term                      (alert-only, no fence).",
+                );
+            }
+        }
+        verdict
+    }
 
+    fn commit_passes_gates_inner(&self, commit: &TopologyCommit, committed: u64) -> bool {
         // Validate: term must be strictly higher.
         if commit.term <= committed {
             self.detect_committed_history_fork(commit, committed);
@@ -2983,6 +3050,11 @@ impl TopologyAuthority {
             self.last_commit_at_unix_ms
                 .store(d.as_millis() as u64, Ordering::Relaxed);
         }
+
+        // §9 arm 1 — an applied commit is the self-clearing edge for the
+        // persistent-refusal streak.
+        self.refused_higher_term.store(0, Ordering::Relaxed);
+        REFUSED_HIGHER_TERM_STREAK.store(0, Ordering::Relaxed);
 
         // Clear any pending proposal (superseded by this commit).
         *self.pending_proposal.lock() = None;
@@ -7994,6 +8066,79 @@ mod tests {
         assert!(
             !auth.holds_committed_assignment(),
             "a term carrying no assignment must not leave a stale one behind",
+        );
+    }
+
+    /// §9 arm 1 — the persistent-refusal streak counts only PROVEN,
+    /// bounded, higher-term refusals, and self-clears on the next apply.
+    #[test]
+    fn refused_higher_term_streak_counts_and_self_clears() {
+        let mems = members(&[1, 2, 3]);
+        let auth = TopologyAuthority::new(NodeId(2), Duration::from_secs(1), 2);
+        commit_membership(&auth, 1, &[1, 2, 3]);
+
+        assert_eq!(auth.refused_higher_term_streak(), 0);
+
+        // A quorum-backed higher-term commit with a BAD digest: refused, and
+        // the streak advances.
+        let bad = TopologyCommit {
+            term: 2,
+            proposer: NodeId(1),
+            members: mems.clone(),
+            cluster_id: ClusterId::UNSET,
+            placement_version: 1,
+            committed_peak: 3,
+            digest: [0xAB; 32],
+            voters: mems.clone(),
+            rf: 2,
+            assignment: None,
+        };
+        assert_eq!(auth.handle_commit(&bad), None);
+        assert_eq!(
+            auth.refused_higher_term_streak(),
+            1,
+            "a proven higher-term refusal must advance the streak",
+        );
+
+        // A SUB-QUORUM frame must not manufacture divergence evidence.
+        let unproven = TopologyCommit {
+            voters: members(&[1]),
+            ..bad.clone()
+        };
+        assert_eq!(auth.handle_commit(&unproven), None);
+        assert_eq!(
+            auth.refused_higher_term_streak(),
+            1,
+            "an unproven frame must not advance the streak",
+        );
+
+        // A wild term beyond MAX_TERM_JUMP must not count either.
+        let wild = TopologyCommit {
+            term: 1 + crate::cluster::election::MAX_TERM_JUMP + 5,
+            ..bad.clone()
+        };
+        assert_eq!(auth.handle_commit(&wild), None);
+        assert_eq!(auth.refused_higher_term_streak(), 1);
+
+        // Applying a good commit clears the streak.
+        let good = TopologyTerm::new(2, mems.clone(), NodeId(1), ClusterId::UNSET, 1, 3, 2);
+        let commit = TopologyCommit {
+            term: 2,
+            proposer: NodeId(1),
+            members: mems.clone(),
+            cluster_id: ClusterId::UNSET,
+            placement_version: 1,
+            committed_peak: 3,
+            digest: good.digest,
+            voters: mems.clone(),
+            rf: 2,
+            assignment: None,
+        };
+        assert_eq!(auth.handle_commit(&commit), Some(2));
+        assert_eq!(
+            auth.refused_higher_term_streak(),
+            0,
+            "an applied commit is the self-clearing edge",
         );
     }
 

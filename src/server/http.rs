@@ -1480,6 +1480,21 @@ pub(crate) fn render_metrics_text(
         "teraslab_assignment_master_count_alerts_total",
         crate::cluster::election::assignment_master_count_alerts_total(),
     );
+    // §9 arm 1 — persistent-divergence gauge: consecutive quorum-backed
+    // higher-term commits refused since the last apply. Non-zero and rising
+    // means this node is on the losing side of an attestation split.
+    {
+        use std::fmt::Write as _;
+        let _ = writeln!(
+            out,
+            "# TYPE teraslab_topology_refused_higher_term_streak gauge"
+        );
+        let _ = writeln!(
+            out,
+            "teraslab_topology_refused_higher_term_streak {}",
+            crate::cluster::topology::refused_higher_term_streak(),
+        );
+    }
     if let Some(a) = allocator_metrics() {
         prom_counter(&mut out, "teraslab_alloc_total", a.alloc_total.get());
         prom_counter(
@@ -4909,6 +4924,7 @@ mod tests {
             "teraslab_topology_committed_digest_fork_total",
             "teraslab_assignment_rejected_total",
             "teraslab_assignment_master_count_alerts_total",
+            "teraslab_topology_refused_higher_term_streak",
             "teraslab_alloc_total",
             "teraslab_alloc_bytes_total",
             "teraslab_free_total",
