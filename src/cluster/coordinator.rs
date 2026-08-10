@@ -78,6 +78,12 @@ const STRANDED_TASK_REAP_AFTER: Duration = Duration::from_secs(45);
 /// cluster-wide agreement. Faster rounds cannot fix a loop whose rounds can
 /// themselves introduce the mismatch they are meant to repair.
 const NORMAL_REACTIVATION_COOLDOWN: Duration = Duration::from_secs(15);
+
+/// §9 Q3 — minimum spacing between re-election proposals. Short enough that
+/// a rejoined node gets its masterships back well inside the harness's 10s
+/// readiness window (exchange ≈2s + proposal round ≈1s), long enough that
+/// oscillating evidence cannot mint a term per tick.
+const REELECTION_MIN_INTERVAL: Duration = Duration::from_secs(5);
 const SAME_TERM_REACTIVATION_COOLDOWN: Duration = Duration::from_secs(30);
 
 const DRAIN_REACTIVATION_INTERVAL: Duration = Duration::from_secs(2);
@@ -2066,6 +2072,10 @@ impl ClusterCoordinator {
             // exchange on every 100 ms tick while the first exchange is in
             // flight; cleared implicitly by advancing as the term advances.
             let mut prompt_exchange_term: u64 = 0;
+            // Re-election pacing: prompt (event-driven off a fresh exchange
+            // view) but never a storm. Seeded in the past so the FIRST
+            // contradiction after boot can fire immediately.
+            let mut last_reelection_at = std::time::Instant::now() - REELECTION_MIN_INTERVAL;
             // W5-followup — progress tracker for the fast self-drain
             // reactivation cadence. Holds `(term, work_remaining)` captured the
             // last time the fast path fired. `None` (or a stale term) means the
@@ -2995,6 +3005,52 @@ impl ClusterCoordinator {
                     // §8 — retain the freshest cluster-wide holder view for
                     // the assignment provider's next election.
                     *retained_exchange_view_event.lock() = partition_view.clone();
+                    // §9 Q3 — prompt re-election. The fresh view may
+                    // contradict the committed assignment (the canonical
+                    // case: a rejoined node reported for the first time, so
+                    // deviations carried under the evidence-unusable rule can
+                    // now be reverted and the rejoined node given its
+                    // masterships back). Without this, the committed
+                    // assignment is a fixed point and a stable-membership
+                    // cluster NEVER rebalances — the wait_cluster_ready
+                    // min_masters>0 wedge. Event-driven (the tick would add
+                    // up to a full cooldown of latency to every rejoin) but
+                    // rate-limited, and only when the elected result actually
+                    // differs (propose_reelection returns None otherwise).
+                    if last_reelection_at.elapsed() >= REELECTION_MIN_INTERVAL
+                        && migration.lock().active_count() == 0
+                        && let Some(reelection) = topo_authority_event.propose_reelection()
+                    {
+                        last_reelection_at = std::time::Instant::now();
+                        let peak = peak_size_event.load(Ordering::Relaxed) as u64;
+                        let inc = swim_incarnation_event.load(Ordering::Relaxed);
+                        // F-E1 / H10: persist the re-election term before
+                        // broadcasting; skip the spawn if it isn't durable
+                        // (a later exchange re-evaluates).
+                        let persisted_ok = persist_topology_state_durable(
+                            topo_state_path_event.as_deref(),
+                            &topo_authority_event.persisted_state(peak, inc),
+                        );
+                        if persisted_ok {
+                            let ta = topo_authority_event.clone();
+                            let na = node_addrs_for_topo.clone();
+                            let tx = topology_commit_tx_event.clone();
+                            let tp = topo_state_path_event.clone();
+                            let ps = peak_size_event.clone();
+                            let si = swim_incarnation_event.clone();
+                            let secret = cluster_secret_event.clone();
+                            std::thread::spawn(move || {
+                                run_topology_proposer(
+                                    reelection, ta, na, self_id, tx, tp, ps, si, secret,
+                                );
+                            });
+                        } else {
+                            tracing::error!(
+                                term = reelection.term,
+                                "cluster: NOT spawning re-election proposer — term not durable",
+                            );
+                        }
+                    }
                     tracing::info!(
                         term,
                         epoch = term,

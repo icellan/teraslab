@@ -3276,6 +3276,87 @@ impl TopologyAuthority {
         Some(term)
     }
 
+    /// §9 Q3 / re-election — propose a NEW term for the UNCHANGED committed
+    /// membership so mastership can be re-derived from fresh evidence.
+    ///
+    /// The election's anchor makes the committed assignment a fixed point:
+    /// with no new term, a deviation persists forever even after its
+    /// justification stops holding. The concrete wedge: a node rejoins, the
+    /// rejoin term's election runs against a RETAINED view from before the
+    /// rejoin (the node never reported in it), the evidence-unusable rule
+    /// (correctly) carries the anchor, the rejoined node gets zero masters —
+    /// and with membership now stable, nothing ever mints another term. A
+    /// re-election is the only ordered way to move authority (a node-local
+    /// mastership change is unorderable and unfenceable), so it needs its
+    /// own term.
+    ///
+    /// Returns `None` unless ALL of:
+    ///   * this node is the deterministic proposer (lowest committed member),
+    ///   * a topology AND an assignment are committed (there is something to
+    ///     re-elect; plain-term clusters never re-elect),
+    ///   * no proposal is already pending,
+    ///   * the freshly elected assignment DIFFERS from the committed one
+    ///     (identical result = the fixed point is where it should be).
+    ///
+    /// The caller supplies rate limiting and any activity gating (e.g. no
+    /// re-election while migrations are in flight).
+    pub fn propose_reelection(&self) -> Option<TopologyTerm> {
+        let committed_members = self.committed_members.read().unwrap().clone();
+        if committed_members.is_empty() {
+            return None;
+        }
+        let proposer = committed_members.iter().copied().min()?;
+        if proposer != self.self_id {
+            return None;
+        }
+        if self.pending_proposal.lock().is_some() {
+            return None;
+        }
+        let committed_assignment = self.committed_assignment.read().unwrap().clone()?;
+
+        let committed_term = self.committed_term.load(Ordering::Relaxed);
+        let voted = self.voted_term.load(Ordering::Relaxed);
+        let new_term = self.next_proposal_term(committed_term, voted);
+        let committed_peak = self.peak_cluster_size();
+        let term = TopologyTerm::new(
+            new_term,
+            committed_members.clone(),
+            self.self_id,
+            self.cluster_id(),
+            self.committed_placement_version(),
+            committed_peak,
+            self.rf,
+        );
+        // Run the election. `None` from the provider (or an unregistered
+        // provider) means no re-election — there is no fresh evidence.
+        let term = self.attach_assignment(term)?;
+        match &term.assignment {
+            Some(next) if *next != committed_assignment => {}
+            // Identical (or absent) result: the committed assignment already
+            // reflects the evidence — do not spend a term on it.
+            _ => return None,
+        }
+        self.record_vote(new_term, term.digest);
+
+        let quorum_needed = self.activation_quorum_needed(committed_members.len());
+        let mut votes = std::collections::HashMap::new();
+        votes.insert(self.self_id, true);
+
+        *self.pending_proposal.lock() = Some(PendingProposal {
+            term: term.clone(),
+            votes,
+            quorum_needed,
+            _started_at: Instant::now(),
+        });
+
+        tracing::info!(
+            term = new_term,
+            "cluster: proposing re-election — fresh evidence contradicts the \
+             committed assignment",
+        );
+        Some(term)
+    }
+
     /// W6 (INVARIANT ii) — propose a placement-version UPGRADE for the
     /// already-committed membership.
     ///
@@ -8066,6 +8147,100 @@ mod tests {
         assert!(
             !auth.holds_committed_assignment(),
             "a term carrying no assignment must not leave a stale one behind",
+        );
+    }
+
+    /// §9 Q3 — the re-election producer: fires only for the deterministic
+    /// proposer, only when an assignment is committed, and only when fresh
+    /// evidence elects a DIFFERENT assignment. The rejoin wedge it exists
+    /// for: deviations carried under the evidence-unusable rule leave a
+    /// rejoined det-master with zero shards, and with stable membership no
+    /// other producer ever mints a term to revert them.
+    #[test]
+    fn reelection_fires_only_on_contradicting_evidence() {
+        use crate::cluster::shards::{NUM_SHARDS, ShardTable};
+
+        let mems = members(&[1, 2, 3]);
+        let det = ShardTable::compute_with_epoch(&mems, 2, 0, 1);
+        let det_masters: Vec<NodeId> = (0..NUM_SHARDS as u16)
+            .map(|shard| det.target_assignment(shard).master)
+            .collect();
+
+        // Commit an assignment DEVIATED on one shard (its det master data-
+        // less at the time): shard 0 anchored onto its first replica.
+        let shard0 = det.target_assignment(0);
+        let deviating = shard0.replicas[0];
+        let mut committed_masters = det_masters.clone();
+        committed_masters[0] = deviating;
+        let pair = crate::cluster::election::CommittedAssignment::new(
+            committed_masters.clone(),
+            &vec![false; NUM_SHARDS],
+        );
+        let term = TopologyTerm::new(2, mems.clone(), NodeId(1), ClusterId::UNSET, 1, 3, 2)
+            .with_assignment(pair)
+            .expect("valid");
+        let commit = TopologyCommit {
+            term: term.term,
+            proposer: term.proposer,
+            members: term.members.clone(),
+            cluster_id: term.cluster_id,
+            placement_version: term.placement_version,
+            committed_peak: term.committed_peak,
+            digest: term.digest,
+            voters: mems.clone(),
+            rf: term.rf,
+            assignment: term.assignment.clone(),
+        };
+        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1), 2);
+        assert_eq!(auth.handle_commit(&commit), Some(2));
+
+        // Provider #1: evidence still supports the deviation → the election
+        // reproduces the committed assignment → NO re-election.
+        let same = committed_masters.clone();
+        auth.set_assignment_provider(Box::new(move |_req| {
+            Some(crate::cluster::election::CommittedAssignment::new(
+                same.clone(),
+                &vec![false; NUM_SHARDS],
+            ))
+        }));
+        assert!(
+            auth.propose_reelection().is_none(),
+            "identical evidence must not spend a term",
+        );
+
+        // Provider #2: fresh evidence reverts the deviation → re-election
+        // fires, carrying the reverted assignment, and installs a pending
+        // proposal for a HIGHER term.
+        let reverted = det_masters.clone();
+        auth.set_assignment_provider(Box::new(move |_req| {
+            Some(crate::cluster::election::CommittedAssignment::new(
+                reverted.clone(),
+                &vec![false; NUM_SHARDS],
+            ))
+        }));
+        let proposal = auth
+            .propose_reelection()
+            .expect("contradicting evidence must fire a re-election");
+        assert!(proposal.term > 2);
+        assert_eq!(proposal.members, mems);
+        assert_eq!(
+            proposal.assignment.as_ref().map(|a| a.masters.clone()),
+            Some(det_masters.clone()),
+        );
+
+        // Not the deterministic proposer → never fires.
+        let follower = TopologyAuthority::new(NodeId(2), Duration::from_secs(1), 2);
+        assert_eq!(follower.handle_commit(&commit), Some(2));
+        let rv = det_masters.clone();
+        follower.set_assignment_provider(Box::new(move |_req| {
+            Some(crate::cluster::election::CommittedAssignment::new(
+                rv.clone(),
+                &vec![false; NUM_SHARDS],
+            ))
+        }));
+        assert!(
+            follower.propose_reelection().is_none(),
+            "only the deterministic proposer re-elects",
         );
     }
 
