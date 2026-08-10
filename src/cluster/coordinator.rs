@@ -2294,6 +2294,51 @@ impl ClusterCoordinator {
                         // and prevents it from racing operational scenarios
                         // (rolling restart, scale up/down) where activations keep
                         // `last_activation_at` fresh.
+                        // §9 Q3 — re-election backstop. The prompt driver at
+                        // the exchange-receive site is one-shot: if that
+                        // activation took the non-exchange path (direct
+                        // commit-apply), or migrations were active at that
+                        // instant, the opportunity is lost and a rejoined
+                        // node sits at zero masters forever (observed in
+                        // scenario 05: node2 rejoined, masters 2065/0/2031,
+                        // no re-election ever fired). The tick re-evaluates
+                        // every loop timeout under the same rate limiter, so
+                        // a missed one-shot lands within ~1-2s. Cheap when
+                        // idle: propose_reelection early-returns for
+                        // non-proposers and for evidence that matches the
+                        // committed assignment.
+                        if last_reelection_at.elapsed() >= REELECTION_MIN_INTERVAL
+                            && migration.lock().active_count() == 0
+                            && let Some(reelection) = topo_authority_event.propose_reelection()
+                        {
+                            last_reelection_at = std::time::Instant::now();
+                            let peak = peak_size_event.load(Ordering::Relaxed) as u64;
+                            let inc = swim_incarnation_event.load(Ordering::Relaxed);
+                            let persisted_ok = persist_topology_state_durable(
+                                topo_state_path_event.as_deref(),
+                                &topo_authority_event.persisted_state(peak, inc),
+                            );
+                            if persisted_ok {
+                                let ta = topo_authority_event.clone();
+                                let na = node_addrs_for_topo.clone();
+                                let tx = topology_commit_tx_event.clone();
+                                let tp = topo_state_path_event.clone();
+                                let ps = peak_size_event.clone();
+                                let si = swim_incarnation_event.clone();
+                                let secret = cluster_secret_event.clone();
+                                std::thread::spawn(move || {
+                                    run_topology_proposer(
+                                        reelection, ta, na, self_id, tx, tp, ps, si, secret,
+                                    );
+                                });
+                            } else {
+                                tracing::error!(
+                                    term = reelection.term,
+                                    "cluster: NOT spawning re-election proposer — term not durable",
+                                );
+                            }
+                        }
+
                         const PLACEMENT_UPGRADE_SETTLE: Duration = Duration::from_secs(60);
                         let upgrade_settled = migration.lock().active_count() == 0
                             && last_activation_at.elapsed() >= PLACEMENT_UPGRADE_SETTLE;
