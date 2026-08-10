@@ -492,16 +492,43 @@ flakiness cause on record (`migration_pool_size 128 > max_connections_per_ip
 
 ## 16. Implementation order
 
+Status as of 2026-08-10, branch `fix/e2e-scenarios-green`:
+
 1. **Rule 2 (strictly-ascending `members`)** — both reviewers say land it
    independently; it is a latent same-term split vector in today's code.
+   **BUILT** (`35f4adc`).
 2. Rule 10 (member-growth bound) — closes a pre-existing one-frame permanent
-   wedge.
+   wedge. **BUILT** (`5fdf9ae`).
 3. §10 persistence: CRC + bounds + presence flag; persist the winning commit.
+   **BUILT** (`373ffe9`; format v2→v3 with `voted_digest` in step 4).
 4. §4 attestation (digest, `voted_digest`, recompute-from-bytes).
-5. §5 conditional anchor + §11 replica swap.
-6. §6/§6.1 validation and reject-not-fence.
-7. §7 provenance fence.
-8. §8 the ten sites + R5's authority predicate.
-9. §12 harness secret + armed-state unanimity gate.
+   **BUILT** (`1663e8a` attestation; `a27fbff` rf + assignment digest-bound,
+   wire format v2).
+5. §5 conditional anchor + §11 replica swap. **BUILT** (`3ca442d`,
+   `src/cluster/election.rs`).
+6. §6/§6.1 validation and reject-not-fence. **BUILT** (`4d27a8a` validator;
+   `2bee865` enforced in the commit gate).
+7. §7 provenance fence. **BUILT** (`5b8bd7f` — `CommittedAssignment` pairs
+   masters + unproven bitmap; `local_fence` with the P0-4 alert-no-source
+   arm). The serving-side wiring of `local_fence` into `is_master` is NOT
+   yet armed.
+8. §8 the ten sites + R5's authority predicate. **BUILT** (`672b16f` install
+   + vote-side live-member drop gate; `e215f57` provider armed, gated on
+   real signals — a blind first-term election discarded the exchange-view
+   refinement; `4235f18` detectors/boot-restore/relinquish-oracle read the
+   committed baseline). Partition-map catch-up already installs routing
+   only (`committed_topology_from_routing_snapshot` returns `None`).
+9. §12 harness secret + armed-state unanimity gate. **NOT BUILT** — turning
+   the harness onto a `cluster_secret` flips the trusted-overlay peer
+   exemptions suite-wide and needs its own CI measurement.
 10. §9 detection — **alert-only first**; the fence arms behind the operator
-    switch once 1–9 are green.
+    switch once 1–9 are green. **Arm 1 BUILT** (`f79559c`,
+    persistent-refusal streak, alert-only). Arm 2 (same-term digest gossip
+    with P1-4 corroboration) NOT built.
+
+Build-order lesson worth keeping: arming the election (`e215f57`) before the
+detector read-sites moved onto the committed baseline (`4235f18`) produced a
+nightly where ALL five topology-touching scenarios failed — the detectors
+re-drove reactivation against every elected deviation. The §8 audit table's
+"every path reads the committed assignment" is load-bearing as a UNIT; a
+partial cut is worse than none.
