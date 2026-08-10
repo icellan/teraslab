@@ -84,6 +84,17 @@ const NORMAL_REACTIVATION_COOLDOWN: Duration = Duration::from_secs(15);
 /// readiness window (exchange ≈2s + proposal round ≈1s), long enough that
 /// oscillating evidence cannot mint a term per tick.
 const REELECTION_MIN_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Active under-replication sweep cadence. Scenario 08's read-verify gives
+/// under-replicated records 60s to heal, so a 20s cadence lands 2-3 repair
+/// passes inside any such window; a busy cluster still only pays one
+/// view-snapshot + table scan per interval.
+const UNDER_REPLICATION_SWEEP_INTERVAL: Duration = Duration::from_secs(20);
+
+/// Per-sweep cap on signaled shards, so one pass cannot flood the resync
+/// channel. The remainder is LOGGED (never silently dropped) and the next
+/// sweep re-derives it — the gap list shrinks as resyncs land.
+const UNDER_REPLICATION_SWEEP_MAX_SHARDS: usize = 1024;
 const SAME_TERM_REACTIVATION_COOLDOWN: Duration = Duration::from_secs(30);
 
 const DRAIN_REACTIVATION_INTERVAL: Duration = Duration::from_secs(2);
@@ -1979,6 +1990,7 @@ impl ClusterCoordinator {
         let (resync_request_tx, resync_request_rx) =
             std::sync::mpsc::channel::<crate::replication::manager::ResyncRequest>();
         let resync_request_tx_for_cluster = resync_request_tx.clone();
+        let resync_request_tx_event = resync_request_tx.clone();
         // W1.1 FIX B — shard transfer-request channel. The dispatch
         // handler for OP_MIGRATION_TRANSFER_REQUEST posts requests from
         // migration targets; the event loop drains them and re-runs the
@@ -2076,6 +2088,7 @@ impl ClusterCoordinator {
             // view) but never a storm. Seeded in the past so the FIRST
             // contradiction after boot can fire immediately.
             let mut last_reelection_at = std::time::Instant::now() - REELECTION_MIN_INTERVAL;
+            let mut last_under_replication_sweep = std::time::Instant::now();
             // W5-followup — progress tracker for the fast self-drain
             // reactivation cadence. Holds `(term, work_remaining)` captured the
             // last time the fast path fired. `None` (or a stale term) means the
@@ -2336,6 +2349,83 @@ impl ClusterCoordinator {
                                     term = reelection.term,
                                     "cluster: NOT spawning re-election proposer — term not durable",
                                 );
+                            }
+                        }
+
+                        // Active under-replication sweep (E2E design decision
+                        // #5): a replica that lost its copy (crash, wipe,
+                        // missed intents) is otherwise repaired only when
+                        // WRITE traffic touches the shard — a quiet shard
+                        // stays under-replicated forever, and scenario 08's
+                        // read-verify sees min_replicas violations long after
+                        // the partition healed. Sweep this node's OWN mastered,
+                        // non-empty shards against the retained exchange view:
+                        // a replica that reported but shows no data for a
+                        // shard it should hold gets a resync signal. Gated on
+                        // no active migrations (in-flight catch-up IS the
+                        // repair) and rate-limited; the per-sweep cap is
+                        // logged, never silent.
+                        if last_under_replication_sweep.elapsed()
+                            >= UNDER_REPLICATION_SWEEP_INTERVAL
+                            && migration.lock().active_count() == 0
+                        {
+                            last_under_replication_sweep = std::time::Instant::now();
+                            let view = retained_exchange_view_event.lock().clone();
+                            if !view.is_empty() {
+                                let mut full: std::collections::HashSet<(NodeId, u16)> =
+                                    std::collections::HashSet::new();
+                                for (node, entries) in &view {
+                                    for entry in entries {
+                                        if entry.last_applied_seq > 0 {
+                                            full.insert((*node, entry.shard));
+                                        }
+                                    }
+                                }
+                                let mut missing: std::collections::HashMap<NodeId, Vec<u16>> =
+                                    std::collections::HashMap::new();
+                                let mut signaled = 0usize;
+                                let mut dropped = 0usize;
+                                {
+                                    let table = shard_table.read();
+                                    for shard in 0..crate::cluster::shards::NUM_SHARDS as u16 {
+                                        let assignment = table.target_assignment(shard);
+                                        if assignment.master != self_id
+                                            || engine.shard_record_count(shard) == 0
+                                        {
+                                            continue;
+                                        }
+                                        for replica in &assignment.replicas {
+                                            if *replica == self_id
+                                                || !view.contains_key(replica)
+                                                || full.contains(&(*replica, shard))
+                                            {
+                                                continue;
+                                            }
+                                            if signaled < UNDER_REPLICATION_SWEEP_MAX_SHARDS {
+                                                missing.entry(*replica).or_default().push(shard);
+                                                signaled += 1;
+                                            } else {
+                                                dropped += 1;
+                                            }
+                                        }
+                                    }
+                                }
+                                if signaled > 0 || dropped > 0 {
+                                    tracing::info!(
+                                        signaled,
+                                        dropped,
+                                        replicas = missing.len(),
+                                        "cluster: under-replication sweep signaling resyncs                                          (dropped remainder re-derived next sweep)",
+                                    );
+                                }
+                                for (replica, shards) in missing {
+                                    let _ = resync_request_tx_event.send(
+                                        crate::replication::manager::ResyncRequest {
+                                            node_id: replica.0,
+                                            shards,
+                                        },
+                                    );
+                                }
                             }
                         }
 
