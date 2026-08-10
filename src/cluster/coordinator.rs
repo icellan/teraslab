@@ -476,6 +476,11 @@ struct RelinquishContext {
     /// Engine handle to check whether `self` holds any records for a shard
     /// (only an EMPTY local shard is no-loss-safe to relinquish on failure).
     engine: Arc<Engine>,
+    /// §8 — the committed (elected) assignment snapshotted at migration-spawn
+    /// time, so the relinquish oracle derives the rightful master from the
+    /// SAME authority the cluster agreed on, not a recompute that an elected
+    /// deviation would contradict.
+    committed_elected: Option<crate::cluster::election::CommittedAssignment>,
 }
 
 /// Fail an outbound migration task, relinquishing the shard to its committed
@@ -532,6 +537,7 @@ fn fail_or_relinquish_outbound_task(
                     self_holds_records,
                     target_holds_superset,
                     ctx.placement_version,
+                    ctx.committed_elected.as_ref(),
                 )
             };
             match disposition {
@@ -730,6 +736,27 @@ fn complete_migration_task_current_epoch_with_midpoint(
 /// A settled cluster therefore yields `mismatched == 0` and the loop is a
 /// no-op (W1.1 FIX C).
 ///
+/// §8 — the committed BASELINE table for detector comparisons and boot
+/// restore: the deterministic table for the committed term, with the
+/// committed assignment overlaid when one is held. Detectors comparing
+/// against plain det would flag every elected deviation as a phantom or
+/// missing master and re-drive reactivation forever — the machinery fighting
+/// the election it installed.
+fn committed_baseline_table(
+    committed_members: &[NodeId],
+    rf: u8,
+    epoch: u64,
+    placement_version: u16,
+    elected: Option<&crate::cluster::election::CommittedAssignment>,
+) -> ShardTable {
+    let mut baseline =
+        ShardTable::compute_with_epoch(committed_members, rf, epoch, placement_version.max(1));
+    if let Some(assignment) = elected {
+        crate::cluster::election::install_assignment(&mut baseline, &assignment.masters);
+    }
+    baseline
+}
+
 /// When the table has not activated the committed term at all
 /// (`table.version != committed_term`, e.g. a node that missed the commit
 /// signal), there is no recorded intent for that term; report at least one
@@ -823,6 +850,7 @@ fn phantom_master_shard_count(
     rf: u8,
     self_id: NodeId,
     placement_version: u16,
+    elected: Option<&crate::cluster::election::CommittedAssignment>,
 ) -> usize {
     // A single-member committed set cannot over-own (every shard is self's
     // by definition); skip the recompute.
@@ -833,13 +861,13 @@ fn phantom_master_shard_count(
     // for v1, HRW for v2) so a settled v2 cluster is compared against the
     // SAME algorithm it serves — comparing a v2 table to a v1 baseline would
     // flag almost every shard as a phantom and trigger a reshuffle storm.
-    let committed = ShardTable::compute_with_epoch(committed_members, rf, 0, placement_version);
+    let committed = committed_baseline_table(committed_members, rf, 0, placement_version, elected);
     (0..crate::cluster::shards::NUM_SHARDS as u16)
         .filter(|&shard| {
-            // This node locally masters the shard, but the deterministic
-            // committed-version master for the committed members is a
-            // different node — the exact shard an empty-view reactivation
-            // reassigns.
+            // This node locally masters the shard, but the committed
+            // baseline (elected assignment when held, deterministic
+            // otherwise) gives it to a different node — the exact shard an
+            // empty-view reactivation reassigns.
             table.target_assignment(shard).master == self_id
                 && committed.target_assignment(shard).master != self_id
         })
@@ -971,13 +999,15 @@ fn missing_master_shard_count(
     rf: u8,
     self_id: NodeId,
     placement_version: u16,
+    elected: Option<&crate::cluster::election::CommittedAssignment>,
 ) -> usize {
     if committed_members.is_empty() {
         return 0;
     }
-    // Same recompute contract as `phantom_master_shard_count`: compare against
-    // the committed term's placement algorithm, never a different version's.
-    let committed = ShardTable::compute_with_epoch(committed_members, rf, 0, placement_version);
+    // Same baseline contract as `phantom_master_shard_count`: compare against
+    // the committed term's placement (elected assignment overlaid when held),
+    // never a different version's.
+    let committed = committed_baseline_table(committed_members, rf, 0, placement_version, elected);
     (0..crate::cluster::shards::NUM_SHARDS as u16)
         .filter(|&shard| {
             committed.target_assignment(shard).master == self_id
@@ -1081,6 +1111,7 @@ fn failed_handoff_disposition(
     self_holds_records: bool,
     target_holds_superset: bool,
     placement_version: u16,
+    elected: Option<&crate::cluster::election::CommittedAssignment>,
 ) -> FailedHandoffDisposition {
     // Cond 1: only master handoffs cause the over-count.
     if !task.is_master {
@@ -1102,9 +1133,9 @@ fn failed_handoff_disposition(
     if self_holds_records && !target_holds_superset {
         return FailedHandoffDisposition::RollbackToSelf;
     }
-    // Cond 2 + 3: the deterministic committed master must be a DIFFERENT,
-    // live, committed member.
-    let committed = ShardTable::compute_with_epoch(committed_members, rf, 0, placement_version);
+    // Cond 2 + 3: the committed master (elected when held, deterministic
+    // otherwise) must be a DIFFERENT, live, committed member.
+    let committed = committed_baseline_table(committed_members, rf, 0, placement_version, elected);
     let rightful = committed.target_assignment(task.shard).master;
     if rightful == self_id
         || !committed_members.contains(&rightful)
@@ -1616,15 +1647,21 @@ pub(crate) fn restored_committed_shard_table(
     replication_factor: u8,
     committed_term: u64,
     placement_version: u16,
+    elected: Option<&crate::cluster::election::CommittedAssignment>,
 ) -> Option<ShardTable> {
     if committed_term == 0 || committed_members.is_empty() {
         return None;
     }
-    Some(ShardTable::compute_with_epoch(
+    // §8/R5 — a node restoring a term whose winning commit carried an
+    // assignment boots with THAT assignment, not round-robin: rebooting into
+    // round-robin at the committed term is how a restarted node used to
+    // serve stale shards it no longer mastered while reporting mismatched=0.
+    Some(committed_baseline_table(
         committed_members,
         replication_factor,
         committed_term,
-        placement_version.max(1),
+        placement_version,
+        elected,
     ))
 }
 
@@ -1740,11 +1777,13 @@ impl ClusterCoordinator {
         let committed_term = self.topology_authority.committed_term();
         let members = self.topology_authority.committed_members();
         let placement_version = self.topology_authority.committed_placement_version();
+        let restored_assignment = self.topology_authority.committed_assignment();
         if let Some(table) = restored_committed_shard_table(
             &members,
             self.replication_factor,
             committed_term,
             placement_version,
+            restored_assignment.as_ref(),
         ) {
             *self.shard_table.write() = table;
         }
@@ -2677,12 +2716,14 @@ impl ClusterCoordinator {
                             // intent-only mismatch metric is blind to (a stale
                             // local table stamped with the committed term that
                             // still masters reassigned shards).
+                            let committed_elected = topo_authority_event.committed_assignment();
                             let phantom_masters = phantom_master_shard_count(
                                 &table,
                                 &committed_members,
                                 rf,
                                 self_id,
                                 committed_pv,
+                                committed_elected.as_ref(),
                             );
                             // The mirror of the phantom counter: shards the
                             // committed placement gives THIS node that its
@@ -2697,6 +2738,7 @@ impl ClusterCoordinator {
                                 rf,
                                 self_id,
                                 committed_pv,
+                                committed_elected.as_ref(),
                             );
                             (
                                 mismatched,
@@ -3243,6 +3285,7 @@ impl ClusterCoordinator {
                                     self_id,
                                     live_members,
                                     engine: engine.clone(),
+                                    committed_elected: topo_authority_event.committed_assignment(),
                                 })
                             };
                             std::thread::spawn(move || {
@@ -3551,6 +3594,7 @@ impl ClusterCoordinator {
                                 self_id,
                                 live_members,
                                 engine: engine.clone(),
+                                committed_elected: topology_authority.committed_assignment(),
                             })
                         };
                         std::thread::spawn(move || {
@@ -4388,8 +4432,14 @@ impl ClusterCoordinator {
             // is failing to include those shards or including them and failing
             // to complete. `phantom_planned < phantom_masters` points at
             // planning; equal points at execution.
-            let phantom_now =
-                phantom_master_shard_count(&new_table, members, rf, self_id, placement_version);
+            let phantom_now = phantom_master_shard_count(
+                &new_table,
+                members,
+                rf,
+                self_id,
+                placement_version,
+                committed_assignment.as_ref(),
+            );
             let committed_for_phantom =
                 ShardTable::compute_with_epoch(members, rf, 0, placement_version);
             let phantom_planned = outbound_tasks
@@ -4527,6 +4577,7 @@ impl ClusterCoordinator {
                     self_id,
                     live_members,
                     engine: engine.clone(),
+                    committed_elected: committed_assignment.clone(),
                 })
             };
 
@@ -14204,6 +14255,7 @@ mod tests {
             /* self_holds_records */ false,
             /* target_holds_superset */ false,
             1,
+            None,
         );
         assert_eq!(
             disposition,
@@ -14321,6 +14373,7 @@ mod tests {
             /* self_holds_records */ true,
             /* target_holds_superset */ false,
             1,
+            None,
         );
         assert_eq!(
             disposition,
@@ -14349,6 +14402,7 @@ mod tests {
             /* self_holds_records */ false,
             /* target_holds_superset */ false,
             1,
+            None,
         );
         assert_eq!(disposition, FailedHandoffDisposition::RollbackToSelf);
     }
@@ -14373,6 +14427,7 @@ mod tests {
             /* self_holds_records */ false,
             /* target_holds_superset */ false,
             1,
+            None,
         );
         assert_eq!(disposition, FailedHandoffDisposition::RollbackToSelf);
     }
@@ -14398,6 +14453,7 @@ mod tests {
             /* self_holds_records */ false,
             /* target_holds_superset */ false,
             1,
+            None,
         );
         assert_eq!(disposition, FailedHandoffDisposition::RollbackToSelf);
     }
@@ -15650,6 +15706,7 @@ mod tests {
             /* self_holds_records */ true,
             /* target_holds_superset */ false,
             1,
+            None,
         );
         assert_eq!(
             disposition_with_records,
@@ -15670,6 +15727,7 @@ mod tests {
             /* self_holds_records */ false,
             /* target_holds_superset */ false,
             1,
+            None,
         );
         assert_eq!(
             disposition_empty,
@@ -15705,6 +15763,7 @@ mod tests {
             /* self_holds_records */ true,
             /* target_holds_superset */ false,
             1,
+            None,
         );
         assert_eq!(
             stuck,
@@ -15726,6 +15785,7 @@ mod tests {
             /* self_holds_records */ true,
             /* target_holds_superset */ true,
             1,
+            None,
         );
         assert_eq!(
             converged,
@@ -15756,6 +15816,7 @@ mod tests {
             /* self_holds_records */ true,
             /* target_holds_superset */ true,
             1,
+            None,
         );
         assert_eq!(
             disposition,
@@ -18081,7 +18142,7 @@ mod tests {
         );
 
         // The new detector flags exactly the phantom-mastered shards.
-        let phantom = phantom_master_shard_count(&stale_table, &committed, rf, self_id, 1);
+        let phantom = phantom_master_shard_count(&stale_table, &committed, rf, self_id, 1, None);
         assert_eq!(
             phantom, over_owned,
             "phantom_master_shard_count must flag every committed-non-owned local master",
@@ -18120,7 +18181,7 @@ mod tests {
         // phantom masters.
         for &node in &committed {
             assert_eq!(
-                phantom_master_shard_count(&table, &committed, rf, node, 1),
+                phantom_master_shard_count(&table, &committed, rf, node, 1, None,),
                 0,
                 "a node activated on the committed term must report no phantom masters",
             );
@@ -18201,7 +18262,7 @@ mod tests {
         // same-term empty-view reactivation will hand back to their
         // round-robin masters, collapsing the cluster to single-mastership.
         assert_eq!(
-            phantom_master_shard_count(&table, &committed, rf, NodeId(1), 1),
+            phantom_master_shard_count(&table, &committed, rf, NodeId(1), 1, None,),
             deviated,
             "election-deviated self-masters must be flagged for reconciliation",
         );
@@ -18669,12 +18730,12 @@ mod tests {
         // A converged node has nothing outstanding in either direction.
         for node in &members {
             assert_eq!(
-                missing_master_shard_count(&committed, &members, rf, *node, pv),
+                missing_master_shard_count(&committed, &members, rf, *node, pv, None,),
                 0,
                 "a table equal to the committed placement owes nothing"
             );
             assert_eq!(
-                phantom_master_shard_count(&committed, &members, rf, *node, pv),
+                phantom_master_shard_count(&committed, &members, rf, *node, pv, None,),
                 0
             );
         }
@@ -18707,12 +18768,12 @@ mod tests {
         );
 
         assert_eq!(
-            missing_master_shard_count(&rolled_back, &members, rf, NodeId(2), pv),
+            missing_master_shard_count(&rolled_back, &members, rf, NodeId(2), pv, None,),
             handed_off,
             "node2 must be seen to owe every master it failed to acquire"
         );
         assert_eq!(
-            phantom_master_shard_count(&rolled_back, &members, rf, NodeId(2), pv),
+            phantom_master_shard_count(&rolled_back, &members, rf, NodeId(2), pv, None,),
             0,
             "node2 is not OVER-owning — the existing counter cannot see this"
         );
@@ -22621,7 +22682,7 @@ mod tests {
 
         // C6 boot: install the RESTORED committed table — not the `[self]`
         // bootstrap table stamped to the committed term (the old bug).
-        let boot_table = restored_committed_shard_table(&committed_members, rf, term, pv)
+        let boot_table = restored_committed_shard_table(&committed_members, rf, term, pv, None)
             .expect("multi-node committed membership yields a restored table");
         assert_eq!(
             boot_table.version, term,
