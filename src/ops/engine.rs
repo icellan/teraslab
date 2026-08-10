@@ -3706,17 +3706,45 @@ impl Engine {
         for (device_id, offset) in locs {
             match self.read_metadata_fast(device_id, offset) {
                 Ok(meta) => out.push(TxKey::from_bytes(meta.tx_id)),
-                Err(e) => {
-                    skipped += 1;
-                    self.enumeration_unreadable
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    tracing::warn!(
-                        target: "teraslab::engine",
-                        device_id,
-                        offset,
-                        err = %e,
-                        "key enumeration: record footer unreadable; skipping full-txid resolution",
-                    );
+                Err(first_err) => {
+                    // An unreadable footer during enumeration is almost always
+                    // a record MID-WRITE: the writer stamps the CRC last, so
+                    // the footer settles within microseconds. Re-read briefly
+                    // before declaring it unreadable — without this, a busy
+                    // shard's enumeration keeps skipping fresh writes, the
+                    // issue-#46 fail-safe refuses the handoff, the retry
+                    // meets NEWER writes, and the handoff livelocks for as
+                    // long as load continues (observed: 199 transient skips
+                    // wedging scale-up handoffs for 120s+). Genuine
+                    // corruption fails every re-read and still lands in
+                    // `skipped`, so the #46 refusal keeps protecting against
+                    // handing off an incomplete key set. This is the cold
+                    // migration-scan path; the bounded sleeps are not on any
+                    // request path.
+                    let mut recovered = None;
+                    for backoff_us in [50u64, 500, 5_000] {
+                        std::thread::sleep(std::time::Duration::from_micros(backoff_us));
+                        if let Ok(meta) = self.read_metadata_fast(device_id, offset) {
+                            recovered = Some(meta);
+                            break;
+                        }
+                    }
+                    match recovered {
+                        Some(meta) => out.push(TxKey::from_bytes(meta.tx_id)),
+                        None => {
+                            skipped += 1;
+                            self.enumeration_unreadable
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            tracing::warn!(
+                                target: "teraslab::engine",
+                                device_id,
+                                offset,
+                                err = %first_err,
+                                "key enumeration: record footer unreadable after re-read \
+                                 backoff; skipping full-txid resolution",
+                            );
+                        }
+                    }
                 }
             }
         }
