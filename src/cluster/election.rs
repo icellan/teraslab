@@ -320,12 +320,26 @@ pub fn elect_committed_assignment(
                 .unwrap_or(base)
         };
 
-        // (E3) KEEPING a deviation and CREATING one are the same decision, and
-        // both must clear the same bar: the deviating master self-reports full
-        // AND the deterministic master self-reports data-less, for
-        // DEVIATION_HYSTERESIS_TERMS consecutive terms. Evaluate the shard's
-        // streak exactly ONCE per term — advancing it twice in one pass lets a
-        // single term of evidence clear a two-term bar.
+        // (E3) The hysteresis gates deviation CREATION; KEEPING an
+        // already-committed deviation requires only that its justification
+        // still holds. The two must not share the bar — field evidence
+        // (scenario 14.1, post-heal reads 0/50) showed why: while a fresh
+        // deviation's streak builds, sharing the bar REVERTS mastership onto
+        // a det master that self-reports DATA-LESS, and with no serving
+        // fence wired that master serves empty (reviewer H1's exact
+        // scenario). An already-committed deviation carries a quorum's
+        // agreement; holding it while its justification stands is not "one
+        // term of influence becoming permanent", because the reversion edge
+        // is untouched — the moment the det master proves full (its
+        // migration landed) or the deviating holder stops proving full, the
+        // deviation reverts. This is also what keeps a scale-up joiner from
+        // being handed mastership before its data arrives: the anchored
+        // holders stay masters exactly until the joiner reports full.
+        //
+        // CREATION keeps the full k-term bar: a single skewed view must not
+        // move a master. Evaluate the shard's streak exactly ONCE per term —
+        // advancing it twice in one pass lets a single term of evidence
+        // clear a two-term bar.
         //
         // Without the reversion edge a deviation is self-justifying: the named
         // master receives its migration, so it holds the data from then on, so
@@ -338,7 +352,10 @@ pub fn elect_committed_assignment(
             let justification_holds = inputs.reports.is_full(desired, shard)
                 && !inputs.reports.is_full(det_master, shard);
             let streak = history.observe(shard, justification_holds);
-            if justification_holds && streak >= DEVIATION_HYSTERESIS_TERMS {
+            let was_committed_deviation = prev == Some(desired);
+            if justification_holds
+                && (was_committed_deviation || streak >= DEVIATION_HYSTERESIS_TERMS)
+            {
                 (desired, ShardOutcome::Deviated)
             } else {
                 (det_master, ShardOutcome::Reverted)
@@ -1148,16 +1165,82 @@ mod tests {
             live: &live(&[1, 2, 3]),
         };
 
-        // First term: the streak is still building, so the deviation reverts.
+        // An already-COMMITTED deviation whose justification holds is kept
+        // from the FIRST term — the hysteresis gates creation, not keeping.
+        // Reverting it while a streak builds would land mastership on a det
+        // master that self-reports data-less, which (with no serving fence)
+        // serves reads empty: scenario 14.1's post-heal 0/50.
         let first = elect_committed_assignment(&inputs, &mut history);
-        assert_eq!(first.assignment[shard as usize], det_master);
-
-        // Once the streak is met the deviation stands and stays.
+        assert_eq!(
+            first.assignment[shard as usize], deviating,
+            "an anchored, justified deviation must be kept immediately",
+        );
         let second = elect_committed_assignment(&inputs, &mut history);
         assert_eq!(second.assignment[shard as usize], deviating);
         let third = elect_committed_assignment(&inputs, &mut history);
         assert_eq!(third.assignment[shard as usize], deviating);
         assert_eq!(third.outcomes[shard as usize], ShardOutcome::Deviated);
+    }
+
+    /// Scenario 14.1's regression pinned: post-heal, the anchored holders
+    /// keep mastership while the det masters still self-report data-less —
+    /// reads never route to an empty master. And the scale-up variant: a
+    /// data-less joiner is NOT handed its det masterships until it reports
+    /// full, at which point the deviation reverts (the reversion edge).
+    #[test]
+    fn a_committed_deviation_never_reverts_onto_a_dataless_master() {
+        let det = det_table(&[1, 2, 3], 2);
+        let shard = 0u16;
+        let shard_candidates = candidates(&det, shard);
+        let det_master = shard_candidates[0];
+        let holder = shard_candidates[1];
+
+        let mut prev = det_assignment(&det);
+        prev[shard as usize] = holder; // committed deviation onto the holder
+
+        // det master data-less, holder full: justification holds → the
+        // committed deviation is KEPT from the very first term.
+        let dataless = HolderReports::from_entries(
+            shard_candidates.clone(),
+            vec![(det_master, shard, 0u64), (holder, shard, 9u64)],
+        );
+        let mut history = DeviationHistory::new();
+        let kept = elect_committed_assignment(
+            &ElectionInputs {
+                det: &det,
+                prev_committed: Some(&prev),
+                reports: &dataless,
+                live: &live(&[1, 2, 3]),
+            },
+            &mut history,
+        );
+        assert_eq!(
+            kept.assignment[shard as usize], holder,
+            "mastership must stay on the proven holder, never an empty master",
+        );
+        assert_eq!(kept.outcomes[shard as usize], ShardOutcome::Deviated);
+
+        // The det master's migration lands (it now reports full): the
+        // justification fails and the deviation reverts immediately.
+        let filled = HolderReports::from_entries(
+            shard_candidates.clone(),
+            vec![(det_master, shard, 5u64), (holder, shard, 9u64)],
+        );
+        let mut history = DeviationHistory::new();
+        let reverted = elect_committed_assignment(
+            &ElectionInputs {
+                det: &det,
+                prev_committed: Some(&prev),
+                reports: &filled,
+                live: &live(&[1, 2, 3]),
+            },
+            &mut history,
+        );
+        assert_eq!(
+            reverted.assignment[shard as usize], det_master,
+            "the reversion edge stands: a full det master reclaims immediately",
+        );
+        assert_eq!(reverted.outcomes[shard as usize], ShardOutcome::Reverted);
     }
 
     /// A previously committed master that is no longer a candidate for this
