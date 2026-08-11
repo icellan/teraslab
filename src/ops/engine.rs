@@ -3700,37 +3700,81 @@ impl Engine {
     /// on the cluster reshard path MUST treat `skipped > 0` as an incomplete
     /// enumeration and refuse to finalize a shard handoff built from it — a
     /// silently short key set would drop a UTXO from the transfer.
-    fn resolve_full_keys(&self, locs: Vec<(u8, u64)>) -> (Vec<TxKey>, usize) {
+    fn resolve_full_keys(&self, locs: Vec<(TxKey, u8, u64)>) -> (Vec<TxKey>, usize) {
         let mut out = Vec::with_capacity(locs.len());
         let mut skipped = 0usize;
-        for (device_id, offset) in locs {
+        for (prefix_key, device_id, offset) in locs {
             match self.read_metadata_fast(device_id, offset) {
                 Ok(meta) => out.push(TxKey::from_bytes(meta.tx_id)),
                 Err(first_err) => {
-                    // An unreadable footer during enumeration is almost always
-                    // a record MID-WRITE: the writer stamps the CRC last, so
-                    // the footer settles within microseconds. Re-read briefly
-                    // before declaring it unreadable — without this, a busy
-                    // shard's enumeration keeps skipping fresh writes, the
-                    // issue-#46 fail-safe refuses the handoff, the retry
-                    // meets NEWER writes, and the handoff livelocks for as
-                    // long as load continues (observed: 199 transient skips
-                    // wedging scale-up handoffs for 120s+). Genuine
-                    // corruption fails every re-read and still lands in
-                    // `skipped`, so the #46 refusal keeps protecting against
-                    // handing off an incomplete key set. This is the cold
-                    // migration-scan path; the bounded sleeps are not on any
-                    // request path.
-                    let mut recovered = None;
-                    for backoff_us in [50u64, 500, 5_000] {
-                        std::thread::sleep(std::time::Duration::from_micros(backoff_us));
-                        if let Ok(meta) = self.read_metadata_fast(device_id, offset) {
-                            recovered = Some(meta);
-                            break;
+                    // An unreadable footer during enumeration has two benign
+                    // causes and one real one:
+                    //
+                    // * MID-WRITE: the writer stamps the CRC last, so the
+                    //   footer settles within microseconds — the bounded
+                    //   re-read backoff below heals it.
+                    // * RELOCATED: on a log-structured (segment) store a
+                    //   concurrent spend RELOCATES the record, and once the
+                    //   old segment is reclaimed the snapshotted offset is
+                    //   unreadable FOREVER — no amount of re-reading the old
+                    //   offset helps. Under sustained write load every
+                    //   enumeration pass collected fresh casualties, the
+                    //   issue-#46 fail-safe refused the handoff each time,
+                    //   and scale-up livelocked (observed: 670 stale-offset
+                    //   skips per pass wedging scenario 06 with
+                    //   masters=4733/4096). The heal loop below re-resolves
+                    //   the CURRENT locator through the index — the
+                    //   snapshotted 12-byte prefix IS the index's own key
+                    //   identity — and reads the record there. A record
+                    //   whose index entry is GONE was concurrently deleted:
+                    //   the enumeration is simply newer than the snapshot
+                    //   (the delete replicates/tombstones on its own path),
+                    //   so it is excluded WITHOUT counting toward #46.
+                    // * GENUINE CORRUPTION: the index still names the same
+                    //   locator and its footer never reads back — lands in
+                    //   `skipped`, so the #46 refusal keeps protecting
+                    //   against handing off an incomplete key set.
+                    //
+                    // This is the cold migration-scan path; the bounded
+                    // sleeps are not on any request path.
+                    let mut cur = (device_id, offset);
+                    let mut resolved = None;
+                    let mut concurrently_gone = false;
+                    // Up to 3 locator generations; each hop requires the
+                    // index to name a DIFFERENT locator (progress), so this
+                    // terminates even under continuous relocation.
+                    'heal: for _generation in 0..3 {
+                        for backoff_us in [50u64, 500, 5_000] {
+                            std::thread::sleep(std::time::Duration::from_micros(backoff_us));
+                            if let Ok(meta) = self.read_metadata_fast(cur.0, cur.1) {
+                                resolved = Some(meta);
+                                break 'heal;
+                            }
+                        }
+                        match self.index.lookup_checked(&prefix_key) {
+                            Ok(Some(entry)) if (entry.device_id, entry.record_offset) != cur => {
+                                cur = (entry.device_id, entry.record_offset);
+                            }
+                            Ok(None) => {
+                                concurrently_gone = true;
+                                break 'heal;
+                            }
+                            // Same locator (genuine corruption) or an index
+                            // read failure: fail closed into the #46 skip.
+                            _ => break 'heal,
                         }
                     }
-                    match recovered {
+                    match resolved {
                         Some(meta) => out.push(TxKey::from_bytes(meta.tx_id)),
+                        None if concurrently_gone => {
+                            tracing::debug!(
+                                target: "teraslab::engine",
+                                device_id,
+                                offset,
+                                "key enumeration: record deleted concurrently \
+                                 with the scan; excluded (not a skip)",
+                            );
+                        }
                         None => {
                             skipped += 1;
                             self.enumeration_unreadable
@@ -3739,9 +3783,12 @@ impl Engine {
                                 target: "teraslab::engine",
                                 device_id,
                                 offset,
+                                current_device = cur.0,
+                                current_offset = cur.1,
                                 err = %first_err,
                                 "key enumeration: record footer unreadable after re-read \
-                                 backoff; skipping full-txid resolution",
+                                 backoff and index re-resolution; skipping full-txid \
+                                 resolution",
                             );
                         }
                     }
@@ -3758,9 +3805,9 @@ impl Engine {
     /// prefix). Locators are snapshotted under the index read lock, then the
     /// device reads happen outside it.
     pub fn all_keys(&self) -> Vec<TxKey> {
-        let mut locs: Vec<(u8, u64)> = Vec::new();
+        let mut locs: Vec<(TxKey, u8, u64)> = Vec::new();
         self.index
-            .for_each(|_k, e| locs.push((e.device_id, e.record_offset)));
+            .for_each(|k, e| locs.push((k, e.device_id, e.record_offset)));
         // Skipped-count dropped here: this admin/test enumerator keeps its
         // Vec return. The skip is still observable via the
         // `enumeration_unreadable` counter bumped inside `resolve_full_keys`.
@@ -3774,10 +3821,10 @@ impl Engine {
     /// preserves, so the shard filter is applied cheaply on the prefix key
     /// first; only the survivors' full txids are resolved from the device.
     pub fn keys_for_shard(&self, shard: u16) -> Vec<TxKey> {
-        let mut locs: Vec<(u8, u64)> = Vec::new();
+        let mut locs: Vec<(TxKey, u8, u64)> = Vec::new();
         self.index.for_each(|k, e| {
             if crate::cluster::shards::ShardTable::shard_for_key(&k) == shard {
-                locs.push((e.device_id, e.record_offset));
+                locs.push((k, e.device_id, e.record_offset));
             }
         });
         // Skipped-count dropped here (Vec return retained for the many
@@ -3791,14 +3838,14 @@ impl Engine {
     ///
     /// Returns a HashMap from shard number to Vec of FULL txids.
     pub fn keys_by_shard(&self) -> std::collections::HashMap<u16, Vec<TxKey>> {
-        let mut by_shard: std::collections::HashMap<u16, Vec<(u8, u64)>> =
+        let mut by_shard: std::collections::HashMap<u16, Vec<(TxKey, u8, u64)>> =
             std::collections::HashMap::new();
         self.index.for_each(|k, e| {
             let shard = crate::cluster::shards::ShardTable::shard_for_key(&k);
             by_shard
                 .entry(shard)
                 .or_default()
-                .push((e.device_id, e.record_offset));
+                .push((k, e.device_id, e.record_offset));
         });
         // Skipped-count dropped here (HashMap return retained for admin/test
         // callers); each skip is still observable via `enumeration_unreadable`.
@@ -3829,7 +3876,7 @@ impl Engine {
         &self,
         shard_filter: &std::collections::HashSet<u16>,
     ) -> (std::collections::HashMap<u16, Vec<TxKey>>, usize) {
-        let mut by_shard: std::collections::HashMap<u16, Vec<(u8, u64)>> =
+        let mut by_shard: std::collections::HashMap<u16, Vec<(TxKey, u8, u64)>> =
             std::collections::HashMap::new();
         self.index.for_each(|k, e| {
             let shard = crate::cluster::shards::ShardTable::shard_for_key(&k);
@@ -3837,7 +3884,7 @@ impl Engine {
                 by_shard
                     .entry(shard)
                     .or_default()
-                    .push((e.device_id, e.record_offset));
+                    .push((k, e.device_id, e.record_offset));
             }
         });
         let mut total_skipped = 0usize;
@@ -17227,6 +17274,91 @@ mod tests {
         assert!(
             done.load(Ordering::SeqCst),
             "tombstone completes once the block write guard is released"
+        );
+    }
+
+    fn padded_prefix_key(key: &TxKey) -> TxKey {
+        // What `Index::for_each` actually yields: the stored 12-byte prefix
+        // zero-padded to 32 bytes — NOT the full txid.
+        let mut txid = [0u8; 32];
+        txid[..12].copy_from_slice(&key.txid[..12]);
+        TxKey { txid }
+    }
+
+    /// Scenario 06/11.10 wedge: an enumeration locator snapshotted before a
+    /// concurrent relocation points at an offset that segment reclamation
+    /// can make permanently unreadable — no amount of re-reading the OLD
+    /// offset heals it. The resolver must re-resolve the CURRENT locator
+    /// through the index (by the snapshotted prefix, the index's own key
+    /// identity) and read the record there: resolved, NOT skipped, so the
+    /// issue-#46 refusal stops livelocking shard handoffs under write load.
+    #[test]
+    fn enumeration_heals_a_relocated_locator() {
+        let (engine, _dev, key, meta, _slots, old_offset) = seg_engine_with_record();
+
+        let new_offset = engine.relocate_record(0, &key, &meta, &[]).unwrap();
+        assert_ne!(new_offset, old_offset);
+        // Emulate segment reclamation of the old image: the stale offset
+        // becomes unreadable exactly as in production.
+        engine
+            .write_zeroed_metadata_header(0, old_offset, TxMetadata::record_size_for(4))
+            .unwrap();
+
+        let (keys, skipped) =
+            engine.resolve_full_keys(vec![(padded_prefix_key(&key), 0, old_offset)]);
+        assert_eq!(
+            keys,
+            vec![key],
+            "a relocated record must resolve at its CURRENT offset",
+        );
+        assert_eq!(skipped, 0, "a healed relocation is not a #46 skip");
+    }
+
+    /// A record deleted between the locator snapshot and the device read is
+    /// NOT a dropped UTXO — the enumeration is simply newer than the
+    /// snapshot (the delete replicates/tombstones on its own path). It must
+    /// be excluded from both the key set and the #46 skip count.
+    #[test]
+    fn enumeration_excludes_a_concurrently_deleted_record() {
+        let (engine, _dev, key, _meta, _slots, old_offset) = seg_engine_with_record();
+
+        engine
+            .delete(&crate::ops::remaining::DeleteRequest {
+                tx_key: key,
+                due_guard: None,
+            })
+            .unwrap();
+
+        let (keys, skipped) =
+            engine.resolve_full_keys(vec![(padded_prefix_key(&key), 0, old_offset)]);
+        assert!(
+            keys.is_empty(),
+            "a concurrently deleted record must not be resolved"
+        );
+        assert_eq!(
+            skipped, 0,
+            "a concurrent delete is not an incomplete enumeration",
+        );
+    }
+
+    /// Genuine corruption — the index still maps the prefix to the SAME
+    /// offset and its footer is unreadable — must still count as a skip so
+    /// the issue-#46 fail-safe keeps refusing to hand off an incomplete
+    /// key set.
+    #[test]
+    fn enumeration_still_refuses_genuine_corruption() {
+        let (engine, _dev, key, _meta, _slots, old_offset) = seg_engine_with_record();
+
+        engine
+            .write_zeroed_metadata_header(0, old_offset, TxMetadata::record_size_for(4))
+            .unwrap();
+
+        let (keys, skipped) =
+            engine.resolve_full_keys(vec![(padded_prefix_key(&key), 0, old_offset)]);
+        assert!(keys.is_empty());
+        assert_eq!(
+            skipped, 1,
+            "an unreadable record the index still points at is a REAL skip",
         );
     }
 
