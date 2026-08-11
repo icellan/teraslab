@@ -95,6 +95,69 @@ const UNDER_REPLICATION_SWEEP_INTERVAL: Duration = Duration::from_secs(20);
 /// channel. The remainder is LOGGED (never silently dropped) and the next
 /// sweep re-derives it — the gap list shrinks as resyncs land.
 const UNDER_REPLICATION_SWEEP_MAX_SHARDS: usize = 1024;
+
+/// Derives one under-replication sweep round's resync signals.
+///
+/// Pure so the sweep contract is unit-testable. Inputs: the retained
+/// exchange `view` (peer self-reports; survives peer death by design), the
+/// current SWIM-`alive` set, and `mastered_nonempty` — the `(shard,
+/// committed replicas)` pairs for shards this node masters that hold
+/// records. Returns `(missing, signaled, dropped, dead_skipped)`: the
+/// per-replica shard lists to signal, how many were signaled, how many the
+/// `cap` dropped (re-derived next sweep; the caller logs the count), and
+/// how many candidates were skipped because their replica is SWIM-dead.
+///
+/// A replica is signaled only when it is not this node, reported in the
+/// exchange view, is currently SWIM-alive (dead-peer guard: a resync
+/// toward a dead peer ties the replication manager up in retries against
+/// a black hole exactly when the cluster is already degraded), and shows
+/// no data for the shard.
+fn derive_under_replication_resyncs(
+    view: &std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>>,
+    alive: &std::collections::HashSet<NodeId>,
+    self_id: NodeId,
+    mastered_nonempty: &[(u16, Vec<NodeId>)],
+    cap: usize,
+) -> (
+    std::collections::HashMap<NodeId, Vec<u16>>,
+    usize,
+    usize,
+    usize,
+) {
+    let mut full: std::collections::HashSet<(NodeId, u16)> = std::collections::HashSet::new();
+    for (node, entries) in view {
+        for entry in entries {
+            if entry.last_applied_seq > 0 {
+                full.insert((*node, entry.shard));
+            }
+        }
+    }
+    let mut missing: std::collections::HashMap<NodeId, Vec<u16>> = std::collections::HashMap::new();
+    let mut signaled = 0usize;
+    let mut dropped = 0usize;
+    let mut dead_skipped = 0usize;
+    for (shard, replicas) in mastered_nonempty {
+        for replica in replicas {
+            if *replica == self_id
+                || !view.contains_key(replica)
+                || full.contains(&(*replica, *shard))
+            {
+                continue;
+            }
+            if !alive.contains(replica) {
+                dead_skipped += 1;
+                continue;
+            }
+            if signaled < cap {
+                missing.entry(*replica).or_default().push(*shard);
+                signaled += 1;
+            } else {
+                dropped += 1;
+            }
+        }
+    }
+    (missing, signaled, dropped, dead_skipped)
+}
 const SAME_TERM_REACTIVATION_COOLDOWN: Duration = Duration::from_secs(30);
 
 const DRAIN_REACTIVATION_INTERVAL: Duration = Duration::from_secs(2);
@@ -2392,48 +2455,52 @@ impl ClusterCoordinator {
                             last_under_replication_sweep = std::time::Instant::now();
                             let view = retained_exchange_view_event.lock().clone();
                             if !view.is_empty() {
-                                let mut full: std::collections::HashSet<(NodeId, u16)> =
-                                    std::collections::HashSet::new();
-                                for (node, entries) in &view {
-                                    for entry in entries {
-                                        if entry.last_applied_seq > 0 {
-                                            full.insert((*node, entry.shard));
-                                        }
-                                    }
-                                }
-                                let mut missing: std::collections::HashMap<NodeId, Vec<u16>> =
-                                    std::collections::HashMap::new();
-                                let mut signaled = 0usize;
-                                let mut dropped = 0usize;
-                                {
+                                // Dead-peer guard input: liveness is re-checked
+                                // at signal time because the retained view
+                                // deliberately survives peer death. Same
+                                // derivation as the vote-side liveness
+                                // provider; self is implicitly alive.
+                                let alive: std::collections::HashSet<NodeId> = {
+                                    use crate::cluster::membership::NodeState;
+                                    let mut alive: std::collections::HashSet<NodeId> =
+                                        swim_membership_event
+                                            .lock()
+                                            .all_member_states()
+                                            .into_iter()
+                                            .filter(|(_, state, _, _)| *state == NodeState::Alive)
+                                            .map(|(id, _, _, _)| id)
+                                            .collect();
+                                    alive.insert(self_id);
+                                    alive
+                                };
+                                let mastered_nonempty: Vec<(u16, Vec<NodeId>)> = {
                                     let table = shard_table.read();
-                                    for shard in 0..crate::cluster::shards::NUM_SHARDS as u16 {
-                                        let assignment = table.target_assignment(shard);
-                                        if assignment.master != self_id
-                                            || engine.shard_record_count(shard) == 0
-                                        {
-                                            continue;
-                                        }
-                                        for replica in &assignment.replicas {
-                                            if *replica == self_id
-                                                || !view.contains_key(replica)
-                                                || full.contains(&(*replica, shard))
+                                    (0..crate::cluster::shards::NUM_SHARDS as u16)
+                                        .filter_map(|shard| {
+                                            let assignment = table.target_assignment(shard);
+                                            if assignment.master != self_id
+                                                || engine.shard_record_count(shard) == 0
                                             {
-                                                continue;
-                                            }
-                                            if signaled < UNDER_REPLICATION_SWEEP_MAX_SHARDS {
-                                                missing.entry(*replica).or_default().push(shard);
-                                                signaled += 1;
+                                                None
                                             } else {
-                                                dropped += 1;
+                                                Some((shard, assignment.replicas.clone()))
                                             }
-                                        }
-                                    }
-                                }
-                                if signaled > 0 || dropped > 0 {
+                                        })
+                                        .collect()
+                                };
+                                let (missing, signaled, dropped, dead_skipped) =
+                                    derive_under_replication_resyncs(
+                                        &view,
+                                        &alive,
+                                        self_id,
+                                        &mastered_nonempty,
+                                        UNDER_REPLICATION_SWEEP_MAX_SHARDS,
+                                    );
+                                if signaled > 0 || dropped > 0 || dead_skipped > 0 {
                                     tracing::info!(
                                         signaled,
                                         dropped,
+                                        dead_skipped,
                                         replicas = missing.len(),
                                         "cluster: under-replication sweep signaling resyncs                                          (dropped remainder re-derived next sweep)",
                                     );
@@ -13318,6 +13385,155 @@ pub(crate) fn new_test_running_cluster(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sweep_entry(shard: u16, last_applied_seq: u64) -> PartitionVersionEntry {
+        PartitionVersionEntry {
+            shard,
+            flags: 0,
+            replica_count: 0,
+            last_applied_seq,
+            manifest_digest: 0,
+            max_generation: 0,
+        }
+    }
+
+    /// Base sweep contract: a replica that reported in the exchange view
+    /// but shows no data for a mastered non-empty shard gets a resync
+    /// signal.
+    #[test]
+    fn sweep_signals_resync_for_reported_dataless_replica() {
+        let master = NodeId(1);
+        let replica = NodeId(2);
+        let mut view = std::collections::HashMap::new();
+        view.insert(replica, vec![sweep_entry(7, 0)]);
+        let alive: std::collections::HashSet<NodeId> = [master, replica].into_iter().collect();
+        let mastered = vec![(7u16, vec![replica])];
+
+        let (missing, signaled, dropped, dead_skipped) =
+            derive_under_replication_resyncs(&view, &alive, master, &mastered, 1024);
+
+        assert_eq!(
+            missing.get(&replica).map(|s| s.as_slice()),
+            Some(&[7u16][..]),
+            "dataless reported replica must be signaled for the shard",
+        );
+        assert_eq!(signaled, 1);
+        assert_eq!(dropped, 0);
+        assert_eq!(dead_skipped, 0);
+    }
+
+    /// A replica whose exchange report shows data for the shard is healthy
+    /// — no signal.
+    #[test]
+    fn sweep_skips_replica_with_data() {
+        let master = NodeId(1);
+        let replica = NodeId(2);
+        let mut view = std::collections::HashMap::new();
+        view.insert(replica, vec![sweep_entry(7, 42)]);
+        let alive: std::collections::HashSet<NodeId> = [master, replica].into_iter().collect();
+        let mastered = vec![(7u16, vec![replica])];
+
+        let (missing, signaled, dropped, dead_skipped) =
+            derive_under_replication_resyncs(&view, &alive, master, &mastered, 1024);
+
+        assert!(missing.is_empty(), "replica with data must not be signaled");
+        assert_eq!(signaled, 0);
+        assert_eq!(dropped, 0);
+        assert_eq!(dead_skipped, 0);
+    }
+
+    /// A replica that never reported in the exchange is unreachable at the
+    /// replication layer — the sweep has no evidence to act on and must
+    /// not signal it.
+    #[test]
+    fn sweep_skips_replica_absent_from_view() {
+        let master = NodeId(1);
+        let replica = NodeId(2);
+        let view: std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>> =
+            std::collections::HashMap::new();
+        let alive: std::collections::HashSet<NodeId> = [master, replica].into_iter().collect();
+        let mastered = vec![(7u16, vec![replica])];
+
+        let (missing, signaled, dropped, dead_skipped) =
+            derive_under_replication_resyncs(&view, &alive, master, &mastered, 1024);
+
+        assert!(missing.is_empty());
+        assert_eq!(signaled, 0);
+        assert_eq!(dropped, 0);
+        assert_eq!(dead_skipped, 0);
+    }
+
+    /// Dead-peer guard (the 04/10 regression suspect): a replica still
+    /// present in the RETAINED exchange view — it reported before dying —
+    /// but currently SWIM-dead must NOT be signaled. Every 20s resync
+    /// toward a black hole ties up the replication manager's connection
+    /// pool in retries exactly when the cluster is already degraded; the
+    /// retained view deliberately survives peer death, so liveness has to
+    /// be re-checked at signal time. The skip is counted, never silent.
+    #[test]
+    fn sweep_never_signals_a_swim_dead_replica() {
+        let master = NodeId(1);
+        let replica = NodeId(2);
+        let mut view = std::collections::HashMap::new();
+        view.insert(replica, vec![sweep_entry(7, 0)]);
+        // SWIM says the replica is gone; only the master itself is alive.
+        let alive: std::collections::HashSet<NodeId> = [master].into_iter().collect();
+        let mastered = vec![(7u16, vec![replica])];
+
+        let (missing, signaled, dropped, dead_skipped) =
+            derive_under_replication_resyncs(&view, &alive, master, &mastered, 1024);
+
+        assert!(
+            missing.is_empty(),
+            "a SWIM-dead replica must never receive a resync signal",
+        );
+        assert_eq!(signaled, 0);
+        assert_eq!(dropped, 0);
+        assert_eq!(
+            dead_skipped, 1,
+            "the dead-peer skip must be counted so the log line surfaces it",
+        );
+    }
+
+    /// The per-sweep cap stops signaling but counts what it drops — the
+    /// remainder is re-derived next sweep and must never vanish silently.
+    #[test]
+    fn sweep_cap_counts_dropped_candidates() {
+        let master = NodeId(1);
+        let replica = NodeId(2);
+        let mut view = std::collections::HashMap::new();
+        view.insert(replica, vec![sweep_entry(3, 0), sweep_entry(9, 0)]);
+        let alive: std::collections::HashSet<NodeId> = [master, replica].into_iter().collect();
+        let mastered = vec![(3u16, vec![replica]), (9u16, vec![replica])];
+
+        let (missing, signaled, dropped, dead_skipped) =
+            derive_under_replication_resyncs(&view, &alive, master, &mastered, 1);
+
+        assert_eq!(signaled, 1);
+        assert_eq!(dropped, 1);
+        assert_eq!(dead_skipped, 0);
+        let total: usize = missing.values().map(|s| s.len()).sum();
+        assert_eq!(total, 1, "cap must bound the signaled set");
+    }
+
+    /// Self never signals itself, even when the assignment lists it as a
+    /// replica of its own mastered shard.
+    #[test]
+    fn sweep_skips_self_replica() {
+        let master = NodeId(1);
+        let mut view = std::collections::HashMap::new();
+        view.insert(master, vec![sweep_entry(7, 0)]);
+        let alive: std::collections::HashSet<NodeId> = [master].into_iter().collect();
+        let mastered = vec![(7u16, vec![master])];
+
+        let (missing, signaled, dropped, dead_skipped) =
+            derive_under_replication_resyncs(&view, &alive, master, &mastered, 1024);
+
+        assert!(missing.is_empty());
+        assert_eq!(signaled, 0);
+        assert_eq!(dropped, 0);
+        assert_eq!(dead_skipped, 0);
+    }
 
     /// Fix D: a `ReplicaAck::Error` payload on a STATUS_ERROR migration-batch
     /// response is decoded to its REAL message, not the bogus `code=1` the
