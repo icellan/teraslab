@@ -1519,6 +1519,18 @@ pub(crate) fn handle_request(
             // exact-entry list with `record_count > 0` is not evidence of
             // anything — the receiver must still verify via the SHA-256 manifest
             // (H3 safety requirement).
+            // EPOCH-CURRENCY, hoisted above the exact-entry loop because the
+            // per-key generation acceptance depends on it (see
+            // `forward_completion_generation_ok`); the count decision below
+            // reuses the same value. Pure read of the active table version.
+            let completion_epoch_current = if let Some(cluster) = cluster {
+                let shard_table = cluster.shard_table();
+                let table = shard_table.read();
+                migration_epoch > 0 && migration_epoch == table.version
+            } else {
+                false
+            };
+
             let exact_entries_verified = if let Some(entries) = source_entries.as_ref()
                 && !entries.is_empty()
                 && entries.len() as u64 == expected_records
@@ -1564,14 +1576,19 @@ pub(crate) fn handle_request(
                     let generation_ok = if is_heal_completion {
                         actual_generation >= *expected_generation
                     } else {
-                        actual_generation == *expected_generation
+                        forward_completion_generation_ok(
+                            actual_generation,
+                            *expected_generation,
+                            completion_epoch_current,
+                        )
                     };
                     if !generation_ok {
                         return error_response(
                             request.request_id,
                             ERR_MIGRATION_IN_PROGRESS,
                             &format!(
-                                "shard {shard} generation mismatch for {:?}: expected {}, got {}",
+                                "shard {shard} generation mismatch for {:?}: expected {}, got {} \
+                                 (epoch_current={completion_epoch_current})",
                                 key, expected_generation, actual_generation,
                             ),
                         );
@@ -1607,15 +1624,8 @@ pub(crate) fn handle_request(
             //
             // A legacy no-epoch completion (epoch == 0) cannot be proven current
             // and is treated as not-current → strict.
-            let completion_epoch_current = if let Some(cluster) = cluster {
-                let shard_table = cluster.shard_table();
-                let table = shard_table.read();
-                migration_epoch > 0 && migration_epoch == table.version
-            } else {
-                false
-            };
-
             // Count decision (Fix B — accept a VERIFIED, EPOCH-CURRENT superset).
+            // (`completion_epoch_current` computed above the exact-entry loop.)
             //
             //   * expected_records == 0: a CURRENT-epoch source that streamed
             //     ZERO records (empty snapshot / stale re-attempt) is allowed to
@@ -1710,7 +1720,13 @@ pub(crate) fn handle_request(
                         request.request_id,
                         ERR_MIGRATION_MANIFEST_MISMATCH,
                         &format!(
-                            "shard {shard} manifest hash mismatch (count matched at {actual} records but content differs)",
+                            "shard {shard} manifest hash mismatch (count matched at {actual} \
+                             records but content differs; exact_entries={}, expected={expected_records}, \
+                             epoch_current={completion_epoch_current})",
+                            source_entries
+                                .as_ref()
+                                .map(|e| e.len().to_string())
+                                .unwrap_or_else(|| "absent".to_string()),
                         ),
                     );
                 }
@@ -9746,6 +9762,36 @@ fn handle_preserve_until_batch(
     }
 
     batch_response_with_outcome(req.request_id, &errors, repl_outcome)
+}
+
+/// Per-key generation acceptance for a FORWARD migration completion's
+/// exact-entry verify.
+///
+/// `actual` is the target's local generation for the key; `expected` is the
+/// source's fence-time generation.
+///
+/// * Exact match — always accepted.
+/// * Target AHEAD (wrapping-serial order, [`crate::record::generation_target_ahead`]):
+///   accepted iff the completion is EPOCH-CURRENT. During overlapping
+///   current-epoch migrations (a scale-up re-placement streams one shard
+///   from several holders, and a transiently divergent second master
+///   replicates into this holder with no fence check on the replica-apply
+///   path), the target legitimately receives NEWER current-epoch writes
+///   for a key AFTER the source's fence froze its manifest — the fence
+///   point is a LOWER bound on the target's final state, not the final
+///   word. Accepting ahead-ness loses nothing (every source key is present
+///   at >= its fence generation; the newer state is exactly what
+///   post-commit serving must expose) and unwedges the completion-retry
+///   livelock (observed: 638 rejected completions on one shard in
+///   scenario 06 while a concurrent writer kept the target perpetually one
+///   write ahead, ending in mass phantom-mastership relinquish and
+///   masters=3072/4096). A NON-epoch-current completion keeps strict
+///   equality: its "ahead" target may hold writes from a NEWER plan this
+///   stale source knows nothing about (#29 anti-stale-serving).
+/// * Target BEHIND: always rejected — a genuine un-applied source record.
+fn forward_completion_generation_ok(actual: u32, expected: u32, epoch_current: bool) -> bool {
+    actual == expected
+        || (epoch_current && crate::record::generation_target_ahead(expected, actual))
 }
 
 fn handle_delete_batch(
@@ -29348,6 +29394,26 @@ mod tests {
         assert_eq!(resp.status, STATUS_PARTIAL_ERROR);
         assert_eq!(after_succ - before_succ, 1, "freezes_succeeded += 1");
         assert_eq!(after_fail - before_fail, 1, "freezes_failed += 1");
+    }
+
+    #[test]
+    fn forward_completion_generation_acceptance_matrix_holds() {
+        // Exact match: accepted regardless of epoch currency.
+        assert!(forward_completion_generation_ok(7, 7, true));
+        assert!(forward_completion_generation_ok(7, 7, false));
+        // Target AHEAD: only an epoch-current completion may accept — the
+        // extra generations are newer current-epoch writes delivered after
+        // the source's fence froze its manifest.
+        assert!(forward_completion_generation_ok(8, 7, true));
+        assert!(!forward_completion_generation_ok(8, 7, false));
+        // Target BEHIND: never — a genuine un-applied source record.
+        assert!(!forward_completion_generation_ok(6, 7, true));
+        assert!(!forward_completion_generation_ok(6, 7, false));
+        // Wrapping-serial ordering, not plain integer compare: a target
+        // just past the wrap is AHEAD of a source near u32::MAX...
+        assert!(forward_completion_generation_ok(1, u32::MAX, true));
+        // ...and a target near u32::MAX is BEHIND a source past the wrap.
+        assert!(!forward_completion_generation_ok(u32::MAX, 1, true));
     }
 
     #[test]

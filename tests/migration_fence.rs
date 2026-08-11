@@ -124,6 +124,12 @@ fn create_node(node_id: u64, seed_swim_ports: &[u16], rf: u8) -> TestNode {
         reverse_heal_online: false,
         heal_deadline: Duration::from_secs(300),
         heal_deadline_action: teraslab::config::HealDeadlineAction::AlertAndHold,
+        // Deterministic fence choreography: the armed election/sweep would
+        // add background term churn these tests do not model (same posture
+        // as cluster_tcp / g8_cluster_id, unlike the armed proving-ground
+        // suites).
+        committed_master_election_enabled: false,
+        under_replication_sweep_enabled: false,
     };
 
     let coordinator = ClusterCoordinator::new(cluster_config, 1);
