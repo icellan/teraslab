@@ -207,6 +207,7 @@ async fn run_scenario() -> Result<(), ClientError> {
             cluster_refresh_interval: Duration::from_secs(300),
             max_redirects: 0,
             addr_map: std::collections::HashMap::new(),
+            cluster_secret: common::docker_cluster_secret()?,
             ..Default::default()
         };
         // The connection to node3 may fail outright (if node3 is refusing connections)
@@ -267,6 +268,7 @@ async fn run_scenario() -> Result<(), ClientError> {
                     cluster_refresh_interval: Duration::from_secs(300),
                     max_redirects: 0,
                     addr_map: std::collections::HashMap::new(),
+                    cluster_secret: common::docker_cluster_secret()?,
                     ..Default::default()
                 };
                 let rejected = match Client::new(retry_config).await {
@@ -649,6 +651,7 @@ async fn run_scenario() -> Result<(), ClientError> {
             cluster_refresh_interval: Duration::from_secs(30),
             max_redirects: 5,
             addr_map: docker.docker_addr_map(),
+            cluster_secret: common::docker_cluster_secret()?,
             ..Default::default()
         };
         let client = Client::new(slow_config).await?;

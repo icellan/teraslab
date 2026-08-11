@@ -79,6 +79,21 @@ pub fn docker_5node(scenario_id: u16) -> DockerHelpers {
     DockerHelpers::new(&compose_dir(), scenario_id, 5)
 }
 
+/// Cluster secret for the test client when the docker HMAC opt-in
+/// (`TERASLAB_DOCKER_CLUSTER_SECRET=1`) is armed; `None` on the default
+/// trusted-overlay path. Resolves from the same env var and constant the
+/// config generator uses, so the client always signs with exactly the
+/// secret `render_node_config` wrote into every node config. Every
+/// `ClientConfig` built by the docker scenarios must set `cluster_secret`
+/// from this — an unsigned client against secret-configured nodes fails
+/// its partition-map bootstrap with `ERR_CLUSTER_AUTH_FAILED`.
+pub fn docker_cluster_secret() -> Result<Option<Vec<u8>>, ClientError> {
+    Ok(
+        teraslab_test_client::helpers::docker_cluster_secret_from_env()?
+            .map(|s| s.as_bytes().to_vec()),
+    )
+}
+
 /// Create a Client connected to N nodes via host port mapping, using ports
 /// derived from the given DockerHelpers instance.
 pub async fn create_client(
@@ -92,6 +107,7 @@ pub async fn create_client(
         cluster_refresh_interval: Duration::from_secs(30),
         max_redirects: 3,
         addr_map: docker.docker_addr_map(),
+        cluster_secret: docker_cluster_secret()?,
         ..Default::default()
     };
     Client::new(config).await
@@ -119,6 +135,7 @@ pub async fn create_client_subset(
         cluster_refresh_interval: Duration::from_secs(30),
         max_redirects: 3,
         addr_map: docker.docker_addr_map(),
+        cluster_secret: docker_cluster_secret()?,
         ..Default::default()
     };
     Client::new(config).await

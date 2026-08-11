@@ -935,6 +935,7 @@ async fn test_cascading_recovery() -> Result<(), ClientError> {
         cluster_refresh_interval: Duration::from_secs(30),
         max_redirects: 3,
         addr_map: docker.docker_addr_map(),
+        cluster_secret: common::docker_cluster_secret()?,
         ..Default::default()
     };
     let client_2node = Client::new(config_2node).await?;

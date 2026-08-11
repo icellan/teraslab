@@ -3,7 +3,7 @@ name: Nightly E2E
 # Surfaces the armed-qualification opt-ins in the run list so armed runs are
 # distinguishable from default-path runs at a glance. Scheduled runs have an
 # empty `inputs` context and render as plain "Nightly E2E".
-run-name: "Nightly E2E${{ inputs.arm_election && ' [armed: election]' || '' }}${{ inputs.arm_sweep && ' [armed: sweep]' || '' }}"
+run-name: "Nightly E2E${{ inputs.arm_election && ' [armed: election]' || '' }}${{ inputs.arm_sweep && ' [armed: sweep]' || '' }}${{ inputs.with_secret && ' [secret]' || '' }}"
 
 on:
   schedule:
@@ -17,6 +17,10 @@ on:
         default: false
       arm_sweep:
         description: "Arm under_replication_sweep_enabled in every generated docker node config"
+        type: boolean
+        default: false
+      with_secret:
+        description: "Emit the fixed TEST-ONLY cluster_secret into every generated docker node config (HMAC-authenticated mode; scheduled runs stay trusted-overlay)"
         type: boolean
         default: false
 
@@ -159,8 +163,13 @@ jobs:
           # and the generated configs keep both flags default-off.
           TERASLAB_DOCKER_COMMITTED_ELECTION: ${{ inputs.arm_election && '1' || '0' }}
           TERASLAB_DOCKER_UNDER_REPLICATION_SWEEP: ${{ inputs.arm_sweep && '1' || '0' }}
+          # HMAC-authenticated opt-in: '1' emits the fixed TEST-ONLY
+          # cluster_secret into every generated node config and makes the
+          # test client sign the auth-gated opcodes with it. Scheduled runs
+          # yield '0' and keep measuring the trusted-overlay default.
+          TERASLAB_DOCKER_CLUSTER_SECRET: ${{ inputs.with_secret && '1' || '0' }}
         run: |
-          echo "arming: election=${TERASLAB_DOCKER_COMMITTED_ELECTION} sweep=${TERASLAB_DOCKER_UNDER_REPLICATION_SWEEP}"
+          echo "arming: election=${TERASLAB_DOCKER_COMMITTED_ELECTION} sweep=${TERASLAB_DOCKER_UNDER_REPLICATION_SWEEP} secret=${TERASLAB_DOCKER_CLUSTER_SECRET}"
           ./run_all.sh --tier nightly
 
       - name: Collect logs on failure

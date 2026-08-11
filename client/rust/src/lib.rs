@@ -3051,6 +3051,15 @@ impl Client {
     /// test scenarios that need to bypass cluster routing (e.g., to read
     /// from a specific replica node with `FLAG_LOCAL_READ`).
     ///
+    /// When the client is configured with a `cluster_secret` and `op_code`
+    /// is one the server auth-gates (`is_inter_node_auth_opcode`), the frame
+    /// is HMAC-signed exactly like the partition-map refresh — otherwise a
+    /// raw `OP_ADMIN_CLUSTER_HEALTH`/`OP_ADMIN_DIAGNOSE_KEY` probe against a
+    /// secret-configured node is rejected with `ERR_CLUSTER_AUTH_FAILED`.
+    /// Non-gated opcodes are always sent unsigned: the server does not
+    /// verify (or strip) a tag on those frames, so signing them would
+    /// corrupt the request.
+    ///
     /// # Parameters
     ///
     /// - `addr`: The `host:port` address to connect to.
@@ -3060,7 +3069,8 @@ impl Client {
     ///
     /// # Errors
     ///
-    /// Returns [`ClientError::Connection`] if the connection or request fails.
+    /// Returns [`ClientError::Connection`] if the connection or request fails
+    /// (including a signing failure).
     pub async fn send_to_addr(
         &self,
         addr: &str,
@@ -3071,9 +3081,24 @@ impl Client {
         let dial_timeout = Duration::from_secs(5);
         let request_timeout = Duration::from_secs(30);
         let conn = crate::conn::PipeConn::dial(addr, dial_timeout, request_timeout).await?;
-        let resp = conn.round_trip(op_code, flags, payload).await?;
+        let resp = match self.cluster_secret.as_deref() {
+            Some(secret) if should_sign_raw_op(Some(secret), op_code) => {
+                conn.round_trip_signed(op_code, flags, payload, secret)
+                    .await?
+            }
+            _ => conn.round_trip(op_code, flags, payload).await?,
+        };
         Ok((resp.status, resp.payload))
     }
+}
+
+/// Whether a raw [`Client::send_to_addr`] frame must be HMAC-signed: a
+/// non-empty `cluster_secret` is configured AND the opcode is one the server
+/// auth-gates (`is_inter_node_auth_opcode`). The decision is per-opcode, not
+/// per-connection: the server only verifies (and strips) the tag on gated
+/// opcodes, so signing anything else would be decoded as trailing payload.
+fn should_sign_raw_op(secret: Option<&[u8]>, op_code: u16) -> bool {
+    secret.is_some_and(|s| !s.is_empty()) && is_inter_node_auth_opcode(op_code)
 }
 
 // ===========================================================================
@@ -3599,6 +3624,52 @@ mod tests {
             1024 * 1024,
             "default config threshold must be 1 MiB (no runtime change)"
         );
+    }
+
+    /// `Client::send_to_addr` signing decision: a configured `cluster_secret`
+    /// must sign exactly the auth-gated inter-node opcodes and nothing else.
+    /// Signing a non-gated opcode would append an HMAC tag the server decodes
+    /// as payload (corrupting the request), while NOT signing a gated opcode
+    /// against a secret-configured node gets `ERR_CLUSTER_AUTH_FAILED`.
+    #[test]
+    fn raw_send_signs_only_auth_gated_opcodes_with_secret() {
+        // The gated opcodes the docker harness sends raw via send_to_addr,
+        // plus OP_GET_NODE_HEIGHT as a representative of the rest of the
+        // is_inter_node_auth_opcode set.
+        for op in [
+            OP_GET_PARTITION_MAP,
+            OP_ADMIN_CLUSTER_HEALTH,
+            OP_ADMIN_DIAGNOSE_KEY,
+            OP_GET_NODE_HEIGHT,
+        ] {
+            assert!(
+                should_sign_raw_op(Some(b"secret"), op),
+                "gated op {op} must be signed when a secret is configured",
+            );
+            assert!(
+                !should_sign_raw_op(None, op),
+                "gated op {op} must stay unsigned without a secret (trusted overlay)",
+            );
+            assert!(
+                !should_sign_raw_op(Some(b""), op),
+                "gated op {op} must stay unsigned with an empty secret",
+            );
+        }
+
+        // Data-plane and liveness opcodes never sign, secret or not — the
+        // server does not verify (or strip) a tag on non-gated frames.
+        for op in [
+            OP_GET_BATCH,
+            OP_SPEND_BATCH,
+            OP_CREATE_BATCH,
+            OP_PING,
+            OP_HEARTBEAT,
+        ] {
+            assert!(
+                !should_sign_raw_op(Some(b"secret"), op),
+                "non-gated op {op} must never be signed",
+            );
+        }
     }
 
     #[test]

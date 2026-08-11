@@ -61,6 +61,14 @@ fn docker_migration_batch_size_from_env() -> Result<usize, ClientError> {
 const ENV_DOCKER_COMMITTED_ELECTION: &str = "TERASLAB_DOCKER_COMMITTED_ELECTION";
 const ENV_DOCKER_UNDER_REPLICATION_SWEEP: &str = "TERASLAB_DOCKER_UNDER_REPLICATION_SWEEP";
 
+// HMAC-authenticated opt-in: when set to 1/true, every generated node config
+// gets the fixed, public [`DOCKER_TEST_CLUSTER_SECRET`] and the test client
+// signs the auth-gated opcodes with the same value, so a dedicated CI run can
+// qualify the signed inter-node path without touching the trusted-overlay
+// shape scheduled nightlies measure. Shares `parse_docker_arming_flag` so a
+// typo fails the run loudly instead of silently measuring the default path.
+const ENV_DOCKER_CLUSTER_SECRET: &str = "TERASLAB_DOCKER_CLUSTER_SECRET";
+
 fn parse_docker_arming_flag(env_name: &str, raw: &str) -> Result<bool, String> {
     match raw.trim() {
         "" | "0" | "false" => Ok(false),
@@ -79,6 +87,24 @@ fn docker_arming_flag_from_env(env_name: &str) -> Result<bool, ClientError> {
             "{env_name} could not be read: {e}"
         ))),
     }
+}
+
+/// Resolve the docker HMAC opt-in: `Some(`[`DOCKER_TEST_CLUSTER_SECRET`]`)`
+/// when `TERASLAB_DOCKER_CLUSTER_SECRET` is `1`/`true`, `None` when it is
+/// unset/empty/`0`/`false` (the trusted-overlay default).
+///
+/// Both sides of the harness derive from this single call: the config
+/// generator emits the secret into every node TOML and the test clients set
+/// `ClientConfig::cluster_secret` to the same bytes, so the signed path is
+/// exercised end to end or not at all.
+///
+/// # Errors
+/// `ClientError::Connection` on any other value — a typo must fail the run
+/// loudly instead of silently qualifying the unauthenticated path (same
+/// contract as [`parse_docker_arming_flag`] for the arming flags).
+pub fn docker_cluster_secret_from_env() -> Result<Option<&'static str>, ClientError> {
+    Ok(docker_arming_flag_from_env(ENV_DOCKER_CLUSTER_SECRET)?
+        .then_some(DOCKER_TEST_CLUSTER_SECRET))
 }
 
 /// Per-scenario SWIM failure-detection timing: `(probe_interval_ms, suspicion_timeout_ms)`.
@@ -113,6 +139,19 @@ fn swim_timing_for_scenario(scenario_id: u16) -> (u32, u32) {
 /// test configs also set `enable_remote_bind = true`.
 pub const DOCKER_TEST_ADMIN_TOKEN: &str = "teraslab-docker-test-token";
 
+/// Fixed cluster secret for docker test nodes when the HMAC-authenticated
+/// mode is opted in via `TERASLAB_DOCKER_CLUSTER_SECRET=1`.
+///
+/// TEST-ONLY CREDENTIAL: this value is public by design, exactly like
+/// [`DOCKER_TEST_ADMIN_TOKEN`] — it only ever guards nodes reachable on the
+/// private per-scenario docker network and the loopback host port mapping.
+/// It is shared between the generated node configs ([`render_node_config`])
+/// and the test client ([`docker_cluster_secret_from_env`] →
+/// `ClientConfig::cluster_secret`), which HMAC-signs the auth-gated opcodes
+/// with it. 32 hex chars = 32 bytes as a raw TOML string, double the
+/// server's `ServerConfig::MIN_CLUSTER_SECRET_LEN` (16 bytes).
+pub const DOCKER_TEST_CLUSTER_SECRET: &str = "decafbaddecafbaddecafbaddecafbad";
+
 #[allow(clippy::too_many_arguments)]
 fn render_node_config(
     node_id: u32,
@@ -124,7 +163,46 @@ fn render_node_config(
     swim_suspicion_timeout_ms: u32,
     committed_master_election_enabled: bool,
     under_replication_sweep_enabled: bool,
+    cluster_secret: Option<&str>,
 ) -> String {
+    let cluster_secret_block = match cluster_secret {
+        // Trusted-overlay default: no secret. This is the shape every
+        // scheduled nightly measures.
+        None => "\
+# Intentionally NOT setting `cluster_secret`: the test client does not
+# HMAC-sign its frames, and `OP_GET_PARTITION_MAP` is an inter-node
+# opcode that gets auth_required when a secret is configured. The
+# default (no secret) is fail-open with a per-event warn — exactly
+# what we want for in-process docker integration tests. RF>1 also
+# emits a warn but accepts the config in non-strict mode.
+#
+# F-X-002 (production default flipped strict_auth to `true`): explicit
+# opt-out is required to keep the trusted-overlay shape this test
+# harness relies on. The daemon still emits a prominent boot-time
+# warn naming the opt-out so the audit trail surfaces the missing
+# secret.
+#
+# Opt in to the HMAC-authenticated shape with
+# TERASLAB_DOCKER_CLUSTER_SECRET=1 (workflow_dispatch: with_secret)."
+            .to_string(),
+        // HMAC-authenticated opt-in (TERASLAB_DOCKER_CLUSTER_SECRET=1).
+        Some(secret) => format!(
+            "\
+# HMAC-authenticated opt-in (TERASLAB_DOCKER_CLUSTER_SECRET=1): this is
+# the fixed, public DOCKER_TEST_CLUSTER_SECRET test credential — see its
+# doc comment; it only guards the private per-scenario docker network.
+# Every node and the test client share it, so inter-node frames AND the
+# client's auth-gated opcodes (OP_GET_PARTITION_MAP,
+# OP_ADMIN_CLUSTER_HEALTH, OP_ADMIN_DIAGNOSE_KEY, ...) are HMAC-signed
+# and verified end to end. With a secret configured, known cluster peers
+# become EXEMPT from max_connections_per_ip (REL-128), so migration
+# bursts stop counting against the per-IP cap; the default
+# migration_pool_size (48) stays below the cap (64) in either mode.
+# The `strict_auth = false` opt-out below stays pinned but is inert
+# here — runtime auth enforcement keys on secret presence.
+cluster_secret = \"{secret}\""
+        ),
+    };
     format!(
         r#"node_id = {node_id}
 listen_addr = "{node_ip}:3300"
@@ -158,18 +236,7 @@ enable_remote_bind = true
 # stuck at 2 nodes and every scenario fails at `wait_cluster_ready`.
 # 32 hex chars = 16 bytes — see `ServerConfig::resolved_cluster_id`.
 cluster_id = "ababababababababababababababab01"
-# Intentionally NOT setting `cluster_secret`: the test client does not
-# HMAC-sign its frames, and `OP_GET_PARTITION_MAP` is an inter-node
-# opcode that gets auth_required when a secret is configured. The
-# default (no secret) is fail-open with a per-event warn — exactly
-# what we want for in-process docker integration tests. RF>1 also
-# emits a warn but accepts the config in non-strict mode.
-#
-# F-X-002 (production default flipped strict_auth to `true`): explicit
-# opt-out is required to keep the trusted-overlay shape this test
-# harness relies on. The daemon still emits a prominent boot-time
-# warn naming the opt-out so the audit trail surfaces the missing
-# secret.
+{cluster_secret_block}
 strict_auth = false
 # Register the /admin/* and /debug/* HTTP routes the test harness polls
 # (/admin/migration_status, /debug/redo, /admin/quiesce, ...). Without
@@ -465,6 +532,7 @@ services:
             docker_arming_flag_from_env(ENV_DOCKER_COMMITTED_ELECTION)?;
         let under_replication_sweep_enabled =
             docker_arming_flag_from_env(ENV_DOCKER_UNDER_REPLICATION_SWEEP)?;
+        let cluster_secret = docker_cluster_secret_from_env()?;
         let (swim_probe_interval_ms, swim_suspicion_timeout_ms) =
             swim_timing_for_scenario(self.scenario_id);
 
@@ -489,6 +557,7 @@ services:
                 swim_suspicion_timeout_ms,
                 committed_master_election_enabled,
                 under_replication_sweep_enabled,
+                cluster_secret,
             );
 
             let path = format!("{config_dir}/ts{:02}-node{n}.toml", self.scenario_id);
@@ -1000,6 +1069,24 @@ mod tests {
         assert!(err.contains("armed"), "err must echo the bad value: {err}");
     }
 
+    /// The HMAC opt-in env var shares the arming-flag parser, so it inherits
+    /// the same contract: default off on empty, 1/true/0/false accepted, and
+    /// a typo fails the run loudly (echoing the env name and the bad value)
+    /// instead of silently measuring the unauthenticated path.
+    #[test]
+    fn docker_cluster_secret_flag_parse_mirrors_arming_flags() {
+        assert!(!parse_docker_arming_flag(ENV_DOCKER_CLUSTER_SECRET, "").unwrap());
+        assert!(!parse_docker_arming_flag(ENV_DOCKER_CLUSTER_SECRET, "   ").unwrap());
+        assert!(parse_docker_arming_flag(ENV_DOCKER_CLUSTER_SECRET, "1").unwrap());
+        assert!(parse_docker_arming_flag(ENV_DOCKER_CLUSTER_SECRET, "true").unwrap());
+        assert!(!parse_docker_arming_flag(ENV_DOCKER_CLUSTER_SECRET, "0").unwrap());
+        assert!(!parse_docker_arming_flag(ENV_DOCKER_CLUSTER_SECRET, "false").unwrap());
+
+        let err = parse_docker_arming_flag(ENV_DOCKER_CLUSTER_SECRET, "hmac").unwrap_err();
+        assert!(err.contains(ENV_DOCKER_CLUSTER_SECRET), "err was: {err}");
+        assert!(err.contains("hmac"), "err must echo the bad value: {err}");
+    }
+
     #[test]
     fn node_config_contains_configured_migration_tuning() {
         let config = render_node_config(
@@ -1012,6 +1099,7 @@ mod tests {
             1000,
             false,
             false,
+            None,
         );
 
         assert!(config.contains("node_id = 2"));
@@ -1043,6 +1131,7 @@ mod tests {
             5000,
             false,
             false,
+            None,
         );
         assert!(
             disarmed.contains("committed_master_election_enabled = false"),
@@ -1063,6 +1152,7 @@ mod tests {
             5000,
             true,
             true,
+            None,
         );
         let cfg: ServerConfig = toml::from_str(&armed)
             .expect("armed docker node config must be a valid ServerConfig TOML payload");
@@ -1076,6 +1166,87 @@ mod tests {
         );
         cfg.validate_safe_defaults()
             .expect("armed docker node config must still pass safe-defaults validation");
+    }
+
+    /// HMAC opt-in (TERASLAB_DOCKER_CLUSTER_SECRET): the default render must
+    /// stay trusted-overlay (NO `cluster_secret` key — the shape every
+    /// scheduled nightly measures), and the opted-in render must emit exactly
+    /// the fixed TEST-ONLY secret AND survive the `ServerConfig` round-trip
+    /// plus safe-defaults gate — a secret-mode TOML the daemon refuses to
+    /// boot would fail every scenario at `wait_cluster_ready`.
+    #[test]
+    fn node_config_emits_cluster_secret_only_when_requested() {
+        use teraslab::config::ServerConfig;
+
+        let trusted = render_node_config(
+            1,
+            "172.38.0.11",
+            "\"172.38.0.12:3301\", \"172.38.0.13:3301\"",
+            48,
+            1000,
+            200,
+            5000,
+            false,
+            false,
+            None,
+        );
+        let cfg: ServerConfig = toml::from_str(&trusted)
+            .expect("trusted-overlay docker node config must be a valid ServerConfig TOML payload");
+        assert!(
+            cfg.cluster_secret.is_none(),
+            "default render must stay trusted-overlay: no cluster_secret key",
+        );
+
+        let secured = render_node_config(
+            1,
+            "172.38.0.11",
+            "\"172.38.0.12:3301\", \"172.38.0.13:3301\"",
+            48,
+            1000,
+            200,
+            5000,
+            false,
+            false,
+            Some(DOCKER_TEST_CLUSTER_SECRET),
+        );
+        let cfg: ServerConfig = toml::from_str(&secured)
+            .expect("secret-mode docker node config must be a valid ServerConfig TOML payload");
+        let secret = cfg
+            .cluster_secret
+            .clone()
+            .expect("secret-mode render must emit a cluster_secret");
+        assert_eq!(
+            secret.as_str(),
+            DOCKER_TEST_CLUSTER_SECRET,
+            "emitted secret must be the fixed test-only constant the client signs with",
+        );
+        cfg.validate_safe_defaults().expect(
+            "secret-mode docker node config must pass safe-defaults validation \
+             (secret length, cluster_id pairing)",
+        );
+    }
+
+    /// The fixed docker secret must keep its test-only shape: 32+ hex chars
+    /// (obviously non-production, greppable) and long enough for the server's
+    /// minimum-entropy gate so a secret-mode node actually boots.
+    #[test]
+    fn docker_test_cluster_secret_is_test_only_shaped() {
+        use teraslab::config::ServerConfig;
+
+        assert!(
+            DOCKER_TEST_CLUSTER_SECRET.len() >= 32,
+            "test cluster secret must be at least 32 chars",
+        );
+        assert!(
+            DOCKER_TEST_CLUSTER_SECRET
+                .chars()
+                .all(|c| c.is_ascii_hexdigit()),
+            "test cluster secret must be hex chars only",
+        );
+        assert!(
+            DOCKER_TEST_CLUSTER_SECRET.len() >= ServerConfig::MIN_CLUSTER_SECRET_LEN,
+            "test cluster secret must satisfy the server's minimum secret length",
+        );
     }
 
     /// W0.4: aggressive SWIM timing only where failure-detection speed is
@@ -1121,6 +1292,7 @@ mod tests {
             5000,
             false,
             false,
+            None,
         );
         let cfg: ServerConfig = toml::from_str(&rendered)
             .expect("rendered docker node config must be a valid ServerConfig TOML payload");
