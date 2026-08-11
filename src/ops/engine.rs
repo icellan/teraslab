@@ -6309,11 +6309,30 @@ impl Engine {
     ///
     /// Inherits `read_cold_data`'s g2 concurrency contract: barrier-dependent,
     /// no per-record `io_locks()` coverage of the cold-data read.
+    ///
+    /// Cold data is CLIENT-OPAQUE unless it parses as the extended
+    /// input/output layout: the create path stores bytes this parser cannot
+    /// read (`parse_cold_data_fields` is best-effort), so an unparseable
+    /// child never had recorded parent linkage to prune — treated as "no
+    /// parents", exactly like the conflicting-child propagation path's
+    /// handling of the same parse. Hard-failing here instead made every
+    /// opaque-cold-data record permanently UN-DELETABLE (the client delete
+    /// surfaced STORAGE_IO — Docker scenario 11.6). Genuine corruption of a
+    /// real extended layout is caught by the record CRC before this parse.
     pub fn parent_txids_for_child(&self, child_key: &TxKey) -> Result<Vec<[u8; 32]>, SpendError> {
         let cold_bytes = self.read_cold_data(child_key)?;
-        extract_parent_txids_from_cold_data(&cold_bytes).map_err(|err| SpendError::StorageError {
-            detail: format!("parse child parent txids: {err}"),
-        })
+        match extract_parent_txids_from_cold_data(&cold_bytes) {
+            Ok(parents) => Ok(parents),
+            Err(err) => {
+                tracing::warn!(
+                    ?child_key,
+                    err,
+                    "delete parent-prune: cold data is not the extended layout; \
+                     no parents to prune"
+                );
+                Ok(Vec::new())
+            }
+        }
     }
 
     /// Find parent UTXO slots currently spent by `child_txid`.

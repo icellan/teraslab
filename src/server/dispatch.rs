@@ -10162,6 +10162,20 @@ fn handle_delete_batch(
     // encoding stays in ascending item order regardless of which phase failed.
     errors.sort_by_key(|e| e.item_index);
 
+    // The per-item error_data strings never reach client-side scenario
+    // output (PartialError shows codes only), so a delete failure was
+    // undiagnosable from CI artifacts — name the first one here.
+    if let Some(first) = errors.first() {
+        tracing::warn!(
+            failed = errors.len(),
+            total = total_items,
+            first_item = first.item_index,
+            first_code = first.error_code,
+            first_error = %String::from_utf8_lossy(&first.error_data),
+            "delete batch: item error(s)"
+        );
+    }
+
     let failed_total = errors.len() as u64;
     let succeeded_total = total_items
         .saturating_sub(failed_total)

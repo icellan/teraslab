@@ -34,9 +34,9 @@ use teraslab::protocol::codec::{
 };
 use teraslab::protocol::frame::{RequestFrame, ResponseFrame};
 use teraslab::protocol::opcodes::{
-    FLAG_LOCAL_READ, OP_CREATE_BATCH, OP_DELETE_BATCH, OP_GET_BATCH, OP_PRESERVE_UNTIL_BATCH,
-    OP_PROCESS_EXPIRED_PRESERVATIONS, OP_SET_CONFLICTING_BATCH, OP_SET_MINED_BATCH, OP_SPEND_BATCH,
-    STATUS_OK,
+    CREATE_FLAG_EXTERNAL_BLOB, FLAG_LOCAL_READ, OP_CREATE_BATCH, OP_DELETE_BATCH, OP_GET_BATCH,
+    OP_PRESERVE_UNTIL_BATCH, OP_PROCESS_EXPIRED_PRESERVATIONS, OP_SET_CONFLICTING_BATCH,
+    OP_SET_MINED_BATCH, OP_SPEND_BATCH, STATUS_OK,
 };
 use teraslab::redo::RedoLog;
 use teraslab::replication::manager::AckPolicy;
@@ -134,13 +134,22 @@ fn create_cluster_node_with_ack_policy(
 
     let dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(32 * 1024 * 1024, 4096).unwrap());
     let seg = SegmentAllocator::new(dev.clone(), TEST_SEGMENT_SIZE).unwrap();
-    let engine = Arc::new(Engine::new(
+    let mut engine = Engine::new(
         dev,
         Index::new(1000).unwrap(),
         seg,
         StripedLocks::new(256),
         DahIndex::new(),
-    ));
+    );
+    // Production always configures a blob store; without one the EXTERNAL
+    // (pre-uploaded cold_data) create/delete paths would be untestable here.
+    // The SAME store must reach both the engine (replica-op read-back) and
+    // the Server (dispatch's create/delete external checks) — they are
+    // plumbed separately, exactly as bin/server.rs wires one store to both.
+    let blob_store: Arc<dyn teraslab::storage::blobstore::BlobStore> =
+        Arc::new(teraslab::storage::blobstore::MemoryBlobStore::new());
+    engine.set_blob_store(blob_store.clone());
+    let engine = Arc::new(engine);
     // Deletion tombstones ON, matching what these nodes get in production:
     // `ReverseHealConfig::tombstones_enabled` defaults to ON for a clustered
     // node (RF > 1), and RF is 2 here. Without this the sweep would run with
@@ -208,7 +217,11 @@ fn create_cluster_node_with_ack_policy(
         strict_auth: false,
         ..Default::default()
     };
-    let server = Arc::new(Server::new(engine.clone(), config).with_cluster(running.clone()));
+    let server = Arc::new(
+        Server::new(engine.clone(), config)
+            .with_cluster(running.clone())
+            .with_blob_store(blob_store),
+    );
     let server_clone = server.clone();
     std::thread::spawn(move || {
         let _ = server_clone.run();
@@ -1689,5 +1702,97 @@ fn ineligible_preservation_expiry_clears_the_preservation_on_every_holder() {
         "after the preservation cleared and the record became all-spent, its fresh DAH \
          must reclaim it on every holder: {}",
         survivors.join(" | ")
+    );
+}
+
+/// Scenario 11.6 (Docker) repro: a replicated client delete of an EXTERNAL
+/// record — cold_data pre-uploaded to the master's blob store, the wire item
+/// carrying `CREATE_FLAG_EXTERNAL_BLOB` with no inline bytes — must succeed
+/// and remove the record from every holder. Replicas legitimately hold the
+/// record WITHOUT a local blob (blob replication is deferred by design), so
+/// nothing on the delete path may treat a missing blob as an error.
+#[test]
+fn client_delete_removes_an_external_record_from_every_holder() {
+    let node1 = create_cluster_node(871, &[]);
+    let seed_ports = [node1.swim_port];
+    let node2 = create_cluster_node(872, &seed_ports);
+    let node3 = create_cluster_node(873, &seed_ports);
+    let nodes = [&node1, &node2, &node3];
+    wait_for_settled_three_node_topology(&nodes);
+
+    let seed = owned_seeds(&node1, 1)[0];
+    let txid = make_txid(seed);
+
+    // Pre-upload the blob to the MASTER's store, exactly as the production
+    // client does before an external create.
+    node1
+        .engine
+        .blob_store()
+        .expect("fixture engines carry a blob store")
+        .put(&txid, &vec![0xAB; 64 * 1024])
+        .expect("blob upload");
+
+    let item = WireCreateItem {
+        txid,
+        tx_version: 2,
+        locktime: 0,
+        fee: 1000,
+        size_in_bytes: 64 * 1024,
+        extended_size: 0,
+        is_coinbase: false,
+        spending_height: 0,
+        created_at: 1700000000000,
+        flags: CREATE_FLAG_EXTERNAL_BLOB,
+        utxo_hashes: vec![utxo_hash_for(seed)],
+        cold_data: vec![],
+        block_height: 0,
+        mined_block_id: None,
+        mined_block_height: None,
+        mined_subtree_idx: None,
+        parent_txids: vec![],
+    };
+    let resp = request_at(
+        node1.tcp_port,
+        OP_CREATE_BATCH,
+        0,
+        encode_create_batch(&[item]),
+    );
+    assert_eq!(
+        resp.status,
+        STATUS_OK,
+        "external create must be accepted (status {}, payload {:?})",
+        resp.status,
+        &resp.payload[..resp.payload.len().min(64)],
+    );
+
+    let holders = local_holders(&nodes, &txid);
+    assert_eq!(
+        holders.len(),
+        2,
+        "external record must be on exactly 2 nodes before the delete, found {holders:?}"
+    );
+
+    let resp = request_at(
+        node1.tcp_port,
+        OP_DELETE_BATCH,
+        0,
+        encode_txid_batch(&[txid], &[]),
+    );
+    let delete_status = resp.status;
+    let after = local_holders(&nodes, &txid);
+
+    shutdown_node(&node1);
+    shutdown_node(&node2);
+    shutdown_node(&node3);
+
+    assert_eq!(
+        delete_status,
+        STATUS_OK,
+        "external delete must be accepted, not partial (status {delete_status}, payload {:?})",
+        String::from_utf8_lossy(&resp.payload[..resp.payload.len().min(200)]),
+    );
+    assert!(
+        after.is_empty(),
+        "deleted external record still present on nodes {after:?}"
     );
 }
