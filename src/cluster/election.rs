@@ -712,6 +712,43 @@ pub fn assignment_master_count_alerts_total() -> u64 {
     ASSIGNMENT_MASTER_COUNT_ALERTS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// §7 — serving-side fences raised (shards withheld from service with a
+/// concrete pull source). Read via [`serving_fence_raised_total`].
+static SERVING_FENCE_RAISED_TOTAL: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// §7 (P0-4) — fence conditions that held with NO nameable pull source, so
+/// the node alerted and SERVED instead of fencing. Read via
+/// [`serving_fence_no_source_alerts_total`].
+static SERVING_FENCE_NO_SOURCE_ALERTS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// §7 — shards the serving-side fence withheld from service, cumulatively
+/// across activations. Each raise names a concrete pull source (the previous
+/// committed master); the clearing edge is the completion handshake or the
+/// node's own provenance at the next activation.
+pub fn serving_fence_raised_total() -> u64 {
+    SERVING_FENCE_RAISED_TOTAL.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// §7 (P0-4) — shards whose fence condition held with no concrete source to
+/// pull from: the node alerted and served. A climbing counter means committed
+/// unproven bits (or missing provenance) with nothing to repair from — an
+/// operator signal, never a refusal.
+pub fn serving_fence_no_source_alerts_total() -> u64 {
+    SERVING_FENCE_NO_SOURCE_ALERTS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Count `n` §7 serving fences raised (coordinator activation path).
+pub(crate) fn note_serving_fences_raised(n: u64) {
+    SERVING_FENCE_RAISED_TOTAL.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Count `n` §7 no-source alert-and-serve events (coordinator activation path).
+pub(crate) fn note_serving_fence_no_source_alerts(n: u64) {
+    SERVING_FENCE_NO_SOURCE_ALERTS.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// The canonical assignment encoding: a fixed [`NUM_SHARDS`] array of u16
 /// indices into `members` **as received**, little-endian. 8 KiB exactly,
 /// never length-prefixed — a length field is one more thing a sender can lie

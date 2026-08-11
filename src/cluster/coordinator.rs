@@ -2050,9 +2050,13 @@ impl ClusterCoordinator {
         let fenced_bitmap = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
         let inbound_atomic = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
         let migrating_bitmap = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+        // §7 — serving-side fence bitmap (committed master election). Only
+        // ever populated when `committed_master_election_enabled`.
+        let serving_fence = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
         let fenced_bm_event = fenced_bitmap.clone();
         let migrating_bm_event = migrating_bitmap.clone();
         let inbound_bm_event = inbound_atomic.clone();
+        let serving_fence_event = serving_fence.clone();
         // Reverse-heal Phase 3b — online re-heal backoff cache, shared between the
         // event loop (which mutates it on each partition-view refresh) and the
         // struct (whose `run_online_reheal` also touches it in tests).
@@ -2225,6 +2229,8 @@ impl ClusterCoordinator {
                                 &fenced_bm_event,
                                 &migrating_bm_event,
                                 &inbound_bm_event,
+                                &serving_fence_event,
+                                committed_master_election_enabled_event,
                                 &topo_authority_event,
                                 &node_addrs_for_topo,
                                 &topology_commit_tx_event,
@@ -2337,6 +2343,8 @@ impl ClusterCoordinator {
                                             &topo_authority_event,
                                             commit.term,
                                         ),
+                                        &serving_fence_event,
+                                        committed_master_election_enabled_event,
                                     );
                                     last_activation_at = std::time::Instant::now();
                                 }
@@ -2595,6 +2603,8 @@ impl ClusterCoordinator {
                         &fenced_bm_event,
                         &migrating_bm_event,
                         &inbound_bm_event,
+                        &serving_fence_event,
+                        committed_master_election_enabled_event,
                         &topo_authority_event,
                         &node_addrs_for_topo,
                         &topology_commit_tx_event,
@@ -3083,6 +3093,8 @@ impl ClusterCoordinator {
                                     &topo_authority_event,
                                     committed_term,
                                 ),
+                                &serving_fence_event,
+                                committed_master_election_enabled_event,
                             );
                         }
                     }
@@ -3189,6 +3201,8 @@ impl ClusterCoordinator {
                         &migration_throttle_event,
                         &cluster_secret_event,
                         committed_assignment_for_activation(&topo_authority_event, term),
+                        &serving_fence_event,
+                        committed_master_election_enabled_event,
                     );
                     last_activation_at = std::time::Instant::now();
                     if let Some(ref path) = cluster_state_path {
@@ -3302,6 +3316,8 @@ impl ClusterCoordinator {
                         &migration_throttle_event,
                         &cluster_secret_event,
                         committed_assignment_for_activation(&topo_authority_event, term),
+                        &serving_fence_event,
+                        committed_master_election_enabled_event,
                     );
                     // Reverse-heal Phase 3b — RUNTIME online re-heal. The
                     // partition view just refreshed carries every peer's per-shard
@@ -3627,6 +3643,8 @@ impl ClusterCoordinator {
                                     &topo_authority_event,
                                     committed_term,
                                 ),
+                                &serving_fence_event,
+                                committed_master_election_enabled_event,
                             );
                         }
                     }
@@ -3754,6 +3772,8 @@ impl ClusterCoordinator {
             fenced_bitmap,
             inbound_atomic,
             migrating_bitmap,
+            serving_fence,
+            committed_master_election_enabled: self.committed_master_election_enabled,
             topology_commit_tx,
             resync_request_tx: resync_request_tx_for_cluster,
             transfer_request_tx: transfer_request_tx_for_cluster,
@@ -3788,6 +3808,10 @@ impl ClusterCoordinator {
         fenced_bm: &Arc<crate::cluster::migration::AtomicShardBitmap>,
         migrating_bm: &Arc<crate::cluster::migration::AtomicShardBitmap>,
         inbound_bm: &Arc<crate::cluster::migration::AtomicShardBitmap>,
+        // §7 — serving-side fence bitmap + arming flag, forwarded to the
+        // activation this handler may drive (see `activate_topology`).
+        serving_fence_bm: &Arc<crate::cluster::migration::AtomicShardBitmap>,
+        committed_master_election_enabled: bool,
         topology_authority: &Arc<crate::cluster::topology::TopologyAuthority>,
         node_addrs_for_topo: &Arc<RwLock<std::collections::HashMap<NodeId, SocketAddr>>>,
         topology_commit_tx: &std::sync::mpsc::Sender<(Vec<NodeId>, u64)>,
@@ -3983,6 +4007,8 @@ impl ClusterCoordinator {
                             migration_throttle,
                             cluster_secret,
                             committed_assignment_for_activation(topology_authority, commit.term),
+                            serving_fence_bm,
+                            committed_master_election_enabled,
                         );
                         // POST-commit persist: the term is already committed +
                         // activated in memory and cannot be rolled back, so this
@@ -4349,6 +4375,8 @@ impl ClusterCoordinator {
         migration_throttle: &Arc<crate::cluster::migration::MigrationThrottle>,
         cluster_secret: &Option<Arc<Vec<u8>>>,
         committed_assignment: Option<crate::cluster::election::CommittedAssignment>,
+        serving_fence_bm: &Arc<crate::cluster::migration::AtomicShardBitmap>,
+        committed_master_election_enabled: bool,
     ) {
         let empty_view: std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>> =
             std::collections::HashMap::new();
@@ -4374,6 +4402,8 @@ impl ClusterCoordinator {
             migration_throttle,
             cluster_secret,
             committed_assignment,
+            serving_fence_bm,
+            committed_master_election_enabled,
         );
     }
 
@@ -4409,6 +4439,12 @@ impl ClusterCoordinator {
         migration_throttle: &Arc<crate::cluster::migration::MigrationThrottle>,
         cluster_secret: &Option<Arc<Vec<u8>>>,
         committed_assignment: Option<crate::cluster::election::CommittedAssignment>,
+        // §7 — the serving-side fence bitmap, recomputed on every activation.
+        serving_fence_bm: &Arc<crate::cluster::migration::AtomicShardBitmap>,
+        // HARD GATE: the §7 serving fence is computed ONLY when the committed
+        // master election is armed. Disarmed, the bitmap is never populated
+        // (and `is_master` does not consult it) — byte-identical behavior.
+        committed_master_election_enabled: bool,
     ) {
         *active_topology_members.write() = members.to_vec();
 
@@ -4446,6 +4482,11 @@ impl ClusterCoordinator {
                 fenced_bm.clear_all();
                 migrating_bm.clear_all();
                 inbound_bm.clear_all();
+                // §7 — a single-node empty bootstrap has nothing to serve
+                // stale; any residual serving fence is cleared with the rest.
+                if committed_master_election_enabled {
+                    serving_fence_bm.clear_all();
+                }
                 return;
             }
         }
@@ -4482,6 +4523,26 @@ impl ClusterCoordinator {
             // as before.
             None => {
                 apply_master_election(&mut new_table, &old_table_snap, partition_view, &evicted);
+            }
+        }
+        // §7 — serving-side fence, recomputed on EVERY (non-fast-path)
+        // activation from this node's own provenance: the table being
+        // replaced (`old_table_snap`, the previous committed holder set under
+        // the armed regime) against the freshly committed assignment. HARD
+        // GATE: armed only. A term carrying NO assignment has no §7 authority
+        // to fence from, so any previous fence clears (I15: a fence must
+        // always have a clearing edge; the no-assignment authority state is
+        // handled by R5/I8, not here).
+        if committed_master_election_enabled {
+            match &committed_assignment {
+                Some(assignment) => {
+                    let plan =
+                        compute_serving_fence_plan(self_id, assignment, &old_table_snap, &|s| {
+                            inbound_bm.test(s)
+                        });
+                    apply_serving_fence_plan(serving_fence_bm, &plan);
+                }
+                None => serving_fence_bm.clear_all(),
             }
         }
         // Phase D: when a partition view is available, use it to skip
@@ -5260,6 +5321,110 @@ fn serving_masters_from_table(
             if master.0 == 0 { None } else { Some(master.0) }
         })
         .collect()
+}
+
+/// §7 — the serving-side fence decisions for one topology activation, split
+/// by [`crate::cluster::election::FenceDecision`] arm. Computed by
+/// [`compute_serving_fence_plan`], installed by [`apply_serving_fence_plan`].
+struct ServingFencePlan {
+    /// Shards to withhold from service, each with its concrete pull source
+    /// (the previous committed master). `is_master` answers `Transitioning`
+    /// (retryable) for these — never a redirect, because the source is not
+    /// the committed master and redirecting to it would loop.
+    fenced: Vec<(u16, NodeId)>,
+    /// (P0-4) Shards whose fence condition holds with NO nameable source:
+    /// alert-and-serve. A fence with no source has no clearing edge, and that
+    /// exact shape is on record as having blocked repair.
+    alerts: Vec<u16>,
+}
+
+/// §7 — evaluate [`crate::cluster::election::local_fence`] for every shard
+/// the committed `assignment` names `self_id` master of.
+///
+/// Provenance mapping (all knowable at activation time):
+/// - `prev_committed` / `prev_det` — `prev_table`, the ACTIVE table being
+///   replaced by this activation. Under the armed election it was installed
+///   verbatim from the previous committed assignment (§8) with the §11
+///   replica swap, so its per-shard `{master} ∪ replicas` IS the previous
+///   committed holder set. A bootstrap or freshly-restored table names this
+///   node master of everything it serves, which degrades toward serve-and-
+///   alert — the fail-safe direction (mirrors C11: fences are not persisted).
+/// - `proven_completion` — constantly `false`: a completion at an epoch >=
+///   the commit being activated cannot exist yet. The completion handshake's
+///   effect is the post-activation clearing edge instead
+///   (`RunningCluster::mark_inbound_complete*` clears the fence bit).
+/// - `inbound_fenced` — the live inbound fence, so a previous holder with a
+///   still-incomplete inbound migration (a subset holder) is fenced too.
+///
+/// Pure over its inputs; the caller applies the plan and emits the metrics.
+fn compute_serving_fence_plan(
+    self_id: NodeId,
+    assignment: &crate::cluster::election::CommittedAssignment,
+    prev_table: &ShardTable,
+    inbound_fenced: &dyn Fn(u16) -> bool,
+) -> ServingFencePlan {
+    use crate::cluster::election::{FenceDecision, HolderProvenance, local_fence};
+    let prev_masters: Vec<NodeId> = (0..NUM_SHARDS as u16)
+        .map(|shard| prev_table.target_assignment(shard).master)
+        .collect();
+    let provenance = HolderProvenance {
+        prev_committed: Some(&prev_masters),
+        prev_det: Some(prev_table),
+        proven_completion: &|_| false,
+        inbound_fenced,
+    };
+    let mut plan = ServingFencePlan {
+        fenced: Vec::new(),
+        alerts: Vec::new(),
+    };
+    for (shard, master) in assignment.masters.iter().enumerate() {
+        if *master != self_id {
+            continue;
+        }
+        let shard = shard as u16;
+        match local_fence(self_id, shard, assignment, &provenance) {
+            FenceDecision::Serve => {}
+            FenceDecision::FenceWithSource { source } => plan.fenced.push((shard, source)),
+            FenceDecision::AlertNoSource => plan.alerts.push(shard),
+        }
+    }
+    plan
+}
+
+/// §7 — install a [`ServingFencePlan`] into the hot-path bitmap and emit the
+/// fence-event counters and logs.
+///
+/// The bitmap is REPLACED word-atomically (`load_from`), so stale bits from a
+/// previous term never survive a recompute and a previously-fenced shard is
+/// never observable as momentarily clear. Alert-no-source shards get a warn
+/// plus a counter and SERVE — never a blank refusal (P0-4).
+fn apply_serving_fence_plan(
+    bitmap: &crate::cluster::migration::AtomicShardBitmap,
+    plan: &ServingFencePlan,
+) {
+    let mut bits = crate::cluster::migration::ShardBitmap::new();
+    for (shard, _) in &plan.fenced {
+        bits.set(*shard);
+    }
+    bitmap.load_from(&bits);
+    if !plan.fenced.is_empty() {
+        crate::cluster::election::note_serving_fences_raised(plan.fenced.len() as u64);
+        tracing::warn!(
+            count = plan.fenced.len(),
+            sample = ?&plan.fenced[..plan.fenced.len().min(8)],
+            "cluster: §7 serving fence raised — withholding mastered shards without \
+             provenance until the completion handshake (shard, pull source)",
+        );
+    }
+    if !plan.alerts.is_empty() {
+        crate::cluster::election::note_serving_fence_no_source_alerts(plan.alerts.len() as u64);
+        tracing::warn!(
+            count = plan.alerts.len(),
+            sample = ?&plan.alerts[..plan.alerts.len().min(8)],
+            "cluster: §7 fence condition with NO pull source — alerting and SERVING \
+             (P0-4: a fence with no source has no clearing edge)",
+        );
+    }
 }
 
 /// W5-followup — decide whether a node that is *gracefully draining itself*
@@ -10957,6 +11122,17 @@ pub struct RunningCluster {
     inbound_atomic: Arc<crate::cluster::migration::AtomicShardBitmap>,
     /// Lock-free bitmap: shards actively migrating outbound.
     migrating_bitmap: Arc<crate::cluster::migration::AtomicShardBitmap>,
+    /// §7 — lock-free bitmap: shards this node is the COMMITTED master of but
+    /// must withhold from service (no provenance / committed unproven bit,
+    /// with a concrete pull source). Recomputed by every topology activation
+    /// (`apply_serving_fence_plan`); cleared per shard by the completion
+    /// handshake (`mark_inbound_complete*`). Consulted by `is_master` /
+    /// `is_master_snapshot` ONLY when `committed_master_election_enabled` —
+    /// disarmed it stays empty and unread (byte-identical behavior).
+    serving_fence: Arc<crate::cluster::migration::AtomicShardBitmap>,
+    /// §7 HARD GATE — mirror of `Config::committed_master_election_enabled`
+    /// (default false). Gates the serving-fence consult on the read path.
+    committed_master_election_enabled: bool,
     /// Channel for signaling topology commits from dispatch or proposer threads.
     /// The event loop receives these and activates the shard table.
     topology_commit_tx: std::sync::mpsc::Sender<(Vec<NodeId>, u64)>,
@@ -11331,6 +11507,23 @@ impl RunningCluster {
                 last_known_term: committed,
             };
         }
+        // §7 — the committed-election serving-side fence: this node IS the
+        // committed master but its provenance does not cover the shard (or
+        // the committed unproven bit is raised) and a concrete pull source
+        // exists. Withhold service as a retryable `Transitioning` — NEVER a
+        // redirect: the source is not the committed master, so redirecting a
+        // client to it would loop. I0-compatible (withholding service does
+        // not change who the committed master is); cleared by the completion
+        // handshake or the next activation's recompute. Armed only —
+        // disarmed, the bitmap is never populated and never consulted.
+        if self.committed_master_election_enabled
+            && auth_master == self.self_id
+            && self.serving_fence.test(shard)
+        {
+            return MasterQueryResult::Transitioning {
+                last_known_term: committed,
+            };
+        }
         if auth_master == self.self_id {
             MasterQueryResult::Yes
         } else {
@@ -11408,6 +11601,19 @@ impl RunningCluster {
         let shard = ShardTable::shard_for_key(key);
         let auth_master = snap.master_for_key(key);
         if self.inbound_atomic.test(shard) && auth_master == self.self_id {
+            return MasterQueryResult::Transitioning {
+                last_known_term: committed,
+            };
+        }
+        // §7 serving-side fence — see `is_master`. The bitmap is live (not
+        // snapshot-frozen) exactly like `inbound_atomic` above: a fence can
+        // only appear via an activation, which also advances the committed
+        // term and trips the stale-snapshot gate; a mid-batch CLEAR (the
+        // completion handshake) only ever widens service, never serves stale.
+        if self.committed_master_election_enabled
+            && auth_master == self.self_id
+            && self.serving_fence.test(shard)
+        {
             return MasterQueryResult::Transitioning {
                 last_known_term: committed,
             };
@@ -11588,6 +11794,13 @@ impl RunningCluster {
         let mgr = &mut self.migration.lock();
         mgr.mark_inbound_complete(shard);
         self.inbound_atomic.load_from(mgr.inbound_bitmap());
+        // §7 clearing edge — a completion handshake proves the shard
+        // complete, so the serving-side fence lifts with the inbound fence.
+        // Deliberately NOT flag-gated: the bitmap is empty when disarmed, and
+        // a flag flip must never strand a raised fence. Any residual
+        // incompleteness (multi-source subset) keeps refusing via
+        // `inbound_atomic` regardless.
+        self.serving_fence.clear(shard);
         if let Some(ref path) = self.inbound_state_path {
             crate::cluster::migration::persist_inbound_state(path, mgr);
         }
@@ -11597,6 +11810,8 @@ impl RunningCluster {
         let mgr = &mut self.migration.lock();
         mgr.mark_inbound_complete_all(shard);
         self.inbound_atomic.load_from(mgr.inbound_bitmap());
+        // §7 clearing edge — see `mark_inbound_complete`.
+        self.serving_fence.clear(shard);
         if let Some(ref path) = self.inbound_state_path {
             crate::cluster::migration::persist_inbound_state(path, mgr);
         }
@@ -11606,6 +11821,8 @@ impl RunningCluster {
         let mgr = &mut self.migration.lock();
         mgr.mark_inbound_complete_from_source(shard, from_node);
         self.inbound_atomic.load_from(mgr.inbound_bitmap());
+        // §7 clearing edge — see `mark_inbound_complete`.
+        self.serving_fence.clear(shard);
         if let Some(ref path) = self.inbound_state_path {
             crate::cluster::migration::persist_inbound_state(path, mgr);
         }
@@ -11618,6 +11835,10 @@ impl RunningCluster {
         let mgr = &mut self.migration.lock();
         mgr.mark_inbound_complete_many_from_source(shards.iter().copied(), from_node);
         self.inbound_atomic.load_from(mgr.inbound_bitmap());
+        // §7 clearing edge — see `mark_inbound_complete`.
+        for shard in shards {
+            self.serving_fence.clear(*shard);
+        }
         if let Some(ref path) = self.inbound_state_path {
             crate::cluster::migration::persist_inbound_state(path, mgr);
         }
@@ -13444,6 +13665,10 @@ pub(crate) fn new_test_running_cluster(
         fenced_bitmap,
         inbound_atomic,
         migrating_bitmap,
+        // §7 — fixture defaults to DISARMED with an empty fence; seam tests
+        // arm the flag and set bits explicitly.
+        serving_fence: Arc::new(crate::cluster::migration::AtomicShardBitmap::new()),
+        committed_master_election_enabled: false,
         topology_commit_tx,
         resync_request_tx,
         transfer_request_tx,
@@ -20758,6 +20983,403 @@ mod tests {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // §7 serving-side fence (committed master election) — wiring seam tests
+    // -----------------------------------------------------------------------
+
+    /// Members `[1, 2, 3]` at rf=2: every shard is held by exactly two of the
+    /// three nodes, so every node is a NON-holder of some shard. Returns the
+    /// previous table plus, for `outsider`, one shard it does not hold, that
+    /// shard's previous master, one shard it masters, and one shard it
+    /// replicates (but does not master).
+    fn serving_fence_fixture(outsider: NodeId) -> (ShardTable, u16, NodeId, u16, u16) {
+        let members = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let prev_table = ShardTable::compute_with_epoch(&members, 2, 1, 1);
+        let mut non_held = None;
+        let mut mastered = None;
+        let mut replicated = None;
+        for shard in 0..NUM_SHARDS as u16 {
+            let assignment = prev_table.target_assignment(shard);
+            let holder = assignment.master == outsider || assignment.replicas.contains(&outsider);
+            if !holder && non_held.is_none() {
+                non_held = Some((shard, assignment.master));
+            }
+            if assignment.master == outsider && mastered.is_none() {
+                mastered = Some(shard);
+            }
+            if assignment.master != outsider
+                && assignment.replicas.contains(&outsider)
+                && replicated.is_none()
+            {
+                replicated = Some(shard);
+            }
+            if non_held.is_some() && mastered.is_some() && replicated.is_some() {
+                break;
+            }
+        }
+        let (non_held_shard, prev_master) = non_held.expect("rf=2 of 3 must exclude the outsider");
+        (
+            prev_table,
+            non_held_shard,
+            prev_master,
+            mastered.expect("outsider must master some shard"),
+            replicated.expect("outsider must replicate some shard"),
+        )
+    }
+
+    /// §7 — a committed master with NO provenance for the shard (not the
+    /// previous master, not a previous replica) is fenced, and the fence
+    /// names the previous committed master as the concrete pull source.
+    #[test]
+    fn serving_fence_plan_fences_non_holder_master_with_source() {
+        let self_id = NodeId(1);
+        let (prev_table, shard, prev_master, _, _) = serving_fence_fixture(self_id);
+
+        let mut masters: Vec<NodeId> = (0..NUM_SHARDS as u16)
+            .map(|s| prev_table.target_assignment(s).master)
+            .collect();
+        masters[shard as usize] = self_id;
+        let assignment =
+            crate::cluster::election::CommittedAssignment::new(masters, &[false; NUM_SHARDS]);
+
+        let plan = compute_serving_fence_plan(self_id, &assignment, &prev_table, &|_| false);
+        assert_eq!(
+            plan.fenced,
+            vec![(shard, prev_master)],
+            "the non-holder master must be fenced with the previous master as source",
+        );
+        assert!(
+            plan.alerts.is_empty(),
+            "a fence with a concrete source must not be downgraded to an alert",
+        );
+    }
+
+    /// §7 (P0-4) — the committed unproven bit on a shard whose previous
+    /// master IS this node leaves no concrete pull source (pulling from self
+    /// is meaningless): alert-and-serve, never a blank refusal.
+    #[test]
+    fn serving_fence_plan_unproven_prev_master_alerts_and_serves() {
+        let self_id = NodeId(1);
+        let (prev_table, _, _, mastered_shard, _) = serving_fence_fixture(self_id);
+
+        let masters: Vec<NodeId> = (0..NUM_SHARDS as u16)
+            .map(|s| prev_table.target_assignment(s).master)
+            .collect();
+        let mut unproven = [false; NUM_SHARDS];
+        unproven[mastered_shard as usize] = true;
+        let assignment = crate::cluster::election::CommittedAssignment::new(masters, &unproven);
+
+        let plan = compute_serving_fence_plan(self_id, &assignment, &prev_table, &|_| false);
+        assert_eq!(
+            plan.alerts,
+            vec![mastered_shard],
+            "unproven with no nameable source must ALERT (and serve), not fence",
+        );
+        assert!(
+            plan.fenced.is_empty(),
+            "no shard has both a fence condition and a concrete source here",
+        );
+    }
+
+    /// §7 — a previous REPLICA promoted to master has provenance (the holder
+    /// set is master ∪ replicas of the previous committed term): no fence,
+    /// no alert. Shards mastered by other nodes are never evaluated locally.
+    #[test]
+    fn serving_fence_plan_prev_replica_serves_and_foreign_shards_are_skipped() {
+        let self_id = NodeId(1);
+        let (prev_table, non_held_shard, _, _, replicated_shard) = serving_fence_fixture(self_id);
+
+        let mut masters: Vec<NodeId> = (0..NUM_SHARDS as u16)
+            .map(|s| prev_table.target_assignment(s).master)
+            .collect();
+        // Promote self on a shard it previously REPLICATED.
+        masters[replicated_shard as usize] = self_id;
+        // Flag a foreign shard unproven: its master is another node, so this
+        // node must not evaluate (let alone fence) it.
+        let mut unproven = [false; NUM_SHARDS];
+        unproven[non_held_shard as usize] = true;
+        assert_ne!(
+            masters[non_held_shard as usize], self_id,
+            "fixture: the unproven shard must be mastered by another node",
+        );
+        let assignment = crate::cluster::election::CommittedAssignment::new(masters, &unproven);
+
+        let plan = compute_serving_fence_plan(self_id, &assignment, &prev_table, &|_| false);
+        assert!(
+            plan.fenced.is_empty() && plan.alerts.is_empty(),
+            "a previous replica has provenance and foreign shards are skipped; got \
+             fenced={:?} alerts={:?}",
+            plan.fenced,
+            plan.alerts,
+        );
+    }
+
+    /// §7 — a previous holder with a still-pending inbound migration is a
+    /// SUBSET holder: the inbound fence raises the serving fence, with the
+    /// previous master as the source.
+    #[test]
+    fn serving_fence_plan_inbound_subset_holder_is_fenced() {
+        let self_id = NodeId(1);
+        let (prev_table, _, _, _, replicated_shard) = serving_fence_fixture(self_id);
+        let prev_master = prev_table.target_assignment(replicated_shard).master;
+
+        let mut masters: Vec<NodeId> = (0..NUM_SHARDS as u16)
+            .map(|s| prev_table.target_assignment(s).master)
+            .collect();
+        masters[replicated_shard as usize] = self_id;
+        let assignment =
+            crate::cluster::election::CommittedAssignment::new(masters, &[false; NUM_SHARDS]);
+
+        let plan = compute_serving_fence_plan(self_id, &assignment, &prev_table, &|s| {
+            s == replicated_shard
+        });
+        assert_eq!(
+            plan.fenced,
+            vec![(replicated_shard, prev_master)],
+            "a subset holder (pending inbound) must be fenced with the previous master \
+             as source",
+        );
+    }
+
+    /// Multi-node fixture where `self` (NodeId(1)) IS the authoritative
+    /// master of the returned shard, so `is_master` answers `Yes` unless the
+    /// serving fence intervenes.
+    fn cluster_for_serving_fence_seam() -> (RunningCluster, u16) {
+        let members = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let table = ShardTable::compute_with_epoch(&members, 2, 1, 1);
+        let shard = (0..NUM_SHARDS as u16)
+            .find(|&s| table.target_assignment(s).master == NodeId(1))
+            .expect("NodeId(1) must master some shard");
+        let cluster = new_test_running_cluster(
+            NodeId(1),
+            table,
+            &[
+                (NodeId(1), "127.0.0.1:4811".parse().unwrap()),
+                (NodeId(2), "127.0.0.1:4812".parse().unwrap()),
+                (NodeId(3), "127.0.0.1:4813".parse().unwrap()),
+            ],
+            &members,
+            &[],
+            &[],
+            &[],
+            3,
+        );
+        (cluster, shard)
+    }
+
+    /// §7 — ARMED: a raised serving fence withholds mastership as a retryable
+    /// `Transitioning` (never a redirect — the source is not the committed
+    /// master), on both the per-key and the batch-snapshot lookups.
+    #[test]
+    fn is_master_refuses_serving_fenced_shard_when_armed() {
+        let (mut cluster, shard) = cluster_for_serving_fence_seam();
+        cluster.committed_master_election_enabled = true;
+        let key = key_for_shard(shard);
+        assert_eq!(
+            cluster.is_master(&key),
+            MasterQueryResult::Yes,
+            "baseline: armed with no fence raised must serve",
+        );
+
+        cluster.serving_fence.set(shard);
+        match cluster.is_master(&key) {
+            MasterQueryResult::Transitioning { .. } => {}
+            other => panic!("a serving-fenced master must answer Transitioning, got {other:?}"),
+        }
+        let snap = cluster.master_snapshot();
+        match cluster.is_master_snapshot(&snap, &key) {
+            MasterQueryResult::Transitioning { .. } => {}
+            other => panic!("the batch-snapshot path must apply the same fence, got {other:?}"),
+        }
+    }
+
+    /// HARD GATE — DISARMED: the serving fence bitmap must be invisible.
+    /// Even a (forced) populated bitmap cannot alter any answer, pinning
+    /// byte-identical disarmed behavior.
+    #[test]
+    fn serving_fence_bit_is_ignored_when_disarmed() {
+        let (cluster, shard) = cluster_for_serving_fence_seam();
+        assert!(
+            !cluster.committed_master_election_enabled,
+            "fixture must default to the disarmed flag",
+        );
+        cluster.serving_fence.set(shard);
+        let key = key_for_shard(shard);
+        assert_eq!(
+            cluster.is_master(&key),
+            MasterQueryResult::Yes,
+            "disarmed: the fence bit must not be consulted",
+        );
+        let snap = cluster.master_snapshot();
+        assert_eq!(
+            cluster.is_master_snapshot(&snap, &key),
+            MasterQueryResult::Yes,
+            "disarmed: the snapshot path must not consult the fence bit",
+        );
+    }
+
+    /// §7 clearing edge — a completion handshake (`mark_inbound_complete`)
+    /// proves the shard complete and lifts the serving fence.
+    #[test]
+    fn completion_handshake_clears_serving_fence() {
+        let (mut cluster, shard) = cluster_for_serving_fence_seam();
+        cluster.committed_master_election_enabled = true;
+        cluster.serving_fence.set(shard);
+        let key = key_for_shard(shard);
+        match cluster.is_master(&key) {
+            MasterQueryResult::Transitioning { .. } => {}
+            other => panic!("precondition: fence must withhold service, got {other:?}"),
+        }
+
+        cluster.mark_inbound_complete(shard);
+        assert!(
+            !cluster.serving_fence.test(shard),
+            "the completion handshake must clear the serving fence",
+        );
+        assert_eq!(
+            cluster.is_master(&key),
+            MasterQueryResult::Yes,
+            "a proven-complete shard must serve again",
+        );
+    }
+
+    /// The plan applicator: installs exactly the fenced bits (clearing stale
+    /// ones) and bumps the §7 counters for both arms.
+    #[test]
+    fn apply_serving_fence_plan_sets_bits_and_bumps_counters() {
+        let bm = crate::cluster::migration::AtomicShardBitmap::new();
+        bm.set(9); // stale bit from a previous term — must be cleared
+        let raised_before = crate::cluster::election::serving_fence_raised_total();
+        let alerts_before = crate::cluster::election::serving_fence_no_source_alerts_total();
+
+        let plan = ServingFencePlan {
+            fenced: vec![(3, NodeId(2)), (5, NodeId(3))],
+            alerts: vec![7],
+        };
+        apply_serving_fence_plan(&bm, &plan);
+
+        assert!(bm.test(3) && bm.test(5), "fenced shards must be set");
+        assert!(!bm.test(7), "an alert-no-source shard must SERVE (no bit)");
+        assert!(!bm.test(9), "stale bits must not survive a recompute");
+        assert!(
+            crate::cluster::election::serving_fence_raised_total() >= raised_before + 2,
+            "raised counter must count both fenced shards",
+        );
+        assert!(
+            crate::cluster::election::serving_fence_no_source_alerts_total() > alerts_before,
+            "no-source alert counter must count the alerted shard",
+        );
+    }
+
+    /// End to end through the REAL activation path: armed with a committed
+    /// assignment, `activate_topology_with_view` computes and installs the
+    /// serving fence; disarmed, the bitmap stays empty for the same inputs.
+    #[test]
+    fn activate_topology_installs_serving_fence_only_when_armed() {
+        let _guard = migration_metrics_test_guard();
+        let _metrics = install_test_migration_metrics();
+
+        let members = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let placement_version = 1u16;
+        let rf = 2u8;
+        let self_id = NodeId(2);
+        let table = ShardTable::compute_with_epoch(&members, rf, 1, placement_version);
+        // A shard node 2 does not hold under the previous table.
+        let shard = (0..NUM_SHARDS as u16)
+            .find(|&s| {
+                let a = table.target_assignment(s);
+                a.master != self_id && !a.replicas.contains(&self_id)
+            })
+            .expect("rf=2 of 3 must exclude node 2 somewhere");
+        let cluster = new_test_running_cluster(
+            self_id,
+            table.clone(),
+            &[
+                (NodeId(1), "127.0.0.1:4821".parse().unwrap()),
+                (NodeId(2), "127.0.0.1:4822".parse().unwrap()),
+                (NodeId(3), "127.0.0.1:4823".parse().unwrap()),
+            ],
+            &members,
+            &[],
+            &[],
+            &[],
+            3,
+        );
+        let engine = Arc::new(test_engine());
+        let view: std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>> =
+            std::collections::HashMap::new();
+
+        // The committed assignment names node 2 master of the non-held shard.
+        let mut masters: Vec<NodeId> = (0..NUM_SHARDS as u16)
+            .map(|s| table.target_assignment(s).master)
+            .collect();
+        masters[shard as usize] = self_id;
+        let assignment =
+            crate::cluster::election::CommittedAssignment::new(masters, &[false; NUM_SHARDS]);
+
+        // DISARMED first: same inputs, flag off → the bitmap must stay empty.
+        ClusterCoordinator::activate_topology_with_view(
+            &members,
+            2,
+            placement_version,
+            self_id,
+            rf,
+            &cluster.shard_table,
+            &cluster.migration,
+            &cluster.node_addrs,
+            &engine,
+            &None,
+            1,
+            1,
+            1,
+            &cluster.fenced_bitmap,
+            &cluster.migrating_bitmap,
+            &cluster.inbound_atomic,
+            &cluster.active_topology_members,
+            &view,
+            &cluster.migration_throttle,
+            &cluster.cluster_secret,
+            Some(assignment.clone()),
+            &cluster.serving_fence,
+            false,
+        );
+        assert!(
+            !cluster.serving_fence.test(shard),
+            "disarmed activation must never populate the serving fence",
+        );
+
+        // ARMED: the same activation fences the non-holder master.
+        ClusterCoordinator::activate_topology_with_view(
+            &members,
+            3,
+            placement_version,
+            self_id,
+            rf,
+            &cluster.shard_table,
+            &cluster.migration,
+            &cluster.node_addrs,
+            &engine,
+            &None,
+            1,
+            1,
+            1,
+            &cluster.fenced_bitmap,
+            &cluster.migrating_bitmap,
+            &cluster.inbound_atomic,
+            &cluster.active_topology_members,
+            &view,
+            &cluster.migration_throttle,
+            &cluster.cluster_secret,
+            Some(assignment),
+            &cluster.serving_fence,
+            true,
+        );
+        assert!(
+            cluster.serving_fence.test(shard),
+            "armed activation must fence the non-holder committed master",
+        );
+    }
+
     /// Reverse-heal Phase 1: the cluster handle exposes the suspected-stale
     /// shard set (sorted + deduped) and refreshes the `stale_suspect_shards`
     /// gauge to the set cardinality; an empty set clears both.
@@ -22355,6 +22977,8 @@ mod tests {
             &cluster.migration_throttle,
             &cluster.cluster_secret,
             None,
+            &cluster.serving_fence,
+            false,
         );
 
         // The manager retained the unproven lost entry across the supersede (C17).
@@ -22471,6 +23095,8 @@ mod tests {
             &cluster.migration_throttle,
             &cluster.cluster_secret,
             None,
+            &cluster.serving_fence,
+            false,
         );
 
         // The heal entry must survive the supersede (manager + hot-path atomic).
@@ -22571,6 +23197,8 @@ mod tests {
             &cluster.migration_throttle,
             &cluster.cluster_secret,
             None,
+            &cluster.serving_fence,
+            false,
         );
 
         assert!(

@@ -1485,6 +1485,20 @@ pub(crate) fn render_metrics_text(
         "teraslab_assignment_master_count_alerts_total",
         crate::cluster::election::assignment_master_count_alerts_total(),
     );
+    // §7 — serving-side fence events. `raised` counts shards withheld from
+    // service (with a concrete pull source); `no_source_alerts` counts the
+    // P0-4 alert-and-serve arm (fence condition with nothing to pull from —
+    // the node keeps serving).
+    prom_counter(
+        &mut out,
+        "teraslab_serving_fence_raised_total",
+        crate::cluster::election::serving_fence_raised_total(),
+    );
+    prom_counter(
+        &mut out,
+        "teraslab_serving_fence_no_source_alerts_total",
+        crate::cluster::election::serving_fence_no_source_alerts_total(),
+    );
     // §9 arm 1 — persistent-divergence gauge: consecutive quorum-backed
     // higher-term commits refused since the last apply. Non-zero and rising
     // means this node is on the losing side of an attestation split.
@@ -4930,6 +4944,8 @@ mod tests {
             "teraslab_topology_committed_digest_fork_total",
             "teraslab_assignment_rejected_total",
             "teraslab_assignment_master_count_alerts_total",
+            "teraslab_serving_fence_raised_total",
+            "teraslab_serving_fence_no_source_alerts_total",
             "teraslab_topology_refused_higher_term_streak",
             "teraslab_alloc_total",
             "teraslab_alloc_bytes_total",
