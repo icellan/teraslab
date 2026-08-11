@@ -156,6 +156,15 @@ const OP_CHUNK: u8 = 20;
 /// (chunks carry their own index/count/total).
 pub const CHUNK_PAYLOAD_MAX: usize = 8 * 1024 * 1024;
 
+/// Serialized-batch budget for one replication frame.
+///
+/// `MAX_FRAME_SIZE` minus headroom for the request-frame envelope and the
+/// HMAC suffix, so a sub-batch produced by [`split_ops_for_wire`] /
+/// [`ReplicaBatch::split_for_wire`] always encodes below the receiver's
+/// hard frame cap.
+pub const REPLICA_SEND_BUDGET: usize =
+    crate::protocol::opcodes::MAX_FRAME_SIZE as usize - 128 * 1024;
+
 /// A single replication operation sent from master to replica.
 /// A mutation operation to be replicated from master to replica.
 ///
@@ -1318,6 +1327,36 @@ impl CatchupRequest {
     }
 }
 
+/// Chunk-split `ops` ([`ReplicaOp::split_for_wire`]) and partition them
+/// greedily, in order, into groups whose batch wire form (header + per-op
+/// length prefixes + ops) fits `budget`. Shared core of
+/// [`ReplicaBatch::split_for_wire`] and the dispatch send loop's
+/// multi-frame path. A lone op that exceeds `budget` even after chunking
+/// still gets its own group (never dropped, never looped) — the
+/// transport's honest oversize reject names it.
+pub fn split_ops_for_wire(ops: Vec<ReplicaOp>, budget: usize) -> Vec<Vec<ReplicaOp>> {
+    let split_ops: Vec<ReplicaOp> = ops
+        .into_iter()
+        .flat_map(ReplicaOp::split_for_wire)
+        .collect();
+    let mut out: Vec<Vec<ReplicaOp>> = Vec::new();
+    let mut cur: Vec<ReplicaOp> = Vec::new();
+    let mut cur_len = ReplicaBatch::HEADER_SIZE;
+    for op in split_ops {
+        let need = 4 + op.wire_len();
+        if !cur.is_empty() && cur_len + need > budget {
+            out.push(std::mem::take(&mut cur));
+            cur_len = ReplicaBatch::HEADER_SIZE;
+        }
+        cur_len += need;
+        cur.push(op);
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
 impl ReplicaBatch {
     /// Serialize to bytes using the V2 wire format.
     ///
@@ -1456,42 +1495,20 @@ impl ReplicaBatch {
             source_node_id,
             cluster_key,
         } = self;
-        let split_ops: Vec<ReplicaOp> = ops
-            .into_iter()
-            .flat_map(ReplicaOp::split_for_wire)
-            .collect();
-
         let mut out: Vec<ReplicaBatch> = Vec::new();
-        let mut cur: Vec<ReplicaOp> = Vec::new();
-        let mut cur_len = Self::HEADER_SIZE;
         let mut seq_cursor = first_sequence;
-        for op in split_ops {
-            let need = 4 + op.wire_len();
-            if !cur.is_empty() && cur_len + need > budget {
-                let count = cur.len() as u64;
-                out.push(ReplicaBatch {
-                    first_sequence: seq_cursor,
-                    ops: std::mem::take(&mut cur),
-                    trace_ctx,
-                    source_node_id,
-                    cluster_key,
-                });
-                if first_sequence != 0 {
-                    seq_cursor += count;
-                }
-                cur_len = Self::HEADER_SIZE;
-            }
-            cur_len += need;
-            cur.push(op);
-        }
-        if !cur.is_empty() {
+        for group in split_ops_for_wire(ops, budget) {
+            let count = group.len() as u64;
             out.push(ReplicaBatch {
                 first_sequence: seq_cursor,
-                ops: cur,
+                ops: group,
                 trace_ctx,
                 source_node_id,
                 cluster_key,
             });
+            if first_sequence != 0 {
+                seq_cursor += count;
+            }
         }
         out
     }

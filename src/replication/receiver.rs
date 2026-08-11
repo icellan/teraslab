@@ -741,6 +741,161 @@ pub fn handle_replica_batch_with_tracker(
 /// mode, within the clock-skew window) regains only the post-epoch-bump
 /// tail it already had pre-bump for the same frame; the vouchable rule
 /// above keeps that tail bounded by per-record guards.
+/// Per-inner-op staging cap for chunked-op reassembly. Bounds the memory a
+/// single oversized op may hold in staging; a `total_len` above this NAKs
+/// the opening part before any bytes are buffered. Sized to cover the
+/// largest records the store ships (scenario 11's 50 MiB tier) with
+/// headroom.
+const MAX_STAGED_OP_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Process-wide staging cap across ALL open chunk assemblies. A part-0
+/// whose declared `total_len` would push the sum of open assemblies past
+/// this NAKs instead of buffering — a bounded receiver can never be ballooned
+/// by many concurrent oversized streams.
+const MAX_STAGED_TOTAL_BYTES: u64 = 256 * 1024 * 1024;
+
+/// One open chunked-op assembly (see [`stage_chunk`]).
+struct ChunkStaging {
+    buf: Vec<u8>,
+    next_index: u32,
+    chunk_count: u32,
+    total_len: u64,
+}
+
+/// Open chunk assemblies, keyed by `(effective stream key, tx_key)` so
+/// concurrent senders (and concurrent tests) reassemble independently.
+/// Process-global because assemblies span batches — and therefore
+/// potentially connections — of one logical stream. In-RAM only: a
+/// receiver restart drops open assemblies, the next part NAKs, and the
+/// sender re-ships the whole op.
+static CHUNK_STAGING: std::sync::OnceLock<
+    parking_lot::Mutex<std::collections::HashMap<(String, TxKey), ChunkStaging>>,
+> = std::sync::OnceLock::new();
+
+fn chunk_staging()
+-> &'static parking_lot::Mutex<std::collections::HashMap<(String, TxKey), ChunkStaging>> {
+    CHUNK_STAGING.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Feed one [`ReplicaOp::OpChunk`] part into staging.
+///
+/// Returns `Ok(None)` for a mid-assembly part (nothing to apply),
+/// `Ok(Some(inner))` when this part completed the assembly — the caller
+/// applies `inner` through the normal per-op path — and `Err(message)`
+/// on any violation, after dropping the open assembly so a full re-send
+/// from part 0 starts clean:
+///
+/// - index out of range, or a part that is not the next expected index
+///   (parts are ordered within one TCP stream; a mismatch means loss or
+///   reorder upstream);
+/// - a part whose `chunk_count`/`total_len` contradicts the open assembly
+///   (tamper/corruption);
+/// - `total_len` beyond [`MAX_STAGED_OP_BYTES`], or an opening part that
+///   would push open assemblies past [`MAX_STAGED_TOTAL_BYTES`];
+/// - a part for which no assembly is open (receiver restarted
+///   mid-assembly, or part 0 was never seen);
+/// - a completed assembly whose bytes disagree with `total_len`, decode
+///   to trailing garbage, or decode to a nested chunk.
+///
+/// Part 0 always (re)opens the assembly — an idempotent re-send restarts
+/// cleanly rather than corrupting a half-built buffer.
+fn stage_chunk(stream_key: &str, op: &ReplicaOp) -> std::result::Result<Option<ReplicaOp>, String> {
+    let ReplicaOp::OpChunk {
+        tx_key,
+        chunk_index,
+        chunk_count,
+        total_len,
+        payload,
+    } = op
+    else {
+        return Err("stage_chunk called on a non-chunk op".to_string());
+    };
+    if *chunk_count == 0 || *chunk_index >= *chunk_count {
+        return Err(format!(
+            "chunk index {chunk_index} out of range (count {chunk_count})"
+        ));
+    }
+    if *total_len > MAX_STAGED_OP_BYTES {
+        return Err(format!(
+            "chunked op total_len {total_len} exceeds the {MAX_STAGED_OP_BYTES} byte per-op staging cap"
+        ));
+    }
+    let key = (stream_key.to_string(), *tx_key);
+    let mut map = chunk_staging().lock();
+    if *chunk_index == 0 {
+        let open_elsewhere: u64 = map
+            .iter()
+            .filter(|(k, _)| **k != key)
+            .map(|(_, st)| st.total_len)
+            .sum();
+        if open_elsewhere + *total_len > MAX_STAGED_TOTAL_BYTES {
+            return Err(format!(
+                "chunk staging full: {open_elsewhere} bytes already open, refusing {total_len} more                  (cap {MAX_STAGED_TOTAL_BYTES})"
+            ));
+        }
+        map.insert(
+            key.clone(),
+            ChunkStaging {
+                buf: Vec::with_capacity(*total_len as usize),
+                next_index: 0,
+                chunk_count: *chunk_count,
+                total_len: *total_len,
+            },
+        );
+    }
+    let Some(st) = map.get_mut(&key) else {
+        return Err(format!(
+            "chunk {chunk_index}/{chunk_count} for {tx_key:?} has no open assembly              (receiver restarted mid-assembly or part 0 was never delivered) — re-send from part 0"
+        ));
+    };
+    if *chunk_index != st.next_index || *chunk_count != st.chunk_count || *total_len != st.total_len
+    {
+        let expected = st.next_index;
+        map.remove(&key);
+        return Err(format!(
+            "chunk sequence violation for {tx_key:?}: got part {chunk_index}/{chunk_count}              (total_len {total_len}), expected part {expected} — assembly dropped, re-send from part 0"
+        ));
+    }
+    if st.buf.len() as u64 + payload.len() as u64 > st.total_len {
+        map.remove(&key);
+        return Err(format!(
+            "chunk payloads for {tx_key:?} exceed the declared total_len {total_len} —              assembly dropped"
+        ));
+    }
+    st.buf.extend_from_slice(payload);
+    st.next_index += 1;
+    if st.next_index < st.chunk_count {
+        return Ok(None);
+    }
+    let Some(st) = map.remove(&key) else {
+        return Err(format!(
+            "chunk assembly for {tx_key:?} vanished mid-completion"
+        ));
+    };
+    drop(map);
+    if st.buf.len() as u64 != st.total_len {
+        return Err(format!(
+            "reassembled op for {tx_key:?} is {} bytes, declared total_len {}",
+            st.buf.len(),
+            st.total_len,
+        ));
+    }
+    let (inner, consumed) = ReplicaOp::deserialize(&st.buf)
+        .map_err(|e| format!("reassembled op for {tx_key:?} failed to decode: {e}"))?;
+    if consumed != st.buf.len() {
+        return Err(format!(
+            "reassembled op for {tx_key:?} decoded {consumed} of {} bytes — trailing garbage",
+            st.buf.len(),
+        ));
+    }
+    if matches!(inner, ReplicaOp::OpChunk { .. }) {
+        return Err(format!(
+            "reassembled op for {tx_key:?} is a nested chunk — protocol violation"
+        ));
+    }
+    Ok(Some(inner))
+}
+
 /// Batched serving-master lookup handed to the receiver's stale-epoch
 /// gate: resolves EVERY shard under one shard-table snapshot and returns
 /// the serving (effective) master's raw node id per slot, `None` for
@@ -1147,6 +1302,34 @@ pub fn handle_replica_batch_with_tracker_and_master_lookup(
         .zip(batch.ops.iter().skip(skip_count))
         .enumerate()
     {
+        // Chunked-transport reassembly: a chunk part feeds staging; the
+        // FINAL part swaps itself for the reassembled inner op, which then
+        // flows through the same apply + journal path as a directly
+        // shipped op (generation guards included). Mid-assembly parts
+        // apply nothing and advance nothing but the batch cursor.
+        let reassembled;
+        let op = if matches!(op, ReplicaOp::OpChunk { .. }) {
+            match stage_chunk(&effective_stream_key, op) {
+                Ok(None) => continue,
+                Ok(Some(inner)) => {
+                    reassembled = inner;
+                    &reassembled
+                }
+                Err(message) => {
+                    let ack = ReplicaAck::Error {
+                        failed_sequence: seq,
+                        message,
+                    };
+                    return ResponseFrame {
+                        request_id: request.request_id,
+                        status: STATUS_ERROR,
+                        payload: ack.serialize(),
+                    };
+                }
+            }
+        } else {
+            op
+        };
         // C15: only a steady-state, dense-sequence–tracked, non-migration batch
         // NAKs on a record it is missing (a real divergence — the master
         // committed a mutation against a record this replica never received).
@@ -8319,6 +8502,221 @@ mod tests {
     /// stale-key acceptance gate keys its per-op master check on this.
     fn shard_of(k: TxKey) -> u16 {
         crate::cluster::shards::ShardTable::shard_for_key(&k)
+    }
+
+    /// Slice a serialized op into OpChunk parts (any tiling is valid — the
+    /// receiver keys on index/count/total_len, not on CHUNK_PAYLOAD_MAX).
+    fn chunk_op(op: &ReplicaOp, parts: usize) -> Vec<ReplicaOp> {
+        let tx_key = op.tx_key().unwrap();
+        let bytes = op.serialize();
+        let per = bytes.len().div_ceil(parts);
+        let slices: Vec<&[u8]> = bytes.chunks(per).collect();
+        let count = slices.len() as u32;
+        slices
+            .iter()
+            .enumerate()
+            .map(|(i, p)| ReplicaOp::OpChunk {
+                tx_key,
+                chunk_index: i as u32,
+                chunk_count: count,
+                total_len: bytes.len() as u64,
+                payload: p.to_vec(),
+            })
+            .collect()
+    }
+
+    fn chunk_test_create(k: TxKey) -> ReplicaOp {
+        ReplicaOp::Create {
+            tx_key: k,
+            metadata_bytes: vec![0; 64],
+            utxo_hashes: vec![[0xAA; 32]; 2],
+            cold_data: Some(vec![0xAB; 4096]),
+            is_external: false,
+        }
+    }
+
+    fn chunk_batch(first_sequence: u64, ops: Vec<ReplicaOp>) -> ReplicaBatch {
+        ReplicaBatch {
+            first_sequence,
+            ops,
+            trace_ctx: None,
+            source_node_id: None,
+            cluster_key: 0,
+        }
+    }
+
+    fn send_tracked(
+        engine: &Engine,
+        tracker: &ReplicaAppliedTracker,
+        batch: &ReplicaBatch,
+    ) -> ResponseFrame {
+        let last_applied = AtomicU64::new(0);
+        let req = batch_request(batch, batch.first_sequence);
+        handle_replica_batch_with_tracker(
+            &req,
+            engine,
+            &last_applied,
+            Some(tracker),
+            DEFAULT_STREAM_KEY,
+            0,
+        )
+    }
+
+    /// A chunked Create reassembles across BATCHES and applies only when
+    /// the final part lands — mid-assembly parts ack without touching the
+    /// engine.
+    #[test]
+    fn chunked_create_reassembles_across_batches_and_applies() {
+        let engine = make_engine();
+        let tracker = ReplicaAppliedTracker::in_memory();
+        let k = key(90);
+        let parts = chunk_op(&chunk_test_create(k), 3);
+        assert_eq!(parts.len(), 3);
+
+        let batch_a = chunk_batch(1, parts[..2].to_vec());
+        let resp_a = send_tracked(&engine, &tracker, &batch_a);
+        assert_eq!(resp_a.status, STATUS_OK, "mid-assembly parts must ack");
+        assert!(
+            engine.read_metadata(&k).is_err(),
+            "nothing may apply before the final part",
+        );
+
+        let batch_b = chunk_batch(3, parts[2..].to_vec());
+        let resp_b = send_tracked(&engine, &tracker, &batch_b);
+        assert_eq!(resp_b.status, STATUS_OK, "final part must ack");
+        assert!(
+            engine.read_metadata(&k).is_ok(),
+            "the reassembled Create must have applied",
+        );
+        assert_eq!(tracker.get(DEFAULT_STREAM_KEY), 3);
+    }
+
+    /// A re-send restarting at part 0 resets the assembly cleanly
+    /// (idempotent re-delivery must not corrupt staging).
+    #[test]
+    fn chunk_restart_at_index_zero_resets_assembly() {
+        let engine = make_engine();
+        let tracker = ReplicaAppliedTracker::in_memory();
+        let k = key(91);
+        let parts = chunk_op(&chunk_test_create(k), 3);
+
+        // Two parts land, then the sender restarts the whole op.
+        let resp = send_tracked(&engine, &tracker, &chunk_batch(1, parts[..2].to_vec()));
+        assert_eq!(resp.status, STATUS_OK);
+        let resp = send_tracked(&engine, &tracker, &chunk_batch(3, parts.clone()));
+        assert_eq!(resp.status, STATUS_OK);
+        assert!(
+            engine.read_metadata(&k).is_ok(),
+            "restarted assembly must complete and apply",
+        );
+    }
+
+    /// An out-of-order part NAKs, clears the assembly, and a full re-send
+    /// then succeeds.
+    #[test]
+    fn chunk_out_of_order_naks_and_clears_staging() {
+        let engine = make_engine();
+        let tracker = ReplicaAppliedTracker::in_memory();
+        let k = key(92);
+        let parts = chunk_op(&chunk_test_create(k), 3);
+
+        let resp = send_tracked(&engine, &tracker, &chunk_batch(1, parts[..1].to_vec()));
+        assert_eq!(resp.status, STATUS_OK);
+        // Part 2 skips part 1 → sequence violation.
+        let resp = send_tracked(&engine, &tracker, &chunk_batch(2, parts[2..].to_vec()));
+        assert_eq!(resp.status, STATUS_ERROR);
+        match ReplicaAck::deserialize(&resp.payload).expect("ack decodes") {
+            ReplicaAck::Error { message, .. } => {
+                assert!(message.contains("chunk"), "message was: {message}")
+            }
+            other => panic!("expected ReplicaAck::Error, got {other:?}"),
+        }
+        assert!(engine.read_metadata(&k).is_err());
+
+        // Full re-send from part 0 succeeds (staging was cleared).
+        let resp = send_tracked(&engine, &tracker, &chunk_batch(2, parts.clone()));
+        assert_eq!(resp.status, STATUS_OK);
+        assert!(engine.read_metadata(&k).is_ok());
+    }
+
+    /// The staging bound is enforced UP FRONT from the declared total_len.
+    #[test]
+    fn chunk_over_cap_total_len_rejected() {
+        let engine = make_engine();
+        let tracker = ReplicaAppliedTracker::in_memory();
+        let k = key(93);
+        let part = ReplicaOp::OpChunk {
+            tx_key: k,
+            chunk_index: 0,
+            chunk_count: 2,
+            total_len: MAX_STAGED_OP_BYTES + 1,
+            payload: vec![0xAB; 8],
+        };
+        let resp = send_tracked(&engine, &tracker, &chunk_batch(1, vec![part]));
+        assert_eq!(resp.status, STATUS_ERROR);
+        match ReplicaAck::deserialize(&resp.payload).expect("ack decodes") {
+            ReplicaAck::Error { message, .. } => {
+                assert!(message.contains("staging"), "message was: {message}")
+            }
+            other => panic!("expected ReplicaAck::Error, got {other:?}"),
+        }
+    }
+
+    /// A reassembled inner op that is itself a chunk is a protocol
+    /// violation — rejected, never recursed into.
+    #[test]
+    fn chunk_nested_chunk_rejected() {
+        let engine = make_engine();
+        let tracker = ReplicaAppliedTracker::in_memory();
+        let k = key(94);
+        let inner = ReplicaOp::OpChunk {
+            tx_key: k,
+            chunk_index: 0,
+            chunk_count: 1,
+            total_len: 8,
+            payload: vec![0xCD; 8],
+        };
+        let parts = chunk_op(&inner, 1);
+        let resp = send_tracked(&engine, &tracker, &chunk_batch(1, parts));
+        assert_eq!(resp.status, STATUS_ERROR);
+        match ReplicaAck::deserialize(&resp.payload).expect("ack decodes") {
+            ReplicaAck::Error { message, .. } => {
+                assert!(message.contains("nested"), "message was: {message}")
+            }
+            other => panic!("expected ReplicaAck::Error, got {other:?}"),
+        }
+    }
+
+    /// A part whose declared total_len contradicts the open assembly NAKs
+    /// (tamper/corruption fail-closed).
+    #[test]
+    fn chunk_mismatched_total_len_rejected() {
+        let engine = make_engine();
+        let tracker = ReplicaAppliedTracker::in_memory();
+        let k = key(95);
+        let parts = chunk_op(&chunk_test_create(k), 3);
+
+        let resp = send_tracked(&engine, &tracker, &chunk_batch(1, parts[..1].to_vec()));
+        assert_eq!(resp.status, STATUS_OK);
+        let tampered = match &parts[1] {
+            ReplicaOp::OpChunk {
+                tx_key,
+                chunk_index,
+                chunk_count,
+                total_len,
+                payload,
+            } => ReplicaOp::OpChunk {
+                tx_key: *tx_key,
+                chunk_index: *chunk_index,
+                chunk_count: *chunk_count,
+                total_len: total_len + 1,
+                payload: payload.clone(),
+            },
+            other => panic!("fixture must be a chunk, got {other:?}"),
+        };
+        let resp = send_tracked(&engine, &tracker, &chunk_batch(2, vec![tampered]));
+        assert_eq!(resp.status, STATUS_ERROR);
+        assert!(engine.read_metadata(&k).is_err());
     }
 
     /// The 06/09 churn fix: a sender whose cluster_key atomic lags its own

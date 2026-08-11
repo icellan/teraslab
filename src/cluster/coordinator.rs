@@ -8630,86 +8630,92 @@ fn stream_shard_baseline(
 
         // Send as OP_REPLICA_BATCH with FLAG_MIGRATION_BATCH so the
         // target registers the shard as receiving inbound migration data.
-        let request = RequestFrame {
-            request_id: task.shard as u64,
-            op_code: OP_REPLICA_BATCH,
-            flags: FLAG_MIGRATION_BATCH,
-            payload: batch.serialize().into(),
-        };
+        // Scenario 11: a baseline embedding large records can exceed one
+        // frame — split (chunking oversized ops) and ship the sub-batches
+        // sequentially on this same stream, acking each one. A batch that
+        // already fits passes through as a single sub-batch.
+        for sub in batch.split_for_wire(crate::replication::protocol::REPLICA_SEND_BUDGET) {
+            let request = RequestFrame {
+                request_id: task.shard as u64,
+                op_code: OP_REPLICA_BATCH,
+                flags: FLAG_MIGRATION_BATCH,
+                payload: sub.serialize().into(),
+            };
 
-        let response = exchange_frame(stream, &request, auth_secret)?;
+            let response = exchange_frame(stream, &request, auth_secret)?;
 
-        use crate::replication::protocol::ReplicaAck;
-        // Check the frame status first. A STATUS_ERROR response carries EITHER a
-        // `ReplicaAck::Error` payload (migration-batch apply failure, decoded
-        // below via Fix D) OR a [code:2][msg_len:2][msg] error envelope (e.g.
-        // ERR_STALE_EPOCH from the pre-apply epoch gate). The success path (this
-        // status == STATUS_OK) parses the payload as a ReplicaAck.
-        if response.status != STATUS_OK {
-            // Fix D: a migration-batch apply failure on the receiver is sent as a
-            // STATUS_ERROR frame whose payload is a `ReplicaAck::Error`
-            // ([tag=1][failed_sequence:u64][msg_len:u32][msg]), NOT the
-            // [code:u16][msg_len:u16][msg] error envelope. Decoding it as the
-            // latter mis-reads the tag/sequence bytes into a bogus `code=1`
-            // (or 257 / 513) with an empty message — hiding the real failure
-            // from docker validation. Try the ReplicaAck decode first and, when
-            // it is a `ReplicaAck::Error`, surface its real message. Only fall
-            // back to the [code][msg] envelope for genuine envelope errors
-            // (e.g. ERR_STALE_EPOCH from the pre-apply epoch gate).
-            let detail = decode_migration_batch_error_detail(&response.payload);
-            return Err(format!(
-                "migration batch failed with status {}{detail}",
-                response.status
-            ));
-        }
-        if !response.payload.is_empty() {
-            match ReplicaAck::deserialize(&response.payload) {
-                Ok(ReplicaAck::Error {
-                    failed_sequence,
-                    message,
-                }) => {
-                    return Err(format!(
-                        "migration batch: replica reported error at seq {failed_sequence}: {message}"
-                    ));
-                }
-                Ok(ReplicaAck::Ok { .. }) => {} // success
-                Ok(ReplicaAck::Gap {
-                    expected_sequence,
-                    received_first_sequence,
-                }) => {
-                    // Migration batches bypass the receiver's sequence
-                    // tracking; a Gap NAK here means a protocol bug.
-                    return Err(format!(
-                        "migration batch: unexpected sequence-gap NAK \
+            use crate::replication::protocol::ReplicaAck;
+            // Check the frame status first. A STATUS_ERROR response carries EITHER a
+            // `ReplicaAck::Error` payload (migration-batch apply failure, decoded
+            // below via Fix D) OR a [code:2][msg_len:2][msg] error envelope (e.g.
+            // ERR_STALE_EPOCH from the pre-apply epoch gate). The success path (this
+            // status == STATUS_OK) parses the payload as a ReplicaAck.
+            if response.status != STATUS_OK {
+                // Fix D: a migration-batch apply failure on the receiver is sent as a
+                // STATUS_ERROR frame whose payload is a `ReplicaAck::Error`
+                // ([tag=1][failed_sequence:u64][msg_len:u32][msg]), NOT the
+                // [code:u16][msg_len:u16][msg] error envelope. Decoding it as the
+                // latter mis-reads the tag/sequence bytes into a bogus `code=1`
+                // (or 257 / 513) with an empty message — hiding the real failure
+                // from docker validation. Try the ReplicaAck decode first and, when
+                // it is a `ReplicaAck::Error`, surface its real message. Only fall
+                // back to the [code][msg] envelope for genuine envelope errors
+                // (e.g. ERR_STALE_EPOCH from the pre-apply epoch gate).
+                let detail = decode_migration_batch_error_detail(&response.payload);
+                return Err(format!(
+                    "migration batch failed with status {}{detail}",
+                    response.status
+                ));
+            }
+            if !response.payload.is_empty() {
+                match ReplicaAck::deserialize(&response.payload) {
+                    Ok(ReplicaAck::Error {
+                        failed_sequence,
+                        message,
+                    }) => {
+                        return Err(format!(
+                            "migration batch: replica reported error at seq {failed_sequence}: {message}"
+                        ));
+                    }
+                    Ok(ReplicaAck::Ok { .. }) => {} // success
+                    Ok(ReplicaAck::Gap {
+                        expected_sequence,
+                        received_first_sequence,
+                    }) => {
+                        // Migration batches bypass the receiver's sequence
+                        // tracking; a Gap NAK here means a protocol bug.
+                        return Err(format!(
+                            "migration batch: unexpected sequence-gap NAK \
                          (expected {expected_sequence}, sent {received_first_sequence})"
-                    ));
-                }
-                Ok(ReplicaAck::Busy { first_sequence }) => {
-                    // FU#6a: the receiver's redo was momentarily full, so
-                    // nothing was applied or journaled — the whole migration
-                    // batch is safe to retry (no partial state to reconcile).
-                    return Err(format!(
-                        "migration batch: replica redo busy (backpressure) at seq {first_sequence}"
-                    ));
-                }
-                Ok(ReplicaAck::MissingRecord {
-                    failed_sequence,
-                    tx_keys,
-                }) => {
-                    // Unreachable by construction: the missing-record NAK is
-                    // raised only when `nak_on_missing` is true, and
-                    // `FLAG_MIGRATION_BATCH` forces it false (the baseline
-                    // legitimately streams records the target lacks). Treat it
-                    // as the protocol bug it would be rather than silently
-                    // succeeding.
-                    return Err(format!(
-                        "migration batch: unexpected missing-record NAK at seq {failed_sequence} \
+                        ));
+                    }
+                    Ok(ReplicaAck::Busy { first_sequence }) => {
+                        // FU#6a: the receiver's redo was momentarily full, so
+                        // nothing was applied or journaled — the whole migration
+                        // batch is safe to retry (no partial state to reconcile).
+                        return Err(format!(
+                            "migration batch: replica redo busy (backpressure) at seq {first_sequence}"
+                        ));
+                    }
+                    Ok(ReplicaAck::MissingRecord {
+                        failed_sequence,
+                        tx_keys,
+                    }) => {
+                        // Unreachable by construction: the missing-record NAK is
+                        // raised only when `nak_on_missing` is true, and
+                        // `FLAG_MIGRATION_BATCH` forces it false (the baseline
+                        // legitimately streams records the target lacks). Treat it
+                        // as the protocol bug it would be rather than silently
+                        // succeeding.
+                        return Err(format!(
+                            "migration batch: unexpected missing-record NAK at seq {failed_sequence} \
                          for {} key(s) (a migration baseline must never NAK on absence)",
-                        tx_keys.len()
-                    ));
-                }
-                Err(e) => {
-                    return Err(format!("migration batch: failed to parse replica ack: {e}"));
+                            tx_keys.len()
+                        ));
+                    }
+                    Err(e) => {
+                        return Err(format!("migration batch: failed to parse replica ack: {e}"));
+                    }
                 }
             }
         }
@@ -9855,79 +9861,85 @@ fn send_delta_ops(
         // Phase B3: stamped with the source's live coordinator epoch.
         cluster_key,
     };
-    let request = RequestFrame {
-        request_id: shard as u64,
-        op_code: OP_REPLICA_BATCH,
-        flags: FLAG_MIGRATION_BATCH,
-        payload: batch.serialize().into(),
-    };
-    let response = exchange_frame(stream, &request, auth_secret)?;
+    // Scenario 11: a delta window can carry a large-record Create that
+    // exceeds one frame — split (chunking oversized ops) and ship the
+    // sub-batches sequentially on this stream, acking each. A delta set
+    // that already fits passes through as a single sub-batch.
+    for sub in batch.split_for_wire(crate::replication::protocol::REPLICA_SEND_BUDGET) {
+        let request = RequestFrame {
+            request_id: shard as u64,
+            op_code: OP_REPLICA_BATCH,
+            flags: FLAG_MIGRATION_BATCH,
+            payload: sub.serialize().into(),
+        };
+        let response = exchange_frame(stream, &request, auth_secret)?;
 
-    // Check the frame STATUS first — same ordering as the baseline migration
-    // path above, and load-bearing for the same reason. A STATUS_ERROR frame
-    // carries EITHER a `ReplicaAck::Error` payload (a receiver-side apply
-    // failure) OR the `[code:u16][msg_len:u16][msg]` error envelope (e.g.
-    // ERR_STALE_EPOCH from the pre-apply epoch gate). Parsing the envelope as
-    // a `ReplicaAck` reads the error code's low byte as an ack tag, so
-    // ERR_STALE_EPOCH (24) came back as "unknown op type: 24" — which both
-    // hid the real cause and mis-classified a RETRYABLE stale-epoch rejection
-    // as a permanent protocol failure. `decode_migration_batch_error_detail`
-    // tries the ack decode first and falls back to the envelope, so both
-    // shapes report truthfully.
-    if response.status != STATUS_OK {
-        let detail = decode_migration_batch_error_detail(&response.payload);
-        return Err(format!(
-            "delta batch rejected: status {}{detail}",
-            response.status
-        ));
-    }
+        // Check the frame STATUS first — same ordering as the baseline migration
+        // path above, and load-bearing for the same reason. A STATUS_ERROR frame
+        // carries EITHER a `ReplicaAck::Error` payload (a receiver-side apply
+        // failure) OR the `[code:u16][msg_len:u16][msg]` error envelope (e.g.
+        // ERR_STALE_EPOCH from the pre-apply epoch gate). Parsing the envelope as
+        // a `ReplicaAck` reads the error code's low byte as an ack tag, so
+        // ERR_STALE_EPOCH (24) came back as "unknown op type: 24" — which both
+        // hid the real cause and mis-classified a RETRYABLE stale-epoch rejection
+        // as a permanent protocol failure. `decode_migration_batch_error_detail`
+        // tries the ack decode first and falls back to the envelope, so both
+        // shapes report truthfully.
+        if response.status != STATUS_OK {
+            let detail = decode_migration_batch_error_detail(&response.payload);
+            return Err(format!(
+                "delta batch rejected: status {}{detail}",
+                response.status
+            ));
+        }
 
-    // Validate ReplicaAck payload
-    if !response.payload.is_empty() {
-        match ReplicaAck::deserialize(&response.payload) {
-            Ok(ReplicaAck::Error {
-                failed_sequence,
-                message,
-            }) => {
-                return Err(format!(
-                    "delta apply error at seq {failed_sequence}: {message}"
-                ));
-            }
-            Ok(ReplicaAck::Ok { .. }) => {}
-            Ok(ReplicaAck::Gap {
-                expected_sequence,
-                received_first_sequence,
-            }) => {
-                // Delta batches carry FLAG_MIGRATION_BATCH and bypass the
-                // receiver's sequence tracking; a Gap NAK is a protocol bug.
-                return Err(format!(
-                    "delta batch: unexpected sequence-gap NAK \
+        // Validate ReplicaAck payload
+        if !response.payload.is_empty() {
+            match ReplicaAck::deserialize(&response.payload) {
+                Ok(ReplicaAck::Error {
+                    failed_sequence,
+                    message,
+                }) => {
+                    return Err(format!(
+                        "delta apply error at seq {failed_sequence}: {message}"
+                    ));
+                }
+                Ok(ReplicaAck::Ok { .. }) => {}
+                Ok(ReplicaAck::Gap {
+                    expected_sequence,
+                    received_first_sequence,
+                }) => {
+                    // Delta batches carry FLAG_MIGRATION_BATCH and bypass the
+                    // receiver's sequence tracking; a Gap NAK is a protocol bug.
+                    return Err(format!(
+                        "delta batch: unexpected sequence-gap NAK \
                      (expected {expected_sequence}, sent {received_first_sequence})"
-                ));
-            }
-            Ok(ReplicaAck::Busy { first_sequence }) => {
-                // FU#6a: the receiver's redo was momentarily full; nothing was
-                // applied or journaled, so the whole delta batch is retryable.
-                return Err(format!(
-                    "delta batch: replica redo busy (backpressure) at seq {first_sequence}"
-                ));
-            }
-            Ok(ReplicaAck::MissingRecord {
-                failed_sequence,
-                tx_keys,
-            }) => {
-                // Same as the baseline path: `FLAG_MIGRATION_BATCH` forces
-                // `nak_on_missing = false`, so this variant cannot legitimately
-                // reach a delta batch. Fail loudly instead of treating an
-                // unrecognised NAK as success.
-                return Err(format!(
-                    "delta batch: unexpected missing-record NAK at seq {failed_sequence} \
+                    ));
+                }
+                Ok(ReplicaAck::Busy { first_sequence }) => {
+                    // FU#6a: the receiver's redo was momentarily full; nothing was
+                    // applied or journaled, so the whole delta batch is retryable.
+                    return Err(format!(
+                        "delta batch: replica redo busy (backpressure) at seq {first_sequence}"
+                    ));
+                }
+                Ok(ReplicaAck::MissingRecord {
+                    failed_sequence,
+                    tx_keys,
+                }) => {
+                    // Same as the baseline path: `FLAG_MIGRATION_BATCH` forces
+                    // `nak_on_missing = false`, so this variant cannot legitimately
+                    // reach a delta batch. Fail loudly instead of treating an
+                    // unrecognised NAK as success.
+                    return Err(format!(
+                        "delta batch: unexpected missing-record NAK at seq {failed_sequence} \
                      for {} key(s) (a migration delta must never NAK on absence)",
-                    tx_keys.len()
-                ));
-            }
-            Err(e) => {
-                return Err(format!("failed to parse delta ack: {e}"));
+                        tx_keys.len()
+                    ));
+                }
+                Err(e) => {
+                    return Err(format!("failed to parse delta ack: {e}"));
+                }
             }
         }
     }

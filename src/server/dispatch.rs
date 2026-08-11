@@ -5529,146 +5529,166 @@ fn send_replica_ops_loop(
         }
     };
 
+    // Scenario 11: chunk-split oversized ops (a Create embedding a large
+    // record exceeds one frame) and partition the result into budgeted
+    // frame groups, shipped sequentially on this same stream with
+    // contiguous labels. The common path — everything fits one frame —
+    // yields exactly one group and behaves as the historical single-batch
+    // send.
+    let groups = crate::replication::protocol::split_ops_for_wire(
+        ops.to_vec(),
+        crate::replication::protocol::REPLICA_SEND_BUDGET,
+    );
+    let last_group = groups.len().saturating_sub(1);
+
     // Two independent budgets: sequence renegotiation (Gap / duplicate-skip
     // resync) and Busy backpressure resends. Busy never consumes a
-    // renegotiation attempt (it relabels nothing), so both are bounded and the
-    // loop always terminates.
+    // renegotiation attempt (it relabels nothing), so both are bounded and
+    // the loop always terminates. Budgets span ALL groups (strictest —
+    // identical to the historical single-batch semantics when one group).
     let mut reneg_attempts = 0usize;
     let mut busy_retries = 0usize;
-    loop {
-        let batch = ReplicaBatch {
-            first_sequence: next,
-            ops: ops.to_vec(),
-            trace_ctx: crate::observability::WireTraceContext::from_current_span(),
-            source_node_id: Some(source_node_id),
-            cluster_key,
-        };
-        let last = batch.last_sequence();
+    for (group_idx, group) in groups.iter().enumerate() {
+        loop {
+            let batch = ReplicaBatch {
+                first_sequence: next,
+                ops: group.clone(),
+                trace_ctx: crate::observability::WireTraceContext::from_current_span(),
+                source_node_id: Some(source_node_id),
+                cluster_key,
+            };
+            let last = batch.last_sequence();
 
-        let ack = match exchange(&batch) {
-            Ok(ack) => ack,
-            Err(e) => {
-                // Burn the assigned positions: the frame may have been applied
-                // with the ACK lost in flight. Reusing the positions for
-                // different content could be dedup-skipped by the receiver; a
-                // hole heals via Gap/relabel instead.
-                *next_sequence = Some(last + 1);
-                return Err(ReplicaSendError::Failed(e));
-            }
-        };
+            let ack = match exchange(&batch) {
+                Ok(ack) => ack,
+                Err(e) => {
+                    // Burn the assigned positions: the frame may have been applied
+                    // with the ACK lost in flight. Reusing the positions for
+                    // different content could be dedup-skipped by the receiver; a
+                    // hole heals via Gap/relabel instead.
+                    *next_sequence = Some(last + 1);
+                    return Err(ReplicaSendError::Failed(e));
+                }
+            };
 
-        match ack {
-            ReplicaAck::Ok { through_sequence } if through_sequence == last => {
-                *next_sequence = Some(last + 1);
-                *last_acked = through_sequence;
-                // Persist the redo-log coverage for crash-safe catch-up and lag
-                // monitoring (real redo space, not the stream labels).
-                if redo_high > 0
-                    && let Some(tracker) = ACK_TRACKER.get()
-                {
-                    tracker.record_ack(addr, redo_high);
+            match ack {
+                ReplicaAck::Ok { through_sequence } if through_sequence == last => {
+                    *next_sequence = Some(last + 1);
+                    *last_acked = through_sequence;
+                    next = last + 1;
+                    // Persist the redo-log coverage for crash-safe catch-up and
+                    // lag monitoring (real redo space, not the stream labels) —
+                    // once, after the FINAL group, so coverage is only recorded
+                    // when the whole op set is on the replica.
+                    if group_idx == last_group
+                        && redo_high > 0
+                        && let Some(tracker) = ACK_TRACKER.get()
+                    {
+                        tracker.record_ack(addr, redo_high);
+                    }
+                    break;
                 }
-                return Ok(());
-            }
-            ReplicaAck::Ok { through_sequence } => {
-                // Duplicate-skip against a watermark ahead of our cursor:
-                // nothing from THIS batch was applied. Adopt and retry.
-                reneg_attempts += 1;
-                if reneg_attempts >= MAX_SEQUENCE_RENEGOTIATIONS {
-                    return Err(ReplicaSendError::Failed(format!(
-                        "replication to {addr}: sequence renegotiation did not converge after \
+                ReplicaAck::Ok { through_sequence } => {
+                    // Duplicate-skip against a watermark ahead of our cursor:
+                    // nothing from THIS batch was applied. Adopt and retry.
+                    reneg_attempts += 1;
+                    if reneg_attempts >= MAX_SEQUENCE_RENEGOTIATIONS {
+                        return Err(ReplicaSendError::Failed(format!(
+                            "replication to {addr}: sequence renegotiation did not converge after \
                          {MAX_SEQUENCE_RENEGOTIATIONS} attempts",
-                    )));
+                        )));
+                    }
+                    tracing::warn!(
+                        %addr,
+                        attempt = reneg_attempts,
+                        sent_first = next,
+                        sent_last = last,
+                        replica_through = through_sequence,
+                        "replication: cursor behind replica watermark; resyncing and relabeling",
+                    );
+                    *next_sequence = Some(through_sequence + 1);
+                    next = through_sequence + 1;
                 }
-                tracing::warn!(
-                    %addr,
-                    attempt = reneg_attempts,
-                    sent_first = next,
-                    sent_last = last,
-                    replica_through = through_sequence,
-                    "replication: cursor behind replica watermark; resyncing and relabeling",
-                );
-                *next_sequence = Some(through_sequence + 1);
-                next = through_sequence + 1;
-            }
-            ReplicaAck::Gap {
-                expected_sequence, ..
-            } => {
-                // Benign hole left by burned positions; relabel down to the
-                // replica's next-expected sequence and retry.
-                reneg_attempts += 1;
-                if reneg_attempts >= MAX_SEQUENCE_RENEGOTIATIONS {
-                    return Err(ReplicaSendError::Failed(format!(
-                        "replication to {addr}: sequence renegotiation did not converge after \
+                ReplicaAck::Gap {
+                    expected_sequence, ..
+                } => {
+                    // Benign hole left by burned positions; relabel down to the
+                    // replica's next-expected sequence and retry.
+                    reneg_attempts += 1;
+                    if reneg_attempts >= MAX_SEQUENCE_RENEGOTIATIONS {
+                        return Err(ReplicaSendError::Failed(format!(
+                            "replication to {addr}: sequence renegotiation did not converge after \
                          {MAX_SEQUENCE_RENEGOTIATIONS} attempts",
-                    )));
+                        )));
+                    }
+                    tracing::warn!(
+                        %addr,
+                        attempt = reneg_attempts,
+                        sent_first = next,
+                        expected_sequence,
+                        "replication: replica NAKed sequence gap; relabeling and re-sending",
+                    );
+                    *next_sequence = Some(expected_sequence);
+                    next = expected_sequence;
                 }
-                tracing::warn!(
-                    %addr,
-                    attempt = reneg_attempts,
-                    sent_first = next,
-                    expected_sequence,
-                    "replication: replica NAKed sequence gap; relabeling and re-sending",
-                );
-                *next_sequence = Some(expected_sequence);
-                next = expected_sequence;
-            }
-            ReplicaAck::Busy { first_sequence } => {
-                // FU#6a: retryable redo-backpressure NAK. Nothing was applied or
-                // journaled and the replica's watermark is unchanged, so the
-                // IDENTICAL labeled batch is correct to resend — do NOT burn or
-                // relabel, and do NOT consume a renegotiation attempt. Resend
-                // the SAME batch under a bounded budget with a short backoff.
-                if busy_retries >= MAX_BUSY_RETRIES {
-                    // Exhaustion: the replica's redo is genuinely stuck (drain
-                    // wedged). Fall back to the Error behavior — burn the
-                    // positions and fail so the caller's replication-failure
-                    // path fires.
+                ReplicaAck::Busy { first_sequence } => {
+                    // FU#6a: retryable redo-backpressure NAK. Nothing was applied or
+                    // journaled and the replica's watermark is unchanged, so the
+                    // IDENTICAL labeled batch is correct to resend — do NOT burn or
+                    // relabel, and do NOT consume a renegotiation attempt. Resend
+                    // the SAME batch under a bounded budget with a short backoff.
+                    if busy_retries >= MAX_BUSY_RETRIES {
+                        // Exhaustion: the replica's redo is genuinely stuck (drain
+                        // wedged). Fall back to the Error behavior — burn the
+                        // positions and fail so the caller's replication-failure
+                        // path fires.
+                        *next_sequence = Some(last + 1);
+                        return Err(ReplicaSendError::Failed(format!(
+                            "replica redo busy: still full after {MAX_BUSY_RETRIES} retries \
+                         (first_sequence {first_sequence})",
+                        )));
+                    }
+                    busy_retries += 1;
+                    tracing::warn!(
+                        %addr,
+                        busy_retries,
+                        first_sequence,
+                        "replication: replica NAKed redo-busy (backpressure); backing off and re-sending",
+                    );
+                    std::thread::sleep(BUSY_RETRY_BACKOFF);
+                    // `next` unchanged — the resend carries the identical label.
+                }
+                ReplicaAck::Error { message, .. } => {
+                    // Burn the positions — the replica may have applied a prefix
+                    // before failing.
                     *next_sequence = Some(last + 1);
                     return Err(ReplicaSendError::Failed(format!(
-                        "replica redo busy: still full after {MAX_BUSY_RETRIES} retries \
-                         (first_sequence {first_sequence})",
+                        "replica error: {message}"
                     )));
                 }
-                busy_retries += 1;
-                tracing::warn!(
-                    %addr,
-                    busy_retries,
-                    first_sequence,
-                    "replication: replica NAKed redo-busy (backpressure); backing off and re-sending",
-                );
-                std::thread::sleep(BUSY_RETRY_BACKOFF);
-                // `next` unchanged — the resend carries the identical label.
-            }
-            ReplicaAck::Error { message, .. } => {
-                // Burn the positions — the replica may have applied a prefix
-                // before failing.
-                *next_sequence = Some(last + 1);
-                return Err(ReplicaSendError::Failed(format!(
-                    "replica error: {message}"
-                )));
-            }
-            ReplicaAck::MissingRecord {
-                failed_sequence,
-                tx_keys,
-            } => {
-                // The replica aborted because it does not have these records.
-                // Burn the positions exactly as for `Error` (the replica may
-                // have applied the prefix before the failing op, and its
-                // watermark did not advance). Report the keys so the caller can
-                // re-ship them and re-send — this loop deliberately does NOT
-                // retry here: it has no engine handle, and a blind resend of the
-                // same ops would NAK identically forever.
-                *next_sequence = Some(last + 1);
-                let detail = format!(
-                    "replica {addr} is missing {} record(s), first {:?} (NAK at seq {failed_sequence})",
-                    tx_keys.len(),
-                    tx_keys.first(),
-                );
-                return Err(ReplicaSendError::MissingRecord { tx_keys, detail });
+                ReplicaAck::MissingRecord {
+                    failed_sequence,
+                    tx_keys,
+                } => {
+                    // The replica aborted because it does not have these records.
+                    // Burn the positions exactly as for `Error` (the replica may
+                    // have applied the prefix before the failing op, and its
+                    // watermark did not advance). Report the keys so the caller can
+                    // re-ship them and re-send — this loop deliberately does NOT
+                    // retry here: it has no engine handle, and a blind resend of the
+                    // same ops would NAK identically forever.
+                    *next_sequence = Some(last + 1);
+                    let detail = format!(
+                        "replica {addr} is missing {} record(s), first {:?} (NAK at seq {failed_sequence})",
+                        tx_keys.len(),
+                        tx_keys.first(),
+                    );
+                    return Err(ReplicaSendError::MissingRecord { tx_keys, detail });
+                }
             }
         }
     }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -13188,6 +13208,94 @@ mod tests {
         let index = Index::new(10000).unwrap();
         let locks = StripedLocks::new(1024);
         Engine::new(dev, index, alloc, locks, DahIndex::new())
+    }
+
+    /// Scenario 11: an op whose wire form exceeds the frame budget (a
+    /// Create embedding a large record) is chunked and shipped across
+    /// MULTIPLE budgeted frames on the same stream — contiguous sequence
+    /// labels, every frame under `REPLICA_SEND_BUDGET`, and the chunk
+    /// payloads tiling the original op's serialized bytes exactly.
+    #[test]
+    fn oversized_op_chunks_across_multiple_budgeted_frames() {
+        use crate::replication::protocol::{CHUNK_PAYLOAD_MAX, REPLICA_SEND_BUDGET};
+
+        let addr: SocketAddr = "127.0.0.1:9004".parse().unwrap();
+        let big = ReplicaOp::Create {
+            tx_key: crate::index::TxKey { txid: [9u8; 32] },
+            metadata_bytes: vec![0x11; 64],
+            utxo_hashes: vec![[0x22; 32]],
+            cold_data: Some(vec![0x33; 2 * CHUNK_PAYLOAD_MAX + CHUNK_PAYLOAD_MAX / 2]),
+            is_external: false,
+        };
+        let small = ReplicaOp::Spend {
+            tx_key: crate::index::TxKey { txid: [10u8; 32] },
+            offset: 0,
+            spending_data: [0u8; 36],
+            current_block_height: 0,
+            block_height_retention: 0,
+            master_generation: 0,
+        };
+        let original_big_bytes = big.serialize();
+        let ops = vec![big, small.clone()];
+
+        let mut next_sequence = Some(5u64);
+        let mut last_acked = 0u64;
+        let mut captured: Vec<ReplicaBatch> = Vec::new();
+
+        let res = send_replica_ops_loop(
+            addr,
+            &ops,
+            0,
+            1,
+            0,
+            &mut next_sequence,
+            &mut last_acked,
+            |batch: &ReplicaBatch| {
+                captured.push(batch.clone());
+                Ok(ReplicaAck::Ok {
+                    through_sequence: batch.last_sequence(),
+                })
+            },
+        );
+        assert!(res.is_ok(), "multi-frame send must succeed: {res:?}");
+        assert!(
+            captured.len() >= 2,
+            "a 2.5x-budget op cannot fit one frame (got {} frames)",
+            captured.len(),
+        );
+
+        let mut expected_first = 5u64;
+        let mut reassembled = Vec::new();
+        let mut total_ops = 0usize;
+        for batch in &captured {
+            assert!(
+                batch.serialize().len() <= REPLICA_SEND_BUDGET,
+                "every frame must fit the send budget",
+            );
+            assert_eq!(
+                batch.first_sequence, expected_first,
+                "frames must carry contiguous sequence labels",
+            );
+            expected_first += batch.ops.len() as u64;
+            total_ops += batch.ops.len();
+            for op in &batch.ops {
+                if let ReplicaOp::OpChunk { payload, .. } = op {
+                    reassembled.extend_from_slice(payload);
+                }
+            }
+        }
+        assert_eq!(
+            reassembled, original_big_bytes,
+            "chunk payloads must tile the oversized op bytewise",
+        );
+        let flat_last = captured.last().unwrap().ops.last().unwrap();
+        assert_eq!(flat_last, &small, "op order must be preserved");
+        assert_eq!(
+            next_sequence,
+            Some(5 + total_ops as u64),
+            "the cursor must advance past every post-split op",
+        );
+        assert_eq!(last_acked, 5 + total_ops as u64 - 1);
     }
 
     /// FU#6a: a `Busy` NAK must be RESENT — identically labeled, with NO burn,
