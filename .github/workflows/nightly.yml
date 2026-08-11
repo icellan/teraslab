@@ -1,10 +1,24 @@
 name: Nightly E2E
 
+# Surfaces the armed-qualification opt-ins in the run list so armed runs are
+# distinguishable from default-path runs at a glance. Scheduled runs have an
+# empty `inputs` context and render as plain "Nightly E2E".
+run-name: "Nightly E2E${{ inputs.arm_election && ' [armed: election]' || '' }}${{ inputs.arm_sweep && ' [armed: sweep]' || '' }}"
+
 on:
   schedule:
     # Every day at 03:00 UTC
     - cron: "0 3 * * *"
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      arm_election:
+        description: "Arm committed_master_election_enabled in every generated docker node config"
+        type: boolean
+        default: false
+      arm_sweep:
+        description: "Arm under_replication_sweep_enabled in every generated docker node config"
+        type: boolean
+        default: false
 
 env:
   CARGO_TERM_COLOR: always
@@ -138,7 +152,16 @@ jobs:
 
       - name: Run nightly scenarios
         working-directory: teraslab-tests
-        run: ./run_all.sh --tier nightly
+        env:
+          # Armed-qualification opt-ins, consumed by the test client's
+          # config generator (teraslab-tests/client/src/helpers.rs). On
+          # scheduled runs `inputs` is empty, the expressions yield '0',
+          # and the generated configs keep both flags default-off.
+          TERASLAB_DOCKER_COMMITTED_ELECTION: ${{ inputs.arm_election && '1' || '0' }}
+          TERASLAB_DOCKER_UNDER_REPLICATION_SWEEP: ${{ inputs.arm_sweep && '1' || '0' }}
+        run: |
+          echo "arming: election=${TERASLAB_DOCKER_COMMITTED_ELECTION} sweep=${TERASLAB_DOCKER_UNDER_REPLICATION_SWEEP}"
+          ./run_all.sh --tier nightly
 
       - name: Collect logs on failure
         if: failure()

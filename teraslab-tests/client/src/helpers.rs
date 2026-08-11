@@ -52,6 +52,35 @@ fn docker_migration_batch_size_from_env() -> Result<usize, ClientError> {
     }
 }
 
+// Armed-qualification opt-ins: flip the two default-off topology flags
+// (committed master election / under-replication sweep) in every generated
+// node config so a dedicated CI run can qualify the ARMED path without
+// touching the default path scheduled nightlies measure. Two separate vars
+// so runs can isolate each mechanism, matching how the flag split was
+// diagnosed in the first place.
+const ENV_DOCKER_COMMITTED_ELECTION: &str = "TERASLAB_DOCKER_COMMITTED_ELECTION";
+const ENV_DOCKER_UNDER_REPLICATION_SWEEP: &str = "TERASLAB_DOCKER_UNDER_REPLICATION_SWEEP";
+
+fn parse_docker_arming_flag(env_name: &str, raw: &str) -> Result<bool, String> {
+    match raw.trim() {
+        "" | "0" | "false" => Ok(false),
+        "1" | "true" => Ok(true),
+        other => Err(format!(
+            "{env_name} must be one of 1/true/0/false, got {other:?}"
+        )),
+    }
+}
+
+fn docker_arming_flag_from_env(env_name: &str) -> Result<bool, ClientError> {
+    match std::env::var(env_name) {
+        Ok(raw) => parse_docker_arming_flag(env_name, &raw).map_err(ClientError::Connection),
+        Err(std::env::VarError::NotPresent) => Ok(false),
+        Err(e) => Err(ClientError::Connection(format!(
+            "{env_name} could not be read: {e}"
+        ))),
+    }
+}
+
 /// Per-scenario SWIM failure-detection timing: `(probe_interval_ms, suspicion_timeout_ms)`.
 ///
 /// Rule: aggressive timing (150/1000) ONLY for scenarios where failure-detection
@@ -84,6 +113,7 @@ fn swim_timing_for_scenario(scenario_id: u16) -> (u32, u32) {
 /// test configs also set `enable_remote_bind = true`.
 pub const DOCKER_TEST_ADMIN_TOKEN: &str = "teraslab-docker-test-token";
 
+#[allow(clippy::too_many_arguments)]
 fn render_node_config(
     node_id: u32,
     node_ip: &str,
@@ -92,6 +122,8 @@ fn render_node_config(
     migration_batch_size: usize,
     swim_probe_interval_ms: u32,
     swim_suspicion_timeout_ms: u32,
+    committed_master_election_enabled: bool,
+    under_replication_sweep_enabled: bool,
 ) -> String {
     format!(
         r#"node_id = {node_id}
@@ -147,6 +179,13 @@ strict_auth = false
 # network and must be >= 16 bytes because enable_remote_bind = true.
 enable_admin_endpoints = true
 admin_token = "{admin_token}"
+
+# Armed-qualification opt-ins (TERASLAB_DOCKER_COMMITTED_ELECTION /
+# TERASLAB_DOCKER_UNDER_REPLICATION_SWEEP). Both flags default off in the
+# shipped config; pinned explicitly here so every generated config states
+# which path — armed or default — the run actually measured.
+committed_master_election_enabled = {committed_master_election_enabled}
+under_replication_sweep_enabled = {under_replication_sweep_enabled}
 "#,
         admin_token = DOCKER_TEST_ADMIN_TOKEN,
     )
@@ -422,6 +461,10 @@ services:
         let config_dir = format!("{}/config", self.compose_dir);
         let migration_pool_size = docker_migration_pool_size_from_env()?;
         let migration_batch_size = docker_migration_batch_size_from_env()?;
+        let committed_master_election_enabled =
+            docker_arming_flag_from_env(ENV_DOCKER_COMMITTED_ELECTION)?;
+        let under_replication_sweep_enabled =
+            docker_arming_flag_from_env(ENV_DOCKER_UNDER_REPLICATION_SWEEP)?;
         let (swim_probe_interval_ms, swim_suspicion_timeout_ms) =
             swim_timing_for_scenario(self.scenario_id);
 
@@ -444,6 +487,8 @@ services:
                 migration_batch_size,
                 swim_probe_interval_ms,
                 swim_suspicion_timeout_ms,
+                committed_master_election_enabled,
+                under_replication_sweep_enabled,
             );
 
             let path = format!("{config_dir}/ts{:02}-node{n}.toml", self.scenario_id);
@@ -929,6 +974,33 @@ mod tests {
     }
 
     #[test]
+    fn docker_arming_flag_parse_defaults_off_on_empty() {
+        assert!(!parse_docker_arming_flag(ENV_DOCKER_COMMITTED_ELECTION, "").unwrap());
+        assert!(!parse_docker_arming_flag(ENV_DOCKER_UNDER_REPLICATION_SWEEP, "   ").unwrap());
+    }
+
+    #[test]
+    fn docker_arming_flag_parse_accepts_truthy_and_falsy_spellings() {
+        assert!(parse_docker_arming_flag(ENV_DOCKER_COMMITTED_ELECTION, "1").unwrap());
+        assert!(parse_docker_arming_flag(ENV_DOCKER_COMMITTED_ELECTION, "true").unwrap());
+        assert!(!parse_docker_arming_flag(ENV_DOCKER_COMMITTED_ELECTION, "0").unwrap());
+        assert!(!parse_docker_arming_flag(ENV_DOCKER_COMMITTED_ELECTION, "false").unwrap());
+    }
+
+    /// A typo in the arming env var must fail the run loudly, not silently
+    /// qualify the default path while claiming to have measured the armed
+    /// one (the vacuous-pass failure mode this harness has been burned by).
+    #[test]
+    fn docker_arming_flag_parse_rejects_invalid_values() {
+        let err = parse_docker_arming_flag(ENV_DOCKER_COMMITTED_ELECTION, "armed").unwrap_err();
+        assert!(
+            err.contains(ENV_DOCKER_COMMITTED_ELECTION),
+            "err was: {err}"
+        );
+        assert!(err.contains("armed"), "err must echo the bad value: {err}");
+    }
+
+    #[test]
     fn node_config_contains_configured_migration_tuning() {
         let config = render_node_config(
             2,
@@ -938,6 +1010,8 @@ mod tests {
             2048,
             150,
             1000,
+            false,
+            false,
         );
 
         assert!(config.contains("node_id = 2"));
@@ -947,6 +1021,61 @@ mod tests {
         assert!(config.contains("seed_nodes = [\"172.38.0.11:3301\", \"172.38.0.13:3301\"]"));
         assert!(config.contains("swim_probe_interval_ms = 150"));
         assert!(config.contains("swim_suspicion_timeout_ms = 1000"));
+    }
+
+    /// Armed-qualification opt-in: a default render must pin both topology
+    /// flags to their shipped default (off) so scheduled nightlies keep
+    /// measuring the default path, and an armed render must flip exactly
+    /// those two flags AND survive the `ServerConfig` round-trip plus
+    /// safe-defaults gate — an armed TOML that the daemon refuses to boot
+    /// would fail every scenario at `wait_cluster_ready`.
+    #[test]
+    fn node_config_arms_election_and_sweep_only_when_requested() {
+        use teraslab::config::ServerConfig;
+
+        let disarmed = render_node_config(
+            1,
+            "172.38.0.11",
+            "\"172.38.0.12:3301\", \"172.38.0.13:3301\"",
+            48,
+            1000,
+            200,
+            5000,
+            false,
+            false,
+        );
+        assert!(
+            disarmed.contains("committed_master_election_enabled = false"),
+            "disarmed render must pin election OFF explicitly",
+        );
+        assert!(
+            disarmed.contains("under_replication_sweep_enabled = false"),
+            "disarmed render must pin the sweep OFF explicitly",
+        );
+
+        let armed = render_node_config(
+            1,
+            "172.38.0.11",
+            "\"172.38.0.12:3301\", \"172.38.0.13:3301\"",
+            48,
+            1000,
+            200,
+            5000,
+            true,
+            true,
+        );
+        let cfg: ServerConfig = toml::from_str(&armed)
+            .expect("armed docker node config must be a valid ServerConfig TOML payload");
+        assert!(
+            cfg.committed_master_election_enabled,
+            "armed render must flip committed_master_election_enabled on",
+        );
+        assert!(
+            cfg.under_replication_sweep_enabled,
+            "armed render must flip under_replication_sweep_enabled on",
+        );
+        cfg.validate_safe_defaults()
+            .expect("armed docker node config must still pass safe-defaults validation");
     }
 
     /// W0.4: aggressive SWIM timing only where failure-detection speed is
@@ -990,6 +1119,8 @@ mod tests {
             500,
             200,
             5000,
+            false,
+            false,
         );
         let cfg: ServerConfig = toml::from_str(&rendered)
             .expect("rendered docker node config must be a valid ServerConfig TOML payload");
