@@ -4097,7 +4097,12 @@ impl ClusterCoordinator {
                         let cluster_secret = &catch_up_secret;
                         let swim_membership = &catch_up_swim;
                         let committed_members = topology_authority.committed_members();
-                        let peers: Vec<SocketAddr> = {
+                        // §9 arm 2 — carry the peer's NodeId next to its
+                        // address: the committed-topology exchange below is a
+                        // receive site for a peer's (term, digest) pair, and
+                        // the fork-corroboration witness is keyed by WHO
+                        // served the digest, not who once proposed it.
+                        let peers: Vec<(NodeId, SocketAddr)> = {
                             let addrs = node_addrs_for_topo.read();
                             addrs
                                 .iter()
@@ -4105,12 +4110,12 @@ impl ClusterCoordinator {
                                 .filter(|(id, _)| {
                                     committed_members.is_empty() || committed_members.contains(id)
                                 })
-                                .map(|(_, &addr)| addr)
+                                .map(|(&id, &addr)| (id, addr))
                                 .collect()
                         };
 
                         let local_active_version = { shard_table.read().version };
-                        for peer_addr in &peers {
+                        for (_, peer_addr) in &peers {
                             if let Ok(payload) = send_topology_frame(
                                 *peer_addr,
                                 OP_GET_PARTITION_MAP,
@@ -4175,7 +4180,7 @@ impl ClusterCoordinator {
 
                         let local_term = topology_authority.committed_term();
                         let mut caught_up = false;
-                        for peer_addr in &peers {
+                        for (peer_id, peer_addr) in &peers {
                             if let Ok(payload) = send_topology_frame(
                                 *peer_addr,
                                 OP_GET_COMMITTED_TOPOLOGY,
@@ -4191,6 +4196,16 @@ impl ClusterCoordinator {
                                 // Skip if the committed term isn't higher
                                 // than ours — the peer may not have advanced yet.
                                 if commit.term <= local_term {
+                                    // §9 arm 2 — but this reply is a committed
+                                    // member serving its OWN committed state
+                                    // over the HMAC-verified TCP path: at OUR
+                                    // exact term with a different digest it is
+                                    // fork evidence. Record it for P1-4
+                                    // corroboration (alert-only; every gate —
+                                    // term equality, digest mismatch, quorum
+                                    // proof, membership — lives inside).
+                                    topology_authority
+                                        .observe_peer_committed_digest(*peer_id, &commit);
                                     continue;
                                 }
                                 // G9 — adopt the peer's committed term only after

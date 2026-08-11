@@ -1472,6 +1472,14 @@ pub(crate) fn render_metrics_text(
         "teraslab_topology_committed_digest_fork_total",
         crate::cluster::topology::committed_digest_fork_total(),
     );
+    // §9 arm 2 — corroborated same-term forks: ≥2 distinct committed members
+    // asserted a foreign quorum-backed digest at this node's committed term
+    // (P1-4; one mismatched peer is noise and only moves the counter above).
+    prom_counter(
+        &mut out,
+        "teraslab_topology_committed_digest_fork_corroborated_total",
+        crate::cluster::topology::committed_digest_fork_corroborated_total(),
+    );
     // §6 — assignment validation outcomes. Rejections are refusals to
     // install, never fences; the alert counter is the E7 concentration
     // signal, which is deliberately not a rejection.
@@ -4928,6 +4936,7 @@ mod tests {
             "teraslab_swim_ping_req_dropped_total",
             "teraslab_topology_vote_digest_mismatch_total",
             "teraslab_topology_committed_digest_fork_total",
+            "teraslab_topology_committed_digest_fork_corroborated_total",
             "teraslab_assignment_rejected_total",
             "teraslab_assignment_master_count_alerts_total",
             "teraslab_topology_refused_higher_term_streak",

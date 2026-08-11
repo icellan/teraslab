@@ -1429,6 +1429,29 @@ pub struct TopologyAuthority {
     /// which it must not treat any locally derived assignment as
     /// authoritative.
     committed_assignment: RwLock<Option<crate::cluster::election::CommittedAssignment>>,
+    /// §9 arm 2 (P1-4) — same-term fork witnesses: which distinct committed
+    /// members were observed asserting a quorum-backed digest DIFFERENT from
+    /// ours at our committed term, plus the once-per-term alert latch.
+    same_term_fork: Mutex<SameTermForkWitnesses>,
+}
+
+/// §9 arm 2 (P1-4) — corroboration state for same-term committed-digest
+/// mismatches. One mismatched peer is noise (SWIM is UDP; the node that
+/// fences is the node that listens, not the one that lies), so a single
+/// source must never look like fork evidence. Alert-only: nothing reads this
+/// on a serving path.
+#[derive(Debug, Default)]
+struct SameTermForkWitnesses {
+    /// The committed term the recorded sources refer to. Observations are
+    /// only ever compared against the CURRENT committed term; a stale value
+    /// here means the set below is superseded and reads as empty.
+    term: u64,
+    /// Distinct committed members observed asserting a quorum-backed foreign
+    /// digest at `term`.
+    sources: HashSet<NodeId>,
+    /// §9's dedicated latch — the corroborated alert fires ONCE per term
+    /// (the latch is the rate limit) and clears when a new term commits.
+    alerted: bool,
 }
 
 /// §4.4 — count of commits rejected because their digest disagreed with the
@@ -1440,6 +1463,17 @@ static VOTE_DIGEST_MISMATCH_TOTAL: AtomicU64 = AtomicU64::new(0);
 /// digest than the one it committed there. Read via
 /// [`committed_digest_fork_total`].
 static COMMITTED_DIGEST_FORK_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// §9 arm 2 — count of CORROBORATED same-term committed-digest mismatches:
+/// at least [`COMMITTED_DIGEST_FORK_CORROBORATION_MIN`] distinct committed
+/// members asserted a quorum-backed digest different from this node's at its
+/// committed term. Read via [`committed_digest_fork_corroborated_total`].
+static COMMITTED_DIGEST_FORK_CORROBORATED_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// §9 arm 2 (P1-4) — how many DISTINCT sources must assert a foreign digest
+/// at this node's committed term before the corroborated alert fires. Never
+/// alert on a single gossip frame: one peer is noise or an attacker.
+pub const COMMITTED_DIGEST_FORK_CORROBORATION_MIN: usize = 2;
 
 /// §9 arm 1 — consecutive quorum-backed HIGHER-term commits this node
 /// refused while its own committed term stood still. Read via
@@ -1482,6 +1516,19 @@ pub fn vote_digest_mismatch_total() -> u64 {
 /// one term. Any non-zero value is an incident.
 pub fn committed_digest_fork_total() -> u64 {
     COMMITTED_DIGEST_FORK_TOTAL.load(Ordering::Relaxed)
+}
+
+/// §9 arm 2 — corroborated same-term committed-digest forks.
+///
+/// Unlike [`committed_digest_fork_total`] (which counts every quorum-backed
+/// mismatching frame, one lying peer included), this only moves after
+/// [`COMMITTED_DIGEST_FORK_CORROBORATION_MIN`] DISTINCT committed members
+/// asserted a foreign digest at this node's committed term — P1-4's bar for
+/// treating same-term gossip as fork evidence. Fires at most once per
+/// committed term. Alert-only: any non-zero value is an incident, and
+/// nothing is fenced.
+pub fn committed_digest_fork_corroborated_total() -> u64 {
+    COMMITTED_DIGEST_FORK_CORROBORATED_TOTAL.load(Ordering::Relaxed)
 }
 
 impl TopologyAuthority {
@@ -1533,6 +1580,7 @@ impl TopologyAuthority {
             liveness_provider: RwLock::new(None),
             refused_higher_term: AtomicU64::new(0),
             peer_term_hint: AtomicU64::new(0),
+            same_term_fork: Mutex::new(SameTermForkWitnesses::default()),
         }
     }
 
@@ -2924,6 +2972,100 @@ impl TopologyAuthority {
              node's committed term with different content. Two topologies were \
              committed at one term; the cluster's history has diverged.",
         );
+        // §9 arm 2 — the proposer is a node ASSERTING this foreign digest at
+        // our committed term: feed it to the corroboration witness set. The
+        // observe path re-runs every gate, so this stays correct even if the
+        // checks above ever drift.
+        self.observe_peer_committed_digest(commit.proposer, commit);
+    }
+
+    /// §9 arm 2 (P1-4) — record that `source` asserts `commit` as its
+    /// committed state, and raise the corroborated same-term fork alert once
+    /// [`COMMITTED_DIGEST_FORK_CORROBORATION_MIN`] DISTINCT sources have
+    /// asserted a foreign digest at this node's committed term.
+    ///
+    /// Call this wherever a peer's committed `(term, digest)` pair is visible
+    /// on the wire: the commit receive path calls it with the proposer as the
+    /// source; the catch-up exchange calls it with the serving peer. Every
+    /// evidence gate lives HERE, so call sites stay dumb:
+    ///
+    /// - the commit must name exactly this node's CURRENT committed term
+    ///   (older terms leave no digest to compare; newer terms are the commit
+    ///   path's business);
+    /// - the digest must differ from ours (agreement is not evidence);
+    /// - the frame must carry a structurally valid quorum proof (§4.7 — the
+    ///   voter list is self-declared, but an unproven frame proves nothing);
+    /// - `source` must be a committed member of that term in THIS node's
+    ///   view, and not this node itself — an unknown NodeId cannot
+    ///   corroborate (P1-4: "sender is a committed member of that term").
+    ///
+    /// ALERT-ONLY: no fencing, no refusal, no behavior change. One counter
+    /// increment and one ERROR per committed term (the dedicated latch is the
+    /// rate limit); the witness set self-clears when a new term commits.
+    pub fn observe_peer_committed_digest(&self, source: NodeId, commit: &TopologyCommit) {
+        let committed = self.committed_term.load(Ordering::Relaxed);
+        if commit.term != committed || committed == 0 {
+            return;
+        }
+        let Some(committed_digest) = self.committed_digest() else {
+            return;
+        };
+        // P1-5 torn-read guard: `committed_digest` publishes BEFORE
+        // `committed_term` advances, so re-check the term after reading the
+        // digest — if an apply raced in between, this observation compares a
+        // peer's term-T digest against term-T+1's and must be discarded.
+        if self.committed_term.load(Ordering::Relaxed) != committed {
+            return;
+        }
+        if commit.digest == committed_digest || !commit.has_quorum_voter_proof() {
+            return;
+        }
+        if source == self.self_id || !self.committed_members().contains(&source) {
+            return;
+        }
+        let mut witnesses = self.same_term_fork.lock();
+        // A stale set refers to a superseded term: start fresh. (Applies
+        // also reset this eagerly; this is the belt to that brace.)
+        if witnesses.term != committed {
+            witnesses.term = committed;
+            witnesses.sources.clear();
+            witnesses.alerted = false;
+        }
+        witnesses.sources.insert(source);
+        if !witnesses.alerted && witnesses.sources.len() >= COMMITTED_DIGEST_FORK_CORROBORATION_MIN
+        {
+            witnesses.alerted = true;
+            COMMITTED_DIGEST_FORK_CORROBORATED_TOTAL.fetch_add(1, Ordering::Relaxed);
+            tracing::error!(
+                self_id = self.self_id.0,
+                term = committed,
+                witnesses = witnesses.sources.len(),
+                committed_digest = ?&committed_digest[..8],
+                "cluster: SAME-TERM FORK CORROBORATED — multiple distinct committed \
+                 members assert quorum-backed digests different from this node's at \
+                 its committed term. Two topologies were committed at one term; the \
+                 cluster's history has diverged (alert-only, no fence).",
+            );
+        }
+    }
+
+    /// §9 arm 2 — how many DISTINCT sources have asserted a quorum-backed
+    /// foreign digest at the CURRENT committed term. Reads as zero once a
+    /// newer term commits (the evidence is superseded).
+    pub fn same_term_fork_witnesses(&self) -> usize {
+        let witnesses = self.same_term_fork.lock();
+        if witnesses.term == self.committed_term.load(Ordering::Relaxed) {
+            witnesses.sources.len()
+        } else {
+            0
+        }
+    }
+
+    /// §9 arm 2 — whether the corroborated same-term fork alert has fired
+    /// for the CURRENT committed term.
+    pub fn same_term_fork_alerted(&self) -> bool {
+        let witnesses = self.same_term_fork.lock();
+        witnesses.alerted && witnesses.term == self.committed_term.load(Ordering::Relaxed)
     }
 
     /// Apply a commit that has already passed every validation gate in
@@ -3055,6 +3197,16 @@ impl TopologyAuthority {
         // persistent-refusal streak.
         self.refused_higher_term.store(0, Ordering::Relaxed);
         REFUSED_HIGHER_TERM_STREAK.store(0, Ordering::Relaxed);
+
+        // §9 arm 2 — the same edge supersedes the same-term fork witness set
+        // and its per-term alert latch: evidence about an older term says
+        // nothing about the one just applied.
+        {
+            let mut witnesses = self.same_term_fork.lock();
+            witnesses.term = commit.term;
+            witnesses.sources.clear();
+            witnesses.alerted = false;
+        }
 
         // Clear any pending proposal (superseded by this commit).
         *self.pending_proposal.lock() = None;
@@ -8762,6 +8914,193 @@ mod tests {
             before,
             "an unproven frame must not be able to assert a fork",
         );
+    }
+
+    /// §9 arm 2 test helper — a quorum-backed commit over `ids` at `term`.
+    /// The digest is computed over the commit's own fields, so distinct
+    /// member sets at one term produce distinct digests (a same-term fork).
+    fn quorum_commit_over(term: u64, ids: &[u64], proposer: u64) -> TopologyCommit {
+        let mems = members(ids);
+        TopologyCommit {
+            term,
+            rf: 2,
+            assignment: None,
+            proposer: NodeId(proposer),
+            members: mems.clone(),
+            cluster_id: ClusterId::UNSET,
+            placement_version: 1,
+            committed_peak: mems.len() as u64,
+            digest: TopologyTerm::compute_digest(
+                term,
+                &ClusterId::UNSET,
+                &mems,
+                1,
+                mems.len() as u64,
+                2,
+                ASSIGNMENT_ABSENT_DIGEST,
+            ),
+            voters: mems.clone(),
+        }
+    }
+
+    /// §9 arm 2 — a peer advertising OUR digest at OUR committed term is
+    /// agreement, not fork evidence. No witness is recorded.
+    #[test]
+    fn same_term_matching_digest_is_not_fork_evidence() {
+        let auth = TopologyAuthority::new(NodeId(2), Duration::from_secs(1), 2);
+        commit_membership(&auth, 5, &[1, 2, 3, 4, 5]);
+
+        // Identical fields → identical digest to what this node committed.
+        let same = quorum_commit_over(5, &[1, 2, 3, 4, 5], 1);
+        assert_eq!(auth.committed_digest(), Some(same.digest));
+
+        auth.observe_peer_committed_digest(NodeId(3), &same);
+        auth.observe_peer_committed_digest(NodeId(4), &same);
+        assert_eq!(auth.same_term_fork_witnesses(), 0);
+        assert!(!auth.same_term_fork_alerted());
+    }
+
+    /// §9 arm 2 (P1-4) — ONE mismatched peer is noise, not a fork: a single
+    /// source records a witness but never alerts, and re-observing the SAME
+    /// source never counts as corroboration.
+    #[test]
+    fn single_peer_same_term_mismatch_records_but_does_not_alert() {
+        let auth = TopologyAuthority::new(NodeId(2), Duration::from_secs(1), 2);
+        commit_membership(&auth, 5, &[1, 2, 3, 4, 5]);
+
+        let fork = quorum_commit_over(5, &[1, 2, 4, 5], 4);
+        assert_ne!(auth.committed_digest(), Some(fork.digest));
+
+        auth.observe_peer_committed_digest(NodeId(4), &fork);
+        assert_eq!(auth.same_term_fork_witnesses(), 1);
+        assert!(!auth.same_term_fork_alerted());
+
+        // The same peer repeating itself is one observation, not two.
+        auth.observe_peer_committed_digest(NodeId(4), &fork);
+        assert_eq!(auth.same_term_fork_witnesses(), 1);
+        assert!(
+            !auth.same_term_fork_alerted(),
+            "a single source must never satisfy P1-4 corroboration",
+        );
+    }
+
+    /// §9 arm 2 — two DISTINCT committed members asserting quorum-backed
+    /// foreign digests at our committed term is corroborated fork evidence:
+    /// the counter moves and the per-term latch fires exactly once.
+    #[test]
+    fn corroborated_same_term_mismatch_alerts_once() {
+        let auth = TopologyAuthority::new(NodeId(2), Duration::from_secs(1), 2);
+        commit_membership(&auth, 5, &[1, 2, 3, 4, 5]);
+
+        let fork_a = quorum_commit_over(5, &[1, 2, 4, 5], 4);
+        let fork_b = quorum_commit_over(5, &[2, 4, 5], 5);
+        assert_ne!(fork_a.digest, fork_b.digest);
+
+        let before = committed_digest_fork_corroborated_total();
+        auth.observe_peer_committed_digest(NodeId(4), &fork_a);
+        assert!(!auth.same_term_fork_alerted());
+        auth.observe_peer_committed_digest(NodeId(5), &fork_b);
+        assert_eq!(auth.same_term_fork_witnesses(), 2);
+        assert!(auth.same_term_fork_alerted());
+        // Process-global mirror: assert MOVEMENT, not an exact value —
+        // parallel tests share the counter.
+        assert!(
+            committed_digest_fork_corroborated_total() > before,
+            "the corroborated-fork counter must move",
+        );
+
+        // A third distinct source keeps the latch raised; the alert fired
+        // once for this term (the latch IS the rate limit).
+        let fork_c = quorum_commit_over(5, &[2, 3, 4, 5], 3);
+        auth.observe_peer_committed_digest(NodeId(3), &fork_c);
+        assert_eq!(auth.same_term_fork_witnesses(), 3);
+        assert!(auth.same_term_fork_alerted());
+    }
+
+    /// §9 arm 2 — the detector is SAME-term only: digests from other terms
+    /// prove nothing about ours (older terms leave no digest to compare;
+    /// newer terms are the commit path's business).
+    #[test]
+    fn other_term_digest_mismatch_is_ignored() {
+        let auth = TopologyAuthority::new(NodeId(2), Duration::from_secs(1), 2);
+        commit_membership(&auth, 5, &[1, 2, 3, 4, 5]);
+
+        let lower = quorum_commit_over(4, &[1, 2, 4, 5], 4);
+        let higher = quorum_commit_over(6, &[1, 2, 4, 5], 4);
+        auth.observe_peer_committed_digest(NodeId(4), &lower);
+        auth.observe_peer_committed_digest(NodeId(4), &higher);
+        assert_eq!(auth.same_term_fork_witnesses(), 0);
+        assert!(!auth.same_term_fork_alerted());
+    }
+
+    /// §9 arm 2 (P1-4) — evidence gates: an unproven frame, a source outside
+    /// this node's committed member set, and this node itself can none of
+    /// them place a witness.
+    #[test]
+    fn unproven_frames_and_foreign_sources_cannot_witness_a_fork() {
+        let auth = TopologyAuthority::new(NodeId(2), Duration::from_secs(1), 2);
+        commit_membership(&auth, 5, &[1, 2, 3, 4, 5]);
+
+        // Sub-quorum voter list: structurally unproven (§4.7).
+        let mut unproven = quorum_commit_over(5, &[1, 2, 4, 5], 4);
+        unproven.voters = members(&[4]);
+        assert!(!unproven.has_quorum_voter_proof());
+        auth.observe_peer_committed_digest(NodeId(4), &unproven);
+        assert_eq!(auth.same_term_fork_witnesses(), 0);
+
+        // A source that is not a committed member of this term.
+        let fork = quorum_commit_over(5, &[1, 2, 4, 5], 4);
+        auth.observe_peer_committed_digest(NodeId(9), &fork);
+        assert_eq!(auth.same_term_fork_witnesses(), 0);
+
+        // This node cannot corroborate against itself.
+        auth.observe_peer_committed_digest(NodeId(2), &fork);
+        assert_eq!(auth.same_term_fork_witnesses(), 0);
+        assert!(!auth.same_term_fork_alerted());
+    }
+
+    /// §9 arm 2 — the witness set and latch are per-term: applying a new
+    /// committed term supersedes all recorded evidence (self-clearing, the
+    /// same edge arm 1 clears on).
+    #[test]
+    fn witnesses_clear_when_a_new_term_commits() {
+        let auth = TopologyAuthority::new(NodeId(2), Duration::from_secs(1), 2);
+        commit_membership(&auth, 5, &[1, 2, 3, 4, 5]);
+
+        let fork = quorum_commit_over(5, &[1, 2, 4, 5], 4);
+        auth.observe_peer_committed_digest(NodeId(4), &fork);
+        assert_eq!(auth.same_term_fork_witnesses(), 1);
+
+        commit_membership(&auth, 6, &[1, 2, 3, 4, 5]);
+        assert_eq!(auth.same_term_fork_witnesses(), 0);
+        assert!(!auth.same_term_fork_alerted());
+    }
+
+    /// §9 arm 2, observation site A — two forked quorum-backed commits from
+    /// two distinct proposers arriving through the ordinary commit path
+    /// (`handle_commit`) corroborate without any direct observe call: the
+    /// §4.5 detector feeds the arm-2 witness set.
+    #[test]
+    fn same_term_forked_commits_from_two_proposers_corroborate() {
+        let auth = TopologyAuthority::new(NodeId(2), Duration::from_secs(1), 2);
+        commit_membership(&auth, 5, &[1, 2, 3, 4, 5]);
+
+        let fork_a = quorum_commit_over(5, &[1, 2, 4, 5], 4);
+        let fork_b = quorum_commit_over(5, &[2, 4, 5], 5);
+
+        let before = committed_digest_fork_corroborated_total();
+        assert_eq!(auth.handle_commit(&fork_a), None, "stale term is rejected");
+        assert_eq!(auth.same_term_fork_witnesses(), 1);
+        assert!(!auth.same_term_fork_alerted());
+
+        assert_eq!(auth.handle_commit(&fork_b), None, "stale term is rejected");
+        assert_eq!(auth.same_term_fork_witnesses(), 2);
+        assert!(auth.same_term_fork_alerted());
+        assert!(
+            committed_digest_fork_corroborated_total() > before,
+            "site A must feed the corroborated-fork counter",
+        );
+        assert_eq!(auth.committed_term(), 5, "alert-only: nothing is fenced");
     }
 
     #[test]
