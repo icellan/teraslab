@@ -984,6 +984,15 @@ pub struct ReplicationMetrics {
     /// stale-epoch gate). A non-zero value means a master is sending
     /// from a stale epoch and should re-discover the cluster topology.
     pub replica_rejected_stale_cluster_key: PaddedCounter,
+    /// Receiver-side counter — incremented every time the local node
+    /// accepts an inbound `OP_REPLICA_BATCH` DESPITE a stale
+    /// `cluster_key`, because the batch's `source_node_id` is the
+    /// committed master of every op's shard per the local active shard
+    /// table (assignment-aware acceptance, the 06/09 churn fix). A
+    /// steadily climbing value means a master's cluster_key atomic lags
+    /// its commit-apply — benign, but worth correlating with topology
+    /// commit latency.
+    pub replica_accepted_stale_cluster_key_from_master: PaddedCounter,
     /// F-G7-006: receiver-side counter — incremented every time
     /// `apply_op` gracefully skips a non-Create/non-Delete op because
     /// the target TX or slot was not found. A non-zero value means
@@ -1123,6 +1132,7 @@ impl ReplicationMetrics {
             per_replica: [ZERO_CELL; MAX_REPLICAS],
             leader_sequence: AtomicU64::new(0),
             replica_rejected_stale_cluster_key: PaddedCounter::new(),
+            replica_accepted_stale_cluster_key_from_master: PaddedCounter::new(),
             replica_apply_skipped_missing_tx: PaddedCounter::new(),
             replica_apply_divergence_total: PaddedCounter::new(),
             replica_missing_record_repaired: PaddedCounter::new(),

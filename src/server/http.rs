@@ -1221,6 +1221,11 @@ pub(crate) fn render_metrics_text(
         );
         prom_counter(
             &mut out,
+            "teraslab_replica_accepted_stale_cluster_key_from_master_total",
+            r.replica_accepted_stale_cluster_key_from_master.get(),
+        );
+        prom_counter(
+            &mut out,
             "teraslab_replica_apply_skipped_missing_tx_total",
             r.replica_apply_skipped_missing_tx.get(),
         );
@@ -4891,6 +4896,7 @@ mod tests {
             "teraslab_repl_batch_latency_ns",
             "teraslab_repl_lag_sequences",
             "teraslab_replica_rejected_stale_cluster_key_total",
+            "teraslab_replica_accepted_stale_cluster_key_from_master_total",
             "teraslab_replica_apply_skipped_missing_tx_total",
             "teraslab_replica_apply_divergence_total",
             "teraslab_replica_missing_record_repaired_total",

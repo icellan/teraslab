@@ -25,7 +25,7 @@ use crate::record::{ExternalRef, METADATA_SIZE, TxFlags};
 use crate::redo::{RedoLog, RedoOp};
 use crate::replication::manager::ReplicaTransport;
 use crate::replication::protocol::{ReplicaAck, ReplicaBatch, ReplicaOp};
-use crate::replication::receiver::{DEFAULT_STREAM_KEY, handle_replica_batch_with_tracker};
+use crate::replication::receiver::DEFAULT_STREAM_KEY;
 use crate::replication::tcp_transport::TcpReplicaTransport;
 use crate::storage::blobstore::BlobStore;
 use parking_lot::Mutex;
@@ -984,13 +984,23 @@ pub(crate) fn handle_request(
             // `0` which preserves the V1-compat "accept all" behavior.
             let local_cluster_key = cluster.map(|c| c.local_cluster_key()).unwrap_or(0);
             if let Some(applied) = REPLICA_APPLIED_TRACKER.get() {
-                handle_replica_batch_with_tracker(
+                // Assignment-aware stale-key acceptance: the committed
+                // master authority is the coordinator's active shard
+                // table. `None` (non-clustered dispatch) keeps the gate
+                // fail-closed exactly as before.
+                let committed_master =
+                    cluster.map(|c| move |shard: u16| c.committed_master_of(shard));
+                let committed_master_lookup: Option<&dyn Fn(u16) -> Option<u64>> = committed_master
+                    .as_ref()
+                    .map(|f| f as &dyn Fn(u16) -> Option<u64>);
+                crate::replication::receiver::handle_replica_batch_with_tracker_and_master_lookup(
                     request,
                     engine,
                     &DISPATCH_REPLICA_LAST_APPLIED,
                     Some(applied),
                     DEFAULT_STREAM_KEY,
                     local_cluster_key,
+                    committed_master_lookup,
                 )
             } else {
                 // Test harness / single-stream path: route through the

@@ -7750,6 +7750,7 @@ fn run_migration_batch(
                                         task.shard,
                                         &delta_ops,
                                         topology_epoch,
+                                        task.from_node.0,
                                         auth_secret,
                                     )
                                 {
@@ -9817,6 +9818,7 @@ fn send_delta_ops(
     shard: u16,
     ops: &[crate::replication::protocol::ReplicaOp],
     cluster_key: u64,
+    source_node_id: u64,
     auth_secret: Option<&[u8]>,
 ) -> std::result::Result<(), String> {
     use crate::replication::protocol::{ReplicaAck, ReplicaBatch};
@@ -9825,7 +9827,10 @@ fn send_delta_ops(
         first_sequence: 0,
         ops: ops.to_vec(),
         trace_ctx: crate::observability::WireTraceContext::from_current_span(),
-        source_node_id: None,
+        // Stamped so the receiver's assignment-aware stale-key gate can
+        // vouch for a sender whose cluster_key atomic lags its own
+        // commit-apply (mirrors the pipelined migration batch path).
+        source_node_id: Some(source_node_id),
         // Phase B3: stamped with the source's live coordinator epoch.
         cluster_key,
     };
@@ -11104,6 +11109,23 @@ impl RunningCluster {
     /// Get the current shard table.
     pub fn shard_table(&self) -> Arc<ShardTableLock<ShardTable>> {
         self.shard_table.clone()
+    }
+
+    /// Committed master of `shard` per this node's active shard table
+    /// (`target_assignment`), as a raw node id, or `None` for the
+    /// unassigned sentinel (`NodeId(0)`).
+    ///
+    /// This is the receiver-side authority for assignment-aware
+    /// stale-cluster_key acceptance (see
+    /// `replication::receiver::handle_replica_batch_with_tracker_and_master_lookup`):
+    /// a batch stamped with an old epoch key is accepted anyway iff its
+    /// `source_node_id` is the committed master of every op's shard per
+    /// THIS lookup — the local committed assignment outranks the sender's
+    /// self-reported key in both directions.
+    pub fn committed_master_of(&self, shard: u16) -> Option<u64> {
+        let table = self.shard_table.read();
+        let master = table.target_assignment(shard).master;
+        if master.0 == 0 { None } else { Some(master.0) }
     }
 
     /// Reverse-heal (finding C1): the shards this node is the committed TARGET
@@ -19461,7 +19483,7 @@ mod tests {
         stream
             .set_read_timeout(Some(Duration::from_secs(2)))
             .unwrap();
-        let err = send_delta_ops(&mut stream, 7, &[], 99, None)
+        let err = send_delta_ops(&mut stream, 7, &[], 99, 1, None)
             .expect_err("a STATUS_ERROR delta response must fail the send");
 
         assert!(
