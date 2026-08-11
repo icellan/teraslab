@@ -15,7 +15,9 @@ use teraslab_test_client::verifier::StateVerifier;
 use teraslab_test_client::{Client, ClientError};
 
 use teraslab::protocol::codec::encode_get_batch;
-use teraslab::protocol::opcodes::{FLAG_LOCAL_READ, OP_GET_BATCH, STATUS_OK};
+use teraslab::protocol::opcodes::{
+    ERR_RESPONSE_TOO_LARGE, FLAG_LOCAL_READ, OP_GET_BATCH, STATUS_OK,
+};
 
 use rand::Rng;
 
@@ -119,6 +121,36 @@ async fn find_holders(
     Ok((holders, non_holders))
 }
 
+/// Read one tier back through the server's documented big-record contract:
+/// `FIELD_ALL` downgrades an item whose data cannot fit the 16 MiB response
+/// frame to `ERR_RESPONSE_TOO_LARGE` (code 38) — the response stays useful
+/// for every other item — and the caller re-fetches the blob via
+/// `stream_read_cold_data` (FU#4). Returns the observed data length.
+async fn read_tier_via_big_record_contract(
+    client: &Client,
+    label: &str,
+    txid: &[u8; 32],
+) -> Result<usize, ClientError> {
+    let results = client
+        .get_batch(FIELD_ALL, std::slice::from_ref(txid))
+        .await?;
+    assert!(!results.is_empty(), "{label}: empty get_batch result");
+    let status = results.item(0).status;
+    if status == 0 {
+        return Ok(results.item(0).data.len());
+    }
+    assert_eq!(
+        status, ERR_RESPONSE_TOO_LARGE as u8,
+        "{label}: read failed with item status {status}",
+    );
+    let cold = client.stream_read_cold_data(txid).await?;
+    assert!(
+        !cold.is_empty(),
+        "{label}: stream-read fallback returned no data",
+    );
+    Ok(cold.len())
+}
+
 /// Get the total data length from a direct_get payload for a single txid.
 /// Returns 0 if the record was not found or response is malformed.
 fn payload_data_len(payload: &[u8]) -> usize {
@@ -174,24 +206,19 @@ async fn run_scenario() -> Result<(), ClientError> {
     client.create_batch(&[vlarge_item]).await?;
     eprintln!("[11.1] 50MiB (very large) created");
 
-    // Read each back to verify they exist
+    // Read each back to verify they exist. The 50MiB tier exceeds the
+    // 16MiB response-frame budget and comes back via the documented
+    // stream-read contract.
     for (label, txid) in [
         ("small/200B", &small_txid),
         ("medium/100KiB", &medium_txid),
         ("large/5MiB", &large_txid),
         ("vlarge/50MiB", &vlarge_txid),
     ] {
-        let results = client
-            .get_batch(FIELD_ALL, std::slice::from_ref(txid))
-            .await?;
-        assert!(
-            !results.is_empty() && results.item(0).status == 0,
-            "11.1: {label} tx read failed"
-        );
-        assert!(
-            !results.item(0).data.is_empty(),
-            "11.1: {label} tx read returned empty data"
-        );
+        let observed =
+            read_tier_via_big_record_contract(&client, &format!("11.1: {label} tx read"), txid)
+                .await?;
+        assert!(observed > 0, "11.1: {label} tx read returned no data");
     }
     eprintln!("[11.1] All 4 size tiers created and verified");
 
@@ -302,24 +329,25 @@ async fn run_scenario() -> Result<(), ClientError> {
         );
     }
 
-    // Verify metadata-only response is much smaller than full response for the
-    // very large transaction
-    let vlarge_full = client
-        .get_batch(FIELD_ALL, std::slice::from_ref(&vlarge_txid))
-        .await?;
+    // Verify metadata-only response is much smaller than the full record.
+    // The 50MiB record's full form only exists via the stream-read contract
+    // (a FIELD_ALL get downgrades it to ERR_RESPONSE_TOO_LARGE by design),
+    // so the "full" side of the comparison is the streamed cold data.
+    let vlarge_cold_len =
+        read_tier_via_big_record_contract(&client, "11.3: vlarge full read", &vlarge_txid).await?;
     let vlarge_meta = client
         .get_batch(FIELD_ALL_METADATA, std::slice::from_ref(&vlarge_txid))
         .await?;
     assert!(
-        vlarge_meta.item(0).data.len() < vlarge_full.item(0).data.len(),
-        "11.3: metadata-only response ({} bytes) should be smaller than full response \
-         ({} bytes) for a 50MiB cold_data transaction",
+        vlarge_meta.item(0).data.len() < vlarge_cold_len,
+        "11.3: metadata-only response ({} bytes) should be smaller than the full \
+         record ({} bytes) for a 50MiB cold_data transaction",
         vlarge_meta.item(0).data.len(),
-        vlarge_full.item(0).data.len()
+        vlarge_cold_len
     );
     eprintln!(
         "[11.3] Metadata-only reads verified. 50MiB tx: full={} bytes, meta-only={} bytes",
-        vlarge_full.item(0).data.len(),
+        vlarge_cold_len,
         vlarge_meta.item(0).data.len()
     );
 
@@ -365,22 +393,22 @@ async fn run_scenario() -> Result<(), ClientError> {
     // Wait for replication to propagate
     common::wait_replication_settled(&docker, 3, Duration::from_secs(5)).await?;
 
-    // Verify all records are accessible (implying replicas are up to date)
+    // Verify all records are accessible (implying replicas are up to date).
+    // The 50MiB tier reads via the stream-read contract.
     for (label, txid) in [
         ("small", &small_txid),
         ("medium", &medium_txid),
         ("large", &large_txid),
         ("vlarge", &vlarge_txid),
     ] {
-        let results = client
-            .get_batch(FIELD_ALL, std::slice::from_ref(txid))
-            .await?;
+        let observed = read_tier_via_big_record_contract(
+            &client,
+            &format!("11.5: {label} tx replication check"),
+            txid,
+        )
+        .await?;
         assert!(
-            !results.is_empty() && results.item(0).status == 0,
-            "11.5: {label} tx replication check failed"
-        );
-        assert!(
-            !results.item(0).data.is_empty(),
+            observed > 0,
             "11.5: {label} tx replication check returned empty data"
         );
     }
@@ -875,23 +903,44 @@ async fn run_scenario() -> Result<(), ClientError> {
             .await
         {
             Ok(results) => {
-                if !results.is_empty() && results.item(0).status == 0 {
+                let status = if results.is_empty() {
+                    255
+                } else {
+                    results.item(0).status
+                };
+                let read_ok = if status == 0 {
                     assert!(
                         results.item(0).data.len() > 50 * 1024 * 1024,
                         "11.11: read {read_num} returned data but too small ({})",
                         results.item(0).data.len()
                     );
+                    true
+                } else if status == ERR_RESPONSE_TOO_LARGE as u8 {
+                    // Big-record contract: the item exceeds the response
+                    // frame budget by design — fetch via stream-read.
+                    match client_4.stream_read_cold_data(&concurrent_txid).await {
+                        Ok(cold) => {
+                            assert!(
+                                cold.len() >= 50 * 1024 * 1024,
+                                "11.11: read {read_num} streamed too little ({})",
+                                cold.len()
+                            );
+                            true
+                        }
+                        Err(e) => {
+                            eprintln!("[11.11] Read {read_num} stream failed: {e}");
+                            let _ = client_4.refresh_routing().await;
+                            false
+                        }
+                    }
+                } else {
+                    eprintln!("[11.11] Read {read_num}: record not found (status={status})");
+                    false
+                };
+                if read_ok {
                     successful_reads += 1;
                 } else {
                     failed_reads += 1;
-                    eprintln!(
-                        "[11.11] Read {read_num}: record not found (status={})",
-                        if results.is_empty() {
-                            255
-                        } else {
-                            results.item(0).status
-                        }
-                    );
                 }
             }
             Err(e) => {
