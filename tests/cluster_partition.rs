@@ -236,6 +236,11 @@ fn spawn_proxied_server(
         swim_advertise_addr: Some(proxy.swim),
         seed_nodes: seed_swim.to_vec(),
         replication_factor: rf,
+        // These tests are the election machinery's local proving ground —
+        // keep both default-off features ARMED here so the armed paths stay
+        // covered while the Docker suite qualifies them.
+        committed_master_election_enabled: true,
+        under_replication_sweep_enabled: true,
         probe_interval: Duration::from_millis(100),
         suspicion_timeout: Duration::from_secs(2),
         cluster_secret: Some(CLUSTER_SECRET.as_bytes().to_vec()),

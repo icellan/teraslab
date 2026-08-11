@@ -1841,6 +1841,8 @@ fn main() {
             swim_advertise_addr: None,
             seed_nodes: seed_addrs,
             replication_factor: config.replication_factor,
+            committed_master_election_enabled: config.committed_master_election_enabled,
+            under_replication_sweep_enabled: config.under_replication_sweep_enabled,
             probe_interval,
             suspicion_timeout: std::time::Duration::from_millis(config.swim_suspicion_timeout_ms),
             cluster_secret: config

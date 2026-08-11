@@ -3683,6 +3683,8 @@ mod tests {
             swim_advertise_addr: None,
             seed_nodes: seeds,
             replication_factor,
+            committed_master_election_enabled: false,
+            under_replication_sweep_enabled: false,
             probe_interval: Duration::from_millis(100),
             suspicion_timeout: Duration::from_secs(2),
             cluster_secret: None,

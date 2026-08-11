@@ -1492,6 +1492,24 @@ pub struct ServerConfig {
     /// Replication factor (1 = no replication, 2 = master + 1 replica).
     pub replication_factor: u8,
 
+    /// Committed master election (COMMITTED_MASTER_ELECTION_DESIGN.md, §16
+    /// steps 8-10): proposals carry an elected, digest-bound shard assignment
+    /// that every node installs identically, with prompt re-election on fresh
+    /// evidence. Default OFF: the gates, wire format, validators and
+    /// persistence (steps 1-7) are always active and inert without a carried
+    /// assignment; ARMING the election is opt-in until its composed behavior
+    /// is CI-green (the armed nightlies trended 6→4 of 14 while every unit
+    /// and integration suite stayed green — the same green-but-wrong shape
+    /// that put the P1 regime failover behind default-off flags).
+    pub committed_master_election_enabled: bool,
+
+    /// Active under-replication sweep (E2E design decision #5): periodically
+    /// resync replicas that report no data for shards the committed placement
+    /// says they should hold. Default OFF pending CI qualification — its
+    /// first composed run regressed scenarios 04/10 (hard-kill, sustained
+    /// load), consistent with resync signalling toward dead or lagging peers.
+    pub under_replication_sweep_enabled: bool,
+
     /// SWIM probe interval in milliseconds.
     pub swim_probe_interval_ms: u64,
 
@@ -1781,6 +1799,8 @@ impl Default for ServerConfig {
             swim_port: 3301,
             seed_nodes: vec![],
             replication_factor: 1,
+            committed_master_election_enabled: false,
+            under_replication_sweep_enabled: false,
             swim_probe_interval_ms: 200,
             swim_suspicion_timeout_ms: 5000,
             topology_propose_timeout_ms: 0,

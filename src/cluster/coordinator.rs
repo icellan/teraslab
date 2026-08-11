@@ -1495,6 +1495,15 @@ pub struct ClusterConfig {
     pub swim_advertise_addr: Option<SocketAddr>,
     pub seed_nodes: Vec<SocketAddr>,
     pub replication_factor: u8,
+    /// Committed master election arming (see `Config`
+    /// `committed_master_election_enabled`). Default-off: gates/wire stay
+    /// active and inert; arming attaches elected assignments to proposals
+    /// and drives re-elections.
+    pub committed_master_election_enabled: bool,
+    /// Active under-replication sweep arming (see `Config`
+    /// `under_replication_sweep_enabled`). Default-off pending CI
+    /// qualification.
+    pub under_replication_sweep_enabled: bool,
     pub probe_interval: Duration,
     pub suspicion_timeout: Duration,
     /// Shared secret for HMAC authentication of SWIM and inter-node traffic.
@@ -1564,6 +1573,8 @@ pub struct ClusterCoordinator {
     swim: Option<SwimRunner>,
     migration: Arc<Mutex<MigrationManager>>,
     replication_factor: u8,
+    committed_master_election_enabled: bool,
+    under_replication_sweep_enabled: bool,
     node_addrs: Arc<RwLock<std::collections::HashMap<NodeId, SocketAddr>>>,
     shutdown: Arc<AtomicBool>,
     initial_peak: usize,
@@ -1740,6 +1751,8 @@ impl ClusterCoordinator {
             swim: Some(swim),
             migration: Arc::new(Mutex::new(MigrationManager::new())),
             replication_factor: config.replication_factor,
+            committed_master_election_enabled: config.committed_master_election_enabled,
+            under_replication_sweep_enabled: config.under_replication_sweep_enabled,
             node_addrs: Arc::new(RwLock::new(addrs)),
             shutdown: Arc::new(AtomicBool::new(false)),
             initial_peak,
@@ -1878,7 +1891,10 @@ impl ClusterCoordinator {
         // carries a committed assignment elected over the retained exchange
         // view, anchored on the previous committed assignment. Runs under
         // the authority's vote_decision lock — pure CPU, no I/O.
-        {
+        // Registration is the feature's ARMING point: without a provider no
+        // proposal ever carries an assignment and every downstream gate is
+        // inert (default-off; see `committed_master_election_enabled`).
+        if self.committed_master_election_enabled {
             use crate::cluster::election::{
                 ElectionInputs, HolderReports, elect_committed_assignment,
             };
@@ -1942,6 +1958,8 @@ impl ClusterCoordinator {
         // quorum-gated shrink (see `react_to_committed_shrink`).
         let swim_membership_event = swim_membership.clone();
         let retained_exchange_view_event = retained_exchange_view.clone();
+        let committed_master_election_enabled_event = self.committed_master_election_enabled;
+        let under_replication_sweep_enabled_event = self.under_replication_sweep_enabled;
         let (swim_shutdown, swim_handle, event_rx) = swim.start();
 
         let shard_table = self.shard_table.clone();
@@ -2320,7 +2338,8 @@ impl ClusterCoordinator {
                         // idle: propose_reelection early-returns for
                         // non-proposers and for evidence that matches the
                         // committed assignment.
-                        if last_reelection_at.elapsed() >= REELECTION_MIN_INTERVAL
+                        if committed_master_election_enabled_event
+                            && last_reelection_at.elapsed() >= REELECTION_MIN_INTERVAL
                             && migration.lock().active_count() == 0
                             && let Some(reelection) = topo_authority_event.propose_reelection()
                         {
@@ -2365,8 +2384,9 @@ impl ClusterCoordinator {
                         // no active migrations (in-flight catch-up IS the
                         // repair) and rate-limited; the per-sweep cap is
                         // logged, never silent.
-                        if last_under_replication_sweep.elapsed()
-                            >= UNDER_REPLICATION_SWEEP_INTERVAL
+                        if under_replication_sweep_enabled_event
+                            && last_under_replication_sweep.elapsed()
+                                >= UNDER_REPLICATION_SWEEP_INTERVAL
                             && migration.lock().active_count() == 0
                         {
                             last_under_replication_sweep = std::time::Instant::now();
@@ -3152,7 +3172,8 @@ impl ClusterCoordinator {
                     // up to a full cooldown of latency to every rejoin) but
                     // rate-limited, and only when the elected result actually
                     // differs (propose_reelection returns None otherwise).
-                    if last_reelection_at.elapsed() >= REELECTION_MIN_INTERVAL
+                    if committed_master_election_enabled_event
+                        && last_reelection_at.elapsed() >= REELECTION_MIN_INTERVAL
                         && migration.lock().active_count() == 0
                         && let Some(reelection) = topo_authority_event.propose_reelection()
                     {

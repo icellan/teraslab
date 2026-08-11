@@ -9030,6 +9030,8 @@ mod tests {
             swim_advertise_addr: None,
             seed_nodes: Vec::new(),
             replication_factor: 3,
+            committed_master_election_enabled: false,
+            under_replication_sweep_enabled: false,
             probe_interval: Duration::from_millis(100),
             suspicion_timeout: Duration::from_secs(1),
             cluster_secret: None,
