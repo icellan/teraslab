@@ -140,6 +140,21 @@ const OP_REMOVE_CONFLICTING_CHILD: u8 = 17;
 /// ORDERED (every node must understand tag 19 before any node emits it), which
 /// is the correct trade against a silent-divergence wire hazard.
 const OP_EXPIRE_PRESERVATION: u8 = 19;
+/// Chunked-transport shim: one part of an oversized op's serialized bytes.
+/// A single `ReplicaOp` (in practice a `Create` embedding a large record)
+/// can exceed `MAX_FRAME_SIZE`; the sender splits its serialized form into
+/// `OP_CHUNK` parts of at most [`CHUNK_PAYLOAD_MAX`] bytes and the receiver
+/// reassembles in bounded staging, applying the inner op on the last part.
+const OP_CHUNK: u8 = 20;
+
+/// Upper bound on one [`ReplicaOp::OpChunk`] payload slice.
+///
+/// Sized so a chunk op plus batch/frame headers sits far below
+/// `MAX_FRAME_SIZE` (16 MiB): one chunk per half-frame leaves room for
+/// small ops sharing the batch and the HMAC suffix. Splitting and
+/// reassembly both key on this bound; changing it is wire-compatible
+/// (chunks carry their own index/count/total).
+pub const CHUNK_PAYLOAD_MAX: usize = 8 * 1024 * 1024;
 
 /// A single replication operation sent from master to replica.
 /// A mutation operation to be replicated from master to replica.
@@ -331,6 +346,22 @@ pub enum ReplicaOp {
         block_height_retention: u32,
         master_generation: u32,
     },
+    /// One part of an oversized op's serialized bytes (transport shim; see
+    /// [`OP_CHUNK`]). `payload` holds
+    /// `serialized_inner[chunk_index * CHUNK_PAYLOAD_MAX ..]` capped at
+    /// [`CHUNK_PAYLOAD_MAX`]; `total_len` is the full serialized inner-op
+    /// length so the receiver can bound its staging buffer up front and
+    /// verify the reassembled length. `tx_key` duplicates the inner op's
+    /// key so routing and the assignment-aware stale-key gate see the same
+    /// shard on every part. Chunks carry no generation of their own — the
+    /// reassembled inner op's guards apply on the final part.
+    OpChunk {
+        tx_key: TxKey,
+        chunk_index: u32,
+        chunk_count: u32,
+        total_len: u64,
+        payload: Vec<u8>,
+    },
 }
 
 impl ReplicaOp {
@@ -361,7 +392,8 @@ impl ReplicaOp {
             | Self::Delete { tx_key, .. }
             | Self::PruneSlot { tx_key, .. }
             | Self::PruneSlotIfSpentBy { tx_key, .. }
-            | Self::MarkLongestChain { tx_key, .. } => Some(*tx_key),
+            | Self::MarkLongestChain { tx_key, .. }
+            | Self::OpChunk { tx_key, .. } => Some(*tx_key),
             Self::SetMinedBatch { txids, .. } => match txids.as_slice() {
                 [tx_key] => Some(*tx_key),
                 _ => None,
@@ -422,8 +454,84 @@ impl ReplicaOp {
             // SetMinedBatch carries no master_generation — see the variant's
             // doc comment: `set_mined_inner` is idempotent by block_id, so
             // there is no staleness check to gate or generation to sync.
-            | Self::SetMinedBatch { .. } => None,
+            | Self::SetMinedBatch { .. }
+            // OpChunk is a transport shim — the reassembled inner op's
+            // generation guard applies when the final part lands.
+            | Self::OpChunk { .. } => None,
         }
+    }
+
+    /// Exact on-wire size of this op's [`Self::serialize`] output, in bytes.
+    ///
+    /// Batch splitting budgets frames on this value, so it must stay EXACT
+    /// (pinned against `serialize().len()` for every variant by
+    /// `all_variants_round_trip`). The three variants whose size scales
+    /// with their contents are computed structurally to avoid allocating a
+    /// multi-megabyte buffer just to measure it; every other variant is
+    /// small and self-maintaining via `serialize()`.
+    pub fn wire_len(&self) -> usize {
+        match self {
+            Self::Create {
+                metadata_bytes,
+                utxo_hashes,
+                cold_data,
+                ..
+            } => {
+                // tag + txid + [len + metadata] + [count + hashes] +
+                // [len + cold_data] + is_external
+                1 + 32
+                    + 4
+                    + metadata_bytes.len()
+                    + 4
+                    + 32 * utxo_hashes.len()
+                    + 4
+                    + cold_data.as_ref().map_or(0, Vec::len)
+                    + 1
+            }
+            // tag + block_id + block_height + subtree_idx + on_longest_chain
+            // + current_block_height + block_height_retention + unset
+            // + count + txids
+            Self::SetMinedBatch { txids, .. } => {
+                1 + 4 + 4 + 4 + 1 + 4 + 4 + 1 + 4 + 32 * txids.len()
+            }
+            // tag + txid + chunk_index + chunk_count + total_len
+            // + payload_len + payload
+            Self::OpChunk { payload, .. } => 1 + 32 + 4 + 4 + 8 + 4 + payload.len(),
+            small => small.serialize().len(),
+        }
+    }
+
+    /// Split an op whose wire form exceeds [`CHUNK_PAYLOAD_MAX`] into
+    /// [`Self::OpChunk`] parts that tile its serialized bytes; an op that
+    /// fits (including any `OpChunk`, which is capped by construction)
+    /// passes through unchanged as a single-element vec.
+    pub fn split_for_wire(self) -> Vec<ReplicaOp> {
+        if self.wire_len() <= CHUNK_PAYLOAD_MAX {
+            return vec![self];
+        }
+        let tx_key = match self.tx_key() {
+            Some(k) => k,
+            // SetMinedBatch with 0 or 2+ txids is the only keyless shape,
+            // and it is structurally bounded far below the cap
+            // (max_batch_size txids × 32B) — but stay total: an unkeyed
+            // oversized op cannot be chunked, so ship it whole and let the
+            // transport's honest oversize reject name it.
+            None => return vec![self],
+        };
+        let serialized = self.serialize();
+        let total_len = serialized.len() as u64;
+        let chunk_count = serialized.len().div_ceil(CHUNK_PAYLOAD_MAX) as u32;
+        serialized
+            .chunks(CHUNK_PAYLOAD_MAX)
+            .enumerate()
+            .map(|(i, part)| ReplicaOp::OpChunk {
+                tx_key,
+                chunk_index: i as u32,
+                chunk_count,
+                total_len,
+                payload: part.to_vec(),
+            })
+            .collect()
     }
 }
 
@@ -640,6 +748,21 @@ impl ReplicaOp {
                     None => buf.extend_from_slice(&0u32.to_le_bytes()),
                 }
                 buf.push(if *is_external { 1 } else { 0 });
+            }
+            ReplicaOp::OpChunk {
+                tx_key,
+                chunk_index,
+                chunk_count,
+                total_len,
+                payload,
+            } => {
+                buf.push(OP_CHUNK);
+                buf.extend_from_slice(&tx_key.txid);
+                buf.extend_from_slice(&chunk_index.to_le_bytes());
+                buf.extend_from_slice(&chunk_count.to_le_bytes());
+                buf.extend_from_slice(&total_len.to_le_bytes());
+                buf.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+                buf.extend_from_slice(payload);
             }
             ReplicaOp::Delete { tx_key } => {
                 buf.push(OP_DELETE);
@@ -994,6 +1117,28 @@ impl ReplicaOp {
                     46,
                 ))
             }
+            OP_CHUNK => {
+                // 32(tx_key) + 4(chunk_index) + 4(chunk_count) + 8(total_len)
+                // + 4(payload_len) = 52 fixed, then the payload bytes.
+                need(rest, 52)?;
+                let payload_len = r_u32(rest, 48) as usize;
+                need(rest, 52 + payload_len)?;
+                Ok((
+                    ReplicaOp::OpChunk {
+                        tx_key: read_key(rest),
+                        chunk_index: r_u32(rest, 32),
+                        chunk_count: r_u32(rest, 36),
+                        total_len: u64::from_le_bytes(rest[40..48].try_into().map_err(|_| {
+                            ProtocolError::BufferTooShort {
+                                need: 48,
+                                have: rest.len(),
+                            }
+                        })?),
+                        payload: rest[52..52 + payload_len].to_vec(),
+                    },
+                    1 + 52 + payload_len,
+                ))
+            }
             _ => Err(ProtocolError::UnknownOp(op_type)),
         }
     }
@@ -1275,6 +1420,80 @@ impl ReplicaBatch {
     /// The last sequence number in this batch.
     pub fn last_sequence(&self) -> u64 {
         self.first_sequence + self.ops.len().saturating_sub(1) as u64
+    }
+
+    /// Exact on-wire size of this batch's [`Self::serialize`] output.
+    pub fn wire_len(&self) -> usize {
+        Self::HEADER_SIZE + self.ops.iter().map(|op| 4 + op.wire_len()).sum::<usize>()
+    }
+
+    /// Split this batch into wire-sized sub-batches, each with a
+    /// serialized form of at most `budget` bytes.
+    ///
+    /// Oversized ops are first chunked via [`ReplicaOp::split_for_wire`],
+    /// then ops are partitioned greedily in order. Sequenced batches
+    /// (`first_sequence > 0`) renumber contiguously — the dense per-stream
+    /// sequence space counts POST-split ops, so callers must derive their
+    /// cursor/ack bookkeeping from the returned sub-batches, not the input.
+    /// Out-of-band batches (`first_sequence == 0`) stay out-of-band on
+    /// every sub-batch. A batch already within `budget` (after the
+    /// chunk-splitting check) passes through unchanged.
+    ///
+    /// `budget` must leave room for one chunk plus headers
+    /// (`HEADER_SIZE + 4 + CHUNK_PAYLOAD_MAX + ~64`); with a smaller
+    /// budget a lone over-budget op is still emitted as its own sub-batch
+    /// (never dropped, never looped) and the transport's honest oversize
+    /// reject names it.
+    pub fn split_for_wire(self, budget: usize) -> Vec<ReplicaBatch> {
+        let needs_chunking = self.ops.iter().any(|op| op.wire_len() > CHUNK_PAYLOAD_MAX);
+        if !needs_chunking && self.wire_len() <= budget {
+            return vec![self];
+        }
+        let ReplicaBatch {
+            first_sequence,
+            ops,
+            trace_ctx,
+            source_node_id,
+            cluster_key,
+        } = self;
+        let split_ops: Vec<ReplicaOp> = ops
+            .into_iter()
+            .flat_map(ReplicaOp::split_for_wire)
+            .collect();
+
+        let mut out: Vec<ReplicaBatch> = Vec::new();
+        let mut cur: Vec<ReplicaOp> = Vec::new();
+        let mut cur_len = Self::HEADER_SIZE;
+        let mut seq_cursor = first_sequence;
+        for op in split_ops {
+            let need = 4 + op.wire_len();
+            if !cur.is_empty() && cur_len + need > budget {
+                let count = cur.len() as u64;
+                out.push(ReplicaBatch {
+                    first_sequence: seq_cursor,
+                    ops: std::mem::take(&mut cur),
+                    trace_ctx,
+                    source_node_id,
+                    cluster_key,
+                });
+                if first_sequence != 0 {
+                    seq_cursor += count;
+                }
+                cur_len = Self::HEADER_SIZE;
+            }
+            cur_len += need;
+            cur.push(op);
+        }
+        if !cur.is_empty() {
+            out.push(ReplicaBatch {
+                first_sequence: seq_cursor,
+                ops: cur,
+                trace_ctx,
+                source_node_id,
+                cluster_key,
+            });
+        }
+        out
     }
 
     /// Current (V2) batch header overhead in bytes.
@@ -1653,6 +1872,13 @@ mod tests {
                 block_height_retention: 288,
                 master_generation: 7,
             },
+            ReplicaOp::OpChunk {
+                tx_key: key(21),
+                chunk_index: 2,
+                chunk_count: 7,
+                total_len: 52_000_000,
+                payload: vec![0xCD; 1024],
+            },
         ];
 
         for op in &ops {
@@ -1660,7 +1886,195 @@ mod tests {
             let (decoded, consumed) = ReplicaOp::deserialize(&bytes).unwrap();
             assert_eq!(&decoded, op, "round-trip failed for {op:?}");
             assert_eq!(consumed, bytes.len());
+            assert_eq!(
+                op.wire_len(),
+                bytes.len(),
+                "wire_len must be EXACT (batch splitting budgets on it) for {op:?}",
+            );
         }
+    }
+
+    /// A chunk is a transport shim: it routes by the inner op's key and
+    /// carries no generation of its own.
+    #[test]
+    fn op_chunk_routes_by_key_and_has_no_generation() {
+        let op = ReplicaOp::OpChunk {
+            tx_key: key(9),
+            chunk_index: 0,
+            chunk_count: 2,
+            total_len: 10,
+            payload: vec![0xEE; 5],
+        };
+        assert_eq!(op.tx_key(), Some(key(9)));
+        assert_eq!(op.master_generation(), None);
+    }
+
+    /// Small ops pass through the splitter untouched.
+    #[test]
+    fn split_for_wire_passes_small_ops_through() {
+        let op = ReplicaOp::Spend {
+            tx_key: key(1),
+            offset: 5,
+            spending_data: [0xAB; 36],
+            current_block_height: 700_000,
+            block_height_retention: 144,
+            master_generation: 0,
+        };
+        let split = op.clone().split_for_wire();
+        assert_eq!(split, vec![op]);
+    }
+
+    /// An oversized Create is chunked: every payload within the cap,
+    /// indexes dense from 0, all parts keyed by the inner op's tx_key, and
+    /// the concatenated payloads tile the original serialized bytes
+    /// exactly (total_len pins the length on every part).
+    #[test]
+    fn split_for_wire_chunks_an_oversized_create_and_tiles_its_bytes() {
+        let op = ReplicaOp::Create {
+            tx_key: key(2),
+            metadata_bytes: vec![0x11; 64],
+            utxo_hashes: vec![[0x22; 32]],
+            cold_data: Some(vec![0x33; CHUNK_PAYLOAD_MAX + CHUNK_PAYLOAD_MAX / 2]),
+            is_external: false,
+        };
+        let original = op.serialize();
+
+        let split = op.split_for_wire();
+        assert!(split.len() >= 2, "1.5x-cap op must produce 2+ chunks");
+
+        let mut reassembled = Vec::new();
+        for (i, part) in split.iter().enumerate() {
+            match part {
+                ReplicaOp::OpChunk {
+                    tx_key,
+                    chunk_index,
+                    chunk_count,
+                    total_len,
+                    payload,
+                } => {
+                    assert_eq!(*tx_key, key(2));
+                    assert_eq!(*chunk_index as usize, i);
+                    assert_eq!(*chunk_count as usize, split.len());
+                    assert_eq!(*total_len as usize, original.len());
+                    assert!(payload.len() <= CHUNK_PAYLOAD_MAX);
+                    assert!(!payload.is_empty());
+                    reassembled.extend_from_slice(payload);
+                }
+                other => panic!("expected OpChunk, got {other:?}"),
+            }
+        }
+        assert_eq!(
+            reassembled, original,
+            "chunk payloads must tile the serialized op bytewise",
+        );
+    }
+
+    /// Batch splitting: every sub-batch fits the wire budget, sequenced
+    /// batches renumber contiguously across sub-batches (the dense
+    /// per-stream sequence space counts POST-split ops), and op order is
+    /// preserved.
+    #[test]
+    fn batch_split_for_wire_respects_budget_and_renumbers_contiguously() {
+        let small = |n: u8| ReplicaOp::Spend {
+            tx_key: key(n),
+            offset: 0,
+            spending_data: [0xAA; 36],
+            current_block_height: 700_000,
+            block_height_retention: 144,
+            master_generation: 0,
+        };
+        let big = ReplicaOp::Create {
+            tx_key: key(3),
+            metadata_bytes: vec![0x11; 64],
+            utxo_hashes: vec![[0x22; 32]],
+            cold_data: Some(vec![0x33; 3 * CHUNK_PAYLOAD_MAX]),
+            is_external: false,
+        };
+        let batch = ReplicaBatch {
+            first_sequence: 100,
+            ops: vec![small(1), big, small(4)],
+            trace_ctx: None,
+            source_node_id: Some(9),
+            cluster_key: 5,
+        };
+        let budget = CHUNK_PAYLOAD_MAX + CHUNK_PAYLOAD_MAX / 2;
+
+        let subs = batch.split_for_wire(budget);
+        assert!(subs.len() >= 2, "3x-cap op cannot fit one budgeted frame");
+
+        let mut expected_first = 100u64;
+        let mut total_ops = 0usize;
+        for sub in &subs {
+            assert!(
+                sub.serialize().len() <= budget,
+                "sub-batch of {} ops exceeds the {budget} byte budget",
+                sub.ops.len(),
+            );
+            assert!(!sub.ops.is_empty());
+            assert_eq!(
+                sub.first_sequence, expected_first,
+                "sub-batches must renumber contiguously",
+            );
+            assert_eq!(sub.source_node_id, Some(9));
+            assert_eq!(sub.cluster_key, 5);
+            expected_first += sub.ops.len() as u64;
+            total_ops += sub.ops.len();
+        }
+
+        // Order preserved: first op is the small spend, last is the other
+        // small spend, everything between is the chunked create.
+        let flat: Vec<&ReplicaOp> = subs.iter().flat_map(|s| s.ops.iter()).collect();
+        assert_eq!(flat[0], &small(1));
+        assert_eq!(flat[total_ops - 1], &small(4));
+        for mid in &flat[1..total_ops - 1] {
+            assert!(
+                matches!(mid, ReplicaOp::OpChunk { .. }),
+                "middle ops must be the chunked create",
+            );
+        }
+    }
+
+    /// Out-of-band batches (first_sequence == 0) stay out-of-band on every
+    /// sub-batch, and an in-budget batch passes through unchanged.
+    #[test]
+    fn batch_split_for_wire_oob_and_passthrough() {
+        let big = ReplicaOp::Create {
+            tx_key: key(5),
+            metadata_bytes: vec![0x11; 64],
+            utxo_hashes: vec![[0x22; 32]],
+            cold_data: Some(vec![0x33; 3 * CHUNK_PAYLOAD_MAX]),
+            is_external: false,
+        };
+        let oob = ReplicaBatch {
+            first_sequence: 0,
+            ops: vec![big],
+            trace_ctx: None,
+            source_node_id: Some(9),
+            cluster_key: 5,
+        };
+        let budget = CHUNK_PAYLOAD_MAX + CHUNK_PAYLOAD_MAX / 2;
+        let subs = oob.split_for_wire(budget);
+        assert!(subs.len() >= 2);
+        for sub in &subs {
+            assert_eq!(
+                sub.first_sequence, 0,
+                "out-of-band sub-batches must stay out-of-band",
+            );
+        }
+
+        let tiny = ReplicaBatch {
+            first_sequence: 42,
+            ops: vec![ReplicaOp::Delete { tx_key: key(6) }],
+            trace_ctx: None,
+            source_node_id: None,
+            cluster_key: 0,
+        };
+        let expected = tiny.clone();
+        assert_eq!(
+            tiny.split_for_wire(budget),
+            vec![expected],
+            "an in-budget batch passes through unchanged",
+        );
     }
 
     use super::*;

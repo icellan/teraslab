@@ -1909,6 +1909,21 @@ fn apply_op_journal_inner(
     let mut reassign_prior_hash: Option<[u8; 32]> = None;
 
     match op {
+        // A chunk must be reassembled by the batch apply loop before any op
+        // reaches this function; one arriving here is a protocol violation
+        // (e.g. a sender emitting chunks on a path with no reassembly).
+        ReplicaOp::OpChunk {
+            tx_key,
+            chunk_index,
+            chunk_count,
+            ..
+        } => {
+            return Err(format!(
+                "OpChunk {chunk_index}/{chunk_count} for {tx_key:?} reached apply_op — \
+                 chunks must be reassembled by the batch apply loop"
+            )
+            .into());
+        }
         ReplicaOp::Spend {
             tx_key,
             offset,
@@ -2758,6 +2773,9 @@ fn build_post_apply_redo_op(
         return Ok(None);
     }
     match op {
+        // Transport shim — never applied directly, so never journaled; the
+        // reassembled inner op is journaled when the final part applies it.
+        ReplicaOp::OpChunk { .. } => Ok(None),
         ReplicaOp::Spend {
             tx_key,
             offset,

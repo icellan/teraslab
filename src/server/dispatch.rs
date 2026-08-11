@@ -4116,6 +4116,10 @@ fn compensate_replication_failure(
     for (i, (key, ops)) in repl_ops.iter().enumerate() {
         for (j, op) in ops.iter().enumerate() {
             match op {
+                // Wire-level transport shim: chunking happens at frame build
+                // time (ReplicaBatch::split_for_wire), never in the logical
+                // op set this compensation tracks. Nothing to undo.
+                ReplicaOp::OpChunk { .. } => {}
                 ReplicaOp::Spend {
                     offset,
                     current_block_height,
