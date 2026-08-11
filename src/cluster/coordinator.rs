@@ -5241,6 +5241,27 @@ fn should_promptly_activate_committed_term(
     committed_members_len > 1 && committed_term > active_version
 }
 
+/// Pure core of [`RunningCluster::serving_masters_of`] — see its doc for
+/// the two load-bearing properties (version gate, effective assignment).
+/// Separated so the vouching contract is unit-testable against handcrafted
+/// tables (including mid-handoff states).
+fn serving_masters_from_table(
+    table: &ShardTable,
+    committed_key: u64,
+    shards: &[u16],
+) -> Vec<Option<u64>> {
+    if table.version < committed_key {
+        return vec![None; shards.len()];
+    }
+    shards
+        .iter()
+        .map(|&s| {
+            let master = table.effective_assignment(s).master;
+            if master.0 == 0 { None } else { Some(master.0) }
+        })
+        .collect()
+}
+
 /// W5-followup — decide whether a node that is *gracefully draining itself*
 /// (an operator `quiesce`, whose committed topology EXCLUDES `self`) may re-drive
 /// its outbound handoffs on the short [`DRAIN_REACTIVATION_INTERVAL`] cadence
@@ -11111,21 +11132,45 @@ impl RunningCluster {
         self.shard_table.clone()
     }
 
-    /// Committed master of `shard` per this node's active shard table
-    /// (`target_assignment`), as a raw node id, or `None` for the
-    /// unassigned sentinel (`NodeId(0)`).
+    /// Serving masters of `shards` per this node's ACTIVE shard table,
+    /// resolved under ONE table read guard so a batch is never validated
+    /// against a torn multi-version scan.
     ///
-    /// This is the receiver-side authority for assignment-aware
+    /// This is the receiver-side lookup for assignment-aware
     /// stale-cluster_key acceptance (see
-    /// `replication::receiver::handle_replica_batch_with_tracker_and_master_lookup`):
-    /// a batch stamped with an old epoch key is accepted anyway iff its
-    /// `source_node_id` is the committed master of every op's shard per
-    /// THIS lookup — the local committed assignment outranks the sender's
-    /// self-reported key in both directions.
-    pub fn committed_master_of(&self, shard: u16) -> Option<u64> {
+    /// `replication::receiver::handle_replica_batch_with_tracker_and_master_lookup`).
+    /// Two properties are load-bearing (review findings F1/F2 on the
+    /// original cut):
+    ///
+    /// - **The table must not lag the committed key it overrides.** The
+    ///   committed key advances synchronously on commit-apply; the table
+    ///   activates only after the exchange phase (W1.5 — seconds, up to
+    ///   the 30s reactivation cooldown). In that window the table still
+    ///   names the PREVIOUS term's masters, so vouching from it would
+    ///   accept exactly the demoted master the new term fenced.
+    ///   `serving_masters_from_table` refuses wholesale while
+    ///   `table.version < committed_key`.
+    /// - **The EFFECTIVE assignment is the authority, not the target.**
+    ///   During a two-phase handoff the old master serves (and
+    ///   legitimately replicates) until `ServingNew`; the migration target
+    ///   holds a subset and must not be vouched for.
+    ///
+    /// The table's master is a node-local activated value (Phase F
+    /// election refinement is per-node), NOT a cluster-agreed one — which
+    /// is why this lookup only ever WIDENS acceptance for
+    /// generation-guarded ops (see the receiver predicate's vouchable
+    /// rule) and never influences routing or fencing of current-key
+    /// traffic.
+    ///
+    /// `NodeId(0)` (unassigned sentinel) maps to `None`. Callers must not
+    /// hold the shard-table lock when calling (parking_lot reads are not
+    /// reentrant past a queued writer).
+    pub fn serving_masters_of(&self, shards: &[u16]) -> Vec<Option<u64>> {
         let table = self.shard_table.read();
-        let master = table.target_assignment(shard).master;
-        if master.0 == 0 { None } else { Some(master.0) }
+        // Key read AFTER acquiring the guard: the freshest committed key
+        // is compared against the table view actually held.
+        let committed = self.local_cluster_key();
+        serving_masters_from_table(&table, committed, shards)
     }
 
     /// Reverse-heal (finding C1): the shards this node is the committed TARGET
@@ -13417,6 +13462,68 @@ mod tests {
             manifest_digest: 0,
             max_generation: 0,
         }
+    }
+
+    /// Stale-key gate review F1: commit-apply advances the committed key
+    /// synchronously, but the shard table only activates after the
+    /// exchange phase (the W1.5 lag window, up to the 30s reactivation
+    /// cooldown). A table older than the key it would override must refuse
+    /// to vouch — otherwise the gate vouches for the demoted master using
+    /// the very table its term replaced.
+    #[test]
+    fn stale_key_vouching_refuses_while_the_table_lags_the_committed_term() {
+        let members: Vec<NodeId> = [1u64, 2, 3].iter().map(|&n| NodeId(n)).collect();
+        let table = ShardTable::compute_with_epoch(&members, 2, 1, 1);
+        let shard = 7u16;
+        let master = table.effective_assignment(shard).master.0;
+        assert_ne!(master, 0, "fixture shard must be assigned");
+
+        assert_eq!(
+            serving_masters_from_table(&table, 1, &[shard]),
+            vec![Some(master)],
+            "a table AT the committed term vouches",
+        );
+        assert_eq!(
+            serving_masters_from_table(&table, 2, &[shard]),
+            vec![None],
+            "a table BEHIND the committed term must refuse for every shard",
+        );
+    }
+
+    /// Stale-key gate review F2: during a two-phase handoff the OLD master
+    /// stays authoritative until ServingNew — the vouching lookup must
+    /// follow the EFFECTIVE (serving) assignment, never the
+    /// not-yet-authoritative migration target.
+    #[test]
+    fn stale_key_vouching_follows_the_effective_serving_master_mid_handoff() {
+        let old_members: Vec<NodeId> = [1u64, 2, 3].iter().map(|&n| NodeId(n)).collect();
+        let new_members: Vec<NodeId> = [1u64, 2, 3, 4].iter().map(|&n| NodeId(n)).collect();
+        let mut table = ShardTable::compute_with_epoch(&old_members, 2, 1, 1);
+        let new_table = ShardTable::compute_with_epoch(&new_members, 2, 2, 1);
+
+        let mut changed = None;
+        for shard in 0..crate::cluster::shards::NUM_SHARDS as u16 {
+            let old_master = table.assignment(shard).master;
+            let new_master = new_table.target_assignment(shard).master;
+            if old_master != new_master {
+                changed = Some((shard, old_master, new_master));
+                break;
+            }
+        }
+        let (shard, old_master, new_master) =
+            changed.expect("scale-up must move at least one shard");
+
+        // Every shard has data → master moves enter Copying (old serves).
+        table.begin_handoff_with(&new_table, |_| true);
+
+        let got = serving_masters_from_table(&table, 2, &[shard]);
+        assert_eq!(
+            got,
+            vec![Some(old_master.0)],
+            "mid-handoff (Copying) the OLD master serves and is the only \
+             node the gate may vouch for; the target {new_master:?} is not \
+             yet authoritative",
+        );
     }
 
     /// Base sweep contract: a replica that reported in the exchange view

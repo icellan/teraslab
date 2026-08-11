@@ -984,15 +984,20 @@ pub(crate) fn handle_request(
             // `0` which preserves the V1-compat "accept all" behavior.
             let local_cluster_key = cluster.map(|c| c.local_cluster_key()).unwrap_or(0);
             if let Some(applied) = REPLICA_APPLIED_TRACKER.get() {
-                // Assignment-aware stale-key acceptance: the committed
-                // master authority is the coordinator's active shard
-                // table. `None` (non-clustered dispatch) keeps the gate
-                // fail-closed exactly as before.
-                let committed_master =
-                    cluster.map(|c| move |shard: u16| c.committed_master_of(shard));
-                let committed_master_lookup: Option<&dyn Fn(u16) -> Option<u64>> = committed_master
+                // Assignment-aware stale-key acceptance: the serving-master
+                // authority is the coordinator's active shard table,
+                // resolved batchwise under one snapshot (see
+                // `RunningCluster::serving_masters_of` for the version-lag
+                // refusal and effective-assignment semantics). `None`
+                // (non-clustered dispatch) keeps the gate fail-closed
+                // exactly as before.
+                let serving_masters =
+                    cluster.map(|c| move |shards: &[u16]| c.serving_masters_of(shards));
+                let serving_master_lookup: Option<
+                    crate::replication::receiver::ServingMasterLookup<'_>,
+                > = serving_masters
                     .as_ref()
-                    .map(|f| f as &dyn Fn(u16) -> Option<u64>);
+                    .map(|f| f as crate::replication::receiver::ServingMasterLookup<'_>);
                 crate::replication::receiver::handle_replica_batch_with_tracker_and_master_lookup(
                     request,
                     engine,
@@ -1000,7 +1005,7 @@ pub(crate) fn handle_request(
                     Some(applied),
                     DEFAULT_STREAM_KEY,
                     local_cluster_key,
-                    committed_master_lookup,
+                    serving_master_lookup,
                 )
             } else {
                 // Test harness / single-stream path: route through the

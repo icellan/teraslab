@@ -702,60 +702,111 @@ pub fn handle_replica_batch_with_tracker(
     )
 }
 
-/// Assignment-aware stale-cluster_key acceptance predicate.
+/// Assignment-aware stale-cluster_key acceptance predicate (mutating
+/// batches only — the gate handles empty-ops probes separately).
 ///
-/// Returns `true` iff the batch's `source_node_id` is the committed master
-/// of EVERY shard touched by EVERY op in the batch, per `lookup` (the
-/// receiver's active shard table authority). This is the acceptance arm of
-/// the stale-epoch gate: a master whose cluster_key atomic lags its own
-/// commit-apply stamps an old key on batches it legitimately sends AS the
-/// committed master, and the receiver's own committed assignment — not the
-/// self-reported key — is the authority on whether the sender is fenced.
+/// Returns `true` iff the batch's `source_node_id` is the SERVING master
+/// of every op's primary-key shard, per one consistent snapshot from
+/// `lookup` (see `RunningCluster::serving_masters_of`: effective — not
+/// target — assignment, refusing wholesale when the active table lags the
+/// committed key). "Primary-key shard" is deliberate: an op like
+/// `SetConflicting` also touches parent records on other shards, exactly
+/// as the normal accept path does with zero checks — the predicate gates
+/// on the authority for the op's own key, not its full write footprint.
 ///
-/// Fail-closed everywhere: absent/zero `source_node_id`, empty ops (a
-/// watermark probe carries no shard evidence), an op with no derivable
-/// txid, an empty `SetMinedBatch`, or a `lookup` miss all return `false`
-/// (→ the caller rejects exactly as before this gate existed).
+/// Only ops whose apply is bounded by a per-record guard may be vouched
+/// past the epoch fence: an op carrying a `master_generation` (Create's
+/// is embedded in its metadata), or the block-id-idempotent
+/// `SetMinedBatch`. `Delete`/`PruneSlot`/`PruneSlotIfSpentBy`/
+/// `RemoveConflictingChild` apply unconditionally on the receiver, so a
+/// wrongly-vouched batch containing one would be unbounded — their
+/// presence rejects the whole batch (the sender re-discovers topology,
+/// exactly as before this gate existed). `OpChunk` defers its inner op's
+/// guards to reassembly, where this gate no longer runs — also rejected.
+///
+/// Remaining fail-closed arms: absent/zero `source_node_id`, an op with
+/// no derivable txid, an empty `SetMinedBatch`, a `lookup` miss.
+///
+/// The shard set is deduplicated and resolved in ONE `lookup` call: one
+/// table snapshot (a torn multi-version scan must never vouch — a batch
+/// spanning two table versions could otherwise pass with no SINGLE
+/// version vouching for the source), and per-batch cost bounded by
+/// `NUM_SHARDS` regardless of txid count.
 ///
 /// Trust note: `source_node_id` is exactly as trustworthy as the batch's
-/// `cluster_key` — both are covered by the frame HMAC when
-/// `cluster_secret` is configured, and both are unauthenticated on a
-/// trusted overlay. A forger gains nothing here it could not already gain
-/// by stamping a NEWER key, which the gate accepts by design.
-fn stale_batch_from_current_master(
-    batch: &ReplicaBatch,
-    lookup: &dyn Fn(u16) -> Option<u64>,
-) -> bool {
+/// `cluster_key` — both sit under the frame HMAC when `cluster_secret` is
+/// configured, and both are unauthenticated on a trusted overlay. A
+/// FORGER gains nothing here it could not already gain by stamping a
+/// NEWER key, which the gate accepts by design. A REPLAYER (on-path, HMAC
+/// mode, within the clock-skew window) regains only the post-epoch-bump
+/// tail it already had pre-bump for the same frame; the vouchable rule
+/// above keeps that tail bounded by per-record guards.
+/// Batched serving-master lookup handed to the receiver's stale-epoch
+/// gate: resolves EVERY shard under one shard-table snapshot and returns
+/// the serving (effective) master's raw node id per slot, `None` for
+/// unknown/unassigned — see `RunningCluster::serving_masters_of`.
+pub type ServingMasterLookup<'a> = &'a dyn Fn(&[u16]) -> Vec<Option<u64>>;
+
+fn stale_batch_from_current_master(batch: &ReplicaBatch, lookup: ServingMasterLookup<'_>) -> bool {
     let Some(source) = batch.source_node_id.filter(|s| *s != 0) else {
         return false;
     };
     if batch.ops.is_empty() {
         return false;
     }
-    let mastered =
-        |k: &TxKey| lookup(crate::cluster::shards::ShardTable::shard_for_key(k)) == Some(source);
-    batch.ops.iter().all(|op| match op {
-        ReplicaOp::SetMinedBatch { txids, .. } => !txids.is_empty() && txids.iter().all(mastered),
-        other => other.tx_key().is_some_and(|k| mastered(&k)),
-    })
+    let vouchable = |op: &ReplicaOp| -> bool {
+        op.master_generation().is_some()
+            || matches!(op, ReplicaOp::SetMinedBatch { txids, .. } if !txids.is_empty())
+    };
+    if !batch.ops.iter().all(vouchable) {
+        return false;
+    }
+    let mut shards: Vec<u16> = Vec::new();
+    for op in &batch.ops {
+        match op {
+            ReplicaOp::SetMinedBatch { txids, .. } => shards.extend(
+                txids
+                    .iter()
+                    .map(crate::cluster::shards::ShardTable::shard_for_key),
+            ),
+            other => match other.tx_key() {
+                Some(k) => shards.push(crate::cluster::shards::ShardTable::shard_for_key(&k)),
+                None => return false,
+            },
+        }
+    }
+    shards.sort_unstable();
+    shards.dedup();
+    let masters = lookup(&shards);
+    masters.len() == shards.len() && masters.iter().all(|m| *m == Some(source))
 }
 
 /// Assignment-aware variant of [`handle_replica_batch_with_tracker`].
 ///
 /// Identical in every respect except the stale-epoch gate: when
-/// `committed_master_lookup` is `Some` and
-/// [`stale_batch_from_current_master`] holds, a batch with
+/// `serving_master_lookup` is `Some`, a batch with
 /// `batch.cluster_key < local_cluster_key` is ACCEPTED instead of NAKed
-/// with `ERR_STALE_EPOCH` — the sender is the committed master of every
-/// op's shard per this node's own active shard table, so the stale key is
-/// a lagging atomic, not a fenced master (the 06/09 scale-up /
-/// rolling-restart churn fix). `None` (and every fail-closed arm of the
-/// predicate) preserves the pre-existing reject behavior byte-for-byte.
+/// with `ERR_STALE_EPOCH` in exactly two shapes:
 ///
-/// `committed_master_lookup(shard)` must return the committed master's
-/// raw node id per the ACTIVE local shard table, or `None` when unknown
-/// (unassigned sentinel included) — see
-/// `RunningCluster::committed_master_of`.
+/// - a MUTATING batch for which [`stale_batch_from_current_master`] holds
+///   — its source is the serving master of every op's primary-key shard
+///   per this node's own active table, so the stale key is a lagging
+///   atomic, not a fenced master (the 06/09 scale-up / rolling-restart
+///   churn fix);
+/// - an EMPTY-ops watermark probe from a stamped source — probes mutate
+///   nothing (the fence exists for mutations), and rejecting them starved
+///   every fresh cursor of the data batch the arm above would vet: a
+///   sender opens each new stream with a probe.
+///
+/// `None` (and every fail-closed arm of the predicate) preserves the
+/// pre-existing reject behavior byte-for-byte.
+///
+/// `serving_master_lookup(shards)` must resolve ALL shards under ONE
+/// shard-table snapshot and return the serving (effective) master's raw
+/// node id per slot, `None` for unknown/unassigned — see
+/// `RunningCluster::serving_masters_of`, including its version-lag
+/// refusal and its no-reentrancy note (callers must not hold the
+/// shard-table lock).
 #[allow(clippy::too_many_arguments)]
 pub fn handle_replica_batch_with_tracker_and_master_lookup(
     request: &RequestFrame,
@@ -764,7 +815,7 @@ pub fn handle_replica_batch_with_tracker_and_master_lookup(
     applied: Option<&ReplicaAppliedTracker>,
     stream_key: &str,
     local_cluster_key: u64,
-    committed_master_lookup: Option<&dyn Fn(u16) -> Option<u64>>,
+    serving_master_lookup: Option<ServingMasterLookup<'_>>,
 ) -> ResponseFrame {
     let batch = match ReplicaBatch::deserialize(&request.payload) {
         Ok(b) => b,
@@ -807,13 +858,18 @@ pub fn handle_replica_batch_with_tracker_and_master_lookup(
     // * `batch.cluster_key == local_cluster_key`
     //                                       → in lock-step; accept.
     if batch.cluster_key != 0 && local_cluster_key != 0 && batch.cluster_key < local_cluster_key {
-        // Assignment-aware acceptance arm: the receiver's OWN committed
-        // assignment outranks the sender's self-reported key. See
-        // `stale_batch_from_current_master` for the predicate and its
-        // fail-closed arms.
-        if committed_master_lookup
-            .is_some_and(|lookup| stale_batch_from_current_master(&batch, lookup))
-        {
+        // Assignment-aware acceptance arm. Empty-ops probes are
+        // side-effect-free (the fence exists for mutations) and are
+        // accepted from any stamped source when a lookup is installed —
+        // the data batches that follow are vetted per-op by the
+        // predicate. See `stale_batch_from_current_master` for the
+        // mutating-batch rule and its fail-closed arms.
+        let stale_accepted = match serving_master_lookup {
+            Some(_) if batch.ops.is_empty() => batch.source_node_id.is_some_and(|s| s != 0),
+            Some(lookup) => stale_batch_from_current_master(&batch, lookup),
+            None => false,
+        };
+        if stale_accepted {
             if let Some(m) = crate::metrics::replication_metrics() {
                 m.replica_accepted_stale_cluster_key_from_master.inc();
             }
@@ -825,7 +881,7 @@ pub fn handle_replica_batch_with_tracker_and_master_lookup(
                 ops_len = batch.ops.len(),
                 is_migration = request.flags & FLAG_MIGRATION_BATCH != 0,
                 "replica accepted stale-cluster_key batch: source is the \
-                 committed master of every op shard"
+                 serving master of every op shard (or a side-effect-free probe)"
             );
         } else {
             if let Some(m) = crate::metrics::replication_metrics() {
@@ -8290,12 +8346,17 @@ mod tests {
         let req = batch_request(&batch, 1);
 
         let source_shard = shard_of(key(72));
-        let lookup = move |shard: u16| {
-            if shard == source_shard {
-                Some(9u64)
-            } else {
-                Some(1u64)
-            }
+        let lookup = move |shards: &[u16]| -> Vec<Option<u64>> {
+            shards
+                .iter()
+                .map(|&s| {
+                    if s == source_shard {
+                        Some(9u64)
+                    } else {
+                        Some(1u64)
+                    }
+                })
+                .collect()
         };
 
         let resp = handle_replica_batch_with_tracker_and_master_lookup(
@@ -8346,8 +8407,10 @@ mod tests {
         batch.source_node_id = Some(9);
         let req = batch_request(&batch, 1);
 
-        // The committed master of every shard is node 1, not the sender.
-        let lookup = move |_shard: u16| Some(1u64);
+        // The serving master of every shard is node 1, not the sender.
+        let lookup = move |shards: &[u16]| -> Vec<Option<u64>> {
+            shards.iter().map(|_| Some(1u64)).collect()
+        };
 
         let resp = handle_replica_batch_with_tracker_and_master_lookup(
             &req,
@@ -8388,12 +8451,11 @@ mod tests {
         let req = batch_request(&batch, 1);
 
         let source_shard = shard_of(key(74));
-        let lookup = move |shard: u16| {
-            if shard == source_shard {
-                Some(9u64)
-            } else {
-                None
-            }
+        let lookup = move |shards: &[u16]| -> Vec<Option<u64>> {
+            shards
+                .iter()
+                .map(|&s| if s == source_shard { Some(9u64) } else { None })
+                .collect()
         };
 
         let resp = handle_replica_batch_with_tracker_and_master_lookup(
@@ -8439,9 +8501,10 @@ mod tests {
     }
 
     /// The acceptance predicate quantifies over EVERY op: one op on a
-    /// shard the source does not master rejects the WHOLE batch (batches
-    /// are atomic on the wire — partial application would desync the
-    /// dense sequence contract).
+    /// shard the source does not master rejects the WHOLE batch. The gate
+    /// must decide up front: the apply path is op-by-op (NOT atomic — a
+    /// mid-batch failure leaves the prefix applied), so per-op acceptance
+    /// inside a stale batch is not an option.
     #[test]
     fn stale_key_acceptance_requires_every_op_shard_mastered() {
         let engine = make_engine();
@@ -8476,12 +8539,11 @@ mod tests {
         let req = batch_request(&batch, 1);
 
         // Source masters shard_a but NOT shard_b.
-        let lookup = move |shard: u16| {
-            if shard == shard_a {
-                Some(9u64)
-            } else {
-                Some(1u64)
-            }
+        let lookup = move |shards: &[u16]| -> Vec<Option<u64>> {
+            shards
+                .iter()
+                .map(|&s| if s == shard_a { Some(9u64) } else { Some(1u64) })
+                .collect()
         };
 
         let resp = handle_replica_batch_with_tracker_and_master_lookup(
@@ -8539,12 +8601,11 @@ mod tests {
         let req = batch_request(&batch, 1);
 
         // Source masters shard_a but NOT shard_b → reject.
-        let lookup = move |shard: u16| {
-            if shard == shard_a {
-                Some(9u64)
-            } else {
-                Some(1u64)
-            }
+        let lookup = move |shards: &[u16]| -> Vec<Option<u64>> {
+            shards
+                .iter()
+                .map(|&s| if s == shard_a { Some(9u64) } else { Some(1u64) })
+                .collect()
         };
 
         let resp = handle_replica_batch_with_tracker_and_master_lookup(
@@ -8564,12 +8625,68 @@ mod tests {
         assert_eq!(decode_error_code(&resp.payload), ERR_STALE_EPOCH);
     }
 
-    /// Fail-closed on empty ops: a watermark probe carries no shard
-    /// evidence, so a stale-key probe stays rejected even from a source
-    /// the lookup vouches for. The sender retries once its key catches
-    /// up; data batches are what the acceptance gate exists for.
+    /// A watermark probe mutates nothing — the epoch fence exists for
+    /// mutations, and a rejected probe starves every fresh cursor of the
+    /// data batch the acceptance arm would vet (a sender opens each new
+    /// stream with a probe; review finding F5). A stale-keyed probe from
+    /// a stamped source is therefore accepted: the sender learns its
+    /// watermark, and its subsequent DATA batches face the per-op
+    /// mastership predicate.
     #[test]
-    fn stale_key_probe_rejected_even_from_committed_master() {
+    fn stale_key_probe_accepted_without_mutation() {
+        let engine = make_engine();
+
+        let last_applied = Arc::new(AtomicU64::new(0));
+        let tracker = ReplicaAppliedTracker::in_memory();
+        tracker.set("node:9", 13);
+
+        let batch = ReplicaBatch {
+            // Sequenced probe: empty ops on the tracked stream adopt the
+            // replica's watermark without touching the engine.
+            first_sequence: 14,
+            ops: Vec::new(),
+            trace_ctx: None,
+            source_node_id: Some(9),
+            cluster_key: 5,
+        };
+        let req = batch_request(&batch, 1);
+
+        let lookup = move |shards: &[u16]| -> Vec<Option<u64>> {
+            shards.iter().map(|_| Some(9u64)).collect()
+        };
+
+        let resp = handle_replica_batch_with_tracker_and_master_lookup(
+            &req,
+            &engine,
+            &last_applied,
+            Some(&tracker),
+            DEFAULT_STREAM_KEY,
+            7,
+            Some(&lookup),
+        );
+
+        assert_eq!(
+            resp.status, STATUS_OK,
+            "a side-effect-free probe must not be epoch-fenced",
+        );
+        match ReplicaAck::deserialize(&resp.payload).expect("ack decodes") {
+            ReplicaAck::Ok { through_sequence } => assert_eq!(
+                through_sequence, 13,
+                "the probe must return the stream's watermark",
+            ),
+            other => panic!("expected ReplicaAck::Ok, got {other:?}"),
+        }
+        assert_eq!(
+            tracker.get("node:9"),
+            13,
+            "a probe must not advance the watermark",
+        );
+    }
+
+    /// An unstamped stale probe keeps today's reject — the probe arm
+    /// requires an identifiable sender.
+    #[test]
+    fn stale_key_probe_rejected_without_source_id() {
         let engine = make_engine();
 
         let last_applied = Arc::new(AtomicU64::new(0));
@@ -8579,12 +8696,14 @@ mod tests {
             first_sequence: 0,
             ops: Vec::new(),
             trace_ctx: None,
-            source_node_id: Some(9),
+            source_node_id: None,
             cluster_key: 5,
         };
         let req = batch_request(&batch, 1);
 
-        let lookup = move |_shard: u16| Some(9u64);
+        let lookup = move |shards: &[u16]| -> Vec<Option<u64>> {
+            shards.iter().map(|_| Some(9u64)).collect()
+        };
 
         let resp = handle_replica_batch_with_tracker_and_master_lookup(
             &req,
@@ -8598,6 +8717,57 @@ mod tests {
 
         assert_eq!(resp.status, STATUS_ERROR);
         assert_eq!(decode_error_code(&resp.payload), ERR_STALE_EPOCH);
+    }
+
+    /// Review finding F4: `Delete`/`PruneSlot`-class ops apply
+    /// unconditionally on the receiver (no generation guard), so a
+    /// wrongly-vouched batch containing one is unbounded. Their presence
+    /// rejects the WHOLE stale batch even when the source is the serving
+    /// master of every shard.
+    #[test]
+    fn stale_key_batch_rejected_when_it_carries_a_generation_less_destructive_op() {
+        let engine = make_engine();
+        create_record(&engine, key(80), 3);
+
+        let last_applied = Arc::new(AtomicU64::new(0));
+        let tracker = ReplicaAppliedTracker::in_memory();
+        tracker.set("node:9", 19);
+
+        let slot0_before = engine.read_slot(&key(80), 0).unwrap().status;
+
+        let mut batch = batch_with_cluster_key(20, key(80), 0..1, 1, /* stale */ 5);
+        batch.ops.push(ReplicaOp::Delete { tx_key: key(80) });
+        batch.source_node_id = Some(9);
+        let req = batch_request(&batch, 1);
+
+        // The source IS the serving master of every shard — the rejection
+        // must come from the vouchable rule alone.
+        let lookup = move |shards: &[u16]| -> Vec<Option<u64>> {
+            shards.iter().map(|_| Some(9u64)).collect()
+        };
+
+        let resp = handle_replica_batch_with_tracker_and_master_lookup(
+            &req,
+            &engine,
+            &last_applied,
+            Some(&tracker),
+            DEFAULT_STREAM_KEY,
+            7,
+            Some(&lookup),
+        );
+
+        assert_eq!(resp.status, STATUS_ERROR);
+        assert_eq!(decode_error_code(&resp.payload), ERR_STALE_EPOCH);
+        assert_eq!(
+            engine.read_slot(&key(80), 0).unwrap().status,
+            slot0_before,
+            "no op of the rejected batch may apply",
+        );
+        assert!(
+            engine.read_metadata(&key(80)).is_ok(),
+            "the record must survive — the Delete must not reach the engine",
+        );
+        assert_eq!(tracker.get("node:9"), 19);
     }
 
     #[test]
