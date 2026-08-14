@@ -1140,14 +1140,18 @@ pub enum ReplicaAppliedError {
 }
 
 /// Per-shard `(shard_or_stream_id, last_applied_seq)` journal used by
-/// the replication receiver to guarantee batch-level idempotency.
+/// the replication receiver for sequence-gap detection and watermark
+/// probes.
 ///
 /// The receiver consults this tracker before dispatching an incoming
-/// batch: if the batch's first sequence is less-than-or-equal to
-/// `get(stream)`, the batch has already been applied and is skipped.
-/// On successful apply the tracker is updated and — subject to a
-/// configurable batch / time budget — flushed to disk so that a
-/// receiver restart resumes from the correct point.
+/// batch: a batch starting AHEAD of `get(stream) + 1` is NAKed as a
+/// gap. Batches at or below the watermark are re-applied idempotently
+/// rather than skipped (issue #17: a covered position proves some batch
+/// carrying that label was applied, not that THIS batch's content was —
+/// the sender relabels batches downward after a Gap NAK). On successful
+/// apply the tracker is updated and — subject to a configurable batch /
+/// time budget — flushed to disk so that a receiver restart resumes
+/// from the correct point.
 ///
 /// The file format mirrors [`AckTracker`]:
 /// `[entry_count:4 LE]([id_len:2 LE][id_bytes][last_applied:8 LE])*`

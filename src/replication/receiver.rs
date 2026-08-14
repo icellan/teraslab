@@ -96,10 +96,13 @@ pub const DEFAULT_STREAM_KEY: &str = "default";
 /// sends back `ReplicaAck` response frames.
 ///
 /// Multiple master connections can be handled concurrently; each gets
-/// its own handler thread. Incoming batches are deduplicated via a
-/// [`ReplicaAppliedTracker`] so a leader re-sending the same sequence
-/// range after a replica restart (or network retry) does not cause
-/// double-application of ops.
+/// its own handler thread. A [`ReplicaAppliedTracker`] records the
+/// per-stream applied watermark for gap detection and probe answers;
+/// re-delivered sequence ranges are re-applied idempotently rather than
+/// skipped (issue #17: a covered position does not prove the batch's
+/// content was applied — the sender relabels after a Gap NAK), with the
+/// per-record generation guard and engine-level idempotency absorbing
+/// genuine duplicates.
 ///
 /// When an `ack_state_path` is configured the tracker persists
 /// per-stream state to disk before each ACK, guaranteeing that a
@@ -283,10 +286,11 @@ impl ReplicationReceiver {
 /// Handle a single connection from the master.
 ///
 /// Reads request frames in a loop. For each `OP_REPLICA_BATCH`,
-/// deserializes the batch, consults the idempotency journal to skip
-/// already-applied prefixes, applies every remaining op to the
-/// engine, persists the updated applied sequence to disk, and sends
-/// back a `ReplicaAck` response.
+/// deserializes the batch, consults the idempotency journal for gap
+/// detection, applies every op to the engine (idempotently for
+/// re-deliveries — see issue #17: covered positions are re-applied,
+/// never skipped), persists the updated applied sequence to disk, and
+/// sends back a `ReplicaAck` response.
 struct ConnectionContext<'a> {
     engine: &'a Engine,
     running: &'a AtomicBool,
@@ -654,16 +658,19 @@ pub fn handle_replica_batch_with_cluster_key(
 ///    * empty `ops` → watermark **probe**: ACK `Ok { watermark }`
 ///      without touching the engine. Masters send a probe to adopt the
 ///      replica's authoritative position before assigning sequences.
-///    * `last_sequence() <= watermark` → true duplicate (idempotent
-///      re-send): ACK `Ok { watermark }` without applying.
 ///    * `first_sequence > expected` → sequence **gap**: NAK with
 ///      [`ReplicaAck::Gap`] (STATUS_ERROR). Nothing is applied, the
 ///      watermark does not advance, and the master must re-send
 ///      relabeled at `expected` or run catch-up. This is what makes
 ///      out-of-order delivery and lost batches detectable instead of
 ///      silently ACK-dropped (audit finding D-1).
-///    * otherwise apply, skipping any already-applied prefix
-///      (`first_sequence <= watermark < last_sequence()`).
+///    * otherwise apply EVERY op — including ops at positions covered by
+///      the watermark (issue #17). A covered position proves some batch
+///      carrying that label was durably applied, NOT that this batch's
+///      content was: the sender relabels batches downward after a Gap
+///      NAK, so covered positions can carry fresh content. Genuine
+///      duplicates re-apply idempotently; the ACK reports
+///      `max(last_sequence(), watermark)`.
 /// 4. Apply the surviving ops via [`apply_op`].
 /// 5. `applied.set(stream_key, through_sequence)` and `applied.flush()`
 ///    BEFORE ACK, so durability is guaranteed on the wire.
@@ -1177,20 +1184,27 @@ pub fn handle_replica_batch_with_tracker_and_master_lookup(
             };
         }
 
-        // True duplicate — the ENTIRE batch range is at or below the
-        // watermark, so every position is provably applied. ACK with
-        // the existing watermark so the master knows the data is
-        // durable on this replica.
-        if through <= already_applied {
-            let ack = ReplicaAck::Ok {
-                through_sequence: already_applied,
-            };
-            return ResponseFrame {
-                request_id: request.request_id,
-                status: STATUS_OK,
-                payload: ack.serialize(),
-            };
-        }
+        // Positions at or below the watermark are deliberately NOT
+        // skipped (issue #17, CI 31536584294 / scenario 17.1). A covered
+        // position only proves that SOME batch carrying that label was
+        // durably applied — not that THIS batch's content was. The sender
+        // relabels a batch downward after a Gap NAK
+        // (`send_replica_ops_loop`), so a frame that timed out at the
+        // sender but is still in flight here can apply first and advance
+        // the watermark over labels the relabeled batch now carries with
+        // FRESH content. Pre-fix the receiver ACKed `Ok { through }` for
+        // such a batch without applying it; with `through ==
+        // last_sequence()` the sender recorded full success, the master
+        // counted the ACK toward WriteAll quorum, and the content was
+        // permanently lost on this replica. Fail closed instead: fall
+        // through and apply every op — re-application of genuinely
+        // duplicated content is idempotent (per-record generation guard,
+        // create-payload dedup, engine-level idempotent re-spend /
+        // no-op unspend) and cheap, while a skipped-but-ACKed op is
+        // unrecoverable. The watermark's remaining jobs are gap DETECTION
+        // (below), the probe answer, and the ACK value — never content
+        // dedup. Steady-state batches arrive at exactly `watermark + 1`,
+        // so this costs nothing outside the renegotiation races.
 
         // Sequence gap — the batch starts ahead of the next-expected
         // sequence. NAK without applying and without advancing the
@@ -1233,23 +1247,12 @@ pub fn handle_replica_batch_with_tracker_and_master_lookup(
     // `clock_gettime` syscall per individual operation.
     engine.refresh_clock();
 
-    // Determine where in the batch real work starts. If `first_sequence`
-    // is already covered by `already_applied`, skip the duplicate prefix
-    // (positions at or below the watermark are provably applied in the
-    // dense stream space). Migration / out-of-band / untracked batches
-    // bypass this skip — every op applies.
-    let skip_count = if !tracked || applied.is_none() {
-        0
-    } else if batch.first_sequence <= already_applied {
-        // `already_applied` is the highest sequence number already
-        // durably applied. The first op in the batch corresponds to
-        // sequence `first_sequence`; sequence `first_sequence + i` is
-        // op `i`. We keep ops with seq > already_applied, which means
-        // dropping `already_applied + 1 - first_sequence` ops.
-        (already_applied + 1 - batch.first_sequence) as usize
-    } else {
-        0
-    };
+    // Every op in the batch applies — including ops at positions covered
+    // by the watermark. See the fail-closed rationale above the gap check:
+    // a covered position does not prove THIS batch's content was applied,
+    // so dropping a "duplicate prefix" here silently loses relabeled fresh
+    // content while the ACK still reports full success. Idempotent
+    // re-application is the safe direction.
 
     // Migration-baseline applies suppress the HEAVY per-op engine redo (the
     // single 64 MiB redo log would otherwise fill during a large baseline
@@ -1264,7 +1267,6 @@ pub fn handle_replica_batch_with_tracker_and_master_lookup(
     // compensation batches carry no `FLAG_MIGRATION_BATCH` (`is_migration ==
     // false`) and journal the FULL redo — they are normal replicated mutations.
     let journal = !is_migration;
-    let start_seq = batch.first_sequence + skip_count as u64;
 
     // Issue #29 — replica-side redo backpressure. The master mutation path
     // stalls on this same gate before it fills the redo (see
@@ -1298,10 +1300,7 @@ pub fn handle_replica_batch_with_tracker_and_master_lookup(
     // per-op in the loop (mutate-first, journal-second is preserved); only the
     // journaling is deferred to the ONE atomic admission after the loop.
     let mut redo_entries: Vec<(crate::redo::RedoOp, u8)> = Vec::new();
-    for (idx, (seq, op)) in (start_seq..)
-        .zip(batch.ops.iter().skip(skip_count))
-        .enumerate()
-    {
+    for (idx, (seq, op)) in (batch.first_sequence..).zip(batch.ops.iter()).enumerate() {
         // Chunked-transport reassembly: a chunk part feeds staging; the
         // FINAL part swaps itself for the reassembled inner op, which then
         // flows through the same apply + journal path as a directly
@@ -1357,7 +1356,7 @@ pub fn handle_replica_batch_with_tracker_and_master_lookup(
                     engine.note_replica_stream_hole();
                     ReplicaAck::MissingRecord {
                         failed_sequence: seq,
-                        tx_keys: absent_keys_from(engine, tx_key, &batch.ops[skip_count + idx..]),
+                        tx_keys: absent_keys_from(engine, tx_key, &batch.ops[idx..]),
                     }
                 }
                 ReplicaApplyError::Failed(message) => ReplicaAck::Error {
@@ -1484,7 +1483,17 @@ pub fn handle_replica_batch_with_tracker_and_master_lookup(
     }
 
     let ack = ReplicaAck::Ok {
-        through_sequence: if tracked { through } else { already_applied },
+        // `through` for the steady-state next-expected batch; the (higher)
+        // watermark for a batch that sat entirely below it and was just
+        // re-applied. Reporting the max keeps the sender's cursor
+        // renegotiation (`Ok { through != last }` in
+        // `send_replica_ops_loop`) moving FORWARD to `watermark + 1`
+        // instead of adopting a regressed position.
+        through_sequence: if tracked {
+            through.max(already_applied)
+        } else {
+            already_applied
+        },
     };
     ResponseFrame {
         request_id: request.request_id,
@@ -6843,12 +6852,15 @@ mod tests {
         }
     }
 
-    /// `replica_skips_duplicate_resend`: the leader re-transmits an
-    /// identical batch. The receiver must apply ops exactly once and
-    /// then short-circuit the resend without touching the engine a
-    /// second time.
+    /// The leader re-transmits an identical batch. Post-issue-#17 the
+    /// receiver re-applies it (positions covered by the watermark are no
+    /// longer skipped — a covered position does not prove THIS batch's
+    /// content was applied), so the contract under test is observable
+    /// idempotency: the resend must ACK the same watermark and must not
+    /// move any engine state (no generation bump, no double-spend
+    /// side-effects).
     #[test]
-    fn replica_skips_duplicate_resend() {
+    fn replica_duplicate_resend_is_idempotent() {
         let engine = make_engine();
         // 3 UTXOs so we can spend offsets 0..3.
         create_record(&engine, key(42), 3);
@@ -6888,15 +6900,10 @@ mod tests {
         // The tracker recorded the high-water mark.
         assert_eq!(tracker.get(stream_key), 12);
 
-        // Mutate slot 1 OUT-OF-BAND to a state the spend op would
-        // overwrite — if the resend hit apply_op again it would
-        // zero the spending_data we inject here. A real system
-        // would never do this; the test needs a witness that
-        // proves no engine-level work happens.
-        //
-        // Simpler witness: ensure the resend does NOT increment the
-        // engine's internal generation counter for the record. Read
-        // the current metadata generation and compare after resend.
+        // Witness for idempotency: the resend re-applies through the
+        // engine, whose equal-generation / matching-spending-data paths
+        // must short-circuit without observable effect. Read the current
+        // metadata generation and compare after resend.
         let gen_after_first = { engine.read_metadata(&key(42)).unwrap().generation };
 
         // Resend the same batch.
@@ -6910,7 +6917,7 @@ mod tests {
         );
         assert_eq!(resp_2.status, STATUS_OK);
         let ack_2 = ReplicaAck::deserialize(&resp_2.payload).unwrap();
-        // Skipped batches still ACK with the existing high-water mark.
+        // The re-applied duplicate still ACKs the existing high-water mark.
         assert_eq!(
             ack_2,
             ReplicaAck::Ok {
@@ -6919,7 +6926,7 @@ mod tests {
         );
 
         // Generation must NOT have moved on the resend — proof the
-        // engine was not touched a second time.
+        // re-application was an engine-level no-op.
         let gen_after_resend = { engine.read_metadata(&key(42)).unwrap().generation };
         assert_eq!(
             gen_after_resend, gen_after_first,
@@ -6928,6 +6935,144 @@ mod tests {
 
         // Tracker still sits at the same high-water mark.
         assert_eq!(tracker.get(stream_key), 12);
+    }
+
+    /// Issue #17 (CI 31536584294, scenario 17.1) — acked-loss via the
+    /// duplicate-position skip. A batch whose positions are covered by the
+    /// stream watermark can carry content the replica has NEVER applied:
+    /// the sender relabels a batch downward after a Gap NAK
+    /// (`send_replica_ops_loop`), so when an earlier frame that timed out
+    /// at the sender is still in flight here and applies first, the
+    /// relabeled batch's FRESH ops land at-or-below the watermark. Pre-fix
+    /// the receiver ACKed `Ok { through == last_sequence }` WITHOUT
+    /// applying — the master counted that ACK toward WriteAll quorum and
+    /// the ops were permanently lost on this replica. The receiver must
+    /// apply the ops (idempotently) instead of vouching for content it
+    /// never saw.
+    #[test]
+    fn covered_positions_with_fresh_content_apply_instead_of_silent_ack() {
+        let engine = make_engine();
+        create_record(&engine, key(90), 2);
+        create_record(&engine, key(91), 2);
+
+        let last_applied = Arc::new(AtomicU64::new(0));
+        let tracker = ReplicaAppliedTracker::in_memory();
+        let stream_key = "peer-A:5000";
+
+        // Frame A: the timed-out-at-sender frame — spends on key(90) at
+        // positions 1..=2. It applies here (the sender has already burned
+        // these positions), advancing the watermark to 2.
+        let frame_a = make_spend_batch(1, key(90), 0..2, 1);
+        let resp_a = handle_replica_batch_with_tracker(
+            &batch_request(&frame_a, 1),
+            &engine,
+            &last_applied,
+            Some(&tracker),
+            stream_key,
+            0,
+        );
+        assert_eq!(resp_a.status, STATUS_OK);
+        assert_eq!(tracker.get(stream_key), 2);
+
+        // Frame B: DIFFERENT content (spends on key(91)) that the sender
+        // relabeled into the SAME positions 1..=2 after frame A's Gap NAK
+        // window. through == watermark == last_sequence.
+        let frame_b = make_spend_batch(1, key(91), 0..2, 1);
+        let resp_b = handle_replica_batch_with_tracker(
+            &batch_request(&frame_b, 2),
+            &engine,
+            &last_applied,
+            Some(&tracker),
+            stream_key,
+            0,
+        );
+        assert_eq!(resp_b.status, STATUS_OK);
+        let ack_b = ReplicaAck::deserialize(&resp_b.payload).unwrap();
+        // `through_sequence == frame_b.last_sequence()` is exactly the ACK
+        // shape `send_replica_ops_loop` records as full success — so the
+        // ops it covers MUST be applied.
+        assert_eq!(
+            ack_b,
+            ReplicaAck::Ok {
+                through_sequence: 2
+            }
+        );
+        assert_eq!(
+            engine.read_slot(&key(91), 0).unwrap().status,
+            UTXO_SPENT,
+            "op at a watermark-covered position was ACKed but never applied \
+             — acked write lost on this replica",
+        );
+        assert_eq!(
+            engine.read_slot(&key(91), 1).unwrap().status,
+            UTXO_SPENT,
+            "op at a watermark-covered position was ACKed but never applied \
+             — acked write lost on this replica",
+        );
+        // Frame A's content stays applied (re-application did not regress it).
+        assert_eq!(engine.read_slot(&key(90), 0).unwrap().status, UTXO_SPENT);
+        assert_eq!(engine.read_slot(&key(90), 1).unwrap().status, UTXO_SPENT);
+        assert_eq!(tracker.get(stream_key), 2);
+    }
+
+    /// Companion to
+    /// `covered_positions_with_fresh_content_apply_instead_of_silent_ack`:
+    /// the PARTIAL overlap shape. The relabeled batch extends past the
+    /// watermark, so pre-fix `skip_count` silently dropped its leading ops
+    /// (fresh content at covered positions) while the applied suffix made
+    /// the ACK `Ok { through == last_sequence }` — full success at the
+    /// sender, with the prefix ops permanently lost. Every op must apply.
+    #[test]
+    fn covered_prefix_with_fresh_content_applies_instead_of_being_dropped() {
+        let engine = make_engine();
+        create_record(&engine, key(92), 2);
+        create_record(&engine, key(93), 4);
+
+        let last_applied = Arc::new(AtomicU64::new(0));
+        let tracker = ReplicaAppliedTracker::in_memory();
+        let stream_key = "peer-A:5000";
+
+        // Watermark reaches 2 via a normally-applied frame.
+        let frame_a = make_spend_batch(1, key(92), 0..2, 1);
+        let resp_a = handle_replica_batch_with_tracker(
+            &batch_request(&frame_a, 1),
+            &engine,
+            &last_applied,
+            Some(&tracker),
+            stream_key,
+            0,
+        );
+        assert_eq!(resp_a.status, STATUS_OK);
+        assert_eq!(tracker.get(stream_key), 2);
+
+        // Relabeled batch [1..=4]: four FRESH spends on key(93). Positions
+        // 1..=2 are covered by the watermark; pre-fix the first two ops
+        // were dropped by the duplicate-prefix skip.
+        let frame_b = make_spend_batch(1, key(93), 0..4, 1);
+        let resp_b = handle_replica_batch_with_tracker(
+            &batch_request(&frame_b, 2),
+            &engine,
+            &last_applied,
+            Some(&tracker),
+            stream_key,
+            0,
+        );
+        assert_eq!(resp_b.status, STATUS_OK);
+        let ack_b = ReplicaAck::deserialize(&resp_b.payload).unwrap();
+        assert_eq!(
+            ack_b,
+            ReplicaAck::Ok {
+                through_sequence: 4
+            }
+        );
+        for offset in 0..4 {
+            assert_eq!(
+                engine.read_slot(&key(93), offset).unwrap().status,
+                UTXO_SPENT,
+                "op {offset} of the relabeled batch was ACKed but never applied",
+            );
+        }
+        assert_eq!(tracker.get(stream_key), 4);
     }
 
     /// Issue #29 — the replica apply path must honour redo backpressure.
@@ -8195,12 +8340,14 @@ mod tests {
     }
 
     /// F-G7-015 (positive verification): when the master retries a
-    /// batch after a partial / stale-connection drop, the receiver's
-    /// dedup tracker MUST skip the prefix that already applied and
-    /// only re-apply the suffix. Sending the exact same batch twice
-    /// must result in exactly one durable mutation per op, never two.
+    /// batch after a partial / stale-connection drop, sending the exact
+    /// same batch twice must result in exactly one durable mutation per
+    /// op, never two. Post-issue-#17 the retry is RE-APPLIED rather than
+    /// skipped (a watermark-covered position does not prove this batch's
+    /// content was applied), so the observable contract is idempotency:
+    /// counters and generation must not move on the retry.
     #[test]
-    fn duplicate_batch_after_stale_connection_skips_already_applied() {
+    fn duplicate_batch_after_stale_connection_is_idempotent() {
         let engine = make_engine();
         let k = key(85);
         create_record(&engine, k, 3);
@@ -8230,8 +8377,8 @@ mod tests {
         assert_eq!(spent_after_first, 2);
 
         // Master retries the same batch (simulating a stale-connection
-        // drop on the master side). The receiver's dedup tracker must
-        // skip both ops; engine counters must not move.
+        // drop on the master side). The retry re-applies idempotently;
+        // engine counters must not move.
         let resp2 = handle_replica_batch_with_tracker(
             &req,
             &engine,
