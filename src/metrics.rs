@@ -1082,6 +1082,16 @@ pub struct ReplicationMetrics {
     /// master is repeatedly desynchronized from this replica's
     /// applied watermark.
     pub replica_rejected_sequence_gap: PaddedCounter,
+    /// Issue #17: receiver-side counter — incremented every time a
+    /// tracked `OP_REPLICA_BATCH` whose entire range sits at or below
+    /// the stream watermark enters apply (covered positions re-apply,
+    /// never skip). These batches are produced by the sender's
+    /// renegotiation races and each consumes redo space exactly when a
+    /// stalled/backpressured receiver is most likely short of it —
+    /// sustained growth means a master is repeatedly relabeling into
+    /// covered positions and the redo budget is absorbing the re-apply
+    /// churn.
+    pub replica_covered_batch_reapplied: PaddedCounter,
 }
 
 /// Per-replica drill-down state exposed on `/admin/top`.
@@ -1143,6 +1153,7 @@ impl ReplicationMetrics {
             replica_worker_panics_total: PaddedCounter::new(),
             replica_unauthenticated_accept_total: PaddedCounter::new(),
             replica_rejected_sequence_gap: PaddedCounter::new(),
+            replica_covered_batch_reapplied: PaddedCounter::new(),
         }
     }
 

@@ -1593,7 +1593,7 @@ fn tcp_duplicate_resend_acked_applied_once() {
         .generation;
     assert_eq!(
         gen_after_first, gen_after_resend,
-        "duplicate re-send must not touch the engine",
+        "duplicate re-send must re-apply as an engine-level no-op",
     );
     assert_eq!(receiver.applied_tracker().get("node:22"), 1);
     receiver.stop();

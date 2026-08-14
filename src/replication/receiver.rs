@@ -801,11 +801,13 @@ fn chunk_staging()
 ///   would push open assemblies past [`MAX_STAGED_TOTAL_BYTES`];
 /// - a part for which no assembly is open (receiver restarted
 ///   mid-assembly, or part 0 was never seen);
+/// - a part 0 while an assembly for this key is already open (issue #17
+///   follow-up): a concurrent duplicate delivery or stale residue — the
+///   open assembly is dropped and the delivery errors, so two deliveries
+///   can never splice into one buffer; the sender re-ships from part 0
+///   onto the now-empty entry;
 /// - a completed assembly whose bytes disagree with `total_len`, decode
 ///   to trailing garbage, or decode to a nested chunk.
-///
-/// Part 0 always (re)opens the assembly — an idempotent re-send restarts
-/// cleanly rather than corrupting a half-built buffer.
 fn stage_chunk(stream_key: &str, op: &ReplicaOp) -> std::result::Result<Option<ReplicaOp>, String> {
     let ReplicaOp::OpChunk {
         tx_key,
@@ -830,6 +832,30 @@ fn stage_chunk(stream_key: &str, op: &ReplicaOp) -> std::result::Result<Option<R
     let key = (stream_key.to_string(), *tx_key);
     let mut map = chunk_staging().lock();
     if *chunk_index == 0 {
+        // Issue #17 follow-up (splice close): a part 0 arriving while an
+        // assembly for this key is already open is a CONFLICT, never a
+        // silent reset. Covered positions re-apply now, so a re-delivered
+        // frame's parts reach staging while another delivery of the SAME
+        // op may be mid-assembly on a different connection; the old
+        // "part 0 always reopens" rule let the second delivery's part 0
+        // replace the buffer between the first delivery's parts, and two
+        // same-length images (two images of one record) splice into a
+        // buffer that passes the total_len check and decodes silently.
+        // Fail closed: DROP the open assembly AND error this delivery.
+        // Dropping (rather than keeping) makes the conflict self-clearing
+        // — abandoned residue can never wedge the key, and the NAKed
+        // sender's full re-send starts on an empty entry — while the
+        // error guarantees the only outcomes are a single-source
+        // completed buffer or an explicit NAK, never a mixed image. The
+        // other delivery's in-flight parts fail below with "no open
+        // assembly" and its sender re-ships from part 0.
+        if map.remove(&key).is_some() {
+            return Err(format!(
+                "chunk assembly conflict for {tx_key:?}: part 0 arrived while an \
+                 assembly was already open (concurrent duplicate delivery or stale \
+                 residue) — assembly dropped, re-send from part 0"
+            ));
+        }
         let open_elsewhere: u64 = map
             .iter()
             .filter(|(k, _)| **k != key)
@@ -1239,6 +1265,25 @@ pub fn handle_replica_batch_with_tracker_and_master_lookup(
                 status: STATUS_ERROR,
                 payload: ack.serialize(),
             };
+        }
+
+        // Fully-covered re-delivery: every position sits at or below the
+        // watermark and the batch still APPLIES (fail-closed rationale
+        // above). Meter it — these batches are produced by the sender's
+        // renegotiation races and each consumes redo space exactly when a
+        // stalled/backpressured receiver is most likely short of it.
+        if through <= already_applied {
+            if let Some(m) = crate::metrics::replication_metrics() {
+                m.replica_covered_batch_reapplied.inc();
+            }
+            tracing::info!(
+                stream_key = %effective_stream_key,
+                first_sequence = batch.first_sequence,
+                through_sequence = through,
+                watermark = already_applied,
+                ops_len = batch.ops.len(),
+                "replica: fully-covered batch re-applied (positions at/below watermark)",
+            );
         }
     }
 
@@ -8738,23 +8783,42 @@ mod tests {
         assert_eq!(tracker.get(DEFAULT_STREAM_KEY), 3);
     }
 
-    /// A re-send restarting at part 0 resets the assembly cleanly
-    /// (idempotent re-delivery must not corrupt staging).
+    /// A re-send restarting at part 0 over residue first CONFLICTS
+    /// (clearing the residue), then the follow-up re-send completes.
+    /// Issue #17 follow-up: the old contract silently reset the buffer,
+    /// which is exactly the splice window
+    /// (`chunk_part0_over_open_assembly_conflicts_instead_of_splicing`) —
+    /// the restart now costs one explicit NAK round instead.
     #[test]
-    fn chunk_restart_at_index_zero_resets_assembly() {
+    fn chunk_restart_at_index_zero_conflicts_then_clean_resend_applies() {
         let engine = make_engine();
         let tracker = ReplicaAppliedTracker::in_memory();
         let k = key(91);
         let parts = chunk_op(&chunk_test_create(k), 3);
 
-        // Two parts land, then the sender restarts the whole op.
+        // Two parts land, then the sender restarts the whole op: the
+        // part 0 over the open assembly NAKs and clears the residue.
         let resp = send_tracked(&engine, &tracker, &chunk_batch(1, parts[..2].to_vec()));
         assert_eq!(resp.status, STATUS_OK);
+        let resp = send_tracked(&engine, &tracker, &chunk_batch(3, parts.clone()));
+        assert_eq!(resp.status, STATUS_ERROR);
+        match ReplicaAck::deserialize(&resp.payload).expect("ack decodes") {
+            ReplicaAck::Error { message, .. } => {
+                assert!(message.contains("conflict"), "message was: {message}")
+            }
+            other => panic!("expected ReplicaAck::Error, got {other:?}"),
+        }
+        assert!(
+            engine.read_metadata(&k).is_err(),
+            "nothing may apply from a conflicted assembly",
+        );
+
+        // The conflict cleared the entry: the next full re-send applies.
         let resp = send_tracked(&engine, &tracker, &chunk_batch(3, parts.clone()));
         assert_eq!(resp.status, STATUS_OK);
         assert!(
             engine.read_metadata(&k).is_ok(),
-            "restarted assembly must complete and apply",
+            "restarted assembly must complete and apply after the conflict cleared",
         );
     }
 
@@ -8784,6 +8848,306 @@ mod tests {
         let resp = send_tracked(&engine, &tracker, &chunk_batch(2, parts.clone()));
         assert_eq!(resp.status, STATUS_OK);
         assert!(engine.read_metadata(&k).is_ok());
+    }
+
+    /// Issue #17 follow-up (splice close). Covered positions now re-apply,
+    /// so a re-delivered frame's chunk parts reach staging while another
+    /// delivery of the SAME op (same stream key, same tx_key) may still be
+    /// mid-assembly on a different connection. The old "part 0 always
+    /// reopens" rule let the second delivery's part 0 silently replace the
+    /// buffer BETWEEN the first delivery's parts; with both images the
+    /// same length (two images of the same record), the spliced buffer
+    /// passes the total_len check and decodes silently — one op assembled
+    /// from two different images. A part 0 over an open assembly must
+    /// CONFLICT (drop the open assembly, error this delivery) so the only
+    /// possible outcomes are a single-source completed buffer or an
+    /// explicit NAK — and a subsequent clean re-send must succeed (the
+    /// conflict self-clears; no wedge).
+    #[test]
+    fn chunk_part0_over_open_assembly_conflicts_instead_of_splicing() {
+        let sk = "splice-race-stream";
+        let k = key(96);
+        let image = |offset: u32, fill: u8| -> Vec<u8> {
+            ReplicaOp::Spend {
+                tx_key: k,
+                offset,
+                spending_data: [fill; 36],
+                current_block_height: 700_000,
+                block_height_retention: 288,
+                master_generation: 1,
+            }
+            .serialize()
+        };
+        // Same length, different bytes in BOTH the part-0 range (offset,
+        // leading spending_data) and the later parts (trailing
+        // spending_data) — the shape whose splice is silent pre-fix.
+        let img_a = image(0, 0xAA);
+        let img_b = image(1, 0xBB);
+        assert_eq!(img_a.len(), img_b.len());
+        assert!(img_a.len() > 80, "need 3 non-empty parts at 40-byte cuts");
+        let parts = |img: &[u8]| -> Vec<ReplicaOp> {
+            let cuts = [0usize, 40, 80, img.len()];
+            (0..3)
+                .map(|i| ReplicaOp::OpChunk {
+                    tx_key: k,
+                    chunk_index: i as u32,
+                    chunk_count: 3,
+                    total_len: img.len() as u64,
+                    payload: img[cuts[i]..cuts[i + 1]].to_vec(),
+                })
+                .collect()
+        };
+        let a = parts(&img_a);
+        let b = parts(&img_b);
+
+        // Delivery 1 opens the assembly.
+        let r0 = stage_chunk(sk, &a[0]).expect("first part 0 opens cleanly");
+        assert!(r0.is_none(), "mid-assembly part must not complete");
+
+        // Delivery 2's part 0 lands mid-assembly: must CONFLICT, never
+        // silently reset the buffer under delivery 1's feet.
+        let conflict = stage_chunk(sk, &b[0]);
+        match &conflict {
+            Err(message) => assert!(
+                message.contains("conflict"),
+                "conflict NAK must name the conflict, got: {message}"
+            ),
+            Ok(other) => panic!(
+                "part 0 over an open assembly silently reset the buffer \
+                 (splice window open), got: {other:?}"
+            ),
+        }
+
+        // Delivery 1's remaining parts now fail visibly ("no open
+        // assembly") instead of stacking onto delivery 2's buffer. If ANY
+        // completion emerges from this interleaving, it must be one of the
+        // two genuine images — a mixed buffer is the silent-corruption
+        // outcome this test exists to forbid.
+        for part in &a[1..] {
+            if let Ok(Some(inner)) = stage_chunk(sk, part) {
+                let ser = inner.serialize();
+                assert!(
+                    ser == img_a || ser == img_b,
+                    "SPLICED op assembled from two deliveries' parts",
+                );
+                panic!("no completion may emerge after a staging conflict");
+            }
+        }
+
+        // The conflict self-clears: a full clean re-send of one image
+        // completes and yields exactly that image (no wedge).
+        let resend = parts(&img_a);
+        assert!(stage_chunk(sk, &resend[0]).expect("clean part 0").is_none());
+        assert!(stage_chunk(sk, &resend[1]).expect("clean part 1").is_none());
+        let done = stage_chunk(sk, &resend[2])
+            .expect("clean part 2")
+            .expect("final part completes the assembly");
+        assert_eq!(
+            done.serialize(),
+            img_a,
+            "clean re-send must reassemble the exact single-source image",
+        );
+    }
+
+    /// Issue #17 follow-up: a covered position can re-deliver a STALE
+    /// Create image (the record's original create) over a record that has
+    /// since been mutated to a higher generation. The receiver must keep
+    /// the newer local record untouched: no delete+recreate (which would
+    /// resurrect spent UTXOs), no lifecycle/generation regression (which
+    /// would re-open the generation guard every covered mutation replay
+    /// leans on). The mechanism pinned here: `ReplicaOp::Create` exposes
+    /// its EMBEDDED generation via `master_generation()`
+    /// (`create_embedded_generation`), so the pre-apply generation guard
+    /// in `apply_op_journal_inner` drops the strictly-behind image before
+    /// the DuplicateTxId replace/lifecycle arms can run. If this test
+    /// fails, that guard is broken and every covered replay containing a
+    /// stale Create becomes a UTXO-resurrection vector. (Legacy short
+    /// creates with metadata < 50 bytes carry no generation and skip the
+    /// guard — modern masters always ship the 70-byte form.)
+    #[test]
+    fn covered_stale_create_image_never_replaces_the_live_record() {
+        let engine = make_engine();
+        let k = key(98);
+        create_record(&engine, k, 2);
+
+        let last_applied = Arc::new(AtomicU64::new(0));
+        let tracker = ReplicaAppliedTracker::in_memory();
+        let stream_key = "stale-create-stream";
+
+        // Position 1: a spend at master generation 3 — slot 0 SPENT and
+        // the record's generation synced to 3.
+        let spend = make_spend_batch(1, k, 0..1, 3);
+        let resp = handle_replica_batch_with_tracker(
+            &batch_request(&spend, 1),
+            &engine,
+            &last_applied,
+            Some(&tracker),
+            stream_key,
+            0,
+        );
+        assert_eq!(resp.status, STATUS_OK);
+        assert_eq!(engine.read_slot(&k, 0).unwrap().status, UTXO_SPENT);
+        assert_eq!({ engine.read_metadata(&k).unwrap().generation }, 3);
+
+        // Covered re-delivery at position 1: the record's ORIGINAL create
+        // image — embedded generation 1 (strictly behind the live 3) and a
+        // created_at that no longer matches the live record, i.e. the
+        // shape that pre-fix took the destructive delete+recreate path.
+        let mut metadata = vec![0u8; 70];
+        metadata[0..4].copy_from_slice(&1u32.to_le_bytes()); // tx_version
+        metadata[37..45].copy_from_slice(&999u64.to_le_bytes()); // created_at
+        metadata[46..50].copy_from_slice(&1u32.to_le_bytes()); // generation
+        let hashes: Vec<[u8; 32]> = (0..2u32)
+            .map(|i| {
+                let mut h = [0u8; 32];
+                h[0] = i as u8;
+                h[4..8].copy_from_slice(&k.txid[0..4]);
+                h
+            })
+            .collect();
+        let stale_create = ReplicaBatch {
+            first_sequence: 1,
+            ops: vec![ReplicaOp::Create {
+                tx_key: k,
+                metadata_bytes: metadata,
+                utxo_hashes: hashes,
+                cold_data: None,
+                is_external: false,
+            }],
+            trace_ctx: None,
+            source_node_id: None,
+            cluster_key: 0,
+        };
+        let resp = handle_replica_batch_with_tracker(
+            &batch_request(&stale_create, 2),
+            &engine,
+            &last_applied,
+            Some(&tracker),
+            stream_key,
+            0,
+        );
+        assert_eq!(resp.status, STATUS_OK);
+        let ack = ReplicaAck::deserialize(&resp.payload).unwrap();
+        assert_eq!(
+            ack,
+            ReplicaAck::Ok {
+                through_sequence: 1
+            }
+        );
+        // The live record is untouched: the spent slot stays SPENT (a
+        // delete+recreate would have reset it UNSPENT — UTXO resurrection)
+        // and the generation stays 3 (a lifecycle overwrite would have
+        // regressed it to 1, re-admitting every stale mutation replay).
+        assert_eq!(
+            engine.read_slot(&k, 0).unwrap().status,
+            UTXO_SPENT,
+            "stale create image replaced the live record — spent UTXO resurrected",
+        );
+        assert_eq!(
+            { engine.read_metadata(&k).unwrap().generation },
+            3,
+            "stale create image regressed the live record's generation",
+        );
+        assert_eq!(tracker.get(stream_key), 1);
+    }
+
+    /// Issue #17 follow-up — documents the KNOWN residual, so any change
+    /// to it is loud. A covered-position Delete carries no generation and
+    /// re-applies WITH EFFECT: re-delivered over a key that was since
+    /// re-created, it deletes the newer record (a "zombie delete"). This
+    /// is the accepted current semantics: the master still holds the
+    /// re-created record, so its next mutation of the key NAKs
+    /// `MissingRecord` and the repair path re-ships the full image (and
+    /// the reverse-heal machinery closes the gap even without a
+    /// mutation). Changing this assertion means changing that contract —
+    /// do it deliberately.
+    #[test]
+    fn covered_delete_over_recreated_key_reapplies_as_zombie_delete() {
+        let engine = make_engine();
+        let k = key(99);
+
+        let last_applied = Arc::new(AtomicU64::new(0));
+        let tracker = ReplicaAppliedTracker::in_memory();
+        let stream_key = "zombie-delete-stream";
+
+        let mut metadata = vec![0u8; 70];
+        metadata[0..4].copy_from_slice(&1u32.to_le_bytes()); // tx_version
+        metadata[46..50].copy_from_slice(&1u32.to_le_bytes()); // generation
+        let create_op = || ReplicaOp::Create {
+            tx_key: k,
+            metadata_bytes: metadata.clone(),
+            utxo_hashes: vec![[0xEE; 32]; 2],
+            cold_data: None,
+            is_external: false,
+        };
+
+        // Positions 1..=2: create then delete — the key ends absent.
+        let create_delete = ReplicaBatch {
+            first_sequence: 1,
+            ops: vec![create_op(), ReplicaOp::Delete { tx_key: k }],
+            trace_ctx: None,
+            source_node_id: None,
+            cluster_key: 0,
+        };
+        let resp = handle_replica_batch_with_tracker(
+            &batch_request(&create_delete, 1),
+            &engine,
+            &last_applied,
+            Some(&tracker),
+            stream_key,
+            0,
+        );
+        assert_eq!(resp.status, STATUS_OK);
+        assert!(engine.lookup(&k).is_none());
+
+        // Position 3: the key is re-created — live again.
+        let recreate = ReplicaBatch {
+            first_sequence: 3,
+            ops: vec![create_op()],
+            trace_ctx: None,
+            source_node_id: None,
+            cluster_key: 0,
+        };
+        let resp = handle_replica_batch_with_tracker(
+            &batch_request(&recreate, 2),
+            &engine,
+            &last_applied,
+            Some(&tracker),
+            stream_key,
+            0,
+        );
+        assert_eq!(resp.status, STATUS_OK);
+        assert!(engine.lookup(&k).is_some());
+        assert_eq!(tracker.get(stream_key), 3);
+
+        // Covered re-delivery of positions 1..=2: the generation-less
+        // Delete re-applies with effect — the re-created record is
+        // deleted. The ACK still reports the watermark (3), so the sender
+        // records success; the divergence is repaired via the
+        // MissingRecord NAK + re-ship path on the master's next mutation.
+        let resp = handle_replica_batch_with_tracker(
+            &batch_request(&create_delete, 3),
+            &engine,
+            &last_applied,
+            Some(&tracker),
+            stream_key,
+            0,
+        );
+        assert_eq!(resp.status, STATUS_OK);
+        let ack = ReplicaAck::deserialize(&resp.payload).unwrap();
+        assert_eq!(
+            ack,
+            ReplicaAck::Ok {
+                through_sequence: 3
+            },
+            "covered re-delivery ACKs the watermark",
+        );
+        assert!(
+            engine.lookup(&k).is_none(),
+            "KNOWN residual changed: a covered generation-less Delete no \
+             longer re-applies — update this test's contract note deliberately",
+        );
+        assert_eq!(tracker.get(stream_key), 3);
     }
 
     /// The staging bound is enforced UP FRONT from the declared total_len.

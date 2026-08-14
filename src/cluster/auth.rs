@@ -48,7 +48,7 @@
 //! original delivery — a replay is indistinguishable from a benign retry.
 //! The audit below lists each mutating inter-node opcode and the
 //! mechanism that makes it idempotent under replay; the integration test
-//! `tests/g8_swim_replay::replica_batch_replay_is_idempotent` exercises
+//! `tests/g8_e4_tcp_frame_replay::replica_batch_replay_is_idempotent` exercises
 //! the representative `OP_REPLICA_BATCH` path end-to-end.
 //!
 //! | Opcode | Idempotency mechanism (replay ⇒ no-op) |
