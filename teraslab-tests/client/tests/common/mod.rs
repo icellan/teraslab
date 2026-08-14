@@ -1145,6 +1145,99 @@ async fn reconcile_existing_seed_records(
     reconciled
 }
 
+/// Publish every create the server has already acknowledged: record it in the
+/// verifier and append its txid to the caller's list, draining the staging
+/// buffer.
+///
+/// Chaos scenarios routinely wrap `seed_records` in `tokio::time::timeout`,
+/// and a timeout DROPS the future — anything still sitting in a local staging
+/// buffer at that moment is lost even though the server really did create
+/// those records, so the caller reports "zero records created" for a window in
+/// which the cluster created plenty. Publishing at every point where an ack is
+/// observed, always BEFORE the next `.await`, keeps the verifier correct on
+/// the cancellation path as well as on the give-up error path.
+///
+/// # Parameters
+/// - `verifier`: shared expected-state tracker to record the creates into.
+/// - `utxos_per_tx`: output count each seeded record was created with.
+/// - `succeeded_meta`: staging buffer of acknowledged creates; drained.
+/// - `txids`: caller's accumulating list of created txids.
+fn publish_seeded_records(
+    verifier: &StateVerifier,
+    utxos_per_tx: u32,
+    succeeded_meta: &mut Vec<SeedMeta>,
+    txids: &mut Vec<[u8; 32]>,
+) {
+    for (txid, utxo_hashes) in succeeded_meta.drain(..) {
+        verifier.record_create(txid, utxos_per_tx, utxo_hashes);
+        txids.push(txid);
+    }
+}
+
+/// Split a partial-failure response into "retry these" and "these landed".
+///
+/// Items whose index does not appear in the error list were applied by the
+/// server, so they must not be re-sent (that would surface
+/// `ERR_ALREADY_EXISTS`) and must not be forgotten. This runs on EVERY failed
+/// attempt, including the last one, so a partial success on the final attempt
+/// is accounted for instead of being discarded along with the returned error.
+///
+/// A non-partial error leaves both sets untouched: nothing is known to have
+/// landed, so the whole batch stays in the retry set (and is reconciled).
+///
+/// # Parameters
+/// - `err`: the error returned by `create_batch`.
+/// - `attempt`: 0-based attempt number, for the diagnostic line only.
+/// - `remaining_items`/`remaining_meta`: the retry set, filtered in place.
+/// - `succeeded_meta`: staging buffer the acknowledged items are moved into.
+fn split_partial_successes(
+    err: &ClientError,
+    attempt: u32,
+    remaining_items: &mut Vec<CreateItem>,
+    remaining_meta: &mut Vec<SeedMeta>,
+    succeeded_meta: &mut Vec<SeedMeta>,
+) {
+    let ClientError::Partial(pe) = err else {
+        return;
+    };
+    let mut code_counts = std::collections::BTreeMap::new();
+    for item_err in &pe.errors {
+        *code_counts.entry(item_err.code).or_insert(0usize) += 1;
+    }
+    let code_summary = code_counts
+        .iter()
+        .map(|(code, count)| {
+            format!(
+                "{}={count}",
+                teraslab_test_client::errors::error_code_string(*code),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let failed_indices: std::collections::HashSet<usize> =
+        pe.errors.iter().map(|e| e.item_index as usize).collect();
+    let mut retry_items = Vec::new();
+    let mut retry_meta = Vec::new();
+    for (i, (item, meta)) in remaining_items
+        .drain(..)
+        .zip(remaining_meta.drain(..))
+        .enumerate()
+    {
+        if failed_indices.contains(&i) {
+            retry_items.push(item);
+            retry_meta.push(meta);
+        } else {
+            succeeded_meta.push(meta);
+        }
+    }
+    *remaining_items = retry_items;
+    *remaining_meta = retry_meta;
+    eprintln!(
+        "seed_records: partial error on attempt {attempt}: {} failed item(s) [{code_summary}]",
+        failed_indices.len()
+    );
+}
+
 pub async fn seed_records(
     client: &Client,
     verifier: &StateVerifier,
@@ -1205,6 +1298,10 @@ pub async fn seed_records(
         //
         // On partial success, only retry the failed items (not items that
         // already succeeded — re-sending those would cause ERR_ALREADY_EXISTS).
+        // Acknowledged items are published into the verifier as soon as they
+        // are observed (see `publish_seeded_records`) rather than at the end of
+        // the batch, so a caller that wraps this call in a timeout still sees
+        // every create the cluster actually performed.
         const MAX_SEED_RETRIES: u32 = teraslab_test_client::retry::MAX_TRANSIENT_ATTEMPTS;
         let mut remaining_items = items;
         let mut remaining_meta = batch_meta;
@@ -1221,44 +1318,17 @@ pub async fn seed_records(
                 Err(ref e) if attempt + 1 < MAX_SEED_RETRIES => {
                     // On partial error, extract which items failed and only
                     // retry those. Items not in the error list succeeded.
-                    if let ClientError::Partial(pe) = e {
-                        let mut code_counts = std::collections::BTreeMap::new();
-                        for err in &pe.errors {
-                            *code_counts.entry(err.code).or_insert(0usize) += 1;
-                        }
-                        let code_summary = code_counts
-                            .iter()
-                            .map(|(code, count)| {
-                                format!(
-                                    "{}={count}",
-                                    teraslab_test_client::errors::error_code_string(*code),
-                                )
-                            })
-                            .collect::<Vec<_>>()
-                            .join(", ");
-                        let failed_indices: std::collections::HashSet<usize> =
-                            pe.errors.iter().map(|e| e.item_index as usize).collect();
-                        let mut retry_items = Vec::new();
-                        let mut retry_meta = Vec::new();
-                        for (i, (item, meta)) in remaining_items
-                            .drain(..)
-                            .zip(remaining_meta.drain(..))
-                            .enumerate()
-                        {
-                            if failed_indices.contains(&i) {
-                                retry_items.push(item);
-                                retry_meta.push(meta);
-                            } else {
-                                succeeded_meta.push(meta);
-                            }
-                        }
-                        remaining_items = retry_items;
-                        remaining_meta = retry_meta;
-                        eprintln!(
-                            "seed_records: partial error on attempt {attempt}: {} failed item(s) [{code_summary}]",
-                            failed_indices.len()
-                        );
-                    }
+                    split_partial_successes(
+                        e,
+                        attempt,
+                        &mut remaining_items,
+                        &mut remaining_meta,
+                        &mut succeeded_meta,
+                    );
+                    // Publish before the next `.await`. From here the future
+                    // can be cancelled by a caller's timeout, and a dropped
+                    // future must not take server-acked creates with it.
+                    publish_seeded_records(verifier, utxos_per_tx, &mut succeeded_meta, &mut txids);
                     let reconciled = reconcile_existing_seed_records(
                         client,
                         &mut remaining_items,
@@ -1271,6 +1341,9 @@ pub async fn seed_records(
                             "seed_records: reconciled {reconciled} ambiguous existing record(s) after attempt {attempt}"
                         );
                     }
+                    // Reconcile promotes items too; publish again before the
+                    // backoff sleep for the same cancellation reason.
+                    publish_seeded_records(verifier, utxos_per_tx, &mut succeeded_meta, &mut txids);
                     if remaining_items.is_empty() {
                         break;
                     }
@@ -1286,20 +1359,30 @@ pub async fn seed_records(
                     let _ = client.refresh_routing().await;
                 }
                 Err(e) => {
+                    // Last attempt: still credit whatever this response
+                    // acknowledged before giving up. Dropping those would
+                    // under-report writes the cluster really performed.
+                    split_partial_successes(
+                        &e,
+                        attempt,
+                        &mut remaining_items,
+                        &mut remaining_meta,
+                        &mut succeeded_meta,
+                    );
+                    publish_seeded_records(verifier, utxos_per_tx, &mut succeeded_meta, &mut txids);
                     eprintln!("seed_records: failed after {MAX_SEED_RETRIES} attempts: {e}");
                     return Err(e);
                 }
             }
         }
+        // Publish BEFORE the give-up check: creates the server acknowledged
+        // are real regardless of whether the rest of the batch converged.
+        publish_seeded_records(verifier, utxos_per_tx, &mut succeeded_meta, &mut txids);
         if !remaining_items.is_empty() {
             return Err(ClientError::Connection(format!(
                 "create_batch: {} items still failing after retries",
                 remaining_items.len()
             )));
-        }
-        for (txid, utxo_hashes) in succeeded_meta {
-            verifier.record_create(txid, utxos_per_tx, utxo_hashes);
-            txids.push(txid);
         }
     }
 
@@ -2801,5 +2884,156 @@ mod replication_report_tests {
             dump.contains("shard=7"),
             "expected shard=7 (first response): {dump}"
         );
+    }
+}
+
+#[cfg(test)]
+mod seed_records_accounting_tests {
+    use super::*;
+    use teraslab_test_client::PartialError;
+    use teraslab_test_client::types::BatchItemError;
+
+    /// Build a minimal create item for the given txid.
+    fn item(txid: [u8; 32]) -> CreateItem {
+        CreateItem {
+            txid,
+            utxo_hashes: vec![[1u8; 32]],
+            tx_version: 1,
+            locktime: 0,
+            fee: 500,
+            size_in_bytes: 250,
+            extended_size: 0,
+            is_coinbase: false,
+            spending_height: 0,
+            created_at: 1710000000000,
+            flags: 0,
+            cold_data: vec![],
+            mined_block_id: None,
+            mined_block_height: None,
+            mined_subtree_idx: None,
+            parent_txids: vec![],
+        }
+    }
+
+    fn partial_error(failed_indices: &[u32]) -> ClientError {
+        ClientError::Partial(PartialError {
+            successes: vec![],
+            errors: failed_indices
+                .iter()
+                .map(|&item_index| BatchItemError {
+                    item_index,
+                    // ERR_REPLICATION_FAILED -- the ambiguous outcome a
+                    // partition produces for shards whose holder pair is cut.
+                    code: 20,
+                    data: vec![],
+                })
+                .collect(),
+            degraded: false,
+        })
+    }
+
+    #[test]
+    fn split_partial_successes_moves_only_acked_items_out_of_the_retry_set() {
+        let txids: Vec<[u8; 32]> = (0u8..3).map(|i| [i; 32]).collect();
+        let mut remaining_items: Vec<CreateItem> = txids.iter().map(|t| item(*t)).collect();
+        let mut remaining_meta: Vec<SeedMeta> =
+            txids.iter().map(|t| (*t, vec![[1u8; 32]])).collect();
+        let mut succeeded_meta: Vec<SeedMeta> = Vec::new();
+
+        // Item 1 failed; items 0 and 2 were applied by the server.
+        split_partial_successes(
+            &partial_error(&[1]),
+            0,
+            &mut remaining_items,
+            &mut remaining_meta,
+            &mut succeeded_meta,
+        );
+
+        assert_eq!(remaining_items.len(), 1);
+        assert_eq!(remaining_items[0].txid, txids[1]);
+        assert_eq!(remaining_meta.len(), 1);
+        assert_eq!(remaining_meta[0].0, txids[1]);
+        assert_eq!(
+            succeeded_meta.iter().map(|(t, _)| *t).collect::<Vec<_>>(),
+            vec![txids[0], txids[2]]
+        );
+    }
+
+    #[test]
+    fn split_partial_successes_leaves_the_batch_intact_for_a_non_partial_error() {
+        let txids: Vec<[u8; 32]> = (0u8..2).map(|i| [i; 32]).collect();
+        let mut remaining_items: Vec<CreateItem> = txids.iter().map(|t| item(*t)).collect();
+        let mut remaining_meta: Vec<SeedMeta> =
+            txids.iter().map(|t| (*t, vec![[1u8; 32]])).collect();
+        let mut succeeded_meta: Vec<SeedMeta> = Vec::new();
+
+        split_partial_successes(
+            &ClientError::Connection("peer unreachable".to_string()),
+            2,
+            &mut remaining_items,
+            &mut remaining_meta,
+            &mut succeeded_meta,
+        );
+
+        // Nothing is known to have landed: the whole batch stays retryable.
+        assert_eq!(remaining_items.len(), 2);
+        assert_eq!(remaining_meta.len(), 2);
+        assert!(succeeded_meta.is_empty());
+    }
+
+    #[test]
+    fn publish_seeded_records_drains_into_the_verifier_and_the_txid_list() {
+        let verifier = StateVerifier::new();
+        let mut txids: Vec<[u8; 32]> = Vec::new();
+        let hashes_a = vec![[0xaa; 32], [0xab; 32]];
+        let hashes_b = vec![[0xba; 32], [0xbb; 32]];
+        let mut succeeded_meta: Vec<SeedMeta> =
+            vec![([7u8; 32], hashes_a.clone()), ([8u8; 32], hashes_b)];
+
+        publish_seeded_records(&verifier, 2, &mut succeeded_meta, &mut txids);
+
+        assert!(
+            succeeded_meta.is_empty(),
+            "staging buffer must be drained so a later publish cannot double-record"
+        );
+        assert_eq!(txids, vec![[7u8; 32], [8u8; 32]]);
+        assert_eq!(verifier.record_count(), 2);
+        let rec = verifier
+            .get_record(&[7u8; 32])
+            .expect("published record must be tracked by the verifier");
+        assert_eq!(rec.utxo_count, 2);
+        assert_eq!(rec.utxo_hashes, hashes_a);
+        assert_eq!(rec.spent_utxos, 0);
+    }
+
+    /// The cancellation shape the harness actually hits: a caller wraps
+    /// `seed_records` in a timeout, the future is dropped mid-flight, and the
+    /// return value is lost. Anything published before the drop must survive
+    /// in the verifier -- that is the only channel a cancelled caller has.
+    #[tokio::test]
+    async fn records_published_before_a_cancellation_survive_in_the_verifier() {
+        let verifier = StateVerifier::new();
+        let mut txids: Vec<[u8; 32]> = Vec::new();
+        let mut succeeded_meta: Vec<SeedMeta> = vec![([9u8; 32], vec![[0xcc; 32]])];
+
+        let cancelled = tokio::time::timeout(Duration::from_millis(50), async {
+            publish_seeded_records(&verifier, 1, &mut succeeded_meta, &mut txids);
+            // Stand in for the awaits that follow a publish in `seed_records`
+            // (reconcile read-back, backoff sleep, routing refresh).
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            txids.clone()
+        })
+        .await;
+
+        assert!(
+            cancelled.is_err(),
+            "the future must be cancelled mid-flight"
+        );
+        assert_eq!(
+            verifier.record_count(),
+            1,
+            "an ack published before the cancellation point must not be lost"
+        );
+        assert!(verifier.all_txids().contains(&[9u8; 32]));
     }
 }

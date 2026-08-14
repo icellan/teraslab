@@ -869,10 +869,18 @@ async fn run_scenario() -> Result<(), ClientError> {
         let reporter = Arc::new(MetricsReporter::new());
         let workload_duration = Duration::from_secs(30);
         let deadline = tokio::time::Instant::now() + workload_duration;
-        let mut partition_txids: Vec<[u8; 32]> = Vec::new();
         let mut errors = 0u32;
         let mut total_ops = 0u32;
         let mut batch_idx = 0u32;
+        // Records created during the partition are harvested from the verifier
+        // afterwards, NOT from each batch's return value. A batch abandoned by
+        // the per-batch timeout below has its future dropped, so its return
+        // value is lost even though `seed_records` already published every
+        // server-acked create into the verifier. Counting only returned
+        // batches reported "zero records were created" on a run where server
+        // metrics proved 21 records had been created (CI 31536584294).
+        let pre_workload_txids: std::collections::HashSet<[u8; 32]> =
+            verifier.all_txids().into_iter().collect();
 
         while tokio::time::Instant::now() < deadline {
             batch_idx += 1;
@@ -898,27 +906,43 @@ async fn run_scenario() -> Result<(), ClientError> {
             // Bound each batch by a SLICE of the budget, not the whole thing.
             // `seed_records` retries a transient batch up to 16 times with
             // backoff, and under this partition every attempt pays a connect
-            // timeout toward the unreachable peer — so one unlucky batch (any
-            // of its 5 records mapping to an affected shard) consumes the
-            // entire 30s window. Observed exactly that: "batch 1 exceeded the
-            // remaining workload budget (29.99s)", leaving 2 ops and 0 records
-            // created, which then trips the zero-records check.
+            // timeout toward the unreachable peer — so one unlucky batch
+            // (mapping to an affected shard) consumes the entire 30s window.
+            // Observed exactly that: "batch 1 exceeded the remaining workload
+            // budget (29.99s)", leaving 2 ops and 0 records created, which
+            // then trips the zero-records check.
             //
             // This sub-test measures how much work SURVIVES an asymmetric
             // partition, so it needs many attempts spread across the window
             // rather than one exhaustive retry chain. Abandon a stuck batch
             // quickly and move to the next.
-            const PER_BATCH_BUDGET: Duration = Duration::from_secs(3);
+            //
+            // The budget MUST stay comfortably above every bounded wait a
+            // create can legitimately pay under this partition, or the timeout
+            // fires first and turns real server answers into "abandoned":
+            //   * `replication_timeout_ms` = 3000 (src/config.rs) -- a create
+            //     whose holder pair straddles the cut waits the full replica
+            //     ack timeout before the server NAKs it;
+            //   * ~5s connect timeout toward a peer whose packets iptables
+            //     DROPs (blackhole, no RST).
+            // It was 3s -- exactly `replication_timeout_ms` -- so every batch
+            // touching a cut shard was abandoned by construction and counted
+            // zero creates (CI 31536584294). Keep the two apart: raise this if
+            // `replication_timeout_ms` ever rises.
+            const PER_BATCH_BUDGET: Duration = Duration::from_secs(8);
             let batch_budget = PER_BATCH_BUDGET
                 .min(remaining)
                 .max(Duration::from_millis(500));
+            // ONE record per budgeted batch: 5 random txids hash to ~5
+            // different shards, so a 5-record batch had only a ~2% chance of
+            // avoiding the cut holder pair entirely -- one unlucky shard
+            // failed the whole batch and discarded four good writes.
             let create =
-                tokio::time::timeout(batch_budget, common::seed_records(&client, &verifier, 5, 5))
+                tokio::time::timeout(batch_budget, common::seed_records(&client, &verifier, 1, 5))
                     .await;
             match create {
-                Ok(Ok(batch)) => {
+                Ok(Ok(_)) => {
                     reporter.record("create", op_start.elapsed());
-                    partition_txids.extend_from_slice(&batch);
                     total_ops += 1;
                 }
                 Ok(Err(e)) => {
@@ -961,6 +985,15 @@ async fn run_scenario() -> Result<(), ClientError> {
             // Throttle to ~50 ops/sec
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+
+        // Everything the verifier gained during the window was created during
+        // the partition, including creates from batches the per-batch timeout
+        // abandoned before they could return.
+        let partition_txids: Vec<[u8; 32]> = verifier
+            .all_txids()
+            .into_iter()
+            .filter(|txid| !pre_workload_txids.contains(txid))
+            .collect();
 
         eprintln!(
             "[8d.2] Workload complete: {total_ops} ops, {errors} errors, {} records created",
