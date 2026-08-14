@@ -11,9 +11,18 @@
 //! reverts the unsynced tombstone (leaving the record's header intact on the
 //! data device) while the redo device keeps the durable FreeRegion. On recovery
 //! the device scan re-indexes the still-intact record at offset X, and redo
-//! replay pushes X onto the freelist — leaving the record LIVE in the index AND
-//! its offset FREE for reuse. A later `create` then allocates X and silently
-//! overwrites the acked, durable record.
+//! replay pushes X onto the freelist — pre-fix leaving the record LIVE in the
+//! index AND its offset FREE for reuse, so a later `create` could silently
+//! overwrite the acked, durable record.
+//!
+//! The resolution is DELETE-WINS (scenario-09 phantom fix): the fsynced
+//! `FreeRegion` is the delete's durable commit record, so `FreeRegion` replay
+//! evicts any index entry still pointing at the freed slot. The delete sticks
+//! deterministically regardless of which buffered writes survived the crash —
+//! the alternative ("index wins, the delete never happened") is unsound
+//! because the tombstone write and the index removal are NOT lost together: a
+//! flushed tombstone with a stale index snapshot resurrects a phantom entry
+//! over zeroed bytes (CRC-mismatch wedge, CI scenario 09).
 //!
 //! These tests reproduce that exact window through the PRODUCTION delete + the
 //! real recovery pipeline (device-scan rebuild + redo replay), with NO
@@ -241,12 +250,13 @@ fn assert_no_live_and_free(engine: &Engine, k: &TxKey) -> Option<u64> {
 /// Create A (buffered, acked, checkpointed), delete A (fsyncs FreeRegion, buffers
 /// the tombstone + index removal), crash BEFORE the next checkpoint, recover.
 /// The invariant must hold: A is never both live in the index and on the
-/// freelist. Index-wins reconciliation restores the consistent "delete never
-/// happened" tail-loss state — A alive, its offset reserved.
+/// freelist. Delete-wins: the fsynced FreeRegion is the delete's durable commit
+/// record, so replay evicts the re-indexed entry — A is fully gone and its
+/// offset legitimately reusable, never a phantom.
 #[test]
 fn buffered_delete_freeregion_durable_index_lost_stays_consistent() {
     let h = Harness::new();
-    let (off, stored) = h.seed_record(11, 2);
+    let (off, _stored) = h.seed_record(11, 2);
     let k = key(11);
 
     // Production buffered delete: fsyncs FreeRegion via allocator.free, but the
@@ -264,34 +274,27 @@ fn buffered_delete_freeregion_durable_index_lost_stays_consistent() {
     let rec = h.recover();
 
     // The record's header survived (tombstone unsynced), so the device-scan
-    // rebuild re-indexes it. Reconciliation must have pulled its offset back off
-    // the freelist — otherwise a create could overwrite it.
-    let recovered_off =
-        assert_no_live_and_free(&rec, &k).expect("A's intact header must be re-indexed on rebuild");
-    assert_eq!(
-        recovered_off, off,
-        "A must be re-indexed at its original offset",
+    // rebuild re-indexed it — but the durable FreeRegion must evict it on
+    // replay: the acked delete sticks, and the invariant holds trivially.
+    assert!(
+        assert_no_live_and_free(&rec, &k).is_none(),
+        "A's fsynced FreeRegion is the delete's durable commit record — the \
+         re-indexed entry must be evicted on replay, not resurrected",
     );
-
-    // And A's data must be intact and readable.
-    let meta = rec.read_metadata(&k).expect("A metadata readable");
-    assert_eq!({ meta.utxo_count }, 2, "A must keep its two slots");
-    for v in 0..2u32 {
-        let slot = rec.read_slot(&k, v).expect("A slot readable");
-        assert_eq!(
-            slot.hash, stored[v as usize],
-            "A slot {v} data must be intact",
-        );
-    }
+    assert!(
+        rec.allocator().lock().free_region_containing(off).is_some(),
+        "the deleted record's offset must be on the freelist for reuse",
+    );
 }
 
-/// Test 2 — no silent overwrite of the resurrected record.
+/// Test 2 — a post-recovery create may safely reuse the freed offset.
 ///
-/// Following recovery from the window in test 1 (A live again), create a NEW
-/// record B. B must NOT land on A's offset while A is still indexed, and A must
-/// read back intact afterwards.
+/// Following recovery from the window in test 1 (A evicted, its offset free),
+/// create a NEW record B. B may legitimately land on A's freed offset — the
+/// delete stuck, so nothing live is overwritten — and B must be fully readable
+/// while A stays gone.
 #[test]
-fn create_after_recovery_does_not_overwrite_resurrected_record() {
+fn create_after_recovery_reuses_freed_offset_safely() {
     let h = Harness::new();
     let (off_a, stored_a) = h.seed_record(11, 2);
     let k_a = key(11);
@@ -305,36 +308,43 @@ fn create_after_recovery_does_not_overwrite_resurrected_record() {
     h.crash();
     let rec = h.recover();
 
-    // A is live again after reconciliation.
-    let recovered_a = assert_no_live_and_free(&rec, &k_a).expect("A must be live after recovery");
-    assert_eq!(recovered_a, off_a);
+    // Delete-wins: A is gone after recovery, never live-and-free.
+    assert!(
+        assert_no_live_and_free(&rec, &k_a).is_none(),
+        "A must stay deleted after recovery",
+    );
 
-    // Allocate/create B. With A's offset reserved, B must land elsewhere.
-    let hashes_b: Vec<[u8; 32]> = (0..3).map(|v| slot_hash(22, v)).collect();
+    // Create B. A's freed offset is allocatable again, so B may reuse it.
+    let hashes_b: Vec<[u8; 32]> = (0..2).map(|v| slot_hash(22, v)).collect();
     rec.create(&base_create_req(22, &hashes_b))
         .expect("create B must succeed");
     let k_b = key(22);
     let off_b = rec.lookup(&k_b).expect("B must be indexed").record_offset;
-    assert_ne!(
+    assert_eq!(
         off_b, off_a,
-        "B must NOT be placed on A's still-indexed offset (silent overwrite)",
+        "B (same reservation size) must reuse A's freed offset — the delete \
+         stuck, so the slot is legitimately allocatable",
     );
 
-    // A must still read back intact — not overwritten by B.
-    let meta_a = rec.read_metadata(&k_a).expect("A metadata still readable");
-    assert_eq!({ meta_a.utxo_count }, 2, "A must keep its two slots");
+    // B's own data is correct (its create really landed over the old bytes:
+    // the metadata is B's, and every slot passes its CRC — no torn remnant of
+    // A at the reused offset).
+    let meta_b = rec.read_metadata(&k_b).expect("B metadata readable");
+    assert_eq!({ meta_b.utxo_count }, 2, "B must have its two slots");
     for v in 0..2u32 {
         let slot = rec
-            .read_slot(&k_a, v)
-            .expect("A slot readable after B create");
-        assert_eq!(
-            slot.hash, stored_a[v as usize],
-            "A slot {v} must be intact after B is created",
+            .read_slot(&k_b, v)
+            .expect("B slot must be CRC-valid at the reused offset");
+        assert!(
+            !stored_a.contains(&slot.hash),
+            "B slot {v} must hold B's data, not a remnant of deleted A",
         );
     }
-    // And B's own data is correct (its create really happened, not a no-op).
-    let meta_b = rec.read_metadata(&k_b).expect("B metadata readable");
-    assert_eq!({ meta_b.utxo_count }, 3, "B must have its three slots");
+    // And A stays gone — no aliasing onto B's record.
+    assert!(
+        rec.lookup(&k_a).is_none(),
+        "A must not alias B's record at the reused offset",
+    );
 }
 
 /// Test 3 — positive control / regression guard.

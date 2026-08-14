@@ -8801,21 +8801,23 @@ impl Engine {
         // index entry), and it now also precedes the tombstone.
         //
         // Crash recovery of a buffered delete: production journals NO
-        // `RedoOp::Delete` (deletes are local prune GC), so redo-replay does NOT
-        // remove the record. What IS durable at the allocator `free` below is a
-        // fsynced `FreeRegion` redo record; the tombstone header write and this
-        // index removal are buffered (write-back cache) and become durable only
-        // at the next checkpoint. A crash after the `FreeRegion` fsync but before
-        // that checkpoint reverts the unsynced tombstone, so the device-scan
-        // rebuild re-indexes the still-intact record as LIVE while replay puts
-        // its offset on the freelist. Recovery reconciles this index-wins: it
-        // carves any live record's offset back out of the freelist
-        // (`recovery::reconcile_freelist_against_live_index` →
-        // `SlotAllocator::reserve_recovered_live_region`), restoring the
-        // consistent "delete never happened" lost-tail state (buffered mode's
-        // contract) so a future allocation cannot overwrite the live record. The
-        // tombstone remains the device-scan-rebuild guard for a CHECKPOINTED
-        // delete (durable tombstone ⇒ the record is not re-indexed at all).
+        // `RedoOp::Delete` (deletes are local prune GC). The fsynced
+        // `FreeRegion` redo record written at the allocator `free` below is the
+        // delete's ONLY durable commit record; the tombstone header write and
+        // this index removal stay in the write-back cache until the next
+        // checkpoint. Recovery resolves that window DELETE-WINS: `FreeRegion`
+        // replay evicts every index entry still pointing at the freed slot
+        // (`recovery::evict_freed_region_owner`), so a delete that crossed the
+        // last index snapshot — or whose still-intact record a device-scan
+        // rebuild re-indexed as live — does not resurrect as a phantom over
+        // freed bytes. The freelist carve-out
+        // (`recovery::reconcile_freelist_against_live_index`) is NOT the
+        // delete's undo: it is the safety net for the no-`FreeRegion`-in-tail
+        // case only (e.g. a torn checkpoint sequence), keeping a future
+        // allocation from overwriting a live record whose free never became
+        // durable. The tombstone remains the device-scan-rebuild guard for a
+        // CHECKPOINTED delete (durable tombstone ⇒ the record is not
+        // re-indexed at all).
         //
         // `unregister_with_shard_count` only decrements when an entry was actually
         // removed (H2: no underflow if the key was concurrently removed). G-4: if
