@@ -5404,10 +5404,13 @@ const MAX_SEQUENCE_RENEGOTIATIONS: usize = 2;
 ///    * `Gap { expected_sequence }` — the replica is missing positions
 ///      below the label (burned by an earlier failed batch): relabel at
 ///      `expected_sequence` and retry once.
-///    * `Ok { through > last_sequence }` — duplicate-skip against a
-///      watermark ahead of the cursor (cursor desync): adopt
-///      `through + 1` and retry once. The batch content was NOT applied,
-///      so this is never treated as success.
+///    * `Ok { through > last_sequence }` — the replica's watermark is
+///      ahead of the cursor (cursor desync). Post-issue-#17 the receiver
+///      applies every op before ACKing (covered positions are re-applied,
+///      never skipped), so the content IS durably applied; the
+///      conservative adopt-`through + 1`-and-retry is kept anyway — the
+///      relabeled resend re-applies idempotently and re-syncs the cursor
+///      in the same round-trip.
 ///    * transport / replica error — fail the batch and **burn** the
 ///      assigned positions (advance the cursor past them). The replica
 ///      may or may not have applied the frame; burning guarantees a
@@ -5605,8 +5608,11 @@ fn send_replica_ops_loop(
                     break;
                 }
                 ReplicaAck::Ok { through_sequence } => {
-                    // Duplicate-skip against a watermark ahead of our cursor:
-                    // nothing from THIS batch was applied. Adopt and retry.
+                    // Watermark ahead of our cursor (cursor desync). The
+                    // receiver applied this batch's ops before ACKing
+                    // (issue #17: covered positions re-apply, never skip);
+                    // adopt and retry anyway — the relabeled resend
+                    // re-applies idempotently and re-syncs the cursor.
                     reneg_attempts += 1;
                     if reneg_attempts >= MAX_SEQUENCE_RENEGOTIATIONS {
                         return Err(ReplicaSendError::Failed(format!(

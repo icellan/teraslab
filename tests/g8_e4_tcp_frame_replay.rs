@@ -167,8 +167,11 @@ fn replica_batch_replay_is_idempotent() {
     );
     let (decoded_replay, _) = RequestFrame::decode(&verified_replay).expect("decode replay");
 
-    // Part 2: applying the replay is a no-op — the applied-sequence
-    // journal short-circuits it before touching the engine.
+    // Part 2: applying the replay is an observable no-op. Post-issue-#17
+    // the replay is RE-APPLIED rather than journal-skipped (a covered
+    // position does not prove this batch's content was applied), so the
+    // engine's own idempotency (matching-spending-data re-spend,
+    // equal-generation sync) must absorb it without effect.
     let resp_2 = handle_replica_batch_with_tracker(
         &decoded_replay,
         &engine,
