@@ -895,17 +895,22 @@ fn committed_topology_reactivation_metrics(
 ///
 /// The only function that is deterministic and identical on every node is the
 /// round-robin `compute_with_epoch(committed_members)`: each node derives the
-/// exact same master per shard from the same member SET. A same-term
-/// reactivation runs `activate_topology` with an EMPTY partition view, which
-/// makes `apply_master_election` a no-op and installs precisely that
-/// round-robin table — so once reactivation fires on every divergent node the
-/// cluster collapses to a single master per shard (sum == `NUM_SHARDS`) and
-/// STAYS there (the round-robin table is a fixed point of this detector).
+/// exact same master per shard from the same member SET. Startup and
+/// self-drain reactivation run `activate_topology` with an EMPTY partition
+/// view, which makes `apply_master_election` a no-op and installs precisely
+/// that round-robin table. The plain same-term repair (task #47) instead
+/// collects a FRESH partition view first and re-runs the election against it
+/// — since #47 the election is a pure function of (round-robin table, view)
+/// with strict data superiority required to deviate, so every divergent node
+/// converges on the SAME refined table (sum == `NUM_SHARDS`) without waiting
+/// for a data migration, and once the round-robin masters hold their data the
+/// refinement is the identity and the round-robin table is again a fixed
+/// point of this detector.
 ///
 /// This detector therefore counts shards where `self` is the local master but
 /// the round-robin master for that shard under `committed_members` is a
 /// DIFFERENT node — i.e. exactly the election-deviated (or stale) shards a
-/// same-term empty-view reactivation will reassign. A node only knows its own
+/// same-term reactivation will reconcile. A node only knows its own
 /// table, so the check is purely local; every divergent node independently
 /// fires reactivation and relinquishes its deviant masters.
 ///
@@ -2086,10 +2091,15 @@ impl ClusterCoordinator {
         // OP_PARTITION_VERSION_REPORT from peers, then signals back here so
         // the event loop can build the migration plan against the actual
         // distribution rather than a topology-derived guess.
+        // The trailing bool marks a Task #47 SAME-TERM re-heal exchange
+        // (spawned by the reactivation repair to refresh the partition view
+        // for an already-activated term); it bypasses the duplicate-activation
+        // dedup but is dropped if the topology moved while it was in flight.
         type ExchangeResult = (
             Vec<NodeId>,
             u64,
             std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>>,
+            bool,
         );
         let (exchange_complete_tx, exchange_complete_rx) =
             std::sync::mpsc::channel::<ExchangeResult>();
@@ -2165,6 +2175,13 @@ impl ClusterCoordinator {
             // exchange on every 100 ms tick while the first exchange is in
             // flight; cleared implicitly by advancing as the term advances.
             let mut prompt_exchange_term: u64 = 0;
+            // Task #47 — term-keyed single-flight slot for the same-term
+            // re-heal exchange spawned by the normal reactivation repair.
+            // `Some(term)` while an exchange for that term is in flight;
+            // released when its (possibly stale) result arrives on
+            // `exchange_complete_rx`. Keyed by term, not a bare busy flag, so
+            // a term advance never wedges the slot.
+            let mut reheal_exchange_term: Option<u64> = None;
             // Re-election pacing: prompt (event-driven off a fresh exchange
             // view) but never a storm. Seeded in the past so the FIRST
             // contradiction after boot can fire immediately.
@@ -2884,7 +2901,7 @@ impl ClusterCoordinator {
                                 std::time::Duration::from_millis(2000),
                                 &secret_x,
                             );
-                            let _ = exchange_tx.send((members_x, committed_term, view));
+                            let _ = exchange_tx.send((members_x, committed_term, view, false));
                         });
                     }
                 }
@@ -3028,62 +3045,118 @@ impl ClusterCoordinator {
                             } else {
                                 fast_reactivation_progress = None;
                             }
-                            if startup_reactivation_due {
-                                startup_reactivation_event.store(false, Ordering::Release);
-                                tracing::info!(
-                                    term = committed_term,
-                                    pending_handoffs,
-                                    mismatched,
-                                    stuck_subset,
-                                    phantom_masters,
-                                    "cluster: re-activating topology after restored outbound migration state",
-                                );
-                            } else if drain_due && !normal_reactivation_due {
-                                tracing::info!(
-                                    term = committed_term,
-                                    pending_handoffs,
-                                    mismatched,
-                                    stuck_subset,
-                                    total_work,
-                                    "cluster: re-driving self-drain handoffs (prompt cadence)",
-                                );
+                            // Task #47 — the plain same-term repair collects a
+                            // FRESH partition view before re-activating, so the
+                            // election re-runs against current cluster-wide
+                            // evidence and every divergent node converges on
+                            // the SAME refined table (a table-level heal that
+                            // needs no data movement when the holder should
+                            // simply keep serving). Startup and self-drain
+                            // repair keep the empty-view path: their job is to
+                            // push the deterministic plan promptly, and the
+                            // drain cadence must not gate on an exchange RTT.
+                            let reheal_with_fresh_view =
+                                normal_reactivation_due && !startup_reactivation_due && !drain_due;
+                            if reheal_with_fresh_view {
+                                // Term-keyed single-flight: while this term's
+                                // re-heal exchange is in flight, skip; the
+                                // result lands on `exchange_complete_rx`.
+                                if reheal_exchange_term != Some(committed_term) {
+                                    reheal_exchange_term = Some(committed_term);
+                                    tracing::info!(
+                                        term = committed_term,
+                                        pending_handoffs,
+                                        mismatched,
+                                        stuck_subset,
+                                        phantom_masters,
+                                        "cluster: re-activating topology — collecting a fresh partition view",
+                                    );
+                                    last_reactivation_at = std::time::Instant::now();
+                                    let exchange_tx = exchange_complete_tx.clone();
+                                    let node_addrs_x = node_addrs.clone();
+                                    let engine_x = engine.clone();
+                                    let shard_table_x = shard_table.clone();
+                                    let inbound_bm_x = inbound_bm_event.clone();
+                                    let secret_x = cluster_secret_event.clone();
+                                    let members_x = committed_members.clone();
+                                    std::thread::spawn(move || {
+                                        let view = Self::run_exchange_phase(
+                                            &members_x,
+                                            self_id,
+                                            committed_term,
+                                            &node_addrs_x,
+                                            &engine_x,
+                                            &shard_table_x,
+                                            &inbound_bm_x,
+                                            std::time::Duration::from_millis(2000),
+                                            &secret_x,
+                                        );
+                                        let _ = exchange_tx.send((
+                                            members_x,
+                                            committed_term,
+                                            view,
+                                            true,
+                                        ));
+                                    });
+                                }
                             } else {
-                                tracing::info!(
-                                    term = committed_term,
-                                    pending_handoffs,
-                                    mismatched,
-                                    stuck_subset,
-                                    phantom_masters,
-                                    "cluster: re-activating topology",
+                                if startup_reactivation_due {
+                                    startup_reactivation_event.store(false, Ordering::Release);
+                                    tracing::info!(
+                                        term = committed_term,
+                                        pending_handoffs,
+                                        mismatched,
+                                        stuck_subset,
+                                        phantom_masters,
+                                        "cluster: re-activating topology after restored outbound migration state",
+                                    );
+                                } else if drain_due && !normal_reactivation_due {
+                                    tracing::info!(
+                                        term = committed_term,
+                                        pending_handoffs,
+                                        mismatched,
+                                        stuck_subset,
+                                        total_work,
+                                        "cluster: re-driving self-drain handoffs (prompt cadence)",
+                                    );
+                                } else {
+                                    tracing::info!(
+                                        term = committed_term,
+                                        pending_handoffs,
+                                        mismatched,
+                                        stuck_subset,
+                                        phantom_masters,
+                                        "cluster: re-activating topology",
+                                    );
+                                }
+                                last_reactivation_at = std::time::Instant::now();
+                                last_activation_at = std::time::Instant::now();
+                                Self::activate_topology(
+                                    &committed_members,
+                                    committed_term,
+                                    committed_pv,
+                                    self_id,
+                                    rf,
+                                    &shard_table,
+                                    &migration,
+                                    &node_addrs,
+                                    &engine,
+                                    &redo_for_events,
+                                    max_migration_threads,
+                                    migration_pool_size,
+                                    migration_batch_size,
+                                    &fenced_bm_event,
+                                    &migrating_bm_event,
+                                    &inbound_bm_event,
+                                    &active_topology_members_event,
+                                    &migration_throttle_event,
+                                    &cluster_secret_event,
+                                    committed_assignment_for_activation(
+                                        &topo_authority_event,
+                                        committed_term,
+                                    ),
                                 );
                             }
-                            last_reactivation_at = std::time::Instant::now();
-                            last_activation_at = std::time::Instant::now();
-                            Self::activate_topology(
-                                &committed_members,
-                                committed_term,
-                                committed_pv,
-                                self_id,
-                                rf,
-                                &shard_table,
-                                &migration,
-                                &node_addrs,
-                                &engine,
-                                &redo_for_events,
-                                max_migration_threads,
-                                migration_pool_size,
-                                migration_batch_size,
-                                &fenced_bm_event,
-                                &migrating_bm_event,
-                                &inbound_bm_event,
-                                &active_topology_members_event,
-                                &migration_throttle_event,
-                                &cluster_secret_event,
-                                committed_assignment_for_activation(
-                                    &topo_authority_event,
-                                    committed_term,
-                                ),
-                            );
                         }
                     }
                 }
@@ -3155,7 +3228,7 @@ impl ClusterCoordinator {
                                 std::time::Duration::from_millis(2000),
                                 &secret_x,
                             );
-                            let _ = exchange_tx.send((members_x, term, view));
+                            let _ = exchange_tx.send((members_x, term, view, false));
                         });
                         continue;
                     }
@@ -3205,22 +3278,47 @@ impl ClusterCoordinator {
                 // build the migration plan against the collected partition
                 // view and activate.
                 while !activation_held
-                    && let Ok((members, term, partition_view)) = exchange_complete_rx.try_recv()
+                    && let Ok((members, term, partition_view, same_term_reheal)) =
+                        exchange_complete_rx.try_recv()
                 {
-                    let active_members = active_topology_members_event.read().clone();
-                    if topology_commit_already_activated(
-                        term,
-                        last_activated_term,
-                        &active_members,
-                        &members,
-                    ) {
-                        tracing::debug!(
+                    if same_term_reheal {
+                        // Task #47 — release the single-flight slot for this
+                        // term regardless of whether the result still applies.
+                        if reheal_exchange_term == Some(term) {
+                            reheal_exchange_term = None;
+                        }
+                        // A re-heal view is only valid for the CURRENT
+                        // committed topology; if a new term committed (or the
+                        // member set moved) while the exchange was in flight,
+                        // the normal commit-signal activation owns the table.
+                        if !same_term_reheal_applicable(
+                            term,
+                            topo_authority_event.committed_term(),
+                            &members,
+                            &topo_authority_event.committed_members(),
+                        ) {
+                            tracing::info!(
+                                term,
+                                "cluster: dropping same-term re-heal view — topology moved during the exchange",
+                            );
+                            continue;
+                        }
+                    } else {
+                        let active_members = active_topology_members_event.read().clone();
+                        if topology_commit_already_activated(
                             term,
                             last_activated_term,
-                            members = members.len(),
-                            "cluster: skipping duplicate exchange-phase activation",
-                        );
-                        continue;
+                            &active_members,
+                            &members,
+                        ) {
+                            tracing::debug!(
+                                term,
+                                last_activated_term,
+                                members = members.len(),
+                                "cluster: skipping duplicate exchange-phase activation",
+                            );
+                            continue;
+                        }
                     }
                     last_activated_term = term;
                     topology_epoch.store(term, Ordering::Relaxed);
@@ -5406,6 +5504,23 @@ fn topology_commit_already_activated(
     commit_members: &[NodeId],
 ) -> bool {
     term < last_activated_term || (term == last_activated_term && active_members == commit_members)
+}
+
+/// Task #47 — gate for applying a SAME-TERM re-heal exchange result.
+///
+/// The normal reactivation repair spawns an exchange to refresh the partition
+/// view for the term it is repairing; by the time the view arrives the
+/// authority may have committed a newer term (or the member set may have
+/// moved). Such a stale view must be dropped — activating it would install a
+/// table for a superseded topology. Applicable iff the view was collected for
+/// exactly the CURRENT committed term and member set.
+fn same_term_reheal_applicable(
+    view_term: u64,
+    committed_term: u64,
+    view_members: &[NodeId],
+    committed_members: &[NodeId],
+) -> bool {
+    view_term == committed_term && view_members == committed_members
 }
 
 /// Topology proposer thread: broadcasts a proposal to all peers, collects
@@ -10559,8 +10674,6 @@ fn split_transfer_request_tasks(
 ///
 /// For every shard, build the candidate set from the shard's target
 /// assignment (master + replicas), tag each candidate with:
-/// - `was_previous_master`: held the master role for this shard in
-///   `prev_table` and is still in the new member set.
 /// - `is_subset`: not yet observed to hold full data — either the
 ///   partition view shows no entries for the candidate or the candidate
 ///   reports `last_applied_seq == 0` for the shard.
@@ -10568,30 +10681,42 @@ fn split_transfer_request_tasks(
 ///   (collected from the prior exchange phase).
 ///
 /// Run [`elect_master`] over the candidates and, when the elected master
-/// differs from the current round-robin pick, swap it into place via
-/// [`ShardTable::set_master_for_shard`].
+/// differs from the current round-robin pick AND strictly outranks it on
+/// data, swap it into place via [`ShardTable::set_master_for_shard`].
+///
+/// # Election is a pure function of (round-robin table, view) — Task #47
+///
+/// This function deliberately reads NO node-local state: `_prev_table` is
+/// retained for call-site compatibility but no longer participates.
+/// `was_previous_master` used to be derived from each node's OWN previous
+/// table, and deviation used to follow the elected winner even on a data
+/// TIE — so two nodes at the SAME committed term with the SAME view could
+/// elect DIFFERENT masters for one shard (each preferring its own prior
+/// deviation), the sticky dual-master state of E2E scenario 11.10
+/// (masters=4115/4096 with zero handoffs). Two rules restore cluster-wide
+/// agreement:
+/// - every candidate's `was_previous_master` is `false`, so ranking depends
+///   only on the shared view (ties fall to the node-id order, identical
+///   everywhere);
+/// - deviation from the round-robin pick requires STRICT rank superiority
+///   (full over subset/evicted). A tie keeps the round-robin master — the
+///   only assignment every node derives identically — which also makes a
+///   healed deviation DECAY: once the round-robin master reports data, every
+///   node returns to it and the round-robin table is again the fixed point
+///   of the reactivation detector.
 ///
 /// # Empty partition views must be a true no-op (Task #22)
 ///
 /// When `partition_view` is empty the round-robin pick is left COMPLETELY
 /// unchanged — the function returns before touching any shard. This is
-/// load-bearing for cluster convergence, not just an optimization:
-/// `elect_master` ranks candidates by `(data_score, was_previous_master,
-/// Reverse(node_id))`, and with an empty view every candidate scores equal on
-/// data, so the `was_previous_master` stickiness tiebreaker decides. That
-/// tiebreaker reads each node's OWN `prev_table`, which differs per node — so
-/// running election on an empty view produces a DIFFERENT master per node for
-/// the same shard, breaking the single-master-per-shard invariant. The
-/// same-term reactivation path (`activate_topology`, the convergence
-/// mechanism) always passes an empty view precisely so it installs the
-/// deterministic round-robin table identically on every node; election on an
-/// empty view would defeat that and leave the cluster permanently
-/// over-mastered (the 4626/4096 dual-master state). The previous code
-/// proceeded through the loop for `view_empty`, applying stickiness — that was
-/// the convergence bug.
+/// load-bearing for cluster convergence: an empty view carries no data
+/// signal, so no deviation can be justified, and the empty-view
+/// reactivation paths (`activate_topology` on startup/drain repair) rely on
+/// this to install the deterministic round-robin table identically on every
+/// node.
 pub fn apply_master_election(
     table: &mut ShardTable,
-    prev_table: &ShardTable,
+    _prev_table: &ShardTable,
     partition_view: &std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>>,
     evicted: &std::collections::HashSet<NodeId>,
 ) {
@@ -10623,7 +10748,6 @@ pub fn apply_master_election(
 
     for shard in 0..NUM_SHARDS as u16 {
         let assignment = table.target_assignment(shard);
-        let prev_master = prev_table.target_assignment(shard).master;
 
         let mut candidate_nodes: Vec<NodeId> = Vec::with_capacity(1 + assignment.replicas.len());
         candidate_nodes.push(assignment.master);
@@ -10639,12 +10763,16 @@ pub fn apply_master_election(
         // re-creates the dual-master state on every committed term (worst under
         // load, when the bounded exchange times out and returns partial views).
         // Require every candidate for this shard to have REPORTED in the view:
-        // a candidate absent from the view did not respond (it is down or
-        // unreachable), and a down node is absent from EVERY node's view, so
-        // skipping deviation here is a consistent decision cluster-wide. With a
-        // partial view (some candidate missing) preserve the deterministic
-        // round-robin master. (The eviction-only empty-view path bypasses this:
-        // it has no responders by construction.)
+        // with a partial view (some candidate missing) preserve the
+        // deterministic round-robin master. NOTE (task #47): this check alone
+        // is NOT cluster-consistent — asymmetric reachability and mid-commit
+        // report rejections mean one node's view can be complete while
+        // another's is not (the exchange even records a failed peer query as
+        // present-with-no-entries). The resulting divergence is reconciled by
+        // the same-term re-heal reactivation, which re-collects a fresh view
+        // and re-runs this election on every divergent node. (The
+        // eviction-only empty-view path bypasses this: it has no responders
+        // by construction.)
         let all_candidates_reported = view_empty
             || candidate_nodes
                 .iter()
@@ -10684,7 +10812,13 @@ pub fn apply_master_election(
                         > 0;
                 MasterCandidate {
                     node_id,
-                    was_previous_master: node_id == prev_master,
+                    // Task #47 — never feed node-local history into the
+                    // ranking: each node's prev_table diverges (rollbacks,
+                    // prior deviations), so a prev-master tiebreak elects a
+                    // DIFFERENT master per node from the SAME view. With the
+                    // flag uniformly false the ranking is a pure function of
+                    // the shared view.
+                    was_previous_master: false,
                     is_subset: !has_data,
                     was_evicted: evicted.contains(&node_id),
                 }
@@ -10694,7 +10828,25 @@ pub fn apply_master_election(
         if let Some(elected) = elect_master(shard, &candidates)
             && elected != assignment.master
         {
-            table.set_master_for_shard(shard, elected);
+            // Task #47 — deviation requires STRICT rank superiority over the
+            // round-robin pick. On a tie (both full, or both subset) every
+            // node keeps the round-robin master — the only cluster-agreed
+            // assignment — so equal views always produce equal tables, and a
+            // once-justified deviation decays back to round-robin as soon as
+            // the round-robin master reports data.
+            let rr_master = assignment.master;
+            let rank_of = |node: NodeId| {
+                candidates
+                    .iter()
+                    .find(|c| c.node_id == node)
+                    .map(|c| {
+                        rank_master_candidate(c.node_id, c.node_id, c.is_subset, c.was_evicted)
+                    })
+                    .unwrap_or(0)
+            };
+            if rank_of(elected) > rank_of(rr_master) {
+                table.set_master_for_shard(shard, elected);
+            }
         }
     }
 }
@@ -23840,6 +23992,190 @@ mod tests {
             table.target_assignment(shard).master,
             NodeId(1),
             "evicted node must never remain master after election",
+        );
+    }
+
+    /// Task #47 — Phase F per-node refinement divergence. Two nodes at the
+    /// SAME committed table version, holding the SAME (converged) partition
+    /// view, must compute the IDENTICAL master for every shard — regardless
+    /// of how their local `prev_table`s diverged (e.g. one carries an earlier
+    /// election deviation or a rolled-back handoff). Before the fix the
+    /// `was_previous_master` tiebreaker read each node's own previous table,
+    /// so two full candidates tied on data and each node elected ITSELF —
+    /// the sticky dual-master state of E2E scenario 11.10 (masters=4115/4096).
+    #[test]
+    fn apply_master_election_equal_views_agree_despite_divergent_prev_tables() {
+        let members = [NodeId(1), NodeId(2), NodeId(3), NodeId(4)];
+        let rf = 2;
+        let term = 5;
+        let det = ShardTable::compute_with_epoch(&members, rf, term, 1);
+
+        // A shard whose round-robin master is N4 with N1 in the replica set —
+        // the scale-up shape: N4 is the new det owner, N1 the data holder.
+        let shard = (0..NUM_SHARDS as u16)
+            .find(|&s| {
+                det.target_assignment(s).master == NodeId(4)
+                    && det.target_assignment(s).replicas.contains(&NodeId(1))
+            })
+            .expect("some shard has master N4 with replica N1 in a 4-member ring");
+
+        // The CONVERGED view both nodes hold: N1 and N4 both report data for
+        // the shard (N4 is mid-fill but non-empty, so both classify as full);
+        // N2/N3 responded with no entries (present-but-empty, as the exchange
+        // records failed or empty reports).
+        let mut view: std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>> =
+            std::collections::HashMap::new();
+        view.insert(
+            NodeId(1),
+            vec![PartitionVersionEntry {
+                shard,
+                flags: 0,
+                replica_count: 1,
+                last_applied_seq: 5,
+                manifest_digest: 0,
+                max_generation: 0,
+            }],
+        );
+        view.insert(
+            NodeId(4),
+            vec![PartitionVersionEntry {
+                shard,
+                flags: 0,
+                replica_count: 1,
+                last_applied_seq: 3,
+                manifest_digest: 0,
+                max_generation: 0,
+            }],
+        );
+        view.insert(NodeId(2), Vec::new());
+        view.insert(NodeId(3), Vec::new());
+
+        // Node 1's previous table carries an old deviation: it mastered the
+        // shard. Node 4's previous table is the plain deterministic one.
+        let mut prev_node1 = det.clone();
+        prev_node1.set_master_for_shard(shard, NodeId(1));
+        let prev_node4 = det.clone();
+
+        let mut table_node1 = ShardTable::compute_with_epoch(&members, rf, term, 1);
+        apply_master_election(
+            &mut table_node1,
+            &prev_node1,
+            &view,
+            &std::collections::HashSet::new(),
+        );
+        let mut table_node4 = ShardTable::compute_with_epoch(&members, rf, term, 1);
+        apply_master_election(
+            &mut table_node4,
+            &prev_node4,
+            &view,
+            &std::collections::HashSet::new(),
+        );
+
+        assert_eq!(
+            table_node1.target_assignment(shard).master,
+            table_node4.target_assignment(shard).master,
+            "equal views at the same table version must elect the same master on every node",
+        );
+        // A data TIE must never deviate: the round-robin pick is the only
+        // cluster-agreed assignment, so deviation requires strict data
+        // superiority over it.
+        assert_eq!(
+            table_node1.target_assignment(shard).master,
+            NodeId(4),
+            "a data tie must preserve the deterministic round-robin master",
+        );
+    }
+
+    /// Task #47 — a previously-legitimate deviation (holder elected while the
+    /// round-robin master was empty) must DECAY back to the round-robin pick
+    /// once the round-robin master reports data, on every node, regardless of
+    /// each node's diverged `prev_table`. Before the fix the stickiness
+    /// tiebreaker pinned the deviation on the node that carried it, so the
+    /// deviated node and the det master disagreed forever.
+    #[test]
+    fn apply_master_election_reconverges_to_round_robin_once_det_master_reports_data() {
+        let members = [NodeId(1), NodeId(2), NodeId(3), NodeId(4)];
+        let rf = 2;
+        let term = 5;
+        let det = ShardTable::compute_with_epoch(&members, rf, term, 1);
+        let shard = (0..NUM_SHARDS as u16)
+            .find(|&s| {
+                det.target_assignment(s).master == NodeId(4)
+                    && det.target_assignment(s).replicas.contains(&NodeId(1))
+            })
+            .expect("some shard has master N4 with replica N1 in a 4-member ring");
+
+        // The diverged state left over from an asymmetric exchange: node 1's
+        // table masters the shard (it held the data), node 4's table is pure
+        // round-robin (it mastered the same shard) — the dual-master state.
+        let mut diverged_node1 = det.clone();
+        diverged_node1.set_master_for_shard(shard, NodeId(1));
+        let diverged_node4 = det.clone();
+
+        // Views have since converged and N4 now reports data for the shard.
+        let mut view: std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>> =
+            std::collections::HashMap::new();
+        for node in [NodeId(1), NodeId(4)] {
+            view.insert(
+                node,
+                vec![PartitionVersionEntry {
+                    shard,
+                    flags: 0,
+                    replica_count: 1,
+                    last_applied_seq: 5,
+                    manifest_digest: 0,
+                    max_generation: 0,
+                }],
+            );
+        }
+        view.insert(NodeId(2), Vec::new());
+        view.insert(NodeId(3), Vec::new());
+
+        let mut reheal_node1 = ShardTable::compute_with_epoch(&members, rf, term, 1);
+        apply_master_election(
+            &mut reheal_node1,
+            &diverged_node1,
+            &view,
+            &std::collections::HashSet::new(),
+        );
+        let mut reheal_node4 = ShardTable::compute_with_epoch(&members, rf, term, 1);
+        apply_master_election(
+            &mut reheal_node4,
+            &diverged_node4,
+            &view,
+            &std::collections::HashSet::new(),
+        );
+
+        assert_eq!(
+            reheal_node1.target_assignment(shard).master,
+            NodeId(4),
+            "once the round-robin master holds data, the deviated node must return to it",
+        );
+        assert_eq!(
+            reheal_node4.target_assignment(shard).master,
+            NodeId(4),
+            "the round-robin master must keep itself once it holds data",
+        );
+    }
+
+    /// Task #47 — a same-term re-heal exchange result may only be applied
+    /// while the committed topology it was collected for is still current;
+    /// a term advance or member-set change during the exchange invalidates it.
+    #[test]
+    fn same_term_reheal_applicable_only_for_current_term_and_members() {
+        let members = vec![NodeId(1), NodeId(2), NodeId(3)];
+        assert!(
+            same_term_reheal_applicable(4, 4, &members, &members),
+            "a view for the current committed term and member set must apply",
+        );
+        assert!(
+            !same_term_reheal_applicable(4, 5, &members, &members),
+            "a view collected for a superseded term must be dropped",
+        );
+        let grown = vec![NodeId(1), NodeId(2), NodeId(3), NodeId(4)];
+        assert!(
+            !same_term_reheal_applicable(4, 4, &members, &grown),
+            "a view collected for a stale member set must be dropped",
         );
     }
 
