@@ -1159,8 +1159,14 @@ mod tests {
 
     /// Exercises the exact `if let Err(msg) = ... { panic!("{msg}") }` shape
     /// used at both real call sites (8c.2 and 8d.2).
+    ///
+    /// The `[selftest] ` prefix is this fixture's alone -- the real call
+    /// sites do not carry it -- so a raw scenario log can be grepped for the
+    /// failure text without matching this deliberate look-alike.
     #[test]
-    #[should_panic(expected = "8c.2: zero records were created (180 ops attempted, all failed)")]
+    #[should_panic(
+        expected = "[selftest] 8c.2: zero records were created (180 ops attempted, all failed)"
+    )]
     fn total_outage_panics_like_the_real_call_site() {
         if let Err(msg) = validate_workload_made_progress(
             "8c.2",
@@ -1169,7 +1175,7 @@ mod tests {
             0,
             SLOW_NETWORK_ERROR_RATE_CEILING_PCT,
         ) {
-            panic!("{msg}");
+            panic!("[selftest] {msg}");
         }
     }
 
@@ -1247,9 +1253,14 @@ mod tests {
     /// Exercises the exact `if let Err(msg) = ... { panic!("{msg}") }` shape
     /// used at both real call sites, with the actual catastrophe shape this
     /// ceiling exists to catch: near-total failure under injected chaos.
+    ///
+    /// The `[selftest] ` prefix keeps this fixture's panic body out of raw
+    /// scenario-log greps for the real failure text.
     #[test]
-    #[should_panic(expected = "8d.2: error rate 95.0% (950/1000) is at or above the 80% \
-                                catastrophe-detector ceiling")]
+    #[should_panic(
+        expected = "[selftest] 8d.2: error rate 95.0% (950/1000) is at or above the 80% \
+                                catastrophe-detector ceiling"
+    )]
     fn near_total_collapse_panics_like_the_real_call_site() {
         if let Err(msg) = validate_workload_made_progress(
             "8d.2",
@@ -1258,7 +1269,7 @@ mod tests {
             50,
             ASYMMETRIC_PARTITION_ERROR_RATE_CEILING_PCT,
         ) {
-            panic!("{msg}");
+            panic!("[selftest] {msg}");
         }
     }
 }

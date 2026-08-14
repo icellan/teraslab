@@ -616,11 +616,15 @@ mod tests {
     /// shape used at the real call site in `run_scenario`, so this test
     /// watches the panic path itself fire rather than just checking the
     /// `Result` plumbing.
+    ///
+    /// The `[selftest] ` prefix is this fixture's alone -- the real call
+    /// site does not carry it -- so a raw scenario log can be grepped for
+    /// the failure text without matching this deliberate look-alike.
     #[test]
-    #[should_panic(expected = "13.3: zero successful creates (400 errors)")]
+    #[should_panic(expected = "[selftest] 13.3: zero successful creates (400 errors)")]
     fn total_outage_evidence_panics_like_the_real_call_site() {
         if let Err(msg) = validate_workload_progress(1000, 0, 400, 0) {
-            panic!("13.3: {msg}");
+            panic!("[selftest] 13.3: {msg}");
         }
     }
 }

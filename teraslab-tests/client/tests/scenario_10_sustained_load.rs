@@ -11,6 +11,7 @@
 #[allow(dead_code)]
 mod common;
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
@@ -56,6 +57,92 @@ const CHECKPOINT_INTERVAL_SECS: u64 = 15;
 /// margin against transient errors around the checkpoint pause/resume
 /// boundaries, not a calibrated adverse-condition budget.
 const CREATE_ERROR_RATE_THRESHOLD_PCT: f64 = 5.0;
+
+/// Maximum tolerated first-to-last p99 degradation ratio for an op type.
+const P99_DEGRADATION_RATIO_CEILING: f64 = 5.0;
+
+/// Minimum sample count an op type needs in BOTH the first and the last
+/// checkpoint window before its p99 degradation ratio is judged.
+///
+/// A percentile is only a percentile if there are samples behind it: with
+/// 13 delete samples, `percentile_value` puts p95, p99 and max on the same
+/// observation, so ONE 6.2s outlier becomes "the p99" and the ratio gate
+/// fires on a single unlucky request. 100 samples puts at least one distinct
+/// observation above p99's index and keeps a lone outlier from defining the
+/// percentile. Under-sampled ops are logged with their counts and skipped;
+/// well-sampled ops keep the full ratio gate.
+const P99_MIN_SAMPLES: u64 = 100;
+
+/// One op type's latency picture at a checkpoint.
+#[derive(Debug, Clone, Copy)]
+struct OpLatency {
+    /// p99 over the samples recorded so far for this op type.
+    p99: Duration,
+    /// Number of samples behind that p99.
+    count: u64,
+}
+
+/// Outcome of the per-op p99 degradation gate.
+#[derive(Debug, Default)]
+struct P99GateOutcome {
+    /// One line per op type whose ratio was actually judged.
+    checked: Vec<String>,
+    /// One line per op type skipped for having too few samples.
+    skipped: Vec<String>,
+    /// The assertion message when a judged op type breached the ceiling.
+    failure: Option<String>,
+}
+
+/// Compare per-op p99 latency between the first and last checkpoint,
+/// applying the [`P99_MIN_SAMPLES`] floor.
+///
+/// Op types missing from either checkpoint, or below the sample floor in
+/// either one, are reported in `skipped` and never fail the run. Every other
+/// op type must keep `last_p99 / first_p99 <= max_ratio`.
+fn evaluate_p99_degradation(
+    first: &BTreeMap<String, OpLatency>,
+    last: &BTreeMap<String, OpLatency>,
+    min_samples: u64,
+    max_ratio: f64,
+) -> P99GateOutcome {
+    let mut outcome = P99GateOutcome::default();
+    for (op, first_stats) in first {
+        let Some(last_stats) = last.get(op) else {
+            outcome.skipped.push(format!(
+                "{op}: absent from the last checkpoint (first={} samples)",
+                first_stats.count
+            ));
+            continue;
+        };
+        if first_stats.count < min_samples || last_stats.count < min_samples {
+            outcome.skipped.push(format!(
+                "{op}: {}/{} samples (first/last) below the {min_samples}-sample floor, \
+                 p99 {:?} -> {:?} not judged",
+                first_stats.count, last_stats.count, first_stats.p99, last_stats.p99
+            ));
+            continue;
+        }
+        if first_stats.p99.is_zero() {
+            outcome.skipped.push(format!(
+                "{op}: first-checkpoint p99 is zero, ratio undefined"
+            ));
+            continue;
+        }
+        let ratio = last_stats.p99.as_secs_f64() / first_stats.p99.as_secs_f64();
+        outcome.checked.push(format!(
+            "{op}: p99 {:?} -> {:?}, ratio={ratio:.2} ({}/{} samples)",
+            first_stats.p99, last_stats.p99, first_stats.count, last_stats.count
+        ));
+        if ratio > max_ratio && outcome.failure.is_none() {
+            outcome.failure = Some(format!(
+                "10: p99 latency degraded for {op}: first={:?}, last={:?}, ratio={ratio:.2} \
+                 (expected <={max_ratio:.1}) over {}/{} samples",
+                first_stats.p99, last_stats.p99, first_stats.count, last_stats.count
+            ));
+        }
+    }
+    outcome
+}
 
 /// Checks that the sustained-load run actually exercised the cluster before
 /// the invariant checks in [`run_scenario`] (`final_mismatches == 0`, every
@@ -158,6 +245,12 @@ struct Checkpoint {
     rss_bytes: u64,
     /// p99 latency across all operation types (from reporter).
     p99_latency: Duration,
+    /// Per-op-type p99 and sample count, keyed by op name. The aggregate
+    /// `p99_latency` above is a max across these and so is dominated by
+    /// whichever op type happened to see the worst outlier -- including one
+    /// with a handful of samples, which is why the degradation gate reads
+    /// this map instead.
+    op_latencies: BTreeMap<String, OpLatency>,
     /// Throughput (ops/sec) for this interval.
     throughput: f64,
 }
@@ -581,10 +674,18 @@ async fn run_scenario() -> Result<(), ClientError> {
 
             let all_stats = reporter.all_stats();
             let mut max_p99 = Duration::ZERO;
-            for stats in all_stats.values() {
+            let mut op_latencies: BTreeMap<String, OpLatency> = BTreeMap::new();
+            for (op, stats) in &all_stats {
                 if stats.p99 > max_p99 {
                     max_p99 = stats.p99;
                 }
+                op_latencies.insert(
+                    op.clone(),
+                    OpLatency {
+                        p99: stats.p99,
+                        count: stats.count,
+                    },
+                );
             }
 
             let checkpoint = Checkpoint {
@@ -593,6 +694,7 @@ async fn run_scenario() -> Result<(), ClientError> {
                 replication_mismatches: repl_mismatches,
                 rss_bytes,
                 p99_latency: max_p99,
+                op_latencies,
                 throughput,
             };
 
@@ -738,22 +840,32 @@ async fn run_scenario() -> Result<(), ClientError> {
         }
     }
 
-    // 4. p99 latency stable within 2x
+    // 4. p99 latency stable, judged PER OP TYPE and only where the op has
+    //    enough samples for a p99 to mean anything (see P99_MIN_SAMPLES).
     if checkpoints.len() >= 2 {
-        let first_p99 = checkpoints[0].p99_latency;
-        let last_p99 = checkpoints[checkpoints.len() - 1].p99_latency;
-        if !first_p99.is_zero() {
-            let ratio = last_p99.as_secs_f64() / first_p99.as_secs_f64();
-            assert!(
-                ratio <= 5.0,
-                "10: p99 latency degraded: first={first_p99:?}, last={last_p99:?}, \
-                 ratio={ratio:.2} (expected <=5.0)"
-            );
-            eprintln!(
-                "[10.final] p99 latency stable: first={first_p99:?}, \
-                 last={last_p99:?}, ratio={ratio:.2}"
-            );
+        let first = &checkpoints[0].op_latencies;
+        let last = &checkpoints[checkpoints.len() - 1].op_latencies;
+        let outcome =
+            evaluate_p99_degradation(first, last, P99_MIN_SAMPLES, P99_DEGRADATION_RATIO_CEILING);
+        for line in &outcome.skipped {
+            eprintln!("[10.final] p99 gate skipped -- {line}");
         }
+        for line in &outcome.checked {
+            eprintln!("[10.final] p99 gate checked -- {line}");
+        }
+        assert!(
+            outcome.failure.is_none(),
+            "{}",
+            outcome.failure.unwrap_or_default()
+        );
+        eprintln!(
+            "[10.final] p99 latency stable across {} judged op type(s), {} skipped \
+             (aggregate max p99: first={:?}, last={:?})",
+            outcome.checked.len(),
+            outcome.skipped.len(),
+            checkpoints[0].p99_latency,
+            checkpoints[checkpoints.len() - 1].p99_latency,
+        );
     }
 
     tlog!(t0, "teardown_all (cleanup)");
@@ -893,6 +1005,112 @@ fn payloads_match_ignore_updated_at(a: &[u8], b: &[u8]) -> bool {
 mod tests {
     use super::*;
 
+    fn op(p99_ms: u64, count: u64) -> OpLatency {
+        OpLatency {
+            p99: Duration::from_millis(p99_ms),
+            count,
+        }
+    }
+
+    fn ops(entries: &[(&str, OpLatency)]) -> BTreeMap<String, OpLatency> {
+        entries
+            .iter()
+            .map(|(name, stats)| ((*name).to_string(), *stats))
+            .collect()
+    }
+
+    #[test]
+    fn p99_gate_skips_an_op_below_the_sample_floor() {
+        // The exact CI shape: 13 delete samples, so p95 == p99 == max == one
+        // 6.2s observation. A 6.2s/8ms ratio must not fail the run.
+        let first = ops(&[("delete", op(8, 13))]);
+        let last = ops(&[("delete", op(6200, 13))]);
+        let outcome = evaluate_p99_degradation(&first, &last, P99_MIN_SAMPLES, 5.0);
+        assert!(outcome.failure.is_none(), "{:?}", outcome.failure);
+        assert!(outcome.checked.is_empty(), "{:?}", outcome.checked);
+        assert_eq!(outcome.skipped.len(), 1);
+        assert!(
+            outcome.skipped[0].contains("13/13 samples (first/last) below the 100-sample floor"),
+            "skipped line was: {}",
+            outcome.skipped[0]
+        );
+    }
+
+    #[test]
+    fn p99_gate_still_fails_a_well_sampled_op() {
+        let first = ops(&[("read", op(10, 50_000))]);
+        let last = ops(&[("read", op(61, 90_000))]);
+        let outcome = evaluate_p99_degradation(&first, &last, P99_MIN_SAMPLES, 5.0);
+        let failure = outcome.failure.expect("6.1x degradation must fail");
+        assert!(
+            failure.contains("p99 latency degraded for read"),
+            "failure was: {failure}"
+        );
+        assert!(failure.contains("ratio=6.10"), "failure was: {failure}");
+        assert!(
+            failure.contains("50000/90000 samples"),
+            "failure was: {failure}"
+        );
+    }
+
+    #[test]
+    fn p99_gate_passes_a_well_sampled_op_within_the_ceiling() {
+        let first = ops(&[("create", op(10, 20_000)), ("spend", op(20, 80_000))]);
+        let last = ops(&[("create", op(45, 40_000)), ("spend", op(30, 160_000))]);
+        let outcome = evaluate_p99_degradation(&first, &last, P99_MIN_SAMPLES, 5.0);
+        assert!(outcome.failure.is_none(), "{:?}", outcome.failure);
+        assert_eq!(outcome.checked.len(), 2, "{:?}", outcome.checked);
+        assert!(outcome.skipped.is_empty(), "{:?}", outcome.skipped);
+        assert!(
+            outcome.checked[0].contains("create:") && outcome.checked[0].contains("ratio=4.50"),
+            "checked line was: {}",
+            outcome.checked[0]
+        );
+    }
+
+    #[test]
+    fn p99_gate_judges_well_sampled_ops_alongside_a_skipped_one() {
+        // The under-sampled delete must not mask the well-sampled read's
+        // breach, nor be judged itself.
+        let first = ops(&[("delete", op(8, 13)), ("read", op(10, 30_000))]);
+        let last = ops(&[("delete", op(6200, 13)), ("read", op(100, 60_000))]);
+        let outcome = evaluate_p99_degradation(&first, &last, P99_MIN_SAMPLES, 5.0);
+        let failure = outcome.failure.expect("the read breach must still fire");
+        assert!(failure.contains("for read"), "failure was: {failure}");
+        assert_eq!(outcome.skipped.len(), 1);
+        assert!(outcome.skipped[0].starts_with("delete:"));
+        assert_eq!(outcome.checked.len(), 1);
+        assert!(outcome.checked[0].starts_with("read:"));
+    }
+
+    #[test]
+    fn p99_gate_skips_an_op_missing_from_the_last_checkpoint() {
+        let first = ops(&[("freeze", op(5, 500))]);
+        let last = ops(&[("read", op(5, 500))]);
+        let outcome = evaluate_p99_degradation(&first, &last, P99_MIN_SAMPLES, 5.0);
+        assert!(outcome.failure.is_none(), "{:?}", outcome.failure);
+        assert_eq!(outcome.skipped.len(), 1);
+        assert!(
+            outcome.skipped[0].contains("absent from the last checkpoint"),
+            "skipped line was: {}",
+            outcome.skipped[0]
+        );
+    }
+
+    #[test]
+    fn p99_gate_skips_a_zero_first_p99() {
+        let first = ops(&[("read", op(0, 5_000))]);
+        let last = ops(&[("read", op(50, 9_000))]);
+        let outcome = evaluate_p99_degradation(&first, &last, P99_MIN_SAMPLES, 5.0);
+        assert!(outcome.failure.is_none(), "{:?}", outcome.failure);
+        assert_eq!(outcome.skipped.len(), 1);
+        assert!(
+            outcome.skipped[0].contains("first-checkpoint p99 is zero"),
+            "skipped line was: {}",
+            outcome.skipped[0]
+        );
+    }
+
     #[test]
     fn validate_workload_progress_rejects_zero_total_ops() {
         let err = validate_workload_progress(0, 0, 0, 0, 0).unwrap_err();
@@ -972,11 +1190,15 @@ mod tests {
     /// shape used at the real call site in `run_scenario`, so this test
     /// doesn't just check the `Result` plumbing -- it watches the panic
     /// path itself fire, with the actual nightly-outage numbers.
+    ///
+    /// The `[selftest] ` prefix is this fixture's alone -- the real call
+    /// site does not carry it -- so a raw scenario log can be grepped for
+    /// the failure text without matching this deliberate look-alike.
     #[test]
-    #[should_panic(expected = "10: zero successful creates (50 errors)")]
+    #[should_panic(expected = "[selftest] 10: zero successful creates (50 errors)")]
     fn total_outage_evidence_panics_like_the_real_call_site() {
         if let Err(msg) = validate_workload_progress(50, 0, 50, 0, 0) {
-            panic!("10: {msg}");
+            panic!("[selftest] 10: {msg}");
         }
     }
 }

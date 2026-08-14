@@ -1030,12 +1030,18 @@ mod tests {
 
     /// Watches the exact `if let Err(msg) = ... { panic!("Test 15.3 iteration {iteration}: \
     /// {msg}") }` shape used at the real call site fire on the vacuous input.
+    ///
+    /// The `[selftest] ` prefix is this fixture's alone -- the real call
+    /// site does not carry it -- so a raw scenario log can be grepped for
+    /// the failure text without matching this deliberate look-alike.
     #[test]
-    #[should_panic(expected = "Test 15.3 iteration 1: zero creates succeeded beyond the 200")]
+    #[should_panic(
+        expected = "[selftest] Test 15.3 iteration 1: zero creates succeeded beyond the 200"
+    )]
     fn validate_kill_workload_progress_panics_like_the_real_call_site() {
         let iteration = 1;
         if let Err(msg) = validate_kill_workload_progress(200, 200, 150) {
-            panic!("Test 15.3 iteration {iteration}: {msg}");
+            panic!("[selftest] Test 15.3 iteration {iteration}: {msg}");
         }
     }
 
@@ -1054,11 +1060,13 @@ mod tests {
         assert!(result.is_ok(), "expected pass: {result:?}");
     }
 
+    /// The `[selftest] ` prefix keeps this fixture's panic body out of raw
+    /// scenario-log greps for the real failure text.
     #[test]
-    #[should_panic(expected = "Test 15.4: none of the 50 target records")]
+    #[should_panic(expected = "[selftest] Test 15.4: none of the 50 target records")]
     fn validate_spend_multi_observations_panics_like_the_real_call_site() {
         if let Err(msg) = validate_spend_multi_observations(0, 50) {
-            panic!("Test 15.4: {msg}");
+            panic!("[selftest] Test 15.4: {msg}");
         }
     }
 
@@ -1083,11 +1091,13 @@ mod tests {
         assert!(result.is_ok(), "expected pass: {result:?}");
     }
 
+    /// The `[selftest] ` prefix keeps this fixture's panic body out of raw
+    /// scenario-log greps for the real failure text.
     #[test]
-    #[should_panic(expected = "Test 15.5: none of the 100 target records")]
+    #[should_panic(expected = "[selftest] Test 15.5: none of the 100 target records")]
     fn validate_set_mined_observations_panics_like_the_real_call_site() {
         if let Err(msg) = validate_set_mined_observations(0, 0, 0, 100) {
-            panic!("Test 15.5: {msg}");
+            panic!("[selftest] Test 15.5: {msg}");
         }
     }
 
@@ -1126,11 +1136,13 @@ mod tests {
         assert!(result.is_ok(), "expected pass: {result:?}");
     }
 
+    /// The `[selftest] ` prefix keeps this fixture's panic body out of raw
+    /// scenario-log greps for the real failure text.
     #[test]
-    #[should_panic(expected = "Test 15.6: 200/200 reads errored")]
+    #[should_panic(expected = "[selftest] Test 15.6: 200/200 reads errored")]
     fn validate_create_kill_observations_panics_like_the_real_call_site() {
         if let Err(msg) = validate_create_kill_observations(200, false, 0, 200) {
-            panic!("Test 15.6: {msg}");
+            panic!("[selftest] Test 15.6: {msg}");
         }
     }
 }

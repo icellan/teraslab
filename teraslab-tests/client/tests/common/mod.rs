@@ -554,10 +554,92 @@ pub async fn wait_specific_migrations_complete(
     }
 }
 
+/// One node's committed-topology view, as read from `/status`.
+///
+/// `version` is the node's `shard_table_version`, which the server derives
+/// from the committed topology term (see `ClusterCoordinator::shard_table_version`),
+/// so two nodes that committed the same term always report the same value.
+/// `members` is that term's `committed_members` list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NodeTopologyView {
+    /// 1-based node number the view was polled from.
+    node: u32,
+    /// Committed topology term / shard-table version.
+    version: u64,
+    /// Node ids in the committed term's membership.
+    members: Vec<u64>,
+}
+
+/// Decide whether the polled `/status` views can describe a settled
+/// `node_count`-member cluster.
+///
+/// The migration gate's master-count condition (`sum == 4096`) is satisfied
+/// by the topology that came BEFORE a membership change just as well as by
+/// the one that follows it: right after a 4th node joins a 3-node cluster,
+/// `1366 + 1365 + 1365 + 0 == 4096` holds while the new node still has no
+/// shards and no migration plan exists anywhere. That is exactly how a
+/// scale-up scenario's "wait for migrations" returned in 0.17s and let the
+/// shard-balance assertion read the pre-scale-up distribution.
+///
+/// Returns `None` when every polled node reports the same non-zero committed
+/// term and that term's membership has exactly `node_count` entries.
+/// Otherwise returns the reason the gate is being held, including the
+/// per-node version/member dump so a timeout is self-explanatory.
+///
+/// Nodes that did not answer `/status` contribute no view — same as the
+/// master-count sum, which cannot see them either. That is deliberate: a
+/// stale membership is still caught, because every REACHABLE node must
+/// already carry the post-change member list.
+fn topology_gate_reason(views: &[NodeTopologyView], node_count: u32) -> Option<String> {
+    let detail = || {
+        views
+            .iter()
+            .map(|v| format!("node{}:ver={},members={:?}", v.node, v.version, v.members))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+
+    if views.is_empty() {
+        return Some("no node answered /status".to_string());
+    }
+    if let Some(v) = views.iter().find(|v| v.version == 0) {
+        return Some(format!(
+            "node{} has not committed a topology term yet [{}]",
+            v.node,
+            detail()
+        ));
+    }
+    let first = views[0].version;
+    if let Some(v) = views.iter().find(|v| v.version != first) {
+        return Some(format!(
+            "node{} is on shard table version {} while node{} is on {first} [{}]",
+            v.node,
+            v.version,
+            views[0].node,
+            detail()
+        ));
+    }
+    if let Some(v) = views
+        .iter()
+        .find(|v| v.members.len() != node_count as usize)
+    {
+        return Some(format!(
+            "node{}'s committed topology has {} member(s), expected {node_count} [{}]",
+            v.node,
+            v.members.len(),
+            detail()
+        ));
+    }
+    None
+}
+
 /// Wait until all active migrations complete on all nodes.
 ///
 /// Also waits for shard master counts to sum to 4096 (all shards assigned)
-/// to catch shards stuck in handoff after migration completion.
+/// to catch shards stuck in handoff after migration completion, and for the
+/// committed topology itself to describe a `node_count`-member cluster that
+/// every polled node agrees on — see [`topology_gate_reason`] for why the
+/// master-count sum alone is satisfied by the PREVIOUS topology.
 pub async fn wait_migrations_complete(
     docker: &DockerHelpers,
     node_count: u32,
@@ -573,6 +655,7 @@ pub async fn wait_migrations_complete(
         let mut total_pending_handoffs: u64 = 0;
         let mut total_inbound_pending: u64 = 0;
         let mut node_details = Vec::new();
+        let mut topology_views: Vec<NodeTopologyView> = Vec::new();
         for i in 1..=node_count {
             let port = docker.http_port(i);
             let url = format!("http://127.0.0.1:{port}/admin/migration_status");
@@ -600,8 +683,20 @@ pub async fn wait_migrations_complete(
                 let cluster_size = json["cluster_size"].as_u64().unwrap_or(0);
                 let version = json["shard_table_version"].as_u64().unwrap_or(0);
                 let m = json["master_shard_count"].as_u64().unwrap_or(0);
+                let members: Vec<u64> = json["committed_members"]
+                    .as_array()
+                    .map(|a| a.iter().filter_map(|v| v.as_u64()).collect())
+                    .unwrap_or_default();
                 total_masters += m;
-                node_details.push(format!("node{i}:size={cluster_size},ver={version},m={m}"));
+                node_details.push(format!(
+                    "node{i}:size={cluster_size},ver={version},m={m},committed={}",
+                    members.len()
+                ));
+                topology_views.push(NodeTopologyView {
+                    node: i,
+                    version,
+                    members,
+                });
                 if let Some(h) = json["pending_handoff_shards"].as_u64() {
                     total_pending_handoffs += h;
                     if h > 0 {
@@ -612,7 +707,8 @@ pub async fn wait_migrations_complete(
                 node_details.push(format!("node{i}:status-unavailable"));
             }
         }
-        let masters_ok = total_masters == 4096;
+        let topology_reason = topology_gate_reason(&topology_views, node_count);
+        let masters_ok = total_masters == 4096 && topology_reason.is_none();
         if masters_ok && total_pending_handoffs == 0 && total_inbound_pending == 0 && all_idle {
             ready_polls += 1;
             if ready_polls < 3 {
@@ -630,15 +726,20 @@ pub async fn wait_migrations_complete(
         ready_polls = 0;
         if timing_enabled() && mig_last_log.elapsed() >= Duration::from_secs(2) {
             eprintln!(
-                "  wait_migrations: masters={total_masters}/4096, handoffs={total_pending_handoffs}, inbound={total_inbound_pending}, idle={all_idle} ({:.1}s) [{}]",
+                "  wait_migrations: masters={total_masters}/4096, handoffs={total_pending_handoffs}, inbound={total_inbound_pending}, idle={all_idle}, topology={} ({:.1}s) [{}]",
+                topology_reason.as_deref().unwrap_or("ok"),
                 mig_start.elapsed().as_secs_f64(),
                 node_details.join(", ")
             );
             mig_last_log = std::time::Instant::now();
         }
         if start.elapsed() >= timeout {
+            // The topology reason carries the per-node version/member dump,
+            // so a gate held ONLY by a stale membership names the nodes
+            // holding it instead of leaving `masters=4096` looking settled.
             return Err(ClientError::Connection(format!(
-                "migrations still active after {timeout:?} [masters={total_masters}/4096, handoffs={total_pending_handoffs}, inbound={total_inbound_pending}] [{}]",
+                "migrations still active after {timeout:?} [masters={total_masters}/4096, handoffs={total_pending_handoffs}, inbound={total_inbound_pending}, topology={}] [{}]",
+                topology_reason.as_deref().unwrap_or("ok"),
                 node_details.join(", ")
             )));
         }
@@ -2234,8 +2335,61 @@ fn first_payload_diffs(a: &[u8], b: &[u8], limit: usize) -> String {
     }
 }
 
+/// How long [`assert_rf2_replication_exact`] keeps re-taking the holder
+/// census before it calls a violation permanent.
+///
+/// Both directions of an RF=2 violation are CONVERGING conditions right
+/// after a migration: over-replication clears when the coordinator's orphan
+/// cleanup — deliberately spawned detached once `active_count` reaches 0 —
+/// finishes its sweep, and under-replication clears when repair backfills
+/// the missing holder. A single instantaneous sample taken the moment the
+/// migration counters hit zero therefore fails on records that are merely
+/// mid-sweep; one observed run had cleanup finish 0.4-0.7s AFTER the
+/// assertion fired, with 16/294 records still showing 3 holders.
+const RF2_CENSUS_WINDOW: Duration = Duration::from_secs(15);
+
+/// Delay between holder-census rounds inside [`RF2_CENSUS_WINDOW`].
+const RF2_CENSUS_POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+/// What to do after one round of the RF=2 holder census.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Rf2CensusVerdict {
+    /// Every record has exactly RF=2 holders with identical payloads.
+    Settled,
+    /// Violations remain but the convergence window has time left.
+    Retry,
+    /// Violations survived the whole window — assert on THIS census.
+    Fail,
+}
+
+/// Classify one census round.
+///
+/// `elapsed` is the time since the FIRST round started, so the window is a
+/// bound on total convergence time rather than a per-round timeout. The
+/// exact-equality requirement is unchanged; it is simply evaluated at the
+/// deadline instead of at the first sample.
+fn rf2_census_verdict(
+    holder_errors: u32,
+    mismatches: u32,
+    elapsed: Duration,
+    window: Duration,
+) -> Rf2CensusVerdict {
+    if holder_errors == 0 && mismatches == 0 {
+        Rf2CensusVerdict::Settled
+    } else if elapsed < window {
+        Rf2CensusVerdict::Retry
+    } else {
+        Rf2CensusVerdict::Fail
+    }
+}
+
 /// Assert that every present record has exactly the RF=2 holder count and
 /// byte-identical local-read payloads across its holders.
+///
+/// The census is re-taken every [`RF2_CENSUS_POLL_INTERVAL`] for up to
+/// [`RF2_CENSUS_WINDOW`]; violations only fail the scenario if they are
+/// still present at the deadline, and the assertion then reports the LAST
+/// census's histogram and examples.
 pub async fn assert_rf2_replication_exact(
     client: &Client,
     docker: &DockerHelpers,
@@ -2247,24 +2401,55 @@ pub async fn assert_rf2_replication_exact(
         return Ok(());
     }
     let node_addrs = docker.host_client_addrs(node_count);
-    let report = batch_verify_replication_report(client, &node_addrs, txids, true).await?;
-    assert_eq!(
-        report.holder_errors,
-        0,
-        "{label}: {}/{} records did not have exactly RF=2 local holders ({})",
-        report.holder_errors,
-        txids.len(),
-        report.holder_diagnostics(),
-    );
-    assert_eq!(
-        report.mismatches,
-        0,
-        "{label}: {}/{} records had non-identical local holder payloads ({})",
-        report.mismatches,
-        txids.len(),
-        report.mismatch_diagnostics(),
-    );
-    Ok(())
+    let start = std::time::Instant::now();
+    let mut rounds = 0u32;
+    loop {
+        let report = batch_verify_replication_report(client, &node_addrs, txids, true).await?;
+        rounds += 1;
+        match rf2_census_verdict(
+            report.holder_errors,
+            report.mismatches,
+            start.elapsed(),
+            RF2_CENSUS_WINDOW,
+        ) {
+            Rf2CensusVerdict::Settled => {
+                if rounds > 1 {
+                    eprintln!(
+                        "[{label}] RF=2 census settled after {rounds} rounds ({:.1}s of convergence)",
+                        start.elapsed().as_secs_f64()
+                    );
+                }
+                return Ok(());
+            }
+            Rf2CensusVerdict::Retry => {
+                tokio::time::sleep(RF2_CENSUS_POLL_INTERVAL).await;
+            }
+            Rf2CensusVerdict::Fail => {
+                let elapsed = start.elapsed().as_secs_f64();
+                assert_eq!(
+                    report.holder_errors,
+                    0,
+                    "{label}: {}/{} records did not have exactly RF=2 local holders ({}) \
+                     [still violated after {rounds} census rounds over {elapsed:.1}s]",
+                    report.holder_errors,
+                    txids.len(),
+                    report.holder_diagnostics(),
+                );
+                assert_eq!(
+                    report.mismatches,
+                    0,
+                    "{label}: {}/{} records had non-identical local holder payloads ({}) \
+                     [still violated after {rounds} census rounds over {elapsed:.1}s]",
+                    report.mismatches,
+                    txids.len(),
+                    report.mismatch_diagnostics(),
+                );
+                unreachable!(
+                    "Rf2CensusVerdict::Fail requires holder_errors or mismatches to be non-zero"
+                );
+            }
+        }
+    }
 }
 
 /// For a given txid, determine which nodes hold the record via FLAG_LOCAL_READ.
@@ -2600,6 +2785,173 @@ async fn wait_ports_free(first_http_port: u16, _scenario_id: u16, node_count: u3
             return;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+#[cfg(test)]
+mod migration_gate_tests {
+    use super::*;
+
+    fn view(node: u32, version: u64, members: &[u64]) -> NodeTopologyView {
+        NodeTopologyView {
+            node,
+            version,
+            members: members.to_vec(),
+        }
+    }
+
+    #[test]
+    fn settled_four_node_topology_passes_the_gate() {
+        let views = vec![
+            view(1, 2, &[1, 2, 3, 4]),
+            view(2, 2, &[1, 2, 3, 4]),
+            view(3, 2, &[1, 2, 3, 4]),
+            view(4, 2, &[1, 2, 3, 4]),
+        ];
+        assert_eq!(topology_gate_reason(&views, 4), None);
+    }
+
+    #[test]
+    fn pre_scale_up_membership_cannot_satisfy_the_gate() {
+        // The exact scenario-06 shape: node4 is up and polled, but nothing
+        // has committed the 4-member term yet, so every node still carries
+        // the 3-member table whose master counts already sum to 4096.
+        let views = vec![
+            view(1, 1, &[1, 2, 3]),
+            view(2, 1, &[1, 2, 3]),
+            view(3, 1, &[1, 2, 3]),
+            view(4, 1, &[1, 2, 3]),
+        ];
+        let reason = topology_gate_reason(&views, 4).expect("stale membership must hold the gate");
+        assert!(
+            reason.contains("has 3 member(s), expected 4"),
+            "reason was: {reason}"
+        );
+        // The dump the timeout path prints must name every node's version
+        // and member list.
+        assert!(reason.contains("node4:ver=1,members=[1, 2, 3]"), "{reason}");
+        assert!(reason.contains("node1:ver=1"), "{reason}");
+    }
+
+    #[test]
+    fn a_node_that_never_committed_a_term_holds_the_gate() {
+        let views = vec![
+            view(1, 3, &[1, 2, 3]),
+            view(2, 3, &[1, 2, 3]),
+            view(3, 0, &[]),
+        ];
+        let reason = topology_gate_reason(&views, 3).expect("term 0 must hold the gate");
+        assert!(
+            reason.contains("node3 has not committed a topology term yet"),
+            "reason was: {reason}"
+        );
+    }
+
+    #[test]
+    fn disagreeing_shard_table_versions_hold_the_gate() {
+        let views = vec![
+            view(1, 4, &[1, 2, 3]),
+            view(2, 4, &[1, 2, 3]),
+            view(3, 3, &[1, 2, 3]),
+        ];
+        let reason = topology_gate_reason(&views, 3).expect("version split must hold the gate");
+        assert!(
+            reason.contains("node3 is on shard table version 3 while node1 is on 4"),
+            "reason was: {reason}"
+        );
+    }
+
+    #[test]
+    fn an_unreachable_node_does_not_by_itself_hold_the_gate() {
+        // node3 did not answer /status, so it contributes no view -- but the
+        // two that did answer must still carry the full committed membership.
+        let views = vec![view(1, 5, &[1, 2, 3]), view(2, 5, &[1, 2, 3])];
+        assert_eq!(topology_gate_reason(&views, 3), None);
+    }
+
+    #[test]
+    fn no_reachable_node_holds_the_gate() {
+        let reason = topology_gate_reason(&[], 3).expect("zero views must hold the gate");
+        assert_eq!(reason, "no node answered /status");
+    }
+
+    #[test]
+    fn post_scale_down_membership_passes_at_the_new_node_count() {
+        let views = vec![
+            view(1, 7, &[1, 2, 3]),
+            view(2, 7, &[1, 2, 3]),
+            view(3, 7, &[1, 2, 3]),
+        ];
+        assert_eq!(topology_gate_reason(&views, 3), None);
+        // The same views must NOT pass a gate that still expects 4 members.
+        assert!(topology_gate_reason(&views, 4).is_some());
+    }
+}
+
+#[cfg(test)]
+mod rf2_census_tests {
+    use super::*;
+
+    #[test]
+    fn a_clean_census_settles_immediately() {
+        assert_eq!(
+            rf2_census_verdict(0, 0, Duration::ZERO, RF2_CENSUS_WINDOW),
+            Rf2CensusVerdict::Settled
+        );
+    }
+
+    #[test]
+    fn over_replication_inside_the_window_retries() {
+        // 16 records still on 3 holders 0.4s after migration counters hit
+        // zero: the detached orphan sweep is mid-flight, not broken.
+        assert_eq!(
+            rf2_census_verdict(16, 0, Duration::from_millis(400), RF2_CENSUS_WINDOW),
+            Rf2CensusVerdict::Retry
+        );
+    }
+
+    #[test]
+    fn under_replication_inside_the_window_retries() {
+        // Under-replication converges via repair, so it gets the same window.
+        assert_eq!(
+            rf2_census_verdict(5, 0, Duration::from_secs(14), RF2_CENSUS_WINDOW),
+            Rf2CensusVerdict::Retry
+        );
+    }
+
+    #[test]
+    fn payload_mismatches_inside_the_window_retry() {
+        assert_eq!(
+            rf2_census_verdict(0, 3, Duration::from_secs(1), RF2_CENSUS_WINDOW),
+            Rf2CensusVerdict::Retry
+        );
+    }
+
+    #[test]
+    fn violations_surviving_the_window_fail() {
+        assert_eq!(
+            rf2_census_verdict(16, 0, RF2_CENSUS_WINDOW, RF2_CENSUS_WINDOW),
+            Rf2CensusVerdict::Fail
+        );
+        assert_eq!(
+            rf2_census_verdict(
+                0,
+                1,
+                RF2_CENSUS_WINDOW + Duration::from_secs(1),
+                RF2_CENSUS_WINDOW
+            ),
+            Rf2CensusVerdict::Fail
+        );
+    }
+
+    #[test]
+    fn a_census_that_converges_at_the_deadline_still_settles() {
+        // Exact equality is preserved: it is evaluated at the deadline, and
+        // a clean census there is a pass, not a failure.
+        assert_eq!(
+            rf2_census_verdict(0, 0, RF2_CENSUS_WINDOW, RF2_CENSUS_WINDOW),
+            Rf2CensusVerdict::Settled
+        );
     }
 }
 

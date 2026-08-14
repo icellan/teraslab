@@ -480,11 +480,17 @@ mod tests {
     /// Exercises the exact `if let Err(msg) = ... { panic!("Test 7.4: {msg}") }`
     /// shape used at the real call site, with the actual outage shape: a
     /// dead connection on chunk 1 of a 5000-record pass.
+    ///
+    /// The `[selftest] ` prefix is this fixture's alone -- the real call
+    /// site does not carry it -- so a raw scenario log can be grepped for
+    /// the failure text without matching this deliberate look-alike.
     #[test]
-    #[should_panic(expected = "Test 7.4: cluster unreachable mid-pass -- only checked 0/5000")]
+    #[should_panic(
+        expected = "[selftest] Test 7.4: cluster unreachable mid-pass -- only checked 0/5000"
+    )]
     fn total_outage_panics_like_the_real_call_site() {
         if let Err(msg) = validate_read_pass(true, 0, 5000, 0) {
-            panic!("Test 7.4: {msg}");
+            panic!("[selftest] Test 7.4: {msg}");
         }
     }
 
@@ -511,11 +517,14 @@ mod tests {
     /// Exercises the exact `if let Err(msg) = ... { panic!("{msg}") }` shape
     /// used at the real call site, with the actual failure this guard
     /// exists to catch: node4 never drained within the timeout.
+    ///
+    /// The `[selftest] ` prefix keeps this fixture's panic body out of raw
+    /// scenario-log greps for the real failure text.
     #[test]
-    #[should_panic(expected = "Test 7.2: node4 did not fully drain")]
+    #[should_panic(expected = "[selftest] Test 7.2: node4 did not fully drain")]
     fn node4_never_drained_panics_like_the_real_call_site() {
         if let Err(msg) = validate_node4_drained(false, 120) {
-            panic!("{msg}");
+            panic!("[selftest] {msg}");
         }
     }
 }

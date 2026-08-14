@@ -732,11 +732,15 @@ mod tests {
     /// Exercises the exact `if let Err(msg) = ... { panic!("Test 14.2: {msg}") }`
     /// shape used at the real call site, so this watches the panic path
     /// itself fire on the vacuous input (zero writes accepted anywhere).
+    ///
+    /// The `[selftest] ` prefix is this fixture's alone -- the real call
+    /// site does not carry it -- so a raw scenario log can be grepped for
+    /// the failure text without matching this deliberate look-alike.
     #[test]
-    #[should_panic(expected = "Test 14.2: zero writes were accepted on any node")]
+    #[should_panic(expected = "[selftest] Test 14.2: zero writes were accepted on any node")]
     fn validate_partition_writes_observed_panics_like_the_real_call_site() {
         if let Err(msg) = validate_partition_writes_observed(0) {
-            panic!("Test 14.2: {msg}");
+            panic!("[selftest] Test 14.2: {msg}");
         }
     }
 
@@ -759,11 +763,14 @@ mod tests {
     /// Exercises the exact `if let Err(msg) = ... { panic!("Test 14.3: {msg}") }`
     /// shape used at the real call site, watching the panic fire on the
     /// vacuous input (zero successful creates for the whole flap window).
+    ///
+    /// The `[selftest] ` prefix keeps this fixture's panic body out of raw
+    /// scenario-log greps for the real failure text.
     #[test]
-    #[should_panic(expected = "Test 14.3: zero successful creates")]
+    #[should_panic(expected = "[selftest] Test 14.3: zero successful creates")]
     fn validate_flap_workload_progress_panics_like_the_real_call_site() {
         if let Err(msg) = validate_flap_workload_progress(0, 300) {
-            panic!("Test 14.3: {msg}");
+            panic!("[selftest] Test 14.3: {msg}");
         }
     }
 }

@@ -1319,13 +1319,17 @@ mod tests {
     /// shape used at the real call site in `run_scenario`, so this test
     /// watches the panic path itself fire rather than just the `Result`
     /// plumbing.
+    ///
+    /// The `[selftest] ` prefix is this fixture's alone -- the real call
+    /// site does not carry it -- so a raw scenario log can be grepped for
+    /// the failure text without matching this deliberate look-alike.
     #[test]
     #[should_panic(
-        expected = "16: zero successful ops for: creates, reads, spends, set_mined, deletes"
+        expected = "[selftest] 16: zero successful ops for: creates, reads, spends, set_mined, deletes"
     )]
     fn total_outage_panics_like_the_real_call_site() {
         if let Err(msg) = validate_chaos_workload_progress(0, 0, 0, 0, 0) {
-            panic!("16: {msg}");
+            panic!("[selftest] 16: {msg}");
         }
     }
 }
