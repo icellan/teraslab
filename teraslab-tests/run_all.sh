@@ -89,6 +89,18 @@ fi
 # the thread name (`thread '<name>' (<id>) panicked at ...`). An
 # unattributable line is always kept -- suppression requires a positive match.
 # Lines may carry the [HH:MM:SS] prefix added by ts_filter.
+#
+# A suppressed panic is a WINDOW, not a single line: the panic MESSAGE BODY
+# follows on the next lines and carries no thread name of its own, so a
+# should-panic test whose message happens to contain "scenario failed" would
+# otherwise be printed as the run's cause right after its own `panicked at`
+# line was correctly skipped. The window opens on a suppressed panic line and
+# closes at the next `test ` line (the result line of that same test, or the
+# start of the next one).
+#
+# If every match in the log turns out to be suppressed, print a literal
+# `no attributable panic` so the SUMMARY FAIL row still has a cause cell
+# instead of an empty one.
 first_real_panic() {
     awk '
         function strip(s) { sub(/^\[[0-9][0-9]:[0-9][0-9]:[0-9][0-9]\] /, "", s); return s }
@@ -103,14 +115,27 @@ first_real_panic() {
         }
         {
             line = strip($0)
+            if (line ~ /^test /) { suppressing = 0 }
             if (line ~ /panicked at/) {
                 n = split(line, parts, q)
-                if (n >= 3 && (parts[2] in expected)) next
+                if (n >= 3 && (parts[2] in expected)) {
+                    suppressing = 1
+                    suppressed = 1
+                    next
+                }
+                suppressing = 0
+                printed = 1
                 print $0
                 exit
             }
-            if (line ~ /scenario failed/) { print $0; exit }
+            if (line ~ /scenario failed/) {
+                if (suppressing) { suppressed = 1; next }
+                printed = 1
+                print $0
+                exit
+            }
         }
+        END { if (!printed && suppressed) print "no attributable panic" }
     ' "$1" "$1"
 }
 

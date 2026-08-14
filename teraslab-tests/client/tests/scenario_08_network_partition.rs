@@ -917,28 +917,41 @@ async fn run_scenario() -> Result<(), ClientError> {
             // rather than one exhaustive retry chain. Abandon a stuck batch
             // quickly and move to the next.
             //
-            // The budget MUST stay comfortably above every bounded wait a
-            // create can legitimately pay under this partition, or the timeout
-            // fires first and turns real server answers into "abandoned":
-            //   * `replication_timeout_ms` = 3000 (src/config.rs) -- a create
-            //     whose holder pair straddles the cut waits the full replica
-            //     ack timeout before the server NAKs it;
-            //   * ~5s connect timeout toward a peer whose packets iptables
-            //     DROPs (blackhole, no RST).
-            // It was 3s -- exactly `replication_timeout_ms` -- so every batch
-            // touching a cut shard was abandoned by construction and counted
-            // zero creates (CI 31536584294). Keep the two apart: raise this if
-            // `replication_timeout_ms` ever rises.
+            // The budget's job is to CAP THE STALL of a batch whose items ALL
+            // land on cut shards -- not to give a stuck create room to finish.
+            // Nothing here can be sized "comfortably above" what such a batch
+            // costs, because the real bounds are far longer than the whole
+            // workload window:
+            //   * when EVERY item of a batch fails with a retryable code
+            //     (ERR_REPLICATION_FAILED is one), the client retries inside
+            //     `create_batch` itself -- 15 attempts whose sleeps alone sum
+            //     to ~31s (`TRANSIENT_MUTATION_RETRY_DELAYS_MS`, client/rust);
+            //   * one server-side replica round trip under an iptables DROP
+            //     blackhole is ~13s on its own: 5s connect + 5s reconnect +
+            //     the 3s `replication_timeout_ms` ack wait
+            //     (`exchange_replica_batch`, src/server/dispatch.rs).
+            // A batch that is only PARTIALLY cut does not pay any of that: a
+            // partial response returns immediately, and `seed_records`
+            // credits the items it acknowledged into the verifier before its
+            // next await -- so the records survive even when the budget fires
+            // and drops this future. The earlier 3s budget was pure loss: it
+            // equalled `replication_timeout_ms`, so every batch touching a cut
+            // shard was abandoned by construction and counted zero creates
+            // (CI 31536584294).
             const PER_BATCH_BUDGET: Duration = Duration::from_secs(8);
             let batch_budget = PER_BATCH_BUDGET
                 .min(remaining)
                 .max(Duration::from_millis(500));
-            // ONE record per budgeted batch: 5 random txids hash to ~5
-            // different shards, so a 5-record batch had only a ~2% chance of
-            // avoiding the cut holder pair entirely -- one unlucky shard
-            // failed the whole batch and discarded four good writes.
+            // FIVE records per budgeted batch. With 3 nodes at RF=2 and one
+            // holder pair cut, ~1/3 of pairs straddle the partition, so a
+            // 5-item batch dodges the cut entirely only ~(2/3)^5 = 13% of the
+            // time -- dodging is not the point. Partial crediting is: a
+            // straddling batch fails FAST and partially, and the intact items
+            // are credited. A 1-item batch is all-or-nothing by construction,
+            // which is exactly the shape that triggers the client's ~31s
+            // internal retry chain and never produces a partial to credit.
             let create =
-                tokio::time::timeout(batch_budget, common::seed_records(&client, &verifier, 1, 5))
+                tokio::time::timeout(batch_budget, common::seed_records(&client, &verifier, 5, 5))
                     .await;
             match create {
                 Ok(Ok(_)) => {
