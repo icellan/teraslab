@@ -8454,6 +8454,42 @@ fn decode_migration_batch_error_detail(payload: &[u8]) -> String {
     }
 }
 
+/// Append the extended create-wire section the receiver's `ReplicaOp::Create`
+/// apply arm parses at metadata offset 70+, carrying the record's
+/// [`crate::record::ExternalRef`] verbatim.
+///
+/// The receiver reconstructs `CreateRequest::external_ref` ONLY from this
+/// section, and `Engine::create` rejects an EXTERNAL create without one
+/// (`CreateError::MissingExternalRef` — the scenario-11 "external blob
+/// reference missing" baseline failure). Shipping the blob bytes inline is not
+/// enough: the receiver fails the create BEFORE its blob-put ever runs. So an
+/// EXTERNAL migration/repair Create must always carry this section; the live
+/// dispatch path (`handle_create_batch`'s `register_one`) has always shipped
+/// it.
+///
+/// The section's block-entry and parent-txid fields are deliberately empty
+/// here: a migration/repair replay ships mined state as explicit
+/// `ReplicaOp::SetMined` ops sourced from the MinedIndex (never via the
+/// create), its lifecycle bytes (offsets 46..70) are the authority for
+/// `unmined_since`, and parent links live in the blob itself.
+fn append_external_ref_wire_section(meta_buf: &mut Vec<u8>, ext: &crate::record::ExternalRef) {
+    // block_height: unused on this path (lifecycle bytes carry unmined_since).
+    meta_buf.extend_from_slice(&0u32.to_le_bytes());
+    // block_count: mined state ships as explicit SetMined ops, never here.
+    meta_buf.push(0);
+    // parent_txid_count.
+    meta_buf.extend_from_slice(&0u16.to_le_bytes());
+    // ExternalRef, 65 bytes — the same field order the receiver parses and
+    // the dispatch-side live create path serializes.
+    meta_buf.push(ext.store_type);
+    meta_buf.extend_from_slice(&ext.content_hash);
+    meta_buf.extend_from_slice(&ext.total_size.to_le_bytes());
+    meta_buf.extend_from_slice(&ext.input_count.to_le_bytes());
+    meta_buf.extend_from_slice(&ext.output_count.to_le_bytes());
+    meta_buf.extend_from_slice(&ext.inputs_offset.to_le_bytes());
+    meta_buf.extend_from_slice(&ext.outputs_offset.to_le_bytes());
+}
+
 /// One record's full current state, expressed as the [`ReplicaOp`] sequence
 /// that reconstructs it on a peer that does not have it.
 pub(crate) struct RecordReplay {
@@ -8561,6 +8597,11 @@ pub(crate) fn build_record_replay_ops(
     // FAIL so the caller retries rather than shipping an incomplete record.
     let is_external = meta.flags.contains(crate::record::TxFlags::EXTERNAL);
     let cold_data = if is_external {
+        // Scenario 11: the blob bytes alone are not applicable — the receiver's
+        // `engine.create` needs the record's ExternalRef from the extended
+        // metadata section, or it rejects the create ("external blob reference
+        // missing") before its blob-put ever runs.
+        append_external_ref_wire_section(&mut meta_buf, &{ meta.external_ref });
         match engine.blob_store() {
             Some(bs) => match bs.get(&key.txid) {
                 Ok(Some(blob)) => Some(blob),
@@ -9752,6 +9793,11 @@ fn convert_migration_create(
     // source retries rather than handing off an incomplete record.
     let is_external = meta.flags.contains(crate::record::TxFlags::EXTERNAL);
     let cold_data = if is_external {
+        // Scenario 11: the blob bytes alone are not applicable — the receiver's
+        // `engine.create` needs the record's ExternalRef from the extended
+        // metadata section, or it rejects the create ("external blob reference
+        // missing") before its blob-put ever runs.
+        append_external_ref_wire_section(&mut meta_buf, &{ meta.external_ref });
         match engine.blob_store() {
             Some(bs) => match bs.get(&tx_key.txid) {
                 Ok(Some(blob)) => Some(blob),
@@ -25415,6 +25461,195 @@ mod tests {
         assert_ne!(
             shipped_unmined, device_unmined,
             "regression guard: the stale device value must never be what ships"
+        );
+    }
+
+    /// Put `content` into `engine`'s blob store and create an EXTERNAL record
+    /// for `key` whose `ExternalRef` is digest-bound to it — exactly the state
+    /// a streamed client upload (`OP_STREAM_*` + `OP_CREATE_BATCH` with
+    /// `FLAG_EXTERNAL_BLOB`) leaves on a master. Returns the persisted ref so
+    /// tests can assert it arrives verbatim on a migration target.
+    fn create_external_record_with_content(
+        engine: &Engine,
+        key: TxKey,
+        content: &[u8],
+    ) -> crate::record::ExternalRef {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(content);
+        let mut content_hash = [0u8; 32];
+        content_hash.copy_from_slice(&hasher.finalize());
+        let ext = crate::record::ExternalRef {
+            store_type: 1,
+            content_hash,
+            total_size: content.len() as u64,
+            input_count: 1,
+            output_count: 1,
+            inputs_offset: 0,
+            outputs_offset: 128,
+        };
+        engine
+            .blob_store()
+            .expect("test engine must have a blob store")
+            .put(&key.txid, content)
+            .unwrap();
+        let utxo_hashes = [[0x44u8; 32]];
+        engine
+            .create(&crate::ops::create::CreateRequest {
+                tx_id: key.txid,
+                tx_version: 1,
+                locktime: 0,
+                fee: 100,
+                size_in_bytes: content.len() as u64,
+                extended_size: 0,
+                is_coinbase: false,
+                spending_height: 0,
+                utxo_hashes: &utxo_hashes,
+                inputs: None,
+                outputs: None,
+                inpoints: None,
+                is_external: true,
+                created_at: 1710000000000,
+                block_height: 0,
+                mined_block_infos: &[],
+                frozen: false,
+                conflicting: false,
+                locked: false,
+                external_ref: Some(ext),
+                parent_txids: &[],
+            })
+            .unwrap();
+        ext
+    }
+
+    /// Scenario 11 (CI run 31536584294, 501 hits): a migration BASELINE for a
+    /// shard holding an EXTERNAL record must be applicable on a receiver whose
+    /// blob store does NOT have the blob. The pre-fix baseline shipped the blob
+    /// bytes inline (S3) but a 70-byte metadata payload with NO ExternalRef
+    /// wire section, so the receiver's `engine.create` rejected every such
+    /// record with `CreateError::MissingExternalRef` ("create: external blob
+    /// reference missing") — before its blob-put ever ran — deterministically
+    /// failing the shard's baseline forever. The replay must carry the
+    /// `ExternalRef` verbatim so the record AND its blob content are fully
+    /// reconstructed on the target.
+    #[test]
+    fn baseline_replay_reconstructs_external_record_on_blob_less_target() {
+        use crate::replication::protocol::ReplicaOp;
+
+        let mut source = test_engine();
+        source.set_blob_store(std::sync::Arc::new(
+            crate::storage::blobstore::MemoryBlobStore::new(),
+        ));
+        let key = tx_key_for_shard(14, 1);
+        let content: Vec<u8> = (0..3000u32).map(|i| (i % 251) as u8).collect();
+        let ext = create_external_record_with_content(&source, key, &content);
+
+        let replay = build_record_replay_ops(&source, &key)
+            .expect("replay build must succeed with the blob present")
+            .expect("the record is live on the source");
+
+        // Sender sanity: the Create is the first op and carries the blob
+        // bytes inline (the S3 read-back), so the receiver can store them.
+        match &replay.ops[0] {
+            ReplicaOp::Create {
+                cold_data,
+                is_external,
+                ..
+            } => {
+                assert!(*is_external, "the replayed Create must stay EXTERNAL");
+                assert_eq!(
+                    cold_data.as_deref(),
+                    Some(content.as_slice()),
+                    "the replayed Create must embed the blob content inline"
+                );
+            }
+            other => panic!("the replay must start with a Create, got {other:?}"),
+        }
+
+        // Target: blob store configured but EMPTY — a migration target that
+        // never held this shard has none of its blobs.
+        let mut target = test_engine();
+        target.set_blob_store(std::sync::Arc::new(
+            crate::storage::blobstore::MemoryBlobStore::new(),
+        ));
+        for op in &replay.ops {
+            crate::replication::receiver::apply_op_journal(&target, op, false, true)
+                .expect("migration-baseline apply must succeed on a blob-less target");
+        }
+
+        let meta = target.read_metadata(&key).unwrap();
+        assert!(
+            meta.flags.contains(crate::record::TxFlags::EXTERNAL),
+            "the applied record must be EXTERNAL"
+        );
+        let applied_ref = { meta.external_ref };
+        assert_eq!(
+            applied_ref, ext,
+            "the ExternalRef must arrive on the target verbatim"
+        );
+        // `read_cold_data` verifies blob length AND sha256 digest against the
+        // applied ExternalRef before returning the bytes — this proves the
+        // record and its blob content are both fully present and consistent.
+        assert_eq!(
+            target.read_cold_data(&key).unwrap(),
+            content,
+            "the target must serve the exact blob content"
+        );
+    }
+
+    /// Delta-path twin of
+    /// [`baseline_replay_reconstructs_external_record_on_blob_less_target`]:
+    /// a post-baseline create converted from the redo log
+    /// (`redo_entry_to_replica_op` → `convert_migration_create`, also the
+    /// replica catch-up path) had the same 70-byte metadata payload and hit the
+    /// same `MissingExternalRef` rejection on the target.
+    #[test]
+    fn delta_create_reconstructs_external_record_on_blob_less_target() {
+        use crate::redo::{RedoEntry, RedoOp};
+
+        let mut source = test_engine();
+        source.set_blob_store(std::sync::Arc::new(
+            crate::storage::blobstore::MemoryBlobStore::new(),
+        ));
+        let shard = 14u16;
+        let key = tx_key_for_shard(shard, 2);
+        let content: Vec<u8> = (0..2000u32).map(|i| (i % 239) as u8).collect();
+        let ext = create_external_record_with_content(&source, key, &content);
+
+        let entry = RedoEntry {
+            sequence: 1,
+            op: RedoOp::ReplicaCreate {
+                tx_key: key,
+                device_id: 0,
+                record_offset: 0,
+                utxo_count: 1,
+            },
+        };
+        let op = redo_entry_to_replica_op(&entry, shard, &source)
+            .expect("delta conversion must succeed with the blob present")
+            .expect("the delta must ship a Create for the live record");
+
+        let mut target = test_engine();
+        target.set_blob_store(std::sync::Arc::new(
+            crate::storage::blobstore::MemoryBlobStore::new(),
+        ));
+        crate::replication::receiver::apply_op_journal(&target, &op, false, true)
+            .expect("migration-delta apply must succeed on a blob-less target");
+
+        let meta = target.read_metadata(&key).unwrap();
+        assert!(
+            meta.flags.contains(crate::record::TxFlags::EXTERNAL),
+            "the applied record must be EXTERNAL"
+        );
+        let applied_ref = { meta.external_ref };
+        assert_eq!(
+            applied_ref, ext,
+            "the ExternalRef must arrive on the target verbatim"
+        );
+        assert_eq!(
+            target.read_cold_data(&key).unwrap(),
+            content,
+            "the target must serve the exact blob content"
         );
     }
 }
