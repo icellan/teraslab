@@ -25483,8 +25483,8 @@ mod tests {
             store_type: 1,
             content_hash,
             total_size: content.len() as u64,
-            input_count: 1,
-            output_count: 1,
+            input_count: 3,
+            output_count: 7,
             inputs_offset: 0,
             outputs_offset: 128,
         };
