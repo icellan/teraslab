@@ -1145,6 +1145,326 @@ async fn reconcile_existing_seed_records(
     reconciled
 }
 
+/// Publish every create the server has already acknowledged: record it in the
+/// verifier and append its txid to the caller's list, draining the staging
+/// buffer.
+///
+/// Chaos scenarios routinely wrap `seed_records` in `tokio::time::timeout`,
+/// and a timeout DROPS the future — anything still sitting in a local staging
+/// buffer at that moment is lost even though the server really did create
+/// those records, so the caller reports "zero records created" for a window in
+/// which the cluster created plenty. Publishing at every point where an ack is
+/// observed, always BEFORE the next `.await`, keeps the verifier correct on
+/// the cancellation path as well as on the give-up error path.
+///
+/// # Parameters
+/// - `verifier`: shared expected-state tracker to record the creates into.
+/// - `utxos_per_tx`: output count each seeded record was created with.
+/// - `succeeded_meta`: staging buffer of acknowledged creates; drained.
+/// - `txids`: caller's accumulating list of created txids.
+fn publish_seeded_records(
+    verifier: &StateVerifier,
+    utxos_per_tx: u32,
+    succeeded_meta: &mut Vec<SeedMeta>,
+    txids: &mut Vec<[u8; 32]>,
+) {
+    for (txid, utxo_hashes) in succeeded_meta.drain(..) {
+        verifier.record_create(txid, utxos_per_tx, utxo_hashes);
+        txids.push(txid);
+    }
+}
+
+/// Split a partial-failure response into "retry these" and "these landed".
+///
+/// Items whose index does not appear in the error list were applied by the
+/// server, so they must not be re-sent (that would surface
+/// `ERR_ALREADY_EXISTS`) and must not be forgotten. This runs on EVERY failed
+/// attempt, including the last one, so a partial success on the final attempt
+/// is accounted for instead of being discarded along with the returned error.
+///
+/// A non-partial error leaves both sets untouched: nothing is known to have
+/// landed, so the whole batch stays in the retry set (and is reconciled).
+///
+/// Two more cases credit NOTHING and leave the whole batch in the retry set:
+///
+/// * `PartialError::degraded` — the applied items were replicated below
+///   quorum (single-node durable, may be lost if that node dies before
+///   catch-up streaming; see `client/rust/src/errors.rs`). Callers of
+///   `seed_records` feed the verifier into hard assertions such as
+///   `assert_rf2_replication_exact` and the acked-write-durability check
+///   after a SIGKILL, so a degraded ack is not a durable seed. Leaving those
+///   items in the retry set hands them to `reconcile_existing_seed_records`,
+///   whose two-read settle check confirms them only once they survive.
+/// * an item index at or past the end of the retry set — the client's
+///   sub-batch→batch index remap leaves an out-of-range index UNMAPPED
+///   (`client/rust/src/lib.rs`, `remap_batch_errors`), and credit here is by
+///   COMPLEMENT of the failed set, so one malformed index would silently
+///   promote a failed item into a phantom "created" record that a later hard
+///   assertion demands to exist.
+///
+/// # Parameters
+/// - `err`: the error returned by `create_batch`.
+/// - `attempt`: 0-based attempt number, for the diagnostic line only.
+/// - `remaining_items`/`remaining_meta`: the retry set, filtered in place.
+/// - `succeeded_meta`: staging buffer the acknowledged items are moved into.
+fn split_partial_successes(
+    err: &ClientError,
+    attempt: u32,
+    remaining_items: &mut Vec<CreateItem>,
+    remaining_meta: &mut Vec<SeedMeta>,
+    succeeded_meta: &mut Vec<SeedMeta>,
+) {
+    let ClientError::Partial(pe) = err else {
+        return;
+    };
+    let mut code_counts = std::collections::BTreeMap::new();
+    for item_err in &pe.errors {
+        *code_counts.entry(item_err.code).or_insert(0usize) += 1;
+    }
+    let code_summary = code_counts
+        .iter()
+        .map(|(code, count)| {
+            format!(
+                "{}={count}",
+                teraslab_test_client::errors::error_code_string(*code),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    if pe.degraded {
+        eprintln!(
+            "seed_records: partial error on attempt {attempt} is degraded=true \
+             (below-quorum durability) [{code_summary}]: crediting none of the \
+             {} item(s), reconcile confirms them instead",
+            remaining_items.len()
+        );
+        return;
+    }
+    let failed_indices: std::collections::HashSet<usize> =
+        pe.errors.iter().map(|e| e.item_index as usize).collect();
+    if let Some(out_of_range) = failed_indices.iter().find(|i| **i >= remaining_items.len()) {
+        eprintln!(
+            "seed_records: partial error on attempt {attempt} reports item_index \
+             {out_of_range} for a {}-item batch [{code_summary}]: indices are \
+             untrustworthy, crediting none of them",
+            remaining_items.len()
+        );
+        return;
+    }
+    let mut retry_items = Vec::new();
+    let mut retry_meta = Vec::new();
+    for (i, (item, meta)) in remaining_items
+        .drain(..)
+        .zip(remaining_meta.drain(..))
+        .enumerate()
+    {
+        if failed_indices.contains(&i) {
+            retry_items.push(item);
+            retry_meta.push(meta);
+        } else {
+            succeeded_meta.push(meta);
+        }
+    }
+    *remaining_items = retry_items;
+    *remaining_meta = retry_meta;
+    eprintln!(
+        "seed_records: partial error on attempt {attempt}: {} failed item(s) [{code_summary}]",
+        failed_indices.len()
+    );
+}
+
+/// Fold ONE `create_batch` attempt into the seed accounting.
+///
+/// `attempt_error` is `None` when the attempt returned `Ok` — every remaining
+/// item was acknowledged — and `Some(err)` otherwise. Acknowledged items are
+/// moved out of the retry set and published into the verifier here, before
+/// control returns to the loop and therefore before the loop's next `.await`
+/// (see [`publish_seeded_records`] for why that ordering is load-bearing).
+///
+/// This runs on EVERY attempt, the final one included: a partial success on
+/// the last attempt used to be discarded along with the returned error.
+///
+/// The staging buffer is local: split and publish happen back-to-back, so
+/// nothing an ack produced can be stranded between them.
+///
+/// # Parameters
+/// - `attempt_error`: `None` for a fully successful attempt, else the error.
+/// - `attempt`: 0-based attempt number, for diagnostics only.
+/// - `verifier`/`utxos_per_tx`/`txids`: where acknowledged creates are published.
+/// - `remaining_items`/`remaining_meta`: the retry set, filtered in place.
+///
+/// Returns true when the retry set is now empty, i.e. the batch is complete.
+fn record_batch_attempt(
+    attempt_error: Option<&ClientError>,
+    attempt: u32,
+    verifier: &StateVerifier,
+    utxos_per_tx: u32,
+    remaining_items: &mut Vec<CreateItem>,
+    remaining_meta: &mut Vec<SeedMeta>,
+    txids: &mut Vec<[u8; 32]>,
+) -> bool {
+    let mut succeeded_meta: Vec<SeedMeta> = Vec::new();
+    match attempt_error {
+        None => {
+            succeeded_meta.append(remaining_meta);
+            remaining_items.clear();
+        }
+        Some(err) => split_partial_successes(
+            err,
+            attempt,
+            remaining_items,
+            remaining_meta,
+            &mut succeeded_meta,
+        ),
+    }
+    publish_seeded_records(verifier, utxos_per_tx, &mut succeeded_meta, txids);
+    remaining_items.is_empty()
+}
+
+/// The client round-trips one seed batch makes, behind a seam.
+///
+/// [`seed_one_batch`]'s value is in its COMPOSITION — publish at every point
+/// an ack is observed, and always before the next `.await` — which no
+/// helper-level test can pin. This trait lets the unit tests drive the real
+/// loop with scripted outcomes and a backoff that never returns, so a
+/// regression in that composition (a publish moved back to the end of the
+/// batch, the final-attempt split re-gated behind `attempt + 1 < MAX`) fails
+/// a test instead of silently under-reporting creates in Docker.
+trait SeedBatchDriver {
+    /// Send one create batch. `Ok` means every item in it was acknowledged.
+    async fn send_batch(&mut self, items: &[CreateItem]) -> Result<(), ClientError>;
+
+    /// Read back the ambiguous items and move the durably-present ones into
+    /// `succeeded_meta`. Returns how many were reconciled.
+    async fn reconcile(
+        &mut self,
+        remaining_items: &mut Vec<CreateItem>,
+        remaining_meta: &mut Vec<SeedMeta>,
+        succeeded_meta: &mut Vec<SeedMeta>,
+    ) -> usize;
+
+    /// Wait out the retry backoff for `attempt`, then refresh routing.
+    async fn backoff(&mut self, attempt: u32);
+}
+
+/// The production driver: a real clustered client.
+struct ClientSeedDriver<'a> {
+    client: &'a Client,
+}
+
+impl SeedBatchDriver for ClientSeedDriver<'_> {
+    async fn send_batch(&mut self, items: &[CreateItem]) -> Result<(), ClientError> {
+        self.client.create_batch(items).await.map(|_| ())
+    }
+
+    async fn reconcile(
+        &mut self,
+        remaining_items: &mut Vec<CreateItem>,
+        remaining_meta: &mut Vec<SeedMeta>,
+        succeeded_meta: &mut Vec<SeedMeta>,
+    ) -> usize {
+        reconcile_existing_seed_records(
+            self.client,
+            remaining_items,
+            remaining_meta,
+            succeeded_meta,
+        )
+        .await
+    }
+
+    async fn backoff(&mut self, attempt: u32) {
+        tokio::time::sleep(teraslab_test_client::retry::backoff_for_attempt(attempt)).await;
+        let _ = self.client.refresh_routing().await;
+    }
+}
+
+/// Drive one batch of creates to completion, retrying only what has not been
+/// acknowledged and publishing what has.
+///
+/// Retries transient errors from SWIM instability, dead nodes, cluster
+/// topology changes, or ambiguous `ERR_REPLICATION_FAILED` (code 20). Backoff
+/// and the attempt budget come from the shared `retry` policy module so every
+/// mutation helper rides out the same post-topology-change settle window.
+///
+/// Errors: returns the last error from the driver if the retry budget is
+/// exhausted, or `ClientError::Connection` if items remain unacknowledged
+/// without a final error to attribute it to.
+async fn seed_one_batch<D: SeedBatchDriver>(
+    driver: &mut D,
+    verifier: &StateVerifier,
+    utxos_per_tx: u32,
+    mut remaining_items: Vec<CreateItem>,
+    mut remaining_meta: Vec<SeedMeta>,
+    txids: &mut Vec<[u8; 32]>,
+) -> Result<(), ClientError> {
+    const MAX_SEED_RETRIES: u32 = teraslab_test_client::retry::MAX_TRANSIENT_ATTEMPTS;
+
+    for attempt in 0..MAX_SEED_RETRIES {
+        let attempt_result = driver.send_batch(&remaining_items).await;
+        // Account for the attempt BEFORE anything else awaits: from here the
+        // future can be cancelled by a caller's timeout, and a dropped future
+        // must not take server-acked creates with it.
+        let complete = record_batch_attempt(
+            attempt_result.as_ref().err(),
+            attempt,
+            verifier,
+            utxos_per_tx,
+            &mut remaining_items,
+            &mut remaining_meta,
+            txids,
+        );
+        let Err(e) = attempt_result else {
+            break;
+        };
+        if complete {
+            // The response failed as a whole but every item in it landed.
+            break;
+        }
+        if attempt + 1 >= MAX_SEED_RETRIES {
+            let degraded = matches!(&e, ClientError::Partial(pe) if pe.degraded);
+            eprintln!(
+                "seed_records: failed after {MAX_SEED_RETRIES} attempts (degraded={degraded}): {e}"
+            );
+            return Err(e);
+        }
+        let mut reconciled_meta: Vec<SeedMeta> = Vec::new();
+        let reconciled = driver
+            .reconcile(
+                &mut remaining_items,
+                &mut remaining_meta,
+                &mut reconciled_meta,
+            )
+            .await;
+        if reconciled > 0 {
+            eprintln!(
+                "seed_records: reconciled {reconciled} ambiguous existing record(s) after attempt {attempt}"
+            );
+        }
+        // Reconcile promotes items too; publish before the backoff sleep for
+        // the same cancellation reason.
+        publish_seeded_records(verifier, utxos_per_tx, &mut reconciled_meta, txids);
+        if remaining_items.is_empty() {
+            break;
+        }
+        if attempt == 0 {
+            eprintln!(
+                "seed_records: transient error on attempt {attempt}, \
+                retrying {} items: {e}",
+                remaining_items.len()
+            );
+        }
+        driver.backoff(attempt).await;
+    }
+
+    if !remaining_items.is_empty() {
+        return Err(ClientError::Connection(format!(
+            "create_batch: {} items still failing after retries",
+            remaining_items.len()
+        )));
+    }
+    Ok(())
+}
+
 pub async fn seed_records(
     client: &Client,
     verifier: &StateVerifier,
@@ -1155,6 +1475,7 @@ pub async fn seed_records(
 
     let mut rng = rand::thread_rng();
     let mut txids = Vec::with_capacity(count as usize);
+    let mut driver = ClientSeedDriver { client };
 
     for batch_start in (0..count).step_by(100) {
         let batch_end = (batch_start + 100).min(count);
@@ -1196,111 +1517,22 @@ pub async fn seed_records(
 
         // Only record in verifier AFTER the create succeeds, to avoid
         // phantom records when the create fails (e.g., during degradation).
-        // Retry on transient errors from SWIM instability, dead nodes,
-        // cluster topology changes, or ambiguous ERR_REPLICATION_FAILED
-        // (code 20). Backoff and the attempt budget come from the shared
-        // `retry` policy module (`retry::backoff_for_attempt` /
-        // `retry::MAX_TRANSIENT_ATTEMPTS`) so every mutation helper rides
-        // out the same post-topology-change settle window.
         //
         // On partial success, only retry the failed items (not items that
         // already succeeded — re-sending those would cause ERR_ALREADY_EXISTS).
-        const MAX_SEED_RETRIES: u32 = teraslab_test_client::retry::MAX_TRANSIENT_ATTEMPTS;
-        let mut remaining_items = items;
-        let mut remaining_meta = batch_meta;
-        let mut succeeded_meta: Vec<([u8; 32], Vec<[u8; 32]>)> = Vec::new();
-
-        for attempt in 0..MAX_SEED_RETRIES {
-            match client.create_batch(&remaining_items).await {
-                Ok(_) => {
-                    // All remaining items succeeded.
-                    succeeded_meta.append(&mut remaining_meta);
-                    remaining_items.clear();
-                    break;
-                }
-                Err(ref e) if attempt + 1 < MAX_SEED_RETRIES => {
-                    // On partial error, extract which items failed and only
-                    // retry those. Items not in the error list succeeded.
-                    if let ClientError::Partial(pe) = e {
-                        let mut code_counts = std::collections::BTreeMap::new();
-                        for err in &pe.errors {
-                            *code_counts.entry(err.code).or_insert(0usize) += 1;
-                        }
-                        let code_summary = code_counts
-                            .iter()
-                            .map(|(code, count)| {
-                                format!(
-                                    "{}={count}",
-                                    teraslab_test_client::errors::error_code_string(*code),
-                                )
-                            })
-                            .collect::<Vec<_>>()
-                            .join(", ");
-                        let failed_indices: std::collections::HashSet<usize> =
-                            pe.errors.iter().map(|e| e.item_index as usize).collect();
-                        let mut retry_items = Vec::new();
-                        let mut retry_meta = Vec::new();
-                        for (i, (item, meta)) in remaining_items
-                            .drain(..)
-                            .zip(remaining_meta.drain(..))
-                            .enumerate()
-                        {
-                            if failed_indices.contains(&i) {
-                                retry_items.push(item);
-                                retry_meta.push(meta);
-                            } else {
-                                succeeded_meta.push(meta);
-                            }
-                        }
-                        remaining_items = retry_items;
-                        remaining_meta = retry_meta;
-                        eprintln!(
-                            "seed_records: partial error on attempt {attempt}: {} failed item(s) [{code_summary}]",
-                            failed_indices.len()
-                        );
-                    }
-                    let reconciled = reconcile_existing_seed_records(
-                        client,
-                        &mut remaining_items,
-                        &mut remaining_meta,
-                        &mut succeeded_meta,
-                    )
-                    .await;
-                    if reconciled > 0 {
-                        eprintln!(
-                            "seed_records: reconciled {reconciled} ambiguous existing record(s) after attempt {attempt}"
-                        );
-                    }
-                    if remaining_items.is_empty() {
-                        break;
-                    }
-                    if attempt == 0 {
-                        eprintln!(
-                            "seed_records: transient error on attempt {attempt}, \
-                            retrying {} items: {e}",
-                            remaining_items.len()
-                        );
-                    }
-                    tokio::time::sleep(teraslab_test_client::retry::backoff_for_attempt(attempt))
-                        .await;
-                    let _ = client.refresh_routing().await;
-                }
-                Err(e) => {
-                    eprintln!("seed_records: failed after {MAX_SEED_RETRIES} attempts: {e}");
-                    return Err(e);
-                }
-            }
-        }
-        if !remaining_items.is_empty() {
-            return Err(ClientError::Connection(format!(
-                "create_batch: {} items still failing after retries",
-                remaining_items.len()
-            )));
-        }
-        for (txid, utxo_hashes) in succeeded_meta {
-            verifier.record_create(txid, utxos_per_tx, utxo_hashes);
-            txids.push(txid);
-        }
+        // Acknowledged items are published into the verifier as soon as they
+        // are observed (see `publish_seeded_records`) rather than at the end of
+        // the batch, so a caller that wraps this call in a timeout still sees
+        // every create the cluster actually performed.
+        seed_one_batch(
+            &mut driver,
+            verifier,
+            utxos_per_tx,
+            items,
+            batch_meta,
+            &mut txids,
+        )
+        .await?;
     }
 
     Ok(txids)
@@ -2801,5 +3033,442 @@ mod replication_report_tests {
             dump.contains("shard=7"),
             "expected shard=7 (first response): {dump}"
         );
+    }
+}
+
+#[cfg(test)]
+mod seed_records_accounting_tests {
+    use super::*;
+    use teraslab_test_client::PartialError;
+    use teraslab_test_client::types::BatchItemError;
+
+    /// Build a minimal create item for the given txid.
+    fn item(txid: [u8; 32]) -> CreateItem {
+        CreateItem {
+            txid,
+            utxo_hashes: vec![[1u8; 32]],
+            tx_version: 1,
+            locktime: 0,
+            fee: 500,
+            size_in_bytes: 250,
+            extended_size: 0,
+            is_coinbase: false,
+            spending_height: 0,
+            created_at: 1710000000000,
+            flags: 0,
+            cold_data: vec![],
+            mined_block_id: None,
+            mined_block_height: None,
+            mined_subtree_idx: None,
+            parent_txids: vec![],
+        }
+    }
+
+    fn partial_error_with(failed_indices: &[u32], degraded: bool) -> ClientError {
+        ClientError::Partial(PartialError {
+            successes: vec![],
+            errors: failed_indices
+                .iter()
+                .map(|&item_index| BatchItemError {
+                    item_index,
+                    // ERR_REPLICATION_FAILED -- the ambiguous outcome a
+                    // partition produces for shards whose holder pair is cut.
+                    code: 20,
+                    data: vec![],
+                })
+                .collect(),
+            degraded,
+        })
+    }
+
+    fn partial_error(failed_indices: &[u32]) -> ClientError {
+        partial_error_with(failed_indices, false)
+    }
+
+    /// Scripted [`SeedBatchDriver`] for the loop-composition tests: replays a
+    /// canned sequence of `create_batch` outcomes with no Docker cluster in
+    /// sight, and can block forever in `backoff` so a caller's timeout
+    /// cancels the loop exactly where the real one would be sleeping.
+    struct ScriptedDriver {
+        /// Outcomes for successive `send_batch` calls, in order. Once the
+        /// script runs out every further send reports a connection error.
+        sends: std::collections::VecDeque<Result<(), ClientError>>,
+        /// Txids the simulated reconcile read-back finds durably present.
+        reconcilable: std::collections::HashSet<[u8; 32]>,
+        /// Retry-set size observed by each `send_batch` call.
+        sent_sizes: Vec<usize>,
+        /// When set, `backoff` never returns.
+        block_in_backoff: bool,
+    }
+
+    impl ScriptedDriver {
+        fn new(sends: Vec<Result<(), ClientError>>) -> Self {
+            Self {
+                sends: sends.into(),
+                reconcilable: std::collections::HashSet::new(),
+                sent_sizes: Vec::new(),
+                block_in_backoff: false,
+            }
+        }
+    }
+
+    impl SeedBatchDriver for ScriptedDriver {
+        async fn send_batch(&mut self, items: &[CreateItem]) -> Result<(), ClientError> {
+            self.sent_sizes.push(items.len());
+            self.sends
+                .pop_front()
+                .unwrap_or_else(|| Err(ClientError::Connection("script exhausted".to_string())))
+        }
+
+        async fn reconcile(
+            &mut self,
+            remaining_items: &mut Vec<CreateItem>,
+            remaining_meta: &mut Vec<SeedMeta>,
+            succeeded_meta: &mut Vec<SeedMeta>,
+        ) -> usize {
+            let items = std::mem::take(remaining_items);
+            let meta = std::mem::take(remaining_meta);
+            let mut reconciled = 0usize;
+            for (item, m) in items.into_iter().zip(meta) {
+                if self.reconcilable.contains(&m.0) {
+                    succeeded_meta.push(m);
+                    reconciled += 1;
+                } else {
+                    remaining_items.push(item);
+                    remaining_meta.push(m);
+                }
+            }
+            reconciled
+        }
+
+        async fn backoff(&mut self, _attempt: u32) {
+            if self.block_in_backoff {
+                std::future::pending::<()>().await;
+            }
+        }
+    }
+
+    /// Two items, `txids[0]` and `txids[1]`, ready to hand to
+    /// [`seed_one_batch`].
+    fn two_item_batch() -> (Vec<[u8; 32]>, Vec<CreateItem>, Vec<SeedMeta>) {
+        let txids: Vec<[u8; 32]> = (0u8..2).map(|i| [i; 32]).collect();
+        let items = txids.iter().map(|t| item(*t)).collect();
+        let meta = txids.iter().map(|t| (*t, vec![[1u8; 32]])).collect();
+        (txids, items, meta)
+    }
+
+    const MAX_SEED_RETRIES: u32 = teraslab_test_client::retry::MAX_TRANSIENT_ATTEMPTS;
+
+    #[test]
+    fn split_partial_successes_moves_only_acked_items_out_of_the_retry_set() {
+        let txids: Vec<[u8; 32]> = (0u8..3).map(|i| [i; 32]).collect();
+        let mut remaining_items: Vec<CreateItem> = txids.iter().map(|t| item(*t)).collect();
+        let mut remaining_meta: Vec<SeedMeta> =
+            txids.iter().map(|t| (*t, vec![[1u8; 32]])).collect();
+        let mut succeeded_meta: Vec<SeedMeta> = Vec::new();
+
+        // Item 1 failed; items 0 and 2 were applied by the server.
+        split_partial_successes(
+            &partial_error(&[1]),
+            0,
+            &mut remaining_items,
+            &mut remaining_meta,
+            &mut succeeded_meta,
+        );
+
+        assert_eq!(remaining_items.len(), 1);
+        assert_eq!(remaining_items[0].txid, txids[1]);
+        assert_eq!(remaining_meta.len(), 1);
+        assert_eq!(remaining_meta[0].0, txids[1]);
+        assert_eq!(
+            succeeded_meta.iter().map(|(t, _)| *t).collect::<Vec<_>>(),
+            vec![txids[0], txids[2]]
+        );
+    }
+
+    /// `degraded = true` means the items that DID apply are only single-node
+    /// durable and may be lost (`client/rust/src/errors.rs`). Crediting them
+    /// would leak a below-quorum write into `assert_rf2_replication_exact`
+    /// and the acked-write-durability-after-SIGKILL check, which then fail
+    /// for a reason the harness invented.
+    #[test]
+    fn split_partial_successes_credits_nothing_when_the_partial_is_degraded() {
+        let txids: Vec<[u8; 32]> = (0u8..3).map(|i| [i; 32]).collect();
+        let mut remaining_items: Vec<CreateItem> = txids.iter().map(|t| item(*t)).collect();
+        let mut remaining_meta: Vec<SeedMeta> =
+            txids.iter().map(|t| (*t, vec![[1u8; 32]])).collect();
+        let mut succeeded_meta: Vec<SeedMeta> = Vec::new();
+
+        // Item 1 failed; items 0 and 2 applied -- but below quorum.
+        split_partial_successes(
+            &partial_error_with(&[1], true),
+            0,
+            &mut remaining_items,
+            &mut remaining_meta,
+            &mut succeeded_meta,
+        );
+
+        assert!(
+            succeeded_meta.is_empty(),
+            "a degraded partial must not credit its applied items"
+        );
+        assert_eq!(
+            remaining_items.len(),
+            3,
+            "every item stays in the retry set so reconcile can confirm it"
+        );
+        assert_eq!(
+            remaining_meta.iter().map(|(t, _)| *t).collect::<Vec<_>>(),
+            txids
+        );
+    }
+
+    /// Credit here is by COMPLEMENT of the reported failures, and the
+    /// client's sub-batch -> batch index remap leaves an out-of-range
+    /// `item_index` UNMAPPED. One malformed index would therefore turn a
+    /// FAILED item into a credited phantom record that a later hard
+    /// assertion demands to exist.
+    #[test]
+    fn split_partial_successes_credits_nothing_for_an_out_of_range_item_index() {
+        let txids: Vec<[u8; 32]> = (0u8..3).map(|i| [i; 32]).collect();
+        let mut remaining_items: Vec<CreateItem> = txids.iter().map(|t| item(*t)).collect();
+        let mut remaining_meta: Vec<SeedMeta> =
+            txids.iter().map(|t| (*t, vec![[1u8; 32]])).collect();
+        let mut succeeded_meta: Vec<SeedMeta> = Vec::new();
+
+        // Index 7 cannot refer to a 3-item batch.
+        split_partial_successes(
+            &partial_error(&[1, 7]),
+            0,
+            &mut remaining_items,
+            &mut remaining_meta,
+            &mut succeeded_meta,
+        );
+
+        assert!(
+            succeeded_meta.is_empty(),
+            "an out-of-range index makes the whole index set untrustworthy"
+        );
+        assert_eq!(remaining_items.len(), 3);
+        assert_eq!(
+            remaining_meta.iter().map(|(t, _)| *t).collect::<Vec<_>>(),
+            txids
+        );
+    }
+
+    #[test]
+    fn split_partial_successes_leaves_the_batch_intact_for_a_non_partial_error() {
+        let txids: Vec<[u8; 32]> = (0u8..2).map(|i| [i; 32]).collect();
+        let mut remaining_items: Vec<CreateItem> = txids.iter().map(|t| item(*t)).collect();
+        let mut remaining_meta: Vec<SeedMeta> =
+            txids.iter().map(|t| (*t, vec![[1u8; 32]])).collect();
+        let mut succeeded_meta: Vec<SeedMeta> = Vec::new();
+
+        split_partial_successes(
+            &ClientError::Connection("peer unreachable".to_string()),
+            2,
+            &mut remaining_items,
+            &mut remaining_meta,
+            &mut succeeded_meta,
+        );
+
+        // Nothing is known to have landed: the whole batch stays retryable.
+        assert_eq!(remaining_items.len(), 2);
+        assert_eq!(remaining_meta.len(), 2);
+        assert!(succeeded_meta.is_empty());
+    }
+
+    #[test]
+    fn publish_seeded_records_drains_into_the_verifier_and_the_txid_list() {
+        let verifier = StateVerifier::new();
+        let mut txids: Vec<[u8; 32]> = Vec::new();
+        let hashes_a = vec![[0xaa; 32], [0xab; 32]];
+        let hashes_b = vec![[0xba; 32], [0xbb; 32]];
+        let mut succeeded_meta: Vec<SeedMeta> =
+            vec![([7u8; 32], hashes_a.clone()), ([8u8; 32], hashes_b)];
+
+        publish_seeded_records(&verifier, 2, &mut succeeded_meta, &mut txids);
+
+        assert!(
+            succeeded_meta.is_empty(),
+            "staging buffer must be drained so a later publish cannot double-record"
+        );
+        assert_eq!(txids, vec![[7u8; 32], [8u8; 32]]);
+        assert_eq!(verifier.record_count(), 2);
+        let rec = verifier
+            .get_record(&[7u8; 32])
+            .expect("published record must be tracked by the verifier");
+        assert_eq!(rec.utxo_count, 2);
+        assert_eq!(rec.utxo_hashes, hashes_a);
+        assert_eq!(rec.spent_utxos, 0);
+    }
+
+    /// The cancellation shape the harness actually hits: a caller wraps
+    /// `seed_records` in a timeout, the future is dropped mid-flight, and the
+    /// return value is lost. Anything published before the drop must survive
+    /// in the verifier -- that is the only channel a cancelled caller has.
+    #[tokio::test]
+    async fn records_published_before_a_cancellation_survive_in_the_verifier() {
+        let verifier = StateVerifier::new();
+        let mut txids: Vec<[u8; 32]> = Vec::new();
+        let mut succeeded_meta: Vec<SeedMeta> = vec![([9u8; 32], vec![[0xcc; 32]])];
+
+        let cancelled = tokio::time::timeout(Duration::from_millis(50), async {
+            publish_seeded_records(&verifier, 1, &mut succeeded_meta, &mut txids);
+            // Stand in for the awaits that follow a publish in `seed_records`
+            // (reconcile read-back, backoff sleep, routing refresh).
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            txids.clone()
+        })
+        .await;
+
+        assert!(
+            cancelled.is_err(),
+            "the future must be cancelled mid-flight"
+        );
+        assert_eq!(
+            verifier.record_count(),
+            1,
+            "an ack published before the cancellation point must not be lost"
+        );
+        assert!(verifier.all_txids().contains(&[9u8; 32]));
+    }
+
+    // ---------------------------------------------------------------------
+    // Loop-composition tests. These drive the REAL `seed_one_batch` loop
+    // through the `SeedBatchDriver` seam, so they fail when the split or a
+    // publish is moved to the wrong place -- which the helper-level tests
+    // above cannot detect.
+    // ---------------------------------------------------------------------
+
+    /// The final attempt's response is still a response: items it
+    /// acknowledged were created by the cluster and must be credited, even
+    /// though the batch as a whole gives up and returns an error. Fails if
+    /// the split is ever re-gated behind `attempt + 1 < MAX_SEED_RETRIES`.
+    #[tokio::test]
+    async fn final_attempt_partial_still_publishes_the_items_that_landed() {
+        let verifier = StateVerifier::new();
+        let mut txids_out: Vec<[u8; 32]> = Vec::new();
+        let (txids, items, meta) = two_item_batch();
+
+        // Every attempt but the last fails opaquely (nothing creditable);
+        // the last one comes back partial with item 1 failed.
+        let mut sends: Vec<Result<(), ClientError>> = (0..MAX_SEED_RETRIES - 1)
+            .map(|_| Err(ClientError::Connection("peer unreachable".to_string())))
+            .collect();
+        sends.push(Err(partial_error(&[1])));
+        let mut driver = ScriptedDriver::new(sends);
+
+        let result = seed_one_batch(&mut driver, &verifier, 1, items, meta, &mut txids_out).await;
+
+        assert!(
+            matches!(&result, Err(ClientError::Partial(pe)) if pe.errors.len() == 1),
+            "the batch must still report the failure it gave up on: {result:?}"
+        );
+        assert_eq!(
+            txids_out,
+            vec![txids[0]],
+            "the item the final response acknowledged must be credited"
+        );
+        assert_eq!(verifier.record_count(), 1);
+        assert_eq!(driver.sent_sizes.len() as u32, MAX_SEED_RETRIES);
+    }
+
+    /// A degraded partial acknowledges items at below-quorum durability. The
+    /// loop must credit none of them and keep re-sending, so the record only
+    /// ever enters the verifier via a non-degraded ack or reconcile.
+    #[tokio::test]
+    async fn degraded_partial_never_credits_through_the_loop() {
+        let verifier = StateVerifier::new();
+        let mut txids_out: Vec<[u8; 32]> = Vec::new();
+        let (_txids, items, meta) = two_item_batch();
+
+        let sends: Vec<Result<(), ClientError>> = (0..MAX_SEED_RETRIES)
+            .map(|_| Err(partial_error_with(&[1], true)))
+            .collect();
+        let mut driver = ScriptedDriver::new(sends);
+
+        let result = seed_one_batch(&mut driver, &verifier, 1, items, meta, &mut txids_out).await;
+
+        assert!(
+            matches!(&result, Err(ClientError::Partial(pe)) if pe.degraded),
+            "the degraded partial must surface as the batch error: {result:?}"
+        );
+        assert_eq!(verifier.record_count(), 0, "no degraded item may be seeded");
+        assert!(txids_out.is_empty());
+        assert!(
+            driver.sent_sizes.iter().all(|n| *n == 2),
+            "the retry set must never shrink on a degraded ack: {:?}",
+            driver.sent_sizes
+        );
+    }
+
+    /// The cancellation shape 8d.2 actually hits: the caller wraps the seed
+    /// in a timeout and the future is dropped while the loop is sleeping out
+    /// its retry backoff. Whatever the response before that sleep
+    /// acknowledged must already be in the verifier. Fails if the publish is
+    /// moved back to the end of the batch.
+    #[tokio::test]
+    async fn acked_items_survive_a_cancellation_during_the_retry_backoff() {
+        let verifier = StateVerifier::new();
+        let mut txids_out: Vec<[u8; 32]> = Vec::new();
+        let (txids, items, meta) = two_item_batch();
+
+        let mut driver = ScriptedDriver::new(vec![Err(partial_error(&[1]))]);
+        // Item 1 stays unacknowledged, so the loop reaches the backoff --
+        // where it now hangs until the caller's timeout drops it.
+        driver.block_in_backoff = true;
+
+        let cancelled = tokio::time::timeout(
+            Duration::from_millis(50),
+            seed_one_batch(&mut driver, &verifier, 1, items, meta, &mut txids_out),
+        )
+        .await;
+
+        assert!(
+            cancelled.is_err(),
+            "the future must be cancelled mid-flight"
+        );
+        assert_eq!(
+            txids_out,
+            vec![txids[0]],
+            "the acked item must survive the dropped future"
+        );
+        assert_eq!(verifier.record_count(), 1);
+    }
+
+    /// Reconcile promotes ambiguous items too, and the very next thing the
+    /// loop does is sleep. Fails if the publish between reconcile and the
+    /// backoff is removed.
+    #[tokio::test]
+    async fn reconciled_items_are_published_before_the_backoff_sleep() {
+        let verifier = StateVerifier::new();
+        let mut txids_out: Vec<[u8; 32]> = Vec::new();
+        let (txids, items, meta) = two_item_batch();
+
+        // Opaque failure: nothing creditable from the response itself.
+        let mut driver =
+            ScriptedDriver::new(vec![Err(ClientError::Connection("ambiguous".to_string()))]);
+        // The read-back finds item 0 durably present; item 1 is really gone,
+        // so the loop still has work and reaches the (blocking) backoff.
+        driver.reconcilable.insert(txids[0]);
+        driver.block_in_backoff = true;
+
+        let cancelled = tokio::time::timeout(
+            Duration::from_millis(50),
+            seed_one_batch(&mut driver, &verifier, 1, items, meta, &mut txids_out),
+        )
+        .await;
+
+        assert!(
+            cancelled.is_err(),
+            "the future must be cancelled mid-flight"
+        );
+        assert_eq!(
+            txids_out,
+            vec![txids[0]],
+            "a reconciled item must be published before the backoff sleep"
+        );
+        assert_eq!(verifier.record_count(), 1);
     }
 }

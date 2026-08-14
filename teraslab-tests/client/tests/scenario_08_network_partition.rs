@@ -869,10 +869,18 @@ async fn run_scenario() -> Result<(), ClientError> {
         let reporter = Arc::new(MetricsReporter::new());
         let workload_duration = Duration::from_secs(30);
         let deadline = tokio::time::Instant::now() + workload_duration;
-        let mut partition_txids: Vec<[u8; 32]> = Vec::new();
         let mut errors = 0u32;
         let mut total_ops = 0u32;
         let mut batch_idx = 0u32;
+        // Records created during the partition are harvested from the verifier
+        // afterwards, NOT from each batch's return value. A batch abandoned by
+        // the per-batch timeout below has its future dropped, so its return
+        // value is lost even though `seed_records` already published every
+        // server-acked create into the verifier. Counting only returned
+        // batches reported "zero records were created" on a run where server
+        // metrics proved 21 records had been created (CI 31536584294).
+        let pre_workload_txids: std::collections::HashSet<[u8; 32]> =
+            verifier.all_txids().into_iter().collect();
 
         while tokio::time::Instant::now() < deadline {
             batch_idx += 1;
@@ -898,27 +906,56 @@ async fn run_scenario() -> Result<(), ClientError> {
             // Bound each batch by a SLICE of the budget, not the whole thing.
             // `seed_records` retries a transient batch up to 16 times with
             // backoff, and under this partition every attempt pays a connect
-            // timeout toward the unreachable peer — so one unlucky batch (any
-            // of its 5 records mapping to an affected shard) consumes the
-            // entire 30s window. Observed exactly that: "batch 1 exceeded the
-            // remaining workload budget (29.99s)", leaving 2 ops and 0 records
-            // created, which then trips the zero-records check.
+            // timeout toward the unreachable peer — so one unlucky batch
+            // (mapping to an affected shard) consumes the entire 30s window.
+            // Observed exactly that: "batch 1 exceeded the remaining workload
+            // budget (29.99s)", leaving 2 ops and 0 records created, which
+            // then trips the zero-records check.
             //
             // This sub-test measures how much work SURVIVES an asymmetric
             // partition, so it needs many attempts spread across the window
             // rather than one exhaustive retry chain. Abandon a stuck batch
             // quickly and move to the next.
-            const PER_BATCH_BUDGET: Duration = Duration::from_secs(3);
+            //
+            // The budget's job is to CAP THE STALL of a batch whose items ALL
+            // land on cut shards -- not to give a stuck create room to finish.
+            // Nothing here can be sized "comfortably above" what such a batch
+            // costs, because the real bounds are far longer than the whole
+            // workload window:
+            //   * when EVERY item of a batch fails with a retryable code
+            //     (ERR_REPLICATION_FAILED is one), the client retries inside
+            //     `create_batch` itself -- 15 attempts whose sleeps alone sum
+            //     to ~31s (`TRANSIENT_MUTATION_RETRY_DELAYS_MS`, client/rust);
+            //   * one server-side replica round trip under an iptables DROP
+            //     blackhole is ~13s on its own: 5s connect + 5s reconnect +
+            //     the 3s `replication_timeout_ms` ack wait
+            //     (`exchange_replica_batch`, src/server/dispatch.rs).
+            // A batch that is only PARTIALLY cut does not pay any of that: a
+            // partial response returns immediately, and `seed_records`
+            // credits the items it acknowledged into the verifier before its
+            // next await -- so the records survive even when the budget fires
+            // and drops this future. The earlier 3s budget was pure loss: it
+            // equalled `replication_timeout_ms`, so every batch touching a cut
+            // shard was abandoned by construction and counted zero creates
+            // (CI 31536584294).
+            const PER_BATCH_BUDGET: Duration = Duration::from_secs(8);
             let batch_budget = PER_BATCH_BUDGET
                 .min(remaining)
                 .max(Duration::from_millis(500));
+            // FIVE records per budgeted batch. With 3 nodes at RF=2 and one
+            // holder pair cut, ~1/3 of pairs straddle the partition, so a
+            // 5-item batch dodges the cut entirely only ~(2/3)^5 = 13% of the
+            // time -- dodging is not the point. Partial crediting is: a
+            // straddling batch fails FAST and partially, and the intact items
+            // are credited. A 1-item batch is all-or-nothing by construction,
+            // which is exactly the shape that triggers the client's ~31s
+            // internal retry chain and never produces a partial to credit.
             let create =
                 tokio::time::timeout(batch_budget, common::seed_records(&client, &verifier, 5, 5))
                     .await;
             match create {
-                Ok(Ok(batch)) => {
+                Ok(Ok(_)) => {
                     reporter.record("create", op_start.elapsed());
-                    partition_txids.extend_from_slice(&batch);
                     total_ops += 1;
                 }
                 Ok(Err(e)) => {
@@ -961,6 +998,15 @@ async fn run_scenario() -> Result<(), ClientError> {
             // Throttle to ~50 ops/sec
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+
+        // Everything the verifier gained during the window was created during
+        // the partition, including creates from batches the per-batch timeout
+        // abandoned before they could return.
+        let partition_txids: Vec<[u8; 32]> = verifier
+            .all_txids()
+            .into_iter()
+            .filter(|txid| !pre_workload_txids.contains(txid))
+            .collect();
 
         eprintln!(
             "[8d.2] Workload complete: {total_ops} ops, {errors} errors, {} records created",

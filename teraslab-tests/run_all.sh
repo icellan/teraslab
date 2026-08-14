@@ -75,6 +75,70 @@ else
     ts_filter() { awk '{ cmd = "date +%H:%M:%S"; cmd | getline t; close(cmd); printf "[%s] %s\n", t, $0; fflush(); }'; }
 fi
 
+# Print the first panic line in $1 that belongs to a REAL failure.
+#
+# `#[should_panic]` unit tests panic BY DESIGN, and under --nocapture their
+# panic text lands in the log AHEAD of the scenario's own failure. A plain
+# `grep -m1 'panicked at'` therefore blames a unit test that PASSED
+# ("test <name> - should panic ... ok") for the run's failure, which sends
+# triage down the wrong path.
+#
+# Pass 1 collects the names of tests whose result line says they panicked as
+# expected; pass 2 prints the first `panicked at` / `scenario failed` line
+# that is NOT attributable to one of them. Panic lines carry their test in
+# the thread name (`thread '<name>' (<id>) panicked at ...`). An
+# unattributable line is always kept -- suppression requires a positive match.
+# Lines may carry the [HH:MM:SS] prefix added by ts_filter.
+#
+# A suppressed panic is a WINDOW, not a single line: the panic MESSAGE BODY
+# follows on the next lines and carries no thread name of its own, so a
+# should-panic test whose message happens to contain "scenario failed" would
+# otherwise be printed as the run's cause right after its own `panicked at`
+# line was correctly skipped. The window opens on a suppressed panic line and
+# closes at the next `test ` line (the result line of that same test, or the
+# start of the next one).
+#
+# If every match in the log turns out to be suppressed, print a literal
+# `no attributable panic` so the SUMMARY FAIL row still has a cause cell
+# instead of an empty one.
+first_real_panic() {
+    awk '
+        function strip(s) { sub(/^\[[0-9][0-9]:[0-9][0-9]:[0-9][0-9]\] /, "", s); return s }
+        BEGIN { q = sprintf("%c", 39) }
+        NR == FNR {
+            line = strip($0)
+            if (line ~ /^test .* - should panic \.\.\. ok$/) {
+                split(line, f, " ")
+                expected[f[2]] = 1
+            }
+            next
+        }
+        {
+            line = strip($0)
+            if (line ~ /^test /) { suppressing = 0 }
+            if (line ~ /panicked at/) {
+                n = split(line, parts, q)
+                if (n >= 3 && (parts[2] in expected)) {
+                    suppressing = 1
+                    suppressed = 1
+                    next
+                }
+                suppressing = 0
+                printed = 1
+                print $0
+                exit
+            }
+            if (line ~ /scenario failed/) {
+                if (suppressing) { suppressed = 1; next }
+                printed = 1
+                print $0
+                exit
+            }
+        }
+        END { if (!printed && suppressed) print "no attributable panic" }
+    ' "$1" "$1"
+}
+
 # Wait until no containers matching the scenario-container pattern remain
 # and `docker ps` responds cleanly. Protects scenario 15 (next up) from
 # starting on a Docker daemon still recovering from the previous scenario's
@@ -171,7 +235,7 @@ for NUM in "${SCENARIOS[@]}"; do
     # For FAIL rows capture the first panic line (if any) for the summary.
     FIRST_PANIC=""
     if [ "$STATUS" = "FAIL" ]; then
-        FIRST_PANIC="$(grep -m1 -E 'panicked at|scenario failed' "$RESULTS_DIR/${TEST_NAME}.log" 2>/dev/null \
+        FIRST_PANIC="$(first_real_panic "$RESULTS_DIR/${TEST_NAME}.log" 2>/dev/null \
             | sed 's/[|]/\\|/g' | head -c 200 || true)"
     fi
     SUMMARY_ROWS+=("| $NUM | $NAME | $STATUS | ${SCENARIO_DURATION}s | ${FIRST_PANIC} |")
