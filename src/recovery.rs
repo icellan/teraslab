@@ -2242,71 +2242,93 @@ fn replay_unfreeze(
     ReplayResult::Applied
 }
 
-/// BUG-1 fix #3: register a recovered create entry while enforcing the
-/// offset-uniqueness invariant — no two keys may map to the same
-/// `record_offset`.
-///
-/// `index.register` rejects a duplicate KEY but NOT a duplicate OFFSET, so
-/// a stale aliased entry `A → record_offset` left in the index (e.g. by a
-/// pre-fix recovery run, or a snapshot taken before this fix) would coexist
-/// with the rightful owner being registered here, and `lookup(A)` would
-/// read the wrong record's bytes.
-///
-/// The caller has already verified (BUG-1 fix #2) that the on-device
-/// metadata at `record_offset` carries `key.txid`, so `key` is the rightful
-/// owner of whatever record currently lives there. Any OTHER key already
-/// mapped to the same offset is therefore the stale alias and is
-/// unregistered before `key` is registered. After this call exactly one
-/// key maps to `record_offset`.
-///
-/// Cost: a single index scan to locate a conflicting different-key entry.
-/// This runs only on the recovery (startup) create path, never the serving
-/// hot path. Returns the underlying [`crate::index::IndexError`] if the
-/// final `register` fails.
-/// Reverse map from `record_offset` to the single key that currently owns
-/// that offset in the primary index.
+/// Reverse map from a `(device_id, record_offset)` slot to the keys whose
+/// primary-index entries currently point at that slot.
 ///
 /// BUG-1 offset-uniqueness (fix #3) requires that, after recovery, no two
 /// keys map to the same `record_offset`. The original implementation
 /// enforced this by scanning the entire primary index (`index.iter()`) on
 /// EVERY recovered create to find a pre-existing alias — O(N) per create,
 /// O(M×N) total (M = creates replayed, N = loaded index size). This map
-/// replaces that scan: it is built ONCE at the start of recovery from
-/// `index.iter()` (O(N)), then each create consults it in O(1) and keeps it
+/// replaces that scan: it is built ONCE at the start of recovery from the
+/// loaded index (O(N)), then each create consults it in O(1) and keeps it
 /// in sync. Total cost is therefore O(N) once + O(1) per create.
 ///
-/// At the 10M-record target the map holds up to 10M `(u64, [u8; 32])`
-/// pairs ≈ 40 bytes/entry of payload (~400 MB transient, plus `HashMap`
-/// bucket overhead). It lives only for the duration of recovery and is
-/// dropped immediately after, so the peak is a startup-only cost.
+/// At the 10M-record target the map holds up to 10M slot → owner entries
+/// ≈ 40 bytes/entry of payload (~400 MB transient, plus `HashMap` bucket
+/// overhead). It lives only for the duration of recovery and is dropped
+/// immediately after, so the peak is a startup-only cost.
 // Keyed by (device_id, record_offset): record offsets are store-LOCAL, so two
 // records on different stores can legitimately share the same offset value.
 // Keying on offset alone would make a create on store 1 evict the same-offset
 // record on store 0 (multi-store aliasing false-positive).
-type OffsetOwners = std::collections::HashMap<(u8, u64), TxKey>;
+type OffsetOwners = std::collections::HashMap<(u8, u64), SlotOwners>;
 
-/// Build the [`OffsetOwners`] reverse map from the loaded primary index in a
-/// single O(N) pass.
+/// The owner set of one `(device_id, record_offset)` slot in [`OffsetOwners`].
 ///
-/// Called ONCE per recovery run, before the replay loop. After this point
-/// the map is the authoritative record of which key owns each offset and is
-/// updated incrementally by [`register_unique_offset`]; the per-create
-/// `index.iter()` scan is gone.
-///
-/// If the loaded index already contains two keys aliasing one offset (an
-/// impossible-but-defensive case from a corrupt snapshot), the last one
-/// visited by `iter()` wins in the map. That does not weaken correctness:
-/// the first legitimate create replayed against that offset will still
-/// evict whichever stale key the map records, and any remaining alias is
-/// caught by the R2 tx_id-mismatch purge.
+/// Almost every slot has exactly one owner (`One`, inline, no allocation).
+/// `Many` arises only when the fuzzy per-shard index snapshot captured two
+/// keys aliasing one slot (see [`build_offset_owners`]) — rare enough that
+/// its heap allocation is irrelevant.
+enum SlotOwners {
+    One(TxKey),
+    Many(Vec<TxKey>),
+}
+
+impl SlotOwners {
+    /// Iterate over every owner recorded for the slot.
+    fn iter(&self) -> std::slice::Iter<'_, TxKey> {
+        match self {
+            Self::One(k) => std::slice::from_ref(k).iter(),
+            Self::Many(v) => v.iter(),
+        }
+    }
+
+    /// Add `key` to the owner set. Build-time only: replay-time registration
+    /// collapses a slot to a single owner via `OffsetOwners::insert` (see
+    /// [`register_unique_offset`]), so `Many` never grows during replay.
+    fn push(&mut self, key: TxKey) {
+        match self {
+            Self::One(existing) => *self = Self::Many(vec![*existing, key]),
+            Self::Many(v) => v.push(key),
+        }
+    }
+}
+
 /// Build the [`OffsetOwners`] reverse map from the loaded primary index in a
 /// single O(N) pass, fanning out across all shards via [`ShardedIndex::for_each`].
 ///
-/// Called ONCE per recovery run, before the replay loop.
+/// Called ONCE per recovery run, before the replay loop. After this point the
+/// map is kept in sync incrementally: [`register_unique_offset`] (the only
+/// replay-time registration path) collapses a slot's owner set to the newly
+/// registered key, and [`evict_freed_region_owner`] clears it. Unregistrations
+/// that bypass the map (`replay_delete`) merely leave STALE map entries, which
+/// every consumer filters through the index-authority check (`index.lookup`
+/// must still point at the slot). The load-bearing invariant, established here
+/// and preserved by the above, is completeness: every key indexed at slot S
+/// appears in the map's owner set for S at all times.
+///
+/// Two keys aliasing one slot is legitimately reachable — NOT a corrupt-
+/// snapshot defensive case. The index snapshot is fuzzy PER-SHARD
+/// (`snapshot_all_concurrent` serializes each shard under its own short-lived
+/// lock while serving stays live), so "delete key1@X, LIFO-freelist-reuse
+/// create key2@X" is captured as BOTH key1 → X and key2 → X whenever
+/// shard(key1) serialized before the delete and shard(key2) after the create.
+/// All such aliases are tracked ([`SlotOwners::Many`]): a replayed
+/// `FreeRegion(X)` evicts every owner still pointing at X (delete-wins), and
+/// the reuse-create — globally sequenced after that free — re-registers the
+/// surviving key, collapsing the slot back to a single owner.
 fn build_offset_owners(index: &ShardedIndex) -> OffsetOwners {
     let mut owners = OffsetOwners::new();
     index.for_each(|key, entry| {
-        owners.insert((entry.device_id, entry.record_offset), key);
+        match owners.entry((entry.device_id, entry.record_offset)) {
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(SlotOwners::One(key));
+            }
+            // Fuzzy per-shard snapshot alias (see doc above) — track ALL
+            // owners so FreeRegion eviction sees every one of them.
+            std::collections::hash_map::Entry::Occupied(mut slot) => slot.get_mut().push(key),
+        }
     });
     owners
 }
@@ -2314,18 +2336,21 @@ fn build_offset_owners(index: &ShardedIndex) -> OffsetOwners {
 /// Register `key → entry` while preserving the BUG-1 offset-uniqueness
 /// invariant: no two keys may map to the same `record_offset`.
 ///
-/// Complexity: O(1). The pre-existing alias (a DIFFERENT key carried in
-/// from a persisted/snapshotted index that maps to the same offset) is
-/// found via an O(1) `offset_owners.get(&record_offset)` instead of a full
-/// `index.iter()` scan. With BUG-1 fix #2 in force no NEW alias can be
-/// created during this recovery run (registration only proceeds when the
-/// on-device tx_id matches the key, and one offset holds exactly one record
-/// / tx_id), so the only alias this evicts is that pre-existing one.
+/// The caller has already verified (BUG-1 fix #2) that the on-device
+/// metadata at `record_offset` carries `key.txid`, so `key` is the rightful
+/// owner of whatever record currently lives there. Every OTHER key in the
+/// slot's owner set — the fuzzy per-shard snapshot can carry more than one
+/// (see [`build_offset_owners`]) — is a candidate stale alias; each is
+/// verified against the live index (the map entry may be stale: a
+/// re-pointed key's OLD offset lingers, and `replay_delete` unregisters
+/// without touching the map) and unregistered only while its entry still
+/// points at this slot. After the call exactly `key` maps to the slot and
+/// the owner set collapses to it, so subsequent creates see the new owner.
 ///
-/// The correctness guarantee is identical to the prior O(N)-scan version:
-/// after the call the offset maps to exactly `key`, and any other key that
-/// previously aliased it has been `unregister`ed. `offset_owners` is kept
-/// in sync so subsequent creates see the new owner.
+/// Complexity: O(1) — one `offset_owners.get` plus one index lookup per
+/// (rare) alias candidate — on the recovery (startup) create path only,
+/// never the serving hot path. Returns the underlying
+/// [`crate::index::IndexError`] if the final `register` fails.
 fn register_unique_offset(
     index: &ShardedIndex,
     offset_owners: &mut OffsetOwners,
@@ -2333,29 +2358,37 @@ fn register_unique_offset(
     entry: TxIndexEntry,
 ) -> Result<(), crate::index::IndexError> {
     let record_offset = entry.record_offset;
-    let owner_key = (entry.device_id, record_offset);
+    let owner_slot = (entry.device_id, record_offset);
 
-    // O(1) lookup of any DIFFERENT key already aliasing this (store, offset).
-    if let Some(&stale) = offset_owners.get(&owner_key)
-        && stale != key
-    {
-        // The rightful owner is `key` (its txid matches the on-device
-        // record per fix #2); drop the stale alias so the offset maps to
-        // exactly one key.
-        index.unregister(&stale);
-        tracing::warn!(
-            target: "teraslab::recovery",
-            stale_txid_prefix = ?&stale.txid[..4],
-            owner_txid_prefix = ?&key.txid[..4],
-            record_offset,
-            "BUG-1: dropped stale index entry aliasing a record offset now owned by another key",
-        );
+    // O(1) lookup of any DIFFERENT keys already aliasing this (store, offset).
+    if let Some(prior_owners) = offset_owners.get(&owner_slot) {
+        for stale in prior_owners.iter().filter(|stale| **stale != key) {
+            // Index-authority check: only an entry STILL pointing at this
+            // slot is a real alias — a stale map entry (re-pointed or
+            // deleted key) must not evict a live entry elsewhere.
+            let aliases_slot = index.lookup(stale).is_some_and(|e| {
+                e.device_id == entry.device_id && e.record_offset == record_offset
+            });
+            if aliases_slot {
+                // The rightful owner is `key` (its txid matches the
+                // on-device record per fix #2); drop the stale alias so the
+                // offset maps to exactly one key.
+                index.unregister(stale);
+                tracing::warn!(
+                    target: "teraslab::recovery",
+                    stale_txid_prefix = ?&stale.txid[..4],
+                    owner_txid_prefix = ?&key.txid[..4],
+                    record_offset,
+                    "BUG-1: dropped stale index entry aliasing a record offset now owned by another key",
+                );
+            }
+        }
     }
 
     index.register(key, entry)?;
     // Record the rightful owner so a later create for the same (store, offset)
     // (or a re-replay of this one) sees `key`, not a stale snapshot alias.
-    offset_owners.insert(owner_key, key);
+    offset_owners.insert(owner_slot, SlotOwners::One(key));
     Ok(())
 }
 
@@ -2377,14 +2410,24 @@ fn register_unique_offset(
 /// `FreeRegion` is globally sequenced BEFORE the re-create, so the re-create
 /// registers cleanly instead of skipping against the stale snapshot offset.
 ///
+/// The slot's owner set can legitimately hold MORE than one key: the fuzzy
+/// per-shard snapshot captures "delete key1@X, LIFO-reuse create key2@X" as
+/// both key1 → X and key2 → X (see [`build_offset_owners`]). Delete-wins
+/// applies to ALL of them — every owner still pointing at the freed slot is
+/// evicted. That is correct for the slot-reusing successor too: its own
+/// create is globally sequenced AFTER this free, so its replay re-registers
+/// it (the eviction merely rewinds the index to this free's point in the
+/// mutation order); if the successor was itself deleted before the crash,
+/// its own later `FreeRegion` is the durable record that keeps it out.
+///
 /// `offset_owners` alone is NOT authoritative: `register_unique_offset`
 /// records a re-pointed key's NEW offset but leaves its OLD offset in the map
-/// (e.g. a legacy `Relocate` replayed earlier in this same pass), so the owner
-/// is verified against the live index and only unregistered while it still
-/// points at the freed `(device_id, offset)` slot. The map entry is dropped
-/// either way — after the free the slot has no owner.
+/// (e.g. a legacy `Relocate` replayed earlier in this same pass), so each
+/// owner is verified against the live index and only unregistered while it
+/// still points at the freed `(device_id, offset)` slot. The map entry is
+/// dropped either way — after the free the slot has no owner.
 ///
-/// Returns `true` when a stale entry was unregistered.
+/// Returns `true` when at least one stale entry was unregistered.
 fn evict_freed_region_owner(
     index: &ShardedIndex,
     offset_owners: &mut OffsetOwners,
@@ -2392,26 +2435,30 @@ fn evict_freed_region_owner(
     offset: u64,
 ) -> bool {
     let owner_slot = (device_id, offset);
-    let Some(owner) = offset_owners.remove(&owner_slot) else {
+    let Some(owners) = offset_owners.remove(&owner_slot) else {
         return false;
     };
-    let still_points_at_freed_slot = index
-        .lookup(&owner)
-        .is_some_and(|e| e.device_id == device_id && e.record_offset == offset);
-    if !still_points_at_freed_slot {
-        return false;
+    let mut evicted = false;
+    for owner in owners.iter() {
+        let still_points_at_freed_slot = index
+            .lookup(owner)
+            .is_some_and(|e| e.device_id == device_id && e.record_offset == offset);
+        if !still_points_at_freed_slot {
+            continue;
+        }
+        index.unregister(owner);
+        tracing::warn!(
+            target: "teraslab::recovery",
+            owner_txid_prefix = ?&owner.txid[..4],
+            device_id,
+            record_offset = offset,
+            "FreeRegion replay evicted a stale index entry pointing at the freed \
+             region (a delete crossed the last index snapshot; the fsynced \
+             FreeRegion is the delete's durable commit record)",
+        );
+        evicted = true;
     }
-    index.unregister(&owner);
-    tracing::warn!(
-        target: "teraslab::recovery",
-        owner_txid_prefix = ?&owner.txid[..4],
-        device_id,
-        record_offset = offset,
-        "FreeRegion replay evicted a stale index entry pointing at the freed \
-         region (a delete crossed the last index snapshot; the fsynced \
-         FreeRegion is the delete's durable commit record)",
-    );
-    true
+    evicted
 }
 
 /// Legacy (pre-`Create`) create replay.
@@ -8954,6 +9001,196 @@ mod tests {
             entry.record_offset, offset_b,
             "the entry must still point at the relocated offset B",
         );
+    }
+
+    /// Build the fuzzy-per-shard-snapshot alias state: two keys whose loaded
+    /// snapshot entries BOTH point at the same slot. True history: delete
+    /// `key1`@X, then a LIFO-freelist reuse creates `key2`@X; shard(key1) was
+    /// serialized BEFORE the delete and shard(key2) AFTER the create
+    /// (`snapshot_all_concurrent` serializes each shard under its own
+    /// short-lived lock), so the loaded index carries both aliases. The device
+    /// holds `key2`'s record at X — the last durable image before the crash.
+    fn register_fuzzy_alias_pair(
+        h: &mut RecoveryTestHarness,
+        n1: u8,
+        n2: u8,
+        utxo_count: u32,
+    ) -> (TxKey, TxKey, u64) {
+        // `create_record` writes key2's bytes at a fresh slot X and registers
+        // key2 → X.
+        let key2 = h.create_record(n2, utxo_count);
+        let offset = h.index.lookup(&key2).unwrap().record_offset;
+        // key1's snapshot entry still points at X (its delete crossed the
+        // snapshot; key2's create reused the freed slot).
+        let mut txid = [0u8; 32];
+        txid[0] = n1;
+        let key1 = TxKey { txid };
+        h.index
+            .register(
+                key1,
+                TxIndexEntry {
+                    device_id: 0,
+                    record_offset: offset,
+                    mined_slot: crate::index::mined_index::NO_MINED_SLOT,
+                },
+            )
+            .unwrap();
+        (key1, key2, offset)
+    }
+
+    /// `build_offset_owners` must track EVERY snapshot key aliasing a slot,
+    /// not a last-`for_each`-wins single owner. With a single-slot map one of
+    /// the two aliases is invisible to `evict_freed_region_owner` (which one
+    /// depends on the process-random shard/bucket seed), leaving a phantom
+    /// after `FreeRegion` replay in whichever branch the seed picks.
+    #[test]
+    fn build_offset_owners_tracks_all_fuzzy_snapshot_aliases() {
+        let mut h = RecoveryTestHarness::new();
+        let (key1, key2, offset) = register_fuzzy_alias_pair(&mut h, 0xE0, 0xE1, 2);
+
+        let owners = build_offset_owners(&h.index);
+        let at_slot = owners
+            .get(&(0, offset))
+            .expect("the aliased slot must have owners");
+        let listed: Vec<TxKey> = at_slot.iter().copied().collect();
+        assert_eq!(listed.len(), 2, "both snapshot aliases must be tracked");
+        assert!(
+            listed.contains(&key1) && listed.contains(&key2),
+            "owner set must contain BOTH aliased keys (order irrelevant)",
+        );
+    }
+
+    /// Residual scenario-09 window: fuzzy-snapshot aliasing must not defeat
+    /// FreeRegion eviction. True history: delete key1@X (L1), LIFO-reuse
+    /// create key2@X (L2), delete key2 (L3), crash. The loaded snapshot
+    /// aliases BOTH keys to X; the tail carries FreeRegion(X),
+    /// AllocateRegion(X)+create(key2@X), FreeRegion(X). Post-recovery NOTHING
+    /// may point at X and X must be free. Pre-fix the single-slot
+    /// `offset_owners` map failed this under EVERY seed: whichever alias the
+    /// map dropped survived as a phantom (branch (a): key2 outlives its L3
+    /// delete because the L2 skip-path never refreshed the map; branch (b):
+    /// key1 is never evicted because the map only ever knew key2), and the
+    /// index-wins freelist reconciliation then carved the freed slot back out
+    /// for the phantom.
+    #[test]
+    fn free_region_replay_closes_fuzzy_snapshot_alias_phantom() {
+        let mut h = RecoveryTestHarness::new();
+        let (key1, key2, offset) = register_fuzzy_alias_pair(&mut h, 0xE2, 0xE3, 2);
+        let record_size = TxMetadata::record_size_for(2);
+
+        let mut redo = h.redo_log();
+        // L1: key1's delete — the fsynced FreeRegion is its only durable
+        // commit record.
+        redo.append_and_flush(RedoOp::FreeRegion {
+            offset,
+            size: record_size,
+            device_id: 0,
+        })
+        .unwrap();
+        // L2: key2's create reuses the freed slot (LIFO freelist). The reuse
+        // allocation is journaled (C6) ahead of the create itself.
+        redo.append_and_flush(RedoOp::AllocateRegion {
+            offset,
+            size: record_size,
+            device_id: 0,
+        })
+        .unwrap();
+        redo.append_and_flush(RedoOp::ReplicaCreate {
+            device_id: 0,
+            tx_key: key2,
+            record_offset: offset,
+            utxo_count: 2,
+        })
+        .unwrap();
+        // L3: key2's delete.
+        redo.append_and_flush(RedoOp::FreeRegion {
+            offset,
+            size: record_size,
+            device_id: 0,
+        })
+        .unwrap();
+
+        let mut dah = DahBackend::new_in_memory();
+        let stats =
+            recover_all_with_allocator(&*h.data_dev, &redo, &h.index, &mut dah, Some(&mut h.alloc))
+                .unwrap();
+
+        assert!(
+            h.index.lookup(&key2).is_none(),
+            "key2 was durably deleted at L3 — it must not survive as a \
+             phantom over the freed slot (branch (a): the L2 skip left the \
+             single-slot owner map blind to key2)",
+        );
+        assert!(
+            h.index.lookup(&key1).is_none(),
+            "key1 was durably deleted at L1 — it must not survive as an \
+             unseen alias (branch (b): the single-slot owner map only ever \
+             knew key2)",
+        );
+        assert!(
+            h.alloc.free_region_containing(offset).is_some(),
+            "the twice-freed slot must end on the freelist — no index-wins \
+             carve-out for a phantom",
+        );
+        assert_eq!(stats.entries_failed, 0, "{stats:?}");
+    }
+
+    /// Branch (b) mechanism in isolation (crash BEFORE key2's delete):
+    /// `evict_freed_region_owner` must evict EVERY snapshot alias still
+    /// pointing at the freed slot — key1's delete-wins eviction must not
+    /// depend on which alias the owner map happens to hold — and the
+    /// globally-later create must then re-register key2 cleanly. Pre-fix
+    /// this failed whenever the process-random `for_each` order made the
+    /// last-wins map hold key2: the FreeRegion evicted key2 (re-registered
+    /// by the L2 create) while key1 stayed indexed at X forever.
+    #[test]
+    fn free_region_replay_evicts_every_aliased_snapshot_owner() {
+        let mut h = RecoveryTestHarness::new();
+        let (key1, key2, offset) = register_fuzzy_alias_pair(&mut h, 0xE4, 0xE5, 2);
+        let record_size = TxMetadata::record_size_for(2);
+
+        let mut redo = h.redo_log();
+        // key1's delete, then key2's slot-reusing create — crash before
+        // key2's own delete.
+        redo.append_and_flush(RedoOp::FreeRegion {
+            offset,
+            size: record_size,
+            device_id: 0,
+        })
+        .unwrap();
+        redo.append_and_flush(RedoOp::AllocateRegion {
+            offset,
+            size: record_size,
+            device_id: 0,
+        })
+        .unwrap();
+        redo.append_and_flush(RedoOp::ReplicaCreate {
+            device_id: 0,
+            tx_key: key2,
+            record_offset: offset,
+            utxo_count: 2,
+        })
+        .unwrap();
+
+        let mut dah = DahBackend::new_in_memory();
+        let stats =
+            recover_all_with_allocator(&*h.data_dev, &redo, &h.index, &mut dah, Some(&mut h.alloc))
+                .unwrap();
+
+        assert!(
+            h.index.lookup(&key1).is_none(),
+            "the FreeRegion must evict key1 even when the single-slot owner \
+             map would have held key2 (delete-wins applies to ALL aliases)",
+        );
+        let entry = h
+            .index
+            .lookup(&key2)
+            .expect("key2's durable re-create must survive recovery");
+        assert_eq!(
+            entry.record_offset, offset,
+            "key2 must be re-registered at the reused slot",
+        );
+        assert_eq!(stats.entries_failed, 0, "{stats:?}");
     }
 
     /// Task 16d: spend replay recomputes `spent_utxos` / `generation` /
