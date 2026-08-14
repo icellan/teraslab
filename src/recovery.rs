@@ -983,15 +983,36 @@ fn replay_one_recovery_entry(
             });
             ReplayResult::Skipped
         }
-        RedoOp::AllocateRegion { .. } | RedoOp::FreeRegion { .. } => {
+        RedoOp::AllocateRegion { .. } => match allocator.as_deref_mut() {
+            Some(alloc) => {
+                if alloc.replay_redo(&entry.op) {
+                    ReplayResult::Applied
+                } else {
+                    ReplayResult::Skipped
+                }
+            }
+            None => ReplayResult::Skipped,
+        },
+        RedoOp::FreeRegion {
+            offset, device_id, ..
+        } => {
+            // Scenario-09 phantom fix: production deletes journal NO
+            // `RedoOp::Delete` — the fsynced `FreeRegion` is the delete's only
+            // durable commit record (`Engine::delete_inner`). Evict any index
+            // entry still pointing at the freed slot BEFORE the allocator
+            // replays the free, or a delete that crossed the last index
+            // snapshot resurrects as a phantom entry over freed bytes. See
+            // `evict_freed_region_owner`.
+            let evicted = evict_freed_region_owner(index, offset_owners, *device_id, *offset);
             match allocator.as_deref_mut() {
                 Some(alloc) => {
-                    if alloc.replay_redo(&entry.op) {
+                    if alloc.replay_redo(&entry.op) || evicted {
                         ReplayResult::Applied
                     } else {
                         ReplayResult::Skipped
                     }
                 }
+                None if evicted => ReplayResult::Applied,
                 None => ReplayResult::Skipped,
             }
         }
@@ -1825,10 +1846,25 @@ fn replay_entry(
         // from it. `recover_all` handles it via the secondary backend; the
         // single-backend `recover` path skips.
         RedoOp::SecondaryDahUpdate { .. } => ReplayResult::Skipped,
-        // AllocateRegion / FreeRegion are allocator-scoped records. The
-        // single-backend `recover` path has no allocator handle — skip
-        // here and rely on `recover_all_with_allocator` to process them.
-        RedoOp::AllocateRegion { .. } | RedoOp::FreeRegion { .. } => ReplayResult::Skipped,
+        // AllocateRegion is an allocator-scoped record. The single-backend
+        // `recover` path has no allocator handle — skip here and rely on
+        // `recover_all_with_allocator` to process it.
+        RedoOp::AllocateRegion { .. } => ReplayResult::Skipped,
+        // FreeRegion: the allocator part is likewise skipped here, but the
+        // index part must still apply — the fsynced `FreeRegion` is the only
+        // durable record of a production delete, so any index entry still
+        // pointing at the freed slot is a phantom and must be evicted
+        // (mirrors `replay_one_recovery_entry`, keeping `recover` and the
+        // allocator paths convergent on the recovered index).
+        RedoOp::FreeRegion {
+            offset, device_id, ..
+        } => {
+            if evict_freed_region_owner(index, offset_owners, *device_id, *offset) {
+                ReplayResult::Applied
+            } else {
+                ReplayResult::Skipped
+            }
+        }
         // HashtableResizeBegin / HashtableResizeCommit are file-backed
         // index durability records handled by `recover_all_with_allocator`
         // (which tracks the pending-resize set and cleans up orphan tmp
@@ -2323,6 +2359,61 @@ fn register_unique_offset(
     Ok(())
 }
 
+/// Evict the index entry (if any) still pointing at a region being freed by a
+/// replayed [`RedoOp::FreeRegion`].
+///
+/// Production deletes (`Engine::delete_inner` — both `prune_delete` and
+/// `reclaim_held_copy`) journal NO `RedoOp::Delete`: the fsynced `FreeRegion`
+/// is the delete's ONLY durable commit record, while the tombstone header
+/// write and the primary-index removal stay in the volatile write-back cache /
+/// RAM. A delete that crossed the last index snapshot therefore leaves the
+/// snapshot entry live with only a `FreeRegion` in the redo tail; without this
+/// eviction the entry survives replay as a phantom pointing at freed (often
+/// already-zeroed) bytes — every read fails with a CRC mismatch and cluster
+/// drain wedges (CI scenario 09). A freed region can never legally keep a live
+/// index entry, so evicting restores exactly the invariant the fuzzy-snapshot
+/// contract assumes idempotent redo replay re-establishes. It also resolves
+/// the F-G4-014 delete+recreate-crossed-snapshot case: the old offset's
+/// `FreeRegion` is globally sequenced BEFORE the re-create, so the re-create
+/// registers cleanly instead of skipping against the stale snapshot offset.
+///
+/// `offset_owners` alone is NOT authoritative: `register_unique_offset`
+/// records a re-pointed key's NEW offset but leaves its OLD offset in the map
+/// (e.g. a legacy `Relocate` replayed earlier in this same pass), so the owner
+/// is verified against the live index and only unregistered while it still
+/// points at the freed `(device_id, offset)` slot. The map entry is dropped
+/// either way — after the free the slot has no owner.
+///
+/// Returns `true` when a stale entry was unregistered.
+fn evict_freed_region_owner(
+    index: &ShardedIndex,
+    offset_owners: &mut OffsetOwners,
+    device_id: u8,
+    offset: u64,
+) -> bool {
+    let owner_slot = (device_id, offset);
+    let Some(owner) = offset_owners.remove(&owner_slot) else {
+        return false;
+    };
+    let still_points_at_freed_slot = index
+        .lookup(&owner)
+        .is_some_and(|e| e.device_id == device_id && e.record_offset == offset);
+    if !still_points_at_freed_slot {
+        return false;
+    }
+    index.unregister(&owner);
+    tracing::warn!(
+        target: "teraslab::recovery",
+        owner_txid_prefix = ?&owner.txid[..4],
+        device_id,
+        record_offset = offset,
+        "FreeRegion replay evicted a stale index entry pointing at the freed \
+         region (a delete crossed the last index snapshot; the fsynced \
+         FreeRegion is the delete's durable commit record)",
+    );
+    true
+}
+
 /// Legacy (pre-`Create`) create replay.
 ///
 /// Replays a `RedoOp::ReplicaCreate` entry written before gap #2 added the
@@ -2366,18 +2457,21 @@ fn replay_replica_create(
     // surface a warning (F-G4-014). Skipping is still correct (a
     // later replay of Delete + Create restamped the index entry), but
     // the reordering may indicate an upstream bug worth investigating.
+    // The delete+recreate-crossed-snapshot case no longer lands here:
+    // the delete's `FreeRegion` for the old offset is globally sequenced
+    // BEFORE this re-create, and its replay evicts the stale snapshot
+    // entry (`evict_freed_region_owner`), so this create registers
+    // cleanly instead of skipping against the freed offset.
     if let Some(existing) = index.lookup(tx_key) {
         // The slim primary index no longer caches `utxo_count`; the record
-        // offset divergence is the load-bearing diagnostic (a delete+recreate
-        // that crossed the redo log restamps the offset).
+        // offset divergence is the load-bearing diagnostic.
         if existing.record_offset != record_offset {
             tracing::warn!(
                 target: "teraslab::recovery",
                 txid_prefix = ?&tx_key.txid[..4],
                 expected_record_offset = record_offset,
                 actual_record_offset = existing.record_offset,
-                "F-G4-014: replay_replica_create skipped — existing index entry diverges from redo entry; \
-                 likely a delete+recreate that crossed the redo log",
+                "F-G4-014: replay_replica_create skipped — existing index entry diverges from redo entry",
             );
         }
         return ReplayResult::Skipped;
@@ -3165,12 +3259,22 @@ fn replay_compensate_set_locked(
 /// then live in the index AND its offset is allocatable, so a later `create` can
 /// silently overwrite acked, durable data.
 ///
-/// Buffered mode's contract is that a crash may lose the tail of un-checkpointed
-/// mutations. A delete whose `FreeRegion` was fsynced but whose tombstone /
-/// index removal was NOT is exactly such a lost-tail delete, so the consistent
-/// recovered state is "the delete never happened": the record is ALIVE and its
-/// offset must NOT be reusable. This pass restores that by carving each live
-/// record's region back out of the freelist (index wins over the replayed free).
+/// The PRIMARY resolution is delete-wins at replay time: a `FreeRegion` in the
+/// replayed tail evicts any index entry still pointing at the freed slot
+/// (`evict_freed_region_owner` — the fsynced `FreeRegion` is the delete's
+/// durable commit record), so the journaled-FreeRegion case above never reaches
+/// this pass with a live entry. "The delete never happened" is NOT a sound
+/// resolution for it: the tombstone write and the index removal are not lost
+/// together, so resurrecting the entry can revive a phantom over already-zeroed
+/// bytes (CI scenario 09).
+///
+/// This pass remains the safety net for live-and-free skew that arrives WITHOUT
+/// a `FreeRegion` in the replayed tail — e.g. a torn checkpoint sequence that
+/// persisted the allocator snapshot (freelist contains the offset) after the
+/// index snapshot (entry still live) with the redo prefix already reclaimed.
+/// With no redo evidence of the delete, index-wins is the only consistent
+/// reconstruction: the record is ALIVE and its offset must NOT be reusable, so
+/// each live record's region is carved back out of the freelist.
 ///
 /// Zero hot-path cost: runs once at boot, after replay, before writes are
 /// accepted. Only offsets actually on the freelist trigger a metadata read, so a
@@ -8623,6 +8727,232 @@ mod tests {
             once.free_region_count(),
             twice.free_region_count(),
             "freelist size must be identical after any number of replays"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // FreeRegion replay must evict a stale index owner (scenario-09 phantom).
+    // -----------------------------------------------------------------------
+
+    /// Allocate a fresh region and write a full record for `txid` there
+    /// WITHOUT registering it in the index — the on-device image of a
+    /// post-snapshot recreate/relocate whose only index evidence is in the
+    /// redo tail.
+    fn allocate_and_write_record(
+        data_dev: &MemoryDevice,
+        alloc: &mut crate::allocator::BoxedAllocator,
+        txid: [u8; 32],
+        utxo_count: u32,
+    ) -> u64 {
+        let record_size = TxMetadata::record_size_for(utxo_count);
+        let offset = alloc.allocate(record_size).unwrap();
+        let mut meta = TxMetadata::new(utxo_count);
+        meta.tx_id = txid;
+        meta.record_size = record_size as u32;
+        let slots: Vec<UtxoSlot> = (0..utxo_count)
+            .map(|i| {
+                let mut h = [0u8; 32];
+                h[0] = i as u8;
+                UtxoSlot::new_unspent(h)
+            })
+            .collect();
+        io::write_full_record(data_dev, offset, &meta, &slots).unwrap();
+        offset
+    }
+
+    /// Scenario-09 (CI rolling restart) phantom resurrection: a record deleted
+    /// AFTER the last index-snapshot checkpoint journals NO `RedoOp::Delete` —
+    /// the fsynced `RedoOp::FreeRegion` is the delete's only durable commit
+    /// record (`Engine::delete_inner`). The snapshot-loaded index still
+    /// carries the entry, so `FreeRegion` replay must evict it. Pre-fix the
+    /// replay was allocator-only and the entry survived as a phantom pointing
+    /// at the freed slot — every read failed "CRC mismatch: expected
+    /// 0x00000000" and cluster drain wedged permanently.
+    #[test]
+    fn free_region_replay_evicts_index_entry_of_deleted_record() {
+        let mut h = RecoveryTestHarness::new();
+        // Registered in the harness index = present in the loaded snapshot.
+        let key = h.create_record(0xD9, 2);
+        let record_offset = h.index.lookup(&key).unwrap().record_offset;
+        let record_size = TxMetadata::record_size_for(2);
+
+        // The post-snapshot delete's only redo evidence.
+        let mut redo = h.redo_log();
+        redo.append_and_flush(RedoOp::FreeRegion {
+            offset: record_offset,
+            size: record_size,
+            device_id: 0,
+        })
+        .unwrap();
+
+        let mut dah = DahBackend::new_in_memory();
+        let stats =
+            recover_all_with_allocator(&*h.data_dev, &redo, &h.index, &mut dah, Some(&mut h.alloc))
+                .unwrap();
+
+        assert!(
+            h.index.lookup(&key).is_none(),
+            "FreeRegion replay must unregister the index entry still pointing \
+             at the freed slot — a freed region cannot keep a live index entry \
+             (scenario-09 phantom resurrection)",
+        );
+        assert!(
+            h.alloc.free_region_containing(record_offset).is_some(),
+            "the freed region must stay on the freelist — no index-wins \
+             reservation of a durably deleted record",
+        );
+        assert_eq!(stats.entries_replayed, 1, "the FreeRegion entry applied");
+    }
+
+    /// F-G4-014 subset: delete + recreate of the SAME key crossing the index
+    /// snapshot. The snapshot carries key → A; the redo tail carries the
+    /// delete's `FreeRegion(A)` (globally sequenced BEFORE the recreate) and
+    /// then the recreate at B. Pre-fix, `FreeRegion` replay left key → A in
+    /// the index, so the recreate hit the F-G4-014 "already indexed, offsets
+    /// diverge" skip and the index kept pointing at the FREED offset A. The
+    /// eviction lets the recreate register cleanly at B.
+    #[test]
+    fn free_region_replay_lets_recreate_register_after_crossing_snapshot() {
+        let mut h = RecoveryTestHarness::new();
+        let key = h.create_record(0xDA, 2);
+        let offset_a = h.index.lookup(&key).unwrap().record_offset;
+        let record_size = TxMetadata::record_size_for(2);
+        // The recreate's durable on-device image at a fresh offset B.
+        let offset_b = allocate_and_write_record(&h.data_dev, &mut h.alloc, key.txid, 2);
+
+        let mut redo = h.redo_log();
+        redo.append_and_flush(RedoOp::FreeRegion {
+            offset: offset_a,
+            size: record_size,
+            device_id: 0,
+        })
+        .unwrap();
+        redo.append_and_flush(RedoOp::ReplicaCreate {
+            device_id: 0,
+            tx_key: key,
+            record_offset: offset_b,
+            utxo_count: 2,
+        })
+        .unwrap();
+
+        let mut dah = DahBackend::new_in_memory();
+        recover_all_with_allocator(&*h.data_dev, &redo, &h.index, &mut dah, Some(&mut h.alloc))
+            .unwrap();
+
+        let entry = h
+            .index
+            .lookup(&key)
+            .expect("recreated record must be indexed after recovery");
+        assert_eq!(
+            entry.record_offset, offset_b,
+            "the index must point at the recreate's offset B, not the freed \
+             snapshot offset A (delete+recreate crossed the snapshot)",
+        );
+    }
+
+    /// Regression guard: a `FreeRegion` for a region with NO index owner
+    /// (e.g. an overflow parent/child array — never a record_offset) is a
+    /// pure allocator replay: unrelated live records are untouched and the
+    /// free still lands on the freelist.
+    #[test]
+    fn free_region_replay_without_index_owner_is_allocator_only() {
+        let mut h = RecoveryTestHarness::new();
+        let live_key = h.create_record(0xDB, 1);
+        // A non-record allocation; no index entry ever points at it.
+        let offset = h.alloc.allocate(4096).unwrap();
+
+        let mut redo = h.redo_log();
+        redo.append_and_flush(RedoOp::FreeRegion {
+            offset,
+            size: 4096,
+            device_id: 0,
+        })
+        .unwrap();
+
+        let mut dah = DahBackend::new_in_memory();
+        let stats =
+            recover_all_with_allocator(&*h.data_dev, &redo, &h.index, &mut dah, Some(&mut h.alloc))
+                .unwrap();
+
+        assert!(
+            h.index.lookup(&live_key).is_some(),
+            "an unrelated live record must survive a FreeRegion with no owner",
+        );
+        assert!(
+            h.alloc.free_region_containing(offset).is_some(),
+            "the ownerless free must still replay into the allocator",
+        );
+        assert_eq!(stats.entries_replayed, 1, "allocator applied the free");
+    }
+
+    /// The single-backend `recover` path (no allocator handle) must apply the
+    /// SAME index eviction, or `recover` and `recover_all_with_allocator`
+    /// diverge on the recovered index.
+    #[test]
+    fn recover_free_region_evicts_index_entry_without_allocator() {
+        let mut h = RecoveryTestHarness::new();
+        let key = h.create_record(0xDC, 2);
+        let record_offset = h.index.lookup(&key).unwrap().record_offset;
+
+        let mut redo = h.redo_log();
+        redo.append_and_flush(RedoOp::FreeRegion {
+            offset: record_offset,
+            size: TxMetadata::record_size_for(2),
+            device_id: 0,
+        })
+        .unwrap();
+
+        let stats = recover(&*h.data_dev, &redo, &h.index).unwrap();
+
+        assert!(
+            h.index.lookup(&key).is_none(),
+            "the single-backend path must evict the freed slot's index entry \
+             exactly like the allocator path",
+        );
+        assert_eq!(
+            stats.entries_replayed, 1,
+            "the eviction is an applied index mutation, not a skip",
+        );
+    }
+
+    /// Guard for the eviction's index-authority check: a key re-pointed to a
+    /// NEW offset earlier in the SAME replay (legacy `Relocate` log era)
+    /// leaves its OLD offset stale in `offset_owners`; a later `FreeRegion`
+    /// for the old extent must NOT evict the live re-pointed entry.
+    #[test]
+    fn free_region_replay_keeps_entry_repointed_by_earlier_relocate() {
+        let mut h = RecoveryTestHarness::new();
+        let key = h.create_record(0xDD, 2);
+        let offset_a = h.index.lookup(&key).unwrap().record_offset;
+        let record_size = TxMetadata::record_size_for(2);
+        // The relocated image at B, durable on device.
+        let offset_b = allocate_and_write_record(&h.data_dev, &mut h.alloc, key.txid, 2);
+
+        let mut redo = h.redo_log();
+        redo.append_and_flush(RedoOp::Relocate {
+            tx_key: key,
+            device_id: 0,
+            record_offset: offset_b,
+            utxo_count: 2,
+        })
+        .unwrap();
+        redo.append_and_flush(RedoOp::FreeRegion {
+            offset: offset_a,
+            size: record_size,
+            device_id: 0,
+        })
+        .unwrap();
+
+        let mut dah = DahBackend::new_in_memory();
+        recover_all_with_allocator(&*h.data_dev, &redo, &h.index, &mut dah, Some(&mut h.alloc))
+            .unwrap();
+
+        let entry = h.index.lookup(&key).expect(
+            "relocated record must stay live — FreeRegion for its OLD extent must not evict it",
+        );
+        assert_eq!(
+            entry.record_offset, offset_b,
+            "the entry must still point at the relocated offset B",
         );
     }
 

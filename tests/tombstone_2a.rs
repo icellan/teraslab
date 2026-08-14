@@ -523,13 +523,19 @@ fn tombstone_not_written_for_preserved_or_notdue_delete() {
     assert!(h.engine.tombstone_lookup(&k).is_none());
 }
 
-/// **Invariant TS-1.** A delete lost to a pre-checkpoint crash leaves the record
-/// LIVE (resurrected by the buffered-delete reconcile) and writes NO tombstone.
-/// This empirically validates that the tombstone append rides the SAME barrier
-/// as the delete's index-unregister + FreeRegion: a crash before checkpoint
-/// reverts BOTH, so there is never a dangling tombstone over a live record.
+/// **Invariant TS-1.** There is never a dangling tombstone over a LIVE record.
+///
+/// A delete crashed before the next checkpoint now STICKS (delete-wins,
+/// scenario-09 phantom fix): the fsynced FreeRegion is the delete's durable
+/// commit record, so `FreeRegion` replay evicts the re-indexed entry — while
+/// the un-checkpointed tombstone append reverts (the tombstone log persists at
+/// checkpoint, step 2c). The recovered state is "deleted, no tombstone": TS-1
+/// holds vacuously, and the exposure is in the SAFE direction — a missing
+/// tombstone merely lets a peer heal re-push the key's replicated copy
+/// (eventually consistent, spec §3.18), whereas a dangling tombstone over a
+/// live record would wrongly veto repairs, and that state remains impossible.
 #[test]
-fn tombstone_absent_when_delete_reverted_by_buffered_reconcile() {
+fn tombstone_absent_when_uncheckpointed_delete_sticks() {
     let h = Harness::new_with_tombstones();
     let k = h.seed_record(11, 2);
 
@@ -547,16 +553,18 @@ fn tombstone_absent_when_delete_reverted_by_buffered_reconcile() {
     h.crash();
     let rec = h.recover();
 
-    // The record's intact header is re-indexed and reconciliation pulls its
-    // offset back off the freelist: the record is LIVE again.
+    // Delete-wins: the durable FreeRegion evicts the re-indexed entry on
+    // replay — the acked delete sticks across the crash.
     assert!(
-        rec.lookup(&k).is_some(),
-        "TS-1: a delete reverted by the buffered reconcile must leave the record LIVE"
+        rec.lookup(&k).is_none(),
+        "the fsynced FreeRegion is the delete's durable commit record — the \
+         delete must stick across a pre-checkpoint crash, not revert"
     );
-    // And there must be NO tombstone — the un-checkpointed append reverted too.
+    // And there is NO tombstone — the un-checkpointed append reverted. TS-1
+    // (no dangling tombstone over a live record) holds: the record is gone.
     assert!(
         !rec.tombstone_at_or_ahead(&k, u32::MAX),
-        "TS-1 VIOLATED: a dangling tombstone survived over a resurrected live record"
+        "TS-1 VIOLATED: a tombstone survived a crash its append never checkpointed through"
     );
     assert!(rec.tombstone_lookup(&k).is_none());
 }
