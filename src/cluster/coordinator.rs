@@ -8718,6 +8718,45 @@ pub(crate) fn build_record_replay_ops(
     }))
 }
 
+/// Scenario 11 (staging backpressure): bounded same-batch resends when a
+/// migration target NAKs a sub-batch [`ReplicaAck::Busy`] (chunk-staging
+/// pressure at a part-0 open, or a transiently full redo — FU#6a), with the
+/// backoff between tries.
+///
+/// Deliberately a LONGER budget than the steady-state replication loop's
+/// (`MAX_BUSY_RETRIES` × `BUSY_RETRY_BACKOFF` in `server::dispatch`, kept
+/// short to protect client mutation latency): staging pressure clears only
+/// when a concurrent large-op assembly COMPLETES — seconds for a 50 MiB
+/// baseline op on a loaded target — and the migration worker has no client
+/// waiting on it. Bounded so a wedged target still fails the sub-batch, which
+/// fails the shard and hands control back to the outer migration
+/// retry/backoff machinery.
+const MIGRATION_BUSY_RETRIES: usize = 20;
+const MIGRATION_BUSY_BACKOFF: Duration = Duration::from_millis(250);
+
+/// Decode a migration-batch response payload as the retriable
+/// [`ReplicaAck::Busy`] backpressure NAK, if that is what it is.
+///
+/// The receiver ships `Busy` in a `STATUS_ERROR` envelope, so the migration
+/// senders must sniff it BEFORE the generic error decode: a Busy NAK means
+/// nothing was applied, staged, or journaled, and the identical sub-batch can
+/// succeed once the pressure drains — failing the shard instead re-runs the
+/// whole baseline later, amplifying churn under exactly the memory pressure
+/// that caused the NAK. The exact-length check (a serialized `Busy` is
+/// exactly 9 bytes) keeps a `[code:u16][msg_len:u16][msg]` error envelope
+/// whose code low byte happens to be the Busy tag from ever classifying as
+/// retriable.
+fn decode_migration_busy_nak(payload: &[u8]) -> Option<u64> {
+    use crate::replication::protocol::ReplicaAck;
+    if payload.len() != 9 {
+        return None;
+    }
+    match ReplicaAck::deserialize(payload) {
+        Ok(ReplicaAck::Busy { first_sequence }) => Some(first_sequence),
+        _ => None,
+    }
+}
+
 /// Stream baseline records for one shard on an existing TCP connection.
 ///
 /// Returns the manifest hash accumulated over all streamed records
@@ -8798,7 +8837,35 @@ fn stream_shard_baseline(
                 payload: sub.serialize().into(),
             };
 
-            let response = exchange_frame(stream, &request, auth_secret)?;
+            // Scenario 11: a `Busy` NAK (chunk-staging/redo backpressure) is
+            // retriable — nothing was applied or staged on the target, so
+            // re-send the IDENTICAL sub-batch after a backoff, bounded by
+            // `MIGRATION_BUSY_RETRIES`, instead of failing the whole shard
+            // baseline over transient memory pressure.
+            let mut busy_retries = 0usize;
+            let response = loop {
+                let response = exchange_frame(stream, &request, auth_secret)?;
+                if response.status != STATUS_OK
+                    && let Some(first_sequence) = decode_migration_busy_nak(&response.payload)
+                {
+                    busy_retries += 1;
+                    if busy_retries > MIGRATION_BUSY_RETRIES {
+                        return Err(format!(
+                            "migration batch: replica still busy (backpressure) at seq \
+                             {first_sequence} after {MIGRATION_BUSY_RETRIES} same-batch retries"
+                        ));
+                    }
+                    tracing::warn!(
+                        shard = task.shard,
+                        busy_retries,
+                        "cluster: migration target NAKed Busy (backpressure); \
+                         backing off and re-sending the same sub-batch",
+                    );
+                    std::thread::sleep(MIGRATION_BUSY_BACKOFF);
+                    continue;
+                }
+                break response;
+            };
 
             use crate::replication::protocol::ReplicaAck;
             // Check the frame status first. A STATUS_ERROR response carries EITHER a
@@ -10033,7 +10100,36 @@ fn send_delta_ops(
             flags: FLAG_MIGRATION_BATCH,
             payload: sub.serialize().into(),
         };
-        let response = exchange_frame(stream, &request, auth_secret)?;
+
+        // Scenario 11: a `Busy` NAK (chunk-staging/redo backpressure) is
+        // retriable — nothing was applied or staged on the target, so re-send
+        // the IDENTICAL sub-batch after a backoff, bounded by
+        // `MIGRATION_BUSY_RETRIES`, instead of failing the delta (and with it
+        // the shard) over transient memory pressure.
+        let mut busy_retries = 0usize;
+        let response = loop {
+            let response = exchange_frame(stream, &request, auth_secret)?;
+            if response.status != STATUS_OK
+                && let Some(first_sequence) = decode_migration_busy_nak(&response.payload)
+            {
+                busy_retries += 1;
+                if busy_retries > MIGRATION_BUSY_RETRIES {
+                    return Err(format!(
+                        "delta batch: replica still busy (backpressure) at seq \
+                         {first_sequence} after {MIGRATION_BUSY_RETRIES} same-batch retries"
+                    ));
+                }
+                tracing::warn!(
+                    shard,
+                    busy_retries,
+                    "cluster: delta target NAKed Busy (backpressure); \
+                     backing off and re-sending the same sub-batch",
+                );
+                std::thread::sleep(MIGRATION_BUSY_BACKOFF);
+                continue;
+            }
+            break response;
+        };
 
         // Check the frame STATUS first — same ordering as the baseline migration
         // path above, and load-bearing for the same reason. A STATUS_ERROR frame
@@ -19816,6 +19912,131 @@ mod tests {
             "the receiver's message must be surfaced, got: {err}"
         );
         server.join().unwrap();
+    }
+
+    /// Read one framed request off a mock migration-target connection.
+    fn read_request_frame(conn: &mut std::net::TcpStream) -> RequestFrame {
+        use std::io::Read as _;
+        let mut header = [0u8; 4];
+        conn.read_exact(&mut header).unwrap();
+        let len = u32::from_le_bytes(header) as usize;
+        let mut body = vec![0u8; len];
+        conn.read_exact(&mut body).unwrap();
+        let mut frame = header.to_vec();
+        frame.extend_from_slice(&body);
+        let (request, _) = RequestFrame::decode(&frame).unwrap();
+        request
+    }
+
+    /// Scenario 11 (staging backpressure): a delta sub-batch NAKed `Busy`
+    /// (STATUS_ERROR envelope — the receiver's chunk-staging or full-redo
+    /// pressure NAK) must be re-sent IDENTICALLY after a backoff instead of
+    /// failing the shard, and the send must succeed once the target admits it.
+    #[test]
+    fn send_delta_ops_retries_identical_batch_on_busy_nak() {
+        use crate::protocol::opcodes::{STATUS_ERROR, STATUS_OK};
+        use crate::replication::protocol::{ReplicaAck, ReplicaOp};
+        use std::io::Write as _;
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            let first = read_request_frame(&mut conn);
+            let busy = ResponseFrame {
+                request_id: first.request_id,
+                status: STATUS_ERROR,
+                payload: ReplicaAck::Busy { first_sequence: 0 }.serialize(),
+            };
+            conn.write_all(&busy.encode()).unwrap();
+            let second = read_request_frame(&mut conn);
+            let ok = ResponseFrame {
+                request_id: second.request_id,
+                status: STATUS_OK,
+                payload: ReplicaAck::Ok {
+                    through_sequence: 0,
+                }
+                .serialize(),
+            };
+            conn.write_all(&ok.encode()).unwrap();
+            (first.payload, second.payload)
+        });
+
+        let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(1)).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let ops = vec![ReplicaOp::Freeze {
+            tx_key: TxKey { txid: [7u8; 32] },
+            offset: 0,
+            master_generation: 1,
+        }];
+        send_delta_ops(&mut stream, 7, &ops, 99, 1, None)
+            .expect("a Busy NAK must back off and retry the same sub-batch, then succeed");
+
+        let (first, second) = server.join().unwrap();
+        assert_eq!(
+            first, second,
+            "the Busy retry must re-send the IDENTICAL sub-batch"
+        );
+    }
+
+    /// Scenario 11 (staging backpressure): same contract for the shard
+    /// baseline — a `Busy` NAK re-sends the identical sub-batch instead of
+    /// failing the whole baseline (which would re-run the entire shard
+    /// migration later, amplifying churn under the very memory pressure
+    /// that caused the NAK).
+    #[test]
+    fn stream_shard_baseline_retries_identical_batch_on_busy_nak() {
+        use crate::protocol::opcodes::{STATUS_ERROR, STATUS_OK};
+        use crate::replication::protocol::ReplicaAck;
+        use std::io::Write as _;
+
+        let engine = test_engine();
+        let shard = 77u16;
+        let live_key = tx_key_for_shard(shard, 1);
+        create_test_record(&engine, live_key);
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let receiver = std::thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            let first = read_request_frame(&mut conn);
+            let busy = ResponseFrame {
+                request_id: first.request_id,
+                status: STATUS_ERROR,
+                payload: ReplicaAck::Busy { first_sequence: 0 }.serialize(),
+            };
+            conn.write_all(&busy.encode()).unwrap();
+            let second = read_request_frame(&mut conn);
+            let ok = ResponseFrame {
+                request_id: second.request_id,
+                status: STATUS_OK,
+                payload: ReplicaAck::Ok {
+                    through_sequence: 0,
+                }
+                .serialize(),
+            };
+            conn.write_all(&ok.encode()).unwrap();
+            (first.payload, second.payload)
+        });
+
+        let mut stream = std::net::TcpStream::connect(addr).unwrap();
+        let task = MigrationTask {
+            shard,
+            from_node: NodeId(1),
+            to_node: NodeId(2),
+            is_master: true,
+        };
+        stream_shard_baseline(&task, &[&live_key], &engine, &mut stream, 64, 0, None)
+            .expect("a Busy NAK must back off and retry the same sub-batch, then succeed");
+
+        let (first, second) = receiver.join().unwrap();
+        assert_eq!(
+            first, second,
+            "the Busy retry must re-send the IDENTICAL sub-batch"
+        );
     }
 
     fn key_for_shard(shard: u16) -> TxKey {

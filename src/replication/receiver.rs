@@ -761,6 +761,31 @@ const MAX_STAGED_OP_BYTES: u64 = 64 * 1024 * 1024;
 /// by many concurrent oversized streams.
 const MAX_STAGED_TOTAL_BYTES: u64 = 256 * 1024 * 1024;
 
+/// Why [`stage_chunk`] refused a part, split by retriability.
+///
+/// `Pressure` is the ONE transient refusal: an opening part that would push
+/// the sum of open assemblies past [`MAX_STAGED_TOTAL_BYTES`]. Nothing of the
+/// op was staged (the check fires at part 0, before any insert), so the
+/// IDENTICAL delivery can succeed once an open assembly elsewhere completes —
+/// the apply loop maps it to the retriable [`ReplicaAck::Busy`] NAK, mirroring
+/// the full-redo backpressure NAK, so the sender backs off and re-sends the
+/// same batch. The historical terminal [`ReplicaAck::Error`] here failed an
+/// ENTIRE shard baseline/delta over a moment of memory pressure (CI scenario
+/// 11: concurrent large-blob baselines against one target), re-running the
+/// whole shard later and amplifying churn under exactly the pressure that
+/// caused it.
+///
+/// Every other refusal is `Hard`: re-sending the same bytes can never succeed
+/// (per-op cap, index/sequence violations, conflicts, tamper, decode
+/// failures), so those keep the fail-closed error path — including the part-0
+/// conflict NAK, whose contract is re-send-from-part-0, never same-batch
+/// retry.
+#[derive(Debug)]
+enum ChunkStageError {
+    Pressure(String),
+    Hard(String),
+}
+
 /// One open chunked-op assembly (see [`stage_chunk`]).
 struct ChunkStaging {
     buf: Vec<u8>,
@@ -788,9 +813,10 @@ fn chunk_staging()
 ///
 /// Returns `Ok(None)` for a mid-assembly part (nothing to apply),
 /// `Ok(Some(inner))` when this part completed the assembly — the caller
-/// applies `inner` through the normal per-op path — and `Err(message)`
-/// on any violation, after dropping the open assembly so a full re-send
-/// from part 0 starts clean:
+/// applies `inner` through the normal per-op path — and an error
+/// (classified for retriability, see [`ChunkStageError`]) on any
+/// violation, after dropping the open assembly so a full re-send from
+/// part 0 starts clean:
 ///
 /// - index out of range, or a part that is not the next expected index
 ///   (parts are ordered within one TCP stream; a mismatch means loss or
@@ -808,7 +834,10 @@ fn chunk_staging()
 ///   onto the now-empty entry;
 /// - a completed assembly whose bytes disagree with `total_len`, decode
 ///   to trailing garbage, or decode to a nested chunk.
-fn stage_chunk(stream_key: &str, op: &ReplicaOp) -> std::result::Result<Option<ReplicaOp>, String> {
+fn stage_chunk(
+    stream_key: &str,
+    op: &ReplicaOp,
+) -> std::result::Result<Option<ReplicaOp>, ChunkStageError> {
     let ReplicaOp::OpChunk {
         tx_key,
         chunk_index,
@@ -817,17 +846,19 @@ fn stage_chunk(stream_key: &str, op: &ReplicaOp) -> std::result::Result<Option<R
         payload,
     } = op
     else {
-        return Err("stage_chunk called on a non-chunk op".to_string());
+        return Err(ChunkStageError::Hard(
+            "stage_chunk called on a non-chunk op".to_string(),
+        ));
     };
     if *chunk_count == 0 || *chunk_index >= *chunk_count {
-        return Err(format!(
+        return Err(ChunkStageError::Hard(format!(
             "chunk index {chunk_index} out of range (count {chunk_count})"
-        ));
+        )));
     }
     if *total_len > MAX_STAGED_OP_BYTES {
-        return Err(format!(
+        return Err(ChunkStageError::Hard(format!(
             "chunked op total_len {total_len} exceeds the {MAX_STAGED_OP_BYTES} byte per-op staging cap"
-        ));
+        )));
     }
     let key = (stream_key.to_string(), *tx_key);
     let mut map = chunk_staging().lock();
@@ -850,11 +881,11 @@ fn stage_chunk(stream_key: &str, op: &ReplicaOp) -> std::result::Result<Option<R
         // other delivery's in-flight parts fail below with "no open
         // assembly" and its sender re-ships from part 0.
         if map.remove(&key).is_some() {
-            return Err(format!(
+            return Err(ChunkStageError::Hard(format!(
                 "chunk assembly conflict for {tx_key:?}: part 0 arrived while an \
                  assembly was already open (concurrent duplicate delivery or stale \
                  residue) — assembly dropped, re-send from part 0"
-            ));
+            )));
         }
         let open_elsewhere: u64 = map
             .iter()
@@ -862,9 +893,9 @@ fn stage_chunk(stream_key: &str, op: &ReplicaOp) -> std::result::Result<Option<R
             .map(|(_, st)| st.total_len)
             .sum();
         if open_elsewhere + *total_len > MAX_STAGED_TOTAL_BYTES {
-            return Err(format!(
+            return Err(ChunkStageError::Pressure(format!(
                 "chunk staging full: {open_elsewhere} bytes already open, refusing {total_len} more                  (cap {MAX_STAGED_TOTAL_BYTES})"
-            ));
+            )));
         }
         map.insert(
             key.clone(),
@@ -877,23 +908,23 @@ fn stage_chunk(stream_key: &str, op: &ReplicaOp) -> std::result::Result<Option<R
         );
     }
     let Some(st) = map.get_mut(&key) else {
-        return Err(format!(
+        return Err(ChunkStageError::Hard(format!(
             "chunk {chunk_index}/{chunk_count} for {tx_key:?} has no open assembly              (receiver restarted mid-assembly or part 0 was never delivered) — re-send from part 0"
-        ));
+        )));
     };
     if *chunk_index != st.next_index || *chunk_count != st.chunk_count || *total_len != st.total_len
     {
         let expected = st.next_index;
         map.remove(&key);
-        return Err(format!(
+        return Err(ChunkStageError::Hard(format!(
             "chunk sequence violation for {tx_key:?}: got part {chunk_index}/{chunk_count}              (total_len {total_len}), expected part {expected} — assembly dropped, re-send from part 0"
-        ));
+        )));
     }
     if st.buf.len() as u64 + payload.len() as u64 > st.total_len {
         map.remove(&key);
-        return Err(format!(
+        return Err(ChunkStageError::Hard(format!(
             "chunk payloads for {tx_key:?} exceed the declared total_len {total_len} —              assembly dropped"
-        ));
+        )));
     }
     st.buf.extend_from_slice(payload);
     st.next_index += 1;
@@ -901,30 +932,33 @@ fn stage_chunk(stream_key: &str, op: &ReplicaOp) -> std::result::Result<Option<R
         return Ok(None);
     }
     let Some(st) = map.remove(&key) else {
-        return Err(format!(
+        return Err(ChunkStageError::Hard(format!(
             "chunk assembly for {tx_key:?} vanished mid-completion"
-        ));
+        )));
     };
     drop(map);
     if st.buf.len() as u64 != st.total_len {
-        return Err(format!(
+        return Err(ChunkStageError::Hard(format!(
             "reassembled op for {tx_key:?} is {} bytes, declared total_len {}",
             st.buf.len(),
             st.total_len,
-        ));
+        )));
     }
-    let (inner, consumed) = ReplicaOp::deserialize(&st.buf)
-        .map_err(|e| format!("reassembled op for {tx_key:?} failed to decode: {e}"))?;
+    let (inner, consumed) = ReplicaOp::deserialize(&st.buf).map_err(|e| {
+        ChunkStageError::Hard(format!(
+            "reassembled op for {tx_key:?} failed to decode: {e}"
+        ))
+    })?;
     if consumed != st.buf.len() {
-        return Err(format!(
+        return Err(ChunkStageError::Hard(format!(
             "reassembled op for {tx_key:?} decoded {consumed} of {} bytes — trailing garbage",
             st.buf.len(),
-        ));
+        )));
     }
     if matches!(inner, ReplicaOp::OpChunk { .. }) {
-        return Err(format!(
+        return Err(ChunkStageError::Hard(format!(
             "reassembled op for {tx_key:?} is a nested chunk — protocol violation"
-        ));
+        )));
     }
     Ok(Some(inner))
 }
@@ -1359,7 +1393,35 @@ pub fn handle_replica_batch_with_tracker_and_master_lookup(
                     reassembled = inner;
                     &reassembled
                 }
-                Err(message) => {
+                Err(ChunkStageError::Pressure(message)) => {
+                    // Scenario 11: the process-wide chunk-staging cap is
+                    // momentarily exhausted by concurrent large-op assemblies
+                    // (other baselines/deltas against this node). Nothing of
+                    // THIS op was staged (the cap check fires at part 0,
+                    // before any insert), nothing was journaled, and the
+                    // watermark does not advance — mirror the full-redo NAK
+                    // below: `Busy` in the `STATUS_ERROR` envelope, so the
+                    // sender re-sends the IDENTICAL batch after a short
+                    // backoff instead of failing the whole shard over
+                    // transient memory pressure. A batch prefix already
+                    // applied in RAM re-applies idempotently on the resend
+                    // and re-collects its redo, exactly like the full-redo
+                    // Busy path.
+                    tracing::warn!(
+                        seq,
+                        %message,
+                        "replication: chunk staging at capacity; NAKing Busy (retriable)",
+                    );
+                    let ack = ReplicaAck::Busy {
+                        first_sequence: batch.first_sequence,
+                    };
+                    return ResponseFrame {
+                        request_id: request.request_id,
+                        status: STATUS_ERROR,
+                        payload: ack.serialize(),
+                    };
+                }
+                Err(ChunkStageError::Hard(message)) => {
                     let ack = ReplicaAck::Error {
                         failed_sequence: seq,
                         message,
@@ -8696,6 +8758,16 @@ mod tests {
         crate::cluster::shards::ShardTable::shard_for_key(&k)
     }
 
+    /// Serializes tests that OPEN chunk assemblies against the process-global
+    /// [`CHUNK_STAGING`] map. The staging-pressure test saturates the
+    /// process-wide cap ([`MAX_STAGED_TOTAL_BYTES`]) for its whole body; a
+    /// concurrent part-0 open in another test would then NAK `Busy` and fail
+    /// that test's `STATUS_OK` assertion. parking_lot mutex (no poisoning) so
+    /// one panicking test cannot cascade. Tests whose part never opens an
+    /// assembly (e.g. the per-op-cap reject, which fires before the process
+    /// cap) do not need it.
+    static CHUNK_STAGING_TEST_SERIAL: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
     /// Slice a serialized op into OpChunk parts (any tiling is valid — the
     /// receiver keys on index/count/total_len, not on CHUNK_PAYLOAD_MAX).
     fn chunk_op(op: &ReplicaOp, parts: usize) -> Vec<ReplicaOp> {
@@ -8759,6 +8831,7 @@ mod tests {
     /// engine.
     #[test]
     fn chunked_create_reassembles_across_batches_and_applies() {
+        let _serial = CHUNK_STAGING_TEST_SERIAL.lock();
         let engine = make_engine();
         let tracker = ReplicaAppliedTracker::in_memory();
         let k = key(90);
@@ -8791,6 +8864,7 @@ mod tests {
     /// the restart now costs one explicit NAK round instead.
     #[test]
     fn chunk_restart_at_index_zero_conflicts_then_clean_resend_applies() {
+        let _serial = CHUNK_STAGING_TEST_SERIAL.lock();
         let engine = make_engine();
         let tracker = ReplicaAppliedTracker::in_memory();
         let k = key(91);
@@ -8826,6 +8900,7 @@ mod tests {
     /// then succeeds.
     #[test]
     fn chunk_out_of_order_naks_and_clears_staging() {
+        let _serial = CHUNK_STAGING_TEST_SERIAL.lock();
         let engine = make_engine();
         let tracker = ReplicaAppliedTracker::in_memory();
         let k = key(92);
@@ -8850,6 +8925,88 @@ mod tests {
         assert!(engine.read_metadata(&k).is_ok());
     }
 
+    /// Scenario 11 (staging backpressure): a part-0 open that would push the
+    /// process-wide staging sum past [`MAX_STAGED_TOTAL_BYTES`] is TRANSIENT
+    /// pressure — concurrent large-blob baselines hold the cap and will
+    /// release it when their assemblies complete. The receiver must NAK the
+    /// retriable [`ReplicaAck::Busy`] (mirroring the full-redo backpressure
+    /// NAK) with NOTHING applied or staged, so the sender re-sends the
+    /// IDENTICAL batch after a backoff instead of failing the whole shard
+    /// baseline/delta. Once the pressure clears, that identical re-send must
+    /// apply — which also proves nothing of the op was staged under the Busy
+    /// NAK (a staged part 0 would make the re-send's part 0 CONFLICT).
+    #[test]
+    fn chunk_staging_pressure_naks_busy_then_identical_resend_applies() {
+        let _serial = CHUNK_STAGING_TEST_SERIAL.lock();
+        let engine = make_engine();
+        let tracker = ReplicaAppliedTracker::in_memory();
+        let k = key(97);
+        let parts = chunk_op(&chunk_test_create(k), 3);
+        let batch = chunk_batch(1, parts);
+
+        // Saturate the process cap: 4 assemblies × MAX_STAGED_OP_BYTES
+        // (summing to exactly MAX_STAGED_TOTAL_BYTES) opened on a dedicated
+        // stream, each fed only part 0 of 2 so they stay open.
+        let pressure_stream = "staging-pressure-elsewhere";
+        let pressure_part0 = |n: u8| ReplicaOp::OpChunk {
+            tx_key: key(n),
+            chunk_index: 0,
+            chunk_count: 2,
+            total_len: MAX_STAGED_OP_BYTES,
+            payload: vec![0u8; 8],
+        };
+        for n in 210..214u8 {
+            let opened = stage_chunk(pressure_stream, &pressure_part0(n))
+                .expect("pressure part 0 opens cleanly");
+            assert!(opened.is_none(), "a 2-part assembly must stay open");
+        }
+
+        // Delivery under pressure: the batch's part 0 must NAK Busy —
+        // retriable, echoing the batch's first_sequence — applying and
+        // staging NOTHING, and advancing NO watermark.
+        let resp = send_tracked(&engine, &tracker, &batch);
+        assert_eq!(resp.status, STATUS_ERROR, "staging pressure must NAK");
+        match ReplicaAck::deserialize(&resp.payload).expect("ack decodes") {
+            ReplicaAck::Busy { first_sequence } => {
+                assert_eq!(first_sequence, 1, "Busy must echo the batch first_sequence")
+            }
+            other => panic!("staging pressure must NAK the retriable Busy, got {other:?}"),
+        }
+        assert!(
+            engine.read_metadata(&k).is_err(),
+            "nothing may apply under a staging-pressure Busy NAK"
+        );
+        assert_eq!(
+            tracker.get(DEFAULT_STREAM_KEY),
+            0,
+            "Busy must not advance the watermark"
+        );
+
+        // Free the pressure: a part 0 over each open assembly conflicts and
+        // drops it (the documented self-clearing path).
+        for n in 210..214u8 {
+            match stage_chunk(pressure_stream, &pressure_part0(n)) {
+                Err(ChunkStageError::Hard(message)) => assert!(
+                    message.contains("conflict"),
+                    "expected the conflict drop, got: {message}"
+                ),
+                other => panic!("part 0 over an open assembly must conflict, got {other:?}"),
+            }
+        }
+
+        // The IDENTICAL batch re-delivered now applies end to end.
+        let resp = send_tracked(&engine, &tracker, &batch);
+        assert_eq!(
+            resp.status, STATUS_OK,
+            "the identical re-send must apply once the pressure clears"
+        );
+        assert!(
+            engine.read_metadata(&k).is_ok(),
+            "the reassembled Create must have applied"
+        );
+        assert_eq!(tracker.get(DEFAULT_STREAM_KEY), 3);
+    }
+
     /// Issue #17 follow-up (splice close). Covered positions now re-apply,
     /// so a re-delivered frame's chunk parts reach staging while another
     /// delivery of the SAME op (same stream key, same tx_key) may still be
@@ -8865,6 +9022,7 @@ mod tests {
     /// conflict self-clears; no wedge).
     #[test]
     fn chunk_part0_over_open_assembly_conflicts_instead_of_splicing() {
+        let _serial = CHUNK_STAGING_TEST_SERIAL.lock();
         let sk = "splice-race-stream";
         let k = key(96);
         let image = |offset: u32, fill: u8| -> Vec<u8> {
@@ -8908,9 +9066,13 @@ mod tests {
         // silently reset the buffer under delivery 1's feet.
         let conflict = stage_chunk(sk, &b[0]);
         match &conflict {
-            Err(message) => assert!(
+            Err(ChunkStageError::Hard(message)) => assert!(
                 message.contains("conflict"),
                 "conflict NAK must name the conflict, got: {message}"
+            ),
+            Err(ChunkStageError::Pressure(message)) => panic!(
+                "the part-0 conflict must stay a HARD error (re-send from part 0), \
+                 never a retriable pressure NAK, got: {message}"
             ),
             Ok(other) => panic!(
                 "part 0 over an open assembly silently reset the buffer \
@@ -9177,6 +9339,7 @@ mod tests {
     /// violation — rejected, never recursed into.
     #[test]
     fn chunk_nested_chunk_rejected() {
+        let _serial = CHUNK_STAGING_TEST_SERIAL.lock();
         let engine = make_engine();
         let tracker = ReplicaAppliedTracker::in_memory();
         let k = key(94);
@@ -9202,6 +9365,7 @@ mod tests {
     /// (tamper/corruption fail-closed).
     #[test]
     fn chunk_mismatched_total_len_rejected() {
+        let _serial = CHUNK_STAGING_TEST_SERIAL.lock();
         let engine = make_engine();
         let tracker = ReplicaAppliedTracker::in_memory();
         let k = key(95);
