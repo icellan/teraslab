@@ -13103,6 +13103,8 @@ fn handle_admin_diagnose_key(
                 is_shard_fenced: false,
                 is_migrating_shard: false,
                 topology_epoch: 0,
+                local_view_effective_master_id: 0,
+                is_serving_fenced: false,
             },
         };
 
@@ -13241,6 +13243,8 @@ fn encode_key_diagnosis(d: &crate::cluster::migration::KeyDiagnosis, out: &mut V
     out.push(u8::from(d.is_shard_fenced));
     out.push(u8::from(d.is_migrating_shard));
     out.extend_from_slice(&d.topology_epoch.to_le_bytes());
+    out.extend_from_slice(&d.local_view_effective_master_id.to_le_bytes());
+    out.push(u8::from(d.is_serving_fenced));
     debug_assert_eq!(out.len() - start, KEY_DIAGNOSIS_ENCODED_SIZE);
 }
 
@@ -30899,6 +30903,13 @@ mod tests {
             cluster.topology_epoch(),
             "topology_epoch must match coordinator"
         );
+        // F7 tail: no handoff in flight → effective master == target (1);
+        // shard_a has no pending inbound → serving fence down.
+        let effective_master_a =
+            u64::from_le_bytes(body[off_a + 31..off_a + 39].try_into().unwrap());
+        assert_eq!(effective_master_a, 1, "no handoff: effective == target");
+        let is_serving_fenced_a = body[off_a + 39];
+        assert_eq!(is_serving_fenced_a, 0, "shard_a is not inbound-fenced");
 
         // Decode entry 1 (txid_b).
         let off_b = 4 + entry_size;
@@ -30913,6 +30924,10 @@ mod tests {
         assert_eq!(has_pending_inbound_b, 1, "shard_b is in inbound_shards");
         let is_shard_fenced_b = body[off_b + 21];
         assert_eq!(is_shard_fenced_b, 0, "shard_b was not fenced");
+        // F7 tail: shard_b's pending inbound sets the lock-free serving
+        // fence bit `is_master` reads.
+        let is_serving_fenced_b = body[off_b + 39];
+        assert_eq!(is_serving_fenced_b, 1, "shard_b's serving fence must be up");
     }
 
     /// Truncated payloads (count claims more txids than bytes provide) and

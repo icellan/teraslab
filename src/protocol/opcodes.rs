@@ -78,9 +78,16 @@ pub const OP_GET_COMMITTED_TOPOLOGY: u16 = 103;
 ///     is_shard_fenced:                u8       (offset 21,  1 byte; 0|1)
 ///     is_migrating_shard:             u8       (offset 22,  1 byte; 0|1)
 ///     topology_epoch:                 u64 LE   (offset 23,  8 bytes)
+///     local_view_effective_master_id: u64 LE   (offset 31,  8 bytes)
+///     is_serving_fenced:              u8       (offset 39,  1 byte; 0|1)
 /// ```
 ///
-/// Total entry width is `KEY_DIAGNOSIS_ENCODED_SIZE = 31` bytes. All
+/// The trailing pair (F7) exposes the SERVING side: the effective-assignment
+/// master this node routes by mid-handoff, and the lock-free serving-fence
+/// bit `is_master` reads — so run diagnostics can distinguish a
+/// serving-vs-target split from a settled table.
+///
+/// Total entry width is `KEY_DIAGNOSIS_ENCODED_SIZE = 40` bytes. All
 /// widths are fixed (no varints) so callers can index entries by stride.
 ///
 /// Malformed requests (count > 64, or insufficient trailing bytes) are
@@ -154,7 +161,7 @@ pub const ADMIN_DIAGNOSE_KEY_MAX_TXIDS: u32 = 64;
 /// Encoded width of a single `KeyDiagnosis` entry in the response payload
 /// of `OP_ADMIN_DIAGNOSE_KEY`. See the opcode's doc comment for the
 /// per-field layout.
-pub const KEY_DIAGNOSIS_ENCODED_SIZE: usize = 2 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 8;
+pub const KEY_DIAGNOSIS_ENCODED_SIZE: usize = 2 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 8 + 8 + 1;
 
 /// Per-shard partition version report exchanged during the post-commit
 /// exchange phase before a migration plan is built.

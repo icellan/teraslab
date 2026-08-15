@@ -208,6 +208,19 @@ pub struct KeyDiagnosis {
     pub is_migrating_shard: bool,
     /// Current monotonic topology epoch on the responding node.
     pub topology_epoch: u64,
+    /// The master this node is actually SERVING the shard from, per its
+    /// local table's effective assignment (F7). During a two-phase handoff
+    /// this stays the pre-handoff owner until the handoff commits, so it can
+    /// differ from `local_view_canonical_master_id` (the target assignment)
+    /// — the serving-vs-target split CI run diagnostics previously could not
+    /// distinguish.
+    pub local_view_effective_master_id: u64,
+    /// True iff the lock-free per-shard serving fence is up on this node —
+    /// the same `inbound_atomic` bit `is_master` reads to answer
+    /// `Transitioning` instead of `Yes` (F7). Unlike `has_pending_inbound`
+    /// (the migration tracker's view), this is the bit that actually gates
+    /// serving.
+    pub is_serving_fenced: bool,
 }
 
 /// State of an active shard migration.
@@ -1353,6 +1366,8 @@ impl MigrationManager {
             is_shard_fenced: self.is_shard_fenced(shard),
             is_migrating_shard: self.is_migrating_shard(shard),
             topology_epoch: 0,
+            local_view_effective_master_id: 0,
+            is_serving_fenced: false,
         }
     }
 
