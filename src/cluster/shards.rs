@@ -597,6 +597,55 @@ impl ShardTable {
         self.intended_masters[idx] = new_master;
     }
 
+    /// W3 FIX A — election-only adoption of a view-evidenced holder from
+    /// OUTSIDE the shard's assignment.
+    ///
+    /// [`Self::set_master_for_shard`] deliberately refuses a candidate
+    /// outside the shard's assignment so a malformed COMMITTED assignment
+    /// cannot fabricate an arbitrary owner (armed mode installs assignments
+    /// through it verbatim, and that refusal must stand there). The
+    /// equal-version divergence sustainer (CI run 31875324685, scenarios
+    /// 11/17) needs the opposite on the ELECTION path: after a terminal
+    /// migration abort rolls a shard back to its old owner, the only node
+    /// holding the shard's data can be outside the deterministic pair, and an
+    /// election that cannot install that answer leaves the det master
+    /// claiming a shard the holder keeps serving, forever.
+    ///
+    /// An in-assignment `new_master` delegates to `set_master_for_shard`
+    /// (ordinary promotion swap). Otherwise the demoted deterministic master
+    /// takes `displaced_slot` in the replica set so it REMAINS an assignment
+    /// member: the under-replication machinery backfills it, and once it
+    /// reports comparable data the next election's tie-keeps-deterministic
+    /// rule decays the deviation back to it. With an empty replica set (rf=1)
+    /// the demoted master necessarily leaves the assignment; a
+    /// `displaced_slot` beyond the replica set likewise drops the demoted
+    /// master rather than growing the set.
+    ///
+    /// The caller owns the no-loss precondition: the node leaving the
+    /// assignment must be one the shared partition view shows holding NOTHING
+    /// for the shard (`apply_master_election` only adopts under that guard).
+    pub fn adopt_external_master(&mut self, shard: u16, new_master: NodeId, displaced_slot: usize) {
+        let idx = shard as usize;
+        {
+            let current = &self.assignments[idx];
+            if current.master == new_master {
+                return;
+            }
+            if current.replicas.contains(&new_master) {
+                self.set_master_for_shard(shard, new_master);
+                return;
+            }
+        }
+        let current = &mut self.assignments[idx];
+        let demoted = std::mem::replace(&mut current.master, new_master);
+        if let Some(slot) = current.replicas.get_mut(displaced_slot) {
+            *slot = demoted;
+        }
+        // Same intent bookkeeping as `set_master_for_shard`: the reactivation
+        // mismatch metric must treat the elected master as authoritative.
+        self.intended_masters[idx] = new_master;
+    }
+
     /// The master the most recent activation intended for `shard`
     /// (election-refined). Diverges from `target_assignment(shard).master`
     /// only when a handoff was rolled back after a failed migration —
@@ -980,6 +1029,67 @@ mod tests {
             replica,
             "election override must move the intent with the assignment"
         );
+    }
+
+    /// W3 FIX A — `adopt_external_master` installs a view-evidenced holder
+    /// from OUTSIDE the shard's assignment (which `set_master_for_shard`
+    /// refuses by design) and demotes the det master into the displaced
+    /// replica slot so it stays an assignment member (the decay path).
+    #[test]
+    fn adopt_external_master_installs_out_of_assignment_holder() {
+        let members = nodes(&[1, 2, 3]);
+        let mut table = ShardTable::compute_with_epoch(&members, 2, 3, 1);
+        let (shard, outside) = (0..NUM_SHARDS as u16)
+            .find_map(|s| {
+                let a = table.target_assignment(s);
+                members
+                    .iter()
+                    .find(|n| a.master != **n && !a.replicas.contains(n))
+                    .map(|n| (s, *n))
+            })
+            .expect("rf=2 over 3 members leaves one node outside each assignment");
+        let det_master = table.target_assignment(shard).master;
+
+        table.adopt_external_master(shard, outside, 0);
+        assert_eq!(
+            table.target_assignment(shard).master,
+            outside,
+            "an out-of-assignment holder must be installable by the election",
+        );
+        assert!(
+            table
+                .target_assignment(shard)
+                .replicas
+                .contains(&det_master),
+            "the demoted det master must take the displaced replica slot",
+        );
+        assert_eq!(
+            table.intended_master(shard),
+            outside,
+            "adoption must keep the recorded intent in step with the assignment",
+        );
+    }
+
+    /// W3 FIX A — an in-assignment candidate handed to `adopt_external_master`
+    /// takes the ordinary `set_master_for_shard` promotion path (swap with
+    /// the candidate's own slot), regardless of the displaced-slot argument.
+    #[test]
+    fn adopt_external_master_delegates_in_assignment_promotion() {
+        let members = nodes(&[1, 2, 3]);
+        let mut table = ShardTable::compute_with_epoch(&members, 2, 3, 1);
+        let shard = (0..NUM_SHARDS as u16)
+            .find(|&s| !table.target_assignment(s).replicas.is_empty())
+            .expect("rf=2 over 3 members must give replicas");
+        let master = table.target_assignment(shard).master;
+        let replica = table.target_assignment(shard).replicas[0];
+
+        table.adopt_external_master(shard, replica, 0);
+        assert_eq!(table.target_assignment(shard).master, replica);
+        assert!(
+            table.target_assignment(shard).replicas.contains(&master),
+            "the ordinary promotion swap must demote the old master into the replica set",
+        );
+        assert_eq!(table.intended_master(shard), replica);
     }
 
     #[test]
