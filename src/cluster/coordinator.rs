@@ -8157,6 +8157,9 @@ fn run_migration_batch(
                                         batch_size,
                                         topology_epoch,
                                         auth_secret,
+                                        Some(&|| {
+                                            migration_epoch_current(shard_table, topology_epoch)
+                                        }),
                                     )
                                     .map_err(EscalationAttemptError::Repush)?;
                                     send_migration_complete(
