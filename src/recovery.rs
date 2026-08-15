@@ -3352,8 +3352,9 @@ fn replay_compensate_set_locked(
 /// accepted. Only offsets actually on the freelist trigger a metadata read, so a
 /// clean store (empty/small freelist) does near-zero device I/O. No-op for the
 /// log-structured segment allocator (its `reserve_recovered_live_region` default
-/// returns `false`) — its deletes bump per-segment dead-byte counters rather than
-/// fsyncing a `FreeRegion`, so it has no such window; its layout is re-derived by
+/// returns `false`) — its deletes also fsync a `FreeRegion`
+/// (`SegmentAllocator::free_durable`), but it has no freelist to carve: reuse is
+/// whole-segment and its layout is re-derived by
 /// [`crate::allocator::RecordAllocator::reconcile_recovered_free_list`].
 ///
 /// `devices[i]` backs `allocators[i]` (store `i`); each live index entry is
@@ -3410,6 +3411,19 @@ fn reconcile_freelist_against_live_index(
     Ok(())
 }
 
+/// Maximum number of unreadable frontier candidates (phantom index entries
+/// over freed bytes) [`recover_allocator_frontiers`] drops per store before
+/// giving up with the FIRST error. Generous — a real crash leaves at most a
+/// handful of un-evicted deletes — but bounded, so a truly-corrupt device
+/// stays loud instead of being silently unwound entry by entry.
+const MAX_FRONTIER_PHANTOM_DROPS: usize = 64;
+
+/// How many of the highest-offset `(offset, key)` candidates the frontier
+/// pass tracks per store during its single O(index) collection sweep. Sized
+/// past the drop bound so the retreat never needs a second index pass; the
+/// factor of 2 absorbs fuzzy-snapshot offset aliases (two keys, one slot).
+const FRONTIER_CANDIDATES_PER_STORE: usize = 2 * (MAX_FRONTIER_PHANTOM_DROPS + 1);
+
 /// Recompute each store's append frontier from the rebuilt index so a segment
 /// allocator (which journals no `AllocateRegion` ops) does not overwrite records
 /// created after the last checkpoint.
@@ -3418,16 +3432,37 @@ fn reconcile_freelist_against_live_index(
 /// `record_size`, and advances that store's allocator frontier past it (rounded
 /// up to a device block — a safe over-estimate). The highest-offset live record
 /// has the highest end offset because records are packed contiguously without
-/// overlap, so a single read per store suffices. No-op for the in-place
-/// [`crate::allocator::SlotAllocator`] (its `recover_frontier_at_least` default
-/// does nothing — it re-derives its high-water mark from replayed `AllocateRegion`
-/// ops). Call AFTER the index is fully rebuilt/recovered and BEFORE accepting
-/// writes; `devices[i]` and `allocators[i]` are store `i`.
+/// overlap. No-op for the in-place [`crate::allocator::SlotAllocator`] (its
+/// `recover_frontier_at_least` default does nothing — it re-derives its
+/// high-water mark from replayed `AllocateRegion` ops). Call AFTER the index is
+/// fully rebuilt/recovered and BEFORE accepting writes; `devices[i]` and
+/// `allocators[i]` are store `i`.
+///
+/// # Phantom retreat (scenario-09 belt-and-braces)
+///
+/// A dangling index entry must not be a boot-blocker. When the candidate at
+/// the highest offset fails its metadata read with a CORRUPTION-shaped error
+/// (zeroed/recycled bytes → CRC mismatch — the on-device shape of a deleted
+/// record whose index removal was lost), the entry is a phantom: it is
+/// unregistered (loudly) and the frontier retreats to the next-highest
+/// offset, up to [`MAX_FRONTIER_PHANTOM_DROPS`] drops per store — beyond
+/// that, or on ANY non-corruption error (transport/out-of-bounds), recovery
+/// fails closed with the first/offending error. Dropped phantoms are also
+/// excluded from the live set handed to `reconcile_recovered_free_list`, and
+/// when the candidate window was truncated a targeted sweep
+/// ([`unregister_keys_at_dropped_offsets`]) evicts any out-of-window alias
+/// still pointing at a dropped offset. The
+/// PRIMARY fix is upstream — the delete's fsynced `FreeRegion`
+/// (`SegmentAllocator::free_durable`) lets replay evict the phantom before
+/// this pass ever sees it — so the retreat only fires for a phantom whose
+/// `FreeRegion` never reached the replayed tail (e.g. a torn checkpoint
+/// sequence).
 ///
 /// # Errors
-/// Propagates a device error if the highest-offset record's metadata cannot be
-/// read (a corrupt frontier record fails recovery closed rather than risking an
-/// under-advanced cursor that could overwrite live data).
+/// Propagates a device error if the frontier record's metadata cannot be read
+/// with a non-corruption error, or after the phantom-drop bound is exhausted
+/// (fails closed rather than risking an under-advanced cursor that could
+/// overwrite live data).
 pub fn recover_allocator_frontiers(
     index: &ShardedIndex,
     devices: &[std::sync::Arc<dyn BlockDevice>],
@@ -3439,28 +3474,176 @@ pub fn recover_allocator_frontiers(
     // of segments that still hold a live record (design §3.2). The in-place
     // SlotAllocator ignores the list (its `reconcile_recovered_free_list` is a
     // no-op) and only uses the frontier.
+    //
+    // The same pass tracks a small bounded list of the HIGHEST-offset
+    // `(offset, key)` candidates per store — the keys are needed to unregister
+    // phantoms during the retreat, and carrying keys for every entry would
+    // multiply the pass's memory by 5x at billions of records.
     let n = allocators.len();
     let mut live_offsets: Vec<Vec<u64>> = vec![Vec::new(); n];
-    index.for_each(|_key, e| {
+    let mut candidates: Vec<Vec<(u64, TxKey)>> = vec![Vec::new(); n];
+    let mut truncated: Vec<bool> = vec![false; n];
+    index.for_each(|key, e| {
         let s = e.device_id as usize;
         if s < n {
             live_offsets[s].push(e.record_offset);
+            let c = &mut candidates[s];
+            c.push((e.record_offset, key));
+            if c.len() >= 4 * FRONTIER_CANDIDATES_PER_STORE {
+                // Amortized compaction: keep only the top window.
+                c.sort_unstable_by_key(|&(off, _)| std::cmp::Reverse(off));
+                c.truncate(FRONTIER_CANDIDATES_PER_STORE);
+                truncated[s] = true;
+            }
         }
     });
     for s in 0..n {
-        // 1) Advance the frontier past the highest live record so a fresh
-        //    allocation cannot overwrite it (over-estimate, block-rounded).
-        if let Some(&max) = live_offsets[s].iter().max() {
-            let meta = io::read_metadata(&*devices[s], max)?;
-            let align = devices[s].alignment() as u64;
-            let end = (max + meta.record_size as u64).div_ceil(align) * align;
-            allocators[s].recover_frontier_at_least(end);
+        let cands = &mut candidates[s];
+        cands.sort_unstable_by_key(|&(off, _)| std::cmp::Reverse(off));
+        if cands.len() > FRONTIER_CANDIDATES_PER_STORE {
+            cands.truncate(FRONTIER_CANDIDATES_PER_STORE);
+            truncated[s] = true;
+        }
+
+        // 1) Advance the frontier past the highest READABLE live record so a
+        //    fresh allocation cannot overwrite it (over-estimate,
+        //    block-rounded), dropping bounded phantoms along the way.
+        let mut dropped: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        let mut first_err: Option<DeviceError> = None;
+        let mut advanced_or_empty = cands.is_empty();
+        let mut i = 0usize;
+        while i < cands.len() {
+            let max = cands[i].0;
+            match io::read_metadata(&*devices[s], max) {
+                Ok(meta) => {
+                    let align = devices[s].alignment() as u64;
+                    let end = (max + meta.record_size as u64).div_ceil(align) * align;
+                    allocators[s].recover_frontier_at_least(end);
+                    advanced_or_empty = true;
+                    break;
+                }
+                Err(e @ DeviceError::RecordCorruption { .. }) => {
+                    if dropped.len() >= MAX_FRONTIER_PHANTOM_DROPS {
+                        // Bound exhausted: the device is not phantom-shaped,
+                        // it is corrupt. Surface the FIRST error (the one the
+                        // operator saw at the true frontier).
+                        return Err(first_err.unwrap_or(e));
+                    }
+                    tracing::error!(
+                        target: "teraslab::recovery::allocator",
+                        store = s,
+                        offset = max,
+                        err = %e,
+                        "frontier recovery: the index entry at the highest live offset points \
+                         at unreadable bytes — dropping it as a phantom (a delete whose \
+                         FreeRegion never reached the replayed tail) and retreating to the \
+                         next-highest offset",
+                    );
+                    if first_err.is_none() {
+                        first_err = Some(e);
+                    }
+                    // Unregister EVERY candidate key still pointing at this
+                    // slot (fuzzy-snapshot aliases share an offset).
+                    while i < cands.len() && cands[i].0 == max {
+                        let key = cands[i].1;
+                        let still_points_here = index.lookup(&key).is_some_and(|le| {
+                            le.device_id as usize == s && le.record_offset == max
+                        });
+                        if still_points_here {
+                            index.unregister(&key);
+                            tracing::error!(
+                                target: "teraslab::recovery::allocator",
+                                store = s,
+                                offset = max,
+                                txid_prefix = ?&key.txid[..4],
+                                "frontier recovery: unregistered phantom index entry over freed bytes",
+                            );
+                        }
+                        i += 1;
+                    }
+                    dropped.insert(max);
+                }
+                // Any non-corruption failure (transport, out-of-bounds) is NOT
+                // phantom evidence: dropping a live max-offset entry on a
+                // transient error would let the frontier under-advance and
+                // overwrite live data. Fail closed, exactly as before.
+                Err(e) => return Err(e),
+            }
+        }
+        if !advanced_or_empty {
+            // Candidates exhausted without one readable record. If the
+            // tracked window was truncated, live entries exist BELOW it that
+            // the retreat cannot reach — stay loud with the first error.
+            // Otherwise every live entry on this store was a phantom and has
+            // been dropped: the store is empty and the header cursor stands.
+            if truncated[s]
+                && let Some(e) = first_err
+            {
+                return Err(e);
+            }
+        }
+        if !dropped.is_empty() {
+            // Truncation insurance: the in-window unregister loop above can
+            // only reach alias keys INSIDE the tracked candidate window. If
+            // the window was truncated, an out-of-window alias of a dropped
+            // offset could stay registered while the drop removes the offset
+            // from the live set below — its segment then loses `has_live`,
+            // gets reclaimed and reused, and the stale entry points at reused
+            // bytes. One targeted pass closes the class. (With the current
+            // by-offset sort, ties are adjacent, so a dropped offset's whole
+            // alias group sits in-window whenever the retreat SUCCEEDS — this
+            // pass is insurance against that proof rotting under future
+            // window/sort changes, and it runs only in the already-rare
+            // truncated-and-dropped case.)
+            if truncated[s] {
+                unregister_keys_at_dropped_offsets(index, s, &dropped);
+            }
+            live_offsets[s].retain(|o| !dropped.contains(o));
         }
         // 2) Segment engine: rebuild the reuse free list from the live set (so a
         //    defragged bounded-growth layout survives the crash). No-op in-place.
         allocators[s].reconcile_recovered_free_list(&live_offsets[s]);
     }
     Ok(())
+}
+
+/// Unregister every index key on `store` still pointing at one of the
+/// `dropped` phantom offsets — the frontier retreat's truncation-insurance
+/// sweep (see the call site in [`recover_allocator_frontiers`]). A key is
+/// unregistered only while its CURRENT entry still points at a dropped
+/// `(store, offset)` slot (the same index-authority check the in-window
+/// unregister applies), so a re-pointed key is never evicted. Returns the
+/// number of keys unregistered. One O(index) pass + one lookup per match;
+/// runs only when a store's candidate window was truncated AND phantoms were
+/// dropped — never on a clean boot.
+fn unregister_keys_at_dropped_offsets(
+    index: &ShardedIndex,
+    store: usize,
+    dropped: &std::collections::HashSet<u64>,
+) -> usize {
+    let mut stale: Vec<TxKey> = Vec::new();
+    index.for_each(|key, e| {
+        if e.device_id as usize == store && dropped.contains(&e.record_offset) {
+            stale.push(key);
+        }
+    });
+    let mut unregistered = 0usize;
+    for key in stale {
+        let still_points_at_dropped = index.lookup(&key).is_some_and(|le| {
+            le.device_id as usize == store && dropped.contains(&le.record_offset)
+        });
+        if still_points_at_dropped {
+            index.unregister(&key);
+            tracing::error!(
+                target: "teraslab::recovery::allocator",
+                store,
+                txid_prefix = ?&key.txid[..4],
+                "frontier recovery: unregistered an out-of-window alias of a dropped phantom offset",
+            );
+            unregistered += 1;
+        }
+    }
+    unregistered
 }
 
 // ---------------------------------------------------------------------------
@@ -5728,6 +5911,440 @@ mod tests {
         assert!(
             next >= live_frontier,
             "next allocation must not overwrite a post-checkpoint record"
+        );
+    }
+
+    /// Create a record on a segment-engine device: allocate from `alloc`,
+    /// write the full record, register `key → offset` in `index`.
+    fn make_segment_record(
+        device: &Arc<dyn BlockDevice>,
+        alloc: &mut crate::segment_allocator::SegmentAllocator,
+        index: &ShardedIndex,
+        n: u8,
+    ) -> (TxKey, u64) {
+        let utxo_count = 2u32;
+        let mut txid = [0u8; 32];
+        txid[0] = n;
+        let key = TxKey { txid };
+        let offset = alloc
+            .allocate(TxMetadata::record_size_for(utxo_count))
+            .unwrap();
+        let mut meta = TxMetadata::new(utxo_count);
+        meta.tx_id = txid;
+        let slots: Vec<UtxoSlot> = (0..utxo_count)
+            .map(|i| {
+                let mut hh = [0u8; 32];
+                hh[0] = i as u8;
+                UtxoSlot::new_unspent(hh)
+            })
+            .collect();
+        io::write_full_record(&**device, offset, &meta, &slots).unwrap();
+        index
+            .register(
+                key,
+                TxIndexEntry {
+                    device_id: 0,
+                    record_offset: offset,
+                    mined_slot: crate::index::mined_index::NO_MINED_SLOT,
+                },
+            )
+            .unwrap();
+        (key, offset)
+    }
+
+    /// Register a PHANTOM index entry: `key → offset` where `offset` was
+    /// allocated (cursor advanced) but the record bytes were never written —
+    /// the exact on-device shape of a deleted (tombstoned/zeroed) record whose
+    /// index removal was lost with the crash.
+    fn register_phantom(
+        alloc: &mut crate::segment_allocator::SegmentAllocator,
+        index: &ShardedIndex,
+        n: u8,
+    ) -> (TxKey, u64) {
+        let mut txid = [0u8; 32];
+        txid[0] = n;
+        let key = TxKey { txid };
+        let offset = alloc.allocate(TxMetadata::record_size_for(2)).unwrap();
+        index
+            .register(
+                key,
+                TxIndexEntry {
+                    device_id: 0,
+                    record_offset: offset,
+                    mined_slot: crate::index::mined_index::NO_MINED_SLOT,
+                },
+            )
+            .unwrap();
+        (key, offset)
+    }
+
+    /// Scenario-09 PRIMARY fix, segment engine: a production delete
+    /// (`Engine::delete` → `delete_inner`) must leave a durable commit record
+    /// — the fsynced `RedoOp::FreeRegion` — in the redo tail, so recovery's
+    /// delete-wins eviction (`evict_freed_region_owner`) drops the
+    /// snapshot-loaded index entry instead of resurrecting it as a phantom
+    /// over the tombstoned bytes. Pre-fix `SegmentAllocator::free` journaled
+    /// nothing: the replayed tail was empty (`replayed:0, skipped:0`), the
+    /// phantom survived at the HIGHEST live offset, and
+    /// `recover_allocator_frontiers` failed the boot on its zeroed header
+    /// ("CRC mismatch: expected 0x00000000" — CI run 31875324685).
+    #[test]
+    fn segment_delete_round_trip_drops_phantom_and_frontier_recovers() {
+        use crate::ops::remaining::DeleteRequest;
+        use crate::segment_allocator::SegmentAllocator;
+
+        let dev: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let redo_dev: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
+        let redo = Arc::new(parking_lot::Mutex::new(
+            RedoLog::open(redo_dev, 0, 1024 * 1024).unwrap(),
+        ));
+
+        let mut seg = SegmentAllocator::new(dev.clone(), 8 * 1024 * 1024).unwrap();
+        crate::allocator::RecordAllocator::set_redo_log(&mut seg, redo.clone());
+
+        // Records are created through the shared helper against a scratch
+        // index, then re-registered on the engine's own index below.
+        let scratch = ShardedIndex::from_single(PrimaryBackend::new_in_memory(1000).unwrap());
+        let (k1, o1) = make_segment_record(&dev, &mut seg, &scratch, 1);
+        let (k2, o2) = make_segment_record(&dev, &mut seg, &scratch, 2);
+        assert!(o2 > o1, "k2 must sit at the higher (frontier) offset");
+
+        let engine = Engine::new(
+            dev.clone(),
+            crate::index::Index::new(64).unwrap(),
+            seg,
+            StripedLocks::new(64),
+            crate::index::DahIndex::new(),
+        );
+        assert!(engine.store_is_log_structured(0));
+        for (k, o) in [(k1, o1), (k2, o2)] {
+            engine
+                .register(
+                    k,
+                    TxIndexEntry {
+                        device_id: 0,
+                        record_offset: o,
+                        mined_slot: crate::index::mined_index::NO_MINED_SLOT,
+                    },
+                )
+                .unwrap();
+        }
+
+        // "Checkpoint": persist the allocator header + capture the index
+        // snapshot (what a crash-reload would load).
+        engine.persist_allocator().unwrap();
+        let snapshot = ShardedIndex::from_single(PrimaryBackend::new_in_memory(1000).unwrap());
+        for (k, o) in [(k1, o1), (k2, o2)] {
+            snapshot
+                .register(
+                    k,
+                    TxIndexEntry {
+                        device_id: 0,
+                        record_offset: o,
+                        mined_slot: crate::index::mined_index::NO_MINED_SLOT,
+                    },
+                )
+                .unwrap();
+        }
+
+        // POST-snapshot production delete of k2: tombstones the header,
+        // unregisters, frees the region. Its only durable trace must be the
+        // FreeRegion in the redo tail.
+        engine
+            .delete(&DeleteRequest {
+                tx_key: k2,
+                due_guard: None,
+            })
+            .unwrap();
+
+        // "Crash": rebuild from the persisted header + snapshot index + tail.
+        let mut recovered: BoxedAllocator =
+            Box::new(SegmentAllocator::recover(dev.clone()).unwrap());
+        let mut dah = DahBackend::new_in_memory();
+        {
+            let redo_guard = redo.lock();
+            recover_all_with_allocator(
+                &*dev,
+                &redo_guard,
+                &snapshot,
+                &mut dah,
+                Some(&mut recovered),
+            )
+            .unwrap();
+        }
+
+        // The delete's journaled FreeRegion must evict the phantom BEFORE the
+        // frontier pass ever looks at it.
+        assert!(
+            snapshot.lookup(&k2).is_none(),
+            "the deleted record's snapshot entry must be evicted by FreeRegion \
+             replay — on the segment engine the fsynced FreeRegion is the \
+             delete's ONLY durable commit record",
+        );
+        assert!(
+            snapshot.lookup(&k1).is_some(),
+            "the live record must survive recovery untouched",
+        );
+        // The replayed free must restore the post-checkpoint dead-byte delta.
+        let dead = recovered
+            .segment_stats()
+            .expect("segment allocator reports segment stats")
+            .dead_bytes;
+        assert!(
+            dead > 0,
+            "the replayed FreeRegion must dead-mark the deleted record's bytes \
+             (got dead_bytes = {dead})",
+        );
+
+        // Frontier recompute over the post-eviction index: the highest LIVE
+        // offset is k1's readable record, so the boot-fatal path is never hit.
+        let devices = vec![dev.clone()];
+        let mut allocs = vec![recovered];
+        recover_allocator_frontiers(&snapshot, &devices, &mut allocs).unwrap();
+        assert!(
+            allocs[0].next_offset() > o1,
+            "the frontier must cover the highest live record",
+        );
+    }
+
+    /// Belt-and-braces (scenario-09): a dangling index entry at the
+    /// allocation frontier must NOT be a boot-blocker. A candidate whose
+    /// header bytes are unreadable (zeroed → CRC mismatch) is dropped loudly
+    /// (unregistered) and the frontier retreats to the next-highest offset
+    /// until a readable record is found.
+    #[test]
+    fn frontier_recovery_drops_phantoms_and_retreats_to_next_valid() {
+        use crate::segment_allocator::SegmentAllocator;
+
+        let device: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let index = ShardedIndex::from_single(PrimaryBackend::new_in_memory(1000).unwrap());
+
+        // Lay out the device with a scratch allocator: one real record, then
+        // TWO phantoms above it (the multi-step retreat case).
+        let mut scratch = SegmentAllocator::new(device.clone(), 8 * 1024 * 1024).unwrap();
+        let (real_key, real_offset) = make_segment_record(&device, &mut scratch, &index, 1);
+        let real_end = scratch.cursor();
+        let (p1_key, p1_offset) = register_phantom(&mut scratch, &index, 0xE1);
+        let (p2_key, _p2_offset) = register_phantom(&mut scratch, &index, 0xE2);
+
+        // Recover with a FRESH allocator (stale-header shape: cursor at the
+        // data region start) so the recomputed frontier is observable.
+        let mut allocs: Vec<BoxedAllocator> = vec![Box::new(
+            SegmentAllocator::new(device.clone(), 8 * 1024 * 1024).unwrap(),
+        )];
+        let devices = vec![device.clone()];
+        recover_allocator_frontiers(&index, &devices, &mut allocs)
+            .expect("a phantom frontier candidate must not fail recovery");
+
+        assert!(
+            index.lookup(&p1_key).is_none() && index.lookup(&p2_key).is_none(),
+            "both phantom entries must be unregistered",
+        );
+        assert!(
+            index.lookup(&real_key).is_some(),
+            "the real record must stay indexed",
+        );
+        let frontier = allocs[0].next_offset();
+        assert!(
+            frontier >= real_end,
+            "frontier {frontier} must cover the real record ending at {real_end}",
+        );
+        assert!(
+            frontier <= p1_offset,
+            "frontier {frontier} must RETREAT below the dropped phantom at {p1_offset} \
+             (their bytes are freed space, legal to reuse)",
+        );
+        let _ = real_offset;
+    }
+
+    /// The phantom retreat is BOUNDED: after 64 consecutive unreadable
+    /// frontier candidates recovery gives up with the ORIGINAL corruption
+    /// error — a truly-corrupt device must stay loud, not be silently
+    /// unwound entry by entry.
+    #[test]
+    fn frontier_recovery_fails_after_phantom_bound() {
+        use crate::segment_allocator::SegmentAllocator;
+
+        let device: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let index = ShardedIndex::from_single(PrimaryBackend::new_in_memory(1000).unwrap());
+
+        let mut scratch = SegmentAllocator::new(device.clone(), 8 * 1024 * 1024).unwrap();
+        let (real_key, _real_offset) = make_segment_record(&device, &mut scratch, &index, 1);
+        // 65 phantoms above the real record: one more than the retreat bound.
+        for n in 0..65u8 {
+            register_phantom(&mut scratch, &index, 0x80 + n);
+        }
+
+        let mut allocs: Vec<BoxedAllocator> = vec![Box::new(
+            SegmentAllocator::new(device.clone(), 8 * 1024 * 1024).unwrap(),
+        )];
+        let devices = vec![device.clone()];
+        let err = recover_allocator_frontiers(&index, &devices, &mut allocs)
+            .expect_err("65 consecutive phantoms must exhaust the retreat bound");
+        assert!(
+            matches!(err, DeviceError::RecordCorruption { .. }),
+            "the surfaced error must be the original corruption, got {err:?}",
+        );
+        assert!(
+            index.lookup(&real_key).is_some(),
+            "the real record must not be scrubbed on the failure path",
+        );
+    }
+
+    /// The truncation-insurance sweep (`unregister_keys_at_dropped_offsets`):
+    /// alias keys of a dropped phantom offset that sat OUTSIDE the retreat's
+    /// candidate window must still be unregistered — a stale alias whose
+    /// segment loses `has_live` would otherwise point at reclaimed-and-reused
+    /// bytes. Only entries still pointing at a dropped `(store, offset)` slot
+    /// are evicted; re-pointed keys and other stores are untouched.
+    #[test]
+    fn dropped_offset_alias_sweep_unregisters_out_of_window_keys() {
+        let index = ShardedIndex::from_single(PrimaryBackend::new_in_memory(1000).unwrap());
+        let x = crate::segment_allocator::DATA_REGION_OFFSET + 8192;
+        let y = crate::segment_allocator::DATA_REGION_OFFSET + 4096;
+        let entry = |device_id: u8, record_offset: u64| TxIndexEntry {
+            device_id,
+            record_offset,
+            mined_slot: crate::index::mined_index::NO_MINED_SLOT,
+        };
+        let key = |n: u8| {
+            let mut txid = [0u8; 32];
+            txid[0] = n;
+            TxKey { txid }
+        };
+        // Two aliases of the dropped offset X on store 0, one live record at
+        // Y on store 0, one entry at X on ANOTHER store.
+        let (a, b, c, d) = (key(1), key(2), key(3), key(4));
+        index.register(a, entry(0, x)).unwrap();
+        index.register(b, entry(0, x)).unwrap();
+        index.register(c, entry(0, y)).unwrap();
+        index.register(d, entry(1, x)).unwrap();
+
+        let dropped: std::collections::HashSet<u64> = [x].into_iter().collect();
+        let n = unregister_keys_at_dropped_offsets(&index, 0, &dropped);
+
+        assert_eq!(n, 2, "exactly the two store-0 aliases of X are evicted");
+        assert!(index.lookup(&a).is_none() && index.lookup(&b).is_none());
+        assert!(
+            index.lookup(&c).is_some(),
+            "a live record at a non-dropped offset must survive"
+        );
+        assert!(
+            index.lookup(&d).is_some(),
+            "an entry at X on ANOTHER store must survive"
+        );
+    }
+
+    /// End-to-end pin with an ACTUALLY-TRUNCATED candidate window (more live
+    /// entries than the window tracks): a phantom at the top is dropped, the
+    /// retreat lands on the highest real record, the truncation-insurance
+    /// sweep runs, and afterwards NO key points at a dropped offset while
+    /// every real record stays indexed.
+    #[test]
+    fn frontier_recovery_with_truncated_window_leaves_no_key_at_dropped_offsets() {
+        use crate::segment_allocator::SegmentAllocator;
+
+        let device: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let index = ShardedIndex::from_single(PrimaryBackend::new_in_memory(1000).unwrap());
+        let mut scratch = SegmentAllocator::new(device.clone(), 8 * 1024 * 1024).unwrap();
+
+        // More real records than FRONTIER_CANDIDATES_PER_STORE (130) tracks.
+        let mut real: Vec<(TxKey, u64)> = Vec::new();
+        for n in 1..=132u8 {
+            real.push(make_segment_record(&device, &mut scratch, &index, n));
+        }
+        let (real_max_key, real_max_offset) =
+            *real.iter().max_by_key(|(_, o)| *o).expect("records exist");
+
+        // A phantom ABOVE every real record, with a second alias key at the
+        // SAME offset.
+        let (p_key, p_offset) = register_phantom(&mut scratch, &index, 0xF1);
+        let mut txid = [0u8; 32];
+        txid[0] = 0xF2;
+        let alias_key = TxKey { txid };
+        index
+            .register(
+                alias_key,
+                TxIndexEntry {
+                    device_id: 0,
+                    record_offset: p_offset,
+                    mined_slot: crate::index::mined_index::NO_MINED_SLOT,
+                },
+            )
+            .unwrap();
+
+        let mut allocs: Vec<BoxedAllocator> = vec![Box::new(
+            SegmentAllocator::new(device.clone(), 8 * 1024 * 1024).unwrap(),
+        )];
+        let devices = vec![device.clone()];
+        recover_allocator_frontiers(&index, &devices, &mut allocs)
+            .expect("retreat over a truncated window must still succeed");
+
+        assert!(
+            index.lookup(&p_key).is_none() && index.lookup(&alias_key).is_none(),
+            "no key may still point at the dropped phantom offset after recovery",
+        );
+        assert!(
+            index.lookup(&real_max_key).is_some(),
+            "the highest real record must stay indexed",
+        );
+        for (k, _) in &real {
+            assert!(index.lookup(k).is_some(), "every real record must survive");
+        }
+        assert!(
+            allocs[0].next_offset() > real_max_offset,
+            "the frontier must cover the highest real record",
+        );
+    }
+
+    /// Only a CORRUPTION-shaped read failure is phantom evidence. Any other
+    /// read error (transport, out-of-bounds) fails recovery closed
+    /// immediately — dropping a live max-offset entry on a transient error
+    /// would let the frontier under-advance and overwrite live data.
+    #[test]
+    fn frontier_recovery_propagates_non_corruption_errors() {
+        use crate::segment_allocator::SegmentAllocator;
+
+        let device: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let index = ShardedIndex::from_single(PrimaryBackend::new_in_memory(1000).unwrap());
+        let mut scratch = SegmentAllocator::new(device.clone(), 8 * 1024 * 1024).unwrap();
+        let (_real_key, _real_offset) = make_segment_record(&device, &mut scratch, &index, 1);
+
+        // An entry pointing past the device end: read_metadata fails with
+        // OutOfBounds, not RecordCorruption.
+        let mut txid = [0u8; 32];
+        txid[0] = 0xEE;
+        let oob_key = TxKey { txid };
+        index
+            .register(
+                oob_key,
+                TxIndexEntry {
+                    device_id: 0,
+                    record_offset: device.size(),
+                    mined_slot: crate::index::mined_index::NO_MINED_SLOT,
+                },
+            )
+            .unwrap();
+
+        let mut allocs: Vec<BoxedAllocator> = vec![Box::new(
+            SegmentAllocator::new(device.clone(), 8 * 1024 * 1024).unwrap(),
+        )];
+        let devices = vec![device.clone()];
+        let err = recover_allocator_frontiers(&index, &devices, &mut allocs)
+            .expect_err("a non-corruption read error must fail recovery closed");
+        assert!(
+            matches!(err, DeviceError::OutOfBounds { .. }),
+            "expected OutOfBounds to propagate, got {err:?}",
+        );
+        assert!(
+            index.lookup(&oob_key).is_some(),
+            "a non-corruption failure must NOT unregister the entry",
         );
     }
 

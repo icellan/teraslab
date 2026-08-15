@@ -8802,7 +8802,8 @@ impl Engine {
         //
         // Crash recovery of a buffered delete: production journals NO
         // `RedoOp::Delete` (deletes are local prune GC). The fsynced
-        // `FreeRegion` redo record written at the allocator `free` below is the
+        // `FreeRegion` redo record written at the allocator `free_durable`
+        // below (both engines journal it there) is the
         // delete's ONLY durable commit record; the tombstone header write and
         // this index removal stay in the write-back cache until the next
         // checkpoint. Recovery resolves that window DELETE-WINS: `FreeRegion`
@@ -8859,10 +8860,17 @@ impl Engine {
         // the offset can be handed out to a future `create`/`create_at_offset`.
         // Because step 2 already removed the primary-index entry, no
         // reader can reach this offset via `lookup(req.tx_key)` any longer.
+        //
+        // `free_durable`, not `free`: the fsynced `FreeRegion` this journals
+        // is the delete's ONLY durable commit record on BOTH engines. The
+        // in-place SlotAllocator journals inside its plain `free` anyway;
+        // the segment allocator journals ONLY here — its plain `free` is the
+        // un-journaled relocate-on-spend dead-mark and must stay that way
+        // (scenario-09 phantom fix).
         {
             let mut alloc = self.allocator_for(entry.device_id).lock();
             alloc
-                .free(entry.record_offset, record_size)
+                .free_durable(entry.record_offset, record_size)
                 .map_err(|e| SpendError::StorageError {
                     detail: format!("{e}"),
                 })?;

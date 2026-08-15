@@ -133,6 +133,15 @@ pub enum SegmentAllocatorError {
         size: u64,
     },
 
+    /// Appending/fsyncing the [`RedoOp::FreeRegion`] journal entry for a
+    /// durable free failed. The allocator state was left untouched — callers
+    /// never observe a free that is not durably journaled.
+    #[error("redo log failure: {detail}")]
+    RedoLogFailure {
+        /// Human-readable description of the underlying redo failure.
+        detail: String,
+    },
+
     /// A device I/O error occurred.
     #[error("device error: {0}")]
     Device(#[from] DeviceError),
@@ -313,10 +322,13 @@ pub struct SegmentAllocator {
     /// Persisted; the device's format wins over config across restarts.
     packed: bool,
     /// Optional redo log handle. Unlike [`crate::allocator::SlotAllocator`], the
-    /// segment allocator journals NO region ops on allocate/free — its cursor is
+    /// segment allocator journals NO `AllocateRegion` ops — its cursor is
     /// recomputed from the index at recovery (design §3.2), so there is no
-    /// `AllocateRegion`/orphan window. The handle is retained for the relocate
-    /// path (increment 4, `OP_RELOCATE`). Not persisted.
+    /// orphan window — and its plain [`Self::free`] (the relocate-on-spend
+    /// dead-mark) journals nothing either. The ONE journaled region op is the
+    /// delete path's [`Self::free_durable`], whose fsynced
+    /// [`RedoOp::FreeRegion`] is a production delete's only durable commit
+    /// record (scenario-09 phantom fix). Not persisted.
     redo_log: Option<Arc<Mutex<RedoLog>>>,
     /// Store tag stamped on this allocator's future redo entries (relocate).
     redo_device_id: u8,
@@ -328,6 +340,18 @@ pub struct SegmentAllocator {
     /// duration of a backup copy (design: restore ≡ crash recovery). Not
     /// persisted; RAM-only and released when the backup finishes or aborts.
     pinned: bool,
+    /// Offsets whose replayed [`RedoOp::FreeRegion`] has already been
+    /// dead-counted in THIS recovery run — the segment engine's replay
+    /// idempotence state (the SlotAllocator checks its freelist instead; the
+    /// segment engine has no per-region structure to check). Dedup by offset
+    /// is sound within a replayable tail: an offset can only be legally
+    /// re-freed after a whole-segment reclaim + rewrite, and reclaim runs
+    /// only at a checkpoint, which fences the first free out of the tail.
+    /// Populated exclusively by `replay_redo` (single-threaded boot
+    /// recovery), cleared by [`Self::reconcile_recovered_free_list`] (the
+    /// end-of-recovery reconciliation), never consulted on the serving path.
+    /// Not persisted.
+    replayed_free_offsets: std::collections::HashSet<u64>,
 }
 
 impl std::fmt::Debug for SegmentAllocator {
@@ -385,6 +409,7 @@ impl SegmentAllocator {
             redo_log: None,
             redo_device_id: 0,
             pinned: false,
+            replayed_free_offsets: std::collections::HashSet::new(),
         })
     }
 
@@ -602,9 +627,10 @@ impl SegmentAllocator {
     /// it is fully dead. This closes a P0 data-overwrite bug — after crash recovery
     /// a REUSED segment can carry stale `used == dead > 0` from the checkpoint
     /// header (its pre-reuse fully-dead state) while now holding a live
-    /// post-checkpoint record whose bytes recovery never re-added to `used`
-    /// ([`crate::recovery::recover_allocator_frontiers`] restores only the frontier
-    /// and free list, never `used`). Trusting `used == dead` there would reset+free
+    /// post-checkpoint record whose bytes recovery only partially re-adds to
+    /// `used` ([`Self::reconcile_recovered_free_list`] rebuilds a LOWER-BOUND
+    /// `used` floor from the live set, never the exact value). Trusting
+    /// `used == dead` there would reset+free
     /// the segment and let a later allocate hand out the live record's offset,
     /// overwriting acked UTXO data while the index still points at it.
     pub fn reclaim_fully_dead_segments(&mut self, live_offsets: &[u64]) -> Vec<u32> {
@@ -703,12 +729,9 @@ impl SegmentAllocator {
             .collect()
     }
 
-    /// Mark a previously-allocated region as dead.
-    ///
-    /// Phase 1 does NOT reclaim space — this only updates the owning segment's
-    /// dead-byte accounting for wear/occupancy stats (and, in Phase 3, defrag
-    /// victim selection). Validates that the region lies within the data region.
-    pub fn free(&mut self, offset: u64, size: u64) -> Result<()> {
+    /// Validate a free/dead-mark request: non-zero aligned size, within the
+    /// data region, owned by a segment. Returns `(aligned_size, segment)`.
+    fn validate_free(&self, offset: u64, size: u64) -> Result<(u64, u32)> {
         let aligned_size = self.align_reservation(size);
         let Some(end) = offset.checked_add(aligned_size) else {
             return Err(SegmentAllocatorError::InvalidFree {
@@ -728,8 +751,117 @@ impl SegmentAllocator {
                 size: aligned_size,
             });
         };
+        Ok((aligned_size, seg))
+    }
+
+    /// Mark a previously-allocated region as dead.
+    ///
+    /// Phase 1 does NOT reclaim space — this only updates the owning segment's
+    /// dead-byte accounting for wear/occupancy stats (and, in Phase 3, defrag
+    /// victim selection). Validates that the region lies within the data region.
+    ///
+    /// Journals NOTHING, by design: this is the relocate-on-spend hot path's
+    /// dead-mark (and the create-rollback / children-block reclaim), whose
+    /// state is re-derived from the index at recovery. Journaling here would
+    /// add a redo fsync per spend AND let a replayed `FreeRegion` evict the
+    /// sole index entry of a LIVE record whose un-journaled relocate re-point
+    /// was lost with the crash. A record DELETION must call
+    /// [`Self::free_durable`] instead — its fsynced `FreeRegion` is the
+    /// delete's only durable commit record.
+    pub fn free(&mut self, offset: u64, size: u64) -> Result<()> {
+        let (aligned_size, seg) = self.validate_free(offset, size)?;
         self.segments[seg as usize].dead += aligned_size;
         Ok(())
+    }
+
+    /// Dead-mark a region as a record DELETION's durable commit record.
+    ///
+    /// When a redo log is attached, a [`RedoOp::FreeRegion`] entry is appended
+    /// and fsynced BEFORE the dead-mark — mirroring
+    /// [`crate::allocator::SlotAllocator::free`]'s contract — so recovery
+    /// replays the free and, load-bearingly, evicts any index entry still
+    /// pointing at the freed slot (`recovery::evict_freed_region_owner`).
+    /// Production deletes journal no `RedoOp::Delete`; without this entry a
+    /// delete crossing the last index snapshot resurrects as a phantom over
+    /// tombstoned bytes, and one at the highest live offset bricks the boot
+    /// (scenario-09). On journal failure
+    /// [`SegmentAllocatorError::RedoLogFailure`] is returned and no state is
+    /// mutated.
+    ///
+    /// # Errors
+    /// [`SegmentAllocatorError::InvalidFree`] for a region outside the data
+    /// region; [`SegmentAllocatorError::RedoLogFailure`] if the journal
+    /// append/flush fails.
+    pub fn free_durable(&mut self, offset: u64, size: u64) -> Result<()> {
+        let (aligned_size, seg) = self.validate_free(offset, size)?;
+
+        // Journal the release BEFORE mutating the dead-byte accounting — on
+        // fsync failure the in-memory state is left unchanged so callers never
+        // observe a free that isn't durably journaled (same ordering as
+        // `SlotAllocator::free`).
+        if let Some(log_arc) = self.redo_log.clone() {
+            let op = RedoOp::FreeRegion {
+                offset,
+                size: aligned_size,
+                device_id: self.redo_device_id,
+            };
+            let flush_result = {
+                let mut log = log_arc.lock();
+                log.append_and_flush(op)
+            };
+            if let Err(e) = flush_result {
+                return Err(SegmentAllocatorError::RedoLogFailure {
+                    detail: format!("free redo append/flush failed: {e}"),
+                });
+            }
+            // Fault-injection sync point: "redo durable, dead-mark not yet
+            // applied" — the same crash window `SlotAllocator::free` exposes.
+            crate::fault_injection::check(crate::fault_injection::SyncPoint::MidAllocatorPersist);
+        }
+
+        self.segments[seg as usize].dead += aligned_size;
+        Ok(())
+    }
+
+    /// Apply a replayed [`RedoOp::FreeRegion`] dead-mark (crash recovery).
+    ///
+    /// Idempotent per recovery run: dedup by offset
+    /// (`replayed_free_offsets`), so replaying the same tail twice — or a
+    /// legacy `RedoOp::Delete` + explicit `FreeRegion` pair for one delete —
+    /// counts a region once. Skips, returning `false`:
+    /// - a corrupt entry (validation failure — logged, like the
+    ///   SlotAllocator's replay);
+    /// - a segment whose recovered `used` is still 0: a segment first written
+    ///   AFTER the last header persist (creates journal no `AllocateRegion`).
+    ///   Its accounting is recomputed by
+    ///   [`Self::reconcile_recovered_free_list`]; counting dead into it would
+    ///   persist `dead > 0 && used == 0`, which [`Self::recover`] rejects as
+    ///   a torn header — a boot poison pill.
+    ///
+    /// The residual imprecision (a fuzzy checkpoint can persist a free that
+    /// is also still in the post-fence tail → one-time over-count; skipped
+    /// virgin-segment frees → under-count) only skews compaction victim
+    /// RANKING, never safety: whole-segment reclaim is gated on the live
+    /// index (`reclaim_fully_dead_segments`' `has_live` ground truth), and
+    /// the documented `dead >= used` drain rule self-heals both directions.
+    fn replay_free(&mut self, offset: u64, size: u64) -> bool {
+        let Ok((aligned_size, seg)) = self.validate_free(offset, size) else {
+            tracing::error!(
+                target = "teraslab::segment_allocator",
+                offset,
+                size,
+                "replay_free: FreeRegion outside the data region — dropped as corrupt",
+            );
+            return false;
+        };
+        if self.segments[seg as usize].used == 0 {
+            return false;
+        }
+        if !self.replayed_free_offsets.insert(offset) {
+            return false;
+        }
+        self.segments[seg as usize].dead += aligned_size;
+        true
     }
 
     // -- batch reservation (orphan-prevention parity with SlotAllocator) -----
@@ -889,8 +1021,23 @@ impl SegmentAllocator {
     /// store. Every segment strictly BELOW `open_segment` (the already-used
     /// region) that holds NO live record is a defrag hole — its records were all
     /// relocated out (spend) or deleted — so reset it to empty and return it to the
-    /// reuse free list. Segments with live records keep their (checkpoint-recovered)
-    /// accounting.
+    /// reuse free list.
+    ///
+    /// Segments WITH live records keep their (checkpoint-recovered) accounting,
+    /// except that their `used` is raised to a LOWER-BOUND floor rebuilt from
+    /// the live set: `(highest live offset in the segment − segment start) +
+    /// one minimum reservation`, and for the open segment the exact
+    /// `cursor − segment start`. Creates journal no `AllocateRegion`, so a
+    /// segment first written after the last header persist recovers with
+    /// `used == 0` while holding live records; without the floor, the very
+    /// next dead-mark (delete `free_durable`, spend-relocate `free`) plants
+    /// `dead > 0 && used == 0`, the next checkpoint persists it, and the next
+    /// restart is bricked by [`Self::recover`]'s torn-header rejection. A
+    /// LOWER bound (record sizes are unknowable here without a device read
+    /// per record) errs in the safe direction: whole-segment reclaim stays
+    /// gated on the live index (`reclaim_fully_dead_segments`' `has_live`),
+    /// and an under-counted `used` only makes `dead >= used` drain SOONER —
+    /// it can never strand capacity the way an over-count would.
     ///
     /// Correctness: this is EXACT for the free list, which is what matters — future
     /// appends only ever reuse a live-free segment, so no live record is
@@ -900,10 +1047,17 @@ impl SegmentAllocator {
     /// self-heals as new spends dead-mark. The open segment is never freed (the
     /// cursor is inside it, and it holds the highest live record by construction).
     pub fn reconcile_recovered_free_list(&mut self, live_offsets: &[u64]) {
+        // Recovery is complete once the free list is reconciled — drop the
+        // FreeRegion replay dedup set (see `replay_free`); `replay_redo` is
+        // never called on the serving path.
+        self.replayed_free_offsets.clear();
         let mut has_live = vec![false; self.segment_count as usize];
+        // Highest live offset per segment — the basis of the `used` floor.
+        let mut max_live = vec![0u64; self.segment_count as usize];
         for &off in live_offsets {
             if let Some(s) = self.segment_of(off) {
                 has_live[s as usize] = true;
+                max_live[s as usize] = max_live[s as usize].max(off);
             }
         }
         // Scan up to the reuse FRONTIER — `max(open_segment, highest_used)` — not
@@ -922,12 +1076,33 @@ impl SegmentAllocator {
         let frontier = self.open_segment.max(self.highest_used());
         self.free_segments.clear();
         for idx in 0..=frontier {
-            if idx == self.open_segment || has_live[idx as usize] {
+            if idx == self.open_segment {
+                continue;
+            }
+            if has_live[idx as usize] {
+                // Used-floor rebuild (see the doc): the append cursor wrote
+                // this sealed segment contiguously from its start, so at
+                // least `(max_live − start) + one minimum reservation` bytes
+                // were consumed. `align_reservation(1)` is the smallest
+                // reservation `allocate` ever hands out in the current mode.
+                let floor =
+                    (max_live[idx as usize] - self.segment_start(idx)) + self.align_reservation(1);
+                let seg = &mut self.segments[idx as usize];
+                seg.used = seg.used.max(floor);
                 continue;
             }
             self.segments[idx as usize] = SegmentMeta::default();
             self.free_segments.push_back(idx);
         }
+        // The OPEN segment's `used` is exactly the append cursor's progress —
+        // `set_cursor_at_least` has already positioned the cursor past the
+        // highest live record, so this is both a floor and (on the recovery
+        // path) the true high-water.
+        let open_used = self
+            .cursor
+            .saturating_sub(self.segment_start(self.open_segment));
+        let open = &mut self.segments[self.open_segment as usize];
+        open.used = open.used.max(open_used);
     }
 
     /// The device identity formatted as a 32-character lowercase hex string.
@@ -1277,6 +1452,7 @@ impl SegmentAllocator {
             redo_log: None,
             redo_device_id: 0,
             pinned: false,
+            replayed_free_offsets: std::collections::HashSet::new(),
         })
     }
 
@@ -1305,6 +1481,7 @@ impl From<SegmentAllocatorError> for crate::allocator::AllocatorError {
                 largest_free: 0,
             },
             SegmentAllocatorError::InvalidFree { offset, size } => A::InvalidFree { offset, size },
+            SegmentAllocatorError::RedoLogFailure { detail } => A::RedoLogFailure { detail },
             SegmentAllocatorError::Device(d) => A::Device(d),
             SegmentAllocatorError::Getrandom(g) => A::Getrandom(g),
             SegmentAllocatorError::NoPersistedState => A::NoPersistedState,
@@ -1351,16 +1528,32 @@ impl RecordAllocator for SegmentAllocator {
     fn free(&mut self, offset: u64, size: u64) -> crate::allocator::Result<()> {
         Ok(SegmentAllocator::free(self, offset, size)?)
     }
+    fn free_durable(&mut self, offset: u64, size: u64) -> crate::allocator::Result<()> {
+        Ok(SegmentAllocator::free_durable(self, offset, size)?)
+    }
     fn persist(&self) -> crate::allocator::Result<()> {
         Ok(SegmentAllocator::persist(self)?)
     }
     fn persist_header_no_sync(&self) -> crate::allocator::Result<()> {
         Ok(SegmentAllocator::persist_header_no_sync(self)?)
     }
-    fn replay_redo(&mut self, _op: &RedoOp) -> bool {
-        // The segment allocator journals no region ops (cursor is recomputed from
-        // the index at recovery); the relocate op arrives in increment 4.
-        false
+    fn replay_redo(&mut self, op: &RedoOp) -> bool {
+        // The ONLY region op the segment allocator journals is the delete
+        // path's `FreeRegion` (`free_durable`). The append cursor is
+        // recomputed from the index at recovery, so `AllocateRegion` is never
+        // journaled and nothing else here is allocator-scoped.
+        let RedoOp::FreeRegion {
+            offset,
+            size,
+            device_id,
+        } = op
+        else {
+            return false;
+        };
+        if *device_id != self.redo_device_id {
+            return false;
+        }
+        self.replay_free(*offset, *size)
     }
     fn is_allocated_range(&self, offset: u64, size: u64) -> bool {
         self.is_allocated_range_impl(offset, size)
@@ -2371,5 +2564,224 @@ mod tests {
             matches!(e, AllocatorError::DeviceFull { .. }),
             "segment DeviceFull must map to AllocatorError::DeviceFull, got {e:?}"
         );
+    }
+
+    // ---- FreeRegion journal + replay (scenario-09 delete durability) -------
+
+    /// A redo log over its own memory device, ready to attach.
+    fn make_redo_log(size: u64) -> Arc<Mutex<RedoLog>> {
+        let dev = Arc::new(MemoryDevice::new(size, ALIGN).unwrap());
+        Arc::new(Mutex::new(RedoLog::open(dev, 0, size).unwrap()))
+    }
+
+    /// `free_durable` mirrors `SlotAllocator::free`'s journal contract: one
+    /// fsynced `RedoOp::FreeRegion` with the exact offset, the ALIGNED size,
+    /// and this store's device tag — appended before the dead-mark.
+    #[test]
+    fn free_durable_journals_free_region_op() {
+        use crate::allocator::RecordAllocator;
+        let mut a = alloc(64, 8 * 1024 * 1024);
+        let redo = make_redo_log(1024 * 1024);
+        RecordAllocator::set_redo_log(&mut a, redo.clone());
+        RecordAllocator::set_redo_device_id(&mut a, 2);
+
+        let offset = a.allocate(600).unwrap();
+        a.free_durable(offset, 600).unwrap();
+        assert_eq!(
+            a.stats().dead_bytes,
+            4096,
+            "non-packed free rounds to a block"
+        );
+
+        let entries = redo.lock().recover().unwrap();
+        assert_eq!(
+            entries.len(),
+            1,
+            "expected exactly the FreeRegion entry (the segment allocator journals no AllocateRegion)"
+        );
+        match &entries[0].op {
+            RedoOp::FreeRegion {
+                offset: redo_offset,
+                size,
+                device_id,
+            } => {
+                assert_eq!(*redo_offset, offset);
+                assert_eq!(*size, 4096, "journaled size is the aligned reservation");
+                assert_eq!(*device_id, 2, "stamped with this store's tag");
+            }
+            other => panic!("expected FreeRegion redo entry, got {other:?}"),
+        }
+    }
+
+    /// The plain `free` (relocate-on-spend dead-mark, rollback frees,
+    /// children-block reclaim) must journal NOTHING even with a log attached
+    /// — journaling there would fsync per spend and, worse, let a replayed
+    /// `FreeRegion` evict the sole index entry of a LIVE record whose
+    /// un-journaled relocate re-point died with the crash.
+    #[test]
+    fn plain_free_journals_nothing() {
+        use crate::allocator::RecordAllocator;
+        let mut a = alloc(64, 8 * 1024 * 1024);
+        let redo = make_redo_log(1024 * 1024);
+        RecordAllocator::set_redo_log(&mut a, redo.clone());
+
+        let offset = a.allocate(4096).unwrap();
+        a.free(offset, 4096).unwrap();
+        assert_eq!(a.stats().dead_bytes, 4096, "the dead-mark still applies");
+        assert!(
+            redo.lock().recover().unwrap().is_empty(),
+            "the relocate dead-mark path must stay un-journaled"
+        );
+    }
+
+    /// Review finding 1 (137e52d follow-up): recovery must rebuild a `used`
+    /// floor for live segments, or the LIVE dead-mark paths plant the
+    /// `dead > 0 && used == 0` boot poison. The chain: checkpoint (header
+    /// persisted) → post-checkpoint creates span S0/S1 (used bumps in RAM
+    /// only) → crash → recover leaves S0 holding live records with
+    /// `used == 0` → any delete/dead-mark on S0 → `dead > 0 && used == 0` →
+    /// the next checkpoint persists it → the NEXT restart fails
+    /// `CorruptedHeader("segment has dead bytes but zero used")` — a boot
+    /// brick in exactly scenario 09's crash-cycle workload.
+    #[test]
+    fn reconcile_rebuilds_used_floor_so_post_recovery_deletes_survive_repersist() {
+        let device = dev(64);
+        let seg_size = 2 * 4096u64;
+        let mut a = SegmentAllocator::new(device.clone(), seg_size).unwrap();
+        // "Checkpoint" BEFORE any create: the persisted header knows nothing.
+        a.persist().unwrap();
+        let o1 = a.allocate(4096).unwrap(); // S0
+        let o2 = a.allocate(4096).unwrap(); // S0 (fills it)
+        let o3 = a.allocate(4096).unwrap(); // S1 (open)
+        let end = a.cursor();
+
+        // Crash + reload: every segment's `used` is the stale checkpoint 0.
+        let mut r = SegmentAllocator::recover(device.clone()).unwrap();
+        assert_eq!(
+            r.stats().used_bytes,
+            0,
+            "recovered header predates every create"
+        );
+
+        // Standard recovery sequence (recover_allocator_frontiers wraps these).
+        r.set_cursor_at_least(end);
+        r.reconcile_recovered_free_list(&[o1, o2, o3]);
+
+        // The rebuilt floor: S0 = (o2 - seg_start) + min reservation = 8192
+        // (exact here), S1 (open) = cursor - seg_start = 4096.
+        assert_eq!(
+            r.stats().used_bytes,
+            12288,
+            "reconcile must rebuild the per-segment used floor from the live set"
+        );
+
+        // Post-recovery delete dead-marks S0, then the next checkpoint
+        // persists — this wrote dead > 0 && used == 0 pre-fix.
+        r.free_durable(o1, 4096).unwrap();
+        r.persist().unwrap();
+
+        // The NEXT restart must not be bricked by the persisted header.
+        let r2 = SegmentAllocator::recover(device).expect(
+            "a post-recovery delete must not poison the persisted header \
+             (dead > 0 && used == 0 is rejected as a torn header by recover)",
+        );
+        assert!(r2.stats().used_bytes > 0);
+        assert_eq!(r2.stats().dead_bytes, 4096);
+    }
+
+    /// A journal failure must leave the allocator untouched: callers never
+    /// observe a free that is not durably journaled (mirror of
+    /// `SlotAllocator`'s `free_rollback_on_redo_flush_failure`).
+    #[test]
+    fn free_durable_rollback_on_redo_failure() {
+        use crate::allocator::RecordAllocator;
+        let mut a = alloc(64, 8 * 1024 * 1024);
+        let redo = make_redo_log(1024 * 1024);
+        RecordAllocator::set_redo_log(&mut a, redo.clone());
+
+        let offset = a.allocate(4096).unwrap();
+        // Poison the log: the next append fails deterministically.
+        redo.lock().poison();
+
+        let err = a.free_durable(offset, 4096).unwrap_err();
+        assert!(
+            matches!(err, SegmentAllocatorError::RedoLogFailure { .. }),
+            "expected RedoLogFailure, got {err:?}"
+        );
+        assert_eq!(
+            a.stats().dead_bytes,
+            0,
+            "dead accounting must be untouched when the journal append fails"
+        );
+    }
+
+    /// Replaying the SAME `FreeRegion` twice (recovery run twice over one
+    /// tail, or a legacy `RedoOp::Delete` + explicit `FreeRegion` pair for a
+    /// single delete) must count the region's dead bytes exactly ONCE.
+    #[test]
+    fn replay_free_region_counts_dead_bytes_once() {
+        use crate::allocator::RecordAllocator;
+        let mut a = alloc(64, 8 * 1024 * 1024);
+        let off = a.allocate(4096).unwrap();
+        assert_eq!(a.stats().dead_bytes, 0);
+
+        let op = RedoOp::FreeRegion {
+            offset: off,
+            size: 4096,
+            device_id: 0,
+        };
+        assert!(
+            RecordAllocator::replay_redo(&mut a, &op),
+            "first FreeRegion replay must apply the dead-mark"
+        );
+        assert_eq!(
+            a.stats().dead_bytes,
+            4096,
+            "first replay counts the region once"
+        );
+        assert!(
+            !RecordAllocator::replay_redo(&mut a, &op),
+            "second replay of the same region must be an idempotent no-op"
+        );
+        assert_eq!(
+            a.stats().dead_bytes,
+            4096,
+            "second replay must not double-count dead bytes"
+        );
+    }
+
+    /// A `FreeRegion` stamped with another store's device_id must be ignored
+    /// (same replay gate as the SlotAllocator).
+    #[test]
+    fn replay_free_region_ignores_other_store() {
+        use crate::allocator::RecordAllocator;
+        let mut a = alloc(64, 8 * 1024 * 1024);
+        let off = a.allocate(4096).unwrap();
+        let op = RedoOp::FreeRegion {
+            offset: off,
+            size: 4096,
+            device_id: 3,
+        };
+        assert!(!RecordAllocator::replay_redo(&mut a, &op));
+        assert_eq!(a.stats().dead_bytes, 0);
+    }
+
+    /// Replaying a free into a segment whose recovered `used` is 0 (a segment
+    /// first written AFTER the last header persist — creates journal no
+    /// `AllocateRegion`, so its `used` is only in RAM) must NOT count dead
+    /// bytes: `recover` rejects `dead > 0 && used == 0` as a torn header, so
+    /// counting would plant a poison pill in the next persisted header.
+    #[test]
+    fn replay_free_region_skips_virgin_segment() {
+        use crate::allocator::RecordAllocator;
+        let mut a = alloc(64, 8 * 1024 * 1024);
+        // No allocation: segment 0 has used == 0.
+        let op = RedoOp::FreeRegion {
+            offset: DATA_REGION_OFFSET,
+            size: 4096,
+            device_id: 0,
+        };
+        assert!(!RecordAllocator::replay_redo(&mut a, &op));
+        assert_eq!(a.stats().dead_bytes, 0);
     }
 }

@@ -222,19 +222,42 @@ pub async fn wait_cluster_ready(
     let start = std::time::Instant::now();
     let mut last_log = std::time::Instant::now();
     loop {
+        // Collect every node's answer UNCONDITIONALLY: a survivor answering
+        // with the WRONG cluster_size is otherwise rendered identically to a
+        // node that never answered ("0/3 nodes ready (versions: [])"), which
+        // is useless for diagnosing a wedged rolling restart.
         let mut ready = 0u32;
         let mut versions: Vec<u64> = Vec::new();
+        let mut min_masters = u64::MAX;
+        let mut node_states: Vec<String> = Vec::new();
         for i in 1..=node_count {
             let port = docker.http_port(i);
             let url = format!("http://127.0.0.1:{port}/status");
-            if let Ok(json) = poll_json(&url).await
-                && let Some(size) = json["cluster_size"].as_u64()
-                && size == node_count as u64
-            {
-                ready += 1;
-                if let Some(v) = json["shard_table_version"].as_u64() {
-                    versions.push(v);
+            match poll_json(&url).await {
+                Ok(json) => {
+                    let size = json["cluster_size"].as_u64();
+                    let ver = json["shard_table_version"].as_u64();
+                    let masters = json["master_shard_count"].as_u64();
+                    if size == Some(node_count as u64) {
+                        ready += 1;
+                        if let Some(v) = ver {
+                            versions.push(v);
+                        }
+                    }
+                    if let Some(m) = masters {
+                        min_masters = min_masters.min(m);
+                    }
+                    let fmt = |v: Option<u64>| {
+                        v.map(|v| v.to_string()).unwrap_or_else(|| "?".to_string())
+                    };
+                    node_states.push(format!(
+                        "node{i}:size={},ver={},masters={}",
+                        fmt(size),
+                        fmt(ver),
+                        fmt(masters)
+                    ));
                 }
+                Err(_) => node_states.push(format!("node{i}:UNREACHABLE")),
             }
         }
         // All nodes must report correct cluster size AND agree on the
@@ -242,17 +265,6 @@ pub async fn wait_cluster_ready(
         // master shards assigned. This ensures the cluster has fully
         // converged and the shard table includes all nodes before tests
         // begin.
-        // Check that each node actually has master shards
-        let mut min_masters = u64::MAX;
-        for i in 1..=node_count {
-            let port = docker.http_port(i);
-            let url = format!("http://127.0.0.1:{port}/status");
-            if let Ok(json) = poll_json(&url).await
-                && let Some(m) = json["master_shard_count"].as_u64()
-            {
-                min_masters = min_masters.min(m);
-            }
-        }
         let balanced = node_count <= 1 || min_masters > 0;
         if ready == node_count
             && versions.len() == node_count as usize
@@ -277,7 +289,8 @@ pub async fn wait_cluster_ready(
         }
         if start.elapsed() >= timeout {
             return Err(ClientError::Connection(format!(
-                "{ready}/{node_count} nodes ready (versions: {versions:?}) after {timeout:?}"
+                "{ready}/{node_count} nodes ready ({}) after {timeout:?}",
+                node_states.join(" ")
             )));
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
