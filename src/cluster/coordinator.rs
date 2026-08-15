@@ -1101,6 +1101,69 @@ fn missing_master_shard_count(
         .count()
 }
 
+/// Count shards whose local master deviates from the committed-baseline
+/// expectation while `self` is NEITHER side of the deviation — the blind spot
+/// left between [`phantom_master_shard_count`] (self over-owns) and
+/// [`missing_master_shard_count`] (self under-owns).
+///
+/// # The bug this exists for (F7, CI run 31787458246)
+///
+/// All settled-state detectors were self-centric: the phantom counter only
+/// counts shards SELF masters, the missing counter only shards the baseline
+/// assigns to SELF, and the settled branch of
+/// [`committed_topology_reactivation_metrics`] compares the table against its
+/// own `intended_master` — internal consistency, never the committed
+/// expectation. A node whose table deviates shard S from det-master B to
+/// holder C, with self neither B nor C, therefore measures ZERO work
+/// everywhere and never re-heals. That is exactly how equal-version master
+/// divergence persisted unnoticed in scenario 09: three nodes all settled at
+/// `ver=8` with three DIFFERENT tables (masters summing 6424/4096), and node2
+/// — holding 90% of the ring — saw nothing wrong because its own shards
+/// matched.
+///
+/// A nonzero count feeds the same reactivation work metric as the phantom and
+/// missing counters, so the same-term re-heal fires, collects a fresh
+/// partition view, and re-runs the (now pure, task #47) election — every
+/// divergent node converges on the same refined table.
+///
+/// # Baseline contract
+///
+/// Same as the sibling detectors (§8): the committed term's deterministic
+/// placement with the committed elected assignment overlaid when one is held
+/// — a deviation the committed assignment itself mandates is NOT counted, so
+/// this never fights a regime-fenced failover assignment.
+///
+/// # Cost
+///
+/// A data-justified election deviation (full holder over a subset det master)
+/// is also counted, so re-heal keeps re-arming on the cooldown cadence until
+/// the deterministic master catches up and the deviation decays (task #47).
+/// Each such round is a table-level heal plus migration re-planning toward
+/// the committed master — the deliberate price of making third-party
+/// divergence self-correcting rather than permanent.
+fn third_party_deviation_shard_count(
+    table: &ShardTable,
+    committed_members: &[NodeId],
+    rf: u8,
+    self_id: NodeId,
+    placement_version: u16,
+    elected: Option<&crate::cluster::election::CommittedAssignment>,
+) -> usize {
+    // With fewer than 3 members every deviation has self on one side and is
+    // already covered by the phantom/missing pair; skip the recompute.
+    if committed_members.len() <= 2 {
+        return 0;
+    }
+    let committed = committed_baseline_table(committed_members, rf, 0, placement_version, elected);
+    (0..crate::cluster::shards::NUM_SHARDS as u16)
+        .filter(|&shard| {
+            let local = table.target_assignment(shard).master;
+            let expected = committed.target_assignment(shard).master;
+            local != expected && local != self_id && expected != self_id
+        })
+        .count()
+}
+
 /// Result of a batched completion handshake (`send_completion_only_handshakes`),
 /// per shard. Distinguishes a delivered commit from the two failure flavours so
 /// the caller can choose between relinquish and rollback (Task #25).
@@ -2989,11 +3052,27 @@ impl ClusterCoordinator {
                                 committed_pv,
                                 committed_elected.as_ref(),
                             );
+                            // F7 — the third leg: shards deviated between two
+                            // OTHER nodes. Self-centric detectors read zero
+                            // for those, so a node whose own shards match the
+                            // baseline never re-healed a third-party
+                            // deviation it was still routing by (see
+                            // `third_party_deviation_shard_count`).
+                            let third_party = third_party_deviation_shard_count(
+                                &table,
+                                &committed_members,
+                                rf,
+                                self_id,
+                                committed_pv,
+                                committed_elected.as_ref(),
+                            );
                             (
                                 mismatched,
                                 pending_handoffs,
                                 stuck_subset,
-                                phantom_masters.saturating_add(missing_masters),
+                                phantom_masters
+                                    .saturating_add(missing_masters)
+                                    .saturating_add(third_party),
                             )
                         };
 
@@ -5050,7 +5129,21 @@ impl ClusterCoordinator {
         // Query peers in parallel. Each peer thread sends its result over a
         // shared channel; the collecting loop drains the channel until the
         // total deadline elapses or every expected reply has arrived.
-        type PeerResult = (NodeId, Vec<PartitionVersionEntry>);
+        //
+        // F1 (task #47 residual, CI run 31787458246): a FAILED or garbled
+        // report query is `None` and leaves the peer ABSENT from the view —
+        // never recorded as present-with-no-entries. Fabricated emptiness
+        // passed `apply_master_election`'s `all_candidates_reported` gate on
+        // the elector whose query failed while an elector whose query
+        // succeeded computed a different view, so the two deviated
+        // differently from the same deterministic table (scenario 11's
+        // masters summing 4098/4096 at one version). An absent peer keeps
+        // the partial-view gate closed for every shard it is a candidate of,
+        // so a flaky peer degrades to "no deviation" (the deterministic
+        // master is preserved), never to divergence; the same-term re-heal
+        // re-collects a fresh view each cooldown, and a genuinely dead peer
+        // exits via SWIM reap + member-set change.
+        type PeerResult = (NodeId, Option<Vec<PartitionVersionEntry>>);
         let (tx, rx) = std::sync::mpsc::channel::<PeerResult>();
         for (peer, addr) in &peer_addrs {
             let tx = tx.clone();
@@ -5064,8 +5157,8 @@ impl ClusterCoordinator {
                     &cluster_key.to_le_bytes(),
                     secret.as_deref().map(Vec::as_slice),
                 ) {
-                    Ok(payload) => parse_partition_version_response(&payload).unwrap_or_default(),
-                    Err(_) => Vec::new(),
+                    Ok(payload) => parse_partition_version_response(&payload),
+                    Err(_) => None,
                 };
                 let _ = tx.send((peer, entries));
             });
@@ -5079,9 +5172,13 @@ impl ClusterCoordinator {
                 break;
             }
             match rx.recv_timeout(remaining) {
-                Ok((peer, entries)) => {
+                Ok((peer, Some(entries))) => {
                     phase.record(peer, entries);
                 }
+                // Failed query or unparseable payload: consume the reply so
+                // the drain loop still exits as soon as every peer answered,
+                // but leave the peer out of the view.
+                Ok((_, None)) => {}
                 Err(_) => break,
             }
         }
@@ -10531,15 +10628,20 @@ pub struct MasterCandidate {
     /// (e.g. a still-in-flight inbound migration). Subset candidates lose
     /// to any non-subset, non-evicted candidate.
     ///
-    /// Classified from raw `last_applied_seq > 0` in `apply_master_election`.
+    /// Classified in `apply_master_election` from `last_applied_seq` (the
+    /// shard's reported record count) RELATIVE to the max reported among the
+    /// shard's candidates (F2): strictly behind the max = subset, at the max
+    /// = full. A pure function of the shared view, so two electors holding
+    /// the same view still classify identically; cross-elector view skew is
+    /// gated by `all_candidates_reported` and reconciled by the same-term
+    /// re-heal.
     /// DO NOT classify this off the `PARTITION_FLAG_PENDING_INBOUND` flag
     /// (finding R4, rejected): that flag is the SAME `inbound_atomic` bit the
     /// serving fence reads (`is_master` -> Transitioning), so "an elector sees
     /// the flag clear" is equivalent to "the node's own fence is down" — a
     /// node mis-classified full at the migration-completion boundary is
     /// therefore UNFENCED and would serve, so a cross-elector skew on the flag
-    /// yields a dual-SERVING master, not a fail-safe fenced one. `seq > 0` is a
-    /// monotone threshold all electors agree on once crossed; the flag is not.
+    /// yields a dual-SERVING master, not a fail-safe fenced one.
     /// Electing a still-fenced subset holder is already SAFE (it cannot serve),
     /// so this term buys only availability at the cost of a double-spend window.
     pub is_subset: bool,
@@ -10810,15 +10912,17 @@ pub fn apply_master_election(
         // load, when the bounded exchange times out and returns partial views).
         // Require every candidate for this shard to have REPORTED in the view:
         // with a partial view (some candidate missing) preserve the
-        // deterministic round-robin master. NOTE (task #47): this check alone
-        // is NOT cluster-consistent — asymmetric reachability and mid-commit
-        // report rejections mean one node's view can be complete while
-        // another's is not (the exchange even records a failed peer query as
-        // present-with-no-entries). The resulting divergence is reconciled by
-        // the same-term re-heal reactivation, which re-collects a fresh view
-        // and re-runs this election on every divergent node. (The
-        // eviction-only empty-view path bypasses this: it has no responders
-        // by construction.)
+        // deterministic round-robin master. F1: the exchange records a peer
+        // only on a SUCCESSFUL report — a failed or garbled query leaves the
+        // peer ABSENT, so this gate genuinely blocks deviation on a partial
+        // view instead of passing on fabricated emptiness. NOTE (task #47):
+        // the check still is not fully cluster-consistent — asymmetric
+        // reachability means one node's view can be complete while another's
+        // is not. The residual divergence is reconciled by the same-term
+        // re-heal reactivation, which re-collects a fresh view and re-runs
+        // this election on every divergent node. (The eviction-only
+        // empty-view path bypasses this: it has no responders by
+        // construction.)
         let all_candidates_reported = view_empty
             || candidate_nodes
                 .iter()
@@ -10832,14 +10936,30 @@ pub fn apply_master_election(
         // and `elect_master`'s `was_previous_master` stickiness would silently
         // un-do the round-robin assignment to a newcomer. The eviction-only
         // empty-view path treats every candidate as full and must not skip.
-        let any_candidate_has_data = candidate_nodes.iter().any(|&node_id| {
-            seq_by_node_shard
-                .get(&(node_id, shard))
-                .copied()
-                .unwrap_or(0)
-                > 0
-        });
-        if !view_empty && !any_candidate_has_data {
+        //
+        // F2 (CI run 31787458246, scenario 09) — fullness is RELATIVE, not
+        // `seq > 0`: `last_applied_seq` reports the shard's record count, and
+        // an absolute threshold let a scale-up newcomer holding ONE record
+        // rank equal (full) to a complete holder, so the deterministic table
+        // kept mastering shards whose data lived elsewhere (reverse-heal
+        // Tier-2 detected a replica holding a strict superset of 13 mastered
+        // shards). A candidate strictly behind the max reported count among
+        // the shard's candidates is classified subset; only a candidate at
+        // the max is full. Ranking stays 3-valued (full=3 / subset=2 /
+        // evicted=0) and every pinned behavior is preserved: full-over-subset
+        // still promotes, equal counts are a tie that keeps the deterministic
+        // pick, the empty-view path is untouched.
+        let max_reported = candidate_nodes
+            .iter()
+            .map(|&node_id| {
+                seq_by_node_shard
+                    .get(&(node_id, shard))
+                    .copied()
+                    .unwrap_or(0)
+            })
+            .max()
+            .unwrap_or(0);
+        if !view_empty && max_reported == 0 {
             continue;
         }
 
@@ -10848,14 +10968,15 @@ pub fn apply_master_election(
             .map(|&node_id| {
                 // Eviction-only path (empty view): treat every candidate as
                 // full so election runs solely to skip the evicted node. With
-                // a real view, a node is "full" iff it reports a non-zero
-                // last_applied_seq for the shard, else "subset".
+                // a real view, a node is "full" iff its reported count for
+                // the shard matches the max among candidates (F2), else
+                // "subset" — an unreported shard counts as 0.
                 let has_data = view_empty
                     || seq_by_node_shard
                         .get(&(node_id, shard))
                         .copied()
                         .unwrap_or(0)
-                        > 0;
+                        == max_reported;
                 MasterCandidate {
                     node_id,
                     // Task #47 — never feed node-local history into the
@@ -12597,6 +12718,14 @@ impl RunningCluster {
         diag.local_view_canonical_master_id = local_master.0;
         diag.is_local_master_of_shard = local_master == self.self_id;
         diag.topology_epoch = self.topology_epoch();
+        // F7 — the SERVING side, so run diagnostics can tell a
+        // serving-vs-target split (mid-handoff, or an equal-version master
+        // divergence) apart from a settled table: the effective assignment
+        // this node routes by, and the lock-free serving-fence bit
+        // `is_master` actually reads (distinct from the tracker's
+        // `has_pending_inbound` above).
+        diag.local_view_effective_master_id = table.effective_assignment(shard).master.0;
+        diag.is_serving_fenced = self.inbound_atomic.test(shard);
         diag
     }
 
@@ -19035,6 +19164,172 @@ mod tests {
         );
     }
 
+    /// F7 (CI run 31787458246, scenario 09) — the reactivation detectors are
+    /// self-centric: `phantom_master_shard_count` counts only self-mastered
+    /// shards, `missing_master_shard_count` only shards the baseline assigns
+    /// to self, and the settled-branch intent metric is internal
+    /// self-consistency. A node whose table deviates shard S from det-master
+    /// B to holder C, with self neither B nor C, measures ZERO work on every
+    /// existing detector and never re-heals — how equal-version divergence
+    /// persisted unnoticed (scenario 09's node2 holding 90% of the ring saw
+    /// nothing wrong). `third_party_deviation_shard_count` closes the blind
+    /// spot: it counts ALL shards whose local master differs from the
+    /// committed-baseline expectation while self is neither side, arming the
+    /// same re-heal trigger.
+    #[test]
+    fn third_party_deviation_count_flags_deviation_self_detectors_miss() {
+        let committed = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let rf = 2;
+        let term = 5u64;
+        let det = ShardTable::compute_with_epoch(&committed, rf, term, 1);
+        let shard = (0..NUM_SHARDS as u16)
+            .find(|&s| {
+                det.target_assignment(s).master == NodeId(1)
+                    && det.target_assignment(s).replicas.contains(&NodeId(2))
+            })
+            .expect("some shard has master N1 with replica N2 in a 3-member ring");
+
+        // The deviated table: shard's master moved from det-master N1 to
+        // holder N2. From N3's point of view this is a THIRD-PARTY deviation.
+        let mut table = det.clone();
+        table.set_master_for_shard(shard, NodeId(2));
+
+        // Every existing detector on N3 reads zero — the blindness under test.
+        let (mismatched, _pending) =
+            committed_topology_reactivation_metrics(&table, &committed, rf, term, 1);
+        assert_eq!(
+            mismatched, 0,
+            "the settled-branch intent metric is self-consistent and blind to the deviation",
+        );
+        assert_eq!(
+            phantom_master_shard_count(&table, &committed, rf, NodeId(3), 1, None),
+            0,
+            "phantom detector only counts self-mastered shards",
+        );
+        assert_eq!(
+            missing_master_shard_count(&table, &committed, rf, NodeId(3), 1, None),
+            0,
+            "missing detector only counts shards the baseline assigns to self",
+        );
+
+        // The new detector must flag exactly the one deviated shard.
+        assert_eq!(
+            third_party_deviation_shard_count(&table, &committed, rf, NodeId(3), 1, None),
+            1,
+            "a third-party deviation (self neither det master nor deviated master) must arm re-heal",
+        );
+
+        // No false fire on the undisturbed deterministic table.
+        assert_eq!(
+            third_party_deviation_shard_count(&det, &committed, rf, NodeId(3), 1, None),
+            0,
+            "a table matching the committed baseline must not arm re-heal",
+        );
+
+        // When self IS a side of the deviation the existing detectors already
+        // count it; the third-party detector must not double count.
+        assert_eq!(
+            third_party_deviation_shard_count(&table, &committed, rf, NodeId(1), 1, None),
+            0,
+            "det-master side is missing_master_shard_count's job",
+        );
+        assert_eq!(
+            missing_master_shard_count(&table, &committed, rf, NodeId(1), 1, None),
+            1,
+            "sanity: the det-master side is indeed counted by the missing detector",
+        );
+        assert_eq!(
+            third_party_deviation_shard_count(&table, &committed, rf, NodeId(2), 1, None),
+            0,
+            "deviated-master side is phantom_master_shard_count's job",
+        );
+
+        // §8 — a committed elected assignment that ITSELF deviates the shard
+        // is the cluster-agreed baseline; the detector must not fight it.
+        let masters: Vec<NodeId> = (0..NUM_SHARDS as u16)
+            .map(|s| {
+                if s == shard {
+                    NodeId(2)
+                } else {
+                    det.target_assignment(s).master
+                }
+            })
+            .collect();
+        let assignment =
+            crate::cluster::election::CommittedAssignment::new(masters, &[false; NUM_SHARDS]);
+        assert_eq!(
+            third_party_deviation_shard_count(
+                &table,
+                &committed,
+                rf,
+                NodeId(3),
+                1,
+                Some(&assignment),
+            ),
+            0,
+            "a deviation matching the committed elected assignment is not a deviation",
+        );
+    }
+
+    /// F7 — `diagnose_key_routing` must expose the SERVING side of the shard
+    /// table (effective master + the lock-free serving fence `is_master`
+    /// actually reads), not just the target assignment: CI run 31787458246's
+    /// diagnostics could not distinguish a serving-vs-target split from a
+    /// settled table, so equal-version master divergence was invisible in the
+    /// run dumps.
+    #[test]
+    fn diagnose_key_routing_reports_effective_master_and_serving_fence() {
+        let members = vec![NodeId(1), NodeId(2)];
+        let old = ShardTable::compute_with_epoch(&[NodeId(1)], 1, 2, 1);
+        let new = ShardTable::compute_with_epoch(&members, 2, 3, 1);
+        let split_shard = (0..NUM_SHARDS as u16)
+            .find(|&s| new.target_assignment(s).master == NodeId(2))
+            .expect("some shard mastered by N2 in a 2-member ring");
+        let fenced_shard = (0..NUM_SHARDS as u16)
+            .find(|&s| s != split_shard)
+            .expect("a second shard exists");
+
+        // Mid-handoff table: target(split_shard) is N2, but N1 keeps SERVING
+        // it until the handoff commits (effective assignment = previous).
+        let mut table = old.clone();
+        table.begin_handoff_with(&new, |s| s == split_shard);
+
+        let cluster = new_test_running_cluster(
+            NodeId(1),
+            table,
+            &[(NodeId(1), "127.0.0.1:4899".parse().unwrap())],
+            &members,
+            &[fenced_shard], // inbound_shards → serving fence bit set
+            &[],
+            &[],
+            2,
+        );
+
+        let split = cluster.diagnose_key_routing(split_shard);
+        assert_eq!(
+            split.local_view_canonical_master_id, 2,
+            "target assignment must name the handoff destination",
+        );
+        assert_eq!(
+            split.local_view_effective_master_id, 1,
+            "the effective (serving) master must remain the pre-handoff owner until commit",
+        );
+        assert!(
+            !split.is_serving_fenced,
+            "no pending inbound for the split shard on this node",
+        );
+
+        let fenced = cluster.diagnose_key_routing(fenced_shard);
+        assert!(
+            fenced.is_serving_fenced,
+            "the serving-fence bit must mirror the lock-free inbound bitmap `is_master` reads",
+        );
+        assert_eq!(
+            fenced.local_view_effective_master_id, fenced.local_view_canonical_master_id,
+            "no handoff in flight for the fenced shard: serving == target",
+        );
+    }
+
     /// W1.1 FIX D — persisting topology state must succeed even when the
     /// parent directory does not exist yet (persist racing data-dir
     /// creation at boot produced `No such file or directory`, failing the
@@ -23942,6 +24237,170 @@ mod tests {
         );
     }
 
+    /// F1 (CI run 31787458246) — a peer whose report query FAILS must be
+    /// ABSENT from the collected partition view, never recorded as
+    /// present-with-no-entries. Fabricated emptiness passes the
+    /// `all_candidates_reported` gate on THIS elector while an elector whose
+    /// query succeeded computes a different view — the input divergence
+    /// behind scenario 11's target tables disagreeing at the same version
+    /// (masters summing 4098/4096). With the peer honestly absent, the
+    /// partial-view gate blocks deviation and every elector keeps the
+    /// deterministic pick.
+    #[test]
+    fn run_exchange_phase_leaves_failed_peer_absent_so_election_cannot_deviate() {
+        let members = [NodeId(1), NodeId(2)];
+        let rf = 2;
+        let term = 3u64;
+        let det = ShardTable::compute_with_epoch(&members, rf, term, 1);
+        // A shard the deterministic table masters to the unreachable peer,
+        // with self holding data — the exact shape where fabricated peer
+        // emptiness would let self deviate the master to itself.
+        let shard = (0..NUM_SHARDS as u16)
+            .find(|&s| det.target_assignment(s).master == NodeId(2))
+            .expect("some shard mastered by N2 in a 2-member ring");
+        let engine = Arc::new(test_engine());
+        create_test_record(&engine, tx_key_for_shard(shard, 1));
+
+        // N2's address points at a closed port, so its report query FAILS.
+        let mut addrs = std::collections::HashMap::new();
+        addrs.insert(NodeId(1), "127.0.0.1:1".parse().unwrap());
+        addrs.insert(NodeId(2), "127.0.0.1:1".parse().unwrap());
+        let node_addrs = Arc::new(RwLock::new(addrs));
+        let shard_table = Arc::new(ShardTableLock::new(det.clone()));
+        let inbound_bm = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+
+        let view = ClusterCoordinator::run_exchange_phase(
+            &members,
+            NodeId(1),
+            term,
+            &node_addrs,
+            &engine,
+            &shard_table,
+            &inbound_bm,
+            std::time::Duration::from_millis(1500),
+            &None,
+        );
+
+        assert!(
+            view.contains_key(&NodeId(1)),
+            "the in-process self-report must always be present",
+        );
+        assert!(
+            !view.contains_key(&NodeId(2)),
+            "a peer whose report query failed must be ABSENT from the view, not present-with-no-entries",
+        );
+
+        // The honest partial view must block deviation: the failed peer is a
+        // candidate for the shard, so `all_candidates_reported` is false and
+        // the deterministic master is preserved.
+        let mut table = ShardTable::compute_with_epoch(&members, rf, term, 1);
+        apply_master_election(&mut table, &det, &view, &std::collections::HashSet::new());
+        assert_eq!(
+            table.target_assignment(shard).master,
+            NodeId(2),
+            "a view missing a candidate (failed query) must not allow deviation from the deterministic master",
+        );
+    }
+
+    /// F2 (CI run 31787458246, scenario 09) — fullness must be RELATIVE. A
+    /// scale-up newcomer holding a single record used to classify "full"
+    /// (`last_applied_seq > 0`) and tie with a complete holder, so the
+    /// deterministic table kept mastering shards whose data lives elsewhere
+    /// (node4 mastering 13 shards a replica held a strict superset of). A
+    /// candidate strictly behind the max reported count among the shard's
+    /// candidates is a subset; the full holder strictly outranks it and wins.
+    #[test]
+    fn apply_master_election_demotes_master_strictly_behind_the_max_reported() {
+        let members = [NodeId(1), NodeId(2)];
+        let prev_table = ShardTable::compute_with_epoch(&members, 2, 1, 1);
+        let mut table = ShardTable::compute_with_epoch(&members, 2, 2, 1);
+        let shard = (0..NUM_SHARDS as u16)
+            .find(|&s| table.target_assignment(s).master == NodeId(1))
+            .expect("at least one shard mastered by N1 in 2-member ring");
+
+        // The deterministic master N1 is a newcomer with 1 record; the
+        // replica N2 holds the complete shard.
+        let mut view: std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>> =
+            std::collections::HashMap::new();
+        view.insert(
+            NodeId(1),
+            vec![PartitionVersionEntry {
+                shard,
+                flags: 0,
+                replica_count: 1,
+                last_applied_seq: 1,
+                manifest_digest: 0,
+                max_generation: 0,
+            }],
+        );
+        view.insert(
+            NodeId(2),
+            vec![PartitionVersionEntry {
+                shard,
+                flags: 0,
+                replica_count: 1,
+                last_applied_seq: 500,
+                manifest_digest: 0,
+                max_generation: 0,
+            }],
+        );
+
+        apply_master_election(
+            &mut table,
+            &prev_table,
+            &view,
+            &std::collections::HashSet::new(),
+        );
+
+        assert_eq!(
+            table.target_assignment(shard).master,
+            NodeId(2),
+            "a deterministic master strictly behind the max reported count is a subset; the full holder must win",
+        );
+    }
+
+    /// F2 pin — EQUAL reported counts are a tie, and a tie never deviates:
+    /// the deterministic pick is the only cluster-agreed assignment, so the
+    /// relative classifier must not manufacture deviations out of equality.
+    #[test]
+    fn apply_master_election_keeps_round_robin_on_equal_reported_counts() {
+        let members = [NodeId(1), NodeId(2)];
+        let prev_table = ShardTable::compute_with_epoch(&members, 2, 1, 1);
+        let mut table = ShardTable::compute_with_epoch(&members, 2, 2, 1);
+        let shard = (0..NUM_SHARDS as u16)
+            .find(|&s| table.target_assignment(s).master == NodeId(1))
+            .expect("at least one shard mastered by N1 in 2-member ring");
+
+        let mut view: std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>> =
+            std::collections::HashMap::new();
+        for node in members {
+            view.insert(
+                node,
+                vec![PartitionVersionEntry {
+                    shard,
+                    flags: 0,
+                    replica_count: 1,
+                    last_applied_seq: 500,
+                    manifest_digest: 0,
+                    max_generation: 0,
+                }],
+            );
+        }
+
+        apply_master_election(
+            &mut table,
+            &prev_table,
+            &view,
+            &std::collections::HashSet::new(),
+        );
+
+        assert_eq!(
+            table.target_assignment(shard).master,
+            NodeId(1),
+            "equal reported counts are a data tie; the deterministic master must be preserved",
+        );
+    }
+
     /// Task #22 — determinism gate: when the partition view is PARTIAL (a
     /// candidate for the shard did not report — e.g. unreachable during a
     /// load-induced exchange timeout), election must NOT deviate the master.
@@ -24065,10 +24524,10 @@ mod tests {
             })
             .expect("some shard has master N4 with replica N1 in a 4-member ring");
 
-        // The CONVERGED view both nodes hold: N1 and N4 both report data for
-        // the shard (N4 is mid-fill but non-empty, so both classify as full);
-        // N2/N3 responded with no entries (present-but-empty, as the exchange
-        // records failed or empty reports).
+        // The CONVERGED view both nodes hold: N1 and N4 both report the SAME
+        // count for the shard (F2 relative fullness — equal counts classify
+        // both as full, a data tie); N2/N3 responded with no entries
+        // (present-but-empty — a successful report of holding nothing).
         let mut view: std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>> =
             std::collections::HashMap::new();
         view.insert(
@@ -24088,7 +24547,7 @@ mod tests {
                 shard,
                 flags: 0,
                 replica_count: 1,
-                last_applied_seq: 3,
+                last_applied_seq: 5,
                 manifest_digest: 0,
                 max_generation: 0,
             }],

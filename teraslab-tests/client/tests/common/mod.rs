@@ -2566,6 +2566,8 @@ pub fn decode_admin_diagnose_key(
         let is_shard_fenced = entry[21] != 0;
         let is_migrating_shard = entry[22] != 0;
         let topology_epoch = u64::from_le_bytes(entry[23..31].try_into().unwrap());
+        let local_view_effective_master_id = u64::from_le_bytes(entry[31..39].try_into().unwrap());
+        let is_serving_fenced = entry[39] != 0;
         out.push(KeyDiagnosis {
             shard,
             this_node_id,
@@ -2576,6 +2578,8 @@ pub fn decode_admin_diagnose_key(
             is_shard_fenced,
             is_migrating_shard,
             topology_epoch,
+            local_view_effective_master_id,
+            is_serving_fenced,
         });
     }
     Ok(out)
@@ -2673,6 +2677,8 @@ mod replication_report_tests {
                 is_shard_fenced: true,
                 is_migrating_shard: false,
                 topology_epoch: 42,
+                local_view_effective_master_id: 7,
+                is_serving_fenced: false,
             },
             KeyDiagnosis {
                 shard: 4095,
@@ -2684,6 +2690,11 @@ mod replication_report_tests {
                 is_shard_fenced: false,
                 is_migrating_shard: true,
                 topology_epoch: 42,
+                // Serving-vs-target split: the pre-handoff owner (3) still
+                // serves while the target assignment names 9, behind an
+                // up serving fence.
+                local_view_effective_master_id: 3,
+                is_serving_fenced: true,
             },
         ];
 
@@ -2700,6 +2711,8 @@ mod replication_report_tests {
             body.push(u8::from(d.is_shard_fenced));
             body.push(u8::from(d.is_migrating_shard));
             body.extend_from_slice(&d.topology_epoch.to_le_bytes());
+            body.extend_from_slice(&d.local_view_effective_master_id.to_le_bytes());
+            body.push(u8::from(d.is_serving_fenced));
         }
         let decoded = decode_admin_diagnose_key(&body).unwrap();
         assert_eq!(decoded, entries);
@@ -2752,6 +2765,10 @@ mod replication_report_tests {
             is_shard_fenced: s.is_fenced,
             is_migrating_shard: s.is_migrating,
             topology_epoch: s.epoch,
+            // These format-oriented tests exercise the tracker/routing
+            // columns; the F7 serving-side fields default to "no split".
+            local_view_effective_master_id: s.master_id,
+            is_serving_fenced: false,
         }
     }
 
