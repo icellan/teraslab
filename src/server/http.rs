@@ -1880,8 +1880,38 @@ async fn wait_for_cluster_drain(cluster: &RunningCluster, wait_seconds: u64) -> 
     }
 }
 
-async fn handle_status(State(state): State<Arc<HttpState>>) -> impl IntoResponse {
-    let status = build_status_json(&state);
+/// Query parameters for `GET /status`.
+#[derive(Debug, Default, serde::Deserialize)]
+struct StatusQuery {
+    /// W4 — when non-zero, the payload additionally carries
+    /// `master_shards`: the IDs of every shard whose EFFECTIVE assignment
+    /// this node masters (the same predicate `master_shard_count` counts).
+    /// Opt-in because the list is ~KBs on a settled node and the harness
+    /// polls `/status` on a tight loop; only its failure diagnostics need
+    /// the per-shard sets (to name overlapping/orphaned shards when the
+    /// cluster-wide master sum diverges from `NUM_SHARDS`).
+    #[serde(default)]
+    master_shards: u8,
+}
+
+async fn handle_status(
+    Query(query): Query<StatusQuery>,
+    State(state): State<Arc<HttpState>>,
+) -> impl IntoResponse {
+    let mut status = build_status_json(&state);
+    if query.master_shards != 0
+        && let Some(ref cluster) = state.cluster
+        && let Some(obj) = status.as_object_mut()
+    {
+        let self_id = cluster.self_id();
+        let table = cluster.shard_table();
+        let table_guard = table.read();
+        let masters: Vec<u16> = (0..NUM_SHARDS as u16)
+            .filter(|&s| table_guard.effective_assignment(s).master == self_id)
+            .collect();
+        drop(table_guard);
+        obj.insert("master_shards".to_string(), serde_json::json!(masters));
+    }
     (
         StatusCode::OK,
         [("content-type", "application/json")],
@@ -5493,7 +5523,9 @@ mod tests {
 
         // Healthy node: write_healthy=true, redo_poisoned=false.
         let (healthy, _log) = build_ready_test_state_with_redo(true, false);
-        let resp = handle_status(State(healthy)).await.into_response();
+        let resp = handle_status(Query(StatusQuery::default()), State(healthy))
+            .await
+            .into_response();
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
             .unwrap();
@@ -5503,7 +5535,9 @@ mod tests {
 
         // Poisoned node: write_healthy=false, redo_poisoned=true.
         let (poisoned, _log) = build_ready_test_state_with_redo(true, true);
-        let resp = handle_status(State(poisoned)).await.into_response();
+        let resp = handle_status(Query(StatusQuery::default()), State(poisoned))
+            .await
+            .into_response();
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
             .unwrap();

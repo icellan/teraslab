@@ -7622,6 +7622,83 @@ fn drain_in_flight_mutations(engine: &Engine) {
 /// pools or large clusters a chunk can be the whole transfer).
 const MIGRATION_PIPELINE_SUB_BATCH: usize = 32;
 
+/// W4 (run 31904708491 scenario 09) — batch-scoped abandoned-task sweep.
+///
+/// A worker inside [`run_migration_batch`] can abort without resolving the
+/// rest of its chunk: the "peer reports our epoch is superseded" return and
+/// the mid-batch stale-epoch returns all bail out of the worker leaving
+/// every not-yet-resolved task exactly as it was (`Preparing` / `Streaming`
+/// / `Fenced`) with no worker left to drive it. When the LOCAL epoch flipped,
+/// the newer activation's stale-task cancel reaps those entries — but when
+/// the local table is still current (the peer-superseded case, observed 46
+/// times on node3), NOTHING reaps them: `active_count()` stays above zero
+/// forever, which holds the event loop's same-term re-heal gate
+/// (`active_count() == 0` in the reactivation block) shut, and the failed
+/// tasks from the same round sit "awaiting explicit retry on
+/// membership/topology change" — an edge a stable cluster never produces.
+/// Deadlocked pair: the re-heal waits for the migrations to drain; the
+/// migrations wait for a topology change (masters frozen at 4464/4096 with
+/// node1 at 288 and node3 at 1689 stranded entries for the rest of the run).
+///
+/// Called after the batch's worker scope has JOINED, so nothing is in
+/// flight for these tasks anymore: any of THIS batch's tasks still
+/// unresolved is definitionally abandoned. They are parked as `Failed`
+/// (joining the durable retry queue the membership re-drive and the next
+/// activation's cleanup already handle), the hot-path bitmaps are cleared,
+/// and a MASTER handoff is rolled back to self — the historical no-loss
+/// disposition (`FailedTaskTableAction::Rollback`); a REPLICA push leaves
+/// the table untouched (W3 FIX C: `rollback_shard` would revert the whole
+/// assignment while a master handoff may still be mid-Copying). With
+/// `active_count()` drained, the re-heal machinery re-plans on its normal
+/// cadence with a fresh partition view.
+///
+/// Epoch-stale batches are skipped entirely: their entries were (or will
+/// be) reaped by the newer activation itself, and sweeping here could brush
+/// same-identity entries that activation has ALREADY re-registered.
+///
+/// Returns the number of tasks parked.
+fn retire_abandoned_batch_tasks(
+    migration: &Arc<Mutex<MigrationManager>>,
+    shard_table: &Arc<ShardTableLock<ShardTable>>,
+    fenced_bm: &Arc<crate::cluster::migration::AtomicShardBitmap>,
+    migrating_bm: &Arc<crate::cluster::migration::AtomicShardBitmap>,
+    tasks: &[MigrationTask],
+    topology_epoch: u64,
+) -> usize {
+    if !migration_epoch_current(shard_table, topology_epoch) {
+        return 0;
+    }
+    let marked = {
+        let mut mgr = migration.lock();
+        let marked = mgr.fail_unresolved_tasks(tasks);
+        for task in &marked {
+            if !mgr.is_shard_fenced(task.shard) {
+                fenced_bm.clear(task.shard);
+            }
+            migrating_bm.clear(task.shard);
+        }
+        marked
+    };
+    // Same lock order as `fail_migration_task_current_epoch`: the migration
+    // mutex is NOT held across the shard-table write. Re-check the epoch so a
+    // table that advanced between the marking and this write is never rolled
+    // back under a superseded plan.
+    for task in &marked {
+        if task.is_master && migration_epoch_current(shard_table, topology_epoch) {
+            shard_table.write().rollback_shard(task.shard);
+        }
+    }
+    if !marked.is_empty() {
+        tracing::warn!(
+            abandoned = marked.len(),
+            task_epoch = topology_epoch,
+            "cluster: parked abandoned migration task(s) an aborted worker left \
+             unresolved — active_count releases the re-heal gate",
+        );
+    }
+    marked.len()
+}
+
 /// 1. Streams baseline records
 /// 2. Fences source writes
 /// 3. Streams redo deltas
@@ -7715,6 +7792,12 @@ fn run_migration_batch(
         );
         return;
     }
+    // W4 — everything this batch is responsible for, captured before the
+    // task list is split/consumed below. Every exit of this function runs
+    // `retire_abandoned_batch_tasks` over this list so an aborted worker can
+    // never leave a task stranded non-terminal (which would hold
+    // `active_count()` above zero and the re-heal gate shut forever).
+    let all_batch_tasks: Vec<MigrationTask> = tasks.clone();
 
     // Pre-group keys by shard ONCE. Without this, each shard does an
     // O(N) scan of all keys, making total cost O(shards × keys).
@@ -7952,6 +8035,17 @@ fn run_migration_batch(
             );
             return;
         }
+        // W4 — belt-and-braces: nothing on the empty/skipped paths above may
+        // leave a task unresolved, and this pins it (a no-op when they all
+        // resolved, as they must).
+        retire_abandoned_batch_tasks(
+            migration,
+            shard_table,
+            &fenced_bm,
+            &migrating_bm,
+            &all_batch_tasks,
+            topology_epoch,
+        );
         migration.lock().cleanup_completed_keep_failed();
         let c = completed.load(Ordering::Relaxed);
         let f = failed.load(Ordering::Relaxed);
@@ -8789,6 +8883,19 @@ fn run_migration_batch(
             });
         }
     });
+
+    // W4 — the workers have all JOINED; any of this batch's tasks still
+    // unresolved was abandoned by an aborted worker (peer-superseded or
+    // stale-epoch early return) and would hold `active_count()` above zero
+    // forever, keeping the same-term re-heal gate shut. Park them as Failed.
+    retire_abandoned_batch_tasks(
+        migration,
+        shard_table,
+        &fenced_bm,
+        &migrating_bm,
+        &all_batch_tasks,
+        topology_epoch,
+    );
 
     let c = completed.load(Ordering::Relaxed);
     let f = failed.load(Ordering::Relaxed);
@@ -19532,6 +19639,358 @@ mod tests {
         );
         drop(mgr);
         receiver.join().unwrap();
+    }
+
+    /// W4 (run 31904708491 scenario 09) — a worker-level abort must not leave
+    /// its remaining tasks stranded in a non-terminal state, holding the
+    /// same-term re-heal gate (`active_count() == 0` in the event loop's
+    /// reactivation block) shut forever.
+    ///
+    /// Repro shape: two data-shard tasks share one worker chunk; the target
+    /// rejects the FIRST baseline with the `ERR_STALE_EPOCH` envelope, so the
+    /// worker takes the "peer reports our epoch is superseded" early return —
+    /// with the LOCAL table still current (the observed node3 state: 46 such
+    /// aborts, 1689 entries frozen in `Preparing`/`Streaming`, `failed_count`
+    /// 0, and no re-heal ever firing again). Before the fix both entries
+    /// stayed non-terminal after `run_migration_batch` returned; the
+    /// batch-end sweep must park them as `Failed` (the durable retry queue),
+    /// clear the hot-path bitmaps, and roll the master handoffs back to self
+    /// so `active_count()` drains and the re-heal machinery re-plans on its
+    /// normal cadence.
+    #[test]
+    fn peer_superseded_worker_abort_parks_stranded_tasks_and_reopens_the_reheal_gate() {
+        let old_members = vec![NodeId(1), NodeId(2)];
+        let new_members = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let old_table = ShardTable::compute_with_epoch(&old_members, 2, 1, 1);
+        let new_table = ShardTable::compute_with_epoch(&new_members, 2, 2, 1);
+        let moving: Vec<u16> = (0..NUM_SHARDS as u16)
+            .filter(|&s| {
+                old_table.target_assignment(s).master == NodeId(1)
+                    && new_table.target_assignment(s).master == NodeId(3)
+            })
+            .take(2)
+            .collect();
+        assert_eq!(moving.len(), 2, "need two shards moving 1 -> 3");
+        let tasks: Vec<MigrationTask> = moving
+            .iter()
+            .map(|&shard| MigrationTask {
+                shard,
+                from_node: NodeId(1),
+                to_node: NodeId(3),
+                is_master: true,
+            })
+            .collect();
+
+        let mut handoff = old_table.clone();
+        handoff.begin_handoff_with(&new_table, |s| moving.contains(&s));
+        for &s in &moving {
+            assert_eq!(
+                handoff.shard_handoff_state(s),
+                ShardHandoff::Copying,
+                "both shards must take the data-migration path"
+            );
+        }
+        let shard_table = Arc::new(ShardTableLock::new(handoff));
+
+        let dev: Arc<dyn crate::device::BlockDevice> =
+            Arc::new(crate::device::MemoryDevice::new(4 * 1024 * 1024, 4096).unwrap());
+        let alloc = crate::allocator::SlotAllocator::new(dev.clone()).unwrap();
+        let index = crate::index::Index::new(128).unwrap();
+        let engine = Arc::new(crate::ops::engine::Engine::new(
+            dev,
+            index,
+            alloc,
+            crate::locks::StripedLocks::new(64),
+            crate::index::DahIndex::new(),
+        ));
+
+        // One record per shard so both tasks are DATA tasks (the worker's
+        // Phase-1 baseline loop is where the peer-superseded abort lives).
+        let mut keys = Vec::new();
+        for &shard in &moving {
+            let mut nonce = 0u64;
+            let tx_id = loop {
+                let mut tx_id = [0u8; 32];
+                tx_id[..8].copy_from_slice(&nonce.to_le_bytes());
+                tx_id[8..16].copy_from_slice(&u64::from(shard).to_le_bytes());
+                if ShardTable::shard_for_key(&TxKey { txid: tx_id }) == shard {
+                    break tx_id;
+                }
+                nonce += 1;
+            };
+            let utxo_hashes = [[0x44u8; 32]];
+            engine
+                .create(&crate::ops::create::CreateRequest {
+                    tx_id,
+                    tx_version: 1,
+                    locktime: 0,
+                    fee: 100,
+                    size_in_bytes: 100,
+                    extended_size: 0,
+                    is_coinbase: false,
+                    spending_height: 0,
+                    utxo_hashes: &utxo_hashes,
+                    inputs: None,
+                    outputs: None,
+                    inpoints: None,
+                    is_external: false,
+                    created_at: 1710000000000,
+                    block_height: 0,
+                    mined_block_infos: &[],
+                    frozen: false,
+                    conflicting: false,
+                    locked: false,
+                    external_ref: None,
+                    parent_txids: &[],
+                })
+                .unwrap();
+            keys.push(TxKey { txid: tx_id });
+        }
+
+        let migration = Arc::new(Mutex::new(MigrationManager::new()));
+        let populated: std::collections::HashSet<u16> = moving.iter().copied().collect();
+        migration
+            .lock()
+            .start_outbound(&tasks, NodeId(1), &populated);
+
+        let fenced_bm = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+        let migrating_bm = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+        for &s in &moving {
+            migrating_bm.set(s);
+        }
+        let inbound_bm = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+
+        // Target that rejects the first baseline frame with the real
+        // ERR_STALE_EPOCH envelope — the worker recognises it via
+        // `migration_error_is_stale_epoch` and returns, abandoning the rest
+        // of its chunk.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let target_addr = listener.local_addr().unwrap();
+        let receiver = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut header = [0u8; 4];
+            stream.read_exact(&mut header).unwrap();
+            let payload_len = u32::from_le_bytes(header) as usize;
+            let mut rest = vec![0u8; payload_len];
+            stream.read_exact(&mut rest).unwrap();
+            let mut frame_bytes = header.to_vec();
+            frame_bytes.extend_from_slice(&rest);
+            let (request, _) = RequestFrame::decode(&frame_bytes).unwrap();
+            let msg = b"stale cluster key";
+            let mut payload = Vec::new();
+            payload.extend_from_slice(&ERR_STALE_EPOCH.to_le_bytes());
+            payload.extend_from_slice(&(msg.len() as u16).to_le_bytes());
+            payload.extend_from_slice(msg);
+            let response = ResponseFrame {
+                request_id: request.request_id,
+                status: 1,
+                payload,
+            };
+            stream.write_all(&response.encode()).unwrap();
+        });
+
+        run_migration_batch(
+            tasks.clone(),
+            Some(target_addr),
+            &keys,
+            engine,
+            &migration,
+            &shard_table,
+            &None,
+            new_table.version,
+            1,
+            100,
+            fenced_bm.clone(),
+            migrating_bm.clone(),
+            inbound_bm,
+            NodeId(1),
+            None,
+            None,
+        );
+        receiver.join().unwrap();
+
+        // THE deadlocked gate: the event loop's same-term re-heal only fires
+        // when `active_count() == 0`. Stranded non-terminal entries held it
+        // shut forever (observed: node1 288, node3 1689, both frozen).
+        let mut mgr = migration.lock();
+        assert_eq!(
+            mgr.active_count(),
+            0,
+            "no task of a finished batch may stay non-terminal — stranded \
+             entries hold the re-heal gate (active_count()==0) shut forever; \
+             entries: {:?}",
+            mgr.active_migrations(),
+        );
+        // The stranded tasks are PARKED, not lost: they join the Failed
+        // durable retry queue the membership/topology re-drive consumes.
+        assert_eq!(
+            mgr.failed_count(),
+            2,
+            "both abandoned tasks must be parked as Failed for explicit retry"
+        );
+        let retry = mgr.take_failed_tasks();
+        assert_eq!(
+            retry.len(),
+            2,
+            "the parked tasks must remain re-drivable via take_failed_tasks"
+        );
+        drop(mgr);
+
+        let table = shard_table.read();
+        for &s in &moving {
+            assert!(
+                !migrating_bm.test(s),
+                "shard {s}: migrating_bm must clear when its task is parked"
+            );
+            assert!(
+                !fenced_bm.test(s),
+                "shard {s}: no fence may remain once its task is parked"
+            );
+            assert_eq!(
+                table.shard_handoff_state(s),
+                ShardHandoff::ServingNew,
+                "shard {s}: master handoff must roll back to the old assignment"
+            );
+            assert_eq!(
+                table.target_assignment(s).master,
+                NodeId(1),
+                "shard {s}: the source must keep authority after the rollback"
+            );
+        }
+    }
+
+    /// W4 — the abandoned-task sweep must NOT touch a stale-epoch batch:
+    /// the newer activation's stale-task cancel owns those entries, and a
+    /// sweep could brush same-identity entries that activation has already
+    /// re-registered.
+    #[test]
+    fn retire_abandoned_batch_tasks_is_a_no_op_for_a_stale_epoch_batch() {
+        let members = vec![NodeId(1), NodeId(2)];
+        // Table already advanced to version 3; the batch was planned at 2.
+        let table = ShardTable::compute_with_epoch(&members, 2, 3, 1);
+        let shard_table = Arc::new(ShardTableLock::new(table));
+        let task = MigrationTask {
+            shard: 9,
+            from_node: NodeId(1),
+            to_node: NodeId(2),
+            is_master: true,
+        };
+        let migration = Arc::new(Mutex::new(MigrationManager::new()));
+        migration.lock().start_outbound(
+            std::slice::from_ref(&task),
+            NodeId(1),
+            &std::collections::HashSet::new(),
+        );
+        let fenced_bm = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+        let migrating_bm = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+
+        let parked = retire_abandoned_batch_tasks(
+            &migration,
+            &shard_table,
+            &fenced_bm,
+            &migrating_bm,
+            std::slice::from_ref(&task),
+            2,
+        );
+
+        assert_eq!(parked, 0, "a stale-epoch batch must not be swept");
+        let mgr = migration.lock();
+        assert_eq!(
+            mgr.active_count(),
+            1,
+            "the stale entry is left for the newer activation's cancel"
+        );
+        assert_eq!(mgr.failed_count(), 0);
+    }
+
+    /// W4 — table disposition of the sweep: a stranded MASTER handoff rolls
+    /// its Copying shard back to the old assignment (no-loss), while a
+    /// stranded REPLICA push leaves the table untouched (W3 FIX C:
+    /// `rollback_shard` would revert the whole assignment while a master
+    /// handoff may still be mid-Copying elsewhere).
+    #[test]
+    fn retire_abandoned_batch_tasks_rolls_back_master_but_not_replica() {
+        let old_members = vec![NodeId(1), NodeId(2)];
+        let new_members = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let old_table = ShardTable::compute_with_epoch(&old_members, 2, 1, 1);
+        let new_table = ShardTable::compute_with_epoch(&new_members, 2, 2, 1);
+        let master_shard = (0..NUM_SHARDS as u16)
+            .find(|&s| {
+                old_table.target_assignment(s).master == NodeId(1)
+                    && new_table.target_assignment(s).master == NodeId(3)
+            })
+            .expect("need a master shard moving 1 -> 3");
+        let replica_shard = (0..NUM_SHARDS as u16)
+            .find(|&s| s != master_shard && new_table.target_assignment(s).master == NodeId(1))
+            .expect("need a shard node1 keeps mastering (replica backfill source)");
+        let master_task = MigrationTask {
+            shard: master_shard,
+            from_node: NodeId(1),
+            to_node: NodeId(3),
+            is_master: true,
+        };
+        let replica_task = MigrationTask {
+            shard: replica_shard,
+            from_node: NodeId(1),
+            to_node: NodeId(3),
+            is_master: false,
+        };
+
+        let mut handoff = old_table.clone();
+        handoff.begin_handoff_with(&new_table, |s| s == master_shard);
+        assert_eq!(
+            handoff.shard_handoff_state(master_shard),
+            ShardHandoff::Copying
+        );
+        let shard_table = Arc::new(ShardTableLock::new(handoff));
+        let replica_master_before = shard_table.read().target_assignment(replica_shard).master;
+
+        let migration = Arc::new(Mutex::new(MigrationManager::new()));
+        migration.lock().start_outbound(
+            &[master_task.clone(), replica_task.clone()],
+            NodeId(1),
+            &std::collections::HashSet::new(),
+        );
+        let fenced_bm = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+        let migrating_bm = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+        migrating_bm.set(master_shard);
+        migrating_bm.set(replica_shard);
+
+        let parked = retire_abandoned_batch_tasks(
+            &migration,
+            &shard_table,
+            &fenced_bm,
+            &migrating_bm,
+            &[master_task.clone(), replica_task.clone()],
+            new_table.version,
+        );
+
+        assert_eq!(parked, 2, "both stranded tasks must be parked");
+        let mgr = migration.lock();
+        assert_eq!(mgr.active_count(), 0, "the re-heal gate condition reopens");
+        assert_eq!(mgr.failed_count(), 2);
+        drop(mgr);
+        assert!(!migrating_bm.test(master_shard));
+        assert!(!migrating_bm.test(replica_shard));
+        let table = shard_table.read();
+        assert_eq!(
+            table.shard_handoff_state(master_shard),
+            ShardHandoff::ServingNew,
+            "the master handoff must roll back"
+        );
+        assert_eq!(
+            table.target_assignment(master_shard).master,
+            NodeId(1),
+            "the source keeps authority for the rolled-back master shard"
+        );
+        assert_eq!(
+            table.target_assignment(replica_shard).master,
+            replica_master_before,
+            "a replica push must not revert the shard's assignment (W3 FIX C)"
+        );
     }
 
     /// Variant of the pipelined-failure test: target never reads or replies

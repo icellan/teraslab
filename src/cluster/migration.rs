@@ -1277,6 +1277,42 @@ impl MigrationManager {
         self.retire_failed_task(task)
     }
 
+    /// W4 — park every task in `tasks` whose tracking entry is still
+    /// UNRESOLVED (neither `Complete` nor `Failed`) as `Failed`, returning
+    /// exactly the tasks that were marked.
+    ///
+    /// This is the batch-end abandoned-task sweep's manager half: a migration
+    /// batch whose workers aborted early (e.g. the peer-superseded return)
+    /// leaves its untouched tasks in `Preparing`/`Streaming`/`Fenced` with no
+    /// worker left to drive them — and those entries hold `active_count()`
+    /// above zero forever, which keeps the event loop's same-term re-heal
+    /// gate shut (observed in run 31904708491 scenario 09: 288/1689 frozen
+    /// entries, no re-heal for the rest of the run). Marking them `Failed`
+    /// parks them in the durable retry queue (`take_failed_tasks`) and runs
+    /// `mark_failed`'s fence/dual-write bookkeeping.
+    ///
+    /// The membership check and the marking happen under one `&mut self`
+    /// borrow so a concurrent re-registration cannot interleave between the
+    /// two. Entries already `Complete` or `Failed` are left untouched.
+    pub fn fail_unresolved_tasks(&mut self, tasks: &[MigrationTask]) -> Vec<MigrationTask> {
+        let mut marked = Vec::new();
+        for task in tasks {
+            let unresolved = self.active.iter().any(|p| {
+                p.shard == task.shard
+                    && p.from_node == task.from_node
+                    && p.to_node == task.to_node
+                    && p.is_master == task.is_master
+                    && !p.is_complete()
+                    && p.state != MigrationState::Failed
+            });
+            if unresolved {
+                self.mark_failed(task);
+                marked.push(task.clone());
+            }
+        }
+        marked
+    }
+
     /// Collect all failed migration tasks for re-execution.
     pub fn take_failed_tasks(&mut self) -> Vec<MigrationTask> {
         let tasks: Vec<MigrationTask> = self
@@ -3486,6 +3522,66 @@ mod tests {
         assert_eq!(retries.len(), 2);
         assert_eq!(mgr.failed_count(), 0);
         assert_eq!(mgr.active_count(), 2); // now Streaming again
+    }
+
+    /// W4 — `fail_unresolved_tasks` parks exactly the tasks whose entries are
+    /// still non-terminal, leaving Complete and already-Failed entries alone.
+    /// The parked entries drain `active_count()` (the re-heal gate) while
+    /// staying re-drivable through `take_failed_tasks`.
+    #[test]
+    fn fail_unresolved_tasks_marks_only_unresolved_entries() {
+        let mut mgr = MigrationManager::new();
+        let make = |shard: u16| MigrationTask {
+            shard,
+            from_node: NodeId(1),
+            to_node: NodeId(2),
+            is_master: true,
+        };
+        let completed = make(1);
+        let failed = make(2);
+        let stranded_streaming = make(3);
+        let stranded_preparing = make(4);
+        let tasks = [
+            completed.clone(),
+            failed.clone(),
+            stranded_streaming.clone(),
+            stranded_preparing.clone(),
+        ];
+        mgr.start_outbound(&tasks, NodeId(1), &std::collections::HashSet::new());
+        mgr.mark_complete(&completed);
+        mgr.mark_failed(&failed);
+        mgr.set_snapshot_sequence(&stranded_streaming, 7); // -> Streaming
+        assert_eq!(mgr.active_count(), 2, "two entries are stranded pre-sweep");
+
+        let marked = mgr.fail_unresolved_tasks(&tasks);
+
+        let marked_shards: Vec<u16> = marked.iter().map(|t| t.shard).collect();
+        assert_eq!(
+            marked_shards,
+            vec![3, 4],
+            "only the stranded entries may be parked"
+        );
+        assert_eq!(
+            mgr.active_count(),
+            0,
+            "the sweep must drain active_count (the re-heal gate condition)"
+        );
+        assert_eq!(mgr.failed_count(), 3, "failed + both stranded are parked");
+        let complete_entry = mgr
+            .active_migrations()
+            .iter()
+            .find(|p| p.shard == 1)
+            .expect("the Complete entry must survive the sweep");
+        assert_eq!(
+            complete_entry.state,
+            MigrationState::Complete,
+            "a Complete entry must never be flipped back to Failed"
+        );
+        assert_eq!(
+            mgr.take_failed_tasks().len(),
+            3,
+            "parked tasks must remain re-drivable via take_failed_tasks"
+        );
     }
 
     /// F3 — `retire_failed_task` removes exactly the matching FAILED entry:
