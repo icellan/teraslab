@@ -874,6 +874,11 @@ pub struct NodeInfo {
     pub id: u64,
     /// Network address (host:port).
     pub addr: String,
+    /// Whether the cluster's failure detector currently considers this node
+    /// alive. Decoded from the partition-map wire format: the coordinator
+    /// advertises `0` for nodes it has declared dead (C21) so clients stop
+    /// dialing them. Routing must never target a dead-advertised node.
+    pub is_alive: bool,
 }
 
 // ---------------------------------------------------------------------------
