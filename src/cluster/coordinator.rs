@@ -1149,8 +1149,15 @@ fn third_party_deviation_shard_count(
     placement_version: u16,
     elected: Option<&crate::cluster::election::CommittedAssignment>,
 ) -> usize {
-    // With fewer than 3 members every deviation has self on one side and is
-    // already covered by the phantom/missing pair; skip the recompute.
+    // With fewer than 3 members, skip the recompute. Not because self is
+    // always a side of a deviation — a stale table can still name an
+    // evicted NON-member as master, self on neither side — but because the
+    // committed-baseline master is always a committed member (self or the
+    // single peer), so the deviation's expected side is then the peer,
+    // whose own `missing_master_shard_count` re-drives the repair whenever
+    // the shard is genuinely unmastered. (With 1 member, self is every
+    // baseline master.) Counting here would add no repair that path does
+    // not already drive.
     if committed_members.len() <= 2 {
         return 0;
     }
@@ -5090,8 +5097,10 @@ impl ClusterCoordinator {
     /// (and the local node) and return the per-node partition view.
     ///
     /// Self-report is computed locally without TCP. Peers are queried in
-    /// parallel; an unreachable peer is treated as "no data" rather than
-    /// blocking the full per-peer timeout. The total wall-clock budget is
+    /// parallel; a peer whose query fails — unreachable, rejected (non-OK
+    /// status), or unparseable — is left ABSENT from the returned view (F1,
+    /// so election's partial-view gate genuinely blocks deviation) and does
+    /// not block the full per-peer timeout. The total wall-clock budget is
     /// bounded by `total_timeout`.
     #[allow(clippy::too_many_arguments)]
     fn run_exchange_phase(
@@ -5151,7 +5160,9 @@ impl ClusterCoordinator {
             let addr = *addr;
             let secret = auth_secret.clone();
             std::thread::spawn(move || {
-                let entries = match send_topology_frame(
+                // `_ok`: a rejected report (non-OK status) is a failed query
+                // by design, not an empty report — see F1 above.
+                let entries = match send_topology_frame_ok(
                     addr,
                     OP_PARTITION_VERSION_REPORT,
                     &cluster_key.to_le_bytes(),
@@ -5987,16 +5998,17 @@ fn exchange_frame(
     Ok(response)
 }
 
-/// Send a topology-protocol frame to a peer and return the response payload.
+/// Send a topology-protocol frame to a peer and return the full
+/// [`ResponseFrame`] (status + payload).
 ///
-/// Uses the standard TeraSlab framed TCP protocol with a 3-second connect
-/// timeout and 5-second read timeout.
-fn send_topology_frame(
+/// Uses the standard TeraSlab framed TCP protocol with a 500ms connect
+/// timeout and 2-second read timeout.
+fn send_topology_frame_response(
     addr: SocketAddr,
     op_code: u16,
     payload: &[u8],
     auth_secret: Option<&[u8]>,
-) -> Result<Vec<u8>, String> {
+) -> Result<ResponseFrame, String> {
     let mut stream = TcpStream::connect_timeout(&addr, Duration::from_millis(500))
         .map_err(|e| format!("connect: {e}"))?;
     stream
@@ -6010,7 +6022,40 @@ fn send_topology_frame(
         flags: 0,
         payload: bytes::Bytes::copy_from_slice(payload),
     };
-    let response = exchange_frame(&mut stream, &request, auth_secret)?;
+    exchange_frame(&mut stream, &request, auth_secret)
+}
+
+/// Send a topology-protocol frame to a peer and return the response payload
+/// regardless of status. Callers that need to distinguish rejection decode
+/// the error envelope from the payload themselves (e.g. the propose/commit
+/// paths); callers that must treat rejection as failure use
+/// [`send_topology_frame_ok`].
+fn send_topology_frame(
+    addr: SocketAddr,
+    op_code: u16,
+    payload: &[u8],
+    auth_secret: Option<&[u8]>,
+) -> Result<Vec<u8>, String> {
+    Ok(send_topology_frame_response(addr, op_code, payload, auth_secret)?.payload)
+}
+
+/// Like [`send_topology_frame`], but a non-`STATUS_OK` response is an `Err`.
+///
+/// F1 — used by the exchange report path so a REJECTED report query (e.g.
+/// `ERR_STALE_EPOCH` on a cluster_key mismatch) is failure BY DESIGN — the
+/// peer stays absent from the partition view — rather than by the accident
+/// of the error envelope failing `parse_partition_version_response`'s
+/// stride check.
+fn send_topology_frame_ok(
+    addr: SocketAddr,
+    op_code: u16,
+    payload: &[u8],
+    auth_secret: Option<&[u8]>,
+) -> Result<Vec<u8>, String> {
+    let response = send_topology_frame_response(addr, op_code, payload, auth_secret)?;
+    if response.status != STATUS_OK {
+        return Err(format!("peer replied status {}", response.status));
+    }
     Ok(response.payload)
 }
 
@@ -10630,11 +10675,15 @@ pub struct MasterCandidate {
     ///
     /// Classified in `apply_master_election` from `last_applied_seq` (the
     /// shard's reported record count) RELATIVE to the max reported among the
-    /// shard's candidates (F2): strictly behind the max = subset, at the max
-    /// = full. A pure function of the shared view, so two electors holding
-    /// the same view still classify identically; cross-elector view skew is
-    /// gated by `all_candidates_reported` and reconciled by the same-term
-    /// re-heal.
+    /// shard's candidates (F2): subset iff `count == 0 || count*2 < max`,
+    /// full otherwise. The 2x material-lag threshold is what keeps the
+    /// classification stable across electors even though counts are sampled
+    /// at different instants per report: exchange-window skew is additive
+    /// and bounded, so it cannot flip a 2x disparity — once a candidate has
+    /// crossed half of any elector's observed max, EVERY elector classifies
+    /// it full, the same agree-once-crossed property the old `seq > 0`
+    /// threshold had. Residual cross-elector view skew is gated by
+    /// `all_candidates_reported` and reconciled by the same-term re-heal.
     /// DO NOT classify this off the `PARTITION_FLAG_PENDING_INBOUND` flag
     /// (finding R4, rejected): that flag is the SAME `inbound_atomic` bit the
     /// serving fence reads (`is_master` -> Transitioning), so "an elector sees
@@ -10943,12 +10992,26 @@ pub fn apply_master_election(
         // rank equal (full) to a complete holder, so the deterministic table
         // kept mastering shards whose data lived elsewhere (reverse-heal
         // Tier-2 detected a replica holding a strict superset of 13 mastered
-        // shards). A candidate strictly behind the max reported count among
-        // the shard's candidates is classified subset; only a candidate at
-        // the max is full. Ranking stays 3-valued (full=3 / subset=2 /
-        // evicted=0) and every pinned behavior is preserved: full-over-subset
-        // still promotes, equal counts are a tie that keeps the deterministic
-        // pick, the empty-view path is untouched.
+        // shards). Demotion requires MATERIAL lag: a candidate is subset iff
+        // `count == 0 || count*2 < max_reported`. A strict `count < max`
+        // rule would consume live-moving counts sampled at different
+        // instants inside the ~2s exchange window (self-report at t0, each
+        // peer report regenerated fresh per query), so one write landing in
+        // the window would make electors disagree at equal views-by-name —
+        // exactly the observer-dependent hazard `elect_master`'s recency
+        // comment forbids. The 2x threshold restores the electors-agree
+        // property the old `seq > 0` rule had: window skew is additive and
+        // bounded (the writes of ~2s), so it cannot produce a 2x disparity
+        // on any shard with non-trivial count — once a candidate crosses
+        // half of any elector's observed max, every elector classifies it
+        // full. The genuine defect (a newcomer with ~1 record vs a complete
+        // holder) is precisely the massive-disparity case; near-boundary
+        // shards resolve by the fill completing, at which point the tie
+        // keeps (or decays back to) the deterministic pick. Ranking stays
+        // 3-valued (full=3 / subset=2 / evicted=0) and every pinned behavior
+        // is preserved: full-over-subset still promotes, near-equal and
+        // equal counts are a tie that keeps the deterministic pick, the
+        // empty-view path is untouched.
         let max_reported = candidate_nodes
             .iter()
             .map(|&node_id| {
@@ -10968,15 +11031,14 @@ pub fn apply_master_election(
             .map(|&node_id| {
                 // Eviction-only path (empty view): treat every candidate as
                 // full so election runs solely to skip the evicted node. With
-                // a real view, a node is "full" iff its reported count for
-                // the shard matches the max among candidates (F2), else
-                // "subset" — an unreported shard counts as 0.
-                let has_data = view_empty
-                    || seq_by_node_shard
-                        .get(&(node_id, shard))
-                        .copied()
-                        .unwrap_or(0)
-                        == max_reported;
+                // a real view, a node is "subset" iff it reports nothing or
+                // is MATERIALLY behind the max among candidates (F2:
+                // `count*2 < max`) — an unreported shard counts as 0.
+                let count = seq_by_node_shard
+                    .get(&(node_id, shard))
+                    .copied()
+                    .unwrap_or(0);
+                let has_data = view_empty || (count > 0 && count.saturating_mul(2) >= max_reported);
                 MasterCandidate {
                     node_id,
                     // Task #47 — never feed node-local history into the
@@ -24302,15 +24364,11 @@ mod tests {
         );
     }
 
-    /// F2 (CI run 31787458246, scenario 09) — fullness must be RELATIVE. A
-    /// scale-up newcomer holding a single record used to classify "full"
-    /// (`last_applied_seq > 0`) and tie with a complete holder, so the
-    /// deterministic table kept mastering shards whose data lives elsewhere
-    /// (node4 mastering 13 shards a replica held a strict superset of). A
-    /// candidate strictly behind the max reported count among the shard's
-    /// candidates is a subset; the full holder strictly outranks it and wins.
-    #[test]
-    fn apply_master_election_demotes_master_strictly_behind_the_max_reported() {
+    /// F2 helper — 2-member ring, deterministic master N1 reporting
+    /// `det_count` and its replica N2 reporting `holder_count` for one
+    /// shard; runs the election and returns
+    /// `(det_master, holder, resulting_master)`.
+    fn election_result_with_counts(det_count: u64, holder_count: u64) -> (NodeId, NodeId, NodeId) {
         let members = [NodeId(1), NodeId(2)];
         let prev_table = ShardTable::compute_with_epoch(&members, 2, 1, 1);
         let mut table = ShardTable::compute_with_epoch(&members, 2, 2, 1);
@@ -24318,23 +24376,114 @@ mod tests {
             .find(|&s| table.target_assignment(s).master == NodeId(1))
             .expect("at least one shard mastered by N1 in 2-member ring");
 
-        // The deterministic master N1 is a newcomer with 1 record; the
-        // replica N2 holds the complete shard.
-        let mut view: std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>> =
-            std::collections::HashMap::new();
-        view.insert(
-            NodeId(1),
+        let entry = |seq: u64| {
             vec![PartitionVersionEntry {
                 shard,
                 flags: 0,
                 replica_count: 1,
-                last_applied_seq: 1,
+                last_applied_seq: seq,
                 manifest_digest: 0,
                 max_generation: 0,
-            }],
+            }]
+        };
+        let mut view: std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>> =
+            std::collections::HashMap::new();
+        view.insert(NodeId(1), entry(det_count));
+        view.insert(NodeId(2), entry(holder_count));
+
+        apply_master_election(
+            &mut table,
+            &prev_table,
+            &view,
+            &std::collections::HashSet::new(),
         );
+        (NodeId(1), NodeId(2), table.target_assignment(shard).master)
+    }
+
+    /// F2 (CI run 31787458246, scenario 09) — fullness is RELATIVE, and
+    /// demotion requires MATERIAL lag (`count == 0 || count*2 < max`). A
+    /// scale-up newcomer holding a single record used to classify "full"
+    /// (`last_applied_seq > 0`) and tie with a complete holder, so the
+    /// deterministic table kept mastering shards whose data lives elsewhere
+    /// (node4 mastering 13 shards a replica held a strict superset of). The
+    /// genuine defect is exactly this massive-disparity shape; both sides of
+    /// the 2x boundary are pinned here and in the keep-side test below.
+    #[test]
+    fn apply_master_election_demotes_master_materially_behind_the_max_reported() {
+        // Newcomer shape: 1 record vs a complete holder.
+        let (_, holder, elected) = election_result_with_counts(1, 500);
+        assert_eq!(
+            elected, holder,
+            "a det master with ~1 record vs a complete holder is materially behind; the holder must win",
+        );
+        // Demote side of the boundary: 249*2 = 498 < 500 → still material.
+        let (_, holder, elected) = election_result_with_counts(249, 500);
+        assert_eq!(
+            elected, holder,
+            "count*2 strictly below the max is material lag; the holder must win",
+        );
+        // Empty det master (the pre-F2 subset case) still demotes.
+        let (_, holder, elected) = election_result_with_counts(0, 500);
+        assert_eq!(
+            elected, holder,
+            "an empty det master is a subset; the holder must win",
+        );
+    }
+
+    /// F2 pin (keep side) — lag WITHIN the material threshold is a tie and a
+    /// tie never deviates. This is the skew-stability property: report counts
+    /// are sampled at different instants inside the ~2s exchange window, so
+    /// two electors can legitimately observe counts differing by the writes
+    /// landed in that window; a bounded additive skew must never flip the
+    /// classification, or electors disagree at equal views-by-name and
+    /// re-create equal-version divergence with zero faults.
+    #[test]
+    fn apply_master_election_keeps_det_master_within_material_lag_of_max() {
+        // Keep side of the boundary: 250*2 = 500 >= 500 → full → tie.
+        let (det, _, elected) = election_result_with_counts(250, 500);
+        assert_eq!(
+            elected, det,
+            "count*2 at/above the max is not material lag; the deterministic master must be preserved",
+        );
+        // Near-equal: the one-write-in-the-window shape must be a tie.
+        let (det, _, elected) = election_result_with_counts(499, 500);
+        assert_eq!(
+            elected, det,
+            "a near-equal count (exchange-window skew) must never demote the deterministic master",
+        );
+        // Equal counts are a tie.
+        let (det, _, elected) = election_result_with_counts(500, 500);
+        assert_eq!(
+            elected, det,
+            "equal reported counts are a data tie; the deterministic master must be preserved",
+        );
+    }
+
+    /// F2/#47 — the agreement-WITH-deviation outcome needs a two-elector
+    /// pin: when the det master is MATERIALLY behind the full holder, every
+    /// elector must deviate to the SAME holder regardless of how the local
+    /// `prev_table`s diverged. (The near-equal 5-vs-3 shape of the original
+    /// equal-views pin resolves as a tie under material lag; this covers the
+    /// deviating counterpart.)
+    #[test]
+    fn apply_master_election_agrees_on_full_holder_when_det_master_materially_behind() {
+        let members = [NodeId(1), NodeId(2), NodeId(3), NodeId(4)];
+        let rf = 2;
+        let term = 5;
+        let det = ShardTable::compute_with_epoch(&members, rf, term, 1);
+        let shard = (0..NUM_SHARDS as u16)
+            .find(|&s| {
+                det.target_assignment(s).master == NodeId(4)
+                    && det.target_assignment(s).replicas.contains(&NodeId(1))
+            })
+            .expect("some shard has master N4 with replica N1 in a 4-member ring");
+
+        // N1 holds the complete shard; the det master N4 is mid-fill with 3
+        // records — material lag (3*2 < 500).
+        let mut view: std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>> =
+            std::collections::HashMap::new();
         view.insert(
-            NodeId(2),
+            NodeId(1),
             vec![PartitionVersionEntry {
                 shard,
                 flags: 0,
@@ -24344,60 +24493,50 @@ mod tests {
                 max_generation: 0,
             }],
         );
+        view.insert(
+            NodeId(4),
+            vec![PartitionVersionEntry {
+                shard,
+                flags: 0,
+                replica_count: 1,
+                last_applied_seq: 3,
+                manifest_digest: 0,
+                max_generation: 0,
+            }],
+        );
+        view.insert(NodeId(2), Vec::new());
+        view.insert(NodeId(3), Vec::new());
 
+        // Divergent local histories: node 1's previous table carries an old
+        // deviation to itself; node 4's is the plain deterministic table.
+        let mut prev_node1 = det.clone();
+        prev_node1.set_master_for_shard(shard, NodeId(1));
+        let prev_node4 = det.clone();
+
+        let mut table_node1 = ShardTable::compute_with_epoch(&members, rf, term, 1);
         apply_master_election(
-            &mut table,
-            &prev_table,
+            &mut table_node1,
+            &prev_node1,
+            &view,
+            &std::collections::HashSet::new(),
+        );
+        let mut table_node4 = ShardTable::compute_with_epoch(&members, rf, term, 1);
+        apply_master_election(
+            &mut table_node4,
+            &prev_node4,
             &view,
             &std::collections::HashSet::new(),
         );
 
         assert_eq!(
-            table.target_assignment(shard).master,
-            NodeId(2),
-            "a deterministic master strictly behind the max reported count is a subset; the full holder must win",
+            table_node1.target_assignment(shard).master,
+            table_node4.target_assignment(shard).master,
+            "equal views must elect the same master on every node even when deviating",
         );
-    }
-
-    /// F2 pin — EQUAL reported counts are a tie, and a tie never deviates:
-    /// the deterministic pick is the only cluster-agreed assignment, so the
-    /// relative classifier must not manufacture deviations out of equality.
-    #[test]
-    fn apply_master_election_keeps_round_robin_on_equal_reported_counts() {
-        let members = [NodeId(1), NodeId(2)];
-        let prev_table = ShardTable::compute_with_epoch(&members, 2, 1, 1);
-        let mut table = ShardTable::compute_with_epoch(&members, 2, 2, 1);
-        let shard = (0..NUM_SHARDS as u16)
-            .find(|&s| table.target_assignment(s).master == NodeId(1))
-            .expect("at least one shard mastered by N1 in 2-member ring");
-
-        let mut view: std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>> =
-            std::collections::HashMap::new();
-        for node in members {
-            view.insert(
-                node,
-                vec![PartitionVersionEntry {
-                    shard,
-                    flags: 0,
-                    replica_count: 1,
-                    last_applied_seq: 500,
-                    manifest_digest: 0,
-                    max_generation: 0,
-                }],
-            );
-        }
-
-        apply_master_election(
-            &mut table,
-            &prev_table,
-            &view,
-            &std::collections::HashSet::new(),
-        );
-
         assert_eq!(
-            table.target_assignment(shard).master,
+            table_node1.target_assignment(shard).master,
             NodeId(1),
-            "equal reported counts are a data tie; the deterministic master must be preserved",
+            "both electors must deviate to the full holder when the det master is materially behind",
         );
     }
 
