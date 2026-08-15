@@ -1092,6 +1092,16 @@ pub struct ReplicationMetrics {
     /// covered positions and the redo budget is absorbing the re-apply
     /// churn.
     pub replica_covered_batch_reapplied: PaddedCounter,
+    /// Scenario 11: receiver-side counter — incremented every time an
+    /// inbound `OP_REPLICA_BATCH` is NAKed with the retriable
+    /// `ReplicaAck::Busy` by the pre-batch chunk-staging pressure gate
+    /// (the batch's part-0 opens would push the process-wide staging sum
+    /// past its cap). Occasional ticks are normal when concurrent
+    /// large-blob baselines/deltas target this node — the senders back
+    /// off and re-send the identical batch; sustained growth means the
+    /// staging cap is chronically saturated (too many concurrent large
+    /// streams, or stale open assemblies pinning the cap).
+    pub replica_staging_pressure_naks: PaddedCounter,
 }
 
 /// Per-replica drill-down state exposed on `/admin/top`.
@@ -1154,6 +1164,7 @@ impl ReplicationMetrics {
             replica_unauthenticated_accept_total: PaddedCounter::new(),
             replica_rejected_sequence_gap: PaddedCounter::new(),
             replica_covered_batch_reapplied: PaddedCounter::new(),
+            replica_staging_pressure_naks: PaddedCounter::new(),
         }
     }
 

@@ -765,15 +765,20 @@ const MAX_STAGED_TOTAL_BYTES: u64 = 256 * 1024 * 1024;
 ///
 /// `Pressure` is the ONE transient refusal: an opening part that would push
 /// the sum of open assemblies past [`MAX_STAGED_TOTAL_BYTES`]. Nothing of the
-/// op was staged (the check fires at part 0, before any insert), so the
-/// IDENTICAL delivery can succeed once an open assembly elsewhere completes —
-/// the apply loop maps it to the retriable [`ReplicaAck::Busy`] NAK, mirroring
-/// the full-redo backpressure NAK, so the sender backs off and re-sends the
-/// same batch. The historical terminal [`ReplicaAck::Error`] here failed an
-/// ENTIRE shard baseline/delta over a moment of memory pressure (CI scenario
-/// 11: concurrent large-blob baselines against one target), re-running the
-/// whole shard later and amplifying churn under exactly the pressure that
-/// caused it.
+/// op is staged (the check fires at part 0, before any insert), and the
+/// IDENTICAL delivery can succeed once an open assembly elsewhere completes.
+/// The retriable [`ReplicaAck::Busy`] NAK for this condition is issued by the
+/// PRE-BATCH gate ([`batch_chunk_staging_pressure`]) — before any op of the
+/// batch applies or stages — because a Busy decided mid-loop is unsound for
+/// a batch whose earlier ops consumed a cross-batch tail (see the gate's
+/// doc). A `Pressure` that still reaches the apply loop means another
+/// connection opened assemblies between the gate and this op (a race); the
+/// loop maps it to the terminal [`ReplicaAck::Error`], preserving the
+/// invariant that `Busy` is only ever sent with nothing applied. The
+/// historical always-terminal behavior failed an ENTIRE shard baseline/delta
+/// over a moment of memory pressure (CI scenario 11: concurrent large-blob
+/// baselines against one target), re-running the whole shard later and
+/// amplifying churn under exactly the pressure that caused it.
 ///
 /// Every other refusal is `Hard`: re-sending the same bytes can never succeed
 /// (per-op cap, index/sequence violations, conflicts, tamper, decode
@@ -784,6 +789,111 @@ const MAX_STAGED_TOTAL_BYTES: u64 = 256 * 1024 * 1024;
 enum ChunkStageError {
     Pressure(String),
     Hard(String),
+}
+
+/// F1 hoisted staging-pressure gate: decide BEFORE the apply loop whether
+/// this batch's chunk part-0 opens would push the process-wide staging sum
+/// past [`MAX_STAGED_TOTAL_BYTES`].
+///
+/// Returns `Some(detail)` when the batch must be NAKed [`ReplicaAck::Busy`]
+/// up front — nothing applied, staged, or journaled, so the identical resend
+/// is trivially correct for the WHOLE batch. Deciding this mid-loop instead
+/// is unsound for the modal sub-batch shape `[A.tail, B.part 0]`
+/// ([`CHUNK_PAYLOAD_MAX`](crate::replication::protocol::CHUNK_PAYLOAD_MAX)
+/// 8 MiB vs the ~16 MiB send budget packs them together): the tail COMPLETES
+/// its assembly and applies before B's part 0 trips the cap, so the "Busy"
+/// resend re-delivers a tail whose assembly no longer exists — a Hard NAK,
+/// failing the shard the Busy existed to protect.
+///
+/// The walk simulates opens AND completions in apply order — an assembly
+/// this batch completes frees its bytes before a later part 0 needs them. A
+/// plain sum of part-0 `total_len`s would deterministically re-NAK that same
+/// `[A.tail, B.part 0]` shape under pressure (A's bytes never credited back),
+/// starving it instead of admitting it. Anything the walk cannot vouch for
+/// is left to the loop's fail-closed Hard errors, all of which pre-empt any
+/// later staging:
+///
+/// - a part 0 over an open assembly (the b13b221 conflict) or a duplicate
+///   part 0 within one batch: the walk stops (`None`) so the loop's conflict
+///   check — which fires BEFORE its pressure check — NAKs Hard; pressure
+///   never masks a conflict;
+/// - a per-op-cap violation, or a continuation with no open assembly: Hard
+///   in the loop; ops beyond it never stage;
+/// - malformed sequence metadata (wrong index/count/total): the loop NAKs
+///   Hard at that op; the walk may mis-simulate LATER ops, which at worst
+///   trades one Hard NAK for a bounded Busy round — never a false apply.
+///
+/// Races remain possible (another stream can open assemblies between this
+/// gate and the loop's own staging); an in-loop cap trip is therefore mapped
+/// to a HARD error — rare after this gate, and it preserves "Busy is only
+/// ever sent with nothing applied".
+fn batch_chunk_staging_pressure(stream_key: &str, ops: &[ReplicaOp]) -> Option<String> {
+    if !ops
+        .iter()
+        .any(|op| matches!(op, ReplicaOp::OpChunk { chunk_index: 0, .. }))
+    {
+        return None;
+    }
+    // Snapshot the open set under the lock, walk without it: the walk only
+    // simulates, and the benign race direction (an assembly elsewhere
+    // completing after the snapshot) costs at most one extra Busy round.
+    let (mut open_sum, mut open) = {
+        let map = chunk_staging().lock();
+        let open_sum: u64 = map.values().map(|st| st.total_len).sum();
+        let open: std::collections::HashMap<(String, TxKey), (u32, u64)> = map
+            .iter()
+            .map(|(k, st)| {
+                (
+                    k.clone(),
+                    (st.chunk_count.saturating_sub(st.next_index), st.total_len),
+                )
+            })
+            .collect();
+        (open_sum, open)
+    };
+    for op in ops {
+        let ReplicaOp::OpChunk {
+            tx_key,
+            chunk_index,
+            chunk_count,
+            total_len,
+            ..
+        } = op
+        else {
+            continue;
+        };
+        let key = (stream_key.to_string(), *tx_key);
+        if *chunk_index == 0 {
+            if open.contains_key(&key) {
+                // b13b221 conflict (or duplicate part 0 in one batch): the
+                // loop Hard-NAKs at this op before any pressure check.
+                return None;
+            }
+            if *total_len > MAX_STAGED_OP_BYTES {
+                // Per-op cap: Hard in the loop; ops beyond it never stage.
+                return None;
+            }
+            if open_sum + *total_len > MAX_STAGED_TOTAL_BYTES {
+                return Some(format!(
+                    "chunk staging full: {open_sum} bytes already open, refusing {total_len} \
+                     more (cap {MAX_STAGED_TOTAL_BYTES})"
+                ));
+            }
+            open_sum += *total_len;
+            open.insert(key, (chunk_count.saturating_sub(1), *total_len));
+        } else if let Some((remaining, tl)) = open.get_mut(&key) {
+            *remaining = remaining.saturating_sub(1);
+            if *remaining == 0 {
+                open_sum = open_sum.saturating_sub(*tl);
+                open.remove(&key);
+            }
+        } else {
+            // Continuation with no open assembly: Hard in the loop; ops
+            // beyond it never stage.
+            return None;
+        }
+    }
+    None
 }
 
 /// One open chunked-op assembly (see [`stage_chunk`]).
@@ -1374,6 +1484,35 @@ pub fn handle_replica_batch_with_tracker_and_master_lookup(
     // `LogFull` → poison path rather than hanging.
     crate::server::dispatch::redo_backpressure_gate(engine);
 
+    // F1 (scenario 11): pre-batch chunk-staging pressure gate. Decided HERE —
+    // after every acceptance gate, before ANY op applies or stages — so the
+    // Busy NAK's contract ("nothing applied, nothing staged, nothing
+    // journaled; the identical resend is correct") holds for the WHOLE
+    // batch, including the modal `[A.tail, B.part 0]` sub-batch shape whose
+    // tail a mid-loop decision would have consumed. See
+    // `batch_chunk_staging_pressure` for the walk's semantics; senders back
+    // off and re-send the identical batch (mirroring the full-redo Busy
+    // below) instead of failing the whole shard baseline/delta.
+    if let Some(message) = batch_chunk_staging_pressure(&effective_stream_key, &batch.ops) {
+        if let Some(m) = crate::metrics::replication_metrics() {
+            m.replica_staging_pressure_naks.inc();
+        }
+        tracing::warn!(
+            stream_key = %effective_stream_key,
+            first_sequence = batch.first_sequence,
+            %message,
+            "replica NAK: chunk staging at capacity; NAKing Busy (retriable)",
+        );
+        let ack = ReplicaAck::Busy {
+            first_sequence: batch.first_sequence,
+        };
+        return ResponseFrame {
+            request_id: request.request_id,
+            status: STATUS_ERROR,
+            payload: ack.serialize(),
+        };
+    }
+
     // FU#6a: COLLECT each op's post-apply redo entries (with their owning
     // store) instead of appending them inline. The mutations still happen
     // per-op in the loop (mutate-first, journal-second is preserved); only the
@@ -1394,26 +1533,22 @@ pub fn handle_replica_batch_with_tracker_and_master_lookup(
                     &reassembled
                 }
                 Err(ChunkStageError::Pressure(message)) => {
-                    // Scenario 11: the process-wide chunk-staging cap is
-                    // momentarily exhausted by concurrent large-op assemblies
-                    // (other baselines/deltas against this node). Nothing of
-                    // THIS op was staged (the cap check fires at part 0,
-                    // before any insert), nothing was journaled, and the
-                    // watermark does not advance — mirror the full-redo NAK
-                    // below: `Busy` in the `STATUS_ERROR` envelope, so the
-                    // sender re-sends the IDENTICAL batch after a short
-                    // backoff instead of failing the whole shard over
-                    // transient memory pressure. A batch prefix already
-                    // applied in RAM re-applies idempotently on the resend
-                    // and re-collects its redo, exactly like the full-redo
-                    // Busy path.
-                    tracing::warn!(
-                        seq,
-                        %message,
-                        "replication: chunk staging at capacity; NAKing Busy (retriable)",
-                    );
-                    let ack = ReplicaAck::Busy {
-                        first_sequence: batch.first_sequence,
+                    // F1: staging pressure that RACED past the pre-batch gate
+                    // (`batch_chunk_staging_pressure` admitted this batch, but
+                    // another connection opened assemblies since). Mid-loop,
+                    // earlier ops of this batch may already be applied — and a
+                    // cross-batch tail may already be CONSUMED — so "re-send
+                    // the identical batch" is no longer guaranteed correct.
+                    // Fail HARD like any other staging violation, preserving
+                    // the invariant that `Busy` is only ever sent with nothing
+                    // applied; the sender's re-ship from part 0 (or the outer
+                    // migration retry) recovers, and the gate makes this arm
+                    // rare.
+                    let ack = ReplicaAck::Error {
+                        failed_sequence: seq,
+                        message: format!(
+                            "staging pressure raced past the pre-batch gate: {message}"
+                        ),
                     };
                     return ResponseFrame {
                         request_id: request.request_id,
@@ -8790,12 +8925,35 @@ mod tests {
     }
 
     fn chunk_test_create(k: TxKey) -> ReplicaOp {
+        chunk_test_create_with_cold(k, 4096)
+    }
+
+    fn chunk_test_create_with_cold(k: TxKey, cold_len: usize) -> ReplicaOp {
         ReplicaOp::Create {
             tx_key: k,
             metadata_bytes: vec![0; 64],
             utxo_hashes: vec![[0xAA; 32]; 2],
-            cold_data: Some(vec![0xAB; 4096]),
+            cold_data: Some(vec![0xAB; cold_len]),
             is_external: false,
+        }
+    }
+
+    /// F8: unconditional cleanup for tests that SATURATE the process-global
+    /// staging map. On a panic mid-test the open pressure assemblies
+    /// (≈256 MiB declared) would otherwise outlive the test and Busy-poison
+    /// every serialized sibling; `Drop` runs on unwind, so the cleanup is
+    /// unconditional. Declare it AFTER the `CHUNK_STAGING_TEST_SERIAL`
+    /// guard so it drops BEFORE the serialization lock releases.
+    struct StagingCleanup {
+        stream: &'static str,
+        keys: Vec<TxKey>,
+    }
+
+    impl Drop for StagingCleanup {
+        fn drop(&mut self) {
+            chunk_staging()
+                .lock()
+                .retain(|(s, k), _| s != self.stream && !self.keys.contains(k));
         }
     }
 
@@ -8938,6 +9096,10 @@ mod tests {
     #[test]
     fn chunk_staging_pressure_naks_busy_then_identical_resend_applies() {
         let _serial = CHUNK_STAGING_TEST_SERIAL.lock();
+        let _cleanup = StagingCleanup {
+            stream: "staging-pressure-elsewhere",
+            keys: vec![key(97)],
+        };
         let engine = make_engine();
         let tracker = ReplicaAppliedTracker::in_memory();
         let k = key(97);
@@ -9005,6 +9167,129 @@ mod tests {
             "the reassembled Create must have applied"
         );
         assert_eq!(tracker.get(DEFAULT_STREAM_KEY), 3);
+    }
+
+    /// F1 — the MODAL scenario-11 sub-batch shape `[A.tail, B.part 0]`
+    /// (CHUNK_PAYLOAD_MAX 8 MiB vs the ~16 MiB send budget packs the tail of
+    /// one chunked op and the opening part of the next into ONE sub-batch).
+    /// A staging-pressure Busy decided mid-loop is UNSOUND here: A's tail
+    /// completes its assembly and applies BEFORE B's part 0 trips the cap,
+    /// so the "identical resend" re-delivers a tail whose assembly no longer
+    /// exists — a Hard conflict, failing the shard the Busy existed to
+    /// protect. The pressure decision must therefore be hoisted AHEAD of the
+    /// apply loop: the Busy NAK fires with NOTHING applied or staged (A's
+    /// assembly still open, A not applied), and the identical resend then
+    /// applies cleanly — with the walk crediting A's in-batch completion so
+    /// the freed bytes count toward B's open (a plain part-0 sum would
+    /// deterministically re-NAK this shape under pressure, starving it).
+    #[test]
+    fn cross_batch_tail_then_pressured_part0_naks_busy_then_identical_resend_applies() {
+        let _serial = CHUNK_STAGING_TEST_SERIAL.lock();
+        let pressure_stream = "staging-pressure-tail-shape";
+        let ka = key(87);
+        let kb = key(88);
+        let _cleanup = StagingCleanup {
+            stream: pressure_stream,
+            keys: vec![ka, kb],
+        };
+        let engine = make_engine();
+        let tracker = ReplicaAppliedTracker::in_memory();
+
+        // A: 2-part chunked op; B: a strictly LARGER 2-part chunked op, so
+        // freeing A's declared bytes alone cannot admit B.
+        let a_parts = chunk_op(&chunk_test_create(ka), 2);
+        let b_parts = chunk_op(&chunk_test_create_with_cold(kb, 8192), 2);
+        let a_total = match &a_parts[0] {
+            ReplicaOp::OpChunk { total_len, .. } => *total_len,
+            other => panic!("fixture must be a chunk, got {other:?}"),
+        };
+
+        // Batch 1 opens A's assembly (cross-batch continuation left open).
+        let resp = send_tracked(&engine, &tracker, &chunk_batch(1, vec![a_parts[0].clone()]));
+        assert_eq!(resp.status, STATUS_OK, "A's part 0 must open cleanly");
+
+        // Saturate the cap to EXACTLY MAX_STAGED_TOTAL_BYTES including A:
+        // 3 × 64 MiB plus one (64 MiB − A) assembly. Completing A then frees
+        // room for anything up to A's size — and B is strictly larger.
+        let pressure_part0 = |n: u8, total_len: u64| ReplicaOp::OpChunk {
+            tx_key: key(n),
+            chunk_index: 0,
+            chunk_count: 2,
+            total_len,
+            payload: vec![0u8; 8],
+        };
+        for n in 214..217u8 {
+            let opened = stage_chunk(pressure_stream, &pressure_part0(n, MAX_STAGED_OP_BYTES))
+                .expect("pressure part 0 opens cleanly");
+            assert!(opened.is_none(), "a 2-part assembly must stay open");
+        }
+        let opened = stage_chunk(
+            pressure_stream,
+            &pressure_part0(217, MAX_STAGED_OP_BYTES - a_total),
+        )
+        .expect("final pressure part 0 opens cleanly (sum is exactly the cap)");
+        assert!(opened.is_none());
+
+        // The modal sub-batch: A's final part, then B's part 0. A completes
+        // and frees `a_total`, but B needs more — pressure, decided BEFORE
+        // anything applies or stages.
+        let tail_batch = chunk_batch(2, vec![a_parts[1].clone(), b_parts[0].clone()]);
+        let resp = send_tracked(&engine, &tracker, &tail_batch);
+        assert_eq!(resp.status, STATUS_ERROR, "staging pressure must NAK");
+        match ReplicaAck::deserialize(&resp.payload).expect("ack decodes") {
+            ReplicaAck::Busy { first_sequence } => {
+                assert_eq!(first_sequence, 2, "Busy must echo the batch first_sequence")
+            }
+            other => panic!("staging pressure must NAK the retriable Busy, got {other:?}"),
+        }
+        assert!(
+            engine.read_metadata(&ka).is_err(),
+            "A must NOT have applied under the Busy NAK — a mid-loop pressure \
+             decision consumes A's tail and poisons the identical resend"
+        );
+        assert!(
+            engine.read_metadata(&kb).is_err(),
+            "B must not have applied"
+        );
+        assert_eq!(
+            tracker.get(DEFAULT_STREAM_KEY),
+            1,
+            "Busy must not advance the watermark"
+        );
+
+        // Free the pressure (part 0 over each open assembly conflicts and
+        // drops it), then re-deliver the IDENTICAL batch. This only succeeds
+        // if the Busy left A's assembly open at its pre-batch state: a
+        // consumed tail would NAK "no open assembly", a staged B part 0
+        // would NAK the b13b221 conflict.
+        for n in 214..218u8 {
+            match stage_chunk(pressure_stream, &pressure_part0(n, MAX_STAGED_OP_BYTES)) {
+                Err(ChunkStageError::Hard(message)) => assert!(
+                    message.contains("conflict"),
+                    "expected the conflict drop, got: {message}"
+                ),
+                other => panic!("part 0 over an open assembly must conflict, got {other:?}"),
+            }
+        }
+        let resp = send_tracked(&engine, &tracker, &tail_batch);
+        assert_eq!(
+            resp.status, STATUS_OK,
+            "the identical re-send must apply once the pressure clears"
+        );
+        assert!(
+            engine.read_metadata(&ka).is_ok(),
+            "A must complete and apply on the resend"
+        );
+        assert_eq!(tracker.get(DEFAULT_STREAM_KEY), 3);
+
+        // B's final part completes it through the normal cross-batch path.
+        let resp = send_tracked(&engine, &tracker, &chunk_batch(4, vec![b_parts[1].clone()]));
+        assert_eq!(resp.status, STATUS_OK, "B's final part must apply");
+        assert!(
+            engine.read_metadata(&kb).is_ok(),
+            "B must complete and apply after the pressure episode"
+        );
+        assert_eq!(tracker.get(DEFAULT_STREAM_KEY), 4);
     }
 
     /// Issue #17 follow-up (splice close). Covered positions now re-apply,

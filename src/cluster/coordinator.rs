@@ -7606,6 +7606,7 @@ fn run_migration_batch(
                             batch_size,
                             topology_epoch,
                             auth_secret,
+                            Some(&|| migration_epoch_current(shard_table, topology_epoch)),
                         ) {
                             Ok((_, skipped)) => {
                                 if !skipped.is_empty() {
@@ -7841,8 +7842,14 @@ fn run_migration_batch(
                         if !late_keys.is_empty() {
                             let late_refs: Vec<&TxKey> = late_keys.iter().collect();
                             if let Err(e) = stream_shard_baseline(
-                                task, &late_refs, &engine, &mut stream, batch_size, topology_epoch,
+                                task,
+                                &late_refs,
+                                &engine,
+                                &mut stream,
+                                batch_size,
+                                topology_epoch,
                                 auth_secret,
+                                Some(&|| migration_epoch_current(shard_table, topology_epoch)),
                             ) {
                                 tracing::warn!(
                                     shard = task.shard,
@@ -7888,6 +7895,9 @@ fn run_migration_batch(
                                         topology_epoch,
                                         task.from_node.0,
                                         auth_secret,
+                                        Some(&|| {
+                                            migration_epoch_current(shard_table, topology_epoch)
+                                        }),
                                     )
                                 {
                                     tracing::warn!(
@@ -8742,10 +8752,16 @@ const MIGRATION_BUSY_BACKOFF: Duration = Duration::from_millis(250);
 /// nothing was applied, staged, or journaled, and the identical sub-batch can
 /// succeed once the pressure drains — failing the shard instead re-runs the
 /// whole baseline later, amplifying churn under exactly the memory pressure
-/// that caused the NAK. The exact-length check (a serialized `Busy` is
-/// exactly 9 bytes) keeps a `[code:u16][msg_len:u16][msg]` error envelope
-/// whose code low byte happens to be the Busy tag from ever classifying as
-/// retriable.
+/// that caused the NAK.
+///
+/// Ambiguity bound: the ack decoder keys on payload byte 0, so a
+/// `[code:u16][msg_len:u16][msg]` error envelope could only masquerade as
+/// `Busy` when its code's LOW byte equals the Busy ack tag (3) AND the
+/// payload is exactly 9 bytes (the length of a serialized `Busy`; envelope
+/// msg_len 5). The one defined error code shaped like that is
+/// `ERR_ALREADY_SPENT` (3) — a client spend-path code that is never emitted
+/// on the `OP_REPLICA_BATCH` response path, pinned by
+/// `replica_batch_envelope_codes_never_collide_with_busy_ack_tag`.
 fn decode_migration_busy_nak(payload: &[u8]) -> Option<u64> {
     use crate::replication::protocol::ReplicaAck;
     if payload.len() != 9 {
@@ -8757,11 +8773,70 @@ fn decode_migration_busy_nak(payload: &[u8]) -> Option<u64> {
     }
 }
 
+/// Exchange one migration sub-batch frame, transparently absorbing retriable
+/// [`ReplicaAck::Busy`] backpressure NAKs: the identical frame is re-sent
+/// after [`MIGRATION_BUSY_BACKOFF`], at most [`MIGRATION_BUSY_RETRIES`]
+/// times, then the exhaustion surfaces as an error (failing the sub-batch —
+/// and with it the shard — back to the outer migration retry machinery).
+///
+/// `label` names the traffic in errors and logs (`"migration batch"` /
+/// `"delta batch"`). `still_current` is the migration-epoch fence,
+/// re-checked before EVERY backoff: a worker whose topology epoch was
+/// superseded while the target backpressures aborts immediately instead of
+/// burning the full retry budget per sub-batch against a plan the cluster
+/// has already replaced (its own per-task fence then discards the stale
+/// work). `None` (tests, callers without a fence) retries unconditionally.
+fn exchange_frame_with_busy_retry(
+    stream: &mut TcpStream,
+    request: &RequestFrame,
+    auth_secret: Option<&[u8]>,
+    shard: u16,
+    label: &str,
+    still_current: Option<&dyn Fn() -> bool>,
+) -> std::result::Result<ResponseFrame, String> {
+    let mut busy_retries = 0usize;
+    loop {
+        let response = exchange_frame(stream, request, auth_secret)?;
+        if response.status != STATUS_OK
+            && let Some(first_sequence) = decode_migration_busy_nak(&response.payload)
+        {
+            busy_retries += 1;
+            if busy_retries > MIGRATION_BUSY_RETRIES {
+                return Err(format!(
+                    "{label}: replica still busy (backpressure) at seq {first_sequence} \
+                     after {MIGRATION_BUSY_RETRIES} same-batch retries"
+                ));
+            }
+            if let Some(check) = still_current
+                && !check()
+            {
+                return Err(format!(
+                    "{label}: aborting busy backoff — migration epoch superseded \
+                     (topology changed while the target was backpressuring)"
+                ));
+            }
+            tracing::warn!(
+                shard,
+                busy_retries,
+                label,
+                "cluster: migration target NAKed Busy (backpressure); \
+                 backing off and re-sending the same sub-batch",
+            );
+            std::thread::sleep(MIGRATION_BUSY_BACKOFF);
+            continue;
+        }
+        return Ok(response);
+    }
+}
+
 /// Stream baseline records for one shard on an existing TCP connection.
 ///
 /// Returns the manifest hash accumulated over all streamed records
 /// (txid XOR generation for each record). The hash is order-independent
 /// so the target can verify content equality regardless of apply order.
+///
+/// `still_current` is the migration-epoch fence handed to the per-sub-batch
+/// Busy retry loop — see [`exchange_frame_with_busy_retry`].
 #[allow(clippy::too_many_arguments)]
 fn stream_shard_baseline(
     task: &MigrationTask,
@@ -8771,6 +8846,7 @@ fn stream_shard_baseline(
     batch_size: usize,
     cluster_key: u64,
     auth_secret: Option<&[u8]>,
+    still_current: Option<&dyn Fn() -> bool>,
 ) -> std::result::Result<(ManifestHasher, Vec<TxKey>), String> {
     use crate::replication::protocol::ReplicaBatch;
 
@@ -8842,30 +8918,14 @@ fn stream_shard_baseline(
             // re-send the IDENTICAL sub-batch after a backoff, bounded by
             // `MIGRATION_BUSY_RETRIES`, instead of failing the whole shard
             // baseline over transient memory pressure.
-            let mut busy_retries = 0usize;
-            let response = loop {
-                let response = exchange_frame(stream, &request, auth_secret)?;
-                if response.status != STATUS_OK
-                    && let Some(first_sequence) = decode_migration_busy_nak(&response.payload)
-                {
-                    busy_retries += 1;
-                    if busy_retries > MIGRATION_BUSY_RETRIES {
-                        return Err(format!(
-                            "migration batch: replica still busy (backpressure) at seq \
-                             {first_sequence} after {MIGRATION_BUSY_RETRIES} same-batch retries"
-                        ));
-                    }
-                    tracing::warn!(
-                        shard = task.shard,
-                        busy_retries,
-                        "cluster: migration target NAKed Busy (backpressure); \
-                         backing off and re-sending the same sub-batch",
-                    );
-                    std::thread::sleep(MIGRATION_BUSY_BACKOFF);
-                    continue;
-                }
-                break response;
-            };
+            let response = exchange_frame_with_busy_retry(
+                stream,
+                &request,
+                auth_secret,
+                task.shard,
+                "migration batch",
+                still_current,
+            )?;
 
             use crate::replication::protocol::ReplicaAck;
             // Check the frame status first. A STATUS_ERROR response carries EITHER a
@@ -10068,6 +10128,9 @@ fn shard_membership_changed_in_window(
 ///
 /// Used by the pipelined batch migration (`run_migration_batch` and the
 /// fenced-delta replay path) to close the baseline-to-fence redo window.
+///
+/// `still_current` is the migration-epoch fence handed to the per-sub-batch
+/// Busy retry loop — see [`exchange_frame_with_busy_retry`].
 fn send_delta_ops(
     stream: &mut TcpStream,
     shard: u16,
@@ -10075,6 +10138,7 @@ fn send_delta_ops(
     cluster_key: u64,
     source_node_id: u64,
     auth_secret: Option<&[u8]>,
+    still_current: Option<&dyn Fn() -> bool>,
 ) -> std::result::Result<(), String> {
     use crate::replication::protocol::{ReplicaAck, ReplicaBatch};
 
@@ -10106,30 +10170,14 @@ fn send_delta_ops(
         // the IDENTICAL sub-batch after a backoff, bounded by
         // `MIGRATION_BUSY_RETRIES`, instead of failing the delta (and with it
         // the shard) over transient memory pressure.
-        let mut busy_retries = 0usize;
-        let response = loop {
-            let response = exchange_frame(stream, &request, auth_secret)?;
-            if response.status != STATUS_OK
-                && let Some(first_sequence) = decode_migration_busy_nak(&response.payload)
-            {
-                busy_retries += 1;
-                if busy_retries > MIGRATION_BUSY_RETRIES {
-                    return Err(format!(
-                        "delta batch: replica still busy (backpressure) at seq \
-                         {first_sequence} after {MIGRATION_BUSY_RETRIES} same-batch retries"
-                    ));
-                }
-                tracing::warn!(
-                    shard,
-                    busy_retries,
-                    "cluster: delta target NAKed Busy (backpressure); \
-                     backing off and re-sending the same sub-batch",
-                );
-                std::thread::sleep(MIGRATION_BUSY_BACKOFF);
-                continue;
-            }
-            break response;
-        };
+        let response = exchange_frame_with_busy_retry(
+            stream,
+            &request,
+            auth_secret,
+            shard,
+            "delta batch",
+            still_current,
+        )?;
 
         // Check the frame STATUS first — same ordering as the baseline migration
         // path above, and load-bearing for the same reason. A STATUS_ERROR frame
@@ -14288,6 +14336,7 @@ mod tests {
             64,
             /* cluster_key */ 0,
             None,
+            None,
         )
         .unwrap();
 
@@ -14397,6 +14446,7 @@ mod tests {
             &mut stream,
             64,
             /* cluster_key */ 0,
+            None,
             None,
         )
         .unwrap();
@@ -14560,6 +14610,7 @@ mod tests {
             64,
             /* cluster_key */ 0,
             None,
+            None,
         )
         .unwrap();
 
@@ -14665,6 +14716,7 @@ mod tests {
             64,
             /* cluster_key */ 0,
             None,
+            None,
         );
 
         match result {
@@ -14762,7 +14814,7 @@ mod tests {
             to_node: NodeId(2),
             is_master: true,
         };
-        stream_shard_baseline(&task, &[&key], &source, &mut stream, 64, 0, None).unwrap();
+        stream_shard_baseline(&task, &[&key], &source, &mut stream, 64, 0, None, None).unwrap();
 
         let batch = receiver.join().unwrap();
         for op in &batch.ops {
@@ -19896,7 +19948,7 @@ mod tests {
         stream
             .set_read_timeout(Some(Duration::from_secs(2)))
             .unwrap();
-        let err = send_delta_ops(&mut stream, 7, &[], 99, 1, None)
+        let err = send_delta_ops(&mut stream, 7, &[], 99, 1, None, None)
             .expect_err("a STATUS_ERROR delta response must fail the send");
 
         assert!(
@@ -19972,7 +20024,7 @@ mod tests {
             offset: 0,
             master_generation: 1,
         }];
-        send_delta_ops(&mut stream, 7, &ops, 99, 1, None)
+        send_delta_ops(&mut stream, 7, &ops, 99, 1, None, None)
             .expect("a Busy NAK must back off and retry the same sub-batch, then succeed");
 
         let (first, second) = server.join().unwrap();
@@ -19980,6 +20032,49 @@ mod tests {
             first, second,
             "the Busy retry must re-send the IDENTICAL sub-batch"
         );
+    }
+
+    /// F5: `decode_migration_busy_nak` keys on payload byte 0 (the ack tag)
+    /// plus an exact 9-byte length, so a `[code:u16][msg_len:u16][msg]`
+    /// error envelope can only masquerade as `Busy` when its code's LOW byte
+    /// equals the Busy ack tag (3) and its message is exactly 5 bytes. Pin
+    /// that no envelope code emitted on the `OP_REPLICA_BATCH` response path
+    /// has that low byte. The list mirrors the emission sites: the dispatch
+    /// migration-batch guard (`ERR_INVARIANT_VIOLATION`), the receiver's
+    /// stale-epoch gate (`ERR_STALE_EPOCH`), and the frame layer
+    /// (`ERR_CLUSTER_AUTH_FAILED`, `ERR_PAYLOAD_MALFORMED`,
+    /// `ERR_RATE_LIMITED`, `ERR_RESPONSE_TOO_LARGE`); extend it when a new
+    /// envelope code is added to that path. `ERR_ALREADY_SPENT` (3) is the
+    /// one defined collision-shaped code — a client spend-path code that
+    /// must never be emitted there.
+    #[test]
+    fn replica_batch_envelope_codes_never_collide_with_busy_ack_tag() {
+        use crate::protocol::opcodes::{
+            ERR_ALREADY_SPENT, ERR_CLUSTER_AUTH_FAILED, ERR_INVARIANT_VIOLATION,
+            ERR_PAYLOAD_MALFORMED, ERR_RATE_LIMITED, ERR_RESPONSE_TOO_LARGE, ERR_STALE_EPOCH,
+        };
+        const BUSY_ACK_TAG: u16 = 3;
+        assert_eq!(
+            ERR_ALREADY_SPENT, BUSY_ACK_TAG,
+            "collision premise: ERR_ALREADY_SPENT is the defined code whose low byte \
+             is the Busy ack tag — if this moved, update decode_migration_busy_nak's doc"
+        );
+        for code in [
+            ERR_INVARIANT_VIOLATION,
+            ERR_STALE_EPOCH,
+            ERR_CLUSTER_AUTH_FAILED,
+            ERR_PAYLOAD_MALFORMED,
+            ERR_RATE_LIMITED,
+            ERR_RESPONSE_TOO_LARGE,
+        ] {
+            assert_ne!(
+                code & 0xFF,
+                BUSY_ACK_TAG,
+                "an OP_REPLICA_BATCH envelope code whose low byte equals the Busy ack \
+                 tag could misclassify a terminal error as a retriable Busy NAK in \
+                 decode_migration_busy_nak (code {code})"
+            );
+        }
     }
 
     /// Scenario 11 (staging backpressure): same contract for the shard
@@ -20029,7 +20124,7 @@ mod tests {
             to_node: NodeId(2),
             is_master: true,
         };
-        stream_shard_baseline(&task, &[&live_key], &engine, &mut stream, 64, 0, None)
+        stream_shard_baseline(&task, &[&live_key], &engine, &mut stream, 64, 0, None, None)
             .expect("a Busy NAK must back off and retry the same sub-batch, then succeed");
 
         let (first, second) = receiver.join().unwrap();
