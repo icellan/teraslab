@@ -8005,7 +8005,8 @@ fn run_migration_batch(
                                         batch_size,
                                         topology_epoch,
                                         auth_secret,
-                                    )?;
+                                    )
+                                    .map_err(EscalationAttemptError::Repush)?;
                                     send_migration_complete(
                                         addr,
                                         task.shard,
@@ -8019,6 +8020,7 @@ fn run_migration_batch(
                                         true,
                                         auth_secret,
                                     )
+                                    .map_err(EscalationAttemptError::Completion)
                                 },
                             );
                             match escalation {
@@ -8567,9 +8569,19 @@ const MAX_EXACT_KEY_ESCALATIONS: usize = 3;
 /// Returns an empty vec for anything that is not an exact-key rejection —
 /// other `code=19` rejections (count mismatch: the sc09/sc05 relinquish case)
 /// and every other code keep the historical failure handling.
-fn completion_rejection_missing_keys(err: &str, manifest: &[(TxKey, u32)]) -> Vec<TxKey> {
+///
+/// The dispatch producer, the [`migration_complete_rejection_error`] envelope
+/// and this parser are pinned together by the cross-module contract test
+/// `missing_exact_key_rejection_is_recognised_by_the_repush_parser`
+/// (`server::dispatch` tests), so the formats cannot drift apart.
+pub(crate) fn completion_rejection_missing_keys(
+    err: &str,
+    manifest: &[(TxKey, u32)],
+) -> Vec<TxKey> {
+    // The `:` keeps the match exact — without it a future code in the
+    // 190..=199 range would also satisfy the code=19 discriminator.
     if !err.contains(&format!(
-        "(code={}",
+        "(code={}:",
         crate::protocol::opcodes::ERR_MIGRATION_IN_PROGRESS
     )) || !err.contains("missing exact key")
     {
@@ -8613,15 +8625,35 @@ fn completion_rejection_missing_keys(err: &str, manifest: &[(TxKey, u32)]) -> Ve
 enum ExactKeyEscalation {
     /// A re-push landed and a completion retry verified — proceed to commit.
     Verified,
-    /// The rejection does not (or no longer does) name a missing manifest key:
-    /// the historical failure handling (abort + superset probe +
-    /// fail/relinquish, task stays retryable) applies with this error.
+    /// The COMPLETION rejection does not (or no longer does) name a missing
+    /// manifest key: the historical failure handling (abort + superset probe
+    /// + fail/relinquish, task stays retryable) applies with this error.
     NotExactKey { last_err: String },
-    /// Every attempt still named a missing key — the source cannot satisfy its
-    /// own manifest (named-but-never-shipped record that is now unreadable, or
-    /// destroyed locally). Re-sending the same handshake can never succeed:
-    /// terminally abort via [`terminally_abort_unshippable_task`].
+    /// Every attempt either still named a missing key (the completion retry
+    /// kept rejecting) or failed the RE-PUSH itself on the source side (an
+    /// indexed key whose record cannot be read back — e.g. its blob is
+    /// missing — or the stream broke mid-repair). Either way the named
+    /// deficit was never repaired, so re-sending the same handshake can
+    /// never succeed: terminally abort via
+    /// [`terminally_abort_unshippable_task`].
     Exhausted { last_err: String },
+}
+
+/// F3 — which phase of an escalation attempt failed
+/// ([`escalate_missing_exact_keys`]'s `repush_and_retry`).
+#[derive(Debug, PartialEq, Eq)]
+enum EscalationAttemptError {
+    /// The re-push of the named record(s) failed on the SOURCE side — the
+    /// record is unreadable (an indexed key whose blob is missing returns a
+    /// read `Err`, not `Ok(None)`, from `build_record_replay_ops`) or the
+    /// stream broke. The named deficit was NOT repaired: the attempt is
+    /// burned and the same missing set is retried, so a source that can
+    /// never ship the record still exhausts to the terminal rollback instead
+    /// of looping forever through the retryable path (review finding 1).
+    Repush(String),
+    /// The completion retry itself failed after a successful re-push; its
+    /// message is re-parsed for (possibly new) missing keys.
+    Completion(String),
 }
 
 /// F3 (a) — bounded escalation for a `code=19` "missing exact key" completion
@@ -8632,14 +8664,17 @@ enum ExactKeyEscalation {
 /// sources), so instead: resolve the named key(s) against `manifest_entries`
 /// and invoke `repush_and_retry`, which ships the named record(s) through the
 /// existing baseline machinery and re-sends the verify handshake. Up to
-/// `max_attempts` rounds; each follow-up rejection is re-parsed so a new
-/// missing key gets its own re-push. An error that stops naming missing keys
-/// falls back to the historical handling ([`ExactKeyEscalation::NotExactKey`]).
+/// `max_attempts` rounds; each follow-up COMPLETION rejection is re-parsed so
+/// a new missing key gets its own re-push, while a RE-PUSH failure keeps the
+/// same missing set and burns the attempt (see
+/// [`EscalationAttemptError::Repush`]). A completion error that stops naming
+/// missing keys falls back to the historical handling
+/// ([`ExactKeyEscalation::NotExactKey`]).
 fn escalate_missing_exact_keys(
     initial_err: String,
     manifest_entries: &[(TxKey, u32)],
     max_attempts: usize,
-    mut repush_and_retry: impl FnMut(&[TxKey]) -> std::result::Result<(), String>,
+    mut repush_and_retry: impl FnMut(&[TxKey]) -> std::result::Result<(), EscalationAttemptError>,
 ) -> ExactKeyEscalation {
     let mut last_err = initial_err;
     let mut missing = completion_rejection_missing_keys(&last_err, manifest_entries);
@@ -8649,7 +8684,12 @@ fn escalate_missing_exact_keys(
     for _ in 0..max_attempts {
         match repush_and_retry(&missing) {
             Ok(()) => return ExactKeyEscalation::Verified,
-            Err(e) => {
+            Err(EscalationAttemptError::Repush(e)) => {
+                // Source-side repair failure: the deficit stands. Burn the
+                // attempt and keep the same missing set.
+                last_err = e;
+            }
+            Err(EscalationAttemptError::Completion(e)) => {
                 last_err = e;
                 missing = completion_rejection_missing_keys(&last_err, manifest_entries);
                 if missing.is_empty() {
@@ -8671,14 +8711,19 @@ fn escalate_missing_exact_keys(
 /// instead of hanging at serving = target+1. NEVER a relinquish here: the
 /// target just proved it does NOT hold every record.
 ///
-/// Terminality: the Failed tracking entry is retired
-/// (`MigrationManager::retire_failed_task`) so the failed-task re-drive cannot
-/// re-send the same doomed handshake forever. The rolled-back table still
-/// diverges from the committed topology, so the re-heal machinery re-plans the
-/// handoff from a FRESH manifest on a later round — which succeeds once the
-/// record reads cleanly (or names it no longer).
+/// Terminality: the tracking entry is failed AND retired atomically under one
+/// manager lock (`MigrationManager::fail_and_retire_task`) so the failed-task
+/// re-drive can neither re-send the same doomed handshake forever nor — via
+/// `take_failed_tasks` racing between a separate mark-Failed and retire —
+/// resurrect the transient Failed entry (review finding 3). The rolled-back
+/// table still diverges from the committed topology, so the re-heal machinery
+/// re-plans the handoff from a FRESH manifest on a later round — which
+/// succeeds once the record reads cleanly (or names it no longer).
 ///
-/// Returns `true` when the task was tracked and counted as failed.
+/// Returns `true` when the task was tracked, retired, and rolled back at the
+/// current epoch (the caller counts it as a failed task). A stale-epoch task
+/// is retired without touching the newer table and returns `false`, matching
+/// `fail_migration_task_current_epoch`'s stale-epoch semantics.
 fn terminally_abort_unshippable_task(
     migration: &Arc<Mutex<MigrationManager>>,
     shard_table: &Arc<ShardTableLock<ShardTable>>,
@@ -8687,24 +8732,49 @@ fn terminally_abort_unshippable_task(
     task: &MigrationTask,
     topology_epoch: u64,
 ) -> bool {
-    let counted = fail_migration_task_current_epoch(
-        migration,
-        shard_table,
-        fenced_bm,
-        migrating_bm,
-        task,
-        topology_epoch,
-        FailedTaskTableAction::Rollback,
-    );
-    let retired = migration.lock().retire_failed_task(task);
+    // Epoch guard mirrors `fail_migration_task_current_epoch`: a stale task
+    // must not roll back a table that has moved to a newer epoch, but the
+    // task itself is dead either way and must still be retired.
+    let epoch_current = migration_epoch_current(shard_table, topology_epoch);
+    if !epoch_current && let Some(m) = crate::metrics::migration_metrics() {
+        m.topology_epoch_mismatch.inc();
+    }
+    // Review finding 3 — mark-Failed and retire under ONE manager lock: with
+    // two separate lock acquisitions a concurrent NodeJoined
+    // `take_failed_tasks` could observe the transient Failed entry, reset it
+    // to Streaming and re-drive the doomed handshake once more.
+    let retired = {
+        let mut mgr = migration.lock();
+        let retired = mgr.fail_and_retire_task(task);
+        if retired {
+            if !mgr.is_shard_fenced(task.shard) {
+                fenced_bm.clear(task.shard);
+            }
+            migrating_bm.clear(task.shard);
+        }
+        retired
+    };
+    if !retired {
+        tracing::info!(
+            shard = task.shard,
+            task_epoch = topology_epoch,
+            "cluster: ignoring untracked terminal migration abort",
+        );
+        return false;
+    }
+    if epoch_current {
+        // (The migration mutex is NOT held across the shard-table write —
+        // same lock order as `fail_migration_task_current_epoch`.)
+        shard_table.write().rollback_shard(task.shard);
+    }
     tracing::warn!(
         shard = task.shard,
         to_node = task.to_node.0,
-        retired,
+        epoch_current,
         "cluster: migration terminally aborted after missing-exact-key escalation — \
          source keeps authority; re-heal re-plans on a later round",
     );
-    counted
+    epoch_current
 }
 
 fn decode_migration_batch_error_detail(payload: &[u8]) -> String {
@@ -9223,29 +9293,37 @@ fn send_migration_complete(
     let response = exchange_frame(s, &request, auth_secret)?;
 
     if response.status != STATUS_OK {
-        let detail = if response.payload.is_empty() {
-            String::new()
-        } else {
-            // Error payload: [code:2][msg_len:2][msg:N]
-            if response.payload.len() >= 4 {
-                let code = u16::from_le_bytes(response.payload[..2].try_into().unwrap());
-                let msg_len =
-                    u16::from_le_bytes(response.payload[2..4].try_into().unwrap()) as usize;
-                let msg = std::str::from_utf8(
-                    &response.payload[4..4 + msg_len.min(response.payload.len() - 4)],
-                )
-                .unwrap_or("(non-utf8)");
-                format!(" (code={code}: {msg})")
-            } else {
-                format!(" (payload: {:?})", response.payload)
-            }
-        };
-        return Err(format!(
-            "target rejected: status {}{detail}",
-            response.status
+        return Err(migration_complete_rejection_error(
+            response.status,
+            &response.payload,
         ));
     }
     Ok(())
+}
+
+/// Compose the error string [`send_migration_complete`] returns for a non-OK
+/// `OP_MIGRATION_COMPLETE` response: `target rejected: status N (code=C: msg)`
+/// from the `[code:2][msg_len:2][msg:N]` error envelope.
+///
+/// Extracted so the cross-module contract test
+/// `missing_exact_key_rejection_is_recognised_by_the_repush_parser`
+/// (`server::dispatch` tests) can drive the REAL dispatch rejection through
+/// the REAL envelope into [`completion_rejection_missing_keys`] — pinning the
+/// producer, this envelope and the parser together so the formats cannot
+/// drift apart (review finding 2).
+pub(crate) fn migration_complete_rejection_error(status: u8, payload: &[u8]) -> String {
+    let detail = if payload.is_empty() {
+        String::new()
+    } else if payload.len() >= 4 {
+        let code = u16::from_le_bytes([payload[0], payload[1]]);
+        let msg_len = u16::from_le_bytes([payload[2], payload[3]]) as usize;
+        let msg = std::str::from_utf8(&payload[4..4 + msg_len.min(payload.len() - 4)])
+            .unwrap_or("(non-utf8)");
+        format!(" (code={code}: {msg})")
+    } else {
+        format!(" (payload: {payload:?})")
+    };
+    format!("target rejected: status {status}{detail}")
 }
 
 /// Probe the rightful master to confirm it holds a SUPERSET of `self`'s shard
@@ -19798,6 +19876,16 @@ mod tests {
             completion_rejection_missing_keys(&unknown_key, &manifest).is_empty(),
             "a named key absent from the manifest cannot be re-pushed",
         );
+        // Review finding 4: the code match must be exact — a future code in
+        // the 190..=199 range must not satisfy the code=19 discriminator.
+        let code_190 = format!(
+            "target rejected: status 4 (code=190: shard 227 missing exact key {:?}: TxNotFound)",
+            tk(1),
+        );
+        assert!(
+            completion_rejection_missing_keys(&code_190, &manifest).is_empty(),
+            "code=190 must not match the code=19 discriminator",
+        );
     }
 
     /// F3 (a) — a completion rejection naming a missing exact key triggers a
@@ -19836,12 +19924,50 @@ mod tests {
         let outcome = escalate_missing_exact_keys(reject.clone(), &manifest, 3, |missing| {
             attempts += 1;
             assert_eq!(missing, [tk(2)]);
-            Err(reject.clone())
+            Err(EscalationAttemptError::Completion(reject.clone()))
         });
         assert_eq!(attempts, 3, "escalation must stop at the attempt bound");
         match outcome {
             ExactKeyEscalation::Exhausted { last_err } => {
                 assert!(last_err.contains("missing exact key"), "got: {last_err}");
+            }
+            other => panic!("expected Exhausted, got {other:?}"),
+        }
+    }
+
+    /// Review finding 1 — an indexed key whose record the SOURCE cannot read
+    /// back (e.g. blob destroyed by GC) fails the RE-PUSH itself, not the
+    /// completion retry. Those source-read failures must burn escalation
+    /// attempts so exhaustion still reaches the terminal rollback; otherwise
+    /// the task falls back to the retryable path and the re-drive loops
+    /// forever (the exact wedge F3 exists to close).
+    #[test]
+    fn exact_key_escalation_exhausts_when_the_source_cannot_read_the_named_record() {
+        let manifest = vec![(tk(2), 7u32)];
+        let initial = format!(
+            "target rejected: status 4 (code=19: shard 227 missing exact key {:?}: TxNotFound)",
+            tk(2),
+        );
+        let mut attempts = 0usize;
+        let outcome = escalate_missing_exact_keys(initial, &manifest, 3, |missing| {
+            attempts += 1;
+            assert_eq!(missing, [tk(2)]);
+            Err(EscalationAttemptError::Repush(
+                "baseline shard 227: read_record_snapshot TxKey(0200000000000000...): \
+                 external blob missing"
+                    .to_string(),
+            ))
+        });
+        assert_eq!(
+            attempts, 3,
+            "source-read failures must burn attempts toward the terminal bound",
+        );
+        match outcome {
+            ExactKeyEscalation::Exhausted { last_err } => {
+                assert!(
+                    last_err.contains("external blob missing"),
+                    "got: {last_err}"
+                );
             }
             other => panic!("expected Exhausted, got {other:?}"),
         }
@@ -19881,7 +20007,9 @@ mod tests {
         let mut attempts = 0usize;
         let outcome = escalate_missing_exact_keys(initial, &manifest, 3, |_missing| {
             attempts += 1;
-            Err("target rejected: status 4 (code=37: target not on epoch)".to_string())
+            Err(EscalationAttemptError::Completion(
+                "target rejected: status 4 (code=37: target not on epoch)".to_string(),
+            ))
         });
         assert_eq!(attempts, 1, "a changed error must stop the escalation");
         match outcome {

@@ -1240,6 +1240,30 @@ impl MigrationManager {
         before != self.active.len()
     }
 
+    /// F3 / review finding 3 — atomically mark an outbound task Failed and
+    /// remove its tracking entry under a single `&mut self` borrow.
+    ///
+    /// The caller (the terminal completion abort) holds the manager lock for
+    /// exactly one call, so a concurrent `take_failed_tasks` re-drive can
+    /// never observe the transient Failed state between the mark and the
+    /// removal and resurrect the task. The entry must match the task's FULL
+    /// identity (shard, from, to, is_master); `mark_failed`'s fence and
+    /// dual-write bookkeeping runs as usual. Returns `true` when a matching
+    /// entry was failed and removed.
+    pub fn fail_and_retire_task(&mut self, task: &MigrationTask) -> bool {
+        let tracked = self.active.iter().any(|p| {
+            p.shard == task.shard
+                && p.from_node == task.from_node
+                && p.to_node == task.to_node
+                && p.is_master == task.is_master
+        });
+        if !tracked {
+            return false;
+        }
+        self.mark_failed(task);
+        self.retire_failed_task(task)
+    }
+
     /// Collect all failed migration tasks for re-execution.
     pub fn take_failed_tasks(&mut self) -> Vec<MigrationTask> {
         let tasks: Vec<MigrationTask> = self
@@ -3490,6 +3514,51 @@ mod tests {
             "the streaming task must survive",
         );
         assert_eq!(mgr.active_migrations()[0].shard, streaming.shard);
+    }
+
+    /// Review finding 3 — `fail_and_retire_task` marks Failed and removes the
+    /// entry under a SINGLE `&mut self` borrow, so a concurrent
+    /// `take_failed_tasks` re-drive can never observe (and resurrect) the
+    /// transient Failed state. Identity must match in full — a near-miss task
+    /// must leave the tracked entry untouched.
+    #[test]
+    fn fail_and_retire_task_is_atomic_and_matches_full_identity() {
+        let mut mgr = MigrationManager::new();
+        let t = MigrationTask {
+            shard: 5,
+            from_node: NodeId(1),
+            to_node: NodeId(2),
+            is_master: true,
+        };
+        mgr.start_outbound(
+            std::slice::from_ref(&t),
+            NodeId(1),
+            &std::collections::HashSet::new(),
+        );
+
+        let wrong_target = MigrationTask {
+            shard: 5,
+            from_node: NodeId(1),
+            to_node: NodeId(3),
+            is_master: true,
+        };
+        assert!(
+            !mgr.fail_and_retire_task(&wrong_target),
+            "a non-matching identity must be a no-op",
+        );
+        assert_eq!(
+            mgr.active_count(),
+            1,
+            "the tracked entry must be untouched by the near-miss",
+        );
+
+        assert!(
+            mgr.fail_and_retire_task(&t),
+            "the tracked entry must retire"
+        );
+        assert_eq!(mgr.failed_count(), 0);
+        assert!(mgr.take_failed_tasks().is_empty());
+        assert!(mgr.active_migrations().is_empty());
     }
 
     /// Verify that mark_failed lifts the write fence.
