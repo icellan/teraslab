@@ -600,10 +600,10 @@ struct NodeShardView {
 ///    up with the activated table. Completion-gated handoffs move serving
 ///    masters onto the newcomer one shard at a time while the SUM stays at
 ///    4096 the whole way, so the sum check cannot see that window at all.
-///    (The existing per-node `pending_handoff_shards == 0` term covers the
-///    same ground whenever that field is present; this clause also holds for
-///    the `/status` shape that omits it, where the handoff term silently
-///    contributes nothing.)
+///    (The existing per-node `pending_handoff_shards == 0` term — emitted
+///    unconditionally by both `/status` branches — already implies this
+///    clause; it is kept for the failure message, which names the exact
+///    serving/target mismatch instead of a bare handoff count.)
 ///
 /// Returns `None` when both hold for every polled node, otherwise the reason
 /// the gate is being held, including the per-node serving/target dump so a
@@ -2881,6 +2881,22 @@ mod migration_gate_tests {
     }
 
     #[test]
+    fn a_fully_drained_node_deadlocks_the_gate_by_design() {
+        // serving 0 / target 0 on a polled node: clause (a) holds the gate
+        // for the full timeout. No current call site polls a drained-but-
+        // running node; a future "wait while node N is drained" caller must
+        // poll only the remaining nodes or this gate will time out.
+        let views = vec![view(1, 2048, 2048), view(2, 2048, 2048), view(3, 0, 0)];
+        assert_eq!(serving_sum(&views), 4096);
+        let reason =
+            shard_activation_gate_reason(&views, 3).expect("a zero-target node must hold the gate");
+        assert!(
+            reason.contains("target=0"),
+            "reason must name the zero-target clause, got: {reason}"
+        );
+    }
+
+    #[test]
     fn a_converged_three_node_table_passes_the_gate() {
         // Scenario 07 after the shrink: nodes 1-3 are polled (node4's
         // container is gone), each serving exactly what it targets.
@@ -2898,7 +2914,12 @@ mod migration_gate_tests {
         // node3 did not answer /status, so it contributes no view. The nodes
         // that did answer are converged, so the gate does not hold on their
         // account -- the master-count sum is what judges the missing node.
-        let views = vec![view(1, 2048, 2048), view(2, 2048, 2048)];
+        // The counts deliberately sum to 2731 (not 4096): this shape can only
+        // arise with a genuinely missing third node, so if unreachable nodes
+        // ever started synthesizing zero-views, clause (a) would fire and
+        // this assertion would catch it.
+        let views = vec![view(1, 1366, 1366), view(2, 1365, 1365)];
+        assert_eq!(serving_sum(&views), 2731);
         assert_eq!(shard_activation_gate_reason(&views, 3), None);
     }
 
