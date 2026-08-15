@@ -92,9 +92,19 @@ const REELECTION_MIN_INTERVAL: Duration = Duration::from_secs(5);
 const UNDER_REPLICATION_SWEEP_INTERVAL: Duration = Duration::from_secs(20);
 
 /// Per-sweep cap on signaled shards, so one pass cannot flood the resync
-/// channel. The remainder is LOGGED (never silently dropped) and the next
-/// sweep re-derives it — the gap list shrinks as resyncs land.
-const UNDER_REPLICATION_SWEEP_MAX_SHARDS: usize = 1024;
+/// channel. The remainder is LOGGED (never silently dropped) and re-armed:
+/// `dropped > 0` re-arms the event trigger, so the backlog drains in
+/// debounce-window (1.5s) chunks — the gap list shrinks as resyncs land.
+///
+/// 128, sized against run 31904714169's storm math: uncapped ~300-650-shard
+/// passes stacked ~6 backfill runs × `max_migration_threads` (16) ≈ 96
+/// concurrent streams per node and collapsed effective repair throughput to
+/// ~0.55 rec/s (132s for 476 records). The scenario 15.3 contract
+/// (~100-300 records, at most a few hundred shards, healed within
+/// ~5-10s) fits in 1-3 chunks ≈ a few seconds; a worst-case whole-node
+/// rebuild (4096 shards) walks 32 bounded steps (~48s of signaling) with
+/// steady per-chunk progress instead of a wedge.
+const UNDER_REPLICATION_SWEEP_MAX_SHARDS: usize = 128;
 
 /// Task #50 — debounce window for EVENT-DRIVEN under-replication repair.
 /// A membership change (death or rejoin) or a completed exchange arms one
@@ -122,18 +132,38 @@ const UNDER_REPLICATION_EVENT_DEBOUNCE: Duration = Duration::from_millis(1500);
 /// `start_outbound`-tracked, so `active_count` cannot see them; without
 /// this skip a re-armed pass re-signals a shard mid-stream and spawns a
 /// DUPLICATE concurrent backfill at the same replica). Returns
-/// `(missing, signaled, dropped, dead_skipped, inflight_skipped)`: the
-/// per-replica shard lists to signal, how many were signaled, how many the
-/// `cap` dropped (re-derived next sweep; the caller logs the count), how
-/// many candidates were skipped because their replica is SWIM-dead, and
-/// how many were skipped as already in flight. In-flight skips do not
-/// consume cap budget.
+/// `(missing, signaled, dropped, dead_skipped, inflight_skipped,
+/// stale_fenced)`: the per-replica shard lists to signal, how many were
+/// signaled, how many the `cap` dropped (re-derived next sweep; the
+/// caller logs the count), how many candidates were skipped because their
+/// replica is SWIM-dead, how many were skipped as already in flight, and
+/// how many SHARDS the freshness fence skipped whole. In-flight and
+/// fence skips do not consume cap budget.
 ///
-/// A replica is signaled only when it is not this node, reported in the
-/// exchange view, is currently SWIM-alive (dead-peer guard: a resync
-/// toward a dead peer ties the replication manager up in retries against
-/// a black hole exactly when the cluster is already degraded), shows no
-/// data for the shard, and has no backfill for the shard in flight.
+/// FRESHNESS FENCE (run 31904714169): the derive compares LIVE local
+/// counts (`mastered_nonempty`) against the RETAINED exchange view — a
+/// snapshot whose only writer is the exchange-completion arm. A stable
+/// cluster never re-exchanges, so the view can be stuck at FORMATION time
+/// when every shard was empty; every shard that has since acquired
+/// records would then classify every replica as under-replicated forever
+/// (the ~300-650-shard resync storm, delta-fence write rejections, wedged
+/// nodes). The fence: a shard is only judged if the view witnesses THIS
+/// node's OWN data for it (`full` contains `(self_id, shard)`). Self
+/// reports through the exact same `last_applied_seq = record count` path
+/// as peers (`build_self_partition_version_entries`), so a view fresh
+/// enough to see local data is fresh enough for its replica zeros to
+/// mean absence of data rather than absence of evidence. Fail-safe
+/// direction: a genuinely under-replicated shard whose data postdates
+/// the last exchange stays unrepaired for at most one exchange cycle
+/// (and its writes replicate live anyway) — versus the storm making the
+/// whole cluster unavailable.
+///
+/// A replica is signaled only when the shard passes the freshness fence
+/// and the replica is not this node, reported in the exchange view, is
+/// currently SWIM-alive (dead-peer guard: a resync toward a dead peer
+/// ties the replication manager up in retries against a black hole
+/// exactly when the cluster is already degraded), shows no data for the
+/// shard, and has no backfill for the shard in flight.
 fn derive_under_replication_resyncs(
     view: &std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>>,
     alive: &std::collections::HashSet<NodeId>,
@@ -143,6 +173,7 @@ fn derive_under_replication_resyncs(
     cap: usize,
 ) -> (
     std::collections::HashMap<NodeId, Vec<u16>>,
+    usize,
     usize,
     usize,
     usize,
@@ -161,7 +192,15 @@ fn derive_under_replication_resyncs(
     let mut dropped = 0usize;
     let mut dead_skipped = 0usize;
     let mut inflight_skipped = 0usize;
+    let mut stale_fenced = 0usize;
     for (shard, replicas) in mastered_nonempty {
+        // Freshness fence (see the doc comment): the shard is locally
+        // non-empty, so a view that does not witness this node's own data
+        // for it predates the data — its replica zeros are unusable.
+        if !full.contains(&(self_id, *shard)) {
+            stale_fenced += 1;
+            continue;
+        }
         for replica in replicas {
             if *replica == self_id
                 || !view.contains_key(replica)
@@ -185,7 +224,14 @@ fn derive_under_replication_resyncs(
             }
         }
     }
-    (missing, signaled, dropped, dead_skipped, inflight_skipped)
+    (
+        missing,
+        signaled,
+        dropped,
+        dead_skipped,
+        inflight_skipped,
+        stale_fenced,
+    )
 }
 
 /// Task #50 — debounced, epoch-fenced trigger for event-driven
@@ -367,7 +413,7 @@ fn run_under_replication_pass(
     origin: &'static str,
     resync_tx: &std::sync::mpsc::Sender<crate::replication::manager::ResyncRequest>,
 ) -> (usize, usize, usize, usize) {
-    let (missing, signaled, dropped, dead_skipped, inflight_skipped) =
+    let (missing, signaled, dropped, dead_skipped, inflight_skipped, stale_fenced) =
         derive_under_replication_resyncs(view, alive, self_id, mastered_nonempty, in_flight, cap);
     if signaled > 0 || dropped > 0 || dead_skipped > 0 || inflight_skipped > 0 {
         tracing::info!(
@@ -376,9 +422,21 @@ fn run_under_replication_pass(
             dropped,
             dead_skipped,
             in_flight_skipped = inflight_skipped,
-            replicas = missing.len(),
+            stale_fenced,
+            targets = missing.len(),
             "cluster: under-replication pass signaling resyncs \
              (dropped remainder re-derived next pass)",
+        );
+    } else if stale_fenced > 0 {
+        // The whole pass was fenced: the retained view predates the local
+        // data (formation-shape view on a stable cluster). Expected and
+        // harmless — the next completed exchange refreshes the view — but
+        // never silent.
+        tracing::debug!(
+            origin,
+            stale_fenced,
+            "cluster: under-replication pass fully fenced — retained \
+             exchange view does not witness this node's own data",
         );
     }
     for (replica, shards) in missing {
@@ -2844,6 +2902,13 @@ impl ClusterCoordinator {
                         {
                             last_under_replication_sweep = std::time::Instant::now();
                             let view = retained_exchange_view_event.lock().clone();
+                            // NOT a staleness check — map emptiness only means
+                            // no exchange EVER completed (first-term window),
+                            // where there is nothing to derive from. A
+                            // non-empty view can still be arbitrarily stale
+                            // (formation-shape: keys present, all seqs zero);
+                            // per-shard staleness is fenced INSIDE the derive
+                            // via the self-witness (`stale_fenced`).
                             if !view.is_empty() {
                                 let (alive, mastered_nonempty) = snapshot_under_replication_inputs(
                                     &swim_membership_event,
@@ -3016,6 +3081,9 @@ impl ClusterCoordinator {
                     )
                 {
                     let view = retained_exchange_view_event.lock().clone();
+                    // NOT a staleness check — see the periodic sweep site: map
+                    // emptiness only means no exchange ever completed; actual
+                    // staleness is fenced per shard inside the derive.
                     if !view.is_empty() {
                         let (alive, mastered_nonempty) = snapshot_under_replication_inputs(
                             &swim_membership_event,
@@ -15109,17 +15177,19 @@ mod tests {
 
     /// Base sweep contract: a replica that reported in the exchange view
     /// but shows no data for a mastered non-empty shard gets a resync
-    /// signal.
+    /// signal. The view carries the master's own entry with data — the
+    /// freshness witness the fence requires.
     #[test]
     fn sweep_signals_resync_for_reported_dataless_replica() {
         let master = NodeId(1);
         let replica = NodeId(2);
         let mut view = std::collections::HashMap::new();
+        view.insert(master, vec![sweep_entry(7, 5)]);
         view.insert(replica, vec![sweep_entry(7, 0)]);
         let alive: std::collections::HashSet<NodeId> = [master, replica].into_iter().collect();
         let mastered = vec![(7u16, vec![replica])];
 
-        let (missing, signaled, dropped, dead_skipped, _inflight_skipped) =
+        let (missing, signaled, dropped, dead_skipped, _inflight_skipped, _stale_fenced) =
             derive_under_replication_resyncs(
                 &view,
                 &alive,
@@ -15146,11 +15216,12 @@ mod tests {
         let master = NodeId(1);
         let replica = NodeId(2);
         let mut view = std::collections::HashMap::new();
+        view.insert(master, vec![sweep_entry(7, 42)]);
         view.insert(replica, vec![sweep_entry(7, 42)]);
         let alive: std::collections::HashSet<NodeId> = [master, replica].into_iter().collect();
         let mastered = vec![(7u16, vec![replica])];
 
-        let (missing, signaled, dropped, dead_skipped, _inflight_skipped) =
+        let (missing, signaled, dropped, dead_skipped, _inflight_skipped, _stale_fenced) =
             derive_under_replication_resyncs(
                 &view,
                 &alive,
@@ -15168,17 +15239,18 @@ mod tests {
 
     /// A replica that never reported in the exchange is unreachable at the
     /// replication layer — the sweep has no evidence to act on and must
-    /// not signal it.
+    /// not signal it. The view is otherwise fresh (self witness present),
+    /// so the absence of the replica — not the fence — is what suppresses.
     #[test]
     fn sweep_skips_replica_absent_from_view() {
         let master = NodeId(1);
         let replica = NodeId(2);
-        let view: std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>> =
-            std::collections::HashMap::new();
+        let mut view = std::collections::HashMap::new();
+        view.insert(master, vec![sweep_entry(7, 5)]);
         let alive: std::collections::HashSet<NodeId> = [master, replica].into_iter().collect();
         let mastered = vec![(7u16, vec![replica])];
 
-        let (missing, signaled, dropped, dead_skipped, _inflight_skipped) =
+        let (missing, signaled, dropped, dead_skipped, _inflight_skipped, _stale_fenced) =
             derive_under_replication_resyncs(
                 &view,
                 &alive,
@@ -15206,12 +15278,13 @@ mod tests {
         let master = NodeId(1);
         let replica = NodeId(2);
         let mut view = std::collections::HashMap::new();
+        view.insert(master, vec![sweep_entry(7, 5)]);
         view.insert(replica, vec![sweep_entry(7, 0)]);
         // SWIM says the replica is gone; only the master itself is alive.
         let alive: std::collections::HashSet<NodeId> = [master].into_iter().collect();
         let mastered = vec![(7u16, vec![replica])];
 
-        let (missing, signaled, dropped, dead_skipped, _inflight_skipped) =
+        let (missing, signaled, dropped, dead_skipped, _inflight_skipped, _stale_fenced) =
             derive_under_replication_resyncs(
                 &view,
                 &alive,
@@ -15240,11 +15313,12 @@ mod tests {
         let master = NodeId(1);
         let replica = NodeId(2);
         let mut view = std::collections::HashMap::new();
+        view.insert(master, vec![sweep_entry(3, 5), sweep_entry(9, 5)]);
         view.insert(replica, vec![sweep_entry(3, 0), sweep_entry(9, 0)]);
         let alive: std::collections::HashSet<NodeId> = [master, replica].into_iter().collect();
         let mastered = vec![(3u16, vec![replica]), (9u16, vec![replica])];
 
-        let (missing, signaled, dropped, dead_skipped, _inflight_skipped) =
+        let (missing, signaled, dropped, dead_skipped, _inflight_skipped, _stale_fenced) =
             derive_under_replication_resyncs(
                 &view,
                 &alive,
@@ -15262,16 +15336,17 @@ mod tests {
     }
 
     /// Self never signals itself, even when the assignment lists it as a
-    /// replica of its own mastered shard.
+    /// replica of its own mastered shard. The self entry shows data so the
+    /// freshness fence passes — the self-skip is what suppresses here.
     #[test]
     fn sweep_skips_self_replica() {
         let master = NodeId(1);
         let mut view = std::collections::HashMap::new();
-        view.insert(master, vec![sweep_entry(7, 0)]);
+        view.insert(master, vec![sweep_entry(7, 5)]);
         let alive: std::collections::HashSet<NodeId> = [master].into_iter().collect();
         let mastered = vec![(7u16, vec![master])];
 
-        let (missing, signaled, dropped, dead_skipped, _inflight_skipped) =
+        let (missing, signaled, dropped, dead_skipped, _inflight_skipped, _stale_fenced) =
             derive_under_replication_resyncs(
                 &view,
                 &alive,
@@ -15285,6 +15360,140 @@ mod tests {
         assert_eq!(signaled, 0);
         assert_eq!(dropped, 0);
         assert_eq!(dead_skipped, 0);
+    }
+
+    /// Freshness fence (run 31904714169) — the FORMATION-SHAPE view: every
+    /// node reported (self included) but every entry shows zero records,
+    /// because the only writer of the retained view is the
+    /// exchange-completion arm and a stable cluster never re-exchanges.
+    /// Live local counts say the mastered shards are non-empty, so the view
+    /// PREDATES the data — its zero for a replica is absence of evidence,
+    /// not evidence of absence. The sweep must signal NOTHING (before the
+    /// fence it signaled every replica of every non-empty shard, forever:
+    /// the ~300-650-shard resync storm).
+    #[test]
+    fn sweep_signals_nothing_when_view_lacks_self_witness() {
+        let master = NodeId(1);
+        let replica = NodeId(2);
+        let mut view = std::collections::HashMap::new();
+        view.insert(master, vec![sweep_entry(3, 0), sweep_entry(9, 0)]);
+        view.insert(replica, vec![sweep_entry(3, 0), sweep_entry(9, 0)]);
+        let alive: std::collections::HashSet<NodeId> = [master, replica].into_iter().collect();
+        let mastered = vec![(3u16, vec![replica]), (9u16, vec![replica])];
+
+        let (missing, signaled, dropped, dead_skipped, _inflight_skipped, stale_fenced) =
+            derive_under_replication_resyncs(
+                &view,
+                &alive,
+                master,
+                &mastered,
+                &std::collections::HashSet::new(),
+                1024,
+            );
+
+        assert!(
+            missing.is_empty(),
+            "a view that does not witness this node's own data is too stale \
+             to indict any replica — nothing may be signaled",
+        );
+        assert_eq!(signaled, 0);
+        assert_eq!(dropped, 0);
+        assert_eq!(dead_skipped, 0);
+        assert_eq!(
+            stale_fenced, 2,
+            "both fenced shards must be counted so the pass is never silent",
+        );
+    }
+
+    /// Freshness fence counterpart — the scenario 15.3 REPAIR shape stays
+    /// signaled: the post-rejoin exchange stored a view whose self entry
+    /// shows this master's data (the freshness witness) while the rejoined
+    /// replica reported near-empty. The fence must NOT suppress this.
+    #[test]
+    fn sweep_signals_dataless_replica_when_self_witness_is_fresh() {
+        let master = NodeId(1);
+        let replica = NodeId(2);
+        let mut view = std::collections::HashMap::new();
+        view.insert(master, vec![sweep_entry(7, 42)]);
+        view.insert(replica, vec![sweep_entry(7, 0)]);
+        let alive: std::collections::HashSet<NodeId> = [master, replica].into_iter().collect();
+        let mastered = vec![(7u16, vec![replica])];
+
+        let (missing, signaled, dropped, dead_skipped, _inflight_skipped, stale_fenced) =
+            derive_under_replication_resyncs(
+                &view,
+                &alive,
+                master,
+                &mastered,
+                &std::collections::HashSet::new(),
+                1024,
+            );
+
+        assert_eq!(
+            missing.get(&replica).map(|s| s.as_slice()),
+            Some(&[7u16][..]),
+            "a self-witnessed view showing a dataless replica is the 15.3 \
+             repair case and must still be signaled",
+        );
+        assert_eq!(signaled, 1);
+        assert_eq!(dropped, 0);
+        assert_eq!(dead_skipped, 0);
+        assert_eq!(stale_fenced, 0, "the fence must not trip on a fresh view");
+    }
+
+    /// Volume bound (run 31904714169): even a CORRECT large signal must not
+    /// open ~96 concurrent backfill streams per node. One pass signals at
+    /// most `UNDER_REPLICATION_SWEEP_MAX_SHARDS` = 128 shards; the dropped
+    /// remainder re-arms the event trigger and drains in debounce-window
+    /// chunks. 128 covers a typical 15.3 rejoin gap (~100-300 records over
+    /// at most a few hundred shards) in 1-3 chunks ≈ seconds, while a
+    /// worst-case whole-node rebuild walks 4096 shards in 32 bounded steps
+    /// instead of stacking runs until throughput collapses (observed:
+    /// 0.55 rec/s, 132s for 476 records).
+    #[test]
+    fn sweep_cap_bounds_one_pass_to_128_signals() {
+        assert_eq!(
+            UNDER_REPLICATION_SWEEP_MAX_SHARDS, 128,
+            "per-pass cap must bound the signal volume the storm math allows",
+        );
+        let master = NodeId(1);
+        let replica = NodeId(2);
+        let shards: Vec<u16> = (0..200u16).collect();
+        let mut view = std::collections::HashMap::new();
+        view.insert(
+            master,
+            shards
+                .iter()
+                .map(|&s| sweep_entry(s, 5))
+                .collect::<Vec<_>>(),
+        );
+        view.insert(
+            replica,
+            shards
+                .iter()
+                .map(|&s| sweep_entry(s, 0))
+                .collect::<Vec<_>>(),
+        );
+        let alive: std::collections::HashSet<NodeId> = [master, replica].into_iter().collect();
+        let mastered: Vec<(u16, Vec<NodeId>)> =
+            shards.iter().map(|&s| (s, vec![replica])).collect();
+
+        let (missing, signaled, dropped, dead_skipped, _inflight_skipped, stale_fenced) =
+            derive_under_replication_resyncs(
+                &view,
+                &alive,
+                master,
+                &mastered,
+                &std::collections::HashSet::new(),
+                UNDER_REPLICATION_SWEEP_MAX_SHARDS,
+            );
+
+        assert_eq!(signaled, 128, "one pass signals at most the cap");
+        assert_eq!(dropped, 72, "the remainder is counted, never silent");
+        assert_eq!(dead_skipped, 0);
+        assert_eq!(stale_fenced, 0);
+        let total: usize = missing.values().map(|s| s.len()).sum();
+        assert_eq!(total, 128);
     }
 
     fn repair_test_addr(port: u16) -> SocketAddr {
@@ -15347,9 +15556,12 @@ mod tests {
             "the rejoin grows the alive set and the debounced pass fires",
         );
 
-        // The fired pass: rejoined node2 reported in the exchange but holds
-        // no data for two shards node1 masters — both must be pushed.
+        // The fired pass: the post-rejoin exchange stored a view whose
+        // self entry shows node1's data (the freshness witness) while
+        // rejoined node2 reported but holds no data for two shards node1
+        // masters — both must be pushed.
         let mut view = std::collections::HashMap::new();
+        view.insert(NodeId(1), vec![sweep_entry(3, 4), sweep_entry(9, 2)]);
         view.insert(NodeId(2), vec![sweep_entry(3, 0), sweep_entry(9, 0)]);
         let alive: std::collections::HashSet<NodeId> = [NodeId(1), NodeId(2)].into_iter().collect();
         let mastered = vec![(3u16, vec![NodeId(2)]), (9u16, vec![NodeId(2)])];
@@ -15471,6 +15683,7 @@ mod tests {
         let master = NodeId(1);
         let replica = NodeId(2);
         let mut view = std::collections::HashMap::new();
+        view.insert(master, vec![sweep_entry(7, 5)]);
         view.insert(replica, vec![sweep_entry(7, 0)]);
         // SWIM says the replica is gone; only the master itself is alive.
         let alive: std::collections::HashSet<NodeId> = [master].into_iter().collect();
@@ -15629,6 +15842,7 @@ mod tests {
         let master = NodeId(1);
         let replica = NodeId(2);
         let mut view = std::collections::HashMap::new();
+        view.insert(master, vec![sweep_entry(3, 5), sweep_entry(9, 5)]);
         view.insert(replica, vec![sweep_entry(3, 0), sweep_entry(9, 0)]);
         let alive: std::collections::HashSet<NodeId> = [master, replica].into_iter().collect();
         let mastered = vec![(3u16, vec![replica]), (9u16, vec![replica])];
@@ -15636,7 +15850,7 @@ mod tests {
 
         // cap=1: the in-flight shard 3 must not eat the budget — shard 9
         // is signaled, nothing is dropped.
-        let (missing, signaled, dropped, dead_skipped, inflight_skipped) =
+        let (missing, signaled, dropped, dead_skipped, inflight_skipped, _stale_fenced) =
             derive_under_replication_resyncs(&view, &alive, master, &mastered, &in_flight, 1);
 
         assert_eq!(
