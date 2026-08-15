@@ -1504,20 +1504,24 @@ fn reconcile_secondary_indexes_for_keys_multi(
 /// Reconcile the external blob store against the primary index after
 /// recovery has finished replaying the redo log (R-049).
 ///
-/// Walks every blob returned by [`BlobStore::list`] and deletes any blob
-/// whose primary-index entry is absent OR present without
-/// [`crate::record::TxFlags::EXTERNAL`]. Both signal an orphan from a failed
-/// create / aborted upload / cancelled migration: the foreground pipeline
-/// will never reference the blob again, so leaving it on disk would leak
-/// inodes forever.
+/// Walks every blob returned by [`BlobStore::list`] under
+/// [`blob_gc::GcPass::Recovery`] semantics: blobs referenced by an
+/// EXTERNAL-flagged record are kept; everything else is QUARANTINED
+/// (retained + logged loudly), never deleted. The recovery-time index can
+/// transiently miss entries that boot-time heals (G3 lost-create
+/// reverse-pull, replica resync) re-register moments later, and an entry
+/// present WITHOUT the EXTERNAL flag marks an upstream flag-fidelity defect
+/// whose blob may be the record's only payload copy — deleting either class
+/// here permanently destroyed externalized records in CI scenario-11
+/// (run 31787458246). Genuine orphans are reclaimed by the periodic sweep
+/// once the node is serving.
 ///
 /// Call this from startup AFTER [`recover_all_with_allocator`] returns
 /// successfully and BEFORE accepting client connections — the reconciliation
 /// is race-free at that point because no concurrent dispatch can write a new
 /// blob whose registration has not yet landed.
 ///
-/// Errors from the underlying blob enumeration are surfaced; per-blob delete
-/// failures are logged at warn and counted in `delete_failed`.
+/// Errors from the underlying blob enumeration are surfaced.
 pub fn reconcile_blobs_after_recovery(
     blob_store: &dyn BlobStore,
     index: &ShardedIndex,
@@ -1529,11 +1533,20 @@ pub fn reconcile_blobs_after_recovery(
         elapsed_ms = started.elapsed().as_millis() as u64,
         total_blobs = stats.total_blobs,
         kept = stats.kept,
-        deleted_no_index = stats.deleted_no_index,
-        deleted_not_external = stats.deleted_not_external,
+        quarantined_no_index = stats.quarantined_no_index,
+        quarantined_not_external = stats.quarantined_not_external,
         delete_failed = stats.delete_failed,
         "recovery: blob-store reconciliation complete",
     );
+    if stats.quarantined_total() > 0 {
+        tracing::warn!(
+            quarantined_no_index = stats.quarantined_no_index,
+            quarantined_not_external = stats.quarantined_not_external,
+            "recovery: blob reconciliation QUARANTINED unreferenced blobs instead of \
+             deleting them — non-zero quarantined_not_external means live records are \
+             missing their EXTERNAL flag (flag-fidelity defect upstream); investigate",
+        );
+    }
     Ok(stats)
 }
 
@@ -3553,6 +3566,309 @@ mod tests {
             buf[intra] ^= 0xFF;
             self.data_dev.pwrite_all_at(&buf, aligned).unwrap();
         }
+    }
+
+    /// Build a digest-bound external record image exactly like the dispatch
+    /// external-create path: EXTERNAL flag set, `external_ref` bound to the
+    /// blob store digest (store_type 1, zeroed section offsets), NO inline
+    /// cold tail. Returns `(meta, slots)`.
+    fn external_record_parts(
+        txid: [u8; 32],
+        utxo_count: u32,
+        digest: &crate::storage::blobstore::BlobDigest,
+    ) -> (TxMetadata, Vec<UtxoSlot>) {
+        let mut meta = TxMetadata::new(utxo_count);
+        meta.tx_id = txid;
+        meta.flags = TxFlags::EXTERNAL;
+        meta.external_ref = ExternalRef {
+            store_type: 1,
+            content_hash: digest.sha256,
+            total_size: digest.length,
+            input_count: 0,
+            output_count: 0,
+            inputs_offset: 0,
+            outputs_offset: 0,
+        };
+        let slots: Vec<UtxoSlot> = (0..utxo_count)
+            .map(|i| {
+                let mut h = [0u8; 32];
+                h[0] = i as u8;
+                UtxoSlot::new_unspent(h)
+            })
+            .collect();
+        (meta, slots)
+    }
+
+    /// Assert the recovered index entry for `key` resolves to an on-device
+    /// footer still carrying [`TxFlags::EXTERNAL`] and the exact
+    /// digest-bound [`ExternalRef`] the create stamped.
+    fn assert_external_footer_intact(
+        device: &dyn BlockDevice,
+        index: &ShardedIndex,
+        key: &TxKey,
+        expected_offset: u64,
+        expected_ref: &ExternalRef,
+    ) {
+        let entry = index
+            .lookup(key)
+            .expect("external create must be recovered");
+        assert_eq!(
+            entry.record_offset, expected_offset,
+            "recovered entry must point at the record's offset",
+        );
+        let meta = io::read_metadata(device, entry.record_offset).unwrap();
+        assert!(
+            meta.flags.contains(TxFlags::EXTERNAL),
+            "recovery must preserve the EXTERNAL flag in the record footer \
+             (losing it makes the blob reconciler destroy the payload)",
+        );
+        let recovered_ref = { meta.external_ref };
+        assert_eq!(
+            recovered_ref, *expected_ref,
+            "recovery must preserve the digest-bound ExternalRef verbatim",
+        );
+    }
+
+    /// Scenario-11 fidelity pin (CI run 31787458246), CreateV2 path: an
+    /// EXTERNAL record created under buffered durability (index-only
+    /// `CreateV2` redo, bytes read back from the device on replay) must come
+    /// out of a crash+restart with the EXTERNAL flag + ExternalRef intact,
+    /// the blob KEPT by the post-recovery reconcile, and the full payload
+    /// readable through `Engine::read_cold_data`.
+    #[test]
+    fn recovery_preserves_external_flag_and_blob_through_create_v2_replay() {
+        use crate::locks::StripedLocks;
+        use crate::ops::engine::Engine;
+        use crate::storage::blobstore::MemoryBlobStore;
+
+        let mut h = RecoveryTestHarness::new();
+
+        // Externalized payload, pre-uploaded (OP_STREAM_CHUNK model).
+        let payload: Vec<u8> = (0..8192u32).map(|i| (i % 251) as u8).collect();
+        let blob_store = std::sync::Arc::new(MemoryBlobStore::new());
+        let mut txid = [0u8; 32];
+        txid[0] = 0xE1;
+        txid[16] = 0x77; // non-zero mined-shard routing bytes
+        let key = TxKey { txid };
+        let digest = blob_store.put(&txid, &payload).unwrap();
+
+        // Live create: record bytes on the device (EXTERNAL + digest-bound
+        // ExternalRef, no inline cold tail)...
+        let utxo_count = 2u32;
+        let (meta, slots) = external_record_parts(txid, utxo_count, &digest);
+        let expected_ref = { meta.external_ref };
+        let offset = h
+            .alloc
+            .allocate(TxMetadata::record_size_for(utxo_count))
+            .unwrap();
+        io::write_full_record(&*h.data_dev, offset, &meta, &slots).unwrap();
+
+        // ...and the buffered-durability WAL form: index-only CreateV2.
+        let mut redo = h.redo_log();
+        redo.append_and_flush(RedoOp::CreateV2 {
+            tx_key: key,
+            device_id: 0,
+            record_offset: offset,
+            utxo_count,
+            is_conflicting: false,
+            parent_txids: Vec::new(),
+        })
+        .unwrap();
+
+        // Crash + restart: replay into the fresh (empty) index.
+        let mut dah = DahBackend::new_in_memory();
+        let stats = recover_all_with_allocator(&*h.data_dev, &redo, &h.index, &mut dah, None)
+            .expect("recovery succeeds");
+        assert_eq!(stats.entries_replayed, 1);
+
+        assert_external_footer_intact(&*h.data_dev, &h.index, &key, offset, &expected_ref);
+
+        // The post-recovery blob reconcile must KEEP the blob.
+        let devices: Vec<std::sync::Arc<dyn BlockDevice>> = vec![h.data_dev.clone()];
+        let gstats = reconcile_blobs_after_recovery(
+            blob_store.as_ref() as &dyn BlobStore,
+            &h.index,
+            &devices,
+        )
+        .unwrap();
+        assert_eq!(gstats.total_blobs, 1);
+        assert_eq!(gstats.kept, 1);
+        assert_eq!(gstats.deleted_total(), 0);
+        assert!(blob_store.exists(&txid).unwrap());
+
+        // A full engine over the recovered index serves the complete
+        // externalized payload back (digest-verified read).
+        let RecoveryTestHarness {
+            data_dev, index, ..
+        } = h;
+        let dev_dyn: std::sync::Arc<dyn BlockDevice> = data_dev.clone();
+        let alloc2 = SlotAllocator::new(dev_dyn.clone()).unwrap();
+        let mut engine =
+            Engine::new_with_sharded_index(dev_dyn, index, alloc2, StripedLocks::new(64), dah);
+        engine.set_blob_store(blob_store.clone() as std::sync::Arc<dyn BlobStore>);
+        let served = engine
+            .read_cold_data(&key)
+            .expect("recovered external record must serve its cold data");
+        assert_eq!(
+            served, payload,
+            "read_cold_data after recovery must return the full externalized payload",
+        );
+    }
+
+    /// Scenario-11 fidelity pin, legacy byte-embedding `Create` path (strict
+    /// durability / non-co-located stores): the WAL-captured record image is
+    /// the ONLY durable copy; replay must reconstruct the footer with the
+    /// EXTERNAL flag + ExternalRef byte-for-byte.
+    #[test]
+    fn recovery_preserves_external_flag_through_legacy_create_replay() {
+        use crate::storage::blobstore::MemoryBlobStore;
+
+        let mut h = RecoveryTestHarness::new();
+
+        let payload = b"externalized-payload-embedded-create".to_vec();
+        let blob_store = MemoryBlobStore::new();
+        let mut txid = [0u8; 32];
+        txid[0] = 0xE2;
+        let key = TxKey { txid };
+        let digest = blob_store.put(&txid, &payload).unwrap();
+
+        let utxo_count = 1u32;
+        let (meta, slots) = external_record_parts(txid, utxo_count, &digest);
+        let expected_ref = { meta.external_ref };
+        let record_size = TxMetadata::record_size_for(utxo_count);
+        let offset = h.alloc.allocate(record_size).unwrap();
+
+        // Build the exact record image the engine would write (metadata +
+        // slots, no cold tail) — but do NOT write it to the device: the
+        // strict-durability WAL embed is the only copy, exactly the state a
+        // crash between redo fsync and the device write leaves behind.
+        let mut image = Vec::with_capacity(record_size as usize);
+        let mut meta_bytes = [0u8; METADATA_SIZE];
+        meta.to_bytes(&mut meta_bytes);
+        image.extend_from_slice(&meta_bytes);
+        for slot in &slots {
+            let mut slot_bytes = [0u8; UTXO_SLOT_SIZE];
+            slot.to_bytes(&mut slot_bytes);
+            image.extend_from_slice(&slot_bytes);
+        }
+
+        let mut redo = h.redo_log();
+        redo.append_and_flush(RedoOp::Create {
+            tx_key: key,
+            device_id: 0,
+            record_offset: offset,
+            utxo_count,
+            is_conflicting: false,
+            record_bytes: image.into(),
+            parent_txids: Vec::new(),
+        })
+        .unwrap();
+
+        let mut dah = DahBackend::new_in_memory();
+        let stats = recover_all_with_allocator(&*h.data_dev, &redo, &h.index, &mut dah, None)
+            .expect("recovery succeeds");
+        assert_eq!(stats.entries_replayed, 1);
+
+        assert_external_footer_intact(&*h.data_dev, &h.index, &key, offset, &expected_ref);
+
+        // Reconcile keeps the blob for the replayed EXTERNAL record.
+        let devices: Vec<std::sync::Arc<dyn BlockDevice>> = vec![h.data_dev.clone()];
+        let gstats =
+            reconcile_blobs_after_recovery(&blob_store as &dyn BlobStore, &h.index, &devices)
+                .unwrap();
+        assert_eq!(gstats.kept, 1);
+        assert!(blob_store.exists(&txid).unwrap());
+    }
+
+    /// Scenario-11 fidelity pin, replica path: a replica/migration-received
+    /// EXTERNAL record journals an index-only `ReplicaCreate`; replay reads
+    /// the footer back from the device and must re-register an entry whose
+    /// footer still carries the EXTERNAL flag + ExternalRef.
+    #[test]
+    fn recovery_preserves_external_flag_through_replica_create_replay() {
+        use crate::storage::blobstore::MemoryBlobStore;
+
+        let mut h = RecoveryTestHarness::new();
+
+        let payload = b"externalized-payload-replica-create".to_vec();
+        let blob_store = MemoryBlobStore::new();
+        let mut txid = [0u8; 32];
+        txid[0] = 0xE3;
+        let key = TxKey { txid };
+        let digest = blob_store.put(&txid, &payload).unwrap();
+
+        let utxo_count = 3u32;
+        let (meta, slots) = external_record_parts(txid, utxo_count, &digest);
+        let expected_ref = { meta.external_ref };
+        let offset = h
+            .alloc
+            .allocate(TxMetadata::record_size_for(utxo_count))
+            .unwrap();
+        io::write_full_record(&*h.data_dev, offset, &meta, &slots).unwrap();
+
+        let mut redo = h.redo_log();
+        redo.append_and_flush(RedoOp::ReplicaCreate {
+            tx_key: key,
+            device_id: 0,
+            record_offset: offset,
+            utxo_count,
+        })
+        .unwrap();
+
+        let mut dah = DahBackend::new_in_memory();
+        let stats = recover_all_with_allocator(&*h.data_dev, &redo, &h.index, &mut dah, None)
+            .expect("recovery succeeds");
+        assert_eq!(stats.entries_replayed, 1);
+
+        assert_external_footer_intact(&*h.data_dev, &h.index, &key, offset, &expected_ref);
+
+        let devices: Vec<std::sync::Arc<dyn BlockDevice>> = vec![h.data_dev.clone()];
+        let gstats =
+            reconcile_blobs_after_recovery(&blob_store as &dyn BlobStore, &h.index, &devices)
+                .unwrap();
+        assert_eq!(gstats.kept, 1);
+        assert!(blob_store.exists(&txid).unwrap());
+    }
+
+    /// Scenario-11 fidelity pin, device-scan index rebuild (the
+    /// "no index snapshot found, rebuilding from device" boot path): the
+    /// scan must register the external record and the footer at the
+    /// registered offset must still carry the EXTERNAL flag + ExternalRef —
+    /// the scan reads, never rewrites.
+    #[test]
+    fn device_scan_rebuild_preserves_external_flag() {
+        use crate::index::Index;
+        use crate::storage::blobstore::MemoryBlobStore;
+
+        let mut h = RecoveryTestHarness::new();
+
+        let payload = b"externalized-payload-device-scan".to_vec();
+        let blob_store = MemoryBlobStore::new();
+        let mut txid = [0u8; 32];
+        txid[0] = 0xE4;
+        let key = TxKey { txid };
+        let digest = blob_store.put(&txid, &payload).unwrap();
+
+        let utxo_count = 2u32;
+        let (meta, slots) = external_record_parts(txid, utxo_count, &digest);
+        let expected_ref = { meta.external_ref };
+        let offset = h
+            .alloc
+            .allocate(TxMetadata::record_size_for(utxo_count))
+            .unwrap();
+        io::write_full_record(&*h.data_dev, offset, &meta, &slots).unwrap();
+
+        let rebuilt = Index::rebuild(&*h.data_dev, &*h.alloc).expect("device scan rebuild");
+        let sharded = ShardedIndex::from_single(crate::index::PrimaryBackend::from(rebuilt));
+        assert_external_footer_intact(&*h.data_dev, &sharded, &key, offset, &expected_ref);
+
+        // And the recovery reconcile over the scan-rebuilt index keeps the blob.
+        let devices: Vec<std::sync::Arc<dyn BlockDevice>> = vec![h.data_dev.clone()];
+        let gstats =
+            reconcile_blobs_after_recovery(&blob_store as &dyn BlobStore, &sharded, &devices)
+                .unwrap();
+        assert_eq!(gstats.kept, 1);
+        assert!(blob_store.exists(&txid).unwrap());
     }
 
     /// B-5: a SpendV2 entry WITHOUT the slot hash (legacy V2) cannot

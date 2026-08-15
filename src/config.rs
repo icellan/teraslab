@@ -1575,10 +1575,14 @@ pub struct ServerConfig {
 
     /// Interval in seconds between periodic orphan-blob garbage-collection
     /// sweeps (R-049). Each tick walks the blob store and deletes any blob
-    /// whose primary-index entry is absent or not flagged EXTERNAL — debris
-    /// from failed creates, aborted uploads, and cancelled migrations.
+    /// with NO primary-index entry at all — debris from failed creates,
+    /// aborted uploads, and cancelled migrations. A blob whose index entry
+    /// exists but is not flagged EXTERNAL is QUARANTINED (retained + logged),
+    /// never deleted: it may be a live record's only payload copy behind an
+    /// upstream flag-fidelity defect.
     /// Default: 3600 seconds (1 hour). Set to 0 to disable the periodic
-    /// sweep (recovery-time reconciliation still runs on every startup).
+    /// sweep (recovery-time reconciliation still runs on every startup and
+    /// quarantines rather than deletes).
     pub blob_gc_interval_secs: u64,
 
     /// Redo-log usage fraction (0.0..1.0) at or above which the

@@ -2,9 +2,14 @@
 //! recovery time and from the periodic background sweep.
 //!
 //! Pre-fix, every failed create / aborted upload / cancelled migration
-//! leaked a blob to disk forever (audit IJK-08). These tests model each
-//! leak source against a real [`FileBlobStore`] and assert that the
-//! recovery-time `reconcile_blobs_after_recovery` pass deletes them.
+//! leaked a blob to disk forever (audit IJK-08). The RECOVERY pass, however,
+//! must delete NOTHING (CI scenario-11, run 31787458246: it destroyed 8
+//! externalized records' payloads): the replayed index can transiently miss
+//! entries that boot-time heals re-register, and an entry present without
+//! the EXTERNAL flag is an upstream flag-fidelity defect whose blob must
+//! survive for repair. These tests assert the recovery pass QUARANTINES
+//! (retains + counts) both classes, and that the PERIODIC sweep still
+//! reclaims genuine no-index debris.
 //!
 //! The slim primary index no longer caches `tx_flags`, so the blob GC reads
 //! the EXTERNAL flag from each record's on-device footer. These tests
@@ -20,6 +25,33 @@ use teraslab::record::TxFlags;
 use teraslab::recovery::reconcile_blobs_after_recovery;
 use teraslab::storage::blob_gc::{BlobGcStats, reconcile_orphan_blobs_against_index};
 use teraslab::storage::blobstore::{BlobStore, FileBlobStore};
+
+/// Run the PERIODIC-pass reconciler over `store` with an index lookup that
+/// resolves each txid's EXTERNAL flag from the on-device footer, mirroring
+/// the engine-backed background sweep (no age filter so freshly-written test
+/// blobs are visible; an empty pin set).
+fn periodic_sweep(
+    store: &FileBlobStore,
+    index: &ShardedIndex,
+    device: &Arc<dyn BlockDevice>,
+) -> BlobGcStats {
+    use teraslab::storage::blob_gc::{LookupOutcome, reconcile_orphan_blobs_with_pins};
+    use teraslab::storage::blobstore::BlobPinSet;
+
+    let pins = BlobPinSet::new();
+    reconcile_orphan_blobs_with_pins(store as &dyn BlobStore, None, &pins, |key| {
+        match index.lookup(key) {
+            Some(entry) => {
+                let external = teraslab::io::read_metadata(&**device, entry.record_offset)
+                    .map(|meta| meta.tx_id != key.txid || meta.flags.contains(TxFlags::EXTERNAL))
+                    .unwrap_or(true);
+                LookupOutcome::Found { external }
+            }
+            None => LookupOutcome::NoEntry,
+        }
+    })
+    .expect("periodic sweep")
+}
 
 /// Build a fresh primary index + blob store + data device on a tempdir.
 fn fresh() -> (
@@ -82,13 +114,15 @@ fn register_entry(
         .expect("register index entry");
 }
 
-/// Pin: a process crash AFTER the blob has been written but BEFORE the
-/// primary-index entry was registered must reclaim the blob on the next
-/// startup. This is the audit-prescribed test name for R-049.
+/// A process crash AFTER the blob has been written but BEFORE the
+/// primary-index entry was registered (R-049 leak source #1). The RECOVERY
+/// pass must QUARANTINE the blob — recovery cannot distinguish this from a
+/// key a queued reverse-heal is about to re-register — and the PERIODIC
+/// sweep then reclaims it as genuine debris.
 #[test]
-fn failed_create_blob_garbage_collected_on_recovery() {
+fn failed_create_blob_quarantined_on_recovery_then_reclaimed_by_periodic_sweep() {
     let (index, store, _dir, device, _alloc) = fresh();
-    let devices = [device];
+    let devices = [device.clone()];
 
     // Simulate a failed create: blob written successfully, but the create
     // dispatch errored out before the index registration could land.
@@ -98,18 +132,27 @@ fn failed_create_blob_garbage_collected_on_recovery() {
     assert!(store.exists(&leaked).unwrap());
     assert_eq!(digest.length, payload.len() as u64);
 
-    // Recovery runs against the (empty) primary index — reconciliation
-    // must delete the leaked blob.
+    // Recovery runs against the (empty) primary index — the recovery pass
+    // retains (quarantines) the blob rather than racing a possible heal.
     let stats: BlobGcStats =
         reconcile_blobs_after_recovery(&store as &dyn BlobStore, &index, &devices).unwrap();
     assert_eq!(stats.total_blobs, 1);
     assert_eq!(stats.kept, 0);
-    assert_eq!(stats.deleted_no_index, 1);
-    assert_eq!(stats.deleted_not_external, 0);
+    assert_eq!(stats.quarantined_no_index, 1);
+    assert_eq!(stats.deleted_total(), 0);
     assert_eq!(stats.delete_failed, 0);
     assert!(
+        store.exists(&leaked).unwrap(),
+        "recovery pass must retain the blob (quarantine, not delete)"
+    );
+
+    // The periodic sweep (node serving, heals landed) reclaims the leak so
+    // it does not accumulate forever (audit IJK-08).
+    let stats = periodic_sweep(&store, &index, &device);
+    assert_eq!(stats.deleted_no_index, 1);
+    assert!(
         !store.exists(&leaked).unwrap(),
-        "leaked blob must be deleted"
+        "periodic sweep must reclaim the genuine no-index leak"
     );
 }
 
@@ -129,8 +172,8 @@ fn blob_gc_keeps_blobs_referenced_by_external_flagged_records() {
     let stats = reconcile_blobs_after_recovery(&store as &dyn BlobStore, &index, &devices).unwrap();
     assert_eq!(stats.total_blobs, 1);
     assert_eq!(stats.kept, 1);
-    assert_eq!(stats.deleted_no_index, 0);
-    assert_eq!(stats.deleted_not_external, 0);
+    assert_eq!(stats.deleted_total(), 0);
+    assert_eq!(stats.quarantined_total(), 0);
     assert!(
         store.exists(&live).unwrap(),
         "live external blob must be kept"
@@ -141,14 +184,15 @@ fn blob_gc_keeps_blobs_referenced_by_external_flagged_records() {
     assert_eq!(read, b"live external payload");
 }
 
-/// A blob whose txid does not appear in the primary index at all is an
-/// orphan. The audit-prescribed test name for the IJK-08 case.
+/// Blobs whose txids do not appear in the primary index at all: at RECOVERY
+/// time these are quarantined (a queued heal may still re-register the key),
+/// not deleted. The periodic sweep is the reclamation path (IJK-08).
 #[test]
-fn blob_gc_skips_blobs_not_in_primary_index() {
+fn blob_gc_quarantines_blobs_not_in_primary_index_on_recovery() {
     let (index, store, _dir, device, _alloc) = fresh();
     let devices = [device];
 
-    // Three orphans, no index entries at all.
+    // Three unreferenced blobs, no index entries at all.
     let o1 = txid(1);
     let o2 = txid(2);
     let o3 = txid(3);
@@ -159,62 +203,96 @@ fn blob_gc_skips_blobs_not_in_primary_index() {
     let stats = reconcile_blobs_after_recovery(&store as &dyn BlobStore, &index, &devices).unwrap();
     assert_eq!(stats.total_blobs, 3);
     assert_eq!(stats.kept, 0);
-    assert_eq!(stats.deleted_no_index, 3);
-    assert_eq!(stats.deleted_not_external, 0);
-    assert!(!store.exists(&o1).unwrap());
-    assert!(!store.exists(&o2).unwrap());
-    assert!(!store.exists(&o3).unwrap());
+    assert_eq!(stats.quarantined_no_index, 3);
+    assert_eq!(stats.deleted_total(), 0);
+    assert!(store.exists(&o1).unwrap());
+    assert!(store.exists(&o2).unwrap());
+    assert!(store.exists(&o3).unwrap());
 }
 
-/// A blob whose primary-index entry is present but does NOT carry the
-/// EXTERNAL flag is debris from an aborted attempt that ended up using the
-/// inline / separate-tier path instead. Must be reclaimed.
+/// CI scenario-11 (run 31787458246) regression: a blob whose primary-index
+/// entry is present but does NOT carry the EXTERNAL flag is a live record
+/// with a flag-fidelity defect — the blob may be its only payload copy.
+/// The recovery pass must retain it (quarantine), never delete.
 #[test]
-fn blob_gc_deletes_blobs_when_index_entry_missing_external_flag() {
+fn blob_gc_quarantines_blobs_when_index_entry_missing_external_flag() {
     let (index, store, _dir, device, mut alloc) = fresh();
 
-    let stale = txid(0x20);
-    store.put(&stale, b"stale blob").unwrap();
-    register_entry(&index, &*device, &mut alloc, &stale, TxFlags::IS_COINBASE);
-    let devices = [device];
+    let suspect = txid(0x20);
+    store
+        .put(&suspect, b"possibly the only payload copy")
+        .unwrap();
+    register_entry(&index, &*device, &mut alloc, &suspect, TxFlags::IS_COINBASE);
+    let devices = [device.clone()];
 
     let stats = reconcile_blobs_after_recovery(&store as &dyn BlobStore, &index, &devices).unwrap();
     assert_eq!(stats.total_blobs, 1);
-    assert_eq!(stats.deleted_not_external, 1);
-    assert!(!store.exists(&stale).unwrap());
+    assert_eq!(stats.quarantined_not_external, 1);
+    assert_eq!(stats.deleted_total(), 0);
+    assert!(
+        store.exists(&suspect).unwrap(),
+        "entry-present-without-flag blob must survive recovery"
+    );
+
+    // The PERIODIC sweep must not delete it either — same data-loss class,
+    // just an hour later.
+    let stats = periodic_sweep(&store, &index, &device);
+    assert_eq!(stats.quarantined_not_external, 1);
+    assert_eq!(stats.deleted_total(), 0);
+    assert!(
+        store.exists(&suspect).unwrap(),
+        "entry-present-without-flag blob must survive the periodic sweep too"
+    );
+    assert_eq!(
+        store.get(&suspect).unwrap().unwrap(),
+        b"possibly the only payload copy".to_vec(),
+        "payload must remain readable for a later heal/repair"
+    );
 }
 
-/// A mixed set covering all three categories at once — kept, no-index
-/// orphan, present-but-not-EXTERNAL orphan. Verifies the reconciler does
-/// not get confused by interleaving in `BlobStore::list` order.
+/// A mixed set covering all three categories at once — kept, no-index,
+/// present-but-not-EXTERNAL. Verifies the recovery reconciler does not get
+/// confused by interleaving in `BlobStore::list` order, and that the
+/// periodic sweep then reclaims ONLY the genuine no-index debris.
 #[test]
 fn blob_gc_mixed_set_recovery() {
     let (index, store, _dir, device, mut alloc) = fresh();
 
     let keep_ext = txid(0x30);
     let orphan_no_idx = txid(0x31);
-    let orphan_no_flag = txid(0x32);
+    let quarantine_no_flag = txid(0x32);
     store.put(&keep_ext, b"k").unwrap();
     store.put(&orphan_no_idx, b"o1").unwrap();
-    store.put(&orphan_no_flag, b"o2").unwrap();
+    store.put(&quarantine_no_flag, b"o2").unwrap();
     register_entry(&index, &*device, &mut alloc, &keep_ext, TxFlags::EXTERNAL);
     register_entry(
         &index,
         &*device,
         &mut alloc,
-        &orphan_no_flag,
+        &quarantine_no_flag,
         TxFlags::empty(),
     );
-    let devices = [device];
+    let devices = [device.clone()];
 
+    // Recovery: nothing deleted; both unreferenced classes quarantined.
     let stats = reconcile_blobs_after_recovery(&store as &dyn BlobStore, &index, &devices).unwrap();
     assert_eq!(stats.total_blobs, 3);
     assert_eq!(stats.kept, 1);
+    assert_eq!(stats.quarantined_no_index, 1);
+    assert_eq!(stats.quarantined_not_external, 1);
+    assert_eq!(stats.deleted_total(), 0);
+    assert!(store.exists(&keep_ext).unwrap());
+    assert!(store.exists(&orphan_no_idx).unwrap());
+    assert!(store.exists(&quarantine_no_flag).unwrap());
+
+    // Periodic: only the genuine no-index debris is reclaimed.
+    let stats = periodic_sweep(&store, &index, &device);
+    assert_eq!(stats.kept, 1);
     assert_eq!(stats.deleted_no_index, 1);
-    assert_eq!(stats.deleted_not_external, 1);
+    assert_eq!(stats.quarantined_not_external, 1);
     assert!(store.exists(&keep_ext).unwrap());
     assert!(!store.exists(&orphan_no_idx).unwrap());
-    assert!(!store.exists(&orphan_no_flag).unwrap());
+    assert!(store.exists(&quarantine_no_flag).unwrap());
 }
 
 /// Pin: stale `.tmp` upload artefacts older than
@@ -282,8 +360,8 @@ fn stale_tmp_files_swept_on_recovery() {
         .expect("reconcile");
     assert_eq!(stats.total_blobs, 1);
     assert_eq!(stats.kept, 1);
-    assert_eq!(stats.deleted_no_index, 0);
-    assert_eq!(stats.deleted_not_external, 0);
+    assert_eq!(stats.deleted_total(), 0);
+    assert_eq!(stats.quarantined_total(), 0);
 
     assert!(!stale_tmp.exists(), "stale .tmp must be swept on recovery");
     assert!(fresh_tmp.exists(), "fresh .tmp must survive");
@@ -302,9 +380,9 @@ fn reconcile_orphan_blobs_against_index_smoke() {
     let mut alloc = SlotAllocator::new(device.clone()).unwrap();
 
     let keep = txid(0x50);
-    let orphan = txid(0x51);
+    let unreferenced = txid(0x51);
     store.put(&keep, b"keep").unwrap();
-    store.put(&orphan, b"drop").unwrap();
+    store.put(&unreferenced, b"retain-until-periodic").unwrap();
     register_entry(&index, &*device, &mut alloc, &keep, TxFlags::EXTERNAL);
     let devices = [device];
 
@@ -312,7 +390,8 @@ fn reconcile_orphan_blobs_against_index_smoke() {
         .expect("reconcile");
     assert_eq!(stats.total_blobs, 2);
     assert_eq!(stats.kept, 1);
-    assert_eq!(stats.deleted_no_index, 1);
+    assert_eq!(stats.quarantined_no_index, 1);
+    assert_eq!(stats.deleted_total(), 0);
     assert!(store.exists(&keep).unwrap());
-    assert!(!store.exists(&orphan).unwrap());
+    assert!(store.exists(&unreferenced).unwrap());
 }
