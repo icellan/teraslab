@@ -2071,6 +2071,28 @@ pub trait RecordAllocator: Send {
     fn rollback_pending(&mut self, pending: PendingBatchAllocation);
     /// Return a region; see [`SlotAllocator::free`].
     fn free(&mut self, offset: u64, size: u64) -> Result<()>;
+    /// Free a region as a record DELETION's durable commit record: when a
+    /// redo log is attached, `RedoOp::FreeRegion` is appended and fsynced
+    /// BEFORE any in-memory mutation, so recovery replays the free and evicts
+    /// any index entry still pointing at the freed slot
+    /// (`recovery::evict_freed_region_owner` — production deletes journal no
+    /// `RedoOp::Delete`). `Engine::delete_inner` is the intended caller.
+    ///
+    /// Distinct from [`Self::free`] ONLY on the log-structured segment
+    /// engine, whose plain `free` is the un-journaled relocate-on-spend
+    /// dead-mark (journaling there would fsync per spend AND let a replayed
+    /// `FreeRegion` evict the sole index entry of a LIVE record whose
+    /// un-journaled relocate re-point was lost with the crash). The in-place
+    /// [`SlotAllocator`]'s `free` already journals + fsyncs `FreeRegion`, so
+    /// this default forward is exactly it.
+    ///
+    /// # Errors
+    /// Same contract as [`Self::free`]; additionally
+    /// [`AllocatorError::RedoLogFailure`] when the journal append/flush fails
+    /// (no state is mutated in that case).
+    fn free_durable(&mut self, offset: u64, size: u64) -> Result<()> {
+        self.free(offset, size)
+    }
     /// Persist allocator state to the device header and fsync.
     fn persist(&self) -> Result<()>;
     /// Write the header without the durability fsync (checkpoint hoists the sync).
@@ -2157,9 +2179,10 @@ pub trait RecordAllocator: Send {
     /// never overwrite it. `size` is the record's on-device `record_size`. See
     /// [`SlotAllocator::reserve_recovered_live_region`] for the buffered-delete
     /// lost-tail window this closes. Returns `true` if the range was removed.
-    /// Default no-op (returns `false`): the log-structured segment allocator has
-    /// no fsynced-`FreeRegion` delete window — its deletes only bump per-segment
-    /// dead-byte counters and its layout is re-derived by
+    /// Default no-op (returns `false`): the log-structured segment allocator
+    /// has no freelist to carve — its deletes journal a fsynced `FreeRegion`
+    /// too (`free_durable`, the delete's commit record), but reuse is
+    /// whole-segment and its layout is re-derived by
     /// [`Self::reconcile_recovered_free_list`] from the live set.
     fn reserve_recovered_live_region(&mut self, offset: u64, size: u64) -> bool {
         let _ = (offset, size);
@@ -2257,6 +2280,11 @@ impl RecordAllocator for BoxedAllocator {
     }
     fn free(&mut self, offset: u64, size: u64) -> Result<()> {
         (**self).free(offset, size)
+    }
+    fn free_durable(&mut self, offset: u64, size: u64) -> Result<()> {
+        // Forward explicitly: the trait default would route through THIS
+        // impl's `free` and lose the inner allocator's override.
+        (**self).free_durable(offset, size)
     }
     fn persist(&self) -> Result<()> {
         (**self).persist()
