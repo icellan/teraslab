@@ -864,6 +864,16 @@ fn batch_chunk_staging_pressure(stream_key: &str, ops: &[ReplicaOp]) -> Option<S
         };
         let key = (stream_key.to_string(), *tx_key);
         if *chunk_index == 0 {
+            if *chunk_count <= 1 {
+                // N2: non-conforming shapes the walk must not simulate as an
+                // open. chunk_count == 0 is Hard-NAK'd by the loop's range
+                // check before any staging; chunk_count == 1 opens AND
+                // completes inside one stage_chunk call, so simulating a
+                // persistent open would over-reserve. Neither is produced by
+                // `split_ops_for_wire` (chunking only ever splits an op into
+                // ≥ 2 parts) — stop vouching and let the loop decide.
+                return None;
+            }
             if open.contains_key(&key) {
                 // b13b221 conflict (or duplicate part 0 in one batch): the
                 // loop Hard-NAKs at this op before any pressure check.
@@ -1532,22 +1542,53 @@ pub fn handle_replica_batch_with_tracker_and_master_lookup(
                     reassembled = inner;
                     &reassembled
                 }
+                Err(ChunkStageError::Pressure(message)) if idx == 0 => {
+                    // N3: pressure at the batch's FIRST op (the pre-batch gate
+                    // declined to vouch — a race, or a non-conforming chunk
+                    // shape like chunk_count ≤ 1). Nothing of this batch has
+                    // applied or staged yet — the pressure check fires at
+                    // part 0 before any insert — so the retriable Busy is
+                    // sound here exactly as it is from the gate.
+                    if let Some(m) = crate::metrics::replication_metrics() {
+                        m.replica_staging_pressure_naks.inc();
+                    }
+                    tracing::warn!(
+                        stream_key = %effective_stream_key,
+                        first_sequence = batch.first_sequence,
+                        %message,
+                        "replica NAK: chunk staging at capacity at the batch's first op; \
+                         NAKing Busy (retriable)",
+                    );
+                    let ack = ReplicaAck::Busy {
+                        first_sequence: batch.first_sequence,
+                    };
+                    return ResponseFrame {
+                        request_id: request.request_id,
+                        status: STATUS_ERROR,
+                        payload: ack.serialize(),
+                    };
+                }
                 Err(ChunkStageError::Pressure(message)) => {
-                    // F1: staging pressure that RACED past the pre-batch gate
-                    // (`batch_chunk_staging_pressure` admitted this batch, but
-                    // another connection opened assemblies since). Mid-loop,
-                    // earlier ops of this batch may already be applied — and a
-                    // cross-batch tail may already be CONSUMED — so "re-send
-                    // the identical batch" is no longer guaranteed correct.
-                    // Fail HARD like any other staging violation, preserving
-                    // the invariant that `Busy` is only ever sent with nothing
-                    // applied; the sender's re-ship from part 0 (or the outer
-                    // migration retry) recovers, and the gate makes this arm
-                    // rare.
+                    // F1: MID-BATCH staging pressure the pre-batch gate did
+                    // not predict — a cross-connection race, or a
+                    // non-conforming chunk shape the gate's walk refuses to
+                    // vouch for. Earlier ops of this batch may already be
+                    // applied — and a cross-batch tail may already be
+                    // CONSUMED — so "re-send the identical batch" is no
+                    // longer guaranteed correct. Fail HARD like any other
+                    // staging violation, preserving the invariant that `Busy`
+                    // is only ever sent with nothing applied; the sender's
+                    // re-ship from part 0 (or the outer migration retry)
+                    // recovers. Metered (N4) so CI can validate this arm's
+                    // rarity instead of assuming it.
+                    if let Some(m) = crate::metrics::replication_metrics() {
+                        m.replica_staging_pressure_race_hard.inc();
+                    }
                     let ack = ReplicaAck::Error {
                         failed_sequence: seq,
                         message: format!(
-                            "staging pressure raced past the pre-batch gate: {message}"
+                            "staging pressure past the pre-batch gate mid-batch \
+                             (race or non-conforming chunk shape): {message}"
                         ),
                     };
                     return ResponseFrame {
@@ -9290,6 +9331,242 @@ mod tests {
             "B must complete and apply after the pressure episode"
         );
         assert_eq!(tracker.get(DEFAULT_STREAM_KEY), 4);
+    }
+
+    /// N1 — the completion-credit in `batch_chunk_staging_pressure` is
+    /// LOAD-BEARING here: staging is saturated to exactly the cap INCLUDING
+    /// A's open assembly, and B is no larger than A, so `[A.tail, B.part 0]`
+    /// fits ONLY because the walk credits A's in-batch completion back to
+    /// the budget before evaluating B's open. Deleting the credit
+    /// (`open_sum.saturating_sub(*tl)` + `open.remove(&key)`) makes the walk
+    /// see cap + B > cap and Busy-NAK a batch that sequential staging
+    /// admits — the deterministic starvation of the modal sub-batch shape
+    /// the gate's doc warns about. This test fails on that mutation where
+    /// the F1 conflict-shape test (B strictly larger than A) does not.
+    #[test]
+    fn tail_completion_credit_admits_fitting_part0_first_try() {
+        let _serial = CHUNK_STAGING_TEST_SERIAL.lock();
+        let pressure_stream = "staging-pressure-credit";
+        let ka = key(84);
+        let kb = key(86);
+        let _cleanup = StagingCleanup {
+            stream: pressure_stream,
+            keys: vec![ka, kb],
+        };
+        let engine = make_engine();
+        let tracker = ReplicaAppliedTracker::in_memory();
+
+        // A: 2-part chunked op; B: a strictly SMALLER 2-part chunked op, so
+        // A's freed bytes alone are enough to admit B — if and only if the
+        // walk credits them.
+        let a_parts = chunk_op(&chunk_test_create(ka), 2);
+        let b_parts = chunk_op(&chunk_test_create_with_cold(kb, 2048), 2);
+        let a_total = match &a_parts[0] {
+            ReplicaOp::OpChunk { total_len, .. } => *total_len,
+            other => panic!("fixture must be a chunk, got {other:?}"),
+        };
+
+        // Batch 1 opens A's assembly (cross-batch continuation left open).
+        let resp = send_tracked(&engine, &tracker, &chunk_batch(1, vec![a_parts[0].clone()]));
+        assert_eq!(resp.status, STATUS_OK, "A's part 0 must open cleanly");
+
+        // Saturate to EXACTLY the cap including A: 3 × 64 MiB plus one
+        // (64 MiB − A) assembly.
+        let pressure_part0 = |n: u8, total_len: u64| ReplicaOp::OpChunk {
+            tx_key: key(n),
+            chunk_index: 0,
+            chunk_count: 2,
+            total_len,
+            payload: vec![0u8; 8],
+        };
+        for n in 218..221u8 {
+            let opened = stage_chunk(pressure_stream, &pressure_part0(n, MAX_STAGED_OP_BYTES))
+                .expect("pressure part 0 opens cleanly");
+            assert!(opened.is_none(), "a 2-part assembly must stay open");
+        }
+        let opened = stage_chunk(
+            pressure_stream,
+            &pressure_part0(221, MAX_STAGED_OP_BYTES - a_total),
+        )
+        .expect("final pressure part 0 opens cleanly (sum is exactly the cap)");
+        assert!(opened.is_none());
+
+        // The modal sub-batch fits FIRST TRY: A completes and frees a_total,
+        // and B (≤ A) opens into exactly that freed room.
+        let tail_batch = chunk_batch(2, vec![a_parts[1].clone(), b_parts[0].clone()]);
+        let resp = send_tracked(&engine, &tracker, &tail_batch);
+        assert_eq!(
+            resp.status, STATUS_OK,
+            "the walk must credit A's in-batch completion and admit B first try \
+             (a Busy here means the completion-credit regressed)"
+        );
+        assert!(
+            engine.read_metadata(&ka).is_ok(),
+            "A must complete and apply"
+        );
+        assert_eq!(tracker.get(DEFAULT_STREAM_KEY), 3);
+
+        // B completes cross-batch and applies.
+        let resp = send_tracked(&engine, &tracker, &chunk_batch(4, vec![b_parts[1].clone()]));
+        assert_eq!(resp.status, STATUS_OK, "B's final part must apply");
+        assert!(
+            engine.read_metadata(&kb).is_ok(),
+            "B must complete and apply"
+        );
+        assert_eq!(tracker.get(DEFAULT_STREAM_KEY), 4);
+    }
+
+    /// N2 + N3 — a single-part chunk (`chunk_count == 1`) is a shape the
+    /// gate's walk refuses to vouch for (it opens AND completes inside one
+    /// `stage_chunk` call, so simulating a persistent open would
+    /// over-reserve). Under saturation its part 0 therefore trips pressure
+    /// IN-LOOP — and at the batch's FIRST op that is still the retriable
+    /// Busy (nothing applied, nothing staged), not the mid-batch Hard: the
+    /// identical resend applies once the pressure clears.
+    #[test]
+    fn single_part_chunk_pressure_at_first_op_naks_busy_and_resend_applies() {
+        let _serial = CHUNK_STAGING_TEST_SERIAL.lock();
+        let pressure_stream = "staging-pressure-first-op";
+        let k = key(230);
+        let _cleanup = StagingCleanup {
+            stream: pressure_stream,
+            keys: vec![k],
+        };
+        let engine = make_engine();
+        let tracker = ReplicaAppliedTracker::in_memory();
+        let parts = chunk_op(&chunk_test_create(k), 1);
+        assert_eq!(parts.len(), 1, "fixture must be a single-part chunk");
+        let batch = chunk_batch(1, parts);
+
+        let pressure_part0 = |n: u8| ReplicaOp::OpChunk {
+            tx_key: key(n),
+            chunk_index: 0,
+            chunk_count: 2,
+            total_len: MAX_STAGED_OP_BYTES,
+            payload: vec![0u8; 8],
+        };
+        for n in 231..235u8 {
+            let opened = stage_chunk(pressure_stream, &pressure_part0(n))
+                .expect("pressure part 0 opens cleanly");
+            assert!(opened.is_none(), "a 2-part assembly must stay open");
+        }
+
+        let resp = send_tracked(&engine, &tracker, &batch);
+        assert_eq!(resp.status, STATUS_ERROR, "staging pressure must NAK");
+        match ReplicaAck::deserialize(&resp.payload).expect("ack decodes") {
+            ReplicaAck::Busy { first_sequence } => {
+                assert_eq!(first_sequence, 1, "Busy must echo the batch first_sequence")
+            }
+            other => panic!(
+                "in-loop pressure at the batch's FIRST op must stay the retriable \
+                 Busy, got {other:?}"
+            ),
+        }
+        assert!(
+            engine.read_metadata(&k).is_err(),
+            "nothing may apply under the first-op Busy NAK"
+        );
+        assert_eq!(tracker.get(DEFAULT_STREAM_KEY), 0);
+
+        // Free the pressure; the identical resend opens, completes, applies.
+        for n in 231..235u8 {
+            match stage_chunk(pressure_stream, &pressure_part0(n)) {
+                Err(ChunkStageError::Hard(message)) => assert!(
+                    message.contains("conflict"),
+                    "expected the conflict drop, got: {message}"
+                ),
+                other => panic!("part 0 over an open assembly must conflict, got {other:?}"),
+            }
+        }
+        let resp = send_tracked(&engine, &tracker, &batch);
+        assert_eq!(
+            resp.status, STATUS_OK,
+            "the identical re-send must apply once the pressure clears"
+        );
+        assert!(
+            engine.read_metadata(&k).is_ok(),
+            "the single-part op must have applied"
+        );
+        assert_eq!(tracker.get(DEFAULT_STREAM_KEY), 1);
+    }
+
+    /// N4 — pressure tripping MID-BATCH past the gate stays the terminal
+    /// Hard error, because the batch's prefix has already applied. Reached
+    /// deterministically via the non-conforming single-part shape the walk
+    /// refuses to vouch for: C (conforming, 2 parts) completes and applies,
+    /// then an oversized single-part D trips the cap at idx 2 — Error, not
+    /// Busy, with C's apply pinned as the reason a Busy would be unsound.
+    #[test]
+    fn mid_batch_pressure_past_gate_fails_hard_with_prefix_applied() {
+        let _serial = CHUNK_STAGING_TEST_SERIAL.lock();
+        let pressure_stream = "staging-pressure-midbatch";
+        let kc = key(235);
+        let kd = key(236);
+        let _cleanup = StagingCleanup {
+            stream: pressure_stream,
+            keys: vec![kc, kd],
+        };
+        let engine = make_engine();
+        let tracker = ReplicaAppliedTracker::in_memory();
+        let c_parts = chunk_op(&chunk_test_create(kc), 2);
+        let d_parts = chunk_op(&chunk_test_create_with_cold(kd, 8192), 1);
+        assert_eq!(d_parts.len(), 1, "D must be a single-part chunk");
+        let c_total = match &c_parts[0] {
+            ReplicaOp::OpChunk { total_len, .. } => *total_len,
+            other => panic!("fixture must be a chunk, got {other:?}"),
+        };
+
+        // Pressure = cap − C exactly: C's open fits, D (> C) does not even
+        // after C completes and frees its bytes.
+        let pressure_part0 = |n: u8, total_len: u64| ReplicaOp::OpChunk {
+            tx_key: key(n),
+            chunk_index: 0,
+            chunk_count: 2,
+            total_len,
+            payload: vec![0u8; 8],
+        };
+        for n in 237..240u8 {
+            let opened = stage_chunk(pressure_stream, &pressure_part0(n, MAX_STAGED_OP_BYTES))
+                .expect("pressure part 0 opens cleanly");
+            assert!(opened.is_none(), "a 2-part assembly must stay open");
+        }
+        let opened = stage_chunk(
+            pressure_stream,
+            &pressure_part0(240, MAX_STAGED_OP_BYTES - c_total),
+        )
+        .expect("final pressure part 0 opens cleanly");
+        assert!(opened.is_none());
+
+        let batch = chunk_batch(
+            1,
+            vec![c_parts[0].clone(), c_parts[1].clone(), d_parts[0].clone()],
+        );
+        let resp = send_tracked(&engine, &tracker, &batch);
+        assert_eq!(resp.status, STATUS_ERROR, "mid-batch pressure must NAK");
+        match ReplicaAck::deserialize(&resp.payload).expect("ack decodes") {
+            ReplicaAck::Error {
+                failed_sequence,
+                message,
+            } => {
+                assert_eq!(failed_sequence, 3, "the Error must name D's sequence");
+                assert!(
+                    message.contains("mid-batch"),
+                    "the Error must name the mid-batch pressure cause, got: {message}"
+                );
+            }
+            other => panic!(
+                "mid-batch pressure must stay the terminal Hard error \
+                 (the prefix already applied), got {other:?}"
+            ),
+        }
+        assert!(
+            engine.read_metadata(&kc).is_ok(),
+            "C applied before the trip — exactly why a mid-batch Busy is unsound"
+        );
+        assert!(
+            engine.read_metadata(&kd).is_err(),
+            "D must not have applied"
+        );
     }
 
     /// Issue #17 follow-up (splice close). Covered positions now re-apply,

@@ -1094,14 +1094,27 @@ pub struct ReplicationMetrics {
     pub replica_covered_batch_reapplied: PaddedCounter,
     /// Scenario 11: receiver-side counter — incremented every time an
     /// inbound `OP_REPLICA_BATCH` is NAKed with the retriable
-    /// `ReplicaAck::Busy` by the pre-batch chunk-staging pressure gate
-    /// (the batch's part-0 opens would push the process-wide staging sum
-    /// past its cap). Occasional ticks are normal when concurrent
-    /// large-blob baselines/deltas target this node — the senders back
-    /// off and re-send the identical batch; sustained growth means the
-    /// staging cap is chronically saturated (too many concurrent large
-    /// streams, or stale open assemblies pinning the cap).
+    /// `ReplicaAck::Busy` for chunk-staging pressure: by the pre-batch
+    /// gate (the batch's part-0 opens would push the process-wide staging
+    /// sum past its cap), or by an in-loop trip at the batch's FIRST op
+    /// (equally clean — nothing applied or staged). Occasional ticks are
+    /// normal when concurrent large-blob baselines/deltas target this
+    /// node — the senders back off and re-send the identical batch;
+    /// sustained growth means the staging cap is chronically saturated
+    /// (too many concurrent large streams, or stale open assemblies
+    /// pinning the cap).
     pub replica_staging_pressure_naks: PaddedCounter,
+    /// N4: receiver-side counter — incremented when chunk-staging
+    /// pressure trips MID-BATCH, past the pre-batch gate (a
+    /// cross-connection race, or a non-conforming chunk shape the gate's
+    /// walk refuses to vouch for), forcing the terminal
+    /// `ReplicaAck::Error` because earlier ops of the batch may already
+    /// be applied. The design claim is that the gate makes this arm RARE;
+    /// this counter lets CI and operators validate that claim instead of
+    /// assuming it — sustained growth means the gate's snapshot is being
+    /// outraced (or a sender ships non-conforming chunks) and shards are
+    /// paying the hard-failure price.
+    pub replica_staging_pressure_race_hard: PaddedCounter,
 }
 
 /// Per-replica drill-down state exposed on `/admin/top`.
@@ -1165,6 +1178,7 @@ impl ReplicationMetrics {
             replica_rejected_sequence_gap: PaddedCounter::new(),
             replica_covered_batch_reapplied: PaddedCounter::new(),
             replica_staging_pressure_naks: PaddedCounter::new(),
+            replica_staging_pressure_race_hard: PaddedCounter::new(),
         }
     }
 
