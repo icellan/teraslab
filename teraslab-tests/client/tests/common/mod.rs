@@ -664,6 +664,85 @@ fn shard_activation_gate_reason(views: &[NodeShardView], node_count: u32) -> Opt
     None
 }
 
+/// W4 — name the shards behind a diverging cluster-wide master sum.
+///
+/// `per_node` holds each node's EFFECTIVE mastered shard IDs (from
+/// `/status?master_shards=1`). Returns a compact diagnostic naming the
+/// OVERLAPPING shards (mastered by two or more nodes — the "4464/4096"
+/// shape) and the ORPHANED shards (mastered by nobody — the "<4096" shape),
+/// each list capped at [`MASTER_OVERLAP_DIAGNOSTIC_CAP`] entries with a
+/// total count, so the timeout error names the divergent shards instead of
+/// only their sum. Overlapping entries carry the claimant node numbers.
+///
+/// `unfetched` names nodes whose master set could not be fetched (review
+/// nit): every shard such a node masters is counted as "orphaned" here, so
+/// naming the missing nodes keeps an inflated orphan count honest.
+pub fn master_overlap_diagnostic(per_node: &[(u32, Vec<u16>)], unfetched: &[u32]) -> String {
+    const NUM_SHARDS: usize = 4096;
+    let mut claimants: Vec<Vec<u32>> = vec![Vec::new(); NUM_SHARDS];
+    for (node, shards) in per_node {
+        for &s in shards {
+            if let Some(c) = claimants.get_mut(s as usize) {
+                c.push(*node);
+            }
+        }
+    }
+    let overlapping: Vec<(u16, &Vec<u32>)> = claimants
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c.len() >= 2)
+        .map(|(s, c)| (s as u16, c))
+        .collect();
+    let orphaned: Vec<u16> = claimants
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c.is_empty())
+        .map(|(s, _)| s as u16)
+        .collect();
+    let overlap_names: Vec<String> = overlapping
+        .iter()
+        .take(MASTER_OVERLAP_DIAGNOSTIC_CAP)
+        .map(|(s, c)| {
+            let nodes: Vec<String> = c.iter().map(|n| format!("n{n}")).collect();
+            format!("{s}({})", nodes.join("+"))
+        })
+        .collect();
+    let orphan_names: Vec<String> = orphaned
+        .iter()
+        .take(MASTER_OVERLAP_DIAGNOSTIC_CAP)
+        .map(|s| s.to_string())
+        .collect();
+    let more = |total: usize| {
+        if total > MASTER_OVERLAP_DIAGNOSTIC_CAP {
+            format!(" +{} more", total - MASTER_OVERLAP_DIAGNOSTIC_CAP)
+        } else {
+            String::new()
+        }
+    };
+    let unfetched_suffix = if unfetched.is_empty() {
+        String::new()
+    } else {
+        let names: Vec<String> = unfetched.iter().map(|n| format!("n{n}")).collect();
+        format!(
+            ", unfetched=[{}] (their masters count as orphaned)",
+            names.join(", ")
+        )
+    };
+    format!(
+        "overlapping={} [{}{}], orphaned={} [{}{}]{}",
+        overlapping.len(),
+        overlap_names.join(", "),
+        more(overlapping.len()),
+        orphaned.len(),
+        orphan_names.join(", "),
+        more(orphaned.len()),
+        unfetched_suffix,
+    )
+}
+
+/// Cap on the shard IDs [`master_overlap_diagnostic`] prints per list.
+pub const MASTER_OVERLAP_DIAGNOSTIC_CAP: usize = 20;
+
 /// Wait until all active migrations complete on all nodes.
 ///
 /// Also waits for shard master counts to sum to 4096 (all shards assigned)
@@ -761,11 +840,46 @@ pub async fn wait_migrations_complete(
             mig_last_log = std::time::Instant::now();
         }
         if start.elapsed() >= timeout {
+            // W4 — when the cluster-wide master sum diverges from 4096
+            // (double-mastered or orphaned shards), fetch each node's
+            // EFFECTIVE mastered shard IDs and NAME the divergent shards, so
+            // the next "4464/4096" comes with a shard list instead of a sum.
+            let overlap_detail = if total_masters != 4096 {
+                let mut per_node: Vec<(u32, Vec<u16>)> = Vec::new();
+                let mut unfetched: Vec<u32> = Vec::new();
+                for i in 1..=node_count {
+                    let port = docker.http_port(i);
+                    let url = format!("http://127.0.0.1:{port}/status?master_shards=1");
+                    if let Ok(json) = poll_json(&url).await
+                        && let Some(list) = json["master_shards"].as_array()
+                    {
+                        let shards: Vec<u16> = list
+                            .iter()
+                            .filter_map(|v| v.as_u64())
+                            .filter_map(|v| u16::try_from(v).ok())
+                            .collect();
+                        per_node.push((i, shards));
+                    } else {
+                        unfetched.push(i);
+                    }
+                }
+                if per_node.is_empty() {
+                    let names: Vec<String> = unfetched.iter().map(|n| format!("n{n}")).collect();
+                    format!(
+                        " [master sets unavailable: unfetched=[{}]]",
+                        names.join(", ")
+                    )
+                } else {
+                    format!(" [{}]", master_overlap_diagnostic(&per_node, &unfetched))
+                }
+            } else {
+                String::new()
+            };
             // The activation reason carries the per-node serving/target dump,
             // so a gate held ONLY by an unactivated table names the nodes
             // holding it instead of leaving `masters=4096` looking settled.
             return Err(ClientError::Connection(format!(
-                "migrations still active after {timeout:?} [masters={total_masters}/4096, handoffs={total_pending_handoffs}, inbound={total_inbound_pending}, activation={}] [{}]",
+                "migrations still active after {timeout:?} [masters={total_masters}/4096, handoffs={total_pending_handoffs}, inbound={total_inbound_pending}, activation={}] [{}]{overlap_detail}",
                 activation_reason.as_deref().unwrap_or("ok"),
                 node_details.join(", ")
             )));
@@ -3032,6 +3146,96 @@ mod rf2_census_tests {
         assert_eq!(
             rf2_census_verdict(0, 0, RF2_CENSUS_WINDOW, RF2_CENSUS_WINDOW),
             Rf2CensusVerdict::Settled
+        );
+    }
+}
+
+#[cfg(test)]
+mod master_overlap_diagnostic_tests {
+    use super::*;
+
+    /// The run-31904708491 scenario-09 shape in miniature: shards mastered by
+    /// two nodes at once must be NAMED with their claimants, and shards
+    /// mastered by nobody must be named as orphaned.
+    #[test]
+    fn overlapping_and_orphaned_shards_are_named() {
+        // node1 masters 0..=2, node2 masters 2..=4, node3 masters 5 — shard 2
+        // is double-mastered and every shard >= 6 is orphaned.
+        let per_node = vec![
+            (1u32, vec![0u16, 1, 2]),
+            (2u32, vec![2u16, 3, 4]),
+            (3u32, vec![5u16]),
+        ];
+        let d = master_overlap_diagnostic(&per_node, &[]);
+        assert!(
+            d.contains("overlapping=1 [2(n1+n2)]"),
+            "the double-mastered shard must be named with both claimants: {d}"
+        );
+        assert!(
+            d.contains("orphaned=4090"),
+            "4096-6 shards are orphaned: {d}"
+        );
+        // The orphan list starts at the first unclaimed shard and is capped.
+        assert!(d.contains("[6, 7,"), "orphan IDs must be listed: {d}");
+        assert!(
+            d.contains(&format!(" +{} more", 4090 - MASTER_OVERLAP_DIAGNOSTIC_CAP)),
+            "the orphan list must be capped with a remainder count: {d}"
+        );
+    }
+
+    /// Nodes whose master set could not be fetched are NAMED, because every
+    /// shard they master shows up as "orphaned" — the reader must see the
+    /// inflation's source instead of trusting the orphan count.
+    #[test]
+    fn unfetched_nodes_are_named_next_to_the_inflated_orphan_count() {
+        let per_node = vec![(1u32, vec![0u16, 1])];
+        let d = master_overlap_diagnostic(&per_node, &[2, 3]);
+        assert!(
+            d.contains("unfetched=[n2, n3] (their masters count as orphaned)"),
+            "missing nodes must be named with the inflation caveat: {d}"
+        );
+        assert!(d.contains("orphaned=4094"), "{d}");
+        // No unfetched nodes -> no suffix at all.
+        let clean = master_overlap_diagnostic(&per_node, &[]);
+        assert!(
+            !clean.contains("unfetched"),
+            "no suffix when every node answered: {clean}"
+        );
+    }
+
+    /// A fully-claimed, non-overlapping table produces empty lists — the
+    /// diagnostic must not invent divergence.
+    #[test]
+    fn a_clean_partition_reports_no_overlap_and_no_orphans() {
+        let mut per_node: Vec<(u32, Vec<u16>)> = vec![(1, vec![]), (2, vec![])];
+        for s in 0..4096u16 {
+            per_node[(s % 2) as usize].1.push(s);
+        }
+        let d = master_overlap_diagnostic(&per_node, &[]);
+        assert_eq!(
+            d, "overlapping=0 [], orphaned=0 []",
+            "a clean table must produce empty lists"
+        );
+    }
+
+    /// The overlap list itself is capped at the configured maximum with a
+    /// remainder count (the observed wedge had 368 overlapping shards — the
+    /// error must stay one line, not 368).
+    #[test]
+    fn the_overlap_list_is_capped() {
+        let all: Vec<u16> = (0..4096).collect();
+        // Every shard is claimed by both nodes.
+        let per_node = vec![(1u32, all.clone()), (2u32, all)];
+        let d = master_overlap_diagnostic(&per_node, &[]);
+        assert!(d.contains("overlapping=4096"), "{d}");
+        assert!(
+            d.contains(&format!(" +{} more", 4096 - MASTER_OVERLAP_DIAGNOSTIC_CAP)),
+            "the overlap list must be capped with a remainder count: {d}"
+        );
+        let named = d.matches("(n1+n2)").count();
+        assert_eq!(
+            named, MASTER_OVERLAP_DIAGNOSTIC_CAP,
+            "exactly the cap's worth of shard IDs may be printed: {d}"
         );
     }
 }
