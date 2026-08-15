@@ -2996,9 +2996,11 @@ impl ClusterCoordinator {
                 // drain. NOTE the resync backfills this pass itself spawns
                 // are NOT in `active_count` (Phase H tasks are not
                 // start_outbound-tracked); concurrent duplicates toward
-                // them are prevented by the `resync_inflight` set instead,
-                // and aggregate stream concurrency is bounded by the
-                // migration thread/byte throttles. Firing (inside
+                // them are prevented by the `resync_inflight` set instead.
+                // Aggregate concurrency: `max_migration_threads` bounds each
+                // RUN, not the aggregate — N stacked runs (≤ceil(backlog/cap))
+                // can hold N× that many threads, mostly parked on the SHARED
+                // byte throttle, which is the true global bound. Firing (inside
                 // `event_repair_take_fire`) resets the periodic timer so
                 // the fallback cadence never double-runs right behind an
                 // event pass; a capped-off remainder re-arms the trigger so
