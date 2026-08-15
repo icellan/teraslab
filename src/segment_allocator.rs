@@ -627,9 +627,10 @@ impl SegmentAllocator {
     /// it is fully dead. This closes a P0 data-overwrite bug — after crash recovery
     /// a REUSED segment can carry stale `used == dead > 0` from the checkpoint
     /// header (its pre-reuse fully-dead state) while now holding a live
-    /// post-checkpoint record whose bytes recovery never re-added to `used`
-    /// ([`crate::recovery::recover_allocator_frontiers`] restores only the frontier
-    /// and free list, never `used`). Trusting `used == dead` there would reset+free
+    /// post-checkpoint record whose bytes recovery only partially re-adds to
+    /// `used` ([`Self::reconcile_recovered_free_list`] rebuilds a LOWER-BOUND
+    /// `used` floor from the live set, never the exact value). Trusting
+    /// `used == dead` there would reset+free
     /// the segment and let a later allocate hand out the live record's offset,
     /// overwriting acked UTXO data while the index still points at it.
     pub fn reclaim_fully_dead_segments(&mut self, live_offsets: &[u64]) -> Vec<u32> {
@@ -1020,8 +1021,23 @@ impl SegmentAllocator {
     /// store. Every segment strictly BELOW `open_segment` (the already-used
     /// region) that holds NO live record is a defrag hole — its records were all
     /// relocated out (spend) or deleted — so reset it to empty and return it to the
-    /// reuse free list. Segments with live records keep their (checkpoint-recovered)
-    /// accounting.
+    /// reuse free list.
+    ///
+    /// Segments WITH live records keep their (checkpoint-recovered) accounting,
+    /// except that their `used` is raised to a LOWER-BOUND floor rebuilt from
+    /// the live set: `(highest live offset in the segment − segment start) +
+    /// one minimum reservation`, and for the open segment the exact
+    /// `cursor − segment start`. Creates journal no `AllocateRegion`, so a
+    /// segment first written after the last header persist recovers with
+    /// `used == 0` while holding live records; without the floor, the very
+    /// next dead-mark (delete `free_durable`, spend-relocate `free`) plants
+    /// `dead > 0 && used == 0`, the next checkpoint persists it, and the next
+    /// restart is bricked by [`Self::recover`]'s torn-header rejection. A
+    /// LOWER bound (record sizes are unknowable here without a device read
+    /// per record) errs in the safe direction: whole-segment reclaim stays
+    /// gated on the live index (`reclaim_fully_dead_segments`' `has_live`),
+    /// and an under-counted `used` only makes `dead >= used` drain SOONER —
+    /// it can never strand capacity the way an over-count would.
     ///
     /// Correctness: this is EXACT for the free list, which is what matters — future
     /// appends only ever reuse a live-free segment, so no live record is
@@ -1036,9 +1052,12 @@ impl SegmentAllocator {
         // never called on the serving path.
         self.replayed_free_offsets.clear();
         let mut has_live = vec![false; self.segment_count as usize];
+        // Highest live offset per segment — the basis of the `used` floor.
+        let mut max_live = vec![0u64; self.segment_count as usize];
         for &off in live_offsets {
             if let Some(s) = self.segment_of(off) {
                 has_live[s as usize] = true;
+                max_live[s as usize] = max_live[s as usize].max(off);
             }
         }
         // Scan up to the reuse FRONTIER — `max(open_segment, highest_used)` — not
@@ -1057,12 +1076,33 @@ impl SegmentAllocator {
         let frontier = self.open_segment.max(self.highest_used());
         self.free_segments.clear();
         for idx in 0..=frontier {
-            if idx == self.open_segment || has_live[idx as usize] {
+            if idx == self.open_segment {
+                continue;
+            }
+            if has_live[idx as usize] {
+                // Used-floor rebuild (see the doc): the append cursor wrote
+                // this sealed segment contiguously from its start, so at
+                // least `(max_live − start) + one minimum reservation` bytes
+                // were consumed. `align_reservation(1)` is the smallest
+                // reservation `allocate` ever hands out in the current mode.
+                let floor =
+                    (max_live[idx as usize] - self.segment_start(idx)) + self.align_reservation(1);
+                let seg = &mut self.segments[idx as usize];
+                seg.used = seg.used.max(floor);
                 continue;
             }
             self.segments[idx as usize] = SegmentMeta::default();
             self.free_segments.push_back(idx);
         }
+        // The OPEN segment's `used` is exactly the append cursor's progress —
+        // `set_cursor_at_least` has already positioned the cursor past the
+        // highest live record, so this is both a floor and (on the recovery
+        // path) the true high-water.
+        let open_used = self
+            .cursor
+            .saturating_sub(self.segment_start(self.open_segment));
+        let open = &mut self.segments[self.open_segment as usize];
+        open.used = open.used.max(open_used);
     }
 
     /// The device identity formatted as a 32-character lowercase hex string.
@@ -2592,6 +2632,61 @@ mod tests {
             redo.lock().recover().unwrap().is_empty(),
             "the relocate dead-mark path must stay un-journaled"
         );
+    }
+
+    /// Review finding 1 (137e52d follow-up): recovery must rebuild a `used`
+    /// floor for live segments, or the LIVE dead-mark paths plant the
+    /// `dead > 0 && used == 0` boot poison. The chain: checkpoint (header
+    /// persisted) → post-checkpoint creates span S0/S1 (used bumps in RAM
+    /// only) → crash → recover leaves S0 holding live records with
+    /// `used == 0` → any delete/dead-mark on S0 → `dead > 0 && used == 0` →
+    /// the next checkpoint persists it → the NEXT restart fails
+    /// `CorruptedHeader("segment has dead bytes but zero used")` — a boot
+    /// brick in exactly scenario 09's crash-cycle workload.
+    #[test]
+    fn reconcile_rebuilds_used_floor_so_post_recovery_deletes_survive_repersist() {
+        let device = dev(64);
+        let seg_size = 2 * 4096u64;
+        let mut a = SegmentAllocator::new(device.clone(), seg_size).unwrap();
+        // "Checkpoint" BEFORE any create: the persisted header knows nothing.
+        a.persist().unwrap();
+        let o1 = a.allocate(4096).unwrap(); // S0
+        let o2 = a.allocate(4096).unwrap(); // S0 (fills it)
+        let o3 = a.allocate(4096).unwrap(); // S1 (open)
+        let end = a.cursor();
+
+        // Crash + reload: every segment's `used` is the stale checkpoint 0.
+        let mut r = SegmentAllocator::recover(device.clone()).unwrap();
+        assert_eq!(
+            r.stats().used_bytes,
+            0,
+            "recovered header predates every create"
+        );
+
+        // Standard recovery sequence (recover_allocator_frontiers wraps these).
+        r.set_cursor_at_least(end);
+        r.reconcile_recovered_free_list(&[o1, o2, o3]);
+
+        // The rebuilt floor: S0 = (o2 - seg_start) + min reservation = 8192
+        // (exact here), S1 (open) = cursor - seg_start = 4096.
+        assert_eq!(
+            r.stats().used_bytes,
+            12288,
+            "reconcile must rebuild the per-segment used floor from the live set"
+        );
+
+        // Post-recovery delete dead-marks S0, then the next checkpoint
+        // persists — this wrote dead > 0 && used == 0 pre-fix.
+        r.free_durable(o1, 4096).unwrap();
+        r.persist().unwrap();
+
+        // The NEXT restart must not be bricked by the persisted header.
+        let r2 = SegmentAllocator::recover(device).expect(
+            "a post-recovery delete must not poison the persisted header \
+             (dead > 0 && used == 0 is rejected as a torn header by recover)",
+        );
+        assert!(r2.stats().used_bytes > 0);
+        assert_eq!(r2.stats().dead_bytes, 4096);
     }
 
     /// A journal failure must leave the allocator untouched: callers never

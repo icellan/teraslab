@@ -3448,7 +3448,10 @@ const FRONTIER_CANDIDATES_PER_STORE: usize = 2 * (MAX_FRONTIER_PHANTOM_DROPS + 1
 /// offset, up to [`MAX_FRONTIER_PHANTOM_DROPS`] drops per store — beyond
 /// that, or on ANY non-corruption error (transport/out-of-bounds), recovery
 /// fails closed with the first/offending error. Dropped phantoms are also
-/// excluded from the live set handed to `reconcile_recovered_free_list`. The
+/// excluded from the live set handed to `reconcile_recovered_free_list`, and
+/// when the candidate window was truncated a targeted sweep
+/// ([`unregister_keys_at_dropped_offsets`]) evicts any out-of-window alias
+/// still pointing at a dropped offset. The
 /// PRIMARY fix is upstream — the delete's fsynced `FreeRegion`
 /// (`SegmentAllocator::free_durable`) lets replay evict the phantom before
 /// this pass ever sees it — so the retreat only fires for a phantom whose
@@ -3505,7 +3508,7 @@ pub fn recover_allocator_frontiers(
         // 1) Advance the frontier past the highest READABLE live record so a
         //    fresh allocation cannot overwrite it (over-estimate,
         //    block-rounded), dropping bounded phantoms along the way.
-        let mut dropped: Vec<u64> = Vec::new();
+        let mut dropped: std::collections::HashSet<u64> = std::collections::HashSet::new();
         let mut first_err: Option<DeviceError> = None;
         let mut advanced_or_empty = cands.is_empty();
         let mut i = 0usize;
@@ -3558,7 +3561,7 @@ pub fn recover_allocator_frontiers(
                         }
                         i += 1;
                     }
-                    dropped.push(max);
+                    dropped.insert(max);
                 }
                 // Any non-corruption failure (transport, out-of-bounds) is NOT
                 // phantom evidence: dropping a live max-offset entry on a
@@ -3580,6 +3583,21 @@ pub fn recover_allocator_frontiers(
             }
         }
         if !dropped.is_empty() {
+            // Truncation insurance: the in-window unregister loop above can
+            // only reach alias keys INSIDE the tracked candidate window. If
+            // the window was truncated, an out-of-window alias of a dropped
+            // offset could stay registered while the drop removes the offset
+            // from the live set below — its segment then loses `has_live`,
+            // gets reclaimed and reused, and the stale entry points at reused
+            // bytes. One targeted pass closes the class. (With the current
+            // by-offset sort, ties are adjacent, so a dropped offset's whole
+            // alias group sits in-window whenever the retreat SUCCEEDS — this
+            // pass is insurance against that proof rotting under future
+            // window/sort changes, and it runs only in the already-rare
+            // truncated-and-dropped case.)
+            if truncated[s] {
+                unregister_keys_at_dropped_offsets(index, s, &dropped);
+            }
             live_offsets[s].retain(|o| !dropped.contains(o));
         }
         // 2) Segment engine: rebuild the reuse free list from the live set (so a
@@ -3587,6 +3605,45 @@ pub fn recover_allocator_frontiers(
         allocators[s].reconcile_recovered_free_list(&live_offsets[s]);
     }
     Ok(())
+}
+
+/// Unregister every index key on `store` still pointing at one of the
+/// `dropped` phantom offsets — the frontier retreat's truncation-insurance
+/// sweep (see the call site in [`recover_allocator_frontiers`]). A key is
+/// unregistered only while its CURRENT entry still points at a dropped
+/// `(store, offset)` slot (the same index-authority check the in-window
+/// unregister applies), so a re-pointed key is never evicted. Returns the
+/// number of keys unregistered. One O(index) pass + one lookup per match;
+/// runs only when a store's candidate window was truncated AND phantoms were
+/// dropped — never on a clean boot.
+fn unregister_keys_at_dropped_offsets(
+    index: &ShardedIndex,
+    store: usize,
+    dropped: &std::collections::HashSet<u64>,
+) -> usize {
+    let mut stale: Vec<TxKey> = Vec::new();
+    index.for_each(|key, e| {
+        if e.device_id as usize == store && dropped.contains(&e.record_offset) {
+            stale.push(key);
+        }
+    });
+    let mut unregistered = 0usize;
+    for key in stale {
+        let still_points_at_dropped = index.lookup(&key).is_some_and(|le| {
+            le.device_id as usize == store && dropped.contains(&le.record_offset)
+        });
+        if still_points_at_dropped {
+            index.unregister(&key);
+            tracing::error!(
+                target: "teraslab::recovery::allocator",
+                store,
+                txid_prefix = ?&key.txid[..4],
+                "frontier recovery: unregistered an out-of-window alias of a dropped phantom offset",
+            );
+            unregistered += 1;
+        }
+    }
+    unregistered
 }
 
 // ---------------------------------------------------------------------------
@@ -6135,6 +6192,113 @@ mod tests {
         assert!(
             index.lookup(&real_key).is_some(),
             "the real record must not be scrubbed on the failure path",
+        );
+    }
+
+    /// The truncation-insurance sweep (`unregister_keys_at_dropped_offsets`):
+    /// alias keys of a dropped phantom offset that sat OUTSIDE the retreat's
+    /// candidate window must still be unregistered — a stale alias whose
+    /// segment loses `has_live` would otherwise point at reclaimed-and-reused
+    /// bytes. Only entries still pointing at a dropped `(store, offset)` slot
+    /// are evicted; re-pointed keys and other stores are untouched.
+    #[test]
+    fn dropped_offset_alias_sweep_unregisters_out_of_window_keys() {
+        let index = ShardedIndex::from_single(PrimaryBackend::new_in_memory(1000).unwrap());
+        let x = crate::segment_allocator::DATA_REGION_OFFSET + 8192;
+        let y = crate::segment_allocator::DATA_REGION_OFFSET + 4096;
+        let entry = |device_id: u8, record_offset: u64| TxIndexEntry {
+            device_id,
+            record_offset,
+            mined_slot: crate::index::mined_index::NO_MINED_SLOT,
+        };
+        let key = |n: u8| {
+            let mut txid = [0u8; 32];
+            txid[0] = n;
+            TxKey { txid }
+        };
+        // Two aliases of the dropped offset X on store 0, one live record at
+        // Y on store 0, one entry at X on ANOTHER store.
+        let (a, b, c, d) = (key(1), key(2), key(3), key(4));
+        index.register(a, entry(0, x)).unwrap();
+        index.register(b, entry(0, x)).unwrap();
+        index.register(c, entry(0, y)).unwrap();
+        index.register(d, entry(1, x)).unwrap();
+
+        let dropped: std::collections::HashSet<u64> = [x].into_iter().collect();
+        let n = unregister_keys_at_dropped_offsets(&index, 0, &dropped);
+
+        assert_eq!(n, 2, "exactly the two store-0 aliases of X are evicted");
+        assert!(index.lookup(&a).is_none() && index.lookup(&b).is_none());
+        assert!(
+            index.lookup(&c).is_some(),
+            "a live record at a non-dropped offset must survive"
+        );
+        assert!(
+            index.lookup(&d).is_some(),
+            "an entry at X on ANOTHER store must survive"
+        );
+    }
+
+    /// End-to-end pin with an ACTUALLY-TRUNCATED candidate window (more live
+    /// entries than the window tracks): a phantom at the top is dropped, the
+    /// retreat lands on the highest real record, the truncation-insurance
+    /// sweep runs, and afterwards NO key points at a dropped offset while
+    /// every real record stays indexed.
+    #[test]
+    fn frontier_recovery_with_truncated_window_leaves_no_key_at_dropped_offsets() {
+        use crate::segment_allocator::SegmentAllocator;
+
+        let device: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let index = ShardedIndex::from_single(PrimaryBackend::new_in_memory(1000).unwrap());
+        let mut scratch = SegmentAllocator::new(device.clone(), 8 * 1024 * 1024).unwrap();
+
+        // More real records than FRONTIER_CANDIDATES_PER_STORE (130) tracks.
+        let mut real: Vec<(TxKey, u64)> = Vec::new();
+        for n in 1..=132u8 {
+            real.push(make_segment_record(&device, &mut scratch, &index, n));
+        }
+        let (real_max_key, real_max_offset) =
+            *real.iter().max_by_key(|(_, o)| *o).expect("records exist");
+
+        // A phantom ABOVE every real record, with a second alias key at the
+        // SAME offset.
+        let (p_key, p_offset) = register_phantom(&mut scratch, &index, 0xF1);
+        let mut txid = [0u8; 32];
+        txid[0] = 0xF2;
+        let alias_key = TxKey { txid };
+        index
+            .register(
+                alias_key,
+                TxIndexEntry {
+                    device_id: 0,
+                    record_offset: p_offset,
+                    mined_slot: crate::index::mined_index::NO_MINED_SLOT,
+                },
+            )
+            .unwrap();
+
+        let mut allocs: Vec<BoxedAllocator> = vec![Box::new(
+            SegmentAllocator::new(device.clone(), 8 * 1024 * 1024).unwrap(),
+        )];
+        let devices = vec![device.clone()];
+        recover_allocator_frontiers(&index, &devices, &mut allocs)
+            .expect("retreat over a truncated window must still succeed");
+
+        assert!(
+            index.lookup(&p_key).is_none() && index.lookup(&alias_key).is_none(),
+            "no key may still point at the dropped phantom offset after recovery",
+        );
+        assert!(
+            index.lookup(&real_max_key).is_some(),
+            "the highest real record must stay indexed",
+        );
+        for (k, _) in &real {
+            assert!(index.lookup(k).is_some(), "every real record must survive");
+        }
+        assert!(
+            allocs[0].next_offset() > real_max_offset,
+            "the frontier must cover the highest real record",
         );
     }
 
