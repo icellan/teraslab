@@ -16,7 +16,7 @@ use crate::ops::engine::Engine;
 use crate::redo::RedoLog;
 use axum::Router;
 use axum::extract::ws::{Message, WebSocket};
-use axum::extract::{Path, Query, Request, State};
+use axum::extract::{Path, Query, RawQuery, Request, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::IntoResponse;
@@ -1880,26 +1880,35 @@ async fn wait_for_cluster_drain(cluster: &RunningCluster, wait_seconds: u64) -> 
     }
 }
 
-/// Query parameters for `GET /status`.
-#[derive(Debug, Default, serde::Deserialize)]
-struct StatusQuery {
-    /// W4 — when non-zero, the payload additionally carries
-    /// `master_shards`: the IDs of every shard whose EFFECTIVE assignment
-    /// this node masters (the same predicate `master_shard_count` counts).
-    /// Opt-in because the list is ~KBs on a settled node and the harness
-    /// polls `/status` on a tight loop; only its failure diagnostics need
-    /// the per-shard sets (to name overlapping/orphaned shards when the
-    /// cluster-wide master sum diverges from `NUM_SHARDS`).
-    #[serde(default)]
-    master_shards: u8,
+/// W4 — does the `/status` query string opt in to the `master_shards`
+/// payload field (the IDs of every shard whose EFFECTIVE assignment this
+/// node masters — the same predicate `master_shard_count` counts)?
+///
+/// Opt-in because the list is ~KBs on a settled node and the harness polls
+/// `/status` on a tight loop; only its failure diagnostics need the
+/// per-shard sets (to name overlapping/orphaned shards when the
+/// cluster-wide master sum diverges from `NUM_SHARDS`).
+///
+/// Manual parse over a typed `Query<T>` extractor (review nit): the old
+/// handler ignored the query string entirely, so a malformed one must
+/// DEGRADE to the plain payload rather than reject the request with a 400 —
+/// `RawQuery` never rejects. Enabled when a `master_shards` key is present
+/// with any value other than `0` or empty; an unparseable value degrades to
+/// enabled, which only adds the field.
+fn status_query_wants_master_shards(query: Option<&str>) -> bool {
+    let Some(query) = query else { return false };
+    query.split('&').any(|kv| {
+        let mut it = kv.splitn(2, '=');
+        it.next() == Some("master_shards") && !matches!(it.next(), Some("0") | Some(""))
+    })
 }
 
 async fn handle_status(
-    Query(query): Query<StatusQuery>,
+    RawQuery(query): RawQuery,
     State(state): State<Arc<HttpState>>,
 ) -> impl IntoResponse {
     let mut status = build_status_json(&state);
-    if query.master_shards != 0
+    if status_query_wants_master_shards(query.as_deref())
         && let Some(ref cluster) = state.cluster
         && let Some(obj) = status.as_object_mut()
     {
@@ -5523,7 +5532,7 @@ mod tests {
 
         // Healthy node: write_healthy=true, redo_poisoned=false.
         let (healthy, _log) = build_ready_test_state_with_redo(true, false);
-        let resp = handle_status(Query(StatusQuery::default()), State(healthy))
+        let resp = handle_status(RawQuery(None), State(healthy))
             .await
             .into_response();
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
@@ -5535,7 +5544,7 @@ mod tests {
 
         // Poisoned node: write_healthy=false, redo_poisoned=true.
         let (poisoned, _log) = build_ready_test_state_with_redo(true, true);
-        let resp = handle_status(Query(StatusQuery::default()), State(poisoned))
+        let resp = handle_status(RawQuery(None), State(poisoned))
             .await
             .into_response();
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
@@ -5544,6 +5553,32 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["write_healthy"], serde_json::json!(false));
         assert_eq!(json["redo_poisoned"], serde_json::json!(true));
+    }
+
+    /// W4 review nit — the `/status` query flag is a tolerant manual parse:
+    /// junk query strings degrade instead of 400ing the request (which a
+    /// typed `Query<T>` extractor would do), and the flag only engages on a
+    /// real `master_shards` key.
+    #[test]
+    fn status_query_master_shards_flag_is_tolerant() {
+        assert!(!status_query_wants_master_shards(None));
+        assert!(!status_query_wants_master_shards(Some("")));
+        assert!(status_query_wants_master_shards(Some("master_shards=1")));
+        // Bare key (no `=`) opts in.
+        assert!(status_query_wants_master_shards(Some("master_shards")));
+        // Explicitly off.
+        assert!(!status_query_wants_master_shards(Some("master_shards=0")));
+        assert!(!status_query_wants_master_shards(Some("master_shards=")));
+        // Malformed value degrades to enabled (only adds the field) — the
+        // point is no request-level rejection either way.
+        assert!(status_query_wants_master_shards(Some("master_shards=abc")));
+        // Other keys — including junk — never engage the flag.
+        assert!(!status_query_wants_master_shards(Some("foo=%%%&bar")));
+        assert!(!status_query_wants_master_shards(Some("xmaster_shards=1")));
+        // The key is found among other parameters.
+        assert!(status_query_wants_master_shards(Some(
+            "foo=1&master_shards=1&bar=2"
+        )));
     }
 
     /// R-055 baseline: in single-node mode (no cluster) with the

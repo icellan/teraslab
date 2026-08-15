@@ -278,6 +278,18 @@ pub struct MigrationProgress {
     /// All mutations between snapshot_sequence and fence_sequence are
     /// the delta that must be applied on the target.
     pub fence_sequence: u64,
+    /// W4 review P1 — drive-attempt generation stamp. A fresh value from the
+    /// manager's monotonic counter is assigned whenever a driver takes (or
+    /// re-takes) ownership of this entry: `start_outbound` on registration,
+    /// `retry_failed` on the failed-task re-drive, and `restore_outbound` on
+    /// boot restore. A batch captures its tasks' stamps at spawn
+    /// (`capture_task_attempts`) and its end-of-batch abandoned sweep parks
+    /// ONLY entries whose stamp still matches — an entry re-driven in place
+    /// by the NodeJoined retry (same identity, same epoch, no new entry)
+    /// carries a newer stamp and is left to its new driver. Process-local
+    /// coordination state: NOT serialized by `serialize_outbound` (restored
+    /// entries are re-stamped, and no pre-restart capture survives a boot).
+    pub attempt: u64,
 }
 
 impl MigrationProgress {
@@ -294,6 +306,7 @@ impl MigrationProgress {
             bytes_sent: 0,
             snapshot_sequence: 0,
             fence_sequence: 0,
+            attempt: 0,
         }
     }
 
@@ -574,6 +587,11 @@ pub struct MigrationManager {
     /// retains its last copy rather than stranding it. Cleared when this
     /// node re-acquires the shard as an inbound migration target.
     committed_handoffs: std::collections::HashMap<u16, u64>,
+    /// W4 review P1 — monotonic source for [`MigrationProgress::attempt`]
+    /// stamps. Bumped once per stamp so every (re-)drive of an entry gets a
+    /// unique generation; starts at 1 so a stamp of 0 (the `from_task`
+    /// default, never handed to a batch capture) matches nothing.
+    next_attempt: u64,
 }
 
 impl MigrationManager {
@@ -586,7 +604,15 @@ impl MigrationManager {
             fenced_shards: ShardBitmap::new(),
             dual_write_targets: std::collections::HashMap::new(),
             committed_handoffs: std::collections::HashMap::new(),
+            next_attempt: 1,
         }
+    }
+
+    /// W4 review P1 — hand out the next drive-attempt generation stamp.
+    fn bump_attempt(&mut self) -> u64 {
+        let a = self.next_attempt;
+        self.next_attempt += 1;
+        a
     }
 
     /// Record that this node has COMMITTED-ly handed off `shard` as the
@@ -671,7 +697,10 @@ impl MigrationManager {
     ) {
         for task in tasks {
             if task.from_node == self_id {
-                self.active.push(MigrationProgress::from_task(task));
+                let attempt = self.bump_attempt();
+                let mut progress = MigrationProgress::from_task(task);
+                progress.attempt = attempt;
+                self.active.push(progress);
                 // Phase E: open dual-write window so writes during the
                 // migration land on the new master / replica destination
                 // as well as the old replica set.
@@ -1209,8 +1238,16 @@ impl MigrationManager {
 
     /// Reset a failed migration back to Streaming so it can be retried.
     ///
+    /// W4 review P1 — the reset re-stamps [`MigrationProgress::attempt`]
+    /// with a fresh generation: the retry re-drives the SAME entry in place
+    /// (same identity, same epoch), so without the new stamp a still-draining
+    /// earlier batch's end-of-batch abandoned sweep would see its captured
+    /// stamp match and park the entry out from under the retry batch —
+    /// lifting its fence mid fence-to-completion window.
+    ///
     /// Returns true if the migration was found and reset, false otherwise.
     pub fn retry_failed(&mut self, task: &MigrationTask) -> bool {
+        let attempt = self.bump_attempt();
         if let Some(p) = self.active.iter_mut().find(|p| {
             p.shard == task.shard
                 && p.from_node == task.from_node
@@ -1220,6 +1257,7 @@ impl MigrationManager {
             p.state = MigrationState::Streaming;
             p.migrated_records = 0;
             p.bytes_sent = 0;
+            p.attempt = attempt;
             true
         } else {
             false
@@ -1291,17 +1329,28 @@ impl MigrationManager {
     /// parks them in the durable retry queue (`take_failed_tasks`) and runs
     /// `mark_failed`'s fence/dual-write bookkeeping.
     ///
-    /// The membership check and the marking happen under one `&mut self`
-    /// borrow so a concurrent re-registration cannot interleave between the
-    /// two. Entries already `Complete` or `Failed` are left untouched.
-    pub fn fail_unresolved_tasks(&mut self, tasks: &[MigrationTask]) -> Vec<MigrationTask> {
+    /// Each element pairs the task with the drive-attempt stamp the batch
+    /// captured at spawn ([`Self::capture_task_attempts`]); an entry whose
+    /// stamp has moved on (re-driven by `retry_failed`, or re-registered by
+    /// `start_outbound`) belongs to a newer driver and is skipped. The
+    /// membership check and the marking happen under one `&mut self` borrow
+    /// so a concurrent re-registration cannot interleave between the two.
+    /// Entries already `Complete` or `Failed` are left untouched.
+    pub fn fail_unresolved_tasks(&mut self, tasks: &[(MigrationTask, u64)]) -> Vec<MigrationTask> {
         let mut marked = Vec::new();
-        for task in tasks {
+        for (task, expected_attempt) in tasks {
             let unresolved = self.active.iter().any(|p| {
                 p.shard == task.shard
                     && p.from_node == task.from_node
                     && p.to_node == task.to_node
                     && p.is_master == task.is_master
+                    // W4 review P1 — the generation guard: park ONLY the
+                    // exact drive attempt this batch captured at spawn. A
+                    // newer stamp means the entry was re-driven in place
+                    // (`retry_failed`) or re-registered under the same
+                    // identity (`start_outbound`) after the capture — it has
+                    // a live driver and is not this batch's to park.
+                    && p.attempt == *expected_attempt
                     && !p.is_complete()
                     && p.state != MigrationState::Failed
             });
@@ -1311,6 +1360,31 @@ impl MigrationManager {
             }
         }
         marked
+    }
+
+    /// W4 review P1 — snapshot each task's CURRENT drive-attempt stamp
+    /// ([`MigrationProgress::attempt`]) so a batch can prove, at its
+    /// end-of-batch abandoned sweep, that an entry was not re-driven in
+    /// place (the NodeJoined `take_failed_tasks` -> `retry_failed` path
+    /// resets the SAME entry to `Streaming` at the same epoch) or
+    /// re-registered under the same identity since the batch spawned. Tasks
+    /// with no tracked entry are omitted — there is nothing to park for
+    /// them. Called under the same manager lock the batch registration used.
+    pub fn capture_task_attempts(&self, tasks: &[MigrationTask]) -> Vec<(MigrationTask, u64)> {
+        tasks
+            .iter()
+            .filter_map(|task| {
+                self.active
+                    .iter()
+                    .find(|p| {
+                        p.shard == task.shard
+                            && p.from_node == task.from_node
+                            && p.to_node == task.to_node
+                            && p.is_master == task.is_master
+                    })
+                    .map(|p| (task.clone(), p.attempt))
+            })
+            .collect()
     }
 
     /// Collect all failed migration tasks for re-execution.
@@ -2044,7 +2118,9 @@ impl MigrationManager {
             };
             // Only add if not already tracked.
             if self.find_task_mut(&task).is_none() {
+                let attempt = self.bump_attempt();
                 let mut progress = MigrationProgress::from_task(&task);
+                progress.attempt = attempt;
                 progress.state = state;
                 progress.snapshot_sequence = snapshot_sequence;
                 progress.fence_sequence = fence_sequence;
@@ -3553,7 +3629,8 @@ mod tests {
         mgr.set_snapshot_sequence(&stranded_streaming, 7); // -> Streaming
         assert_eq!(mgr.active_count(), 2, "two entries are stranded pre-sweep");
 
-        let marked = mgr.fail_unresolved_tasks(&tasks);
+        let captured = mgr.capture_task_attempts(&tasks);
+        let marked = mgr.fail_unresolved_tasks(&captured);
 
         let marked_shards: Vec<u16> = marked.iter().map(|t| t.shard).collect();
         assert_eq!(

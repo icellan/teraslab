@@ -7654,7 +7654,17 @@ const MIGRATION_PIPELINE_SUB_BATCH: usize = 32;
 ///
 /// Epoch-stale batches are skipped entirely: their entries were (or will
 /// be) reaped by the newer activation itself, and sweeping here could brush
-/// same-identity entries that activation has ALREADY re-registered.
+/// same-identity entries that activation has ALREADY re-registered. That
+/// skip does NOT cover a SAME-TERM re-heal reactivation — it reuses the
+/// committed term, so a batch it supersedes is not epoch-stale. There,
+/// safety rests on the re-heal only firing at `active_count() == 0` (this
+/// batch's own non-terminal entries hold that gate until they are terminal,
+/// leaving the sweep nothing to park) and on the per-task drive-attempt
+/// stamps (review P1): `start_outbound` re-stamps a re-registered identity
+/// and `retry_failed` re-stamps a re-driven one, so the sweep's captured
+/// stamps stop matching — the same microsecond-scale interleavings that
+/// already exist around `fail_migration_task_current_epoch` remain, but a
+/// re-owned entry can no longer be parked by a stale sweep.
 ///
 /// Returns the number of tasks parked.
 fn retire_abandoned_batch_tasks(
@@ -7662,7 +7672,7 @@ fn retire_abandoned_batch_tasks(
     shard_table: &Arc<ShardTableLock<ShardTable>>,
     fenced_bm: &Arc<crate::cluster::migration::AtomicShardBitmap>,
     migrating_bm: &Arc<crate::cluster::migration::AtomicShardBitmap>,
-    tasks: &[MigrationTask],
+    tasks: &[(MigrationTask, u64)],
     topology_epoch: u64,
 ) -> usize {
     if !migration_epoch_current(shard_table, topology_epoch) {
@@ -7793,11 +7803,14 @@ fn run_migration_batch(
         return;
     }
     // W4 — everything this batch is responsible for, captured before the
-    // task list is split/consumed below. Every exit of this function runs
+    // task list is split/consumed below, PAIRED with each entry's current
+    // drive-attempt stamp (review P1). Every exit of this function runs
     // `retire_abandoned_batch_tasks` over this list so an aborted worker can
     // never leave a task stranded non-terminal (which would hold
-    // `active_count()` above zero and the re-heal gate shut forever).
-    let all_batch_tasks: Vec<MigrationTask> = tasks.clone();
+    // `active_count()` above zero and the re-heal gate shut forever) — while
+    // the stamp lets the sweep skip any entry a failed-task retry re-drove
+    // in place after this capture.
+    let all_batch_tasks: Vec<(MigrationTask, u64)> = migration.lock().capture_task_attempts(&tasks);
 
     // Pre-group keys by shard ONCE. Without this, each shard does an
     // O(N) scan of all keys, making total cost O(shards × keys).
@@ -19887,12 +19900,15 @@ mod tests {
         let fenced_bm = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
         let migrating_bm = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
 
+        let captured = migration
+            .lock()
+            .capture_task_attempts(std::slice::from_ref(&task));
         let parked = retire_abandoned_batch_tasks(
             &migration,
             &shard_table,
             &fenced_bm,
             &migrating_bm,
-            std::slice::from_ref(&task),
+            &captured,
             2,
         );
 
@@ -19959,12 +19975,15 @@ mod tests {
         migrating_bm.set(master_shard);
         migrating_bm.set(replica_shard);
 
+        let captured = migration
+            .lock()
+            .capture_task_attempts(&[master_task.clone(), replica_task.clone()]);
         let parked = retire_abandoned_batch_tasks(
             &migration,
             &shard_table,
             &fenced_bm,
             &migrating_bm,
-            &[master_task.clone(), replica_task.clone()],
+            &captured,
             new_table.version,
         );
 
@@ -19990,6 +20009,135 @@ mod tests {
             table.target_assignment(replica_shard).master,
             replica_master_before,
             "a replica push must not revert the shard's assignment (W3 FIX C)"
+        );
+    }
+
+    /// W4 review P1 — the overlap window: batch A's end-of-batch sweep runs
+    /// while the NodeJoined failed-task retry has already RE-DRIVEN one of
+    /// A's tasks in place (`take_failed_tasks` -> `retry_failed` resets the
+    /// SAME entry to Streaming at the same epoch — no new entry, no term
+    /// bump). A's sweep must recognise the entry as re-owned (its
+    /// drive-attempt stamp moved past A's capture) and leave it alone:
+    /// parking it would lift retry batch B's fence mid
+    /// fence-to-completion window, roll the shard back, and let unfenced
+    /// source writes race B's committed manifest — the orphan-cleanup
+    /// data-loss chain the reviewer traced.
+    #[test]
+    fn sweep_skips_an_entry_re_driven_by_the_failed_task_retry() {
+        let old_members = vec![NodeId(1), NodeId(2)];
+        let new_members = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let old_table = ShardTable::compute_with_epoch(&old_members, 2, 1, 1);
+        let new_table = ShardTable::compute_with_epoch(&new_members, 2, 2, 1);
+        let shard = (0..NUM_SHARDS as u16)
+            .find(|&s| {
+                old_table.target_assignment(s).master == NodeId(1)
+                    && new_table.target_assignment(s).master == NodeId(3)
+            })
+            .expect("need a master shard moving 1 -> 3");
+        let task = MigrationTask {
+            shard,
+            from_node: NodeId(1),
+            to_node: NodeId(3),
+            is_master: true,
+        };
+
+        let mut handoff = old_table.clone();
+        handoff.begin_handoff_with(&new_table, |s| s == shard);
+        assert_eq!(handoff.shard_handoff_state(shard), ShardHandoff::Copying);
+        let shard_table = Arc::new(ShardTableLock::new(handoff));
+
+        let migration = Arc::new(Mutex::new(MigrationManager::new()));
+        migration.lock().start_outbound(
+            std::slice::from_ref(&task),
+            NodeId(1),
+            &std::collections::HashSet::new(),
+        );
+        let fenced_bm = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+        let migrating_bm = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+        migrating_bm.set(shard);
+
+        // Batch A registers and captures its tasks' drive-attempt stamps.
+        let batch_a_capture = migration
+            .lock()
+            .capture_task_attempts(std::slice::from_ref(&task));
+        assert_eq!(batch_a_capture.len(), 1);
+
+        // A's worker fails the task mid-batch; before A's other tasks drain,
+        // a NodeJoined retry re-drives it IN PLACE (same entry, same epoch)
+        // and spawns retry batch B.
+        {
+            let mut mgr = migration.lock();
+            mgr.mark_failed(&task);
+            let retried = mgr.take_failed_tasks();
+            assert_eq!(retried.len(), 1, "the retry must pick the task up");
+        }
+
+        // A's end-of-batch sweep runs with its STALE capture while B owns
+        // the entry (currently Streaming).
+        let parked = retire_abandoned_batch_tasks(
+            &migration,
+            &shard_table,
+            &fenced_bm,
+            &migrating_bm,
+            &batch_a_capture,
+            new_table.version,
+        );
+        assert_eq!(
+            parked, 0,
+            "the sweep must not park an entry the failed-task retry re-drove"
+        );
+        {
+            let mgr = migration.lock();
+            let entry = mgr
+                .active_migrations()
+                .iter()
+                .find(|p| p.shard == shard)
+                .expect("the re-driven entry must survive A's sweep");
+            assert_eq!(
+                entry.state,
+                crate::cluster::migration::MigrationState::Streaming,
+                "B's re-driven entry must stay Streaming, not be parked as Failed"
+            );
+            assert_eq!(mgr.failed_count(), 0);
+        }
+        assert_eq!(
+            shard_table.read().shard_handoff_state(shard),
+            ShardHandoff::Copying,
+            "A's sweep must not roll back the shard B is actively migrating"
+        );
+
+        // Worst case from the review: B has advanced into its
+        // fence-to-completion window. A's stale sweep must not lift the fence.
+        {
+            let mut mgr = migration.lock();
+            mgr.fence_shard(shard);
+            mgr.mark_fenced(&task, 42);
+        }
+        fenced_bm.set(shard);
+        let parked = retire_abandoned_batch_tasks(
+            &migration,
+            &shard_table,
+            &fenced_bm,
+            &migrating_bm,
+            &batch_a_capture,
+            new_table.version,
+        );
+        assert_eq!(parked, 0, "the fenced re-driven entry must also be skipped");
+        {
+            let mgr = migration.lock();
+            assert!(
+                mgr.is_shard_fenced(shard),
+                "B's write fence must survive A's stale sweep"
+            );
+        }
+        assert!(
+            fenced_bm.test(shard),
+            "the hot-path fence bit must survive A's stale sweep"
+        );
+        assert_eq!(
+            shard_table.read().shard_handoff_state(shard),
+            ShardHandoff::Copying,
+            "the shard must stay in B's handoff after the fenced-window sweep"
         );
     }
 
