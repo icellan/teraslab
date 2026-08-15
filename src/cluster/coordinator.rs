@@ -9039,8 +9039,13 @@ fn terminally_abort_unshippable_task(
         // assignment while the master handoff is still Copying (scenario 17's
         // single divergent shard at 4097/4096: all nine of node1's terminal
         // aborts there were replica-side). A replica task is retired above
-        // with the table untouched; the under-replication machinery re-plans
-        // the backfill.
+        // with the table untouched. NOTE: with the table unchanged, diff-based
+        // re-heal plans will NOT re-plan this replica fill — the shard serves
+        // below RF until a topology change or the under-replication repair
+        // machinery (`under_replication_sweep_enabled`, default off pending CI
+        // arming) picks it up. Strictly better than the pre-fix behavior
+        // (reverting a mid-Copying master assignment), but not self-healing
+        // on its own.
         //
         // (The migration mutex is NOT held across the shard-table write —
         // same lock order as `fail_migration_task_current_epoch`.)
