@@ -791,12 +791,20 @@ async fn run_scenario() -> Result<(), ClientError> {
         .copied()
         .collect();
 
+    // The 50MiB tier cannot come back whole through `FIELD_ALL`: the server
+    // downgrades any item that overflows the 16 MiB response frame to
+    // ERR_RESPONSE_TOO_LARGE by design. That status means "present but too
+    // big to inline", NOT "missing" — only a different non-zero status (or an
+    // empty batch) counts as a record that did not survive the migration.
     let mut missing_after_first = Vec::new();
     for (i, txid) in all_large_txids.iter().enumerate() {
         let results = client_4
             .get_batch(FIELD_ALL, std::slice::from_ref(txid))
             .await?;
-        if results.is_empty() || results.item(0).status != 0 {
+        if results.is_empty()
+            || (results.item(0).status != 0
+                && results.item(0).status != ERR_RESPONSE_TOO_LARGE as u8)
+        {
             missing_after_first.push((i, *txid));
         }
     }
@@ -811,12 +819,18 @@ async fn run_scenario() -> Result<(), ClientError> {
         tokio::time::sleep(Duration::from_millis(500)).await;
         client_4.refresh_routing().await?;
         for (i, txid) in &missing_after_first {
-            let results = client_4
-                .get_batch(FIELD_ALL, std::slice::from_ref(txid))
-                .await?;
+            // Read through the big-record contract: this proves the record's
+            // bytes survived the migration (inline for the 5MiB tier, streamed
+            // for the 50MiB tier) rather than just observing a zero status.
+            let observed = read_tier_via_big_record_contract(
+                &client_4,
+                &format!("11.10: large record {i}"),
+                txid,
+            )
+            .await?;
             assert!(
-                !results.is_empty() && results.item(0).status == 0,
-                "11.10: large record {i} should be accessible after migration"
+                observed > 0,
+                "11.10: large record {i} returned no data after migration"
             );
         }
     }
@@ -837,6 +851,15 @@ async fn run_scenario() -> Result<(), ClientError> {
                     data_len > 1024 * 1024,
                     "11.10: node4 holds record but data_len ({data_len}) is too small"
                 );
+                node4_holds += 1;
+            } else if item_status == ERR_RESPONSE_TOO_LARGE as u8 {
+                // Same big-record contract as the routed reads above. The
+                // downgrade is only ever produced for an item whose assembled
+                // data overflowed the 16 MiB frame budget, so seeing it on a
+                // FLAG_LOCAL_READ proves node4 holds this record's blob — a
+                // record node4 did not hold answers ERR_TX_NOT_FOUND instead.
+                // The downgraded item carries no data, so the >1MiB length
+                // check does not apply (the contract already implies >16MiB).
                 node4_holds += 1;
             }
         }
