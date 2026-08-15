@@ -7560,7 +7560,10 @@ fn run_migration_batch(
         let c = completed.load(Ordering::Relaxed);
         let f = failed.load(Ordering::Relaxed);
         tracing::info!(%addr, completed = c, failed = f, "cluster: batch migration finished");
-        if f == 0 {
+        // Scenario 17 — mirror of the data-path spawn gate: failed tasks no
+        // longer veto the sweep; it skips (only) the unsettled shards. The
+        // epoch was verified current above.
+        {
             let ce = engine.clone();
             let cs = shard_table.clone();
             let cm = migration.clone();
@@ -8095,7 +8098,7 @@ fn run_migration_batch(
                             }
                         };
                         let manifest_hash = compute_manifest_for_entries(&manifest_entries);
-                        if let Err(e) = send_migration_complete(
+                        let verify_result = send_migration_complete(
                             addr,
                             task.shard,
                             task.from_node,
@@ -8107,53 +8110,149 @@ fn run_migration_batch(
                             &manifest_entries,
                             true,
                             auth_secret,
-                        ) {
-                            tracing::warn!(shard = task.shard, err = %e, "cluster: shard completion failed");
-                            send_migration_abort_completion_best_effort(
-                                addr,
-                                task,
-                                "manifest verification failed",
-                                auth_secret,
+                        );
+                        if let Err(e) = verify_result {
+                            tracing::warn!(shard = task.shard, err = %e, "cluster: shard completion rejected");
+                            // F3 — a code=19 "missing exact key" rejection means
+                            // the manifest names a record the target never
+                            // received (a record acquired between the Phase-1
+                            // stream and the fence-time manifest rebuild, or one
+                            // that is locally unreadable). Re-sending the SAME
+                            // handshake can never succeed, so escalate: re-push
+                            // the named record(s) through the existing baseline
+                            // machinery, then retry the verify. Bounded; on
+                            // exhaustion the shard is TERMINALLY rolled back to
+                            // self so the cluster converges to ONE serving
+                            // master instead of wedging at serving = target+1
+                            // (observed: sc07 shard 227 six rounds, sc11 for
+                            // 5 minutes from three sources). Any non-exact-key
+                            // rejection skips the escalation entirely.
+                            let escalation = escalate_missing_exact_keys(
+                                e,
+                                &manifest_entries,
+                                MAX_EXACT_KEY_ESCALATIONS,
+                                |missing| {
+                                    tracing::info!(
+                                        shard = task.shard,
+                                        keys = missing.len(),
+                                        "cluster: re-pushing missing exact key(s) named by \
+                                         completion rejection",
+                                    );
+                                    let refs: Vec<&TxKey> = missing.iter().collect();
+                                    stream_shard_baseline(
+                                        task,
+                                        &refs,
+                                        &engine,
+                                        &mut stream,
+                                        batch_size,
+                                        topology_epoch,
+                                        auth_secret,
+                                    )
+                                    .map_err(EscalationAttemptError::Repush)?;
+                                    send_migration_complete(
+                                        addr,
+                                        task.shard,
+                                        task.from_node,
+                                        manifest_entries.len() as u64,
+                                        fence_seq,
+                                        topology_epoch,
+                                        Some(&mut stream),
+                                        &manifest_hash,
+                                        &manifest_entries,
+                                        true,
+                                        auth_secret,
+                                    )
+                                    .map_err(EscalationAttemptError::Completion)
+                                },
                             );
-                            // sc09/sc05 drain convergence — the completion was
-                            // rejected (the rightful master already serves the
-                            // shard and holds MORE records, so the exact-count
-                            // completion mismatches). We just streamed our full
-                            // manifest to that master, and the abort above only
-                            // cleared the target's inbound fence — it RETAINS the
-                            // streamed records. So a verify-only superset probe
-                            // can now prove the rightful master holds every one
-                            // of our records; if it does, relinquish the phantom
-                            // (transfer-then-relinquish, no-loss). If the probe
-                            // fails or is inconclusive, the non-empty copy rolls
-                            // back to self exactly as before.
-                            let _ = &e;
-                            let manifest_for_probe = manifest_entries.clone();
-                            let probe = || {
-                                confirm_target_holds_superset(
-                                    addr,
-                                    task.shard,
-                                    task.from_node,
-                                    topology_epoch,
-                                    &manifest_for_probe,
-                                    auth_secret,
-                                )
-                            };
-                            if fail_or_relinquish_outbound_task(
-                                &migration,
-                                shard_table,
-                                &fenced_bm,
-                                &migrating_bm,
-                                task,
-                                topology_epoch,
-                                relinquish_ctx,
-                                Some(&probe),
-                            ) {
-                                failed.fetch_add(1, Ordering::Relaxed);
+                            match escalation {
+                                ExactKeyEscalation::Verified => {
+                                    tracing::info!(
+                                        shard = task.shard,
+                                        "cluster: completion verified after re-pushing \
+                                         missing exact key(s)",
+                                    );
+                                }
+                                ExactKeyEscalation::Exhausted { last_err } => {
+                                    tracing::warn!(
+                                        shard = task.shard,
+                                        err = %last_err,
+                                        "cluster: shard completion terminally failed — \
+                                         missing-exact-key escalation exhausted; rolling \
+                                         back to source",
+                                    );
+                                    send_migration_abort_completion_best_effort(
+                                        addr,
+                                        task,
+                                        "missing-exact-key escalation exhausted",
+                                        auth_secret,
+                                    );
+                                    // The target provably does NOT hold every
+                                    // record — never relinquish; roll back to
+                                    // self and retire the task so the re-drive
+                                    // cannot re-send the same doomed handshake.
+                                    if terminally_abort_unshippable_task(
+                                        &migration,
+                                        shard_table,
+                                        &fenced_bm,
+                                        &migrating_bm,
+                                        task,
+                                        topology_epoch,
+                                    ) {
+                                        failed.fetch_add(1, Ordering::Relaxed);
+                                    }
+                                    // Reconnect — stream may be broken.
+                                    if let Some(s) = new_conn() { stream = s; }
+                                    continue;
+                                }
+                                ExactKeyEscalation::NotExactKey { last_err } => {
+                                    tracing::warn!(shard = task.shard, err = %last_err, "cluster: shard completion failed");
+                                    send_migration_abort_completion_best_effort(
+                                        addr,
+                                        task,
+                                        "manifest verification failed",
+                                        auth_secret,
+                                    );
+                                    // sc09/sc05 drain convergence — the completion was
+                                    // rejected (the rightful master already serves the
+                                    // shard and holds MORE records, so the exact-count
+                                    // completion mismatches). We just streamed our full
+                                    // manifest to that master, and the abort above only
+                                    // cleared the target's inbound fence — it RETAINS the
+                                    // streamed records. So a verify-only superset probe
+                                    // can now prove the rightful master holds every one
+                                    // of our records; if it does, relinquish the phantom
+                                    // (transfer-then-relinquish, no-loss). If the probe
+                                    // fails or is inconclusive, the non-empty copy rolls
+                                    // back to self exactly as before.
+                                    let manifest_for_probe = manifest_entries.clone();
+                                    let probe = || {
+                                        confirm_target_holds_superset(
+                                            addr,
+                                            task.shard,
+                                            task.from_node,
+                                            topology_epoch,
+                                            &manifest_for_probe,
+                                            auth_secret,
+                                        )
+                                    };
+                                    if fail_or_relinquish_outbound_task(
+                                        &migration,
+                                        shard_table,
+                                        &fenced_bm,
+                                        &migrating_bm,
+                                        task,
+                                        topology_epoch,
+                                        relinquish_ctx,
+                                        Some(&probe),
+                                    ) {
+                                        failed.fetch_add(1, Ordering::Relaxed);
+                                    }
+                                    // Reconnect — stream may be broken.
+                                    if let Some(s) = new_conn() { stream = s; }
+                                    continue;
+                                }
                             }
-                            // Reconnect — stream may be broken.
-                            if let Some(s) = new_conn() { stream = s; }
-                            continue;
                         }
                         verified_tasks.push(task.clone());
                     }
@@ -8281,7 +8380,10 @@ fn run_migration_batch(
         "cluster: batch migration finished",
     );
 
-    if !has_failed_tasks_remaining && f == 0 && batch_epoch_current {
+    // Scenario 17 — spawn the sweep whenever this batch's epoch is still
+    // current: failed tasks no longer veto cleanup globally; the sweep itself
+    // skips (only) the shards with unresolved tasks.
+    if batch_epoch_current {
         let cleanup_engine = engine.clone();
         let cleanup_st = shard_table.clone();
         let cleanup_mig = migration.clone();
@@ -8334,7 +8436,11 @@ fn run_migration_batch(
 /// orphaned records and deletes them.
 ///
 /// Safety guards:
-/// - Skips if other migrations are still active (`active_count > 0`).
+/// - Skips (only) shards that still have an unresolved — active or failed —
+///   outbound task. Scenario 17: this gate is PER-SHARD, not global; a
+///   handful of failed shards must not suppress reclamation of ~1000
+///   unrelated settled shards (observed: 1401/2000 records at 3 holders
+///   under RF=2).
 /// - Checks the topology epoch before each shard — aborts if it changed.
 /// - Data-loss guard (task #28): deletes a non-owned shard ONLY if this node
 ///   has positive committed-handoff evidence for it
@@ -8355,14 +8461,6 @@ fn run_orphan_cleanup(
     use crate::cluster::shards::NUM_SHARDS;
     use crate::ops::remaining::DeleteRequest;
 
-    // Guard: skip if migrations are still active or failed work remains.
-    {
-        let mgr = migration.lock();
-        if mgr.active_count() > 0 || mgr.failed_count() > 0 {
-            return;
-        }
-    }
-
     // Guard: topology must not have changed since the migration started.
     let current_epoch = shard_table.read().version;
     if current_epoch != topology_epoch {
@@ -8373,7 +8471,23 @@ fn run_orphan_cleanup(
     {
         let table = shard_table.read();
         let mgr = migration.lock();
+        // Scenario 17 — the task gate is PER-SHARD, not global: a shard with
+        // ANY unresolved (active or failed) outbound task is skipped, and
+        // every other shard is judged solely by the real per-shard safety
+        // guard below (`has_committed_handoff`). The previous global
+        // `active_count > 0 || failed_count > 0` bail let 5 failed shards
+        // suppress cleanup of ~1000 unrelated settled shards.
+        let unsettled: std::collections::HashSet<u16> = mgr
+            .active_migrations()
+            .iter()
+            .filter(|p| !p.is_complete())
+            .map(|p| p.shard)
+            .collect();
         for shard in 0..NUM_SHARDS as u16 {
+            if unsettled.contains(&shard) {
+                debug_shard_log(shard, "orphan_cleanup SKIP (unresolved task for shard)");
+                continue;
+            }
             let assignment = table.effective_assignment(shard);
             let owned = assignment.master == self_id || assignment.replicas.contains(&self_id);
             if owned || engine.shard_record_count(shard) == 0 {
@@ -8488,9 +8602,10 @@ fn cleanup_orphaned_shard_if_settled(
 
     {
         let mgr = migration.lock();
-        if mgr.active_count() > 0 || mgr.failed_count() > 0 {
-            return;
-        }
+        // Scenario 17 — gate PER-SHARD, not globally: only unresolved work on
+        // THIS shard defers its cleanup; activity on unrelated shards must not
+        // (the broad-sweep mirror of this change lives in
+        // `run_orphan_cleanup`).
         let shard_still_active = mgr.active_migrations().iter().any(|p| {
             p.shard == shard
                 && !p.is_complete()
@@ -8576,6 +8691,232 @@ fn migration_error_is_stale_epoch(err: &str) -> bool {
         "(code={}",
         crate::protocol::opcodes::ERR_STALE_EPOCH
     ))
+}
+
+/// F3 — how many times a `code=19` "missing exact key" completion rejection is
+/// escalated (re-push the named record, retry the verify) before the shard's
+/// migration is terminally aborted (`terminally_abort_unshippable_task`).
+const MAX_EXACT_KEY_ESCALATIONS: usize = 3;
+
+/// F3 — resolve the missing key(s) named by an exact-key completion rejection
+/// back to the source's full manifest keys.
+///
+/// The target's verify (`OP_MIGRATION_COMPLETE`, dispatch) rejects with
+/// `code=19` and the message `shard N missing exact key TxKey(<16 hex>...):
+/// <err>` when the manifest names a record it never received. `TxKey`'s Debug
+/// form truncates the txid to its first 8 bytes, so the name is matched as a
+/// PREFIX against `manifest` and every matching entry is returned (a prefix
+/// collision re-pushes an extra record, which is idempotent and safe).
+///
+/// Returns an empty vec for anything that is not an exact-key rejection —
+/// other `code=19` rejections (count mismatch: the sc09/sc05 relinquish case)
+/// and every other code keep the historical failure handling.
+///
+/// The dispatch producer, the [`migration_complete_rejection_error`] envelope
+/// and this parser are pinned together by the cross-module contract test
+/// `missing_exact_key_rejection_is_recognised_by_the_repush_parser`
+/// (`server::dispatch` tests), so the formats cannot drift apart.
+pub(crate) fn completion_rejection_missing_keys(
+    err: &str,
+    manifest: &[(TxKey, u32)],
+) -> Vec<TxKey> {
+    // The `:` keeps the match exact — without it a future code in the
+    // 190..=199 range would also satisfy the code=19 discriminator.
+    if !err.contains(&format!(
+        "(code={}:",
+        crate::protocol::opcodes::ERR_MIGRATION_IN_PROGRESS
+    )) || !err.contains("missing exact key")
+    {
+        return Vec::new();
+    }
+    let mut out: Vec<TxKey> = Vec::new();
+    let mut rest = err;
+    while let Some(pos) = rest.find("TxKey(") {
+        rest = &rest[pos + "TxKey(".len()..];
+        let hex: &str = &rest[..rest
+            .find(|c: char| !c.is_ascii_hexdigit())
+            .unwrap_or(rest.len())];
+        let mut prefix: Vec<u8> = Vec::with_capacity(hex.len() / 2);
+        for pair in hex.as_bytes().chunks_exact(2) {
+            match std::str::from_utf8(pair)
+                .ok()
+                .and_then(|s| u8::from_str_radix(s, 16).ok())
+            {
+                Some(b) => prefix.push(b),
+                None => {
+                    prefix.clear();
+                    break;
+                }
+            }
+        }
+        if prefix.is_empty() {
+            continue;
+        }
+        for (key, _) in manifest {
+            if key.txid.starts_with(&prefix) && !out.contains(key) {
+                out.push(*key);
+            }
+        }
+    }
+    out
+}
+
+/// F3 — outcome of the bounded missing-exact-key completion escalation
+/// ([`escalate_missing_exact_keys`]).
+#[derive(Debug, PartialEq, Eq)]
+enum ExactKeyEscalation {
+    /// A re-push landed and a completion retry verified — proceed to commit.
+    Verified,
+    /// The COMPLETION rejection does not (or no longer does) name a missing
+    /// manifest key: the historical failure handling (abort + superset probe
+    /// + fail/relinquish, task stays retryable) applies with this error.
+    NotExactKey { last_err: String },
+    /// Every attempt either still named a missing key (the completion retry
+    /// kept rejecting) or failed the RE-PUSH itself on the source side (an
+    /// indexed key whose record cannot be read back — e.g. its blob is
+    /// missing — or the stream broke mid-repair). Either way the named
+    /// deficit was never repaired, so re-sending the same handshake can
+    /// never succeed: terminally abort via
+    /// [`terminally_abort_unshippable_task`].
+    Exhausted { last_err: String },
+}
+
+/// F3 — which phase of an escalation attempt failed
+/// ([`escalate_missing_exact_keys`]'s `repush_and_retry`).
+#[derive(Debug, PartialEq, Eq)]
+enum EscalationAttemptError {
+    /// The re-push of the named record(s) failed on the SOURCE side — the
+    /// record is unreadable (an indexed key whose blob is missing returns a
+    /// read `Err`, not `Ok(None)`, from `build_record_replay_ops`) or the
+    /// stream broke. The named deficit was NOT repaired: the attempt is
+    /// burned and the same missing set is retried, so a source that can
+    /// never ship the record still exhausts to the terminal rollback instead
+    /// of looping forever through the retryable path (review finding 1).
+    Repush(String),
+    /// The completion retry itself failed after a successful re-push; its
+    /// message is re-parsed for (possibly new) missing keys.
+    Completion(String),
+}
+
+/// F3 (a) — bounded escalation for a `code=19` "missing exact key" completion
+/// rejection.
+///
+/// Re-sending the SAME handshake verbatim can never succeed (observed wedging
+/// scenario 07 shard 227 six times and scenario 11 for 5 minutes from three
+/// sources), so instead: resolve the named key(s) against `manifest_entries`
+/// and invoke `repush_and_retry`, which ships the named record(s) through the
+/// existing baseline machinery and re-sends the verify handshake. Up to
+/// `max_attempts` rounds; each follow-up COMPLETION rejection is re-parsed so
+/// a new missing key gets its own re-push, while a RE-PUSH failure keeps the
+/// same missing set and burns the attempt (see
+/// [`EscalationAttemptError::Repush`]). A completion error that stops naming
+/// missing keys falls back to the historical handling
+/// ([`ExactKeyEscalation::NotExactKey`]).
+fn escalate_missing_exact_keys(
+    initial_err: String,
+    manifest_entries: &[(TxKey, u32)],
+    max_attempts: usize,
+    mut repush_and_retry: impl FnMut(&[TxKey]) -> std::result::Result<(), EscalationAttemptError>,
+) -> ExactKeyEscalation {
+    let mut last_err = initial_err;
+    let mut missing = completion_rejection_missing_keys(&last_err, manifest_entries);
+    if missing.is_empty() {
+        return ExactKeyEscalation::NotExactKey { last_err };
+    }
+    for _ in 0..max_attempts {
+        match repush_and_retry(&missing) {
+            Ok(()) => return ExactKeyEscalation::Verified,
+            Err(EscalationAttemptError::Repush(e)) => {
+                // Source-side repair failure: the deficit stands. Burn the
+                // attempt and keep the same missing set.
+                last_err = e;
+            }
+            Err(EscalationAttemptError::Completion(e)) => {
+                last_err = e;
+                missing = completion_rejection_missing_keys(&last_err, manifest_entries);
+                if missing.is_empty() {
+                    return ExactKeyEscalation::NotExactKey { last_err };
+                }
+            }
+        }
+    }
+    ExactKeyEscalation::Exhausted { last_err }
+}
+
+/// F3 (b) — terminal abort for a shard whose completion the target keeps
+/// rejecting with a missing exact key the source cannot deliver.
+///
+/// Data safety: the shard is rolled back to `self`
+/// ([`FailedTaskTableAction::Rollback`] → `ShardTable::rollback_shard`), so
+/// the SOURCE — which provably holds every record the target is missing —
+/// keeps authority and the shard converges to exactly ONE serving master
+/// instead of hanging at serving = target+1. NEVER a relinquish here: the
+/// target just proved it does NOT hold every record.
+///
+/// Terminality: the tracking entry is failed AND retired atomically under one
+/// manager lock (`MigrationManager::fail_and_retire_task`) so the failed-task
+/// re-drive can neither re-send the same doomed handshake forever nor — via
+/// `take_failed_tasks` racing between a separate mark-Failed and retire —
+/// resurrect the transient Failed entry (review finding 3). The rolled-back
+/// table still diverges from the committed topology, so the re-heal machinery
+/// re-plans the handoff from a FRESH manifest on a later round — which
+/// succeeds once the record reads cleanly (or names it no longer).
+///
+/// Returns `true` when the task was tracked, retired, and rolled back at the
+/// current epoch (the caller counts it as a failed task). A stale-epoch task
+/// is retired without touching the newer table and returns `false`, matching
+/// `fail_migration_task_current_epoch`'s stale-epoch semantics.
+fn terminally_abort_unshippable_task(
+    migration: &Arc<Mutex<MigrationManager>>,
+    shard_table: &Arc<ShardTableLock<ShardTable>>,
+    fenced_bm: &Arc<crate::cluster::migration::AtomicShardBitmap>,
+    migrating_bm: &Arc<crate::cluster::migration::AtomicShardBitmap>,
+    task: &MigrationTask,
+    topology_epoch: u64,
+) -> bool {
+    // Epoch guard mirrors `fail_migration_task_current_epoch`: a stale task
+    // must not roll back a table that has moved to a newer epoch, but the
+    // task itself is dead either way and must still be retired.
+    let epoch_current = migration_epoch_current(shard_table, topology_epoch);
+    if !epoch_current && let Some(m) = crate::metrics::migration_metrics() {
+        m.topology_epoch_mismatch.inc();
+    }
+    // Review finding 3 — mark-Failed and retire under ONE manager lock: with
+    // two separate lock acquisitions a concurrent NodeJoined
+    // `take_failed_tasks` could observe the transient Failed entry, reset it
+    // to Streaming and re-drive the doomed handshake once more.
+    let retired = {
+        let mut mgr = migration.lock();
+        let retired = mgr.fail_and_retire_task(task);
+        if retired {
+            if !mgr.is_shard_fenced(task.shard) {
+                fenced_bm.clear(task.shard);
+            }
+            migrating_bm.clear(task.shard);
+        }
+        retired
+    };
+    if !retired {
+        tracing::info!(
+            shard = task.shard,
+            task_epoch = topology_epoch,
+            "cluster: ignoring untracked terminal migration abort",
+        );
+        return false;
+    }
+    if epoch_current {
+        // (The migration mutex is NOT held across the shard-table write —
+        // same lock order as `fail_migration_task_current_epoch`.)
+        shard_table.write().rollback_shard(task.shard);
+    }
+    tracing::warn!(
+        shard = task.shard,
+        to_node = task.to_node.0,
+        epoch_current,
+        "cluster: migration terminally aborted after missing-exact-key escalation — \
+         source keeps authority; re-heal re-plans on a later round",
+    );
+    epoch_current
 }
 
 fn decode_migration_batch_error_detail(payload: &[u8]) -> String {
@@ -9094,29 +9435,37 @@ fn send_migration_complete(
     let response = exchange_frame(s, &request, auth_secret)?;
 
     if response.status != STATUS_OK {
-        let detail = if response.payload.is_empty() {
-            String::new()
-        } else {
-            // Error payload: [code:2][msg_len:2][msg:N]
-            if response.payload.len() >= 4 {
-                let code = u16::from_le_bytes(response.payload[..2].try_into().unwrap());
-                let msg_len =
-                    u16::from_le_bytes(response.payload[2..4].try_into().unwrap()) as usize;
-                let msg = std::str::from_utf8(
-                    &response.payload[4..4 + msg_len.min(response.payload.len() - 4)],
-                )
-                .unwrap_or("(non-utf8)");
-                format!(" (code={code}: {msg})")
-            } else {
-                format!(" (payload: {:?})", response.payload)
-            }
-        };
-        return Err(format!(
-            "target rejected: status {}{detail}",
-            response.status
+        return Err(migration_complete_rejection_error(
+            response.status,
+            &response.payload,
         ));
     }
     Ok(())
+}
+
+/// Compose the error string [`send_migration_complete`] returns for a non-OK
+/// `OP_MIGRATION_COMPLETE` response: `target rejected: status N (code=C: msg)`
+/// from the `[code:2][msg_len:2][msg:N]` error envelope.
+///
+/// Extracted so the cross-module contract test
+/// `missing_exact_key_rejection_is_recognised_by_the_repush_parser`
+/// (`server::dispatch` tests) can drive the REAL dispatch rejection through
+/// the REAL envelope into [`completion_rejection_missing_keys`] — pinning the
+/// producer, this envelope and the parser together so the formats cannot
+/// drift apart (review finding 2).
+pub(crate) fn migration_complete_rejection_error(status: u8, payload: &[u8]) -> String {
+    let detail = if payload.is_empty() {
+        String::new()
+    } else if payload.len() >= 4 {
+        let code = u16::from_le_bytes([payload[0], payload[1]]);
+        let msg_len = u16::from_le_bytes([payload[2], payload[3]]) as usize;
+        let msg = std::str::from_utf8(&payload[4..4 + msg_len.min(payload.len() - 4)])
+            .unwrap_or("(non-utf8)");
+        format!(" (code={code}: {msg})")
+    } else {
+        format!(" (payload: {payload:?})")
+    };
+    format!("target rejected: status {status}{detail}")
 }
 
 /// Probe the rightful master to confirm it holds a SUPERSET of `self`'s shard
@@ -16410,6 +16759,77 @@ mod tests {
         );
     }
 
+    /// Scenario 17 — the cleanup gate must be PER-SHARD, not global: a failed
+    /// task on ONE shard must not suppress reclamation of an UNRELATED settled
+    /// shard. Observed: 5 failed shards held ~1000 settled shards hostage on
+    /// node1, leaving 1401/2000 records at 3 holders under RF=2. Both shards
+    /// carry committed-handoff evidence here, so retention of the failed shard
+    /// is attributable ONLY to its unresolved task.
+    #[test]
+    fn run_orphan_cleanup_failed_shard_does_not_block_unrelated_settled_shard() {
+        let old_table =
+            ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2), NodeId(3)], 2, 10, 1);
+        let new_table = ShardTable::compute_with_epoch(&[NodeId(2), NodeId(3)], 2, 11, 1);
+        let unowned = |s: u16| {
+            let old = old_table.target_assignment(s);
+            let new = new_table.target_assignment(s);
+            (old.master == NodeId(1) || old.replicas.contains(&NodeId(1)))
+                && new.master != NodeId(1)
+                && !new.replicas.contains(&NodeId(1))
+        };
+        let failed_shard = (0..NUM_SHARDS as u16)
+            .find(|&s| unowned(s))
+            .expect("node1 should hold a shard it no longer owns after removal");
+        let settled_shard = (0..NUM_SHARDS as u16)
+            .find(|&s| s != failed_shard && unowned(s))
+            .expect("a second unowned shard must exist");
+
+        let engine = Arc::new(test_engine());
+        create_test_record(&engine, tx_key_for_shard(failed_shard, 50));
+        create_test_record(&engine, tx_key_for_shard(settled_shard, 51));
+
+        let shard_table = Arc::new(ShardTableLock::new(new_table.clone()));
+        let migration = Arc::new(Mutex::new(MigrationManager::new()));
+        {
+            let mut mgr = migration.lock();
+            mgr.record_committed_handoff(failed_shard, new_table.version);
+            mgr.record_committed_handoff(settled_shard, new_table.version);
+            let task = MigrationTask {
+                shard: failed_shard,
+                from_node: NodeId(1),
+                to_node: NodeId(2),
+                is_master: true,
+            };
+            mgr.start_outbound(
+                std::slice::from_ref(&task),
+                NodeId(1),
+                &std::collections::HashSet::from([failed_shard]),
+            );
+            mgr.mark_failed(&task);
+            assert_eq!(mgr.failed_count(), 1, "precondition: one failed task");
+        }
+
+        run_orphan_cleanup(
+            NodeId(1),
+            &engine,
+            &shard_table,
+            &migration,
+            new_table.version,
+        );
+
+        assert_eq!(
+            engine.shard_record_count(settled_shard),
+            0,
+            "a failed task on shard {failed_shard} must not block cleanup of \
+             settled shard {settled_shard}",
+        );
+        assert_eq!(
+            engine.shard_record_count(failed_shard),
+            1,
+            "the shard with the unresolved task must be retained",
+        );
+    }
+
     /// Integration-style reproduction of the task #28 data-loss bug, driving
     /// the REAL completion + REAL orphan-cleanup paths.
     ///
@@ -16873,17 +17293,25 @@ mod tests {
         assert_eq!(engine.shard_record_count(shard), 1);
     }
 
+    /// Scenario 17 mirror (per-shard path): activity on an UNRELATED shard
+    /// must not block reclamation of a settled shard that carries
+    /// committed-handoff evidence — the gate is per-shard, not global. The
+    /// same-shard wait is pinned separately by
+    /// `per_shard_orphan_cleanup_waits_for_active_same_shard_task`.
     #[test]
-    fn per_shard_orphan_cleanup_waits_for_any_active_epoch_work() {
+    fn per_shard_orphan_cleanup_ignores_unrelated_shard_activity() {
         let old_table =
             ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2), NodeId(3)], 2, 10, 1);
         let new_table = ShardTable::compute_with_epoch(&[NodeId(2), NodeId(3)], 2, 11, 1);
         let shard = (0..NUM_SHARDS as u16)
             .find(|&s| {
                 let old = old_table.target_assignment(s);
-                old.master == NodeId(1) || old.replicas.contains(&NodeId(1))
+                let new = new_table.target_assignment(s);
+                (old.master == NodeId(1) || old.replicas.contains(&NodeId(1)))
+                    && new.master != NodeId(1)
+                    && !new.replicas.contains(&NodeId(1))
             })
-            .expect("node1 should hold at least one shard before removal");
+            .expect("node1 should hold a shard it no longer owns after removal");
         let other_shard = (0..NUM_SHARDS as u16)
             .find(|&s| s != shard)
             .expect("expected a distinct shard");
@@ -16893,6 +17321,9 @@ mod tests {
 
         let shard_table = Arc::new(ShardTableLock::new(new_table.clone()));
         let migration = Arc::new(Mutex::new(MigrationManager::new()));
+        migration
+            .lock()
+            .record_committed_handoff(shard, new_table.version);
         let task = MigrationTask {
             shard: other_shard,
             from_node: NodeId(1),
@@ -16914,7 +17345,12 @@ mod tests {
             new_table.version,
         );
 
-        assert_eq!(engine.shard_record_count(shard), 1);
+        assert_eq!(
+            engine.shard_record_count(shard),
+            0,
+            "an active task on shard {other_shard} must not block per-shard \
+             cleanup of settled shard {shard}",
+        );
     }
 
     #[test]
@@ -19748,6 +20184,266 @@ mod tests {
         assert!(
             late_keys_needing_stream(&fenced, &snapshot, &skipped).is_empty(),
             "a key deleted before the fence must stay deleted",
+        );
+    }
+
+    /// F3 — the production wire format: the target's `code=19` completion
+    /// rejection names the missing key only via `TxKey`'s truncated Debug form
+    /// (`TxKey(<16 hex>...)`); it must resolve back to the FULL manifest key.
+    #[test]
+    fn missing_exact_keys_resolve_truncated_debug_names_against_the_manifest() {
+        let manifest = vec![(tk(1), 3u32), (tk(2), 7u32)];
+        let err = format!(
+            "target rejected: status 4 (code=19: shard 227 missing exact key {:?}: TxNotFound)",
+            tk(2),
+        );
+        assert_eq!(
+            completion_rejection_missing_keys(&err, &manifest),
+            vec![tk(2)],
+            "the truncated Debug name must resolve to the full manifest key",
+        );
+    }
+
+    /// F3 — only the exact-key rejection engages the escalation. Other code=19
+    /// rejections (count mismatch — the sc09/sc05 relinquish case) and other
+    /// codes carrying a similar phrase must resolve to NO keys.
+    #[test]
+    fn missing_exact_keys_ignore_other_rejections() {
+        let manifest = vec![(tk(1), 3u32)];
+        let count_mismatch = "target rejected: status 4 (code=19: shard 227 record count \
+                              mismatch: expected 5, got 9)"
+            .to_string();
+        assert!(
+            completion_rejection_missing_keys(&count_mismatch, &manifest).is_empty(),
+            "count-mismatch rejections must not be treated as missing keys",
+        );
+        let other_code = format!(
+            "target rejected: status 4 (code=22: shard 227 missing exact key {:?}: TxNotFound)",
+            tk(1),
+        );
+        assert!(
+            completion_rejection_missing_keys(&other_code, &manifest).is_empty(),
+            "only code=19 carries the exact-key verify rejection",
+        );
+        let unknown_key = format!(
+            "target rejected: status 4 (code=19: shard 227 missing exact key {:?}: TxNotFound)",
+            tk(9),
+        );
+        assert!(
+            completion_rejection_missing_keys(&unknown_key, &manifest).is_empty(),
+            "a named key absent from the manifest cannot be re-pushed",
+        );
+        // Review finding 4: the code match must be exact — a future code in
+        // the 190..=199 range must not satisfy the code=19 discriminator.
+        let code_190 = format!(
+            "target rejected: status 4 (code=190: shard 227 missing exact key {:?}: TxNotFound)",
+            tk(1),
+        );
+        assert!(
+            completion_rejection_missing_keys(&code_190, &manifest).is_empty(),
+            "code=190 must not match the code=19 discriminator",
+        );
+    }
+
+    /// F3 (a) — a completion rejection naming a missing exact key triggers a
+    /// re-push of that key (resolved to its full txid) and the following
+    /// completion retry verifies.
+    #[test]
+    fn exact_key_escalation_repushes_named_key_then_verifies() {
+        let manifest = vec![(tk(1), 3u32), (tk(2), 7u32)];
+        let initial = format!(
+            "target rejected: status 4 (code=19: shard 227 missing exact key {:?}: TxNotFound)",
+            tk(2),
+        );
+        let mut pushed: Vec<Vec<TxKey>> = Vec::new();
+        let outcome = escalate_missing_exact_keys(initial, &manifest, 3, |missing| {
+            pushed.push(missing.to_vec());
+            Ok(())
+        });
+        assert_eq!(outcome, ExactKeyEscalation::Verified);
+        assert_eq!(
+            pushed,
+            vec![vec![tk(2)]],
+            "exactly the named key must be re-pushed, once",
+        );
+    }
+
+    /// F3 (b) — attempts are bounded: a target that keeps naming a key the
+    /// source cannot deliver exhausts the escalation (terminal for this task).
+    #[test]
+    fn exact_key_escalation_exhausts_after_bounded_attempts() {
+        let manifest = vec![(tk(2), 7u32)];
+        let reject = format!(
+            "target rejected: status 4 (code=19: shard 227 missing exact key {:?}: TxNotFound)",
+            tk(2),
+        );
+        let mut attempts = 0usize;
+        let outcome = escalate_missing_exact_keys(reject.clone(), &manifest, 3, |missing| {
+            attempts += 1;
+            assert_eq!(missing, [tk(2)]);
+            Err(EscalationAttemptError::Completion(reject.clone()))
+        });
+        assert_eq!(attempts, 3, "escalation must stop at the attempt bound");
+        match outcome {
+            ExactKeyEscalation::Exhausted { last_err } => {
+                assert!(last_err.contains("missing exact key"), "got: {last_err}");
+            }
+            other => panic!("expected Exhausted, got {other:?}"),
+        }
+    }
+
+    /// Review finding 1 — an indexed key whose record the SOURCE cannot read
+    /// back (e.g. blob destroyed by GC) fails the RE-PUSH itself, not the
+    /// completion retry. Those source-read failures must burn escalation
+    /// attempts so exhaustion still reaches the terminal rollback; otherwise
+    /// the task falls back to the retryable path and the re-drive loops
+    /// forever (the exact wedge F3 exists to close).
+    #[test]
+    fn exact_key_escalation_exhausts_when_the_source_cannot_read_the_named_record() {
+        let manifest = vec![(tk(2), 7u32)];
+        let initial = format!(
+            "target rejected: status 4 (code=19: shard 227 missing exact key {:?}: TxNotFound)",
+            tk(2),
+        );
+        let mut attempts = 0usize;
+        let outcome = escalate_missing_exact_keys(initial, &manifest, 3, |missing| {
+            attempts += 1;
+            assert_eq!(missing, [tk(2)]);
+            Err(EscalationAttemptError::Repush(
+                "baseline shard 227: read_record_snapshot TxKey(0200000000000000...): \
+                 external blob missing"
+                    .to_string(),
+            ))
+        });
+        assert_eq!(
+            attempts, 3,
+            "source-read failures must burn attempts toward the terminal bound",
+        );
+        match outcome {
+            ExactKeyEscalation::Exhausted { last_err } => {
+                assert!(
+                    last_err.contains("external blob missing"),
+                    "got: {last_err}"
+                );
+            }
+            other => panic!("expected Exhausted, got {other:?}"),
+        }
+    }
+
+    /// sc09/sc05 guard: a rejection that is NOT an exact-key rejection keeps
+    /// the historical probe/relinquish failure handling — the escalation must
+    /// not engage at all.
+    #[test]
+    fn exact_key_escalation_leaves_other_rejections_to_the_historical_path() {
+        let manifest = vec![(tk(1), 1u32)];
+        let err = "target rejected: status 4 (code=19: shard 227 record count mismatch: \
+                   expected 5, got 9)"
+            .to_string();
+        let mut called = false;
+        let outcome = escalate_missing_exact_keys(err.clone(), &manifest, 3, |_missing| {
+            called = true;
+            Ok(())
+        });
+        assert_eq!(outcome, ExactKeyEscalation::NotExactKey { last_err: err });
+        assert!(
+            !called,
+            "count-mismatch (relinquish path) must not trigger a re-push",
+        );
+    }
+
+    /// F3 — a rejection that STOPS naming missing keys mid-escalation (e.g.
+    /// the re-push landed but the retry now fails differently) returns to the
+    /// historical failure handling with the newest error.
+    #[test]
+    fn exact_key_escalation_falls_back_when_rejection_stops_naming_keys() {
+        let manifest = vec![(tk(2), 7u32)];
+        let initial = format!(
+            "target rejected: status 4 (code=19: shard 227 missing exact key {:?}: TxNotFound)",
+            tk(2),
+        );
+        let mut attempts = 0usize;
+        let outcome = escalate_missing_exact_keys(initial, &manifest, 3, |_missing| {
+            attempts += 1;
+            Err(EscalationAttemptError::Completion(
+                "target rejected: status 4 (code=37: target not on epoch)".to_string(),
+            ))
+        });
+        assert_eq!(attempts, 1, "a changed error must stop the escalation");
+        match outcome {
+            ExactKeyEscalation::NotExactKey { last_err } => {
+                assert!(last_err.contains("code=37"), "got: {last_err}");
+            }
+            other => panic!("expected NotExactKey, got {other:?}"),
+        }
+    }
+
+    /// F3 (b) — the terminal abort after an exhausted escalation: the shard
+    /// rolls back to the SOURCE as the single serving master and the task is
+    /// RETIRED — no Failed entry remains for the failed-task re-drive to
+    /// re-send the same doomed handshake (the scenario 05/07/11 wedge at
+    /// serving = target+1).
+    #[test]
+    fn terminal_abort_rolls_back_to_single_serving_master_and_retires_task() {
+        use crate::cluster::shards::ShardHandoff;
+        let old_members = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let new_members = vec![NodeId(1), NodeId(2), NodeId(3), NodeId(4)];
+        let mut table = ShardTable::compute_with_epoch(&old_members, 2, 1, 1);
+        let new_table = ShardTable::compute_with_epoch(&new_members, 2, 2, 1);
+        let (shard, new_master) = (0..NUM_SHARDS as u16)
+            .find_map(|s| {
+                let old_master = table.target_assignment(s).master;
+                let new_master = new_table.target_assignment(s).master;
+                (old_master == NodeId(1) && new_master != NodeId(1)).then_some((s, new_master))
+            })
+            .expect("scale-out must move some node1 master");
+        table.begin_handoff(&new_table);
+        assert_eq!(table.shard_handoff_state(shard), ShardHandoff::Copying);
+
+        let shard_table = Arc::new(ShardTableLock::new(table));
+        let migration = Arc::new(Mutex::new(MigrationManager::new()));
+        let fenced = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+        let migrating = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+        let task = MigrationTask {
+            shard,
+            from_node: NodeId(1),
+            to_node: new_master,
+            is_master: true,
+        };
+        migration.lock().start_outbound(
+            std::slice::from_ref(&task),
+            NodeId(1),
+            &std::collections::HashSet::from([shard]),
+        );
+
+        let counted = terminally_abort_unshippable_task(
+            &migration,
+            &shard_table,
+            &fenced,
+            &migrating,
+            &task,
+            new_table.version,
+        );
+        assert!(counted, "the terminal abort must count as a failed task");
+
+        // Exactly ONE serving master: the source, restored as the canonical
+        // (and effective) assignment with the handoff resolved.
+        {
+            let t = shard_table.read();
+            assert_eq!(t.effective_assignment(shard).master, NodeId(1));
+            assert_eq!(t.target_assignment(shard).master, NodeId(1));
+            assert_eq!(t.shard_handoff_state(shard), ShardHandoff::ServingNew);
+        }
+
+        // Terminal task state: nothing left for the failed-task re-drive.
+        let mut mgr = migration.lock();
+        assert_eq!(mgr.failed_count(), 0, "the task must not stay Failed");
+        assert!(
+            mgr.take_failed_tasks().is_empty(),
+            "the re-drive must have nothing to re-send",
+        );
+        assert!(
+            mgr.active_migrations().is_empty(),
+            "the tracking entry must be retired",
         );
     }
 

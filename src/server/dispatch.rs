@@ -26057,6 +26057,83 @@ mod tests {
         );
     }
 
+    /// F3 cross-module contract (review finding 2), following the
+    /// `stale_epoch_detail_is_recognised` precedent: the REAL exact-key
+    /// rejection this handler emits, decoded through the REAL
+    /// `send_migration_complete` error envelope, must resolve back to the
+    /// full missing key on the source's re-push parser. If the producer's
+    /// message, the envelope format, or the parser drifts, this fails instead
+    /// of the escalation silently never engaging again.
+    #[test]
+    fn missing_exact_key_rejection_is_recognised_by_the_repush_parser() {
+        use crate::cluster::coordinator::{
+            completion_rejection_missing_keys, migration_complete_rejection_error,
+        };
+
+        let h = DispatchTestHarness::new();
+        let shard = 53u16;
+        let txid_present = txid_for_shard(shard, 23);
+        let txid_missing = txid_for_shard(shard, 24);
+        assert_eq!(h.create_tx(txid_present, 1).status, STATUS_OK);
+
+        let key_present = TxKey { txid: txid_present };
+        let key_missing = TxKey { txid: txid_missing };
+        let meta_present = h.engine.read_metadata(&key_present).unwrap();
+        // The source's manifest names TWO keys; the target holds only one.
+        let entries = vec![(key_present, meta_present.generation), (key_missing, 1)];
+
+        let members = vec![crate::cluster::shards::NodeId(1)];
+        let table = crate::cluster::shards::ShardTable::compute_with_epoch(&members, 1, 62, 1);
+        let cluster = crate::cluster::coordinator::new_test_running_cluster(
+            crate::cluster::shards::NodeId(1),
+            table,
+            &[(
+                crate::cluster::shards::NodeId(1),
+                "127.0.0.1:4713".parse().unwrap(),
+            )],
+            &members,
+            &[shard],
+            &[],
+            &[],
+            1,
+        );
+
+        let payload =
+            build_migration_complete_payload(2, 0, 0, None, Some(&entries), Some(NodeId(9)));
+        let req = RequestFrame {
+            request_id: shard as u64,
+            op_code: OP_MIGRATION_COMPLETE,
+            flags: 0,
+            payload: payload.into(),
+        };
+        let mut conn_state = crate::server::ConnectionState::new();
+        let resp = handle_request(
+            &req,
+            &h.engine,
+            8192,
+            Some(&cluster),
+            None,
+            &mut conn_state,
+            None,
+        );
+        assert_eq!(resp.status, STATUS_ERROR);
+
+        // The REAL consumer-side envelope `send_migration_complete` builds.
+        let err = migration_complete_rejection_error(resp.status, &resp.payload);
+        assert!(
+            err.contains("missing exact key"),
+            "producer message drifted: {err}"
+        );
+
+        // The parser must resolve the truncated Debug name back to the FULL
+        // manifest key — and only the missing one.
+        assert_eq!(
+            completion_rejection_missing_keys(&err, &entries),
+            vec![key_missing],
+            "the real rejection must resolve to the full missing key, got: {err}"
+        );
+    }
+
     /// Fix B (no-loss). A generation MISMATCH on a source key (target holds the
     /// key at a different generation) must REJECT — the superset proof requires
     /// the matching generation.
