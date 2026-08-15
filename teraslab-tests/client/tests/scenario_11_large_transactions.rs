@@ -912,10 +912,23 @@ async fn run_scenario() -> Result<(), ClientError> {
             // Wait for surviving nodes to detect the kill and complete migrations
             common::wait_specific_nodes_ready(&docker_5, &[1, 3, 4], 3, Duration::from_secs(30))
                 .await?;
+            // Budget must EXCEED the cluster's own repair period, not match
+            // it. The re-election this kill triggers can leave shards
+            // dual-claimed (observed masters=4103/4096 with every node idle
+            // and mig=0), and the mechanism that repairs that is the
+            // same-term re-activation in `src/cluster/coordinator.rs`, gated
+            // on `SAME_TERM_REACTIVATION_COOLDOWN` (30s since the last
+            // activation) plus a ~2s exchange phase before the repaired table
+            // activates. A 30s wait therefore expires just BEFORE the first
+            // re-heal is even due — it can only pass when the repair happens
+            // to have already been in flight (CI 31911172622 failed here).
+            // 90s covers two full cooldown periods plus exchange/activation.
+            // Every other post-membership-change wait in this suite uses
+            // 120s; this is the same class of wait.
             common::wait_specific_migrations_complete(
                 &docker_5,
                 &[1, 3, 4],
-                Duration::from_secs(30),
+                Duration::from_secs(90),
             )
             .await?;
             let _ = client_4.refresh_routing().await;

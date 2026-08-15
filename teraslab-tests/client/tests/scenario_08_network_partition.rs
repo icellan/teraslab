@@ -62,6 +62,107 @@ const SLOW_NETWORK_ERROR_RATE_CEILING_PCT: f64 = 50.0;
 /// only once real CI data shows the actual distribution.
 const ASYMMETRIC_PARTITION_ERROR_RATE_CEILING_PCT: f64 = 80.0;
 
+/// Per-batch wall-clock budget for 8d.2's create batches.
+///
+/// The budget's job is to CAP THE STALL of a batch whose items ALL land on
+/// cut shards -- not to give a stuck create room to finish. Nothing here can
+/// be sized "comfortably above" what such a batch costs, because the real
+/// bounds are far longer than the whole workload window:
+///
+/// * when EVERY item of a batch fails with a retryable code
+///   (ERR_REPLICATION_FAILED is one), the client retries inside
+///   `create_batch` itself -- 15 attempts whose sleeps alone sum to ~31s
+///   (`TRANSIENT_MUTATION_RETRY_DELAYS_MS`, client/rust);
+/// * one server-side replica round trip under an iptables DROP blackhole
+///   is ~13s on its own: 5s connect + 5s reconnect + the 3s
+///   `replication_timeout_ms` ack wait (`exchange_replica_batch`,
+///   src/server/dispatch.rs).
+///
+/// A batch that is only PARTIALLY cut does not pay any of that: a partial
+/// response returns immediately, and `seed_records` credits the items it
+/// acknowledged into the verifier before its next await -- so the records
+/// survive even when the budget fires and drops this future. The earlier 3s
+/// budget was pure loss: it equalled `replication_timeout_ms`, so every batch
+/// touching a cut shard was abandoned by construction and counted zero
+/// creates (CI 31536584294).
+///
+/// Do NOT raise this to "let a straddling batch finish": a straddling batch
+/// costs ~13s server-side, so a bigger budget buys nothing but FEWER attempts
+/// inside the fixed 30s window -- strictly worse (see
+/// [`CONCURRENT_BATCHES`]).
+const PER_BATCH_BUDGET: Duration = Duration::from_secs(8);
+
+/// How many 8d.2 create batches are kept in flight at once.
+///
+/// Issuing the batches SERIALLY made this sub-test a coin flip. With 3 nodes
+/// at RF=2 and one holder pair cut, ~1/3 of holder pairs straddle the
+/// partition, so a 5-item batch dodges the cut entirely only ~(2/3)^5 = 13.2%
+/// of the time -- and a batch that does NOT dodge blocks ~13s server-side, so
+/// it never returns inside [`PER_BATCH_BUDGET`] and credits nothing (not even
+/// partially: `seed_records` never sees a response at all). Serially that is
+/// ~4 attempts per 30s window, i.e. P(zero records created) = (1 - 0.132)^4 =
+/// 57% -- a structural flake that the zero-records check then reports as a
+/// failure (CI 31911172622).
+///
+/// Running 4 batches concurrently and immediately replacing each one as it
+/// completes or expires fills the window instead of stalling it: ~4 slots x
+/// (30s / 8s) = ~15 attempts, so P(zero records created) = (1 - 0.132)^15 =
+/// ~12%. Concurrency is what buys attempts here; the budget cannot (raising
+/// it fits FEWER attempts in the window).
+const CONCURRENT_BATCHES: usize = 4;
+
+/// How many replacement create batches 8d.2's driver loop should launch this
+/// iteration: enough to refill the [`CONCURRENT_BATCHES`] slots, and nothing
+/// once the workload window has closed (batches already in flight still run
+/// to their own per-batch budget and are still accounted).
+fn batches_to_launch(in_flight: usize, window_open: bool) -> usize {
+    if !window_open {
+        return 0;
+    }
+    CONCURRENT_BATCHES.saturating_sub(in_flight)
+}
+
+/// How one 8d.2 create batch ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BatchOutcome {
+    /// `seed_records` returned Ok within [`PER_BATCH_BUDGET`].
+    Completed,
+    /// `seed_records` returned an error within [`PER_BATCH_BUDGET`].
+    Failed,
+    /// [`PER_BATCH_BUDGET`] fired and the batch future was dropped. Creates
+    /// the server already acked are still credited -- `seed_records`
+    /// publishes them into the verifier before every await.
+    Abandoned,
+    /// The spawned task itself did not produce a result (panic / runtime
+    /// shutdown). Counted as an error like any other batch that did not
+    /// complete, so a lost task can never silently shrink the denominator.
+    Lost,
+}
+
+/// Ops/errors accounting for 8d.2's concurrently issued create batches.
+///
+/// Keeps the serial loop's definitions unchanged: one op per batch LAUNCHED,
+/// one error per batch that did not complete (failed, abandoned by the
+/// per-batch budget, or lost with its task). Every launched batch is joined
+/// before the workload reports, so `ops` always equals the number launched.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct BatchTally {
+    /// Batches launched (and joined) -- one op each.
+    ops: u32,
+    /// Batches that did not complete.
+    errors: u32,
+}
+
+impl BatchTally {
+    /// Account for one joined batch.
+    fn record(&mut self, outcome: BatchOutcome) {
+        self.ops += 1;
+        if outcome != BatchOutcome::Completed {
+            self.errors += 1;
+        }
+    }
+}
+
 /// Validates that a sustained workload (8c.2's degraded-network workload,
 /// 8d.2's asymmetric-partition workload) actually created some records,
 /// rather than every single attempt failing while downstream checks over
@@ -849,7 +950,9 @@ async fn run_scenario() -> Result<(), ClientError> {
         common::wait_migrations_complete(&docker, 3, Duration::from_secs(120)).await?;
         client.refresh_routing().await?;
 
-        let verifier = StateVerifier::new();
+        // Shared by reference with 8d.2's concurrently spawned create batches.
+        let client = Arc::new(client);
+        let verifier = Arc::new(StateVerifier::new());
 
         eprintln!("[8d.0] Seeding 1000 records with 10 UTXOs each");
         let initial_txids = common::seed_records(&client, &verifier, 1000, 10).await?;
@@ -869,8 +972,12 @@ async fn run_scenario() -> Result<(), ClientError> {
         let reporter = Arc::new(MetricsReporter::new());
         let workload_duration = Duration::from_secs(30);
         let deadline = tokio::time::Instant::now() + workload_duration;
-        let mut errors = 0u32;
-        let mut total_ops = 0u32;
+        // Create-batch accounting (one op per batch launched, one error per
+        // batch that did not complete) and read accounting, summed at the end
+        // into the same `total_ops` / `errors` the checks below consume.
+        let mut tally = BatchTally::default();
+        let mut read_ops = 0u32;
+        let mut read_errors = 0u32;
         let mut batch_idx = 0u32;
         // Records created during the partition are harvested from the verifier
         // afterwards, NOT from each batch's return value. A batch abandoned by
@@ -882,122 +989,124 @@ async fn run_scenario() -> Result<(), ClientError> {
         let pre_workload_txids: std::collections::HashSet<[u8; 32]> =
             verifier.all_txids().into_iter().collect();
 
-        while tokio::time::Instant::now() < deadline {
-            batch_idx += 1;
-
-            // Create records.
-            //
-            // Bounded by the REMAINING budget, not left to run unbounded. The
-            // loop condition is only evaluated between iterations, and under an
-            // active partition a single `seed_records` call can run for many
-            // minutes: it retries `MAX_TRANSIENT_ATTEMPTS` (16) times with
-            // backoff, ERR_REPLICATION_FAILED counts as transient so every
-            // attempt retries, each attempt pays a ~5 s connect timeout to the
-            // unreachable peer, and the client retries internally on top of
-            // that. One nightly run entered this loop at 04:15:04, printed its
-            // last line at 04:16:49, and never reached "[8d.2] Workload
-            // complete" before the 900 s scenario timeout killed it.
-            //
-            // A phase that cannot finish inside its stated window must report
-            // that, not silently overrun — so a timed-out create counts as the
-            // error it is.
-            let op_start = std::time::Instant::now();
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            // Bound each batch by a SLICE of the budget, not the whole thing.
-            // `seed_records` retries a transient batch up to 16 times with
-            // backoff, and under this partition every attempt pays a connect
-            // timeout toward the unreachable peer — so one unlucky batch
-            // (mapping to an affected shard) consumes the entire 30s window.
-            // Observed exactly that: "batch 1 exceeded the remaining workload
-            // budget (29.99s)", leaving 2 ops and 0 records created, which
-            // then trips the zero-records check.
-            //
-            // This sub-test measures how much work SURVIVES an asymmetric
-            // partition, so it needs many attempts spread across the window
-            // rather than one exhaustive retry chain. Abandon a stuck batch
-            // quickly and move to the next.
-            //
-            // The budget's job is to CAP THE STALL of a batch whose items ALL
-            // land on cut shards -- not to give a stuck create room to finish.
-            // Nothing here can be sized "comfortably above" what such a batch
-            // costs, because the real bounds are far longer than the whole
-            // workload window:
-            //   * when EVERY item of a batch fails with a retryable code
-            //     (ERR_REPLICATION_FAILED is one), the client retries inside
-            //     `create_batch` itself -- 15 attempts whose sleeps alone sum
-            //     to ~31s (`TRANSIENT_MUTATION_RETRY_DELAYS_MS`, client/rust);
-            //   * one server-side replica round trip under an iptables DROP
-            //     blackhole is ~13s on its own: 5s connect + 5s reconnect +
-            //     the 3s `replication_timeout_ms` ack wait
-            //     (`exchange_replica_batch`, src/server/dispatch.rs).
-            // A batch that is only PARTIALLY cut does not pay any of that: a
-            // partial response returns immediately, and `seed_records`
-            // credits the items it acknowledged into the verifier before its
-            // next await -- so the records survive even when the budget fires
-            // and drops this future. The earlier 3s budget was pure loss: it
-            // equalled `replication_timeout_ms`, so every batch touching a cut
-            // shard was abandoned by construction and counted zero creates
-            // (CI 31536584294).
-            const PER_BATCH_BUDGET: Duration = Duration::from_secs(8);
-            let batch_budget = PER_BATCH_BUDGET
-                .min(remaining)
-                .max(Duration::from_millis(500));
-            // FIVE records per budgeted batch. With 3 nodes at RF=2 and one
-            // holder pair cut, ~1/3 of pairs straddle the partition, so a
-            // 5-item batch dodges the cut entirely only ~(2/3)^5 = 13% of the
-            // time -- dodging is not the point. Partial crediting is: a
-            // straddling batch fails FAST and partially, and the intact items
-            // are credited. A 1-item batch is all-or-nothing by construction,
-            // which is exactly the shape that triggers the client's ~31s
-            // internal retry chain and never produces a partial to credit.
-            let create =
-                tokio::time::timeout(batch_budget, common::seed_records(&client, &verifier, 5, 5))
-                    .await;
-            match create {
-                Ok(Ok(_)) => {
-                    reporter.record("create", op_start.elapsed());
-                    total_ops += 1;
-                }
-                Ok(Err(e)) => {
-                    errors += 1;
-                    total_ops += 1;
-                    eprintln!("[8d.2] batch {batch_idx} failed: {e}");
-                }
-                Err(_) => {
-                    errors += 1;
-                    total_ops += 1;
-                    eprintln!(
-                        "[8d.2] batch {batch_idx} exceeded its per-batch budget \
-                         ({batch_budget:?}) and was abandoned"
-                    );
-                }
-            }
-
-            // Read some records
-            if !initial_txids.is_empty() {
-                let read_idx = (batch_idx as usize) % initial_txids.len();
-                let op_start = std::time::Instant::now();
-                match client
-                    .get_batch(
-                        FIELD_ALL_METADATA,
-                        std::slice::from_ref(&initial_txids[read_idx]),
+        // Create records CONCURRENTLY, refilling the slots as batches finish.
+        //
+        // Each batch still runs under its own [`PER_BATCH_BUDGET`], because
+        // under an active partition a single `seed_records` call can run for
+        // many minutes: it retries `MAX_TRANSIENT_ATTEMPTS` (16) times with
+        // backoff, ERR_REPLICATION_FAILED counts as transient so every attempt
+        // retries, each attempt pays a ~5 s connect timeout to the unreachable
+        // peer, and the client retries internally on top of that. One nightly
+        // run entered this loop at 04:15:04, printed its last line at 04:16:49,
+        // and never reached "[8d.2] Workload complete" before the 900 s
+        // scenario timeout killed it. A phase that cannot finish inside its
+        // stated window must report that, not silently overrun — so a
+        // timed-out create counts as the error it is.
+        //
+        // What is NOT still serial is the issuing: a stalled batch used to
+        // block the next attempt for the full 8 s, so the 30 s window held
+        // only ~4 attempts and the sub-test came down to whether one of them
+        // dodged the cut (see [`CONCURRENT_BATCHES`] for the arithmetic).
+        // Batches are independent — different random txids, no ordering
+        // between them — so they run in parallel and only the driver loop
+        // watches the window.
+        let mut in_flight: tokio::task::JoinSet<BatchOutcome> = tokio::task::JoinSet::new();
+        loop {
+            let window_open = tokio::time::Instant::now() < deadline;
+            let launch = batches_to_launch(in_flight.len(), window_open);
+            for _ in 0..launch {
+                batch_idx += 1;
+                let batch_client = Arc::clone(&client);
+                let batch_verifier = Arc::clone(&verifier);
+                let batch_reporter = Arc::clone(&reporter);
+                let this_batch = batch_idx;
+                // FIVE records per budgeted batch. With 3 nodes at RF=2 and
+                // one holder pair cut, ~1/3 of pairs straddle the partition,
+                // so a 5-item batch dodges the cut entirely only ~(2/3)^5 =
+                // 13% of the time. A 1-item batch is all-or-nothing by
+                // construction, which is exactly the shape that triggers the
+                // client's ~31s internal retry chain and never produces a
+                // partial to credit.
+                in_flight.spawn(async move {
+                    let op_start = std::time::Instant::now();
+                    let create = tokio::time::timeout(
+                        PER_BATCH_BUDGET,
+                        common::seed_records(&batch_client, &batch_verifier, 5, 5),
                     )
-                    .await
-                {
-                    Ok(_) => {
-                        reporter.record("read", op_start.elapsed());
-                        total_ops += 1;
+                    .await;
+                    match create {
+                        Ok(Ok(_)) => {
+                            batch_reporter.record("create", op_start.elapsed());
+                            BatchOutcome::Completed
+                        }
+                        Ok(Err(e)) => {
+                            eprintln!("[8d.2] batch {this_batch} failed: {e}");
+                            BatchOutcome::Failed
+                        }
+                        Err(_) => {
+                            eprintln!(
+                                "[8d.2] batch {this_batch} exceeded its per-batch budget \
+                                 ({PER_BATCH_BUDGET:?}) and was abandoned"
+                            );
+                            BatchOutcome::Abandoned
+                        }
                     }
-                    Err(_) => {
-                        errors += 1;
-                        total_ops += 1;
+                });
+
+                // Read some records — one read per create batch launched,
+                // the same 1:1 pairing the serial loop had, so the error-rate
+                // ceiling still weighs the same op mix.
+                if !initial_txids.is_empty() {
+                    let read_idx = (batch_idx as usize) % initial_txids.len();
+                    let op_start = std::time::Instant::now();
+                    match client
+                        .get_batch(
+                            FIELD_ALL_METADATA,
+                            std::slice::from_ref(&initial_txids[read_idx]),
+                        )
+                        .await
+                    {
+                        Ok(_) => {
+                            reporter.record("read", op_start.elapsed());
+                            read_ops += 1;
+                        }
+                        Err(_) => {
+                            read_errors += 1;
+                            read_ops += 1;
+                        }
                     }
                 }
             }
 
-            // Throttle to ~50 ops/sec
+            // Reap finished batches without blocking the launcher, so a freed
+            // slot is refilled on the next iteration (~20ms later).
+            while let Some(joined) = in_flight.try_join_next() {
+                let outcome = match joined {
+                    Ok(outcome) => outcome,
+                    Err(e) => {
+                        eprintln!("[8d.2] batch task did not produce a result: {e}");
+                        BatchOutcome::Lost
+                    }
+                };
+                tally.record(outcome);
+            }
+
+            // The window is over only once every batch it launched has been
+            // joined and accounted; a batch started just before the deadline
+            // still gets its full per-batch budget, so the workload can run up
+            // to PER_BATCH_BUDGET past the 30s window.
+            if !window_open && in_flight.is_empty() {
+                break;
+            }
+
+            // Driver poll interval: how long a freed slot can sit empty, and
+            // (with the 1:1 read per launched batch) the same ~50 ops/sec
+            // ceiling the serial loop throttled itself to.
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+
+        let total_ops = tally.ops + read_ops;
+        let errors = tally.errors + read_errors;
 
         // Everything the verifier gained during the window was created during
         // the partition, including creates from batches the per-batch timeout
@@ -1009,7 +1118,10 @@ async fn run_scenario() -> Result<(), ClientError> {
             .collect();
 
         eprintln!(
-            "[8d.2] Workload complete: {total_ops} ops, {errors} errors, {} records created",
+            "[8d.2] Workload complete: {total_ops} ops ({} create batches, {read_ops} reads), \
+             {errors} errors ({} batches, {read_errors} reads), {} records created",
+            tally.ops,
+            tally.errors,
             partition_txids.len()
         );
         eprintln!("[8d.2] {}", reporter.format_summary());
@@ -1271,5 +1383,122 @@ mod tests {
         ) {
             panic!("[selftest] {msg}");
         }
+    }
+
+    #[test]
+    fn batches_to_launch_fills_every_free_slot() {
+        assert_eq!(batches_to_launch(0, true), CONCURRENT_BATCHES);
+        assert_eq!(batches_to_launch(1, true), CONCURRENT_BATCHES - 1);
+        assert_eq!(batches_to_launch(CONCURRENT_BATCHES - 1, true), 1);
+    }
+
+    #[test]
+    fn batches_to_launch_is_zero_when_the_slots_are_full() {
+        assert_eq!(batches_to_launch(CONCURRENT_BATCHES, true), 0);
+        // Never underflows if more batches are somehow in flight than the
+        // target concurrency.
+        assert_eq!(batches_to_launch(CONCURRENT_BATCHES + 3, true), 0);
+    }
+
+    #[test]
+    fn batches_to_launch_is_zero_once_the_window_closes() {
+        // The whole point of the driver loop: no new work after the workload
+        // window ends, however many slots are free.
+        assert_eq!(batches_to_launch(0, false), 0);
+        assert_eq!(batches_to_launch(CONCURRENT_BATCHES - 1, false), 0);
+    }
+
+    #[test]
+    fn concurrency_buys_attempts_the_per_batch_budget_cannot() {
+        // Guards the fix's premise: the window must hold several budgeted
+        // batches per slot, and raising the budget instead of the concurrency
+        // would take attempts AWAY (a straddling batch costs ~13s server-side
+        // and can never fit).
+        let window = Duration::from_secs(30);
+        let serial_attempts = window.as_secs_f64() / PER_BATCH_BUDGET.as_secs_f64();
+        assert!(
+            serial_attempts >= 3.0,
+            "a serial window fits {serial_attempts:.1} attempts"
+        );
+        let concurrent_attempts = serial_attempts * CONCURRENT_BATCHES as f64;
+        assert!(
+            concurrent_attempts >= 3.0 * serial_attempts,
+            "concurrency must multiply attempts: {serial_attempts:.1} -> \
+             {concurrent_attempts:.1}"
+        );
+    }
+
+    #[test]
+    fn batch_tally_counts_one_op_per_launched_batch() {
+        let mut tally = BatchTally::default();
+        for _ in 0..7 {
+            tally.record(BatchOutcome::Completed);
+        }
+        assert_eq!(tally, BatchTally { ops: 7, errors: 0 });
+    }
+
+    #[test]
+    fn batch_tally_counts_every_non_completion_as_an_error() {
+        // Failed / abandoned / lost are all "the batch did not complete" —
+        // each is one op AND one error, exactly as the serial loop counted a
+        // failed or budget-abandoned batch.
+        for outcome in [
+            BatchOutcome::Failed,
+            BatchOutcome::Abandoned,
+            BatchOutcome::Lost,
+        ] {
+            let mut tally = BatchTally::default();
+            tally.record(outcome);
+            assert_eq!(
+                tally,
+                BatchTally { ops: 1, errors: 1 },
+                "unexpected accounting for {outcome:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn batch_tally_feeds_the_ceiling_the_same_way_the_serial_loop_did() {
+        // A realistic concurrent window: 15 batches launched, 2 dodged the
+        // cut, the other 13 were abandoned at the per-batch budget; reads are
+        // still paired 1:1 with launched batches and mostly succeed. Records
+        // were created, and the combined error rate stays under the
+        // catastrophe ceiling — i.e. this passes, as it must.
+        let mut tally = BatchTally::default();
+        for _ in 0..2 {
+            tally.record(BatchOutcome::Completed);
+        }
+        for _ in 0..13 {
+            tally.record(BatchOutcome::Abandoned);
+        }
+        assert_eq!(tally, BatchTally { ops: 15, errors: 13 });
+
+        let (read_ops, read_errors) = (15u32, 1u32);
+        let result = validate_workload_made_progress(
+            "8d.2",
+            tally.ops + read_ops,
+            tally.errors + read_errors,
+            10,
+            ASYMMETRIC_PARTITION_ERROR_RATE_CEILING_PCT,
+        );
+        assert!(
+            result.is_ok(),
+            "expected a partition-degraded-but-progressing window to pass: {result:?}"
+        );
+
+        // The same window with ZERO records credited is still rejected: the
+        // concurrency change must not weaken the vacuous-pass guard.
+        let err = validate_workload_made_progress(
+            "8d.2",
+            tally.ops + read_ops,
+            tally.errors + read_errors,
+            0,
+            ASYMMETRIC_PARTITION_ERROR_RATE_CEILING_PCT,
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("zero records were created"),
+            "unexpected message: {err}"
+        );
     }
 }

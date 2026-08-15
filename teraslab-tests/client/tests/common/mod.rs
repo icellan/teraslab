@@ -1715,47 +1715,54 @@ pub async fn seed_records(
 ) -> Result<Vec<[u8; 32]>, ClientError> {
     use rand::Rng;
 
-    let mut rng = rand::thread_rng();
     let mut txids = Vec::with_capacity(count as usize);
     let mut driver = ClientSeedDriver { client };
 
     for batch_start in (0..count).step_by(100) {
         let batch_end = (batch_start + 100).min(count);
-        let mut items = Vec::new();
-        let mut batch_meta: Vec<([u8; 32], Vec<[u8; 32]>)> = Vec::new();
+        // The RNG handle lives and dies inside this block, never across the
+        // await below: `ThreadRng` is `Rc`-backed and therefore `!Send`, and
+        // holding one across an await makes this whole future `!Send` — which
+        // `tokio::spawn` rejects. Callers that issue seed batches
+        // concurrently (scenario 08's 8d.2) spawn this future.
+        let (items, batch_meta) = {
+            let mut rng = rand::thread_rng();
+            let mut items = Vec::new();
+            let mut batch_meta: Vec<([u8; 32], Vec<[u8; 32]>)> = Vec::new();
+            for _ in batch_start..batch_end {
+                let mut txid = [0u8; 32];
+                rng.fill(&mut txid);
+                let utxo_hashes: Vec<[u8; 32]> = (0..utxos_per_tx)
+                    .map(|_| {
+                        let mut h = [0u8; 32];
+                        rng.fill(&mut h);
+                        h
+                    })
+                    .collect();
 
-        for _ in batch_start..batch_end {
-            let mut txid = [0u8; 32];
-            rng.fill(&mut txid);
-            let utxo_hashes: Vec<[u8; 32]> = (0..utxos_per_tx)
-                .map(|_| {
-                    let mut h = [0u8; 32];
-                    rng.fill(&mut h);
-                    h
-                })
-                .collect();
+                items.push(CreateItem {
+                    txid,
+                    utxo_hashes: utxo_hashes.clone(),
+                    tx_version: 1,
+                    locktime: 0,
+                    fee: 500,
+                    size_in_bytes: 250,
+                    extended_size: 0,
+                    is_coinbase: false,
+                    spending_height: 0,
+                    created_at: 1710000000000,
+                    flags: 0,
+                    cold_data: vec![],
+                    mined_block_id: None,
+                    mined_block_height: None,
+                    mined_subtree_idx: None,
+                    parent_txids: vec![],
+                });
 
-            items.push(CreateItem {
-                txid,
-                utxo_hashes: utxo_hashes.clone(),
-                tx_version: 1,
-                locktime: 0,
-                fee: 500,
-                size_in_bytes: 250,
-                extended_size: 0,
-                is_coinbase: false,
-                spending_height: 0,
-                created_at: 1710000000000,
-                flags: 0,
-                cold_data: vec![],
-                mined_block_id: None,
-                mined_block_height: None,
-                mined_subtree_idx: None,
-                parent_txids: vec![],
-            });
-
-            batch_meta.push((txid, utxo_hashes));
-        }
+                batch_meta.push((txid, utxo_hashes));
+            }
+            (items, batch_meta)
+        };
 
         // Only record in verifier AFTER the create succeeds, to avoid
         // phantom records when the create fails (e.g., during degradation).
