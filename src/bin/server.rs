@@ -1249,7 +1249,7 @@ fn main() {
         }
 
         // R-049: reconcile orphan external blobs against the freshly-replayed
-        // primary index. This recovery pass DELETES NOTHING (GcPass::Recovery):
+        // primary index. This recovery pass DELETES NOTHING:
         // the replayed index can transiently miss entries that the G3
         // reverse-heal pull / replica resync re-register right after boot, and
         // an entry present without the EXTERNAL flag marks an upstream

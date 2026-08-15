@@ -33,7 +33,8 @@
 //!   [`reconcile_orphan_blobs`] every `interval_secs`.
 //!
 //! Both sweeps walk [`BlobStore::list`]; what happens to an unreferenced blob
-//! depends on the pass ([`GcPass`]) and the failure class:
+//! depends on the pass (recovery vs. periodic, see `SweepPass`) and the
+//! failure class:
 //!
 //! * entry present WITHOUT [`TxFlags::EXTERNAL`] → **quarantined** (retained
 //!   and logged loudly) by BOTH passes. A live record with this exact txid
@@ -143,25 +144,34 @@ impl BlobGcStats {
 /// [`TxFlags::EXTERNAL`] is quarantined by BOTH passes; see
 /// [`BlobGcStats::quarantined_not_external`]).
 ///
-/// * [`GcPass::Recovery`] — the one-shot startup pass. Deletes NOTHING: the
-///   primary index at this point can transiently miss entries that are
+/// * [`SweepPass::Recovery`] — the one-shot startup pass. Deletes NOTHING:
+///   the primary index at this point can transiently miss entries that are
 ///   re-registered moments later — a buffered-tail-lost `CreateV2` whose key
 ///   the G3 reverse-heal pull re-fetches from a quorum-current replica, or a
 ///   `ReplicaRecordAbsent` create the master resyncs on rejoin. Both heals
 ///   run AFTER this pass, so a recovery-time delete races them and turns a
 ///   transient gap into permanent payload loss (CI scenario-11,
 ///   run 31787458246). Blobs are cheap; lost records are not.
-/// * [`GcPass::Periodic`] — the steady-state background sweep. By the time
-///   it ticks (default hourly) the boot-time heals have landed, so a blob
-///   with no index entry is genuine debris: deleted, guarded by the
-///   F-G9-004 age grace and the F-IJ-002 pin handshake as before.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GcPass {
+/// * [`SweepPass::Periodic`] — the steady-state background sweep. By the
+///   time it ticks (default hourly) the boot-time heals have landed, so a
+///   blob with no index entry is genuine debris: deleted, guarded by the
+///   F-G9-004 age grace and the F-IJ-002 pin handshake it CARRIES — the
+///   variant owns the [`BlobPinSet`] reference precisely so an unguarded
+///   periodic delete is unrepresentable (a prior `Option<&BlobPinSet>`
+///   parameter left a dead `None → unguarded delete` arm a future caller
+///   could silently reach).
+///
+/// Private on purpose: the public entry points
+/// ([`reconcile_orphan_blobs_with`] for recovery,
+/// [`reconcile_orphan_blobs_with_pins`] / [`reconcile_orphan_blobs`] for the
+/// periodic sweep) each hard-code their pass.
+enum SweepPass<'a> {
     /// First post-recovery reconciliation — quarantine everything.
     Recovery,
-    /// Steady-state periodic sweep — delete no-index orphans, quarantine
+    /// Steady-state periodic sweep — delete no-index orphans (always
+    /// pin-guarded via the carried set), quarantine
     /// entry-present-without-EXTERNAL blobs.
-    Periodic,
+    Periodic { pins: &'a BlobPinSet },
 }
 
 /// Result of the per-key index lookup performed by the GC sweep.
@@ -172,7 +182,8 @@ pub enum GcPass {
 /// been built).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LookupOutcome {
-    /// No primary-index entry exists for this txid — orphan, delete.
+    /// No primary-index entry exists for this txid — quarantined by the
+    /// recovery pass, deleted (pin-guarded) by the periodic sweep.
     NoEntry,
     /// A primary-index entry exists. `external` is read from the record's
     /// on-device [`TxFlags::EXTERNAL`] footer flag (the slim primary index no
@@ -185,12 +196,12 @@ pub enum LookupOutcome {
 }
 
 /// Walk every blob in `blob_store` and reconcile it against the primary
-/// index under [`GcPass::Recovery`] semantics: blobs whose entry exists with
+/// index under recovery-pass semantics: blobs whose entry exists with
 /// [`TxFlags::EXTERNAL`] are kept; EVERYTHING else is QUARANTINED (retained
 /// and logged and counted), never deleted — the recovery-time index can
-/// transiently miss entries that boot-time heals re-register (see
-/// [`GcPass`]), and an entry present without the flag marks an upstream
-/// flag-fidelity defect whose payload must survive for repair.
+/// transiently miss entries that boot-time heals re-register, and an entry
+/// present without the flag marks an upstream flag-fidelity defect whose
+/// payload must survive as the potential LAST COPY for repair.
 ///
 /// Generic over the index lookup so the same logic can run against the
 /// runtime [`Engine`] (background sweep) or a borrowed `PrimaryBackend`
@@ -212,7 +223,7 @@ pub fn reconcile_orphan_blobs_with<F>(
 where
     F: FnMut(&TxKey) -> LookupOutcome,
 {
-    reconcile_orphan_blobs_with_filter(blob_store, None, None, GcPass::Recovery, &mut lookup)
+    reconcile_orphan_blobs_with_filter(blob_store, None, SweepPass::Recovery, &mut lookup)
 }
 
 /// Pin-aware sweep against an arbitrary index lookup (F-IJ-002).
@@ -239,22 +250,20 @@ where
     reconcile_orphan_blobs_with_filter(
         blob_store,
         min_blob_age,
-        Some(pins),
-        GcPass::Periodic,
+        SweepPass::Periodic { pins },
         &mut lookup,
     )
 }
 
-/// Internal helper shared by recovery (no min-age filter, no pins,
-/// [`GcPass::Recovery`]) and the periodic sweep (min-age filter + pin
-/// handshake, [`GcPass::Periodic`]). See [`reconcile_orphan_blobs_with`],
-/// [`reconcile_orphan_blobs_with_pins`] and [`reconcile_orphan_blobs`] for
-/// the public entry points.
+/// Internal helper shared by recovery (no min-age filter,
+/// [`SweepPass::Recovery`]) and the periodic sweep (min-age filter + the
+/// pin handshake carried on [`SweepPass::Periodic`]). See
+/// [`reconcile_orphan_blobs_with`], [`reconcile_orphan_blobs_with_pins`]
+/// and [`reconcile_orphan_blobs`] for the public entry points.
 fn reconcile_orphan_blobs_with_filter<F>(
     blob_store: &dyn BlobStore,
     min_blob_age: Option<Duration>,
-    pins: Option<&BlobPinSet>,
-    pass: GcPass,
+    pass: SweepPass<'_>,
     lookup: &mut F,
 ) -> Result<BlobGcStats, BlobError>
 where
@@ -283,9 +292,15 @@ where
                 // flag-fidelity defect upstream (wire/apply/recovery), not
                 // proof the blob is debris. Deleting here destroyed 7
                 // externalized records' payloads in CI scenario-11
-                // (run 31787458246): the blob was the record's ONLY payload
-                // copy on this node. Retain it so a later heal / re-migration
-                // can repair the record; the leak is bounded and observable.
+                // (run 31787458246). Note the retention is NOT for heals to
+                // re-reference in place — a heal/re-migration re-ships the
+                // payload inline and overwrites via `put` regardless. Its
+                // value is LAST-COPY retention: when no peer holds the
+                // record (RF=1, or every holder lost it), this blob is the
+                // only surviving payload and the raw material for repair.
+                // There is no automated flag repair yet (tracked
+                // separately); the leak is bounded and observable
+                // (`teraslab_blob_gc_quarantined_not_external_total`).
                 stats.quarantined_not_external += 1;
                 tracing::warn!(
                     txid = %hex_txid(&txid),
@@ -300,38 +315,39 @@ where
         }
 
         // No primary-index entry.
-        if pass == GcPass::Recovery {
-            // First post-recovery pass: the index can transiently miss
-            // entries that the G3 reverse-heal pull or a replica resync
-            // re-registers AFTER this sweep — deleting now races the heal
-            // (the scenario-11 `deleted_no_index` loss). Retain; the
-            // periodic sweep reclaims genuine orphans later.
-            stats.quarantined_no_index += 1;
-            tracing::warn!(
-                txid = %hex_txid(&txid),
-                "blob_gc: QUARANTINE — no primary-index entry at recovery; retaining \
-                 blob (a queued reverse-heal / replica resync may re-register the key; \
-                 the periodic sweep reclaims genuine orphans once serving)",
-            );
-            continue;
-        }
-
-        // Periodic sweep deletion. With a pin set, re-verify "unpinned AND
-        // still without ANY index entry" under the pin stripe lock
-        // immediately before the unlink so a create racing between the
-        // classification above and this point (F-IJ-002 TOCTOU) cannot lose
-        // its blob. The re-check requires `NoEntry` (not merely "not
-        // external"): an entry that appeared flag-less in the window is the
-        // quarantine class and must not be deleted either. Without a pin set
-        // delete directly.
-        let outcome = match pins {
-            Some(p) => p.delete_orphan_guarded(
-                &txid,
-                || matches!(lookup(&key), LookupOutcome::NoEntry),
-                || blob_store.delete(&txid),
-            ),
-            None => blob_store.delete(&txid).map(|()| PinSweepOutcome::Deleted),
+        let pins = match pass {
+            SweepPass::Recovery => {
+                // First post-recovery pass: the index can transiently miss
+                // entries that the G3 reverse-heal pull or a replica resync
+                // re-registers AFTER this sweep — deleting now races the heal
+                // (the scenario-11 `deleted_no_index` loss). Retain; the
+                // periodic sweep reclaims genuine orphans later.
+                stats.quarantined_no_index += 1;
+                tracing::warn!(
+                    txid = %hex_txid(&txid),
+                    "blob_gc: QUARANTINE — no primary-index entry at recovery; retaining \
+                     blob (a queued reverse-heal / replica resync may re-register the key; \
+                     the periodic sweep reclaims genuine orphans once serving)",
+                );
+                continue;
+            }
+            SweepPass::Periodic { pins } => pins,
         };
+
+        // Periodic sweep deletion — ALWAYS pin-guarded (the pin set is
+        // carried on the Periodic variant, so an unguarded delete is
+        // unrepresentable). Re-verify "unpinned AND still without ANY index
+        // entry" under the pin stripe lock immediately before the unlink so
+        // a create racing between the classification above and this point
+        // (F-IJ-002 TOCTOU) cannot lose its blob. The re-check requires
+        // `NoEntry` (not merely "not external"): an entry that appeared
+        // flag-less in the window is the quarantine class and must not be
+        // deleted either.
+        let outcome = pins.delete_orphan_guarded(
+            &txid,
+            || matches!(lookup(&key), LookupOutcome::NoEntry),
+            || blob_store.delete(&txid),
+        );
         match outcome {
             Ok(PinSweepOutcome::Deleted) => {
                 stats.deleted_no_index += 1;
@@ -373,12 +389,15 @@ where
 /// Called from [`crate::recovery::reconcile_blobs_after_recovery`] after the
 /// redo replay has finished. At this point no client is connected to the
 /// server, so the concurrency race described on
-/// [`reconcile_orphan_blobs_with`] cannot occur. Runs under
-/// [`GcPass::Recovery`]: nothing is deleted — unreferenced blobs are
-/// quarantined (retained + logged) because boot-time heals (G3 reverse-heal
-/// pulls, replica resync) run AFTER this sweep and can re-register keys the
+/// [`reconcile_orphan_blobs_with`] cannot occur. Runs under recovery-pass
+/// semantics: nothing is deleted — unreferenced blobs are quarantined
+/// (retained and logged) because boot-time heals (G3 reverse-heal pulls,
+/// replica resync) run AFTER this sweep and can re-register keys the
 /// replayed index transiently lacks; the periodic sweep reclaims genuine
-/// orphans once the node is serving.
+/// orphans once the node is serving. Retention here is last-copy insurance
+/// — a heal re-ships payload bytes inline and overwrites via `put`, so it
+/// does not need the local blob; but when no peer holds the record, the
+/// retained blob is the only surviving payload for repair.
 pub fn reconcile_orphan_blobs_against_index(
     blob_store: &dyn BlobStore,
     index: &ShardedIndex,
@@ -438,8 +457,9 @@ pub fn reconcile_orphan_blobs(
     reconcile_orphan_blobs_with_filter(
         blob_store,
         Some(PERIODIC_GC_MIN_BLOB_AGE),
-        Some(engine.blob_pins()),
-        GcPass::Periodic,
+        SweepPass::Periodic {
+            pins: engine.blob_pins(),
+        },
         &mut lookup,
     )
 }
@@ -528,6 +548,14 @@ pub fn spawn_blob_gc_task(
                 let started = std::time::Instant::now();
                 match reconcile_orphan_blobs(blob_store.as_ref(), engine.as_ref()) {
                     Ok(stats) => {
+                        // Feed per-sweep quarantine counts into the
+                        // scrape-visible `teraslab_blob_gc_quarantined_*`
+                        // counters (accumulated; re-observations re-count).
+                        let bg = crate::metrics::blob_gc_metrics();
+                        bg.quarantined_no_index_total
+                            .add(stats.quarantined_no_index);
+                        bg.quarantined_not_external_total
+                            .add(stats.quarantined_not_external);
                         tracing::info!(
                             elapsed_ms = started.elapsed().as_millis() as u64,
                             total_blobs = stats.total_blobs,
@@ -688,7 +716,8 @@ mod tests {
         assert_eq!(stats.total_blobs, 1);
         assert_eq!(stats.quarantined_not_external, 1);
         assert_eq!(stats.deleted_total(), 0);
-        // Still readable — a later heal/repair can re-reference it.
+        // Still readable — last-copy retention: if no peer holds this
+        // record, this blob is the only surviving payload for repair.
         assert_eq!(
             blob_store.get(&key).unwrap().unwrap(),
             b"payload-still-referenced".to_vec(),

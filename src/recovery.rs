@@ -1504,17 +1504,21 @@ fn reconcile_secondary_indexes_for_keys_multi(
 /// Reconcile the external blob store against the primary index after
 /// recovery has finished replaying the redo log (R-049).
 ///
-/// Walks every blob returned by [`BlobStore::list`] under
-/// [`blob_gc::GcPass::Recovery`] semantics: blobs referenced by an
-/// EXTERNAL-flagged record are kept; everything else is QUARANTINED
-/// (retained + logged loudly), never deleted. The recovery-time index can
-/// transiently miss entries that boot-time heals (G3 lost-create
-/// reverse-pull, replica resync) re-register moments later, and an entry
-/// present WITHOUT the EXTERNAL flag marks an upstream flag-fidelity defect
-/// whose blob may be the record's only payload copy — deleting either class
-/// here permanently destroyed externalized records in CI scenario-11
-/// (run 31787458246). Genuine orphans are reclaimed by the periodic sweep
-/// once the node is serving.
+/// Walks every blob returned by [`BlobStore::list`] under recovery-pass
+/// semantics: blobs referenced by an EXTERNAL-flagged record are kept;
+/// everything else is QUARANTINED (retained and logged loudly), never
+/// deleted. The recovery-time index can transiently miss entries that
+/// boot-time heals (G3 lost-create reverse-pull, replica resync)
+/// re-register moments later, and an entry present WITHOUT the EXTERNAL
+/// flag marks an upstream flag-fidelity defect whose blob may be the
+/// record's only payload copy — deleting either class here permanently
+/// destroyed externalized records in CI scenario-11 (run 31787458246).
+/// The retention is last-copy insurance, not something heals depend on: a
+/// heal/re-migration re-ships payload bytes inline and overwrites via
+/// `put`; but when no peer holds the record, the retained blob is the only
+/// surviving payload for repair (no automated flag repair exists yet —
+/// tracked separately). Genuine orphans are reclaimed by the periodic
+/// sweep once the node is serving.
 ///
 /// Call this from startup AFTER [`recover_all_with_allocator`] returns
 /// successfully and BEFORE accepting client connections — the reconciliation
@@ -1529,6 +1533,14 @@ pub fn reconcile_blobs_after_recovery(
 ) -> Result<BlobGcStats, BlobError> {
     let started = std::time::Instant::now();
     let stats = blob_gc::reconcile_orphan_blobs_against_index(blob_store, index, devices)?;
+    // Feed the per-sweep quarantine counts into the scrape-visible counters
+    // (`teraslab_blob_gc_quarantined_*_total`) so the tripwire is not
+    // log-only. Accumulated across sweeps: re-observations re-count.
+    let bg = crate::metrics::blob_gc_metrics();
+    bg.quarantined_no_index_total
+        .add(stats.quarantined_no_index);
+    bg.quarantined_not_external_total
+        .add(stats.quarantined_not_external);
     tracing::info!(
         elapsed_ms = started.elapsed().as_millis() as u64,
         total_blobs = stats.total_blobs,

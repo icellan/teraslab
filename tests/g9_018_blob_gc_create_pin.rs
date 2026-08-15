@@ -269,3 +269,50 @@ fn registration_landing_mid_sweep_is_caught_by_under_lock_recheck() {
         "blob registered between classification and unlink must survive"
     );
 }
+
+/// The under-lock re-check must require `NoEntry`, not merely "not
+/// EXTERNAL": an entry that lands WITHOUT the flag between classification
+/// and the unlink is the quarantine class (a live record whose footer lost
+/// its EXTERNAL flag — the blob may be its last payload copy) and must NOT
+/// be deleted. Modeled with a stateful lookup closure: first call (candidate
+/// classification) reports no entry; second call (the re-check under the pin
+/// stripe lock) reports a registered entry with `external: false`.
+#[test]
+fn flagless_entry_landing_mid_sweep_is_retained_by_under_lock_recheck() {
+    let store = MemoryBlobStore::new();
+    let pins = BlobPinSet::new();
+    let key = txid(0xD5);
+    store
+        .put(&key, b"flag-less entry landed mid-sweep")
+        .unwrap();
+
+    let mut calls = 0u32;
+    let stats = reconcile_orphan_blobs_with_pins(&store as &dyn BlobStore, None, &pins, |_k| {
+        calls += 1;
+        if calls == 1 {
+            LookupOutcome::NoEntry
+        } else {
+            LookupOutcome::Found { external: false }
+        }
+    })
+    .unwrap();
+
+    assert_eq!(calls, 2, "sweep must re-verify the index before unlinking");
+    assert_eq!(stats.total_blobs, 1);
+    assert_eq!(
+        stats.deleted_total(),
+        0,
+        "a flag-less entry seen at the re-check must abort the delete"
+    );
+    assert_eq!(
+        stats.kept, 1,
+        "the aborted unlink is counted as kept this sweep; the NEXT sweep's \
+         classification re-files it as quarantined_not_external"
+    );
+    assert_eq!(stats.quarantined_not_external, 0);
+    assert!(
+        store.exists(&key).unwrap(),
+        "blob whose entry landed flag-less between classification and unlink \
+         must survive (potential last payload copy)"
+    );
+}

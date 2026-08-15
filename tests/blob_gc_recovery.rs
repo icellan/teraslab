@@ -225,10 +225,26 @@ fn blob_gc_quarantines_blobs_when_index_entry_missing_external_flag() {
     register_entry(&index, &*device, &mut alloc, &suspect, TxFlags::IS_COINBASE);
     let devices = [device.clone()];
 
+    // The scrape-visible tripwire counter must accumulate the per-sweep
+    // quarantine count (P2: log-only counters are invisible to alerting).
+    // The counter is process-global and other tests in this binary also
+    // quarantine, so assert a monotonic delta, not an absolute value.
+    let metric_before = teraslab::metrics::blob_gc_metrics()
+        .quarantined_not_external_total
+        .get();
+
     let stats = reconcile_blobs_after_recovery(&store as &dyn BlobStore, &index, &devices).unwrap();
     assert_eq!(stats.total_blobs, 1);
     assert_eq!(stats.quarantined_not_external, 1);
     assert_eq!(stats.deleted_total(), 0);
+    let metric_after = teraslab::metrics::blob_gc_metrics()
+        .quarantined_not_external_total
+        .get();
+    assert!(
+        metric_after > metric_before,
+        "teraslab_blob_gc_quarantined_not_external_total must accumulate the \
+         sweep's quarantine count (before={metric_before}, after={metric_after})"
+    );
     assert!(
         store.exists(&suspect).unwrap(),
         "entry-present-without-flag blob must survive recovery"
@@ -246,7 +262,8 @@ fn blob_gc_quarantines_blobs_when_index_entry_missing_external_flag() {
     assert_eq!(
         store.get(&suspect).unwrap().unwrap(),
         b"possibly the only payload copy".to_vec(),
-        "payload must remain readable for a later heal/repair"
+        "payload must remain readable — last-copy retention for repair when \
+         no peer holds the record"
     );
 }
 

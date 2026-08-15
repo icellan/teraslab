@@ -1187,6 +1187,26 @@ pub(crate) fn render_metrics_text(
         enumeration_unreadable,
     );
 
+    // Blob-GC quarantine tripwire (always-available static, no OnceLock
+    // gate): sweep observations of blobs RETAINED instead of deleted.
+    // `..._not_external_total > 0` means live records are missing their
+    // EXTERNAL flag (flag-fidelity defect upstream — the CI scenario-11
+    // data-loss precursor); investigate. Counted per observing sweep, so
+    // alert on non-zero, not magnitude.
+    {
+        let bg = crate::metrics::blob_gc_metrics();
+        prom_counter(
+            &mut out,
+            "teraslab_blob_gc_quarantined_no_index_total",
+            bg.quarantined_no_index_total.get(),
+        );
+        prom_counter(
+            &mut out,
+            "teraslab_blob_gc_quarantined_not_external_total",
+            bg.quarantined_not_external_total.get(),
+        );
+    }
+
     // Connection gauge
     prom_gauge(&mut out, "teraslab_active_connections", active_connections);
 
@@ -4945,6 +4965,8 @@ mod tests {
             "teraslab_freelist_largest_region_bytes",
             "teraslab_allocator_corrupt_redo_entries_total",
             "teraslab_allocator_generation_wrap_warn_total",
+            "teraslab_blob_gc_quarantined_no_index_total",
+            "teraslab_blob_gc_quarantined_not_external_total",
         ] {
             assert!(
                 text.contains(name),
