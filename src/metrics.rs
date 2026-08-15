@@ -1370,6 +1370,14 @@ pub struct MigrationMetrics {
     /// intervention (manual reassign / reboot) — the shard is unavailable but its
     /// data is never lost or served stale, and the reverse-pull keeps retrying.
     pub heal_deadline_alerts: PaddedCounter,
+    /// Task #50 — number of EVENT-TRIGGERED under-replication repair passes
+    /// fired by the coordinator (membership churn or a completed exchange
+    /// armed a debounced pass that ran). The periodic sweep's passes are NOT
+    /// counted here — this counter is the operator-visible signal that the
+    /// event path (not the 20s fallback cadence) is doing the prompt
+    /// re-replication after a member death/rejoin. Only ever non-zero when
+    /// `under_replication_sweep_enabled` is on.
+    pub under_replication_event_repairs: PaddedCounter,
 }
 
 /// Number of {direction, role} buckets for migration byte counters.
@@ -1433,6 +1441,7 @@ impl MigrationMetrics {
             topology_epoch_mismatch: PaddedCounter::new(),
             phantom_master_relinquished: PaddedCounter::new(),
             heal_deadline_alerts: PaddedCounter::new(),
+            under_replication_event_repairs: PaddedCounter::new(),
         }
     }
 

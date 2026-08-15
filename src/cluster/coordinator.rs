@@ -96,30 +96,54 @@ const UNDER_REPLICATION_SWEEP_INTERVAL: Duration = Duration::from_secs(20);
 /// sweep re-derives it — the gap list shrinks as resyncs land.
 const UNDER_REPLICATION_SWEEP_MAX_SHARDS: usize = 1024;
 
+/// Task #50 — debounce window for EVENT-DRIVEN under-replication repair.
+/// A membership change (death or rejoin) or a completed exchange arms one
+/// repair pass this long after the FIRST event of a flurry; later events
+/// coalesce into the same armed pass. NOTE: 1.5s is SHORTER than a
+/// rejoin's commit→exchange sequence (the exchange alone has a 2s
+/// timeout), so a membership-armed pass may fire against the still-stale
+/// retained view — typically a no-op or a dead-peer skip. That is fine:
+/// correctness comes from the exchange-completion observe, which re-arms
+/// the trigger the moment the refreshed view lands and guarantees a
+/// fresh-view pass follows. Do not lengthen this window to "cover" the
+/// exchange — promptness after the view refresh is what restores RF
+/// within scenario 15.3's few-seconds contract, with margin over the 20s
+/// periodic fallback.
+const UNDER_REPLICATION_EVENT_DEBOUNCE: Duration = Duration::from_millis(1500);
+
 /// Derives one under-replication sweep round's resync signals.
 ///
 /// Pure so the sweep contract is unit-testable. Inputs: the retained
 /// exchange `view` (peer self-reports; survives peer death by design), the
-/// current SWIM-`alive` set, and `mastered_nonempty` — the `(shard,
-/// committed replicas)` pairs for shards this node masters that hold
-/// records. Returns `(missing, signaled, dropped, dead_skipped)`: the
+/// current SWIM-`alive` set, `mastered_nonempty` — the `(shard, committed
+/// replicas)` pairs for shards this node masters that hold records — and
+/// `in_flight`, the `(replica NodeId.0, shard)` pairs whose full-shard
+/// resync backfill is still running (review P2: resync tasks are not
+/// `start_outbound`-tracked, so `active_count` cannot see them; without
+/// this skip a re-armed pass re-signals a shard mid-stream and spawns a
+/// DUPLICATE concurrent backfill at the same replica). Returns
+/// `(missing, signaled, dropped, dead_skipped, inflight_skipped)`: the
 /// per-replica shard lists to signal, how many were signaled, how many the
-/// `cap` dropped (re-derived next sweep; the caller logs the count), and
-/// how many candidates were skipped because their replica is SWIM-dead.
+/// `cap` dropped (re-derived next sweep; the caller logs the count), how
+/// many candidates were skipped because their replica is SWIM-dead, and
+/// how many were skipped as already in flight. In-flight skips do not
+/// consume cap budget.
 ///
 /// A replica is signaled only when it is not this node, reported in the
 /// exchange view, is currently SWIM-alive (dead-peer guard: a resync
 /// toward a dead peer ties the replication manager up in retries against
-/// a black hole exactly when the cluster is already degraded), and shows
-/// no data for the shard.
+/// a black hole exactly when the cluster is already degraded), shows no
+/// data for the shard, and has no backfill for the shard in flight.
 fn derive_under_replication_resyncs(
     view: &std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>>,
     alive: &std::collections::HashSet<NodeId>,
     self_id: NodeId,
     mastered_nonempty: &[(u16, Vec<NodeId>)],
+    in_flight: &std::collections::HashSet<(u64, u16)>,
     cap: usize,
 ) -> (
     std::collections::HashMap<NodeId, Vec<u16>>,
+    usize,
     usize,
     usize,
     usize,
@@ -136,6 +160,7 @@ fn derive_under_replication_resyncs(
     let mut signaled = 0usize;
     let mut dropped = 0usize;
     let mut dead_skipped = 0usize;
+    let mut inflight_skipped = 0usize;
     for (shard, replicas) in mastered_nonempty {
         for replica in replicas {
             if *replica == self_id
@@ -148,6 +173,10 @@ fn derive_under_replication_resyncs(
                 dead_skipped += 1;
                 continue;
             }
+            if in_flight.contains(&(replica.0, *shard)) {
+                inflight_skipped += 1;
+                continue;
+            }
             if signaled < cap {
                 missing.entry(*replica).or_default().push(*shard);
                 signaled += 1;
@@ -156,8 +185,248 @@ fn derive_under_replication_resyncs(
             }
         }
     }
-    (missing, signaled, dropped, dead_skipped)
+    (missing, signaled, dropped, dead_skipped, inflight_skipped)
 }
+
+/// Task #50 — debounced, epoch-fenced trigger for event-driven
+/// under-replication repair passes.
+///
+/// The periodic sweep repairs a quiet under-replicated shard eventually
+/// (20s cadence); this trigger runs the SAME pass promptly after the
+/// events that create the gap — a member dying, a member rejoining, or a
+/// topology activation completing. `observe_membership` arms on a GENUINE
+/// alive-set change only (review P2: a Suspect→Alive refutation emits
+/// `MembershipChanged` with an unchanged set — E-03 keeps a Suspect in
+/// the alive view — so flaky-link suspect/refute cycles must not churn
+/// passes); `observe` is the raw arm used by the exchange-completion
+/// site. `take_due` fires the pass once the debounce window has elapsed
+/// under an unchanged local topology epoch. A pass armed under a
+/// superseded epoch is never fired: it re-arms under the current epoch
+/// with a fresh window, mirroring the migration path's stale-epoch gate
+/// (`migration_epoch_current`), so the derive always runs against
+/// post-activation state. A trigger constructed disabled never arms — the
+/// event path is inert exactly when the periodic sweep is.
+#[derive(Debug)]
+struct EventRepairTrigger {
+    /// Debounce window: a pass fires this long after the FIRST arming
+    /// event of a flurry.
+    window: Duration,
+    /// Mirrors `under_replication_sweep_enabled`; `false` = never arm.
+    enabled: bool,
+    /// `Some((armed_at, epoch))` while a pass is pending.
+    armed: Option<(std::time::Instant, u64)>,
+    /// The alive set from the last `MembershipChanged` this trigger saw
+    /// (sorted, as `Membership::alive_members` emits it). Arms only when
+    /// the set actually differs — the refutation-shape filter.
+    last_alive_set: Option<Vec<NodeId>>,
+}
+
+impl EventRepairTrigger {
+    /// Create a trigger with the given debounce `window`. `enabled` gates
+    /// arming — a disabled trigger ignores every observe.
+    fn new(window: Duration, enabled: bool) -> Self {
+        Self {
+            window,
+            enabled,
+            armed: None,
+            last_alive_set: None,
+        }
+    }
+
+    /// Record a `MembershipChanged` alive set at `now` under the local
+    /// topology `epoch`, arming only when the set DIFFERS from the last
+    /// one seen (a Suspect→Alive refutation re-emits the same set and
+    /// must not arm). `members` is the sorted alive list the event
+    /// carries; the first set after boot always counts as a change.
+    fn observe_membership(&mut self, members: &[NodeId], now: std::time::Instant, epoch: u64) {
+        if !self.enabled {
+            return;
+        }
+        if self.last_alive_set.as_deref() == Some(members) {
+            return;
+        }
+        self.last_alive_set = Some(members.to_vec());
+        self.observe(now, epoch);
+    }
+
+    /// Record an arming event at `now` under the local topology `epoch`.
+    ///
+    /// Not armed → arm. Armed under the same epoch → coalesce (the
+    /// pending deadline stands, so a flurry of events yields ONE pass).
+    /// Armed under a different epoch → replace: re-arm under `epoch` with
+    /// a fresh window (the pass must be derived and debounced against the
+    /// epoch that superseded the original arm).
+    fn observe(&mut self, now: std::time::Instant, epoch: u64) {
+        if !self.enabled {
+            return;
+        }
+        match self.armed {
+            Some((_, armed_epoch)) if armed_epoch == epoch => {}
+            _ => self.armed = Some((now, epoch)),
+        }
+    }
+
+    /// Non-consuming peek: whether a pass is armed and its window has
+    /// elapsed at `now`. The cheap pre-gate the event loop checks BEFORE
+    /// taking the migration lock, so flag-off (never-armed) runs pay zero
+    /// extra lock traffic. Epoch currency is deliberately not checked
+    /// here; `take_due` owns that.
+    fn is_armed_and_due(&self, now: std::time::Instant) -> bool {
+        self.armed
+            .is_some_and(|(armed_at, _)| now.duration_since(armed_at) >= self.window)
+    }
+
+    /// Fire the pending pass if it is due at `now` under `current_epoch`.
+    ///
+    /// Returns `true` (and disarms) only when a pass is armed, its window
+    /// has elapsed, and it was armed under `current_epoch`. A due pass
+    /// armed under a stale epoch is re-armed under `current_epoch` with a
+    /// fresh window and `false` is returned — it is never fired stale.
+    /// Callers gate this on being able to actually run the pass (sweep
+    /// flag, no in-flight migrations): an unfired trigger stays armed.
+    fn take_due(&mut self, now: std::time::Instant, current_epoch: u64) -> bool {
+        let Some((armed_at, armed_epoch)) = self.armed else {
+            return false;
+        };
+        if now.duration_since(armed_at) < self.window {
+            return false;
+        }
+        if armed_epoch == current_epoch {
+            self.armed = None;
+            true
+        } else {
+            self.armed = Some((now, current_epoch));
+            false
+        }
+    }
+}
+
+/// Task #50 — consume a due event-repair trigger and do the fire-side
+/// bookkeeping: reset the periodic sweep timer (the fallback cadence must
+/// not double-run right behind an event pass) and bump the event-repair
+/// counter. Returns whether the pass should run now. Split from the event
+/// loop so the reset-on-fire contract is unit-testable.
+fn event_repair_take_fire(
+    trigger: &mut EventRepairTrigger,
+    now: std::time::Instant,
+    current_epoch: u64,
+    last_periodic_sweep: &mut std::time::Instant,
+) -> bool {
+    if !trigger.take_due(now, current_epoch) {
+        return false;
+    }
+    *last_periodic_sweep = now;
+    if let Some(m) = crate::metrics::migration_metrics() {
+        m.under_replication_event_repairs.inc();
+    }
+    true
+}
+
+/// Task #50 review P2 — releases claimed `(replica NodeId.0, shard)`
+/// resync in-flight slots when the backfill run finishes.
+///
+/// Held by the spawned Phase H backfill thread for the pairs it streams;
+/// `Drop` runs on normal return AND on unwind, so completion and failure
+/// both free the slots and a wedged entry cannot outlive its run (the
+/// run itself is bounded by the per-batch migration TCP timeouts).
+struct ResyncInflightGuard {
+    /// The shared in-flight set the event loop consults.
+    set: Arc<Mutex<std::collections::HashSet<(u64, u16)>>>,
+    /// The pairs this run claimed.
+    pairs: Vec<(u64, u16)>,
+}
+
+impl Drop for ResyncInflightGuard {
+    fn drop(&mut self) {
+        let mut set = self.set.lock();
+        for pair in &self.pairs {
+            set.remove(pair);
+        }
+    }
+}
+
+/// Run one under-replication repair pass: derive the resync signals via
+/// [`derive_under_replication_resyncs`] and push them into the resync
+/// channel (the same channel the Phase H catchup loop feeds, so the
+/// signals inherit the full-shard backfill pipeline with Phase E
+/// dual-write protection and Phase G throttling). Shared verbatim by the
+/// periodic sweep and the Task #50 event trigger — the two differ only in
+/// WHEN they run. `in_flight` is a snapshot of the shared resync
+/// in-flight set: pairs already streaming are skipped (and counted), not
+/// re-signaled. `origin` labels the log line. Returns
+/// `(signaled, dropped, dead_skipped, inflight_skipped)`; the dropped
+/// remainder is logged, never silent, and re-derived by the next pass.
+#[allow(clippy::too_many_arguments)]
+fn run_under_replication_pass(
+    view: &std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>>,
+    alive: &std::collections::HashSet<NodeId>,
+    self_id: NodeId,
+    mastered_nonempty: &[(u16, Vec<NodeId>)],
+    in_flight: &std::collections::HashSet<(u64, u16)>,
+    cap: usize,
+    origin: &'static str,
+    resync_tx: &std::sync::mpsc::Sender<crate::replication::manager::ResyncRequest>,
+) -> (usize, usize, usize, usize) {
+    let (missing, signaled, dropped, dead_skipped, inflight_skipped) =
+        derive_under_replication_resyncs(view, alive, self_id, mastered_nonempty, in_flight, cap);
+    if signaled > 0 || dropped > 0 || dead_skipped > 0 || inflight_skipped > 0 {
+        tracing::info!(
+            origin,
+            signaled,
+            dropped,
+            dead_skipped,
+            in_flight_skipped = inflight_skipped,
+            replicas = missing.len(),
+            "cluster: under-replication pass signaling resyncs \
+             (dropped remainder re-derived next pass)",
+        );
+    }
+    for (replica, shards) in missing {
+        let _ = resync_tx.send(crate::replication::manager::ResyncRequest {
+            node_id: replica.0,
+            shards,
+        });
+    }
+    (signaled, dropped, dead_skipped, inflight_skipped)
+}
+
+/// Snapshot the live inputs an under-replication pass derives from:
+/// the SWIM-alive set (dead-peer guard input — liveness is re-checked at
+/// signal time because the retained exchange view deliberately survives
+/// peer death; self is implicitly alive) and this node's mastered,
+/// non-empty shards with their committed replica sets. Shared by the
+/// periodic sweep and the Task #50 event trigger.
+fn snapshot_under_replication_inputs(
+    swim_membership: &Arc<Mutex<crate::cluster::membership::Membership>>,
+    shard_table: &Arc<ShardTableLock<ShardTable>>,
+    engine: &Arc<Engine>,
+    self_id: NodeId,
+) -> (std::collections::HashSet<NodeId>, Vec<(u16, Vec<NodeId>)>) {
+    use crate::cluster::membership::NodeState;
+    let mut alive: std::collections::HashSet<NodeId> = swim_membership
+        .lock()
+        .all_member_states()
+        .into_iter()
+        .filter(|(_, state, _, _)| *state == NodeState::Alive)
+        .map(|(id, _, _, _)| id)
+        .collect();
+    alive.insert(self_id);
+    let mastered_nonempty: Vec<(u16, Vec<NodeId>)> = {
+        let table = shard_table.read();
+        (0..crate::cluster::shards::NUM_SHARDS as u16)
+            .filter_map(|shard| {
+                let assignment = table.target_assignment(shard);
+                if assignment.master != self_id || engine.shard_record_count(shard) == 0 {
+                    None
+                } else {
+                    Some((shard, assignment.replicas.clone()))
+                }
+            })
+            .collect()
+    };
+    (alive, mastered_nonempty)
+}
+
 const SAME_TERM_REACTIVATION_COOLDOWN: Duration = Duration::from_secs(30);
 
 const DRAIN_REACTIVATION_INTERVAL: Duration = Duration::from_secs(2);
@@ -2147,6 +2416,16 @@ impl ClusterCoordinator {
             std::sync::mpsc::channel::<crate::replication::manager::ResyncRequest>();
         let resync_request_tx_for_cluster = resync_request_tx.clone();
         let resync_request_tx_event = resync_request_tx.clone();
+        // Task #50 review P2 — (replica NodeId.0, shard) pairs whose
+        // full-shard resync backfill is currently streaming. Resync tasks
+        // are deliberately not `start_outbound`-tracked, so `active_count`
+        // cannot gate them; this set is what prevents a re-armed repair
+        // pass (or a catchup-loop re-request) from spawning a DUPLICATE
+        // concurrent backfill for the same shard at the same replica.
+        // Inserted by the Phase H drain right before it spawns a run;
+        // cleared by [`ResyncInflightGuard`] when that run finishes.
+        let resync_inflight: Arc<Mutex<std::collections::HashSet<(u64, u16)>>> =
+            Arc::new(Mutex::new(std::collections::HashSet::new()));
         // W1.1 FIX B — shard transfer-request channel. The dispatch
         // handler for OP_MIGRATION_TRANSFER_REQUEST posts requests from
         // migration targets; the event loop drains them and re-runs the
@@ -2273,10 +2552,34 @@ impl ClusterCoordinator {
             // `take_due` after an `observe` at the same instant fires.
             let mut topology_debounce =
                 crate::cluster::topology::TopologyDebounce::from_window(topology_debounce_window);
+            // Task #50 — event-driven under-replication repair trigger
+            // (debounced, epoch-fenced; see [`EventRepairTrigger`]). Armed
+            // by membership churn and by completed exchanges; fired at the
+            // bottom of the loop once the debounce elapses and no migration
+            // is in flight. Enabled iff the periodic sweep is — the flag
+            // stays the single arming decision for BOTH cadences.
+            let mut event_repair_trigger = EventRepairTrigger::new(
+                UNDER_REPLICATION_EVENT_DEBOUNCE,
+                under_replication_sweep_enabled_event,
+            );
             while !shutdown.load(Ordering::Relaxed) {
                 match event_rx.recv_timeout(Duration::from_millis(100)) {
                     Ok(event) => {
                         if let ClusterEvent::MembershipChanged(members) = &event {
+                            // Task #50 — membership churn (a member dying OR
+                            // rejoining; both emit MembershipChanged) arms an
+                            // event-driven repair pass under the CURRENT
+                            // local epoch. `observe_membership` arms only on
+                            // a genuine alive-SET change — a Suspect→Alive
+                            // refutation re-emits the unchanged set (E-03)
+                            // and must not churn passes on flaky links.
+                            // Coalesced by the trigger's debounce; a no-op
+                            // when the sweep flag is off.
+                            event_repair_trigger.observe_membership(
+                                members,
+                                std::time::Instant::now(),
+                                topology_epoch.load(Ordering::Relaxed),
+                            );
                             let current = members.len();
                             peak_size_event.fetch_max(current, Ordering::Relaxed);
                             // E-01: mirror the peak into the topology
@@ -2542,62 +2845,32 @@ impl ClusterCoordinator {
                             last_under_replication_sweep = std::time::Instant::now();
                             let view = retained_exchange_view_event.lock().clone();
                             if !view.is_empty() {
-                                // Dead-peer guard input: liveness is re-checked
-                                // at signal time because the retained view
-                                // deliberately survives peer death. Same
-                                // derivation as the vote-side liveness
-                                // provider; self is implicitly alive.
-                                let alive: std::collections::HashSet<NodeId> = {
-                                    use crate::cluster::membership::NodeState;
-                                    let mut alive: std::collections::HashSet<NodeId> =
-                                        swim_membership_event
-                                            .lock()
-                                            .all_member_states()
-                                            .into_iter()
-                                            .filter(|(_, state, _, _)| *state == NodeState::Alive)
-                                            .map(|(id, _, _, _)| id)
-                                            .collect();
-                                    alive.insert(self_id);
-                                    alive
-                                };
-                                let mastered_nonempty: Vec<(u16, Vec<NodeId>)> = {
-                                    let table = shard_table.read();
-                                    (0..crate::cluster::shards::NUM_SHARDS as u16)
-                                        .filter_map(|shard| {
-                                            let assignment = table.target_assignment(shard);
-                                            if assignment.master != self_id
-                                                || engine.shard_record_count(shard) == 0
-                                            {
-                                                None
-                                            } else {
-                                                Some((shard, assignment.replicas.clone()))
-                                            }
-                                        })
-                                        .collect()
-                                };
-                                let (missing, signaled, dropped, dead_skipped) =
-                                    derive_under_replication_resyncs(
+                                let (alive, mastered_nonempty) = snapshot_under_replication_inputs(
+                                    &swim_membership_event,
+                                    &shard_table,
+                                    &engine,
+                                    self_id,
+                                );
+                                let in_flight = resync_inflight.lock().clone();
+                                let (_signaled, dropped, _dead_skipped, _inflight_skipped) =
+                                    run_under_replication_pass(
                                         &view,
                                         &alive,
                                         self_id,
                                         &mastered_nonempty,
+                                        &in_flight,
                                         UNDER_REPLICATION_SWEEP_MAX_SHARDS,
+                                        "periodic",
+                                        &resync_request_tx_event,
                                     );
-                                if signaled > 0 || dropped > 0 || dead_skipped > 0 {
-                                    tracing::info!(
-                                        signaled,
-                                        dropped,
-                                        dead_skipped,
-                                        replicas = missing.len(),
-                                        "cluster: under-replication sweep signaling resyncs                                          (dropped remainder re-derived next sweep)",
-                                    );
-                                }
-                                for (replica, shards) in missing {
-                                    let _ = resync_request_tx_event.send(
-                                        crate::replication::manager::ResyncRequest {
-                                            node_id: replica.0,
-                                            shards,
-                                        },
+                                // Task #50 review P3 — cap remainder: arm the
+                                // event trigger so the backlog converges in
+                                // debounce-window steps instead of waiting a
+                                // full periodic interval.
+                                if dropped > 0 {
+                                    event_repair_trigger.observe(
+                                        std::time::Instant::now(),
+                                        topology_epoch.load(Ordering::Relaxed),
                                     );
                                 }
                             }
@@ -2705,6 +2978,72 @@ impl ClusterCoordinator {
                         let peak = peak_size_event.load(Ordering::Relaxed) as u64;
                         let epoch = topology_epoch.load(Ordering::Relaxed);
                         persist_cluster_state(path, peak, epoch);
+                    }
+                }
+
+                // Task #50 — fire the event-driven under-replication repair
+                // pass once its debounce elapses. Runs EVERY loop iteration
+                // (not just the recv timeout branch) so event traffic cannot
+                // starve it. The pass is the SAME derivation + resync push
+                // as the periodic sweep above — the trigger only changes
+                // WHEN it runs. Gate ordering matters twice over: the
+                // non-consuming `is_armed_and_due` peek runs FIRST so
+                // flag-off (never-armed) iterations take zero extra lock
+                // traffic, and the no-active-migration gate is checked
+                // BEFORE `take_due` so a pass that cannot run yet stays
+                // ARMED and fires when the tracked migrations (topology
+                // plans — which ARE the repair for reassigned shards)
+                // drain. NOTE the resync backfills this pass itself spawns
+                // are NOT in `active_count` (Phase H tasks are not
+                // start_outbound-tracked); concurrent duplicates toward
+                // them are prevented by the `resync_inflight` set instead.
+                // Aggregate concurrency: `max_migration_threads` bounds each
+                // RUN, not the aggregate — N stacked runs (≤ceil(backlog/cap))
+                // can hold N× that many threads, mostly parked on the SHARED
+                // byte throttle, which is the true global bound. Firing (inside
+                // `event_repair_take_fire`) resets the periodic timer so
+                // the fallback cadence never double-runs right behind an
+                // event pass; a capped-off remainder re-arms the trigger so
+                // the backlog converges in debounce-window steps.
+                let repair_now = std::time::Instant::now();
+                if event_repair_trigger.is_armed_and_due(repair_now)
+                    && migration.lock().active_count() == 0
+                    && event_repair_take_fire(
+                        &mut event_repair_trigger,
+                        repair_now,
+                        topology_epoch.load(Ordering::Relaxed),
+                        &mut last_under_replication_sweep,
+                    )
+                {
+                    let view = retained_exchange_view_event.lock().clone();
+                    if !view.is_empty() {
+                        let (alive, mastered_nonempty) = snapshot_under_replication_inputs(
+                            &swim_membership_event,
+                            &shard_table,
+                            &engine,
+                            self_id,
+                        );
+                        let in_flight = resync_inflight.lock().clone();
+                        let (_signaled, dropped, _dead_skipped, _inflight_skipped) =
+                            run_under_replication_pass(
+                                &view,
+                                &alive,
+                                self_id,
+                                &mastered_nonempty,
+                                &in_flight,
+                                UNDER_REPLICATION_SWEEP_MAX_SHARDS,
+                                "event",
+                                &resync_request_tx_event,
+                            );
+                        // Task #50 review P3 — cap remainder: re-arm so the
+                        // backlog converges in 1.5s steps instead of waiting
+                        // the 20s periodic fallback.
+                        if dropped > 0 {
+                            event_repair_trigger.observe(
+                                std::time::Instant::now(),
+                                topology_epoch.load(Ordering::Relaxed),
+                            );
+                        }
                     }
                 }
 
@@ -3411,6 +3750,14 @@ impl ClusterCoordinator {
                     // §8 — retain the freshest cluster-wide holder view for
                     // the assignment provider's next election.
                     *retained_exchange_view_event.lock() = partition_view.clone();
+                    // Task #50 — a completed exchange is the moment the
+                    // retained view first reflects a rejoined/emptied peer's
+                    // TRUE holdings (the 15.3 shape: the restarted node
+                    // reports its post-crash, near-empty state here), so arm
+                    // an event repair pass under the just-stored term. The
+                    // same-term re-heal exchange re-arms under the unchanged
+                    // term; a pass pending under an older epoch is replaced.
+                    event_repair_trigger.observe(std::time::Instant::now(), term);
                     // §9 Q3 — prompt re-election. The fresh view may
                     // contradict the committed assignment (the canonical
                     // case: a rejoined node reported for the first time, so
@@ -3559,11 +3906,28 @@ impl ClusterCoordinator {
                 // throttling.
                 while let Ok(req) = resync_request_rx.try_recv() {
                     let table = shard_table.read().clone();
-                    let tasks = synthesize_resync_migration_tasks(&req, self_id, &table);
+                    let mut tasks = synthesize_resync_migration_tasks(&req, self_id, &table);
+                    // Task #50 review P2 — drop tasks whose (target, shard)
+                    // backfill is still streaming. This is the enforcement
+                    // point for ALL resync origins (event/periodic passes
+                    // AND catchup-loop re-requests): the drain is the only
+                    // inserter into `resync_inflight`, so a filter here
+                    // followed by an insert below cannot race another
+                    // spawner. Without it, a re-derive against the
+                    // still-stale retained view would spawn a DUPLICATE
+                    // concurrent full-shard stream at the same replica.
+                    let before = tasks.len();
+                    {
+                        let inflight = resync_inflight.lock();
+                        tasks.retain(|t| !inflight.contains(&(t.to_node.0, t.shard)));
+                    }
+                    let in_flight_filtered = before - tasks.len();
                     if tasks.is_empty() {
                         tracing::debug!(
                             target_node = req.node_id,
-                            "cluster: resync request resolved to no tasks (self-target or empty owned set)",
+                            in_flight_filtered,
+                            "cluster: resync request resolved to no tasks \
+                             (self-target, empty owned set, or all in flight)",
                         );
                         continue;
                     }
@@ -3572,6 +3936,7 @@ impl ClusterCoordinator {
                     tracing::info!(
                         target_node = req.node_id,
                         shard_count = tasks.len(),
+                        in_flight_filtered,
                         "cluster: synthesizing full-shard resync tasks",
                     );
                     let (keys_map, skipped) = engine.keys_by_shard_filtered(&target_shards);
@@ -3595,6 +3960,16 @@ impl ClusterCoordinator {
                     }
                     let all_keys: Vec<TxKey> =
                         keys_map.values().flat_map(|v| v.iter().copied()).collect();
+                    // Task #50 review P2 — claim the pairs this run will
+                    // stream; the guard (moved into the thread) releases
+                    // them when the run returns or unwinds.
+                    let pairs: Vec<(u64, u16)> =
+                        tasks.iter().map(|t| (t.to_node.0, t.shard)).collect();
+                    resync_inflight.lock().extend(pairs.iter().copied());
+                    let inflight_guard = ResyncInflightGuard {
+                        set: resync_inflight.clone(),
+                        pairs,
+                    };
                     let migration_ref = migration.clone();
                     let node_addrs_ref = node_addrs.clone();
                     let eng = engine.clone();
@@ -3606,6 +3981,7 @@ impl ClusterCoordinator {
                     let throttle_ref = migration_throttle_event.clone();
                     let secret_ref = cluster_secret_event.clone();
                     std::thread::spawn(move || {
+                        let _inflight_guard = inflight_guard;
                         Self::run_migration_tasks_with_global_limit(
                             tasks,
                             all_keys,
@@ -14743,8 +15119,15 @@ mod tests {
         let alive: std::collections::HashSet<NodeId> = [master, replica].into_iter().collect();
         let mastered = vec![(7u16, vec![replica])];
 
-        let (missing, signaled, dropped, dead_skipped) =
-            derive_under_replication_resyncs(&view, &alive, master, &mastered, 1024);
+        let (missing, signaled, dropped, dead_skipped, _inflight_skipped) =
+            derive_under_replication_resyncs(
+                &view,
+                &alive,
+                master,
+                &mastered,
+                &std::collections::HashSet::new(),
+                1024,
+            );
 
         assert_eq!(
             missing.get(&replica).map(|s| s.as_slice()),
@@ -14767,8 +15150,15 @@ mod tests {
         let alive: std::collections::HashSet<NodeId> = [master, replica].into_iter().collect();
         let mastered = vec![(7u16, vec![replica])];
 
-        let (missing, signaled, dropped, dead_skipped) =
-            derive_under_replication_resyncs(&view, &alive, master, &mastered, 1024);
+        let (missing, signaled, dropped, dead_skipped, _inflight_skipped) =
+            derive_under_replication_resyncs(
+                &view,
+                &alive,
+                master,
+                &mastered,
+                &std::collections::HashSet::new(),
+                1024,
+            );
 
         assert!(missing.is_empty(), "replica with data must not be signaled");
         assert_eq!(signaled, 0);
@@ -14788,8 +15178,15 @@ mod tests {
         let alive: std::collections::HashSet<NodeId> = [master, replica].into_iter().collect();
         let mastered = vec![(7u16, vec![replica])];
 
-        let (missing, signaled, dropped, dead_skipped) =
-            derive_under_replication_resyncs(&view, &alive, master, &mastered, 1024);
+        let (missing, signaled, dropped, dead_skipped, _inflight_skipped) =
+            derive_under_replication_resyncs(
+                &view,
+                &alive,
+                master,
+                &mastered,
+                &std::collections::HashSet::new(),
+                1024,
+            );
 
         assert!(missing.is_empty());
         assert_eq!(signaled, 0);
@@ -14814,8 +15211,15 @@ mod tests {
         let alive: std::collections::HashSet<NodeId> = [master].into_iter().collect();
         let mastered = vec![(7u16, vec![replica])];
 
-        let (missing, signaled, dropped, dead_skipped) =
-            derive_under_replication_resyncs(&view, &alive, master, &mastered, 1024);
+        let (missing, signaled, dropped, dead_skipped, _inflight_skipped) =
+            derive_under_replication_resyncs(
+                &view,
+                &alive,
+                master,
+                &mastered,
+                &std::collections::HashSet::new(),
+                1024,
+            );
 
         assert!(
             missing.is_empty(),
@@ -14840,8 +15244,15 @@ mod tests {
         let alive: std::collections::HashSet<NodeId> = [master, replica].into_iter().collect();
         let mastered = vec![(3u16, vec![replica]), (9u16, vec![replica])];
 
-        let (missing, signaled, dropped, dead_skipped) =
-            derive_under_replication_resyncs(&view, &alive, master, &mastered, 1);
+        let (missing, signaled, dropped, dead_skipped, _inflight_skipped) =
+            derive_under_replication_resyncs(
+                &view,
+                &alive,
+                master,
+                &mastered,
+                &std::collections::HashSet::new(),
+                1,
+            );
 
         assert_eq!(signaled, 1);
         assert_eq!(dropped, 1);
@@ -14860,13 +15271,412 @@ mod tests {
         let alive: std::collections::HashSet<NodeId> = [master].into_iter().collect();
         let mastered = vec![(7u16, vec![master])];
 
-        let (missing, signaled, dropped, dead_skipped) =
-            derive_under_replication_resyncs(&view, &alive, master, &mastered, 1024);
+        let (missing, signaled, dropped, dead_skipped, _inflight_skipped) =
+            derive_under_replication_resyncs(
+                &view,
+                &alive,
+                master,
+                &mastered,
+                &std::collections::HashSet::new(),
+                1024,
+            );
 
         assert!(missing.is_empty());
         assert_eq!(signaled, 0);
         assert_eq!(dropped, 0);
         assert_eq!(dead_skipped, 0);
+    }
+
+    fn repair_test_addr(port: u16) -> SocketAddr {
+        format!("127.0.0.1:{port}")
+            .parse()
+            .expect("valid test addr")
+    }
+
+    /// Feed every `MembershipChanged` in `events` to the trigger exactly
+    /// as the event loop's intercept branch does.
+    fn observe_membership_events(
+        trigger: &mut EventRepairTrigger,
+        events: &[ClusterEvent],
+        now: std::time::Instant,
+        epoch: u64,
+    ) {
+        for event in events {
+            if let ClusterEvent::MembershipChanged(members) = event {
+                trigger.observe_membership(members, now, epoch);
+            }
+        }
+    }
+
+    /// Task #50 (a) — the scenario 15.3 shape: a dead→alive REJOIN emits
+    /// `MembershipChanged` with a GROWN alive set, which arms the event
+    /// repair trigger; once the debounce elapses under an unchanged epoch
+    /// the armed pass fires, and the pass derives the rejoined replica's
+    /// dataless shards and pushes them into the SAME resync channel the
+    /// periodic sweep uses.
+    #[test]
+    fn dead_to_alive_rejoin_arms_event_repair_that_derives_and_pushes() {
+        // Membership: node2 joins, dies, then rejoins (SIGKILL + restart).
+        let mut m =
+            crate::cluster::membership::Membership::new(NodeId(1), Duration::from_millis(10));
+        let t0 = std::time::Instant::now();
+        let epoch = 7u64;
+        let mut trigger = EventRepairTrigger::new(UNDER_REPLICATION_EVENT_DEBOUNCE, true);
+        let joined = m.mark_alive(NodeId(2), repair_test_addr(3001), 1, true);
+        observe_membership_events(&mut trigger, &joined, t0, epoch);
+        assert!(
+            trigger.take_due(t0 + UNDER_REPLICATION_EVENT_DEBOUNCE, epoch),
+            "initial membership formation arms (and clears) a pass",
+        );
+        let died = m.mark_dead(NodeId(2), 1);
+        observe_membership_events(&mut trigger, &died, t0, epoch);
+        assert!(
+            trigger.take_due(t0 + UNDER_REPLICATION_EVENT_DEBOUNCE * 2, epoch),
+            "the death shrinks the alive set and arms (clear it before the rejoin)",
+        );
+
+        let rejoined = m.mark_alive(NodeId(2), repair_test_addr(3001), 1, true);
+        let t1 = t0 + UNDER_REPLICATION_EVENT_DEBOUNCE * 2;
+        observe_membership_events(&mut trigger, &rejoined, t1, epoch);
+        assert!(
+            !trigger.take_due(t1 + Duration::from_millis(100), epoch),
+            "the armed pass must not fire inside the debounce window",
+        );
+        assert!(
+            trigger.take_due(t1 + UNDER_REPLICATION_EVENT_DEBOUNCE, epoch),
+            "the rejoin grows the alive set and the debounced pass fires",
+        );
+
+        // The fired pass: rejoined node2 reported in the exchange but holds
+        // no data for two shards node1 masters — both must be pushed.
+        let mut view = std::collections::HashMap::new();
+        view.insert(NodeId(2), vec![sweep_entry(3, 0), sweep_entry(9, 0)]);
+        let alive: std::collections::HashSet<NodeId> = [NodeId(1), NodeId(2)].into_iter().collect();
+        let mastered = vec![(3u16, vec![NodeId(2)]), (9u16, vec![NodeId(2)])];
+        let in_flight = std::collections::HashSet::new();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (signaled, dropped, dead_skipped, inflight_skipped) = run_under_replication_pass(
+            &view,
+            &alive,
+            NodeId(1),
+            &mastered,
+            &in_flight,
+            1024,
+            "event",
+            &tx,
+        );
+        assert_eq!(signaled, 2, "both dataless shards must be signaled");
+        assert_eq!(dropped, 0);
+        assert_eq!(dead_skipped, 0);
+        assert_eq!(inflight_skipped, 0);
+        let req = rx.try_recv().expect("resync push must be enqueued");
+        assert_eq!(req.node_id, 2, "resync must target the rejoined replica");
+        assert_eq!(
+            req.shards,
+            vec![3, 9],
+            "both dataless shards in one request"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "one replica → one coalesced resync request",
+        );
+    }
+
+    /// Task #50 (b) — flag off: the trigger never arms, so the event path
+    /// stays exactly as inert as the disabled periodic sweep.
+    #[test]
+    fn event_repair_trigger_disabled_never_arms() {
+        let t0 = std::time::Instant::now();
+        let mut trigger = EventRepairTrigger::new(UNDER_REPLICATION_EVENT_DEBOUNCE, false);
+        trigger.observe(t0, 1);
+        assert!(
+            !trigger.take_due(t0 + UNDER_REPLICATION_EVENT_DEBOUNCE * 2, 1),
+            "a disabled trigger must never fire, however long after the event",
+        );
+    }
+
+    /// Task #50 (c) — a flurry of membership events coalesces into ONE
+    /// armed pass: the debounce keeps the deadline of the FIRST event, and
+    /// firing disarms the trigger until a new event re-arms it.
+    #[test]
+    fn event_repair_trigger_coalesces_flurry_into_one_run() {
+        let t0 = std::time::Instant::now();
+        let mut trigger = EventRepairTrigger::new(UNDER_REPLICATION_EVENT_DEBOUNCE, true);
+        trigger.observe(t0, 4);
+        trigger.observe(t0 + Duration::from_millis(10), 4);
+        trigger.observe(t0 + Duration::from_millis(20), 4);
+        assert!(
+            trigger.take_due(t0 + UNDER_REPLICATION_EVENT_DEBOUNCE, 4),
+            "exactly one pass fires for the whole flurry, at the FIRST event's deadline",
+        );
+        assert!(
+            !trigger.take_due(t0 + UNDER_REPLICATION_EVENT_DEBOUNCE * 2, 4),
+            "a fired pass disarms — no second run without a new event",
+        );
+    }
+
+    /// Task #50 (d) — epoch fence: a pass armed under epoch N must not fire
+    /// after the local epoch moved to N+1. It re-arms under the CURRENT
+    /// epoch and fires only after a fresh debounce window, so the derive
+    /// always runs against post-activation state (mirroring the migration
+    /// path's stale-epoch gate).
+    #[test]
+    fn event_repair_trigger_stale_epoch_rearms_under_current_epoch() {
+        let t0 = std::time::Instant::now();
+        let window = UNDER_REPLICATION_EVENT_DEBOUNCE;
+        let mut trigger = EventRepairTrigger::new(window, true);
+        trigger.observe(t0, 5);
+        assert!(
+            !trigger.take_due(t0 + window, 6),
+            "a pass armed under a superseded epoch must be dropped, not fired",
+        );
+        assert!(
+            !trigger.take_due(t0 + window + window / 2, 6),
+            "the re-armed pass must wait out a fresh debounce window",
+        );
+        assert!(
+            trigger.take_due(t0 + window * 2, 6),
+            "the re-derived pass fires under the current epoch",
+        );
+    }
+
+    /// Task #50 — an arming event observed under a NEW epoch replaces a
+    /// pending pass armed under an older one: both the epoch fence and the
+    /// debounce deadline reset, so the eventual pass is derived under (and
+    /// debounced against) the epoch that superseded the original arm.
+    #[test]
+    fn event_repair_trigger_new_epoch_observe_replaces_pending() {
+        let t0 = std::time::Instant::now();
+        let window = UNDER_REPLICATION_EVENT_DEBOUNCE;
+        let mut trigger = EventRepairTrigger::new(window, true);
+        trigger.observe(t0, 5);
+        // Exchange completes; the epoch moves and re-arms the trigger.
+        trigger.observe(t0 + Duration::from_millis(100), 6);
+        assert!(
+            !trigger.take_due(t0 + window, 6),
+            "the replaced pass must respect the NEW arm's debounce deadline",
+        );
+        assert!(
+            trigger.take_due(t0 + window + Duration::from_millis(100), 6),
+            "the re-armed pass fires a full window after the new-epoch arm",
+        );
+    }
+
+    /// Task #50 (e) — the dead-peer guard holds on the EVENT path: the
+    /// shared pass never pushes a resync toward a SWIM-dead replica (the
+    /// retained view deliberately survives peer death), and the skip is
+    /// counted, never silent.
+    #[test]
+    fn event_repair_pass_never_pushes_toward_swim_dead_replica() {
+        let master = NodeId(1);
+        let replica = NodeId(2);
+        let mut view = std::collections::HashMap::new();
+        view.insert(replica, vec![sweep_entry(7, 0)]);
+        // SWIM says the replica is gone; only the master itself is alive.
+        let alive: std::collections::HashSet<NodeId> = [master].into_iter().collect();
+        let mastered = vec![(7u16, vec![replica])];
+        let in_flight = std::collections::HashSet::new();
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        let (signaled, dropped, dead_skipped, inflight_skipped) = run_under_replication_pass(
+            &view, &alive, master, &mastered, &in_flight, 1024, "event", &tx,
+        );
+
+        assert_eq!(signaled, 0);
+        assert_eq!(dropped, 0);
+        assert_eq!(
+            dead_skipped, 1,
+            "the dead-peer skip must be counted so the log line surfaces it",
+        );
+        assert_eq!(inflight_skipped, 0);
+        assert!(
+            rx.try_recv().is_err(),
+            "nothing may be pushed toward a SWIM-dead replica",
+        );
+    }
+
+    /// Task #50 review P2 — a Suspect→Alive REFUTATION emits
+    /// `MembershipChanged` with an UNCHANGED alive set (E-03: suspicion
+    /// never removed the node from the alive view), so a flaky link's
+    /// suspect/refute cycle must NOT arm repair passes. Only a genuine
+    /// alive-set change does.
+    #[test]
+    fn refutation_shaped_membership_change_does_not_arm() {
+        let mut m =
+            crate::cluster::membership::Membership::new(NodeId(1), Duration::from_millis(10));
+        let t0 = std::time::Instant::now();
+        let mut trigger = EventRepairTrigger::new(UNDER_REPLICATION_EVENT_DEBOUNCE, true);
+
+        // Formation: node2 joins — genuine set change, arms; clear it.
+        let joined = m.mark_alive(NodeId(2), repair_test_addr(3001), 1, true);
+        observe_membership_events(&mut trigger, &joined, t0, 1);
+        assert!(trigger.take_due(t0 + UNDER_REPLICATION_EVENT_DEBOUNCE, 1));
+
+        // Flaky link: suspect (no MembershipChanged at all), then a direct
+        // ACK refutes — MembershipChanged fires with the SAME alive set.
+        let suspected = m.mark_suspect(NodeId(2), 1);
+        assert!(
+            !suspected
+                .iter()
+                .any(|e| matches!(e, ClusterEvent::MembershipChanged(_))),
+            "suspicion alone must not emit MembershipChanged (E-03)",
+        );
+        let refuted = m.mark_alive(NodeId(2), repair_test_addr(3001), 1, true);
+        assert!(
+            refuted
+                .iter()
+                .any(|e| matches!(e, ClusterEvent::MembershipChanged(_))),
+            "refutation emits MembershipChanged — the shape under test",
+        );
+        observe_membership_events(&mut trigger, &refuted, t0, 1);
+        assert!(
+            !trigger.take_due(t0 + UNDER_REPLICATION_EVENT_DEBOUNCE * 4, 1),
+            "a refutation-shaped MembershipChanged (unchanged set) must not arm",
+        );
+
+        // A genuine death afterwards still arms.
+        let died = m.mark_dead(NodeId(2), 1);
+        observe_membership_events(&mut trigger, &died, t0, 1);
+        assert!(
+            trigger.take_due(t0 + UNDER_REPLICATION_EVENT_DEBOUNCE * 8, 1),
+            "a genuine alive-set shrink must still arm",
+        );
+    }
+
+    /// Task #50 review — the `mark_dead` → arm path: a member death emits
+    /// `MembershipChanged` with a shrunken set, arming a pass whose fire
+    /// (via `event_repair_take_fire`) also RESETS the periodic sweep
+    /// timer so the fallback cadence never double-runs right behind it.
+    #[test]
+    fn member_death_arms_event_repair_and_fire_resets_periodic_timer() {
+        let mut m =
+            crate::cluster::membership::Membership::new(NodeId(1), Duration::from_millis(10));
+        let t0 = std::time::Instant::now();
+        let mut trigger = EventRepairTrigger::new(UNDER_REPLICATION_EVENT_DEBOUNCE, true);
+        let joined = m.mark_alive(NodeId(2), repair_test_addr(3001), 1, true);
+        observe_membership_events(&mut trigger, &joined, t0, 3);
+        assert!(trigger.take_due(t0 + UNDER_REPLICATION_EVENT_DEBOUNCE, 3));
+
+        let died = m.mark_dead(NodeId(2), 1);
+        observe_membership_events(&mut trigger, &died, t0, 3);
+
+        // Not due yet: the fire helper must not consume or touch the timer.
+        let mut last_sweep = t0;
+        assert!(!event_repair_take_fire(
+            &mut trigger,
+            t0 + Duration::from_millis(100),
+            3,
+            &mut last_sweep,
+        ));
+        assert_eq!(
+            last_sweep, t0,
+            "a non-fire must leave the periodic timer alone"
+        );
+
+        // Due: fires and resets the periodic timer to the fire instant.
+        let fire_at = t0 + UNDER_REPLICATION_EVENT_DEBOUNCE * 2;
+        assert!(event_repair_take_fire(
+            &mut trigger,
+            fire_at,
+            3,
+            &mut last_sweep
+        ));
+        assert_eq!(
+            last_sweep, fire_at,
+            "an event fire must reset the periodic sweep timer",
+        );
+    }
+
+    /// Task #50 review — gate ordering contract: `is_armed_and_due` is the
+    /// cheap NON-CONSUMING pre-gate the loop checks before taking the
+    /// migration lock. While the migration gate stays closed the loop
+    /// never calls `take_due`, so the pass stays armed and fires once the
+    /// gate opens — never lost, never consumed early.
+    #[test]
+    fn event_repair_trigger_peek_is_non_consuming_and_survives_closed_gate() {
+        let t0 = std::time::Instant::now();
+        let mut trigger = EventRepairTrigger::new(UNDER_REPLICATION_EVENT_DEBOUNCE, true);
+        assert!(
+            !trigger.is_armed_and_due(t0 + UNDER_REPLICATION_EVENT_DEBOUNCE * 8),
+            "an unarmed (e.g. flag-off) trigger must peek false — zero lock traffic",
+        );
+        trigger.observe(t0, 2);
+        assert!(!trigger.is_armed_and_due(t0 + Duration::from_millis(100)));
+        let due_at = t0 + UNDER_REPLICATION_EVENT_DEBOUNCE;
+        assert!(trigger.is_armed_and_due(due_at));
+        assert!(
+            trigger.is_armed_and_due(due_at),
+            "peeking must not consume the armed pass",
+        );
+        // Migration gate stayed closed for three windows (take_due never
+        // called) — the pass is still armed and fires when the gate opens.
+        let gate_opens = t0 + UNDER_REPLICATION_EVENT_DEBOUNCE * 4;
+        assert!(trigger.is_armed_and_due(gate_opens));
+        assert!(
+            trigger.take_due(gate_opens, 2),
+            "the deferred pass must fire once the migration gate opens",
+        );
+        assert!(!trigger.is_armed_and_due(gate_opens + Duration::from_millis(1)));
+    }
+
+    /// Task #50 review P2 — the derivation skips a (replica, shard) pair
+    /// whose full-shard resync backfill is still IN FLIGHT (resync tasks
+    /// are not `start_outbound`-tracked, so `active_count` cannot gate
+    /// them), counting the skip separately from the cap and the dead-peer
+    /// guard. The skipped pair does not consume cap budget.
+    #[test]
+    fn derive_skips_in_flight_resyncs_and_counts_them() {
+        let master = NodeId(1);
+        let replica = NodeId(2);
+        let mut view = std::collections::HashMap::new();
+        view.insert(replica, vec![sweep_entry(3, 0), sweep_entry(9, 0)]);
+        let alive: std::collections::HashSet<NodeId> = [master, replica].into_iter().collect();
+        let mastered = vec![(3u16, vec![replica]), (9u16, vec![replica])];
+        let in_flight: std::collections::HashSet<(u64, u16)> = [(2u64, 3u16)].into_iter().collect();
+
+        // cap=1: the in-flight shard 3 must not eat the budget — shard 9
+        // is signaled, nothing is dropped.
+        let (missing, signaled, dropped, dead_skipped, inflight_skipped) =
+            derive_under_replication_resyncs(&view, &alive, master, &mastered, &in_flight, 1);
+
+        assert_eq!(
+            missing.get(&replica).map(|s| s.as_slice()),
+            Some(&[9u16][..]),
+            "only the not-in-flight shard may be signaled",
+        );
+        assert_eq!(signaled, 1);
+        assert_eq!(dropped, 0, "an in-flight skip must not consume cap budget");
+        assert_eq!(dead_skipped, 0);
+        assert_eq!(
+            inflight_skipped, 1,
+            "the in-flight skip must be counted so the log line surfaces it",
+        );
+    }
+
+    /// Task #50 review P2 — the drop guard releases its (node, shard)
+    /// pairs when the backfill thread finishes (return OR unwind), so a
+    /// completed resync becomes re-derivable and a wedged entry cannot
+    /// outlive its run.
+    #[test]
+    fn resync_inflight_guard_clears_pairs_on_drop() {
+        let set: Arc<Mutex<std::collections::HashSet<(u64, u16)>>> = Arc::new(Mutex::new(
+            [(2u64, 3u16), (2u64, 9u16)].into_iter().collect(),
+        ));
+        {
+            let _guard = ResyncInflightGuard {
+                set: set.clone(),
+                pairs: vec![(2, 3), (2, 9)],
+            };
+            assert_eq!(
+                set.lock().len(),
+                2,
+                "pairs stay claimed while the run lives"
+            );
+        }
+        assert!(
+            set.lock().is_empty(),
+            "dropping the guard must release every claimed pair",
+        );
     }
 
     /// Fix D: a `ReplicaAck::Error` payload on a STATUS_ERROR migration-batch
