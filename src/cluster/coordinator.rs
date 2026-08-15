@@ -3486,6 +3486,11 @@ impl ClusterCoordinator {
                         &migration_throttle_event,
                         &cluster_secret_event,
                         committed_assignment_for_activation(&topo_authority_event, term),
+                        // W3 FIX A — the election's view-holder adoption is
+                        // reserved for the settled same-term re-heal; a fresh
+                        // term's exchange activation must keep the det plan so
+                        // the rebalance can fill its still-empty newcomers.
+                        same_term_reheal,
                     );
                     // Reverse-heal Phase 3b — RUNTIME online re-heal. The
                     // partition view just refreshed carries every peer's per-shard
@@ -4558,6 +4563,9 @@ impl ClusterCoordinator {
             migration_throttle,
             cluster_secret,
             committed_assignment,
+            // Empty view — the election's holder extension has nothing to
+            // read anyway; this path is never a same-term re-heal.
+            false,
         );
     }
 
@@ -4593,6 +4601,12 @@ impl ClusterCoordinator {
         migration_throttle: &Arc<crate::cluster::migration::MigrationThrottle>,
         cluster_secret: &Option<Arc<Vec<u8>>>,
         committed_assignment: Option<crate::cluster::election::CommittedAssignment>,
+        // W3 FIX A — true ONLY for the same-term re-heal reactivation (the
+        // exchange loop's `same_term_reheal` result): enables the election's
+        // view-holder candidate extension. A fresh topology activation MUST
+        // pass false — its newcomers are legitimately empty mid-rebalance and
+        // must keep their det masterships so the migration can fill them.
+        adopt_view_holders: bool,
     ) {
         *active_topology_members.write() = members.to_vec();
 
@@ -4665,7 +4679,13 @@ impl ClusterCoordinator {
             // catch-up that carried none): the per-node refinement, exactly
             // as before.
             None => {
-                apply_master_election(&mut new_table, &old_table_snap, partition_view, &evicted);
+                apply_master_election(
+                    &mut new_table,
+                    &old_table_snap,
+                    partition_view,
+                    &evicted,
+                    adopt_view_holders,
+                );
             }
         }
         // Phase D: when a partition view is available, use it to skip
@@ -8137,6 +8157,17 @@ fn run_migration_batch(
                             // (observed: sc07 shard 227 six rounds, sc11 for
                             // 5 minutes from three sources). Any non-exact-key
                             // rejection skips the escalation entirely.
+                            // W3 FIX B — locally-owned manifest the escalation
+                            // may REDUCE by keys the source itself can no
+                            // longer ship (see
+                            // `repush_and_retry_reduced_completion` for the
+                            // no-loss argument). Seeded from the fence-time
+                            // manifest; reductions accumulate across the
+                            // bounded attempts. The original
+                            // `manifest_entries` stays intact for the
+                            // NotExactKey superset probe below.
+                            let mut reduced_entries = manifest_entries.clone();
+                            let mut reduced_hash = manifest_hash;
                             let escalation = escalate_missing_exact_keys(
                                 e,
                                 &manifest_entries,
@@ -8148,34 +8179,56 @@ fn run_migration_batch(
                                         "cluster: re-pushing missing exact key(s) named by \
                                          completion rejection",
                                     );
-                                    let refs: Vec<&TxKey> = missing.iter().collect();
-                                    stream_shard_baseline(
-                                        task,
-                                        &refs,
-                                        &engine,
+                                    let before = reduced_entries.len();
+                                    let attempt = repush_and_retry_reduced_completion(
                                         &mut stream,
-                                        batch_size,
-                                        topology_epoch,
-                                        auth_secret,
-                                        Some(&|| {
-                                            migration_epoch_current(shard_table, topology_epoch)
-                                        }),
-                                    )
-                                    .map_err(EscalationAttemptError::Repush)?;
-                                    send_migration_complete(
-                                        addr,
-                                        task.shard,
-                                        task.from_node,
-                                        manifest_entries.len() as u64,
-                                        fence_seq,
-                                        topology_epoch,
-                                        Some(&mut stream),
-                                        &manifest_hash,
-                                        &manifest_entries,
-                                        true,
-                                        auth_secret,
-                                    )
-                                    .map_err(EscalationAttemptError::Completion)
+                                        missing,
+                                        &mut reduced_entries,
+                                        &mut reduced_hash,
+                                        |stream, refs| {
+                                            stream_shard_baseline(
+                                                task,
+                                                refs,
+                                                &engine,
+                                                stream,
+                                                batch_size,
+                                                topology_epoch,
+                                                auth_secret,
+                                                Some(&|| {
+                                                    migration_epoch_current(
+                                                        shard_table,
+                                                        topology_epoch,
+                                                    )
+                                                }),
+                                            )
+                                            .map(|(_manifest, skipped)| skipped)
+                                        },
+                                        |stream, hash, entries| {
+                                            send_migration_complete(
+                                                addr,
+                                                task.shard,
+                                                task.from_node,
+                                                entries.len() as u64,
+                                                fence_seq,
+                                                topology_epoch,
+                                                Some(stream),
+                                                hash,
+                                                entries,
+                                                true,
+                                                auth_secret,
+                                            )
+                                        },
+                                    );
+                                    if reduced_entries.len() < before {
+                                        tracing::info!(
+                                            shard = task.shard,
+                                            removed = before - reduced_entries.len(),
+                                            remaining = reduced_entries.len(),
+                                            "cluster: completion manifest reduced by keys \
+                                             the source can no longer ship",
+                                        );
+                                    }
+                                    attempt
                                 },
                             );
                             match escalation {
@@ -8856,15 +8909,77 @@ fn escalate_missing_exact_keys(
     ExactKeyEscalation::Exhausted { last_err }
 }
 
+/// W3 FIX B — one escalation attempt: re-push the named missing key(s),
+/// REDUCE the completion manifest by whatever the source itself could not
+/// ship, and retry the completion with the REDUCED manifest.
+///
+/// `stream_repush` (production: [`stream_shard_baseline`]) returns the keys
+/// it SKIPPED — keys the source no longer has (`build_record_replay_ops`
+/// returned `Ok(None)`: the record was deleted/quarantined since the
+/// fence-time manifest was built). No-loss argument for removing them from
+/// the manifest: a skipped key means the SOURCE — the only node that could
+/// ship the record — holds no such record, so demanding it of the target is
+/// unsatisfiable by construction; the record is already lost upstream
+/// (tracked separately by the quarantine/delete path that removed it) and
+/// the reduced manifest simply states what actually exists. Re-sending the
+/// UNREDUCED manifest instead re-provokes the identical `code=19` rejection
+/// verbatim and guarantees `Exhausted` (observed across 8+ identical re-heal
+/// rounds in CI run 31875324685).
+///
+/// A reduction that EMPTIES the manifest is terminal, not retried as a
+/// completion: with zero exact entries the target's verify degenerates to
+/// the strict hash path (`expected_records == 0` passes the epoch-current
+/// count gate, but with no verifiable exact entries the manifest-hash check
+/// folds the target's ENTIRE local shard content and only matches a target
+/// holding nothing) — while this escalation exists precisely because the
+/// target already holds the streamed subset. The attempt is burned as a
+/// source-side [`EscalationAttemptError::Repush`] so the bounded escalation
+/// exhausts into [`terminally_abort_unshippable_task`], today's
+/// zero-shippable disposition.
+///
+/// `reduced_entries` / `reduced_hash` are the escalation's locally-owned
+/// manifest state, carried ACROSS attempts so successive skips accumulate;
+/// the caller seeds them from the fence-time manifest. `ctx` threads the
+/// caller's connection (or a test double) through both phases.
+fn repush_and_retry_reduced_completion<C>(
+    ctx: &mut C,
+    missing: &[TxKey],
+    reduced_entries: &mut Vec<(TxKey, u32)>,
+    reduced_hash: &mut [u8; 32],
+    stream_repush: impl FnOnce(&mut C, &[&TxKey]) -> std::result::Result<Vec<TxKey>, String>,
+    send_completion: impl FnOnce(&mut C, &[u8; 32], &[(TxKey, u32)]) -> std::result::Result<(), String>,
+) -> std::result::Result<(), EscalationAttemptError> {
+    let refs: Vec<&TxKey> = missing.iter().collect();
+    let skipped = stream_repush(ctx, &refs).map_err(EscalationAttemptError::Repush)?;
+    if !skipped.is_empty() {
+        reduced_entries.retain(|(key, _)| !skipped.contains(key));
+        *reduced_hash = compute_manifest_for_entries(reduced_entries);
+    }
+    if reduced_entries.is_empty() {
+        return Err(EscalationAttemptError::Repush(
+            "manifest reduced to zero shippable records — the source holds nothing \
+             it can prove to the target"
+                .to_string(),
+        ));
+    }
+    send_completion(ctx, reduced_hash, reduced_entries).map_err(EscalationAttemptError::Completion)
+}
+
 /// F3 (b) — terminal abort for a shard whose completion the target keeps
 /// rejecting with a missing exact key the source cannot deliver.
 ///
-/// Data safety: the shard is rolled back to `self`
+/// Data safety: a MASTER-handoff task's shard is rolled back to `self`
 /// ([`FailedTaskTableAction::Rollback`] → `ShardTable::rollback_shard`), so
 /// the SOURCE — which provably holds every record the target is missing —
 /// keeps authority and the shard converges to exactly ONE serving master
 /// instead of hanging at serving = target+1. NEVER a relinquish here: the
 /// target just proved it does NOT hold every record.
+///
+/// W3 FIX C — a REPLICA-push task is retired and counted WITHOUT the
+/// rollback: `rollback_shard` restores the shard's whole previous
+/// assignment, so a replica-side abort triggering it would revert the
+/// shard's MASTER assignment while the master handoff is still mid-Copying
+/// (scenario 17's sustained 4097/4096 master count).
 ///
 /// Terminality: the tracking entry is failed AND retired atomically under one
 /// manager lock (`MigrationManager::fail_and_retire_task`) so the failed-task
@@ -8917,7 +9032,16 @@ fn terminally_abort_unshippable_task(
         );
         return false;
     }
-    if epoch_current {
+    if epoch_current && task.is_master {
+        // W3 FIX C — only a MASTER-handoff task may roll the shard back.
+        // `rollback_shard` restores the shard's WHOLE previous assignment, so
+        // a failed REPLICA push triggering it would revert the shard's master
+        // assignment while the master handoff is still Copying (scenario 17's
+        // single divergent shard at 4097/4096: all nine of node1's terminal
+        // aborts there were replica-side). A replica task is retired above
+        // with the table untouched; the under-replication machinery re-plans
+        // the backfill.
+        //
         // (The migration mutex is NOT held across the shard-table write —
         // same lock order as `fail_migration_task_current_epoch`.)
         shard_table.write().rollback_shard(task.shard);
@@ -8925,6 +9049,7 @@ fn terminally_abort_unshippable_task(
     tracing::warn!(
         shard = task.shard,
         to_node = task.to_node.0,
+        is_master = task.is_master,
         epoch_current,
         "cluster: migration terminally aborted after missing-exact-key escalation — \
          source keeps authority; re-heal re-plans on a later round",
@@ -11362,11 +11487,70 @@ fn split_transfer_request_tasks(
     (tasks, diverged)
 }
 
+/// F2/W3 — classify `nodes` into [`MasterCandidate`]s for `shard`, relative
+/// to the max `last_applied_seq` among THEM, and return that max alongside.
+///
+/// Fullness is RELATIVE and 2x-thresholded (see the F2 comment at the call
+/// site in [`apply_master_election`] for the full skew argument): a candidate
+/// is subset iff `count == 0 || count*2 < max`, with an unreported shard
+/// counting as 0. On the eviction-only empty-view path every candidate is
+/// treated as full so election runs solely to skip the evicted node.
+///
+/// Extracted so the W3 adoption refusal can re-run the pre-extension election
+/// over the assignment-only candidate list (classified against the
+/// assignment-only max) without duplicating the classification rules.
+fn classify_shard_candidates(
+    shard: u16,
+    nodes: &[NodeId],
+    seq_by_node_shard: &std::collections::HashMap<(NodeId, u16), u64>,
+    evicted: &std::collections::HashSet<NodeId>,
+    view_empty: bool,
+) -> (u64, Vec<MasterCandidate>) {
+    let count_of = |node_id: NodeId| -> u64 {
+        seq_by_node_shard
+            .get(&(node_id, shard))
+            .copied()
+            .unwrap_or(0)
+    };
+    let max_reported = nodes.iter().map(|&n| count_of(n)).max().unwrap_or(0);
+    let candidates = nodes
+        .iter()
+        .map(|&node_id| {
+            let count = count_of(node_id);
+            let has_data = view_empty || (count > 0 && count.saturating_mul(2) >= max_reported);
+            MasterCandidate {
+                node_id,
+                // Task #47 — never feed node-local history into the
+                // ranking: each node's prev_table diverges (rollbacks,
+                // prior deviations), so a prev-master tiebreak elects a
+                // DIFFERENT master per node from the SAME view. With the
+                // flag uniformly false the ranking is a pure function of
+                // the shared view.
+                was_previous_master: false,
+                is_subset: !has_data,
+                was_evicted: evicted.contains(&node_id),
+            }
+        })
+        .collect();
+    (max_reported, candidates)
+}
+
 /// Phase F — apply election scoring on top of the round-robin
 /// `compute_with_epoch` result.
 ///
 /// For every shard, build the candidate set from the shard's target
-/// assignment (master + replicas), tag each candidate with:
+/// assignment (master + replicas) PLUS — W3 FIX A, only when
+/// `adopt_view_holders` is set (the caller's SAME-TERM RE-HEAL flag; a fresh
+/// topology activation must pass `false` or a scale-up's still-empty
+/// newcomer loses every shard back to the old holders before the fill can
+/// run) — every node the shared partition view shows holding data for the
+/// shard (`last_applied_seq > 0`, sorted and deduped so the set is
+/// independent of view iteration order). Without the extension, a shard
+/// whose data lives entirely outside the det pair (terminal-abort rollback)
+/// is unelectable to its holder: the det candidates all report 0, the
+/// classifier is skipped, and the det master keeps claiming a shard the
+/// holder keeps serving — the equal-version divergence sustainer of CI run
+/// 31875324685. Tag each candidate with:
 /// - `is_subset`: not yet observed to hold full data — either the
 ///   partition view shows no entries for the candidate or the candidate
 ///   reports `last_applied_seq == 0` for the shard.
@@ -11380,7 +11564,9 @@ fn split_transfer_request_tasks(
 /// # Election is a pure function of (round-robin table, view) — Task #47
 ///
 /// This function deliberately reads NO node-local state: `_prev_table` is
-/// retained for call-site compatibility but no longer participates.
+/// retained for call-site compatibility but no longer participates
+/// (`adopt_view_holders` is the exchange loop's cluster-wide election-kind
+/// flag, not node-local history).
 /// `was_previous_master` used to be derived from each node's OWN previous
 /// table, and deviation used to follow the elected winner even on a data
 /// TIE — so two nodes at the SAME committed term with the SAME view could
@@ -11412,6 +11598,7 @@ pub fn apply_master_election(
     _prev_table: &ShardTable,
     partition_view: &std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>>,
     evicted: &std::collections::HashSet<NodeId>,
+    adopt_view_holders: bool,
 ) {
     let view_empty = partition_view.is_empty();
     // Task #22 — an empty view carries no ownership signal. Returning here
@@ -11439,6 +11626,57 @@ pub fn apply_master_election(
         }
     }
 
+    // W3 FIX A (CI run 31875324685, scenarios 11/17) — per-shard list of the
+    // nodes the SHARED view shows holding data (`last_applied_seq > 0`).
+    // These join the candidate set below: after a terminal migration abort
+    // rolls a shard back to its old owner, the only data holder can be
+    // OUTSIDE the shard's det master+replica pair, and a candidate set built
+    // solely from the det assignment cannot EXPRESS that answer — on the
+    // divergent shards every det candidate reports 0, the classifier is
+    // skipped entirely, and the det master keeps claiming a shard the holder
+    // keeps serving (masters wedged at 4101/4096 across 8+ identical re-heal
+    // rounds). Each list is sorted (and deduped) so the candidate order — and
+    // with it the whole election — is independent of the view map's
+    // iteration order: the extension stays a pure function of
+    // (det table, view, adopt_view_holders), and equal views classify and
+    // elect identically on every node running the same election kind.
+    //
+    // GATE — `adopt_view_holders`: the SAME-TERM RE-HEAL election only (the
+    // caller passes the exchange loop's `same_term_reheal` flag). On a fresh
+    // topology activation the identical view shape is a legitimate scale-up
+    // mid-flight: the det master (the newcomer) is empty BECAUSE the
+    // migration that fills it has not run yet, and adopting the holder would
+    // undo the rebalance before it starts (regression caught by
+    // `migration_fence_window_bounded_by_pipeline_sub_batch`: a 1→2 rf=1
+    // scale-up froze — every shard deviated back to the old owner and the
+    // newcomer, dropped from the rf=1 assignment, could never be filled).
+    // NOTE a term-version comparison CANNOT stand in for the flag: the
+    // commit-signal activation (empty view) stamps the term first, so the
+    // exchange-phase activation of a brand-new term already runs with
+    // old.version == new.version. The wedge, by contrast, is repaired
+    // exclusively through the same-term re-heal reactivation, which fires
+    // only in the settled no-active-migration state — on the holder via its
+    // phantom-master counter and on the det master via its stuck-subset
+    // counter — so every divergent elector re-runs THIS election with the
+    // flag set and converges on the holder. The fresh-activator-vs-re-healer
+    // rollout residual reconciles through the same-term re-heal exactly like
+    // the partial-view residual documented above.
+    let mut holders_by_shard: std::collections::HashMap<u16, Vec<NodeId>> =
+        std::collections::HashMap::new();
+    if adopt_view_holders {
+        for (node, entries) in partition_view {
+            for e in entries {
+                if e.last_applied_seq > 0 {
+                    holders_by_shard.entry(e.shard).or_default().push(*node);
+                }
+            }
+        }
+        for holders in holders_by_shard.values_mut() {
+            holders.sort_unstable();
+            holders.dedup();
+        }
+    }
+
     for shard in 0..NUM_SHARDS as u16 {
         let assignment = table.target_assignment(shard);
 
@@ -11447,6 +11685,17 @@ pub fn apply_master_election(
         for replica in &assignment.replicas {
             if !candidate_nodes.contains(replica) {
                 candidate_nodes.push(*replica);
+            }
+        }
+        // W3 FIX A — extend with the view-evidenced holders. Added nodes are
+        // in `nodes_with_view` BY CONSTRUCTION (they come from the view's own
+        // entries), so the `all_candidates_reported` gate below is unaffected:
+        // it still turns on exactly the det candidates' presence.
+        if let Some(holders) = holders_by_shard.get(&shard) {
+            for holder in holders {
+                if !candidate_nodes.contains(holder) {
+                    candidate_nodes.push(*holder);
+                }
             }
         }
 
@@ -11507,48 +11756,22 @@ pub fn apply_master_election(
         // 3-valued (full=3 / subset=2 / evicted=0) and every pinned behavior
         // is preserved: full-over-subset still promotes, near-equal and
         // equal counts are a tie that keeps the deterministic pick, the
-        // empty-view path is untouched.
-        let max_reported = candidate_nodes
-            .iter()
-            .map(|&node_id| {
-                seq_by_node_shard
-                    .get(&(node_id, shard))
-                    .copied()
-                    .unwrap_or(0)
-            })
-            .max()
-            .unwrap_or(0);
+        // empty-view path is untouched. Classification lives in
+        // `classify_shard_candidates` (shared with the W3 adoption-refusal
+        // fallback below): eviction-only empty view treats every candidate as
+        // full; with a real view a node is subset iff it reports nothing or
+        // is materially behind the max among candidates — an unreported shard
+        // counts as 0.
+        let (max_reported, candidates) = classify_shard_candidates(
+            shard,
+            &candidate_nodes,
+            &seq_by_node_shard,
+            evicted,
+            view_empty,
+        );
         if !view_empty && max_reported == 0 {
             continue;
         }
-
-        let candidates: Vec<MasterCandidate> = candidate_nodes
-            .iter()
-            .map(|&node_id| {
-                // Eviction-only path (empty view): treat every candidate as
-                // full so election runs solely to skip the evicted node. With
-                // a real view, a node is "subset" iff it reports nothing or
-                // is MATERIALLY behind the max among candidates (F2:
-                // `count*2 < max`) — an unreported shard counts as 0.
-                let count = seq_by_node_shard
-                    .get(&(node_id, shard))
-                    .copied()
-                    .unwrap_or(0);
-                let has_data = view_empty || (count > 0 && count.saturating_mul(2) >= max_reported);
-                MasterCandidate {
-                    node_id,
-                    // Task #47 — never feed node-local history into the
-                    // ranking: each node's prev_table diverges (rollbacks,
-                    // prior deviations), so a prev-master tiebreak elects a
-                    // DIFFERENT master per node from the SAME view. With the
-                    // flag uniformly false the ranking is a pure function of
-                    // the shared view.
-                    was_previous_master: false,
-                    is_subset: !has_data,
-                    was_evicted: evicted.contains(&node_id),
-                }
-            })
-            .collect();
 
         if let Some(elected) = elect_master(shard, &candidates)
             && elected != assignment.master
@@ -11570,7 +11793,87 @@ pub fn apply_master_election(
                     .unwrap_or(0)
             };
             if rank_of(elected) > rank_of(rr_master) {
-                table.set_master_for_shard(shard, elected);
+                if assignment.replicas.contains(&elected) {
+                    table.set_master_for_shard(shard, elected);
+                } else {
+                    // W3 FIX A — the winner is a view-evidenced holder from
+                    // OUTSIDE the shard's assignment (the rolled-back-handoff
+                    // shape). `set_master_for_shard` refuses such a candidate
+                    // by design, so adopt it explicitly via
+                    // `adopt_external_master` — but only under the NO-LOSS
+                    // guard: adoption displaces an assignment member, counts
+                    // cannot prove the displaced node's records exist
+                    // elsewhere, and orphan cleanup may eventually delete a
+                    // dropped member's copy. The displaced member is
+                    // therefore the min-count replica (ties broken by node
+                    // id — a pure function of (det table, view), identical
+                    // on every elector), and it must report ZERO for the
+                    // shard; with no replica slots (rf=1) the det master
+                    // itself leaves and must likewise report zero.
+                    let count_of = |node: NodeId| -> u64 {
+                        seq_by_node_shard.get(&(node, shard)).copied().unwrap_or(0)
+                    };
+                    let displaced: Option<(usize, NodeId)> = assignment
+                        .replicas
+                        .iter()
+                        .enumerate()
+                        .map(|(slot, &node)| (slot, node))
+                        .min_by_key(|&(_, node)| (count_of(node), node.0));
+                    let rr_replicas = assignment.replicas.clone();
+                    match displaced {
+                        Some((slot, node)) if count_of(node) == 0 => {
+                            table.adopt_external_master(shard, elected, slot);
+                        }
+                        None if count_of(rr_master) == 0 => {
+                            table.adopt_external_master(shard, elected, 0);
+                        }
+                        _ => {
+                            // Adoption refused: every displacement candidate
+                            // holds data. Fall back to the PRE-EXTENSION
+                            // election over the assignment-only candidates,
+                            // classified against the assignment-only max, so
+                            // a data-holding replica is still promoted over
+                            // an empty det master exactly as before the W3
+                            // candidate extension.
+                            let mut pair_nodes: Vec<NodeId> =
+                                Vec::with_capacity(1 + rr_replicas.len());
+                            pair_nodes.push(rr_master);
+                            for replica in &rr_replicas {
+                                if !pair_nodes.contains(replica) {
+                                    pair_nodes.push(*replica);
+                                }
+                            }
+                            let (pair_max, pair_candidates) = classify_shard_candidates(
+                                shard,
+                                &pair_nodes,
+                                &seq_by_node_shard,
+                                evicted,
+                                view_empty,
+                            );
+                            let rank_pair = |node: NodeId| {
+                                pair_candidates
+                                    .iter()
+                                    .find(|c| c.node_id == node)
+                                    .map(|c| {
+                                        rank_master_candidate(
+                                            c.node_id,
+                                            c.node_id,
+                                            c.is_subset,
+                                            c.was_evicted,
+                                        )
+                                    })
+                                    .unwrap_or(0)
+                            };
+                            if (view_empty || pair_max > 0)
+                                && let Some(winner) = elect_master(shard, &pair_candidates)
+                                && winner != rr_master
+                                && rank_pair(winner) > rank_pair(rr_master)
+                            {
+                                table.set_master_for_shard(shard, winner);
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -19046,7 +19349,13 @@ mod tests {
         );
         view.insert(NodeId(2), Vec::new());
         view.insert(NodeId(3), Vec::new());
-        apply_master_election(&mut table, &prev, &view, &std::collections::HashSet::new());
+        apply_master_election(
+            &mut table,
+            &prev,
+            &view,
+            &std::collections::HashSet::new(),
+            false,
+        );
 
         // Sanity: the election actually deviated from round-robin,
         // otherwise this test would not exercise FIX C at all.
@@ -19790,7 +20099,13 @@ mod tests {
         );
         view.insert(NodeId(2), Vec::new());
         view.insert(NodeId(3), Vec::new());
-        apply_master_election(&mut table, &prev, &view, &std::collections::HashSet::new());
+        apply_master_election(
+            &mut table,
+            &prev,
+            &view,
+            &std::collections::HashSet::new(),
+            false,
+        );
 
         // Election must have deviated from round-robin (otherwise the test
         // does not exercise the convergence path).
@@ -20528,6 +20843,172 @@ mod tests {
         }
     }
 
+    /// W3 FIX B tests — a captured completion: `(manifest_hash, entries)`.
+    type SentCompletion = ([u8; 32], Vec<(TxKey, u32)>);
+
+    /// W3 FIX B — the escalation re-push reports the keys the SOURCE itself
+    /// can no longer read back (`Ok(None)` from `build_record_replay_ops`:
+    /// deleted/quarantined since the fence-time manifest was built). Demanding
+    /// those of the target is unsatisfiable by construction, so the retried
+    /// completion must carry a manifest REDUCED by them — recomputed hash,
+    /// reduced count — never the identical doomed handshake.
+    #[test]
+    fn repush_reduces_completion_manifest_by_source_skipped_keys() {
+        let mut reduced = vec![(tk(1), 3u32), (tk(2), 7u32), (tk(3), 9u32)];
+        let mut hash = compute_manifest_for_entries(&reduced);
+        let original_hash = hash;
+        let mut sent: Option<SentCompletion> = None;
+        let result = repush_and_retry_reduced_completion(
+            &mut (),
+            &[tk(2)],
+            &mut reduced,
+            &mut hash,
+            |_, refs| {
+                assert_eq!(refs, [&tk(2)]);
+                Ok(vec![tk(2)])
+            },
+            |_, h, entries| {
+                sent = Some((*h, entries.to_vec()));
+                Ok(())
+            },
+        );
+        assert_eq!(result, Ok(()));
+        let expected_entries = vec![(tk(1), 3u32), (tk(3), 9u32)];
+        assert_eq!(
+            reduced, expected_entries,
+            "the skipped key must be removed from the escalation's manifest",
+        );
+        let (sent_hash, sent_entries) = sent.expect("the completion must be sent");
+        assert_eq!(
+            sent_entries, expected_entries,
+            "the completion must carry the REDUCED manifest",
+        );
+        assert_eq!(
+            sent_hash,
+            compute_manifest_for_entries(&expected_entries),
+            "the manifest hash must be recomputed over the reduced entries",
+        );
+        assert_ne!(sent_hash, original_hash);
+    }
+
+    /// W3 FIX B — a re-push that skips nothing must retry the completion with
+    /// the manifest UNCHANGED (same entries, same hash).
+    #[test]
+    fn repush_without_skips_keeps_the_manifest_intact() {
+        let original = vec![(tk(1), 3u32), (tk(2), 7u32)];
+        let mut reduced = original.clone();
+        let mut hash = compute_manifest_for_entries(&reduced);
+        let original_hash = hash;
+        let mut sent: Option<SentCompletion> = None;
+        let result = repush_and_retry_reduced_completion(
+            &mut (),
+            &[tk(2)],
+            &mut reduced,
+            &mut hash,
+            |_, _refs| Ok(Vec::new()),
+            |_, h, entries| {
+                sent = Some((*h, entries.to_vec()));
+                Ok(())
+            },
+        );
+        assert_eq!(result, Ok(()));
+        assert_eq!(reduced, original);
+        let (sent_hash, sent_entries) = sent.expect("the completion must be sent");
+        assert_eq!(sent_entries, original);
+        assert_eq!(sent_hash, original_hash);
+    }
+
+    /// W3 FIX B — the wedge end-to-end: the target rejects `code=19` for a
+    /// key the source can no longer ship. Re-sending the identical manifest
+    /// is guaranteed `Exhausted` (observed verbatim across 8+ re-heal
+    /// rounds); with the reduction the very next completion carries a
+    /// manifest without the unshippable key and verifies.
+    #[test]
+    fn escalation_verifies_with_reduced_manifest_when_source_lacks_a_key() {
+        let manifest = vec![(tk(1), 3u32), (tk(2), 7u32)];
+        let initial = format!(
+            "target rejected: status 4 (code=19: shard 227 missing exact key {:?}: TxNotFound)",
+            tk(2),
+        );
+        let mut reduced = manifest.clone();
+        let mut hash = compute_manifest_for_entries(&reduced);
+        let mut completions: Vec<Vec<(TxKey, u32)>> = Vec::new();
+        let outcome = escalate_missing_exact_keys(initial, &manifest, 3, |missing| {
+            repush_and_retry_reduced_completion(
+                &mut (),
+                missing,
+                &mut reduced,
+                &mut hash,
+                |_, _refs| Ok(vec![tk(2)]),
+                |_, _h, entries| {
+                    completions.push(entries.to_vec());
+                    if entries.iter().any(|(k, _)| *k == tk(2)) {
+                        Err(format!(
+                            "target rejected: status 4 (code=19: shard 227 missing exact \
+                             key {:?}: TxNotFound)",
+                            tk(2),
+                        ))
+                    } else {
+                        Ok(())
+                    }
+                },
+            )
+        });
+        assert_eq!(outcome, ExactKeyEscalation::Verified);
+        assert_eq!(
+            completions,
+            vec![vec![(tk(1), 3u32)]],
+            "exactly one completion retry, carrying the reduced manifest",
+        );
+    }
+
+    /// W3 FIX B — a reduction that EMPTIES the manifest is terminal. The
+    /// attempt is burned as a source-side failure (no completion is sent), so
+    /// the bounded escalation exhausts into
+    /// `terminally_abort_unshippable_task` — the zero-shippable disposition
+    /// of today. See `repush_and_retry_reduced_completion` for why an
+    /// empty-manifest completion cannot verify here.
+    #[test]
+    fn escalation_exhausts_terminally_when_reduction_empties_the_manifest() {
+        let manifest = vec![(tk(2), 7u32)];
+        let initial = format!(
+            "target rejected: status 4 (code=19: shard 227 missing exact key {:?}: TxNotFound)",
+            tk(2),
+        );
+        let mut reduced = manifest.clone();
+        let mut hash = compute_manifest_for_entries(&reduced);
+        let mut attempts = 0usize;
+        let mut completion_sent = false;
+        let outcome = escalate_missing_exact_keys(initial, &manifest, 3, |missing| {
+            attempts += 1;
+            repush_and_retry_reduced_completion(
+                &mut (),
+                missing,
+                &mut reduced,
+                &mut hash,
+                |_, _refs| Ok(vec![tk(2)]),
+                |_, _h, _entries| {
+                    completion_sent = true;
+                    Ok(())
+                },
+            )
+        });
+        assert_eq!(
+            attempts, 3,
+            "the empty reduction must stay inside the bound"
+        );
+        assert!(
+            !completion_sent,
+            "an emptied manifest must never be sent as a completion",
+        );
+        match outcome {
+            ExactKeyEscalation::Exhausted { last_err } => {
+                assert!(last_err.contains("zero shippable"), "got: {last_err}");
+            }
+            other => panic!("expected Exhausted, got {other:?}"),
+        }
+    }
+
     /// F3 (b) — the terminal abort after an exhausted escalation: the shard
     /// rolls back to the SOURCE as the single serving master and the task is
     /// RETIRED — no Failed entry remains for the failed-task re-drive to
@@ -20583,6 +21064,96 @@ mod tests {
             assert_eq!(t.effective_assignment(shard).master, NodeId(1));
             assert_eq!(t.target_assignment(shard).master, NodeId(1));
             assert_eq!(t.shard_handoff_state(shard), ShardHandoff::ServingNew);
+        }
+
+        // Terminal task state: nothing left for the failed-task re-drive.
+        let mut mgr = migration.lock();
+        assert_eq!(mgr.failed_count(), 0, "the task must not stay Failed");
+        assert!(
+            mgr.take_failed_tasks().is_empty(),
+            "the re-drive must have nothing to re-send",
+        );
+        assert!(
+            mgr.active_migrations().is_empty(),
+            "the tracking entry must be retired",
+        );
+    }
+
+    /// W3 FIX C — a REPLICA-push terminal abort must never revert the shard's
+    /// MASTER assignment. `rollback_shard` restores the shard's whole
+    /// previous assignment, so a failed replica backfill aborting while the
+    /// shard's master handoff is still Copying would yank mastership back to
+    /// the old owner mid-flight (scenario 17's single divergent shard at
+    /// 4097/4096: all nine of node1's terminal aborts there were
+    /// replica-side). The replica task must be retired and counted with the
+    /// table left untouched.
+    #[test]
+    fn replica_task_terminal_abort_leaves_master_assignment_intact() {
+        use crate::cluster::shards::ShardHandoff;
+        let old_members = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let new_members = vec![NodeId(1), NodeId(2), NodeId(3), NodeId(4)];
+        let mut table = ShardTable::compute_with_epoch(&old_members, 2, 1, 1);
+        let new_table = ShardTable::compute_with_epoch(&new_members, 2, 2, 1);
+        let (shard, new_master) = (0..NUM_SHARDS as u16)
+            .find_map(|s| {
+                let old_master = table.target_assignment(s).master;
+                let new_master = new_table.target_assignment(s).master;
+                (old_master == NodeId(1) && new_master != NodeId(1)).then_some((s, new_master))
+            })
+            .expect("scale-out must move some node1 master");
+        table.begin_handoff(&new_table);
+        assert_eq!(table.shard_handoff_state(shard), ShardHandoff::Copying);
+
+        let shard_table = Arc::new(ShardTableLock::new(table));
+        let migration = Arc::new(Mutex::new(MigrationManager::new()));
+        let fenced = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+        let migrating = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+        // A REPLICA backfill task for the same shard (e.g. the new topology
+        // also names NodeId(4) a replica elsewhere) that terminally fails.
+        let task = MigrationTask {
+            shard,
+            from_node: NodeId(1),
+            to_node: NodeId(4),
+            is_master: false,
+        };
+        migration.lock().start_outbound(
+            std::slice::from_ref(&task),
+            NodeId(1),
+            &std::collections::HashSet::from([shard]),
+        );
+
+        let counted = terminally_abort_unshippable_task(
+            &migration,
+            &shard_table,
+            &fenced,
+            &migrating,
+            &task,
+            new_table.version,
+        );
+        assert!(
+            counted,
+            "the terminal abort must still count as a failed task"
+        );
+
+        // The in-flight MASTER handoff must be untouched: still Copying, the
+        // target assignment still naming the new master.
+        {
+            let t = shard_table.read();
+            assert_eq!(
+                t.target_assignment(shard).master,
+                new_master,
+                "a replica-push abort must not revert the shard's master assignment",
+            );
+            assert_eq!(
+                t.shard_handoff_state(shard),
+                ShardHandoff::Copying,
+                "the shard's master handoff must stay in flight",
+            );
+            assert_eq!(
+                t.effective_assignment(shard).master,
+                NodeId(1),
+                "the old master keeps serving mid-handoff exactly as before the abort",
+            );
         }
 
         // Terminal task state: nothing left for the failed-task re-drive.
@@ -23925,6 +24496,7 @@ mod tests {
             &cluster.migration_throttle,
             &cluster.cluster_secret,
             None,
+            false,
         );
 
         // The manager retained the unproven lost entry across the supersede (C17).
@@ -24041,6 +24613,7 @@ mod tests {
             &cluster.migration_throttle,
             &cluster.cluster_secret,
             None,
+            false,
         );
 
         // The heal entry must survive the supersede (manager + hot-path atomic).
@@ -24141,6 +24714,7 @@ mod tests {
             &cluster.migration_throttle,
             &cluster.cluster_secret,
             None,
+            false,
         );
 
         assert!(
@@ -25298,6 +25872,7 @@ mod tests {
             &prev_table,
             &view,
             &std::collections::HashSet::new(),
+            false,
         );
 
         assert_eq!(
@@ -25371,7 +25946,13 @@ mod tests {
         // candidate for the shard, so `all_candidates_reported` is false and
         // the deterministic master is preserved.
         let mut table = ShardTable::compute_with_epoch(&members, rf, term, 1);
-        apply_master_election(&mut table, &det, &view, &std::collections::HashSet::new());
+        apply_master_election(
+            &mut table,
+            &det,
+            &view,
+            &std::collections::HashSet::new(),
+            false,
+        );
         assert_eq!(
             table.target_assignment(shard).master,
             NodeId(2),
@@ -25411,6 +25992,7 @@ mod tests {
             &prev_table,
             &view,
             &std::collections::HashSet::new(),
+            false,
         );
         (NodeId(1), NodeId(2), table.target_assignment(shard).master)
     }
@@ -25534,6 +26116,7 @@ mod tests {
             &prev_node1,
             &view,
             &std::collections::HashSet::new(),
+            true,
         );
         let mut table_node4 = ShardTable::compute_with_epoch(&members, rf, term, 1);
         apply_master_election(
@@ -25541,6 +26124,7 @@ mod tests {
             &prev_node4,
             &view,
             &std::collections::HashSet::new(),
+            true,
         );
 
         assert_eq!(
@@ -25596,6 +26180,7 @@ mod tests {
             &prev_table,
             &view,
             &std::collections::HashSet::new(),
+            false,
         );
         assert_eq!(
             table.target_assignment(shard).master,
@@ -25622,6 +26207,7 @@ mod tests {
             &prev_table,
             &view,
             &std::collections::HashSet::new(),
+            false,
         );
         assert_eq!(
             table.target_assignment(7),
@@ -25646,7 +26232,7 @@ mod tests {
         let mut evicted = std::collections::HashSet::new();
         evicted.insert(NodeId(1));
 
-        apply_master_election(&mut table, &prev_table, &view, &evicted);
+        apply_master_election(&mut table, &prev_table, &view, &evicted, false);
         assert_ne!(
             table.target_assignment(shard).master,
             NodeId(1),
@@ -25721,6 +26307,7 @@ mod tests {
             &prev_node1,
             &view,
             &std::collections::HashSet::new(),
+            true,
         );
         let mut table_node4 = ShardTable::compute_with_epoch(&members, rf, term, 1);
         apply_master_election(
@@ -25728,6 +26315,7 @@ mod tests {
             &prev_node4,
             &view,
             &std::collections::HashSet::new(),
+            true,
         );
 
         assert_eq!(
@@ -25796,6 +26384,7 @@ mod tests {
             &diverged_node1,
             &view,
             &std::collections::HashSet::new(),
+            true,
         );
         let mut reheal_node4 = ShardTable::compute_with_epoch(&members, rf, term, 1);
         apply_master_election(
@@ -25803,6 +26392,7 @@ mod tests {
             &diverged_node4,
             &view,
             &std::collections::HashSet::new(),
+            true,
         );
 
         assert_eq!(
@@ -25814,6 +26404,317 @@ mod tests {
             reheal_node4.target_assignment(shard).master,
             NodeId(4),
             "the round-robin master must keep itself once it holds data",
+        );
+    }
+
+    /// W3 FIX A (CI run 31875324685, scenarios 11/17) — the equal-version
+    /// divergence SUSTAINER. After a terminal migration abort rolls a shard
+    /// back to its old owner, the only node holding the shard's data can be
+    /// OUTSIDE the deterministic master+replica pair. A candidate set built
+    /// solely from the det assignment cannot EXPRESS that answer: on the
+    /// divergent shards every det candidate reports 0, the whole classifier
+    /// is skipped, and the det master keeps claiming a shard the holder keeps
+    /// serving (masters wedged at 4101/4096 across 8+ identical re-heal
+    /// rounds). The election must extend the candidate set with every node
+    /// the SHARED view shows holding data, so every elector converges on the
+    /// holder.
+    #[test]
+    fn apply_master_election_adopts_view_evidenced_holder_outside_det_pair() {
+        let members = [NodeId(1), NodeId(2), NodeId(3), NodeId(4)];
+        let rf = 2;
+        let term = 5;
+        let det = ShardTable::compute_with_epoch(&members, rf, term, 1);
+
+        // A shard whose det assignment (master + replicas) EXCLUDES N1 — the
+        // rolled-back holder in the wedge.
+        let shard = (0..NUM_SHARDS as u16)
+            .find(|&s| {
+                let a = det.target_assignment(s);
+                a.master != NodeId(1) && !a.replicas.contains(&NodeId(1))
+            })
+            .expect("some shard excludes N1 from its assignment in a 4-member ring");
+        let det_master = det.target_assignment(shard).master;
+
+        // Shared view: every det pair member reported successfully but holds
+        // NOTHING for the shard; N1 (outside the pair) holds the records.
+        let mut view: std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>> =
+            std::collections::HashMap::new();
+        for node in members {
+            view.insert(node, Vec::new());
+        }
+        view.insert(
+            NodeId(1),
+            vec![PartitionVersionEntry {
+                shard,
+                flags: 0,
+                replica_count: 1,
+                last_applied_seq: 500,
+                manifest_digest: 0,
+                max_generation: 0,
+            }],
+        );
+
+        // Two electors with divergent local histories must both elect N1.
+        let mut prev_node1 = det.clone();
+        prev_node1.set_master_for_shard(shard, NodeId(1));
+        let prev_node4 = det.clone();
+
+        let mut table_node1 = ShardTable::compute_with_epoch(&members, rf, term, 1);
+        apply_master_election(
+            &mut table_node1,
+            &prev_node1,
+            &view,
+            &std::collections::HashSet::new(),
+            true,
+        );
+        let mut table_node4 = ShardTable::compute_with_epoch(&members, rf, term, 1);
+        apply_master_election(
+            &mut table_node4,
+            &prev_node4,
+            &view,
+            &std::collections::HashSet::new(),
+            true,
+        );
+
+        assert_eq!(
+            table_node1.target_assignment(shard).master,
+            table_node4.target_assignment(shard).master,
+            "equal views must elect the same master on every elector",
+        );
+        assert_eq!(
+            table_node1.target_assignment(shard).master,
+            NodeId(1),
+            "the view-evidenced holder outside the det pair must be electable and win \
+             when the whole det pair is empty",
+        );
+        assert!(
+            table_node1
+                .target_assignment(shard)
+                .replicas
+                .contains(&det_master),
+            "the demoted det master must stay in the assignment so the deviation can \
+             decay back to it once it is backfilled",
+        );
+        assert_eq!(
+            table_node1.intended_master(shard),
+            NodeId(1),
+            "adoption must keep the recorded intent in step with the elected master",
+        );
+    }
+
+    /// W3 FIX A gate — the candidate extension applies ONLY when the caller
+    /// passes `adopt_view_holders = true` (the exchange loop's same-term
+    /// re-heal flag, which fires only in the settled no-active-migration
+    /// state). On a FRESH topology activation (`false`) the identical view
+    /// shape is a legitimate scale-up mid-flight: the det master (the
+    /// newcomer) is empty BECAUSE the migration that fills it has not run
+    /// yet, and adopting the holder would undo the rebalance before it
+    /// starts (regression caught by
+    /// `migration_fence_window_bounded_by_pipeline_sub_batch`: a 1→2 rf=1
+    /// scale-up froze because every shard deviated back to the old owner —
+    /// and a term-version comparison cannot stand in for the flag, because
+    /// the commit-signal activation stamps the term before the fresh term's
+    /// exchange activation runs).
+    #[test]
+    fn apply_master_election_does_not_adopt_on_fresh_term_activation() {
+        let members = [NodeId(1), NodeId(2), NodeId(3), NodeId(4)];
+        let rf = 2;
+        let det = ShardTable::compute_with_epoch(&members, rf, 5, 1);
+        let shard = (0..NUM_SHARDS as u16)
+            .find(|&s| {
+                let a = det.target_assignment(s);
+                a.master != NodeId(1) && !a.replicas.contains(&NodeId(1))
+            })
+            .expect("some shard excludes N1 from its assignment in a 4-member ring");
+        let det_master = det.target_assignment(shard).master;
+
+        let mut view: std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>> =
+            std::collections::HashMap::new();
+        for node in members {
+            view.insert(node, Vec::new());
+        }
+        view.insert(
+            NodeId(1),
+            vec![PartitionVersionEntry {
+                shard,
+                flags: 0,
+                replica_count: 1,
+                last_applied_seq: 500,
+                manifest_digest: 0,
+                max_generation: 0,
+            }],
+        );
+
+        // A fresh activation passes `adopt_view_holders = false` — even a
+        // same-version previous table must not enable adoption.
+        let prev = det.clone();
+        let mut table = ShardTable::compute_with_epoch(&members, rf, 5, 1);
+        apply_master_election(
+            &mut table,
+            &prev,
+            &view,
+            &std::collections::HashSet::new(),
+            false,
+        );
+        assert_eq!(
+            table.target_assignment(shard).master,
+            det_master,
+            "a fresh-term activation must keep the det master (the scale-up fill has \
+             not run yet); adoption is reserved for same-term re-heals",
+        );
+    }
+
+    /// W3 FIX A — the added-candidate path must be independent of the view
+    /// map's iteration order: with TWO out-of-pair holders both classified
+    /// full, every elector (and every insertion order) must resolve the same
+    /// winner — the lowest-id full holder, per `elect_master`'s deterministic
+    /// tie-break.
+    #[test]
+    fn apply_master_election_added_candidates_are_order_independent() {
+        let members = [NodeId(1), NodeId(2), NodeId(3), NodeId(4)];
+        let rf = 2;
+        let term = 5;
+        let det = ShardTable::compute_with_epoch(&members, rf, term, 1);
+
+        // A shard whose assignment excludes BOTH N1 and N2.
+        let shard = (0..NUM_SHARDS as u16)
+            .find(|&s| {
+                let a = det.target_assignment(s);
+                !a.replicas.contains(&NodeId(1))
+                    && !a.replicas.contains(&NodeId(2))
+                    && a.master != NodeId(1)
+                    && a.master != NodeId(2)
+            })
+            .expect("some shard excludes both N1 and N2 in a 4-member ring");
+
+        // N1 (500) and N2 (900) are both full at the 2x threshold
+        // (500*2 >= 900); the det pair reports nothing.
+        let holder_entry = |seq: u64| {
+            vec![PartitionVersionEntry {
+                shard,
+                flags: 0,
+                replica_count: 1,
+                last_applied_seq: seq,
+                manifest_digest: 0,
+                max_generation: 0,
+            }]
+        };
+        let build_view = |order: &[NodeId]| {
+            let mut view: std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>> =
+                std::collections::HashMap::new();
+            for &node in order {
+                let entries = match node {
+                    NodeId(1) => holder_entry(500),
+                    NodeId(2) => holder_entry(900),
+                    _ => Vec::new(),
+                };
+                view.insert(node, entries);
+            }
+            view
+        };
+        let forward = build_view(&[NodeId(1), NodeId(2), NodeId(3), NodeId(4)]);
+        let reversed = build_view(&[NodeId(4), NodeId(3), NodeId(2), NodeId(1)]);
+
+        let mut table_fwd = ShardTable::compute_with_epoch(&members, rf, term, 1);
+        apply_master_election(
+            &mut table_fwd,
+            &det,
+            &forward,
+            &std::collections::HashSet::new(),
+            true,
+        );
+        let mut table_rev = ShardTable::compute_with_epoch(&members, rf, term, 1);
+        apply_master_election(
+            &mut table_rev,
+            &det,
+            &reversed,
+            &std::collections::HashSet::new(),
+            true,
+        );
+
+        assert_eq!(
+            table_fwd.target_assignment(shard).master,
+            table_rev.target_assignment(shard).master,
+            "the added-candidate path must not depend on view insertion order",
+        );
+        assert_eq!(
+            table_fwd.target_assignment(shard).master,
+            NodeId(1),
+            "two full out-of-pair holders must resolve to the lowest-id one on every \
+             elector",
+        );
+    }
+
+    /// W3 FIX A no-loss guard — adoption displaces an assignment member, and
+    /// counts cannot prove the displaced node's records exist elsewhere. A
+    /// replica the view shows HOLDING data must therefore never be displaced;
+    /// the election falls back to the pre-extension assignment-only ranking,
+    /// which still promotes that data-holding replica over an empty det
+    /// master exactly as before the extension.
+    #[test]
+    fn apply_master_election_never_displaces_an_assignment_member_holding_data() {
+        let members = [NodeId(1), NodeId(2), NodeId(3), NodeId(4)];
+        let rf = 2;
+        let term = 5;
+        let det = ShardTable::compute_with_epoch(&members, rf, term, 1);
+
+        let shard = (0..NUM_SHARDS as u16)
+            .find(|&s| {
+                let a = det.target_assignment(s);
+                a.master != NodeId(1) && !a.replicas.contains(&NodeId(1)) && !a.replicas.is_empty()
+            })
+            .expect("some shard excludes N1 and has a replica in a 4-member ring");
+        let det_master = det.target_assignment(shard).master;
+        let det_replica = det.target_assignment(shard).replicas[0];
+
+        // Det master empty; det replica holds 400 (materially behind); N1
+        // holds 900 (full). Adopting N1 would displace the 400-record
+        // replica — refused; the fallback must promote the replica instead.
+        let entry = |seq: u64| {
+            vec![PartitionVersionEntry {
+                shard,
+                flags: 0,
+                replica_count: 1,
+                last_applied_seq: seq,
+                manifest_digest: 0,
+                max_generation: 0,
+            }]
+        };
+        let mut view: std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>> =
+            std::collections::HashMap::new();
+        for node in members {
+            view.insert(node, Vec::new());
+        }
+        view.insert(det_replica, entry(400));
+        view.insert(NodeId(1), entry(900));
+
+        let mut table = ShardTable::compute_with_epoch(&members, rf, term, 1);
+        apply_master_election(
+            &mut table,
+            &det,
+            &view,
+            &std::collections::HashSet::new(),
+            true,
+        );
+
+        assert_ne!(
+            table.target_assignment(shard).master,
+            NodeId(1),
+            "a holder whose adoption would displace a data-holding replica must be \
+             refused",
+        );
+        assert_eq!(
+            table.target_assignment(shard).master,
+            det_replica,
+            "the fallback must still promote the data-holding replica over the empty \
+             det master (pre-extension behavior preserved)",
+        );
+        assert!(
+            table
+                .target_assignment(shard)
+                .replicas
+                .contains(&det_master),
+            "the in-assignment promotion swaps the demoted master into the replica set",
         );
     }
 
