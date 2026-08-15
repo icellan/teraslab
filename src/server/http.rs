@@ -1299,6 +1299,16 @@ pub(crate) fn render_metrics_text(
             "teraslab_replica_covered_batch_reapplied_total",
             r.replica_covered_batch_reapplied.get(),
         );
+        prom_counter(
+            &mut out,
+            "teraslab_replica_staging_pressure_naks_total",
+            r.replica_staging_pressure_naks.get(),
+        );
+        prom_counter(
+            &mut out,
+            "teraslab_replica_staging_pressure_race_hard_total",
+            r.replica_staging_pressure_race_hard.get(),
+        );
         prom_labeled_replica_counter(&mut out, "teraslab_repl_batches_acked_total", |i| {
             r.repl_batches_acked_total.get(i)
         });
@@ -4933,6 +4943,8 @@ mod tests {
             "teraslab_replica_unauthenticated_accept_total",
             "teraslab_replica_rejected_sequence_gap_total",
             "teraslab_replica_covered_batch_reapplied_total",
+            "teraslab_replica_staging_pressure_naks_total",
+            "teraslab_replica_staging_pressure_race_hard_total",
             "teraslab_redo_flush_latency_ns",
             "teraslab_redo_bytes_per_flush",
             "teraslab_redo_entries_per_flush",

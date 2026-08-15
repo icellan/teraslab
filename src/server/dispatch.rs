@@ -5654,20 +5654,26 @@ fn send_replica_ops_loop(
                     next = expected_sequence;
                 }
                 ReplicaAck::Busy { first_sequence } => {
-                    // FU#6a: retryable redo-backpressure NAK. Nothing was applied or
-                    // journaled and the replica's watermark is unchanged, so the
-                    // IDENTICAL labeled batch is correct to resend — do NOT burn or
-                    // relabel, and do NOT consume a renegotiation attempt. Resend
-                    // the SAME batch under a bounded budget with a short backoff.
+                    // FU#6a: retryable backpressure NAK (a transiently full redo
+                    // log, or chunk-staging pressure at the receiver's pre-batch
+                    // gate). Nothing was journaled and the replica's watermark is
+                    // unchanged, so the IDENTICAL labeled batch is correct to
+                    // resend — do NOT burn or relabel, and do NOT consume a
+                    // renegotiation attempt. Resend the SAME batch under a
+                    // bounded budget with a short backoff.
                     if busy_retries >= MAX_BUSY_RETRIES {
-                        // Exhaustion: the replica's redo is genuinely stuck (drain
-                        // wedged). Fall back to the Error behavior — burn the
-                        // positions and fail so the caller's replication-failure
-                        // path fires.
+                        // Exhaustion: the replica is genuinely stuck (redo drain
+                        // wedged, or staging pinned by concurrent large streams).
+                        // Fall back to the Error behavior — burn the positions
+                        // and fail so the caller's replication-failure path
+                        // fires. The wire ack carries no cause; report the
+                        // backpressure neutrally rather than misattributing it
+                        // to the redo. (Follow-up: a reason byte on the Busy ack
+                        // would let this name the actual subsystem.)
                         *next_sequence = Some(last + 1);
                         return Err(ReplicaSendError::Failed(format!(
-                            "replica redo busy: still full after {MAX_BUSY_RETRIES} retries \
-                         (first_sequence {first_sequence})",
+                            "replica busy (backpressure): still busy after {MAX_BUSY_RETRIES} \
+                         retries (first_sequence {first_sequence})",
                         )));
                     }
                     busy_retries += 1;
@@ -5675,7 +5681,7 @@ fn send_replica_ops_loop(
                         %addr,
                         busy_retries,
                         first_sequence,
-                        "replication: replica NAKed redo-busy (backpressure); backing off and re-sending",
+                        "replication: replica NAKed busy (backpressure); backing off and re-sending",
                     );
                     std::thread::sleep(BUSY_RETRY_BACKOFF);
                     // `next` unchanged — the resend carries the identical label.

@@ -1236,14 +1236,24 @@ pub enum ReplicaAck {
         /// The `first_sequence` the offending batch carried.
         received_first_sequence: u64,
     },
-    /// FU#6a retryable-backpressure NAK: the batch's mutations were applied
-    /// in memory but its redo entries could not be admitted because a touched
-    /// redo log is momentarily full (a transient `RedoError::LogFull` the next
-    /// checkpoint reclaims). NOTHING was journaled, the receiver's watermark
-    /// did NOT advance, and no log was poisoned — the master should re-send the
-    /// IDENTICAL, unrelabeled batch after a short backoff (the mutations
-    /// re-apply idempotently). This replaces the pre-fix behavior where a
-    /// transient full redo poisoned the whole node.
+    /// Retryable-backpressure NAK, raised for either transient condition:
+    ///
+    /// - **full redo** (FU#6a): the batch's mutations were applied in memory
+    ///   but its redo entries could not be admitted because a touched redo
+    ///   log is momentarily full (a transient `RedoError::LogFull` the next
+    ///   checkpoint reclaims) — the resend's mutations re-apply
+    ///   idempotently; this replaced the pre-fix behavior where a transient
+    ///   full redo poisoned the whole node;
+    /// - **chunk-staging pressure** (scenario 11): the receiver's pre-batch
+    ///   gate determined the batch's chunked-op opens would push the
+    ///   process-wide staging sum past its cap — decided BEFORE any op of
+    ///   the batch applied or staged, so NOTHING at all was applied.
+    ///
+    /// The load-bearing invariants hold for both causes: NOTHING was
+    /// journaled, the receiver's watermark did NOT advance, no log was
+    /// poisoned, and no chunk staging was consumed or left behind — the
+    /// sender should re-send the IDENTICAL, unrelabeled batch after a short
+    /// backoff. The ack does not name its cause on the wire.
     ///
     /// Wire note: this is an additive ack tag (3), carried in the same
     /// `STATUS_ERROR` envelope as [`Self::Error`]/[`Self::Gap`]. A pre-upgrade
