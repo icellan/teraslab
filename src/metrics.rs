@@ -1620,6 +1620,61 @@ impl AllocatorMetrics {
     }
 }
 
+/// Blob-GC quarantine metrics (`teraslab_blob_gc_*`).
+///
+/// The blob reconciler QUARANTINES (retains + logs) instead of deleting a
+/// blob whose primary-index entry exists without the EXTERNAL flag, and any
+/// unreferenced blob seen by the recovery pass (see
+/// `crate::storage::blob_gc`). These counters are the scrape-visible
+/// tripwire for that: `quarantined_not_external_total > 0` means live
+/// records are missing their EXTERNAL flag (a flag-fidelity defect upstream
+/// — the CI scenario-11 data-loss precursor) and an operator must
+/// investigate.
+///
+/// Semantics: each SWEEP that observes a quarantined blob re-counts it, so
+/// a single retained blob grows the counter once per sweep (recovery pass +
+/// each periodic tick). Alert on the value/rate being non-zero, not on the
+/// magnitude — the magnitude is observations, not distinct blobs.
+#[repr(align(128))]
+pub struct BlobGcMetrics {
+    /// Sweep observations of blobs retained because NO primary-index entry
+    /// existed during the RECOVERY pass (boot-time heals may still
+    /// re-register the key; the periodic sweep deletes this class instead).
+    pub quarantined_no_index_total: PaddedCounter,
+    /// Sweep observations of blobs retained because a primary-index entry
+    /// exists WITHOUT the EXTERNAL flag (both passes). Non-zero is the
+    /// flag-fidelity tripwire.
+    pub quarantined_not_external_total: PaddedCounter,
+}
+
+impl BlobGcMetrics {
+    /// Create a new, zero-initialized blob-GC metrics table.
+    pub const fn new() -> Self {
+        Self {
+            quarantined_no_index_total: PaddedCounter::new(),
+            quarantined_not_external_total: PaddedCounter::new(),
+        }
+    }
+}
+
+impl Default for BlobGcMetrics {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Process-wide blob-GC metrics. Unlike the OnceLock-installed subsystem
+/// metrics below, this is a const-constructed static with an infallible
+/// accessor: the counters have no owning subsystem struct, and the FIRST
+/// increment site (`recovery::reconcile_blobs_after_recovery`) runs before
+/// any subsystem init could have installed a reference.
+static BLOB_GC_METRICS: BlobGcMetrics = BlobGcMetrics::new();
+
+/// Borrow the process-wide blob-GC metrics (always available).
+pub fn blob_gc_metrics() -> &'static BlobGcMetrics {
+    &BLOB_GC_METRICS
+}
+
 // ---------------------------------------------------------------------------
 // Process-wide OnceLock accessors for the subsystem metrics.
 // ---------------------------------------------------------------------------

@@ -1249,12 +1249,17 @@ fn main() {
         }
 
         // R-049: reconcile orphan external blobs against the freshly-replayed
-        // primary index. Failed creates / aborted uploads / cancelled
-        // migrations leave blobs on disk that the foreground pipeline will
-        // never reference; without this sweep they accumulate forever
-        // (audit IJK-08). Errors during reconciliation are non-fatal — a
-        // transient blob-store issue must not block the server from coming
-        // up; the periodic background sweep retries on its next tick.
+        // primary index. This recovery pass DELETES NOTHING:
+        // the replayed index can transiently miss entries that the G3
+        // reverse-heal pull / replica resync re-register right after boot, and
+        // an entry present without the EXTERNAL flag marks an upstream
+        // flag-fidelity defect whose blob must survive for repair (CI
+        // scenario-11 data loss). Unreferenced blobs are quarantined + logged;
+        // the periodic background sweep reclaims genuine orphans (failed
+        // creates / aborted uploads / cancelled migrations, audit IJK-08)
+        // once the node is serving. Errors during reconciliation are
+        // non-fatal — a transient blob-store issue must not block the server
+        // from coming up.
         match teraslab::recovery::reconcile_blobs_after_recovery(
             blob_store.as_ref(),
             &index,
@@ -1264,8 +1269,8 @@ fn main() {
                 tracing::info!(
                     total_blobs = stats.total_blobs,
                     kept = stats.kept,
-                    deleted_no_index = stats.deleted_no_index,
-                    deleted_not_external = stats.deleted_not_external,
+                    quarantined_no_index = stats.quarantined_no_index,
+                    quarantined_not_external = stats.quarantined_not_external,
                     delete_failed = stats.delete_failed,
                     "recovery: blob reconciliation summary",
                 );
