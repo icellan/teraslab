@@ -4,8 +4,9 @@
 //! to a specific node. It maintains per-node connection pools and a background
 //! refresh task that periodically updates the partition map.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use parking_lot::RwLock;
@@ -103,6 +104,13 @@ pub(crate) struct Cluster {
     _refresh_task: JoinHandle<()>,
     /// Channel to stop the refresh task.
     close_tx: tokio::sync::watch::Sender<bool>,
+    /// Single-flight gate for map refreshes: concurrent callers queue here
+    /// so interleaved poll/install rounds cannot reinstate a stale map.
+    refresh_lock: tokio::sync::Mutex<()>,
+    /// Bumped on every successful map adoption. A caller that queued behind
+    /// an in-flight refresh compares epochs after acquiring the lock and
+    /// returns without re-polling when the winner already adopted a map.
+    refresh_epoch: AtomicU64,
 }
 
 impl Cluster {
@@ -128,6 +136,8 @@ impl Cluster {
             addr_to_node,
             _refresh_task: tokio::spawn(async {}), // placeholder, replaced below
             close_tx,
+            refresh_lock: tokio::sync::Mutex::new(()),
+            refresh_epoch: AtomicU64::new(0),
         };
 
         // Bootstrap from seed nodes.
@@ -173,69 +183,76 @@ impl Cluster {
         })
     }
 
-    /// Fetch and decode the partition map from a single pool.
+    /// Node ids the adopted map can route to: nodes advertised alive UNION
+    /// every master named in the shard table.
     ///
-    /// # Errors
-    ///
-    /// Returns [`ClientError::Connection`] if no connection can be obtained,
-    /// or [`ClientError::Protocol`] on a non-OK status or a malformed map.
-    async fn fetch_map_from_pool(&self, pool: &ConnPool) -> Result<PartitionMap, ClientError> {
-        let conn = pool.get().await?;
-
-        // Strict-auth clusters require the whole inter-node frame to be
-        // HMAC-signed (request_id||op||flags||payload); sign via the
-        // server's own sign_frame so it verifies byte-for-byte. Unsecured
-        // clusters send it unsigned (trusted-overlay default).
-        let secret = self
-            .config
-            .cluster_secret
-            .as_deref()
-            .filter(|s| !s.is_empty());
-        let resp = match secret {
-            Some(s) => {
-                conn.round_trip_signed(OP_GET_PARTITION_MAP, 0, Vec::new(), s)
-                    .await?
-            }
-            None => conn.round_trip(OP_GET_PARTITION_MAP, 0, Vec::new()).await?,
-        };
-
-        if resp.status != STATUS_OK {
-            return Err(ClientError::Protocol(format!(
-                "partition map: status {}",
-                resp.status
-            )));
-        }
-        decode_partition_map(&resp.payload)
+    /// The server's `is_alive` derives from its STRICTLY-Alive SWIM view
+    /// (Suspect excluded) while `assignments` come from the committed
+    /// topology table, where a suspect stays a member for the full suspicion
+    /// window. A node mastering any shard MUST keep a pool — otherwise one
+    /// missed probe turns every request to its shards into a non-retryable
+    /// "no pool for node" error until the suspicion resolves.
+    fn routable_ids(pm: &PartitionMap) -> HashSet<u64> {
+        pm.nodes
+            .iter()
+            .filter(|n| n.is_alive)
+            .map(|n| n.id)
+            .chain(pm.assignments.iter().copied())
+            .collect()
     }
 
-    /// Ensure a connection pool (and address mapping) exists for every node
-    /// the map advertises as ALIVE. Dead-advertised nodes get no pool:
-    /// dialing a node the cluster's failure detector has declared dead only
+    /// Ensure a connection pool (and address mapping) exists for every
+    /// routable node (see [`Self::routable_ids`]) the map carries an address
+    /// for. Dead-advertised nodes that master no shard get no pool: dialing
+    /// a node the cluster has both declared dead and fully reassigned only
     /// hands a stale minority view a channel back into the client.
-    fn ensure_pools_for_alive_nodes(&self, pm: &PartitionMap) {
-        let mut pools = self.pools.write();
-        let mut atn = self.addr_to_node.write();
-        for node in pm.nodes.iter().filter(|n| n.is_alive) {
-            let resolved = self.config.resolve_addr(&node.addr).to_string();
-            pools.entry(node.id).or_insert_with(|| {
-                Arc::new(ConnPool::new(resolved, self.config.pool_config.clone()))
-            });
-            atn.insert(node.addr.clone(), node.id);
+    ///
+    /// The two write locks are taken in SEPARATE scopes (never nested):
+    /// `pool_for_redirect_addr` reads `addr_to_node` and `pools` in the
+    /// opposite order, and parking_lot's fairness turns nested opposite-
+    /// order acquisition into a real ABBA deadlock.
+    fn ensure_pools_for_routable_nodes(&self, pm: &PartitionMap, routable: &HashSet<u64>) {
+        let targets: Vec<(u64, String, String)> = pm
+            .nodes
+            .iter()
+            .filter(|n| routable.contains(&n.id))
+            .map(|n| {
+                (
+                    n.id,
+                    n.addr.clone(),
+                    self.config.resolve_addr(&n.addr).to_string(),
+                )
+            })
+            .collect();
+        {
+            let mut pools = self.pools.write();
+            for (id, _, resolved) in &targets {
+                pools.entry(*id).or_insert_with(|| {
+                    Arc::new(ConnPool::new(
+                        resolved.clone(),
+                        self.config.pool_config.clone(),
+                    ))
+                });
+            }
+        }
+        {
+            let mut atn = self.addr_to_node.write();
+            for (id, addr, _) in &targets {
+                atn.insert(addr.clone(), *id);
+            }
         }
     }
 
-    /// Drop pools (and address mappings) for nodes that are absent from —
-    /// or advertised dead in — the adopted map, so a pruned node cannot
-    /// keep winning future refreshes. Returns the removed pools; the caller
-    /// closes them outside the lock. In-flight requests holding an `Arc`
-    /// clone keep their pool valid until they finish; `close()` wakes its
-    /// waiters with [`ClientError::PoolClosed`].
-    fn drop_stale_pools(&self, alive_ids: &std::collections::HashSet<u64>) -> Vec<Arc<ConnPool>> {
+    /// Drop pools (and address mappings) for nodes that are neither
+    /// advertised alive nor master any shard in the adopted map, so a
+    /// pruned node cannot keep winning future refreshes. Returns the
+    /// removed pools; the caller hands them to [`close_after_grace`].
+    fn drop_stale_pools(&self, routable: &HashSet<u64>) -> Vec<Arc<ConnPool>> {
         let mut removed = Vec::new();
         {
             let mut pools = self.pools.write();
             pools.retain(|id, pool| {
-                if alive_ids.contains(id) {
+                if routable.contains(id) {
                     true
                 } else {
                     removed.push(Arc::clone(pool));
@@ -245,51 +262,135 @@ impl Cluster {
         }
         self.addr_to_node
             .write()
-            .retain(|_, id| alive_ids.contains(id));
+            .retain(|_, id| routable.contains(id));
         removed
     }
 
-    /// Bootstrap the cluster by connecting to seed nodes and fetching the
-    /// initial partition map.
-    async fn bootstrap_from_seeds(&self) -> Result<(), ClientError> {
-        let mut last_err = None;
+    /// Install an adopted partition map: create pools for its routable
+    /// nodes, swap the map in, and prune pools the map no longer references.
+    ///
+    /// Ordering: new pools are created BEFORE the map swap (so the new map
+    /// never routes to a missing pool) and stale pools are dropped AFTER it
+    /// (so the old map never routes to a dropped pool).
+    ///
+    /// Two guards apply:
+    /// - Monotonic install: a map older than the currently-installed one is
+    ///   refused (the poll's best answer can still be stale when only stale
+    ///   nodes answered this round). Same-process only — this is not a
+    ///   cross-rebuild fence; a restarted client starts from scratch.
+    /// - Uncorroborated maps: a multi-node map advertising NO alive node
+    ///   besides its source (a just-restarted node's cold SWIM table says
+    ///   everyone-else-dead while it may hold the highest term) is adopted,
+    ///   but the drop phase is skipped so the client keeps its channels to
+    ///   the rest of the cluster until a corroborated map arrives.
+    fn adopt_map(&self, source_addr: &str, pm: PartitionMap) {
+        let routable = Self::routable_ids(&pm);
+        let alive_count = pm.nodes.iter().filter(|n| n.is_alive).count();
+        let uncorroborated = pm.nodes.len() > 1 && alive_count <= 1;
 
-        for addr in &self.config.seeds {
-            let pool = ConnPool::new(addr.clone(), self.config.pool_config.clone());
-            let pm = match self.fetch_map_from_pool(&pool).await {
-                Ok(pm) => pm,
-                Err(e) => {
-                    pool.close().await;
-                    last_err = Some(e);
-                    continue;
-                }
-            };
+        // Log partition map details (and which node's map won) for debugging.
+        let unique_masters: std::collections::BTreeSet<u64> =
+            pm.assignments.iter().copied().collect();
+        let node_ids: std::collections::BTreeSet<u64> =
+            pm.nodes.iter().map(|node| node.id).collect();
+        let dangling_masters: Vec<u64> = unique_masters
+            .iter()
+            .copied()
+            .filter(|master| !node_ids.contains(master))
+            .collect();
+        tracing::debug!(
+            version = pm.version,
+            nodes = pm.nodes.len(),
+            ?node_ids,
+            ?unique_masters,
+            ?dangling_masters,
+            uncorroborated,
+            source = %source_addr,
+            "client: refreshed partition map (freshest of all answering nodes)",
+        );
 
-            // Set up pools for the alive nodes in the partition map.
-            self.ensure_pools_for_alive_nodes(&pm);
-
-            *self.part_map.write() = Some(pm);
-
-            // Close bootstrap pool if it's not one of the known nodes.
-            let found = self
-                .part_map
-                .read()
-                .as_ref()
-                .map(|pm| pm.nodes.iter().any(|n| n.addr == *addr))
-                .unwrap_or(false);
-            if !found {
-                pool.close().await;
+        // Monotonic pre-check (cheap, before creating any pools) …
+        {
+            let guard = self.part_map.read();
+            if guard.as_ref().is_some_and(|cur| cur.version > pm.version) {
+                self.refuse_older_map(guard.as_ref().map(|cur| cur.version), pm.version);
+                return;
             }
-
-            return Ok(());
         }
 
-        Err(ClientError::Connection(format!(
-            "failed to connect to any seed: {}",
-            last_err
-                .map(|e| e.to_string())
-                .unwrap_or_else(|| "no seeds provided".to_string())
-        )))
+        self.ensure_pools_for_routable_nodes(&pm, &routable);
+
+        // … and the authoritative check under the write lock.
+        {
+            let mut guard = self.part_map.write();
+            if guard.as_ref().is_some_and(|cur| cur.version > pm.version) {
+                let installed = guard.as_ref().map(|cur| cur.version);
+                drop(guard);
+                self.refuse_older_map(installed, pm.version);
+                return;
+            }
+            *guard = Some(pm);
+        }
+
+        if !uncorroborated {
+            for pool in self.drop_stale_pools(&routable) {
+                close_after_grace(pool);
+            }
+        }
+        self.refresh_epoch.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Record a refused (older-than-installed) map: the freshest known map
+    /// stays installed, and queued refreshers must not re-poll for it.
+    fn refuse_older_map(&self, installed: Option<u64>, offered: u64) {
+        tracing::debug!(
+            ?installed,
+            offered,
+            "client: refusing to install an older partition map",
+        );
+        self.refresh_epoch.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Bootstrap the cluster by polling EVERY seed node concurrently and
+    /// adopting the highest-version partition map among the answers.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError::Connection`] if no seed answers with a valid
+    /// partition map.
+    async fn bootstrap_from_seeds(&self) -> Result<(), ClientError> {
+        let secret = self.config.cluster_secret.clone().filter(|s| !s.is_empty());
+        let sources: Vec<(String, Arc<ConnPool>)> = self
+            .config
+            .seeds
+            .iter()
+            .map(|seed| {
+                (
+                    seed.clone(),
+                    Arc::new(ConnPool::new(seed.clone(), self.config.pool_config.clone())),
+                )
+            })
+            .collect();
+        let throwaway: Vec<Arc<ConnPool>> = sources.iter().map(|(_, p)| Arc::clone(p)).collect();
+        let (answers, last_err) = poll_sources(sources, secret).await;
+        // The bootstrap pools are throwaway: registered nodes get their own
+        // fresh pools from `adopt_map`, so close them all (nothing is in
+        // flight on them once the poll returns).
+        for pool in throwaway {
+            pool.close().await;
+        }
+
+        let Some((source_addr, pm)) = select_freshest(answers) else {
+            return Err(ClientError::Connection(format!(
+                "failed to connect to any seed: {}",
+                last_err
+                    .map(|e| e.to_string())
+                    .unwrap_or_else(|| "no seeds provided".to_string())
+            )));
+        };
+
+        self.adopt_map(&source_addr, pm);
+        Ok(())
     }
 
     /// Return the connection pool for the node that owns the given txid's shard.
@@ -314,7 +415,11 @@ impl Cluster {
             ));
         }
 
-        if let Some(node_id) = self.addr_to_node.read().get(addr).copied()
+        // Copy the id out first so the `addr_to_node` read guard is dropped
+        // before `pools` is locked — the pool-sync writers touch the same
+        // two locks and must never be part of a nested opposite-order pair.
+        let known_id = self.addr_to_node.read().get(addr).copied();
+        if let Some(node_id) = known_id
             && let Some(pool) = self.pools.read().get(&node_id)
         {
             return Ok(pool.clone());
@@ -407,60 +512,79 @@ impl Cluster {
         })
     }
 
-    /// Refresh the partition map by polling EVERY known node and adopting
-    /// the highest-version map.
+    /// Refresh the partition map by polling EVERY known node concurrently
+    /// and adopting the highest-version map.
     ///
     /// The topology version is globally monotonic, so the highest version is
     /// the freshest cluster view. Polling all pools (instead of returning on
     /// the first answer) prevents a stale minority-side node — still
     /// reachable from the client even though the majority has fenced it —
     /// from pinning the client to its pre-partition shard table on every
-    /// refresh. Individual pool failures are tolerated; pools for nodes the
-    /// adopted map no longer lists as alive are dropped so a pruned node
-    /// cannot win a future refresh.
+    /// refresh. The poll fans out concurrently, so the inline cost is
+    /// bounded by the slowest single node (~one dial timeout for a
+    /// blackholed peer), not the sum over dead nodes.
+    ///
+    /// Refreshes are single-flight: concurrent callers queue behind the
+    /// in-flight one and return as soon as it has adopted a map, instead of
+    /// racing their own poll/install rounds (which could reinstate a stale
+    /// map by interleaving). Installs are additionally monotonic in-process
+    /// (see [`Self::adopt_map`]).
+    ///
+    /// Individual pool failures are tolerated; pools for nodes the adopted
+    /// map neither advertises alive nor assigns shards to are dropped so a
+    /// pruned node cannot win a future refresh.
     ///
     /// # Errors
     ///
     /// Returns an error only if no node (nor seed) could provide a valid
     /// partition map.
     pub async fn refresh_partition_map(&self) -> Result<(), ClientError> {
-        let pools: Vec<Arc<ConnPool>> = {
-            let pools = self.pools.read();
-            pools.values().cloned().collect()
-        };
-
-        let mut best: Option<(String, PartitionMap)> = None;
-        let mut last_err = None;
-
-        for pool in &pools {
-            match self.fetch_map_from_pool(pool).await {
-                Ok(pm) => {
-                    if best.as_ref().is_none_or(|(_, b)| pm.version > b.version) {
-                        best = Some((pool.addr().to_string(), pm));
-                    }
-                }
-                Err(e) => last_err = Some(e),
-            }
+        // Single-flight: if a refresh completed while we waited for the
+        // lock, its result is fresher than anything we could poll now.
+        let epoch_before = self.refresh_epoch.load(Ordering::Acquire);
+        let _flight = self.refresh_lock.lock().await;
+        if self.refresh_epoch.load(Ordering::Acquire) != epoch_before {
+            return Ok(());
         }
+
+        let secret = self.config.cluster_secret.clone().filter(|s| !s.is_empty());
+
+        let sources: Vec<(String, Arc<ConnPool>)> = {
+            let pools = self.pools.read();
+            pools
+                .values()
+                .map(|p| (p.addr().to_string(), Arc::clone(p)))
+                .collect()
+        };
+        let (answers, mut last_err) = poll_sources(sources, secret.clone()).await;
+        let mut best = select_freshest(answers);
 
         // All known pools failed — fall back to seed nodes, again adopting
         // the highest version among the answers. This handles the case where
         // all cached pools point to dead nodes but the surviving nodes are
         // reachable via the original seeds.
         if best.is_none() {
-            for seed in &self.config.seeds {
-                let pool = ConnPool::new(seed.clone(), self.config.pool_config.clone());
-                let res = self.fetch_map_from_pool(&pool).await;
+            let seed_sources: Vec<(String, Arc<ConnPool>)> = self
+                .config
+                .seeds
+                .iter()
+                .map(|seed| {
+                    (
+                        seed.clone(),
+                        Arc::new(ConnPool::new(seed.clone(), self.config.pool_config.clone())),
+                    )
+                })
+                .collect();
+            let throwaway: Vec<Arc<ConnPool>> =
+                seed_sources.iter().map(|(_, p)| Arc::clone(p)).collect();
+            let (answers, seed_err) = poll_sources(seed_sources, secret).await;
+            for pool in throwaway {
                 pool.close().await;
-                match res {
-                    Ok(pm) => {
-                        if best.as_ref().is_none_or(|(_, b)| pm.version > b.version) {
-                            best = Some((seed.clone(), pm));
-                        }
-                    }
-                    Err(e) => last_err = Some(e),
-                }
             }
+            if seed_err.is_some() {
+                last_err = seed_err;
+            }
+            best = select_freshest(answers);
         }
 
         let Some((source_addr, pm)) = best else {
@@ -472,41 +596,7 @@ impl Cluster {
             )));
         };
 
-        // Log partition map details (and which node's map won) for debugging.
-        let unique_masters: std::collections::BTreeSet<u64> =
-            pm.assignments.iter().copied().collect();
-        let node_ids: std::collections::BTreeSet<u64> =
-            pm.nodes.iter().map(|node| node.id).collect();
-        let dangling_masters: Vec<u64> = unique_masters
-            .iter()
-            .copied()
-            .filter(|master| !node_ids.contains(master))
-            .collect();
-        tracing::debug!(
-            version = pm.version,
-            nodes = pm.nodes.len(),
-            ?node_ids,
-            ?unique_masters,
-            ?dangling_masters,
-            source = %source_addr,
-            "client: refreshed partition map (freshest of all answering nodes)",
-        );
-
-        // Create pools for newly-alive nodes BEFORE swapping the map in (so
-        // the new map never routes to a missing pool), and drop stale pools
-        // AFTER (so the old map never routes to a dropped pool).
-        self.ensure_pools_for_alive_nodes(&pm);
-        let alive_ids: std::collections::HashSet<u64> = pm
-            .nodes
-            .iter()
-            .filter(|n| n.is_alive)
-            .map(|n| n.id)
-            .collect();
-        *self.part_map.write() = Some(pm);
-        let stale = self.drop_stale_pools(&alive_ids);
-        for pool in stale {
-            pool.close().await;
-        }
+        self.adopt_map(&source_addr, pm);
         Ok(())
     }
 
@@ -526,12 +616,106 @@ impl Cluster {
 }
 
 // ---------------------------------------------------------------------------
+// Partition map polling
+// ---------------------------------------------------------------------------
+
+/// Fetch and decode the partition map from a single pool.
+///
+/// # Errors
+///
+/// Returns [`ClientError::Connection`] if no connection can be obtained, or
+/// [`ClientError::Protocol`] on a non-OK status or a malformed map.
+async fn fetch_map(pool: &ConnPool, secret: Option<&[u8]>) -> Result<PartitionMap, ClientError> {
+    let conn = pool.get().await?;
+
+    // Strict-auth clusters require the whole inter-node frame to be
+    // HMAC-signed (request_id||op||flags||payload); sign via the server's
+    // own sign_frame so it verifies byte-for-byte. Unsecured clusters send
+    // it unsigned (trusted-overlay default).
+    let resp = match secret {
+        Some(s) => {
+            conn.round_trip_signed(OP_GET_PARTITION_MAP, 0, Vec::new(), s)
+                .await?
+        }
+        None => conn.round_trip(OP_GET_PARTITION_MAP, 0, Vec::new()).await?,
+    };
+
+    if resp.status != STATUS_OK {
+        return Err(ClientError::Protocol(format!(
+            "partition map: status {}",
+            resp.status
+        )));
+    }
+    decode_partition_map(&resp.payload)
+}
+
+/// Concurrently fetch the partition map from every `(label, pool)` source.
+///
+/// Returns every successful `(label, map)` answer plus the last error seen
+/// (for diagnostics when nothing answered). Fanning out bounds the inline
+/// cost to the slowest single source instead of the sum over dead peers.
+async fn poll_sources(
+    sources: Vec<(String, Arc<ConnPool>)>,
+    secret: Option<Vec<u8>>,
+) -> (Vec<(String, PartitionMap)>, Option<ClientError>) {
+    let mut set = tokio::task::JoinSet::new();
+    for (label, pool) in sources {
+        let secret = secret.clone();
+        set.spawn(async move {
+            let res = fetch_map(&pool, secret.as_deref()).await;
+            (label, res)
+        });
+    }
+    let mut answers = Vec::new();
+    let mut last_err = None;
+    while let Some(joined) = set.join_next().await {
+        match joined {
+            Ok((label, Ok(pm))) => answers.push((label, pm)),
+            Ok((_, Err(e))) => last_err = Some(e),
+            Err(e) => last_err = Some(ClientError::Connection(format!("map poll task: {e}"))),
+        }
+    }
+    (answers, last_err)
+}
+
+/// Select the answer with the highest map version (the topology term is
+/// globally monotonic, so the highest version is the freshest view). Ties
+/// keep the first answer seen; a committed term never has two different
+/// tables, so equal versions should carry identical maps. Returns `None`
+/// for no answers.
+fn select_freshest(answers: Vec<(String, PartitionMap)>) -> Option<(String, PartitionMap)> {
+    let mut best: Option<(String, PartitionMap)> = None;
+    for (label, pm) in answers {
+        if best.as_ref().is_none_or(|(_, b)| pm.version > b.version) {
+            best = Some((label, pm));
+        }
+    }
+    best
+}
+
+/// Close a pruned pool AFTER one request-timeout grace period.
+///
+/// `ConnPool::close` clears every connection's pending map, so a waiter
+/// still in flight gets `Connection("connection closed")` even though the
+/// server may still apply the request — an ambiguous outcome for mutations
+/// already on the wire. The grace lets everything that was in flight at
+/// prune time either complete or hit its own request timeout first.
+/// Best-effort: a request started from a stale `all_pools()` snapshot just
+/// before the grace expires can still be aborted.
+fn close_after_grace(pool: Arc<ConnPool>) {
+    tokio::spawn(async move {
+        tokio::time::sleep(pool.request_timeout()).await;
+        pool.close().await;
+    });
+}
+
+// ---------------------------------------------------------------------------
 // Partition map decoding
 // ---------------------------------------------------------------------------
 
 /// Decode a partition map from a response payload.
 ///
-/// Format: `[version:8][node_count:4][nodes: id(8)+addr_len(2)+addr x count][assignments: 4096 x 8]`
+/// Format: `[version:8][node_count:4][nodes: id(8)+addr_len(2)+addr+is_alive(1) x count][assignments: 4096 x 8]`
 ///
 /// # Errors
 ///
@@ -558,25 +742,19 @@ pub(crate) fn decode_partition_map(data: &[u8]) -> Result<PartitionMap, ClientEr
         let node_id = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
         let addr_len = u16::from_le_bytes(data[pos + 8..pos + 10].try_into().unwrap()) as usize;
         pos += 10;
-        if pos + addr_len > data.len() {
+        // Each node entry carries addr + a REQUIRED is_alive byte (the
+        // server advertises 0 for nodes its failure detector has declared
+        // dead, C21) — mirror the server's `RoutingInfo::decode` strictness.
+        if pos + addr_len + 1 > data.len() {
             return Err(ClientError::Protocol(format!(
-                "partition map: truncated node addr {}",
+                "partition map: truncated node {} (addr + is_alive)",
                 i
             )));
         }
         let addr = String::from_utf8_lossy(&data[pos..pos + addr_len]).to_string();
         pos += addr_len;
-        // is_alive byte (part of the RoutingInfo wire format): the server
-        // advertises 0 for nodes its failure detector has declared dead
-        // (C21). Tolerate its absence by defaulting to alive, matching the
-        // previous lenient skip.
-        let is_alive = if pos < data.len() {
-            let alive = data[pos] != 0;
-            pos += 1;
-            alive
-        } else {
-            true
-        };
+        let is_alive = data[pos] != 0;
+        pos += 1;
         nodes.push(NodeInfo {
             id: node_id,
             addr,
@@ -704,17 +882,28 @@ mod tests {
 
     /// In-process mock node: answers every `OP_GET_PARTITION_MAP` with the
     /// current contents of `payload` (swappable mid-test) and any other op
-    /// with an empty OK. `kill()` drops the listener and every accepted
-    /// socket so the node becomes fully unreachable.
+    /// with an empty OK. Counts served map fetches and can delay each map
+    /// response (for the single-flight test). `kill()` drops the listener
+    /// and every accepted socket so the node becomes fully unreachable.
     struct MapServer {
         addr: String,
         payload: Arc<RwLock<Vec<u8>>>,
+        fetches: Arc<std::sync::atomic::AtomicUsize>,
+        delay: Arc<RwLock<Duration>>,
         kill_tx: tokio::sync::watch::Sender<bool>,
     }
 
     impl MapServer {
         fn set_map(&self, map: Vec<u8>) {
             *self.payload.write() = map;
+        }
+
+        fn set_delay(&self, delay: Duration) {
+            *self.delay.write() = delay;
+        }
+
+        fn fetches(&self) -> usize {
+            self.fetches.load(std::sync::atomic::Ordering::SeqCst)
         }
 
         fn kill(&self) {
@@ -727,8 +916,12 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
         let payload: Arc<RwLock<Vec<u8>>> = Arc::new(RwLock::new(Vec::new()));
+        let fetches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let delay: Arc<RwLock<Duration>> = Arc::new(RwLock::new(Duration::ZERO));
         let (kill_tx, kill_rx) = tokio::sync::watch::channel(false);
         let served = Arc::clone(&payload);
+        let fetch_ctr = Arc::clone(&fetches);
+        let serve_delay = Arc::clone(&delay);
         let mut accept_kill = kill_rx.clone();
         tokio::spawn(async move {
             loop {
@@ -741,6 +934,8 @@ mod tests {
                     Err(_) => return,
                 };
                 let served = Arc::clone(&served);
+                let fetch_ctr = Arc::clone(&fetch_ctr);
+                let serve_delay = Arc::clone(&serve_delay);
                 let mut conn_kill = kill_rx.clone();
                 tokio::spawn(async move {
                     loop {
@@ -763,7 +958,14 @@ mod tests {
                         let request_id = u64::from_le_bytes(body[0..8].try_into().unwrap());
                         let op_code = u16::from_le_bytes([body[8], body[9]]);
                         let resp_payload = match op_code {
-                            OP_GET_PARTITION_MAP => served.read().clone(),
+                            OP_GET_PARTITION_MAP => {
+                                fetch_ctr.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                let pause = *serve_delay.read();
+                                if pause > Duration::ZERO {
+                                    tokio::time::sleep(pause).await;
+                                }
+                                served.read().clone()
+                            }
                             _ => Vec::new(),
                         };
                         // Response frame: [inner_len:4][request_id:8][status:1][payload].
@@ -782,6 +984,8 @@ mod tests {
         MapServer {
             addr,
             payload,
+            fetches,
+            delay,
             kill_tx,
         }
     }
@@ -980,6 +1184,284 @@ mod tests {
             );
         }
         cluster2.close().await;
+        s1.kill();
+        s2.kill();
+        s3.kill();
+    }
+
+    /// The freshest-map selection is a pure function; drive BOTH answer
+    /// orders deterministically (the integration test can only randomize
+    /// pool iteration order probabilistically).
+    #[test]
+    fn select_freshest_is_order_independent() {
+        let map = |version: u64| {
+            decode_partition_map(&encode_map(version, &[(1, "10.0.0.1:3300", true)], &[1]))
+                .expect("test map must decode")
+        };
+        let stale = map(2);
+        let fresh = map(3);
+        for answers in [
+            vec![
+                ("a".to_string(), stale.clone()),
+                ("b".to_string(), fresh.clone()),
+            ],
+            vec![
+                ("b".to_string(), fresh.clone()),
+                ("a".to_string(), stale.clone()),
+            ],
+        ] {
+            let (label, pm) = select_freshest(answers).expect("two answers must select one");
+            assert_eq!(pm.version, 3, "the highest version must win in any order");
+            assert_eq!(label, "b", "the winner's label must identify its source");
+        }
+        // Ties keep the first answer seen (equal committed versions carry
+        // identical maps).
+        let (label, pm) = select_freshest(vec![
+            ("a".to_string(), fresh.clone()),
+            ("b".to_string(), fresh),
+        ])
+        .expect("tie must still select");
+        assert_eq!(pm.version, 3);
+        assert_eq!(label, "a", "a version tie keeps the first answer");
+        assert!(
+            select_freshest(Vec::new()).is_none(),
+            "no answers must select nothing",
+        );
+    }
+
+    /// The is_alive byte is REQUIRED (mirrors the server's
+    /// `RoutingInfo::decode`): a node entry ending exactly after its addr
+    /// must be rejected as truncated, not silently defaulted.
+    #[test]
+    fn decode_partition_map_requires_is_alive_byte() {
+        let mut p = Vec::new();
+        p.extend_from_slice(&1u64.to_le_bytes()); // version
+        p.extend_from_slice(&1u32.to_le_bytes()); // node_count
+        p.extend_from_slice(&1u64.to_le_bytes()); // node id
+        p.extend_from_slice(&4u16.to_le_bytes()); // addr_len
+        p.extend_from_slice(b"a:12"); // addr, then NO is_alive byte
+        let err = decode_partition_map(&p).expect_err("a missing is_alive byte must be rejected");
+        match err {
+            ClientError::Protocol(msg) => assert!(
+                msg.contains("truncated node"),
+                "error must identify the truncated node entry, got: {msg}",
+            ),
+            other => panic!("want ClientError::Protocol, got {other:?}"),
+        }
+    }
+
+    /// Finding 1 (P0): the server's `is_alive` derives from its STRICTLY-
+    /// Alive SWIM view (Suspect excluded) while `assignments` come from the
+    /// committed table — a suspected node can be advertised dead while
+    /// still mastering shards for the whole suspicion window. Its pool must
+    /// be created/retained: dropping it turns every request to ~1/N of the
+    /// shards into a non-retryable "no pool for node" error.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dead_advertised_master_keeps_its_pool() {
+        let s1 = spawn_map_server().await;
+        let s2 = spawn_map_server().await;
+        let s3 = spawn_map_server().await;
+        let all_alive_v2 = encode_map(
+            2,
+            &[
+                (1, &s1.addr, true),
+                (2, &s2.addr, true),
+                (3, &s3.addr, true),
+            ],
+            &[1, 2, 3],
+        );
+        for s in [&s1, &s2, &s3] {
+            s.set_map(all_alive_v2.clone());
+        }
+        let cluster = new_test_cluster(vec![s1.addr.clone()]).await;
+
+        // Node 3 becomes Suspect: advertised dead, but the committed table
+        // still assigns it shards.
+        let suspect3_v3 = encode_map(
+            3,
+            &[
+                (1, &s1.addr, true),
+                (2, &s2.addr, true),
+                (3, &s3.addr, false),
+            ],
+            &[1, 2, 3],
+        );
+        for s in [&s1, &s2, &s3] {
+            s.set_map(suspect3_v3.clone());
+        }
+        cluster
+            .refresh_partition_map()
+            .await
+            .expect("refresh must succeed");
+        assert_eq!(cluster.cached_partition_map().expect("cached").version, 3);
+        assert!(
+            cluster.pools.read().contains_key(&3),
+            "a dead-advertised node still mastering shards must keep its pool",
+        );
+        // Shard 2 is round-robined to node 3; routing must still work.
+        let pool = cluster
+            .pool_for_shard(2)
+            .expect("shard 2 must stay routable");
+        assert_eq!(pool.addr(), s3.addr, "shard 2 must route to node 3's pool");
+        cluster.close().await;
+
+        // A fresh bootstrap straight into the suspect map must also create
+        // the mastering node's pool.
+        let cluster2 = new_test_cluster(vec![s1.addr.clone()]).await;
+        assert!(
+            cluster2.pools.read().contains_key(&3),
+            "bootstrap must create a pool for a dead-advertised node that masters shards",
+        );
+        cluster2.close().await;
+        s1.kill();
+        s2.kill();
+        s3.kill();
+    }
+
+    /// Finding 2 (P0): a just-restarted node can hold the HIGHEST topology
+    /// version while its SWIM table still marks every peer dead. Such a map
+    /// (multi-node, no alive node besides its source) is adopted — the
+    /// version is authoritative — but treated as UNCORROBORATED: the drop
+    /// phase is skipped so the client keeps its channels to the rest of
+    /// the cluster instead of pruning down to the lone survivor.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn lone_survivor_map_is_adopted_but_drops_no_pools() {
+        let s1 = spawn_map_server().await;
+        let s2 = spawn_map_server().await;
+        let s3 = spawn_map_server().await;
+        let all_alive_v2 = encode_map(
+            2,
+            &[
+                (1, &s1.addr, true),
+                (2, &s2.addr, true),
+                (3, &s3.addr, true),
+            ],
+            &[1, 2, 3],
+        );
+        for s in [&s1, &s2, &s3] {
+            s.set_map(all_alive_v2.clone());
+        }
+        let cluster = new_test_cluster(vec![s1.addr.clone()]).await;
+
+        // Node 1 restarts with a higher term but a cold SWIM table: only
+        // itself alive, all shards self-assigned. Nodes 2 and 3 still serve
+        // the older map.
+        let lone_v9 = encode_map(
+            9,
+            &[
+                (1, &s1.addr, true),
+                (2, &s2.addr, false),
+                (3, &s3.addr, false),
+            ],
+            &[1],
+        );
+        s1.set_map(lone_v9);
+        cluster
+            .refresh_partition_map()
+            .await
+            .expect("refresh must succeed");
+        assert_eq!(
+            cluster.cached_partition_map().expect("cached").version,
+            9,
+            "the highest version wins adoption",
+        );
+        {
+            let pools = cluster.pools.read();
+            for id in [1u64, 2, 3] {
+                assert!(
+                    pools.contains_key(&id),
+                    "an uncorroborated lone-survivor map must not prune pool {id}",
+                );
+            }
+        }
+        cluster.close().await;
+        s1.kill();
+        s2.kill();
+        s3.kill();
+    }
+
+    /// Finding 3 (P1, monotonic half): once a map is installed, a refresh
+    /// whose best answer is OLDER (e.g. only stale nodes answered this
+    /// round) must not replace it. Same-process only — a client restart
+    /// starts from scratch.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn refresh_never_installs_an_older_map() {
+        let s1 = spawn_map_server().await;
+        let s2 = spawn_map_server().await;
+        let fresh_v3 = encode_map(3, &[(1, &s1.addr, true), (2, &s2.addr, true)], &[1, 2]);
+        let stale_v2 = encode_map(2, &[(1, &s1.addr, true), (2, &s2.addr, true)], &[1, 2]);
+        s1.set_map(fresh_v3.clone());
+        s2.set_map(fresh_v3);
+        let cluster = new_test_cluster(vec![s1.addr.clone()]).await;
+        assert_eq!(cluster.cached_partition_map().expect("cached").version, 3);
+
+        // Every node now answers with an older map (e.g. a stale minority
+        // is the only thing left answering).
+        s1.set_map(stale_v2.clone());
+        s2.set_map(stale_v2);
+        cluster
+            .refresh_partition_map()
+            .await
+            .expect("refresh must still succeed");
+        assert_eq!(
+            cluster.cached_partition_map().expect("cached").version,
+            3,
+            "an older map must never replace a newer one in-process",
+        );
+        cluster.close().await;
+        s1.kill();
+        s2.kill();
+    }
+
+    /// Finding 3 (P1, single-flight half): concurrent refreshes must not
+    /// each run their own poll round (interleaved installs could reinstate
+    /// a stale map by pure concurrency). Callers that queued behind an
+    /// in-flight refresh adopt its result instead of re-polling — with a
+    /// 100ms per-fetch delay, 8 concurrent refreshes over 3 nodes must
+    /// serve far fewer than the unguarded 8 x 3 = 24 fetches.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_refreshes_are_single_flight() {
+        let s1 = spawn_map_server().await;
+        let s2 = spawn_map_server().await;
+        let s3 = spawn_map_server().await;
+        let v3 = encode_map(
+            3,
+            &[
+                (1, &s1.addr, true),
+                (2, &s2.addr, true),
+                (3, &s3.addr, true),
+            ],
+            &[1, 2, 3],
+        );
+        for s in [&s1, &s2, &s3] {
+            s.set_map(v3.clone());
+        }
+        let cluster = Arc::new(new_test_cluster(vec![s1.addr.clone()]).await);
+        let baseline: usize = [&s1, &s2, &s3].iter().map(|s| s.fetches()).sum();
+        for s in [&s1, &s2, &s3] {
+            s.set_delay(Duration::from_millis(100));
+        }
+
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let cl = Arc::clone(&cluster);
+            handles.push(tokio::spawn(
+                async move { cl.refresh_partition_map().await },
+            ));
+        }
+        for h in handles {
+            h.await
+                .expect("refresh task must not panic")
+                .expect("concurrent refresh must succeed");
+        }
+
+        let total: usize = [&s1, &s2, &s3].iter().map(|s| s.fetches()).sum::<usize>() - baseline;
+        assert!(
+            total <= 9,
+            "concurrent refreshes must single-flight (served {total} map fetches, unguarded would be 24)",
+        );
+        assert_eq!(cluster.cached_partition_map().expect("cached").version, 3);
+        cluster.close().await;
         s1.kill();
         s2.kill();
         s3.kill();

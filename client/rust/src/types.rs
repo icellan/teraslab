@@ -868,7 +868,11 @@ pub struct PartitionMap {
 }
 
 /// Describes a single node in the cluster.
+///
+/// Non-exhaustive: decoded from the server's partition-map wire format,
+/// which may grow fields; construct only via the client's decode path.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct NodeInfo {
     /// Unique node identifier.
     pub id: u64,
