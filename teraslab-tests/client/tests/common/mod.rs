@@ -554,47 +554,73 @@ pub async fn wait_specific_migrations_complete(
     }
 }
 
-/// One node's committed-topology view, as read from `/status`.
+/// One node's ACTIVATION-time shard view, as read from `/status`.
 ///
-/// `version` is the node's `shard_table_version`, which the server derives
-/// from the committed topology term (see `ClusterCoordinator::shard_table_version`),
-/// so two nodes that committed the same term always report the same value.
-/// `members` is that term's `committed_members` list.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct NodeTopologyView {
+/// `serving_masters` is `master_shard_count` — shards this node currently
+/// answers for, i.e. `ShardTable::effective_assignment`, which stays on the
+/// OLD owner for any shard still in handoff. `target_masters` is
+/// `target_master_shard_count` — `ShardTable::target_assignment`, the table
+/// this node has actually ACTIVATED.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct NodeShardView {
     /// 1-based node number the view was polled from.
     node: u32,
-    /// Committed topology term / shard-table version.
-    version: u64,
-    /// Node ids in the committed term's membership.
-    members: Vec<u64>,
+    /// Shards this node is serving as master right now.
+    serving_masters: u64,
+    /// Shards this node's activated table says it should master.
+    target_masters: u64,
 }
 
-/// Decide whether the polled `/status` views can describe a settled
-/// `node_count`-member cluster.
+/// Decide whether the polled `/status` views describe a fully ACTIVATED and
+/// settled shard table.
 ///
 /// The migration gate's master-count condition (`sum == 4096`) is satisfied
 /// by the topology that came BEFORE a membership change just as well as by
 /// the one that follows it: right after a 4th node joins a 3-node cluster,
-/// `1366 + 1365 + 1365 + 0 == 4096` holds while the new node still has no
-/// shards and no migration plan exists anywhere. That is exactly how a
-/// scale-up scenario's "wait for migrations" returned in 0.17s and let the
-/// shard-balance assertion read the pre-scale-up distribution.
+/// `1366 + 1365 + 1365 + 0 == 4096` holds while the new node still serves
+/// nothing. That is how a scale-up scenario's "wait for migrations" returned
+/// in 0.17s and let the shard-balance assertion read the pre-scale-up
+/// distribution.
 ///
-/// Returns `None` when every polled node reports the same non-zero committed
-/// term and that term's membership has exactly `node_count` entries.
-/// Otherwise returns the reason the gate is being held, including the
-/// per-node version/member dump so a timeout is self-explanatory.
+/// The commit-time predicates cannot close that race, and checking them here
+/// would be a no-op: `wait_cluster_ready` already runs before these waits and
+/// already pins `cluster_size == node_count` (which is
+/// `alive_node_count()` — committed ∩ alive, so it implies the new member
+/// list is committed) plus cross-node agreement on `shard_table_version`
+/// (which IS the committed topology term). The window that stays open is
+/// commit → ACTIVATION: a multi-node commit spawns a 2000ms exchange phase
+/// and only activates the new table when that reports back
+/// (`src/cluster/coordinator.rs`, "Phase D"), so a newcomer can be a
+/// committed member, at the agreed term, while its shard counts still
+/// describe the previous table. Only activation-time observables can see it:
+///
+/// 1. `target_masters > 0` on every node (for `node_count > 1`) — a
+///    committed-but-not-yet-activated newcomer reports `target = 0`.
+/// 2. `serving_masters == target_masters` on every node — serving has caught
+///    up with the activated table. Completion-gated handoffs move serving
+///    masters onto the newcomer one shard at a time while the SUM stays at
+///    4096 the whole way, so the sum check cannot see that window at all.
+///    (The existing per-node `pending_handoff_shards == 0` term covers the
+///    same ground whenever that field is present; this clause also holds for
+///    the `/status` shape that omits it, where the handoff term silently
+///    contributes nothing.)
+///
+/// Returns `None` when both hold for every polled node, otherwise the reason
+/// the gate is being held, including the per-node serving/target dump so a
+/// timeout is self-explanatory.
 ///
 /// Nodes that did not answer `/status` contribute no view — same as the
-/// master-count sum, which cannot see them either. That is deliberate: a
-/// stale membership is still caught, because every REACHABLE node must
-/// already carry the post-change member list.
-fn topology_gate_reason(views: &[NodeTopologyView], node_count: u32) -> Option<String> {
+/// master-count sum, which cannot see them either.
+fn shard_activation_gate_reason(views: &[NodeShardView], node_count: u32) -> Option<String> {
     let detail = || {
         views
             .iter()
-            .map(|v| format!("node{}:ver={},members={:?}", v.node, v.version, v.members))
+            .map(|v| {
+                format!(
+                    "node{}:serving={},target={}",
+                    v.node, v.serving_masters, v.target_masters
+                )
+            })
             .collect::<Vec<_>>()
             .join(", ")
     };
@@ -602,31 +628,23 @@ fn topology_gate_reason(views: &[NodeTopologyView], node_count: u32) -> Option<S
     if views.is_empty() {
         return Some("no node answered /status".to_string());
     }
-    if let Some(v) = views.iter().find(|v| v.version == 0) {
-        return Some(format!(
-            "node{} has not committed a topology term yet [{}]",
-            v.node,
-            detail()
-        ));
-    }
-    let first = views[0].version;
-    if let Some(v) = views.iter().find(|v| v.version != first) {
-        return Some(format!(
-            "node{} is on shard table version {} while node{} is on {first} [{}]",
-            v.node,
-            v.version,
-            views[0].node,
-            detail()
-        ));
-    }
-    if let Some(v) = views
-        .iter()
-        .find(|v| v.members.len() != node_count as usize)
+    if node_count > 1
+        && let Some(v) = views.iter().find(|v| v.target_masters == 0)
     {
         return Some(format!(
-            "node{}'s committed topology has {} member(s), expected {node_count} [{}]",
+            "node{} has activated no master shards (target=0), so the current \
+             shard table predates this membership [{}]",
             v.node,
-            v.members.len(),
+            detail()
+        ));
+    }
+    if let Some(v) = views.iter().find(|v| v.serving_masters != v.target_masters) {
+        return Some(format!(
+            "node{} serves {} master shards but its activated table targets {} \
+             (handoff still moving) [{}]",
+            v.node,
+            v.serving_masters,
+            v.target_masters,
             detail()
         ));
     }
@@ -636,9 +654,9 @@ fn topology_gate_reason(views: &[NodeTopologyView], node_count: u32) -> Option<S
 /// Wait until all active migrations complete on all nodes.
 ///
 /// Also waits for shard master counts to sum to 4096 (all shards assigned)
-/// to catch shards stuck in handoff after migration completion, and for the
-/// committed topology itself to describe a `node_count`-member cluster that
-/// every polled node agrees on — see [`topology_gate_reason`] for why the
+/// to catch shards stuck in handoff after migration completion, and for every
+/// polled node to have ACTIVATED the current shard table and finished moving
+/// serving masters onto it — see [`shard_activation_gate_reason`] for why the
 /// master-count sum alone is satisfied by the PREVIOUS topology.
 pub async fn wait_migrations_complete(
     docker: &DockerHelpers,
@@ -655,7 +673,7 @@ pub async fn wait_migrations_complete(
         let mut total_pending_handoffs: u64 = 0;
         let mut total_inbound_pending: u64 = 0;
         let mut node_details = Vec::new();
-        let mut topology_views: Vec<NodeTopologyView> = Vec::new();
+        let mut shard_views: Vec<NodeShardView> = Vec::new();
         for i in 1..=node_count {
             let port = docker.http_port(i);
             let url = format!("http://127.0.0.1:{port}/admin/migration_status");
@@ -683,19 +701,15 @@ pub async fn wait_migrations_complete(
                 let cluster_size = json["cluster_size"].as_u64().unwrap_or(0);
                 let version = json["shard_table_version"].as_u64().unwrap_or(0);
                 let m = json["master_shard_count"].as_u64().unwrap_or(0);
-                let members: Vec<u64> = json["committed_members"]
-                    .as_array()
-                    .map(|a| a.iter().filter_map(|v| v.as_u64()).collect())
-                    .unwrap_or_default();
+                let target_m = json["target_master_shard_count"].as_u64().unwrap_or(0);
                 total_masters += m;
                 node_details.push(format!(
-                    "node{i}:size={cluster_size},ver={version},m={m},committed={}",
-                    members.len()
+                    "node{i}:size={cluster_size},ver={version},m={m},target={target_m}"
                 ));
-                topology_views.push(NodeTopologyView {
+                shard_views.push(NodeShardView {
                     node: i,
-                    version,
-                    members,
+                    serving_masters: m,
+                    target_masters: target_m,
                 });
                 if let Some(h) = json["pending_handoff_shards"].as_u64() {
                     total_pending_handoffs += h;
@@ -707,8 +721,8 @@ pub async fn wait_migrations_complete(
                 node_details.push(format!("node{i}:status-unavailable"));
             }
         }
-        let topology_reason = topology_gate_reason(&topology_views, node_count);
-        let masters_ok = total_masters == 4096 && topology_reason.is_none();
+        let activation_reason = shard_activation_gate_reason(&shard_views, node_count);
+        let masters_ok = total_masters == 4096 && activation_reason.is_none();
         if masters_ok && total_pending_handoffs == 0 && total_inbound_pending == 0 && all_idle {
             ready_polls += 1;
             if ready_polls < 3 {
@@ -726,20 +740,20 @@ pub async fn wait_migrations_complete(
         ready_polls = 0;
         if timing_enabled() && mig_last_log.elapsed() >= Duration::from_secs(2) {
             eprintln!(
-                "  wait_migrations: masters={total_masters}/4096, handoffs={total_pending_handoffs}, inbound={total_inbound_pending}, idle={all_idle}, topology={} ({:.1}s) [{}]",
-                topology_reason.as_deref().unwrap_or("ok"),
+                "  wait_migrations: masters={total_masters}/4096, handoffs={total_pending_handoffs}, inbound={total_inbound_pending}, idle={all_idle}, activation={} ({:.1}s) [{}]",
+                activation_reason.as_deref().unwrap_or("ok"),
                 mig_start.elapsed().as_secs_f64(),
                 node_details.join(", ")
             );
             mig_last_log = std::time::Instant::now();
         }
         if start.elapsed() >= timeout {
-            // The topology reason carries the per-node version/member dump,
-            // so a gate held ONLY by a stale membership names the nodes
+            // The activation reason carries the per-node serving/target dump,
+            // so a gate held ONLY by an unactivated table names the nodes
             // holding it instead of leaving `masters=4096` looking settled.
             return Err(ClientError::Connection(format!(
-                "migrations still active after {timeout:?} [masters={total_masters}/4096, handoffs={total_pending_handoffs}, inbound={total_inbound_pending}, topology={}] [{}]",
-                topology_reason.as_deref().unwrap_or("ok"),
+                "migrations still active after {timeout:?} [masters={total_masters}/4096, handoffs={total_pending_handoffs}, inbound={total_inbound_pending}, activation={}] [{}]",
+                activation_reason.as_deref().unwrap_or("ok"),
                 node_details.join(", ")
             )));
         }
@@ -2792,99 +2806,128 @@ async fn wait_ports_free(first_http_port: u16, _scenario_id: u16, node_count: u3
 mod migration_gate_tests {
     use super::*;
 
-    fn view(node: u32, version: u64, members: &[u64]) -> NodeTopologyView {
-        NodeTopologyView {
+    fn view(node: u32, serving_masters: u64, target_masters: u64) -> NodeShardView {
+        NodeShardView {
             node,
-            version,
-            members: members.to_vec(),
+            serving_masters,
+            target_masters,
         }
     }
 
-    #[test]
-    fn settled_four_node_topology_passes_the_gate() {
-        let views = vec![
-            view(1, 2, &[1, 2, 3, 4]),
-            view(2, 2, &[1, 2, 3, 4]),
-            view(3, 2, &[1, 2, 3, 4]),
-            view(4, 2, &[1, 2, 3, 4]),
-        ];
-        assert_eq!(topology_gate_reason(&views, 4), None);
+    /// Every shape below keeps `sum(serving) == 4096`, which is what makes
+    /// them invisible to the master-count condition on its own.
+    fn serving_sum(views: &[NodeShardView]) -> u64 {
+        views.iter().map(|v| v.serving_masters).sum()
     }
 
     #[test]
-    fn pre_scale_up_membership_cannot_satisfy_the_gate() {
-        // The exact scenario-06 shape: node4 is up and polled, but nothing
-        // has committed the 4-member term yet, so every node still carries
-        // the 3-member table whose master counts already sum to 4096.
+    fn a_committed_but_unactivated_newcomer_holds_the_gate() {
+        // The exact scenario-06 shape at 0.17s: node4 is a committed member
+        // at the agreed term (wait_cluster_ready already passed), but the
+        // 2000ms exchange phase has not reported back, so node4 has
+        // activated nothing while nodes 1-3 still serve -- and target --
+        // the 3-member table.
         let views = vec![
-            view(1, 1, &[1, 2, 3]),
-            view(2, 1, &[1, 2, 3]),
-            view(3, 1, &[1, 2, 3]),
-            view(4, 1, &[1, 2, 3]),
+            view(1, 1366, 1366),
+            view(2, 1365, 1365),
+            view(3, 1365, 1365),
+            view(4, 0, 0),
         ];
-        let reason = topology_gate_reason(&views, 4).expect("stale membership must hold the gate");
+        assert_eq!(serving_sum(&views), 4096, "the sum check cannot see this");
+        let reason = shard_activation_gate_reason(&views, 4)
+            .expect("an unactivated newcomer holds the gate");
         assert!(
-            reason.contains("has 3 member(s), expected 4"),
+            reason.contains("node4 has activated no master shards (target=0)"),
             "reason was: {reason}"
         );
-        // The dump the timeout path prints must name every node's version
-        // and member list.
-        assert!(reason.contains("node4:ver=1,members=[1, 2, 3]"), "{reason}");
-        assert!(reason.contains("node1:ver=1"), "{reason}");
-    }
-
-    #[test]
-    fn a_node_that_never_committed_a_term_holds_the_gate() {
-        let views = vec![
-            view(1, 3, &[1, 2, 3]),
-            view(2, 3, &[1, 2, 3]),
-            view(3, 0, &[]),
-        ];
-        let reason = topology_gate_reason(&views, 3).expect("term 0 must hold the gate");
+        // The dump the timeout path prints must name every node's counts.
+        assert!(reason.contains("node4:serving=0,target=0"), "{reason}");
         assert!(
-            reason.contains("node3 has not committed a topology term yet"),
-            "reason was: {reason}"
+            reason.contains("node1:serving=1366,target=1366"),
+            "{reason}"
         );
     }
 
     #[test]
-    fn disagreeing_shard_table_versions_hold_the_gate() {
+    fn serving_behind_target_mid_handoff_holds_the_gate() {
+        // Post-activation: all four nodes target the balanced 4-member table,
+        // but completion-gated handoffs have not yet moved a single serving
+        // master onto node4. The sum is STILL 4096 for this entire window.
         let views = vec![
-            view(1, 4, &[1, 2, 3]),
-            view(2, 4, &[1, 2, 3]),
-            view(3, 3, &[1, 2, 3]),
+            view(1, 1366, 1024),
+            view(2, 1365, 1024),
+            view(3, 1365, 1024),
+            view(4, 0, 1024),
         ];
-        let reason = topology_gate_reason(&views, 3).expect("version split must hold the gate");
+        assert_eq!(serving_sum(&views), 4096, "the sum check cannot see this");
+        let reason =
+            shard_activation_gate_reason(&views, 4).expect("mid-handoff must hold the gate");
         assert!(
-            reason.contains("node3 is on shard table version 3 while node1 is on 4"),
+            reason.contains("node1 serves 1366 master shards but its activated table targets 1024"),
             "reason was: {reason}"
         );
+    }
+
+    #[test]
+    fn a_converged_four_node_table_passes_the_gate() {
+        let views = vec![
+            view(1, 1024, 1024),
+            view(2, 1024, 1024),
+            view(3, 1024, 1024),
+            view(4, 1024, 1024),
+        ];
+        assert_eq!(serving_sum(&views), 4096);
+        assert_eq!(shard_activation_gate_reason(&views, 4), None);
+    }
+
+    #[test]
+    fn a_converged_three_node_table_passes_the_gate() {
+        // Scenario 07 after the shrink: nodes 1-3 are polled (node4's
+        // container is gone), each serving exactly what it targets.
+        let views = vec![
+            view(1, 1366, 1366),
+            view(2, 1365, 1365),
+            view(3, 1365, 1365),
+        ];
+        assert_eq!(serving_sum(&views), 4096);
+        assert_eq!(shard_activation_gate_reason(&views, 3), None);
     }
 
     #[test]
     fn an_unreachable_node_does_not_by_itself_hold_the_gate() {
-        // node3 did not answer /status, so it contributes no view -- but the
-        // two that did answer must still carry the full committed membership.
-        let views = vec![view(1, 5, &[1, 2, 3]), view(2, 5, &[1, 2, 3])];
-        assert_eq!(topology_gate_reason(&views, 3), None);
+        // node3 did not answer /status, so it contributes no view. The nodes
+        // that did answer are converged, so the gate does not hold on their
+        // account -- the master-count sum is what judges the missing node.
+        let views = vec![view(1, 2048, 2048), view(2, 2048, 2048)];
+        assert_eq!(shard_activation_gate_reason(&views, 3), None);
     }
 
     #[test]
     fn no_reachable_node_holds_the_gate() {
-        let reason = topology_gate_reason(&[], 3).expect("zero views must hold the gate");
+        let reason = shard_activation_gate_reason(&[], 3).expect("zero views must hold the gate");
         assert_eq!(reason, "no node answered /status");
     }
 
     #[test]
-    fn post_scale_down_membership_passes_at_the_new_node_count() {
-        let views = vec![
-            view(1, 7, &[1, 2, 3]),
-            view(2, 7, &[1, 2, 3]),
-            view(3, 7, &[1, 2, 3]),
-        ];
-        assert_eq!(topology_gate_reason(&views, 3), None);
-        // The same views must NOT pass a gate that still expects 4 members.
-        assert!(topology_gate_reason(&views, 4).is_some());
+    fn a_single_node_cluster_is_exempt_from_the_target_floor() {
+        // node_count == 1 covers the non-clustered /status shape, which
+        // reports zeros for every shard count; the floor would deadlock it.
+        assert_eq!(shard_activation_gate_reason(&[view(1, 0, 0)], 1), None);
+        // The floor still applies the moment more than one node is expected.
+        assert!(shard_activation_gate_reason(&[view(1, 0, 0)], 2).is_some());
+    }
+
+    #[test]
+    fn a_drained_node_that_still_targets_shards_holds_the_gate() {
+        // A quiesced node has handed its shards away but its activated table
+        // still targets them: serving 0 != target 1365.
+        let views = vec![view(1, 2048, 1366), view(2, 2048, 1365), view(3, 0, 1365)];
+        let reason =
+            shard_activation_gate_reason(&views, 3).expect("a mid-drain node holds the gate");
+        assert!(
+            reason.contains("node1 serves 2048 master shards but its activated table targets 1366"),
+            "reason was: {reason}"
+        );
     }
 }
 

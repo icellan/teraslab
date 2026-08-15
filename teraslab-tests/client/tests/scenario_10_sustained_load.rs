@@ -61,8 +61,8 @@ const CREATE_ERROR_RATE_THRESHOLD_PCT: f64 = 5.0;
 /// Maximum tolerated first-to-last p99 degradation ratio for an op type.
 const P99_DEGRADATION_RATIO_CEILING: f64 = 5.0;
 
-/// Minimum sample count an op type needs in BOTH the first and the last
-/// checkpoint window before its p99 degradation ratio is judged.
+/// Minimum sample count an op type needs at BOTH the first and the last
+/// checkpoint before its p99 degradation ratio is judged.
 ///
 /// A percentile is only a percentile if there are samples behind it: with
 /// 13 delete samples, `percentile_value` puts p95, p99 and max on the same
@@ -87,18 +87,27 @@ struct OpLatency {
 struct P99GateOutcome {
     /// One line per op type whose ratio was actually judged.
     checked: Vec<String>,
-    /// One line per op type skipped for having too few samples.
+    /// One line per op type skipped, with the reason.
     skipped: Vec<String>,
-    /// The assertion message when a judged op type breached the ceiling.
+    /// The assertion message for the WORST breaching op type, if any.
     failure: Option<String>,
 }
 
 /// Compare per-op p99 latency between the first and last checkpoint,
 /// applying the [`P99_MIN_SAMPLES`] floor.
 ///
-/// Op types missing from either checkpoint, or below the sample floor in
-/// either one, are reported in `skipped` and never fail the run. Every other
-/// op type must keep `last_p99 / first_p99 <= max_ratio`.
+/// NOTE ON WHAT IS BEING COMPARED: `MetricsReporter` never resets, so its
+/// stats are CUMULATIVE — the first checkpoint's numbers cover the run up to
+/// that checkpoint and the last checkpoint's cover the whole run. This is a
+/// cumulative-vs-cumulative comparison, not window-vs-window, so a late
+/// regression is damped by every earlier sample rather than exaggerated. It
+/// is a floor on "did tail latency blow up", not a precise interval measure.
+///
+/// Every op type appearing in EITHER checkpoint is accounted for. Op types
+/// missing from one of them, below the sample floor in either, or with a
+/// zero first-checkpoint p99 are reported in `skipped` and never fail the
+/// run. Every other op type must keep `last_p99 / first_p99 <= max_ratio`;
+/// when several breach, `failure` names the one with the worst ratio.
 fn evaluate_p99_degradation(
     first: &BTreeMap<String, OpLatency>,
     last: &BTreeMap<String, OpLatency>,
@@ -106,13 +115,29 @@ fn evaluate_p99_degradation(
     max_ratio: f64,
 ) -> P99GateOutcome {
     let mut outcome = P99GateOutcome::default();
-    for (op, first_stats) in first {
-        let Some(last_stats) = last.get(op) else {
-            outcome.skipped.push(format!(
-                "{op}: absent from the last checkpoint (first={} samples)",
-                first_stats.count
-            ));
-            continue;
+    let mut worst: Option<(f64, String)> = None;
+    let op_names: std::collections::BTreeSet<&String> = first.keys().chain(last.keys()).collect();
+    for op in op_names {
+        let (first_stats, last_stats) = match (first.get(op), last.get(op)) {
+            (Some(f), Some(l)) => (f, l),
+            (Some(f), None) => {
+                outcome.skipped.push(format!(
+                    "{op}: absent from the last checkpoint (first={} samples)",
+                    f.count
+                ));
+                continue;
+            }
+            (None, Some(l)) => {
+                // First seen after the first checkpoint (e.g. deletes only
+                // start once the tracked pool is large enough). There is no
+                // baseline to compare against, but it must still be visible.
+                outcome.skipped.push(format!(
+                    "{op}: absent from the first checkpoint (last={} samples, p99 {:?})",
+                    l.count, l.p99
+                ));
+                continue;
+            }
+            (None, None) => continue,
         };
         if first_stats.count < min_samples || last_stats.count < min_samples {
             outcome.skipped.push(format!(
@@ -133,14 +158,18 @@ fn evaluate_p99_degradation(
             "{op}: p99 {:?} -> {:?}, ratio={ratio:.2} ({}/{} samples)",
             first_stats.p99, last_stats.p99, first_stats.count, last_stats.count
         ));
-        if ratio > max_ratio && outcome.failure.is_none() {
-            outcome.failure = Some(format!(
-                "10: p99 latency degraded for {op}: first={:?}, last={:?}, ratio={ratio:.2} \
-                 (expected <={max_ratio:.1}) over {}/{} samples",
-                first_stats.p99, last_stats.p99, first_stats.count, last_stats.count
+        if ratio > max_ratio && worst.as_ref().is_none_or(|(w, _)| ratio > *w) {
+            worst = Some((
+                ratio,
+                format!(
+                    "10: p99 latency degraded for {op}: first={:?}, last={:?}, ratio={ratio:.2} \
+                     (expected <={max_ratio:.1}) over {}/{} samples",
+                    first_stats.p99, last_stats.p99, first_stats.count, last_stats.count
+                ),
             ));
         }
     }
+    outcome.failure = worst.map(|(_, msg)| msg);
     outcome
 }
 
@@ -1085,16 +1114,59 @@ mod tests {
 
     #[test]
     fn p99_gate_skips_an_op_missing_from_the_last_checkpoint() {
+        // Disjoint key sets: each op is skipped for its own reason, and
+        // neither disappears from the report.
         let first = ops(&[("freeze", op(5, 500))]);
         let last = ops(&[("read", op(5, 500))]);
         let outcome = evaluate_p99_degradation(&first, &last, P99_MIN_SAMPLES, 5.0);
         assert!(outcome.failure.is_none(), "{:?}", outcome.failure);
-        assert_eq!(outcome.skipped.len(), 1);
+        assert!(outcome.checked.is_empty(), "{:?}", outcome.checked);
+        assert_eq!(outcome.skipped.len(), 2, "{:?}", outcome.skipped);
         assert!(
-            outcome.skipped[0].contains("absent from the last checkpoint"),
+            outcome.skipped[0].contains("freeze: absent from the last checkpoint"),
             "skipped line was: {}",
             outcome.skipped[0]
         );
+        assert!(
+            outcome.skipped[1].contains("read: absent from the first checkpoint"),
+            "skipped line was: {}",
+            outcome.skipped[1]
+        );
+    }
+
+    #[test]
+    fn p99_gate_reports_an_op_absent_from_the_first_checkpoint() {
+        // Deletes only start once the tracked pool exceeds 100 txids, so an
+        // op type can appear after the first checkpoint. It cannot be judged
+        // (no baseline) but it must not vanish from the report either.
+        let first = ops(&[("create", op(10, 20_000))]);
+        let last = ops(&[("create", op(12, 40_000)), ("delete", op(6200, 13))]);
+        let outcome = evaluate_p99_degradation(&first, &last, P99_MIN_SAMPLES, 5.0);
+        assert!(outcome.failure.is_none(), "{:?}", outcome.failure);
+        assert_eq!(outcome.checked.len(), 1);
+        assert!(outcome.checked[0].starts_with("create:"));
+        assert_eq!(outcome.skipped.len(), 1, "{:?}", outcome.skipped);
+        assert!(
+            outcome.skipped[0]
+                .contains("delete: absent from the first checkpoint (last=13 samples"),
+            "skipped line was: {}",
+            outcome.skipped[0]
+        );
+    }
+
+    #[test]
+    fn p99_gate_reports_the_worst_breaching_op_not_the_first_alphabetically() {
+        // "create" breaches at 6x and sorts first; "spend" breaches at 20x.
+        let first = ops(&[("create", op(10, 30_000)), ("spend", op(10, 30_000))]);
+        let last = ops(&[("create", op(60, 60_000)), ("spend", op(200, 60_000))]);
+        let outcome = evaluate_p99_degradation(&first, &last, P99_MIN_SAMPLES, 5.0);
+        let failure = outcome.failure.expect("both breaches must fail the run");
+        assert!(
+            failure.contains("for spend") && failure.contains("ratio=20.00"),
+            "failure must name the worst breach, was: {failure}"
+        );
+        // Both are still reported in the checked lines.
+        assert_eq!(outcome.checked.len(), 2, "{:?}", outcome.checked);
     }
 
     #[test]
