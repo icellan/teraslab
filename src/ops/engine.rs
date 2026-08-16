@@ -8675,6 +8675,12 @@ impl Engine {
     ///   triggered by a mutation — the re-ship is. A replica-written tombstone
     ///   would veto exactly that repair and turn a transient, self-healing
     ///   divergence into permanent loss.
+    /// - The cluster orphan cleanup (a node evicting records of a shard it no
+    ///   longer owns after a committed handoff) is the second caller class.
+    ///   Post-handoff no master ever mutates this node's copy, so the re-ship
+    ///   path above never fires; the ONLY restoration path is a migration
+    ///   baseline — which is exactly what an authority tombstone here would
+    ///   permanently veto (the scenario-15 69-record repair deadlock).
     ///
     /// So the removal stays what its name says: a LOCAL SPACE RECLAIM that
     /// asserts nothing about the key — no tombstone, no replication, and no
