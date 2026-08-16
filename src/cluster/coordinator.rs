@@ -2984,12 +2984,14 @@ impl ClusterCoordinator {
             // W1.5 — highest committed term for which the prompt catch-up has
             // already spawned an exchange phase. Prevents re-spawning the
             // exchange on every 100 ms tick while the first exchange is in
-            // flight; cleared implicitly by advancing as the term advances,
-            // and released explicitly when a first activation is HELD on a
-            // below-quorum exchange view (W8 — see
-            // `rearm_prompt_debounce_after_held_activation`) so the hold
-            // retries instead of wedging.
+            // flight; cleared implicitly by advancing as the term advances.
             let mut prompt_exchange_term: u64 = 0;
+            // W8-R2-1 — `Some(term)` while the ACTIVE table for `term` was
+            // installed via the det degrade (below-quorum first activation,
+            // emptied view). Lets a later same-term completion whose member
+            // view reaches quorum through the duplicate-activation gate as
+            // an upgrade; cleared by any admitted quorum activation.
+            let mut degraded_activation_term: Option<u64> = None;
             // Task #47 — term-keyed single-flight slot for the same-term
             // re-heal exchange spawned by the normal reactivation repair.
             // `Some(term)` while an exchange for that term is in flight;
@@ -4410,10 +4412,19 @@ impl ClusterCoordinator {
                 // build the migration plan against the collected partition
                 // view and activate.
                 while !activation_held
-                    && let Ok((members, term, partition_view, same_term_reheal)) =
+                    && let Ok((members, term, mut partition_view, same_term_reheal)) =
                         exchange_complete_rx.try_recv()
                 {
                     loop_heartbeat_event.stamp(crate::cluster::watchdog::LoopPhase::ExchangeDrain);
+                    // Task #73 / W8 — quorum arithmetic counts only
+                    // reporters that are committed members of `term`: the
+                    // self report is recorded unconditionally, but on a
+                    // self-drain term `self` is not a member and must not
+                    // pad the floor.
+                    let member_view_size = partition_view
+                        .keys()
+                        .filter(|n| members.contains(n))
+                        .count();
                     if same_term_reheal {
                         // Task #47 — release the single-flight slot for this
                         // term regardless of whether the result still applies.
@@ -4444,54 +4455,77 @@ impl ClusterCoordinator {
                             &active_members,
                             &members,
                         ) {
-                            tracing::debug!(
+                            // W8-R2-1 — a det-degraded activation of this
+                            // term is not terminal: the commit-signal and
+                            // prompt arms race two exchanges for the same
+                            // term, and the LATER completion often carries
+                            // the quorum view the first one missed. Let a
+                            // strictly better same-term completion through
+                            // the duplicate gate as an UPGRADE; everything
+                            // else is a true duplicate. Gated on no live
+                            // migration wave: the same-epoch re-activation
+                            // supersedes the plan, and stale workers do not
+                            // self-abort without an epoch advance (see the
+                            // helper's doc). A refused upgrade leaves the
+                            // marker set — the det-table residual applies.
+                            if !degraded_term_upgrade_admissible(
+                                degraded_activation_term,
                                 term,
-                                last_activated_term,
-                                members = members.len(),
-                                "cluster: skipping duplicate exchange-phase activation",
+                                member_view_size,
+                                members.len(),
+                                migration.lock().active_count() == 0,
+                            ) {
+                                tracing::debug!(
+                                    term,
+                                    last_activated_term,
+                                    members = members.len(),
+                                    "cluster: skipping duplicate exchange-phase activation",
+                                );
+                                continue;
+                            }
+                            tracing::info!(
+                                term,
+                                member_view_size,
+                                "cluster: upgrading det-degraded activation with a \
+                                 quorum exchange view",
                             );
-                            continue;
                         }
                     }
-                    // Task #73 / W8 — EVERY exchange-phase activation may
-                    // only build the table from a view covering a majority
-                    // of the committed members. A degenerate view would
-                    // install minority-evidence tables: det-only re-heals
-                    // that fight the holders every other node still sees
-                    // (Task #73), or — for the FIRST activation of a term —
-                    // divergent tables stamped at the same version on
-                    // different nodes (W8, the scenario-06/09 asymmetry).
-                    // Skipping HERE — before the term stamp, the retained
-                    // view, the event-repair trigger, and
-                    // `last_activation_at` — leaves every piece of trigger
-                    // state intact: a held re-heal re-fires on the next
-                    // cooldown tick (single-flight slot released above,
-                    // divergence counters stay nonzero), and a held FIRST
-                    // activation re-fires through the W1.5 prompt catch-up
-                    // (committed term still ahead of the un-stamped table)
-                    // once its debounce is released below.
-                    if !exchange_completion_admits_activation(
+                    // Task #73 / W8 — a table may only be REFINED from a
+                    // view covering a majority of the committed members
+                    // (see `admit_exchange_completion`). Below that floor:
+                    // a same-term re-heal is dropped HERE — before the term
+                    // stamp, the retained view, the event-repair trigger,
+                    // and `last_activation_at` — so every trigger stays
+                    // intact and the cooldown re-fires a fresh exchange; a
+                    // FIRST activation instead proceeds with an EMPTIED
+                    // view, installing the byte-identical pure det table
+                    // (the startup-path shape) so the node keeps serving
+                    // and no partial-evidence refinement can diverge.
+                    match admit_exchange_completion(
                         same_term_reheal,
                         term,
-                        partition_view.len(),
+                        member_view_size,
                         members.len(),
                     ) {
-                        if !same_term_reheal {
-                            // W8 — release the prompt-catch-up debounce so
-                            // the held first activation retries on the next
-                            // tick instead of wedging behind its own
-                            // single-flight latch.
-                            prompt_exchange_term = rearm_prompt_debounce_after_held_activation(
-                                prompt_exchange_term,
-                                term,
-                            );
+                        ExchangeAdmission::HoldReheal => continue,
+                        ExchangeAdmission::AdmitDetOnly => {
+                            partition_view.clear();
+                            degraded_activation_term = Some(term);
                         }
-                        continue;
+                        // Any admitted quorum activation (first, upgrade, or
+                        // re-heal) supersedes a pending det degrade.
+                        ExchangeAdmission::Admit => degraded_activation_term = None,
                     }
                     last_activated_term = term;
                     topology_epoch.store(term, Ordering::Relaxed);
                     // §8 — retain the freshest cluster-wide holder view for
-                    // the assignment provider's next election.
+                    // the assignment provider's next election. On the det
+                    // degrade path this deliberately stores the EMPTIED
+                    // view: evidence gathered under a superseded membership
+                    // must not feed the next election, and every reader
+                    // no-ops on an empty view rather than misreading it as
+                    // "nobody holds anything".
                     *retained_exchange_view_event.lock() = partition_view.clone();
                     // Task #50 — a completed exchange is the moment the
                     // retained view first reflects a rejoined/emptied peer's
@@ -4500,7 +4534,13 @@ impl ClusterCoordinator {
                     // an event repair pass under the just-stored term. The
                     // same-term re-heal exchange re-arms under the unchanged
                     // term; a pass pending under an older epoch is replaced.
-                    event_repair_trigger.observe(std::time::Instant::now(), term);
+                    // NOT armed on the det degrade path: an emptied view
+                    // carries no evidence to repair from, and a fired pass
+                    // would burn the arm AND push back the periodic sweep
+                    // timer for nothing.
+                    if !partition_view.is_empty() {
+                        event_repair_trigger.observe(std::time::Instant::now(), term);
+                    }
                     // §9 Q3 — prompt re-election. The fresh view may
                     // contradict the committed assignment (the canonical
                     // case: a rejoined node reported for the first time, so
@@ -6933,133 +6973,181 @@ pub fn reheal_skipped_degenerate_view_total() -> u64 {
     REHEAL_SKIPPED_DEGENERATE_VIEW_TOTAL.load(Ordering::Relaxed)
 }
 
-/// W8 — count of FIRST activations of a term held because their exchange
-/// completed with a degenerate (below-quorum) partition view. Read via
-/// [`activation_held_degenerate_view_total`] and exported as
-/// `teraslab_activation_held_degenerate_view_total`.
-static ACTIVATION_HELD_DEGENERATE_VIEW_TOTAL: std::sync::atomic::AtomicU64 =
+/// W8 — count of FIRST activations of a term that DEGRADED to the pure
+/// deterministic table because their exchange completed with a degenerate
+/// (below-quorum) partition view. Read via
+/// [`activation_degraded_degenerate_view_total`] and exported as
+/// `teraslab_activation_degraded_degenerate_view_total`.
+static ACTIVATION_DEGRADED_DEGENERATE_VIEW_TOTAL: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
-/// Number of first-of-term exchange-phase activations held on a degenerate
-/// (below-quorum) exchange view since process start (W8).
-pub fn activation_held_degenerate_view_total() -> u64 {
-    ACTIVATION_HELD_DEGENERATE_VIEW_TOTAL.load(Ordering::Relaxed)
+/// Number of first-of-term exchange-phase activations degraded to the pure
+/// deterministic (emptied-view) table on a degenerate (below-quorum)
+/// exchange view since process start (W8).
+pub fn activation_degraded_degenerate_view_total() -> u64 {
+    ACTIVATION_DEGRADED_DEGENERATE_VIEW_TOTAL.load(Ordering::Relaxed)
+}
+
+/// Outcome of [`admit_exchange_completion`] for an exchange-phase activation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExchangeAdmission {
+    /// View covers a majority of the committed members: activate from it.
+    Admit,
+    /// Below-quorum FIRST activation of a term: activate, but from an
+    /// EMPTIED view — the pure deterministic table (W8).
+    AdmitDetOnly,
+    /// Below-quorum same-term re-heal: drop the completion, keep the
+    /// current table, let the cooldown re-fire a fresh exchange (Task #73).
+    HoldReheal,
 }
 
 /// Task #73 / W8 — view-quorum admission for exchange-phase activations.
 ///
 /// Under migration churn the 2 s exchange frequently completes with a
-/// degenerate partial view (SELF-ONLY, or `view_size` 2 in a 4-member
-/// cluster). ANY activation built from such a view installs a table refined
-/// from minority evidence: with the honest-absence election (a failed peer
-/// is ABSENT from the view, so no deviation can be justified and the pure
-/// det assignment is installed — see F1 in `run_exchange_phase`), a
-/// self-only re-heal installs det-only tables that fight the holders every
-/// other node still sees, and a partial-view FIRST activation of a term
-/// leaves different nodes with DIVERGENT tables stamped at the SAME version
-/// (observed: two of four members activated a fresh term from view_size-2
-/// exchanges → 622 shards with contradictory masters, which the re-heal arm
-/// of this very gate then correctly refused to repair from its own
-/// below-quorum views — the damage door was open while the repair door was
-/// closed). So EVERY exchange-phase activation — same-term re-heal AND the
-/// first activation of a term — is admitted only when the view covers a
-/// MAJORITY of the committed members: `member_count / 2 + 1`, self included
-/// (`run_exchange_phase` records the self report first, so `view_size`
-/// always counts `self`).
+/// degenerate partial view (SELF-ONLY, or 2 members reporting in a
+/// 4-member cluster). A table REFINED from such partial evidence is the
+/// divergence generator: `apply_master_election` justifies a deviation on
+/// any shard whose candidate set happens to be fully covered by the partial
+/// view, so two nodes with different partial views deviate differently and
+/// stamp DIVERGENT tables at the SAME version (observed: two of four
+/// members activated a fresh term from view-size-2 exchanges → 622 shards
+/// with contradictory masters). The two safe view shapes are a
+/// quorum-covering view (the evidence is representative) and an EMPTY view
+/// (no deviation can be justified anywhere → the byte-identical pure
+/// deterministic table on every node). `member_view_size` counts only
+/// reporters that are COMMITTED MEMBERS of `term` — the self report is
+/// recorded unconditionally by `run_exchange_phase`, but on a self-drain
+/// term `self` is not a member and must not pad the quorum arithmetic.
 ///
-/// A blocked completion is counted (per-arm) and logged, then dropped
-/// WITHOUT touching the shard table or any activation bookkeeping — the
-/// caller `continue`s before `last_activated_term`, the topology epoch, the
-/// retained view, the event-repair trigger, and `last_activation_at` are
-/// updated. Each arm then re-arms its own retry:
+/// Below the majority floor (`member_count / 2 + 1`) the two arms differ:
 ///
-/// - **same-term re-heal** — the term-keyed single-flight slot was already
-///   released, and the divergence counters (recomputed every tick from the
-///   unchanged table against the committed placement) stay nonzero, so the
-///   normal reactivation trigger re-fires a FRESH exchange after the
-///   cooldown (~15-30 s cadence).
-/// - **first activation of a term** — the committed term stays strictly
-///   ahead of the un-stamped active table, so the W1.5 prompt catch-up
-///   predicate keeps firing; the caller releases `prompt_exchange_term`
-///   (see `rearm_prompt_debounce_after_held_activation`) so the next 100 ms
-///   tick spawns a fresh exchange (~2 s effective cadence, bounded by the
-///   exchange budget). The loop terminates when the view reaches quorum:
-///   the admitted activation stamps `last_activated_term`, which stops the
-///   prompt arm.
+/// - **same-term re-heal** → [`ExchangeAdmission::HoldReheal`]: the caller
+///   drops the completion WITHOUT touching the shard table or any
+///   activation bookkeeping. A re-heal exists to REFINE an already-refined
+///   table; rebuilding it from a below-quorum view would clobber refined
+///   masterships back to det and fight the holders every other node still
+///   sees. The term-keyed single-flight slot was already released and the
+///   divergence counters (recomputed every tick from the unchanged table)
+///   stay nonzero, so the normal reactivation trigger re-fires a FRESH
+///   exchange after the cooldown (~15-30 s cadence, which also rate-limits
+///   the skip log).
+/// - **first activation of a term** → [`ExchangeAdmission::AdmitDetOnly`]:
+///   the caller EMPTIES the collected view and activates normally. An
+///   empty-view activation is exactly what the startup/drain reactivation
+///   path installs today: `build_plan_from_partition_view` returns the
+///   topology-derived plan unchanged and the election installs the pure
+///   det assignment, byte-identical on every node that degrades. The node
+///   keeps serving and the two-phase handoff still protects newcomers.
+///   The refinement this activation skipped is usually rescued within ~2 s:
+///   the commit-signal and prompt arms race TWO exchanges for the term, and
+///   a later same-term completion whose member view reaches quorum passes
+///   the duplicate-activation gate as an UPGRADE (see
+///   `degraded_term_upgrade_admissible`). Holding instead would be a
+///   TOTAL serving outage (`table.version < committed term` fails every
+///   serving gate) with no bounded exit: the exchange requires peers to
+///   have APPLIED the commit (`ERR_STALE_EPOCH` on key mismatch), which
+///   voting does not imply, and a committed term's quorum can even include
+///   non-members — so "committed ⇒ exchange reaches quorum" is NOT an
+///   invariant of this codebase, and formation would wedge (observed:
+///   a 2-node formation held forever because the peer's commit apply raced
+///   the 2 s exchange window and the term never advanced again).
 ///
-/// # Liveness — the gate cannot deadlock formation or recovery
+/// # Residuals
 ///
-/// A committed term implies a voting QUORUM of members with live listeners;
-/// the exchange queries those same listeners over the same framed TCP
-/// protocol, so a fresh term's exchange reaches the majority floor as soon
-/// as the voters answer within the 2 s budget — a transient miss retries on
-/// the prompt-catch-up cadence above. With a real majority of the committed
-/// members down, SWIM death detection reaps them, the membership change
-/// mints a NEW term naming the survivors, and THAT term's exchange reaches
-/// a majority of its own (all-live) member set. The one state that holds
-/// indefinitely is a minority partition that can neither reach a majority
-/// of the committed members nor commit a shrunk term (the G8 shrink safety
-/// gate refuses) — exactly the split-brain side that must NOT build a fresh
-/// table from partial evidence; it keeps its previous table (or, at boot,
-/// keeps redirecting via the `NodeId(0)` sentinel) and alerts through the
-/// held counter until the partition heals.
-fn exchange_completion_admits_activation(
+/// - If NO same-term quorum completion ever arrives, the det table and the
+///   unrefined topology-derived migration plan stand for the life of the
+///   term: a pure det table matches the committed placement exactly, so no
+///   reactivation counter arms a same-term re-heal. This exposure is
+///   shared with the startup reactivation path, which installs the same
+///   shape ungated.
+/// - Two DIFFERENT quorum-covering views can still justify different
+///   deviations on a shard whose candidates are covered by one view but
+///   not the other — asymmetric reachability divergence (pre-existing,
+///   documented at the `all_candidates_reported` gate). The same-term
+///   re-heal converges it.
+/// - With committed-master election enabled, electing from an emptied view
+///   observes a no-deviation round for every shard, resetting the
+///   deviation-hysteresis streaks — each degrade delays a legitimate
+///   deviation by up to the hysteresis depth. Inert under the default
+///   configuration.
+fn admit_exchange_completion(
     same_term_reheal: bool,
     term: u64,
-    view_size: usize,
+    member_view_size: usize,
     member_count: usize,
-) -> bool {
-    let quorum = member_count / 2 + 1;
-    if view_size >= quorum {
-        return true;
+) -> ExchangeAdmission {
+    if member_view_reaches_quorum(member_view_size, member_count) {
+        return ExchangeAdmission::Admit;
     }
     if same_term_reheal {
         REHEAL_SKIPPED_DEGENERATE_VIEW_TOTAL.fetch_add(1, Ordering::Relaxed);
         tracing::info!(
             term,
-            view_size,
+            member_view_size,
             member_count,
-            quorum,
             "cluster: skipping same-term re-heal — degenerate exchange view below quorum; \
              holding the current table, re-arming for the next cooldown tick",
         );
+        ExchangeAdmission::HoldReheal
     } else {
-        ACTIVATION_HELD_DEGENERATE_VIEW_TOTAL.fetch_add(1, Ordering::Relaxed);
+        ACTIVATION_DEGRADED_DEGENERATE_VIEW_TOTAL.fetch_add(1, Ordering::Relaxed);
         tracing::info!(
             term,
-            view_size,
+            member_view_size,
             member_count,
-            quorum,
-            "cluster: holding first activation of term — exchange view below quorum; \
-             keeping the previous table, re-arming the prompt catch-up",
+            "cluster: first activation of term on a below-quorum exchange view — \
+             degrading to the pure deterministic table (emptied view)",
         );
+        ExchangeAdmission::AdmitDetOnly
     }
-    false
 }
 
-/// W8 — release the W1.5 prompt-catch-up debounce after a HELD first
-/// activation so the hold re-arms instead of wedging.
+/// Single source of the view-quorum floor: the collected view must cover a
+/// MAJORITY of the committed members (`member_count / 2 + 1`), counting
+/// only reporters that are members (Task #73 / W8).
+fn member_view_reaches_quorum(member_view_size: usize, member_count: usize) -> bool {
+    member_view_size > member_count / 2
+}
+
+/// W8-R2-1 — may a completion that failed the duplicate-activation gate
+/// still activate, as an UPGRADE of a det-degraded table?
 ///
-/// `prompt_exchange_term` is set to the committed term BEFORE the prompt arm
-/// spawns its exchange (single-flight while it runs). When that exchange's
-/// activation is held on a below-quorum view, the debounce still equals the
-/// held term and would block every future re-fire — the committed term can
-/// stay ahead of the active table forever with no exchange in flight.
-/// Releasing the debounce to `held_term - 1` re-satisfies the prompt arm's
-/// `committed_term > prompt_exchange_term` condition on the next tick.
+/// A below-quorum first activation installs the pure det table
+/// ([`ExchangeAdmission::AdmitDetOnly`]) and records its term. The
+/// commit-signal and prompt arms race TWO exchanges for the same term, so
+/// the refinement the degraded activation skipped usually arrives moments
+/// later — as a same-term completion the duplicate gate would otherwise
+/// drop. It is admissible as an upgrade only when ALL THREE hold:
 ///
-/// Two other states are left untouched:
-/// - debounce BELOW the held term (the held exchange was commit-signal
-///   spawned): the prompt arm is already armed;
-/// - debounce ABOVE the held term (a newer term's exchange is in flight):
-///   the hold is stale and the newer exchange owns the table — releasing
-///   downward would double-spawn its exchange.
-fn rearm_prompt_debounce_after_held_activation(prompt_exchange_term: u64, held_term: u64) -> u64 {
-    if prompt_exchange_term == held_term {
-        held_term.saturating_sub(1)
-    } else {
-        prompt_exchange_term
-    }
+/// - **no migration is in flight** — the upgrade re-runs
+///   `activate_topology_with_view` at the SAME epoch, which supersedes the
+///   migration plan: tasks absent from the refined plan are failed
+///   mid-flight (unfencing their shards, closing dual-write windows) and
+///   `clear_inbound` drops the entries that keep `is_master` from serving
+///   a partially-received shard — while the degraded plan's workers,
+///   seeing no epoch advance, keep streaming. Every other same-epoch
+///   caller of this path gates on `active_count() == 0` (the same-term
+///   re-heal, the drain redrive); the upgrade must too. When refused the
+///   marker STAYS SET — the upgrade is simply lost that round and the
+///   documented "det table stands for the term" residual applies, which
+///   is strictly better than tearing down a live wave. In the case the
+///   upgrade exists for (formation / a fresh term whose racing exchange
+///   rescues the view within ~2 s) nothing is typically in flight yet;
+/// - `degraded_activation_term` records exactly this term (the duplicate
+///   gate only fires for `term == last_activated_term`, so a stale marker
+///   for another term can never re-activate it); and
+/// - the late view reaches the member quorum — a second below-quorum view
+///   would just reinstall the same det table.
+fn degraded_term_upgrade_admissible(
+    degraded_activation_term: Option<u64>,
+    term: u64,
+    member_view_size: usize,
+    member_count: usize,
+    no_active_migrations: bool,
+) -> bool {
+    no_active_migrations
+        && degraded_activation_term == Some(term)
+        && member_view_reaches_quorum(member_view_size, member_count)
 }
 
 /// Topology proposer thread: broadcasts a proposal to all peers, collects
@@ -31527,8 +31615,9 @@ mod tests {
         let before = reheal_skipped_degenerate_view_total();
         // Admitted completions must not count a skip. (Asserted inside this
         // test — the only incrementer — so parallel tests cannot race it.)
-        assert!(
-            exchange_completion_admits_activation(true, 7, 2, 3),
+        assert_eq!(
+            admit_exchange_completion(true, 7, 2, 3),
+            ExchangeAdmission::Admit,
             "a majority view must be admitted",
         );
         assert_eq!(
@@ -31538,8 +31627,9 @@ mod tests {
         );
         // The defect shape: a 3-member cluster whose 2s exchange completed
         // self-only (view_size 1 < quorum 2) must hold, not install.
-        assert!(
-            !exchange_completion_admits_activation(true, 7, 1, 3),
+        assert_eq!(
+            admit_exchange_completion(true, 7, 1, 3),
+            ExchangeAdmission::HoldReheal,
             "a self-only view (1 of 3) is below quorum — the same-term re-heal must hold",
         );
         assert_eq!(
@@ -31549,143 +31639,143 @@ mod tests {
         );
     }
 
-    /// Task #73 — a same-term re-heal whose view reaches the majority
-    /// quorum (len/2 + 1, self included) activates exactly as today.
+    /// Task #73 — a same-term re-heal whose MEMBER view reaches the
+    /// majority quorum (len/2 + 1) activates exactly as today.
     #[test]
     fn same_term_reheal_quorum_view_activates() {
-        assert!(
-            exchange_completion_admits_activation(true, 7, 2, 3),
+        assert_eq!(
+            admit_exchange_completion(true, 7, 2, 3),
+            ExchangeAdmission::Admit,
             "2 of 3 is the majority quorum — the re-heal must activate",
         );
-        assert!(
-            exchange_completion_admits_activation(true, 7, 3, 3),
+        assert_eq!(
+            admit_exchange_completion(true, 7, 3, 3),
+            ExchangeAdmission::Admit,
             "a full view must activate",
         );
-        assert!(
-            exchange_completion_admits_activation(true, 7, 3, 5),
+        assert_eq!(
+            admit_exchange_completion(true, 7, 3, 5),
+            ExchangeAdmission::Admit,
             "3 of 5 is the majority quorum — the re-heal must activate",
         );
-        assert!(
-            !exchange_completion_admits_activation(true, 7, 2, 5),
+        assert_eq!(
+            admit_exchange_completion(true, 7, 2, 5),
+            ExchangeAdmission::HoldReheal,
             "2 of 5 is below the majority quorum — the re-heal must hold",
         );
     }
 
-    /// W8 — the FIRST activation of a term is held to the SAME view-quorum
-    /// floor as the same-term re-heal. The observed asymmetry (scenarios
+    /// W8 — a FIRST activation of a term whose exchange completed below the
+    /// member-view quorum DEGRADES to the pure deterministic table instead
+    /// of refining from partial evidence. The observed defect (scenarios
     /// 06+09): in a 4-member cluster (quorum 3) two nodes activated a fresh
     /// term from view_size-2 exchanges and installed DIVERGENT tables at
     /// the SAME version (622 shards, masters 4718/4096), which the re-heal
     /// gate then correctly-but-fatally refused to repair from its own
-    /// below-quorum views. Holding the first activation prevents the
-    /// divergence the re-heal gate can only refuse to worsen.
+    /// below-quorum views. Emptying the view makes the activation pure det
+    /// — byte-identical on every degrading node — while the node KEEPS
+    /// SERVING (a hold is a total serving outage with no bounded exit: the
+    /// exchange needs peers to have APPLIED the commit, which voting does
+    /// not imply — a 2-node formation wedged forever on exactly that race).
     #[test]
-    fn first_activation_below_quorum_view_holds() {
-        let before = activation_held_degenerate_view_total();
-        // The observed defect shape: 4 members, quorum 3, view 2 → hold.
-        assert!(
-            !exchange_completion_admits_activation(false, 2, 2, 4),
-            "a first activation from a below-quorum view (2 of 4) must hold",
+    fn first_activation_below_quorum_view_degrades_to_det() {
+        let before = activation_degraded_degenerate_view_total();
+        // The observed defect shape: 4 members, quorum 3, view 2 → det.
+        assert_eq!(
+            admit_exchange_completion(false, 2, 2, 4),
+            ExchangeAdmission::AdmitDetOnly,
+            "a first activation from a below-quorum view (2 of 4) must degrade to det",
         );
         assert_eq!(
-            activation_held_degenerate_view_total(),
+            activation_degraded_degenerate_view_total(),
             before + 1,
-            "a held first activation must increment its own counter (not the \
-             re-heal skip counter)",
+            "a degraded first activation must increment its own counter (not \
+             the re-heal skip counter)",
         );
-        // Self-only and empty views (the old ungated pins) must hold too.
-        assert!(
-            !exchange_completion_admits_activation(false, 8, 1, 3),
-            "a first activation from a self-only view must hold",
+        // The formation-wedge shape: self-only view (peer's commit apply
+        // raced the 2 s exchange window) must still activate — as pure det.
+        assert_eq!(
+            admit_exchange_completion(false, 8, 1, 3),
+            ExchangeAdmission::AdmitDetOnly,
+            "a first activation from a self-only view must degrade, not wedge",
         );
-        assert!(
-            !exchange_completion_admits_activation(false, 8, 0, 3),
-            "a first activation from an empty view must hold",
+        // The drain shape: on a term whose member set excludes self, the
+        // self report does not count — zero MEMBER reporters still
+        // activates det (P2-5: self must not pad the quorum arithmetic).
+        assert_eq!(
+            admit_exchange_completion(false, 8, 0, 3),
+            ExchangeAdmission::AdmitDetOnly,
+            "zero member reporters on a drain term must degrade to det",
         );
         assert_eq!(
-            activation_held_degenerate_view_total(),
+            activation_degraded_degenerate_view_total(),
             before + 3,
-            "every held first activation must be counted",
+            "every degraded first activation must be counted",
         );
     }
 
-    /// W8 — the held-first-activation re-arm loop. A hold `continue`s
-    /// before `last_activated_term`, the topology epoch, and the shard
-    /// table are stamped, so the committed term stays strictly ahead of the
-    /// active table and the prompt catch-up predicate
-    /// (`should_promptly_activate_committed_term`) stays true. The ONE
-    /// latch that could wedge the loop is `prompt_exchange_term` — set to
-    /// the term BEFORE the prompt arm spawns its exchange — so a hold must
-    /// release it back below the held term. The loop terminates: an
-    /// admitted activation stamps `last_activated_term = term`, and
-    /// `prompt_activation_fires_only_when_committed_term_is_ahead` pins
-    /// that an activated term never re-fires the prompt arm.
-    #[test]
-    fn held_first_activation_rearms_prompt_catch_up() {
-        // Prompt-spawned exchange held: the debounce equals the held term
-        // and must be released so the next tick re-fires the exchange.
-        assert_eq!(
-            rearm_prompt_debounce_after_held_activation(2, 2),
-            1,
-            "holding a prompt-spawned activation must release the debounce",
-        );
-        // Commit-signal-spawned exchange held: the debounce is already
-        // below the term — the prompt arm is armed, leave it alone.
-        assert_eq!(
-            rearm_prompt_debounce_after_held_activation(0, 2),
-            0,
-            "a commit-signal hold leaves an already-armed debounce unchanged",
-        );
-        // A NEWER term's prompt exchange is in flight: the stale hold must
-        // not release the newer term's single-flight debounce.
-        assert_eq!(
-            rearm_prompt_debounce_after_held_activation(5, 2),
-            5,
-            "a stale hold must not release a newer in-flight term's debounce",
-        );
-        // Term 0 never underflows.
-        assert_eq!(rearm_prompt_debounce_after_held_activation(0, 0), 0);
-
-        // Composition: after the release, the prompt arm's full firing
-        // condition holds again for the held term — the committed term is
-        // still ahead of the un-stamped active table and above both
-        // latches — so the exchange re-fires on the next 100 ms tick and
-        // the hold loop makes progress until the view reaches quorum.
-        let held_term = 2u64;
-        let active_version = 1u64; // activation held → table not stamped
-        let last_activated_term = 1u64; // hold ran `continue` before the stamp
-        let rearmed = rearm_prompt_debounce_after_held_activation(held_term, held_term);
-        assert!(
-            should_promptly_activate_committed_term(held_term, active_version, 4)
-                && held_term > last_activated_term
-                && held_term > rearmed,
-            "a held first activation must leave the prompt catch-up armed to re-fire",
-        );
-    }
-
-    /// W8 formation pin — a fresh cluster's first term still activates: a
-    /// commit implies a voting quorum of live listeners, the exchange
-    /// queries those same listeners, so the collected view reaches the
-    /// majority floor (a transient 2 s exchange timeout retries through the
-    /// held-activation re-arm, see
-    /// `held_first_activation_rearms_prompt_catch_up`).
+    /// W8 formation pin — a first activation whose member view reaches the
+    /// majority floor activates from the full view (election refinement
+    /// enabled), including the 2-member unanimity case.
     #[test]
     fn first_activation_quorum_view_proceeds() {
-        assert!(
-            exchange_completion_admits_activation(false, 1, 4, 4),
+        assert_eq!(
+            admit_exchange_completion(false, 1, 4, 4),
+            ExchangeAdmission::Admit,
             "formation with a full view must activate",
         );
-        assert!(
-            exchange_completion_admits_activation(false, 1, 3, 4),
+        assert_eq!(
+            admit_exchange_completion(false, 1, 3, 4),
+            ExchangeAdmission::Admit,
             "3 of 4 is the majority quorum — the first activation must proceed",
         );
-        assert!(
-            exchange_completion_admits_activation(false, 1, 2, 2),
+        assert_eq!(
+            admit_exchange_completion(false, 1, 2, 2),
+            ExchangeAdmission::Admit,
             "2-member formation with both reporting must activate",
         );
-        assert!(
-            exchange_completion_admits_activation(false, 1, 2, 3),
+        assert_eq!(
+            admit_exchange_completion(false, 1, 2, 3),
+            ExchangeAdmission::Admit,
             "2 of 3 is the majority quorum — the first activation must proceed",
+        );
+    }
+
+    /// W8-R2-1 — a det-degraded activation is upgraded by the racing second
+    /// exchange: a later SAME-TERM completion whose member view reaches
+    /// quorum passes the duplicate-activation gate; everything else stays a
+    /// true duplicate.
+    #[test]
+    fn degraded_term_upgrade_admits_only_same_term_quorum_views() {
+        // The rescue shape: term 5 was degraded, the late completion for
+        // term 5 carries a quorum view (3 of 4), nothing in flight → upgrade.
+        assert!(
+            degraded_term_upgrade_admissible(Some(5), 5, 3, 4, true),
+            "a same-term quorum view must upgrade a det-degraded activation",
+        );
+        // A second below-quorum view would reinstall the same det table.
+        assert!(
+            !degraded_term_upgrade_admissible(Some(5), 5, 2, 4, true),
+            "a below-quorum view must stay a duplicate — nothing to upgrade with",
+        );
+        // No degrade recorded: the normal duplicate gate stands.
+        assert!(
+            !degraded_term_upgrade_admissible(None, 5, 4, 4, true),
+            "without a recorded degrade every same-term completion is a duplicate",
+        );
+        // A stale marker for another term must never re-activate it.
+        assert!(
+            !degraded_term_upgrade_admissible(Some(4), 5, 4, 4, true),
+            "a degrade marker for a different term must not admit an upgrade",
+        );
+        // W8-R3-1 — a live migration wave blocks the upgrade: the
+        // same-epoch plan supersede would fail tasks mid-flight (unfencing
+        // their shards) while the degraded plan's workers, seeing no epoch
+        // advance, keep streaming. The marker stays set; the det-table
+        // residual applies instead.
+        assert!(
+            !degraded_term_upgrade_admissible(Some(5), 5, 3, 4, false),
+            "an upgrade must never supersede the plan under a live migration wave",
         );
     }
 

@@ -1550,15 +1550,17 @@ pub(crate) fn render_metrics_text(
         "teraslab_reheal_skipped_degenerate_view_total",
         crate::cluster::coordinator::reheal_skipped_degenerate_view_total(),
     );
-    // W8 — first-of-term activations held on a degenerate (below-quorum)
-    // exchange view. Rising while the committed term stays ahead of the
-    // active table means this node keeps retrying the exchange (prompt
-    // catch-up cadence) without ever seeing a majority of the committed
-    // members.
+    // W8 — first-of-term activations that degraded to the pure
+    // deterministic (emptied-view) table because their exchange completed
+    // below the member-view quorum. Usually rescued within ~2 s by the
+    // racing second exchange (the degraded-term upgrade); if no same-term
+    // quorum view ever arrives, the det table stands for the life of the
+    // term — a det table matches the committed placement, so no
+    // reactivation counter arms a re-heal for it.
     prom_counter(
         &mut out,
-        "teraslab_activation_held_degenerate_view_total",
-        crate::cluster::coordinator::activation_held_degenerate_view_total(),
+        "teraslab_activation_degraded_degenerate_view_total",
+        crate::cluster::coordinator::activation_degraded_degenerate_view_total(),
     );
     // §9 arm 1 — persistent-divergence gauge: consecutive quorum-backed
     // higher-term commits refused since the last apply. Non-zero and rising
@@ -5312,7 +5314,7 @@ mod tests {
             "teraslab_assignment_rejected_total",
             "teraslab_assignment_master_count_alerts_total",
             "teraslab_reheal_skipped_degenerate_view_total",
-            "teraslab_activation_held_degenerate_view_total",
+            "teraslab_activation_degraded_degenerate_view_total",
             "teraslab_topology_refused_higher_term_streak",
             "teraslab_alloc_total",
             "teraslab_alloc_bytes_total",

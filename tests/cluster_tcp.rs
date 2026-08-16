@@ -1290,6 +1290,10 @@ fn segment_cluster_master_failover_preserves_replicated_record() {
 /// Node replacement therefore requires an operator shrink, not a rejoin.
 #[test]
 fn segment_node_rejoins_and_takes_shard_ownership() {
+    // Surface coordinator logs when RUST_LOG is set (diagnostics only).
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .try_init();
     let node1 = create_segment_node(471, 0, 0, &[], 2);
     let node2 = create_segment_node(472, 0, 0, &[node1.swim_port], 2);
     let seed = node1.swim_port;
