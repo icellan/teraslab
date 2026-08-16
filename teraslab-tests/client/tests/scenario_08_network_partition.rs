@@ -104,12 +104,14 @@ const PER_BATCH_BUDGET: Duration = Duration::from_secs(8);
 /// 57% -- a structural flake that the zero-records check then reports as a
 /// failure (CI 31911172622).
 ///
-/// Running 4 batches concurrently and immediately replacing each one as it
-/// completes or expires fills the window instead of stalling it: ~4 slots x
-/// (30s / 8s) = ~15 attempts, so P(zero records created) = (1 - 0.132)^15 =
-/// ~12%. Concurrency is what buys attempts here; the budget cannot (raising
-/// it fits FEWER attempts in the window).
-const CONCURRENT_BATCHES: usize = 4;
+/// Running batches concurrently and immediately replacing each one as it
+/// completes or expires fills the window instead of stalling it: ~8 slots x
+/// (30s / 8s) = ~30 attempts, so P(zero records created) = (1 - 0.132)^30 =
+/// ~1.4% (4 slots left it at ~12%, which CI 31940408347 still lost).
+/// Concurrency is what buys attempts here; the budget cannot (raising it
+/// fits FEWER attempts in the window). All slots share one Client (pool 16
+/// conns/node), so 8 in-flight batches stay well inside the pool.
+const CONCURRENT_BATCHES: usize = 8;
 
 /// How many replacement create batches 8d.2's driver loop should launch this
 /// iteration: enough to refill the [`CONCURRENT_BATCHES`] slots, and nothing
