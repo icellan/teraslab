@@ -639,6 +639,19 @@ pub struct MigrationManager {
     /// Set once at coordinator construction; carried here so the batch
     /// migration path reads it without signature plumbing. Never persisted.
     vetoed_reduction_enabled: bool,
+    /// GAP 1 (armed scenario 06) — per-shard streak of CONSECUTIVE code-22
+    /// "manifest hash mismatch (count matched)" completion rejections, keyed
+    /// by the rejected manifest's hash. Lives on the manager (not the batch
+    /// worker) because each failed-task re-drive re-enters
+    /// `run_migration_batch` fresh and rebuilds the identical fence-time
+    /// manifest — the streak is the only way the source can prove "this
+    /// exact manifest was already rejected" across invocations and escalate
+    /// to a record-level re-sync instead of retrying forever. A different
+    /// hash restarts the streak (the content changed, so a plain retry is
+    /// meaningful again). Transient routing state: never persisted, reset
+    /// naturally on restart (a restarted source re-streams the baseline
+    /// anyway).
+    manifest_mismatch_streaks: std::collections::HashMap<u16, ([u8; 32], u32)>,
 }
 
 impl MigrationManager {
@@ -655,7 +668,35 @@ impl MigrationManager {
             failed_batch_retry_arm: false,
             failed_retry_hold: false,
             vetoed_reduction_enabled: false,
+            manifest_mismatch_streaks: std::collections::HashMap::new(),
         }
+    }
+
+    /// GAP 1 — note a code-22 manifest-mismatch completion rejection for
+    /// `shard` with the rejected manifest's hash; returns the streak of
+    /// CONSECUTIVE rejections of this exact content (1 = first). An
+    /// identical hash extends the streak; a different hash restarts it at 1.
+    /// The completion path escalates to a record-level re-sync once the
+    /// streak proves the identical manifest was already rejected (>= 2) —
+    /// see `manifest_mismatch_streaks` for why this lives on the manager.
+    pub fn note_completion_manifest_mismatch(&mut self, shard: u16, manifest_hash: &[u8; 32]) -> u32 {
+        let entry = self
+            .manifest_mismatch_streaks
+            .entry(shard)
+            .or_insert((*manifest_hash, 0));
+        if entry.0 == *manifest_hash {
+            entry.1 = entry.1.saturating_add(1);
+        } else {
+            *entry = (*manifest_hash, 1);
+        }
+        entry.1
+    }
+
+    /// GAP 1 — drop `shard`'s manifest-mismatch streak: its completion
+    /// verified, or its task was terminally aborted (a later re-plan starts
+    /// with a fresh manifest and deserves fresh bookkeeping).
+    pub fn clear_completion_manifest_mismatch(&mut self, shard: u16) {
+        self.manifest_mismatch_streaks.remove(&shard);
     }
 
     /// W8 review P0-1 — arm/disarm tombstone-vetoed manifest reduction for
@@ -3427,6 +3468,45 @@ mod tests {
         );
         assert!(mgr.is_shard_lost(9), "the collapsed sentinel stays LOST");
         assert!(mgr.inbound_bitmap().test(9), "the fence stays up");
+    }
+
+    /// GAP 1 (armed scenario 06) — the per-shard manifest-mismatch streak
+    /// tracker that breaks the code-22 completion livelock. The count of
+    /// CONSECUTIVE identical-manifest rejections persists across re-drive
+    /// batch invocations (each rebuilds the same fence-time manifest), so
+    /// the source can prove "the identical manifest was already rejected"
+    /// and escalate to a record-level re-sync instead of retrying forever.
+    #[test]
+    fn manifest_mismatch_streak_counts_identical_and_resets() {
+        let mut mgr = MigrationManager::new();
+        let hash_a = [0xAA; 32];
+        let hash_b = [0xBB; 32];
+        assert_eq!(
+            mgr.note_completion_manifest_mismatch(5, &hash_a),
+            1,
+            "first rejection opens the streak",
+        );
+        assert_eq!(
+            mgr.note_completion_manifest_mismatch(5, &hash_a),
+            2,
+            "the IDENTICAL manifest rejected again extends the streak",
+        );
+        assert_eq!(
+            mgr.note_completion_manifest_mismatch(5, &hash_b),
+            1,
+            "different manifest content restarts the streak",
+        );
+        assert_eq!(
+            mgr.note_completion_manifest_mismatch(6, &hash_a),
+            1,
+            "streaks are per-shard",
+        );
+        mgr.clear_completion_manifest_mismatch(5);
+        assert_eq!(
+            mgr.note_completion_manifest_mismatch(5, &hash_b),
+            1,
+            "clearing (verified / terminal) resets the streak",
+        );
     }
 
     /// GAP 3a — an empty committed-membership set (formation / no committed
