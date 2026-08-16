@@ -1,5 +1,6 @@
 //! Shared setup/teardown for Docker cluster test scenarios.
 
+use std::collections::BTreeMap;
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -1058,89 +1059,109 @@ pub async fn wait_for_migration_reads_ready(
     }
 }
 
+/// Node-keyed redo-settle predicate for [`wait_replication_settled`] /
+/// [`wait_specific_replication_settled`].
+///
+/// Each poll round feeds the map `node -> current_sequence` of the nodes that
+/// actually answered `/debug/redo`. Settled means the RESPONDING SET and every
+/// sequence in it were unchanged for two consecutive rounds after the first.
+///
+/// Keyed by node on purpose (run 31936746201 armed-15). The predecessor
+/// collected a positional `Vec<u64>` that silently OMITTED non-responders,
+/// with two failure modes:
+/// (a) a flapping node alternated the vector length, resetting the stability
+///     counter forever ("did not settle after 5s; last redo sequences:
+///     [1033, 1058]" -- two entries for three nodes); and
+/// (b) a MIDDLE node dropping out shifted positions, so one node's sequence
+///     compared against a DIFFERENT node's previous one -- capable of a
+///     FALSE-POSITIVE settle over sequences that never stabilized.
+/// Keying by node makes a missing node "unknown" (never a positional shift),
+/// and any change in the responding set explicitly resets the counter. An
+/// empty responding round can never settle: settling must be evidence of
+/// observed stability, not of nobody answering.
+#[derive(Default)]
+struct SettleTracker {
+    /// The previous round's responses; `None` before the first round.
+    prev: Option<BTreeMap<u32, u64>>,
+    /// Consecutive rounds with an identical (set, sequences) observation.
+    stable_polls: u32,
+}
+
+impl SettleTracker {
+    /// Rounds after the first that must repeat the identical observation.
+    const REQUIRED_STABLE_POLLS: u32 = 2;
+
+    /// Feed one poll round; returns `true` once settled (see type docs).
+    fn observe(&mut self, seqs: BTreeMap<u32, u64>) -> bool {
+        match self.prev.as_ref() {
+            // Responding-set change: a node vanished or (re)appeared. Reset --
+            // a missing node is "unknown", and this round is not comparable to
+            // the previous one, positionally or otherwise.
+            Some(prev) if !prev.keys().eq(seqs.keys()) => self.stable_polls = 0,
+            // Same set, identical sequences: one more stable round.
+            Some(prev) if *prev == seqs => self.stable_polls += 1,
+            // Same set but some sequence moved, or the very first round.
+            _ => self.stable_polls = 0,
+        }
+        let settled = self.stable_polls >= Self::REQUIRED_STABLE_POLLS && !seqs.is_empty();
+        self.prev = Some(seqs);
+        settled
+    }
+}
+
 /// Wait for replication to propagate.
 ///
-/// Polls `/debug/redo` on each reachable node and waits until redo
-/// sequences stabilize (stop changing between polls). This detects when
-/// all in-flight replication has completed without requiring sequences
-/// to be equal across nodes (each node has an independent redo log).
+/// Polls `/debug/redo` on each node `1..=node_count` and waits until the
+/// per-node redo sequences stabilize (stop changing between polls). This
+/// detects when all in-flight replication has completed without requiring
+/// sequences to be equal across nodes (each node has an independent redo log).
+/// See [`SettleTracker`] for the settle predicate.
 pub async fn wait_replication_settled(
     docker: &DockerHelpers,
     node_count: u32,
     timeout: Duration,
 ) -> Result<(), ClientError> {
-    let start = std::time::Instant::now();
-    let mut prev_seqs: Vec<u64> = Vec::new();
-    let mut stable_polls = 0u32;
-
-    loop {
-        let mut seqs = Vec::new();
-        for i in 1..=node_count {
-            let port = docker.http_port(i);
-            let url = format!("http://127.0.0.1:{port}/debug/redo");
-            if let Ok(json) = poll_json(&url).await
-                && let Some(seq) = json["current_sequence"].as_u64()
-            {
-                seqs.push(seq);
-            }
-        }
-
-        // Settled when sequences haven't changed for 2 consecutive polls.
-        if seqs.len() == prev_seqs.len() && seqs == prev_seqs {
-            stable_polls += 1;
-            if stable_polls >= 2 {
-                return Ok(());
-            }
-        } else {
-            stable_polls = 0;
-        }
-        prev_seqs = seqs;
-
-        if start.elapsed() >= timeout {
-            return Err(ClientError::Connection(format!(
-                "replication did not settle on {node_count} nodes after {timeout:?}; last redo sequences: {prev_seqs:?}",
-            )));
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    let nodes: Vec<u32> = (1..=node_count).collect();
+    wait_specific_replication_settled(docker, &nodes, timeout).await
 }
 
 /// Wait for replication to settle on specific nodes only (e.g., surviving
-/// nodes after a kill).
+/// nodes after a kill). See [`SettleTracker`] for the settle predicate; the
+/// timeout error names the nodes that were not answering `/debug/redo`.
 pub async fn wait_specific_replication_settled(
     docker: &DockerHelpers,
     node_nums: &[u32],
     timeout: Duration,
 ) -> Result<(), ClientError> {
     let start = std::time::Instant::now();
-    let mut prev_seqs: Vec<u64> = Vec::new();
-    let mut stable_polls = 0u32;
+    let mut tracker = SettleTracker::default();
 
     loop {
-        let mut seqs = Vec::new();
+        let mut seqs = BTreeMap::new();
         for &n in node_nums {
             let port = docker.http_port(n);
             let url = format!("http://127.0.0.1:{port}/debug/redo");
             if let Ok(json) = poll_json(&url).await
                 && let Some(seq) = json["current_sequence"].as_u64()
             {
-                seqs.push(seq);
+                seqs.insert(n, seq);
             }
         }
 
-        if seqs.len() == prev_seqs.len() && seqs == prev_seqs {
-            stable_polls += 1;
-            if stable_polls >= 2 {
-                return Ok(());
-            }
-        } else {
-            stable_polls = 0;
+        if tracker.observe(seqs.clone()) {
+            return Ok(());
         }
-        prev_seqs = seqs;
 
         if start.elapsed() >= timeout {
+            let non_responding: Vec<u32> = node_nums
+                .iter()
+                .copied()
+                .filter(|n| !seqs.contains_key(n))
+                .collect();
             return Err(ClientError::Connection(format!(
-                "replication did not settle on nodes {node_nums:?} after {timeout:?}; last redo sequences: {prev_seqs:?}",
+                "replication did not settle on nodes {node_nums:?} after {timeout:?}; \
+                 last redo sequences by node: {seqs:?}; \
+                 non-responding nodes: {non_responding:?}",
             )));
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -4127,5 +4148,111 @@ mod seed_records_accounting_tests {
             "a reconciled item must be published before the backoff sleep"
         );
         assert_eq!(verifier.record_count(), 1);
+    }
+}
+
+#[cfg(test)]
+mod settle_predicate_tests {
+    use super::*;
+
+    fn round(entries: &[(u32, u64)]) -> BTreeMap<u32, u64> {
+        entries.iter().copied().collect()
+    }
+
+    #[test]
+    fn full_responder_set_with_stable_seqs_settles() {
+        let mut t = SettleTracker::default();
+        assert!(
+            !t.observe(round(&[(1, 10), (2, 20), (3, 30)])),
+            "the first round can never settle"
+        );
+        assert!(
+            !t.observe(round(&[(1, 10), (2, 20), (3, 30)])),
+            "one stable repeat is not yet settled"
+        );
+        assert!(
+            t.observe(round(&[(1, 10), (2, 20), (3, 30)])),
+            "two stable repeats over the full responding set must settle"
+        );
+    }
+
+    #[test]
+    fn advancing_sequences_never_settle() {
+        let mut t = SettleTracker::default();
+        for i in 0..10u64 {
+            assert!(
+                !t.observe(round(&[(1, 10 + i), (2, 20), (3, 30)])),
+                "round {i}: an advancing sequence must never settle"
+            );
+        }
+    }
+
+    #[test]
+    fn middle_node_dropout_positional_shift_is_not_a_false_settle() {
+        // The exact positional-shift shape: node2 answered nothing in round 1,
+        // node3 answered nothing in rounds 2-4, and node2 reappeared at a
+        // sequence numerically equal to node3's PREVIOUS one. Positionally
+        // every round is [10, 20] -- the predecessor compared exactly that and
+        // SETTLED at round 3 while node2's sequence had moved unobserved and
+        // node3 went dark. Keyed by node, round 2 is a responding-set change
+        // (reset), so nothing may settle before round 4.
+        let mut t = SettleTracker::default();
+        assert!(!t.observe(round(&[(1, 10), (3, 20)])));
+        assert!(
+            !t.observe(round(&[(1, 10), (2, 20)])),
+            "a responding-set change must reset stability"
+        );
+        assert!(
+            !t.observe(round(&[(1, 10), (2, 20)])),
+            "the false-positive shape: positionally identical rounds must NOT \
+             settle across a responding-set change"
+        );
+        assert!(
+            t.observe(round(&[(1, 10), (2, 20)])),
+            "a genuinely stable subset settles once the set itself is stable"
+        );
+    }
+
+    #[test]
+    fn flapping_responder_resets_stability_and_never_false_settles() {
+        // node2 flaps in and out (the armed-15 wedge shape): the responding
+        // set alternates {1,2,3} / {1,3}, so stability must reset every round
+        // and the tracker must never report settled while the flap lasts.
+        let mut t = SettleTracker::default();
+        for i in 0..8 {
+            let settled = if i % 2 == 0 {
+                t.observe(round(&[(1, 10), (2, 20), (3, 30)]))
+            } else {
+                t.observe(round(&[(1, 10), (3, 30)]))
+            };
+            assert!(
+                !settled,
+                "round {i}: a flapping responder must never settle"
+            );
+        }
+        // Once the flap stops, the stable survivor subset settles: a missing
+        // node is "unknown" (tolerated), not a reason to hang forever.
+        assert!(
+            !t.observe(round(&[(1, 10), (3, 30)])),
+            "first stable repeat after the flap: not yet settled"
+        );
+        assert!(
+            t.observe(round(&[(1, 10), (3, 30)])),
+            "a stable survivor subset settles after the flap stops"
+        );
+    }
+
+    #[test]
+    fn no_responders_never_settles() {
+        // All nodes down: the predecessor's `[] == []` compare counted empty
+        // rounds as stable and settled VACUOUSLY after two of them. An empty
+        // responding set is evidence of nothing.
+        let mut t = SettleTracker::default();
+        for i in 0..4 {
+            assert!(
+                !t.observe(round(&[])),
+                "round {i}: an empty responding set must never settle"
+            );
+        }
     }
 }

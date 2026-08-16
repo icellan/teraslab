@@ -2185,6 +2185,17 @@ impl Engine {
         self.tombstone_log.get().and_then(|log| log.lookup(key))
     }
 
+    /// The recorded [`crate::ops::tombstone::TombstoneCause`] for `key`'s
+    /// tombstone, if any — diagnostic companion to
+    /// [`Self::tombstone_blocks_heal_apply`] so a veto site can report WHY an
+    /// apply was dropped. `None` when tombstones are disabled or no tombstone
+    /// covers `key`.
+    pub fn tombstone_cause(&self, key: &TxKey) -> Option<crate::ops::tombstone::TombstoneCause> {
+        self.tombstone_log
+            .get()
+            .and_then(|log| log.lookup_cause(key))
+    }
+
     /// Reverse-heal RULE-DS apply gate (design §C, consumed by the Phase 2c
     /// receiver apply): must a heal/migration-shipped image for `key` at
     /// `incoming_generation` be dropped as a resurrection of this node's delete?

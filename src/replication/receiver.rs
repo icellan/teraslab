@@ -1888,6 +1888,7 @@ fn apply_create_replica(
     if is_migration && engine.lookup(tx_key).is_none() {
         let incoming_gen = incoming_create_generation(metadata_bytes).unwrap_or(0);
         if engine.tombstone_blocks_heal_apply(tx_key, incoming_gen) {
+            record_heal_apply_vetoed(engine, tx_key, incoming_gen);
             return Ok(());
         }
     }
@@ -2081,6 +2082,53 @@ fn record_apply_skipped_missing_tx(op_name: &'static str, tx_key: &TxKey) {
         tx_key = ?tx_key.txid,
         "replica apply: tx or slot not found — skipping op; potential replication divergence",
     );
+}
+
+/// RULE-DS veto observability: a heal/migration-shipped image for `tx_key` was
+/// DROPPED by this node's deletion tombstone
+/// ([`Engine::tombstone_blocks_heal_apply`]). The veto itself is correct — but
+/// silent it is indistinguishable from a landed apply at the sender: the
+/// source re-pushes the repair create, the target keeps answering TxNotFound,
+/// and nothing anywhere says why. Increments
+/// `teraslab_replica_heal_apply_vetoed_total` on EVERY veto and emits a
+/// rate-limited warn (first-10-then-every-100th, see [`heal_veto_warn_due`];
+/// each carries the running total, so suppressed vetoes stay countable)
+/// with the txid prefix, cluster shard, incoming generation, and the
+/// tombstone's recorded cause. Diagnostic only — callers still drop the op as
+/// an idempotent no-op.
+#[inline]
+fn record_heal_apply_vetoed(engine: &Engine, tx_key: &TxKey, incoming_generation: u32) {
+    if let Some(m) = crate::metrics::replication_metrics() {
+        m.replica_heal_apply_vetoed.inc();
+    }
+    static HEAL_VETO_TOTAL: AtomicU64 = AtomicU64::new(0);
+    let n = HEAL_VETO_TOTAL.fetch_add(1, Ordering::Relaxed) + 1;
+    if !heal_veto_warn_due(n) {
+        return;
+    }
+    use std::fmt::Write as _;
+    let mut txid_prefix = String::with_capacity(16);
+    for b in &tx_key.txid[..8] {
+        let _ = write!(txid_prefix, "{b:02x}");
+    }
+    tracing::warn!(
+        txid_prefix = %txid_prefix,
+        shard = crate::cluster::shards::ShardTable::shard_for_key(tx_key),
+        incoming_generation,
+        cause = ?engine.tombstone_cause(tx_key),
+        vetoed_total = n,
+        "replica heal apply vetoed: deletion tombstone dropped a heal/migration create (RULE-DS)",
+    );
+}
+
+/// Whether the `n`th RULE-DS veto (1-based, process-wide) emits its warn: the
+/// first 10 all do (a veto is rare and each one matters), then every 100th (a
+/// veto storm — e.g. a source re-pushing a whole tombstoned shard — must not
+/// flood the log; the metric still counts every one).
+fn heal_veto_warn_due(n: u64) -> bool {
+    const WARN_FIRST: u64 = 10;
+    const WARN_EVERY: u64 = 100;
+    n <= WARN_FIRST || n.is_multiple_of(WARN_EVERY)
 }
 
 /// Why a replica-side apply failed, in a form the batch handler can ROUTE on.
@@ -2415,6 +2463,7 @@ fn apply_op_journal_inner(
             })
             .unwrap_or(0);
         if engine.tombstone_blocks_heal_apply(&tx_key, incoming_gen) {
+            record_heal_apply_vetoed(engine, &tx_key, incoming_gen);
             return Ok(());
         }
     }
@@ -12157,6 +12206,220 @@ mod tests {
             engine.read_slot(&k, 0).unwrap().status,
             UTXO_UNSPENT,
             "the online-healed re-create is a live (unspent) UTXO",
+        );
+    }
+
+    /// The RULE-DS warn rate-limit: the first 10 vetoes each warn (rare, each
+    /// one matters), then exactly every 100th (a veto storm must not flood the
+    /// log while the metric still counts every veto).
+    #[test]
+    fn heal_veto_warn_rate_limit_is_first_ten_then_every_hundredth() {
+        let due: Vec<u64> = (1..=1000).filter(|&n| heal_veto_warn_due(n)).collect();
+        let expected: Vec<u64> = (1..=10).chain((1..=10).map(|k| k * 100)).collect();
+        assert_eq!(due, expected, "warn-due ordinals in 1..=1000");
+    }
+
+    /// The RULE-DS veto must be OBSERVABLE (the silent-veto fix): every veto
+    /// increments `teraslab_replica_heal_apply_vetoed_total` and a rate-limited
+    /// warn fires. Without either signal a vetoed repair create is
+    /// indistinguishable from a landed one at the sender — the source
+    /// re-pushes, the target keeps answering TxNotFound, and nobody knows why.
+    ///
+    /// Drives 710 vetoes through the REAL `apply_op` migration gate. 710 is
+    /// deliberate: the warn ordinal counter is process-global, so other tests
+    /// in this binary that also veto (a handful, one veto each) can interleave.
+    /// A span of 710 consecutive ordinals contains at least 7 multiples of 100,
+    /// and at most a handful can be stolen by interleaved vetoes — so at least
+    /// one warn-due ordinal lands in THIS test's calls no matter the schedule.
+    #[test]
+    fn rule_ds_veto_increments_metric_and_warns_rate_limited() {
+        use std::sync::{Arc, Mutex};
+        use tracing::Event;
+        use tracing::field::{Field, Visit};
+        use tracing_subscriber::Layer;
+        use tracing_subscriber::layer::Context;
+        use tracing_subscriber::prelude::*;
+        use tracing_subscriber::registry::LookupSpan;
+
+        #[derive(Default)]
+        struct CaptureLayer {
+            warnings: Arc<Mutex<Vec<String>>>,
+        }
+
+        /// Renders every Debug/Display-recorded field (`message`, `cause`,
+        /// `txid_prefix`, ...) into one line so assertions can see them all.
+        #[derive(Default)]
+        struct EventVisitor {
+            rendered: String,
+        }
+
+        impl Visit for EventVisitor {
+            fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+                use std::fmt::Write as _;
+                let _ = write!(self.rendered, "{}={:?} ", field.name(), value);
+            }
+        }
+
+        impl<S> Layer<S> for CaptureLayer
+        where
+            S: tracing::Subscriber + for<'a> LookupSpan<'a>,
+        {
+            fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
+                if event.metadata().level() != &tracing::Level::WARN {
+                    return;
+                }
+                let mut visitor = EventVisitor::default();
+                event.record(&mut visitor);
+                if visitor.rendered.contains("heal apply vetoed") {
+                    self.warnings
+                        .lock()
+                        .expect("capture lock")
+                        .push(visitor.rendered);
+                }
+            }
+        }
+
+        // Install the metric subsystem so the counter has somewhere to live
+        // (idempotent — a prior test's install wins; read the EFFECTIVE one).
+        static TEST_METRICS: std::sync::OnceLock<&'static crate::metrics::ReplicationMetrics> =
+            std::sync::OnceLock::new();
+        let metrics_ref = *TEST_METRICS
+            .get_or_init(|| Box::leak(Box::new(crate::metrics::ReplicationMetrics::new())));
+        crate::metrics::init_replication_metrics(metrics_ref);
+        let metrics =
+            crate::metrics::replication_metrics().expect("replication metrics installed for test");
+        let before = metrics.replica_heal_apply_vetoed.get();
+
+        // A client-deleted (tombstoned, absent) key — the veto precondition.
+        let engine = make_engine();
+        enable_tombstones(&engine);
+        let k = key(170);
+        apply_op(&engine, &baseline_create(k, 1, 0)).unwrap();
+        engine
+            .delete(&DeleteRequest {
+                tx_key: k,
+                due_guard: None,
+            })
+            .expect("client delete records a tombstone");
+        assert!(
+            matches!(engine.read_metadata(&k), Err(SpendError::TxNotFound)),
+            "precondition: the record is deleted",
+        );
+
+        const VETOES: u64 = 710;
+        let warnings = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::EnvFilter::new("warn"))
+            .with(CaptureLayer {
+                warnings: warnings.clone(),
+            });
+        tracing::subscriber::with_default(subscriber, || {
+            for _ in 0..VETOES {
+                apply_op_journal(&engine, &baseline_create(k, 1, 0), false, true)
+                    .expect("a vetoed heal apply is an idempotent no-op, not an error");
+            }
+        });
+
+        // NO behavior change: the veto still vetoes.
+        assert!(
+            matches!(engine.read_metadata(&k), Err(SpendError::TxNotFound)),
+            "the veto must still drop the resurrecting create",
+        );
+        // One counter increment per veto (>= because the counter is
+        // process-global and parallel tests may also veto).
+        assert!(
+            metrics.replica_heal_apply_vetoed.get() - before >= VETOES,
+            "every veto must increment teraslab_replica_heal_apply_vetoed_total \
+             (delta {} < {VETOES})",
+            metrics.replica_heal_apply_vetoed.get() - before,
+        );
+        let warns = warnings.lock().expect("capture lock");
+        assert!(
+            !warns.is_empty(),
+            "at least one rate-limited veto warn must fire",
+        );
+        assert!(
+            (warns.len() as u64) < VETOES,
+            "the warn must be rate-limited, not per-veto ({} warns for {VETOES} vetoes)",
+            warns.len(),
+        );
+        assert!(
+            warns.iter().all(|w| w.contains("ClientDelete")),
+            "the warn must carry the tombstone cause; got: {:?}",
+            warns.first(),
+        );
+        assert!(
+            warns.iter().all(|w| w.contains("txid_prefix")
+                && w.contains("shard")
+                && w.contains("incoming_generation")),
+            "the warn must carry txid prefix, shard, and incoming generation; got: {:?}",
+            warns.first(),
+        );
+    }
+
+    /// The `apply_create_replica` RULE-DS gate (defense-in-depth behind the
+    /// general `apply_op` gate) records its veto too: a direct migration
+    /// create against a Dah-tombstoned absent key is dropped AND counted.
+    #[test]
+    fn rule_ds_create_gate_veto_is_recorded() {
+        static TEST_METRICS: std::sync::OnceLock<&'static crate::metrics::ReplicationMetrics> =
+            std::sync::OnceLock::new();
+        let metrics_ref = *TEST_METRICS
+            .get_or_init(|| Box::leak(Box::new(crate::metrics::ReplicationMetrics::new())));
+        crate::metrics::init_replication_metrics(metrics_ref);
+        let metrics =
+            crate::metrics::replication_metrics().expect("replication metrics installed for test");
+        let before = metrics.replica_heal_apply_vetoed.get();
+
+        // A Dah tombstone at generation 5 over an ABSENT key.
+        let engine = make_engine();
+        let log = crate::ops::tombstone::TombstoneLog::new(
+            std::path::PathBuf::from("/nonexistent/rule-ds-create-gate.tombstones"),
+            engine.index_seed(),
+            engine.index_shard_count(),
+            10_000,
+        );
+        let k = key(171);
+        log.record(&k, 5, 0, crate::ops::tombstone::TombstoneCause::Dah);
+        engine.set_tombstone_log(log);
+
+        // Incoming migration create at generation 3 (≤ 5 → blocked).
+        let mut metadata_bytes = vec![0u8; 70];
+        metadata_bytes[46..50].copy_from_slice(&3u32.to_le_bytes());
+        let utxo_hashes = vec![[0x11u8; 32]];
+        let create_req = CreateRequest {
+            tx_id: k.txid,
+            tx_version: 1,
+            locktime: 0,
+            fee: 0,
+            size_in_bytes: 0,
+            extended_size: 0,
+            is_coinbase: false,
+            spending_height: 0,
+            utxo_hashes: &utxo_hashes,
+            inputs: None,
+            outputs: None,
+            inpoints: None,
+            is_external: false,
+            created_at: 0,
+            block_height: 0,
+            mined_block_infos: &[],
+            frozen: false,
+            conflicting: false,
+            locked: false,
+            external_ref: None,
+            parent_txids: &[],
+        };
+        apply_create_replica(&engine, &k, &create_req, &metadata_bytes, &None, true)
+            .expect("a vetoed create-gate apply is an idempotent no-op");
+
+        assert!(
+            matches!(engine.read_metadata(&k), Err(SpendError::TxNotFound)),
+            "the create-gate veto must keep the tombstoned key absent",
+        );
+        assert!(
+            metrics.replica_heal_apply_vetoed.get() > before,
+            "the create-gate veto must increment the veto counter",
         );
     }
 
