@@ -415,7 +415,12 @@ async fn test_kill_during_writes() -> Result<(), ClientError> {
         common::wait_migrations_complete(&docker, 3, Duration::from_secs(120))
             .await
             .unwrap_or_else(|e| eprintln!("[15.2/15.3] migration wait: {e}"));
-        common::wait_replication_settled(&docker, 3, Duration::from_secs(5)).await?;
+        // Tolerant like the migration wait above: a node still catching up can
+        // hold the settle past its 5s budget, and the very next step is
+        // verify_consistency, which retries on its own.
+        common::wait_replication_settled(&docker, 3, Duration::from_secs(5))
+            .await
+            .unwrap_or_else(|e| eprintln!("[15.2/15.3] replication settle wait: {e}"));
 
         let client = common::create_client(&docker, 3).await?;
         client.refresh_routing().await?;

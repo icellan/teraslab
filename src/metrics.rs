@@ -1002,6 +1002,17 @@ pub struct ReplicationMetrics {
     /// diverged from the master without surfacing an error; operators
     /// must investigate any sustained growth.
     pub replica_apply_skipped_missing_tx: PaddedCounter,
+    /// RULE-DS veto observability — receiver-side counter incremented
+    /// every time a heal/migration baseline apply for an ABSENT key was
+    /// DROPPED by this node's deletion tombstone (`blocks_heal_apply`;
+    /// both the `apply_create_replica` gate and the general `apply_op`
+    /// gate). The veto is correct and idempotent, but silent at the
+    /// sender: the source keeps re-pushing a repair create that never
+    /// lands while the target keeps answering TxNotFound. A climbing
+    /// value alongside a stuck under-replication repair is the
+    /// fingerprint of a tombstone veto; correlate with the rate-limited
+    /// "heal apply vetoed" warn for the txid/shard/generation/cause.
+    pub replica_heal_apply_vetoed: PaddedCounter,
     /// External-review P1 follow-up — receiver-side counter incremented
     /// every time `apply_op` aborts a batch because the local slot state
     /// contradicts what the master's mutation expected (e.g. master
@@ -1167,6 +1178,7 @@ impl ReplicationMetrics {
             replica_rejected_stale_cluster_key: PaddedCounter::new(),
             replica_accepted_stale_cluster_key_from_master: PaddedCounter::new(),
             replica_apply_skipped_missing_tx: PaddedCounter::new(),
+            replica_heal_apply_vetoed: PaddedCounter::new(),
             replica_apply_divergence_total: PaddedCounter::new(),
             replica_missing_record_repaired: PaddedCounter::new(),
             replica_missing_record_repair_failed: PaddedCounter::new(),

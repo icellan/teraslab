@@ -408,6 +408,24 @@ impl TombstoneLog {
             .map(|v| (v.generation, v.height))
     }
 
+    /// The recorded [`TombstoneCause`] for `key`, if a tombstone exists —
+    /// diagnostic companion to [`Self::blocks_heal_apply`] so a veto site can
+    /// report WHY an apply was dropped. A stored byte no current cause maps to
+    /// (possible only for a log written by a future version) is reported as
+    /// [`TombstoneCause::ClientDelete`], matching how
+    /// [`Self::blocks_heal_apply`] treats every non-Dah cause (unconditional
+    /// block).
+    pub fn lookup_cause(&self, key: &TxKey) -> Option<TombstoneCause> {
+        self.shards[self.shard_index(key)]
+            .read()
+            .get(key)
+            .map(|v| match v.cause {
+                c if c == TombstoneCause::Dah as u8 => TombstoneCause::Dah,
+                c if c == TombstoneCause::PruneReplace as u8 => TombstoneCause::PruneReplace,
+                _ => TombstoneCause::ClientDelete,
+            })
+    }
+
     /// Total live tombstone count across all shards.
     pub fn len(&self) -> usize {
         self.shards.iter().map(|s| s.read().len()).sum()

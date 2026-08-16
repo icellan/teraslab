@@ -1471,7 +1471,13 @@ mod tests {
         for _ in 0..13 {
             tally.record(BatchOutcome::Abandoned);
         }
-        assert_eq!(tally, BatchTally { ops: 15, errors: 13 });
+        assert_eq!(
+            tally,
+            BatchTally {
+                ops: 15,
+                errors: 13
+            }
+        );
 
         let (read_ops, read_errors) = (15u32, 1u32);
         let result = validate_workload_made_progress(
