@@ -3000,6 +3000,16 @@ impl ClusterCoordinator {
             // view reaches quorum through the duplicate-activation gate as
             // an upgrade; cleared by any admitted quorum activation.
             let mut degraded_activation_term: Option<u64> = None;
+            // W9 FIX 2 — retry pacing for a det-degraded activation:
+            // `(last_attempt, fired_rounds)`, seeded when the degrade is
+            // admitted (the degrading completion counts as attempt zero)
+            // and cleared with the marker on any admitted quorum
+            // activation. While `degraded_activation_term` records the
+            // current committed term, the loop re-fires the exchange on the
+            // `degraded_upgrade_retry_backoff` cadence so the degrade is
+            // never terminal; completions route through the normal
+            // duplicate-gate upgrade path.
+            let mut degraded_retry: Option<(std::time::Instant, u32)> = None;
             // Task #47 — term-keyed single-flight slot for the same-term
             // re-heal exchange spawned by the normal reactivation repair.
             // `Some(term)` while an exchange for that term is in flight;
@@ -3954,6 +3964,74 @@ impl ClusterCoordinator {
                     }
                 }
 
+                // W9 FIX 2 — degraded-upgrade retry. While the ACTIVE table
+                // for the committed term is the det degrade (below-quorum
+                // first activation), re-fire the exchange on a doubling
+                // backoff so a late-applying peer can still deliver the
+                // quorum view; the completion routes through the normal
+                // duplicate-gate upgrade path (`degraded_term_upgrade_-
+                // admissible`). Without this the degrade was terminal: the
+                // det table matches the committed placement so no divergence
+                // counter arms the same-term re-heal, and the prompt arm is
+                // dead because committed == activated.
+                if !activation_held
+                    && let Some((last_attempt, fired_rounds)) = degraded_retry
+                {
+                    let committed_term = topo_authority_event.committed_term();
+                    if degraded_upgrade_retry_due(
+                        degraded_activation_term,
+                        committed_term,
+                        last_attempt.elapsed(),
+                        fired_rounds,
+                    ) {
+                        let committed_members = topo_authority_event.committed_members();
+                        if committed_members.len() > 1 {
+                            degraded_retry = Some((
+                                std::time::Instant::now(),
+                                fired_rounds.saturating_add(1),
+                            ));
+                            tracing::info!(
+                                term = committed_term,
+                                round = fired_rounds.saturating_add(1),
+                                next_backoff_secs = degraded_upgrade_retry_backoff(
+                                    fired_rounds.saturating_add(1)
+                                )
+                                .as_secs(),
+                                "cluster: det-degraded activation — re-running the \
+                                 exchange for a quorum upgrade view",
+                            );
+                            let exchange_tx = exchange_complete_tx.clone();
+                            let node_addrs_x = node_addrs.clone();
+                            let engine_x = engine.clone();
+                            let shard_table_x = shard_table.clone();
+                            let inbound_bm_x = inbound_bm_event.clone();
+                            let secret_x = cluster_secret_event.clone();
+                            let members_x = committed_members.clone();
+                            std::thread::spawn(move || {
+                                let view = Self::run_exchange_phase(
+                                    &members_x,
+                                    self_id,
+                                    committed_term,
+                                    &node_addrs_x,
+                                    &engine_x,
+                                    &shard_table_x,
+                                    &inbound_bm_x,
+                                    std::time::Duration::from_millis(2000),
+                                    &secret_x,
+                                );
+                                let _ =
+                                    exchange_tx.send((members_x, committed_term, view, false));
+                            });
+                        } else {
+                            // Membership contracted to single-node while the
+                            // marker stood; there is no peer view to upgrade
+                            // from — stop retrying (the marker itself stays,
+                            // it is inert without a multi-node term).
+                            degraded_retry = None;
+                        }
+                    }
+                }
+
                 // Re-activate topology if the shard table has rolled-back shards
                 // from failed migrations that don't match the committed topology.
                 // Only fires when: no active migrations, cooldown elapsed, and
@@ -4520,10 +4598,18 @@ impl ClusterCoordinator {
                         ExchangeAdmission::AdmitDetOnly => {
                             partition_view.clear();
                             degraded_activation_term = Some(term);
+                            // W9 FIX 2 — arm the degraded-upgrade retry: the
+                            // degrading completion counts as attempt zero, so
+                            // the first retry fires a full starting backoff
+                            // from NOW.
+                            degraded_retry = Some((std::time::Instant::now(), 0));
                         }
                         // Any admitted quorum activation (first, upgrade, or
                         // re-heal) supersedes a pending det degrade.
-                        ExchangeAdmission::Admit => degraded_activation_term = None,
+                        ExchangeAdmission::Admit => {
+                            degraded_activation_term = None;
+                            degraded_retry = None;
+                        }
                     }
                     last_activated_term = term;
                     topology_epoch.store(term, Ordering::Relaxed);
@@ -7195,6 +7281,61 @@ fn degraded_term_upgrade_admissible(
     no_active_migrations
         && degraded_activation_term == Some(term)
         && member_view_reaches_quorum(member_view_size, member_count)
+}
+
+/// W9 FIX 2 — interval between retry exchanges for a det-degraded
+/// activation, as a function of how many retries have already FIRED for
+/// this degrade. Doubles from 2 s to the 30 s cap (the
+/// [`park_reheal_backoff`] doubling-to-cap shape at the exchange scale):
+/// the common rescue is a peer applying the commit within a few seconds,
+/// while a genuinely partitioned peer must not be probed every 2 s
+/// forever.
+///
+/// The 2 s floor equals the exchange's total deadline, which makes the
+/// retry single-flight BY CONSTRUCTION: an exchange thread always sends
+/// its (possibly partial) result within its deadline, so the previous
+/// retry's exchange has completed before the next one can fire — no
+/// separate in-flight slot to release (a slot released on "any same-term
+/// completion" would be freed early by the racing commit/prompt-arm
+/// exchanges for the same term).
+fn degraded_upgrade_retry_backoff(fired_rounds: u32) -> Duration {
+    const START: Duration = Duration::from_secs(2);
+    const CAP: Duration = Duration::from_secs(30);
+    CAP.min(START.saturating_mul(1u32 << fired_rounds.min(4)))
+}
+
+/// W9 FIX 2 — should the event loop re-fire the exchange phase for a
+/// det-degraded activation this tick?
+///
+/// A det-degraded activation used to be TERMINAL when the racing second
+/// exchange also missed quorum (CI run 31971906387, default-09: node2
+/// degraded term 6, peers applied the commit ~7 s later, and no third
+/// exchange EVER fired — the det table matches the committed placement so
+/// no divergence counter arms the same-term re-heal, and the prompt arm is
+/// dead because committed == activated). Due iff BOTH hold:
+///
+/// - `degraded_activation_term` records exactly the CURRENT committed
+///   term. This encodes every stop condition: the marker is cleared when
+///   the term is upgraded (any [`ExchangeAdmission::Admit`]), and a newly
+///   committed term makes `committed_term` move past the marker (the new
+///   term's own activation path owns the table); and
+/// - the backoff for the current round has elapsed since the last attempt
+///   (the degrade itself counts as attempt zero — the completion that
+///   degraded IS an exchange result, so the first retry waits the full
+///   starting backoff).
+///
+/// The resulting exchange completion is routed through the EXISTING
+/// duplicate-activation upgrade gate ([`degraded_term_upgrade_admissible`])
+/// like any other same-term completion — a below-quorum retry view is
+/// simply discarded there and the cadence continues.
+fn degraded_upgrade_retry_due(
+    degraded_activation_term: Option<u64>,
+    committed_term: u64,
+    since_last_attempt: Duration,
+    fired_rounds: u32,
+) -> bool {
+    degraded_activation_term == Some(committed_term)
+        && since_last_attempt >= degraded_upgrade_retry_backoff(fired_rounds)
 }
 
 /// Topology proposer thread: broadcasts a proposal to all peers, collects
@@ -31991,6 +32132,66 @@ mod tests {
         assert!(
             !degraded_term_upgrade_admissible(Some(5), 5, 3, 4, false),
             "an upgrade must never supersede the plan under a live migration wave",
+        );
+    }
+
+    /// W9 FIX 2 — the degraded-upgrade retry interval doubles from 2 s to
+    /// the 30 s cap (the `park_reheal_backoff` shape at the exchange scale).
+    #[test]
+    fn degraded_upgrade_retry_backoff_doubles_from_start_to_cap() {
+        assert_eq!(degraded_upgrade_retry_backoff(0), Duration::from_secs(2));
+        assert_eq!(degraded_upgrade_retry_backoff(1), Duration::from_secs(4));
+        assert_eq!(degraded_upgrade_retry_backoff(2), Duration::from_secs(8));
+        assert_eq!(degraded_upgrade_retry_backoff(3), Duration::from_secs(16));
+        assert_eq!(
+            degraded_upgrade_retry_backoff(4),
+            Duration::from_secs(30),
+            "the fifth round hits the 30 s cap",
+        );
+        assert_eq!(
+            degraded_upgrade_retry_backoff(u32::MAX),
+            Duration::from_secs(30),
+            "the cap must hold without overflow",
+        );
+    }
+
+    /// W9 FIX 2 (CI run 31971906387, default-09) — a det-degraded
+    /// activation was TERMINAL: node2 degraded term 6, peers applied the
+    /// commit ~7 s later, and no third exchange ever fired (a pure det
+    /// table matches the committed placement so no divergence counter arms
+    /// the re-heal, and the prompt arm is dead because
+    /// committed == activated). The retry arm re-fires the exchange on the
+    /// backoff cadence while the degrade marker stands, and stops the
+    /// moment the term is upgraded (marker cleared on Admit), a new term
+    /// commits, or the node is no longer degraded.
+    #[test]
+    fn degraded_upgrade_retry_due_only_while_term_degraded_and_backoff_elapsed() {
+        // Degraded for the committed term, first-round backoff elapsed → due.
+        assert!(
+            degraded_upgrade_retry_due(Some(6), 6, Duration::from_secs(2), 0),
+            "a degraded term must re-fire once the 2 s starting backoff elapses",
+        );
+        assert!(
+            !degraded_upgrade_retry_due(Some(6), 6, Duration::from_millis(1900), 0),
+            "the retry must pace itself — not due before the backoff elapses",
+        );
+        // Later rounds pace on the doubled interval.
+        assert!(
+            !degraded_upgrade_retry_due(Some(6), 6, Duration::from_millis(3900), 1),
+            "round 1 paces on 4 s",
+        );
+        assert!(degraded_upgrade_retry_due(Some(6), 6, Duration::from_secs(4), 1));
+        // Stop: the term was upgraded (marker cleared on Admit) / the node
+        // is no longer degraded.
+        assert!(
+            !degraded_upgrade_retry_due(None, 6, Duration::from_secs(60), 0),
+            "an upgraded (or never-degraded) term must never re-fire",
+        );
+        // Stop: a new term committed — its own activation path owns the
+        // table now; a retry for the stale term would be dropped anyway.
+        assert!(
+            !degraded_upgrade_retry_due(Some(6), 7, Duration::from_secs(60), 0),
+            "a new committed term must stop the stale term's retry",
         );
     }
 
