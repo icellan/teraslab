@@ -710,6 +710,52 @@ fn shard_activation_gate_reason(views: &[NodeShardView], node_count: u32) -> Opt
     None
 }
 
+/// The cluster-wide sum of per-node ACTIVATED target-master counts, when it
+/// diverges from the required total of 4096: each shard must have exactly
+/// ONE target master, so any other sum means the polled nodes hold
+/// divergent target tables (double-targeted or orphaned shards). Returns
+/// `None` when the sum is exactly 4096. Only meaningful over a COMPLETE
+/// poll — every node answered a full (non-degraded) `/status` — because a
+/// missing node's uncounted targets fake a `< 4096` sum; the caller in
+/// [`wait_migrations_complete`] enforces that, plus a 5s persistence window
+/// against transient mid-install disagreement.
+fn divergent_target_sum(views: &[NodeShardView]) -> Option<u64> {
+    let sum: u64 = views.iter().map(|v| v.target_masters).sum();
+    (sum != 4096).then_some(sum)
+}
+
+/// Advance the divergence-suspicion state machine for one ELIGIBLE poll
+/// (every node answered a full `/status` and agreed on `agreed_version`);
+/// returns `true` when the fail-fast is due.
+///
+/// `suspicion` records when a wrong target sum was FIRST seen and at which
+/// agreed version. The fail-fast fires only when the sum is still wrong,
+/// at the SAME agreed version, `persistence` after it was first recorded.
+/// A wrong sum observed at a DIFFERENT version re-arms the clock instead
+/// of inheriting the older suspicion: a transient at ver=8, a gate-closed
+/// reactivation window of any length, and a fresh transient at ver=9 are
+/// two unrelated samples — not one persistent divergence. A correct sum
+/// clears the suspicion; ineligible polls must simply not call this.
+fn divergence_fail_due(
+    suspicion: &mut Option<(std::time::Instant, u64)>,
+    now: std::time::Instant,
+    agreed_version: u64,
+    divergent: bool,
+    persistence: Duration,
+) -> bool {
+    if !divergent {
+        *suspicion = None;
+        return false;
+    }
+    match *suspicion {
+        Some((since, ver)) if ver == agreed_version => now.duration_since(since) >= persistence,
+        _ => {
+            *suspicion = Some((now, agreed_version));
+            false
+        }
+    }
+}
+
 /// W4 — name the shards behind a diverging cluster-wide master sum.
 ///
 /// `per_node` holds each node's EFFECTIVE mastered shard IDs (from
@@ -805,6 +851,11 @@ pub async fn wait_migrations_complete(
     let mut mig_last_log = std::time::Instant::now();
     let start = std::time::Instant::now();
     let mut ready_polls = 0u32;
+    // Divergence fail-fast state: when the target sum was FIRST seen wrong
+    // and at which agreed shard_table_version; cleared whenever a complete
+    // poll sees it right, re-armed when the agreed version moves. See
+    // `divergence_fail_due` and the check below the node loop.
+    let mut divergent_since: Option<(std::time::Instant, u64)> = None;
     loop {
         let mut all_idle = true;
         let mut total_masters: u64 = 0;
@@ -812,6 +863,8 @@ pub async fn wait_migrations_complete(
         let mut total_inbound_pending: u64 = 0;
         let mut node_details = Vec::new();
         let mut shard_views: Vec<NodeShardView> = Vec::new();
+        let mut complete_status_answers: u32 = 0;
+        let mut status_versions: Vec<u64> = Vec::new();
         for i in 1..=node_count {
             let port = docker.http_port(i);
             let url = format!("http://127.0.0.1:{port}/admin/migration_status");
@@ -847,6 +900,8 @@ pub async fn wait_migrations_complete(
                 if let Some(marker) = status_degraded_marker(&json) {
                     node_details.push(format!("node{i}:{marker}"));
                 } else {
+                    complete_status_answers += 1;
+                    status_versions.push(version);
                     node_details.push(format!(
                         "node{i}:size={cluster_size},ver={version},m={m},target={target_m}"
                     ));
@@ -864,6 +919,47 @@ pub async fn wait_migrations_complete(
                 }
             } else {
                 node_details.push(format!("node{i}:status-unavailable"));
+            }
+        }
+        // Divergence fail-fast (scenario 09 diagnosis): when every node
+        // answered a full (non-degraded) `/status` AND agrees on the
+        // activated `shard_table_version`, the per-node ACTIVATED target
+        // counts must sum to exactly 4096 — one target master per shard,
+        // cluster-wide. A sum that stays wrong for >= 5s at the SAME agreed
+        // version means the nodes hold DIVERGENT target tables for that
+        // version (double-targeted or orphaned shards); no migration
+        // progress can settle that, so burning the remaining timeout only
+        // mislabels the failure as slow migration. A single wrong sample is
+        // tolerated (a node polled mid-install can legitimately disagree
+        // transiently), an incomplete poll neither confirms nor clears the
+        // suspicion, the suspicion clock is scoped to the agreed version
+        // (two unrelated transients straddling a reactivation must not
+        // combine into one "persistent" divergence), and the
+        // version-agreement gate keeps STAGGERED activation honest: a late
+        // activator (the reactivation cooldown reaches 30s) reports
+        // old-table targets under an old version — a legitimate >= 5s
+        // transient, not divergence.
+        if complete_status_answers == node_count && status_versions.windows(2).all(|w| w[0] == w[1])
+        {
+            let agreed_version = status_versions.first().copied().unwrap_or(0);
+            let divergent = divergent_target_sum(&shard_views);
+            if divergence_fail_due(
+                &mut divergent_since,
+                std::time::Instant::now(),
+                agreed_version,
+                divergent.is_some(),
+                Duration::from_secs(5),
+            ) {
+                let sum = divergent.unwrap_or(0);
+                let wrong_for = divergent_since
+                    .map(|(since, _)| since.elapsed().as_secs_f64())
+                    .unwrap_or(0.0);
+                return Err(ClientError::Connection(format!(
+                    "DIVERGENT TARGET TABLES: targets sum to {sum} != 4096 at agreed \
+                     shard_table_version {agreed_version} (wrong for {wrong_for:.1}s across \
+                     consecutive polls) [{}]",
+                    node_details.join(", ")
+                )));
             }
         }
         let activation_reason = shard_activation_gate_reason(&shard_views, node_count);
@@ -3245,6 +3341,108 @@ mod migration_gate_tests {
         ];
         assert_eq!(serving_sum(&views), 4096);
         assert_eq!(shard_activation_gate_reason(&views, 3), None);
+    }
+
+    /// Scenario 09 diagnosis — the target-table divergence detector: a
+    /// cluster whose per-node ACTIVATED target counts do not sum to 4096
+    /// holds divergent tables (double-targeted or orphaned shards), which
+    /// migration progress can never settle.
+    #[test]
+    fn divergent_target_sum_flags_only_a_wrong_total() {
+        // Agreeing tables: one target master per shard, sum exactly 4096.
+        let agreed = vec![
+            view(1, 1366, 1366),
+            view(2, 1365, 1365),
+            view(3, 1365, 1365),
+        ];
+        assert_eq!(divergent_target_sum(&agreed), None);
+
+        // Double-targeted shards: two nodes both target the same shards.
+        let doubled = vec![
+            view(1, 1366, 1366),
+            view(2, 1365, 1365),
+            view(3, 1365, 1733),
+        ];
+        assert_eq!(divergent_target_sum(&doubled), Some(4464));
+
+        // Orphaned shards: nobody targets part of the range.
+        let orphaned = vec![view(1, 1366, 1366), view(2, 1365, 1365), view(3, 1365, 0)];
+        assert_eq!(divergent_target_sum(&orphaned), Some(2731));
+    }
+
+    /// The suspicion clock is scoped to the agreed shard_table_version: a
+    /// transient wrong sum at ver=8, a gate-closed reactivation window of
+    /// any length, and a fresh transient at ver=9 are two UNRELATED samples
+    /// and must re-arm the clock — never combine into one immediate
+    /// hard-fail. Genuine same-version persistence still fires, and a
+    /// correct sum clears the suspicion entirely. Driven with synthetic
+    /// instants so no assertion depends on real elapsed time.
+    #[test]
+    fn divergence_suspicion_clock_is_version_scoped() {
+        let persistence = Duration::from_secs(5);
+        let t0 = std::time::Instant::now();
+        let mut suspicion: Option<(std::time::Instant, u64)> = None;
+
+        // First wrong sample at ver=8 arms the clock but never fires.
+        assert!(!divergence_fail_due(
+            &mut suspicion,
+            t0,
+            8,
+            true,
+            persistence
+        ));
+        assert_eq!(suspicion.map(|(_, v)| v), Some(8));
+
+        // 6s later (>= persistence) the next eligible wrong sample arrives
+        // at ver=9 — a NEW version: re-arm, do not fail on two unrelated
+        // transients straddling a reactivation.
+        let t1 = t0 + Duration::from_secs(6);
+        assert!(!divergence_fail_due(
+            &mut suspicion,
+            t1,
+            9,
+            true,
+            persistence
+        ));
+        assert_eq!(
+            suspicion,
+            Some((t1, 9)),
+            "a wrong sum at a new agreed version must restart the clock"
+        );
+
+        // Still wrong at ver=9 but under the persistence window: no fail.
+        let t2 = t1 + Duration::from_secs(4);
+        assert!(!divergence_fail_due(
+            &mut suspicion,
+            t2,
+            9,
+            true,
+            persistence
+        ));
+
+        // Persistently wrong at the SAME version past the window: fail.
+        let t3 = t1 + persistence;
+        assert!(
+            divergence_fail_due(&mut suspicion, t3, 9, true, persistence),
+            "same-version divergence persisting past the window must fire"
+        );
+
+        // A correct sum clears the suspicion; the next wrong sample at the
+        // same version starts over instead of firing instantly.
+        assert!(!divergence_fail_due(
+            &mut suspicion,
+            t3,
+            9,
+            false,
+            persistence
+        ));
+        assert_eq!(suspicion, None, "a correct sum must clear the suspicion");
+        let t4 = t3 + Duration::from_secs(60);
+        assert!(
+            !divergence_fail_due(&mut suspicion, t4, 9, true, persistence),
+            "after a clear, a fresh wrong sample re-arms rather than fires"
+        );
+        assert_eq!(suspicion.map(|(_, v)| v), Some(9));
     }
 
     #[test]

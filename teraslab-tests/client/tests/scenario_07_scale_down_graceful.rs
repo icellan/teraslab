@@ -253,6 +253,31 @@ async fn run_scenario() -> Result<(), ClientError> {
     workload_running.store(false, std::sync::atomic::Ordering::Relaxed);
     let _ = bg_handle.await;
 
+    // Graceful contract: the 7.2 drain gate only proves node4 no longer
+    // MASTERS any shard. Replica backfill sourced from node4 (its shed
+    // copies re-homing onto the survivors) can still be mid-flight, and
+    // force-removing node4 at that instant strands the receivers' inbound
+    // entries (CI runs 31971906387/31971908443 lost 370-487 records this
+    // way). Wait for cluster-wide migration quiescence — active==0 and
+    // inbound==0 on ALL FOUR nodes — before the topology change, in its
+    // own bounded window. NOTE: this must be `wait_specific_migrations_
+    // complete`, not `wait_migrations_complete` — the latter's activation
+    // gate holds whenever any node reports target=0, and the quiesced
+    // node4 (committed out of the topology) reports exactly that forever.
+    tlog!(t0, "test 7.2b: wait for post-drain migration quiescence");
+    eprintln!("[7.2b] Waiting for cluster-wide migration quiescence before removing node4");
+    common::wait_specific_migrations_complete(&docker5, &[1, 2, 3, 4], Duration::from_secs(120))
+        .await
+        .map_err(|e| {
+            eprintln!(
+                "[7.2b] ERROR: cluster did not reach migration quiescence after node4 drain \
+                 (removing node4 here would strand its in-flight replica backfill): {e}"
+            );
+            e
+        })?;
+    eprintln!("[7.2b] OK -- no active migrations, no pending inbound entries");
+    tlog!(t0, "test 7.2b: done");
+
     // -- Test 7.3: Stop node4, wait for cluster_size=3 --
     tlog!(t0, "test 7.3: stop node4, wait for cluster_size=3");
     eprintln!("[7.3] Force-removing node4 (releases Docker network interface)");
