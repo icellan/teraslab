@@ -3428,7 +3428,6 @@ impl ClusterCoordinator {
                                 FailedTaskTableAction::Rollback,
                             );
                         }
-                        mgr = migration.lock();
                     }
                     // Drop pending inbounds for shards this node does not hold.
                     //
@@ -3442,31 +3441,58 @@ impl ClusterCoordinator {
                     // unmoved). Gated on the local table being the COMMITTED
                     // one, and fail-closed on leftover records
                     // (`inbound_entry_must_be_kept`).
+                    //
+                    // LOCK ORDER (W8, run 31946519864 scenario 06 node4): the
+                    // canonical nesting everywhere else in this file is
+                    // shard_table BEFORE migration (`run_orphan_cleanup`, the
+                    // reactivation metrics block, ...). This section used to
+                    // re-lock migration first and take `shard_table.read()`
+                    // while holding it; parking_lot's write-fair RwLock parks
+                    // new readers behind a waiting writer, so that inversion
+                    // closed a three-way cycle — orphan sweep holding
+                    // table.read blocked on migration; this loop holding
+                    // migration blocked on table.read queued behind a parked
+                    // batch-worker `rollback_shard` write — and wedged the
+                    // event loop permanently (watchdog fingerprint: last_phase
+                    // "inbound_prune", shard_table=HELD migration=HELD). Take
+                    // the table read FIRST, then re-lock migration.
+                    let committed_term = topo_authority_event.committed_term();
+                    let table = shard_table.read();
+                    mgr = migration.lock();
+                    if committed_term > 0
+                        && table.version == committed_term
+                        && mgr.inbound_count() > 0
                     {
-                        let committed_term = topo_authority_event.committed_term();
-                        let table = shard_table.read();
-                        if committed_term > 0
-                            && table.version == committed_term
-                            && mgr.inbound_count() > 0
-                        {
-                            let pruned = mgr.prune_inbound_not_held(|shard| {
-                                inbound_entry_must_be_kept(
-                                    &table,
-                                    self_id,
-                                    shard,
-                                    engine.shard_record_count(shard),
-                                )
-                            });
-                            if pruned > 0 {
-                                tracing::info!(
-                                    pruned,
-                                    term = committed_term,
-                                    "cluster: dropped pending inbound migrations for shards this \
-                                     node no longer holds",
-                                );
-                            }
+                        let pruned = mgr.prune_inbound_not_held(|shard| {
+                            inbound_entry_must_be_kept(
+                                &table,
+                                self_id,
+                                shard,
+                                engine.shard_record_count(shard),
+                            )
+                        });
+                        if pruned > 0 {
+                            tracing::info!(
+                                pruned,
+                                term = committed_term,
+                                "cluster: dropped pending inbound migrations for shards this \
+                                 node no longer holds",
+                            );
                         }
                     }
+                    // Snapshot the handoff count under the read guard, then
+                    // release it: the settled-inbound GC below takes the SWIM
+                    // lock and can write the inbound state file — neither may
+                    // extend a table-read hold (a parked writer would stall
+                    // every hot-path reader behind it for the duration). The
+                    // pre-fix code likewise dropped its read guard before the
+                    // GC acted on the value, so the decision races the same
+                    // concurrent commits/rollbacks it always did — and stays
+                    // fail-closed: the orphan reap additionally requires a
+                    // SWIM-dead source and only marks entries LOST (fence
+                    // kept), never unfences.
+                    let pending_handoffs = table.pending_handoff_count();
+                    drop(table);
                     sync_atomic_migration_bitmaps(
                         &mgr,
                         &fenced_bm_event,
@@ -3476,10 +3502,8 @@ impl ClusterCoordinator {
                     if mgr.inbound_count() > 0
                         && last_inbound_clear.elapsed() >= Duration::from_secs(5)
                     {
-                        let clear_settled_inbound = mgr.active_count() == 0 && {
-                            let table = shard_table.read();
-                            table.pending_handoff_count() == 0
-                        };
+                        let clear_settled_inbound =
+                            mgr.active_count() == 0 && pending_handoffs == 0;
                         let removed = if clear_settled_inbound {
                             // W1.1 residual fix (FIX 1) — only reap inbound
                             // entries that are genuinely orphaned (a source
@@ -3713,8 +3737,12 @@ impl ClusterCoordinator {
                             phantom_masters,
                             parked_shards,
                         ) = {
-                            let mgr = migration.lock();
+                            // LOCK ORDER (W8) — shard_table before migration,
+                            // the canonical nesting; see the InboundPrune
+                            // section above for the deadlock the inverse
+                            // order caused.
                             let table = shard_table.read();
+                            let mgr = migration.lock();
                             let (mismatched, pending_handoffs) =
                                 committed_topology_reactivation_metrics(
                                     &table,
@@ -31501,5 +31529,145 @@ mod tests {
             content,
             "the target must serve the exact blob content"
         );
+    }
+
+    /// W8 (run 31946519864 scenario 06 node4) — lock-order regression guard
+    /// for the event loop's `InboundPrune` section.
+    ///
+    /// Watchdog fingerprint: `last_phase:"inbound_prune",
+    /// locks:"shard_table=HELD migration=HELD node_addrs=free"`, stalled 41s+
+    /// with `/status` dead. The section used to take `migration.lock()` THEN
+    /// `shard_table.read()`, while every other site nests the migration mutex
+    /// INSIDE the table lock. parking_lot's RwLock is write-fair — a parked
+    /// writer blocks NEW readers — so three threads close a cycle:
+    ///
+    ///   T1 (orphan sweep)  holds table.read,  blocked on migration
+    ///   T2 (inbound prune) holds migration,   blocked on table.read
+    ///                      (queued behind T3's parked write)
+    ///   T3 (batch worker)  parked on table.write, waiting for T1's read
+    ///
+    /// This test drives exactly that topology with the production pieces
+    /// callable from a unit test: `run_orphan_cleanup` is T1 verbatim (the
+    /// canonical table→migration nesting), T3 is a table writer
+    /// (`rollback_shard`, the batch-worker rollback shape), and T2 loops the
+    /// InboundPrune section's acquisition shape — table.read BEFORE
+    /// migration.lock, prune under both, handoff-count snapshot, then the
+    /// table guard dropped first. With the pre-fix shape (migration→table)
+    /// this deadlocks within a few hundred iterations (verified: the deadline
+    /// below blows); with the canonical order it converges in well under a
+    /// second. Deadline-bound so a regression fails fast instead of wedging
+    /// the suite.
+    #[test]
+    fn inbound_prune_lock_order_does_not_deadlock_with_orphan_sweep_and_table_writer() {
+        use std::sync::atomic::{AtomicUsize, Ordering as AOrd};
+
+        let members = [NodeId(1), NodeId(2)];
+        let table = ShardTable::compute_with_epoch(&members, 2, 7, 1);
+        let epoch = table.version;
+        let shard_table = Arc::new(ShardTableLock::new(table));
+        let migration = Arc::new(Mutex::new(MigrationManager::new()));
+        let engine = Arc::new(test_engine());
+        let self_id = NodeId(1);
+
+        // Seed pending inbound entries so the prune body does real work every
+        // iteration. With 2 members at RF=2 every shard's target assignment
+        // contains self, so `inbound_entry_must_be_kept` retains all of them —
+        // the entries (and the contention) persist across all iterations.
+        {
+            let mut mgr = migration.lock();
+            for shard in 0..64u16 {
+                mgr.register_inbound_source(shard, NodeId(2));
+            }
+        }
+
+        const ITERS: usize = 300;
+        const THREADS: usize = 3;
+        let done = Arc::new(AtomicUsize::new(0));
+        let barrier = Arc::new(std::sync::Barrier::new(THREADS));
+
+        // T1 — the orphan sweep: the production path that nests the migration
+        // mutex INSIDE a held table read (`run_orphan_cleanup`).
+        let t1 = {
+            let engine = engine.clone();
+            let shard_table = shard_table.clone();
+            let migration = migration.clone();
+            let done = done.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                for _ in 0..ITERS {
+                    run_orphan_cleanup(self_id, &engine, &shard_table, &migration, epoch);
+                }
+                done.fetch_add(1, AOrd::SeqCst);
+            })
+        };
+
+        // T2 — the InboundPrune section's acquisition shape as fixed:
+        // table.read BEFORE migration.lock (with the pre-fix inversion —
+        // migration.lock first, table.read while holding it — this thread
+        // wedges the whole topology; verified red before the fix).
+        let t2 = {
+            let engine = engine.clone();
+            let shard_table = shard_table.clone();
+            let migration = migration.clone();
+            let done = done.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                for _ in 0..ITERS {
+                    let table = shard_table.read();
+                    let mut mgr = migration.lock();
+                    if mgr.inbound_count() > 0 {
+                        let _ = mgr.prune_inbound_not_held(|shard| {
+                            inbound_entry_must_be_kept(
+                                &table,
+                                self_id,
+                                shard,
+                                engine.shard_record_count(shard),
+                            )
+                        });
+                    }
+                    let _pending = table.pending_handoff_count();
+                    drop(table);
+                    drop(mgr);
+                }
+                done.fetch_add(1, AOrd::SeqCst);
+            })
+        };
+
+        // T3 — a topology writer parking on table.write (the batch-worker
+        // rollback shape; a no-op mutation, but a real exclusive acquisition).
+        let t3 = {
+            let shard_table = shard_table.clone();
+            let done = done.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                for _ in 0..ITERS {
+                    shard_table.write().rollback_shard(11);
+                }
+                done.fetch_add(1, AOrd::SeqCst);
+            })
+        };
+
+        // Liveness watchdog: under the canonical (uniform) lock order this
+        // finishes in well under a second; the inverted order leaves
+        // `done < THREADS` forever.
+        let start = std::time::Instant::now();
+        while done.load(AOrd::SeqCst) < THREADS
+            && start.elapsed() < std::time::Duration::from_secs(30)
+        {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(
+            done.load(AOrd::SeqCst),
+            THREADS,
+            "threads did not all finish within 30s — the InboundPrune \
+             migration→shard_table lock-order inversion (W8) has regressed \
+             into a deadlock"
+        );
+        for h in [t1, t2, t3] {
+            h.join().expect("worker joins");
+        }
     }
 }
