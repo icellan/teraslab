@@ -811,6 +811,14 @@ const SAME_TERM_REACTIVATION_COOLDOWN: Duration = Duration::from_secs(30);
 
 const DRAIN_REACTIVATION_INTERVAL: Duration = Duration::from_secs(2);
 
+/// W9 FIX 1 — cadence on which the exchange phase RE-QUERIES a peer whose
+/// `OP_PARTITION_VERSION_REPORT` query failed (rejected, unreachable, or
+/// garbled), bounded by the exchange's total deadline. Short, because the
+/// dominant failure is a fast `STALE_EPOCH` rejection from a peer that has
+/// not yet applied the just-committed term (commit propagation takes 1-7 s
+/// in CI while the exchange fires ~100 ms after the local commit).
+const EXCHANGE_PEER_RETRY_INTERVAL: Duration = Duration::from_millis(500);
+
 fn debug_shard_set() -> &'static std::collections::HashSet<u16> {
     static SET: std::sync::OnceLock<std::collections::HashSet<u16>> = std::sync::OnceLock::new();
     SET.get_or_init(|| {
@@ -6365,10 +6373,16 @@ impl ClusterCoordinator {
     ///
     /// Self-report is computed locally without TCP. Peers are queried in
     /// parallel; a peer whose query fails — unreachable, rejected (non-OK
-    /// status), or unparseable — is left ABSENT from the returned view (F1,
-    /// so election's partial-view gate genuinely blocks deviation) and does
-    /// not block the full per-peer timeout. The total wall-clock budget is
-    /// bounded by `total_timeout`.
+    /// status), or unparseable — is RE-QUERIED on a short cadence
+    /// ([`EXCHANGE_PEER_RETRY_INTERVAL`]) until it answers or the total
+    /// deadline elapses (W9 FIX 1, CI run 31971906387: the exchange fires
+    /// within ~100 ms of the local commit while peers take 1-7 s to APPLY
+    /// it, so a one-shot query chronically collected a below-quorum view and
+    /// det-degraded every first activation). A peer that never answers
+    /// within the deadline is left ABSENT from the returned view (F1, so
+    /// election's partial-view gate genuinely blocks deviation — never
+    /// fabricated emptiness) and does not block the full per-peer timeout.
+    /// The total wall-clock budget is bounded by `total_timeout`.
     #[allow(clippy::too_many_arguments)]
     fn run_exchange_phase(
         members: &[NodeId],
@@ -6421,29 +6435,62 @@ impl ClusterCoordinator {
         // exits via SWIM reap + member-set change.
         type PeerResult = (NodeId, Option<Vec<PartitionVersionEntry>>);
         let (tx, rx) = std::sync::mpsc::channel::<PeerResult>();
+        let deadline = std::time::Instant::now() + total_timeout;
         for (peer, addr) in &peer_addrs {
             let tx = tx.clone();
             let peer = *peer;
             let addr = *addr;
             let secret = auth_secret.clone();
+            // One thread per peer with an internal retry loop (bounded by
+            // the shared deadline) — never a thread per attempt. Each thread
+            // sends EXACTLY ONE final result: the first successful report,
+            // or `None` at the deadline.
             std::thread::spawn(move || {
-                // `_ok`: a rejected report (non-OK status) is a failed query
-                // by design, not an empty report — see F1 above.
-                let entries = match send_topology_frame_ok(
-                    addr,
-                    OP_PARTITION_VERSION_REPORT,
-                    &cluster_key.to_le_bytes(),
-                    secret.as_deref().map(Vec::as_slice),
-                ) {
-                    Ok(payload) => parse_partition_version_response(&payload),
-                    Err(_) => None,
-                };
-                let _ = tx.send((peer, entries));
+                let mut attempts = 0u32;
+                let mut last_failure = String::new();
+                loop {
+                    attempts += 1;
+                    // `_ok`: a rejected report (non-OK status) is a failed
+                    // query by design, not an empty report — see F1 above.
+                    match send_topology_frame_ok(
+                        addr,
+                        OP_PARTITION_VERSION_REPORT,
+                        &cluster_key.to_le_bytes(),
+                        secret.as_deref().map(Vec::as_slice),
+                    ) {
+                        Ok(payload) => match parse_partition_version_response(&payload) {
+                            Some(entries) => {
+                                let _ = tx.send((peer, Some(entries)));
+                                return;
+                            }
+                            None => last_failure = "unparseable report payload".to_string(),
+                        },
+                        Err(err) => last_failure = err,
+                    }
+                    // W9 FIX 1 — re-query on a short cadence until the total
+                    // deadline: the dominant failure is a fast STALE_EPOCH
+                    // rejection from a peer that has not yet applied the
+                    // commit, and it typically starts answering within the
+                    // window. Give up (honest absence) once a full retry
+                    // interval no longer fits before the deadline.
+                    if std::time::Instant::now() + EXCHANGE_PEER_RETRY_INTERVAL >= deadline {
+                        tracing::warn!(
+                            peer = peer.0,
+                            %addr,
+                            attempts,
+                            last_failure,
+                            "cluster: exchange peer ABSENT — every report \
+                             query failed within the exchange deadline",
+                        );
+                        let _ = tx.send((peer, None));
+                        return;
+                    }
+                    std::thread::sleep(EXCHANGE_PEER_RETRY_INTERVAL);
+                }
             });
         }
         drop(tx);
 
-        let deadline = std::time::Instant::now() + total_timeout;
         for _ in 0..peer_addrs.len() {
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             if remaining.is_zero() {
@@ -30823,6 +30870,174 @@ mod tests {
             table.target_assignment(shard).master,
             NodeId(2),
             "a view missing a candidate (failed query) must not allow deviation from the deterministic master",
+        );
+    }
+
+    /// W9 FIX 1 (CI run 31971906387) — a peer that REJECTS the report query
+    /// (non-OK status, e.g. `ERR_STALE_EPOCH` because it has not yet APPLIED
+    /// the just-committed term) must be RE-QUERIED on a short cadence until
+    /// it answers or the total exchange deadline elapses. The one-shot query
+    /// raced commit propagation (1-7 s in CI) against an exchange fired
+    /// ~100 ms after the local commit, so the view chronically collected
+    /// 1-2 of 3-4 members and every first activation det-degraded.
+    ///
+    /// The stub peer rejects the FIRST report and accepts the SECOND; the
+    /// exchange must record the peer's entries within the deadline.
+    #[test]
+    fn run_exchange_phase_requeries_rejecting_peer_until_it_answers() {
+        use std::io::{Read, Write};
+
+        let members = [NodeId(1), NodeId(2)];
+        let term = 4u64;
+        let engine = Arc::new(test_engine());
+        let det = ShardTable::compute_with_epoch(&members, 2, term, 1);
+
+        let peer_entries = vec![PartitionVersionEntry {
+            shard: 9,
+            flags: 0b01,
+            replica_count: 1,
+            last_applied_seq: 7,
+            manifest_digest: 3,
+            max_generation: 2,
+        }];
+        let peer_entries_srv = peer_entries.clone();
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        // NOT joined before the assertion: a regressed (one-shot) exchange
+        // never opens the second connection, and a join would hang the test
+        // instead of failing it. The thread exits with the process.
+        let _server = std::thread::spawn(move || {
+            // Connection 1: reject with a non-OK status (the STALE_EPOCH
+            // shape). Connection 2: answer a valid report.
+            for served in 0..2u32 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut header = [0u8; 4];
+                stream.read_exact(&mut header).unwrap();
+                let len = u32::from_le_bytes(header) as usize;
+                let mut body = vec![0u8; len];
+                stream.read_exact(&mut body).unwrap();
+                let mut frame_bytes = header.to_vec();
+                frame_bytes.extend_from_slice(&body);
+                let (request, _) =
+                    crate::protocol::frame::RequestFrame::decode(&frame_bytes).unwrap();
+                assert_eq!(request.op_code, OP_PARTITION_VERSION_REPORT);
+                let response = if served == 0 {
+                    crate::protocol::frame::ResponseFrame {
+                        request_id: request.request_id,
+                        status: crate::protocol::opcodes::STATUS_ERROR,
+                        payload: Vec::new(),
+                    }
+                } else {
+                    crate::protocol::frame::ResponseFrame {
+                        request_id: request.request_id,
+                        status: crate::protocol::opcodes::STATUS_OK,
+                        payload: encode_partition_version_response(2, term, &peer_entries_srv),
+                    }
+                };
+                stream.write_all(&response.encode()).unwrap();
+            }
+        });
+
+        let mut addrs = std::collections::HashMap::new();
+        addrs.insert(NodeId(2), addr);
+        let node_addrs = Arc::new(RwLock::new(addrs));
+        let shard_table = Arc::new(ShardTableLock::new(det));
+        let inbound_bm = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+
+        let view = ClusterCoordinator::run_exchange_phase(
+            &members,
+            NodeId(1),
+            term,
+            &node_addrs,
+            &engine,
+            &shard_table,
+            &inbound_bm,
+            std::time::Duration::from_millis(3000),
+            &None,
+        );
+
+        assert_eq!(
+            view.get(&NodeId(2)),
+            Some(&peer_entries),
+            "a peer that rejected the first report but accepted the re-query \
+             must be PRESENT in the view with its reported entries",
+        );
+    }
+
+    /// W9 FIX 1 — the re-query loop must keep the F1 honest-absence
+    /// semantics: a peer that rejects EVERY report within the deadline stays
+    /// ABSENT from the view (never recorded as present-with-no-entries).
+    #[test]
+    fn run_exchange_phase_leaves_always_rejecting_peer_absent() {
+        use std::io::{Read, Write};
+
+        let members = [NodeId(1), NodeId(2)];
+        let term = 4u64;
+        let engine = Arc::new(test_engine());
+        let det = ShardTable::compute_with_epoch(&members, 2, term, 1);
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        // Reject every query. Bounded (the ~1.2 s deadline fits at most a
+        // handful of 500 ms-cadence attempts); NOT joined — the thread parks
+        // in accept() once the exchange gives up and exits with the process.
+        std::thread::spawn(move || {
+            for _ in 0..8u32 {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                let mut header = [0u8; 4];
+                if stream.read_exact(&mut header).is_err() {
+                    continue;
+                }
+                let len = u32::from_le_bytes(header) as usize;
+                let mut body = vec![0u8; len];
+                if stream.read_exact(&mut body).is_err() {
+                    continue;
+                }
+                let mut frame_bytes = header.to_vec();
+                frame_bytes.extend_from_slice(&body);
+                let Ok((request, _)) =
+                    crate::protocol::frame::RequestFrame::decode(&frame_bytes)
+                else {
+                    continue;
+                };
+                let response = crate::protocol::frame::ResponseFrame {
+                    request_id: request.request_id,
+                    status: crate::protocol::opcodes::STATUS_ERROR,
+                    payload: Vec::new(),
+                };
+                let _ = stream.write_all(&response.encode());
+            }
+        });
+
+        let mut addrs = std::collections::HashMap::new();
+        addrs.insert(NodeId(2), addr);
+        let node_addrs = Arc::new(RwLock::new(addrs));
+        let shard_table = Arc::new(ShardTableLock::new(det));
+        let inbound_bm = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+
+        let view = ClusterCoordinator::run_exchange_phase(
+            &members,
+            NodeId(1),
+            term,
+            &node_addrs,
+            &engine,
+            &shard_table,
+            &inbound_bm,
+            std::time::Duration::from_millis(1200),
+            &None,
+        );
+
+        assert!(
+            view.contains_key(&NodeId(1)),
+            "the in-process self-report must always be present",
+        );
+        assert!(
+            !view.contains_key(&NodeId(2)),
+            "a peer that rejected every re-query must stay ABSENT — the \
+             retry loop must never record fabricated emptiness",
         );
     }
 
