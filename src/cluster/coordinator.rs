@@ -121,6 +121,51 @@ const UNDER_REPLICATION_SWEEP_MAX_SHARDS: usize = 128;
 /// periodic fallback.
 const UNDER_REPLICATION_EVENT_DEBOUNCE: Duration = Duration::from_millis(1500);
 
+/// sc04 (run 31911177514) — drain-side backpressure watermark: an
+/// under-replication pass (event OR periodic) fires only while the number
+/// of in-flight resync backfill pairs is at or below this. 0 = strictly
+/// one pass-batch at a time. Chosen 0 because it is free where repair is
+/// healthy — scenario 15.3's passes ran with `in_flight_skipped = 0` on
+/// every pass, i.e. the pipeline was always drained before the next fire
+/// — and nothing is lost by refusing: a refused pass stays armed and the
+/// gap is re-derived in full from the retained view once the pipeline
+/// drains. Any watermark > 0 only re-admits bounded stacking (sc04's
+/// defect at smaller scale: concurrent full-shard streams competing for
+/// the same starved pipeline).
+const UNDER_REPLICATION_DRAIN_WATERMARK: usize = 0;
+
+/// sc08 — per-run connection cap for RESYNC-origin backfills. Resyncs are
+/// background repair (scenario 15.3's contract: ~100-300 records restored
+/// within seconds), not bulk migration: 8 pipelined connections stream
+/// that in well under a second, while the observed defect opened 46-48
+/// connections per run for 46 records and — looped 442 times by sc08 —
+/// exhausted the majority peer's 512 per-IP connection cap, starving the
+/// RF=2 client-write replication path. Bulk (topology-plan) migrations
+/// keep the configured `migration_pool_size` untouched.
+const RESYNC_MAX_CONNECTIONS: usize = 8;
+
+/// sc04 — the drain gate shared by BOTH under-replication fire sites:
+/// open only when `inflight_len` (the size of the shared resync in-flight
+/// pair set) has drained to [`UNDER_REPLICATION_DRAIN_WATERMARK`]. A
+/// closed gate refuses the fire without consuming it: the event trigger
+/// stays armed and the periodic timer stays elapsed, so the pass fires on
+/// the first loop tick after the pipeline drains.
+// The watermark is a tunable constant that happens to be 0 (usize's
+// minimum) today; the `<=` shape is the contract, not a typo'd `==`.
+#[allow(clippy::absurd_extreme_comparisons)]
+fn resync_drain_gate_open(inflight_len: usize) -> bool {
+    inflight_len <= UNDER_REPLICATION_DRAIN_WATERMARK
+}
+
+/// sc08 — size the connection fan-out for a RESYNC-origin backfill run:
+/// the configured bulk `migration_pool_size`, capped at
+/// [`RESYNC_MAX_CONNECTIONS`] and floored at 1. Parameterized by origin —
+/// only the Phase H resync drain calls this; topology-plan migrations
+/// pass their configured pool size through unchanged.
+fn resync_migration_pool_size(configured_pool_size: usize) -> usize {
+    configured_pool_size.clamp(1, RESYNC_MAX_CONNECTIONS)
+}
+
 /// Derives one under-replication sweep round's resync signals.
 ///
 /// Pure so the sweep contract is unit-testable. Inputs: the retained
@@ -265,6 +310,12 @@ struct EventRepairTrigger {
     /// (sorted, as `Membership::alive_members` emits it). Arms only when
     /// the set actually differs — the refutation-shape filter.
     last_alive_set: Option<Vec<NodeId>>,
+    /// sc08 — consecutive zero-completion (some-failed) resync outcome
+    /// harvests since the last completed resync. Scales the effective
+    /// debounce window exponentially (see [`Self::effective_window`]) so
+    /// a fail-fast repair loop (fail → re-derive → re-fire) backs off to
+    /// the periodic cadence instead of hammering at the base debounce.
+    failure_streak: u32,
 }
 
 impl EventRepairTrigger {
@@ -276,6 +327,39 @@ impl EventRepairTrigger {
             enabled,
             armed: None,
             last_alive_set: None,
+            failure_streak: 0,
+        }
+    }
+
+    /// sc08 — the streak-scaled debounce window: `window × 2^streak`,
+    /// capped at [`UNDER_REPLICATION_SWEEP_INTERVAL`] (the periodic
+    /// cadence — backing off further would make the event path slower
+    /// than the fallback it accelerates) and never below the base
+    /// window. Evaluated at peek/fire time, so a streak bump landing
+    /// AFTER a re-arm still extends that pending pass's window.
+    fn effective_window(&self) -> Duration {
+        if self.failure_streak == 0 {
+            return self.window;
+        }
+        // Shift capped well past the point where the cap dominates
+        // (2^16 × any real window ≫ 20s) to keep `1u32 << shift` sound.
+        let shift = self.failure_streak.min(16);
+        self.window
+            .saturating_mul(1u32 << shift)
+            .min(UNDER_REPLICATION_SWEEP_INTERVAL)
+            .max(self.window)
+    }
+
+    /// sc08 — fold one harvested resync-run outcome batch into the
+    /// failure streak: any completed resync resets it (repair works —
+    /// restore the base cadence), a zero-completion batch with failures
+    /// extends it, and a neutral batch (stale-epoch abort: nothing
+    /// completed, nothing failed) leaves it untouched.
+    fn record_resync_outcome(&mut self, completed: u64, failed: u64) {
+        if completed > 0 {
+            self.failure_streak = 0;
+        } else if failed > 0 {
+            self.failure_streak = self.failure_streak.saturating_add(1);
         }
     }
 
@@ -312,29 +396,30 @@ impl EventRepairTrigger {
         }
     }
 
-    /// Non-consuming peek: whether a pass is armed and its window has
-    /// elapsed at `now`. The cheap pre-gate the event loop checks BEFORE
-    /// taking the migration lock, so flag-off (never-armed) runs pay zero
-    /// extra lock traffic. Epoch currency is deliberately not checked
-    /// here; `take_due` owns that.
+    /// Non-consuming peek: whether a pass is armed and its (streak-scaled)
+    /// window has elapsed at `now`. The cheap pre-gate the event loop
+    /// checks BEFORE taking the migration lock, so flag-off (never-armed)
+    /// runs pay zero extra lock traffic. Epoch currency is deliberately
+    /// not checked here; `take_due` owns that.
     fn is_armed_and_due(&self, now: std::time::Instant) -> bool {
         self.armed
-            .is_some_and(|(armed_at, _)| now.duration_since(armed_at) >= self.window)
+            .is_some_and(|(armed_at, _)| now.duration_since(armed_at) >= self.effective_window())
     }
 
     /// Fire the pending pass if it is due at `now` under `current_epoch`.
     ///
-    /// Returns `true` (and disarms) only when a pass is armed, its window
-    /// has elapsed, and it was armed under `current_epoch`. A due pass
-    /// armed under a stale epoch is re-armed under `current_epoch` with a
-    /// fresh window and `false` is returned — it is never fired stale.
-    /// Callers gate this on being able to actually run the pass (sweep
-    /// flag, no in-flight migrations): an unfired trigger stays armed.
+    /// Returns `true` (and disarms) only when a pass is armed, its
+    /// (streak-scaled) window has elapsed, and it was armed under
+    /// `current_epoch`. A due pass armed under a stale epoch is re-armed
+    /// under `current_epoch` with a fresh window and `false` is returned
+    /// — it is never fired stale. Callers gate this on being able to
+    /// actually run the pass (sweep flag, no in-flight migrations, drain
+    /// gate): an unfired trigger stays armed.
     fn take_due(&mut self, now: std::time::Instant, current_epoch: u64) -> bool {
         let Some((armed_at, armed_epoch)) = self.armed else {
             return false;
         };
-        if now.duration_since(armed_at) < self.window {
+        if now.duration_since(armed_at) < self.effective_window() {
             return false;
         }
         if armed_epoch == current_epoch {
@@ -352,12 +437,22 @@ impl EventRepairTrigger {
 /// not double-run right behind an event pass) and bump the event-repair
 /// counter. Returns whether the pass should run now. Split from the event
 /// loop so the reset-on-fire contract is unit-testable.
+///
+/// sc04 — `resync_inflight_len` is the drain gate input: while the resync
+/// pipeline is above [`UNDER_REPLICATION_DRAIN_WATERMARK`] the fire is
+/// REFUSED without consuming the trigger (refuse-and-stay-armed), so a
+/// re-armed pass can never stack a new run batch onto still-streaming
+/// ones.
 fn event_repair_take_fire(
     trigger: &mut EventRepairTrigger,
     now: std::time::Instant,
     current_epoch: u64,
+    resync_inflight_len: usize,
     last_periodic_sweep: &mut std::time::Instant,
 ) -> bool {
+    if !resync_drain_gate_open(resync_inflight_len) {
+        return false;
+    }
     if !trigger.take_due(now, current_epoch) {
         return false;
     }
@@ -388,6 +483,39 @@ impl Drop for ResyncInflightGuard {
         for pair in &self.pairs {
             set.remove(pair);
         }
+    }
+}
+
+/// sc08 — aggregate outcome of FINISHED resync backfill runs, reported by
+/// the Phase H spawn threads when their run returns and harvested by the
+/// event loop to drive the failure-streak backoff
+/// ([`EventRepairTrigger::record_resync_outcome`]). Counts task
+/// resolutions, not runs: `completed` > 0 in a harvest means repair is
+/// landing (reset the streak); `completed == 0` with `failed` > 0 is the
+/// sc08 fail-fast shape (extend it).
+#[derive(Debug, Default)]
+struct ResyncRunOutcome {
+    /// Tasks resolved Complete across finished runs since the last harvest.
+    completed: std::sync::atomic::AtomicU64,
+    /// Tasks resolved Failed across finished runs since the last harvest.
+    failed: std::sync::atomic::AtomicU64,
+}
+
+impl ResyncRunOutcome {
+    /// Fold one finished run's `(completed, failed)` task counts in.
+    fn record(&self, completed: u32, failed: u32) {
+        self.completed
+            .fetch_add(u64::from(completed), Ordering::Relaxed);
+        self.failed.fetch_add(u64::from(failed), Ordering::Relaxed);
+    }
+
+    /// Drain and return the accumulated `(completed, failed)` counts, so
+    /// each run's outcome feeds the failure streak exactly once.
+    fn harvest(&self) -> (u64, u64) {
+        (
+            self.completed.swap(0, Ordering::Relaxed),
+            self.failed.swap(0, Ordering::Relaxed),
+        )
     }
 }
 
@@ -2484,6 +2612,11 @@ impl ClusterCoordinator {
         // cleared by [`ResyncInflightGuard`] when that run finishes.
         let resync_inflight: Arc<Mutex<std::collections::HashSet<(u64, u16)>>> =
             Arc::new(Mutex::new(std::collections::HashSet::new()));
+        // sc08 — outcome accumulator for finished resync backfill runs.
+        // The Phase H spawn threads record each run's (completed, failed)
+        // task counts; the event loop harvests them each iteration to
+        // drive the failure-streak backoff on the repair trigger.
+        let resync_run_outcome: Arc<ResyncRunOutcome> = Arc::new(ResyncRunOutcome::default());
         // W1.1 FIX B — shard transfer-request channel. The dispatch
         // handler for OP_MIGRATION_TRANSFER_REQUEST posts requests from
         // migration targets; the event loop drains them and re-runs the
@@ -2894,11 +3027,18 @@ impl ClusterCoordinator {
                         // shard it should hold gets a resync signal. Gated on
                         // no active migrations (in-flight catch-up IS the
                         // repair) and rate-limited; the per-sweep cap is
-                        // logged, never silent.
+                        // logged, never silent. sc04 — ALSO gated on the
+                        // resync pipeline having drained (refuse-and-stay-
+                        // armed: a refused tick leaves the elapsed timer
+                        // alone, so the sweep fires on the first 100ms loop
+                        // tick after the in-flight runs finish, instead of
+                        // stacking a new pass-batch onto still-streaming
+                        // ones).
                         if under_replication_sweep_enabled_event
                             && last_under_replication_sweep.elapsed()
                                 >= UNDER_REPLICATION_SWEEP_INTERVAL
                             && migration.lock().active_count() == 0
+                            && resync_drain_gate_open(resync_inflight.lock().len())
                         {
                             last_under_replication_sweep = std::time::Instant::now();
                             let view = retained_exchange_view_event.lock().clone();
@@ -3061,15 +3201,25 @@ impl ClusterCoordinator {
                 // drain. NOTE the resync backfills this pass itself spawns
                 // are NOT in `active_count` (Phase H tasks are not
                 // start_outbound-tracked); concurrent duplicates toward
-                // them are prevented by the `resync_inflight` set instead.
-                // Aggregate concurrency: `max_migration_threads` bounds each
-                // RUN, not the aggregate — N stacked runs (≤ceil(backlog/cap))
-                // can hold N× that many threads, mostly parked on the SHARED
-                // byte throttle, which is the true global bound. Firing (inside
+                // them are prevented by the `resync_inflight` set, and
+                // sc04's pass STACKING (8 armed re-fires piling 971
+                // concurrent shard streams onto a starved pipeline) is
+                // prevented by the drain gate inside
+                // `event_repair_take_fire`: while `resync_inflight` is
+                // above the watermark the fire is refused WITHOUT
+                // consuming the trigger, so at most one pass-batch of
+                // runs streams at a time. Firing (inside
                 // `event_repair_take_fire`) resets the periodic timer so
                 // the fallback cadence never double-runs right behind an
                 // event pass; a capped-off remainder re-arms the trigger so
-                // the backlog converges in debounce-window steps.
+                // the backlog converges in debounce-window steps — windows
+                // that sc08's failure-streak backoff stretches toward the
+                // periodic cadence while resync runs keep failing without
+                // a single completion (the harvest below feeds it).
+                let (resynced_ok, resync_failed) = resync_run_outcome.harvest();
+                if resynced_ok > 0 || resync_failed > 0 {
+                    event_repair_trigger.record_resync_outcome(resynced_ok, resync_failed);
+                }
                 let repair_now = std::time::Instant::now();
                 if event_repair_trigger.is_armed_and_due(repair_now)
                     && migration.lock().active_count() == 0
@@ -3077,6 +3227,7 @@ impl ClusterCoordinator {
                         &mut event_repair_trigger,
                         repair_now,
                         topology_epoch.load(Ordering::Relaxed),
+                        resync_inflight.lock().len(),
                         &mut last_under_replication_sweep,
                     )
                 {
@@ -4048,30 +4199,41 @@ impl ClusterCoordinator {
                     let ib = inbound_bm_event.clone();
                     let throttle_ref = migration_throttle_event.clone();
                     let secret_ref = cluster_secret_event.clone();
+                    let outcome_ref = resync_run_outcome.clone();
                     std::thread::spawn(move || {
                         let _inflight_guard = inflight_guard;
-                        Self::run_migration_tasks_with_global_limit(
-                            tasks,
-                            all_keys,
-                            node_addrs_ref,
-                            eng,
-                            migration_ref,
-                            st,
-                            redo,
-                            epoch,
-                            max_migration_threads,
-                            migration_pool_size,
-                            migration_batch_size,
-                            fb,
-                            mb,
-                            ib,
-                            self_id,
-                            throttle_ref,
-                            secret_ref,
-                            // Replica resync backfill — never a master handoff,
-                            // so relinquish never applies here.
-                            None,
-                        );
+                        let (run_completed, run_failed) =
+                            Self::run_migration_tasks_with_global_limit(
+                                tasks,
+                                all_keys,
+                                node_addrs_ref,
+                                eng,
+                                migration_ref,
+                                st,
+                                redo,
+                                epoch,
+                                max_migration_threads,
+                                // sc08 — resync-origin runs are background
+                                // repair: cap the per-run connection fan-out
+                                // instead of opening the full bulk pool
+                                // (observed 46-48 connections per run for 46
+                                // records, exhausting the target's per-IP cap
+                                // under the failure loop).
+                                resync_migration_pool_size(migration_pool_size),
+                                migration_batch_size,
+                                fb,
+                                mb,
+                                ib,
+                                self_id,
+                                throttle_ref,
+                                secret_ref,
+                                // Replica resync backfill — never a master handoff,
+                                // so relinquish never applies here.
+                                None,
+                            );
+                        // sc08 — feed the failure-streak backoff: harvested by
+                        // the event loop before its next fire decision.
+                        outcome_ref.record(run_completed, run_failed);
                     });
                 }
 
@@ -5682,9 +5844,14 @@ impl ClusterCoordinator {
         throttle: Arc<crate::cluster::migration::MigrationThrottle>,
         cluster_secret: Option<Arc<Vec<u8>>>,
         relinquish_ctx: Option<Arc<RelinquishContext>>,
-    ) {
+    ) -> (u32, u32) {
+        // Aggregate `(completed, failed)` task resolutions across every
+        // target batch — sc08's resync failure-streak input. Callers that
+        // do not need the counts ignore the return.
+        let total_completed = std::sync::atomic::AtomicU32::new(0);
+        let total_failed = std::sync::atomic::AtomicU32::new(0);
         if tasks.is_empty() {
-            return;
+            return (0, 0);
         }
 
         // Pre-group keys by shard once (O(keys) total).
@@ -5740,7 +5907,10 @@ impl ClusterCoordinator {
             // freshly-spawned migration cycle will pick up the new
             // tasks.
             if _admission_token.is_none() {
-                return;
+                return (
+                    total_completed.load(Ordering::Relaxed),
+                    total_failed.load(Ordering::Relaxed),
+                );
             }
 
             std::thread::scope(|scope| {
@@ -5765,8 +5935,10 @@ impl ClusterCoordinator {
                         }
                     }
 
+                    let total_completed = &total_completed;
+                    let total_failed = &total_failed;
                     scope.spawn(move || {
-                        run_migration_batch(
+                        let (c, f) = run_migration_batch(
                             target_tasks.clone(),
                             target_addr,
                             &target_keys,
@@ -5784,11 +5956,17 @@ impl ClusterCoordinator {
                             secret,
                             relinquish_ctx.as_deref(),
                         );
+                        total_completed.fetch_add(c, Ordering::Relaxed);
+                        total_failed.fetch_add(f, Ordering::Relaxed);
                     });
                 }
             });
             // Token drops here — capacity returns to the throttle.
         }
+        (
+            total_completed.load(Ordering::Relaxed),
+            total_failed.load(Ordering::Relaxed),
+        )
     }
 }
 
@@ -7812,6 +7990,12 @@ fn retire_abandoned_batch_tasks(
 /// migration is spawned in that window, so the stamped key always matches the
 /// activated, committed term. (Pinned by
 /// `activation_keeps_topology_epoch_equal_to_committed_term`.)
+///
+/// Returns the `(completed, failed)` task-resolution counts this batch
+/// tallied (the same counts its "batch migration finished" log line
+/// carries). A stale-epoch abort returns the counts resolved before the
+/// abort — sc08 consumes these via [`ResyncRunOutcome`] to drive the
+/// resync failure-streak backoff.
 #[allow(clippy::too_many_arguments)]
 fn run_migration_batch(
     tasks: Vec<MigrationTask>,
@@ -7833,7 +8017,7 @@ fn run_migration_batch(
     self_id: NodeId,
     cluster_secret: Option<Arc<Vec<u8>>>,
     relinquish_ctx: Option<&RelinquishContext>,
-) {
+) -> (u32, u32) {
     let auth_secret = cluster_secret.as_deref().map(Vec::as_slice);
     let addr = match target_addr {
         Some(a) => a,
@@ -7842,8 +8026,9 @@ fn run_migration_batch(
                 tasks = tasks.len(),
                 "cluster: no address for target, cannot migrate shards"
             );
+            let mut addr_failed = 0u32;
             for task in &tasks {
-                fail_migration_task_current_epoch(
+                if fail_migration_task_current_epoch(
                     migration,
                     shard_table,
                     &fenced_bm,
@@ -7851,12 +8036,14 @@ fn run_migration_batch(
                     task,
                     topology_epoch,
                     true,
-                );
+                ) {
+                    addr_failed += 1;
+                }
             }
             if migration_epoch_current(shard_table, topology_epoch) {
                 migration.lock().cleanup_completed();
             }
-            return;
+            return (0, addr_failed);
         }
     };
 
@@ -7868,7 +8055,9 @@ fn run_migration_batch(
             current_epoch = shard_table.read().version,
             "cluster: skipping stale migration batch",
         );
-        return;
+        // Neutral outcome: a stale-epoch abort resolved nothing — it must
+        // neither extend nor reset a resync failure streak.
+        return (0, 0);
     }
     // W4 — everything this batch is responsible for, captured before the
     // task list is split/consumed below, PAIRED with each entry's current
@@ -8114,7 +8303,10 @@ fn run_migration_batch(
                 current_epoch = shard_table.read().version,
                 "cluster: skipping stale empty migration completion",
             );
-            return;
+            return (
+                completed.load(Ordering::Relaxed),
+                failed.load(Ordering::Relaxed),
+            );
         }
         // W4 — belt-and-braces: nothing on the empty/skipped paths above may
         // leave a task unresolved, and this pins it (a no-op when they all
@@ -8142,7 +8334,7 @@ fn run_migration_batch(
                 run_orphan_cleanup(self_id, &ce, &cs, &cm, topology_epoch);
             });
         }
-        return;
+        return (c, f);
     }
 
     // Split data tasks across a pool of parallel connections.
@@ -9057,6 +9249,7 @@ fn run_migration_batch(
             "cluster: migrations failed — awaiting explicit retry on membership/topology change"
         );
     }
+    (c, f)
 }
 
 /// Delete records for shards this node no longer owns after migration.
@@ -15912,6 +16105,7 @@ mod tests {
             &mut trigger,
             t0 + Duration::from_millis(100),
             3,
+            0,
             &mut last_sweep,
         ));
         assert_eq!(
@@ -15925,6 +16119,7 @@ mod tests {
             &mut trigger,
             fire_at,
             3,
+            0,
             &mut last_sweep
         ));
         assert_eq!(
@@ -16023,6 +16218,209 @@ mod tests {
         assert!(
             set.lock().is_empty(),
             "dropping the guard must release every claimed pair",
+        );
+    }
+
+    /// sc04 drain gate — the watermark boundary: the gate is open only
+    /// while the in-flight resync pair count is at or below the
+    /// watermark. With watermark 0 that is "strictly one pass-batch at a
+    /// time": a single still-streaming run closes the gate for BOTH fire
+    /// sites (event and periodic).
+    #[test]
+    fn drain_gate_watermark_boundary() {
+        assert!(
+            resync_drain_gate_open(UNDER_REPLICATION_DRAIN_WATERMARK),
+            "at the watermark the gate is open (fully drained)",
+        );
+        assert!(
+            !resync_drain_gate_open(UNDER_REPLICATION_DRAIN_WATERMARK + 1),
+            "any still-streaming pass-batch above the watermark closes the gate",
+        );
+    }
+
+    /// sc04 (run 31911177514) — STACKING: the dropped>0 re-arm used to
+    /// fire a fresh 128-shard pass every debounce window regardless of
+    /// whether the previous runs had finished (8 stacked runs, 971
+    /// concurrent shard streams). The fix: an armed+due pass REFUSES to
+    /// fire while the resync pipeline is above the drain watermark, and
+    /// the refusal is non-consuming — the pass stays armed and fires the
+    /// moment the pipeline drains.
+    #[test]
+    fn drain_gate_refuses_event_fire_and_stays_armed_until_drained() {
+        let t0 = std::time::Instant::now();
+        let mut trigger = EventRepairTrigger::new(UNDER_REPLICATION_EVENT_DEBOUNCE, true);
+        trigger.observe(t0, 2);
+        let due = t0 + UNDER_REPLICATION_EVENT_DEBOUNCE;
+        let mut last_sweep = t0;
+        assert!(
+            !event_repair_take_fire(
+                &mut trigger,
+                due,
+                2,
+                UNDER_REPLICATION_DRAIN_WATERMARK + 1,
+                &mut last_sweep,
+            ),
+            "an armed+due pass must refuse to fire while resync runs are draining",
+        );
+        assert!(
+            trigger.is_armed_and_due(due),
+            "the refusal must be non-consuming — refuse-and-stay-armed",
+        );
+        assert_eq!(
+            last_sweep, t0,
+            "a refused fire must leave the periodic timer alone",
+        );
+        let drained_at = due + Duration::from_millis(50);
+        assert!(
+            event_repair_take_fire(
+                &mut trigger,
+                drained_at,
+                2,
+                UNDER_REPLICATION_DRAIN_WATERMARK,
+                &mut last_sweep,
+            ),
+            "the held pass fires as soon as the pipeline drains to the watermark",
+        );
+        assert_eq!(
+            last_sweep, drained_at,
+            "the deferred fire must still reset the periodic timer",
+        );
+    }
+
+    /// sc08 — the failure-backoff schedule: each consecutive
+    /// zero-completion (all-failed) outcome doubles the effective re-arm
+    /// window from the base debounce, capped at the periodic sweep
+    /// interval (1.5s → 3 → 6 → 12 → 20 capped); a neutral outcome
+    /// (stale-epoch abort: nothing completed, nothing failed) leaves the
+    /// streak alone, and ANY completed resync resets it to the base
+    /// cadence.
+    #[test]
+    fn failure_streak_schedule_doubles_and_caps_at_periodic_interval() {
+        let base = UNDER_REPLICATION_EVENT_DEBOUNCE;
+        let mut trigger = EventRepairTrigger::new(base, true);
+        assert_eq!(
+            trigger.effective_window(),
+            base,
+            "no streak → base debounce"
+        );
+        trigger.record_resync_outcome(0, 5);
+        assert_eq!(trigger.effective_window(), base * 2, "streak 1 → 3s");
+        trigger.record_resync_outcome(0, 5);
+        assert_eq!(trigger.effective_window(), base * 4, "streak 2 → 6s");
+        trigger.record_resync_outcome(0, 5);
+        assert_eq!(trigger.effective_window(), base * 8, "streak 3 → 12s");
+        trigger.record_resync_outcome(0, 5);
+        assert_eq!(
+            trigger.effective_window(),
+            UNDER_REPLICATION_SWEEP_INTERVAL,
+            "streak 4 (24s) is capped at the periodic sweep interval",
+        );
+        trigger.record_resync_outcome(0, 5);
+        assert_eq!(
+            trigger.effective_window(),
+            UNDER_REPLICATION_SWEEP_INTERVAL,
+            "the cap holds under an arbitrarily long streak",
+        );
+        trigger.record_resync_outcome(0, 0);
+        assert_eq!(
+            trigger.effective_window(),
+            UNDER_REPLICATION_SWEEP_INTERVAL,
+            "a neutral outcome (stale-epoch abort) must not touch the streak",
+        );
+        trigger.record_resync_outcome(1, 3);
+        assert_eq!(
+            trigger.effective_window(),
+            base,
+            "any completed resync resets the streak to the base debounce",
+        );
+    }
+
+    /// sc08 (run 31911177514) — FAILURE LOOP: fail-fast runs used to
+    /// re-derive and re-fire at the 1.55s debounce cadence, 442 passes
+    /// over 15 minutes. The fix end to end at the trigger: after a pass
+    /// whose runs all failed, the re-armed pass must NOT fire at the base
+    /// debounce — it waits out the streak-scaled window — and a completed
+    /// resync restores the base cadence.
+    #[test]
+    fn failure_streak_delays_rearmed_pass_and_completion_restores_cadence() {
+        let t0 = std::time::Instant::now();
+        let window = UNDER_REPLICATION_EVENT_DEBOUNCE;
+        let mut trigger = EventRepairTrigger::new(window, true);
+
+        // A pass fires; its spawned runs all fail (sc08 shape): streak 1.
+        trigger.observe(t0, 9);
+        assert!(trigger.take_due(t0 + window, 9));
+        trigger.record_resync_outcome(0, 4);
+
+        // The dropped>0 re-arm must not fire at the base debounce.
+        let t1 = t0 + window;
+        trigger.observe(t1, 9);
+        assert!(
+            !trigger.take_due(t1 + window, 9),
+            "a failure streak must hold the re-armed pass past the base debounce",
+        );
+        assert!(
+            trigger.take_due(t1 + window * 2, 9),
+            "streak 1 fires after twice the base window",
+        );
+
+        // A completed resync resets the streak: back to base cadence.
+        trigger.record_resync_outcome(2, 1);
+        let t2 = t1 + window * 2;
+        trigger.observe(t2, 9);
+        assert!(
+            trigger.take_due(t2 + window, 9),
+            "any completed resync resets the re-arm cadence to the base debounce",
+        );
+    }
+
+    /// sc08 — the outcome accumulator the Phase H backfill threads report
+    /// into and the event loop harvests: recording aggregates across
+    /// runs, and harvesting drains, so each run's outcome feeds the
+    /// failure streak exactly once.
+    #[test]
+    fn resync_run_outcome_harvest_drains_recorded_counts() {
+        let outcome = ResyncRunOutcome::default();
+        outcome.record(2, 3);
+        outcome.record(0, 1);
+        assert_eq!(
+            outcome.harvest(),
+            (2, 4),
+            "harvest must aggregate every recorded run outcome",
+        );
+        assert_eq!(
+            outcome.harvest(),
+            (0, 0),
+            "harvest drains — an outcome feeds the streak exactly once",
+        );
+    }
+
+    /// sc08 — connection footprint: a resync backfill is background
+    /// repair, not bulk migration, so its per-run connection fan-out is
+    /// capped at [`RESYNC_MAX_CONNECTIONS`] regardless of the configured
+    /// bulk `migration_pool_size` (observed: 46 shards → 46 records → 46
+    /// connections per run, exhausting the target's 512 per-IP cap under
+    /// the sc08 loop).
+    #[test]
+    fn resync_pool_size_bounds_connection_fanout() {
+        assert_eq!(
+            resync_migration_pool_size(128),
+            RESYNC_MAX_CONNECTIONS,
+            "a bulk-migration pool config must not leak into resync fan-out",
+        );
+        assert_eq!(
+            resync_migration_pool_size(RESYNC_MAX_CONNECTIONS),
+            RESYNC_MAX_CONNECTIONS,
+        );
+        assert_eq!(
+            resync_migration_pool_size(4),
+            4,
+            "a config already below the cap is respected",
+        );
+        assert_eq!(
+            resync_migration_pool_size(0),
+            1,
+            "a degenerate zero config still gets one connection",
         );
     }
 
