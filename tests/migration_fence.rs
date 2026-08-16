@@ -130,6 +130,7 @@ fn create_node(node_id: u64, seed_swim_ports: &[u16], rf: u8) -> TestNode {
         // suites).
         committed_master_election_enabled: false,
         under_replication_sweep_enabled: false,
+        migration_vetoed_reduction_enabled: false,
     };
 
     let coordinator = ClusterCoordinator::new(cluster_config, 1);

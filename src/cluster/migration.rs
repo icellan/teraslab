@@ -616,6 +616,29 @@ pub struct MigrationManager {
     /// restart, and coalescing by design — multiple failed dispositions
     /// before a drain collapse into one arm.
     failed_batch_retry_arm: bool,
+    /// W8 review P0-2 — while set, [`Self::cleanup_completed`] PRESERVES
+    /// `Failed` entries (delegating to
+    /// [`Self::cleanup_completed_keep_failed`]) so the durable retry queue
+    /// actually survives until the delayed re-drive's backoff elapses.
+    /// Without it the coordinator event loop's periodic prune deleted the
+    /// Failed entries ~100ms after the disposition parked them, making the
+    /// entire self-retry (and the historical NodeJoined re-drive on a busy
+    /// loop) an empty-drain no-op.
+    ///
+    /// Lifecycle: set with the arm at the failed disposition
+    /// ([`Self::arm_failed_batch_retry`]); cleared when
+    /// [`Self::take_failed_tasks`] drains the queue (the entries become
+    /// live Streaming re-drives) and by the topology activation's stale-task
+    /// cancel ([`Self::clear_failed_retry_state`]) — the epoch fence: a new
+    /// plan owns its own retries, so superseded Failed entries must reap
+    /// exactly as before. Transient, never persisted.
+    failed_retry_hold: bool,
+    /// W8 review P0-1 — whether the migration source may REDUCE a completion
+    /// manifest by tombstone-vetoed keys (see `Config`
+    /// `migration_vetoed_reduction_enabled` for the rationale; default OFF).
+    /// Set once at coordinator construction; carried here so the batch
+    /// migration path reads it without signature plumbing. Never persisted.
+    vetoed_reduction_enabled: bool,
 }
 
 impl MigrationManager {
@@ -630,23 +653,58 @@ impl MigrationManager {
             committed_handoffs: std::collections::HashMap::new(),
             next_attempt: 1,
             failed_batch_retry_arm: false,
+            failed_retry_hold: false,
+            vetoed_reduction_enabled: false,
         }
+    }
+
+    /// W8 review P0-1 — arm/disarm tombstone-vetoed manifest reduction for
+    /// completions sourced from this node (default OFF; set once at
+    /// coordinator construction from `migration_vetoed_reduction_enabled`).
+    pub fn set_vetoed_reduction_enabled(&mut self, enabled: bool) {
+        self.vetoed_reduction_enabled = enabled;
+    }
+
+    /// W8 review P0-1 — whether tombstone-vetoed manifest reduction is
+    /// armed ([`Self::set_vetoed_reduction_enabled`]).
+    pub fn vetoed_reduction_enabled(&self) -> bool {
+        self.vetoed_reduction_enabled
     }
 
     /// W8 — record that a migration batch finished with failed tasks at a
     /// still-current epoch, so the coordinator event loop should arm the
     /// self-retry machinery (event-repair trigger + delayed failed-task
-    /// re-drive). Idempotent: repeated arms before a drain coalesce.
+    /// re-drive). Also raises the retry HOLD (review P0-2): from here until
+    /// [`Self::take_failed_tasks`] drains the queue (or the activation's
+    /// stale-task cancel epoch-fences it away),
+    /// [`Self::cleanup_completed`] preserves `Failed` entries so the queue
+    /// survives the event loop's periodic prune. Idempotent: repeated arms
+    /// before a drain coalesce.
     pub fn arm_failed_batch_retry(&mut self) {
         self.failed_batch_retry_arm = true;
+        self.failed_retry_hold = true;
     }
 
     /// W8 — drain the pending failed-batch self-retry arm. Returns `true`
     /// exactly once per armed window ([`Self::arm_failed_batch_retry`]);
     /// subsequent calls return `false` until a new failed disposition arms
-    /// again.
+    /// again. Deliberately leaves the retry HOLD in place — the queue must
+    /// keep surviving the periodic prune until the backoff elapses and
+    /// [`Self::take_failed_tasks`] drains it.
     pub fn take_failed_batch_retry_arm(&mut self) -> bool {
         std::mem::take(&mut self.failed_batch_retry_arm)
+    }
+
+    /// W8 review P0-2 — drop the failed-batch retry hold AND any pending
+    /// arm. Called by the topology activation's stale-task cancel just
+    /// before its `cleanup_completed()`: the epoch fence. The new plan
+    /// re-registers (and re-drives) everything it still wants, so `Failed`
+    /// entries from the superseded plan must reap exactly as they always
+    /// have — a hold surviving an activation would let a later
+    /// `take_failed_tasks` resurrect stale-epoch tasks under the new epoch.
+    pub fn clear_failed_retry_state(&mut self) {
+        self.failed_batch_retry_arm = false;
+        self.failed_retry_hold = false;
     }
 
     /// W4 review P1 — hand out the next drive-attempt generation stamp.
@@ -1585,6 +1643,11 @@ impl MigrationManager {
     }
 
     /// Collect all failed migration tasks for re-execution.
+    ///
+    /// W8 review P0-2 — draining also releases the failed-batch retry hold:
+    /// the drained entries are live Streaming re-drives now, so
+    /// [`Self::cleanup_completed`] may resume reaping any FUTURE `Failed`
+    /// entries normally until the next failed disposition re-raises it.
     pub fn take_failed_tasks(&mut self) -> Vec<MigrationTask> {
         let tasks: Vec<MigrationTask> = self
             .active
@@ -1600,6 +1663,7 @@ impl MigrationManager {
         for t in &tasks {
             self.retry_failed(t);
         }
+        self.failed_retry_hold = false;
         tasks
     }
 
@@ -1621,7 +1685,20 @@ impl MigrationManager {
     /// Inbound and outbound tracking are independent — completing outbound
     /// work does NOT clear pending inbound migrations (which may still be
     /// receiving data from other nodes).
+    ///
+    /// W8 review P0-2 — while the failed-batch retry hold is raised
+    /// ([`Self::arm_failed_batch_retry`]), `Failed` entries are PRESERVED by
+    /// delegating to [`Self::cleanup_completed_keep_failed`]: the durable
+    /// retry queue must survive the coordinator event loop's periodic prune
+    /// until the delayed re-drive drains it. Every other effect (completed
+    /// pruning, unfencing, inbound retention) is identical. The hold is
+    /// released by the drain and by the activation's epoch-fenced
+    /// [`Self::clear_failed_retry_state`], after which this reaps `Failed`
+    /// exactly as before.
     pub fn cleanup_completed(&mut self) {
+        if self.failed_retry_hold {
+            return self.cleanup_completed_keep_failed();
+        }
         // Collect shards that had fenced tasks being removed, so we can
         // unfence them if no remaining active task is still fenced.
         let mut maybe_unfence: Vec<u16> = Vec::new();
@@ -4186,6 +4263,68 @@ mod tests {
         assert_eq!(retries.len(), 2);
         assert_eq!(mgr.failed_count(), 0);
         assert_eq!(mgr.active_count(), 2); // now Streaming again
+    }
+
+    /// W8 review P0-2 — while the retry hold is raised, `cleanup_completed`
+    /// preserves `Failed` entries (the durable retry queue survives the
+    /// event loop's periodic prune); draining via `take_failed_tasks`
+    /// releases the hold, and the activation's `clear_failed_retry_state`
+    /// epoch-fences it so superseded `Failed` entries reap as before.
+    #[test]
+    fn cleanup_preserves_failed_while_retry_hold_is_live() {
+        let task = MigrationTask {
+            shard: 5,
+            from_node: NodeId(1),
+            to_node: NodeId(2),
+            is_master: true,
+        };
+        // Hold raised: the Failed entry survives cleanup_completed.
+        let mut mgr = MigrationManager::new();
+        mgr.start_outbound(
+            std::slice::from_ref(&task),
+            NodeId(1),
+            &std::collections::HashSet::new(),
+        );
+        mgr.mark_failed(&task);
+        mgr.arm_failed_batch_retry();
+        mgr.cleanup_completed();
+        assert_eq!(
+            mgr.failed_count(),
+            1,
+            "the retry hold must preserve Failed through cleanup_completed"
+        );
+        // Draining releases the hold: entries reset to Streaming, and a
+        // NEW Failed entry (no fresh arm) reaps normally again.
+        assert_eq!(mgr.take_failed_tasks(), vec![task.clone()]);
+        mgr.mark_failed(&task);
+        mgr.cleanup_completed();
+        assert_eq!(
+            mgr.failed_count(),
+            0,
+            "after the drain releases the hold, cleanup reaps Failed as before"
+        );
+
+        // Epoch fence: the activation's clear_failed_retry_state cancels a
+        // live hold so the stale-task cancel still reaps.
+        let mut mgr = MigrationManager::new();
+        mgr.start_outbound(
+            std::slice::from_ref(&task),
+            NodeId(1),
+            &std::collections::HashSet::new(),
+        );
+        mgr.mark_failed(&task);
+        mgr.arm_failed_batch_retry();
+        mgr.clear_failed_retry_state();
+        mgr.cleanup_completed();
+        assert_eq!(
+            mgr.failed_count(),
+            0,
+            "the activation's epoch fence must let cleanup reap superseded Failed"
+        );
+        assert!(
+            !mgr.take_failed_batch_retry_arm(),
+            "the epoch fence also drops the pending arm"
+        );
     }
 
     /// W8 — the failed-batch self-retry arm is a one-shot, coalescing signal:

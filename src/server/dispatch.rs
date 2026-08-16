@@ -1535,6 +1535,16 @@ pub(crate) fn handle_request(
                 && !entries.is_empty()
                 && entries.len() as u64 == expected_records
             {
+                // W8 review P1-3 — tombstone-vetoed keys are COLLECTED across
+                // the whole manifest and returned as ONE rejection naming the
+                // full set (bounded by `MAX_VETOED_KEYS_NAMED`), so the
+                // source reduces in a single round instead of re-sending a
+                // write-fenced completion per vetoed key. Genuine failures
+                // (missing key without a veto, generation mismatch) still
+                // reject immediately.
+                const MAX_VETOED_KEYS_NAMED: usize = 512;
+                let mut vetoed_named: Vec<String> = Vec::new();
+                let mut vetoed_overflow = 0usize;
                 for (key, expected_generation) in entries {
                     let meta = match engine.read_metadata(key) {
                         Ok(meta) => meta,
@@ -1553,6 +1563,21 @@ pub(crate) fn handle_request(
                             // never causes the target to APPLY the key (RULE-DS
                             // already dropped it), so resurrection-safety is
                             // unchanged.
+                            // W8 review P2-6 — the forward-vs-heal ASYMMETRY
+                            // is deliberate and must never be merged. A
+                            // REVERSE-HEAL completion may passively TOLERATE
+                            // the vetoed key (`continue`): nothing is deleted
+                            // anywhere — the heal simply did not resurrect
+                            // it. The FORWARD branch below instead REJECTS
+                            // with the named veto, because on a forward
+                            // migration the source's response (manifest
+                            // reduction, flag-gated) AUTHORIZES DELETION —
+                            // its copy is orphan-cleaned after the reduced
+                            // completion commits. Folding the heal tolerance
+                            // into the forward path would silently commit
+                            // handoffs minus vetoed keys with no source-side
+                            // soundness check, no operator signal, and no
+                            // flag gate.
                             if is_heal_completion
                                 && engine.tombstone_blocks_heal_apply(key, *expected_generation)
                             {
@@ -1568,31 +1593,36 @@ pub(crate) fn handle_request(
                             // source into a structurally unwinnable 3-attempt
                             // re-push loop against the unconditional
                             // ClientDelete veto. The source's escalation
-                            // recognises this shape and REDUCES its manifest
+                            // recognises this shape and (when
+                            // `migration_vetoed_reduction_enabled` arms it)
+                            // REDUCES its manifest
                             // (`completion_rejection_vetoed_keys`) so the
                             // completion can succeed for the rest of the
                             // shard. Still a rejection — never a silent
                             // tolerance — so the source stays the arbiter of
                             // whether dropping the key from the manifest is
                             // sound (it re-checks the veto's generation
-                            // against its own copy). If the tombstone raced
-                            // away between the veto and this lookup, fall
-                            // through to the historical message.
+                            // against its own copy). P1-3: collected, not
+                            // returned — the rejection after the loop names
+                            // the FULL vetoed set in one round-trip. If the
+                            // tombstone raced away between the veto and this
+                            // lookup, fall through to the historical message.
                             if let Some((tomb_gen, tomb_height)) = engine.tombstone_lookup(key)
                                 && engine.tombstone_blocks_heal_apply(key, *expected_generation)
                             {
-                                let cause = engine
-                                    .tombstone_cause(key)
-                                    .unwrap_or(crate::ops::tombstone::TombstoneCause::ClientDelete);
-                                return error_response(
-                                    request.request_id,
-                                    ERR_MIGRATION_IN_PROGRESS,
-                                    &format!(
-                                        "shard {shard} exact key {:?} vetoed by deletion \
-                                         tombstone (cause={:?} gen={} height={}): {e:?}",
+                                if vetoed_named.len() < MAX_VETOED_KEYS_NAMED {
+                                    let cause = engine.tombstone_cause(key).unwrap_or(
+                                        crate::ops::tombstone::TombstoneCause::ClientDelete,
+                                    );
+                                    vetoed_named.push(format!(
+                                        "exact key {:?} vetoed by deletion tombstone \
+                                         (cause={:?} gen={} height={}): {e:?}",
                                         key, cause, tomb_gen, tomb_height,
-                                    ),
-                                );
+                                    ));
+                                } else {
+                                    vetoed_overflow += 1;
+                                }
+                                continue;
                             }
                             return error_response(
                                 request.request_id,
@@ -1629,6 +1659,18 @@ pub(crate) fn handle_request(
                             ),
                         );
                     }
+                }
+                // P1-3 — one rejection, the whole vetoed set. Keys past the
+                // naming bound are counted, not named; the source's reduce-
+                // round cap makes that overflow shape terminal rather than
+                // an unbounded one-key-per-round walk.
+                if !vetoed_named.is_empty() {
+                    let mut msg = format!("shard {shard} {}", vetoed_named.join("; "));
+                    if vetoed_overflow > 0 {
+                        use std::fmt::Write as _;
+                        let _ = write!(msg, "; and {vetoed_overflow} more vetoed key(s)");
+                    }
+                    return error_response(request.request_id, ERR_MIGRATION_IN_PROGRESS, &msg);
                 }
                 true
             } else {
@@ -26199,12 +26241,17 @@ mod tests {
         let shard = 54u16;
         let txid_present = txid_for_shard(shard, 31);
         let txid_vetoed = txid_for_shard(shard, 32);
+        let txid_vetoed_b = txid_for_shard(shard, 33);
         assert_eq!(h.create_tx(txid_present, 1).status, STATUS_OK);
 
         let key_present = TxKey { txid: txid_present };
         let key_vetoed = TxKey { txid: txid_vetoed };
-        // The target holds a ClientDelete tombstone for the absent key — the
-        // shape RULE-DS vetoes unconditionally.
+        let key_vetoed_b = TxKey {
+            txid: txid_vetoed_b,
+        };
+        // The target holds ClientDelete tombstones for TWO absent keys — the
+        // shape RULE-DS vetoes unconditionally. Review P1-3: ONE rejection
+        // must name the FULL vetoed set, not one key per round-trip.
         let tomb_log = crate::ops::tombstone::TombstoneLog::new(
             std::path::PathBuf::from("/nonexistent/vetoed-contract.tombstones"),
             h.engine.index_seed(),
@@ -26217,11 +26264,22 @@ mod tests {
             900,
             crate::ops::tombstone::TombstoneCause::ClientDelete,
         );
+        tomb_log.record(
+            &key_vetoed_b,
+            11,
+            905,
+            crate::ops::tombstone::TombstoneCause::ClientDelete,
+        );
         h.engine.set_tombstone_log(tomb_log);
         assert!(h.engine.tombstone_blocks_heal_apply(&key_vetoed, 2));
+        assert!(h.engine.tombstone_blocks_heal_apply(&key_vetoed_b, 4));
 
         let meta_present = h.engine.read_metadata(&key_present).unwrap();
-        let entries = vec![(key_present, meta_present.generation), (key_vetoed, 2u32)];
+        let entries = vec![
+            (key_present, meta_present.generation),
+            (key_vetoed, 2u32),
+            (key_vetoed_b, 4u32),
+        ];
 
         let members = vec![crate::cluster::shards::NodeId(1)];
         let table = crate::cluster::shards::ShardTable::compute_with_epoch(&members, 1, 63, 1);
@@ -26240,7 +26298,7 @@ mod tests {
         );
 
         let payload =
-            build_migration_complete_payload(2, 0, 0, None, Some(&entries), Some(NodeId(9)));
+            build_migration_complete_payload(3, 0, 0, None, Some(&entries), Some(NodeId(9)));
         let req = RequestFrame {
             request_id: shard as u64,
             op_code: OP_MIGRATION_COMPLETE,
@@ -26271,10 +26329,14 @@ mod tests {
             err.contains("cause=ClientDelete"),
             "producer must carry the tombstone cause: {err}"
         );
+        // P1-3 — ONE rejection carries the FULL vetoed set (each with its
+        // own tombstone generation), so the source reduces in one round
+        // instead of one write-fenced round-trip per key.
         assert_eq!(
             completion_rejection_vetoed_keys(&err, &entries),
-            vec![(key_vetoed, 9u32)],
-            "the vetoed parser must resolve the full key + tombstone generation, got: {err}"
+            vec![(key_vetoed, 9u32), (key_vetoed_b, 11u32)],
+            "the vetoed parser must resolve EVERY vetoed key + generation \
+             from a single rejection, got: {err}"
         );
         assert!(
             completion_rejection_missing_keys(&err, &entries).is_empty(),

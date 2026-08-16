@@ -123,6 +123,7 @@ fn create_checkpointing_segment_node(
         replication_factor: 2,
         committed_master_election_enabled: true,
         under_replication_sweep_enabled: true,
+        migration_vetoed_reduction_enabled: false,
         probe_interval: Duration::from_millis(100),
         suspicion_timeout: Duration::from_secs(2),
         cluster_secret: None,
