@@ -3983,9 +3983,7 @@ impl ClusterCoordinator {
                 // det table matches the committed placement so no divergence
                 // counter arms the same-term re-heal, and the prompt arm is
                 // dead because committed == activated.
-                if !activation_held
-                    && let Some((last_attempt, fired_rounds)) = degraded_retry
-                {
+                if !activation_held && let Some((last_attempt, fired_rounds)) = degraded_retry {
                     let committed_term = topo_authority_event.committed_term();
                     if degraded_upgrade_retry_due(
                         degraded_activation_term,
@@ -3995,17 +3993,14 @@ impl ClusterCoordinator {
                     ) {
                         let committed_members = topo_authority_event.committed_members();
                         if committed_members.len() > 1 {
-                            degraded_retry = Some((
-                                std::time::Instant::now(),
-                                fired_rounds.saturating_add(1),
-                            ));
+                            degraded_retry =
+                                Some((std::time::Instant::now(), fired_rounds.saturating_add(1)));
                             tracing::info!(
                                 term = committed_term,
                                 round = fired_rounds.saturating_add(1),
-                                next_backoff_secs = degraded_upgrade_retry_backoff(
-                                    fired_rounds.saturating_add(1)
-                                )
-                                .as_secs(),
+                                next_backoff_secs =
+                                    degraded_upgrade_retry_backoff(fired_rounds.saturating_add(1))
+                                        .as_secs(),
                                 "cluster: det-degraded activation — re-running the \
                                  exchange for a quorum upgrade view",
                             );
@@ -4028,8 +4023,7 @@ impl ClusterCoordinator {
                                     std::time::Duration::from_millis(2000),
                                     &secret_x,
                                 );
-                                let _ =
-                                    exchange_tx.send((members_x, committed_term, view, false));
+                                let _ = exchange_tx.send((members_x, committed_term, view, false));
                             });
                         } else {
                             // Membership contracted to single-node while the
@@ -4588,8 +4582,7 @@ impl ClusterCoordinator {
                                 no_live_migration_workers_for_upgrade(
                                     mgr.active_count(),
                                     pending_det_plan.as_ref().is_some_and(|p| {
-                                        p.term == term
-                                            && active_migrations_all_held(&mgr, &p.tasks)
+                                        p.term == term && active_migrations_all_held(&mgr, &p.tasks)
                                     }),
                                 )
                             };
@@ -31652,8 +31645,7 @@ mod tests {
                 }
                 let mut frame_bytes = header.to_vec();
                 frame_bytes.extend_from_slice(&body);
-                let Ok((request, _)) =
-                    crate::protocol::frame::RequestFrame::decode(&frame_bytes)
+                let Ok((request, _)) = crate::protocol::frame::RequestFrame::decode(&frame_bytes)
                 else {
                     continue;
                 };
@@ -32693,7 +32685,12 @@ mod tests {
             !degraded_upgrade_retry_due(Some(6), 6, Duration::from_millis(3900), 1),
             "round 1 paces on 4 s",
         );
-        assert!(degraded_upgrade_retry_due(Some(6), 6, Duration::from_secs(4), 1));
+        assert!(degraded_upgrade_retry_due(
+            Some(6),
+            6,
+            Duration::from_secs(4),
+            1
+        ));
         // Stop: the term was upgraded (marker cleared on Admit) / the node
         // is no longer degraded.
         assert!(
