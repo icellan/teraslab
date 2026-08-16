@@ -376,7 +376,7 @@ struct InboundMigration {
     ///
     /// A DISTINCT marker (rather than overloading `lost`) is used precisely so
     /// those three compose cleanly: the GC skip
-    /// ([`Self::pending_inbound_shards_excluding_recent_requests`]) and the
+    /// ([`Self::orphaned_inbound_shards`]) and the
     /// `lost`-scoped counters all gate on `lost`, untouched, while
     /// [`Self::clear_inbound`] retains BOTH `lost` and `heal_pending` so a
     /// runtime topology commit cannot wipe the reverse-heal fence and serve an
@@ -1567,7 +1567,7 @@ impl MigrationManager {
     /// `OP_MIGRATION_TRANSFER_REQUEST` (pull-based repair) for them.
     ///
     /// The settled-inbound GC consults this stamp via
-    /// [`Self::pending_inbound_shards_excluding_recent_requests`] so it will
+    /// [`Self::orphaned_inbound_shards`] so it will
     /// not reap an entry whose resend is still in flight.
     pub fn mark_inbound_requested(&mut self, shards: &std::collections::HashSet<u16>) {
         let now = std::time::Instant::now();
@@ -1578,18 +1578,33 @@ impl MigrationManager {
         }
     }
 
-    /// W1.1 residual fix — the set of pending inbound shards that the
-    /// settled-inbound fast-path GC is allowed to reap right now: those
-    /// with no outstanding transfer request, OR whose last request is older
-    /// than `request_grace` (so a lost request still gets reaped eventually
-    /// and the normal pull-based retry takes over).
+    /// W1.1 residual fix + scenario 06 — the set of pending inbound shards
+    /// the settled-inbound fast-path GC may treat as ORPHANED (source died
+    /// mid-migration with no completion handshake) right now.
     ///
-    /// Entries requested within `request_grace` are EXCLUDED: their source
-    /// honours the request and pushes the completion handshake AFTER the
-    /// request RPC returns, so reaping them mid-flight strands the shard.
-    pub fn pending_inbound_shards_excluding_recent_requests(
+    /// An entry qualifies only when BOTH hold:
+    ///
+    /// * Its source is NOT in `alive_sources` — the SWIM-alive set (self
+    ///   included; Suspect counts as alive until SWIM declares it Dead).
+    ///   Request-interval settling alone is NOT death evidence: it
+    ///   misclassified slow-but-live migrations as "source died" and fenced
+    ///   up to ~2400/4096 shards LOST at once while every source was alive
+    ///   (e2e armed scenario 06, 37% of writes NO_QUORUM). A slow-but-live
+    ///   source's entries stay pending — fenced, and re-driven by the pull
+    ///   requester every transfer-request interval until the completion
+    ///   handshake lands. A sentinel `NodeId(0)` (no concrete source) is
+    ///   never in the alive set, so a no-source entry stays reapable exactly
+    ///   as before — the requester loop cannot pull it anyway.
+    /// * It has no outstanding transfer request, OR its last request is
+    ///   older than `request_grace` (so a lost request still gets reaped
+    ///   eventually and the normal pull-based retry takes over). Entries
+    ///   requested within `request_grace` are EXCLUDED: their source honours
+    ///   the request and pushes the completion handshake AFTER the request
+    ///   RPC returns, so reaping them mid-flight strands the shard.
+    pub fn orphaned_inbound_shards(
         &self,
         request_grace: std::time::Duration,
+        alive_sources: &std::collections::HashSet<NodeId>,
     ) -> std::collections::HashSet<u16> {
         let now = std::time::Instant::now();
         self.inbound_migrations
@@ -1608,6 +1623,11 @@ impl MigrationManager {
             // that is merely healing). It stays fenced fail-closed and keeps
             // being pulled; the completion handshake clears the marker.
             .filter(|m| !m.heal_pending)
+            // Scenario 06 — a SWIM-alive source is slow, not dead: its entry
+            // is never orphaned no matter how long it has settled. Only a
+            // source SWIM has declared Dead (or dropped from membership) —
+            // or the unpullable NodeId(0) sentinel — qualifies.
+            .filter(|m| !alive_sources.contains(&m.from_node))
             .filter(|m| match m.transfer_requested_at {
                 Some(at) => now.duration_since(at) >= request_grace,
                 None => true,
@@ -3872,7 +3892,7 @@ mod tests {
         let grace = Duration::from_secs(10);
 
         // Before any request: both are reapable (orphaned-source case).
-        let reapable = mgr.pending_inbound_shards_excluding_recent_requests(grace);
+        let reapable = mgr.orphaned_inbound_shards(grace, &std::collections::HashSet::new());
         assert_eq!(reapable, std::collections::HashSet::from([10, 20]));
         assert_eq!(mgr.pending_inbound_requested_count(grace), 0);
 
@@ -3880,7 +3900,7 @@ mod tests {
         mgr.mark_inbound_requested(&std::collections::HashSet::from([10]));
 
         // Shard 10 is now protected; shard 20 (no request) stays reapable.
-        let reapable = mgr.pending_inbound_shards_excluding_recent_requests(grace);
+        let reapable = mgr.orphaned_inbound_shards(grace, &std::collections::HashSet::new());
         assert_eq!(
             reapable,
             std::collections::HashSet::from([20]),
@@ -3902,12 +3922,86 @@ mod tests {
         // With a zero grace (request older than grace), the protection
         // lapses so a genuinely-lost request is still eventually reaped.
         let reapable_no_grace =
-            mgr.pending_inbound_shards_excluding_recent_requests(Duration::ZERO);
+            mgr.orphaned_inbound_shards(Duration::ZERO, &std::collections::HashSet::new());
         assert_eq!(
             reapable_no_grace,
             std::collections::HashSet::from([10]),
             "once the request grace lapses the entry becomes reapable again"
         );
+    }
+
+    /// Scenario 06 (false "source died") — request-interval settling alone is
+    /// NOT evidence of source death. The settled-inbound GC marked
+    /// slow-but-live migrations LOST — up to ~2400/4096 shards fenced at
+    /// once, 37% of writes NO_QUORUM — while every source was SWIM-alive.
+    /// Only an entry whose source has actually left the SWIM-alive set is
+    /// orphaned; a live source's entries stay pending (fenced, and still
+    /// visible to the pull requester, which re-drives the transfer).
+    #[test]
+    fn settled_gc_reaps_only_dead_source_inbound() {
+        let mut mgr = MigrationManager::new();
+        mgr.register_inbound_source(10, NodeId(2)); // source SWIM-alive
+        mgr.register_inbound_source(20, NodeId(3)); // source SWIM-dead
+        let grace = Duration::from_secs(10);
+        let alive = std::collections::HashSet::from([NodeId(1), NodeId(2)]);
+
+        // Neither shard has an in-grace transfer request, so both are
+        // "settled" — but only the dead source's shard is orphaned.
+        let orphaned = mgr.orphaned_inbound_shards(grace, &alive);
+        assert_eq!(
+            orphaned,
+            std::collections::HashSet::from([20]),
+            "a settled inbound from a SWIM-alive source is slow, not orphaned"
+        );
+
+        assert_eq!(mgr.mark_inbound_lost(&orphaned), 1);
+        assert!(
+            !mgr.is_shard_lost(10),
+            "the live source's shard must stay pending, never lost"
+        );
+        assert!(
+            mgr.is_shard_lost(20),
+            "a genuinely dead source's incomplete inbound IS marked lost"
+        );
+        assert!(
+            mgr.has_pending_inbound(10),
+            "the live source's shard stays fenced while it waits"
+        );
+        assert!(
+            mgr.pending_inbound_entries().contains(&(10, NodeId(2))),
+            "and stays visible to the pull requester so the transfer re-arms"
+        );
+
+        // The source later dies: its entry becomes orphaned on the next pass.
+        let none_alive = std::collections::HashSet::from([NodeId(1)]);
+        let orphaned = mgr.orphaned_inbound_shards(grace, &none_alive);
+        assert_eq!(
+            orphaned,
+            std::collections::HashSet::from([10]),
+            "once SWIM declares the source dead the entry is reapable"
+        );
+    }
+
+    /// A sentinel inbound entry with no concrete source (`NodeId(0)`) can
+    /// never be pulled — the transfer requester skips `NodeId(0)` — so the
+    /// liveness gate must not immortalize it: it stays reapable exactly as
+    /// before.
+    #[test]
+    fn settled_gc_still_reaps_sentinel_source_inbound() {
+        let mut mgr = MigrationManager::new();
+        mgr.inbound_migrations
+            .push(InboundMigration::pending(30, NodeId(0)));
+        mgr.inbound_bitmap.set(30);
+
+        let alive = std::collections::HashSet::from([NodeId(1), NodeId(2), NodeId(3)]);
+        let orphaned = mgr.orphaned_inbound_shards(Duration::from_secs(10), &alive);
+        assert_eq!(
+            orphaned,
+            std::collections::HashSet::from([30]),
+            "a no-source sentinel entry is reapable regardless of liveness"
+        );
+        assert_eq!(mgr.mark_inbound_lost(&orphaned), 1);
+        assert!(mgr.is_shard_lost(30));
     }
 
     #[test]
@@ -4516,7 +4610,8 @@ mod tests {
 
         // Settled-inbound GC reap candidates: incomplete entries with no
         // outstanding transfer request.
-        let settled = mgr.pending_inbound_shards_excluding_recent_requests(Duration::from_secs(1));
+        let settled =
+            mgr.orphaned_inbound_shards(Duration::from_secs(1), &std::collections::HashSet::new());
         assert!(
             settled.contains(&7),
             "orphaned incomplete inbound is a reap candidate"
@@ -4535,7 +4630,8 @@ mod tests {
 
         // Idempotent: a lost shard leaves the reap candidate set, so a second
         // GC pass is a no-op — no re-mark, no fence churn.
-        let settled2 = mgr.pending_inbound_shards_excluding_recent_requests(Duration::from_secs(1));
+        let settled2 =
+            mgr.orphaned_inbound_shards(Duration::from_secs(1), &std::collections::HashSet::new());
         assert!(
             !settled2.contains(&7),
             "a lost shard is excluded from further reap candidates",
@@ -4554,7 +4650,8 @@ mod tests {
     fn proven_complete_clears_lost_mark_and_fence() {
         let mut mgr = MigrationManager::new();
         mgr.register_inbound_source(9, NodeId(3));
-        let settled = mgr.pending_inbound_shards_excluding_recent_requests(Duration::from_secs(1));
+        let settled =
+            mgr.orphaned_inbound_shards(Duration::from_secs(1), &std::collections::HashSet::new());
         assert_eq!(mgr.mark_inbound_lost(&settled), 1);
         assert!(mgr.is_shard_lost(9));
         assert!(mgr.has_pending_inbound(9));
@@ -4579,7 +4676,8 @@ mod tests {
     fn re_acquiring_lost_shard_clears_lost_mark() {
         let mut mgr = MigrationManager::new();
         mgr.register_inbound_source(11, NodeId(4));
-        let settled = mgr.pending_inbound_shards_excluding_recent_requests(Duration::from_secs(1));
+        let settled =
+            mgr.orphaned_inbound_shards(Duration::from_secs(1), &std::collections::HashSet::new());
         mgr.mark_inbound_lost(&settled);
         assert!(mgr.is_shard_lost(11));
 
@@ -4602,7 +4700,8 @@ mod tests {
             "still fenced — now actively receiving"
         );
         // It is once again a reap candidate (fresh pending, not lost).
-        let settled2 = mgr.pending_inbound_shards_excluding_recent_requests(Duration::from_secs(1));
+        let settled2 =
+            mgr.orphaned_inbound_shards(Duration::from_secs(1), &std::collections::HashSet::new());
         assert!(settled2.contains(&11));
     }
 

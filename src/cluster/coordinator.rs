@@ -806,6 +806,58 @@ impl Drop for TopologyCatchUpGuard {
     }
 }
 
+/// Scenario 09 (quiesce revert) — the catch-up thread's re-proposal fallback,
+/// behind a commit-freshness re-check.
+///
+/// The fallback exists for the genuinely-stale case: the catch-up was
+/// triggered by `remote_term`, no peer handed over the newer committed
+/// topology, and proposing a fresh term is the only remaining way to converge
+/// (the proposal collects votes from peers that already committed the higher
+/// term). Its membership comes from the ADDRESS BOOK — every node this one
+/// knows an address for — because the newer term's membership is precisely
+/// what this node failed to learn.
+///
+/// But the direct-fetch loop RACES the normal commit broadcast. If the
+/// broadcast landed while we were fetching (the dispatch worker applied it,
+/// so the committed term reached `remote_term`, and the fetch loop then saw
+/// the peer's commit as `NotApplied` — leaving `caught_up` false), the
+/// catch-up's goal is already achieved — and the address book is a strictly
+/// WORSE membership source than the just-committed topology: it still names
+/// nodes that term deliberately excluded. Observed in e2e scenario 09: node2
+/// quiesced itself out at term 5, and this fallback re-proposed term 6 from
+/// the address book 1 ms later, putting node2 straight back in — double
+/// activation, 3134 cancelled migrations, node2 re-assigned all 1365 of its
+/// master shards and never drained.
+///
+/// Returns `None` (skip — nothing stale left to fix, no state touched) once
+/// the committed term has caught up to `remote_term`; otherwise the proposal
+/// to run, built exactly as before. The freshness window is re-read here, at
+/// the last moment before proposing, not from the term captured when the
+/// catch-up began.
+fn catch_up_fallback_proposal(
+    topology_authority: &crate::cluster::topology::TopologyAuthority,
+    node_addrs: &RwLock<std::collections::HashMap<NodeId, SocketAddr>>,
+    remote_term: u64,
+) -> Option<crate::cluster::topology::TopologyTerm> {
+    let committed = topology_authority.committed_term();
+    if committed >= remote_term {
+        tracing::info!(
+            committed,
+            remote_term,
+            "cluster: catch-up: skipping re-proposal — the commit landed during the fetch",
+        );
+        return None;
+    }
+    let members: Vec<NodeId> = {
+        let addrs = node_addrs.read();
+        let mut m: Vec<NodeId> = addrs.keys().copied().collect();
+        m.sort();
+        m
+    };
+    topology_authority.reset_membership_timer();
+    topology_authority.on_membership_changed(&members)
+}
+
 /// Whether a pending inbound entry for `shard` must be KEPT (and the shard left
 /// fenced) on the node identified by `self_id`.
 ///
@@ -3421,11 +3473,32 @@ impl ClusterCoordinator {
                             // it LOST instead: the shard stays fenced
                             // (client-invisible / unavailable) until a future
                             // migration completes it or an operator intervenes.
-                            let settled_shards = mgr
-                                .pending_inbound_shards_excluding_recent_requests(
-                                    TRANSFER_REQUEST_INTERVAL,
-                                );
-                            mgr.mark_inbound_lost(&settled_shards)
+                            //
+                            // Scenario 06 — "orphaned" additionally requires
+                            // the SOURCE to actually be gone from the
+                            // SWIM-alive set (declared Dead, or dropped from
+                            // membership entirely). Settling alone
+                            // misclassified slow-but-live migrations as
+                            // "source died" and marked up to ~2400/4096
+                            // shards LOST at once (37% of writes NO_QUORUM)
+                            // while every source was alive. A slow-but-live
+                            // source's entries stay pending: still fenced,
+                            // and re-driven by the FIX-B transfer requester
+                            // below until the completion handshake lands.
+                            // `alive_members` counts Suspect as alive until
+                            // SWIM declares Dead, so a source that is merely
+                            // late on probes is not reaped either; a genuine
+                            // death crosses to Dead and is reaped on the next
+                            // 5s GC pass.
+                            let alive_sources: std::collections::HashSet<NodeId> =
+                                swim_membership_event
+                                    .lock()
+                                    .alive_members()
+                                    .into_iter()
+                                    .collect();
+                            let orphaned_shards = mgr
+                                .orphaned_inbound_shards(TRANSFER_REQUEST_INTERVAL, &alive_sources);
+                            mgr.mark_inbound_lost(&orphaned_shards)
                         } else {
                             mgr.clear_stale_inbound(Duration::from_secs(30))
                         };
@@ -5038,73 +5111,73 @@ impl ClusterCoordinator {
 
                         // If direct fetch didn't work, fall back to the re-proposal path.
                         // This always converges: the new proposal will collect votes from
-                        // peers that have already committed a higher term.
-                        if !caught_up {
-                            let members: Vec<NodeId> = {
-                                let addrs = node_addrs_for_topo.read();
-                                let mut m: Vec<NodeId> = addrs.keys().copied().collect();
-                                m.sort();
-                                m
-                            };
-                            topology_authority.reset_membership_timer();
-                            if let Some(proposal) =
-                                topology_authority.on_membership_changed(&members)
-                            {
-                                tracing::info!(
+                        // peers that have already committed a higher term. Guarded by a
+                        // commit-freshness re-check (scenario 09): if the commit broadcast
+                        // landed while we were fetching, there is nothing stale left to
+                        // fix, and re-proposing from the address book would revert a
+                        // just-committed quiesce/exclusion. See
+                        // `catch_up_fallback_proposal`.
+                        if !caught_up
+                            && let Some(proposal) = catch_up_fallback_proposal(
+                                topology_authority,
+                                node_addrs_for_topo,
+                                remote_term,
+                            )
+                        {
+                            tracing::info!(
+                                term = proposal.term,
+                                members = proposal.members.len(),
+                                "cluster: catch-up: re-proposing topology",
+                            );
+                            // F-E1 / H10: persist the re-proposal term before
+                            // self-voting; skip if it isn't durable.
+                            let peak = peak_size.load(Ordering::Relaxed) as u64;
+                            let inc = swim_incarnation.load(Ordering::Relaxed);
+                            let persisted_ok = persist_topology_state_durable(
+                                topology_state_path.as_deref(),
+                                &topology_authority.persisted_state(peak, inc),
+                            );
+                            if !persisted_ok {
+                                tracing::error!(
                                     term = proposal.term,
-                                    members = proposal.members.len(),
-                                    "cluster: catch-up: re-proposing topology",
+                                    "cluster: catch-up: NOT re-proposing — term persist \
+                                     failed; will retry (H10)",
                                 );
-                                // F-E1 / H10: persist the re-proposal term before
-                                // self-voting; skip if it isn't durable.
-                                let peak = peak_size.load(Ordering::Relaxed) as u64;
-                                let inc = swim_incarnation.load(Ordering::Relaxed);
-                                let persisted_ok = persist_topology_state_durable(
-                                    topology_state_path.as_deref(),
-                                    &topology_authority.persisted_state(peak, inc),
+                            }
+                            let self_vote = crate::cluster::topology::TopologyVote {
+                                term: proposal.term,
+                                digest: proposal.digest,
+                                voter: self_id,
+                                accepted: true,
+                                voter_current_term: topology_authority.committed_term(),
+                                voter_placement_support:
+                                    crate::cluster::shards::MAX_SUPPORTED_PLACEMENT_VERSION,
+                            };
+                            if persisted_ok
+                                && let Some(commit) = topology_authority.handle_vote(&self_vote)
+                            {
+                                // Single-node quorum: signal the event loop to activate.
+                                topology_authority.handle_commit(&commit);
+                                let _ =
+                                    topology_commit_tx.send((commit.members.clone(), commit.term));
+                            } else if persisted_ok {
+                                let ta = topology_authority.clone();
+                                let na = node_addrs_for_topo.clone();
+                                let tx = topology_commit_tx.clone();
+                                let tp = topology_state_path.clone();
+                                let ps = peak_size.clone();
+                                let si = swim_incarnation.clone();
+                                run_topology_proposer(
+                                    proposal,
+                                    ta,
+                                    na,
+                                    self_id,
+                                    tx,
+                                    tp,
+                                    ps,
+                                    si,
+                                    cluster_secret.clone(),
                                 );
-                                if !persisted_ok {
-                                    tracing::error!(
-                                        term = proposal.term,
-                                        "cluster: catch-up: NOT re-proposing — term persist \
-                                         failed; will retry (H10)",
-                                    );
-                                }
-                                let self_vote = crate::cluster::topology::TopologyVote {
-                                    term: proposal.term,
-                                    digest: proposal.digest,
-                                    voter: self_id,
-                                    accepted: true,
-                                    voter_current_term: topology_authority.committed_term(),
-                                    voter_placement_support:
-                                        crate::cluster::shards::MAX_SUPPORTED_PLACEMENT_VERSION,
-                                };
-                                if persisted_ok
-                                    && let Some(commit) = topology_authority.handle_vote(&self_vote)
-                                {
-                                    // Single-node quorum: signal the event loop to activate.
-                                    topology_authority.handle_commit(&commit);
-                                    let _ = topology_commit_tx
-                                        .send((commit.members.clone(), commit.term));
-                                } else if persisted_ok {
-                                    let ta = topology_authority.clone();
-                                    let na = node_addrs_for_topo.clone();
-                                    let tx = topology_commit_tx.clone();
-                                    let tp = topology_state_path.clone();
-                                    let ps = peak_size.clone();
-                                    let si = swim_incarnation.clone();
-                                    run_topology_proposer(
-                                        proposal,
-                                        ta,
-                                        na,
-                                        self_id,
-                                        tx,
-                                        tp,
-                                        ps,
-                                        si,
-                                        cluster_secret.clone(),
-                                    );
-                                }
                             }
                         }
                     }); // end of catch-up thread
@@ -23743,6 +23816,127 @@ mod tests {
         );
     }
 
+    /// Scenario-09 fixture — an authority whose committed history is term 4 =
+    /// {1,2,3} (so node 2 is an ever-seen committed voter) followed by term 5
+    /// = {1,3} (node 2 quiesced itself out; graceful leave keeps the peak).
+    /// Self is node 1, the deterministic (lowest-id) proposer.
+    fn authority_with_committed_quiesce() -> crate::cluster::topology::TopologyAuthority {
+        use crate::cluster::topology::{
+            ASSIGNMENT_ABSENT_DIGEST, ClusterId, TopologyAuthority, TopologyCommit, TopologyTerm,
+        };
+        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1), 2);
+        let full = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let term4 = TopologyCommit {
+            term: 4,
+            proposer: NodeId(1),
+            members: full.clone(),
+            cluster_id: ClusterId::UNSET,
+            placement_version: 1,
+            committed_peak: 3,
+            digest: TopologyTerm::compute_digest(
+                4,
+                &ClusterId::UNSET,
+                &full,
+                1,
+                3,
+                2,
+                ASSIGNMENT_ABSENT_DIGEST,
+            ),
+            voters: full.clone(),
+            rf: 2,
+            assignment: None,
+        };
+        assert_eq!(
+            auth.handle_commit(&term4),
+            Some(4),
+            "fixture: the full-membership term applies"
+        );
+        let quiesced = vec![NodeId(1), NodeId(3)];
+        let term5 = TopologyCommit {
+            term: 5,
+            proposer: NodeId(1),
+            members: quiesced.clone(),
+            cluster_id: ClusterId::UNSET,
+            placement_version: 1,
+            committed_peak: 3,
+            digest: TopologyTerm::compute_digest(
+                5,
+                &ClusterId::UNSET,
+                &quiesced,
+                1,
+                3,
+                2,
+                ASSIGNMENT_ABSENT_DIGEST,
+            ),
+            voters: quiesced.clone(),
+            rf: 2,
+            assignment: None,
+        };
+        assert_eq!(
+            auth.handle_commit(&term5),
+            Some(5),
+            "fixture: the quiesce term applies"
+        );
+        auth
+    }
+
+    fn three_node_addr_book() -> RwLock<std::collections::HashMap<NodeId, SocketAddr>> {
+        RwLock::new(std::collections::HashMap::from([
+            (NodeId(1), "127.0.0.1:7101".parse().unwrap()),
+            (NodeId(2), "127.0.0.1:7102".parse().unwrap()),
+            (NodeId(3), "127.0.0.1:7103".parse().unwrap()),
+        ]))
+    }
+
+    /// Scenario 09 (quiesce revert) — node2 quiesced itself out at term 5,
+    /// and the commit broadcast landed WHILE this node's catch-up thread was
+    /// still direct-fetching (the dispatch worker applied it, so the fetch
+    /// loop saw `NotApplied` and `caught_up` stayed false). The fallback then
+    /// re-proposed from the address book — quiesced node2 included — putting
+    /// node2 straight back in at term 6 one millisecond after it left. Once
+    /// the committed term has caught up to the remote term that triggered the
+    /// catch-up, the fallback must SKIP: no proposal, membership untouched.
+    #[test]
+    fn catch_up_fallback_skips_reproposal_when_commit_already_caught_up() {
+        let auth = authority_with_committed_quiesce();
+        let addrs = three_node_addr_book();
+
+        // The catch-up was triggered by remote_term 5 — the very term the
+        // broadcast just committed locally.
+        let proposal = catch_up_fallback_proposal(&auth, &addrs, 5);
+        assert!(
+            proposal.is_none(),
+            "no re-proposal once committed_term >= remote_term — the \
+             catch-up's goal is already achieved"
+        );
+        assert_eq!(auth.committed_term(), 5, "committed term untouched");
+        assert_eq!(
+            auth.committed_members(),
+            vec![NodeId(1), NodeId(3)],
+            "the quiesce is NOT reverted — node2 stays excluded"
+        );
+    }
+
+    /// The genuinely-stale case must keep converging: the catch-up target is
+    /// STRICTLY ahead of the committed term and no peer handed the newer
+    /// topology over, so the fallback still re-proposes from the address book
+    /// (the newer membership is unknown by definition here) and the votes of
+    /// already-caught-up peers resolve it.
+    #[test]
+    fn catch_up_fallback_still_reproposes_when_genuinely_stale() {
+        let auth = authority_with_committed_quiesce();
+        let addrs = three_node_addr_book();
+
+        let proposal = catch_up_fallback_proposal(&auth, &addrs, 6)
+            .expect("committed_term 5 < remote_term 6 — the fallback must still propose");
+        assert_eq!(proposal.term, 6, "proposes the next term above committed");
+        assert_eq!(
+            proposal.members,
+            vec![NodeId(1), NodeId(2), NodeId(3)],
+            "membership assembled from the address book, exactly as before"
+        );
+    }
+
     /// `send_delta_ops` must read the frame STATUS before trying to decode the
     /// payload as a `ReplicaAck`.
     ///
@@ -26562,8 +26756,8 @@ mod tests {
         {
             let mgr = &mut cluster.migration.lock();
             mgr.register_inbound_source(shard, NodeId(2));
-            let settled =
-                mgr.pending_inbound_shards_excluding_recent_requests(Duration::from_secs(1));
+            let settled = mgr
+                .orphaned_inbound_shards(Duration::from_secs(1), &std::collections::HashSet::new());
             assert_eq!(mgr.mark_inbound_lost(&settled), 1);
             assert!(mgr.is_shard_lost(shard));
         }
@@ -26604,8 +26798,8 @@ mod tests {
         {
             let mgr = &mut cluster.migration.lock();
             mgr.register_inbound_source(shard, NodeId(2));
-            let settled =
-                mgr.pending_inbound_shards_excluding_recent_requests(Duration::from_secs(1));
+            let settled = mgr
+                .orphaned_inbound_shards(Duration::from_secs(1), &std::collections::HashSet::new());
             assert_eq!(mgr.mark_inbound_lost(&settled), 1);
             mgr.clear_inbound();
             assert!(
@@ -26672,8 +26866,8 @@ mod tests {
         {
             let mgr = &mut cluster.migration.lock();
             mgr.register_inbound_source(shard, NodeId(2));
-            let settled =
-                mgr.pending_inbound_shards_excluding_recent_requests(Duration::from_secs(1));
+            let settled = mgr
+                .orphaned_inbound_shards(Duration::from_secs(1), &std::collections::HashSet::new());
             assert_eq!(mgr.mark_inbound_lost(&settled), 1);
             assert!(mgr.is_shard_lost(shard));
         }
@@ -27080,8 +27274,8 @@ mod tests {
         {
             let mgr = &mut cluster.migration.lock();
             mgr.register_inbound_source(shard, NodeId(2));
-            let settled =
-                mgr.pending_inbound_shards_excluding_recent_requests(Duration::from_secs(1));
+            let settled = mgr
+                .orphaned_inbound_shards(Duration::from_secs(1), &std::collections::HashSet::new());
             assert_eq!(mgr.mark_inbound_lost(&settled), 1);
         }
         cluster.sync_migration_bitmaps();
