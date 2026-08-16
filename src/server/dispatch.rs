@@ -6416,6 +6416,36 @@ fn sweep_role_snap(
     Some(SweepRole::HeldCopy)
 }
 
+/// True at most once per wall-clock second per `slot` — the rate-limit
+/// gate for the write-reject WARN logs in [`resolve_shard_ownership`].
+///
+/// Those reject paths fire PER ITEM, so an unconditional WARN would flood
+/// a busy node; but at DEBUG they were invisible in INFO-level CI
+/// artifacts, which is how a 76-second full-cluster write outage (every
+/// mutation bouncing with `ERR_MIGRATION_IN_PROGRESS` / `ERR_NO_QUORUM`)
+/// left no trace in the collected logs. `slot` stores the epoch second of
+/// the last emitted warn; the CAS
+/// lets exactly one caller win a given second under concurrency.
+/// Suppressed occurrences keep their original DEBUG line, so DEBUG-level
+/// capture is unchanged. A pre-epoch clock reads as second 0 and simply
+/// stops promoting (never floods).
+fn reject_warn_due(slot: &std::sync::atomic::AtomicU64) -> bool {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let last = slot.load(std::sync::atomic::Ordering::Relaxed);
+    now > last
+        && slot
+            .compare_exchange(
+                last,
+                now,
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+            )
+            .is_ok()
+}
+
 /// Resolve a shard-ownership decision from an already-computed
 /// [`MasterQueryResult`](crate::cluster::coordinator::MasterQueryResult),
 /// applying the per-key migration gates and building the redirect error.
@@ -6440,10 +6470,23 @@ fn resolve_shard_ownership(
             // (the `MasterQueryResult::No` arm) where the data is still present.
             if !allow_if_migrating && cluster.has_pending_inbound(key) {
                 let shard = crate::cluster::shards::ShardTable::shard_for_key(key);
-                tracing::debug!(
-                    shard,
-                    "dispatch: write rejected — pending inbound migration"
-                );
+                // Rate-limited WARN (1/s per reject class): these rejects
+                // fire per item, but at DEBUG a cluster-wide write outage
+                // riding this path was invisible in INFO-level CI logs.
+                static LAST_WARN_S: std::sync::atomic::AtomicU64 =
+                    std::sync::atomic::AtomicU64::new(0);
+                if reject_warn_due(&LAST_WARN_S) {
+                    tracing::warn!(
+                        shard,
+                        code = ERR_MIGRATION_IN_PROGRESS,
+                        "dispatch: write rejected — pending inbound migration (warn limited to 1/s)"
+                    );
+                } else {
+                    tracing::debug!(
+                        shard,
+                        "dispatch: write rejected — pending inbound migration"
+                    );
+                }
                 Some(BatchItemError {
                     item_index,
                     error_code: ERR_MIGRATION_IN_PROGRESS,
@@ -6451,10 +6494,20 @@ fn resolve_shard_ownership(
                 })
             } else if !allow_if_migrating && cluster.is_shard_write_fenced(key) {
                 let shard = crate::cluster::shards::ShardTable::shard_for_key(key);
-                tracing::debug!(
-                    shard,
-                    "dispatch: write rejected — write-fenced (delta streaming)"
-                );
+                static LAST_WARN_S: std::sync::atomic::AtomicU64 =
+                    std::sync::atomic::AtomicU64::new(0);
+                if reject_warn_due(&LAST_WARN_S) {
+                    tracing::warn!(
+                        shard,
+                        code = ERR_MIGRATION_IN_PROGRESS,
+                        "dispatch: write rejected — write-fenced (delta streaming) (warn limited to 1/s)"
+                    );
+                } else {
+                    tracing::debug!(
+                        shard,
+                        "dispatch: write rejected — write-fenced (delta streaming)"
+                    );
+                }
                 Some(BatchItemError {
                     item_index,
                     error_code: ERR_MIGRATION_IN_PROGRESS,
@@ -6469,10 +6522,23 @@ fn resolve_shard_ownership(
             // Don't redirect (the redirect target may itself be wrong).
             // Tell the client to retry; once the gap closes the next
             // attempt resolves to Yes or No deterministically.
-            tracing::debug!(
-                last_known_term,
-                "dispatch: deferring request — topology in transition"
-            );
+            let shard = crate::cluster::shards::ShardTable::shard_for_key(key);
+            static LAST_WARN_S: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            if reject_warn_due(&LAST_WARN_S) {
+                tracing::warn!(
+                    shard,
+                    code = ERR_MIGRATION_IN_PROGRESS,
+                    last_known_term,
+                    "dispatch: deferring request — topology in transition (warn limited to 1/s)"
+                );
+            } else {
+                tracing::debug!(
+                    shard,
+                    code = ERR_MIGRATION_IN_PROGRESS,
+                    last_known_term,
+                    "dispatch: deferring request — topology in transition"
+                );
+            }
             Some(BatchItemError {
                 item_index,
                 error_code: ERR_MIGRATION_IN_PROGRESS,
@@ -6519,11 +6585,22 @@ fn resolve_shard_ownership(
                     // blank target.
                     None => {
                         let shard = crate::cluster::shards::ShardTable::shard_for_key(key);
-                        tracing::debug!(
-                            shard,
-                            node = ?node,
-                            "dispatch: master address unknown — returning retryable ERR_NO_QUORUM instead of empty redirect"
-                        );
+                        static LAST_WARN_S: std::sync::atomic::AtomicU64 =
+                            std::sync::atomic::AtomicU64::new(0);
+                        if reject_warn_due(&LAST_WARN_S) {
+                            tracing::warn!(
+                                shard,
+                                code = ERR_NO_QUORUM,
+                                node = ?node,
+                                "dispatch: master address unknown — returning retryable ERR_NO_QUORUM instead of empty redirect (warn limited to 1/s)"
+                            );
+                        } else {
+                            tracing::debug!(
+                                shard,
+                                node = ?node,
+                                "dispatch: master address unknown — returning retryable ERR_NO_QUORUM instead of empty redirect"
+                            );
+                        }
                         return Some(BatchItemError {
                             item_index,
                             error_code: ERR_NO_QUORUM,
@@ -13362,6 +13439,47 @@ mod tests {
         let index = Index::new(10000).unwrap();
         let locks = StripedLocks::new(1024);
         Engine::new(dev, index, alloc, locks, DahIndex::new())
+    }
+
+    /// The write-reject WARN gate: fires on a fresh slot, suppresses while
+    /// the stored second has not elapsed, re-arms once it has. Driven by
+    /// storing sentinel seconds directly so no assertion races a real
+    /// second boundary.
+    #[test]
+    fn reject_warn_gate_fires_once_per_stored_second() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let slot = AtomicU64::new(0);
+        assert!(
+            reject_warn_due(&slot),
+            "a fresh slot (second 0) must win the first warn"
+        );
+        let stored = slot.load(Ordering::Relaxed);
+        assert!(stored > 0, "the winning call must stamp the current second");
+
+        // A slot pinned in the future can never satisfy `now > last` — the
+        // suppressed shape of every later call within the stamped second.
+        slot.store(u64::MAX, Ordering::Relaxed);
+        assert!(
+            !reject_warn_due(&slot),
+            "a not-yet-elapsed second must suppress the warn"
+        );
+        assert_eq!(
+            slot.load(Ordering::Relaxed),
+            u64::MAX,
+            "a suppressed call must not disturb the stamp"
+        );
+
+        // A stamp from a PAST second is due again.
+        slot.store(stored - 1, Ordering::Relaxed);
+        assert!(
+            reject_warn_due(&slot),
+            "an elapsed second must re-arm the warn"
+        );
+        assert!(
+            slot.load(Ordering::Relaxed) >= stored,
+            "re-arming must advance the stamp to the current second"
+        );
     }
 
     /// Scenario 11: an op whose wire form exceeds the frame budget (a
