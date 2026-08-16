@@ -227,7 +227,17 @@ fn derive_under_replication_resyncs(
     let mut full: std::collections::HashSet<(NodeId, u16)> = std::collections::HashSet::new();
     for (node, entries) in view {
         for entry in entries {
-            if entry.last_applied_seq > 0 {
+            // GAP 3b (armed scenario 07) — a PENDING_INBOUND-flagged entry is
+            // a subset/incomplete copy (a LOST or fenced inbound entry keeps
+            // the fence bit set, so the flag rides every report). Its
+            // non-zero count must not count as a full-replica witness: the
+            // partial copy would witness ITSELF and suppress the very resync
+            // that repairs it. Excluding it here is conservative in both
+            // roles of `full` — as a replica witness (the shard becomes
+            // resync-eligible) and as the self freshness witness (a master
+            // holding only a partial fenced copy never sources repair; the
+            // shard is stale_fenced-skipped whole).
+            if entry.last_applied_seq > 0 && entry.flags & PARTITION_FLAG_PENDING_INBOUND == 0 {
                 full.insert((*node, entry.shard));
             }
         }
@@ -17070,6 +17080,82 @@ mod tests {
         assert_eq!(signaled, 0);
         assert_eq!(dropped, 0);
         assert_eq!(dead_skipped, 0);
+    }
+
+    /// GAP 3b (armed scenario 07, runs 31971906387/31971908443) — a replica
+    /// whose exchange report carries the PENDING_INBOUND flag holds only a
+    /// PARTIAL, fenced copy (a LOST inbound entry keeps the fence bit set, so
+    /// the flag rides every report). Its non-zero `last_applied_seq` must NOT
+    /// let the partial copy witness itself as a full replica — that
+    /// self-witness suppressed the very resync that would repair it (370-487
+    /// LOST inbound entries never re-acquired). The shard must be signaled
+    /// resync-eligible.
+    #[test]
+    fn sweep_signals_resync_for_fenced_partial_inbound_replica() {
+        let master = NodeId(1);
+        let replica = NodeId(2);
+        let mut view = std::collections::HashMap::new();
+        view.insert(master, vec![sweep_entry(7, 5)]);
+        // The replica reports RECORDS (a partial copy is non-empty) but the
+        // pending-inbound flag marks it subset/incomplete.
+        let mut partial = sweep_entry(7, 3);
+        partial.flags = PARTITION_FLAG_PENDING_INBOUND;
+        view.insert(replica, vec![partial]);
+        let alive: std::collections::HashSet<NodeId> = [master, replica].into_iter().collect();
+        let mastered = vec![(7u16, vec![replica])];
+
+        let (missing, signaled, _dropped, _dead_skipped, _inflight_skipped, _stale_fenced) =
+            derive_under_replication_resyncs(
+                &view,
+                &alive,
+                master,
+                &mastered,
+                &std::collections::HashSet::new(),
+                1024,
+            );
+
+        assert_eq!(
+            missing.get(&replica).map(|s| s.as_slice()),
+            Some(&[7u16][..]),
+            "a fenced partial (LOST/pending-inbound) copy must not witness \
+             itself — the shard is under-replicated and must be signaled",
+        );
+        assert_eq!(signaled, 1);
+    }
+
+    /// GAP 3b companion (fail-safe direction): when SELF's own report for a
+    /// mastered shard carries the PENDING_INBOUND flag, self holds only a
+    /// partial fenced copy — it must never push that partial state to
+    /// replicas as "repair". The shard is skipped whole via the freshness
+    /// fence (counted, never silent).
+    #[test]
+    fn sweep_never_repairs_from_a_fenced_partial_self_copy() {
+        let master = NodeId(1);
+        let replica = NodeId(2);
+        let mut view = std::collections::HashMap::new();
+        let mut self_partial = sweep_entry(7, 5);
+        self_partial.flags = PARTITION_FLAG_PENDING_INBOUND;
+        view.insert(master, vec![self_partial]);
+        view.insert(replica, vec![sweep_entry(7, 0)]);
+        let alive: std::collections::HashSet<NodeId> = [master, replica].into_iter().collect();
+        let mastered = vec![(7u16, vec![replica])];
+
+        let (missing, signaled, _dropped, _dead_skipped, _inflight_skipped, stale_fenced) =
+            derive_under_replication_resyncs(
+                &view,
+                &alive,
+                master,
+                &mastered,
+                &std::collections::HashSet::new(),
+                1024,
+            );
+
+        assert!(
+            missing.is_empty(),
+            "a master holding only a partial fenced copy must not source repair",
+        );
+        assert_eq!(signaled, 0);
+        assert_eq!(stale_fenced, 1, "the whole-shard skip must be counted");
     }
 
     /// A replica that never reported in the exchange is unreachable at the
