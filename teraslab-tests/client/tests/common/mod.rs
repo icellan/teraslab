@@ -941,6 +941,81 @@ pub async fn wait_migrations_complete(
     }
 }
 
+/// Split the records that are still failing on a
+/// [`wait_for_migration_reads_ready`] timeout into the two DISTINCT failure
+/// classes the helper polls for, capping each at `cap` records.
+///
+/// The two classes fail for different reasons and need different reading:
+/// `master_failed` means the master route would not serve the record at all,
+/// `under_replicated` means the master served it but fewer than `min_replicas`
+/// nodes hold a local copy. Returning them separately (rather than merged) is
+/// the whole point — run 31946515845 scenario 08 timed out with
+/// `master_failed=0/1200, under_replicated=1/50` and printed
+/// `first_failures (rich, n=0)`, because the dump was built exclusively from
+/// the master-route indices and the under-replicated sample indices were
+/// computed and then dropped. The surviving failure mode reported nothing.
+///
+/// `master_failed_idx` and `under_replicated_idx` index into `txids`;
+/// out-of-range indices are skipped rather than panicking. An index that
+/// appears in BOTH lists is reported only under `master_failed` (the stronger
+/// symptom), so the two sections never duplicate a record and the
+/// `under_replicated` section spends its cap on records the first section
+/// does not already cover.
+///
+/// Both classes are always returned, in order, even when empty — a section
+/// reading `n=0` is what tells the reader that class was clean.
+fn select_migration_failure_samples(
+    txids: &[[u8; 32]],
+    master_failed_idx: &[usize],
+    under_replicated_idx: &[usize],
+    cap: usize,
+) -> Vec<(&'static str, Vec<[u8; 32]>)> {
+    let master: Vec<usize> = master_failed_idx
+        .iter()
+        .copied()
+        .filter(|&i| i < txids.len())
+        .take(cap)
+        .collect();
+    let shown: std::collections::HashSet<usize> = master.iter().copied().collect();
+    let under: Vec<usize> = under_replicated_idx
+        .iter()
+        .copied()
+        .filter(|&i| i < txids.len() && !shown.contains(&i))
+        .take(cap)
+        .collect();
+    vec![
+        (
+            "master_failed",
+            master.into_iter().map(|i| txids[i]).collect(),
+        ),
+        (
+            "under_replicated",
+            under.into_iter().map(|i| txids[i]).collect(),
+        ),
+    ]
+}
+
+/// Render the labelled per-class diagnose sections appended to the
+/// [`wait_for_migration_reads_ready`] timeout error.
+///
+/// Each entry is `(class_label, sampled_record_count, dump)` where `dump` is
+/// the [`collect_admin_diagnose_dump`] output for that class (empty when the
+/// class had no records). The label is what tells a master-route failure
+/// apart from an under-replication failure in the log; the count is the
+/// number of records actually diagnosed, which is capped and so can be lower
+/// than the class total reported in the summary line. A class with no
+/// records renders as ` none` rather than a dangling colon.
+fn format_migration_failure_sections(sections: &[(&str, usize, String)]) -> String {
+    sections
+        .iter()
+        .map(|(label, n, dump)| {
+            let body = if dump.is_empty() { " none" } else { dump };
+            format!(" {label} first_failures (rich, n={n}):{body}")
+        })
+        .collect::<Vec<_>>()
+        .join(";")
+}
+
 /// Probe the tracked txids to confirm they are actually readable end-to-end
 /// after migrations report complete.
 ///
@@ -969,7 +1044,10 @@ pub async fn wait_migrations_complete(
 /// and carrying — via [`format_master_failed_diagnostic`] — a per-record /
 /// per-node breakdown derived from `OP_ADMIN_DIAGNOSE_KEY` (shard, master,
 /// holder, inbound, fenced, migrating, topology_epoch) for the first 32
-/// failing txids.
+/// records of EACH failure class: master-route failures and under-replicated
+/// samples are dumped and labelled separately (see
+/// [`select_migration_failure_samples`]), so a timeout held only by
+/// under-replication still names records instead of dumping nothing.
 ///
 /// `node_nums` must list nodes known to be alive post-migration; dead nodes
 /// will fail `direct_get` and count against `min_replicas`.
@@ -1025,7 +1103,11 @@ pub async fn wait_for_migration_reads_ready(
         }
 
         // (2) Replica check via FLAG_LOCAL_READ on sampled txids.
-        let mut holders_by_sample: Vec<usize> = Vec::with_capacity(sample_indices.len());
+        // The txid indices of the under-replicated samples are kept, not just
+        // counted: when this class is the ONLY one failing it is the only
+        // evidence the timeout dump can show (see
+        // `select_migration_failure_samples`).
+        let mut under_replicated_idx: Vec<usize> = Vec::new();
         for &idx in &sample_indices {
             let txid = txids[idx];
             let mut holders = 0usize;
@@ -1044,12 +1126,11 @@ pub async fn wait_for_migration_reads_ready(
                     holders += 1;
                 }
             }
-            holders_by_sample.push(holders);
+            if holders < min_replicas {
+                under_replicated_idx.push(idx);
+            }
         }
-        let under_replicated: usize = holders_by_sample
-            .iter()
-            .filter(|&&h| h < min_replicas)
-            .count();
+        let under_replicated = under_replicated_idx.len();
         let master_failed = master_failed_idx.len();
 
         if master_failed == 0 && under_replicated == 0 {
@@ -1077,31 +1158,36 @@ pub async fn wait_for_migration_reads_ready(
         }
 
         if start.elapsed() >= timeout {
-            // Diagnose the first 32 master-route failures via the
+            // Diagnose the first 32 records of EACH failure class via the
             // OP_ADMIN_DIAGNOSE_KEY admin op, which returns each
             // node's per-shard state (shard, master, holder, inbound,
             // fenced, migrating, topology epoch) for every txid in a
             // single batched call. The collection + formatting lives
             // in `collect_admin_diagnose_dump` so other helpers
             // (e.g. `wait_migrations_complete_with_diag`) can reuse it.
+            // Both classes are dumped and labelled separately, so a timeout
+            // held ONLY by under-replication still shows per-record evidence.
             let cap = (ADMIN_DIAGNOSE_KEY_MAX_TXIDS as usize).min(32);
-            let failing_txids: Vec<[u8; 32]> = master_failed_idx
-                .iter()
-                .take(cap)
-                .map(|&i| txids[i])
-                .collect();
-
-            let dump =
-                collect_admin_diagnose_dump(client, &node_addrs, node_nums, &failing_txids).await;
+            let classes = select_migration_failure_samples(
+                txids,
+                &master_failed_idx,
+                &under_replicated_idx,
+                cap,
+            );
+            let mut dumps: Vec<(&str, usize, String)> = Vec::with_capacity(classes.len());
+            for (label, sample) in &classes {
+                let dump =
+                    collect_admin_diagnose_dump(client, &node_addrs, node_nums, sample).await;
+                dumps.push((label, sample.len(), dump));
+            }
+            let sections = format_migration_failure_sections(&dumps);
 
             return Err(ClientError::Connection(format!(
                 "migration read verify timeout after {timeout:?}: \
                  master_failed={master_failed}/{}, under_replicated={under_replicated}/{} \
-                 (min_replicas={min_replicas}, nodes={node_nums:?}); \
-                 first_failures (rich, n={}):{dump}",
+                 (min_replicas={min_replicas}, nodes={node_nums:?});{sections}",
                 txids.len(),
                 sample_indices.len(),
-                failing_txids.len(),
             )));
         }
 
@@ -3803,6 +3889,154 @@ mod replication_report_tests {
         assert!(
             dump.contains("shard=7"),
             "expected shard=7 (first response): {dump}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod migration_failure_class_tests {
+    use super::*;
+    use teraslab::cluster::migration::KeyDiagnosis;
+
+    fn txid(n: u8) -> [u8; 32] {
+        [n; 32]
+    }
+
+    fn corpus(n: u8) -> Vec<[u8; 32]> {
+        (0..n).map(txid).collect()
+    }
+
+    /// A `KeyDiagnosis` for one node's view of a record, varying only the
+    /// dimension these tests care about: does this node hold the data.
+    fn holder_view(node_id: u64, master_id: u64, has_local_data: bool) -> KeyDiagnosis {
+        KeyDiagnosis {
+            shard: 11,
+            this_node_id: node_id,
+            local_view_canonical_master_id: master_id,
+            has_local_data,
+            is_local_master_of_shard: node_id == master_id,
+            has_pending_inbound: false,
+            is_shard_fenced: false,
+            is_migrating_shard: false,
+            topology_epoch: 4,
+            local_view_effective_master_id: master_id,
+            is_serving_fenced: false,
+        }
+    }
+
+    /// The run-31946515845 scenario-08 shape: the master route served every
+    /// record (`master_failed=0/1200`) and the ONLY failing class was
+    /// under-replication (`under_replicated=1/50`). The under-replicated
+    /// sample index must reach the dump — the predecessor built the dump
+    /// from the master-route indices alone and reported `n=0`.
+    #[test]
+    fn an_under_replicated_only_timeout_still_names_records() {
+        let txids = corpus(20);
+        let classes = select_migration_failure_samples(&txids, &[], &[7], 32);
+
+        assert_eq!(classes.len(), 2, "both classes must always be reported");
+        assert_eq!(classes[0].0, "master_failed");
+        assert!(
+            classes[0].1.is_empty(),
+            "no master-route failure in this shape: {:?}",
+            classes[0].1.len()
+        );
+        assert_eq!(classes[1].0, "under_replicated");
+        assert_eq!(
+            classes[1].1,
+            vec![txid(7)],
+            "the under-replicated sample index must survive into the dump input"
+        );
+    }
+
+    /// Both classes failing: each is reported under its own label, and the
+    /// master-route sample is not polluted with under-replicated records.
+    #[test]
+    fn the_two_classes_are_reported_separately() {
+        let txids = corpus(20);
+        let classes = select_migration_failure_samples(&txids, &[1, 2], &[15, 16], 32);
+
+        assert_eq!(classes[0].1, vec![txid(1), txid(2)]);
+        assert_eq!(classes[1].1, vec![txid(15), txid(16)]);
+    }
+
+    /// A record that is both master-failed AND under-replicated is reported
+    /// once, under the stronger symptom, so the second section spends its
+    /// cap on records the first does not already cover.
+    #[test]
+    fn a_record_in_both_classes_is_reported_only_as_master_failed() {
+        let txids = corpus(20);
+        let classes = select_migration_failure_samples(&txids, &[3], &[3, 9], 32);
+
+        assert_eq!(classes[0].1, vec![txid(3)]);
+        assert_eq!(
+            classes[1].1,
+            vec![txid(9)],
+            "the duplicate must be dropped from the second section, not the unique record"
+        );
+    }
+
+    /// The cap applies per class, so a flood of master-route failures can
+    /// never squeeze the under-replicated evidence out of the dump.
+    #[test]
+    fn each_class_is_capped_independently() {
+        let txids = corpus(40);
+        let master: Vec<usize> = (0..20).collect();
+        let under: Vec<usize> = (20..40).collect();
+        let classes = select_migration_failure_samples(&txids, &master, &under, 4);
+
+        assert_eq!(classes[0].1, vec![txid(0), txid(1), txid(2), txid(3)]);
+        assert_eq!(classes[1].1, vec![txid(20), txid(21), txid(22), txid(23)]);
+    }
+
+    /// Indices are filtered, not indexed blindly: a stale index must not
+    /// panic the diagnostic path that is only reached when a test is
+    /// ALREADY failing.
+    #[test]
+    fn out_of_range_indices_are_skipped() {
+        let txids = corpus(3);
+        let classes = select_migration_failure_samples(&txids, &[99], &[1, 42], 32);
+
+        assert!(classes[0].1.is_empty(), "{:?}", classes[0].1.len());
+        assert_eq!(classes[1].1, vec![txid(1)]);
+    }
+
+    /// End-to-end through the formatter: an under-replication-only timeout
+    /// renders a labelled section carrying the rich per-node holder columns
+    /// (which nodes hold the record, which do not), and the clean class is
+    /// still shown as `n=0` rather than omitted.
+    #[test]
+    fn sections_label_the_classes_and_carry_the_rich_holder_columns() {
+        let txids = corpus(10);
+        let classes = select_migration_failure_samples(&txids, &[], &[2], 32);
+
+        let node_nums = vec![1u32, 2];
+        let responses = vec![
+            Ok(vec![holder_view(1, 1, true)]),
+            Ok(vec![holder_view(2, 1, false)]),
+        ];
+        let under_dump = format_master_failed_diagnostic(&classes[1].1, &node_nums, &responses);
+
+        let sections = format_migration_failure_sections(&[
+            (classes[0].0, classes[0].1.len(), String::new()),
+            (classes[1].0, classes[1].1.len(), under_dump),
+        ]);
+
+        assert!(
+            sections.contains("master_failed first_failures (rich, n=0): none"),
+            "the clean class must still be named: {sections}"
+        );
+        assert!(
+            sections.contains("under_replicated first_failures (rich, n=1):"),
+            "the failing class must be labelled distinctly: {sections}"
+        );
+        assert!(
+            sections.contains("txid=020202020202"),
+            "the under-replicated record must be named: {sections}"
+        );
+        assert!(
+            sections.contains("holders=[n1:Y, n2:N]"),
+            "the dump must show which nodes hold the record: {sections}"
         );
     }
 }

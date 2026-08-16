@@ -6,7 +6,9 @@
 //!
 //! Every 60 seconds: pause writes, run verify_consistency(), scrape metrics.
 //! Final assertions: zero mismatches at every checkpoint, throughput stable
-//! within 10%, RSS growth <20%, p99 latency stable within 2x.
+//! within 10%, RSS growth <20%, and per-op tail latency stable within
+//! [`P99_DEGRADATION_RATIO_CEILING`] on whichever percentile that op's
+//! sample count supports (see [`P99_MIN_SAMPLES`]).
 
 #[allow(dead_code)]
 mod common;
@@ -58,33 +60,58 @@ const CHECKPOINT_INTERVAL_SECS: u64 = 15;
 /// boundaries, not a calibrated adverse-condition budget.
 const CREATE_ERROR_RATE_THRESHOLD_PCT: f64 = 5.0;
 
-/// Maximum tolerated first-to-last p99 degradation ratio for an op type.
+/// Maximum tolerated first-to-last tail-latency degradation ratio for an
+/// op type.
 const P99_DEGRADATION_RATIO_CEILING: f64 = 5.0;
 
 /// Minimum sample count an op type needs at BOTH the first and the last
-/// checkpoint before its p99 degradation ratio is judged.
+/// checkpoint before its **p99** degradation ratio is judged.
 ///
-/// A percentile is only a percentile if there are samples behind it: with
-/// 13 delete samples, `percentile_value` puts p95, p99 and max on the same
-/// observation, so ONE 6.2s outlier becomes "the p99" and the ratio gate
-/// fires on a single unlucky request. 100 samples puts at least one distinct
-/// observation above p99's index and keeps a lone outlier from defining the
-/// percentile. Under-sampled ops are logged with their counts and skipped;
-/// well-sampled ops keep the full ratio gate.
-const P99_MIN_SAMPLES: u64 = 100;
+/// `percentile_value` (see `reporter.rs`) selects the sample at index
+/// `floor(pct * n)`, so a percentile is only a percentile when enough
+/// observations sit at or above that index. The floor used here is
+/// `5 / (1 - pct)` — five observations in the tail, so no single request can
+/// BE the percentile:
+///
+/// - n=13, p99 -> index 12 == the max. One 6.2s outlier becomes "the p99".
+/// - n=150, p99 -> index 148 == the SECOND-WORST sample. Still effectively a
+///   max: run 31946519864 failed this gate with
+///   `read: first=14.11ms, last=98.26ms, ratio=6.96 (150/700 samples)` on a
+///   completely idle cluster — zero migrations, heals or topology events,
+///   CPU ~3%, throughput UP 836->923, and spend's ratio 1.01 over 7657
+///   samples. One or two slow reads moved a 5x ceiling by 7x.
+/// - n=500, p99 -> index 495, five observations in the tail. A lone outlier
+///   can no longer define it.
+///
+/// Op types between [`P95_MIN_SAMPLES`] and this floor are judged on p95
+/// instead — the same ratio ceiling against a percentile their sample count
+/// actually supports. Below [`P95_MIN_SAMPLES`] nothing is judged: the op is
+/// logged with its counts and skipped.
+const P99_MIN_SAMPLES: u64 = 500;
+
+/// Minimum sample count for the middle tier, where the ratio is judged on
+/// **p95** because the sample count cannot support a p99.
+///
+/// Same `5 / (1 - pct)` rule as [`P99_MIN_SAMPLES`]: at n=100, p95 lands on
+/// index 95 with five observations in the tail. Below this an op type has no
+/// percentile worth gating and is skipped entirely.
+const P95_MIN_SAMPLES: u64 = 100;
 
 /// One op type's latency picture at a checkpoint.
 #[derive(Debug, Clone, Copy)]
 struct OpLatency {
+    /// p95 over the samples recorded so far for this op type. Judged
+    /// instead of `p99` when the sample count is in the middle tier.
+    p95: Duration,
     /// p99 over the samples recorded so far for this op type.
     p99: Duration,
-    /// Number of samples behind that p99.
+    /// Number of samples behind those percentiles.
     count: u64,
 }
 
-/// Outcome of the per-op p99 degradation gate.
+/// Outcome of the per-op tail-latency degradation gate.
 #[derive(Debug, Default)]
-struct P99GateOutcome {
+struct TailLatencyGateOutcome {
     /// One line per op type whose ratio was actually judged.
     checked: Vec<String>,
     /// One line per op type skipped, with the reason.
@@ -93,8 +120,13 @@ struct P99GateOutcome {
     failure: Option<String>,
 }
 
-/// Compare per-op p99 latency between the first and last checkpoint,
-/// applying the [`P99_MIN_SAMPLES`] floor.
+/// Compare per-op tail latency between the first and last checkpoint,
+/// picking the percentile the op type's sample count can support:
+/// p99 at or above `p99_min_samples`, p95 at or above `p95_min_samples`,
+/// nothing below that (see [`P99_MIN_SAMPLES`] for the derivation).
+///
+/// The tier is decided by `min(first.count, last.count)` — the ratio is only
+/// as trustworthy as the THINNER of the two windows behind it.
 ///
 /// NOTE ON WHAT IS BEING COMPARED: `MetricsReporter` never resets, so its
 /// stats are CUMULATIVE — the first checkpoint's numbers cover the run up to
@@ -104,17 +136,19 @@ struct P99GateOutcome {
 /// is a floor on "did tail latency blow up", not a precise interval measure.
 ///
 /// Every op type appearing in EITHER checkpoint is accounted for. Op types
-/// missing from one of them, below the sample floor in either, or with a
-/// zero first-checkpoint p99 are reported in `skipped` and never fail the
-/// run. Every other op type must keep `last_p99 / first_p99 <= max_ratio`;
-/// when several breach, `failure` names the one with the worst ratio.
-fn evaluate_p99_degradation(
+/// missing from one of them, below both sample floors, or with a zero
+/// first-checkpoint value for the tier's percentile are reported in
+/// `skipped` and never fail the run. Every other op type must keep
+/// `last / first <= max_ratio` for its tier's percentile; when several
+/// breach, `failure` names the one with the worst ratio.
+fn evaluate_tail_latency_degradation(
     first: &BTreeMap<String, OpLatency>,
     last: &BTreeMap<String, OpLatency>,
-    min_samples: u64,
+    p99_min_samples: u64,
+    p95_min_samples: u64,
     max_ratio: f64,
-) -> P99GateOutcome {
-    let mut outcome = P99GateOutcome::default();
+) -> TailLatencyGateOutcome {
+    let mut outcome = TailLatencyGateOutcome::default();
     let mut worst: Option<(f64, String)> = None;
     let op_names: std::collections::BTreeSet<&String> = first.keys().chain(last.keys()).collect();
     for op in op_names {
@@ -139,32 +173,54 @@ fn evaluate_p99_degradation(
             }
             (None, None) => continue,
         };
-        if first_stats.count < min_samples || last_stats.count < min_samples {
+        let thinner = first_stats.count.min(last_stats.count);
+        // Percentile tier: the ratio is judged against the finest percentile
+        // the THINNER window actually supports, never a dressed-up max.
+        let (pct, first_val, last_val, tier_note) = if thinner >= p99_min_samples {
+            ("p99", first_stats.p99, last_stats.p99, String::new())
+        } else if thinner >= p95_min_samples {
+            (
+                "p95",
+                first_stats.p95,
+                last_stats.p95,
+                format!(
+                    ", judged on p95: {thinner} samples is below the \
+                     {p99_min_samples}-sample p99 floor (p99 {:?} -> {:?} not judged)",
+                    first_stats.p99, last_stats.p99
+                ),
+            )
+        } else {
             outcome.skipped.push(format!(
-                "{op}: {}/{} samples (first/last) below the {min_samples}-sample floor, \
-                 p99 {:?} -> {:?} not judged",
-                first_stats.count, last_stats.count, first_stats.p99, last_stats.p99
+                "{op}: {}/{} samples (first/last) below the {p95_min_samples}-sample floor, \
+                 p95 {:?} -> {:?} and p99 {:?} -> {:?} not judged",
+                first_stats.count,
+                last_stats.count,
+                first_stats.p95,
+                last_stats.p95,
+                first_stats.p99,
+                last_stats.p99
+            ));
+            continue;
+        };
+        if first_val.is_zero() {
+            outcome.skipped.push(format!(
+                "{op}: first-checkpoint {pct} is zero, ratio undefined"
             ));
             continue;
         }
-        if first_stats.p99.is_zero() {
-            outcome.skipped.push(format!(
-                "{op}: first-checkpoint p99 is zero, ratio undefined"
-            ));
-            continue;
-        }
-        let ratio = last_stats.p99.as_secs_f64() / first_stats.p99.as_secs_f64();
+        let ratio = last_val.as_secs_f64() / first_val.as_secs_f64();
         outcome.checked.push(format!(
-            "{op}: p99 {:?} -> {:?}, ratio={ratio:.2} ({}/{} samples)",
-            first_stats.p99, last_stats.p99, first_stats.count, last_stats.count
+            "{op}: {pct} {first_val:?} -> {last_val:?}, ratio={ratio:.2} ({}/{} samples{tier_note})",
+            first_stats.count, last_stats.count
         ));
         if ratio > max_ratio && worst.as_ref().is_none_or(|(w, _)| ratio > *w) {
             worst = Some((
                 ratio,
                 format!(
-                    "10: p99 latency degraded for {op}: first={:?}, last={:?}, ratio={ratio:.2} \
-                     (expected <={max_ratio:.1}) over {}/{} samples",
-                    first_stats.p99, last_stats.p99, first_stats.count, last_stats.count
+                    "10: {pct} latency degraded for {op}: first={first_val:?}, \
+                     last={last_val:?}, ratio={ratio:.2} (expected <={max_ratio:.1}) \
+                     over {}/{} samples",
+                    first_stats.count, last_stats.count
                 ),
             ));
         }
@@ -711,6 +767,7 @@ async fn run_scenario() -> Result<(), ClientError> {
                 op_latencies.insert(
                     op.clone(),
                     OpLatency {
+                        p95: stats.p95,
                         p99: stats.p99,
                         count: stats.count,
                     },
@@ -869,18 +926,24 @@ async fn run_scenario() -> Result<(), ClientError> {
         }
     }
 
-    // 4. p99 latency stable, judged PER OP TYPE and only where the op has
-    //    enough samples for a p99 to mean anything (see P99_MIN_SAMPLES).
+    // 4. Tail latency stable, judged PER OP TYPE against the finest
+    //    percentile that op's sample count supports -- p99 above
+    //    P99_MIN_SAMPLES, p95 above P95_MIN_SAMPLES, nothing below.
     if checkpoints.len() >= 2 {
         let first = &checkpoints[0].op_latencies;
         let last = &checkpoints[checkpoints.len() - 1].op_latencies;
-        let outcome =
-            evaluate_p99_degradation(first, last, P99_MIN_SAMPLES, P99_DEGRADATION_RATIO_CEILING);
+        let outcome = evaluate_tail_latency_degradation(
+            first,
+            last,
+            P99_MIN_SAMPLES,
+            P95_MIN_SAMPLES,
+            P99_DEGRADATION_RATIO_CEILING,
+        );
         for line in &outcome.skipped {
-            eprintln!("[10.final] p99 gate skipped -- {line}");
+            eprintln!("[10.final] tail-latency gate skipped -- {line}");
         }
         for line in &outcome.checked {
-            eprintln!("[10.final] p99 gate checked -- {line}");
+            eprintln!("[10.final] tail-latency gate checked -- {line}");
         }
         assert!(
             outcome.failure.is_none(),
@@ -888,7 +951,7 @@ async fn run_scenario() -> Result<(), ClientError> {
             outcome.failure.unwrap_or_default()
         );
         eprintln!(
-            "[10.final] p99 latency stable across {} judged op type(s), {} skipped \
+            "[10.final] tail latency stable across {} judged op type(s), {} skipped \
              (aggregate max p99: first={:?}, last={:?})",
             outcome.checked.len(),
             outcome.skipped.len(),
@@ -1034,11 +1097,29 @@ fn payloads_match_ignore_updated_at(a: &[u8], b: &[u8]) -> bool {
 mod tests {
     use super::*;
 
-    fn op(p99_ms: u64, count: u64) -> OpLatency {
+    /// An op type's latency picture. `p95_ms` matters only for the middle
+    /// tier; tests that stay in the p99 tier pass the same value for both.
+    fn op_pcts(p95_ms: u64, p99_ms: u64, count: u64) -> OpLatency {
         OpLatency {
+            p95: Duration::from_millis(p95_ms),
             p99: Duration::from_millis(p99_ms),
             count,
         }
+    }
+
+    /// Shorthand for an op whose p95 and p99 are equal — the shape of every
+    /// case that is judged on p99 or skipped outright.
+    fn op(p99_ms: u64, count: u64) -> OpLatency {
+        op_pcts(p99_ms, p99_ms, count)
+    }
+
+    /// Call the gate with the production floors.
+    fn gate(
+        first: &BTreeMap<String, OpLatency>,
+        last: &BTreeMap<String, OpLatency>,
+        max_ratio: f64,
+    ) -> TailLatencyGateOutcome {
+        evaluate_tail_latency_degradation(first, last, P99_MIN_SAMPLES, P95_MIN_SAMPLES, max_ratio)
     }
 
     fn ops(entries: &[(&str, OpLatency)]) -> BTreeMap<String, OpLatency> {
@@ -1051,10 +1132,11 @@ mod tests {
     #[test]
     fn p99_gate_skips_an_op_below_the_sample_floor() {
         // The exact CI shape: 13 delete samples, so p95 == p99 == max == one
-        // 6.2s observation. A 6.2s/8ms ratio must not fail the run.
+        // 6.2s observation -- below the p95 floor too, so no tier applies.
+        // A 6.2s/8ms ratio must not fail the run.
         let first = ops(&[("delete", op(8, 13))]);
         let last = ops(&[("delete", op(6200, 13))]);
-        let outcome = evaluate_p99_degradation(&first, &last, P99_MIN_SAMPLES, 5.0);
+        let outcome = gate(&first, &last, 5.0);
         assert!(outcome.failure.is_none(), "{:?}", outcome.failure);
         assert!(outcome.checked.is_empty(), "{:?}", outcome.checked);
         assert_eq!(outcome.skipped.len(), 1);
@@ -1069,7 +1151,7 @@ mod tests {
     fn p99_gate_still_fails_a_well_sampled_op() {
         let first = ops(&[("read", op(10, 50_000))]);
         let last = ops(&[("read", op(61, 90_000))]);
-        let outcome = evaluate_p99_degradation(&first, &last, P99_MIN_SAMPLES, 5.0);
+        let outcome = gate(&first, &last, 5.0);
         let failure = outcome.failure.expect("6.1x degradation must fail");
         assert!(
             failure.contains("p99 latency degraded for read"),
@@ -1086,7 +1168,7 @@ mod tests {
     fn p99_gate_passes_a_well_sampled_op_within_the_ceiling() {
         let first = ops(&[("create", op(10, 20_000)), ("spend", op(20, 80_000))]);
         let last = ops(&[("create", op(45, 40_000)), ("spend", op(30, 160_000))]);
-        let outcome = evaluate_p99_degradation(&first, &last, P99_MIN_SAMPLES, 5.0);
+        let outcome = gate(&first, &last, 5.0);
         assert!(outcome.failure.is_none(), "{:?}", outcome.failure);
         assert_eq!(outcome.checked.len(), 2, "{:?}", outcome.checked);
         assert!(outcome.skipped.is_empty(), "{:?}", outcome.skipped);
@@ -1103,7 +1185,7 @@ mod tests {
         // breach, nor be judged itself.
         let first = ops(&[("delete", op(8, 13)), ("read", op(10, 30_000))]);
         let last = ops(&[("delete", op(6200, 13)), ("read", op(100, 60_000))]);
-        let outcome = evaluate_p99_degradation(&first, &last, P99_MIN_SAMPLES, 5.0);
+        let outcome = gate(&first, &last, 5.0);
         let failure = outcome.failure.expect("the read breach must still fire");
         assert!(failure.contains("for read"), "failure was: {failure}");
         assert_eq!(outcome.skipped.len(), 1);
@@ -1118,7 +1200,7 @@ mod tests {
         // neither disappears from the report.
         let first = ops(&[("freeze", op(5, 500))]);
         let last = ops(&[("read", op(5, 500))]);
-        let outcome = evaluate_p99_degradation(&first, &last, P99_MIN_SAMPLES, 5.0);
+        let outcome = gate(&first, &last, 5.0);
         assert!(outcome.failure.is_none(), "{:?}", outcome.failure);
         assert!(outcome.checked.is_empty(), "{:?}", outcome.checked);
         assert_eq!(outcome.skipped.len(), 2, "{:?}", outcome.skipped);
@@ -1141,7 +1223,7 @@ mod tests {
         // (no baseline) but it must not vanish from the report either.
         let first = ops(&[("create", op(10, 20_000))]);
         let last = ops(&[("create", op(12, 40_000)), ("delete", op(6200, 13))]);
-        let outcome = evaluate_p99_degradation(&first, &last, P99_MIN_SAMPLES, 5.0);
+        let outcome = gate(&first, &last, 5.0);
         assert!(outcome.failure.is_none(), "{:?}", outcome.failure);
         assert_eq!(outcome.checked.len(), 1);
         assert!(outcome.checked[0].starts_with("create:"));
@@ -1159,7 +1241,7 @@ mod tests {
         // "create" breaches at 6x and sorts first; "spend" breaches at 20x.
         let first = ops(&[("create", op(10, 30_000)), ("spend", op(10, 30_000))]);
         let last = ops(&[("create", op(60, 60_000)), ("spend", op(200, 60_000))]);
-        let outcome = evaluate_p99_degradation(&first, &last, P99_MIN_SAMPLES, 5.0);
+        let outcome = gate(&first, &last, 5.0);
         let failure = outcome.failure.expect("both breaches must fail the run");
         assert!(
             failure.contains("for spend") && failure.contains("ratio=20.00"),
@@ -1173,13 +1255,141 @@ mod tests {
     fn p99_gate_skips_a_zero_first_p99() {
         let first = ops(&[("read", op(0, 5_000))]);
         let last = ops(&[("read", op(50, 9_000))]);
-        let outcome = evaluate_p99_degradation(&first, &last, P99_MIN_SAMPLES, 5.0);
+        let outcome = gate(&first, &last, 5.0);
         assert!(outcome.failure.is_none(), "{:?}", outcome.failure);
         assert_eq!(outcome.skipped.len(), 1);
         assert!(
             outcome.skipped[0].contains("first-checkpoint p99 is zero"),
             "skipped line was: {}",
             outcome.skipped[0]
+        );
+    }
+
+    #[test]
+    fn p95_tier_passes_the_idle_cluster_shape_that_failed_on_p99() {
+        // Run 31946519864 exactly: read p99 14.11ms -> 98.26ms over 150/700
+        // samples, ratio 6.96, on a cluster with zero migrations/heals/
+        // topology events, ~3% CPU and RISING throughput. At n=150 that p99
+        // is the second-worst sample. p95 -- which 150 samples do support --
+        // barely moved, so this run must NOT fail.
+        //
+        // The last checkpoint's 700 samples are above the p99 floor: the
+        // tier follows the THINNER window, so the gate still drops to p95.
+        let first = ops(&[("read", op_pcts(5, 14, 150))]);
+        let last = ops(&[("read", op_pcts(7, 98, 700))]);
+        let outcome = gate(&first, &last, 5.0);
+        assert!(outcome.failure.is_none(), "{:?}", outcome.failure);
+        assert!(outcome.skipped.is_empty(), "{:?}", outcome.skipped);
+        assert_eq!(outcome.checked.len(), 1, "{:?}", outcome.checked);
+        let checked = &outcome.checked[0];
+        assert!(
+            checked.contains("read: p95 5ms -> 7ms, ratio=1.40"),
+            "checked line must judge p95: {checked}"
+        );
+        assert!(
+            checked.contains("150/700 samples") && checked.contains("judged on p95"),
+            "checked line must explain the tier: {checked}"
+        );
+        assert!(
+            checked.contains("p99 14ms -> 98ms not judged"),
+            "the unjudged p99 must still be reported: {checked}"
+        );
+    }
+
+    #[test]
+    fn p95_tier_still_fails_when_p95_itself_degrades() {
+        // Same thin sample count, but the degradation is now in the body of
+        // the distribution, not one unlucky request. The gate must fire, and
+        // it must say which percentile it fired on.
+        let first = ops(&[("read", op_pcts(5, 14, 150))]);
+        let last = ops(&[("read", op_pcts(40, 300, 700))]);
+        let outcome = gate(&first, &last, 5.0);
+        let failure = outcome.failure.expect("an 8x p95 regression must fail");
+        assert!(
+            failure.contains("p95 latency degraded for read"),
+            "failure was: {failure}"
+        );
+        assert!(failure.contains("ratio=8.00"), "failure was: {failure}");
+        assert!(
+            failure.contains("over 150/700 samples"),
+            "failure was: {failure}"
+        );
+    }
+
+    #[test]
+    fn the_p99_tier_starts_exactly_at_its_floor() {
+        // 500 samples: p99 sits at index 495 with five observations in the
+        // tail, so the p99 ratio is judged and a 6x breach fails.
+        let at_floor_first = ops(&[("read", op_pcts(1, 10, P99_MIN_SAMPLES))]);
+        let at_floor_last = ops(&[("read", op_pcts(1, 60, P99_MIN_SAMPLES))]);
+        let at_floor = gate(&at_floor_first, &at_floor_last, 5.0);
+        let failure = at_floor
+            .failure
+            .expect("at the floor the p99 ratio is judged");
+        assert!(
+            failure.contains("p99 latency degraded for read"),
+            "failure was: {failure}"
+        );
+
+        // One sample short of the floor: the identical p99 blow-up is NOT
+        // judged; the stable p95 is judged instead and passes.
+        let below_first = ops(&[("read", op_pcts(1, 10, P99_MIN_SAMPLES - 1))]);
+        let below_last = ops(&[("read", op_pcts(1, 60, P99_MIN_SAMPLES - 1))]);
+        let below = gate(&below_first, &below_last, 5.0);
+        assert!(below.failure.is_none(), "{:?}", below.failure);
+        assert_eq!(below.checked.len(), 1, "{:?}", below.checked);
+        assert!(
+            below.checked[0].contains("read: p95 1ms -> 1ms, ratio=1.00"),
+            "checked line was: {}",
+            below.checked[0]
+        );
+    }
+
+    #[test]
+    fn p95_tier_skips_a_zero_first_p95() {
+        // Sub-millisecond p95 truncating to zero makes the ratio undefined
+        // in the middle tier exactly as it does in the p99 tier.
+        let first = ops(&[("read", op_pcts(0, 14, 150))]);
+        let last = ops(&[("read", op_pcts(7, 98, 150))]);
+        let outcome = gate(&first, &last, 5.0);
+        assert!(outcome.failure.is_none(), "{:?}", outcome.failure);
+        assert!(outcome.checked.is_empty(), "{:?}", outcome.checked);
+        assert_eq!(outcome.skipped.len(), 1);
+        assert!(
+            outcome.skipped[0].contains("first-checkpoint p95 is zero"),
+            "skipped line was: {}",
+            outcome.skipped[0]
+        );
+    }
+
+    #[test]
+    fn the_p95_tier_starts_exactly_at_its_floor() {
+        // At the p95 floor the op is judged; one sample below it, nothing is
+        // judged and the op is reported as skipped with both percentiles.
+        let at_first = ops(&[("read", op_pcts(5, 14, P95_MIN_SAMPLES))]);
+        let at_last = ops(&[("read", op_pcts(40, 98, P95_MIN_SAMPLES))]);
+        let at_floor = gate(&at_first, &at_last, 5.0);
+        assert!(
+            at_floor
+                .failure
+                .as_deref()
+                .is_some_and(|f| f.contains("p95 latency degraded for read")),
+            "at the p95 floor the p95 ratio is judged: {:?}",
+            at_floor.failure
+        );
+
+        let below_first = ops(&[("read", op_pcts(5, 14, P95_MIN_SAMPLES - 1))]);
+        let below_last = ops(&[("read", op_pcts(40, 98, P95_MIN_SAMPLES - 1))]);
+        let below = gate(&below_first, &below_last, 5.0);
+        assert!(below.failure.is_none(), "{:?}", below.failure);
+        assert!(below.checked.is_empty(), "{:?}", below.checked);
+        assert_eq!(below.skipped.len(), 1);
+        assert!(
+            below.skipped[0].contains("99/99 samples (first/last) below the 100-sample floor")
+                && below.skipped[0].contains("p95 5ms -> 40ms")
+                && below.skipped[0].contains("p99 14ms -> 98ms"),
+            "skipped line was: {}",
+            below.skipped[0]
         );
     }
 
