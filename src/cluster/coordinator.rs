@@ -6666,9 +6666,26 @@ impl ClusterCoordinator {
                                 let _ = tx.send((peer, Some(entries)));
                                 return;
                             }
-                            None => last_failure = "unparseable report payload".to_string(),
+                            None => {
+                                let detail = "unparseable report payload";
+                                record_exchange_peer_failure(
+                                    peer,
+                                    addr,
+                                    ExchangePeerFailureKind::Garbled,
+                                    detail,
+                                );
+                                last_failure = detail.to_string();
+                            }
                         },
-                        Err(err) => last_failure = err,
+                        Err(err) => {
+                            record_exchange_peer_failure(
+                                peer,
+                                addr,
+                                classify_exchange_peer_error(&err),
+                                &err,
+                            );
+                            last_failure = err;
+                        }
                     }
                     // W9 FIX 1 — re-query on a short cadence until the total
                     // deadline: the dominant failure is a fast STALE_EPOCH
@@ -7236,6 +7253,122 @@ static ACTIVATION_DEGRADED_DEGENERATE_VIEW_TOTAL: std::sync::atomic::AtomicU64 =
 /// exchange view since process start (W8).
 pub fn activation_degraded_degenerate_view_total() -> u64 {
     ACTIVATION_DEGRADED_DEGENERATE_VIEW_TOTAL.load(Ordering::Relaxed)
+}
+
+/// W9 P2 — outcome classification for a failed exchange report query
+/// (`OP_PARTITION_VERSION_REPORT`). One counter per outcome, because the
+/// chronic view starvation (CI run 31971906387) was undiagnosable while
+/// every failure was silently discarded: `Status` rising means peers are
+/// alive but rejecting (the STALE_EPOCH commit-propagation race), while
+/// `Connect`/`Transport` point at reachability.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExchangePeerFailureKind {
+    /// TCP connect failed (peer down or unreachable).
+    Connect,
+    /// The peer answered with a non-OK status (e.g. `ERR_STALE_EPOCH`
+    /// while it has not yet applied the commit).
+    Status,
+    /// The connection was established but the round-trip failed: a read or
+    /// write error (including read TIMEOUTS), frame decode, or response
+    /// authentication.
+    Transport,
+    /// The peer answered `STATUS_OK` but the report payload failed the
+    /// stride check.
+    Garbled,
+}
+
+/// W9 P2 — classify a [`send_topology_frame_ok`] error string. The
+/// prefixes are authored by `send_topology_frame_response` /
+/// `send_topology_frame_ok` in this same file (the exchange is their only
+/// `_ok` caller), so the match is deterministic; anything unrecognized is
+/// a transport failure.
+fn classify_exchange_peer_error(err: &str) -> ExchangePeerFailureKind {
+    if err.starts_with("connect:") {
+        ExchangePeerFailureKind::Connect
+    } else if err.starts_with("peer replied status") {
+        ExchangePeerFailureKind::Status
+    } else {
+        ExchangePeerFailureKind::Transport
+    }
+}
+
+/// W9 P2 — exchange report queries that failed with a TCP connect error.
+static EXCHANGE_PEER_FAILURE_CONNECT_TOTAL: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+/// W9 P2 — exchange report queries rejected with a non-OK status.
+static EXCHANGE_PEER_FAILURE_STATUS_TOTAL: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+/// W9 P2 — exchange report queries that failed mid-round-trip.
+static EXCHANGE_PEER_FAILURE_TRANSPORT_TOTAL: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+/// W9 P2 — exchange report replies whose payload failed to parse.
+static EXCHANGE_PEER_FAILURE_GARBLED_TOTAL: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Exchange report queries failed on TCP connect since process start
+/// (W9 P2). Exported as `teraslab_exchange_peer_failure_connect_total`.
+pub fn exchange_peer_failure_connect_total() -> u64 {
+    EXCHANGE_PEER_FAILURE_CONNECT_TOTAL.load(Ordering::Relaxed)
+}
+
+/// Exchange report queries rejected with a non-OK status since process
+/// start (W9 P2). Exported as
+/// `teraslab_exchange_peer_failure_status_total`.
+pub fn exchange_peer_failure_status_total() -> u64 {
+    EXCHANGE_PEER_FAILURE_STATUS_TOTAL.load(Ordering::Relaxed)
+}
+
+/// Exchange report queries failed mid-round-trip (read/write/decode/auth,
+/// including read timeouts) since process start (W9 P2). Exported as
+/// `teraslab_exchange_peer_failure_transport_total`.
+pub fn exchange_peer_failure_transport_total() -> u64 {
+    EXCHANGE_PEER_FAILURE_TRANSPORT_TOTAL.load(Ordering::Relaxed)
+}
+
+/// Exchange report replies with an unparseable payload since process start
+/// (W9 P2). Exported as `teraslab_exchange_peer_failure_garbled_total`.
+pub fn exchange_peer_failure_garbled_total() -> u64 {
+    EXCHANGE_PEER_FAILURE_GARBLED_TOTAL.load(Ordering::Relaxed)
+}
+
+/// W9 P2 — whether the `n`th exchange report-query failure (1-based,
+/// process-wide) emits its warn: the first 10 all do, then every 100th.
+/// The re-query cadence retries every 500 ms against a peer that may stay
+/// down for minutes; the counters still count every failure.
+fn exchange_peer_failure_warn_due(n: u64) -> bool {
+    const WARN_FIRST: u64 = 10;
+    const WARN_EVERY: u64 = 100;
+    n <= WARN_FIRST || n.is_multiple_of(WARN_EVERY)
+}
+
+/// W9 P2 — meter + (rate-limited) warn one discarded exchange report
+/// query, naming the peer, address, and failure kind/detail so chronic
+/// view starvation is diagnosable from the log and `/metrics`.
+fn record_exchange_peer_failure(
+    peer: NodeId,
+    addr: SocketAddr,
+    kind: ExchangePeerFailureKind,
+    detail: &str,
+) {
+    let counter = match kind {
+        ExchangePeerFailureKind::Connect => &EXCHANGE_PEER_FAILURE_CONNECT_TOTAL,
+        ExchangePeerFailureKind::Status => &EXCHANGE_PEER_FAILURE_STATUS_TOTAL,
+        ExchangePeerFailureKind::Transport => &EXCHANGE_PEER_FAILURE_TRANSPORT_TOTAL,
+        ExchangePeerFailureKind::Garbled => &EXCHANGE_PEER_FAILURE_GARBLED_TOTAL,
+    };
+    counter.fetch_add(1, Ordering::Relaxed);
+    static FAILURES_SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = FAILURES_SEEN.fetch_add(1, Ordering::Relaxed) + 1;
+    if exchange_peer_failure_warn_due(n) {
+        tracing::warn!(
+            peer = peer.0,
+            %addr,
+            kind = ?kind,
+            detail,
+            "cluster: exchange report query failed — re-querying until the \
+             exchange deadline (warn rate-limited; counters count every failure)",
+        );
+    }
 }
 
 /// Outcome of [`admit_exchange_completion`] for an exchange-phase activation.
@@ -32667,6 +32800,96 @@ mod tests {
         // An empty active set trivially holds.
         let mgr3 = MigrationManager::new();
         assert!(active_migrations_all_held(&mgr3, &held));
+    }
+
+    /// W9 P2 — the exchange discard-site failure classifier. The prefixes
+    /// are authored by `send_topology_frame_response` /
+    /// `send_topology_frame_ok` in this same file; anything else (read or
+    /// write errors — including read TIMEOUTS — decode, auth) is a
+    /// transport failure.
+    #[test]
+    fn classify_exchange_peer_error_maps_connect_status_transport() {
+        assert_eq!(
+            classify_exchange_peer_error("connect: Connection refused (os error 61)"),
+            ExchangePeerFailureKind::Connect,
+        );
+        assert_eq!(
+            classify_exchange_peer_error("peer replied status 24"),
+            ExchangePeerFailureKind::Status,
+        );
+        assert_eq!(
+            classify_exchange_peer_error("read length: Resource temporarily unavailable"),
+            ExchangePeerFailureKind::Transport,
+        );
+        assert_eq!(
+            classify_exchange_peer_error("write: Broken pipe (os error 32)"),
+            ExchangePeerFailureKind::Transport,
+        );
+        assert_eq!(
+            classify_exchange_peer_error("decode: truncated frame"),
+            ExchangePeerFailureKind::Transport,
+        );
+    }
+
+    /// W9 P2 — per-attempt exchange failure warns are rate-limited (first
+    /// 10 all log, then every 100th): the chronic degrade re-queries every
+    /// 500 ms, and an unreachable peer must not flood the log while the
+    /// counters still count every failure.
+    #[test]
+    fn exchange_peer_failure_warn_due_rate_limits() {
+        for n in 1..=10u64 {
+            assert!(exchange_peer_failure_warn_due(n), "failure {n} must log");
+        }
+        assert!(!exchange_peer_failure_warn_due(11));
+        assert!(!exchange_peer_failure_warn_due(99));
+        assert!(exchange_peer_failure_warn_due(100));
+        assert!(!exchange_peer_failure_warn_due(101));
+        assert!(exchange_peer_failure_warn_due(200));
+    }
+
+    /// W9 P2 — every discarded exchange report query increments the counter
+    /// for ITS outcome (the chronic view starvation was undiagnosable
+    /// because every failure was silently discarded).
+    #[test]
+    fn exchange_peer_failures_are_counted_per_outcome() {
+        let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let peer = NodeId(9);
+
+        let before = exchange_peer_failure_connect_total();
+        record_exchange_peer_failure(
+            peer,
+            addr,
+            ExchangePeerFailureKind::Connect,
+            "connect: Connection refused",
+        );
+        assert_eq!(exchange_peer_failure_connect_total(), before + 1);
+
+        let before = exchange_peer_failure_status_total();
+        record_exchange_peer_failure(
+            peer,
+            addr,
+            ExchangePeerFailureKind::Status,
+            "peer replied status 24",
+        );
+        assert_eq!(exchange_peer_failure_status_total(), before + 1);
+
+        let before = exchange_peer_failure_transport_total();
+        record_exchange_peer_failure(
+            peer,
+            addr,
+            ExchangePeerFailureKind::Transport,
+            "read length: timed out",
+        );
+        assert_eq!(exchange_peer_failure_transport_total(), before + 1);
+
+        let before = exchange_peer_failure_garbled_total();
+        record_exchange_peer_failure(
+            peer,
+            addr,
+            ExchangePeerFailureKind::Garbled,
+            "unparseable report payload",
+        );
+        assert_eq!(exchange_peer_failure_garbled_total(), before + 1);
     }
 
     // ── Phase I: cluster startup readiness ───────────────────────────────
