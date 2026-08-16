@@ -9185,7 +9185,16 @@ fn run_orphan_cleanup(
             format!("orphan_cleanup deleting {} key(s)", keys.len(),),
         );
         for key in &keys {
-            match engine.delete(&DeleteRequest {
+            // `reclaim_held_copy`, NOT `delete`: evicting a shard this node no
+            // longer owns after a committed handoff is a NON-AUTHORITATIVE
+            // space reclaim — post-handoff the NEW owner is the key's
+            // authority. The authoritative path records a `ClientDelete`
+            // tombstone whose RULE-DS veto is unconditional, silently dropping
+            // every later migration-baseline / repair create of the key on
+            // this node (code=19 missing-exact-key → terminal abort; scenario
+            // 15, 122 shards). Physically identical removal (same fsynced
+            // `FreeRegion` durability), just no authority claim.
+            match engine.reclaim_held_copy(&DeleteRequest {
                 tx_key: *key,
                 due_guard: None,
             }) {
@@ -9269,7 +9278,11 @@ fn cleanup_orphaned_shard_if_settled(
     let keys = engine.keys_for_shard(shard);
     let mut deleted = 0u64;
     for key in &keys {
-        match engine.delete(&DeleteRequest {
+        // `reclaim_held_copy`, NOT `delete` — non-authoritative held-copy
+        // space reclaim; see the matching comment in `run_orphan_cleanup`
+        // for why an authority tombstone here permanently vetoes the new
+        // owner's repair of the shard.
+        match engine.reclaim_held_copy(&DeleteRequest {
             tx_key: *key,
             due_guard: None,
         }) {
@@ -16079,6 +16092,20 @@ mod tests {
         TxKey { txid }
     }
 
+    /// Attach an in-RAM deletion-tombstone log routing keys identically to the
+    /// engine's primary index — the RF>1 production default. No file I/O:
+    /// `persist` is never called, so the `/nonexistent` path is never touched.
+    /// (Mirror of the receiver test fixture of the same name.)
+    fn enable_tombstones(engine: &Engine) {
+        let log = crate::ops::tombstone::TombstoneLog::new(
+            std::path::PathBuf::from("/nonexistent/orphan-cleanup-test.tombstones"),
+            engine.index_seed(),
+            engine.index_shard_count(),
+            10_000,
+        );
+        engine.set_tombstone_log(log);
+    }
+
     fn create_test_record(engine: &Engine, key: TxKey) {
         let utxo_hashes = [[0x44u8; 32]];
         engine
@@ -18360,6 +18387,159 @@ mod tests {
             0,
             "run_orphan_cleanup must reclaim a non-owned shard after a committed handoff",
         );
+    }
+
+    /// Scenario 15 (run 31911177514) — the orphan-cleanup tombstone-authority
+    /// veto, per-shard site. A node evicting records of a shard it NO LONGER
+    /// OWNS after a committed handoff performs a NON-AUTHORITATIVE space
+    /// reclaim: post-handoff the NEW owner is the key's authority. The
+    /// historical `engine.delete` call recorded a `ClientDelete` authority
+    /// tombstone, whose RULE-DS veto (`TombstoneLog::blocks_heal_apply` —
+    /// unconditionally true for `ClientDelete` until retention GC) then
+    /// silently dropped EVERY later migration-baseline / repair `Create` of
+    /// those keys on this node (`apply_create_replica`), so the completion
+    /// verify failed with code=19 missing-exact-key until terminal abort and
+    /// the under-replication repair could never land (122 shards, node1).
+    ///
+    /// Fail-before: tombstone present after cleanup + the baseline re-apply is
+    /// silently dropped (key stays absent). Pass-after: reclaim still reclaims
+    /// (record gone), NO tombstone is recorded, and the baseline lands.
+    #[test]
+    fn per_shard_orphan_cleanup_reclaims_without_authority_tombstone_and_repair_lands() {
+        let old_table =
+            ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2), NodeId(3)], 2, 10, 1);
+        let new_table = ShardTable::compute_with_epoch(&[NodeId(2), NodeId(3)], 2, 11, 1);
+        let shard = (0..NUM_SHARDS as u16)
+            .find(|&s| {
+                let old = old_table.target_assignment(s);
+                let new = new_table.target_assignment(s);
+                (old.master == NodeId(1) || old.replicas.contains(&NodeId(1)))
+                    && new.master != NodeId(1)
+                    && !new.replicas.contains(&NodeId(1))
+            })
+            .expect("node1 should hold a shard it no longer owns after removal");
+
+        // node1's engine holds the shard's record and — as in every RF>1
+        // production deployment — has a deletion-tombstone log attached.
+        let engine = Arc::new(test_engine());
+        enable_tombstones(&engine);
+        let key = tx_key_for_shard(shard, 50);
+        create_test_record(&engine, key);
+        assert_eq!(engine.shard_record_count(shard), 1);
+
+        // The new owner's engine holds the same record (the committed handoff
+        // installed it there); it is the repair/migration source afterwards.
+        let source = Arc::new(test_engine());
+        create_test_record(&source, key);
+
+        let shard_table = Arc::new(ShardTableLock::new(new_table.clone()));
+        let migration = Arc::new(Mutex::new(MigrationManager::new()));
+        migration
+            .lock()
+            .record_committed_handoff(shard, new_table.version);
+
+        cleanup_orphaned_shard_if_settled(
+            NodeId(1),
+            &engine,
+            &shard_table,
+            &migration,
+            shard,
+            new_table.version,
+        );
+
+        // Reclaim still reclaims: gone from the index and the shard census.
+        assert_eq!(engine.shard_record_count(shard), 0, "reclaim must remove");
+        assert!(engine.lookup(&key).is_none(), "reclaim must unregister");
+        // ...but it asserts NOTHING about the key: no authority tombstone.
+        assert!(
+            engine.tombstone_lookup(&key).is_none(),
+            "orphan cleanup of an unowned shard is a held-copy space reclaim, \
+             not the key's authoritative deletion — it must not record a \
+             tombstone that vetoes the new owner's future repair",
+        );
+
+        // The cluster later re-assigns the shard here (scale-out / repair):
+        // the owner streams the migration baseline. Ship the record's
+        // production replay image and apply it exactly as the migration-batch
+        // receiver does (journal = false, is_migration = true).
+        let replay = build_record_replay_ops(&source, &key)
+            .expect("replay build must not fail")
+            .expect("source must hold the record");
+        for op in &replay.ops {
+            crate::replication::receiver::apply_op_journal(&engine, op, false, true)
+                .expect("baseline apply must not fail");
+        }
+        let meta = engine.read_metadata(&key).expect(
+            "the migration-baseline create must land — a held-copy space \
+             reclaim must never veto the shard's repair",
+        );
+        assert_eq!({ meta.generation }, replay.generation);
+        assert_eq!(engine.shard_record_count(shard), 1);
+    }
+
+    /// Broad-sweep mirror of
+    /// [`per_shard_orphan_cleanup_reclaims_without_authority_tombstone_and_repair_lands`]:
+    /// `run_orphan_cleanup` produced the same `ClientDelete` authority
+    /// tombstones across all 122 orphaned shards in the failing run. Same
+    /// fail-before / pass-after contract via the sweep path.
+    #[test]
+    fn run_orphan_cleanup_reclaims_without_authority_tombstone_and_repair_lands() {
+        let old_table =
+            ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2), NodeId(3)], 2, 10, 1);
+        let new_table = ShardTable::compute_with_epoch(&[NodeId(2), NodeId(3)], 2, 11, 1);
+        let shard = (0..NUM_SHARDS as u16)
+            .find(|&s| {
+                let old = old_table.target_assignment(s);
+                let new = new_table.target_assignment(s);
+                (old.master == NodeId(1) || old.replicas.contains(&NodeId(1)))
+                    && new.master != NodeId(1)
+                    && !new.replicas.contains(&NodeId(1))
+            })
+            .expect("node1 should hold a shard it no longer owns after removal");
+
+        let engine = Arc::new(test_engine());
+        enable_tombstones(&engine);
+        let key = tx_key_for_shard(shard, 51);
+        create_test_record(&engine, key);
+        assert_eq!(engine.shard_record_count(shard), 1);
+
+        let source = Arc::new(test_engine());
+        create_test_record(&source, key);
+
+        let shard_table = Arc::new(ShardTableLock::new(new_table.clone()));
+        let migration = Arc::new(Mutex::new(MigrationManager::new()));
+        migration
+            .lock()
+            .record_committed_handoff(shard, new_table.version);
+
+        run_orphan_cleanup(
+            NodeId(1),
+            &engine,
+            &shard_table,
+            &migration,
+            new_table.version,
+        );
+
+        assert_eq!(engine.shard_record_count(shard), 0, "reclaim must remove");
+        assert!(
+            engine.tombstone_lookup(&key).is_none(),
+            "the broad orphan sweep is a held-copy space reclaim — it must \
+             not record an authority tombstone that vetoes future repair",
+        );
+
+        let replay = build_record_replay_ops(&source, &key)
+            .expect("replay build must not fail")
+            .expect("source must hold the record");
+        for op in &replay.ops {
+            crate::replication::receiver::apply_op_journal(&engine, op, false, true)
+                .expect("baseline apply must not fail");
+        }
+        let meta = engine.read_metadata(&key).expect(
+            "the migration-baseline create must land — the broad sweep's \
+             reclaim must never veto the shard's repair",
+        );
+        assert_eq!({ meta.generation }, replay.generation);
+        assert_eq!(engine.shard_record_count(shard), 1);
     }
 
     /// Scenario 17 — the cleanup gate must be PER-SHARD, not global: a failed
