@@ -3010,6 +3010,15 @@ impl ClusterCoordinator {
             // never terminal; completions route through the normal
             // duplicate-gate upgrade path.
             let mut degraded_retry: Option<(std::time::Instant, u32)> = None;
+            // W9 FIX 3 — the det-degraded activation's migration plan with
+            // its worker launch HELD for `DET_DEGRADE_PLAN_LAUNCH_GRACE`,
+            // so a racing same-term quorum completion can upgrade the table
+            // before thousands of holder-blind tasks start streaming (and
+            // lock the upgrade out via `active_count`). Launched by the
+            // grace tick below, or cancelled by whichever superseding
+            // activation lands first. All transitions happen on THIS
+            // thread — no launch/upgrade race is possible.
+            let mut pending_det_plan: Option<DeferredPlanLaunch> = None;
             // Task #47 — term-keyed single-flight slot for the same-term
             // re-heal exchange spawned by the normal reactivation repair.
             // `Some(term)` while an exchange for that term is in flight;
@@ -4350,6 +4359,15 @@ impl ClusterCoordinator {
                                 }
                                 last_reactivation_at = std::time::Instant::now();
                                 last_activation_at = std::time::Instant::now();
+                                // W9 FIX 3 — defensive: these arms are gated
+                                // on `active_count() == 0`, which a pending
+                                // det plan's registered tasks keep non-zero
+                                // (except the startup arm ≥5 s after
+                                // activation, beyond the 3 s grace). If one
+                                // ever fires while a plan is pending, it
+                                // supersedes it — cancel so the workerless
+                                // tasks cannot be preserved.
+                                cancel_deferred_plan_launch(&mut pending_det_plan, &migration);
                                 Self::activate_topology(
                                     &committed_members,
                                     committed_term,
@@ -4454,6 +4472,10 @@ impl ClusterCoordinator {
                     }
 
                     // Single-node cluster: activate immediately.
+                    // W9 FIX 3 — a pending det plan from a superseded
+                    // multi-node term must not outlive this activation (its
+                    // workerless tasks would otherwise be preservable).
+                    cancel_deferred_plan_launch(&mut pending_det_plan, &migration);
                     last_activated_term = term;
                     topology_epoch.store(term, Ordering::Relaxed);
                     tracing::info!(
@@ -4554,12 +4576,29 @@ impl ClusterCoordinator {
                             // self-abort without an epoch advance (see the
                             // helper's doc). A refused upgrade leaves the
                             // marker set — the det-table residual applies.
+                            //
+                            // W9 FIX 3 — the det plan whose launch is still
+                            // HELD (grace window) has no workers: its tasks
+                            // are registered but the launch closure is
+                            // un-run and owned by this thread, so the
+                            // active set is provably worker-less and safe
+                            // to supersede (verified task-by-task).
+                            let no_live_workers = {
+                                let mgr = migration.lock();
+                                no_live_migration_workers_for_upgrade(
+                                    mgr.active_count(),
+                                    pending_det_plan.as_ref().is_some_and(|p| {
+                                        p.term == term
+                                            && active_migrations_all_held(&mgr, &p.tasks)
+                                    }),
+                                )
+                            };
                             if !degraded_term_upgrade_admissible(
                                 degraded_activation_term,
                                 term,
                                 member_view_size,
                                 members.len(),
-                                migration.lock().active_count() == 0,
+                                no_live_workers,
                             ) {
                                 tracing::debug!(
                                     term,
@@ -4588,12 +4627,13 @@ impl ClusterCoordinator {
                     // view, installing the byte-identical pure det table
                     // (the startup-path shape) so the node keeps serving
                     // and no partial-evidence refinement can diverge.
-                    match admit_exchange_completion(
+                    let admission = admit_exchange_completion(
                         same_term_reheal,
                         term,
                         member_view_size,
                         members.len(),
-                    ) {
+                    );
+                    match admission {
                         ExchangeAdmission::HoldReheal => continue,
                         ExchangeAdmission::AdmitDetOnly => {
                             partition_view.clear();
@@ -4611,6 +4651,13 @@ impl ClusterCoordinator {
                             degraded_retry = None;
                         }
                     }
+                    // W9 FIX 3 — this admitted completion is about to
+                    // activate, superseding any still-unlaunched det plan
+                    // (its own term's quorum upgrade, or a newer term).
+                    // Cancel it FIRST: its tasks have no workers, and
+                    // leaving them Active would let the same-epoch preserve
+                    // below keep workerless tasks alive forever.
+                    cancel_deferred_plan_launch(&mut pending_det_plan, &migration);
                     last_activated_term = term;
                     topology_epoch.store(term, Ordering::Relaxed);
                     // §8 — retain the freshest cluster-wide holder view for
@@ -4688,7 +4735,7 @@ impl ClusterCoordinator {
                         view_size = partition_view.len(),
                         "cluster: activating topology after exchange phase",
                     );
-                    Self::activate_topology_with_view(
+                    let deferred = Self::activate_topology_with_view(
                         &members,
                         term,
                         topo_authority_event.committed_placement_version(),
@@ -4715,7 +4762,21 @@ impl ClusterCoordinator {
                         // term's exchange activation must keep the det plan so
                         // the rebalance can fill its still-empty newcomers.
                         same_term_reheal,
+                        // W9 FIX 3 — hold the det degrade's worker launch for
+                        // the upgrade grace; every other admission launches
+                        // immediately.
+                        admission == ExchangeAdmission::AdmitDetOnly,
                     );
+                    if let Some(pending) = deferred {
+                        tracing::info!(
+                            term = pending.term,
+                            tasks = pending.tasks.len(),
+                            grace_secs = DET_DEGRADE_PLAN_LAUNCH_GRACE.as_secs(),
+                            "cluster: holding the det-degraded migration plan's \
+                             launch so a racing quorum completion can upgrade first",
+                        );
+                        pending_det_plan = Some(pending);
+                    }
                     // Reverse-heal Phase 3b — RUNTIME online re-heal. The
                     // partition view just refreshed carries every peer's per-shard
                     // generation digest, so re-run the Tier-2 detector against this
@@ -4773,6 +4834,28 @@ impl ClusterCoordinator {
                     if let Some(ref path) = outbound_state_path_event {
                         crate::cluster::migration::persist_outbound_state(path, &migration.lock());
                     }
+                }
+
+                // W9 FIX 3 — launch a det-degraded migration plan whose
+                // upgrade grace has elapsed with no quorum completion
+                // arriving. Runs AFTER the exchange drain above so a
+                // same-iteration upgrade always supersedes the plan before
+                // this tick can fire it; ≤100 ms tick granularity on top of
+                // the grace is noise against migration timescales.
+                if !activation_held
+                    && pending_det_plan
+                        .as_ref()
+                        .is_some_and(|p| det_plan_launch_due(p.armed_at.elapsed()))
+                    && let Some(pending) = pending_det_plan.take()
+                {
+                    tracing::info!(
+                        term = pending.term,
+                        tasks = pending.tasks.len(),
+                        held_ms = pending.armed_at.elapsed().as_millis() as u64,
+                        "cluster: launching the det-degraded migration plan — no \
+                         quorum upgrade arrived within the launch grace",
+                    );
+                    std::thread::spawn(pending.launch);
                 }
 
                 // Phase H — drain resync requests posted by the catchup
@@ -5900,6 +5983,10 @@ impl ClusterCoordinator {
             // Empty view — the election's holder extension has nothing to
             // read anyway; this path is never a same-term re-heal.
             false,
+            // Never deferred: this wrapper serves the single-node commit
+            // path and the reactivation repairs, none of which is the
+            // det-degrade first activation (W9 FIX 3).
+            false,
         );
     }
 
@@ -5912,6 +5999,15 @@ impl ClusterCoordinator {
     /// uses the per-node `last_applied_seq` data to skip migrations whose
     /// destination already has the data, and to retarget the source onto a
     /// replica when the planned source has none.
+    ///
+    /// W9 FIX 3 — with `defer_plan_launch`, the table install, handoff
+    /// begin, task registration, and bitmap sync all still run
+    /// synchronously (serving semantics and the hot-path fences are never
+    /// held), but the Phase-2 worker launch is NOT spawned: it is returned
+    /// as a [`DeferredPlanLaunch`] for the event loop to fire after
+    /// [`DET_DEGRADE_PLAN_LAUNCH_GRACE`] — or to cancel if a quorum
+    /// completion upgrades the det table first. Returns `None` when the
+    /// launch was spawned (or there was nothing to launch).
     #[allow(clippy::too_many_arguments)]
     fn activate_topology_with_view(
         members: &[NodeId],
@@ -5941,7 +6037,12 @@ impl ClusterCoordinator {
         // pass false — its newcomers are legitimately empty mid-rebalance and
         // must keep their det masterships so the migration can fill them.
         adopt_view_holders: bool,
-    ) {
+        // W9 FIX 3 — true ONLY for the det-degrade first activation
+        // (`ExchangeAdmission::AdmitDetOnly`): hold the Phase-2 worker
+        // launch and return it as a `DeferredPlanLaunch` instead of
+        // spawning it.
+        defer_plan_launch: bool,
+    ) -> Option<DeferredPlanLaunch> {
         *active_topology_members.write() = members.to_vec();
 
         // Fast path: when the engine has zero records AND the current shard
@@ -5978,7 +6079,7 @@ impl ClusterCoordinator {
                 fenced_bm.clear_all();
                 migrating_bm.clear_all();
                 inbound_bm.clear_all();
-                return;
+                return None;
             }
         }
 
@@ -6405,7 +6506,10 @@ impl ClusterCoordinator {
                 })
             };
 
-            std::thread::spawn(move || {
+            // W9 FIX 3 — keep the outbound task list for the deferred
+            // launch's cancel bookkeeping before the closure takes it.
+            let deferred_tasks = defer_plan_launch.then(|| outbound_tasks.clone());
+            let launch = move || {
                 let (pre_swap_keys_by_shard, skipped) =
                     engine_w.keys_by_shard_filtered(&outbound_shard_set);
                 // Issue #46 fail-safe: this is the primary activation handoff.
@@ -6450,8 +6554,21 @@ impl ClusterCoordinator {
                     secret_w,
                     Some(relinquish_ctx),
                 );
-            });
+            };
+            // W9 FIX 3 — the det-degrade path HOLDS the worker launch (the
+            // event loop fires or cancels it); every other path spawns it
+            // immediately, exactly as before.
+            if let Some(tasks) = deferred_tasks {
+                return Some(DeferredPlanLaunch {
+                    term: epoch,
+                    armed_at: std::time::Instant::now(),
+                    tasks,
+                    launch: Box::new(launch),
+                });
+            }
+            std::thread::spawn(launch);
         }
+        None
     }
 
     /// Phase D: collect `OP_PARTITION_VERSION_REPORT` from every alive peer
@@ -6533,7 +6650,7 @@ impl ClusterCoordinator {
             // or `None` at the deadline.
             std::thread::spawn(move || {
                 let mut attempts = 0u32;
-                let mut last_failure = String::new();
+                let mut last_failure: String;
                 loop {
                     attempts += 1;
                     // `_ok`: a rejected report (non-OK status) is a failed
@@ -7336,6 +7453,122 @@ fn degraded_upgrade_retry_due(
 ) -> bool {
     degraded_activation_term == Some(committed_term)
         && since_last_attempt >= degraded_upgrade_retry_backoff(fired_rounds)
+}
+
+/// W9 FIX 3 — how long a det-degraded activation holds its migration-plan
+/// LAUNCH so a racing same-term quorum completion can upgrade the table
+/// first (scenario 06: the degrade's 3869 holder-blind tasks started
+/// streaming immediately, locking `degraded_term_upgrade_admissible`'s
+/// `active_count() == 0` gate for the plan's whole lifetime). Sized to
+/// cover the racing commit/prompt-arm exchange (≤2 s deadline) plus the
+/// first degraded-upgrade retry (fires at 2 s, answered within ~500 ms by
+/// a peer that has applied the commit — FIX 1). Serving and the shard-table
+/// install are NEVER held — only the worker launch.
+const DET_DEGRADE_PLAN_LAUNCH_GRACE: Duration = Duration::from_secs(3);
+
+/// W9 FIX 3 — a migration-plan launch deferred by the det-degrade grace.
+///
+/// Produced by [`ClusterCoordinator::activate_topology_with_view`] when
+/// called with `defer_plan_launch` and the activation has outbound work.
+/// The activation has ALREADY installed the shard table, begun the
+/// handoffs, registered the tasks, and synced the hot-path bitmaps — only
+/// the Phase-2 worker launch (`launch`) is held. Owned by the event loop,
+/// which either spawns `launch` once [`det_plan_launch_due`] holds, or
+/// cancels the whole plan via [`cancel_deferred_plan_launch`] when a
+/// superseding activation (typically the quorum upgrade) lands first.
+struct DeferredPlanLaunch {
+    /// The term the deferred plan was built for.
+    term: u64,
+    /// When the deferral was armed (the activation instant).
+    armed_at: std::time::Instant,
+    /// The outbound tasks `launch` would drive — kept so a cancel can fail
+    /// them (they have no workers; see [`cancel_deferred_plan_launch`]).
+    tasks: Vec<MigrationTask>,
+    /// The held Phase-2 body: key enumeration + worker spawn.
+    launch: Box<dyn FnOnce() + Send>,
+}
+
+/// W9 FIX 3 — has a deferred det plan been held long enough to launch?
+/// Pure so the grace boundary is unit-testable.
+fn det_plan_launch_due(held_for: Duration) -> bool {
+    held_for >= DET_DEGRADE_PLAN_LAUNCH_GRACE
+}
+
+/// W9 FIX 3 — the "no live migration wave" input to
+/// [`degraded_term_upgrade_admissible`].
+///
+/// The round-4 review blocked the same-epoch supersede under LIVE WORKERS:
+/// tasks absent from the refined plan are failed mid-flight while the
+/// superseded plan's workers, seeing no epoch advance, keep streaming.
+/// Tasks registered by a det plan whose launch is still HELD have no
+/// workers at all — the launch closure is un-run and owned by the same
+/// event-loop thread doing this admissibility check, so nothing can start
+/// streaming concurrently. They are therefore safe to supersede; any other
+/// active migration still locks the upgrade out.
+fn no_live_migration_workers_for_upgrade(
+    active_count: usize,
+    det_plan_launch_held_for_term: bool,
+) -> bool {
+    active_count == 0 || det_plan_launch_held_for_term
+}
+
+/// W9 FIX 3 — TRUE iff every ACTIVE migration is one of the held det
+/// plan's registered outbound tasks, still in `Preparing` (no worker has
+/// touched it). Anything else in the active set — e.g. a FIX-B
+/// transfer-request resend spawned with live workers during the grace, or
+/// a held task something began driving — means the active set is NOT
+/// provably worker-less, and the upgrade must fall back to the strict
+/// `active_count() == 0` gate. (A FIX-B resend never matches a held task:
+/// its idempotency filter drops any task matching a live tracked entry,
+/// and the held tasks are exactly such entries.)
+fn active_migrations_all_held(mgr: &MigrationManager, held: &[MigrationTask]) -> bool {
+    let held_set: std::collections::HashSet<(u16, NodeId, NodeId, bool)> = held
+        .iter()
+        .map(|t| (t.shard, t.from_node, t.to_node, t.is_master))
+        .collect();
+    mgr.active_migrations()
+        .iter()
+        .filter(|p| {
+            p.state != crate::cluster::migration::MigrationState::Complete
+                && p.state != crate::cluster::migration::MigrationState::Failed
+        })
+        .all(|p| {
+            p.state == crate::cluster::migration::MigrationState::Preparing
+                && held_set.contains(&(p.shard, p.from_node, p.to_node, p.is_master))
+        })
+}
+
+/// W9 FIX 3 — cancel a still-unlaunched det plan because a superseding
+/// activation is about to run (same-epoch quorum upgrade, a newer term, or
+/// a single-node re-activation).
+///
+/// Fails every outbound task the held launch would have driven: they have
+/// no workers, so this is pure bookkeeping — and it is REQUIRED, because a
+/// same-epoch superseding activation preserves matching active tasks on
+/// the assumption their workers keep running; preserving a workerless task
+/// would strand its shard in Copying forever. MUST be immediately followed
+/// by the superseding activation in the same event-loop iteration (its
+/// supersede reaps the failed entries and re-registers/re-drives whatever
+/// its plan needs).
+fn cancel_deferred_plan_launch(
+    slot: &mut Option<DeferredPlanLaunch>,
+    migration: &Arc<Mutex<MigrationManager>>,
+) {
+    if let Some(pending) = slot.take() {
+        {
+            let mut mgr = migration.lock();
+            for task in &pending.tasks {
+                mgr.mark_failed(task);
+            }
+        }
+        tracing::info!(
+            term = pending.term,
+            tasks = pending.tasks.len(),
+            held_ms = pending.armed_at.elapsed().as_millis() as u64,
+            "cluster: cancelled an UNLAUNCHED det-degraded migration plan — \
+             superseded before its launch grace elapsed",
+        );
+    }
 }
 
 /// Topology proposer thread: broadcasts a proposal to all peers, collects
@@ -29551,6 +29784,7 @@ mod tests {
             &cluster.cluster_secret,
             None,
             false,
+            false,
         );
 
         // The manager retained the unproven lost entry across the supersede (C17).
@@ -29571,6 +29805,150 @@ mod tests {
                 "a supersede that preserves a LOST inbound shard must NOT serve it as full \
                  authority on the production `activate_topology_with_view` path; got {other:?}",
             ),
+        }
+    }
+
+    /// W9 FIX 3 (CI run 31971906387, default-06) — a det-degraded
+    /// activation's migration plan (thousands of holder-blind tasks on a
+    /// member-add: 3869 in scenario 06) used to start streaming
+    /// immediately, so `degraded_term_upgrade_admissible`'s
+    /// `active_count() == 0` gate locked the quorum rescue out for the
+    /// plan's whole lifetime. With `defer_plan_launch`, the activation must:
+    ///
+    /// - install the shard table and REGISTER the tasks synchronously
+    ///   (serving semantics and the inbound/handoff fences are never held),
+    /// - but NOT launch any migration worker — the launch closure is
+    ///   returned to the caller, to fire only after the grace, and
+    /// - on cancel (a quorum upgrade superseded the plan inside the grace),
+    ///   fail every unlaunched outbound task so the upgrade's same-epoch
+    ///   activation cannot "preserve" a workerless task forever.
+    ///
+    /// The launch closure body is the SAME code the `defer_plan_launch:
+    /// false` path spawns (covered by the surrounding activation tests);
+    /// this test pins the deferral seam itself.
+    #[test]
+    fn det_degrade_defers_plan_launch_but_not_table_install() {
+        let _guard = migration_metrics_test_guard();
+        let _metrics = install_test_migration_metrics();
+
+        let members = vec![NodeId(1), NodeId(2)];
+        let old_members = vec![NodeId(1)];
+        let rf = 1u8;
+        let placement_version = 1u16;
+        let old_table = ShardTable::compute_with_epoch(&old_members, rf, 1, placement_version);
+        let new_epoch = 2u64;
+        let new_table = ShardTable::compute_with_epoch(&members, rf, new_epoch, placement_version);
+
+        // Data on a shard the new det table masters to node 2, so node 1's
+        // plan carries at least one OUTBOUND master handoff.
+        let engine = Arc::new(test_engine());
+        let moving_shard = (0..NUM_SHARDS as u16)
+            .find(|&s| new_table.target_assignment(s).master == NodeId(2))
+            .expect("some shard mastered by N2 in a 2-member ring");
+        create_test_record(&engine, tx_key_for_shard(moving_shard, 1));
+
+        let cluster = new_test_running_cluster(
+            NodeId(1),
+            old_table,
+            &[
+                (NodeId(1), "127.0.0.1:1".parse().unwrap()),
+                (NodeId(2), "127.0.0.1:1".parse().unwrap()),
+            ],
+            &members,
+            &[],
+            &[],
+            &[],
+            2,
+        );
+
+        // The det-degrade shape: EMPTIED partition view, defer_plan_launch.
+        let view: std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>> =
+            std::collections::HashMap::new();
+        let pending = ClusterCoordinator::activate_topology_with_view(
+            &members,
+            new_epoch,
+            placement_version,
+            NodeId(1),
+            rf,
+            &cluster.shard_table,
+            &cluster.migration,
+            &cluster.node_addrs,
+            &engine,
+            &None,
+            1,
+            1,
+            1,
+            &cluster.fenced_bitmap,
+            &cluster.migrating_bitmap,
+            &cluster.inbound_atomic,
+            &cluster.active_topology_members,
+            &view,
+            &cluster.migration_throttle,
+            &cluster.cluster_secret,
+            None,
+            false,
+            true,
+        )
+        .expect("a det activation with outbound tasks must return its deferred launch");
+
+        assert_eq!(pending.term, new_epoch);
+        assert!(
+            !pending.tasks.is_empty(),
+            "the deferred launch must carry the outbound task list for cancel bookkeeping",
+        );
+        // Serving is NOT held: the table is installed at the new epoch.
+        assert_eq!(
+            cluster.shard_table.read().version,
+            new_epoch,
+            "deferral must hold ONLY the plan launch, never the table install",
+        );
+        // The tasks are REGISTERED (fences/dual-write bookkeeping live)...
+        assert!(
+            cluster.migration.lock().active_count() > 0,
+            "deferral must not skip task registration",
+        );
+        // ...but NOTHING is launched: no worker exists, so no task can have
+        // left Preparing (against these closed-port peers a launched worker
+        // fails tasks within milliseconds).
+        std::thread::sleep(Duration::from_millis(150));
+        {
+            let mgr = cluster.migration.lock();
+            assert_eq!(
+                mgr.failed_count(),
+                0,
+                "no worker may run before the deferred launch is invoked",
+            );
+            assert!(
+                mgr.active_migrations()
+                    .iter()
+                    .all(|p| p.state == crate::cluster::migration::MigrationState::Preparing),
+                "every registered task must still be Preparing while the launch is held",
+            );
+        }
+
+        // Cancel (the upgrade-superseded path): every unlaunched OUTBOUND
+        // task must be failed so a same-epoch re-activation re-registers
+        // and re-drives it instead of preserving a workerless task.
+        let outbound_tasks = pending.tasks.clone();
+        let mut slot = Some(pending);
+        cancel_deferred_plan_launch(&mut slot, &cluster.migration);
+        assert!(slot.is_none(), "cancel must consume the pending launch");
+        {
+            let mgr = cluster.migration.lock();
+            for task in &outbound_tasks {
+                assert!(
+                    !mgr.active_migrations().iter().any(|p| {
+                        p.shard == task.shard
+                            && p.from_node == task.from_node
+                            && p.to_node == task.to_node
+                            && p.is_master == task.is_master
+                            && p.state != crate::cluster::migration::MigrationState::Failed
+                            && p.state != crate::cluster::migration::MigrationState::Complete
+                    }),
+                    "cancelled task for shard {} must not remain active",
+                    task.shard,
+                );
+            }
         }
     }
 
@@ -29667,6 +30045,7 @@ mod tests {
             &cluster.migration_throttle,
             &cluster.cluster_secret,
             None,
+            false,
             false,
         );
 
@@ -29768,6 +30147,7 @@ mod tests {
             &cluster.migration_throttle,
             &cluster.cluster_secret,
             None,
+            false,
             false,
         );
 
@@ -32193,6 +32573,100 @@ mod tests {
             !degraded_upgrade_retry_due(Some(6), 7, Duration::from_secs(60), 0),
             "a new committed term must stop the stale term's retry",
         );
+    }
+
+    /// W9 FIX 3 — the det-degrade plan-launch grace: the deferred migration
+    /// plan launches only once the grace has fully elapsed.
+    #[test]
+    fn det_plan_launch_due_waits_out_the_grace() {
+        assert!(
+            !det_plan_launch_due(Duration::from_millis(2999)),
+            "the plan must stay held inside the grace window",
+        );
+        assert!(
+            det_plan_launch_due(Duration::from_secs(3)),
+            "the plan must launch once the grace elapses",
+        );
+        assert!(det_plan_launch_due(Duration::from_secs(60)));
+    }
+
+    /// W9 FIX 3 — the upgrade gate's "no live migration wave" input.
+    /// Registered-but-UNLAUNCHED det-plan tasks are not a live wave: their
+    /// launch closure is still owned (un-run) by the event loop, so no
+    /// worker exists to keep streaming through a same-epoch supersede — the
+    /// exact hazard the round-4 review blocked. Any OTHER source of active
+    /// migrations still locks the upgrade out.
+    #[test]
+    fn no_live_migration_workers_for_upgrade_truth_table() {
+        assert!(
+            no_live_migration_workers_for_upgrade(0, false),
+            "no registered migrations at all — upgrade admissible as before",
+        );
+        assert!(
+            !no_live_migration_workers_for_upgrade(7, false),
+            "active migrations without a held det plan are (or may be) live \
+             workers — the upgrade must stay locked out",
+        );
+        assert!(
+            no_live_migration_workers_for_upgrade(7, true),
+            "tasks registered by a det plan whose launch is still HELD have \
+             no workers — the upgrade may supersede them",
+        );
+        assert!(no_live_migration_workers_for_upgrade(0, true));
+    }
+
+    /// W9 FIX 3 — the held-plan check behind the relaxed upgrade gate: the
+    /// active set must consist EXCLUSIVELY of the held plan's registered
+    /// tasks, all still `Preparing`. A task some worker began driving, or a
+    /// task outside the held plan (the FIX-B transfer-request resend shape,
+    /// which spawns live workers immediately), must fail the check so the
+    /// upgrade falls back to the strict `active_count() == 0` gate.
+    #[test]
+    fn active_migrations_all_held_detects_foreign_or_driven_tasks() {
+        let held = vec![MigrationTask {
+            shard: 1,
+            from_node: NodeId(1),
+            to_node: NodeId(2),
+            is_master: true,
+        }];
+
+        // Registered, untouched → provably worker-less.
+        let mut mgr = MigrationManager::new();
+        mgr.start_outbound(&held, NodeId(1), &std::collections::HashSet::new());
+        assert!(
+            active_migrations_all_held(&mgr, &held),
+            "freshly registered held tasks are provably worker-less",
+        );
+
+        // A worker began driving the held task → no longer provably held.
+        mgr.set_snapshot_sequence(&held[0], 7);
+        assert!(
+            !active_migrations_all_held(&mgr, &held),
+            "a held task that left Preparing must fail the check",
+        );
+
+        // A live task OUTSIDE the held plan → not admissible.
+        let mut mgr2 = MigrationManager::new();
+        mgr2.start_outbound(&held, NodeId(1), &std::collections::HashSet::new());
+        let foreign = MigrationTask {
+            shard: 2,
+            from_node: NodeId(1),
+            to_node: NodeId(3),
+            is_master: false,
+        };
+        mgr2.start_outbound(
+            std::slice::from_ref(&foreign),
+            NodeId(1),
+            &std::collections::HashSet::new(),
+        );
+        assert!(
+            !active_migrations_all_held(&mgr2, &held),
+            "an active task outside the held plan must fail the check",
+        );
+
+        // An empty active set trivially holds.
+        let mgr3 = MigrationManager::new();
+        assert!(active_migrations_all_held(&mgr3, &held));
     }
 
     // ── Phase I: cluster startup readiness ───────────────────────────────
