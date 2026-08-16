@@ -15,6 +15,13 @@ expected_records = 1000000
 lock_stripes = 65536
 max_batch_size = 8192
 max_connections = 1024
+# E2E overlay only — do NOT copy to production (src/config.rs default stays 64).
+# Every harness connection (client pools, scenario pollers, bench workers) enters
+# the compose network through the single Docker gateway IP, so the per-IP cap
+# aggregates ALL harness traffic onto one address; the production default (64)
+# starves it ("per-IP cap reached count=64 limit=64" -> accept-then-close seen
+# as "connection closed"). Same family as migration_pool_size(128) > cap(64).
+max_connections_per_ip = 256
 block_height_retention = 288
 
 # test cluster only — production must use mTLS / non-default secret
