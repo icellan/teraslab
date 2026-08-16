@@ -4037,6 +4037,28 @@ impl ClusterCoordinator {
                             continue;
                         }
                     }
+                    // Task #73 — a SAME-TERM re-heal may only refine the
+                    // table from a view covering a majority of the committed
+                    // members; a degenerate (self-only) view would install
+                    // det-only tables that fight the holders every other
+                    // node still sees. Skipping HERE — before the term
+                    // stamp, the retained view, the event-repair trigger,
+                    // and `last_activation_at` — leaves every piece of
+                    // trigger state intact (the single-flight slot was
+                    // released above, and the divergence counters recomputed
+                    // each tick from the unchanged table stay nonzero), so
+                    // the re-heal re-fires a fresh exchange on the next
+                    // cooldown tick. Fresh-term activations (commit-signal
+                    // and prompt catch-up arms) pass untouched — see the
+                    // gate's liveness note.
+                    if !exchange_completion_admits_activation(
+                        same_term_reheal,
+                        term,
+                        partition_view.len(),
+                        members.len(),
+                    ) {
+                        continue;
+                    }
                     last_activated_term = term;
                     topology_epoch.store(term, Ordering::Relaxed);
                     // §8 — retain the freshest cluster-wide holder view for
@@ -6344,6 +6366,83 @@ fn same_term_reheal_applicable(
     committed_members: &[NodeId],
 ) -> bool {
     view_term == committed_term && view_members == committed_members
+}
+
+/// Task #73 — count of same-term re-heal activations skipped because their
+/// exchange completed with a degenerate (below-quorum) partition view. Read
+/// via [`reheal_skipped_degenerate_view_total`] and exported as
+/// `teraslab_reheal_skipped_degenerate_view_total`.
+static REHEAL_SKIPPED_DEGENERATE_VIEW_TOTAL: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Number of same-term re-heal activations skipped on a degenerate
+/// (below-quorum) exchange view since process start (Task #73).
+pub fn reheal_skipped_degenerate_view_total() -> u64 {
+    REHEAL_SKIPPED_DEGENERATE_VIEW_TOTAL.load(Ordering::Relaxed)
+}
+
+/// Task #73 — view-quorum admission for exchange-phase activations.
+///
+/// Under migration churn the 2 s exchange frequently completes with a
+/// degenerate SELF-ONLY view (`view_size` 1 in a 3-member cluster). A
+/// SAME-TERM re-heal that activates from such a view refines the table from
+/// purely local evidence: with the honest-absence election (a failed peer is
+/// ABSENT from the view, so no deviation can be justified and the pure det
+/// assignment is installed — see F1 in `run_exchange_phase`), a self-only
+/// re-heal installs det-only tables that fight the holders every other node
+/// still sees (observed as thousands of mismatched/phantom masters right
+/// after a "complete" migration wait). Every such activation diverges rather
+/// than repairs, so a same-term re-heal (`same_term_reheal == true`) is
+/// admitted only when the view covers a MAJORITY of the committed members:
+/// `member_count / 2 + 1`, self included (`run_exchange_phase` records the
+/// self report first, so `view_size` always counts `self`).
+///
+/// A blocked re-heal is counted and logged, then dropped WITHOUT touching
+/// the shard table or any activation bookkeeping — the caller `continue`s
+/// before `last_activated_term`, the topology epoch, the retained view, the
+/// event-repair trigger, and `last_activation_at` are updated, and the
+/// term-keyed single-flight slot was already released. The divergence
+/// counters (recomputed every tick from the unchanged table against the
+/// committed placement) therefore stay nonzero and the normal reactivation
+/// trigger re-fires a FRESH exchange after the cooldown (~15-30 s cadence,
+/// which also rate-limits the skip log to at most one line per attempt).
+///
+/// # Liveness — the gate cannot starve recovery
+///
+/// With a real majority of members down, convergence is never driven by the
+/// same-term re-heal: SWIM death detection reaps the dead members, the
+/// membership change mints a NEW topology term, and the commit-signal /
+/// prompt catch-up activations (`same_term_reheal == false`) install it
+/// UNGATED — a fresh term's first activation legitimately proceeds on
+/// whatever view it gets (startup would deadlock otherwise). The same-term
+/// re-heal is purely the settled-state optimizer for intra-term divergence;
+/// while a majority of the members the committed topology names cannot
+/// answer the exchange, installing a minority-evidence table is exactly the
+/// divergence generator this gate closes, and once they answer again the
+/// next cooldown tick's exchange reaches quorum and the held repair runs.
+fn exchange_completion_admits_activation(
+    same_term_reheal: bool,
+    term: u64,
+    view_size: usize,
+    member_count: usize,
+) -> bool {
+    if !same_term_reheal {
+        return true;
+    }
+    let quorum = member_count / 2 + 1;
+    if view_size >= quorum {
+        return true;
+    }
+    REHEAL_SKIPPED_DEGENERATE_VIEW_TOTAL.fetch_add(1, Ordering::Relaxed);
+    tracing::info!(
+        term,
+        view_size,
+        member_count,
+        quorum,
+        "cluster: skipping same-term re-heal — degenerate exchange view below quorum; \
+         holding the current table, re-arming for the next cooldown tick",
+    );
+    false
 }
 
 /// Topology proposer thread: broadcasts a proposal to all peers, collects
@@ -29144,6 +29243,77 @@ mod tests {
         assert!(
             !same_term_reheal_applicable(4, 4, &members, &grown),
             "a view collected for a stale member set must be dropped",
+        );
+    }
+
+    /// Task #73 — a same-term re-heal whose exchange completed with a
+    /// degenerate (below-quorum, e.g. self-only) partition view must NOT
+    /// activate: the skip is counted, and the consumer's `continue` leaves
+    /// the shard table and every piece of trigger state untouched so the
+    /// re-heal re-fires with a fresh exchange on the next cooldown tick.
+    #[test]
+    fn same_term_reheal_degenerate_view_skips_activation() {
+        let before = reheal_skipped_degenerate_view_total();
+        // Admitted completions must not count a skip. (Asserted inside this
+        // test — the only incrementer — so parallel tests cannot race it.)
+        assert!(
+            exchange_completion_admits_activation(true, 7, 2, 3),
+            "a majority view must be admitted",
+        );
+        assert_eq!(
+            reheal_skipped_degenerate_view_total(),
+            before,
+            "an admitted re-heal must not count a degenerate-view skip",
+        );
+        // The defect shape: a 3-member cluster whose 2s exchange completed
+        // self-only (view_size 1 < quorum 2) must hold, not install.
+        assert!(
+            !exchange_completion_admits_activation(true, 7, 1, 3),
+            "a self-only view (1 of 3) is below quorum — the same-term re-heal must hold",
+        );
+        assert_eq!(
+            reheal_skipped_degenerate_view_total(),
+            before + 1,
+            "the degenerate-view skip must increment the skip counter",
+        );
+    }
+
+    /// Task #73 — a same-term re-heal whose view reaches the majority
+    /// quorum (len/2 + 1, self included) activates exactly as today.
+    #[test]
+    fn same_term_reheal_quorum_view_activates() {
+        assert!(
+            exchange_completion_admits_activation(true, 7, 2, 3),
+            "2 of 3 is the majority quorum — the re-heal must activate",
+        );
+        assert!(
+            exchange_completion_admits_activation(true, 7, 3, 3),
+            "a full view must activate",
+        );
+        assert!(
+            exchange_completion_admits_activation(true, 7, 3, 5),
+            "3 of 5 is the majority quorum — the re-heal must activate",
+        );
+        assert!(
+            !exchange_completion_admits_activation(true, 7, 2, 5),
+            "2 of 5 is below the majority quorum — the re-heal must hold",
+        );
+    }
+
+    /// Task #73 scope pin — ONLY the same-term re-heal is gated. A fresh
+    /// term's exchange activation (commit-signal or prompt catch-up, both
+    /// `same_term_reheal == false`) must proceed on whatever view it gets,
+    /// even a self-only one — a majority-down cluster converges through a
+    /// NEW term via exactly this path, and gating it would deadlock startup.
+    #[test]
+    fn fresh_term_activation_ungated_by_view_quorum() {
+        assert!(
+            exchange_completion_admits_activation(false, 8, 1, 3),
+            "a new-term activation with a self-only view must still activate",
+        );
+        assert!(
+            exchange_completion_admits_activation(false, 8, 0, 3),
+            "a new-term activation with an empty view must still activate",
         );
     }
 
