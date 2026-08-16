@@ -1535,6 +1535,16 @@ pub(crate) fn render_metrics_text(
         "teraslab_assignment_master_count_alerts_total",
         crate::cluster::election::assignment_master_count_alerts_total(),
     );
+    // Task #73 — same-term re-heal activations held on a degenerate
+    // (below-quorum) exchange view. Process-global like the topology
+    // counters above; a rising value with nonzero divergence counters
+    // means the re-heal is re-arming but the exchange keeps completing
+    // without a majority of the committed members.
+    prom_counter(
+        &mut out,
+        "teraslab_reheal_skipped_degenerate_view_total",
+        crate::cluster::coordinator::reheal_skipped_degenerate_view_total(),
+    );
     // §9 arm 1 — persistent-divergence gauge: consecutive quorum-backed
     // higher-term commits refused since the last apply. Non-zero and rising
     // means this node is on the losing side of an attestation split.
@@ -5285,6 +5295,7 @@ mod tests {
             "teraslab_topology_committed_digest_fork_total",
             "teraslab_assignment_rejected_total",
             "teraslab_assignment_master_count_alerts_total",
+            "teraslab_reheal_skipped_degenerate_view_total",
             "teraslab_topology_refused_higher_term_streak",
             "teraslab_alloc_total",
             "teraslab_alloc_bytes_total",
