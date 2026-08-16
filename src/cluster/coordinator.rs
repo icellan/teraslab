@@ -390,6 +390,18 @@ impl EventRepairTrigger {
         if !self.enabled {
             return;
         }
+        self.observe_forced(now, epoch);
+    }
+
+    /// W9 — arm REGARDLESS of `enabled` (same coalesce/replace semantics as
+    /// [`Self::observe`]). Used by the replica-abort resync signal
+    /// (`replica_abort_resync_pass`): a replica-side terminal abort leaves its
+    /// shard under-RF with NO other driver in a sweep-off cluster — the
+    /// retired task is gone, the table was deliberately not rolled back, so
+    /// diff-based re-heal never re-plans the fill. The fire path
+    /// (`event_repair_take_fire` → `run_under_replication_pass`) has no
+    /// enabled gate, so a forced arm repairs even with the periodic sweep off.
+    fn observe_forced(&mut self, now: std::time::Instant, epoch: u64) {
         match self.armed {
             Some((_, armed_epoch)) if armed_epoch == epoch => {}
             _ => self.armed = Some((now, epoch)),
@@ -655,6 +667,45 @@ fn failed_batch_retry_pass(
         return None;
     }
     Some(retry_tasks)
+}
+
+/// W9 — one event-loop pass of the replica-abort self-heal signal: drain the
+/// arm a replica-side terminal abort left on the manager
+/// ([`MigrationManager::arm_replica_abort_resync`], set off-loop by the
+/// streaming thread) and FORCE-arm the event-repair trigger
+/// ([`EventRepairTrigger::observe_forced`] — deliberately NOT gated on
+/// `under_replication_sweep_enabled`).
+///
+/// Why forced: a replica-side terminal abort retires the task WITHOUT rolling
+/// the shard table back (W3 FIX C), so diff-based re-heal never re-plans the
+/// fill; in a sweep-off cluster nothing else retries it and the shard serves
+/// under RF forever. With the W9 `CompensatedCreate` tombstone the retried
+/// fill succeeds instead of re-vetoing, so this signal is what closes the
+/// loop. It stays a SIGNAL: the fired pass is the ordinary
+/// `run_under_replication_pass` derive (freshness fence, drain gate, in-flight
+/// dedup all apply) — the event loop owns execution, never this caller.
+/// Returns whether the trigger was armed (for tests).
+///
+/// Residual (documented, accepted): the derive judges shards against the
+/// retained exchange view, so a pass fired before the next view refresh can be
+/// fenced (`stale_fenced`) or see a partially-filled target as full; the
+/// debounce window absorbs the common case and the next abort/exchange re-arms
+/// the rest.
+fn replica_abort_resync_pass(
+    migration: &Arc<Mutex<MigrationManager>>,
+    trigger: &mut EventRepairTrigger,
+    now: std::time::Instant,
+    current_epoch: u64,
+) -> bool {
+    if !migration.lock().take_replica_abort_resync_arm() {
+        return false;
+    }
+    tracing::info!(
+        "cluster: replica-side terminal abort — force-arming the under-replication \
+         event-repair pass (sweep-flag independent)",
+    );
+    trigger.observe_forced(now, current_epoch);
+    true
 }
 
 /// Task #50 review P2 — releases claimed `(replica NodeId.0, shard)`
@@ -3527,6 +3578,16 @@ impl ClusterCoordinator {
                     event_repair_trigger.record_resync_outcome(resynced_ok, resync_failed);
                 }
                 let repair_now = std::time::Instant::now();
+                // W9 Part B — drain the replica-abort resync signal FIRST so
+                // an abort observed this iteration arms the trigger before
+                // the due-check below. Force-armed (sweep-flag independent):
+                // see `replica_abort_resync_pass`.
+                replica_abort_resync_pass(
+                    &migration,
+                    &mut event_repair_trigger,
+                    repair_now,
+                    topology_epoch.load(Ordering::Relaxed),
+                );
                 if event_repair_trigger.is_armed_and_due(repair_now)
                     && migration.lock().active_count() == 0
                     && event_repair_take_fire(
@@ -11241,6 +11302,19 @@ fn terminally_abort_unshippable_task(
                 fenced_bm.clear(task.shard);
             }
             migrating_bm.clear(task.shard);
+            // W9 Part B — a REPLICA-side terminal abort leaves the table
+            // untouched (W3 FIX C below), so diff-based re-heal never
+            // re-plans this fill and the shard serves under RF with no other
+            // driver in sweep-off clusters. Leave the resync signal; the
+            // event loop drains it into a FORCE-armed event-repair pass
+            // (`replica_abort_resync_pass`), and with the W9
+            // CompensatedCreate tombstone the retried fill succeeds instead
+            // of re-vetoing. Armed regardless of epoch currency — the derive
+            // re-judges against live state at fire time. Master-side aborts
+            // are excluded: the rollback below is their re-planner.
+            if !task.is_master {
+                mgr.arm_replica_abort_resync();
+            }
         }
         retired
     };
@@ -11259,13 +11333,12 @@ fn terminally_abort_unshippable_task(
         // assignment while the master handoff is still Copying (scenario 17's
         // single divergent shard at 4097/4096: all nine of node1's terminal
         // aborts there were replica-side). A replica task is retired above
-        // with the table untouched. NOTE: with the table unchanged, diff-based
-        // re-heal plans will NOT re-plan this replica fill — the shard serves
-        // below RF until a topology change or the under-replication repair
-        // machinery (`under_replication_sweep_enabled`, default off pending CI
-        // arming) picks it up. Strictly better than the pre-fix behavior
-        // (reverting a mid-Copying master assignment), but not self-healing
-        // on its own.
+        // with the table untouched. With the table unchanged, diff-based
+        // re-heal plans will NOT re-plan this replica fill — which is why the
+        // retire block above leaves the W9 replica-abort resync signal: the
+        // event loop force-arms the under-replication event-repair pass
+        // (sweep-flag independent) so the fill is retried instead of the
+        // shard serving below RF forever.
         //
         // (The migration mutex is NOT held across the shard-table write —
         // same lock order as `fail_migration_task_current_epoch`.)
@@ -25639,6 +25712,167 @@ mod tests {
             mgr.active_migrations().is_empty(),
             "the tracking entry must be retired",
         );
+    }
+
+    /// W9 Part B — a REPLICA-side terminal abort leaves its shard under-RF
+    /// with NO re-planner (the table is deliberately not rolled back, the
+    /// task is retired, and the abort's own NOTE says nothing re-plans it).
+    /// The abort must therefore leave a resync SIGNAL that the event loop
+    /// drains into a FORCE-armed event-repair pass — working even with
+    /// `under_replication_sweep_enabled = false`, where pre-W9 the shard
+    /// stayed under-RF forever.
+    #[test]
+    fn replica_terminal_abort_signals_forced_resync_with_sweep_disabled() {
+        use crate::cluster::shards::ShardHandoff;
+        let old_members = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let new_members = vec![NodeId(1), NodeId(2), NodeId(3), NodeId(4)];
+        let mut table = ShardTable::compute_with_epoch(&old_members, 2, 1, 1);
+        let new_table = ShardTable::compute_with_epoch(&new_members, 2, 2, 1);
+        let shard = (0..NUM_SHARDS as u16)
+            .find(|s| {
+                table.target_assignment(*s).master == NodeId(1)
+                    && new_table.target_assignment(*s).master != NodeId(1)
+            })
+            .expect("scale-out must move some node1 master");
+        table.begin_handoff(&new_table);
+        assert_eq!(table.shard_handoff_state(shard), ShardHandoff::Copying);
+
+        let shard_table = Arc::new(ShardTableLock::new(table));
+        let migration = Arc::new(Mutex::new(MigrationManager::new()));
+        let fenced = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+        let migrating = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+        let task = MigrationTask {
+            shard,
+            from_node: NodeId(1),
+            to_node: NodeId(4),
+            is_master: false,
+        };
+        migration.lock().start_outbound(
+            std::slice::from_ref(&task),
+            NodeId(1),
+            &std::collections::HashSet::from([shard]),
+        );
+
+        assert!(terminally_abort_unshippable_task(
+            &migration,
+            &shard_table,
+            &fenced,
+            &migrating,
+            &task,
+            new_table.version,
+        ));
+
+        // The abort left the signal; the REAL event-loop pass drains it into
+        // a SWEEP-DISABLED trigger and arms it anyway (observe_forced).
+        let mut trigger = EventRepairTrigger::new(Duration::from_millis(10), false);
+        let now = std::time::Instant::now();
+        assert!(
+            replica_abort_resync_pass(&migration, &mut trigger, now, new_table.version),
+            "a replica-side terminal abort must leave a resync signal for the \
+             event loop (pre-W9: nothing — permanent under-RF in sweep-off \
+             clusters)",
+        );
+        assert!(
+            !replica_abort_resync_pass(&migration, &mut trigger, now, new_table.version),
+            "the signal is one-shot until a new abort arms it again",
+        );
+
+        // The forced arm fires through the ordinary fire path once the
+        // debounce elapses — no enabled gate anywhere downstream.
+        let later = now + Duration::from_millis(20);
+        assert!(trigger.is_armed_and_due(later));
+        let mut last_sweep = now;
+        assert!(
+            event_repair_take_fire(&mut trigger, later, new_table.version, 0, &mut last_sweep),
+            "the forced-armed pass must fire with the sweep flag off",
+        );
+    }
+
+    /// W9 Part B — the signal is REPLICA-side only: a MASTER-handoff terminal
+    /// abort rolls the shard back to the source, and the rolled-back table
+    /// diverging from the committed topology is what makes re-heal re-plan
+    /// it. No forced pass needed (and none armed).
+    #[test]
+    fn master_terminal_abort_does_not_signal_resync() {
+        use crate::cluster::shards::ShardHandoff;
+        let old_members = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let new_members = vec![NodeId(1), NodeId(2), NodeId(3), NodeId(4)];
+        let mut table = ShardTable::compute_with_epoch(&old_members, 2, 1, 1);
+        let new_table = ShardTable::compute_with_epoch(&new_members, 2, 2, 1);
+        let (shard, new_master) = (0..NUM_SHARDS as u16)
+            .find_map(|s| {
+                let old_master = table.target_assignment(s).master;
+                let new_master = new_table.target_assignment(s).master;
+                (old_master == NodeId(1) && new_master != NodeId(1)).then_some((s, new_master))
+            })
+            .expect("scale-out must move some node1 master");
+        table.begin_handoff(&new_table);
+
+        let shard_table = Arc::new(ShardTableLock::new(table));
+        let migration = Arc::new(Mutex::new(MigrationManager::new()));
+        let fenced = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+        let migrating = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+        let task = MigrationTask {
+            shard,
+            from_node: NodeId(1),
+            to_node: new_master,
+            is_master: true,
+        };
+        migration.lock().start_outbound(
+            std::slice::from_ref(&task),
+            NodeId(1),
+            &std::collections::HashSet::from([shard]),
+        );
+
+        assert!(terminally_abort_unshippable_task(
+            &migration,
+            &shard_table,
+            &fenced,
+            &migrating,
+            &task,
+            new_table.version,
+        ));
+        assert!(
+            !migration.lock().take_replica_abort_resync_arm(),
+            "a master-handoff abort rolls back the table (re-heal re-plans it) \
+             and must not force-arm the resync pass",
+        );
+    }
+
+    /// W9 Part B — `observe_forced` arms a DISABLED trigger; the plain
+    /// `observe` stays enabled-gated (the pre-existing pin
+    /// `event_trigger_disabled_never_arms` keeps guarding that side).
+    #[test]
+    fn observe_forced_arms_a_disabled_trigger() {
+        let mut trigger = EventRepairTrigger::new(Duration::from_millis(5), false);
+        let t0 = std::time::Instant::now();
+        trigger.observe(t0, 7);
+        assert!(
+            !trigger.is_armed_and_due(t0 + Duration::from_millis(10)),
+            "plain observe must stay a no-op on a disabled trigger",
+        );
+        trigger.observe_forced(t0, 7);
+        assert!(
+            trigger.is_armed_and_due(t0 + Duration::from_millis(10)),
+            "observe_forced must arm regardless of the enabled flag",
+        );
+        // Same epoch-fence semantics as observe: a stale-epoch fire re-arms
+        // under the current epoch instead of firing stale.
+        let mut last_sweep = t0;
+        assert!(!event_repair_take_fire(
+            &mut trigger,
+            t0 + Duration::from_millis(10),
+            8, // current epoch moved past the armed epoch
+            0,
+            &mut last_sweep,
+        ));
+        assert!(event_repair_take_fire(
+            &mut trigger,
+            t0 + Duration::from_millis(20),
+            8,
+            0,
+            &mut last_sweep,
+        ));
     }
 
     /// The reaper must treat `Preparing` exactly like `Fenced`.
