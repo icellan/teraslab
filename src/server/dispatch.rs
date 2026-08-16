@@ -1558,6 +1558,42 @@ pub(crate) fn handle_request(
                             {
                                 continue;
                             }
+                            // W8 (defect 2) — FORWARD migration: the key is
+                            // absent because THIS node's deletion tombstone
+                            // vetoed its baseline apply (RULE-DS). Reject with
+                            // a DISTINCT message naming the veto (cause +
+                            // recorded generation) instead of the plain
+                            // `missing exact key ... TxNotFound` — which is
+                            // indistinguishable from data loss and sends the
+                            // source into a structurally unwinnable 3-attempt
+                            // re-push loop against the unconditional
+                            // ClientDelete veto. The source's escalation
+                            // recognises this shape and REDUCES its manifest
+                            // (`completion_rejection_vetoed_keys`) so the
+                            // completion can succeed for the rest of the
+                            // shard. Still a rejection — never a silent
+                            // tolerance — so the source stays the arbiter of
+                            // whether dropping the key from the manifest is
+                            // sound (it re-checks the veto's generation
+                            // against its own copy). If the tombstone raced
+                            // away between the veto and this lookup, fall
+                            // through to the historical message.
+                            if let Some((tomb_gen, tomb_height)) = engine.tombstone_lookup(key)
+                                && engine.tombstone_blocks_heal_apply(key, *expected_generation)
+                            {
+                                let cause = engine
+                                    .tombstone_cause(key)
+                                    .unwrap_or(crate::ops::tombstone::TombstoneCause::ClientDelete);
+                                return error_response(
+                                    request.request_id,
+                                    ERR_MIGRATION_IN_PROGRESS,
+                                    &format!(
+                                        "shard {shard} exact key {:?} vetoed by deletion \
+                                         tombstone (cause={:?} gen={} height={}): {e:?}",
+                                        key, cause, tomb_gen, tomb_height,
+                                    ),
+                                );
+                            }
                             return error_response(
                                 request.request_id,
                                 ERR_MIGRATION_IN_PROGRESS,
@@ -26137,6 +26173,112 @@ mod tests {
             completion_rejection_missing_keys(&err, &entries),
             vec![key_missing],
             "the real rejection must resolve to the full missing key, got: {err}"
+        );
+    }
+
+    /// W8 (defect 2) cross-module contract, following the
+    /// `missing_exact_key_rejection_is_recognised_by_the_repush_parser`
+    /// precedent: a FORWARD-migration manifest key that is absent on the
+    /// target BECAUSE a deletion tombstone vetoed its baseline apply
+    /// (RULE-DS) must reject with the DISTINCT `vetoed by deletion
+    /// tombstone` message — pre-fix it rejected as plain `missing exact key
+    /// ... TxNotFound`, indistinguishable from data loss, and the source's
+    /// 3-attempt re-push escalation is structurally unwinnable against the
+    /// unconditional ClientDelete veto. The message, decoded through the
+    /// REAL `send_migration_complete` error envelope, must resolve back to
+    /// the full manifest key AND the tombstone generation on the source's
+    /// vetoed-key parser, while the RE-PUSH parser must NOT match it.
+    #[test]
+    fn vetoed_key_rejection_is_recognised_by_the_vetoed_parser() {
+        use crate::cluster::coordinator::{
+            completion_rejection_missing_keys, completion_rejection_vetoed_keys,
+            migration_complete_rejection_error,
+        };
+
+        let h = DispatchTestHarness::new();
+        let shard = 54u16;
+        let txid_present = txid_for_shard(shard, 31);
+        let txid_vetoed = txid_for_shard(shard, 32);
+        assert_eq!(h.create_tx(txid_present, 1).status, STATUS_OK);
+
+        let key_present = TxKey { txid: txid_present };
+        let key_vetoed = TxKey { txid: txid_vetoed };
+        // The target holds a ClientDelete tombstone for the absent key — the
+        // shape RULE-DS vetoes unconditionally.
+        let tomb_log = crate::ops::tombstone::TombstoneLog::new(
+            std::path::PathBuf::from("/nonexistent/vetoed-contract.tombstones"),
+            h.engine.index_seed(),
+            h.engine.index_shard_count(),
+            10_000,
+        );
+        tomb_log.record(
+            &key_vetoed,
+            9,
+            900,
+            crate::ops::tombstone::TombstoneCause::ClientDelete,
+        );
+        h.engine.set_tombstone_log(tomb_log);
+        assert!(h.engine.tombstone_blocks_heal_apply(&key_vetoed, 2));
+
+        let meta_present = h.engine.read_metadata(&key_present).unwrap();
+        let entries = vec![(key_present, meta_present.generation), (key_vetoed, 2u32)];
+
+        let members = vec![crate::cluster::shards::NodeId(1)];
+        let table = crate::cluster::shards::ShardTable::compute_with_epoch(&members, 1, 63, 1);
+        let cluster = crate::cluster::coordinator::new_test_running_cluster(
+            crate::cluster::shards::NodeId(1),
+            table,
+            &[(
+                crate::cluster::shards::NodeId(1),
+                "127.0.0.1:4714".parse().unwrap(),
+            )],
+            &members,
+            &[shard],
+            &[],
+            &[],
+            1,
+        );
+
+        let payload =
+            build_migration_complete_payload(2, 0, 0, None, Some(&entries), Some(NodeId(9)));
+        let req = RequestFrame {
+            request_id: shard as u64,
+            op_code: OP_MIGRATION_COMPLETE,
+            flags: 0,
+            payload: payload.into(),
+        };
+        let mut conn_state = crate::server::ConnectionState::new();
+        let resp = handle_request(
+            &req,
+            &h.engine,
+            8192,
+            Some(&cluster),
+            None,
+            &mut conn_state,
+            None,
+        );
+        assert_eq!(resp.status, STATUS_ERROR);
+        let err_code = u16::from_le_bytes(resp.payload[..2].try_into().unwrap());
+        assert_eq!(err_code, ERR_MIGRATION_IN_PROGRESS);
+
+        // The REAL consumer-side envelope `send_migration_complete` builds.
+        let err = migration_complete_rejection_error(resp.status, &resp.payload);
+        assert!(
+            err.contains("vetoed by deletion tombstone"),
+            "producer must name the veto distinctly: {err}"
+        );
+        assert!(
+            err.contains("cause=ClientDelete"),
+            "producer must carry the tombstone cause: {err}"
+        );
+        assert_eq!(
+            completion_rejection_vetoed_keys(&err, &entries),
+            vec![(key_vetoed, 9u32)],
+            "the vetoed parser must resolve the full key + tombstone generation, got: {err}"
+        );
+        assert!(
+            completion_rejection_missing_keys(&err, &entries).is_empty(),
+            "the re-push parser must NOT match a veto (no re-push attempts burned): {err}"
         );
     }
 

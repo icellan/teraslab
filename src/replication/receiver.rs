@@ -1889,6 +1889,15 @@ fn apply_create_replica(
         let incoming_gen = incoming_create_generation(metadata_bytes).unwrap_or(0);
         if engine.tombstone_blocks_heal_apply(tx_key, incoming_gen) {
             record_heal_apply_vetoed(engine, tx_key, incoming_gen);
+            // W8 (defect 2): `Ok(())` is correct here — the per-op drop is
+            // an idempotent no-op — but it is NOT the veto's only voice.
+            // The tombstone survives to the completion verify (the Phase 2d
+            // GC guard retains it while the shard is inbound-fenced), where
+            // the dispatch exact-entry check names it distinctly ("vetoed
+            // by deletion tombstone", cause + generation) instead of the
+            // old data-loss-shaped `missing exact key ... TxNotFound`; the
+            // source's escalation then reduces its manifest rather than
+            // burning re-push attempts against this veto.
             return Ok(());
         }
     }
@@ -2464,6 +2473,10 @@ fn apply_op_journal_inner(
             .unwrap_or(0);
         if engine.tombstone_blocks_heal_apply(&tx_key, incoming_gen) {
             record_heal_apply_vetoed(engine, &tx_key, incoming_gen);
+            // W8 (defect 2): the idempotent drop stays silent per-op, but
+            // the completion verify re-checks this same tombstone and
+            // rejects with the DISTINCT vetoed-key message — see the
+            // `apply_create_replica` veto site for the full note.
             return Ok(());
         }
     }

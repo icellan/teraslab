@@ -606,6 +606,16 @@ pub struct MigrationManager {
     /// unique generation; starts at 1 so a stamp of 0 (the `from_task`
     /// default, never handed to a batch capture) matches nothing.
     next_attempt: u64,
+    /// W8 — pending self-retry arm set by a migration-batch disposition that
+    /// ended with failures at a still-current epoch
+    /// (`run_migration_batch`'s `f > 0` disposition, which runs on a worker
+    /// thread) and drained by the coordinator event loop, which arms the
+    /// event-repair trigger and the delayed failed-task re-drive from it.
+    /// Transient routing state only: never persisted (the durable retry
+    /// queue is the `Failed` entries themselves), reset naturally on
+    /// restart, and coalescing by design — multiple failed dispositions
+    /// before a drain collapse into one arm.
+    failed_batch_retry_arm: bool,
 }
 
 impl MigrationManager {
@@ -619,7 +629,24 @@ impl MigrationManager {
             dual_write_targets: std::collections::HashMap::new(),
             committed_handoffs: std::collections::HashMap::new(),
             next_attempt: 1,
+            failed_batch_retry_arm: false,
         }
+    }
+
+    /// W8 — record that a migration batch finished with failed tasks at a
+    /// still-current epoch, so the coordinator event loop should arm the
+    /// self-retry machinery (event-repair trigger + delayed failed-task
+    /// re-drive). Idempotent: repeated arms before a drain coalesce.
+    pub fn arm_failed_batch_retry(&mut self) {
+        self.failed_batch_retry_arm = true;
+    }
+
+    /// W8 — drain the pending failed-batch self-retry arm. Returns `true`
+    /// exactly once per armed window ([`Self::arm_failed_batch_retry`]);
+    /// subsequent calls return `false` until a new failed disposition arms
+    /// again.
+    pub fn take_failed_batch_retry_arm(&mut self) -> bool {
+        std::mem::take(&mut self.failed_batch_retry_arm)
     }
 
     /// W4 review P1 — hand out the next drive-attempt generation stamp.
@@ -4159,6 +4186,28 @@ mod tests {
         assert_eq!(retries.len(), 2);
         assert_eq!(mgr.failed_count(), 0);
         assert_eq!(mgr.active_count(), 2); // now Streaming again
+    }
+
+    /// W8 — the failed-batch self-retry arm is a one-shot, coalescing signal:
+    /// unarmed drains `false`, any number of arms drain as ONE `true`, and the
+    /// drain resets it until the next arm.
+    #[test]
+    fn failed_batch_retry_arm_is_one_shot_and_coalescing() {
+        let mut mgr = MigrationManager::new();
+        assert!(
+            !mgr.take_failed_batch_retry_arm(),
+            "a fresh manager holds no pending arm"
+        );
+        mgr.arm_failed_batch_retry();
+        mgr.arm_failed_batch_retry(); // coalesces with the first
+        assert!(
+            mgr.take_failed_batch_retry_arm(),
+            "an armed manager drains exactly one pending arm"
+        );
+        assert!(
+            !mgr.take_failed_batch_retry_arm(),
+            "the drain resets the arm until the next failed disposition"
+        );
     }
 
     /// W4 — `fail_unresolved_tasks` parks exactly the tasks whose entries are
