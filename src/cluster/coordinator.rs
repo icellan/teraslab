@@ -2794,6 +2794,16 @@ impl ClusterCoordinator {
             // strictly shrinking (see `drain_reactivation_due`). Cleared whenever
             // a non-fast reactivation fires or the committed term moves.
             let mut fast_reactivation_progress: Option<(u64, u32)> = None;
+            // #74 (re-review, item 2) — bound the cadence of re-activation
+            // rounds armed SOLELY by parked no-source heal fences. Counts
+            // consecutive FRUITLESS park-armed rounds (the parked set did not
+            // shrink between rounds) to drive `park_reheal_backoff`'s doubling
+            // interval; any park resolving (or the parked set emptying) resets
+            // both, restoring the prompt cadence. Event-loop local: resets
+            // naturally on restart.
+            let mut park_reheal_rounds: u32 = 0;
+            let mut park_reheal_last_count: Option<usize> = None;
+            let mut last_park_armed_at: Option<std::time::Instant> = None;
             // W3.3 — trailing-edge debounce: SWIM membership changes are
             // coalesced here and only fed to the propose path once the
             // membership has been stable for `topology_debounce_window`
@@ -3519,6 +3529,30 @@ impl ClusterCoordinator {
                                     .collect();
                             let orphaned_shards = mgr
                                 .orphaned_inbound_shards(TRANSFER_REQUEST_INTERVAL, &alive_sources);
+                            // #74 F5 — the heal-entry sibling of the orphan
+                            // reap: a RESOLVED heal pull whose concrete source
+                            // died (SWIM Dead / left membership) with no
+                            // request in flight is RE-PARKED (back to the
+                            // NodeId(0) sentinel, fence kept), so the online
+                            // re-source pass re-selects a fresh quorum-current
+                            // source on a later view instead of the shard
+                            // staying pinned forever to the dead pick. Never
+                            // marked LOST; never unfenced.
+                            let reparked = mgr.repark_dead_source_heals(
+                                TRANSFER_REQUEST_INTERVAL,
+                                &alive_sources,
+                            );
+                            if reparked > 0 {
+                                if let Some(ref path) = inbound_state_path_event {
+                                    crate::cluster::migration::persist_inbound_state(path, &mgr);
+                                }
+                                tracing::warn!(
+                                    reparked,
+                                    "cluster: re-PARKED reverse-heal pull(s) whose source died \
+                                     — shard(s) stay fenced fail-closed; source selection \
+                                     re-runs on the re-heal cadence (#74)",
+                                );
+                            }
                             mgr.mark_inbound_lost(&orphaned_shards)
                         } else {
                             mgr.clear_stale_inbound(Duration::from_secs(30))
@@ -3672,7 +3706,13 @@ impl ClusterCoordinator {
                         // else a settled v2 cluster false-fires the phantom
                         // detector against a v1 baseline.
                         let committed_pv = topo_authority_event.committed_placement_version();
-                        let (mismatched, pending_handoffs, stuck_subset, phantom_masters) = {
+                        let (
+                            mismatched,
+                            pending_handoffs,
+                            stuck_subset,
+                            phantom_masters,
+                            parked_shards,
+                        ) = {
                             let mgr = migration.lock();
                             let table = shard_table.read();
                             let (mismatched, pending_handoffs) =
@@ -3727,6 +3767,15 @@ impl ClusterCoordinator {
                                 committed_pv,
                                 committed_elected.as_ref(),
                             );
+                            // #74 F2 — PARKED no-source heal fences are repair
+                            // work: on a settled cluster nothing else re-drives
+                            // the park-and-retry arc (exchanges are
+                            // event-driven and every divergence counter reads
+                            // zero), so counting them keeps the same-term
+                            // re-heal exchange firing on this cooldown while
+                            // any park exists. The fresh view it collects is
+                            // what the re-source pass selects against.
+                            let parked_shards = mgr.parked_no_source_heal_shards();
                             (
                                 mismatched,
                                 pending_handoffs,
@@ -3734,7 +3783,38 @@ impl ClusterCoordinator {
                                 phantom_masters
                                     .saturating_add(missing_masters)
                                     .saturating_add(third_party),
+                                parked_shards,
                             )
+                        };
+
+                        // #74 (re-review, item 2) — bound the park-armed
+                        // cadence. When parks are the SOLE arming cause, each
+                        // fruitless round (parked set not shrinking) backs the
+                        // next round off (30 s doubling to a 5-minute cap) so
+                        // a permanently-refused park does not rebuild the
+                        // topology plan every cooldown forever. Any park
+                        // resolving — or the set emptying — resets to the
+                        // prompt cadence. Rounds armed by other work are
+                        // never delayed.
+                        let parks_sole_cause = !parked_shards.is_empty()
+                            && mismatched == 0
+                            && stuck_subset == 0
+                            && phantom_masters == 0
+                            && pending_handoffs == 0;
+                        if parked_shards.is_empty()
+                            || park_reheal_last_count.is_some_and(|prev| parked_shards.len() < prev)
+                        {
+                            park_reheal_rounds = 0;
+                            park_reheal_last_count = None;
+                        }
+                        let park_arming_suppressed = parks_sole_cause
+                            && last_park_armed_at.is_some_and(|at| {
+                                at.elapsed() < park_reheal_backoff(park_reheal_rounds)
+                            });
+                        let parked_for_arming = if park_arming_suppressed {
+                            0
+                        } else {
+                            parked_shards.len()
                         };
 
                         // W5-followup — self-drain fast path. Re-drive on the
@@ -3746,10 +3826,13 @@ impl ClusterCoordinator {
                         // that only clears pending handoffs still counts as
                         // progress.
                         let self_is_member = committed_members.contains(&self_id);
-                        let total_work = mismatched
-                            .saturating_add(stuck_subset as u32)
-                            .saturating_add(phantom_masters as u32)
-                            .saturating_add(pending_handoffs as u32);
+                        let repair_shards = reactivation_repair_shard_count(
+                            mismatched,
+                            stuck_subset,
+                            phantom_masters,
+                            parked_for_arming,
+                        );
+                        let total_work = repair_shards.saturating_add(pending_handoffs as u32);
                         // Compare only against the last fast round of THIS term;
                         // a stale term's progress watermark must not block a new
                         // drain.
@@ -3770,9 +3853,7 @@ impl ClusterCoordinator {
                             || should_trigger_topology_reactivation(
                                 startup_reactivation_due,
                                 normal_reactivation_due,
-                                mismatched
-                                    .saturating_add(stuck_subset as u32)
-                                    .saturating_add(phantom_masters as u32),
+                                repair_shards,
                                 pending_handoffs,
                             )
                         {
@@ -3809,9 +3890,34 @@ impl ClusterCoordinator {
                                         mismatched,
                                         stuck_subset,
                                         phantom_masters,
+                                        parked_heals = parked_shards.len(),
                                         "cluster: re-activating topology — collecting a fresh partition view",
                                     );
                                     last_reactivation_at = std::time::Instant::now();
+                                    // #74 (re-review, item 2) — this round is
+                                    // armed SOLELY by parked no-source heal
+                                    // fence(s): meter the fruitless-round
+                                    // backoff and name the parks as the arming
+                                    // cause. Phase-3c deadline alerts remain
+                                    // the primary stuck-shard signal.
+                                    if parks_sole_cause {
+                                        if park_reheal_last_count == Some(parked_shards.len()) {
+                                            park_reheal_rounds =
+                                                park_reheal_rounds.saturating_add(1);
+                                        }
+                                        park_reheal_last_count = Some(parked_shards.len());
+                                        last_park_armed_at = Some(std::time::Instant::now());
+                                        tracing::warn!(
+                                            parked = ?parked_shards,
+                                            fruitless_rounds = park_reheal_rounds,
+                                            next_interval_secs =
+                                                park_reheal_backoff(park_reheal_rounds).as_secs(),
+                                            "cluster: same-term re-heal armed SOLELY by parked \
+                                             no-source heal fence(s) — collecting a fresh view \
+                                             to re-select heal sources (#74; Phase-3c deadline \
+                                             alerts are the primary stuck-shard signal)",
+                                        );
+                                    }
                                     let exchange_tx = exchange_complete_tx.clone();
                                     let node_addrs_x = node_addrs.clone();
                                     let engine_x = engine.clone();
@@ -4180,8 +4286,9 @@ impl ClusterCoordinator {
                             tracing::warn!(
                                 queued,
                                 term,
-                                "reverse-heal Phase 3b: runtime online re-heal fenced + \
-                                 queued reverse-pull for newly-stale mastered shard(s)",
+                                "reverse-heal Phase 3b: runtime online re-heal fenced or \
+                                 re-sourced + queued reverse-pull for stale mastered \
+                                 shard(s)",
                             );
                         }
                         // Reverse-heal Phase 3c (design §E3) — enforce the
@@ -6171,6 +6278,52 @@ fn should_trigger_topology_reactivation(
         || (normal_reactivation_due && (mismatched_shards > 0 || pending_handoffs > 0))
 }
 
+/// #74 F2 — the same-term reactivation shard-REPAIR count: the work metric
+/// that arms [`should_trigger_topology_reactivation`] (and feeds the drain
+/// fast path's progress watermark). Sums the divergence detectors with the
+/// PARKED no-source heal fences
+/// ([`MigrationManager::parked_no_source_heal_shards`]).
+///
+/// Counting parks here is what gives the park-and-retry arc a PRODUCTION
+/// driver on a SETTLED cluster: exchanges are event-driven, and once the
+/// topology converges every divergence counter reads zero — without this
+/// term nothing would ever fire the same-term re-heal exchange whose fresh
+/// partition view [`trigger_online_reheal`]'s re-source pass selects against
+/// (a park is deliberately NOT re-selected against a retained view — stale
+/// evidence must not pick a heal source). With it, the re-heal exchange keeps
+/// firing on the normal reactivation cooldown while any park exists, and
+/// stops the moment the last park resolves or clears.
+fn reactivation_repair_shard_count(
+    mismatched: u32,
+    stuck_subset: usize,
+    phantom_and_missing: usize,
+    parked_heals: usize,
+) -> u32 {
+    mismatched
+        .saturating_add(stuck_subset as u32)
+        .saturating_add(phantom_and_missing as u32)
+        .saturating_add(parked_heals as u32)
+}
+
+/// #74 (re-review, item 2) — the interval between re-activation rounds armed
+/// SOLELY by parked no-source heal fences, as a function of how many
+/// consecutive such rounds were FRUITLESS (the parked set did not shrink).
+///
+/// A permanently-refused park would otherwise arm a FULL re-activation (plan
+/// rebuild + `clear_inbound` + election) every same-term cooldown forever.
+/// Each fruitless park-armed round doubles the interval from the same-term
+/// cooldown (30 s → 60 s → 120 s → 240 s) up to the 5-minute cap; any park
+/// resolving resets the caller's round counter, restoring the prompt cadence
+/// for the remaining parks. Rounds armed by OTHER work (divergence, pending
+/// handoffs) are never delayed — the backoff gates only the parks-are-the-
+/// sole-cause case. Phase-3c deadline alerts remain the primary surfacing of
+/// a permanently-parked shard.
+fn park_reheal_backoff(fruitless_rounds: u32) -> Duration {
+    const CAP: Duration = Duration::from_secs(300);
+    let mult = 1u32 << fruitless_rounds.min(4);
+    CAP.min(SAME_TERM_REACTIVATION_COOLDOWN.saturating_mul(mult))
+}
+
 /// W1.5 — decide whether this node must *promptly* activate a newly-committed
 /// topology term, independent of the 30 s same-term reactivation cooldown.
 ///
@@ -7605,16 +7758,29 @@ fn heal_source_more_recent(
 /// `committed_replicas` set AND it reported a [`PartitionVersionEntry`] for
 /// `shard` in `partition_view` AND that entry is NOT flagged
 /// [`PARTITION_FLAG_PENDING_INBOUND`] (a subset holder still migrating in is not
-/// current). Among the quorum-current candidates the highest-recency one wins; a
-/// fresher-looking node that fails the gate is never chosen. Returns `None` when
-/// no candidate qualifies (heal is not attempted).
+/// current). An EMPTY report (zero records for the shard) is additionally
+/// rejected while any candidate reports non-empty (#74 F3): an empty source
+/// can heal nothing, and its recency fields can still outrank the real holder;
+/// when ALL candidates report empty the shard is genuinely empty and a source
+/// is still picked so the trivial heal can complete and unfence. Among the
+/// surviving candidates the highest-recency one wins; a fresher-looking node
+/// that fails the gate is never chosen. Returns `None` when no candidate
+/// qualifies (heal is not attempted).
+///
+/// HONESTY (#74 F3) — this is an EVIDENCE gate, not a per-key currency proof:
+/// `max_generation` and the record-count proxy are coarse (documented blind to
+/// sub-max divergence), so a committed, reporting, non-empty laggard can still
+/// pass. The gate removes UNEVIDENCED sources (silent, unreported-for-shard,
+/// mid-migration, empty); per-key currency remains open pending the
+/// per-record manifest-exchange design (tracked separately).
 pub fn select_heal_source(
     self_id: NodeId,
     committed_replicas: &[NodeId],
     partition_view: &std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>>,
     shard: u16,
 ) -> Option<NodeId> {
-    let mut best: Option<(NodeId, ShardRecency)> = None;
+    // Gate pass: the candidates with quorum-current evidence.
+    let mut current: Vec<(NodeId, ShardRecency)> = Vec::new();
     for &node in committed_replicas {
         if node == self_id {
             continue;
@@ -7630,7 +7796,17 @@ pub fn select_heal_source(
         if entry.flags & PARTITION_FLAG_PENDING_INBOUND != 0 {
             continue;
         }
-        let recency = ShardRecency::from_entry(entry);
+        current.push((node, ShardRecency::from_entry(entry)));
+    }
+    // #74 F3 — reject empty reports while a non-empty candidate exists (an
+    // empty source can heal nothing); keep them when ALL are empty so a
+    // genuinely-empty shard still heals trivially and unfences.
+    let any_nonzero = current.iter().any(|(_, r)| r.count > 0);
+    let mut best: Option<(NodeId, ShardRecency)> = None;
+    for (node, recency) in current {
+        if any_nonzero && recency.count == 0 {
+            continue;
+        }
         best = match best {
             Some((bn, br)) if !heal_source_more_recent(recency, node, br, bn) => Some((bn, br)),
             _ => Some((node, recency)),
@@ -7679,13 +7855,49 @@ pub fn colocated_create_stale_shards(
 /// ([`RunningCluster::select_reverse_heal_sources`]) and the Phase-3b runtime
 /// online re-heal ([`trigger_online_reheal`]).
 ///
-/// Prefers the quorum-current [`select_heal_source`] (a committed replica that
-/// reported the shard with the highest recency and is not still receiving inbound
-/// data). When that yields no pick — no live replica reported THIS shard — it
-/// falls back to the shard's committed replica set, PREFERRING a replica present
-/// in `partition_view` (LIVE this round) over a silent one, then the lowest
-/// committed `NodeId`. Skips `self_id` and the `NodeId(0)` sentinel. Returns
-/// `(shard, source)` for shards with a source; a shard with NONE is omitted.
+/// QUORUM-CURRENT EVIDENCE ONLY (#74): a source is picked exclusively by
+/// [`select_heal_source`] — the argmax-recency committed replica that reported
+/// THIS shard in `partition_view`, is not still receiving inbound data, and is
+/// not an empty report while a non-empty candidate exists. When no candidate
+/// qualifies the selection REFUSES: the shard is OMITTED,
+/// `teraslab_heal_source_refused_no_quorum_total` is incremented, and a
+/// rate-limited `warn!` names the shard, the candidate set, and why each
+/// candidate failed the gate ([`record_heal_source_refused`]).
+///
+/// The fallback this replaces — "prefer a LIVE committed replica, else the
+/// lowest committed `NodeId`" — existed for BOOT availability: before the
+/// first membership exchange converges a `partition_view` no candidate has any
+/// evidence at all, and the old code guessed a committed-by-assignment holder
+/// so the pull could start immediately. That guess is exactly the #74
+/// double-spend chain: a key spent at generation N → shard hands off → the
+/// old owner reclaims the key → the old owner later re-masters → the fallback
+/// picks a laggard that missed the spend → the key is healed back UNSPENT and
+/// served. So refused shards defer instead: the boot caller parks them FENCED
+/// FAIL-CLOSED ([`RunningCluster::mark_inbound_heal_fence`]) and
+/// [`trigger_online_reheal`]'s re-source pass re-attempts THIS selection
+/// against each freshly-collected partition view — driven even on a settled
+/// cluster because the parked count feeds the same-term reactivation work
+/// metric ([`reactivation_repair_shard_count`], #74 F2), which keeps the
+/// re-heal exchange firing on the reactivation cooldown while any park
+/// exists. A park resolves when a candidate reports the shard with evidence
+/// (replica catch-up streams until converged, so a live laggard gets there).
+///
+/// HONESTY (#74 F3) — this REMOVES UNEVIDENCED SOURCES; it is NOT a per-key
+/// currency proof. The gate's inputs (`max_generation`, the record-count
+/// proxy) are coarse and documented blind to sub-max divergence, so a
+/// committed, reporting, non-empty laggard can still pass and RULE-DS +
+/// generation idempotency cannot veto a key this node lost entirely. Full
+/// per-key currency needs the per-record manifest-exchange design (tracked
+/// separately).
+///
+/// DELIBERATE permanent-refusal posture: a shard whose candidates NEVER
+/// produce evidence stays parked forever — if the only surviving copies
+/// predate a spend no live node holds, serving one IS the double-spend, so
+/// alert-and-hold (the Phase-3c deadline alert names the stuck shard) is
+/// correct, matching the repo-wide precedent that rejected auto-escalation.
+///
+/// Skips `self_id` and the `NodeId(0)` sentinel. Returns `(shard, source)`
+/// for shards with an evidenced source; a refused shard is omitted.
 pub(crate) fn select_reverse_heal_sources_for(
     self_id: NodeId,
     table: &ShardTable,
@@ -7702,19 +7914,85 @@ pub(crate) fn select_reverse_heal_sources_for(
             .chain(assignment.replicas.iter().copied())
             .filter(|&n| n != self_id && n != NodeId(0))
             .collect();
-        let source = select_heal_source(self_id, &committed, partition_view, shard).or_else(|| {
-            committed
-                .iter()
-                .copied()
-                .filter(|n| partition_view.contains_key(n))
-                .min_by_key(|n| n.0)
-                .or_else(|| committed.iter().copied().min_by_key(|n| n.0))
-        });
-        if let Some(src) = source {
-            out.push((shard, src));
+        match select_heal_source(self_id, &committed, partition_view, shard) {
+            Some(src) => out.push((shard, src)),
+            None => record_heal_source_refused(shard, &committed, partition_view),
         }
     }
     out
+}
+
+/// #74 — meter + (rate-limited) warn one REFUSED heal-source selection: no
+/// candidate for `shard` passed the quorum-current gate. Every refusal
+/// increments
+/// [`crate::metrics::MigrationMetrics::heal_source_refused_no_quorum`]; the
+/// warn is rate-limited by [`heal_refusal_warn_due`] because a
+/// permanently-refused shard re-refuses once per partition-view refresh (the
+/// metric still counts every one). The warn names each candidate and why it
+/// failed the gate, so the operator can see WHICH laggard has to catch up
+/// before the parked shard heals.
+fn record_heal_source_refused(
+    shard: u16,
+    committed: &[NodeId],
+    partition_view: &std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>>,
+) {
+    if let Some(m) = crate::metrics::migration_metrics() {
+        m.heal_source_refused_no_quorum.inc();
+    }
+    static HEAL_REFUSAL_TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = HEAL_REFUSAL_TOTAL.fetch_add(1, Ordering::Relaxed) + 1;
+    if !heal_refusal_warn_due(n) {
+        return;
+    }
+    let candidates: Vec<String> = if committed.is_empty() {
+        vec!["<no committed candidate besides self>".to_string()]
+    } else {
+        committed
+            .iter()
+            .map(|&node| match partition_view.get(&node) {
+                None => format!("node {}: silent (no entry in this partition view)", node.0),
+                Some(entries) => match entries.iter().find(|e| e.shard == shard) {
+                    None => format!("node {}: live but did not report this shard", node.0),
+                    Some(e) if e.flags & PARTITION_FLAG_PENDING_INBOUND != 0 => format!(
+                        "node {}: PENDING_INBOUND (subset holder still migrating in)",
+                        node.0
+                    ),
+                    Some(e) if e.last_applied_seq == 0 => format!(
+                        "node {}: reported EMPTY (zero records — cannot heal)",
+                        node.0
+                    ),
+                    // Unreachable in practice: a committed candidate that
+                    // reported the shard unflagged and non-empty would have
+                    // been selected.
+                    Some(_) => format!(
+                        "node {}: reported evidenced (unexpected — selection \
+                         should have picked it)",
+                        node.0
+                    ),
+                },
+            })
+            .collect()
+    };
+    tracing::warn!(
+        shard,
+        candidates = candidates.join("; "),
+        refused_total = n,
+        "reverse-heal: heal-source selection REFUSED — no quorum-current \
+         candidate (#74: healing from an unproven source can resurrect a \
+         spent key); the shard defers and selection re-runs on every \
+         partition-view refresh",
+    );
+}
+
+/// Whether the `n`th heal-source refusal (1-based, process-wide) emits its
+/// warn: the first 10 all do (each early refusal matters — boot refusals are
+/// expected but must stay visible), then every 100th (a permanently-parked
+/// shard re-refuses on every partition-view refresh and must not flood the
+/// log; the metric still counts every one).
+fn heal_refusal_warn_due(n: u64) -> bool {
+    const WARN_FIRST: u64 = 10;
+    const WARN_EVERY: u64 = 100;
+    n <= WARN_FIRST || n.is_multiple_of(WARN_EVERY)
 }
 
 /// Reverse-heal Phase 3b — RUNTIME online re-heal: detect → DIRECTION → fence →
@@ -7745,14 +8023,30 @@ pub(crate) fn select_reverse_heal_sources_for(
 /// pull completes) AND queues a concrete-source inbound entry the existing
 /// requester loop drives — the receiver applies the streamed baseline under
 /// RULE-DS + generation idempotency, and the completion handshake clears the
-/// fence. The inbound fence is persisted so a crash mid-heal re-fences on reboot.
+/// fence. The inbound fence is persisted WITH its kind (the flag byte — see
+/// [`MigrationManager::restore_inbound`], #74 F1), so a crash mid-heal
+/// restores a heal fence AS a heal fence: it re-fences on reboot, survives
+/// the join activation's supersede, and a restored no-source park re-enters
+/// the re-source pass.
 ///
 /// SINGLE-FLIGHT: a shard already inbound-fenced (a heal in flight, a fail-closed
 /// fence, or a forward migration) is skipped, so a stale-but-being-healed shard
 /// stays single-flighted and never thrashes; a shard that heals then re-diverges
-/// later re-triggers (its fence has cleared by then). An empty `partition_view`
-/// (no exchange data) is a no-op. Returns the number of shards newly fenced +
-/// queued.
+/// later re-triggers (its fence has cleared by then).
+///
+/// PARKED-FENCE RE-SOURCE (#74): before detection, every PARKED no-source heal
+/// fence ([`MigrationManager::parked_no_source_heal_shards`] — a shard whose
+/// source selection REFUSED for lack of a quorum-current candidate, e.g. every
+/// boot-stale shard before the first exchange converges a view) re-attempts
+/// strict quorum-current selection against THIS round's fresh view; a
+/// successful pick resolves the parked sentinel to a concrete-source pull
+/// ([`MigrationManager::resolve_heal_source`]) the existing requester loop
+/// drives — park-and-retry, never a terminal give-up. A still-refused shard
+/// stays parked fenced fail-closed (Phase-3c alert-and-hold surfaces it).
+///
+/// An empty `partition_view` (no exchange data) is a no-op. Returns the number
+/// of shards newly fenced + queued, INCLUDING previously-parked fences resolved
+/// to a concrete source this round.
 fn trigger_online_reheal(
     self_id: NodeId,
     shard_table: &Arc<ShardTableLock<ShardTable>>,
@@ -7764,6 +8058,40 @@ fn trigger_online_reheal(
 ) -> usize {
     if partition_view.is_empty() {
         return 0;
+    }
+    // #74 — RE-SOURCE parked no-source heal fences FIRST: a shard fenced
+    // fail-closed because heal-source selection REFUSED (no quorum-current
+    // candidate — e.g. the boot heal before the first membership exchange
+    // converged a view) is re-attempted against THIS round's fresh view. A
+    // candidate that has caught up since (replica catch-up streams until
+    // converged) now passes the quorum-current gate and the parked sentinel
+    // resolves to a concrete-source pull the existing requester loop drives.
+    // A shard that stays refused stays parked (fenced fail-closed, Phase-3c
+    // alert-and-hold) — deliberately: when every candidate is permanently
+    // behind, serving one would be the stale-resurrection double-spend #74
+    // guards against.
+    let mut started = 0usize;
+    let parked = migration.lock().parked_no_source_heal_shards();
+    if !parked.is_empty() {
+        let picks = {
+            let table = shard_table.read();
+            select_reverse_heal_sources_for(self_id, &table, &parked, partition_view)
+        };
+        if !picks.is_empty() {
+            let mgr = &mut migration.lock();
+            for &(shard, source) in &picks {
+                if source == self_id || source == NodeId(0) {
+                    continue;
+                }
+                if mgr.resolve_heal_source(shard, source) {
+                    started += 1;
+                }
+            }
+            inbound_atomic.load_from(mgr.inbound_bitmap());
+            if let Some(path) = inbound_state_path {
+                crate::cluster::migration::persist_inbound_state(path, mgr);
+            }
+        }
     }
     // DIRECTION before fencing (the P1 fix). The Tier-2 detector
     // ([`detect_stale_shards_from_view`]) flags on ANY digest mismatch and is
@@ -7824,14 +8152,18 @@ fn trigger_online_reheal(
             }
         }
         if to_fence.is_empty() {
-            return 0;
+            return started;
         }
         select_reverse_heal_sources_for(self_id, &table, &to_fence, partition_view)
     };
     if sources.is_empty() {
-        return 0;
+        // A newly-stale shard whose selection REFUSED is NOT fenced: an
+        // online master keeps serving as the committed authority (being
+        // coarsely behind an unproven candidate is not proof) and selection
+        // simply re-runs on the next partition-view refresh — no backoff
+        // entry was recorded for a self-behind shard, so it is re-evaluated.
+        return started;
     }
-    let mut started = 0usize;
     {
         let mgr = &mut migration.lock();
         for &(shard, source) in &sources {
@@ -13822,7 +14154,10 @@ impl RunningCluster {
     ///    [`MasterQueryResult::Transitioning`] — NOT `Yes` — for the shard until
     ///    the pull completes. Called at boot BEFORE the node advertises
     ///    readiness, the node never serves un-healed data as authority. The fence
-    ///    is durably persisted, so a crash mid-heal re-fences on restart.
+    ///    is durably persisted WITH its heal kind (the flag byte —
+    ///    [`MigrationManager::restore_inbound`], #74 F1), so a crash mid-heal
+    ///    restores it as a heal fence: it re-fences on restart and survives
+    ///    the join activation's supersede instead of being dropped un-healed.
     /// 2. **PULL** — a concrete-source inbound entry is exactly what the
     ///    coordinator's requester loop pulls on: it sends
     ///    `OP_MIGRATION_TRANSFER_REQUEST` to `source`, which streams the shard
@@ -13878,30 +14213,32 @@ impl RunningCluster {
 
     /// Reverse-heal Phase 2c — choose a heal SOURCE per stale-suspect shard.
     ///
-    /// Prefers the Phase-2b quorum-current [`select_heal_source`] (a committed
-    /// replica that reported the shard in `partition_view` with the highest
-    /// recency and is not still receiving inbound data). When that yields no
-    /// pick — at boot, before the first membership exchange has converged a
-    /// `partition_view`, or when no live replica reported THIS shard — it falls
-    /// back to the shard's committed REPLICA set from the active table,
-    /// PREFERRING a replica that is LIVE (present in `partition_view`, i.e. it
-    /// reported in this membership round) over a silent one, and only then the
-    /// lowest committed NodeId. Preferring a live source matters because there
-    /// is no online re-heal this phase: a pick that is down or unreachable
-    /// leaves the shard fenced-forever, so a live holder is strictly better
-    /// availability at zero correctness cost.
+    /// QUORUM-CURRENT EVIDENCE ONLY (#74): sources come exclusively from the
+    /// Phase-2b [`select_heal_source`] gate — a committed replica that
+    /// reported the shard in `partition_view` with the highest recency, is not
+    /// still receiving inbound data, and is not an empty report while a
+    /// non-empty candidate exists. There is NO fallback: when no candidate
+    /// qualifies — at boot, before the first membership exchange has converged
+    /// a `partition_view`, that is EVERY shard — the shard is omitted (refusal
+    /// metered + rate-limit warned) and the caller parks it fenced fail-closed
+    /// via [`Self::mark_inbound_heal_fence`]. The Phase-3b online pass
+    /// ([`Self::run_online_reheal`]) re-attempts selection against each
+    /// freshly-collected view and starts the pull once a candidate reports the
+    /// shard with evidence; on a settled cluster that cadence is kept alive by
+    /// the parked count feeding the reactivation work metric (#74 F2).
     ///
-    /// SAFETY: this is safe under the single-fault model — a committed replica
-    /// is a data holder by assignment, the SOURCE side re-validates ownership
-    /// in [`split_transfer_request_tasks`] before streaming, and RULE-DS +
-    /// generation idempotency gate every applied image, so a stale pick can
-    /// only waste a request or (for a key the ex-master lost ENTIRELY, with no
-    /// tombstone to compare against) adopt a stale image only under a SECOND,
-    /// independent fault (outside the single-fault model). A source-CURRENCY
-    /// check that would close that double-fault residual is deferred to
-    /// Phase 3. Returns `(shard, source)` for shards with a source; a shard
-    /// with NONE is omitted so the caller can fence it fail-closed (Phase-3
-    /// give-up territory).
+    /// The old committed-replica-by-assignment fallback claimed single-fault
+    /// safety via RULE-DS + generation idempotency, but a key the ex-master
+    /// lost ENTIRELY (no live copy, no tombstone to compare against) adopts
+    /// the source's image unconditionally — so a laggard source that missed a
+    /// spend resurrects the spent key UNSPENT (#74). The gate REMOVES
+    /// UNEVIDENCED sources; it is NOT a per-key currency proof (the recency
+    /// inputs are coarse — a reporting non-empty laggard can still pass).
+    /// Full per-key currency needs the per-record manifest-exchange design
+    /// (tracked separately). See [`select_reverse_heal_sources_for`] for the
+    /// full posture, including why a permanently-refused shard deliberately
+    /// stays parked (alert-and-hold). Returns `(shard, source)` for shards
+    /// with an evidenced source; a refused shard is omitted.
     pub fn select_reverse_heal_sources(
         &self,
         shards: &[u16],
@@ -13917,14 +14254,24 @@ impl RunningCluster {
     /// (single-flight), raise the no-serve-before-heal fence and queue a
     /// delete-safe reverse-PULL from the argmax-recency quorum-current source —
     /// the SAME `register_heal_source` + requester-loop + RULE-DS machinery the
-    /// boot heal uses. Returns the number of shards newly fenced + queued.
+    /// boot heal uses. ALSO re-attempts source selection for every PARKED
+    /// no-source heal fence (#74 — a shard whose selection previously REFUSED
+    /// for lack of quorum-current evidence, e.g. every boot-stale shard),
+    /// resolving the park to a concrete-source pull once a candidate reports
+    /// the shard with evidence in this round's view. Returns the number of
+    /// shards newly fenced + queued, including resolved parked fences.
     ///
     /// This is the online completeness closer for the open consensus P1: a shard
     /// the boot heal missed (or that re-diverges at runtime) is healed here once a
     /// source is available. Idempotent per shard while a heal is in flight (its
     /// inbound fence suppresses re-triggers); a shard that heals then re-diverges
-    /// re-triggers. Driven from the event loop on each partition-view refresh when
-    /// `reverse_heal.tombstones` is enabled; an empty view is a no-op.
+    /// re-triggers. Driven from the event loop whenever an exchange collects a
+    /// fresh partition view when `reverse_heal.tombstones` is enabled — that is
+    /// event-driven, so on a SETTLED cluster the cadence is kept alive by the
+    /// parked-fence count feeding the same-term reactivation work metric
+    /// ([`reactivation_repair_shard_count`], #74 F2), which keeps firing the
+    /// re-heal exchange on the reactivation cooldown while any park exists.
+    /// An empty view is a no-op.
     pub fn run_online_reheal(
         &self,
         partition_view: &std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>>,
@@ -22162,6 +22509,53 @@ mod tests {
         );
     }
 
+    /// #74 F3 — an EMPTY quorum-current report (zero records for the shard)
+    /// is not heal evidence while a NON-empty candidate exists: an empty
+    /// source can heal nothing, and its recency fields can still outrank the
+    /// real holder (`max_generation` is a coarse proxy, not per-key
+    /// currency). Rejected unless ALL candidates report empty — a genuinely
+    /// empty shard heals trivially and must still unfence.
+    #[test]
+    fn source_selection_rejects_empty_report_when_nonzero_candidate_exists() {
+        let self_id = NodeId(1);
+        let empty = NodeId(2); // zero records, but HIGHER max_generation
+        let holder = NodeId(3); // 5 records, lower max_generation
+        let shard = 2u16;
+        let committed = vec![self_id, empty, holder];
+        let mk = |count: u64, g: u32| PartitionVersionEntry {
+            shard,
+            flags: 0,
+            replica_count: 1,
+            last_applied_seq: count,
+            manifest_digest: 1,
+            max_generation: g,
+        };
+
+        let mut view: std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>> =
+            std::collections::HashMap::new();
+        view.insert(empty, vec![mk(0, 9)]);
+        view.insert(holder, vec![mk(5, 3)]);
+        assert_eq!(
+            select_heal_source(self_id, &committed, &view, shard),
+            Some(holder),
+            "an empty report must never outrank a non-empty holder — an empty \
+             source can heal nothing",
+        );
+
+        // ALL candidates report empty → still pick one (the heal of a
+        // genuinely-empty shard completes trivially and unfences).
+        let mut all_empty: std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>> =
+            std::collections::HashMap::new();
+        all_empty.insert(empty, vec![mk(0, 0)]);
+        all_empty.insert(holder, vec![mk(0, 0)]);
+        assert_eq!(
+            select_heal_source(self_id, &committed, &all_empty, shard),
+            Some(holder),
+            "all-empty candidates: selection still yields a source \
+             (deterministic tiebreak) so an empty shard's fence can clear",
+        );
+    }
+
     /// The heal-manifest entry wire marker round-trips LIVE and TOMB kinds; a
     /// short slice or an unknown kind byte decodes to `None` (a peer rejects a
     /// malformed diff rather than guessing).
@@ -25433,18 +25827,26 @@ mod tests {
         );
     }
 
-    /// Reverse-heal G3 (gate + heal wiring). A co-located `CreateV2` whose record
-    /// bytes were lost on the buffered tail is DROPPED by recovery
+    /// Reverse-heal G3 × #74 (gate + heal wiring, park-and-retry). A co-located
+    /// `CreateV2` whose record bytes were lost on the buffered tail is DROPPED
+    /// by recovery
     /// (`colocated_createv2_missing_bytes_flags_resync_create_not_silent_drop`
     /// proves the record is LOST + surfaced). Under active replication (RF>1)
     /// with reverse-heal enabled, [`colocated_create_stale_shards`] maps the
-    /// dropped create's key to its shard, which then drives the SAME Phase-2c
-    /// stale-suspect → source-select → reverse-pull machinery: the shard is
-    /// queued for a pull from the committed replica that still holds the create,
-    /// and is fenced (`is_master` = `Transitioning`) so the node never serves it
-    /// stale until the create is healed back.
+    /// dropped create's key to its shard, which drives the Phase-2c
+    /// stale-suspect → source-select machinery. At BOOT no partition view has
+    /// converged, so selection REFUSES (#74: a guessed committed-by-assignment
+    /// source can be a laggard that missed a spend — healing from it would
+    /// resurrect the spent key) and the shard is PARKED fenced fail-closed —
+    /// never served stale, never healed from unproven evidence. The park is
+    /// NOT terminal: the Phase-3b online pass re-attempts selection on every
+    /// partition-view refresh, and the first view proving the committed
+    /// replica quorum-current resolves the parked fence to a concrete-source
+    /// pull; the completion handshake then un-fences the shard.
     #[test]
-    fn colocated_createv2_skipped_under_rf_marks_shard_stale_and_heals() {
+    fn colocated_createv2_skipped_under_rf_parks_then_heals_on_converged_view() {
+        let _guard = migration_metrics_test_guard();
+        let metrics = install_test_migration_metrics();
         // 2-node RF=2 cluster; pick a shard self (NodeId(1)) masters with
         // NodeId(2) as its committed replica (the holder to heal from).
         let members = vec![NodeId(1), NodeId(2)];
@@ -25492,30 +25894,217 @@ mod tests {
             "precondition: the node masters the shard (would serve it stale)",
         );
 
-        // Drive the SAME Phase-2c boot machinery the stale set feeds.
+        // Drive the SAME Phase-2c boot machinery the stale set feeds. At boot
+        // the partition view is EMPTY — nothing is quorum-current — so #74
+        // selection REFUSES and nothing is queued.
         cluster.record_stale_suspect_shards(stale.clone());
+        let refused_before = metrics.heal_source_refused_no_quorum.get();
         let empty_view = std::collections::HashMap::new();
         let sources = cluster.select_reverse_heal_sources(&stale, &empty_view);
-        assert_eq!(
-            sources,
-            vec![(shard, NodeId(2))],
-            "heal source = the committed replica that still holds the acked create",
+        assert!(
+            sources.is_empty(),
+            "#74: an empty boot view proves no candidate quorum-current — refuse",
+        );
+        assert!(
+            metrics.heal_source_refused_no_quorum.get() > refused_before,
+            "the boot refusal is metered",
         );
         assert_eq!(
             cluster.begin_reverse_heal(&sources),
-            1,
-            "the lost create's shard is queued for a reverse-pull from the replica",
+            0,
+            "a refused selection queues nothing",
         );
 
-        // No-serve-before-heal: the shard is now fenced, so `is_master` answers
-        // Transitioning (client-invisible / retryable) — the node never serves it
-        // stale, and the create is pulled from the replica before it serves.
+        // The boot caller (bin/server.rs Phase 2c) parks every unsourced stale
+        // shard FENCED FAIL-CLOSED: `is_master` answers Transitioning
+        // (client-invisible / retryable) — the node never serves it stale.
+        cluster.mark_inbound_heal_fence(shard);
         assert!(
             matches!(
                 cluster.is_master(&key),
                 MasterQueryResult::Transitioning { .. }
             ),
-            "the shard must be fenced until its lost create is healed from the replica",
+            "a parked shard is fenced fail-closed, never served un-healed",
+        );
+
+        // Park-and-RETRY: the first CONVERGED view in which the committed
+        // replica reports THIS shard (quorum-current) resolves the parked
+        // fence to a concrete-source pull on the online re-heal cadence.
+        let mut view: std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>> =
+            std::collections::HashMap::new();
+        view.insert(
+            NodeId(2),
+            vec![PartitionVersionEntry {
+                shard,
+                flags: 0,
+                replica_count: 1,
+                last_applied_seq: 3,
+                manifest_digest: 7,
+                max_generation: 4,
+            }],
+        );
+        assert_eq!(
+            cluster.run_online_reheal(&view),
+            1,
+            "the parked fence is re-sourced from the first quorum-current view \
+             (park-and-retry, not a terminal give-up)",
+        );
+        let pending = cluster.migration.lock().pending_inbound_entries();
+        assert!(
+            pending
+                .iter()
+                .any(|(s, from)| *s == shard && *from == NodeId(2)),
+            "the parked sentinel resolved to a concrete-source pull from the \
+             quorum-current committed replica",
+        );
+        assert!(
+            matches!(
+                cluster.is_master(&key),
+                MasterQueryResult::Transitioning { .. }
+            ),
+            "still fenced until the pull completes",
+        );
+
+        // The pull completes → the fence clears and the shard serves again.
+        cluster.mark_inbound_complete_from_source(shard, NodeId(2));
+        assert!(
+            matches!(cluster.is_master(&key), MasterQueryResult::Yes),
+            "the completed heal un-fences the shard",
+        );
+    }
+
+    /// #74 — the DELIBERATE permanent-refusal posture: a parked shard whose
+    /// only reporting candidate is PENDING_INBOUND (an unproven subset holder
+    /// still migrating in) stays PARKED — `run_online_reheal` resolves nothing
+    /// and the sentinel keeps the shard fenced fail-closed. If every candidate
+    /// is PERMANENTLY non-current (e.g. the only surviving copies predate a
+    /// spend no live node holds), serving any of them WOULD BE the
+    /// stale-resurrection double-spend, so refusing forever — fenced
+    /// fail-closed, surfaced by the Phase-3c deadline alert-and-hold — is
+    /// correct, matching the repo precedent (auto-escalation and the
+    /// height-aware delete gate were both rejected as unsafe).
+    #[test]
+    fn parked_no_source_heal_fence_stays_parked_while_no_quorum_current() {
+        let _guard = migration_metrics_test_guard();
+        let metrics = install_test_migration_metrics();
+        let (cluster, shard, replica) = three_node_cluster_mastering_with_replica();
+        let key = key_for_shard(shard);
+
+        // Boot parked the shard (selection refused on the empty boot view).
+        cluster.mark_inbound_heal_fence(shard);
+
+        // The only candidate reporting the shard is still receiving inbound
+        // data (PENDING_INBOUND) — not a sound authority to heal from.
+        let mut view: std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>> =
+            std::collections::HashMap::new();
+        view.insert(
+            replica,
+            vec![PartitionVersionEntry {
+                shard,
+                flags: PARTITION_FLAG_PENDING_INBOUND,
+                replica_count: 1,
+                last_applied_seq: 9,
+                manifest_digest: 2,
+                max_generation: 9,
+            }],
+        );
+
+        let refused_before = metrics.heal_source_refused_no_quorum.get();
+        assert_eq!(
+            cluster.run_online_reheal(&view),
+            0,
+            "no quorum-current candidate → the parked shard is NOT re-sourced",
+        );
+        assert!(
+            metrics.heal_source_refused_no_quorum.get() > refused_before,
+            "each refused re-source attempt is metered",
+        );
+        let pending = cluster.migration.lock().pending_inbound_entries();
+        assert!(
+            pending
+                .iter()
+                .any(|(s, from)| *s == shard && *from == NodeId(0)),
+            "the parked sentinel stays unresolved — no guessed source, ever",
+        );
+        assert!(
+            matches!(
+                cluster.is_master(&key),
+                MasterQueryResult::Transitioning { .. }
+            ),
+            "the parked shard stays fenced fail-closed (alert-and-hold), never \
+             served un-healed",
+        );
+    }
+
+    /// #74 F2 — a PARK must have a production driver on a SETTLED cluster:
+    /// exchanges are event-driven and every divergence detector reads zero
+    /// once the topology converges, so the parked-fence count is folded into
+    /// the same-term reactivation work metric. One park → the re-heal
+    /// exchange (which collects the fresh partition view the re-source pass
+    /// selects against) keeps arming on the normal cooldown; park resolved →
+    /// the metric returns to zero and the loop settles again.
+    #[test]
+    fn parked_heal_arms_same_term_reactivation() {
+        let mut mgr = MigrationManager::new();
+
+        // Settled cluster, no park: no repair work → no re-heal round.
+        assert!(!should_trigger_topology_reactivation(
+            false,
+            true,
+            reactivation_repair_shard_count(0, 0, 0, mgr.parked_no_source_heal_shards().len()),
+            0,
+        ));
+
+        // One parked no-source heal fence must arm the same-term re-heal.
+        assert!(mgr.mark_heal_fence_active(33));
+        let parked = mgr.parked_no_source_heal_shards().len();
+        assert_eq!(parked, 1);
+        assert!(
+            should_trigger_topology_reactivation(
+                false,
+                true,
+                reactivation_repair_shard_count(0, 0, 0, parked),
+                0,
+            ),
+            "a settled cluster with a park must keep firing the re-heal \
+             exchange on the reactivation cooldown",
+        );
+
+        // The park resolves → the metric settles back to zero work.
+        assert!(mgr.resolve_heal_source(33, NodeId(2)));
+        assert!(!should_trigger_topology_reactivation(
+            false,
+            true,
+            reactivation_repair_shard_count(0, 0, 0, mgr.parked_no_source_heal_shards().len()),
+            0,
+        ));
+    }
+
+    /// #74 (re-review, item 2) — the park-armed cadence bound: each fruitless
+    /// park-only round doubles the interval from the same-term cooldown up to
+    /// the 5-minute cap, so a permanently-refused park costs one full
+    /// re-activation per 5 minutes at steady state, not one per cooldown.
+    /// (The caller resets the round counter when any park resolves, restoring
+    /// the prompt cadence — covered by the event-loop wiring.)
+    #[test]
+    fn park_reheal_backoff_doubles_from_cooldown_to_cap() {
+        assert_eq!(park_reheal_backoff(0), SAME_TERM_REACTIVATION_COOLDOWN);
+        assert_eq!(
+            park_reheal_backoff(1),
+            SAME_TERM_REACTIVATION_COOLDOWN * 2,
+            "one fruitless round doubles the interval",
+        );
+        assert_eq!(park_reheal_backoff(2), SAME_TERM_REACTIVATION_COOLDOWN * 4);
+        assert_eq!(park_reheal_backoff(3), SAME_TERM_REACTIVATION_COOLDOWN * 8);
+        assert_eq!(
+            park_reheal_backoff(4),
+            Duration::from_secs(300),
+            "the doubling caps at the 5-minute bound",
+        );
+        assert_eq!(
+            park_reheal_backoff(u32::MAX),
+            Duration::from_secs(300),
+            "the cap holds for any round count (no overflow)",
         );
     }
 
@@ -26011,12 +26600,19 @@ mod tests {
         );
     }
 
-    /// Reverse-heal Phase 2c: with no converged partition view (boot), source
-    /// selection falls back to the shard's committed replica — a data holder by
-    /// assignment — so the pull can start immediately without waiting for the
-    /// first membership exchange.
+    /// #74 — Reverse-heal Phase 2c BOOT posture: with no converged partition
+    /// view NOTHING can prove any candidate quorum-current, so source selection
+    /// REFUSES (no source, refusal metered) instead of falling back to a
+    /// committed-by-assignment replica. The removed fallback is how a spent key
+    /// came back: shard hands off → old owner reclaims the key → old owner
+    /// re-masters → the fallback picks a laggard that missed the spend → the
+    /// key is healed back UNSPENT and served (double-spend). The boot caller
+    /// parks refused shards fenced fail-closed; the Phase-3b online pass
+    /// re-attempts selection with the first CONVERGED view.
     #[test]
-    fn select_reverse_heal_sources_falls_back_to_committed_replica_at_boot() {
+    fn select_reverse_heal_sources_refuses_at_boot_without_view() {
+        let _guard = migration_metrics_test_guard();
+        let metrics = install_test_migration_metrics();
         let members = vec![NodeId(1), NodeId(2)];
         // RF=2 so a shard mastered by NodeId(1) lists NodeId(2) as a replica.
         let table = ShardTable::compute_with_epoch(&members, 2, 5, 1);
@@ -26040,22 +26636,31 @@ mod tests {
             2,
         );
 
+        let refused_before = metrics.heal_source_refused_no_quorum.get();
         let empty_view = std::collections::HashMap::new();
         let sources = cluster.select_reverse_heal_sources(&[shard], &empty_view);
+        assert!(
+            sources.is_empty(),
+            "no partition view → no quorum-current evidence → selection must \
+             REFUSE, never guess a committed-by-assignment source",
+        );
         assert_eq!(
-            sources,
-            vec![(shard, NodeId(2))],
-            "boot selection falls back to the committed replica as the heal source",
+            metrics.heal_source_refused_no_quorum.get() - refused_before,
+            1,
+            "the refusal is metered for the operator",
         );
     }
 
-    /// P2-2 — when no live replica reported THIS shard (so `select_heal_source`
-    /// yields nothing) but the partition view DOES carry liveness, the fallback
-    /// prefers a committed replica that is LIVE (present in the view) over a
-    /// silent lower-NodeId one — a down/stale pick would fence the shard forever
-    /// (no online re-heal this phase).
+    /// #74 — a LIVE candidate whose view entry does not cover THIS shard (and a
+    /// silent committed replica) are NOT quorum-current evidence: selection
+    /// must REFUSE rather than pick either. The pre-fix fallback picked the
+    /// live one ("liveness ≈ soundness") — but liveness says nothing about
+    /// whether the candidate missed a spend, and healing from such a laggard
+    /// resurrects the spent key UNSPENT.
     #[test]
-    fn select_reverse_heal_sources_prefers_live_replica_over_silent_lower_id() {
+    fn select_reverse_heal_sources_refuses_without_quorum_current_candidate() {
+        let _guard = migration_metrics_test_guard();
+        let metrics = install_test_migration_metrics();
         let members = vec![NodeId(1), NodeId(2), NodeId(3)];
         // RF=3 so a shard mastered by NodeId(1) lists NodeId(2) and NodeId(3).
         let table = ShardTable::compute_with_epoch(&members, 3, 5, 1);
@@ -26100,12 +26705,81 @@ mod tests {
             }],
         );
 
+        let refused_before = metrics.heal_source_refused_no_quorum.get();
+        let sources = cluster.select_reverse_heal_sources(&[shard], &view);
+        assert!(
+            sources.is_empty(),
+            "neither the live-but-unreported NodeId(3) nor the silent NodeId(2) \
+             is quorum-current for THIS shard — selection must REFUSE",
+        );
+        assert_eq!(
+            metrics.heal_source_refused_no_quorum.get() - refused_before,
+            1,
+            "the refusal is metered for the operator",
+        );
+    }
+
+    /// #74 regression pin — when a quorum-current candidate EXISTS the
+    /// selection is unchanged from the Phase-2b gate: the argmax-recency
+    /// committed replica that reported THIS shard (and is not PENDING_INBOUND)
+    /// is picked exactly as before, and the refusal counter does not move.
+    #[test]
+    fn select_reverse_heal_sources_picks_quorum_current_argmax_recency() {
+        let _guard = migration_metrics_test_guard();
+        let metrics = install_test_migration_metrics();
+        let members = vec![NodeId(1), NodeId(2), NodeId(3)];
+        // RF=3 so a shard mastered by NodeId(1) lists NodeId(2) and NodeId(3).
+        let table = ShardTable::compute_with_epoch(&members, 3, 5, 1);
+        let shard = (0..NUM_SHARDS as u16)
+            .find(|&s| {
+                let a = table.target_assignment(s);
+                a.master == NodeId(1)
+                    && a.replicas.contains(&NodeId(2))
+                    && a.replicas.contains(&NodeId(3))
+            })
+            .expect("some shard mastered by NodeId(1) with NodeId(2)+NodeId(3) replicas");
+        let cluster = new_test_running_cluster(
+            NodeId(1),
+            table,
+            &[
+                (NodeId(1), "127.0.0.1:4951".parse().unwrap()),
+                (NodeId(2), "127.0.0.1:4952".parse().unwrap()),
+                (NodeId(3), "127.0.0.1:4953".parse().unwrap()),
+            ],
+            &members,
+            &[],
+            &[],
+            &[],
+            3,
+        );
+
+        // Both committed replicas report THIS shard, unflagged; NodeId(3) has
+        // the higher recency (max_generation) and must win.
+        let mk = |g: u32| PartitionVersionEntry {
+            shard,
+            flags: 0,
+            replica_count: 1,
+            last_applied_seq: 1,
+            manifest_digest: 0,
+            max_generation: g,
+        };
+        let mut view: std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>> =
+            std::collections::HashMap::new();
+        view.insert(NodeId(2), vec![mk(7)]);
+        view.insert(NodeId(3), vec![mk(11)]);
+
+        let refused_before = metrics.heal_source_refused_no_quorum.get();
         let sources = cluster.select_reverse_heal_sources(&[shard], &view);
         assert_eq!(
             sources,
             vec![(shard, NodeId(3))],
-            "fallback must prefer the LIVE committed replica (NodeId(3)) over the \
-             silent lower-id NodeId(2)",
+            "a quorum-current candidate is selected exactly as before \
+             (argmax-recency pin)",
+        );
+        assert_eq!(
+            metrics.heal_source_refused_no_quorum.get() - refused_before,
+            0,
+            "a successful selection is not a refusal",
         );
     }
 
