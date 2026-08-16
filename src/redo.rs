@@ -1217,6 +1217,52 @@ impl RedoOp {
         }
     }
 
+    /// Human-readable variant name for per-entry logs (recovery
+    /// replay-failure WARNs). Deliberately payload-free: `Debug` on
+    /// `RedoOp` can dump a multi-KB `Create` record payload into a log
+    /// line.
+    pub fn kind_name(&self) -> &'static str {
+        match self {
+            RedoOp::Spend { .. } => "Spend",
+            RedoOp::SpendV2 { .. } => "SpendV2",
+            RedoOp::Unspend { .. } => "Unspend",
+            RedoOp::UnspendV2 { .. } => "UnspendV2",
+            RedoOp::SetMinedBatch { .. } => "SetMinedBatch",
+            RedoOp::Freeze { .. } => "Freeze",
+            RedoOp::FreezeV2 { .. } => "FreezeV2",
+            RedoOp::Unfreeze { .. } => "Unfreeze",
+            RedoOp::UnfreezeV2 { .. } => "UnfreezeV2",
+            RedoOp::Reassign { .. } => "Reassign",
+            RedoOp::ReassignV2 { .. } => "ReassignV2",
+            RedoOp::PruneSlot { .. } => "PruneSlot",
+            RedoOp::PruneSlotIfSpentBy { .. } => "PruneSlotIfSpentBy",
+            RedoOp::ReplicaCreate { .. } => "ReplicaCreate",
+            RedoOp::Create { .. } => "Create",
+            RedoOp::CreateV2 { .. } => "CreateV2",
+            RedoOp::Relocate { .. } => "Relocate",
+            RedoOp::Delete { .. } => "Delete",
+            RedoOp::SetConflicting { .. } => "SetConflicting",
+            RedoOp::AppendConflictingChild { .. } => "AppendConflictingChild",
+            RedoOp::RemoveConflictingChild { .. } => "RemoveConflictingChild",
+            RedoOp::AppendDeletedChild { .. } => "AppendDeletedChild",
+            RedoOp::SetLocked { .. } => "SetLocked",
+            RedoOp::PreserveUntil { .. } => "PreserveUntil",
+            RedoOp::ExpirePreservation { .. } => "ExpirePreservation",
+            RedoOp::MarkOnLongestChain { .. } => "MarkOnLongestChain",
+            RedoOp::SecondaryDahUpdate { .. } => "SecondaryDahUpdate",
+            RedoOp::AllocateRegion { .. } => "AllocateRegion",
+            RedoOp::FreeRegion { .. } => "FreeRegion",
+            RedoOp::HashtableResizeBegin { .. } => "HashtableResizeBegin",
+            RedoOp::HashtableResizeCommit { .. } => "HashtableResizeCommit",
+            RedoOp::CompensateUnsetMined { .. } => "CompensateUnsetMined",
+            RedoOp::CompensateReassign { .. } => "CompensateReassign",
+            RedoOp::CompensatePrune { .. } => "CompensatePrune",
+            RedoOp::CompensateSetLocked { .. } => "CompensateSetLocked",
+            RedoOp::RecoveryProgress { .. } => "RecoveryProgress",
+            RedoOp::Checkpoint => "Checkpoint",
+        }
+    }
+
     /// Extract the tx_key from the operation, if it has one.
     ///
     /// Returns `None` for `Checkpoint` which has no associated key.

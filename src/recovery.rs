@@ -96,6 +96,14 @@ pub enum ReplayCause {
     /// A device read or write call returned an error during replay. NOT
     /// tolerable — the device is unreachable or returning corrupt blocks
     /// and continuing to start would risk serving stale or wrong data.
+    ///
+    /// scenario_09 (run 31911172622): for a NON-AUTHORITATIVE
+    /// (replica/migration-origin) entry, a corruption-SHAPED read result
+    /// (CRC mismatch / zeroed header / short read at a valid offset — the
+    /// signature of bytes that never landed) is classified as
+    /// [`ReplayCause::ReplicaRecordAbsent`] instead, via
+    /// [`classify_record_read_failure`]. Transport-shaped errors (EIO,
+    /// ENXIO, …) always land here, regardless of entry origin.
     IoError,
     /// A record header / metadata block could not be parsed (checksum or
     /// magic mismatch, decoded fields out of range). NOT tolerable.
@@ -128,6 +136,18 @@ pub enum ReplayCause {
     /// never boot → cluster wedged at 0/N ready, scenario_09). Therefore
     /// TOLERABLE up to a cap: the index registration is skipped (no entry
     /// pointing at unreadable bytes) and the node boots and resyncs.
+    ///
+    /// scenario_09 follow-up (run 31911172622): the SAME physical condition
+    /// — record bytes never durable on this node — can also surface while
+    /// replaying a FOLLOW-UP entry for a replica-origin key. Example: the
+    /// index snapshot captured the in-RAM registration of a received create
+    /// whose record bytes were still buffered when the node stopped; on
+    /// restart the `ReplicaCreate` replays as an idempotent skip (key
+    /// already indexed) and the follow-up `SpendV2` / metadata op then reads
+    /// the ZEROED record — a corruption-shaped result. Those sibling paths
+    /// classify the failure here too (via [`classify_record_read_failure`])
+    /// instead of the fatal [`ReplayCause::IoError`]: one misclassified
+    /// entry would otherwise veto the boot this tolerance exists to protect.
     ReplicaRecordAbsent,
 }
 
@@ -254,6 +274,136 @@ fn is_fatal_replay_cause(cause: ReplayCause) -> bool {
     )
 }
 
+/// scenario_09 (run 31911172622): classify a failed READ of a record's
+/// on-device bytes during replay.
+///
+/// THE MAPPING (error variant × entry origin → cause):
+///
+/// | [`DeviceError`] variant                                  | replica-origin entry  | authoritative entry |
+/// |----------------------------------------------------------|-----------------------|---------------------|
+/// | `RecordCorruption` (CRC/parse fail: zeroed or torn bytes)| `ReplicaRecordAbsent` | `IoError`           |
+/// | `ShortRead` (EOF-short at a valid offset)                | `ReplicaRecordAbsent` | `IoError`           |
+/// | `Io` (EIO, ENXIO, … — transport/OS)                      | `IoError`             | `IoError`           |
+/// | anything else (alignment / out-of-bounds / geometry)     | `IoError`             | `IoError`           |
+///
+/// Corruption-SHAPED results are what ABSENT bytes look like: the read
+/// itself worked, but what came back was never written. `replica_origin`
+/// means the key was journaled by [`crate::redo::RedoOp::ReplicaCreate`]
+/// earlier in this same replayed tail — only the replication / migration
+/// receiver writes that op, and its documented durability window (fsync
+/// data device → flush redo → ACK, with group commit able to drag the redo
+/// entries durable first) legitimately leaves redo entries whose record
+/// bytes never landed; the master re-replicates the key on rejoin. One such
+/// entry classified as the fatal `IoError` vetoes the boot that the
+/// [`ReplayCause::ReplicaRecordAbsent`] tolerance exists to protect
+/// (scenario_09: node stranded UNREACHABLE, cluster wedged at 0/N ready).
+///
+/// Transport-SHAPED errors mean the DEVICE failed to perform the read —
+/// never explained by the receiver window, fatal regardless of origin.
+///
+/// AUTHORITATIVE entries (no `ReplicaCreate` for the key in the replayed
+/// tail) keep the fatal mapping for corruption-shaped results too: per the
+/// C1 durability contract an acked authoritative write has durable record
+/// bytes (data fsync before ack), so absence under an authoritative entry
+/// IS device failure or a real bug. Authoritative CREATES carry their own
+/// dedicated tolerances instead and are untouched by this classifier:
+/// `Create` re-writes the record from its captured payload, and `CreateV2`
+/// maps missing bytes to [`ReplayResult::SkippedMissingCreateBytes`] plus
+/// the G3 stale-suspect reverse-heal.
+#[inline]
+fn classify_record_read_failure(err: &DeviceError, replica_origin: bool) -> ReplayCause {
+    if replica_origin
+        && matches!(
+            err,
+            DeviceError::RecordCorruption { .. } | DeviceError::ShortRead { .. }
+        )
+    {
+        ReplayCause::ReplicaRecordAbsent
+    } else {
+        ReplayCause::IoError
+    }
+}
+
+/// OBSERVABILITY (scenario_09 follow-up): cap on full-detail per-entry
+/// replay-failure WARN lines per recovery run. Individual replay failures
+/// were previously invisible — 495 failures produced ZERO per-entry logs,
+/// leaving nothing to correlate a fatal abort with. Recovery replays
+/// millions of entries at scale, so detail is capped: the first
+/// `REPLAY_FAILURE_LOG_DETAIL_CAP` failed entries log in full, then one
+/// notice marks the suppression; the per-cause totals in the recovery
+/// summary carry the rest.
+const REPLAY_FAILURE_LOG_DETAIL_CAP: u64 = 32;
+
+/// What [`warn_replay_failure`] emits for the `nth_failure` (1-based)
+/// failed entry of a recovery run. Factored out of the logging so the cap
+/// boundaries are unit-testable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FailureLogAction {
+    /// Full-detail per-entry WARN (sequence, op kind, txid prefix, offset,
+    /// cause).
+    Detail,
+    /// Single WARN marking that further per-entry detail is suppressed.
+    SuppressNotice,
+    /// Nothing — totals are reported by the recovery summary.
+    Silent,
+}
+
+#[inline]
+fn replay_failure_log_action(nth_failure: u64) -> FailureLogAction {
+    if nth_failure <= REPLAY_FAILURE_LOG_DETAIL_CAP {
+        FailureLogAction::Detail
+    } else if nth_failure == REPLAY_FAILURE_LOG_DETAIL_CAP + 1 {
+        FailureLogAction::SuppressNotice
+    } else {
+        FailureLogAction::Silent
+    }
+}
+
+/// The device byte offset a redo op itself references, for failure logs.
+/// `None` for ops that carry no device offset (slot-level ops locate their
+/// record via the primary index instead).
+fn op_record_offset(op: &RedoOp) -> Option<u64> {
+    match op {
+        RedoOp::Create { record_offset, .. }
+        | RedoOp::CreateV2 { record_offset, .. }
+        | RedoOp::ReplicaCreate { record_offset, .. }
+        | RedoOp::Relocate { record_offset, .. }
+        | RedoOp::Delete { record_offset, .. } => Some(*record_offset),
+        RedoOp::AllocateRegion { offset, .. } | RedoOp::FreeRegion { offset, .. } => Some(*offset),
+        _ => None,
+    }
+}
+
+/// OBSERVABILITY (scenario_09 follow-up): WARN with the identity of a redo
+/// entry whose replay failed, so per-entry failures are diagnosable instead
+/// of invisible. `nth_failure` is the 1-based running failure count of this
+/// recovery run (`RecoveryStats::entries_failed` after accounting); detail
+/// is rate-capped via [`replay_failure_log_action`].
+fn warn_replay_failure(nth_failure: u64, entry: &RedoEntry, cause: ReplayCause) {
+    match replay_failure_log_action(nth_failure) {
+        FailureLogAction::Detail => {
+            tracing::warn!(
+                target: "teraslab::recovery",
+                sequence = entry.sequence,
+                op = entry.op.kind_name(),
+                txid_prefix = ?entry.op.tx_key().map(|k| &k.txid[..4]),
+                record_offset = op_record_offset(&entry.op),
+                cause = ?cause,
+                "recovery: replay of one redo entry failed",
+            );
+        }
+        FailureLogAction::SuppressNotice => {
+            tracing::warn!(
+                target: "teraslab::recovery",
+                detail_cap = REPLAY_FAILURE_LOG_DETAIL_CAP,
+                "recovery: further per-entry replay-failure detail suppressed; \
+                 per-cause totals are in the recovery summary",
+            );
+        }
+        FailureLogAction::Silent => {}
+    }
+}
+
 /// B-6: append a recovery-progress marker, treating a full redo log as a
 /// non-fatal condition.
 ///
@@ -305,6 +455,16 @@ pub fn recover(
     // pre-existing alias in O(1) per create instead of scanning the whole
     // index each time.
     let mut offset_owners = build_offset_owners(index);
+    // scenario_09 (run 31911172622): keys journaled by `RedoOp::ReplicaCreate`
+    // within the replayed tail. Follow-up entries for these keys are
+    // NON-AUTHORITATIVE (the record is a replica/migration-received SECONDARY
+    // copy), so corruption-shaped read failures during their replay classify
+    // as the tolerable `ReplicaRecordAbsent` — see
+    // `classify_record_read_failure`. A `ReplicaCreate` always precedes ops on
+    // the record it creates in redo order, so inserting before dispatch is
+    // sufficient.
+    let mut replica_origin_keys: std::collections::HashSet<TxKey> =
+        std::collections::HashSet::new();
 
     for entry in &entries {
         // Height subsystem (design §4; BUG3): fold the max block height across
@@ -312,7 +472,14 @@ pub fn recover(
         if let Some(h) = entry.op.observed_block_height() {
             stats.max_observed_block_height = stats.max_observed_block_height.max(h);
         }
-        match replay_entry(device, index, &mut offset_owners, entry) {
+        if let RedoOp::ReplicaCreate { tx_key, .. } = &entry.op {
+            replica_origin_keys.insert(*tx_key);
+        }
+        let replica_origin = entry
+            .op
+            .tx_key()
+            .is_some_and(|k| replica_origin_keys.contains(k));
+        match replay_entry(device, index, &mut offset_owners, entry, replica_origin) {
             ReplayResult::Applied => stats.entries_replayed += 1,
             // A missing-create-bytes drop is a benign buffered-tail skip here;
             // the G3 reverse-heal signal is only surfaced by the multi-store
@@ -322,6 +489,7 @@ pub fn recover(
             }
             ReplayResult::Failed(cause) => {
                 stats.record_failure(cause);
+                warn_replay_failure(stats.entries_failed, entry, cause);
                 // F-G4-007: stop on first non-tolerable failure so
                 // subsequent entries cannot land partially-applied
                 // state on top of an already-broken replay.
@@ -744,6 +912,14 @@ pub fn recover_all_multi_store(
     // Secondary ops replay into a throwaway; the authoritative DAH is
     // rebuilt store-routed by the reconcile below.
     let mut throwaway_dah = DahBackend::new_in_memory();
+    // scenario_09 (run 31911172622): keys journaled by `RedoOp::ReplicaCreate`
+    // within the replayed (global-order) tail — follow-up entries for them are
+    // NON-AUTHORITATIVE, so corruption-shaped read failures classify as the
+    // tolerable `ReplicaRecordAbsent` (see `classify_record_read_failure`).
+    // Tracked by key across stores: the create and its follow-up ops route to
+    // the same store, but the identity that matters is the key.
+    let mut replica_origin_keys: std::collections::HashSet<TxKey> =
+        std::collections::HashSet::new();
 
     for (store, entry) in &tagged {
         // Height subsystem: fold the max observed block height regardless of
@@ -751,6 +927,13 @@ pub fn recover_all_multi_store(
         if let Some(h) = entry.op.observed_block_height() {
             total.max_observed_block_height = total.max_observed_block_height.max(h);
         }
+        if let RedoOp::ReplicaCreate { tx_key, .. } = &entry.op {
+            replica_origin_keys.insert(*tx_key);
+        }
+        let replica_origin = entry
+            .op
+            .tx_key()
+            .is_some_and(|k| replica_origin_keys.contains(k));
         let device: &dyn BlockDevice = &*devices[*store as usize];
         let outcome = replay_one_recovery_entry(
             device,
@@ -762,6 +945,7 @@ pub fn recover_all_multi_store(
             &mut pending_dc,
             &mut pending_resizes,
             entry,
+            replica_origin,
         );
         let fatal = matches!(outcome, ReplayResult::Failed(c) if is_fatal_replay_cause(c));
         match outcome {
@@ -800,7 +984,10 @@ pub fn recover_all_multi_store(
                     }
                 }
             }
-            ReplayResult::Failed(cause) => total.record_failure(cause),
+            ReplayResult::Failed(cause) => {
+                total.record_failure(cause);
+                warn_replay_failure(total.entries_failed, entry, cause);
+            }
         }
         // P2 (production delete path): a `FreeRegion` that reclaims a flagged
         // create's exact device slot proves that create was deleted/superseded (a
@@ -938,13 +1125,22 @@ fn replay_one_recovery_entry(
     pending_deleted_children: &mut Vec<PendingAppendDeletedChild>,
     pending_resizes: &mut std::collections::HashMap<u64, Vec<u8>>,
     entry: &RedoEntry,
+    replica_origin: bool,
 ) -> ReplayResult {
     match &entry.op {
         RedoOp::SecondaryDahUpdate {
             tx_key,
             old_height,
             new_height,
-        } => replay_secondary_dah(device, index, dah, tx_key, *old_height, *new_height),
+        } => replay_secondary_dah(
+            device,
+            index,
+            dah,
+            tx_key,
+            *old_height,
+            *new_height,
+            replica_origin,
+        ),
         RedoOp::AppendConflictingChild {
             parent_key,
             child_txid,
@@ -1073,7 +1269,7 @@ fn replay_one_recovery_entry(
             {
                 ReplayResult::Failed(ReplayCause::LogicError)
             } else {
-                replay_entry(device, index, offset_owners, entry)
+                replay_entry(device, index, offset_owners, entry, replica_origin)
             }
         }
         // BUG-1 fix #1: route the legacy `RedoOp::ReplicaCreate` through the
@@ -1177,7 +1373,7 @@ fn replay_one_recovery_entry(
         // records via untested overflow-allocator interleaving with the
         // rest of this replay loop — see the 16d task report.
         RedoOp::CompensateUnsetMined { .. } | RedoOp::SetMinedBatch { .. } => ReplayResult::Skipped,
-        _ => replay_entry(device, index, offset_owners, entry),
+        _ => replay_entry(device, index, offset_owners, entry, replica_origin),
     }
 }
 
@@ -1220,6 +1416,12 @@ fn recover_entries_with_allocator_collecting_pending_conflicts(
     // removed (the primary index file itself is untouched until rename).
     let mut pending_resizes: std::collections::HashMap<u64, Vec<u8>> =
         std::collections::HashMap::new();
+    // scenario_09 (run 31911172622): keys journaled by `RedoOp::ReplicaCreate`
+    // within the replayed tail — follow-up entries for them are
+    // NON-AUTHORITATIVE, so corruption-shaped read failures classify as the
+    // tolerable `ReplicaRecordAbsent` (see `classify_record_read_failure`).
+    let mut replica_origin_keys: std::collections::HashSet<TxKey> =
+        std::collections::HashSet::new();
 
     for entry in &entries {
         // B-7: record every key the redo log touches so a clean recovery
@@ -1237,6 +1439,13 @@ fn recover_entries_with_allocator_collecting_pending_conflicts(
         if let Some(h) = entry.op.observed_block_height() {
             stats.max_observed_block_height = stats.max_observed_block_height.max(h);
         }
+        if let RedoOp::ReplicaCreate { tx_key, .. } = &entry.op {
+            replica_origin_keys.insert(*tx_key);
+        }
+        let replica_origin = entry
+            .op
+            .tx_key()
+            .is_some_and(|k| replica_origin_keys.contains(k));
         let outcome = replay_one_recovery_entry(
             device,
             allocator.as_deref_mut(),
@@ -1247,6 +1456,7 @@ fn recover_entries_with_allocator_collecting_pending_conflicts(
             &mut pending_deleted_children,
             &mut pending_resizes,
             entry,
+            replica_origin,
         );
         let progress_safe = matches!(
             outcome,
@@ -1268,7 +1478,10 @@ fn recover_entries_with_allocator_collecting_pending_conflicts(
             ReplayResult::Skipped | ReplayResult::SkippedMissingCreateBytes => {
                 stats.entries_skipped += 1
             }
-            ReplayResult::Failed(cause) => stats.record_failure(cause),
+            ReplayResult::Failed(cause) => {
+                stats.record_failure(cause);
+                warn_replay_failure(stats.entries_failed, entry, cause);
+            }
         }
         if progress_safe {
             last_safe_sequence = entry.sequence;
@@ -1586,6 +1799,7 @@ fn replay_secondary_dah(
     tx_key: &TxKey,
     old_height: u32,
     new_height: u32,
+    replica_origin: bool,
 ) -> ReplayResult {
     let ie = match index.lookup(tx_key) {
         Some(e) => e,
@@ -1593,7 +1807,7 @@ fn replay_secondary_dah(
     };
     let primary_dah = match io::read_metadata(device, ie.record_offset) {
         Ok(meta) => meta.delete_at_height,
-        Err(_) => return ReplayResult::Failed(ReplayCause::IoError),
+        Err(e) => return ReplayResult::Failed(classify_record_read_failure(&e, replica_origin)),
     };
     if primary_dah != new_height {
         return ReplayResult::Skipped;
@@ -1664,23 +1878,33 @@ struct ReplayDerivedContext {
 /// rather than perpetuated.
 ///
 /// `utxo_count` is the record's slot count (from the metadata header).
-/// Returns `Err(())` on any device read error so the caller can map it to
-/// [`ReplayCause::IoError`].
+/// Returns the [`DeviceError`] on any device read error so the caller can
+/// classify it (see [`classify_record_read_failure`]: corruption-shaped
+/// results on a replica-origin entry are tolerable absence, transport
+/// errors are fatal).
 fn count_spent_slots(
     device: &dyn BlockDevice,
     record_offset: u64,
     utxo_count: u32,
-) -> Result<u32, ()> {
-    let slots = io::read_all_utxo_slots(device, record_offset, utxo_count).map_err(|_| ())?;
+) -> Result<u32, DeviceError> {
+    let slots = io::read_all_utxo_slots(device, record_offset, utxo_count)?;
     let spent = slots.iter().filter(|s| s.status == UTXO_SPENT).count();
     Ok(spent as u32)
 }
 
+/// `replica_origin` (scenario_09, run 31911172622): `true` when `entry`'s
+/// key was journaled by a [`RedoOp::ReplicaCreate`] earlier in this same
+/// replayed tail — the entry then mutates a replica/migration-received
+/// SECONDARY copy whose bytes may legitimately be absent, and
+/// corruption-shaped read failures classify as the tolerable
+/// [`ReplayCause::ReplicaRecordAbsent`] (see
+/// [`classify_record_read_failure`]).
 fn replay_entry(
     device: &dyn BlockDevice,
     index: &ShardedIndex,
     offset_owners: &mut OffsetOwners,
     entry: &RedoEntry,
+    replica_origin: bool,
 ) -> ReplayResult {
     match &entry.op {
         RedoOp::Spend {
@@ -1697,6 +1921,7 @@ fn replay_entry(
             *new_spent_count,
             None,
             None,
+            replica_origin,
         ),
         RedoOp::SpendV2 {
             tx_key,
@@ -1721,6 +1946,7 @@ fn replay_entry(
                 updated_at: *updated_at,
             }),
             utxo_hash.as_ref(),
+            replica_origin,
         ),
         RedoOp::Unspend {
             tx_key,
@@ -1736,6 +1962,7 @@ fn replay_entry(
             *new_spent_count,
             None,
             None,
+            replica_origin,
         ),
         RedoOp::UnspendV2 {
             tx_key,
@@ -1760,24 +1987,41 @@ fn replay_entry(
                 updated_at: *updated_at,
             }),
             utxo_hash.as_ref(),
+            replica_origin,
         ),
         // Task 16d: no longer replayed against the device — see the
         // matching arm's doc comment in `replay_one_recovery_entry`.
         RedoOp::SetMinedBatch { .. } => ReplayResult::Skipped,
-        RedoOp::Freeze { tx_key, offset } => replay_freeze(device, index, tx_key, *offset, None),
+        RedoOp::Freeze { tx_key, offset } => {
+            replay_freeze(device, index, tx_key, *offset, None, replica_origin)
+        }
         RedoOp::FreezeV2 {
             tx_key,
             offset,
             utxo_hash,
-        } => replay_freeze(device, index, tx_key, *offset, Some(utxo_hash)),
+        } => replay_freeze(
+            device,
+            index,
+            tx_key,
+            *offset,
+            Some(utxo_hash),
+            replica_origin,
+        ),
         RedoOp::Unfreeze { tx_key, offset } => {
-            replay_unfreeze(device, index, tx_key, *offset, None)
+            replay_unfreeze(device, index, tx_key, *offset, None, replica_origin)
         }
         RedoOp::UnfreezeV2 {
             tx_key,
             offset,
             utxo_hash,
-        } => replay_unfreeze(device, index, tx_key, *offset, Some(utxo_hash)),
+        } => replay_unfreeze(
+            device,
+            index,
+            tx_key,
+            *offset,
+            Some(utxo_hash),
+            replica_origin,
+        ),
         RedoOp::ReplicaCreate {
             tx_key,
             device_id,
@@ -1936,7 +2180,7 @@ fn replay_entry(
         // PreserveUntil, MarkOnLongestChain) are metadata-only writes.
         // They're idempotent: the metadata pwrite is atomic at the block
         // level. If it completed, the data is there. If not, we re-apply.
-        _ => replay_metadata_op(device, index, entry),
+        _ => replay_metadata_op(device, index, entry, replica_origin),
     }
 }
 
@@ -1955,14 +2199,24 @@ fn replay_entry(
 /// number of SPENT slots, so recomputing it converges regardless of how much of
 /// the log was already applied. Returns the [`ReplayCause`] on a device
 /// read/write failure so callers surface it as [`ReplayResult::Failed`].
+///
+/// scenario_09 (run 31911172622): READ failures are classified via
+/// [`classify_record_read_failure`] — a corruption-shaped result (zeroed
+/// header / CRC fail) on a `replica_origin` entry is the tolerable
+/// [`ReplayCause::ReplicaRecordAbsent`], not the boot-vetoing `IoError`
+/// (this metadata read was the exact sibling path that stranded node2).
+/// WRITE failures stay `IoError` unconditionally: a failed write is a sick
+/// device, never absent bytes.
 fn recompute_replay_metadata(
     device: &dyn BlockDevice,
     record_offset: u64,
     derived: Option<ReplayDerivedContext>,
+    replica_origin: bool,
 ) -> std::result::Result<(), ReplayCause> {
-    let mut meta = io::read_metadata(device, record_offset).map_err(|_| ReplayCause::IoError)?;
+    let mut meta = io::read_metadata(device, record_offset)
+        .map_err(|e| classify_record_read_failure(&e, replica_origin))?;
     meta.spent_utxos = count_spent_slots(device, record_offset, meta.utxo_count)
-        .map_err(|()| ReplayCause::IoError)?;
+        .map_err(|e| classify_record_read_failure(&e, replica_origin))?;
     if let Some(ctx) = derived {
         meta.generation = ctx.target_generation;
         meta.updated_at = ctx.updated_at;
@@ -1985,6 +2239,7 @@ fn replay_spend(
     _new_spent_count: u32,
     derived: Option<ReplayDerivedContext>,
     utxo_hash: Option<&[u8; 32]>,
+    replica_origin: bool,
 ) -> ReplayResult {
     let ie = match index.lookup(tx_key) {
         Some(e) => e,
@@ -1996,11 +2251,13 @@ fn replay_spend(
     // the slot's `utxo_hash`, rebuild the slot from the durable intent
     // instead of fail-closed-bricking the node (boot loop). A
     // non-corruption device I/O error still fails — that is not something
-    // the WAL can repair.
+    // the WAL can repair (scenario_09: a short read on a replica-origin
+    // entry classifies as tolerable absence instead, see
+    // `classify_record_read_failure`).
     let read = match io::read_utxo_slot(device, ie.record_offset, offset) {
         Ok(s) => Some(s),
         Err(DeviceError::RecordCorruption { .. }) => None,
-        Err(_) => return ReplayResult::Failed(ReplayCause::IoError),
+        Err(e) => return ReplayResult::Failed(classify_record_read_failure(&e, replica_origin)),
     };
 
     // Determine the slot hash to write. On a healthy slot it is the
@@ -2013,7 +2270,12 @@ fn replay_spend(
             // SPENT but `spent_utxos` stale (the AfterDataPwrite window), and
             // returning before the recompute would undercount permanently.
             if slot.status == UTXO_SPENT && slot.spending_data == *spending_data {
-                return match recompute_replay_metadata(device, ie.record_offset, derived) {
+                return match recompute_replay_metadata(
+                    device,
+                    ie.record_offset,
+                    derived,
+                    replica_origin,
+                ) {
                     Ok(()) => ReplayResult::Skipped,
                     Err(c) => ReplayResult::Failed(c),
                 };
@@ -2040,8 +2302,17 @@ fn replay_spend(
             // Reconstruct the spent slot directly from the redo entry.
             Some(h) => *h,
             // Legacy V2/V1 entry without the hash: unrepairable here.
-            // Fail closed so the operator can run the repair CLI.
-            None => return ReplayResult::Failed(ReplayCause::IoError),
+            // Fail closed so the operator can run the repair CLI — unless
+            // the entry is replica-origin: the corruption-shaped slot read
+            // that brought us here is the absent-bytes condition, and the
+            // master re-replicates the key on rejoin (scenario_09).
+            None => {
+                return ReplayResult::Failed(if replica_origin {
+                    ReplayCause::ReplicaRecordAbsent
+                } else {
+                    ReplayCause::IoError
+                });
+            }
         },
     };
 
@@ -2057,7 +2328,7 @@ fn replay_spend(
     // Task 16d: replay does NOT re-derive `delete_at_height` (the DAH secondary
     // is rebuilt store-authoritatively from the recovered MinedIndex after
     // replay). See `recompute_replay_metadata`.
-    if let Err(c) = recompute_replay_metadata(device, ie.record_offset, derived) {
+    if let Err(c) = recompute_replay_metadata(device, ie.record_offset, derived, replica_origin) {
         return ReplayResult::Failed(c);
     }
 
@@ -2078,6 +2349,7 @@ fn replay_unspend(
     _new_spent_count: u32,
     derived: Option<ReplayDerivedContext>,
     utxo_hash: Option<&[u8; 32]>,
+    replica_origin: bool,
 ) -> ReplayResult {
     let ie = match index.lookup(tx_key) {
         Some(e) => e,
@@ -2086,11 +2358,12 @@ fn replay_unspend(
 
     // B-5: a CRC-failing slot is rebuilt to UNSPENT from the V3 redo
     // entry's `utxo_hash` rather than fail-closed-bricking. A
-    // non-corruption I/O error still fails.
+    // non-corruption I/O error still fails (scenario_09: classified for
+    // replica-origin absence, see `classify_record_read_failure`).
     let read = match io::read_utxo_slot(device, ie.record_offset, offset) {
         Ok(s) => Some(s),
         Err(DeviceError::RecordCorruption { .. }) => None,
-        Err(_) => return ReplayResult::Failed(ReplayCause::IoError),
+        Err(e) => return ReplayResult::Failed(classify_record_read_failure(&e, replica_origin)),
     };
 
     let hash = match read {
@@ -2100,7 +2373,12 @@ fn replay_unspend(
                 // counter — a crash may have left the slot durably UNSPENT but
                 // `spent_utxos` stale (over-counting), which the sweep would
                 // read as all-spent and delete a record with a live UTXO.
-                return match recompute_replay_metadata(device, ie.record_offset, derived) {
+                return match recompute_replay_metadata(
+                    device,
+                    ie.record_offset,
+                    derived,
+                    replica_origin,
+                ) {
                     Ok(()) => ReplayResult::Skipped,
                     Err(c) => ReplayResult::Failed(c),
                 };
@@ -2130,7 +2408,16 @@ fn replay_unspend(
             // Rebuild the slot's hash from the durable intent; the slot
             // is then written UNSPENT below.
             Some(h) => *h,
-            None => return ReplayResult::Failed(ReplayCause::IoError),
+            // Legacy no-hash entry over a corruption-shaped slot read:
+            // absent bytes for a replica-origin entry (scenario_09),
+            // unrepairable fail-closed otherwise.
+            None => {
+                return ReplayResult::Failed(if replica_origin {
+                    ReplayCause::ReplicaRecordAbsent
+                } else {
+                    ReplayCause::IoError
+                });
+            }
         },
     };
 
@@ -2142,7 +2429,7 @@ fn replay_unspend(
     // R-010 (BC-04) / B-4 / R-013: recompute the counter from the SPENT slots
     // (idempotent across re-spend histories), stamp the derived generation, and
     // propagate read/write errors as Failed. See `recompute_replay_metadata`.
-    if let Err(c) = recompute_replay_metadata(device, ie.record_offset, derived) {
+    if let Err(c) = recompute_replay_metadata(device, ie.record_offset, derived, replica_origin) {
         return ReplayResult::Failed(c);
     }
 
@@ -2155,6 +2442,7 @@ fn replay_freeze(
     tx_key: &TxKey,
     offset: u32,
     expected_hash: Option<&[u8; 32]>,
+    replica_origin: bool,
 ) -> ReplayResult {
     let ie = match index.lookup(tx_key) {
         Some(e) => e,
@@ -2165,11 +2453,12 @@ fn replay_freeze(
     // exactly what this redo entry exists to repair. A FreezeV2 entry carries
     // the slot's `utxo_hash` (passed as `expected_hash`), so rebuild the frozen
     // slot from the durable intent instead of fail-closed-bricking recovery. A
-    // non-corruption device I/O error still fails — the WAL cannot repair that.
+    // non-corruption device I/O error still fails — the WAL cannot repair that
+    // (scenario_09: classified for replica-origin absence).
     let read = match io::read_utxo_slot(device, ie.record_offset, offset) {
         Ok(s) => Some(s),
         Err(DeviceError::RecordCorruption { .. }) => None,
-        Err(_) => return ReplayResult::Failed(ReplayCause::IoError),
+        Err(e) => return ReplayResult::Failed(classify_record_read_failure(&e, replica_origin)),
     };
 
     let frozen = match read {
@@ -2207,8 +2496,15 @@ fn replay_freeze(
             // Torn slot rebuilt directly from the FreezeV2 redo entry's hash.
             Some(h) => UtxoSlot::new_frozen(*h),
             // Legacy V1 entry without the hash: unrepairable here. Fail closed
-            // so the operator can run the repair CLI.
-            None => return ReplayResult::Failed(ReplayCause::IoError),
+            // so the operator can run the repair CLI — replica-origin absence
+            // (scenario_09) is tolerated instead.
+            None => {
+                return ReplayResult::Failed(if replica_origin {
+                    ReplayCause::ReplicaRecordAbsent
+                } else {
+                    ReplayCause::IoError
+                });
+            }
         },
     };
 
@@ -2224,6 +2520,7 @@ fn replay_unfreeze(
     tx_key: &TxKey,
     offset: u32,
     expected_hash: Option<&[u8; 32]>,
+    replica_origin: bool,
 ) -> ReplayResult {
     let ie = match index.lookup(tx_key) {
         Some(e) => e,
@@ -2235,7 +2532,7 @@ fn replay_unfreeze(
     let read = match io::read_utxo_slot(device, ie.record_offset, offset) {
         Ok(s) => Some(s),
         Err(DeviceError::RecordCorruption { .. }) => None,
-        Err(_) => return ReplayResult::Failed(ReplayCause::IoError),
+        Err(e) => return ReplayResult::Failed(classify_record_read_failure(&e, replica_origin)),
     };
 
     let unspent = match read {
@@ -2257,7 +2554,16 @@ fn replay_unfreeze(
         None => match expected_hash {
             // Torn slot rebuilt directly from the UnfreezeV2 redo entry's hash.
             Some(h) => UtxoSlot::new_unspent(*h),
-            None => return ReplayResult::Failed(ReplayCause::IoError),
+            // Legacy no-hash entry over a corruption-shaped slot read:
+            // replica-origin absence (scenario_09) is tolerated, otherwise
+            // fail closed.
+            None => {
+                return ReplayResult::Failed(if replica_origin {
+                    ReplayCause::ReplicaRecordAbsent
+                } else {
+                    ReplayCause::IoError
+                });
+            }
         },
     };
 
@@ -2908,6 +3214,7 @@ fn replay_metadata_op(
     device: &dyn BlockDevice,
     index: &ShardedIndex,
     entry: &RedoEntry,
+    replica_origin: bool,
 ) -> ReplayResult {
     match &entry.op {
         RedoOp::Reassign {
@@ -2923,7 +3230,9 @@ fn replay_metadata_op(
             };
             let slot = match io::read_utxo_slot(device, ie.record_offset, *offset) {
                 Ok(s) => s,
-                Err(_) => return ReplayResult::Failed(ReplayCause::IoError),
+                Err(e) => {
+                    return ReplayResult::Failed(classify_record_read_failure(&e, replica_origin));
+                }
             };
             // Idempotent: already reassigned if hash matches new_hash and status is UNSPENT
             if slot.hash == *new_hash && slot.status == UTXO_UNSPENT {
@@ -2951,7 +3260,9 @@ fn replay_metadata_op(
             };
             let slot = match io::read_utxo_slot(device, ie.record_offset, *offset) {
                 Ok(s) => s,
-                Err(_) => return ReplayResult::Failed(ReplayCause::IoError),
+                Err(e) => {
+                    return ReplayResult::Failed(classify_record_read_failure(&e, replica_origin));
+                }
             };
             // Idempotent: already reassigned if hash matches new_hash and status is UNSPENT.
             if slot.hash == *new_hash && slot.status == UTXO_UNSPENT {
@@ -2983,7 +3294,9 @@ fn replay_metadata_op(
             };
             let slot = match io::read_utxo_slot(device, ie.record_offset, *offset) {
                 Ok(s) => s,
-                Err(_) => return ReplayResult::Failed(ReplayCause::IoError),
+                Err(e) => {
+                    return ReplayResult::Failed(classify_record_read_failure(&e, replica_origin));
+                }
             };
             if slot.status == UTXO_PRUNED {
                 return ReplayResult::Skipped;
@@ -3006,7 +3319,9 @@ fn replay_metadata_op(
             };
             let slot = match io::read_utxo_slot(device, ie.record_offset, *offset) {
                 Ok(s) => s,
-                Err(_) => return ReplayResult::Failed(ReplayCause::IoError),
+                Err(e) => {
+                    return ReplayResult::Failed(classify_record_read_failure(&e, replica_origin));
+                }
             };
             if slot.status == UTXO_PRUNED {
                 return ReplayResult::Skipped;
@@ -3021,7 +3336,9 @@ fn replay_metadata_op(
             }
             let mut meta = match io::read_metadata(device, ie.record_offset) {
                 Ok(meta) => meta,
-                Err(_) => return ReplayResult::Failed(ReplayCause::IoError),
+                Err(e) => {
+                    return ReplayResult::Failed(classify_record_read_failure(&e, replica_origin));
+                }
             };
             meta.spent_utxos = { meta.spent_utxos }.saturating_sub(1);
             meta.pruned_utxos = { meta.pruned_utxos }.saturating_add(1);
@@ -3038,7 +3355,9 @@ fn replay_metadata_op(
             };
             let mut meta = match io::read_metadata(device, ie.record_offset) {
                 Ok(m) => m,
-                Err(_) => return ReplayResult::Failed(ReplayCause::IoError),
+                Err(e) => {
+                    return ReplayResult::Failed(classify_record_read_failure(&e, replica_origin));
+                }
             };
             let has_flag = meta.flags.contains(TxFlags::CONFLICTING);
             if has_flag == *value {
@@ -3063,7 +3382,9 @@ fn replay_metadata_op(
             };
             let mut meta = match io::read_metadata(device, ie.record_offset) {
                 Ok(m) => m,
-                Err(_) => return ReplayResult::Failed(ReplayCause::IoError),
+                Err(e) => {
+                    return ReplayResult::Failed(classify_record_read_failure(&e, replica_origin));
+                }
             };
             let has_flag = meta.flags.contains(TxFlags::LOCKED);
             if has_flag == *value {
@@ -3094,7 +3415,9 @@ fn replay_metadata_op(
             };
             let mut meta = match io::read_metadata(device, ie.record_offset) {
                 Ok(m) => m,
-                Err(_) => return ReplayResult::Failed(ReplayCause::IoError),
+                Err(e) => {
+                    return ReplayResult::Failed(classify_record_read_failure(&e, replica_origin));
+                }
             };
             if { meta.preserve_until } == *block_height {
                 return ReplayResult::Skipped;
@@ -3122,7 +3445,9 @@ fn replay_metadata_op(
             };
             let mut meta = match io::read_metadata(device, ie.record_offset) {
                 Ok(m) => m,
-                Err(_) => return ReplayResult::Failed(ReplayCause::IoError),
+                Err(e) => {
+                    return ReplayResult::Failed(classify_record_read_failure(&e, replica_origin));
+                }
             };
             // Value-equality idempotency, like `PreserveUntil` above: already in
             // the target state means a prior replay (or the live apply that
@@ -3153,7 +3478,9 @@ fn replay_metadata_op(
             };
             let mut meta = match io::read_metadata(device, ie.record_offset) {
                 Ok(m) => m,
-                Err(_) => return ReplayResult::Failed(ReplayCause::IoError),
+                Err(e) => {
+                    return ReplayResult::Failed(classify_record_read_failure(&e, replica_origin));
+                }
             };
             // H7: generation-based idempotency. The redo entry declares the
             // target generation after applying the op. Skip when the
@@ -8625,6 +8952,425 @@ mod tests {
             "a Create short-I/O (MissingRecordBytes) must still abort startup",
         );
         assert!(is_fatal_replay_cause(ReplayCause::MissingRecordBytes));
+    }
+
+    /// scenario_09 (run 31911172622): the SAME physical condition the
+    /// `ReplicaRecordAbsent` tolerance exists for — a replica/migration-origin
+    /// redo entry whose record bytes never landed on this node — reaching a
+    /// SIBLING replay path must be classified the SAME way, not as the fatal
+    /// `IoError`.
+    ///
+    /// Shape of the failing entry: node stopped mid-migration-batch after the
+    /// index snapshot captured the in-RAM registration of a received create,
+    /// but before the record bytes were synced. On restart the `ReplicaCreate`
+    /// replays as `Skipped` (key already indexed), then the follow-up `SpendV2`
+    /// finds the key, reads a CRC-failing (zeroed) slot, rebuilds it from the
+    /// V3 hash (B-5), and finally `recompute_replay_metadata` reads the ZEROED
+    /// metadata header — a corruption-shaped result that is absence, not device
+    /// failure. Pre-fix this was counted as `failed_io: 1` and vetoed the boot
+    /// the tolerance protects (node stranded UNREACHABLE, cluster 0/N ready).
+    #[test]
+    fn spend_after_replica_create_with_absent_bytes_is_replica_record_absent() {
+        use crate::server::startup::check_replay_tolerance;
+
+        let mut h = RecoveryTestHarness::new();
+        let mut txid = [0u8; 32];
+        txid[0] = 0x91;
+        let key = TxKey { txid };
+        let utxo_count: u32 = 2;
+        let record_size = TxMetadata::record_size_for(utxo_count);
+        // Allocate the offset but write NO record bytes — the region stays
+        // zeroed, exactly what an unsynced migration-batch write looks like
+        // after restart.
+        let record_offset = h.alloc.allocate(record_size).unwrap();
+        // Mimic the index snapshot that captured the in-RAM registration.
+        h.index
+            .register(
+                key,
+                TxIndexEntry {
+                    device_id: 0,
+                    record_offset,
+                    mined_slot: crate::index::mined_index::NO_MINED_SLOT,
+                },
+            )
+            .unwrap();
+
+        let mut redo = h.redo_log();
+        redo.append_and_flush(RedoOp::ReplicaCreate {
+            device_id: 0,
+            tx_key: key,
+            record_offset,
+            utxo_count,
+        })
+        .unwrap();
+        redo.append_and_flush(RedoOp::SpendV2 {
+            tx_key: key,
+            offset: 0,
+            spending_data: [0xAB; 36],
+            new_spent_count: 1,
+            current_block_height: 0,
+            block_height_retention: 0,
+            target_generation: 1,
+            updated_at: 1,
+            utxo_hash: Some(h.slot_hash(0)),
+        })
+        .unwrap();
+
+        let stats = recover(&*h.data_dev, &redo, &h.index).unwrap();
+        assert_eq!(
+            stats.failed_io, 0,
+            "absent replica record bytes reached through the spend-replay \
+             sibling path must NOT be classified as a device I/O failure",
+        );
+        assert_eq!(
+            stats.failed_replica_record_absent, 1,
+            "the corruption-shaped read on a replica-origin key must be \
+             counted under the tolerated absence cause",
+        );
+        assert!(
+            check_replay_tolerance(&stats).is_ok(),
+            "the node must boot: one absent replica record through a sibling \
+             path must not veto the tolerance (scenario_09)",
+        );
+    }
+
+    /// scenario_09 sibling path #2: a metadata-only op (`SetConflicting`) on a
+    /// replica-origin key whose record bytes are absent. `replay_metadata_op`
+    /// reads the zeroed metadata header (corruption-shaped) — pre-fix this was
+    /// the fatal `IoError`; it must be the tolerated `ReplicaRecordAbsent`.
+    #[test]
+    fn metadata_op_after_replica_create_with_absent_bytes_is_replica_record_absent() {
+        use crate::server::startup::check_replay_tolerance;
+
+        let mut h = RecoveryTestHarness::new();
+        let mut txid = [0u8; 32];
+        txid[0] = 0x92;
+        let key = TxKey { txid };
+        let utxo_count: u32 = 2;
+        let record_offset = h
+            .alloc
+            .allocate(TxMetadata::record_size_for(utxo_count))
+            .unwrap();
+        h.index
+            .register(
+                key,
+                TxIndexEntry {
+                    device_id: 0,
+                    record_offset,
+                    mined_slot: crate::index::mined_index::NO_MINED_SLOT,
+                },
+            )
+            .unwrap();
+
+        let mut redo = h.redo_log();
+        redo.append_and_flush(RedoOp::ReplicaCreate {
+            device_id: 0,
+            tx_key: key,
+            record_offset,
+            utxo_count,
+        })
+        .unwrap();
+        redo.append_and_flush(RedoOp::SetConflicting {
+            tx_key: key,
+            value: true,
+            current_block_height: 0,
+            block_height_retention: 0,
+        })
+        .unwrap();
+
+        let stats = recover(&*h.data_dev, &redo, &h.index).unwrap();
+        assert_eq!(
+            stats.failed_io, 0,
+            "absent replica record bytes under a metadata-op replay must not \
+             be classified as a device I/O failure",
+        );
+        assert_eq!(
+            stats.failed_replica_record_absent, 1,
+            "the zeroed-header read on a replica-origin key must be counted \
+             under the tolerated absence cause",
+        );
+        assert!(check_replay_tolerance(&stats).is_ok());
+    }
+
+    /// scenario_09 sibling-path fix on the PRODUCTION boot path: the same
+    /// reclassification must hold through `recover_all_multi_store` (the
+    /// `replay_one_recovery_entry` dispatch the server boots through, with
+    /// the secondary reconcile deferred exactly as the server does).
+    #[test]
+    fn replica_absent_bytes_tolerated_through_allocator_recovery() {
+        let mut h = RecoveryTestHarness::new();
+        let mut txid = [0u8; 32];
+        txid[0] = 0x93;
+        let key = TxKey { txid };
+        let utxo_count: u32 = 2;
+        let record_offset = h
+            .alloc
+            .allocate(TxMetadata::record_size_for(utxo_count))
+            .unwrap();
+        h.index
+            .register(
+                key,
+                TxIndexEntry {
+                    device_id: 0,
+                    record_offset,
+                    mined_slot: crate::index::mined_index::NO_MINED_SLOT,
+                },
+            )
+            .unwrap();
+
+        let mut redo = h.redo_log();
+        redo.append_and_flush(RedoOp::ReplicaCreate {
+            device_id: 0,
+            tx_key: key,
+            record_offset,
+            utxo_count,
+        })
+        .unwrap();
+        redo.append_and_flush(RedoOp::SpendV2 {
+            tx_key: key,
+            offset: 0,
+            spending_data: [0xCD; 36],
+            new_spent_count: 1,
+            current_block_height: 0,
+            block_height_retention: 0,
+            target_generation: 1,
+            updated_at: 1,
+            utxo_hash: Some(h.slot_hash(0)),
+        })
+        .unwrap();
+
+        let mut dah = DahBackend::new_in_memory();
+        let devices: Vec<Arc<dyn BlockDevice>> = vec![h.data_dev.clone()];
+        let mut allocators = vec![h.alloc];
+        let mut redo_logs = vec![redo];
+        // Server boot passes defer_secondary_reconcile == true (Task 16d): the
+        // DAH is rebuilt from the recovered MinedIndex afterwards, so no
+        // metadata scan touches the dangling entry here.
+        let (stats, _, _, _, _) = recover_all_multi_store(
+            &devices,
+            &mut allocators,
+            &mut redo_logs,
+            &h.index,
+            &mut dah,
+            false,
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            stats.failed_io, 0,
+            "the allocator-dispatch path must classify absent replica bytes \
+             as absence too",
+        );
+        assert_eq!(stats.failed_replica_record_absent, 1);
+    }
+
+    /// CRITICAL DISCRIMINATION pin: a TRANSPORT-shaped device error (EIO-style
+    /// `DeviceError::Io`) during replay of a replica-origin entry must STAY
+    /// fatal. The absence tolerance covers corruption-shaped reads (bytes
+    /// never landed), never a sick device.
+    #[test]
+    fn transport_read_error_on_replica_origin_key_stays_fatal() {
+        use crate::device::ReadFailingDevice;
+        use crate::server::startup::check_replay_tolerance;
+
+        let mut h = RecoveryTestHarness::new();
+        // A fully VALID record — only the injected transport fault fails reads.
+        let key = h.create_record(0x94, 2);
+        let record_offset = h.index.lookup(&key).unwrap().record_offset;
+
+        let mut redo = h.redo_log();
+        redo.append_and_flush(RedoOp::ReplicaCreate {
+            device_id: 0,
+            tx_key: key,
+            record_offset,
+            utxo_count: 2,
+        })
+        .unwrap();
+        redo.append_and_flush(RedoOp::SpendV2 {
+            tx_key: key,
+            offset: 0,
+            spending_data: [0xEF; 36],
+            new_spent_count: 1,
+            current_block_height: 0,
+            block_height_retention: 0,
+            target_generation: 1,
+            updated_at: 1,
+            utxo_hash: Some(h.slot_hash(0)),
+        })
+        .unwrap();
+
+        let (failing_dev, fail) = ReadFailingDevice::new(h.data_dev.clone());
+        fail.store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let stats = recover(&*failing_dev, &redo, &h.index).unwrap();
+        assert_eq!(
+            stats.failed_io, 1,
+            "a transport error (DeviceError::Io) on a replica-origin key must \
+             remain the fatal IoError cause — the device is sick",
+        );
+        assert_eq!(
+            stats.failed_replica_record_absent, 0,
+            "a transport error must never be absorbed by the absence tolerance",
+        );
+        assert!(
+            check_replay_tolerance(&stats).is_err(),
+            "startup must still abort on a genuine device failure",
+        );
+    }
+
+    /// AUTHORITATIVE entries keep the fatal mapping (C1 contract): an acked
+    /// authoritative write has durable record bytes by contract (data fsync
+    /// before ack), so a corruption-shaped read under an entry with NO
+    /// `ReplicaCreate` in the replayed tail IS device failure or a real bug.
+    #[test]
+    fn authoritative_entry_with_absent_bytes_stays_fatal_io() {
+        use crate::server::startup::check_replay_tolerance;
+
+        let mut h = RecoveryTestHarness::new();
+        let mut txid = [0u8; 32];
+        txid[0] = 0x95;
+        let key = TxKey { txid };
+        let record_offset = h.alloc.allocate(TxMetadata::record_size_for(2)).unwrap();
+        h.index
+            .register(
+                key,
+                TxIndexEntry {
+                    device_id: 0,
+                    record_offset,
+                    mined_slot: crate::index::mined_index::NO_MINED_SLOT,
+                },
+            )
+            .unwrap();
+
+        // NO ReplicaCreate in the tail — the key is authoritative here.
+        let mut redo = h.redo_log();
+        redo.append_and_flush(RedoOp::SpendV2 {
+            tx_key: key,
+            offset: 0,
+            spending_data: [0x11; 36],
+            new_spent_count: 1,
+            current_block_height: 0,
+            block_height_retention: 0,
+            target_generation: 1,
+            updated_at: 1,
+            utxo_hash: Some(h.slot_hash(0)),
+        })
+        .unwrap();
+
+        let stats = recover(&*h.data_dev, &redo, &h.index).unwrap();
+        assert_eq!(
+            stats.failed_io, 1,
+            "corruption-shaped absence under an AUTHORITATIVE entry stays the \
+             fatal IoError — C1: acked authoritative bytes are durable, so \
+             absence there is device failure or a real bug",
+        );
+        assert_eq!(stats.failed_replica_record_absent, 0);
+        assert!(check_replay_tolerance(&stats).is_err());
+    }
+
+    /// THE MAPPING (scenario_09): `classify_record_read_failure` must
+    /// tolerate exactly {corruption-shaped × replica-origin} and nothing
+    /// else.
+    #[test]
+    fn classify_record_read_failure_mapping() {
+        let corruption = DeviceError::RecordCorruption {
+            detail: "crc mismatch".to_string(),
+        };
+        let short = DeviceError::ShortRead {
+            expected: 4096,
+            got: 0,
+            offset: 8192,
+        };
+        let transport = DeviceError::Io(std::io::Error::other("EIO"));
+        let oob = DeviceError::OutOfBounds {
+            offset: 1,
+            len: 2,
+            device_size: 3,
+        };
+
+        // Corruption-shaped + replica-origin → tolerated absence.
+        assert_eq!(
+            classify_record_read_failure(&corruption, true),
+            ReplayCause::ReplicaRecordAbsent,
+        );
+        assert_eq!(
+            classify_record_read_failure(&short, true),
+            ReplayCause::ReplicaRecordAbsent,
+        );
+        // Transport / structural stays fatal even for replica-origin.
+        assert_eq!(
+            classify_record_read_failure(&transport, true),
+            ReplayCause::IoError,
+        );
+        assert_eq!(
+            classify_record_read_failure(&oob, true),
+            ReplayCause::IoError
+        );
+        // Authoritative entries: everything stays fatal (C1 contract).
+        assert_eq!(
+            classify_record_read_failure(&corruption, false),
+            ReplayCause::IoError,
+        );
+        assert_eq!(
+            classify_record_read_failure(&short, false),
+            ReplayCause::IoError,
+        );
+        assert_eq!(
+            classify_record_read_failure(&transport, false),
+            ReplayCause::IoError,
+        );
+    }
+
+    /// OBSERVABILITY: per-entry failure logging is capped — full detail for
+    /// the first `REPLAY_FAILURE_LOG_DETAIL_CAP` failures, one suppression
+    /// notice, then silence (totals live in the recovery summary).
+    #[test]
+    fn replay_failure_log_action_cap_boundaries() {
+        assert_eq!(replay_failure_log_action(1), FailureLogAction::Detail);
+        assert_eq!(
+            replay_failure_log_action(REPLAY_FAILURE_LOG_DETAIL_CAP),
+            FailureLogAction::Detail,
+        );
+        assert_eq!(
+            replay_failure_log_action(REPLAY_FAILURE_LOG_DETAIL_CAP + 1),
+            FailureLogAction::SuppressNotice,
+        );
+        assert_eq!(
+            replay_failure_log_action(REPLAY_FAILURE_LOG_DETAIL_CAP + 2),
+            FailureLogAction::Silent,
+        );
+        assert_eq!(
+            replay_failure_log_action(u64::MAX),
+            FailureLogAction::Silent
+        );
+    }
+
+    /// OBSERVABILITY: the failure log names the op kind (payload-free) and
+    /// carries the device offset only for ops that embed one.
+    #[test]
+    fn failure_log_op_identity_helpers() {
+        let key = TxKey { txid: [0x77; 32] };
+        let replica_create = RedoOp::ReplicaCreate {
+            device_id: 0,
+            tx_key: key,
+            record_offset: 12288,
+            utxo_count: 2,
+        };
+        assert_eq!(replica_create.kind_name(), "ReplicaCreate");
+        assert_eq!(op_record_offset(&replica_create), Some(12288));
+
+        let spend = RedoOp::Spend {
+            tx_key: key,
+            offset: 0,
+            spending_data: [0; 36],
+            new_spent_count: 1,
+        };
+        assert_eq!(spend.kind_name(), "Spend");
+        // Slot-level ops locate their record via the index, not the entry.
+        assert_eq!(op_record_offset(&spend), None);
+
+        assert_eq!(RedoOp::Checkpoint.kind_name(), "Checkpoint");
+        assert_eq!(op_record_offset(&RedoOp::Checkpoint), None);
     }
 
     #[test]
