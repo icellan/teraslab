@@ -3860,7 +3860,10 @@ impl ClusterCoordinator {
                             // kept — so the committed master's
                             // under-replication resync can complete it.
                             let committed_member_set: std::collections::HashSet<NodeId> =
-                                topo_authority_event.committed_members().into_iter().collect();
+                                topo_authority_event
+                                    .committed_members()
+                                    .into_iter()
+                                    .collect();
                             let departed_reparked =
                                 mgr.repark_departed_source_inbound(&committed_member_set);
                             if departed_reparked > 0 {
@@ -25542,7 +25545,10 @@ mod tests {
         assert_eq!(attempts, 3, "escalation must stop at the attempt bound");
         match outcome {
             ManifestMismatchEscalation::Exhausted { last_err } => {
-                assert!(last_err.contains("manifest hash mismatch"), "got: {last_err}");
+                assert!(
+                    last_err.contains("manifest hash mismatch"),
+                    "got: {last_err}"
+                );
             }
             other => panic!("expected Exhausted, got {other:?}"),
         }
@@ -25563,7 +25569,10 @@ mod tests {
             attempts += 1;
             Err(EscalationAttemptError::Completion(other.clone()))
         });
-        assert_eq!(attempts, 1, "a non-mismatch rejection stops the re-sync loop");
+        assert_eq!(
+            attempts, 1,
+            "a non-mismatch rejection stops the re-sync loop"
+        );
         assert_eq!(
             outcome,
             ManifestMismatchEscalation::NotMismatch { last_err: other },

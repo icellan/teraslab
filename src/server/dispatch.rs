@@ -26555,7 +26555,10 @@ mod tests {
         assert_eq!(resp1.status, STATUS_ERROR);
         let err1 = migration_complete_rejection_error(resp1.status, &resp1.payload);
         assert!(completion_rejection_manifest_mismatch(&err1), "got: {err1}");
-        assert_eq!(mgr.note_completion_manifest_mismatch(shard, &manifest_hash), 1);
+        assert_eq!(
+            mgr.note_completion_manifest_mismatch(shard, &manifest_hash),
+            1
+        );
 
         // Blind send #2 (the re-drive rebuilding the identical manifest) —
         // rejected again; streak reaches 2 → escalate, never a third blind send.
@@ -26635,7 +26638,10 @@ mod tests {
             ManifestMismatchEscalation::Verified,
             "the record-level re-sync must converge",
         );
-        assert_eq!(attempts, 1, "one re-sync round suffices for one divergent record");
+        assert_eq!(
+            attempts, 1,
+            "one re-sync round suffices for one divergent record"
+        );
         mgr.clear_completion_manifest_mismatch(shard);
         let dst_gen_after = { h.engine.read_metadata(&key).unwrap().generation };
         assert_eq!(

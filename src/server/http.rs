@@ -1477,7 +1477,8 @@ pub(crate) fn render_metrics_text(
         prom_gauge(
             &mut out,
             "teraslab_orphan_cleanup_retained_no_evidence",
-            mm.orphan_cleanup_retained_no_evidence.load(Ordering::Relaxed) as u64,
+            mm.orphan_cleanup_retained_no_evidence
+                .load(Ordering::Relaxed) as u64,
         );
     }
     if let Some(sw) = swim_metrics() {

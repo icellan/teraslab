@@ -679,7 +679,11 @@ impl MigrationManager {
     /// The completion path escalates to a record-level re-sync once the
     /// streak proves the identical manifest was already rejected (>= 2) —
     /// see `manifest_mismatch_streaks` for why this lives on the manager.
-    pub fn note_completion_manifest_mismatch(&mut self, shard: u16, manifest_hash: &[u8; 32]) -> u32 {
+    pub fn note_completion_manifest_mismatch(
+        &mut self,
+        shard: u16,
+        manifest_hash: &[u8; 32],
+    ) -> u32 {
         let entry = self
             .manifest_mismatch_streaks
             .entry(shard)
