@@ -10,3 +10,4 @@ pub mod routing;
 pub mod shards;
 pub mod swim;
 pub mod topology;
+pub mod watchdog;

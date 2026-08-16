@@ -1908,6 +1908,18 @@ fn status_query_wants_master_shards(query: Option<&str>) -> bool {
     })
 }
 
+/// Task #75 — how long `/status` waits for the shard-table read lock
+/// before serving a DEGRADED payload instead of blocking. Long enough to
+/// ride out a normal activation write-hold, short enough that the harness
+/// (5 s poll timeout) always gets an answer from a wedged node.
+const STATUS_TABLE_LOCK_BUDGET: Duration = Duration::from_millis(500);
+
+/// Task #75 — bounded wait for the auxiliary coordinator locks `/status`
+/// needs (`migration` mutex via `active_migrations`, `node_addrs` read via
+/// `alive_node_count`). Smaller than the table budget so the worst-case
+/// degraded response still answers in well under a second.
+const STATUS_AUX_LOCK_BUDGET: Duration = Duration::from_millis(100);
+
 async fn handle_status(
     RawQuery(query): RawQuery,
     State(state): State<Arc<HttpState>>,
@@ -1919,12 +1931,16 @@ async fn handle_status(
     {
         let self_id = cluster.self_id();
         let table = cluster.shard_table();
-        let table_guard = table.read();
-        let masters: Vec<u16> = (0..NUM_SHARDS as u16)
-            .filter(|&s| table_guard.effective_assignment(s).master == self_id)
-            .collect();
-        drop(table_guard);
-        obj.insert("master_shards".to_string(), serde_json::json!(masters));
+        // Task #75 — bounded: on a wedged shard table the field is simply
+        // absent, which the harness's W4 diagnostic already counts as an
+        // "unfetched" node instead of fabricating an empty master set.
+        if let Some(table_guard) = table.try_read_for(STATUS_TABLE_LOCK_BUDGET) {
+            let masters: Vec<u16> = (0..NUM_SHARDS as u16)
+                .filter(|&s| table_guard.effective_assignment(s).master == self_id)
+                .collect();
+            drop(table_guard);
+            obj.insert("master_shards".to_string(), serde_json::json!(masters));
+        }
     }
     (
         StatusCode::OK,
@@ -1936,45 +1952,96 @@ async fn handle_status(
 /// Build the `/status` JSON payload. Split out of the async handler so unit
 /// tests can assert the payload shape (records, storage/defrag health, cluster
 /// counts) without spinning up an HTTP listener.
+/// Task #75 — which bounded coordinator-lock acquisitions timed out while
+/// building `/status`. Any `true` flag degrades the payload: the shard /
+/// size fields the harness convergence gates read are OMITTED (they parse
+/// as "not converged", never as zeros that pass a gate) and these flags are
+/// merged into the response so the wedge fingerprint reaches the CI logs.
+#[derive(Clone, Copy)]
+struct StatusLockTimeouts {
+    /// `shard_table` read stayed unacquirable for [`STATUS_TABLE_LOCK_BUDGET`].
+    table: bool,
+    /// `migration` mutex stayed unacquirable for [`STATUS_AUX_LOCK_BUDGET`].
+    migration: bool,
+    /// `node_addrs` read stayed unacquirable for [`STATUS_AUX_LOCK_BUDGET`].
+    addrs: bool,
+}
+
 fn build_status_json(state: &HttpState) -> serde_json::Value {
     let m = state.metrics;
 
+    let mut degraded: Option<StatusLockTimeouts> = None;
     let cluster_info = if let Some(ref cluster) = state.cluster {
         let table = cluster.shard_table();
-        let table_guard = table.read();
-        let self_id = cluster.self_id();
-        let (
-            master_count,
-            replica_count,
-            target_master_count,
-            target_replica_count,
-            pending_handoff_shards,
-        ) = shard_counts(&table_guard, self_id);
-        let cluster_size = cluster.alive_node_count();
-        drop(table_guard);
+        // Task #75 — every coordinator lock this payload needs is acquired
+        // with a bounded wait. The observed wedge (task #75) held the event
+        // loop AND `/status` silent for 120 s+ while SWIM stayed alive; an
+        // unbounded `table.read()` here made the harness report the node
+        // UNREACHABLE instead of surfacing WHICH lock was held. All three
+        // probes run even after one fails so the response carries the full
+        // fingerprint.
+        let table_guard = table.try_read_for(STATUS_TABLE_LOCK_BUDGET);
+        let active_migrations = cluster.active_migrations_bounded(STATUS_AUX_LOCK_BUDGET);
+        let cluster_size = cluster.alive_node_count_bounded(STATUS_AUX_LOCK_BUDGET);
+        match (table_guard, active_migrations, cluster_size) {
+            (Some(table_guard), Some(active_migrations), Some(cluster_size)) => {
+                let self_id = cluster.self_id();
+                let (
+                    master_count,
+                    replica_count,
+                    target_master_count,
+                    target_replica_count,
+                    pending_handoff_shards,
+                ) = shard_counts(&table_guard, self_id);
+                drop(table_guard);
 
-        serde_json::json!({
-            "node_id": self_id.0,
-            "cluster_size": cluster_size,
-            "shard_table_version": cluster.shard_table_version(),
-            "topology_term": cluster.committed_topology_term(),
-            // The shard table is a pure function of (members, rf, epoch,
-            // placement_version), so publishing the last two alongside the term
-            // makes a cross-node table divergence directly readable instead of
-            // something to infer from shard counts.
-            "committed_placement_version": cluster.committed_placement_version(),
-            "committed_members": cluster
-                .committed_topology_members()
-                .iter()
-                .map(|n| n.0)
-                .collect::<Vec<_>>(),
-            "master_shard_count": master_count,
-            "replica_shard_count": replica_count,
-            "target_master_shard_count": target_master_count,
-            "target_replica_shard_count": target_replica_count,
-            "pending_handoff_shards": pending_handoff_shards,
-            "active_migrations": cluster.active_migrations(),
-        })
+                serde_json::json!({
+                    "node_id": self_id.0,
+                    "cluster_size": cluster_size,
+                    "shard_table_version": cluster.shard_table_version(),
+                    "topology_term": cluster.committed_topology_term(),
+                    // The shard table is a pure function of (members, rf, epoch,
+                    // placement_version), so publishing the last two alongside the term
+                    // makes a cross-node table divergence directly readable instead of
+                    // something to infer from shard counts.
+                    "committed_placement_version": cluster.committed_placement_version(),
+                    "committed_members": cluster
+                        .committed_topology_members()
+                        .iter()
+                        .map(|n| n.0)
+                        .collect::<Vec<_>>(),
+                    "master_shard_count": master_count,
+                    "replica_shard_count": replica_count,
+                    "target_master_shard_count": target_master_count,
+                    "target_replica_shard_count": target_replica_count,
+                    "pending_handoff_shards": pending_handoff_shards,
+                    "active_migrations": active_migrations,
+                })
+            }
+            (table_guard, active_migrations, cluster_size) => {
+                degraded = Some(StatusLockTimeouts {
+                    table: table_guard.is_none(),
+                    migration: active_migrations.is_none(),
+                    addrs: cluster_size.is_none(),
+                });
+                // DEGRADED payload: only never-blocking sources (atomics +
+                // plain fields). The convergence fields the harness gates
+                // read (`cluster_size`, master/replica/target counts,
+                // `pending_handoff_shards`) are deliberately not populated —
+                // the outer projection serializes them as `null`, which every
+                // consumer's `as_u64()` parses exactly like a missing field:
+                // no `cluster_size` -> node not ready; no
+                // `target_master_shard_count` -> target=0 -> the activation
+                // gate holds. A wedged node therefore reads as
+                // answering-but-not-converged — never as converged.
+                serde_json::json!({
+                    "node_id": cluster.self_id().0,
+                    "shard_table_version": cluster.shard_table_version(),
+                    "topology_term": cluster.committed_topology_term(),
+                    "committed_placement_version": cluster.committed_placement_version(),
+                })
+            }
+        }
     } else {
         serde_json::json!({
             "node_id": 0,
@@ -2012,7 +2079,7 @@ fn build_status_json(state: &HttpState) -> serde_json::Value {
         0.0
     };
 
-    let status = serde_json::json!({
+    let mut status = serde_json::json!({
         "node_id": cluster_info["node_id"],
         "cluster_size": cluster_info["cluster_size"],
         "shard_table_version": cluster_info["shard_table_version"],
@@ -2057,6 +2124,39 @@ fn build_status_json(state: &HttpState) -> serde_json::Value {
         "write_healthy": state.engine.write_healthy(),
         "redo_poisoned": !state.engine.write_healthy(),
     });
+
+    // Task #75 — merged AFTER the named-key projection above (which drops
+    // anything not listed): coordinator event-loop liveness on every
+    // clustered response, plus the degraded-lock flags when any bounded
+    // acquisition above timed out. Together they turn the harness's former
+    // "UNREACHABLE" into a stall fingerprint in the CI logs.
+    if let Some(ref cluster) = state.cluster
+        && let Some(obj) = status.as_object_mut()
+    {
+        let (age_ms, phase) = cluster.event_loop_health();
+        obj.insert(
+            "event_loop".to_string(),
+            serde_json::json!({
+                "last_beat_age_ms": age_ms,
+                "phase": phase.as_str(),
+            }),
+        );
+        if let Some(timeouts) = degraded {
+            obj.insert("status_degraded".to_string(), serde_json::json!(true));
+            obj.insert(
+                "table_lock_unavailable".to_string(),
+                serde_json::json!(timeouts.table),
+            );
+            obj.insert(
+                "migration_lock_unavailable".to_string(),
+                serde_json::json!(timeouts.migration),
+            );
+            obj.insert(
+                "addrs_lock_unavailable".to_string(),
+                serde_json::json!(timeouts.addrs),
+            );
+        }
+    }
 
     status
 }
@@ -4917,6 +5017,167 @@ mod tests {
 
         assert_eq!(storage["compacted"].as_u64().unwrap(), 3);
         assert_eq!(storage["reclaimed"].as_u64().unwrap(), 7);
+    }
+
+    /// Task #75 baseline: with every coordinator lock free, `/status` keeps
+    /// its FULL clustered shape (no degraded flags) and now also reports
+    /// event-loop liveness.
+    #[test]
+    fn status_reports_full_cluster_shape_when_locks_free() {
+        use crate::cluster::coordinator::new_test_running_cluster;
+
+        let table = ShardTable::compute(&[NodeId(1), NodeId(2)], 1);
+        let cluster = Arc::new(new_test_running_cluster(
+            NodeId(1),
+            table,
+            &[(NodeId(2), "127.0.0.1:19099".parse().unwrap())],
+            &[NodeId(1), NodeId(2)],
+            &[],
+            &[],
+            &[],
+            2,
+        ));
+        let state = build_ready_test_state(true, Some(cluster));
+
+        let status = build_status_json(&state);
+        let obj = status.as_object().expect("/status must be an object");
+        assert!(
+            !obj.contains_key("status_degraded"),
+            "healthy path must not carry the degraded marker"
+        );
+        assert!(status["cluster_size"].as_u64().is_some());
+        assert!(status["master_shard_count"].as_u64().is_some());
+        assert!(status["target_master_shard_count"].as_u64().is_some());
+        assert!(status["pending_handoff_shards"].as_u64().is_some());
+        assert_eq!(status["active_migrations"].as_u64(), Some(0));
+        // Event-loop liveness readout (test fixture heartbeat: stamped once
+        // at construction with the Startup tag, never advanced).
+        assert_eq!(status["event_loop"]["phase"].as_str(), Some("startup"));
+        assert!(status["event_loop"]["last_beat_age_ms"].as_u64().is_some());
+    }
+
+    /// Task #75: a wedged shard table (write-hold — the prime suspect for
+    /// the CI node-wedge) must degrade `/status` within the lock budget
+    /// instead of hanging the HTTP server. The degraded payload must (a)
+    /// finger WHICH lock was unacquirable, (b) omit every convergence field
+    /// the harness gates read — `as_u64()` must yield `None`, which the
+    /// wait helpers parse as gate-holding (`unwrap_or(0)` target=0), never
+    /// as converged — and (c) still serve the always-available diagnostics.
+    #[test]
+    fn status_degrades_instead_of_blocking_when_shard_table_write_held() {
+        use crate::cluster::coordinator::new_test_running_cluster;
+        use std::time::Instant;
+
+        let table = ShardTable::compute(&[NodeId(1), NodeId(2)], 1);
+        let cluster = Arc::new(new_test_running_cluster(
+            NodeId(1),
+            table,
+            &[(NodeId(2), "127.0.0.1:19098".parse().unwrap())],
+            &[NodeId(1), NodeId(2)],
+            &[],
+            &[],
+            &[],
+            2,
+        ));
+        let state = build_ready_test_state(true, Some(cluster.clone()));
+
+        let table_lock = cluster.shard_table();
+        let write_guard = table_lock.write();
+        let started = Instant::now();
+        let status = build_status_json(&state);
+        let elapsed = started.elapsed();
+        drop(write_guard);
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "degraded /status must answer within the lock budgets, took {elapsed:?}"
+        );
+
+        // (a) the fingerprint names the held lock — and ONLY that lock.
+        assert_eq!(status["status_degraded"].as_bool(), Some(true));
+        assert_eq!(status["table_lock_unavailable"].as_bool(), Some(true));
+        assert_eq!(status["migration_lock_unavailable"].as_bool(), Some(false));
+        assert_eq!(status["addrs_lock_unavailable"].as_bool(), Some(false));
+
+        // (b) no convergence field parses as positive gate evidence.
+        assert!(status["cluster_size"].as_u64().is_none());
+        assert!(status["master_shard_count"].as_u64().is_none());
+        assert!(status["replica_shard_count"].as_u64().is_none());
+        assert!(status["target_master_shard_count"].as_u64().is_none());
+        assert!(status["target_replica_shard_count"].as_u64().is_none());
+        assert!(status["pending_handoff_shards"].as_u64().is_none());
+        assert!(status["committed_members"].as_array().is_none());
+
+        // (c) never-blocking diagnostics still served.
+        assert!(status["node_id"].as_u64().is_some());
+        assert!(status["shard_table_version"].as_u64().is_some());
+        assert!(status["topology_term"].as_u64().is_some());
+        assert!(status["records"]["total"].as_u64().is_some());
+        assert_eq!(status["ready"].as_bool(), Some(true));
+        assert!(status["event_loop"]["last_beat_age_ms"].as_u64().is_some());
+        assert!(status["event_loop"]["phase"].as_str().is_some());
+    }
+
+    /// Task #75: the `?master_shards=1` opt-in must also stay bounded — on
+    /// a held shard table the field is simply ABSENT (the harness W4
+    /// diagnostic counts the node as "unfetched", never as an empty master
+    /// set) while the response itself still answers 200 with the degraded
+    /// marker.
+    ///
+    /// `await_holding_lock` is allowed deliberately: holding the shard-table
+    /// WRITE guard across the handler call IS the wedge under test, and the
+    /// handler only ever `try_read_for`s the same lock (bounded, same-thread
+    /// safe — parking_lot's timed try fails instead of self-deadlocking), so
+    /// the await can never park on this guard.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn status_omits_master_shards_when_table_lock_held() {
+        use crate::cluster::coordinator::new_test_running_cluster;
+
+        let table = ShardTable::compute(&[NodeId(1)], 1);
+        let cluster = Arc::new(new_test_running_cluster(
+            NodeId(1),
+            table,
+            &[],
+            &[NodeId(1)],
+            &[],
+            &[],
+            &[],
+            1,
+        ));
+        let state = build_ready_test_state(true, Some(cluster.clone()));
+
+        // Healthy: the opt-in field is present and names every shard the
+        // single node masters.
+        let resp = handle_status(
+            RawQuery(Some("master_shards=1".to_string())),
+            State(state.clone()),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let masters = json["master_shards"]
+            .as_array()
+            .expect("healthy /status?master_shards=1 must include the list");
+        assert_eq!(masters.len(), NUM_SHARDS, "single node masters every shard");
+
+        // Wedged: still 200, degraded marker set, opt-in field absent.
+        let table_lock = cluster.shard_table();
+        let write_guard = table_lock.write();
+        let resp = handle_status(RawQuery(Some("master_shards=1".to_string())), State(state))
+            .await
+            .into_response();
+        drop(write_guard);
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["status_degraded"].as_bool(), Some(true));
+        assert!(json["master_shards"].as_array().is_none());
     }
 
     /// Parse a labeled Prometheus counter line of the form
