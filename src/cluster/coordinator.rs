@@ -25794,7 +25794,6 @@ mod tests {
     /// it. No forced pass needed (and none armed).
     #[test]
     fn master_terminal_abort_does_not_signal_resync() {
-        use crate::cluster::shards::ShardHandoff;
         let old_members = vec![NodeId(1), NodeId(2), NodeId(3)];
         let new_members = vec![NodeId(1), NodeId(2), NodeId(3), NodeId(4)];
         let mut table = ShardTable::compute_with_epoch(&old_members, 2, 1, 1);
