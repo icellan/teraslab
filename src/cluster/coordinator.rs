@@ -3056,6 +3056,10 @@ impl ClusterCoordinator {
             // the sweep flag: default-mode runs have no event repair, so
             // this re-drive is their only settled-cluster retry path.
             let mut failed_batch_redrive = FailedBatchRedrive::new();
+            // GAP 2 (armed scenario 17) — last time the exchange-completion
+            // consumer fired an event-driven orphan-cleanup pass
+            // (`event_orphan_cleanup_fire` rate-limits the cadence).
+            let mut last_event_orphan_cleanup: Option<std::time::Instant> = None;
             while !shutdown.load(Ordering::Relaxed) {
                 // Task #75 — heartbeat: every iteration passes here. The
                 // phase stamps below (one per loop section) refresh the
@@ -4574,6 +4578,37 @@ impl ClusterCoordinator {
                     // timer for nothing.
                     if !partition_view.is_empty() {
                         event_repair_trigger.observe(std::time::Instant::now(), term);
+                        // GAP 2 (armed scenario 17) — drive orphan cleanup
+                        // from the exchange-completion event, alongside the
+                        // repair arm above. `run_orphan_cleanup` used to run
+                        // only from batch-completion sites, so once the
+                        // cluster settled nothing ever re-evaluated and a
+                        // third copy whose committed-handoff evidence
+                        // postdated the last batch stayed forever (242
+                        // records at 3 holders under RF=2). Rate-limited
+                        // (~60s) and spawned off the loop; the pass reads
+                        // the CURRENT table version at run time and carries
+                        // its own epoch/task/#28 guards, so racing the
+                        // activation below at worst no-ops until the next
+                        // exchange completion.
+                        if event_orphan_cleanup_fire(
+                            &mut last_event_orphan_cleanup,
+                            std::time::Instant::now(),
+                        ) {
+                            let cleanup_engine = engine.clone();
+                            let cleanup_st = shard_table.clone();
+                            let cleanup_mig = migration.clone();
+                            std::thread::spawn(move || {
+                                let epoch = cleanup_st.read().version;
+                                run_orphan_cleanup(
+                                    self_id,
+                                    &cleanup_engine,
+                                    &cleanup_st,
+                                    &cleanup_mig,
+                                    epoch,
+                                );
+                            });
+                        }
                     }
                     // §9 Q3 — prompt re-election. The fresh view may
                     // contradict the committed assignment (the canonical
@@ -10438,6 +10473,33 @@ fn run_migration_batch(
     (c, f)
 }
 
+/// GAP 2 (armed scenario 17) — minimum interval between EVENT-DRIVEN orphan-
+/// cleanup passes fired from the exchange-completion consumer. Exchange
+/// completions can arrive in bursts (commit-signal + prompt re-heal arms
+/// racing per term); the cleanup pass scans every shard, so it is
+/// rate-limited to one per interval — a settled cluster still converges to
+/// exactly RF within one exchange completion, which is the contract.
+const EVENT_ORPHAN_CLEANUP_MIN_INTERVAL: Duration = Duration::from_secs(60);
+
+/// GAP 2 — the rate-limit gate for the event-driven orphan-cleanup pass.
+///
+/// Returns `true` (and stamps `last_fired`) when no pass has fired yet or
+/// the previous one is at least [`EVENT_ORPHAN_CLEANUP_MIN_INTERVAL`] old;
+/// `false` refuses without consuming anything — the next exchange completion
+/// after the interval fires normally. Pure so the cadence is unit-testable.
+fn event_orphan_cleanup_fire(
+    last_fired: &mut Option<std::time::Instant>,
+    now: std::time::Instant,
+) -> bool {
+    if let Some(at) = *last_fired
+        && now.duration_since(at) < EVENT_ORPHAN_CLEANUP_MIN_INTERVAL
+    {
+        return false;
+    }
+    *last_fired = Some(now);
+    true
+}
+
 /// Delete records for shards this node no longer owns after migration.
 ///
 /// After outbound migrations complete, some records remain on the source
@@ -10477,6 +10539,11 @@ fn run_orphan_cleanup(
     }
 
     let mut orphaned_shards: Vec<u16> = Vec::new();
+    // GAP 2 — census of non-owned shards this pass RETAINS because the #28
+    // committed-handoff evidence is missing. When epoch churn stripped the
+    // evidence permanently, the guard (correctly, fail-closed) never passes;
+    // the gauge makes that census gap visible instead of silent.
+    let mut retained_no_evidence = 0u32;
     {
         let table = shard_table.read();
         let mgr = migration.lock();
@@ -10510,6 +10577,7 @@ fn run_orphan_cleanup(
             // copy. Delete only with positive evidence the data is safe
             // elsewhere: a committed handoff of this shard from this node.
             if !mgr.has_committed_handoff(shard, topology_epoch) {
+                retained_no_evidence = retained_no_evidence.saturating_add(1);
                 debug_shard_log(
                     shard,
                     format!(
@@ -10534,6 +10602,22 @@ fn run_orphan_cleanup(
             );
             orphaned_shards.push(shard);
         }
+    }
+
+    // GAP 2 — publish the retained-without-evidence census for THIS pass
+    // (including zero, so a reclaimed shard leaves the gauge). Stored before
+    // the empty-early-return: a pass that retains everything still reports.
+    if let Some(m) = crate::metrics::migration_metrics() {
+        m.orphan_cleanup_retained_no_evidence
+            .store(retained_no_evidence, Ordering::Relaxed);
+    }
+    if retained_no_evidence > 0 {
+        tracing::warn!(
+            shards = retained_no_evidence,
+            "cluster: orphan cleanup RETAINED non-owned shard(s) without \
+             committed-handoff evidence (fail-closed, #28) — census gap is \
+             gauged as teraslab_orphan_cleanup_retained_no_evidence",
+        );
     }
 
     if orphaned_shards.is_empty() {
@@ -20608,6 +20692,143 @@ mod tests {
             engine.shard_record_count(shard),
             0,
             "run_orphan_cleanup must reclaim a non-owned shard after a committed handoff",
+        );
+    }
+
+    /// GAP 2 (armed scenario 17: 242 records stuck at 3 holders) — the
+    /// event-driven orphan-cleanup pass. `run_orphan_cleanup` used to be
+    /// invoked only from batch-completion sites; once the cluster settled,
+    /// nothing ever re-evaluated, so a third copy whose committed-handoff
+    /// evidence arrived AFTER the last batch stayed forever. The
+    /// exchange-completion consumer now drives a rate-limited pass: one
+    /// exchange completion with evidence present reclaims the shard to RF.
+    #[test]
+    fn event_orphan_cleanup_pass_reclaims_settled_shard_to_rf() {
+        let old_table =
+            ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2), NodeId(3)], 2, 10, 1);
+        let new_table = ShardTable::compute_with_epoch(&[NodeId(2), NodeId(3)], 2, 11, 1);
+        let shard = (0..NUM_SHARDS as u16)
+            .find(|&s| {
+                let old = old_table.target_assignment(s);
+                let new = new_table.target_assignment(s);
+                (old.master == NodeId(1) || old.replicas.contains(&NodeId(1)))
+                    && new.master != NodeId(1)
+                    && !new.replicas.contains(&NodeId(1))
+            })
+            .expect("node1 should hold a shard it no longer owns after removal");
+        let engine = Arc::new(test_engine());
+        let key = tx_key_for_shard(shard, 51);
+        create_test_record(&engine, key);
+        assert_eq!(engine.shard_record_count(shard), 1, "the stale third copy");
+
+        let shard_table = Arc::new(ShardTableLock::new(new_table.clone()));
+        let migration = Arc::new(Mutex::new(MigrationManager::new()));
+        // Evidence present, cluster settled, NO further batch completion will
+        // ever run — only the event-driven pass can reclaim.
+        migration
+            .lock()
+            .record_committed_handoff(shard, new_table.version);
+
+        let mut last_fired: Option<std::time::Instant> = None;
+        let now = std::time::Instant::now();
+        assert!(
+            event_orphan_cleanup_fire(&mut last_fired, now),
+            "the first exchange completion must fire the pass",
+        );
+        run_orphan_cleanup(
+            NodeId(1),
+            &engine,
+            &shard_table,
+            &migration,
+            new_table.version,
+        );
+        assert_eq!(
+            engine.shard_record_count(shard),
+            0,
+            "one event-driven pass must reclaim the settled shard to RF",
+        );
+
+        // Rate limit: a second exchange completion inside the min interval
+        // must NOT fire another pass; after the interval it fires again.
+        assert!(
+            !event_orphan_cleanup_fire(&mut last_fired, now + Duration::from_secs(5)),
+            "a pass within the min interval is refused",
+        );
+        assert!(
+            event_orphan_cleanup_fire(
+                &mut last_fired,
+                now + EVENT_ORPHAN_CLEANUP_MIN_INTERVAL + Duration::from_secs(1),
+            ),
+            "after the min interval the next exchange completion fires again",
+        );
+    }
+
+    /// GAP 2 — the fail-closed #28 guard stays untouched: a non-owned shard
+    /// with PERMANENTLY missing handoff evidence is retained — but it must be
+    /// COUNTED in `teraslab_orphan_cleanup_retained_no_evidence` so the
+    /// census gap is visible, and the gauge must drop back once evidence
+    /// arrives and the copy is reclaimed.
+    #[test]
+    fn orphan_cleanup_counts_retained_no_evidence_shards() {
+        let _guard = migration_metrics_test_guard();
+        let metrics = install_test_migration_metrics();
+        let old_table =
+            ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2), NodeId(3)], 2, 10, 1);
+        let new_table = ShardTable::compute_with_epoch(&[NodeId(2), NodeId(3)], 2, 11, 1);
+        let shard = (0..NUM_SHARDS as u16)
+            .find(|&s| {
+                let old = old_table.target_assignment(s);
+                let new = new_table.target_assignment(s);
+                (old.master == NodeId(1) || old.replicas.contains(&NodeId(1)))
+                    && new.master != NodeId(1)
+                    && !new.replicas.contains(&NodeId(1))
+            })
+            .expect("node1 should hold a shard it no longer owns after removal");
+        let engine = Arc::new(test_engine());
+        let key = tx_key_for_shard(shard, 52);
+        create_test_record(&engine, key);
+
+        let shard_table = Arc::new(ShardTableLock::new(new_table.clone()));
+        let migration = Arc::new(Mutex::new(MigrationManager::new()));
+        metrics
+            .orphan_cleanup_retained_no_evidence
+            .store(0, Ordering::Relaxed);
+
+        // Evidence missing → retained AND counted.
+        run_orphan_cleanup(
+            NodeId(1),
+            &engine,
+            &shard_table,
+            &migration,
+            new_table.version,
+        );
+        assert_eq!(engine.shard_record_count(shard), 1, "fail-closed: retained");
+        assert_eq!(
+            metrics
+                .orphan_cleanup_retained_no_evidence
+                .load(Ordering::Relaxed),
+            1,
+            "the retained-without-evidence shard must be visible in the gauge",
+        );
+
+        // Evidence arrives → reclaimed, gauge drops to zero.
+        migration
+            .lock()
+            .record_committed_handoff(shard, new_table.version);
+        run_orphan_cleanup(
+            NodeId(1),
+            &engine,
+            &shard_table,
+            &migration,
+            new_table.version,
+        );
+        assert_eq!(engine.shard_record_count(shard), 0);
+        assert_eq!(
+            metrics
+                .orphan_cleanup_retained_no_evidence
+                .load(Ordering::Relaxed),
+            0,
+            "a reclaimed shard leaves the retained census",
         );
     }
 

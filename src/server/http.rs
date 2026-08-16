@@ -1474,6 +1474,11 @@ pub(crate) fn render_metrics_text(
             "teraslab_migration_completion_manifest_reduced_vetoed_total",
             mm.migration_completion_manifest_reduced_vetoed.get(),
         );
+        prom_gauge(
+            &mut out,
+            "teraslab_orphan_cleanup_retained_no_evidence",
+            mm.orphan_cleanup_retained_no_evidence.load(Ordering::Relaxed) as u64,
+        );
     }
     if let Some(sw) = swim_metrics() {
         prom_counter(
@@ -5303,6 +5308,7 @@ mod tests {
             "teraslab_migration_phase_serving_new",
             "teraslab_under_replication_event_repairs_total",
             "teraslab_migration_completion_manifest_reduced_vetoed_total",
+            "teraslab_orphan_cleanup_retained_no_evidence",
             "teraslab_swim_probes_sent_total",
             "teraslab_swim_probe_timeouts_total",
             "teraslab_swim_indirect_probes_total",
