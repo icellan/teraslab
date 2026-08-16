@@ -251,12 +251,18 @@ pub async fn wait_cluster_ready(
                     let fmt = |v: Option<u64>| {
                         v.map(|v| v.to_string()).unwrap_or_else(|| "?".to_string())
                     };
-                    node_states.push(format!(
-                        "node{i}:size={},ver={},masters={}",
-                        fmt(size),
-                        fmt(ver),
-                        fmt(masters)
-                    ));
+                    // Task #75 — a degraded answer omits size/masters; name
+                    // the wedge instead of rendering a misleading "?" row.
+                    if let Some(marker) = status_degraded_marker(&json) {
+                        node_states.push(format!("node{i}:{marker}"));
+                    } else {
+                        node_states.push(format!(
+                            "node{i}:size={},ver={},masters={}",
+                            fmt(size),
+                            fmt(ver),
+                            fmt(masters)
+                        ));
+                    }
                 }
                 Err(_) => node_states.push(format!("node{i}:UNREACHABLE")),
             }
@@ -530,6 +536,10 @@ pub async fn wait_specific_migrations_complete(
                         "node{n}:size={cluster_size},ver={shard_table_version},term={topology_term},masters={m},handoff={pending_handoffs},mig={},inbound={inbound_pending}",
                         active_count.unwrap_or(0),
                     ));
+                } else if let Some(marker) = status_degraded_marker(&json) {
+                    // Task #75 — a degraded answer omits the master count;
+                    // name the wedge instead of silently skipping the node.
+                    status_details.push(format!("node{n}:{marker}"));
                 }
             } else {
                 status_details.push(format!(
@@ -566,6 +576,41 @@ pub async fn wait_specific_migrations_complete(
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+}
+
+/// Task #75 — compact marker for a DEGRADED `/status` answer (the server
+/// timed out on a coordinator lock and served the reduced payload).
+///
+/// A degraded payload omits `cluster_size` and every shard-count field, so
+/// without this marker the detail lines above render it as the misleading
+/// `size=0,...,m=0,target=0`. The marker names WHICH locks were
+/// unacquirable (`T`=shard_table, `M`=migration, `A`=node_addrs; `-` =
+/// free) plus the server-reported event-loop heartbeat silence, so a CI
+/// timeout message carries the wedge fingerprint directly.
+///
+/// Gate semantics are unchanged: the degraded payload still parses as
+/// answering-but-not-converged (missing `cluster_size` -> not ready;
+/// missing `target_master_shard_count` -> target=0 -> activation gate
+/// holds). This helper is display-only.
+fn status_degraded_marker(json: &serde_json::Value) -> Option<String> {
+    if json["status_degraded"].as_bool() != Some(true) {
+        return None;
+    }
+    let flag = |key: &str, mark: char| {
+        if json[key].as_bool() == Some(true) {
+            mark
+        } else {
+            '-'
+        }
+    };
+    let stall_ms = json["event_loop"]["last_beat_age_ms"].as_u64().unwrap_or(0);
+    Some(format!(
+        "DEGRADED(locks={}{}{},loop_stall={}ms)",
+        flag("table_lock_unavailable", 'T'),
+        flag("migration_lock_unavailable", 'M'),
+        flag("addrs_lock_unavailable", 'A'),
+        stall_ms,
+    ))
 }
 
 /// One node's ACTIVATION-time shard view, as read from `/status`.
@@ -796,9 +841,16 @@ pub async fn wait_migrations_complete(
                 let m = json["master_shard_count"].as_u64().unwrap_or(0);
                 let target_m = json["target_master_shard_count"].as_u64().unwrap_or(0);
                 total_masters += m;
-                node_details.push(format!(
-                    "node{i}:size={cluster_size},ver={version},m={m},target={target_m}"
-                ));
+                // Task #75 — a degraded answer omits the shard counts (they
+                // parse as 0 and hold the activation gate below); name the
+                // wedge in the detail line instead of a misleading m=0 row.
+                if let Some(marker) = status_degraded_marker(&json) {
+                    node_details.push(format!("node{i}:{marker}"));
+                } else {
+                    node_details.push(format!(
+                        "node{i}:size={cluster_size},ver={version},m={m},target={target_m}"
+                    ));
+                }
                 shard_views.push(NodeShardView {
                     node: i,
                     serving_masters: m,
@@ -2964,6 +3016,47 @@ async fn wait_ports_free(first_http_port: u16, _scenario_id: u16, node_count: u3
 #[cfg(test)]
 mod migration_gate_tests {
     use super::*;
+
+    /// Task #75 — a degraded `/status` payload renders the wedge
+    /// fingerprint, and its missing shard fields keep parsing exactly like
+    /// the gate-holding zero view (never as converged).
+    #[test]
+    fn degraded_status_renders_marker_and_holds_gates() {
+        let degraded = serde_json::json!({
+            "node_id": 2,
+            "shard_table_version": 7,
+            "topology_term": 7,
+            "status_degraded": true,
+            "table_lock_unavailable": true,
+            "migration_lock_unavailable": false,
+            "addrs_lock_unavailable": false,
+            "event_loop": { "last_beat_age_ms": 45_000, "phase": "commit_drain" },
+        });
+        assert_eq!(
+            status_degraded_marker(&degraded).as_deref(),
+            Some("DEGRADED(locks=T--,loop_stall=45000ms)"),
+        );
+
+        // Gate semantics: the missing fields parse as the same
+        // (serving=0, target=0) view the activation gate already holds on.
+        assert!(degraded["cluster_size"].as_u64().is_none());
+        let serving = degraded["master_shard_count"].as_u64().unwrap_or(0);
+        let target = degraded["target_master_shard_count"].as_u64().unwrap_or(0);
+        let views = [view(2, serving, target)];
+        let reason = shard_activation_gate_reason(&views, 3)
+            .expect("a degraded node must hold the activation gate");
+        assert!(
+            reason.contains("node2 has activated no master shards"),
+            "unexpected gate reason: {reason}"
+        );
+
+        // A healthy payload gets no marker.
+        let healthy = serde_json::json!({
+            "cluster_size": 3,
+            "master_shard_count": 1366,
+        });
+        assert_eq!(status_degraded_marker(&healthy), None);
+    }
 
     fn view(node: u32, serving_masters: u64, target_masters: u64) -> NodeShardView {
         NodeShardView {

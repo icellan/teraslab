@@ -2739,6 +2739,13 @@ impl ClusterCoordinator {
         let heal_deadline = self.heal_deadline;
         let heal_deadline_action = self.heal_deadline_action;
 
+        // Task #75 — event-loop liveness heartbeat. The loop stamps it at
+        // the top of every iteration and at each loop-section entry (two
+        // relaxed stores); the watchdog thread spawned after the loop reads
+        // it and reports stalls with the last phase tag + lock fingerprint.
+        let loop_heartbeat = Arc::new(crate::cluster::watchdog::LoopHeartbeat::new());
+        let loop_heartbeat_event = loop_heartbeat.clone();
+
         // Event processing thread
         let event_handle = std::thread::spawn(move || {
             let mut last_reactivation_at = std::time::Instant::now();
@@ -2806,8 +2813,15 @@ impl ClusterCoordinator {
                 under_replication_sweep_enabled_event,
             );
             while !shutdown.load(Ordering::Relaxed) {
+                // Task #75 — heartbeat: every iteration passes here. The
+                // phase stamps below (one per loop section) refresh the
+                // timestamp as the iteration progresses, so on a wedge the
+                // LAST tag names the section the loop entered and never left.
+                loop_heartbeat_event.stamp(crate::cluster::watchdog::LoopPhase::Recv);
                 match event_rx.recv_timeout(Duration::from_millis(100)) {
                     Ok(event) => {
+                        loop_heartbeat_event
+                            .stamp(crate::cluster::watchdog::LoopPhase::HandleEvent);
                         if let ClusterEvent::MembershipChanged(members) = &event {
                             // Task #50 — membership churn (a member dying OR
                             // rejoining; both emit MembershipChanged) arms an
@@ -2883,6 +2897,8 @@ impl ClusterCoordinator {
                         }
                     }
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        loop_heartbeat_event
+                            .stamp(crate::cluster::watchdog::LoopPhase::TimeoutTick);
                         // Poll fallback proposer timeout: if we're not the
                         // deterministic proposer and the timeout has elapsed
                         // without a commit, step up as fallback proposer.
@@ -3086,6 +3102,7 @@ impl ClusterCoordinator {
                         // tick after the in-flight runs finish, instead of
                         // stacking a new pass-batch onto still-streaming
                         // ones).
+                        loop_heartbeat_event.stamp(crate::cluster::watchdog::LoopPhase::Sweep);
                         if under_replication_sweep_enabled_event
                             && last_under_replication_sweep.elapsed()
                                 >= UNDER_REPLICATION_SWEEP_INTERVAL
@@ -3195,6 +3212,8 @@ impl ClusterCoordinator {
                 // immediate). Synthesizing a MembershipChanged event reuses
                 // the unchanged propose body in `handle_event`.
                 if let Some(settled) = topology_debounce.take_due(std::time::Instant::now()) {
+                    loop_heartbeat_event
+                        .stamp(crate::cluster::watchdog::LoopPhase::DebouncePropose);
                     let settled_event = ClusterEvent::MembershipChanged(settled);
                     Self::handle_event(
                         &settled_event,
@@ -3268,6 +3287,7 @@ impl ClusterCoordinator {
                 // that sc08's failure-streak backoff stretches toward the
                 // periodic cadence while resync runs keep failing without
                 // a single completion (the harvest below feeds it).
+                loop_heartbeat_event.stamp(crate::cluster::watchdog::LoopPhase::RepairFire);
                 let (resynced_ok, resync_failed) = resync_run_outcome.harvest();
                 if resynced_ok > 0 || resync_failed > 0 {
                     event_repair_trigger.record_resync_outcome(resynced_ok, resync_failed);
@@ -3321,6 +3341,7 @@ impl ClusterCoordinator {
                 // Periodically prune completed inbound migrations so the
                 // lock-free bitmap stays compact without dropping active
                 // write fences mid-handoff.
+                loop_heartbeat_event.stamp(crate::cluster::watchdog::LoopPhase::InboundPrune);
                 {
                     let mut mgr = migration.lock();
                     mgr.cleanup_completed();
@@ -3565,6 +3586,7 @@ impl ClusterCoordinator {
                 // push-based handoff still lands. `prompt_exchange_term` debounces
                 // re-spawns while the exchange is in flight; FIX A/FIX B remain
                 // as defense-in-depth.
+                loop_heartbeat_event.stamp(crate::cluster::watchdog::LoopPhase::PromptCatchUp);
                 if !activation_held {
                     let committed_term = topo_authority_event.committed_term();
                     let active_version = shard_table.read().version;
@@ -3614,6 +3636,7 @@ impl ClusterCoordinator {
                 // 15s cooldown balances fast recovery against migration storms:
                 // short enough for Docker test scenarios, long enough to let a
                 // topology change fully settle before retrying.
+                loop_heartbeat_event.stamp(crate::cluster::watchdog::LoopPhase::Reactivation);
                 let startup_reactivation_due = startup_reactivation_event.load(Ordering::Acquire)
                     && last_activation_at.elapsed() >= Duration::from_secs(5);
                 // Single lock acquisition shared by both the normal and drain
@@ -3880,6 +3903,7 @@ impl ClusterCoordinator {
 
                 // Poll topology commit signals from dispatch or proposer threads.
                 while !activation_held && let Ok((members, term)) = topology_commit_rx.try_recv() {
+                    loop_heartbeat_event.stamp(crate::cluster::watchdog::LoopPhase::CommitDrain);
                     // G8 stage 3 — every commit this node applies (proposer's
                     // own local apply, a receiver's OP_TOPOLOGY_COMMIT, or a
                     // catch-up re-proposal/peer-fetch) signals here before
@@ -3998,6 +4022,7 @@ impl ClusterCoordinator {
                     && let Ok((members, term, partition_view, same_term_reheal)) =
                         exchange_complete_rx.try_recv()
                 {
+                    loop_heartbeat_event.stamp(crate::cluster::watchdog::LoopPhase::ExchangeDrain);
                     if same_term_reheal {
                         // Task #47 — release the single-flight slot for this
                         // term regardless of whether the result still applies.
@@ -4197,6 +4222,7 @@ impl ClusterCoordinator {
                 // they inherit Phase E dual-write protection and Phase G
                 // throttling.
                 while let Ok(req) = resync_request_rx.try_recv() {
+                    loop_heartbeat_event.stamp(crate::cluster::watchdog::LoopPhase::ResyncDrain);
                     let table = shard_table.read().clone();
                     let mut tasks = synthesize_resync_migration_tasks(&req, self_id, &table);
                     // Task #50 review P2 — drop tasks whose (target, shard)
@@ -4317,6 +4343,7 @@ impl ClusterCoordinator {
                 // (re-)push shards; honour the request only when both
                 // sides are on the same activated epoch.
                 while let Ok(req) = transfer_request_rx.try_recv() {
+                    loop_heartbeat_event.stamp(crate::cluster::watchdog::LoopPhase::TransferDrain);
                     let committed_term = topo_authority_event.committed_term();
                     let table_version = shard_table.read().version;
                     if req.epoch != committed_term || table_version != committed_term {
@@ -4509,6 +4536,7 @@ impl ClusterCoordinator {
                 // inbound entries name concrete sources. Re-fires every
                 // TRANSFER_REQUEST_INTERVAL while the condition persists,
                 // bounding retry of lost requests.
+                loop_heartbeat_event.stamp(crate::cluster::watchdog::LoopPhase::TransferRequest);
                 let transfer_request_due = last_transfer_request_at
                     .map(|at: std::time::Instant| at.elapsed() >= TRANSFER_REQUEST_INTERVAL)
                     .unwrap_or(true);
@@ -4592,6 +4620,17 @@ impl ClusterCoordinator {
             }
         });
 
+        // Task #75 — stall watchdog thread. Detached deliberately: it only
+        // reads atomics / zero-wait try-locks, and exits on its own within
+        // 250 ms of `shutdown` being set (same flag the event loop obeys).
+        drop(crate::cluster::watchdog::spawn_watchdog(
+            loop_heartbeat.clone(),
+            self.shutdown.clone(),
+            self.shard_table.clone(),
+            self.migration.clone(),
+            self.node_addrs.clone(),
+        ));
+
         RunningCluster {
             self_id,
             self_addr: self.self_addr,
@@ -4634,6 +4673,7 @@ impl ClusterCoordinator {
             drop_commit_signals: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
             dual_write_lookup_calls: AtomicU64::new(0),
+            event_loop_heartbeat: loop_heartbeat,
             _swim_handle: swim_handle,
             _event_handle: event_handle,
         }
@@ -13041,6 +13081,9 @@ pub struct RunningCluster {
     /// key. Test-only — no production overhead.
     #[cfg(test)]
     dual_write_lookup_calls: AtomicU64,
+    /// Task #75 — event-loop liveness heartbeat, stamped by the event loop
+    /// and read (atomics only) by the stall watchdog and `/status`.
+    event_loop_heartbeat: Arc<crate::cluster::watchdog::LoopHeartbeat>,
     _swim_handle: std::thread::JoinHandle<()>,
     _event_handle: std::thread::JoinHandle<()>,
 }
@@ -14106,6 +14149,26 @@ impl RunningCluster {
         self.migration.lock().active_count()
     }
 
+    /// Task #75 — bounded [`RunningCluster::active_migrations`]: waits at
+    /// most `timeout` for the migration mutex and returns `None` instead of
+    /// blocking indefinitely when a wedged holder keeps it. `/status` uses
+    /// this so a coordinator wedge degrades the payload instead of hanging
+    /// the HTTP server.
+    pub fn active_migrations_bounded(&self, timeout: Duration) -> Option<usize> {
+        self.migration
+            .try_lock_for(timeout)
+            .map(|mgr| mgr.active_count())
+    }
+
+    /// Task #75 — milliseconds since the coordinator event loop last
+    /// stamped its liveness heartbeat, plus the last
+    /// [`crate::cluster::watchdog::LoopPhase`] tag (the loop section it was
+    /// about to run). Reads two atomics — never blocks — so `/status` can
+    /// report event-loop liveness even while the loop is wedged.
+    pub fn event_loop_health(&self) -> (u64, crate::cluster::watchdog::LoopPhase) {
+        self.event_loop_heartbeat.age_and_phase()
+    }
+
     /// Encode the partition map for client consumption.
     pub fn encode_partition_map(&self) -> Vec<u8> {
         let table = self.shard_table.read();
@@ -14311,8 +14374,28 @@ impl RunningCluster {
     /// count a peer it can no longer reach toward "I still have quorum" during
     /// the suspicion-timeout window — closing a dual-master write window.
     pub fn alive_node_count(&self) -> usize {
+        self.alive_node_count_with(&self.node_addrs.read())
+    }
+
+    /// Task #75 — bounded [`RunningCluster::alive_node_count`]: waits at
+    /// most `timeout` for the `node_addrs` read lock and returns `None`
+    /// instead of blocking indefinitely when a wedged writer keeps it.
+    /// `/status` uses this so a coordinator wedge degrades the payload
+    /// instead of hanging the HTTP server.
+    pub fn alive_node_count_bounded(&self, timeout: Duration) -> Option<usize> {
+        let addrs = self.node_addrs.try_read_for(timeout)?;
+        Some(self.alive_node_count_with(&addrs))
+    }
+
+    /// [`RunningCluster::alive_node_count`] body against an
+    /// already-acquired `node_addrs` view (see the doc comment above for
+    /// the counting rules — this split only decouples the lock
+    /// acquisition so the bounded variant can share the logic).
+    fn alive_node_count_with(
+        &self,
+        addrs: &std::collections::HashMap<NodeId, SocketAddr>,
+    ) -> usize {
         let committed = self.topology_authority.committed_members();
-        let addrs = self.node_addrs.read();
         if committed.is_empty() {
             // Falling back to SWIM addrs during single-node startup.
             // R-039 (EF-02): the local node always counts as alive
@@ -15492,6 +15575,7 @@ pub(crate) fn new_test_running_cluster(
         drop_commit_signals: Arc::new(AtomicBool::new(false)),
         #[cfg(test)]
         dual_write_lookup_calls: AtomicU64::new(0),
+        event_loop_heartbeat: Arc::new(crate::cluster::watchdog::LoopHeartbeat::new()),
         _swim_handle: std::thread::spawn(|| {}),
         _event_handle: std::thread::spawn(|| {}),
     }
