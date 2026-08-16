@@ -1118,6 +1118,85 @@ impl MigrationManager {
         reparked
     }
 
+    /// GAP 3a (armed scenario 07) — RE-PARK plain (non-heal) pending/LOST
+    /// inbound entries whose source has LEFT the committed membership.
+    ///
+    /// The #74 heal sibling ([`Self::repark_dead_source_heals`]) re-sources
+    /// only `heal_pending` entries; a PLAIN forward entry pinned to a removed
+    /// node was left behind forever: the transfer requester kept asking a
+    /// node with no address ("no address for transfer-request source"), and
+    /// [`Self::mark_inbound_complete_from_source`] could never match a
+    /// completion — the shard stayed fenced/LOST with no repair path
+    /// (observed: 370-487 LOST inbound entries with `from_node = 4` after
+    /// node 4's removal). Each such entry's source is restored to the plain
+    /// `NodeId(0)` sentinel — fence kept, `heal_pending` kept CLEAR, `lost`
+    /// kept AS-IS (kind discrimination: the persisted flag byte's bit0/bit1
+    /// survive unchanged) — which makes the entry completable by whichever
+    /// source actually streams the shard (the under-replication resync from
+    /// the committed master; see the source-less-sentinel branch of
+    /// `mark_inbound_complete_from_source`).
+    ///
+    /// Departure is judged against the COMMITTED membership, not the
+    /// SWIM-alive set: a merely-dead member may rejoin with its identity and
+    /// complete its own entries, while a node removed from membership never
+    /// can — its entries are terminally unpullable. There is deliberately no
+    /// request-grace exclusion (unlike the heal sibling): a request in flight
+    /// toward a departed node cannot be honoured. An EMPTY membership set
+    /// re-parks nothing — absence of membership evidence is not evidence of
+    /// departure. Duplicate plain sentinels for one shard are collapsed to
+    /// one, keeping the most conservative kind (`lost` if ANY duplicate was
+    /// lost). Heal entries and already-parked sentinels are never touched.
+    /// Returns the number of entries re-parked.
+    pub fn repark_departed_source_inbound(
+        &mut self,
+        committed_members: &std::collections::HashSet<NodeId>,
+    ) -> usize {
+        if committed_members.is_empty() {
+            return 0;
+        }
+        let mut reparked = 0usize;
+        for m in self.inbound_migrations.iter_mut() {
+            if m.completed || m.heal_pending || m.from_node == NodeId(0) {
+                continue;
+            }
+            if committed_members.contains(&m.from_node) {
+                continue;
+            }
+            m.from_node = NodeId(0);
+            m.transfer_requested_at = None;
+            reparked += 1;
+        }
+        if reparked > 0 {
+            // Collapse duplicate plain sentinels per shard, keeping the
+            // FIRST but folding the dropped duplicates' `lost` marks into it
+            // (fail-closed: LOST if any duplicate was LOST).
+            let mut lost_by_shard: std::collections::HashSet<u16> =
+                std::collections::HashSet::new();
+            for m in &self.inbound_migrations {
+                if !m.completed && !m.heal_pending && m.from_node == NodeId(0) && m.lost {
+                    lost_by_shard.insert(m.shard);
+                }
+            }
+            let mut seen: std::collections::HashSet<u16> = std::collections::HashSet::new();
+            self.inbound_migrations.retain(|m| {
+                if m.completed || m.heal_pending || m.from_node != NodeId(0) {
+                    return true;
+                }
+                seen.insert(m.shard)
+            });
+            for m in self.inbound_migrations.iter_mut() {
+                if !m.completed
+                    && !m.heal_pending
+                    && m.from_node == NodeId(0)
+                    && lost_by_shard.contains(&m.shard)
+                {
+                    m.lost = true;
+                }
+            }
+        }
+        reparked
+    }
+
     /// Reverse-heal completion drop-awareness — is there an ACTIVE (uncompleted)
     /// `heal_pending` inbound entry for `shard` sourced from exactly `from_node`?
     ///
@@ -3252,6 +3331,116 @@ mod tests {
             1,
             "exactly one parked sentinel remains for the twice-failed shard",
         );
+    }
+
+    /// GAP 3a (armed scenario 07) — a PLAIN (non-heal) pending or LOST
+    /// inbound entry whose source has LEFT the committed membership is
+    /// re-parked to the `NodeId(0)` sentinel: the transfer requester stops
+    /// asking a node that no longer exists ("no address for transfer-request
+    /// source" forever), and the sentinel entry is completable by whichever
+    /// source actually streams the shard (the under-replication resync from
+    /// the committed master). Kind discrimination is preserved: `lost` stays
+    /// as it was, `heal_pending` stays clear, and heal entries are never
+    /// touched (the #74 heal sibling owns those).
+    #[test]
+    fn repark_departed_source_inbound_reparks_plain_and_lost_entries() {
+        let mut mgr = MigrationManager::new();
+        let departed = NodeId(4);
+        let member = NodeId(2);
+        assert!(mgr.register_inbound_source(5, departed)); // plain pending
+        assert!(mgr.register_inbound_source(6, member)); // member source
+        assert!(mgr.register_heal_source(7, departed)); // heal entry (not ours)
+        assert!(mgr.register_inbound_source(8, departed)); // will be LOST
+        mgr.mark_inbound_lost(&[8u16].into_iter().collect());
+        assert!(mgr.is_shard_lost(8), "precondition: entry 8 is LOST");
+
+        let committed: std::collections::HashSet<NodeId> =
+            [NodeId(1), member, NodeId(3)].into_iter().collect();
+        assert_eq!(
+            mgr.repark_departed_source_inbound(&committed),
+            2,
+            "exactly the two plain entries with the departed source re-park",
+        );
+
+        // Re-parked to the plain sentinel; the member-sourced entry and the
+        // heal entry are untouched.
+        assert!(mgr.pending_inbound_entries().contains(&(5, NodeId(0))));
+        assert!(mgr.pending_inbound_entries().contains(&(8, NodeId(0))));
+        assert!(mgr.pending_inbound_entries().contains(&(6, member)));
+        assert!(
+            mgr.has_pending_heal_from_source(7, departed),
+            "heal entries belong to repark_dead_source_heals, not this pass",
+        );
+
+        // Kind discrimination preserved.
+        assert!(
+            !mgr.is_shard_lost(5),
+            "a plain pending entry stays non-lost across the re-park",
+        );
+        assert!(
+            mgr.is_shard_lost(8),
+            "the LOST fence-until-proven posture survives the re-park",
+        );
+        assert!(
+            mgr.parked_no_source_heal_shards().is_empty(),
+            "plain re-parked sentinels are NOT heal parks (and 7's heal \
+             entry still has its concrete source)",
+        );
+
+        // Fences stay up: the shards are still unproven.
+        assert!(mgr.inbound_bitmap().test(5));
+        assert!(mgr.inbound_bitmap().test(8));
+
+        // The point of the re-park: whichever source actually streams the
+        // shard (the committed master's resync) can complete the plain
+        // sentinel and clear the fence — the departed pin could never
+        // complete.
+        mgr.mark_inbound_complete_from_source(5, NodeId(3));
+        assert!(!mgr.has_pending_inbound(5), "resync completion clears 5");
+        mgr.mark_inbound_complete_from_source(8, member);
+        assert!(!mgr.has_pending_inbound(8), "resync completion clears 8");
+        assert!(!mgr.is_shard_lost(8), "completion drops the lost predicate");
+
+        // Idempotent: a second pass finds nothing left to re-park.
+        assert_eq!(mgr.repark_departed_source_inbound(&committed), 0);
+    }
+
+    /// GAP 3a — duplicate plain entries for one shard (two departed sources)
+    /// collapse to a single sentinel, and the collapsed sentinel keeps the
+    /// most conservative kind: LOST if ANY collapsed duplicate was LOST.
+    #[test]
+    fn repark_departed_source_inbound_collapses_duplicates_keeping_lost() {
+        let mut mgr = MigrationManager::new();
+        assert!(mgr.register_inbound_source(9, NodeId(4)));
+        assert!(mgr.register_inbound_source(9, NodeId(5)));
+        // Only mark ONE of them LOST is not possible per-entry (mark is
+        // per-shard), so mark the shard: both entries carry lost.
+        mgr.mark_inbound_lost(&[9u16].into_iter().collect());
+
+        let committed: std::collections::HashSet<NodeId> =
+            [NodeId(1), NodeId(2)].into_iter().collect();
+        assert_eq!(mgr.repark_departed_source_inbound(&committed), 2);
+        assert_eq!(
+            mgr.pending_inbound_entries(),
+            vec![(9, NodeId(0))],
+            "duplicate plain sentinels for one shard collapse to one",
+        );
+        assert!(mgr.is_shard_lost(9), "the collapsed sentinel stays LOST");
+        assert!(mgr.inbound_bitmap().test(9), "the fence stays up");
+    }
+
+    /// GAP 3a — an empty committed-membership set (formation / no committed
+    /// term yet) re-parks NOTHING: absence of membership evidence is not
+    /// evidence of departure.
+    #[test]
+    fn repark_departed_source_inbound_noops_on_empty_membership() {
+        let mut mgr = MigrationManager::new();
+        assert!(mgr.register_inbound_source(3, NodeId(4)));
+        assert_eq!(
+            mgr.repark_departed_source_inbound(&std::collections::HashSet::new()),
+            0,
+        );
+        assert_eq!(mgr.pending_inbound_entries(), vec![(3, NodeId(4))]);
     }
 
     /// #74 defensive — if a CONCRETE uncompleted entry for `(shard, source)`

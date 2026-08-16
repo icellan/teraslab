@@ -3846,6 +3846,30 @@ impl ClusterCoordinator {
                                      re-runs on the re-heal cadence (#74)",
                                 );
                             }
+                            // GAP 3a (armed scenario 07) — the PLAIN-entry
+                            // sibling of the heal re-park above: a pending or
+                            // LOST forward inbound entry pinned to a source
+                            // that has LEFT the committed membership can never
+                            // complete from it ("no address for
+                            // transfer-request source" forever). Re-park it to
+                            // the plain NodeId(0) sentinel — fence kept, kinds
+                            // kept — so the committed master's
+                            // under-replication resync can complete it.
+                            let committed_member_set: std::collections::HashSet<NodeId> =
+                                topo_authority_event.committed_members().into_iter().collect();
+                            let departed_reparked =
+                                mgr.repark_departed_source_inbound(&committed_member_set);
+                            if departed_reparked > 0 {
+                                if let Some(ref path) = inbound_state_path_event {
+                                    crate::cluster::migration::persist_inbound_state(path, &mgr);
+                                }
+                                tracing::warn!(
+                                    reparked = departed_reparked,
+                                    "cluster: re-PARKED plain inbound entr(ies) whose source \
+                                     left the committed membership — shard(s) stay fenced; \
+                                     the committed master's resync re-acquires them",
+                                );
+                            }
                             mgr.mark_inbound_lost(&orphaned_shards)
                         } else {
                             mgr.clear_stale_inbound(Duration::from_secs(30))
