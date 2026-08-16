@@ -14512,15 +14512,29 @@ impl MasterSnapshot {
 }
 
 impl RunningCluster {
+    /// The master to route/advertise for `shard`: the EFFECTIVE (serving)
+    /// master while a handoff is in flight and that master is alive,
+    /// otherwise the target.
+    ///
+    /// The `effective == self_id` arm is defensive hardening: self is
+    /// trivially alive — a node answering a routing query does not need the
+    /// address book's opinion of itself. `live_nodes` is the peer address
+    /// book (`node_addrs`); self is seeded into it at construction and no
+    /// known production path removes it today, but were self ever absent (a
+    /// future removal path, a rebuilt map), a serving effective master
+    /// consulting only the map would deny its own mastership mid-handoff
+    /// and bounce clients to the not-yet-authoritative target. The arm
+    /// makes self-liveness structural instead of an address-book invariant.
     fn preferred_master_for_shard(
         table: &ShardTable,
+        self_id: NodeId,
         live_nodes: &std::collections::HashMap<NodeId, SocketAddr>,
         shard: u16,
     ) -> NodeId {
         let effective = table.effective_assignment(shard).master;
         let target = table.target_assignment(shard).master;
 
-        if effective != target && live_nodes.contains_key(&effective) {
+        if effective != target && (effective == self_id || live_nodes.contains_key(&effective)) {
             effective
         } else {
             target
@@ -14534,7 +14548,7 @@ impl RunningCluster {
             return NodeId(0);
         }
         let addrs = self.node_addrs.read();
-        Self::preferred_master_for_shard(&table, &addrs, shard)
+        Self::preferred_master_for_shard(&table, self.self_id, &addrs, shard)
     }
 
     /// This node's ID.
@@ -14769,7 +14783,7 @@ impl RunningCluster {
         }
         let addrs = self.node_addrs.read();
         let masters = (0..NUM_SHARDS as u16)
-            .map(|shard| Self::preferred_master_for_shard(&table, &addrs, shard))
+            .map(|shard| Self::preferred_master_for_shard(&table, self.self_id, &addrs, shard))
             .collect();
         MasterSnapshot { masters, version }
     }
@@ -14905,7 +14919,7 @@ impl RunningCluster {
         }
         let version = table.version;
         let addrs = self.node_addrs.read();
-        let master = Self::preferred_master_for_shard(&table, &addrs, shard);
+        let master = Self::preferred_master_for_shard(&table, self.self_id, &addrs, shard);
 
         if master == self.self_id {
             RouteDecision::HandleLocally
@@ -15566,7 +15580,7 @@ impl RunningCluster {
         // route()/is_master() so clients and servers agree. If the old master
         // is gone, fall back to the target assignment immediately.
         for shard in 0..crate::cluster::shards::NUM_SHARDS as u16 {
-            let master = Self::preferred_master_for_shard(&table, &addrs, shard);
+            let master = Self::preferred_master_for_shard(&table, self.self_id, &addrs, shard);
             buf.extend_from_slice(&master.0.to_le_bytes());
         }
 
@@ -17007,6 +17021,65 @@ mod tests {
             "mid-handoff (Copying) the OLD master serves and is the only \
              node the gate may vouch for; the target {new_master:?} is not \
              yet authoritative",
+        );
+    }
+
+    /// Defensive-hardening pin: a serving EFFECTIVE master must not deny
+    /// its own mastership just because the peer address book carries no
+    /// entry for the local node — self is trivially alive from its own
+    /// perspective. Self is seeded into `node_addrs` at construction and no
+    /// known production path removes it today; this test pins the
+    /// STRUCTURAL guarantee so routing never silently depends on that
+    /// address-book invariant. Were self absent, falling through to the
+    /// not-yet-authoritative TARGET would redirect clients away from the
+    /// only node that can serve the shard mid-handoff.
+    #[test]
+    fn preferred_master_resolves_to_self_when_self_absent_from_addr_map() {
+        let old_members: Vec<NodeId> = [1u64, 2, 3].iter().map(|&n| NodeId(n)).collect();
+        let new_members: Vec<NodeId> = [1u64, 2, 3, 4].iter().map(|&n| NodeId(n)).collect();
+        let mut table = ShardTable::compute_with_epoch(&old_members, 2, 1, 1);
+        let new_table = ShardTable::compute_with_epoch(&new_members, 2, 2, 1);
+
+        let mut changed = None;
+        for shard in 0..crate::cluster::shards::NUM_SHARDS as u16 {
+            let old_master = table.assignment(shard).master;
+            let new_master = new_table.target_assignment(shard).master;
+            if old_master != new_master {
+                changed = Some((shard, old_master, new_master));
+                break;
+            }
+        }
+        let (shard, old_master, new_master) =
+            changed.expect("scale-up must move at least one shard");
+
+        // Every shard has data → the moved shard enters Copying, so the OLD
+        // master stays the effective assignment while the target differs.
+        table.begin_handoff_with(&new_table, |_| true);
+
+        // Address book WITHOUT the effective master (the local node): only
+        // the migration target is known.
+        let dummy: SocketAddr = match "127.0.0.1:1".parse() {
+            Ok(a) => a,
+            Err(e) => panic!("fixture addr must parse: {e}"),
+        };
+        let mut addrs = std::collections::HashMap::new();
+        addrs.insert(new_master, dummy);
+
+        let got = RunningCluster::preferred_master_for_shard(&table, old_master, &addrs, shard);
+        assert_eq!(
+            got, old_master,
+            "effective == self absent from the addr map must resolve to self \
+             (the serving effective master), not route away to the target",
+        );
+
+        // The liveness fallback is untouched for OTHER nodes: an effective
+        // master that is neither self nor in the address book is dead, and
+        // routing falls through to the target.
+        let got_dead =
+            RunningCluster::preferred_master_for_shard(&table, NodeId(99), &addrs, shard);
+        assert_eq!(
+            got_dead, new_master,
+            "a dead non-self effective master must still fall through to the target",
         );
     }
 
