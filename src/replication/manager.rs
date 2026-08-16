@@ -1619,7 +1619,10 @@ mod tests {
 
         let mut mgr = ReplicationManager::new(ReplicationConfig::default(), vec![Box::new(mt)]);
 
-        let ops = vec![ReplicaOp::Delete { tx_key: key(1) }];
+        let ops = vec![ReplicaOp::Delete {
+            tx_key: key(1),
+            cause: crate::ops::tombstone::DeleteCause::ClientDelete,
+        }];
         mgr.replicate_batch(&ops).unwrap();
 
         drop(mgr);

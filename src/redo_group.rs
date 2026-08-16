@@ -456,6 +456,7 @@ mod tests {
             tx_key: crate::index::TxKey { txid: [byte; 32] },
             record_offset: u64::from(byte) * 4096,
             record_size: 4096,
+            cause: crate::ops::tombstone::DeleteCause::ClientDelete,
         }
     }
 

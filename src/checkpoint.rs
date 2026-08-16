@@ -2268,6 +2268,7 @@ mod tests {
                 tx_key: key1,
                 record_offset: tx1_entry_before_delete.record_offset,
                 record_size: TxMetadata::record_size_for(1),
+                cause: crate::ops::tombstone::DeleteCause::ClientDelete,
             })
             .unwrap();
 

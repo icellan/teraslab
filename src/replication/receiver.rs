@@ -2489,7 +2489,7 @@ fn apply_op_journal_inner(
     // while the `Create` lives in store N's can replay out of order and
     // resurrect the deleted record. `None` (key absent locally) routes normally.
     let pre_delete_device_id: Option<u8> = match op {
-        ReplicaOp::Delete { tx_key } => engine.lookup(tx_key).map(|e| e.device_id),
+        ReplicaOp::Delete { tx_key, .. } => engine.lookup(tx_key).map(|e| e.device_id),
         _ => None,
     };
 
@@ -3046,12 +3046,23 @@ fn apply_op_journal_inner(
             )
             .map_err(ReplicaApplyError::Failed)
         }
-        ReplicaOp::Delete { tx_key } => {
+        ReplicaOp::Delete { tx_key, cause } => {
             let req = DeleteRequest {
                 tx_key: *tx_key,
                 due_guard: None,
             };
-            match engine.delete(&req) {
+            // W9 — the op's cause selects which tombstone this holder records:
+            // a client delete keeps the unconditional ClientDelete veto (#78);
+            // a compensating delete (create rollback) records the
+            // generation-overridable CompensatedCreate instead, so the
+            // client-acked copy that survived elsewhere can heal back in.
+            let result = match cause {
+                crate::ops::tombstone::DeleteCause::ClientDelete => engine.delete(&req),
+                crate::ops::tombstone::DeleteCause::CompensatedCreate => {
+                    engine.delete_compensated_create(&req)
+                }
+            };
+            match result {
                 Ok(()) => Ok(()),
                 Err(crate::ops::error::SpendError::TxNotFound) => Ok(()),
                 Err(e) => Err(format!("delete: {e}").into()),
@@ -3621,7 +3632,7 @@ fn build_post_apply_redo_op(
                 utxo_count: utxo_hashes.len() as u32,
             }))
         }
-        ReplicaOp::Delete { tx_key } => {
+        ReplicaOp::Delete { tx_key, cause } => {
             // After delete the index entry is gone, so we cannot re-read
             // the record offset / size. Recovery treats `Delete` as
             // "drop the index entry"; a replica that crashes here will
@@ -3629,11 +3640,13 @@ fn build_post_apply_redo_op(
             // already mutated the index in-memory and the next snapshot
             // (or live engine state) carries no entry. Use sentinel zeros
             // — replay's lookup-then-skip path handles the missing-index
-            // case as Skipped.
+            // case as Skipped. W9: the cause rides along so a redo-derived
+            // re-emit from THIS holder (migration delta) preserves it.
             Ok(Some(RedoOp::Delete {
                 tx_key: *tx_key,
                 record_offset: 0,
                 record_size: 0,
+                cause: *cause,
             }))
         }
         ReplicaOp::PruneSlot { tx_key, offset } => Ok(Some(RedoOp::PruneSlot {
@@ -4990,7 +5003,10 @@ mod tests {
             engine.lookup(&missing).is_none(),
             "precondition: the replica must not hold the record"
         );
-        let op = ReplicaOp::Delete { tx_key: missing };
+        let op = ReplicaOp::Delete {
+            tx_key: missing,
+            cause: crate::ops::tombstone::DeleteCause::ClientDelete,
+        };
         assert_eq!(
             op.master_generation(),
             None,
@@ -5044,7 +5060,10 @@ mod tests {
 
         let k = key(126);
         create_record(&engine, k, 3);
-        let op = ReplicaOp::Delete { tx_key: k };
+        let op = ReplicaOp::Delete {
+            tx_key: k,
+            cause: crate::ops::tombstone::DeleteCause::ClientDelete,
+        };
 
         let mut redo_out = Vec::new();
         assert_eq!(
@@ -5060,6 +5079,7 @@ mod tests {
                     tx_key,
                     record_offset: 0,
                     record_size: 0,
+                    cause: crate::ops::tombstone::DeleteCause::ClientDelete,
                 } if *tx_key == k
             )),
             "the replica must journal a sentinel RedoOp::Delete for the removal so its \
@@ -5157,7 +5177,16 @@ mod tests {
         // store-1 record. The Delete redo must extend store 1's log only.
         let p0 = log0.lock().write_position();
         let p1 = log1.lock().write_position();
-        apply_op_journal(&engine, &ReplicaOp::Delete { tx_key: kb }, true, false).unwrap();
+        apply_op_journal(
+            &engine,
+            &ReplicaOp::Delete {
+                tx_key: kb,
+                cause: crate::ops::tombstone::DeleteCause::ClientDelete,
+            },
+            true,
+            false,
+        )
+        .unwrap();
 
         assert_eq!(
             log0.lock().write_position(),
@@ -5538,7 +5567,14 @@ mod tests {
         let k = key(30);
         create_record(&engine, k, 2);
 
-        apply_op(&engine, &ReplicaOp::Delete { tx_key: k }).unwrap();
+        apply_op(
+            &engine,
+            &ReplicaOp::Delete {
+                tx_key: k,
+                cause: crate::ops::tombstone::DeleteCause::ClientDelete,
+            },
+        )
+        .unwrap();
         assert!(engine.lookup(&k).is_none());
     }
 
@@ -6078,7 +6114,10 @@ mod tests {
         let k = key(57);
         create_record(&engine, k, 2);
 
-        let delete = ReplicaOp::Delete { tx_key: k };
+        let delete = ReplicaOp::Delete {
+            tx_key: k,
+            cause: crate::ops::tombstone::DeleteCause::ClientDelete,
+        };
         apply_op(&engine, &delete).unwrap();
         assert!(engine.lookup(&k).is_none());
 
@@ -6104,7 +6143,14 @@ mod tests {
             },
         )
         .unwrap();
-        apply_op(&engine, &ReplicaOp::Delete { tx_key: k }).unwrap();
+        apply_op(
+            &engine,
+            &ReplicaOp::Delete {
+                tx_key: k,
+                cause: crate::ops::tombstone::DeleteCause::ClientDelete,
+            },
+        )
+        .unwrap();
         apply_op(
             &engine,
             &ReplicaOp::Freeze {
@@ -9870,7 +9916,13 @@ mod tests {
         // Positions 1..=2: create then delete — the key ends absent.
         let create_delete = ReplicaBatch {
             first_sequence: 1,
-            ops: vec![create_op(), ReplicaOp::Delete { tx_key: k }],
+            ops: vec![
+                create_op(),
+                ReplicaOp::Delete {
+                    tx_key: k,
+                    cause: crate::ops::tombstone::DeleteCause::ClientDelete,
+                },
+            ],
             trace_ctx: None,
             source_node_id: None,
             cluster_key: 0,
@@ -10433,7 +10485,10 @@ mod tests {
         let slot0_before = engine.read_slot(&key(80), 0).unwrap().status;
 
         let mut batch = batch_with_cluster_key(20, key(80), 0..1, 1, /* stale */ 5);
-        batch.ops.push(ReplicaOp::Delete { tx_key: key(80) });
+        batch.ops.push(ReplicaOp::Delete {
+            tx_key: key(80),
+            cause: crate::ops::tombstone::DeleteCause::ClientDelete,
+        });
         batch.source_node_id = Some(9);
         let req = batch_request(&batch, 1);
 
@@ -12061,6 +12116,88 @@ mod tests {
             { engine.read_metadata(&k_new).unwrap().generation },
             2,
             "a genuinely-lost record with no tombstone must be adopted",
+        );
+    }
+
+    /// W9 — THE acked-write-loss close (CI runs 31971906387/31971908443). The
+    /// crash-window chain: this node applied a create, its replication fan-out
+    /// failed, and the compensation rolled it back with a COMPENSATED delete —
+    /// while the client's retry landed the create on another node, so a LIVE,
+    /// client-ACKED copy exists. The heal/migration baseline shipping that
+    /// copy back MUST APPLY over the `CompensatedCreate` tombstone (pre-W9 the
+    /// rollback recorded `ClientDelete` and RULE-DS vetoed the heal forever —
+    /// permanent under-replication, and in armed-05/08 the orphan cleanup then
+    /// deleted the last live copy). A strictly-stale image still drops, and a
+    /// REAL client delete keeps its unconditional veto bit-for-bit (#78).
+    #[test]
+    fn compensated_delete_tombstone_admits_heal_of_surviving_acked_copy() {
+        use crate::ops::tombstone::{DeleteCause, TombstoneCause};
+
+        let engine = make_engine();
+        enable_tombstones(&engine);
+
+        // The rollback: create @ gen 1 applied, then compensated away.
+        let k = key(160);
+        apply_op(&engine, &baseline_create(k, 1, 0)).unwrap();
+        apply_op(
+            &engine,
+            &ReplicaOp::Delete {
+                tx_key: k,
+                cause: DeleteCause::CompensatedCreate,
+            },
+        )
+        .unwrap();
+        assert!(
+            matches!(engine.read_metadata(&k), Err(SpendError::TxNotFound)),
+            "precondition: the compensated delete removed the record",
+        );
+        assert_eq!(
+            engine.tombstone_cause(&k),
+            Some(TombstoneCause::CompensatedCreate),
+            "the compensated delete must record the OVERRIDABLE cause",
+        );
+
+        // A stale image strictly behind the rolled-back create stays dropped.
+        apply_op_journal(&engine, &baseline_create(k, 0, 0), false, true).unwrap();
+        assert!(
+            matches!(engine.read_metadata(&k), Err(SpendError::TxNotFound)),
+            "a strictly-stale image must still be vetoed",
+        );
+
+        // The surviving acked copy (same lineage, gen >= tombstone) APPLIES.
+        apply_op_journal(&engine, &baseline_create(k, 1, 0), false, true).unwrap();
+        assert_eq!(
+            { engine.read_metadata(&k).unwrap().generation },
+            1,
+            "the live client-acked copy must defeat its own crash-window \
+             rollback (pre-W9: vetoed forever)",
+        );
+        assert!(
+            engine.tombstone_lookup(&k).is_none(),
+            "the admitted create must clear the tombstone (TS-1)",
+        );
+
+        // Contrast pin: a REAL client delete still vetoes unconditionally,
+        // even a strictly-newer image (#78 untouched).
+        let k2 = key(161);
+        apply_op(&engine, &baseline_create(k2, 1, 0)).unwrap();
+        apply_op(
+            &engine,
+            &ReplicaOp::Delete {
+                tx_key: k2,
+                cause: DeleteCause::ClientDelete,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            engine.tombstone_cause(&k2),
+            Some(TombstoneCause::ClientDelete)
+        );
+        apply_op_journal(&engine, &baseline_create(k2, 5, 0), false, true).unwrap();
+        assert!(
+            matches!(engine.read_metadata(&k2), Err(SpendError::TxNotFound)),
+            "a client-deleted record must stay absent whatever the source \
+             generation (the #78 anti-resurrection posture)",
         );
     }
 

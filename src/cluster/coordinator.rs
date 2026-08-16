@@ -12569,27 +12569,33 @@ fn convert_infallible_op(
             // conservatively map to None.
             None
         }
-        RedoOp::Delete { tx_key, .. } => {
+        RedoOp::Delete { tx_key, cause, .. } => {
             // A delete after the baseline snapshot must be forwarded so the
             // target removes the record. Without this, deleted records would
             // be resurrected on the target.
-            //
-            // Deletion-tombstone §6 scope note: this converter stays on the V1
-            // `ReplicaOp::Delete`. It feeds the migration-baseline catch-up
-            // (which must remain V1/unchanged this phase) AND the
-            // replication-intent crash-recovery re-emit.
             //
             // It is not the only producer of a replicated delete: a CLIENT
             // `OP_DELETE_BATCH` also emits `ReplicaOp::Delete` directly (spec
             // §3.18, `handle_delete_batch` Phase 2). This arm covers the
             // redo-derived cases instead — a migration delta, or a master that
             // crashed BETWEEN a redo commit and its fan-out. Both apply the same
-            // V1 op, and the receiver's Delete arm resolves an absent record to
+            // op, and the receiver's Delete arm resolves an absent record to
             // an idempotent `Ok(())`, so neither can resurrect the record.
+            //
+            // W9 — the CAUSE travels verbatim. A compensating delete (create
+            // rollback) re-emitted through this converter — the D-4 fan-out
+            // reconstruction, a crash-recovered replication intent, or a
+            // migration delta — must land on the applying node as a
+            // generation-OVERRIDABLE CompensatedCreate tombstone, never as the
+            // unconditional ClientDelete veto it used to spread (the CI-proven
+            // permanent acked-write-loss chain).
             if ShardTable::shard_for_key(tx_key) != shard {
                 return None;
             }
-            Some(ReplicaOp::Delete { tx_key: *tx_key })
+            Some(ReplicaOp::Delete {
+                tx_key: *tx_key,
+                cause: *cause,
+            })
         }
         RedoOp::MarkOnLongestChain {
             tx_key,
@@ -20007,6 +20013,7 @@ mod tests {
                 tx_key: deleted,
                 record_offset: 0,
                 record_size: 0,
+                cause: crate::ops::tombstone::DeleteCause::ClientDelete,
             })
             .unwrap();
         redo.lock()

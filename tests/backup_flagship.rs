@@ -258,6 +258,7 @@ fn journal_primary(op: &WorkloadOp, engine: &Engine, redo: &Mutex<RedoLog>) -> u
                 tx_key: *tx_key,
                 record_offset: entry.record_offset,
                 record_size,
+                cause: teraslab::ops::tombstone::DeleteCause::ClientDelete,
             }
         }
         other => panic!("window contains an op with no journaling recipe: {other:?}"),
