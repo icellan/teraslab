@@ -1461,6 +1461,11 @@ pub(crate) fn render_metrics_text(
         );
         prom_counter(
             &mut out,
+            "teraslab_heal_source_refused_no_quorum_total",
+            mm.heal_source_refused_no_quorum.get(),
+        );
+        prom_counter(
+            &mut out,
             "teraslab_under_replication_event_repairs_total",
             mm.under_replication_event_repairs.get(),
         );

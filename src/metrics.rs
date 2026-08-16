@@ -1382,6 +1382,20 @@ pub struct MigrationMetrics {
     /// intervention (manual reassign / reboot) — the shard is unavailable but its
     /// data is never lost or served stale, and the reverse-pull keeps retrying.
     pub heal_deadline_alerts: PaddedCounter,
+    /// #74 — number of times reverse-heal SOURCE selection REFUSED to pick a
+    /// heal source because NO candidate had quorum-current evidence (a
+    /// committed replica that reported the shard in this round's partition
+    /// view and is not still receiving inbound data). The removed fallback
+    /// used to pick a committed-by-assignment replica anyway — a candidate
+    /// that may have missed a spend, whose stale image the heal would
+    /// resurrect UNSPENT and serve (a double-spend). Selection now refuses:
+    /// the shard defers (parked fenced fail-closed at boot; not fenced on the
+    /// online path) and selection re-runs on every partition-view refresh, so
+    /// a candidate that catches up (replica catch-up streams until converged)
+    /// is picked on a later round. A persistently climbing value means some
+    /// shard's candidates are staying non-current — correlate with
+    /// `teraslab_heal_deadline_alerts_total`, which names the parked shard.
+    pub heal_source_refused_no_quorum: PaddedCounter,
     /// Task #50 — number of EVENT-TRIGGERED under-replication repair passes
     /// fired by the coordinator (membership churn or a completed exchange
     /// armed a debounced pass that ran). The periodic sweep's passes are NOT
@@ -1453,6 +1467,7 @@ impl MigrationMetrics {
             topology_epoch_mismatch: PaddedCounter::new(),
             phantom_master_relinquished: PaddedCounter::new(),
             heal_deadline_alerts: PaddedCounter::new(),
+            heal_source_refused_no_quorum: PaddedCounter::new(),
             under_replication_event_repairs: PaddedCounter::new(),
         }
     }

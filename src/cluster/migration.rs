@@ -876,6 +876,78 @@ impl MigrationManager {
         true
     }
 
+    /// #74 — the shards currently PARKED under a no-source FAIL-CLOSED heal
+    /// fence: an uncompleted `heal_pending` entry whose source is still the
+    /// `NodeId(0)` sentinel (heal-source selection REFUSED — no quorum-current
+    /// candidate — so there is nothing for the pull requester loop to drive).
+    ///
+    /// The Phase-3b online re-heal pass re-attempts quorum-current source
+    /// selection for exactly these shards on every partition-view refresh and
+    /// resolves a successful pick via [`Self::resolve_heal_source`] —
+    /// park-and-retry, never a terminal give-up. A forward-migration
+    /// `NodeId(0)` sentinel (`heal_pending` clear) is NOT parked and is not
+    /// returned. Sorted ascending and deduplicated.
+    pub fn parked_no_source_heal_shards(&self) -> Vec<u16> {
+        let mut out: Vec<u16> = self
+            .inbound_migrations
+            .iter()
+            .filter(|m| m.heal_pending && !m.completed && m.from_node == NodeId(0))
+            .map(|m| m.shard)
+            .collect();
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
+    /// #74 — resolve a PARKED no-source heal fence to a CONCRETE quorum-current
+    /// source so the pull requester loop can drive it.
+    ///
+    /// Rewrites the uncompleted `heal_pending` `NodeId(0)`-sentinel entry for
+    /// `shard` to name `from_node` IN PLACE (mirroring the forward-migration
+    /// sentinel replacement in [`Self::register_migrations`]) — never adding a
+    /// second entry, because the completion handshake
+    /// ([`Self::mark_inbound_complete_from_source`]) completes ONE entry and a
+    /// leftover sibling sentinel would hold the fence bit forever. Clears any
+    /// stale `lost` mark and restarts the Phase-3c fenced-heal deadline clock
+    /// (the heal only now became drivable). If an uncompleted CONCRETE entry
+    /// for `(shard, from_node)` already exists, the redundant sentinel is
+    /// dropped instead — the concrete entry keeps the fence up and the pull
+    /// driven, and the single completion handshake then clears the whole
+    /// fence.
+    ///
+    /// Returns `true` iff a sentinel was resolved to `from_node`; `false` when
+    /// there is nothing to resolve (no parked heal fence for `shard`), when
+    /// `from_node` is not a concrete peer (`NodeId(0)`), or when the concrete
+    /// entry already existed. A forward-migration `NodeId(0)` sentinel
+    /// (`heal_pending` clear, e.g. [`Self::mark_inbound_active`]) is never
+    /// touched — its source is assigned by the authoritative migration
+    /// dispatch, not by heal-source selection.
+    pub fn resolve_heal_source(&mut self, shard: u16, from_node: NodeId) -> bool {
+        if from_node == NodeId(0) {
+            return false;
+        }
+        let concrete_exists = self
+            .inbound_migrations
+            .iter()
+            .any(|m| m.shard == shard && m.from_node == from_node && !m.completed);
+        if concrete_exists {
+            self.inbound_migrations.retain(|m| {
+                !(m.shard == shard && m.from_node == NodeId(0) && m.heal_pending && !m.completed)
+            });
+            return false;
+        }
+        if let Some(m) = self.inbound_migrations.iter_mut().find(|m| {
+            m.shard == shard && m.from_node == NodeId(0) && m.heal_pending && !m.completed
+        }) {
+            m.from_node = from_node;
+            m.lost = false;
+            m.heal_started_at = Some(std::time::Instant::now());
+            self.inbound_bitmap.set(shard);
+            return true;
+        }
+        false
+    }
+
     /// Reverse-heal completion drop-awareness — is there an ACTIVE (uncompleted)
     /// `heal_pending` inbound entry for `shard` sourced from `from_node` (or the
     /// no-source `NodeId(0)` sentinel)?
@@ -2636,6 +2708,108 @@ mod tests {
         mgr.mark_inbound_complete(shard);
         assert!(!mgr.has_pending_heal_from_source(shard, NodeId(3)));
         assert!(!mgr.has_pending_inbound(shard));
+    }
+
+    /// #74 — a parked no-source heal fence (`NodeId(0)` sentinel,
+    /// `heal_pending`) is enumerated by `parked_no_source_heal_shards` and
+    /// RESOLVED IN PLACE to a concrete quorum-current source: same entry, new
+    /// `from_node`, fence still up — never a second entry, so the single
+    /// completion handshake clears the whole fence.
+    #[test]
+    fn resolve_heal_source_resolves_parked_sentinel_in_place() {
+        let mut mgr = MigrationManager::new();
+        assert!(mgr.mark_heal_fence_active(7));
+        assert_eq!(mgr.parked_no_source_heal_shards(), vec![7]);
+
+        assert!(mgr.resolve_heal_source(7, NodeId(3)));
+        assert!(
+            mgr.parked_no_source_heal_shards().is_empty(),
+            "resolved — no longer parked",
+        );
+        assert_eq!(
+            mgr.pending_inbound_entries(),
+            vec![(7, NodeId(3))],
+            "the SAME entry now names the concrete source (no sibling entry)",
+        );
+        assert!(
+            mgr.inbound_bitmap().test(7),
+            "the fence stays up until completion",
+        );
+        assert!(
+            mgr.has_pending_heal_from_source(7, NodeId(3)),
+            "the resolved entry is still a heal (completion stays drop-aware)",
+        );
+
+        // The single completion handshake clears the fence entirely.
+        mgr.mark_inbound_complete_from_source(7, NodeId(3));
+        assert!(
+            !mgr.inbound_bitmap().test(7),
+            "one completion clears the resolved fence",
+        );
+    }
+
+    /// #74 — resolve is a strict no-op when there is nothing to resolve: no
+    /// entry at all, a FORWARD-migration sentinel (`heal_pending` clear), or a
+    /// `NodeId(0)` "source" each answer `false` and mutate nothing.
+    #[test]
+    fn resolve_heal_source_ignores_non_heal_and_missing_entries() {
+        let mut mgr = MigrationManager::new();
+        assert!(
+            !mgr.resolve_heal_source(9, NodeId(2)),
+            "nothing registered → nothing to resolve",
+        );
+
+        // A FORWARD sentinel (REPLICA_BATCH arrival, heal_pending clear) is
+        // not a parked heal — its source is assigned by migration dispatch.
+        assert!(mgr.mark_inbound_active(9));
+        assert!(!mgr.resolve_heal_source(9, NodeId(2)));
+        assert_eq!(
+            mgr.pending_inbound_entries(),
+            vec![(9, NodeId(0))],
+            "the forward sentinel is untouched",
+        );
+        assert!(
+            mgr.parked_no_source_heal_shards().is_empty(),
+            "a forward sentinel is not a parked HEAL",
+        );
+
+        // NodeId(0) is never a resolvable source.
+        assert!(mgr.mark_heal_fence_active(11));
+        assert!(!mgr.resolve_heal_source(11, NodeId(0)));
+        assert_eq!(
+            mgr.parked_no_source_heal_shards(),
+            vec![11],
+            "a NodeId(0) \"source\" resolves nothing — the shard stays parked",
+        );
+    }
+
+    /// #74 defensive — if a CONCRETE uncompleted entry for `(shard, source)`
+    /// already exists alongside a parked sentinel, resolving drops the
+    /// redundant sentinel instead of duplicating: exactly one entry remains,
+    /// so the single completion handshake clears the whole fence.
+    #[test]
+    fn resolve_heal_source_drops_redundant_sentinel_when_concrete_exists() {
+        let mut mgr = MigrationManager::new();
+        assert!(mgr.mark_heal_fence_active(5));
+        assert!(mgr.register_heal_source(5, NodeId(4)));
+        assert_eq!(mgr.inbound_count(), 2, "precondition: sentinel + concrete");
+
+        assert!(
+            !mgr.resolve_heal_source(5, NodeId(4)),
+            "concrete already registered → nothing resolved",
+        );
+        assert_eq!(
+            mgr.pending_inbound_entries(),
+            vec![(5, NodeId(4))],
+            "the redundant sentinel is dropped, the concrete pull remains",
+        );
+        assert!(mgr.inbound_bitmap().test(5), "the fence stays up");
+
+        mgr.mark_inbound_complete_from_source(5, NodeId(4));
+        assert!(
+            !mgr.inbound_bitmap().test(5),
+            "one completion clears the whole fence",
+        );
     }
 
     #[test]

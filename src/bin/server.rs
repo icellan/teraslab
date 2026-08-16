@@ -2099,13 +2099,19 @@ fn main() {
         if reverse_heal_enabled {
             let stale = running.stale_suspect_shards();
             if !stale.is_empty() {
-                // No membership exchange has converged a partition view at boot,
-                // so source selection falls back to the shard's committed replica
-                // set (a data holder by assignment; the source re-validates
-                // ownership before streaming, and RULE-DS + generation
-                // idempotency gate every applied image). Shards with a source are
-                // fenced + queued for the pull; shards with NONE are fenced
-                // FAIL-CLOSED (never served un-healed).
+                // #74 — no membership exchange has converged a partition view at
+                // boot, so NOTHING can prove a candidate quorum-current and
+                // source selection REFUSES every shard (the removed fallback
+                // that guessed a committed-by-assignment replica could pick a
+                // laggard that missed a spend and heal the spent key back
+                // UNSPENT — a served double-spend). Every stale shard is
+                // therefore parked FENCED FAIL-CLOSED (never served un-healed);
+                // the Phase-3b online pass re-attempts selection on every
+                // partition-view refresh and resolves each park to a
+                // concrete-source pull once the exchange proves a candidate
+                // quorum-current. Selection is still consulted so any shard
+                // with quorum-current evidence (none today at boot) is queued
+                // directly, keeping this path identical to the online posture.
                 let empty_view = std::collections::HashMap::new();
                 let sources = running.select_reverse_heal_sources(&stale, &empty_view);
                 let queued = running.begin_reverse_heal(&sources);
@@ -2126,8 +2132,9 @@ fn main() {
                     stale_shards = stale.len(),
                     pull_queued = queued,
                     fenced_fail_closed,
-                    "reverse-heal Phase 2c: fenced stale shards (no-serve-before-heal) \
-                     and queued delete-safe reverse-pull from committed sources",
+                    "reverse-heal Phase 2c: fenced stale shards (no-serve-before-heal); \
+                     quorum-current-sourced pulls queued, sourceless shards PARKED \
+                     fail-closed for the online re-source pass (#74)",
                 );
             }
         }
