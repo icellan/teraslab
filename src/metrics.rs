@@ -1385,15 +1385,18 @@ pub struct MigrationMetrics {
     /// #74 — number of times reverse-heal SOURCE selection REFUSED to pick a
     /// heal source because NO candidate had quorum-current evidence (a
     /// committed replica that reported the shard in this round's partition
-    /// view and is not still receiving inbound data). The removed fallback
-    /// used to pick a committed-by-assignment replica anyway — a candidate
-    /// that may have missed a spend, whose stale image the heal would
-    /// resurrect UNSPENT and serve (a double-spend). Selection now refuses:
-    /// the shard defers (parked fenced fail-closed at boot; not fenced on the
-    /// online path) and selection re-runs on every partition-view refresh, so
-    /// a candidate that catches up (replica catch-up streams until converged)
-    /// is picked on a later round. A persistently climbing value means some
-    /// shard's candidates are staying non-current — correlate with
+    /// view, is not still receiving inbound data, and is not an empty report
+    /// while a non-empty candidate exists). The removed fallback used to pick
+    /// a committed-by-assignment replica anyway — a candidate that may have
+    /// missed a spend, whose stale image the heal would resurrect UNSPENT and
+    /// serve (a double-spend). Selection now refuses: the shard defers
+    /// (parked fenced fail-closed at boot; not fenced on the online path) and
+    /// re-selection is driven by the reactivation work metric folding in the
+    /// parked count (#74 F2), so a candidate that catches up (replica
+    /// catch-up streams until converged) is picked on a later round. NOTE the
+    /// gate removes UNEVIDENCED sources only — it is not a per-key currency
+    /// proof. A persistently climbing value means some shard's candidates are
+    /// staying unevidenced — correlate with
     /// `teraslab_heal_deadline_alerts_total`, which names the parked shard.
     pub heal_source_refused_no_quorum: PaddedCounter,
     /// Task #50 — number of EVENT-TRIGGERED under-replication repair passes

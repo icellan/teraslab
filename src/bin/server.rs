@@ -2100,18 +2100,22 @@ fn main() {
             let stale = running.stale_suspect_shards();
             if !stale.is_empty() {
                 // #74 — no membership exchange has converged a partition view at
-                // boot, so NOTHING can prove a candidate quorum-current and
-                // source selection REFUSES every shard (the removed fallback
-                // that guessed a committed-by-assignment replica could pick a
+                // boot, so no candidate carries any evidence and source
+                // selection REFUSES every shard (the removed fallback that
+                // guessed a committed-by-assignment replica could pick a
                 // laggard that missed a spend and heal the spent key back
                 // UNSPENT — a served double-spend). Every stale shard is
                 // therefore parked FENCED FAIL-CLOSED (never served un-healed);
-                // the Phase-3b online pass re-attempts selection on every
-                // partition-view refresh and resolves each park to a
-                // concrete-source pull once the exchange proves a candidate
-                // quorum-current. Selection is still consulted so any shard
-                // with quorum-current evidence (none today at boot) is queued
-                // directly, keeping this path identical to the online posture.
+                // the park is DURABLE (persisted entries restore as unproven —
+                // #74 F1) and has a standing driver: the parked count feeds the
+                // same-term reactivation work metric (#74 F2), which keeps
+                // firing the re-heal exchange whose fresh view the Phase-3b
+                // re-source pass selects against, resolving each park once a
+                // candidate reports the shard with quorum-current EVIDENCE
+                // (an evidence gate, not a per-key currency proof — see
+                // `select_heal_source`). Selection is still consulted so any
+                // shard with evidence (none today at boot) is queued directly,
+                // keeping this path identical to the online posture.
                 let empty_view = std::collections::HashMap::new();
                 let sources = running.select_reverse_heal_sources(&stale, &empty_view);
                 let queued = running.begin_reverse_heal(&sources);
