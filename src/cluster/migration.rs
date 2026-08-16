@@ -421,6 +421,20 @@ impl InboundMigration {
     }
 }
 
+/// #74 (re-review, F1×F4) — persisted inbound-entry flag: the entry is a
+/// reverse-heal fence (a concrete-source heal pull or a parked `NodeId(0)`
+/// no-source fence). Restores with `heal_pending = true` and a fresh Phase-3c
+/// deadline clock, so a park stays a durable, F4-protected park across a
+/// restart while a forward entry (flag clear) restores completable and
+/// supersede-droppable exactly as before persistence.
+const INBOUND_ENTRY_FLAG_HEAL_PENDING: u8 = 1 << 0;
+
+/// #74 (re-review) — persisted inbound-entry flag: the C8 LOST
+/// (unavailable-until-proven) mark. Restores with `lost = true` so the
+/// fence-until-proven posture survives a restart instead of silently
+/// downgrading to an ordinary droppable pending entry.
+const INBOUND_ENTRY_FLAG_LOST: u8 = 1 << 1;
+
 // ---------------------------------------------------------------------------
 // MigrationThrottle — Phase G outbound-bytes admission control
 // ---------------------------------------------------------------------------
@@ -931,11 +945,11 @@ impl MigrationManager {
     /// `heal_pending` is clear (its source is assigned by the authoritative
     /// migration dispatch). Once PROMOTED to a heal fence —
     /// [`Self::mark_heal_fence_active`] raises `heal_pending` on every
-    /// existing entry for the shard, and a restart restores every persisted
-    /// entry as unproven (#74 F1) — the entry IS a park and is resolvable
-    /// here. That is deliberate and fail-closed: the promoted entry already
-    /// fences the shard, and resolving it merely gives the fence a
-    /// quorum-current-evidenced pull to complete through.
+    /// existing entry for the shard, and the promotion is persisted via the
+    /// flag byte so a restart restores it as a park (#74 F1) — the entry IS a
+    /// park and is resolvable here. That is deliberate and fail-closed: the
+    /// promoted entry already fences the shard, and resolving it merely gives
+    /// the fence a quorum-current-evidenced pull to complete through.
     pub fn resolve_heal_source(&mut self, shard: u16, from_node: NodeId) -> bool {
         if from_node == NodeId(0) {
             return false;
@@ -1876,26 +1890,43 @@ impl MigrationManager {
 
     /// Serialize pending (non-completed) inbound migrations to bytes.
     ///
-    /// Format: `[count:4][shard:2 + from_node:8] × count][crc32:4]`.
+    /// Format: `[count:4][(shard:2 + from_node:8 + flags:1)] × count][crc32:4]`.
     /// The trailing CRC32 is computed over the count header and all entries.
     /// Only pending entries are persisted — completed ones are omitted.
     ///
+    /// The per-entry `flags` byte (#74 re-review, F1×F4) persists the entry's
+    /// KIND — [`INBOUND_ENTRY_FLAG_HEAL_PENDING`] and
+    /// [`INBOUND_ENTRY_FLAG_LOST`] — so a restore can tell a reverse-heal
+    /// fence / park from a forward migration and a C8 LOST mark survives a
+    /// restart. Without it, a restored forward sentinel was byte-identical to
+    /// a park (stranded uncompletable) and a restored concrete forward entry
+    /// completed under the relaxed heal verify.
+    ///
     /// The CRC lets [`Self::restore_inbound`] fail closed on a corrupt or
     /// truncated file rather than silently dropping write fences. This is a
-    /// one-time on-disk format break from the pre-CRC layout; an old file
-    /// (no trailing CRC) is rejected by `restore_inbound`, which is the safe
-    /// (still-fenced) outcome.
+    /// one-time on-disk format break from the flagless 10-byte-entry layout
+    /// (itself a break from the pre-CRC layout): an old file fails the
+    /// exact-length check and is rejected, which is the safe (still-fenced,
+    /// loudly surfaced) outcome — deliberate, pre-production.
     pub fn serialize_inbound(&self) -> Vec<u8> {
         let pending: Vec<_> = self
             .inbound_migrations
             .iter()
             .filter(|m| !m.completed)
             .collect();
-        let mut buf = Vec::with_capacity(4 + pending.len() * 10 + 4);
+        let mut buf = Vec::with_capacity(4 + pending.len() * 11 + 4);
         buf.extend_from_slice(&(pending.len() as u32).to_le_bytes());
         for m in &pending {
             buf.extend_from_slice(&m.shard.to_le_bytes());
             buf.extend_from_slice(&m.from_node.0.to_le_bytes());
+            let mut flags = 0u8;
+            if m.heal_pending {
+                flags |= INBOUND_ENTRY_FLAG_HEAL_PENDING;
+            }
+            if m.lost {
+                flags |= INBOUND_ENTRY_FLAG_LOST;
+            }
+            buf.push(flags);
         }
         let crc = crc32fast::hash(&buf);
         buf.extend_from_slice(&crc.to_le_bytes());
@@ -1908,21 +1939,27 @@ impl MigrationManager {
     /// refuse writes for these shards until migration completes or is
     /// explicitly cleared.
     ///
-    /// # Restored entries are UNPROVEN (`heal_pending`) — #74 F1
+    /// # Restored entries keep their persisted KIND — #74 F1 (re-review)
     ///
-    /// The on-disk format carries only `(shard, from_node)`, so a restore
-    /// cannot distinguish a forward migration from a reverse-heal pull or a
-    /// parked no-source fence. A restored inbound is by definition NOT proven
-    /// complete, so EVERY restored entry is marked `heal_pending` (with a
-    /// fresh Phase-3c deadline clock): the fence then SURVIVES the join
-    /// activation's [`Self::clear_inbound`] instead of being dropped and the
-    /// never-healed shard served as authority, a restored `NodeId(0)` park
-    /// re-enters [`Self::parked_no_source_heal_shards`] so the online
-    /// re-source pass re-drives it, and a stuck restored entry is surfaced by
-    /// the Phase-3c alert-and-hold. The cost is deliberate fail-closed bias: a
-    /// restored FORWARD inbound also stays fenced until its re-registered
-    /// migration or completion proves it — fence-until-proven, the C8/C17
-    /// safe default.
+    /// Each entry's flag byte ([`INBOUND_ENTRY_FLAG_HEAL_PENDING`],
+    /// [`INBOUND_ENTRY_FLAG_LOST`]) restores the entry as what it was:
+    ///
+    /// * a HEAL entry (concrete pull or parked `NodeId(0)` fence) restores
+    ///   with `heal_pending = true` and a fresh Phase-3c deadline clock — a
+    ///   park re-enters [`Self::parked_no_source_heal_shards`], survives the
+    ///   join activation's [`Self::clear_inbound`], and stays F4-protected
+    ///   (no foreign completion can consume it);
+    /// * a LOST entry restores with `lost = true` — C8 fence-until-proven
+    ///   survives the restart;
+    /// * a FORWARD entry (flags clear) restores as a plain pending forward
+    ///   inbound — completable by its source under the exact-holding forward
+    ///   verify and droppable by a topology supersede, exactly as before
+    ///   persistence. It is never mistaken for a park (the earlier
+    ///   restore-as-unproven approach stranded a restored forward sentinel as
+    ///   an uncompletable park — the F1×F4 interaction).
+    ///
+    /// Unknown flag bits are reserved and ignored (the CRC already rejects
+    /// corruption; only a future writer could set them).
     ///
     /// # Fail-closed integrity
     ///
@@ -1961,8 +1998,8 @@ impl MigrationManager {
         // an upgraded node with NOTHING to fence boots cleanly instead of
         // crash-looping on a `TooShort` brick. A 4-byte file whose count is
         // non-zero cannot be this stub (an old file with N>=1 entries is
-        // `4 + 10*N` bytes) — it is truncated/corrupt and still falls through to
-        // the fail-closed `TooShort` below.
+        // longer) — it is truncated/corrupt and still falls through to the
+        // fail-closed `TooShort` below.
         if data.len() == 4 && u32::from_le_bytes(data[0..4].try_into().unwrap_or([0; 4])) == 0 {
             return Ok(());
         }
@@ -1970,10 +2007,12 @@ impl MigrationManager {
             return Err(InboundRestoreError::TooShort { len: data.len() });
         }
         let count = u32::from_le_bytes(data[0..4].try_into().unwrap_or([0; 4]));
-        // Exact-length check: [count:4] + count * [entry:10] + [crc:4]. This
-        // rejects both a truncated file (short read) and trailing garbage.
+        // Exact-length check: [count:4] + count * [entry:11] + [crc:4]. This
+        // rejects a truncated file (short read), trailing garbage, AND any
+        // pre-flag-byte 10-byte-entry file (the one-time format break — the
+        // old file fails closed here, the safe still-fenced outcome).
         let expected = 4usize
-            .saturating_add((count as usize).saturating_mul(10))
+            .saturating_add((count as usize).saturating_mul(11))
             .saturating_add(4);
         if data.len() != expected {
             return Err(InboundRestoreError::LengthMismatch {
@@ -1996,19 +2035,26 @@ impl MigrationManager {
             let from_node = NodeId(u64::from_le_bytes(
                 data[pos + 2..pos + 10].try_into().unwrap_or([0; 8]),
             ));
-            pos += 10;
+            let flags = data[pos + 10];
+            pos += 11;
             // Only add if not already present.
             if !self
                 .inbound_migrations
                 .iter()
                 .any(|m| m.shard == shard && m.from_node == from_node)
             {
-                // #74 F1 — restored = UNPROVEN: `heal_pending` makes the fence
-                // survive `clear_inbound` and re-enters a `NodeId(0)` park in
-                // the re-source pass; the fresh deadline clock arms Phase-3c.
+                // #74 F1 (re-review) — restore the entry AS ITS PERSISTED
+                // KIND: a heal entry (concrete pull or park) comes back
+                // `heal_pending` with a fresh Phase-3c deadline clock, a lost
+                // entry comes back `lost` (C8 fence-until-proven), and a
+                // forward entry comes back plain — completable and
+                // supersede-droppable, never mistaken for a park.
+                let heal = flags & INBOUND_ENTRY_FLAG_HEAL_PENDING != 0;
+                let lost = flags & INBOUND_ENTRY_FLAG_LOST != 0;
                 self.inbound_migrations.push(InboundMigration {
-                    heal_pending: true,
-                    heal_started_at: Some(std::time::Instant::now()),
+                    heal_pending: heal,
+                    heal_started_at: heal.then(std::time::Instant::now),
+                    lost,
                     ..InboundMigration::pending(shard, from_node)
                 });
                 self.inbound_bitmap.set(shard);
@@ -2818,18 +2864,100 @@ mod tests {
         assert!(!mgr.has_pending_inbound(shard));
     }
 
-    /// #74 F1 — the park must be DURABLE: a serialize → restore round-trip
-    /// restores EVERY entry as UNPROVEN (`heal_pending`) — a restored inbound
-    /// is by definition not proven complete — so a restarted node's park (a)
-    /// re-enters the parked set and (b) SURVIVES the join activation's
-    /// `clear_inbound` instead of being dropped and served un-healed, and (c)
-    /// carries a deadline clock so Phase-3c alert-and-hold surfaces it.
+    /// #74 F1 (re-review revision) — the round-trip preserves each entry's
+    /// KIND via the persisted flag byte. A PARK restores as a park (durable:
+    /// re-enters the parked set, survives the join activation's
+    /// `clear_inbound`, carries a Phase-3c deadline clock); a CONCRETE heal
+    /// restores as a heal (retained, deadline clock, completion stays
+    /// drop-aware); a LOST entry restores lost (retained, fence-until-proven);
+    /// a FORWARD entry restores as a FORWARD entry — droppable by the
+    /// supersede exactly as before persistence, never mistaken for a park.
     #[test]
-    fn restore_inbound_restores_entries_as_unproven_heal_pending() {
+    fn restore_inbound_round_trip_preserves_entry_kinds() {
         let mut mgr = MigrationManager::new();
         assert!(mgr.mark_heal_fence_active(3)); // park (NodeId(0) sentinel)
         assert!(mgr.register_heal_source(9, NodeId(4))); // sourced heal
         assert!(mgr.mark_inbound_active(12)); // forward sentinel
+        assert!(mgr.register_inbound_source(15, NodeId(6))); // forward, concrete
+        mgr.mark_inbound_lost(&[15u16].into_iter().collect()); // C8 lost
+        let bytes = mgr.serialize_inbound();
+
+        let mut restored = MigrationManager::new();
+        restored
+            .restore_inbound(&bytes)
+            .expect("round-trip restores");
+        // Park → park.
+        assert_eq!(
+            restored.parked_no_source_heal_shards(),
+            vec![3],
+            "ONLY the park restores parked — the forward sentinel (12) must \
+             not be mistaken for one",
+        );
+        // Concrete heal → heal (its completion stays drop-aware).
+        assert!(restored.has_pending_heal_from_source(9, NodeId(4)));
+        // Lost → lost (fence-until-proven survives the restart).
+        assert!(restored.is_shard_lost(15), "the C8 lost mark is durable");
+        // Forward entries restore as forward: not heals, not parks.
+        assert!(!restored.has_pending_heal_from_source(15, NodeId(6)));
+        // Only the HEAL entries carry the Phase-3c deadline clock.
+        assert_eq!(
+            restored.expired_heal_shards(std::time::Duration::ZERO),
+            vec![3, 9],
+        );
+
+        // The supersede keeps the park, the heal, and the lost entry —
+        // and drops the plain forward sentinel exactly as before a28ec4e.
+        restored.clear_inbound();
+        assert_eq!(restored.inbound_count(), 3);
+        for shard in [3u16, 9, 15] {
+            assert!(
+                restored.inbound_bitmap().test(shard),
+                "restored shard {shard} stays fenced until proven",
+            );
+        }
+        assert!(
+            !restored.inbound_bitmap().test(12),
+            "a restored plain forward sentinel is droppable by the supersede \
+             (the pre-a28ec4e behavior)",
+        );
+    }
+
+    /// #74 F1×F4 (re-review P1) — the STRANDED-FORWARD shape: a restored
+    /// forward sentinel must stay completable by whichever source streams it.
+    /// Without the persisted kind flag, restore-as-unproven turned it into a
+    /// park and F4's exclusions made it uncompletable by ANY source — the
+    /// fence never cleared, and with reverse-heal disabled there was no exit
+    /// at all (breaking the "off ⇒ prior runtime behavior" invariant).
+    #[test]
+    fn restored_forward_sentinel_stays_completable_by_any_source() {
+        let mut mgr = MigrationManager::new();
+        assert!(mgr.mark_inbound_active(42)); // forward, source unknown
+        let bytes = mgr.serialize_inbound();
+
+        let mut restored = MigrationManager::new();
+        restored
+            .restore_inbound(&bytes)
+            .expect("round-trip restores");
+        assert!(restored.has_pending_inbound(42));
+
+        // The real source streams the shard and completes — the fence clears.
+        restored.mark_inbound_complete_from_source(42, NodeId(7));
+        assert!(
+            !restored.has_pending_inbound(42),
+            "a restored forward sentinel must be completable by its source — \
+             never stranded as an uncompletable park",
+        );
+        assert!(!restored.inbound_bitmap().test(42));
+    }
+
+    /// #74 F1×F4 (re-review P1) — a restored CONCRETE forward entry completes
+    /// under FORWARD tolerances: its completion must NOT classify as a heal
+    /// (`has_pending_heal_from_source` false), so the exact-holding verify is
+    /// not silently relaxed to the drop-aware heal gate.
+    #[test]
+    fn restored_concrete_forward_completes_under_forward_tolerances() {
+        let mut mgr = MigrationManager::new();
+        assert!(mgr.register_inbound_source(8, NodeId(7)));
         let bytes = mgr.serialize_inbound();
 
         let mut restored = MigrationManager::new();
@@ -2837,29 +2965,13 @@ mod tests {
             .restore_inbound(&bytes)
             .expect("round-trip restores");
         assert!(
-            restored.parked_no_source_heal_shards().contains(&3),
-            "the restored park re-enters the parked set (re-source pass sees it)",
+            !restored.has_pending_heal_from_source(8, NodeId(7)),
+            "a restored forward entry's completion must keep exact-holding \
+             (forward) semantics, not the drop-aware heal tolerance",
         );
-        // The join activation's supersede must RETAIN every restored (unproven)
-        // entry — dropping one would unfence a shard never proven healed.
-        restored.clear_inbound();
-        assert_eq!(
-            restored.inbound_count(),
-            3,
-            "no restored entry is dropped by a topology supersede",
-        );
-        for shard in [3u16, 9, 12] {
-            assert!(
-                restored.inbound_bitmap().test(shard),
-                "restored shard {shard} stays fenced until proven",
-            );
-        }
-        // Restored unproven entries carry a fresh deadline clock, so a stuck
-        // one is surfaced by the Phase-3c alert instead of fencing silently.
-        assert_eq!(
-            restored.expired_heal_shards(std::time::Duration::ZERO),
-            vec![3, 9, 12],
-        );
+        // And it completes normally from its source.
+        restored.mark_inbound_complete_from_source(8, NodeId(7));
+        assert!(!restored.has_pending_inbound(8));
     }
 
     /// #74 F4 — a FOREIGN source's completion must not clear a PARK: the park

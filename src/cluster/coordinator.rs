@@ -2787,6 +2787,16 @@ impl ClusterCoordinator {
             // strictly shrinking (see `drain_reactivation_due`). Cleared whenever
             // a non-fast reactivation fires or the committed term moves.
             let mut fast_reactivation_progress: Option<(u64, u32)> = None;
+            // #74 (re-review, item 2) — bound the cadence of re-activation
+            // rounds armed SOLELY by parked no-source heal fences. Counts
+            // consecutive FRUITLESS park-armed rounds (the parked set did not
+            // shrink between rounds) to drive `park_reheal_backoff`'s doubling
+            // interval; any park resolving (or the parked set emptying) resets
+            // both, restoring the prompt cadence. Event-loop local: resets
+            // naturally on restart.
+            let mut park_reheal_rounds: u32 = 0;
+            let mut park_reheal_last_count: Option<usize> = None;
+            let mut last_park_armed_at: Option<std::time::Instant> = None;
             // W3.3 — trailing-edge debounce: SWIM membership changes are
             // coalesced here and only fed to the propose path once the
             // membership has been stable for `topology_debounce_window`
@@ -3678,7 +3688,7 @@ impl ClusterCoordinator {
                             pending_handoffs,
                             stuck_subset,
                             phantom_masters,
-                            parked_heals,
+                            parked_shards,
                         ) = {
                             let mgr = migration.lock();
                             let table = shard_table.read();
@@ -3742,7 +3752,7 @@ impl ClusterCoordinator {
                             // re-heal exchange firing on this cooldown while
                             // any park exists. The fresh view it collects is
                             // what the re-source pass selects against.
-                            let parked_heals = mgr.parked_no_source_heal_shards().len();
+                            let parked_shards = mgr.parked_no_source_heal_shards();
                             (
                                 mismatched,
                                 pending_handoffs,
@@ -3750,8 +3760,38 @@ impl ClusterCoordinator {
                                 phantom_masters
                                     .saturating_add(missing_masters)
                                     .saturating_add(third_party),
-                                parked_heals,
+                                parked_shards,
                             )
+                        };
+
+                        // #74 (re-review, item 2) — bound the park-armed
+                        // cadence. When parks are the SOLE arming cause, each
+                        // fruitless round (parked set not shrinking) backs the
+                        // next round off (30 s doubling to a 5-minute cap) so
+                        // a permanently-refused park does not rebuild the
+                        // topology plan every cooldown forever. Any park
+                        // resolving — or the set emptying — resets to the
+                        // prompt cadence. Rounds armed by other work are
+                        // never delayed.
+                        let parks_sole_cause = !parked_shards.is_empty()
+                            && mismatched == 0
+                            && stuck_subset == 0
+                            && phantom_masters == 0
+                            && pending_handoffs == 0;
+                        if parked_shards.is_empty()
+                            || park_reheal_last_count.is_some_and(|prev| parked_shards.len() < prev)
+                        {
+                            park_reheal_rounds = 0;
+                            park_reheal_last_count = None;
+                        }
+                        let park_arming_suppressed = parks_sole_cause
+                            && last_park_armed_at.is_some_and(|at| {
+                                at.elapsed() < park_reheal_backoff(park_reheal_rounds)
+                            });
+                        let parked_for_arming = if park_arming_suppressed {
+                            0
+                        } else {
+                            parked_shards.len()
                         };
 
                         // W5-followup — self-drain fast path. Re-drive on the
@@ -3767,7 +3807,7 @@ impl ClusterCoordinator {
                             mismatched,
                             stuck_subset,
                             phantom_masters,
-                            parked_heals,
+                            parked_for_arming,
                         );
                         let total_work = repair_shards.saturating_add(pending_handoffs as u32);
                         // Compare only against the last fast round of THIS term;
@@ -3827,10 +3867,34 @@ impl ClusterCoordinator {
                                         mismatched,
                                         stuck_subset,
                                         phantom_masters,
-                                        parked_heals,
+                                        parked_heals = parked_shards.len(),
                                         "cluster: re-activating topology — collecting a fresh partition view",
                                     );
                                     last_reactivation_at = std::time::Instant::now();
+                                    // #74 (re-review, item 2) — this round is
+                                    // armed SOLELY by parked no-source heal
+                                    // fence(s): meter the fruitless-round
+                                    // backoff and name the parks as the arming
+                                    // cause. Phase-3c deadline alerts remain
+                                    // the primary stuck-shard signal.
+                                    if parks_sole_cause {
+                                        if park_reheal_last_count == Some(parked_shards.len()) {
+                                            park_reheal_rounds =
+                                                park_reheal_rounds.saturating_add(1);
+                                        }
+                                        park_reheal_last_count = Some(parked_shards.len());
+                                        last_park_armed_at = Some(std::time::Instant::now());
+                                        tracing::warn!(
+                                            parked = ?parked_shards,
+                                            fruitless_rounds = park_reheal_rounds,
+                                            next_interval_secs =
+                                                park_reheal_backoff(park_reheal_rounds).as_secs(),
+                                            "cluster: same-term re-heal armed SOLELY by parked \
+                                             no-source heal fence(s) — collecting a fresh view \
+                                             to re-select heal sources (#74; Phase-3c deadline \
+                                             alerts are the primary stuck-shard signal)",
+                                        );
+                                    }
                                     let exchange_tx = exchange_complete_tx.clone();
                                     let node_addrs_x = node_addrs.clone();
                                     let engine_x = engine.clone();
@@ -6201,6 +6265,25 @@ fn reactivation_repair_shard_count(
         .saturating_add(parked_heals as u32)
 }
 
+/// #74 (re-review, item 2) — the interval between re-activation rounds armed
+/// SOLELY by parked no-source heal fences, as a function of how many
+/// consecutive such rounds were FRUITLESS (the parked set did not shrink).
+///
+/// A permanently-refused park would otherwise arm a FULL re-activation (plan
+/// rebuild + `clear_inbound` + election) every same-term cooldown forever.
+/// Each fruitless park-armed round doubles the interval from the same-term
+/// cooldown (30 s → 60 s → 120 s → 240 s) up to the 5-minute cap; any park
+/// resolving resets the caller's round counter, restoring the prompt cadence
+/// for the remaining parks. Rounds armed by OTHER work (divergence, pending
+/// handoffs) are never delayed — the backoff gates only the parks-are-the-
+/// sole-cause case. Phase-3c deadline alerts remain the primary surfacing of
+/// a permanently-parked shard.
+fn park_reheal_backoff(fruitless_rounds: u32) -> Duration {
+    const CAP: Duration = Duration::from_secs(300);
+    let mult = 1u32 << fruitless_rounds.min(4);
+    CAP.min(SAME_TERM_REACTIVATION_COOLDOWN.saturating_mul(mult))
+}
+
 /// W1.5 — decide whether this node must *promptly* activate a newly-committed
 /// topology term, independent of the 30 s same-term reactivation cooldown.
 ///
@@ -7900,11 +7983,11 @@ fn heal_refusal_warn_due(n: u64) -> bool {
 /// pull completes) AND queues a concrete-source inbound entry the existing
 /// requester loop drives — the receiver applies the streamed baseline under
 /// RULE-DS + generation idempotency, and the completion handshake clears the
-/// fence. The inbound fence is persisted, and a restart restores every
-/// persisted entry as UNPROVEN (`heal_pending` — see
+/// fence. The inbound fence is persisted WITH its kind (the flag byte — see
 /// [`MigrationManager::restore_inbound`], #74 F1), so a crash mid-heal
-/// re-fences on reboot AND the restored fence survives the join activation's
-/// supersede; a restored no-source park re-enters the re-source pass.
+/// restores a heal fence AS a heal fence: it re-fences on reboot, survives
+/// the join activation's supersede, and a restored no-source park re-enters
+/// the re-source pass.
 ///
 /// SINGLE-FLIGHT: a shard already inbound-fenced (a heal in flight, a fail-closed
 /// fence, or a forward migration) is skipped, so a stale-but-being-healed shard
@@ -14028,9 +14111,9 @@ impl RunningCluster {
     ///    [`MasterQueryResult::Transitioning`] — NOT `Yes` — for the shard until
     ///    the pull completes. Called at boot BEFORE the node advertises
     ///    readiness, the node never serves un-healed data as authority. The fence
-    ///    is durably persisted, and a restart restores it as UNPROVEN
-    ///    (`heal_pending` — [`MigrationManager::restore_inbound`], #74 F1), so a
-    ///    crash mid-heal re-fences on restart and the restored fence survives
+    ///    is durably persisted WITH its heal kind (the flag byte —
+    ///    [`MigrationManager::restore_inbound`], #74 F1), so a crash mid-heal
+    ///    restores it as a heal fence: it re-fences on restart and survives
     ///    the join activation's supersede instead of being dropped un-healed.
     /// 2. **PULL** — a concrete-source inbound entry is exactly what the
     ///    coordinator's requester loop pulls on: it sends
@@ -25911,6 +25994,34 @@ mod tests {
             reactivation_repair_shard_count(0, 0, 0, mgr.parked_no_source_heal_shards().len()),
             0,
         ));
+    }
+
+    /// #74 (re-review, item 2) — the park-armed cadence bound: each fruitless
+    /// park-only round doubles the interval from the same-term cooldown up to
+    /// the 5-minute cap, so a permanently-refused park costs one full
+    /// re-activation per 5 minutes at steady state, not one per cooldown.
+    /// (The caller resets the round counter when any park resolves, restoring
+    /// the prompt cadence — covered by the event-loop wiring.)
+    #[test]
+    fn park_reheal_backoff_doubles_from_cooldown_to_cap() {
+        assert_eq!(park_reheal_backoff(0), SAME_TERM_REACTIVATION_COOLDOWN);
+        assert_eq!(
+            park_reheal_backoff(1),
+            SAME_TERM_REACTIVATION_COOLDOWN * 2,
+            "one fruitless round doubles the interval",
+        );
+        assert_eq!(park_reheal_backoff(2), SAME_TERM_REACTIVATION_COOLDOWN * 4);
+        assert_eq!(park_reheal_backoff(3), SAME_TERM_REACTIVATION_COOLDOWN * 8);
+        assert_eq!(
+            park_reheal_backoff(4),
+            Duration::from_secs(300),
+            "the doubling caps at the 5-minute bound",
+        );
+        assert_eq!(
+            park_reheal_backoff(u32::MAX),
+            Duration::from_secs(300),
+            "the cap holds for any round count (no overflow)",
+        );
     }
 
     /// Reverse-heal G3 — single-device / RF=1 (or reverse-heal disabled) has NO
