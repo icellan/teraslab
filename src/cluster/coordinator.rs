@@ -463,6 +463,200 @@ fn event_repair_take_fire(
     true
 }
 
+/// W8 (defect 1) — base delay before a failed migration batch's tracked
+/// tasks are re-driven without a membership edge. Doubles per fired attempt
+/// (see [`FailedBatchRedrive::backoff`]).
+const FAILED_REDRIVE_BASE_BACKOFF: Duration = Duration::from_secs(2);
+
+/// W8 — cap on the attempt-scaled re-drive backoff, mirroring the
+/// `park_reheal_backoff` doubling-to-cap shape at the failed-batch scale.
+const FAILED_REDRIVE_BACKOFF_CAP: Duration = Duration::from_secs(30);
+
+/// W8 (defect 1) — delayed self-re-drive for TRACKED (topology-plan) failed
+/// migration batches.
+///
+/// Failed tasks park in the durable retry queue
+/// (`MigrationManager::take_failed_tasks`), whose only production re-drive
+/// was the `NodeJoined` edge — an event a settled cluster never produces
+/// (observed in runs 31946515845/31946519864: a batch finishing with 8
+/// failed shards left their one-holder records unconverged for the rest of
+/// the run). This state machine lives in the coordinator event loop and is
+/// armed from the failed-batch disposition signal
+/// (`MigrationManager::take_failed_batch_retry_arm`); once the
+/// attempt-scaled backoff elapses under an unchanged topology epoch, the
+/// event loop re-drives `take_failed_tasks` through the same spawn the
+/// `NodeJoined` handler uses.
+///
+/// Pacing (review P2-7): attempts double the backoff
+/// ([`FAILED_REDRIVE_BASE_BACKOFF`] → [`FAILED_REDRIVE_BACKOFF_CAP`]) and
+/// then STAND DOWN TO THE CAP CADENCE, never to zero — a hard per-epoch
+/// attempt budget would re-create the original wedge on a settled cluster,
+/// whose epoch can stay unchanged indefinitely. A permanently failing batch
+/// therefore keeps retrying at the (30s) cap — the same
+/// periodic-cadence-as-floor philosophy as the sc08 trigger backoff — with
+/// a one-shot warn when the streak first saturates. An epoch change drops a
+/// pending arm (the new activation re-plans and re-drives through its own
+/// migration cycle) and resets the streak; a fired re-drive that finds the
+/// failed set already empty records recovery, also resetting the streak.
+#[derive(Debug)]
+struct FailedBatchRedrive {
+    /// `Some((armed_at, epoch))` while a re-drive is pending.
+    pending: Option<(std::time::Instant, u64)>,
+    /// Re-drives fired for `attempts_epoch` since its last reset.
+    attempts: u32,
+    /// The topology epoch the attempt streak was accumulated under.
+    attempts_epoch: u64,
+    /// One-shot latch for the cap-saturation warn; reset with the streak.
+    cap_warned: bool,
+}
+
+impl FailedBatchRedrive {
+    /// A fresh, unarmed redrive with an empty attempt streak.
+    fn new() -> Self {
+        Self {
+            pending: None,
+            attempts: 0,
+            attempts_epoch: 0,
+            cap_warned: false,
+        }
+    }
+
+    /// The current attempt-scaled delay: base × 2^attempts, saturating at
+    /// the cap (2s → 4s → 8s → 16s → 30s → 30s → ...).
+    fn backoff(&self) -> Duration {
+        FAILED_REDRIVE_BASE_BACKOFF
+            .saturating_mul(1u32 << self.attempts.min(16))
+            .min(FAILED_REDRIVE_BACKOFF_CAP)
+    }
+
+    /// Reset the attempt streak (epoch change or recovery).
+    fn reset_streak(&mut self, epoch: u64) {
+        self.attempts = 0;
+        self.attempts_epoch = epoch;
+        self.cap_warned = false;
+    }
+
+    /// Arm a delayed re-drive at `now` under the local topology `epoch`.
+    ///
+    /// An epoch differing from the attempt streak's resets the streak first
+    /// (a new plan restarts at the base cadence). Arming while already
+    /// pending under the same epoch coalesces (the FIRST arm's deadline
+    /// stands); a pending arm under another epoch is replaced. Never
+    /// refused: pacing is the backoff's job (P2-7 — a refusal would
+    /// re-create the settled-cluster wedge).
+    fn arm(&mut self, now: std::time::Instant, epoch: u64) {
+        if epoch != self.attempts_epoch {
+            self.reset_streak(epoch);
+        }
+        match self.pending {
+            Some((_, armed_epoch)) if armed_epoch == epoch => {}
+            _ => self.pending = Some((now, epoch)),
+        }
+    }
+
+    /// Non-consuming peek: whether a re-drive is pending and its
+    /// attempt-scaled backoff has elapsed at `now` — the cheap pre-gate the
+    /// event loop checks before touching the migration lock. Epoch currency
+    /// is deliberately left to `take_due`.
+    fn is_armed_and_due(&self, now: std::time::Instant) -> bool {
+        self.pending
+            .is_some_and(|(armed_at, _)| now.duration_since(armed_at) >= self.backoff())
+    }
+
+    /// Fire the pending re-drive if due at `now` under `current_epoch`,
+    /// consuming it and counting the attempt. A pending arm under a
+    /// superseded epoch is DROPPED (never fired stale) and the streak
+    /// resets to the current epoch. The first attempt that saturates the
+    /// backoff at the cap emits a one-shot warn (the operator's signal that
+    /// a batch is failing persistently and self-retry has settled at the
+    /// cap cadence).
+    fn take_due(&mut self, now: std::time::Instant, current_epoch: u64) -> bool {
+        let Some((armed_at, armed_epoch)) = self.pending else {
+            return false;
+        };
+        if armed_epoch != current_epoch {
+            self.pending = None;
+            self.reset_streak(current_epoch);
+            return false;
+        }
+        if now.duration_since(armed_at) < self.backoff() {
+            return false;
+        }
+        self.pending = None;
+        self.attempts = self.attempts.saturating_add(1);
+        if self.backoff() >= FAILED_REDRIVE_BACKOFF_CAP && !self.cap_warned {
+            self.cap_warned = true;
+            tracing::warn!(
+                attempts = self.attempts,
+                cap_secs = FAILED_REDRIVE_BACKOFF_CAP.as_secs(),
+                "cluster: failed-batch self-retry backoff saturated — will keep \
+                 retrying at the cap cadence until the batch recovers or the \
+                 topology changes",
+            );
+        }
+        true
+    }
+
+    /// A fired re-drive found nothing left to re-drive — the failed set
+    /// recovered by other means. Reset the streak so the next failure
+    /// sequence starts at the base cadence.
+    fn record_recovery(&mut self) {
+        self.reset_streak(self.attempts_epoch);
+    }
+}
+
+/// W8 (defect 1) — one event-loop pass of the failed-batch self-retry
+/// section, extracted so the REAL loop body (arm drain → trigger observe →
+/// redrive arm → backoff fire → `take_failed_tasks`) is testable against the
+/// REAL `MigrationManager` cleanup interplay (review P0-2: the previous
+/// inline version was green-but-inert — the loop's periodic
+/// `cleanup_completed()` deleted the Failed entries before the backoff
+/// elapsed, so the drain always came up empty).
+///
+/// Returns `Some(tasks)` when the delayed re-drive fired and drained a
+/// non-empty failed set — the caller re-drives them through
+/// `redrive_failed_migration_tasks`. `None` otherwise (nothing armed, not
+/// due, migrations in flight, or the failed set already recovered — the
+/// latter resets the redrive's attempt streak). The `active_count() == 0`
+/// gate and the `take_failed_tasks` drain run under ONE manager lock so a
+/// concurrently-spawning migration cannot interleave between them.
+fn failed_batch_retry_pass(
+    migration: &Arc<Mutex<MigrationManager>>,
+    trigger: &mut EventRepairTrigger,
+    redrive: &mut FailedBatchRedrive,
+    now: std::time::Instant,
+    current_epoch: u64,
+) -> Option<Vec<MigrationTask>> {
+    // Drain the disposition signal the worker threads leave on the manager
+    // (the disposition runs off-loop; the trigger and the redrive are
+    // loop-local). One signal, two arms: the event-repair trigger
+    // (armed-mode only — a no-op when the sweep flag is off; its sc08
+    // failure-streak backoff bounds a fail-fast loop) and the delayed
+    // re-drive (works in default mode too).
+    if migration.lock().take_failed_batch_retry_arm() {
+        trigger.observe(now, current_epoch);
+        redrive.arm(now, current_epoch);
+    }
+    // Peek first (zero lock traffic while unarmed); gate on no in-flight
+    // migrations BEFORE consuming, mirroring the event-repair fire: an
+    // unfired re-drive stays armed.
+    if !redrive.is_armed_and_due(now) {
+        return None;
+    }
+    let mut mgr = migration.lock();
+    if mgr.active_count() != 0 || !redrive.take_due(now, current_epoch) {
+        return None;
+    }
+    let retry_tasks = mgr.take_failed_tasks();
+    if retry_tasks.is_empty() {
+        // Recovered by other means (activation cleanup, NodeJoined
+        // re-drive, terminal retirement) — reset the attempt streak.
+        redrive.record_recovery();
+        return None;
+    }
+    Some(retry_tasks)
+}
+
 /// Task #50 review P2 — releases claimed `(replica NodeId.0, shard)`
 /// resync in-flight slots when the backfill run finishes.
 ///
@@ -2149,6 +2343,17 @@ pub struct ClusterConfig {
     /// `under_replication_sweep_enabled`). Default-off pending CI
     /// qualification.
     pub under_replication_sweep_enabled: bool,
+    /// W8 review P0-1 — allow tombstone-vetoed manifest reduction on
+    /// migration completions (see `Config`
+    /// `migration_vetoed_reduction_enabled` for the full rationale).
+    /// Default-off (ship-inert): the reduction authorizes deleting the
+    /// source's copy of a vetoed key after the handoff commits, and the
+    /// generation-blind ClientDelete veto cannot distinguish a stale
+    /// tombstone over a re-created lineage from an authoritative delete
+    /// until cross-lineage generations (#78) land. Carried on the shared
+    /// `MigrationManager` so the migration batch path reads it without
+    /// signature plumbing.
+    pub migration_vetoed_reduction_enabled: bool,
     pub probe_interval: Duration,
     pub suspicion_timeout: Duration,
     /// Shared secret for HMAC authentication of SWIM and inter-node traffic.
@@ -2394,7 +2599,14 @@ impl ClusterCoordinator {
             self_addr: config.self_addr,
             shard_table: Arc::new(ShardTableLock::new(initial_table)),
             swim: Some(swim),
-            migration: Arc::new(Mutex::new(MigrationManager::new())),
+            migration: {
+                let mut mgr = MigrationManager::new();
+                // W8 P0-1 — the flag rides on the shared manager so the
+                // migration batch path (a free fn with no config access)
+                // reads it lock-local at the escalation site.
+                mgr.set_vetoed_reduction_enabled(config.migration_vetoed_reduction_enabled);
+                Arc::new(Mutex::new(mgr))
+            },
             replication_factor: config.replication_factor,
             committed_master_election_enabled: config.committed_master_election_enabled,
             under_replication_sweep_enabled: config.under_replication_sweep_enabled,
@@ -2822,6 +3034,12 @@ impl ClusterCoordinator {
                 UNDER_REPLICATION_EVENT_DEBOUNCE,
                 under_replication_sweep_enabled_event,
             );
+            // W8 (defect 1) — delayed self-re-drive for tracked failed
+            // batches, armed from the failed-batch disposition signal the
+            // worker threads leave on the migration manager. NOT gated on
+            // the sweep flag: default-mode runs have no event repair, so
+            // this re-drive is their only settled-cluster retry path.
+            let mut failed_batch_redrive = FailedBatchRedrive::new();
             while !shutdown.load(Ordering::Relaxed) {
                 // Task #75 — heartbeat: every iteration passes here. The
                 // phase stamps below (one per loop section) refresh the
@@ -3346,6 +3564,41 @@ impl ClusterCoordinator {
                             );
                         }
                     }
+                }
+
+                // W8 (defect 1) — the failed-batch self-retry section (arm
+                // drain → trigger observe → redrive arm → backoff fire); see
+                // `failed_batch_retry_pass`. On a fire, the re-drive body is
+                // the same take_failed_tasks -> spawn the NodeJoined edge
+                // uses.
+                if let Some(retry_tasks) = failed_batch_retry_pass(
+                    &migration,
+                    &mut event_repair_trigger,
+                    &mut failed_batch_redrive,
+                    std::time::Instant::now(),
+                    topology_epoch.load(Ordering::Relaxed),
+                ) {
+                    Self::redrive_failed_migration_tasks(
+                        retry_tasks,
+                        "delayed-self-retry",
+                        self_id,
+                        max_migration_threads,
+                        &shard_table,
+                        &migration,
+                        &node_addrs,
+                        &engine,
+                        &redo_for_events,
+                        topology_epoch.load(Ordering::Relaxed),
+                        migration_pool_size,
+                        migration_batch_size,
+                        &fenced_bm_event,
+                        &migrating_bm_event,
+                        &inbound_bm_event,
+                        &topo_authority_event,
+                        &active_topology_members_event,
+                        &migration_throttle_event,
+                        &cluster_secret_event,
+                    );
                 }
 
                 // Periodically prune completed inbound migrations so the
@@ -4836,6 +5089,120 @@ impl ClusterCoordinator {
         }
     }
 
+    /// W8 (defect 1) — re-drive a `take_failed_tasks` batch through the
+    /// standard migration pipeline. Extracted verbatim from the `NodeJoined`
+    /// retry arm so the event loop's DELAYED self-re-drive (no membership
+    /// edge; see [`FailedBatchRedrive`]) and the historical `NodeJoined`
+    /// re-drive share one body. `origin` labels the log line.
+    ///
+    /// The issue-#46 fail-safe applies unchanged: an incomplete enumeration
+    /// rolls the (Streaming, tracked) retry tasks back to the failed set via
+    /// `finalize_enumeration_round` and skips the spawn — the tasks stay
+    /// re-drivable by the next pass.
+    #[allow(clippy::too_many_arguments)]
+    fn redrive_failed_migration_tasks(
+        retry_tasks: Vec<MigrationTask>,
+        origin: &'static str,
+        self_id: NodeId,
+        max_migration_threads: usize,
+        shard_table: &Arc<ShardTableLock<ShardTable>>,
+        migration: &Arc<Mutex<MigrationManager>>,
+        node_addrs: &Arc<RwLock<std::collections::HashMap<NodeId, SocketAddr>>>,
+        engine: &Arc<Engine>,
+        redo_for_events: &Option<Arc<ParkingMutex<RedoLog>>>,
+        epoch: u64,
+        migration_pool_size: usize,
+        migration_batch_size: usize,
+        fenced_bm: &Arc<crate::cluster::migration::AtomicShardBitmap>,
+        migrating_bm: &Arc<crate::cluster::migration::AtomicShardBitmap>,
+        inbound_bm: &Arc<crate::cluster::migration::AtomicShardBitmap>,
+        topology_authority: &Arc<crate::cluster::topology::TopologyAuthority>,
+        active_topology_members: &Arc<RwLock<Vec<NodeId>>>,
+        migration_throttle: &Arc<crate::cluster::migration::MigrationThrottle>,
+        cluster_secret: &Option<Arc<Vec<u8>>>,
+    ) {
+        tracing::info!(
+            count = retry_tasks.len(),
+            origin,
+            "cluster: retrying failed migrations"
+        );
+        let retry_shards: std::collections::HashSet<u16> =
+            retry_tasks.iter().map(|t| t.shard).collect();
+        let (keys_map, skipped) = engine.keys_by_shard_filtered(&retry_shards);
+        // Issue #46 fail-safe: an incomplete enumeration must not
+        // finalize the retried handoff. Re-fail the (Streaming,
+        // tracked) retry tasks — rolling them back to self — so they
+        // return to the failed set and are re-driven next pass.
+        if !finalize_enumeration_round(
+            skipped,
+            &retry_tasks,
+            migration,
+            shard_table,
+            fenced_bm,
+            migrating_bm,
+            epoch,
+        ) {
+            // Rolled back for retry — skip the spawn this round.
+            return;
+        }
+        let all_keys: Vec<TxKey> = keys_map.values().flat_map(|v| v.iter().copied()).collect();
+        let migration_ref = migration.clone();
+        let node_addrs_ref = node_addrs.clone();
+        let eng = engine.clone();
+        let redo = redo_for_events.clone();
+        let st = shard_table.clone();
+        let fb = fenced_bm.clone();
+        let mb = migrating_bm.clone();
+        let ib = inbound_bm.clone();
+        let throttle_ref = migration_throttle.clone();
+        let secret_ref = cluster_secret.clone();
+        // Task #25 — relinquish context for the rejoin retry path,
+        // built from the committed (active) topology members + RF
+        // and the live-member snapshot (peers we have addresses for,
+        // plus self).
+        let relinquish_ctx = {
+            let committed_members = active_topology_members.read().clone();
+            let (rf, placement_version) = {
+                let t = st.read();
+                (t.replication_factor(), t.placement_version())
+            };
+            let mut live_members: std::collections::HashSet<NodeId> =
+                node_addrs.read().keys().copied().collect();
+            live_members.insert(self_id);
+            Arc::new(RelinquishContext {
+                committed_members,
+                rf,
+                placement_version,
+                self_id,
+                live_members,
+                engine: engine.clone(),
+                committed_elected: topology_authority.committed_assignment(),
+            })
+        };
+        std::thread::spawn(move || {
+            Self::run_migration_tasks_with_global_limit(
+                retry_tasks,
+                all_keys,
+                node_addrs_ref,
+                eng,
+                migration_ref,
+                st,
+                redo,
+                epoch,
+                max_migration_threads,
+                migration_pool_size,
+                migration_batch_size,
+                fb,
+                mb,
+                ib,
+                self_id,
+                throttle_ref,
+                secret_ref,
+                Some(relinquish_ctx),
+            );
+        });
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn handle_event(
         event: &ClusterEvent,
@@ -4883,87 +5250,27 @@ impl ClusterCoordinator {
                 // joined node may be the target that was unavailable.
                 let retry_tasks = migration.lock().take_failed_tasks();
                 if !retry_tasks.is_empty() {
-                    tracing::info!(
-                        count = retry_tasks.len(),
-                        "cluster: retrying failed migrations"
-                    );
-                    let epoch = topology_epoch.load(Ordering::Relaxed);
-                    let retry_shards: std::collections::HashSet<u16> =
-                        retry_tasks.iter().map(|t| t.shard).collect();
-                    let (keys_map, skipped) = engine.keys_by_shard_filtered(&retry_shards);
-                    // Issue #46 fail-safe: an incomplete enumeration must not
-                    // finalize the retried handoff. Re-fail the (Streaming,
-                    // tracked) retry tasks — rolling them back to self — so they
-                    // return to the failed set and are re-driven next pass.
-                    if !finalize_enumeration_round(
-                        skipped,
-                        &retry_tasks,
-                        migration,
+                    Self::redrive_failed_migration_tasks(
+                        retry_tasks,
+                        "node-joined",
+                        self_id,
+                        max_migration_threads,
                         shard_table,
+                        migration,
+                        node_addrs,
+                        engine,
+                        redo_for_events,
+                        topology_epoch.load(Ordering::Relaxed),
+                        migration_pool_size,
+                        migration_batch_size,
                         fenced_bm,
                         migrating_bm,
-                        epoch,
-                    ) {
-                        // Rolled back for retry — skip the spawn this round.
-                    } else {
-                        let all_keys: Vec<TxKey> =
-                            keys_map.values().flat_map(|v| v.iter().copied()).collect();
-                        let migration_ref = migration.clone();
-                        let node_addrs_ref = node_addrs.clone();
-                        let eng = engine.clone();
-                        let redo = redo_for_events.clone();
-                        let st = shard_table.clone();
-                        let fb = fenced_bm.clone();
-                        let mb = migrating_bm.clone();
-                        let ib = inbound_bm.clone();
-                        let throttle_ref = migration_throttle.clone();
-                        let secret_ref = cluster_secret.clone();
-                        // Task #25 — relinquish context for the rejoin retry path,
-                        // built from the committed (active) topology members + RF
-                        // and the live-member snapshot (peers we have addresses for,
-                        // plus self).
-                        let relinquish_ctx = {
-                            let committed_members = active_topology_members.read().clone();
-                            let (rf, placement_version) = {
-                                let t = st.read();
-                                (t.replication_factor(), t.placement_version())
-                            };
-                            let mut live_members: std::collections::HashSet<NodeId> =
-                                node_addrs.read().keys().copied().collect();
-                            live_members.insert(self_id);
-                            Arc::new(RelinquishContext {
-                                committed_members,
-                                rf,
-                                placement_version,
-                                self_id,
-                                live_members,
-                                engine: engine.clone(),
-                                committed_elected: topology_authority.committed_assignment(),
-                            })
-                        };
-                        std::thread::spawn(move || {
-                            Self::run_migration_tasks_with_global_limit(
-                                retry_tasks,
-                                all_keys,
-                                node_addrs_ref,
-                                eng,
-                                migration_ref,
-                                st,
-                                redo,
-                                epoch,
-                                max_migration_threads,
-                                migration_pool_size,
-                                migration_batch_size,
-                                fb,
-                                mb,
-                                ib,
-                                self_id,
-                                throttle_ref,
-                                secret_ref,
-                                Some(relinquish_ctx),
-                            );
-                        });
-                    }
+                        inbound_bm,
+                        topology_authority,
+                        active_topology_members,
+                        migration_throttle,
+                        cluster_secret,
+                    );
                 }
             }
             ClusterEvent::NodeLeft(node) => {
@@ -5689,6 +5996,13 @@ impl ClusterCoordinator {
                     mgr.mark_failed(t);
                 }
                 mgr.clear_inbound();
+                // W8 review P0-2 — epoch fence for the failed-batch retry
+                // hold: this activation supersedes the old plan, so any
+                // pending self-retry (and its hold keeping Failed entries
+                // alive) is cancelled BEFORE the cleanup, letting it reap
+                // the superseded Failed entries exactly as it always has.
+                // The new plan re-registers and re-drives what it needs.
+                mgr.clear_failed_retry_state();
                 mgr.cleanup_completed();
             }
 
@@ -8895,6 +9209,18 @@ fn run_migration_batch(
         let c = completed.load(Ordering::Relaxed);
         let f = failed.load(Ordering::Relaxed);
         tracing::info!(%addr, completed = c, failed = f, "cluster: batch migration finished");
+        // W8 (defect 1) — same self-retry arm as the data-path disposition
+        // below: an all-empty batch whose completion handshakes failed parks
+        // its tasks in the durable retry queue exactly the same way, and a
+        // settled cluster produces no membership edge to re-drive them.
+        // The epoch was verified current above.
+        if f > 0 {
+            migration.lock().arm_failed_batch_retry();
+            tracing::warn!(
+                failed = f,
+                "cluster: migrations failed — armed self-retry (event repair + delayed re-drive)"
+            );
+        }
         // Scenario 17 — mirror of the data-path spawn gate: failed tasks no
         // longer veto the sweep; it skips (only) the unsettled shards. The
         // epoch was verified current above.
@@ -9483,67 +9809,138 @@ fn run_migration_batch(
                             // NotExactKey superset probe below.
                             let mut reduced_entries = manifest_entries.clone();
                             let mut reduced_hash = manifest_hash;
+                            // P0-1 — the deletion-authorizing reduction is
+                            // armed by config (default OFF); the flag rides
+                            // on the shared manager.
+                            let vetoed_reduction_enabled =
+                                migration.lock().vetoed_reduction_enabled();
                             let escalation = escalate_missing_exact_keys(
                                 e,
                                 &manifest_entries,
                                 MAX_EXACT_KEY_ESCALATIONS,
-                                |missing| {
-                                    tracing::info!(
-                                        shard = task.shard,
-                                        keys = missing.len(),
-                                        "cluster: re-pushing missing exact key(s) named by \
-                                         completion rejection",
-                                    );
-                                    let before = reduced_entries.len();
-                                    let attempt = repush_and_retry_reduced_completion(
-                                        &mut stream,
-                                        missing,
-                                        &mut reduced_entries,
-                                        &mut reduced_hash,
-                                        |stream, refs| {
-                                            stream_shard_baseline(
-                                                task,
-                                                refs,
-                                                &engine,
-                                                stream,
-                                                batch_size,
-                                                topology_epoch,
-                                                auth_secret,
-                                                Some(&|| {
-                                                    migration_epoch_current(
-                                                        shard_table,
-                                                        topology_epoch,
-                                                    )
-                                                }),
-                                            )
-                                            .map(|(_manifest, skipped)| skipped)
-                                        },
-                                        |stream, hash, entries| {
-                                            send_migration_complete(
-                                                addr,
-                                                task.shard,
-                                                task.from_node,
-                                                entries.len() as u64,
-                                                fence_seq,
-                                                topology_epoch,
-                                                Some(stream),
-                                                hash,
-                                                entries,
-                                                true,
-                                                auth_secret,
-                                            )
-                                        },
-                                    );
-                                    if reduced_entries.len() < before {
+                                vetoed_reduction_enabled,
+                                |action| match action {
+                                    EscalationAction::Repush(missing) => {
                                         tracing::info!(
                                             shard = task.shard,
-                                            removed = before - reduced_entries.len(),
-                                            remaining = reduced_entries.len(),
-                                            "cluster: completion manifest reduced by keys \
-                                             the source can no longer ship",
+                                            keys = missing.len(),
+                                            "cluster: re-pushing missing exact key(s) named by \
+                                             completion rejection",
                                         );
+                                        let before = reduced_entries.len();
+                                        let attempt = repush_and_retry_reduced_completion(
+                                            &mut stream,
+                                            missing,
+                                            &mut reduced_entries,
+                                            &mut reduced_hash,
+                                            |stream, refs| {
+                                                stream_shard_baseline(
+                                                    task,
+                                                    refs,
+                                                    &engine,
+                                                    stream,
+                                                    batch_size,
+                                                    topology_epoch,
+                                                    auth_secret,
+                                                    Some(&|| {
+                                                        migration_epoch_current(
+                                                            shard_table,
+                                                            topology_epoch,
+                                                        )
+                                                    }),
+                                                )
+                                                .map(|(_manifest, skipped)| skipped)
+                                            },
+                                            |stream, hash, entries| {
+                                                send_migration_complete(
+                                                    addr,
+                                                    task.shard,
+                                                    task.from_node,
+                                                    entries.len() as u64,
+                                                    fence_seq,
+                                                    topology_epoch,
+                                                    Some(stream),
+                                                    hash,
+                                                    entries,
+                                                    true,
+                                                    auth_secret,
+                                                )
+                                            },
+                                        );
+                                        if reduced_entries.len() < before {
+                                            tracing::info!(
+                                                shard = task.shard,
+                                                removed = before - reduced_entries.len(),
+                                                remaining = reduced_entries.len(),
+                                                "cluster: completion manifest reduced by keys \
+                                                 the source can no longer ship",
+                                            );
+                                        }
+                                        attempt
                                     }
-                                    attempt
+                                    // W8 (defect 2) — the target vetoed key(s)
+                                    // with deletion tombstones: reduce the
+                                    // manifest (the target's deletion is
+                                    // authoritative for them; soundness and the
+                                    // census walk live on
+                                    // `escalate_missing_exact_keys`) and retry
+                                    // the completion. No re-push, no attempt
+                                    // burned.
+                                    EscalationAction::ReduceVetoed(vetoed) => {
+                                        tracing::info!(
+                                            shard = task.shard,
+                                            keys = vetoed.len(),
+                                            "cluster: target vetoed manifest key(s) with \
+                                             deletion tombstones — reducing the completion \
+                                             manifest (no re-push)",
+                                        );
+                                        let before = reduced_entries.len();
+                                        let attempt = reduce_vetoed_and_retry_completion(
+                                            &mut stream,
+                                            vetoed,
+                                            &mut reduced_entries,
+                                            &mut reduced_hash,
+                                            |stream, hash, entries| {
+                                                send_migration_complete(
+                                                    addr,
+                                                    task.shard,
+                                                    task.from_node,
+                                                    entries.len() as u64,
+                                                    fence_seq,
+                                                    topology_epoch,
+                                                    Some(stream),
+                                                    hash,
+                                                    entries,
+                                                    true,
+                                                    auth_secret,
+                                                )
+                                            },
+                                        );
+                                        if reduced_entries.len() < before {
+                                            let removed = before - reduced_entries.len();
+                                            // P0-1 — every reduction is a
+                                            // deletion-authorizing decision
+                                            // (the source's copy is orphan-
+                                            // cleaned post-commit): warn +
+                                            // counter, never silent.
+                                            if let Some(m) =
+                                                crate::metrics::migration_metrics()
+                                            {
+                                                m.migration_completion_manifest_reduced_vetoed
+                                                    .inc_by(removed as u64);
+                                            }
+                                            tracing::warn!(
+                                                shard = task.shard,
+                                                removed,
+                                                remaining = reduced_entries.len(),
+                                                "cluster: completion manifest REDUCED by \
+                                                 tombstone-vetoed key(s) — the target's \
+                                                 deletion is being honored; the source's \
+                                                 copy will be orphan-cleaned after commit",
+                                            );
+                                        }
+                                        attempt
+                                    }
                                 },
                             );
                             match escalation {
@@ -9815,10 +10212,23 @@ fn run_migration_batch(
         drop(mgr);
     }
 
+    // W8 (defect 1) — a settled cluster never produces the membership/
+    // topology edge the durable retry queue used to wait for (observed: a
+    // resync batch finishing 627/failed 8, then the whole cluster silent for
+    // the census window while the 8 shards' one-holder records never
+    // converged). Arm the coordinator event loop's self-retry instead: it
+    // observes the event-repair trigger (armed-mode under-replication
+    // re-derive, sc08-backoff-bounded) AND schedules the delayed
+    // failed-task re-drive for TRACKED batches (bounded attempts with
+    // backoff, no membership edge required). The no-address early return
+    // above deliberately does NOT arm — without an address for the target a
+    // re-drive cannot succeed, and the address arrives with the NodeJoined
+    // edge whose re-drive already exists.
     if f > 0 && batch_epoch_current {
+        migration.lock().arm_failed_batch_retry();
         tracing::warn!(
             failed = f,
-            "cluster: migrations failed — awaiting explicit retry on membership/topology change"
+            "cluster: migrations failed — armed self-retry (event repair + delayed re-drive)"
         );
     }
     (c, f)
@@ -10106,6 +10516,14 @@ fn migration_error_is_stale_epoch(err: &str) -> bool {
 /// migration is terminally aborted (`terminally_abort_unshippable_task`).
 const MAX_EXACT_KEY_ESCALATIONS: usize = 3;
 
+/// W8 review P1-3 — backstop cap on tombstone-vetoed manifest-reduction
+/// rounds per escalation. The target names its FULL vetoed set in one
+/// rejection, so a legitimate escalation reduces in a single round; a target
+/// that keeps naming NEW vetoed keys on every completion retry (drift, or a
+/// buggy peer) is cut off here rather than walking a large manifest down one
+/// write-fenced round-trip at a time.
+const VETOED_REDUCTION_ROUNDS_MAX: usize = 3;
+
 /// F3 — resolve the missing key(s) named by an exact-key completion rejection
 /// back to the source's full manifest keys.
 ///
@@ -10169,6 +10587,97 @@ pub(crate) fn completion_rejection_missing_keys(
     out
 }
 
+/// W8 (defect 2) — resolve the key(s) a completion rejection names as
+/// TOMBSTONE-VETOED back to the source's manifest, with each veto's recorded
+/// tombstone generation.
+///
+/// The target's verify rejects a FORWARD-migration manifest key that is
+/// locally absent BECAUSE a deletion tombstone vetoed its baseline apply
+/// (RULE-DS) with `code=19` and the message `shard N exact key
+/// TxKey(<16 hex>...) vetoed by deletion tombstone (cause=<C> gen=<G>
+/// height=<H>): <err>` — distinct from the `missing exact key` shape, which
+/// this parser deliberately does NOT match (a veto is the target ASSERTING a
+/// deliberate delete; re-pushing the record is structurally unwinnable
+/// against the unconditional ClientDelete veto, so the escalation must
+/// never burn re-push attempts on it). `TxKey`'s Debug form truncates the
+/// txid, so the name is matched as a PREFIX against `manifest` — and, unlike
+/// the re-push parser (where a collision merely re-pushes an extra record,
+/// idempotent and safe), a REDUCTION must never touch a key the target did
+/// not veto, so a prefix resolving to anything but EXACTLY ONE manifest key
+/// is skipped (review P2-5; the skipped key surfaces again on the next
+/// rejection and ultimately fails through the historical path).
+///
+/// Returns `(manifest key, tombstone generation)` pairs; empty for anything
+/// that is not a vetoed-key rejection. Pinned against the dispatch producer
+/// by the cross-module contract test
+/// `vetoed_key_rejection_is_recognised_by_the_vetoed_parser`
+/// (`server::dispatch` tests).
+pub(crate) fn completion_rejection_vetoed_keys(
+    err: &str,
+    manifest: &[(TxKey, u32)],
+) -> Vec<(TxKey, u32)> {
+    // The `:` keeps the match exact — see `completion_rejection_missing_keys`.
+    if !err.contains(&format!(
+        "(code={}:",
+        crate::protocol::opcodes::ERR_MIGRATION_IN_PROGRESS
+    )) || !err.contains("vetoed by deletion tombstone")
+    {
+        return Vec::new();
+    }
+    let mut out: Vec<(TxKey, u32)> = Vec::new();
+    let mut rest = err;
+    while let Some(pos) = rest.find("TxKey(") {
+        rest = &rest[pos + "TxKey(".len()..];
+        let hex: &str = &rest[..rest
+            .find(|c: char| !c.is_ascii_hexdigit())
+            .unwrap_or(rest.len())];
+        let mut prefix: Vec<u8> = Vec::with_capacity(hex.len() / 2);
+        for pair in hex.as_bytes().chunks_exact(2) {
+            match std::str::from_utf8(pair)
+                .ok()
+                .and_then(|s| u8::from_str_radix(s, 16).ok())
+            {
+                Some(b) => prefix.push(b),
+                None => {
+                    prefix.clear();
+                    break;
+                }
+            }
+        }
+        if prefix.is_empty() {
+            continue;
+        }
+        // The veto marker and its generation must belong to THIS key: look
+        // only at the segment before the next TxKey (if any).
+        let segment = &rest[..rest.find("TxKey(").unwrap_or(rest.len())];
+        let Some(marker) = segment.find("vetoed by deletion tombstone") else {
+            continue;
+        };
+        let after_marker = &segment[marker..];
+        let Some(gen_pos) = after_marker.find("gen=") else {
+            continue;
+        };
+        let digits = &after_marker[gen_pos + "gen=".len()..];
+        let digits = &digits[..digits
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(digits.len())];
+        let Ok(tomb_gen) = digits.parse::<u32>() else {
+            continue;
+        };
+        // Review P2-5 — exactly-one resolution: a reduction must never touch
+        // a key the target did not veto, so an ambiguous prefix is skipped.
+        let mut matches = manifest
+            .iter()
+            .filter(|(key, _)| key.txid.starts_with(&prefix));
+        if let (Some((key, _)), None) = (matches.next(), matches.next())
+            && !out.iter().any(|(k, _)| k == key)
+        {
+            out.push((*key, tomb_gen));
+        }
+    }
+    out
+}
+
 /// F3 — outcome of the bounded missing-exact-key completion escalation
 /// ([`escalate_missing_exact_keys`]).
 #[derive(Debug, PartialEq, Eq)]
@@ -10206,13 +10715,28 @@ enum EscalationAttemptError {
     Completion(String),
 }
 
+/// W8 (defect 2) — what one escalation round asks of the caller's I/O
+/// closure ([`escalate_missing_exact_keys`]).
+#[derive(Debug, PartialEq, Eq)]
+enum EscalationAction<'a> {
+    /// Re-push these genuinely-missing key(s) through the baseline
+    /// machinery, then retry the (possibly already reduced) completion.
+    /// Burns an escalation attempt.
+    Repush(&'a [TxKey]),
+    /// The target VETOED these key(s) with deletion tombstones: REDUCE the
+    /// completion manifest by them — no re-push (structurally unwinnable
+    /// against the unconditional ClientDelete veto) — and retry. Does NOT
+    /// burn an escalation attempt.
+    ReduceVetoed(&'a [TxKey]),
+}
+
 /// F3 (a) — bounded escalation for a `code=19` "missing exact key" completion
-/// rejection.
+/// rejection, extended (W8, defect 2) with tombstone-veto handling.
 ///
 /// Re-sending the SAME handshake verbatim can never succeed (observed wedging
 /// scenario 07 shard 227 six times and scenario 11 for 5 minutes from three
 /// sources), so instead: resolve the named key(s) against `manifest_entries`
-/// and invoke `repush_and_retry`, which ships the named record(s) through the
+/// and invoke `attempt`, which ships the named record(s) through the
 /// existing baseline machinery and re-sends the verify handshake. Up to
 /// `max_attempts` rounds; each follow-up COMPLETION rejection is re-parsed so
 /// a new missing key gets its own re-push, while a RE-PUSH failure keeps the
@@ -10220,35 +10744,186 @@ enum EscalationAttemptError {
 /// [`EscalationAttemptError::Repush`]). A completion error that stops naming
 /// missing keys falls back to the historical handling
 /// ([`ExactKeyEscalation::NotExactKey`]).
+///
+/// # W8 — tombstone-vetoed keys (checked FIRST, attempt-free)
+///
+/// A rejection naming a TOMBSTONE-VETOED key
+/// ([`completion_rejection_vetoed_keys`]) is the target ASSERTING the key is
+/// deliberately deleted (RULE-DS): demanding the target hold it is wrong,
+/// and a re-push is structurally unwinnable — the veto drops every re-pushed
+/// create the same way. Vetoed keys are therefore REDUCED from the manifest
+/// ([`EscalationAction::ReduceVetoed`], no attempt burned) so the completion
+/// can succeed for the rest of the shard — but only after a per-key
+/// soundness gate: the veto's recorded tombstone generation must be
+/// at-or-ahead of the source's manifest generation for the key (LWW — the
+/// delete is then the newest state either side can prove; the source's live
+/// copy is a stale pre-delete image, and after the reduced completion
+/// commits, the source's committed-handoff-gated orphan cleanup removes that
+/// stale copy, converging the record to fully-deleted — the census stops
+/// counting it at all). A veto whose tombstone generation is strictly BEHIND
+/// the manifest generation is provably vetoing a NEWER same-lineage state
+/// (e.g. a reorg `unspend` past a ClientDelete — the generation-blind veto
+/// defect); reducing would let orphan cleanup delete the newest copy, so the
+/// reduction is REFUSED (error-logged loudly) and the rejection falls
+/// through to the historical fail/rollback handling — data-safe, the source
+/// keeps its copy.
+///
+/// KNOWN RESIDUAL (deeper defect, reported not fixed here): a RE-CREATED
+/// key restarts at generation 0, so a stale ClientDelete tombstone from the
+/// prior lineage always reads "at-or-ahead" of the new lineage's manifest
+/// generation and passes the gate — cross-lineage generations are
+/// incomparable, making a stale veto indistinguishable from an
+/// authoritative delete at this layer. That shape reduces (and, post
+/// orphan-cleanup, actively deletes the source's re-created copy) — the
+/// active-deletion extension of the design-acked E5 loss residual on
+/// `TombstoneLog::blocks_heal_apply`. Closing it needs cross-lineage
+/// monotonic generations (seed a re-create's generation past the tombstone's
+/// at the create-path tombstone clear), not a change here.
+///
+/// A vetoed reduction that EMPTIES the manifest is terminal
+/// ([`ExactKeyEscalation::Exhausted`] → `terminally_abort_unshippable_task`):
+/// burning the remaining attempts would send nothing new, matching the W3
+/// zero-shippable disposition. Reduction rounds are additionally capped at
+/// [`VETOED_REDUCTION_ROUNDS_MAX`] (review P1-3): the target names its FULL
+/// vetoed set per rejection, so one round normally suffices — the cap is
+/// the backstop against a drifting target naming new vetoes every retry.
+///
+/// # W8 review P0-1 — the reduction is gated (default OFF)
+///
+/// `vetoed_reduction_enabled` (config `migration_vetoed_reduction_enabled`)
+/// arms the reduction itself. Disabled — the shipped default — a sound
+/// vetoed rejection returns [`ExactKeyEscalation::Exhausted`] directly: the
+/// pre-W8 disposition (terminal abort → rollback to source; a data-safe
+/// wedge, self-retried on the failed-batch cadence) minus the futile
+/// re-pushes the old path burned. The veto NAMING and the LWW soundness
+/// refusal below run regardless of the flag — only the
+/// deletion-authorizing reduction is gated. See the config doc for why the
+/// re-created-lineage window keeps this off until cross-lineage
+/// generations (#78) land.
 fn escalate_missing_exact_keys(
     initial_err: String,
     manifest_entries: &[(TxKey, u32)],
     max_attempts: usize,
-    mut repush_and_retry: impl FnMut(&[TxKey]) -> std::result::Result<(), EscalationAttemptError>,
+    vetoed_reduction_enabled: bool,
+    mut attempt: impl FnMut(EscalationAction<'_>) -> std::result::Result<(), EscalationAttemptError>,
 ) -> ExactKeyEscalation {
     let mut last_err = initial_err;
-    let mut missing = completion_rejection_missing_keys(&last_err, manifest_entries);
-    if missing.is_empty() {
-        return ExactKeyEscalation::NotExactKey { last_err };
-    }
-    for _ in 0..max_attempts {
-        match repush_and_retry(&missing) {
+    // Keys already handled (reduced or refused) — a buggy target re-naming
+    // one cannot loop the attempt-free reduction path; progress is bounded
+    // by the manifest itself.
+    let mut vetoed_seen: Vec<TxKey> = Vec::new();
+    let mut missing: Vec<TxKey> = Vec::new();
+    // Whether `last_err` came from a completion (re-parse it for missing
+    // keys; an empty parse then means "stopped naming keys" → historical
+    // path) or from a re-push failure (keep the previous missing set).
+    let mut reparse_missing = true;
+    let mut attempts_used = 0usize;
+    let mut reduce_rounds_used = 0usize;
+    loop {
+        // W8 — vetoed keys first, attempt-free (see the fn doc).
+        let mut reduce_now: Vec<TxKey> = Vec::new();
+        for (key, tomb_gen) in completion_rejection_vetoed_keys(&last_err, manifest_entries) {
+            if vetoed_seen.contains(&key) {
+                continue;
+            }
+            vetoed_seen.push(key);
+            // Review P2-4 — fail CLOSED on an unresolvable manifest
+            // generation: a key we cannot prove the tombstone is at-or-ahead
+            // of must never be reduced.
+            let Some(manifest_gen) = manifest_entries
+                .iter()
+                .find(|(k, _)| *k == key)
+                .map(|(_, g)| *g)
+            else {
+                tracing::error!(
+                    key = ?key,
+                    tombstone_generation = tomb_gen,
+                    "cluster: vetoed key has no manifest generation to compare \
+                     against — refusing the reduction (fail-closed)",
+                );
+                continue;
+            };
+            if crate::record::generation_at_or_ahead(tomb_gen, manifest_gen) {
+                reduce_now.push(key);
+            } else {
+                tracing::error!(
+                    key = ?key,
+                    manifest_generation = manifest_gen,
+                    tombstone_generation = tomb_gen,
+                    "cluster: deletion tombstone vetoes a manifest key whose source \
+                     generation is AHEAD of the tombstone's — the generation-blind \
+                     veto is blocking a NEWER record. Refusing the manifest \
+                     reduction (data safety); the task fails through the \
+                     historical path",
+                );
+            }
+        }
+        if !reduce_now.is_empty() {
+            // P0-1 — reduction disarmed (the default): keep the pre-W8
+            // disposition. Terminal abort rolls the shard back to the
+            // source — data-safe — and the distinct veto naming above
+            // still tells the operator exactly why.
+            if !vetoed_reduction_enabled {
+                tracing::warn!(
+                    vetoed = reduce_now.len(),
+                    "cluster: completion vetoed by target deletion tombstone(s); \
+                     manifest reduction is DISABLED \
+                     (migration_vetoed_reduction_enabled=false) — terminal abort, \
+                     shard rolls back to source",
+                );
+                return ExactKeyEscalation::Exhausted { last_err };
+            }
+            // P1-3 backstop — the target names its full vetoed set per
+            // rejection, so legitimate escalations reduce in one round;
+            // a target that keeps naming NEW vetoes every retry is cut
+            // off here instead of walking a large manifest down one
+            // completion round-trip at a time.
+            if reduce_rounds_used >= VETOED_REDUCTION_ROUNDS_MAX {
+                tracing::warn!(
+                    rounds = reduce_rounds_used,
+                    "cluster: vetoed-manifest reduction round cap reached — \
+                     terminal abort",
+                );
+                return ExactKeyEscalation::Exhausted { last_err };
+            }
+            reduce_rounds_used += 1;
+            match attempt(EscalationAction::ReduceVetoed(&reduce_now)) {
+                Ok(()) => return ExactKeyEscalation::Verified,
+                Err(EscalationAttemptError::Repush(e)) => {
+                    // The reduction emptied the manifest: terminal (see doc).
+                    return ExactKeyEscalation::Exhausted { last_err: e };
+                }
+                Err(EscalationAttemptError::Completion(e)) => {
+                    last_err = e;
+                    reparse_missing = true;
+                    continue;
+                }
+            }
+        }
+        if reparse_missing {
+            missing = completion_rejection_missing_keys(&last_err, manifest_entries);
+            if missing.is_empty() {
+                return ExactKeyEscalation::NotExactKey { last_err };
+            }
+        }
+        if attempts_used >= max_attempts {
+            return ExactKeyEscalation::Exhausted { last_err };
+        }
+        attempts_used += 1;
+        match attempt(EscalationAction::Repush(&missing)) {
             Ok(()) => return ExactKeyEscalation::Verified,
             Err(EscalationAttemptError::Repush(e)) => {
                 // Source-side repair failure: the deficit stands. Burn the
                 // attempt and keep the same missing set.
                 last_err = e;
+                reparse_missing = false;
             }
             Err(EscalationAttemptError::Completion(e)) => {
                 last_err = e;
-                missing = completion_rejection_missing_keys(&last_err, manifest_entries);
-                if missing.is_empty() {
-                    return ExactKeyEscalation::NotExactKey { last_err };
-                }
+                reparse_missing = true;
             }
         }
     }
-    ExactKeyEscalation::Exhausted { last_err }
 }
 
 /// W3 FIX B — one escalation attempt: re-push the named missing key(s),
@@ -10301,6 +10976,39 @@ fn repush_and_retry_reduced_completion<C>(
         return Err(EscalationAttemptError::Repush(
             "manifest reduced to zero shippable records — the source holds nothing \
              it can prove to the target"
+                .to_string(),
+        ));
+    }
+    send_completion(ctx, reduced_hash, reduced_entries).map_err(EscalationAttemptError::Completion)
+}
+
+/// W8 (defect 2) — one vetoed-key escalation round: REDUCE the completion
+/// manifest by the tombstone-vetoed key(s) — NO re-push — and retry the
+/// completion with the reduced manifest.
+///
+/// The soundness argument (and the per-key generation gate that admits a key
+/// here, plus the re-created-lineage residual) lives on
+/// [`escalate_missing_exact_keys`]; this helper is the mechanical half,
+/// mirroring [`repush_and_retry_reduced_completion`]'s reduction contract:
+/// `reduced_entries` / `reduced_hash` are the escalation's locally-owned
+/// manifest state carried across attempts, and a reduction that EMPTIES the
+/// manifest is terminal, surfaced as a source-side
+/// [`EscalationAttemptError::Repush`] (an empty-manifest completion cannot
+/// verify — see the W3 helper's doc) which the escalation maps straight to
+/// [`ExactKeyEscalation::Exhausted`].
+fn reduce_vetoed_and_retry_completion<C>(
+    ctx: &mut C,
+    vetoed: &[TxKey],
+    reduced_entries: &mut Vec<(TxKey, u32)>,
+    reduced_hash: &mut [u8; 32],
+    send_completion: impl FnOnce(&mut C, &[u8; 32], &[(TxKey, u32)]) -> std::result::Result<(), String>,
+) -> std::result::Result<(), EscalationAttemptError> {
+    reduced_entries.retain(|(key, _)| !vetoed.contains(key));
+    *reduced_hash = compute_manifest_for_entries(reduced_entries);
+    if reduced_entries.is_empty() {
+        return Err(EscalationAttemptError::Repush(
+            "manifest reduced to zero shippable records — the target vetoed every \
+             remaining key with a deletion tombstone"
                 .to_string(),
         ));
     }
@@ -17005,6 +17713,211 @@ mod tests {
         );
     }
 
+    /// W8 (defect 1) — the delayed failed-batch re-drive: armed by a failed
+    /// disposition, it fires only after the attempt-scaled backoff elapses,
+    /// with no membership event required.
+    #[test]
+    fn failed_redrive_arms_and_fires_after_base_backoff() {
+        let t0 = std::time::Instant::now();
+        let mut redrive = FailedBatchRedrive::new();
+        assert!(!redrive.is_armed_and_due(t0), "unarmed never fires");
+        redrive.arm(t0, 3);
+        assert!(
+            !redrive.is_armed_and_due(t0 + FAILED_REDRIVE_BASE_BACKOFF / 2),
+            "the backoff window must elapse first"
+        );
+        assert!(
+            redrive.is_armed_and_due(t0 + FAILED_REDRIVE_BASE_BACKOFF),
+            "peek turns due once the base backoff elapses"
+        );
+        assert!(
+            redrive.take_due(t0 + FAILED_REDRIVE_BASE_BACKOFF, 3),
+            "the due re-drive fires under the armed epoch"
+        );
+        assert!(
+            !redrive.take_due(t0 + FAILED_REDRIVE_BASE_BACKOFF * 2, 3),
+            "a fired re-drive disarms until the next failed disposition"
+        );
+    }
+
+    /// W8 — each fired attempt doubles the next backoff (2s -> 4s -> 8s ...)
+    /// up to the cap, so a permanently-failing batch converges to a slow
+    /// cadence instead of hammering.
+    #[test]
+    fn failed_redrive_backoff_doubles_per_attempt() {
+        let t0 = std::time::Instant::now();
+        let mut redrive = FailedBatchRedrive::new();
+        redrive.arm(t0, 5);
+        assert!(redrive.take_due(t0 + FAILED_REDRIVE_BASE_BACKOFF, 5));
+        // Attempt 1 consumed: the re-arm now waits 2x the base.
+        let t1 = t0 + FAILED_REDRIVE_BASE_BACKOFF;
+        redrive.arm(t1, 5);
+        assert!(
+            !redrive.take_due(t1 + FAILED_REDRIVE_BASE_BACKOFF, 5),
+            "the second attempt must wait the DOUBLED backoff"
+        );
+        assert!(redrive.take_due(t1 + FAILED_REDRIVE_BASE_BACKOFF * 2, 5));
+    }
+
+    /// W8 — re-arms while pending coalesce (the deadline of the FIRST arm
+    /// stands), mirroring the event-repair trigger's flurry behaviour.
+    #[test]
+    fn failed_redrive_coalesces_rearm_under_same_epoch() {
+        let t0 = std::time::Instant::now();
+        let mut redrive = FailedBatchRedrive::new();
+        redrive.arm(t0, 2);
+        redrive.arm(t0 + Duration::from_millis(500), 2);
+        assert!(
+            redrive.take_due(t0 + FAILED_REDRIVE_BASE_BACKOFF, 2),
+            "the coalesced arm fires at the FIRST arm's deadline"
+        );
+    }
+
+    /// W8 — a pending re-drive armed under a superseded epoch is dropped
+    /// (the new activation re-plans and re-drives through its own migration
+    /// cycle) and the attempt streak resets with it.
+    #[test]
+    fn failed_redrive_stale_epoch_drops_pending_and_resets_attempts() {
+        let t0 = std::time::Instant::now();
+        let mut redrive = FailedBatchRedrive::new();
+        redrive.arm(t0, 1);
+        assert!(redrive.take_due(t0 + FAILED_REDRIVE_BASE_BACKOFF, 1));
+        let t1 = t0 + FAILED_REDRIVE_BASE_BACKOFF;
+        redrive.arm(t1, 1);
+        // The topology moved: the pending arm is dropped, never fired stale.
+        assert!(
+            !redrive.take_due(t1 + FAILED_REDRIVE_BACKOFF_CAP, 2),
+            "a stale-epoch arm never fires"
+        );
+        // The streak reset with it: a fresh arm under the new epoch fires at
+        // the BASE backoff again.
+        let t2 = t1 + FAILED_REDRIVE_BACKOFF_CAP;
+        redrive.arm(t2, 2);
+        assert!(
+            redrive.take_due(t2 + FAILED_REDRIVE_BASE_BACKOFF, 2),
+            "an epoch change resets the attempt streak"
+        );
+    }
+
+    /// W8 review P2-7 — the redrive stands down to the CAP CADENCE, never to
+    /// zero: on a settled cluster the epoch can stay unchanged indefinitely,
+    /// so a hard per-epoch attempt budget would re-create the original
+    /// wedge. After many fired attempts, arms are still accepted and fires
+    /// keep coming — but only at the 30s cap; an epoch change restores the
+    /// base cadence.
+    #[test]
+    fn failed_redrive_stands_down_to_cap_cadence_not_to_zero() {
+        let mut now = std::time::Instant::now();
+        let mut redrive = FailedBatchRedrive::new();
+        // Saturate the streak well past the doubling range.
+        for attempt in 0..10u32 {
+            redrive.arm(now, 7);
+            now += FAILED_REDRIVE_BACKOFF_CAP;
+            assert!(redrive.take_due(now, 7), "attempt {attempt} must fire");
+        }
+        // Still arming, still firing — at the cap cadence, not before it.
+        redrive.arm(now, 7);
+        assert!(
+            !redrive.is_armed_and_due(now + FAILED_REDRIVE_BACKOFF_CAP / 2),
+            "a saturated streak must not fire before the cap elapses"
+        );
+        assert!(
+            redrive.take_due(now + FAILED_REDRIVE_BACKOFF_CAP, 7),
+            "the redrive keeps retrying at the cap cadence — never stands down to zero"
+        );
+        // A new epoch is a new plan: back to the base cadence.
+        let t_epoch = now + FAILED_REDRIVE_BACKOFF_CAP;
+        redrive.arm(t_epoch, 8);
+        assert!(
+            redrive.take_due(t_epoch + FAILED_REDRIVE_BASE_BACKOFF, 8),
+            "an epoch change restores the base cadence"
+        );
+    }
+
+    /// W8 review P0-2 — the retry queue must SURVIVE the event loop's
+    /// periodic prune. This drives the REAL loop section
+    /// (`failed_batch_retry_pass`) against a REAL `MigrationManager` with
+    /// the InboundPrune line (`cleanup_completed()`) interleaved every
+    /// simulated 100ms tick, exactly as the event loop runs them. Pre-fix
+    /// this was green-but-inert: `cleanup_completed()` deleted the Failed
+    /// entries ~100ms after the disposition parked them, so by the time the
+    /// 2s backoff elapsed `take_failed_tasks` always drained empty and the
+    /// whole machine was a no-op poll.
+    #[test]
+    fn failed_batch_retry_survives_periodic_cleanup_and_redrives() {
+        let task = MigrationTask {
+            shard: 42,
+            from_node: NodeId(1),
+            to_node: NodeId(2),
+            is_master: true,
+        };
+        let migration = Arc::new(Mutex::new(MigrationManager::new()));
+        {
+            let mut mgr = migration.lock();
+            mgr.start_outbound(
+                std::slice::from_ref(&task),
+                NodeId(1),
+                &std::collections::HashSet::new(),
+            );
+            // The failed-batch disposition, as `run_migration_batch` runs it:
+            // the task resolves Failed, completed entries are pruned keeping
+            // the failed queue, and the self-retry is armed.
+            mgr.mark_failed(&task);
+            mgr.cleanup_completed_keep_failed();
+            mgr.arm_failed_batch_retry();
+        }
+        let mut trigger = EventRepairTrigger::new(UNDER_REPLICATION_EVENT_DEBOUNCE, false);
+        let mut redrive = FailedBatchRedrive::new();
+        let t0 = std::time::Instant::now();
+        let epoch = 7u64;
+        let mut redriven: Option<Vec<MigrationTask>> = None;
+        // 4s of simulated 100ms event-loop iterations: each runs the
+        // InboundPrune cleanup THEN the retry pass, like the real loop.
+        for tick in 0..40u64 {
+            let now = t0 + Duration::from_millis(100 * tick);
+            migration.lock().cleanup_completed();
+            if let Some(tasks) =
+                failed_batch_retry_pass(&migration, &mut trigger, &mut redrive, now, epoch)
+            {
+                redriven = Some(tasks);
+                break;
+            }
+        }
+        assert_eq!(
+            redriven,
+            Some(vec![task.clone()]),
+            "after the backoff the pass must drain the SURVIVING failed task \
+             for re-drive — the periodic cleanup must not have deleted it"
+        );
+        // The drain reset the entry to Streaming (a live re-drive) and
+        // released the retry hold: the next cleanup prunes nothing.
+        let mut mgr = migration.lock();
+        assert_eq!(mgr.failed_count(), 0, "the drained task is Streaming again");
+        assert_eq!(mgr.active_count(), 1);
+        assert!(
+            !mgr.take_failed_batch_retry_arm(),
+            "the disposition arm was consumed by the pass"
+        );
+    }
+
+    /// W8 — a fired re-drive that finds NOTHING left to re-drive (the failed
+    /// set recovered by other means) records recovery, restoring the base
+    /// cadence for the next failure sequence.
+    #[test]
+    fn failed_redrive_recovery_resets_attempts() {
+        let t0 = std::time::Instant::now();
+        let mut redrive = FailedBatchRedrive::new();
+        redrive.arm(t0, 4);
+        assert!(redrive.take_due(t0 + FAILED_REDRIVE_BASE_BACKOFF, 4));
+        redrive.record_recovery();
+        let t1 = t0 + FAILED_REDRIVE_BASE_BACKOFF;
+        redrive.arm(t1, 4);
+        assert!(
+            redrive.take_due(t1 + FAILED_REDRIVE_BASE_BACKOFF, 4),
+            "recovery restores the base backoff"
+        );
+    }
+
     /// sc08 — the outcome accumulator the Phase H backfill threads report
     /// into and the event loop harvests: recording aggregates across
     /// runs, and harvesting drains, so each run's outcome feeds the
@@ -20734,6 +21647,191 @@ mod tests {
         );
     }
 
+    /// W8 (defect 1) — a batch disposition that ends with failed tasks at a
+    /// still-current epoch must ARM the failed-batch self-retry signal
+    /// (`MigrationManager::arm_failed_batch_retry`) so the event loop can
+    /// observe the event-repair trigger and schedule the delayed re-drive.
+    /// Pre-fix the disposition only logged "awaiting explicit retry on
+    /// membership/topology change" — an edge a settled cluster never produces
+    /// (runs 31946515845/31946519864: 8 failed shards' one-holder records
+    /// never converged).
+    #[test]
+    fn failed_batch_disposition_arms_self_retry() {
+        let old_members = vec![NodeId(1), NodeId(2)];
+        let new_members = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let old_table = ShardTable::compute_with_epoch(&old_members, 2, 1, 1);
+        let new_table = ShardTable::compute_with_epoch(&new_members, 2, 2, 1);
+        let shard = (0..NUM_SHARDS as u16)
+            .find(|&s| {
+                old_table.target_assignment(s).master != new_table.target_assignment(s).master
+            })
+            .expect("expected a shard whose master moves");
+        let old_master = old_table.target_assignment(shard).master;
+        let new_master = new_table.target_assignment(shard).master;
+        let task = MigrationTask {
+            shard,
+            from_node: old_master,
+            to_node: new_master,
+            is_master: true,
+        };
+
+        let mut handoff = old_table.clone();
+        handoff.begin_handoff_with(&new_table, |s| s == shard);
+        let shard_table = Arc::new(ShardTableLock::new(handoff));
+
+        let dev: Arc<dyn crate::device::BlockDevice> =
+            Arc::new(crate::device::MemoryDevice::new(4 * 1024 * 1024, 4096).unwrap());
+        let alloc = crate::allocator::SlotAllocator::new(dev.clone()).unwrap();
+        let index = crate::index::Index::new(128).unwrap();
+        let engine = Arc::new(crate::ops::engine::Engine::new(
+            dev,
+            index,
+            alloc,
+            crate::locks::StripedLocks::new(64),
+            crate::index::DahIndex::new(),
+        ));
+
+        // A record in the moving shard puts the batch on the DATA path — the
+        // observed defect's shape (a resync batch with records failing against
+        // an unreachable target).
+        let record_key = tx_key_for_shard(shard, 7);
+        create_test_record(&engine, record_key);
+
+        let migration = Arc::new(Mutex::new(MigrationManager::new()));
+        migration.lock().start_outbound(
+            std::slice::from_ref(&task),
+            old_master,
+            &std::collections::HashSet::new(),
+        );
+
+        let fenced_bm = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+        let migrating_bm = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+        migrating_bm.set(shard);
+        let inbound_bm = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+
+        // Unreachable target: bind a listener for a free port, then drop it so
+        // the batch's connect fails and the task resolves Failed.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let target_addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let (c, f) = run_migration_batch(
+            vec![task],
+            Some(target_addr),
+            &[record_key],
+            engine,
+            &migration,
+            &shard_table,
+            &None,
+            new_table.version,
+            1,
+            100,
+            fenced_bm,
+            migrating_bm,
+            inbound_bm,
+            old_master,
+            None,
+            None,
+        );
+        assert_eq!(c, 0);
+        assert!(f > 0, "the batch must have resolved the task as Failed");
+
+        let mut mgr = migration.lock();
+        assert!(
+            mgr.failed_count() > 0,
+            "the failed task must sit in the durable retry queue"
+        );
+        assert!(
+            mgr.take_failed_batch_retry_arm(),
+            "a failed disposition at a current epoch must arm the self-retry"
+        );
+        assert!(
+            !mgr.take_failed_batch_retry_arm(),
+            "the arm is one-shot until the next failed disposition"
+        );
+    }
+
+    /// W8 (defect 1) — the all-EMPTY batch path returns before the main
+    /// disposition; its completion-handshake failures park tasks in the same
+    /// durable retry queue and must arm the same self-retry.
+    #[test]
+    fn failed_empty_batch_disposition_arms_self_retry() {
+        let old_members = vec![NodeId(1), NodeId(2)];
+        let new_members = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let old_table = ShardTable::compute_with_epoch(&old_members, 2, 1, 1);
+        let new_table = ShardTable::compute_with_epoch(&new_members, 2, 2, 1);
+        let shard = (0..NUM_SHARDS as u16)
+            .find(|&s| {
+                old_table.target_assignment(s).master != new_table.target_assignment(s).master
+            })
+            .expect("expected a shard whose master moves");
+        let old_master = old_table.target_assignment(shard).master;
+        let new_master = new_table.target_assignment(shard).master;
+        let task = MigrationTask {
+            shard,
+            from_node: old_master,
+            to_node: new_master,
+            is_master: true,
+        };
+
+        let mut handoff = old_table.clone();
+        handoff.begin_handoff_with(&new_table, |s| s == shard);
+        let shard_table = Arc::new(ShardTableLock::new(handoff));
+
+        let dev: Arc<dyn crate::device::BlockDevice> =
+            Arc::new(crate::device::MemoryDevice::new(4 * 1024 * 1024, 4096).unwrap());
+        let alloc = crate::allocator::SlotAllocator::new(dev.clone()).unwrap();
+        let index = crate::index::Index::new(128).unwrap();
+        let engine = Arc::new(crate::ops::engine::Engine::new(
+            dev,
+            index,
+            alloc,
+            crate::locks::StripedLocks::new(64),
+            crate::index::DahIndex::new(),
+        ));
+
+        let migration = Arc::new(Mutex::new(MigrationManager::new()));
+        migration.lock().start_outbound(
+            std::slice::from_ref(&task),
+            old_master,
+            &std::collections::HashSet::new(),
+        );
+
+        let fenced_bm = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+        let migrating_bm = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+        migrating_bm.set(shard);
+        let inbound_bm = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let target_addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let (c, f) = run_migration_batch(
+            vec![task],
+            Some(target_addr),
+            &[],
+            engine,
+            &migration,
+            &shard_table,
+            &None,
+            new_table.version,
+            1,
+            100,
+            fenced_bm,
+            migrating_bm,
+            inbound_bm,
+            old_master,
+            None,
+            None,
+        );
+        assert_eq!(c, 0);
+        assert!(f > 0, "the empty-shard handshake must have failed the task");
+        assert!(
+            migration.lock().take_failed_batch_retry_arm(),
+            "the empty-batch early return must arm the self-retry too"
+        );
+    }
+
     #[test]
     fn empty_shard_completion_retries_until_target_is_ready() {
         let old_members = vec![NodeId(1), NodeId(2)];
@@ -23614,7 +24712,10 @@ mod tests {
             tk(2),
         );
         let mut pushed: Vec<Vec<TxKey>> = Vec::new();
-        let outcome = escalate_missing_exact_keys(initial, &manifest, 3, |missing| {
+        let outcome = escalate_missing_exact_keys(initial, &manifest, 3, true, |action| {
+            let EscalationAction::Repush(missing) = action else {
+                panic!("this shape must re-push, not reduce: {action:?}");
+            };
             pushed.push(missing.to_vec());
             Ok(())
         });
@@ -23636,7 +24737,10 @@ mod tests {
             tk(2),
         );
         let mut attempts = 0usize;
-        let outcome = escalate_missing_exact_keys(reject.clone(), &manifest, 3, |missing| {
+        let outcome = escalate_missing_exact_keys(reject.clone(), &manifest, 3, true, |action| {
+            let EscalationAction::Repush(missing) = action else {
+                panic!("this shape must re-push, not reduce: {action:?}");
+            };
             attempts += 1;
             assert_eq!(missing, [tk(2)]);
             Err(EscalationAttemptError::Completion(reject.clone()))
@@ -23664,7 +24768,10 @@ mod tests {
             tk(2),
         );
         let mut attempts = 0usize;
-        let outcome = escalate_missing_exact_keys(initial, &manifest, 3, |missing| {
+        let outcome = escalate_missing_exact_keys(initial, &manifest, 3, true, |action| {
+            let EscalationAction::Repush(missing) = action else {
+                panic!("this shape must re-push, not reduce: {action:?}");
+            };
             attempts += 1;
             assert_eq!(missing, [tk(2)]);
             Err(EscalationAttemptError::Repush(
@@ -23698,7 +24805,7 @@ mod tests {
                    expected 5, got 9)"
             .to_string();
         let mut called = false;
-        let outcome = escalate_missing_exact_keys(err.clone(), &manifest, 3, |_missing| {
+        let outcome = escalate_missing_exact_keys(err.clone(), &manifest, 3, true, |_action| {
             called = true;
             Ok(())
         });
@@ -23720,7 +24827,7 @@ mod tests {
             tk(2),
         );
         let mut attempts = 0usize;
-        let outcome = escalate_missing_exact_keys(initial, &manifest, 3, |_missing| {
+        let outcome = escalate_missing_exact_keys(initial, &manifest, 3, true, |_action| {
             attempts += 1;
             Err(EscalationAttemptError::Completion(
                 "target rejected: status 4 (code=37: target not on epoch)".to_string(),
@@ -23825,7 +24932,10 @@ mod tests {
         let mut reduced = manifest.clone();
         let mut hash = compute_manifest_for_entries(&reduced);
         let mut completions: Vec<Vec<(TxKey, u32)>> = Vec::new();
-        let outcome = escalate_missing_exact_keys(initial, &manifest, 3, |missing| {
+        let outcome = escalate_missing_exact_keys(initial, &manifest, 3, true, |action| {
+            let EscalationAction::Repush(missing) = action else {
+                panic!("this shape must re-push, not reduce: {action:?}");
+            };
             repush_and_retry_reduced_completion(
                 &mut (),
                 missing,
@@ -23871,7 +24981,10 @@ mod tests {
         let mut hash = compute_manifest_for_entries(&reduced);
         let mut attempts = 0usize;
         let mut completion_sent = false;
-        let outcome = escalate_missing_exact_keys(initial, &manifest, 3, |missing| {
+        let outcome = escalate_missing_exact_keys(initial, &manifest, 3, true, |action| {
+            let EscalationAction::Repush(missing) = action else {
+                panic!("this shape must re-push, not reduce: {action:?}");
+            };
             attempts += 1;
             repush_and_retry_reduced_completion(
                 &mut (),
@@ -23899,6 +25012,296 @@ mod tests {
             }
             other => panic!("expected Exhausted, got {other:?}"),
         }
+    }
+
+    /// W8 (defect 2) — builds the target's vetoed-key rejection as the source
+    /// sees it through the completion error envelope.
+    fn vetoed_reject(key: TxKey, tomb_gen: u32) -> String {
+        format!(
+            "target rejected: status 4 (code=19: shard 227 exact key {:?} vetoed by \
+             deletion tombstone (cause=ClientDelete gen={} height=900): TxNotFound)",
+            key, tomb_gen,
+        )
+    }
+
+    /// W8 (defect 2) — the vetoed-key parser resolves the truncated Debug
+    /// name back to the full manifest key WITH the tombstone generation, and
+    /// rejects near-miss shapes (wrong code, missing marker, unknown key).
+    /// The `missing exact key` shape must NOT match — the two parsers split
+    /// the code=19 space between them.
+    #[test]
+    fn completion_rejection_vetoed_keys_parses_the_veto_shape_only() {
+        let manifest = vec![(tk(1), 3u32), (tk(2), 7u32)];
+        assert_eq!(
+            completion_rejection_vetoed_keys(&vetoed_reject(tk(2), 9), &manifest),
+            vec![(tk(2), 9u32)],
+            "the veto shape must resolve to the full key and tombstone generation",
+        );
+        // The missing-key shape is NOT a veto.
+        let missing = format!(
+            "target rejected: status 4 (code=19: shard 227 missing exact key {:?}: TxNotFound)",
+            tk(2),
+        );
+        assert!(completion_rejection_vetoed_keys(&missing, &manifest).is_empty());
+        // And the veto shape is NOT a missing key (no re-push attempts burned).
+        assert!(completion_rejection_missing_keys(&vetoed_reject(tk(2), 9), &manifest).is_empty());
+        // Wrong code: only code=19 carries the verify rejection.
+        let wrong_code = vetoed_reject(tk(2), 9).replace("code=19:", "code=22:");
+        assert!(completion_rejection_vetoed_keys(&wrong_code, &manifest).is_empty());
+        // A named key absent from the manifest resolves to nothing.
+        assert!(completion_rejection_vetoed_keys(&vetoed_reject(tk(9), 4), &manifest).is_empty());
+        // A veto without a parseable generation resolves to nothing.
+        let no_gen = format!(
+            "target rejected: status 4 (code=19: shard 227 exact key {:?} vetoed by \
+             deletion tombstone (cause=ClientDelete): TxNotFound)",
+            tk(2),
+        );
+        assert!(completion_rejection_vetoed_keys(&no_gen, &manifest).is_empty());
+        // Review P2-5 — an AMBIGUOUS truncated name (two manifest keys share
+        // the named 8-byte prefix) resolves to nothing: a reduction must
+        // never touch a key the target did not veto, so exactly-one match is
+        // required (the re-push parser's collision tolerance does not apply
+        // to deletions).
+        let mut twin_a = [0u8; 32];
+        twin_a[0] = 0x77;
+        let mut twin_b = twin_a;
+        twin_b[31] = 1; // differs only past the truncated Debug prefix
+        let ambiguous_manifest = vec![
+            (TxKey { txid: twin_a }, 3u32),
+            (TxKey { txid: twin_b }, 3u32),
+        ];
+        assert!(
+            completion_rejection_vetoed_keys(
+                &vetoed_reject(TxKey { txid: twin_a }, 9),
+                &ambiguous_manifest,
+            )
+            .is_empty(),
+            "an ambiguous prefix must reduce NOTHING",
+        );
+    }
+
+    /// W8 (defect 2) — a vetoed key whose tombstone generation is at-or-ahead
+    /// of the source's manifest generation is REDUCED from the manifest with
+    /// NO re-push and NO attempt burned; the retried completion succeeds for
+    /// the rest of the shard. Pre-fix this shape burned all 3 re-push
+    /// attempts (each re-pushed create vetoed again) and terminally aborted.
+    #[test]
+    fn escalation_reduces_vetoed_key_without_burning_repush_attempts() {
+        let manifest = vec![(tk(1), 3u32), (tk(2), 7u32)];
+        let initial = vetoed_reject(tk(2), 9); // tombstone ahead of gen 7: sound
+        let mut reduced = manifest.clone();
+        let mut hash = compute_manifest_for_entries(&reduced);
+        let mut repushes = 0usize;
+        let mut completions: Vec<Vec<(TxKey, u32)>> = Vec::new();
+        let outcome =
+            escalate_missing_exact_keys(initial, &manifest, 3, true, |action| match action {
+                EscalationAction::Repush(_) => {
+                    repushes += 1;
+                    Ok(())
+                }
+                EscalationAction::ReduceVetoed(vetoed) => {
+                    assert_eq!(vetoed, [tk(2)]);
+                    reduce_vetoed_and_retry_completion(
+                        &mut (),
+                        vetoed,
+                        &mut reduced,
+                        &mut hash,
+                        |_, h, entries| {
+                            assert_eq!(h, &compute_manifest_for_entries(entries));
+                            completions.push(entries.to_vec());
+                            Ok(())
+                        },
+                    )
+                }
+            });
+        assert_eq!(outcome, ExactKeyEscalation::Verified);
+        assert_eq!(repushes, 0, "a veto must never be re-pushed");
+        assert_eq!(
+            completions,
+            vec![vec![(tk(1), 3u32)]],
+            "exactly one completion retry, carrying the veto-reduced manifest",
+        );
+    }
+
+    /// W8 (defect 2, data safety) — a veto whose tombstone generation is
+    /// strictly BEHIND the source's manifest generation is vetoing a NEWER
+    /// same-lineage record (the generation-blind ClientDelete veto). The
+    /// reduction is REFUSED — reducing would let the committed-handoff
+    /// orphan cleanup delete the newest copy — and the rejection falls
+    /// through to the historical (fail/rollback, source keeps its copy)
+    /// handling.
+    #[test]
+    fn escalation_refuses_vetoed_reduction_when_source_generation_is_ahead() {
+        let manifest = vec![(tk(2), 7u32)];
+        let initial = vetoed_reject(tk(2), 3); // tombstone BEHIND gen 7: unsound
+        let mut called = false;
+        let outcome = escalate_missing_exact_keys(initial.clone(), &manifest, 3, true, |_action| {
+            called = true;
+            Ok(())
+        });
+        assert_eq!(
+            outcome,
+            ExactKeyEscalation::NotExactKey { last_err: initial }
+        );
+        assert!(
+            !called,
+            "an unsound veto must neither reduce nor re-push — historical path only",
+        );
+    }
+
+    /// W8 (defect 2) — the all-vetoed shard: the reduction empties the
+    /// manifest, which is terminal (Exhausted -> terminal abort, the
+    /// zero-shippable disposition) without sending an empty completion and
+    /// without burning re-push attempts on the way.
+    #[test]
+    fn escalation_vetoed_reduction_that_empties_the_manifest_is_terminal() {
+        let manifest = vec![(tk(2), 7u32)];
+        let initial = vetoed_reject(tk(2), 9);
+        let mut reduced = manifest.clone();
+        let mut hash = compute_manifest_for_entries(&reduced);
+        let mut completion_sent = false;
+        let outcome =
+            escalate_missing_exact_keys(initial, &manifest, 3, true, |action| match action {
+                EscalationAction::Repush(_) => panic!("a veto must never be re-pushed"),
+                EscalationAction::ReduceVetoed(vetoed) => reduce_vetoed_and_retry_completion(
+                    &mut (),
+                    vetoed,
+                    &mut reduced,
+                    &mut hash,
+                    |_, _h, _entries| {
+                        completion_sent = true;
+                        Ok(())
+                    },
+                ),
+            });
+        assert!(
+            !completion_sent,
+            "an emptied manifest must never be sent as a completion",
+        );
+        match outcome {
+            ExactKeyEscalation::Exhausted { last_err } => {
+                assert!(
+                    last_err.contains("vetoed every"),
+                    "the terminal error must name the veto cause: {last_err}"
+                );
+            }
+            other => panic!("expected Exhausted, got {other:?}"),
+        }
+    }
+
+    /// W8 review P0-1 — the DEFAULT: with `migration_vetoed_reduction_enabled`
+    /// off, a sound vetoed rejection takes the pre-W8 disposition — terminal
+    /// Exhausted (→ terminal abort → rollback to source, data-safe) — with
+    /// NO reduction and NO re-push attempts burned on the unwinnable veto.
+    #[test]
+    fn escalation_flag_off_vetoed_rejection_is_terminal_without_reduction() {
+        let manifest = vec![(tk(1), 3u32), (tk(2), 7u32)];
+        let initial = vetoed_reject(tk(2), 9); // sound veto — would reduce if armed
+        let mut called = false;
+        let outcome =
+            escalate_missing_exact_keys(initial.clone(), &manifest, 3, false, |_action| {
+                called = true;
+                Ok(())
+            });
+        assert!(
+            !called,
+            "with the reduction disarmed, neither a reduce nor a re-push may run"
+        );
+        match outcome {
+            ExactKeyEscalation::Exhausted { last_err } => {
+                assert_eq!(
+                    last_err, initial,
+                    "the terminal disposition must carry the veto-naming rejection"
+                );
+            }
+            other => panic!("expected Exhausted (pre-W8 disposition), got {other:?}"),
+        }
+    }
+
+    /// W8 review P1-3 — the reduction-round backstop: a target that names a
+    /// NEW vetoed key on every completion retry (instead of the full set at
+    /// once) is cut off after `VETOED_REDUCTION_ROUNDS_MAX` rounds rather
+    /// than walking the manifest down one write-fenced round-trip at a time.
+    #[test]
+    fn escalation_caps_vetoed_reduction_rounds() {
+        let manifest: Vec<(TxKey, u32)> = (1..=6).map(|i| (tk(i), 3u32)).collect();
+        let initial = vetoed_reject(tk(1), 9);
+        let mut reduced = manifest.clone();
+        let mut hash = compute_manifest_for_entries(&reduced);
+        let mut rounds = 0usize;
+        let outcome = escalate_missing_exact_keys(initial, &manifest, 3, true, |action| {
+            let EscalationAction::ReduceVetoed(vetoed) = action else {
+                panic!("a veto must never be re-pushed: {action:?}");
+            };
+            rounds += 1;
+            let next = tk(rounds as u8 + 1);
+            reduce_vetoed_and_retry_completion(
+                &mut (),
+                vetoed,
+                &mut reduced,
+                &mut hash,
+                |_, _h, _entries| {
+                    // The drifting target vetoes ANOTHER key every retry.
+                    Err(vetoed_reject(next, 9))
+                },
+            )
+        });
+        assert_eq!(
+            rounds, VETOED_REDUCTION_ROUNDS_MAX,
+            "the reduction must stop at the round cap"
+        );
+        match outcome {
+            ExactKeyEscalation::Exhausted { last_err } => {
+                assert!(
+                    last_err.contains("vetoed by deletion tombstone"),
+                    "the terminal error names the veto: {last_err}"
+                );
+            }
+            other => panic!("expected Exhausted at the round cap, got {other:?}"),
+        }
+    }
+
+    /// W8 (defect 2) — mixed shape: a veto reduction whose completion retry
+    /// then names a genuinely-MISSING key hands over to the re-push path with
+    /// the full attempt budget intact.
+    #[test]
+    fn escalation_handles_veto_then_missing_key_in_sequence() {
+        let manifest = vec![(tk(1), 3u32), (tk(2), 7u32)];
+        let initial = vetoed_reject(tk(2), 9);
+        let mut reduced = manifest.clone();
+        let mut hash = compute_manifest_for_entries(&reduced);
+        let mut actions: Vec<String> = Vec::new();
+        let outcome =
+            escalate_missing_exact_keys(initial, &manifest, 3, true, |action| match action {
+                EscalationAction::ReduceVetoed(vetoed) => {
+                    actions.push(format!("reduce:{}", vetoed.len()));
+                    reduce_vetoed_and_retry_completion(
+                        &mut (),
+                        vetoed,
+                        &mut reduced,
+                        &mut hash,
+                        |_, _h, _entries| {
+                            // The retried completion now names a MISSING key.
+                            Err(format!(
+                                "target rejected: status 4 (code=19: shard 227 missing exact \
+                             key {:?}: TxNotFound)",
+                                tk(1),
+                            ))
+                        },
+                    )
+                }
+                EscalationAction::Repush(missing) => {
+                    actions.push(format!("repush:{}", missing.len()));
+                    assert_eq!(missing, [tk(1)]);
+                    Ok(())
+                }
+            });
+        assert_eq!(outcome, ExactKeyEscalation::Verified);
+        assert_eq!(
+            actions,
+            vec!["reduce:1".to_string(), "repush:1".to_string()],
+            "the veto reduces first (attempt-free), then the missing key re-pushes",
+        );
     }
 
     /// F3 (b) — the terminal abort after an exhausted escalation: the shard

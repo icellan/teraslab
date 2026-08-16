@@ -1407,6 +1407,15 @@ pub struct MigrationMetrics {
     /// re-replication after a member death/rejoin. Only ever non-zero when
     /// `under_replication_sweep_enabled` is on.
     pub under_replication_event_repairs: PaddedCounter,
+    /// W8 review P0-1 — manifest keys REMOVED from a migration completion
+    /// because the target vetoed them with deletion tombstones (RULE-DS)
+    /// and the source's LWW gate judged the veto sound. Every reduction is
+    /// a deletion-authorizing decision (the source's copy is orphan-cleaned
+    /// after the committed handoff), so each one must be operator-visible:
+    /// this counter pairs with the per-shard `warn` the reduction emits.
+    /// Only ever non-zero when `migration_vetoed_reduction_enabled` is on
+    /// (default OFF).
+    pub migration_completion_manifest_reduced_vetoed: PaddedCounter,
 }
 
 /// Number of {direction, role} buckets for migration byte counters.
@@ -1472,6 +1481,7 @@ impl MigrationMetrics {
             heal_deadline_alerts: PaddedCounter::new(),
             heal_source_refused_no_quorum: PaddedCounter::new(),
             under_replication_event_repairs: PaddedCounter::new(),
+            migration_completion_manifest_reduced_vetoed: PaddedCounter::new(),
         }
     }
 

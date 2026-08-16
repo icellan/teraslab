@@ -1510,6 +1510,36 @@ pub struct ServerConfig {
     /// load), consistent with resync signalling toward dead or lagging peers.
     pub under_replication_sweep_enabled: bool,
 
+    /// W8 review P0-1 — allow a migration SOURCE to REDUCE its completion
+    /// manifest by keys the target vetoed with deletion tombstones
+    /// (RULE-DS), letting the handoff commit without them.
+    ///
+    /// Default OFF (ship-inert): the reduction is a deletion-authorizing
+    /// decision — after the reduced completion commits, the source's
+    /// committed-handoff orphan cleanup deletes its own copy of the vetoed
+    /// keys — and the veto it trusts is generation-blind for
+    /// `ClientDelete`/`PruneReplace` tombstones. A legitimately RE-CREATED
+    /// key restarts at generation 0, so a stale tombstone from the prior
+    /// lineage is indistinguishable from an authoritative delete at the
+    /// source (cross-lineage generations are incomparable). That window is
+    /// NOT narrow: the E5 residual keeps stale tombstones alive on exactly
+    /// the non-holders that later receive shard relocations, and E5's own
+    /// mitigation — sizing `tombstone_retention_blocks` above the finality
+    /// horizon — WIDENS it. No freshness bound is derivable today:
+    /// `TxMetadata` carries no immutable create-height (the height-aware
+    /// gate was rejected in review for exactly that reason). Turn this on
+    /// only after cross-lineage monotonic generations (#78) land, making a
+    /// stale-lineage veto detectable at the source's LWW gate.
+    ///
+    /// OFF, a tombstone-vetoed completion keeps the pre-W8 disposition:
+    /// the escalation exhausts terminally and the shard rolls back to the
+    /// source (a data-safe wedge, self-retried on the W8 failed-batch
+    /// cadence). The veto NAMING (distinct rejection message) and the
+    /// source's LWW soundness refusal stay active regardless of this flag.
+    /// ON, every reduction is operator-visible: a per-shard `warn` plus
+    /// `teraslab_migration_completion_manifest_reduced_vetoed_total`.
+    pub migration_vetoed_reduction_enabled: bool,
+
     /// SWIM probe interval in milliseconds.
     pub swim_probe_interval_ms: u64,
 
@@ -1805,6 +1835,7 @@ impl Default for ServerConfig {
             replication_factor: 1,
             committed_master_election_enabled: false,
             under_replication_sweep_enabled: false,
+            migration_vetoed_reduction_enabled: false,
             swim_probe_interval_ms: 200,
             swim_suspicion_timeout_ms: 5000,
             topology_propose_timeout_ms: 0,
