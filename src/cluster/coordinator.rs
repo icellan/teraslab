@@ -1388,6 +1388,31 @@ impl Drop for TopologyCatchUpGuard {
 /// preserve. That mirrors the catch-up's own peer list, which likewise falls
 /// back to the whole address book when `committed_members` is empty.
 ///
+/// # Guard 3 — the monotonic two-step repair, re-seeded (W11 P1-A)
+///
+/// Constraining the member set to `committed_members` also removed the ONLY
+/// way this node could propose the monotonic UNION that repairs a COMPRESSED
+/// TWO-STEP (pre-fix the address book happened to BE that union). That matters
+/// because a commit refused by a gate is refused FOREVER — the fetch loop
+/// treats `NotApplied` as "try the next peer", and every peer returns the same
+/// commit. `revalidate_settled_members(committed_members, …)` can only SHRINK,
+/// so the union could never be reached again and a node in that shape would
+/// stall permanently.
+///
+/// `repair_target` re-seeds it from the refused commit itself: the caller
+/// passes [`crate::cluster::topology::TopologyAuthority::monotonic_repair_for_refused_commit`]'s
+/// output, which is `committed_members ∪ commit.members` after the FULL
+/// `membership_change_is_safe` check. Both halves are consensus-proven, so
+/// this does not re-open the address-book widening channel.
+///
+/// A repair target is used VERBATIM — deliberately NOT passed through the
+/// SWIM-Dead filter. The whole point of the union is to re-include a member
+/// the newer term dropped (typically a drained node that is legitimately gone,
+/// hence Dead) so the change is monotonic again; filtering it back out would
+/// reproduce the very non-monotonic set that is being refused. It is a
+/// transient stepping stone: the next membership event drops the dead node
+/// normally.
+///
 /// `state_of` reports the CURRENT SWIM state of a node (`None` = no SWIM
 /// record); it is read at the last moment before proposing, exactly as in the
 /// debounce path.
@@ -1397,6 +1422,7 @@ fn catch_up_fallback_proposal(
     remote_term: u64,
     self_id: NodeId,
     state_of: impl Fn(&NodeId) -> Option<crate::cluster::membership::NodeState>,
+    repair_target: Option<&[NodeId]>,
 ) -> Option<crate::cluster::topology::TopologyTerm> {
     let committed = topology_authority.committed_term();
     if committed >= remote_term {
@@ -1408,7 +1434,15 @@ fn catch_up_fallback_proposal(
         return None;
     }
     let committed_members = topology_authority.committed_members();
-    let members: Vec<NodeId> = if committed_members.is_empty() {
+    let members: Vec<NodeId> = if let Some(repair) = repair_target {
+        // W11 P1-A — a quorum-proven monotonic union. Used verbatim: it is
+        // already safety-checked, and re-filtering it would drop the very
+        // member whose re-inclusion makes the change monotonic.
+        let mut m = repair.to_vec();
+        m.sort();
+        m.dedup();
+        m
+    } else if committed_members.is_empty() {
         // Never committed a topology — nothing to preserve, and the address
         // book is the only membership source this node has.
         let addrs = node_addrs.read();
@@ -1421,13 +1455,34 @@ fn catch_up_fallback_proposal(
         // strongest, most conservative rule: drop only members SWIM currently
         // proves DEAD, retain everything else — including Suspect members,
         // whose suspicion is transient and must not churn the member set.
-        let mut m = revalidate_settled_members(committed_members, &[], state_of, self_id);
+        let mut m = revalidate_settled_members(committed_members.clone(), &[], state_of, self_id);
         m.sort();
         m
     };
-    topology_authority.reset_membership_timer();
-    let proposal = topology_authority.on_membership_changed(&members);
-    if proposal.is_none() {
+
+    // W11 P2-A — decide BEFORE touching any authority state.
+    //
+    // `on_membership_changed` unconditionally writes `last_membership_change`
+    // and `observed_membership` before it reaches its identical-membership
+    // skip. Under Guard 2 the healthy case now ALWAYS lands on that skip, once
+    // per gossip-driven catch-up (sub-second), so calling through would:
+    //
+    //   * STARVE `check_timeout`, which needs
+    //     `last_membership_change.elapsed() >= propose_timeout` and carries
+    //     the strict-subset drop and the never-seen-joiner add — the other
+    //     half of the two-step repair; and
+    //   * CLOBBER `observed_membership` down to the committed set, which
+    //     `retry_proposal` reads and returns `None` on, silently cancelling an
+    //     in-flight grow.
+    //
+    // Neither is a change this function is entitled to make when it has
+    // nothing to propose, so return before `reset_membership_timer` too.
+    let sorted = |v: &[NodeId]| {
+        let mut out = v.to_vec();
+        out.sort_unstable();
+        out
+    };
+    if sorted(&members) == sorted(&committed_members) {
         if let Some(m) = crate::metrics::migration_metrics() {
             m.topology_catch_up_reproposal_skipped.inc();
         }
@@ -1436,12 +1491,16 @@ fn catch_up_fallback_proposal(
             remote_term,
             members = ?members.iter().map(|n| n.0).collect::<Vec<_>>(),
             "cluster: catch-up: no re-proposal — the member set is constrained to \
-             the committed term and the authority had nothing to propose from it \
-             (W11 FIX 1: the address book must never widen membership); \
-             converging via the direct fetch on the next TopologyStale observation",
+             the committed term and nothing about it changed (W11 FIX 1: the \
+             address book must never widen membership); converging via the \
+             direct fetch on the next TopologyStale observation. Authority state \
+             left untouched (W11 P2-A)",
         );
+        return None;
     }
-    proposal
+
+    topology_authority.reset_membership_timer();
+    topology_authority.on_membership_changed(&members)
 }
 
 /// Whether a pending inbound entry for `shard` must be KEPT (and the shard left
@@ -6445,6 +6504,14 @@ impl ClusterCoordinator {
 
                         let local_term = topology_authority.committed_term();
                         let mut caught_up = false;
+                        // W11 P1-A — the monotonic UNION repair for a commit a
+                        // GATE refused. `NotApplied` below is treated as "try
+                        // the next peer", but every peer returns the SAME
+                        // commit, so a gate refusal is permanent, not
+                        // per-peer. Capture the repair from the HIGHEST such
+                        // term so the fallback can propose the stepping stone
+                        // instead of stalling forever.
+                        let mut repair_target: Option<(u64, Vec<NodeId>)> = None;
                         for peer_addr in &peers {
                             if let Ok(payload) = send_topology_frame(
                                 *peer_addr,
@@ -6504,7 +6571,38 @@ impl ClusterCoordinator {
                                         continue;
                                     }
                                     crate::cluster::topology::DurableCommitOutcome::NotApplied => {
-                                        // Raced / no longer acceptable — try next peer.
+                                        // Raced, superseded, OR refused by a
+                                        // gate. Only the last is permanent —
+                                        // and only the compressed-two-step
+                                        // shape has a safe repair, which
+                                        // `monotonic_repair_for_refused_commit`
+                                        // returns `None` for in every other
+                                        // case (W11 P1-A).
+                                        if let Some(union) = topology_authority
+                                            .monotonic_repair_for_refused_commit(&commit)
+                                        {
+                                            tracing::warn!(
+                                                term = commit.term,
+                                                %peer_addr,
+                                                refused = ?commit.members.iter().map(|n| n.0).collect::<Vec<_>>(),
+                                                union = ?union.iter().map(|n| n.0).collect::<Vec<_>>(),
+                                                "cluster: catch-up: peer's committed term is \
+                                                 non-monotonic against our committed set (a \
+                                                 compressed two-step); every peer will refuse \
+                                                 identically, so proposing the quorum-proven \
+                                                 monotonic union as the repair step (W11 P1-A)",
+                                            );
+                                            if repair_target
+                                                .as_ref()
+                                                .is_none_or(|(term, _)| *term < commit.term)
+                                            {
+                                                repair_target = Some((commit.term, union));
+                                            }
+                                        }
+                                        // Try next peer regardless — a
+                                        // genuinely newer, ACCEPTABLE commit
+                                        // from another peer is still better
+                                        // than any re-proposal.
                                         continue;
                                     }
                                 }
@@ -6526,6 +6624,7 @@ impl ClusterCoordinator {
                                 remote_term,
                                 self_id,
                                 |node| swim_membership.lock().member_info(node).map(|i| i.state),
+                                repair_target.as_ref().map(|(_, union)| union.as_slice()),
                             )
                         {
                             tracing::info!(
@@ -32960,7 +33059,7 @@ mod tests {
             _ => Some(NodeState::Alive),
         };
 
-        let proposal = catch_up_fallback_proposal(&auth, &addrs, 6, NodeId(1), state_of)
+        let proposal = catch_up_fallback_proposal(&auth, &addrs, 6, NodeId(1), state_of, None)
             .expect("committed_term 5 < remote_term 6 and a member died — must propose");
         assert_eq!(proposal.term, 6, "proposes the next term above committed");
         assert_eq!(
@@ -32993,7 +33092,7 @@ mod tests {
         let addrs = four_node_addr_book();
         let state_of = |_: &NodeId| Some(NodeState::Alive);
 
-        let proposal = catch_up_fallback_proposal(&auth, &addrs, 6, NodeId(1), state_of);
+        let proposal = catch_up_fallback_proposal(&auth, &addrs, 6, NodeId(1), state_of, None);
         assert!(
             proposal.is_none(),
             "the committed set {{1,3,4}} is intact, so the constrained member \
@@ -33024,12 +33123,221 @@ mod tests {
             auth.committed_members().is_empty(),
             "fixture: nothing committed yet"
         );
-        let proposal = catch_up_fallback_proposal(&auth, &addrs, 2, NodeId(1), state_of)
+        let proposal = catch_up_fallback_proposal(&auth, &addrs, 2, NodeId(1), state_of, None)
             .expect("a never-committed node still forms a cluster from its address book");
         assert_eq!(
             proposal.members,
             vec![NodeId(1), NodeId(2), NodeId(3)],
             "pre-commit bootstrap keeps the address-book source",
+        );
+    }
+
+    /// W11 P1-A fixture — node 1 committed `{1,2,3}` at term 5 under a
+    /// CONFIGURED `cluster_id` (the production shape: `cluster_id` is required
+    /// for clustered nodes under `strict_auth`, so the F-G8-001 ever-seen
+    /// heuristic is not what gates these commits).
+    ///
+    /// It then MISSES term 6 = `{1,3}` (node 2 drained) — the compressed
+    /// two-step.
+    fn authority_that_missed_a_drain_step() -> (
+        crate::cluster::topology::TopologyAuthority,
+        crate::cluster::topology::ClusterId,
+    ) {
+        use crate::cluster::topology::{
+            ASSIGNMENT_ABSENT_DIGEST, ClusterId, TopologyAuthority, TopologyCommit, TopologyTerm,
+        };
+        let cluster_id = ClusterId([7u8; 16]);
+        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1), 2);
+        auth.set_cluster_id(cluster_id);
+        let members = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let term5 = TopologyCommit {
+            term: 5,
+            proposer: NodeId(1),
+            members: members.clone(),
+            cluster_id,
+            placement_version: 1,
+            committed_peak: 3,
+            digest: TopologyTerm::compute_digest(
+                5,
+                &cluster_id,
+                &members,
+                1,
+                3,
+                2,
+                ASSIGNMENT_ABSENT_DIGEST,
+            ),
+            voters: members.clone(),
+            rf: 2,
+            assignment: None,
+        };
+        assert_eq!(
+            auth.handle_commit(&term5),
+            Some(5),
+            "fixture: the pre-drain term applies"
+        );
+        (auth, cluster_id)
+    }
+
+    fn commit_over(
+        cluster_id: crate::cluster::topology::ClusterId,
+        term: u64,
+        members: &[NodeId],
+    ) -> crate::cluster::topology::TopologyCommit {
+        use crate::cluster::topology::{ASSIGNMENT_ABSENT_DIGEST, TopologyCommit, TopologyTerm};
+        TopologyCommit {
+            term,
+            proposer: members[0],
+            members: members.to_vec(),
+            cluster_id,
+            placement_version: 1,
+            committed_peak: 3,
+            digest: TopologyTerm::compute_digest(
+                term,
+                &cluster_id,
+                members,
+                1,
+                3,
+                2,
+                ASSIGNMENT_ABSENT_DIGEST,
+            ),
+            voters: members.to_vec(),
+            rf: 2,
+            assignment: None,
+        }
+    }
+
+    /// W11 P1-A — a COMPRESSED TWO-STEP must still converge.
+    ///
+    /// Node 1 is in committed `{1,2,3}`; it misses term 6 = `{1,3}` (node 2
+    /// drained); the cluster commits term 7 = `{1,3,4}`. Relative to node 1's
+    /// committed set that both ADDS 4 and REMOVES 2 — non-monotonic — so
+    /// `membership_change_is_safe` refuses it. The catch-up's fetch loop treats
+    /// that refusal as "try the next peer", but EVERY peer hands back the same
+    /// commit, so the refusal is permanent: `refused_higher_term` climbs and
+    /// node 1 never advances.
+    ///
+    /// Pre-W11 the address-book source happened to BE the monotonic union
+    /// `{1,2,3,4}`, which `monotonic_repair_target` then accepted (the design
+    /// comment on `on_membership_changed` names this the intended repair).
+    /// FIX 1's committed-set source can only SHRINK, so the union had to be
+    /// re-seeded — from the refused commit, whose members are quorum-proven.
+    #[test]
+    fn catch_up_repairs_a_compressed_two_step_from_the_refused_commit() {
+        use crate::cluster::membership::NodeState;
+        let (auth, cluster_id) = authority_that_missed_a_drain_step();
+        let term7 = commit_over(cluster_id, 7, &[NodeId(1), NodeId(3), NodeId(4)]);
+
+        // 1. The direct fetch is refused, and would be by every peer alike.
+        assert_eq!(
+            auth.handle_commit(&term7),
+            None,
+            "term 7 is non-monotonic against committed {{1,2,3}} — refused",
+        );
+        assert_eq!(auth.committed_term(), 5, "node 1 is stuck on term 5");
+
+        // 2. The refusal yields a quorum-proven monotonic stepping stone.
+        let repair = auth
+            .monotonic_repair_for_refused_commit(&term7)
+            .expect("committed ∪ refused = {1,2,3,4} is monotonic and safe");
+        assert_eq!(
+            repair,
+            vec![NodeId(1), NodeId(2), NodeId(3), NodeId(4)],
+            "the union of two consensus-proven sets — no address book involved",
+        );
+
+        // 3. The fallback proposes it. Node 2 is SWIM-Dead (it drained), and
+        //    the repair must NOT be filtered by liveness: dropping 2 rebuilds
+        //    the very non-monotonic set that is being refused.
+        let addrs = four_node_addr_book();
+        let state_of = |n: &NodeId| match n.0 {
+            2 => Some(NodeState::Dead),
+            _ => Some(NodeState::Alive),
+        };
+        let proposal =
+            catch_up_fallback_proposal(&auth, &addrs, 7, NodeId(1), state_of, Some(&repair))
+                .expect("the repair step must be proposed, not skipped");
+        assert_eq!(
+            proposal.members,
+            vec![NodeId(1), NodeId(2), NodeId(3), NodeId(4)],
+            "the monotonic union is proposed verbatim — SWIM-Dead node 2 is \
+             retained because its re-inclusion is what makes the change \
+             monotonic",
+        );
+    }
+
+    /// Without the repair target the same node produces NOTHING — the
+    /// permanent stall P1-A identified. Pins that the repair path is what
+    /// rescues it, and that the constrained source alone cannot.
+    #[test]
+    fn catch_up_without_a_repair_target_cannot_escape_a_compressed_two_step() {
+        use crate::cluster::membership::NodeState;
+        let (auth, cluster_id) = authority_that_missed_a_drain_step();
+        let term7 = commit_over(cluster_id, 7, &[NodeId(1), NodeId(3), NodeId(4)]);
+        assert_eq!(auth.handle_commit(&term7), None, "refused as non-monotonic");
+
+        let addrs = four_node_addr_book();
+        let proposal = catch_up_fallback_proposal(
+            &auth,
+            &addrs,
+            7,
+            NodeId(1),
+            |_| Some(NodeState::Alive),
+            None,
+        );
+        assert!(
+            proposal.is_none(),
+            "the committed set is intact, so the constrained source proposes \
+             nothing — this is the stall the repair target exists to break",
+        );
+        assert_eq!(auth.committed_term(), 5, "still stuck without the repair");
+    }
+
+    /// W11 P2-A — when the fallback has nothing to propose it must leave the
+    /// authority's proposer state ALONE.
+    ///
+    /// `on_membership_changed` writes `last_membership_change` and
+    /// `observed_membership` BEFORE its identical-membership skip, and under
+    /// FIX 1 the healthy case now always lands on that skip — once per
+    /// gossip-driven catch-up (sub-second). Calling through would starve
+    /// `check_timeout` (which needs `last_membership_change.elapsed() >=
+    /// propose_timeout` and carries the strict-subset drop and never-seen
+    /// joiner add) and clobber `observed_membership`, which `retry_proposal`
+    /// reads and returns `None` on — silently cancelling an in-flight grow.
+    #[test]
+    fn catch_up_skip_leaves_the_proposer_state_untouched() {
+        use crate::cluster::membership::NodeState;
+        let auth = authority_with_quiesce_out_of_four();
+        let addrs = four_node_addr_book();
+
+        // An in-flight GROW: the observed set is wider than the committed one.
+        let growing = vec![NodeId(1), NodeId(2), NodeId(3), NodeId(4)];
+        auth.test_set_observed_membership(&growing);
+        auth.reset_membership_timer();
+        std::thread::sleep(Duration::from_millis(30));
+        let idle_before = auth.test_membership_idle_millis();
+        assert!(idle_before >= 30, "fixture: the timer has been running");
+
+        let proposal = catch_up_fallback_proposal(
+            &auth,
+            &addrs,
+            9,
+            NodeId(1),
+            |_| Some(NodeState::Alive),
+            None,
+        );
+        assert!(proposal.is_none(), "nothing to propose from the intact set");
+        assert!(
+            auth.test_membership_idle_millis() >= idle_before,
+            "the membership timer must NOT be reset by a skipped re-proposal, \
+             or check_timeout — the other half of the two-step repair — is \
+             starved by sub-second gossip",
+        );
+        assert_eq!(
+            auth.test_observed_membership(),
+            growing,
+            "the in-flight grow must survive: retry_proposal reads \
+             observed_membership and returns None once it is clobbered down to \
+             the committed set",
         );
     }
 
@@ -33201,8 +33509,14 @@ mod tests {
 
         // The catch-up was triggered by remote_term 5 — the very term the
         // broadcast just committed locally.
-        let proposal =
-            catch_up_fallback_proposal(&auth, &addrs, 5, NodeId(1), |_| Some(NodeState::Alive));
+        let proposal = catch_up_fallback_proposal(
+            &auth,
+            &addrs,
+            5,
+            NodeId(1),
+            |_| Some(NodeState::Alive),
+            None,
+        );
         assert!(
             proposal.is_none(),
             "no re-proposal once committed_term >= remote_term — the \

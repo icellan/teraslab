@@ -2092,6 +2092,27 @@ impl TopologyAuthority {
         *self.last_membership_change.lock() = Instant::now();
     }
 
+    /// Test-only — seed `observed_membership` (what `retry_proposal` reads)
+    /// so a test can model an in-flight grow.
+    #[cfg(test)]
+    pub(crate) fn test_set_observed_membership(&self, members: &[NodeId]) {
+        *self.observed_membership.lock() = members.to_vec();
+    }
+
+    /// Test-only — read `observed_membership`.
+    #[cfg(test)]
+    pub(crate) fn test_observed_membership(&self) -> Vec<NodeId> {
+        self.observed_membership.lock().clone()
+    }
+
+    /// Test-only — millis since `last_membership_change` was last stamped.
+    /// `check_timeout` fires only once this reaches `propose_timeout`, so a
+    /// caller that resets it on every gossip tick starves that path.
+    #[cfg(test)]
+    pub(crate) fn test_membership_idle_millis(&self) -> u128 {
+        self.last_membership_change.lock().elapsed().as_millis()
+    }
+
     /// Current persisted state for saving to disk.
     ///
     /// `incarnation` is the SWIM incarnation counter to persist so that
@@ -2142,7 +2163,18 @@ impl TopologyAuthority {
     /// (b) the union passes the full safety check. `None` means no repair
     /// applies (the live set is fine, or the union is a real merge).
     fn monotonic_repair_target(&self, live: &[NodeId]) -> Option<Vec<NodeId>> {
-        if self.membership_change_is_safe(live, Some(self.cluster_id())) {
+        self.monotonic_repair_target_with(live, self.cluster_id())
+    }
+
+    /// [`Self::monotonic_repair_target`] with an explicit proposal
+    /// `cluster_id`, so a repair seeded from a RECEIVED commit is checked
+    /// against that commit's own id rather than assuming ours.
+    fn monotonic_repair_target_with(
+        &self,
+        target: &[NodeId],
+        cluster_id: ClusterId,
+    ) -> Option<Vec<NodeId>> {
+        if self.membership_change_is_safe(target, Some(cluster_id)) {
             return None;
         }
         let committed = self.committed_members.read().unwrap().clone();
@@ -2152,15 +2184,66 @@ impl TopologyAuthority {
         let mut union: Vec<NodeId> = committed
             .iter()
             .copied()
-            .chain(live.iter().copied())
+            .chain(target.iter().copied())
             .collect();
         union.sort_unstable_by_key(|node| node.0);
         union.dedup();
         if union == committed || union.len() > MAX_TOPOLOGY_MEMBERS {
             return None;
         }
-        self.membership_change_is_safe(&union, Some(self.cluster_id()))
+        self.membership_change_is_safe(&union, Some(cluster_id))
             .then_some(union)
+    }
+
+    /// W11 P1-A — the monotonic UNION repair for a QUORUM-COMMITTED term this
+    /// node had to REFUSE, seeded from the commit itself instead of from a
+    /// live SWIM set.
+    ///
+    /// # The permanent stall it repairs
+    ///
+    /// The topology catch-up's direct-fetch loop treats
+    /// [`DurableCommitOutcome::NotApplied`] as "try the next peer" — but every
+    /// peer hands back the SAME commit, so a commit refused by a GATE is
+    /// refused forever, not merely by this peer. The gate that produces this
+    /// shape is [`Self::membership_change_is_safe`]'s monotonicity rule, and
+    /// it fires on a perfectly legitimate COMPRESSED TWO-STEP: node A is in
+    /// committed `{1,2,3}`, A misses term T-1 (`{1,2,3}` → `{1,3}`, node 2
+    /// drained), and the cluster then commits `T = {1,3,4}`. Relative to A's
+    /// committed set that both ADDS 4 and REMOVES 2 — non-monotonic — so A
+    /// refuses T on every retry, `refused_higher_term` climbs, and A never
+    /// advances. (`install_active_routing_snapshot` masks it partially — A
+    /// adopts the routing table — but does NOT advance `committed_term`, so A
+    /// stays on the refusing side of every subsequent commit.)
+    ///
+    /// [`Self::monotonic_repair_target`] is exactly the intended repair for
+    /// this shape (see its doc), but it is only reachable from the PROPOSER
+    /// path, seeded from a live SWIM view. This entry point makes it
+    /// reachable from the catch-up.
+    ///
+    /// # Why the union cannot widen membership
+    ///
+    /// The union is `committed_members ∪ commit.members` — our own committed
+    /// set (consensus-proven) unioned with a quorum-committed term's set
+    /// (consensus-proven). Neither half is an address book, so a node
+    /// deliberately quiesced out of BOTH is still never resurrected, which is
+    /// the invariant W11 FIX 1 established. The union is then put through the
+    /// FULL [`Self::membership_change_is_safe`] check against the commit's own
+    /// `cluster_id`, so it can no more launder a foreign merge (P1.1) or an
+    /// unseen NodeId (F-G8-001) than the proposer-side repair can.
+    ///
+    /// Returns `None` unless the commit carries a quorum voter proof, the
+    /// commit's own membership is currently refused, and the union is
+    /// accepted — i.e. only for the compressed-two-step shape.
+    pub fn monotonic_repair_for_refused_commit(
+        &self,
+        commit: &TopologyCommit,
+    ) -> Option<Vec<NodeId>> {
+        // Unproven membership is not evidence of anything; never fold it into
+        // our own committed set.
+        if !commit.has_quorum_voter_proof() {
+            return None;
+        }
+        self.monotonic_repair_target_with(&commit.members, commit.cluster_id)
     }
 
     /// Called when SWIM reports a membership change.
