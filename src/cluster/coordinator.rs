@@ -819,6 +819,15 @@ const DRAIN_REACTIVATION_INTERVAL: Duration = Duration::from_secs(2);
 /// in CI while the exchange fires ~100 ms after the local commit).
 const EXCHANGE_PEER_RETRY_INTERVAL: Duration = Duration::from_millis(500);
 
+/// Total wall-clock budget for one exchange phase (Phase D partition-view
+/// collection). Every spawn site uses this single value; the det-degrade
+/// plan-launch grace is derived from it
+/// ([`DET_DEGRADE_PLAN_LAUNCH_GRACE`]), so the two cannot silently drift
+/// apart. With the W9 P1-2 quorum early-return the exchange usually
+/// finishes far sooner — this bounds only the wait for a quorum that
+/// never materializes.
+const EXCHANGE_PHASE_TIMEOUT: Duration = Duration::from_millis(2000);
+
 fn debug_shard_set() -> &'static std::collections::HashSet<u16> {
     static SET: std::sync::OnceLock<std::collections::HashSet<u16>> = std::sync::OnceLock::new();
     SET.get_or_init(|| {
@@ -3965,7 +3974,7 @@ impl ClusterCoordinator {
                                 &engine_x,
                                 &shard_table_x,
                                 &inbound_bm_x,
-                                std::time::Duration::from_millis(2000),
+                                EXCHANGE_PHASE_TIMEOUT,
                                 &secret_x,
                             );
                             let _ = exchange_tx.send((members_x, committed_term, view, false));
@@ -4020,7 +4029,7 @@ impl ClusterCoordinator {
                                     &engine_x,
                                     &shard_table_x,
                                     &inbound_bm_x,
-                                    std::time::Duration::from_millis(2000),
+                                    EXCHANGE_PHASE_TIMEOUT,
                                     &secret_x,
                                 );
                                 let _ = exchange_tx.send((members_x, committed_term, view, false));
@@ -4310,7 +4319,7 @@ impl ClusterCoordinator {
                                             &engine_x,
                                             &shard_table_x,
                                             &inbound_bm_x,
-                                            std::time::Duration::from_millis(2000),
+                                            EXCHANGE_PHASE_TIMEOUT,
                                             &secret_x,
                                         );
                                         let _ = exchange_tx.send((
@@ -4457,7 +4466,7 @@ impl ClusterCoordinator {
                                 &engine_x,
                                 &shard_table_x,
                                 &inbound_bm_x,
-                                std::time::Duration::from_millis(2000),
+                                EXCHANGE_PHASE_TIMEOUT,
                                 &secret_x,
                             );
                             let _ = exchange_tx.send((members_x, term, view, false));
@@ -6598,7 +6607,13 @@ impl ClusterCoordinator {
     /// within the deadline is left ABSENT from the returned view (F1, so
     /// election's partial-view gate genuinely blocks deviation — never
     /// fabricated emptiness) and does not block the full per-peer timeout.
-    /// The total wall-clock budget is bounded by `total_timeout`.
+    ///
+    /// W9 P1-2 — the collection returns EARLY as soon as the view covers
+    /// the MEMBER quorum (after draining every answer already in the
+    /// channel), so a silent peer costs quorum-latency instead of the full
+    /// deadline; peers still silent at the early return stay honestly
+    /// absent. The total wall-clock budget is bounded by `total_timeout`
+    /// (a quorum that never materializes waits it out).
     #[allow(clippy::too_many_arguments)]
     fn run_exchange_phase(
         members: &[NodeId],
@@ -6724,19 +6739,54 @@ impl ClusterCoordinator {
         }
         drop(tx);
 
-        for _ in 0..peer_addrs.len() {
+        let mut received = 0usize;
+        while received < peer_addrs.len() {
+            // Opportunistically drain every answer ALREADY in the channel
+            // before deciding anything, so a quorum early-return never
+            // discards evidence that has already arrived — only peers
+            // still silent are left absent.
+            while let Ok((peer, entries)) = rx.try_recv() {
+                received += 1;
+                // A failed query (`None`) is consumed so the drain still
+                // exits as soon as every peer reported, but the peer stays
+                // out of the view (F1).
+                if let Some(entries) = entries {
+                    phase.record(peer, entries);
+                }
+            }
+            if received >= peer_addrs.len() {
+                break;
+            }
+            // W9 P1-2 — return EARLY once the collected view covers the
+            // MEMBER quorum (counting only reporters that are committed
+            // members; on a drain term the self report must not pad the
+            // floor). Refinement is admissible at the quorum floor, so
+            // waiting further only serves peers that have not answered —
+            // and with the FIX 1 re-query loop a silent peer reports only
+            // at the DEADLINE, which made every exchange with any lagging
+            // member burn the full budget on the commit path (eating the
+            // ~4 s FIX-A handoff window) and pushed the degraded-upgrade
+            // retry's completion past the plan-launch grace. Peers still
+            // silent at the early return stay honestly absent (F1).
+            let member_view_size = phase
+                .partition_view()
+                .keys()
+                .filter(|n| members.contains(n))
+                .count();
+            if member_view_reaches_quorum(member_view_size, members.len()) {
+                break;
+            }
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             if remaining.is_zero() {
                 break;
             }
             match rx.recv_timeout(remaining) {
-                Ok((peer, Some(entries))) => {
-                    phase.record(peer, entries);
+                Ok((peer, entries)) => {
+                    received += 1;
+                    if let Some(entries) = entries {
+                        phase.record(peer, entries);
+                    }
                 }
-                // Failed query or unparseable payload: consume the reply so
-                // the drain loop still exits as soon as every peer answered,
-                // but leave the peer out of the view.
-                Ok((_, None)) => {}
                 Err(_) => break,
             }
         }
@@ -7628,12 +7678,18 @@ fn degraded_upgrade_retry_due(
 /// LAUNCH so a racing same-term quorum completion can upgrade the table
 /// first (scenario 06: the degrade's 3869 holder-blind tasks started
 /// streaming immediately, locking `degraded_term_upgrade_admissible`'s
-/// `active_count() == 0` gate for the plan's whole lifetime). Sized to
-/// cover the racing commit/prompt-arm exchange (≤2 s deadline) plus the
-/// first degraded-upgrade retry (fires at 2 s, answered within ~500 ms by
-/// a peer that has applied the commit — FIX 1). Serving and the shard-table
-/// install are NEVER held — only the worker launch.
-const DET_DEGRADE_PLAN_LAUNCH_GRACE: Duration = Duration::from_secs(3);
+/// `active_count() == 0` gate for the plan's whole lifetime).
+///
+/// Sized (and pinned by `det_plan_launch_grace_covers_first_retry_rescue_window`)
+/// to outlast the first degraded-upgrade retry's WHOLE window:
+/// `degraded_upgrade_retry_backoff(0)` (2 s) until the retry fires, plus
+/// the full [`EXCHANGE_PHASE_TIMEOUT`] (2 s — the quorum early-return can
+/// land any time inside it, e.g. when the lagging peer applies the commit
+/// near the end and answers the next 500 ms re-query), plus event-loop
+/// tick slack. The racing commit/prompt-arm exchanges (~0 s) are covered
+/// a fortiori. Serving and the shard-table install are NEVER held — only
+/// the worker launch.
+const DET_DEGRADE_PLAN_LAUNCH_GRACE: Duration = Duration::from_secs(5);
 
 /// W9 FIX 3 — a migration-plan launch deferred by the det-degrade grace.
 ///
@@ -31655,6 +31711,95 @@ mod tests {
         );
     }
 
+    /// W9 P1-2 — the exchange must return EARLY once the collected view
+    /// covers the MEMBER quorum, instead of waiting out the full deadline
+    /// for peers that have not answered. The FIX 1 re-query loop made a
+    /// failing peer report only at the DEADLINE, so with one lagging
+    /// member every exchange on the commit path burned the whole budget
+    /// (eating the FIX-A handoff window) and the degraded-upgrade retry
+    /// completed at backoff + deadline — after the plan-launch grace, so
+    /// the 06 lockout never got rescued. Honest absence is preserved: the
+    /// silent peer is simply not in the returned view.
+    #[test]
+    fn run_exchange_phase_returns_early_once_member_quorum_covered() {
+        use std::io::{Read, Write};
+
+        let members = [NodeId(1), NodeId(2), NodeId(3)];
+        let term = 4u64;
+        let engine = Arc::new(test_engine());
+        let det = ShardTable::compute_with_epoch(&members, 2, term, 1);
+
+        // Peer 2 answers a valid report immediately.
+        let peer_entries = vec![PartitionVersionEntry {
+            shard: 3,
+            flags: 0b01,
+            replica_count: 1,
+            last_applied_seq: 5,
+            manifest_digest: 1,
+            max_generation: 1,
+        }];
+        let peer_entries_srv = peer_entries.clone();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let fast_addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut header = [0u8; 4];
+            stream.read_exact(&mut header).unwrap();
+            let len = u32::from_le_bytes(header) as usize;
+            let mut body = vec![0u8; len];
+            stream.read_exact(&mut body).unwrap();
+            let mut frame_bytes = header.to_vec();
+            frame_bytes.extend_from_slice(&body);
+            let (request, _) = crate::protocol::frame::RequestFrame::decode(&frame_bytes).unwrap();
+            let response = crate::protocol::frame::ResponseFrame {
+                request_id: request.request_id,
+                status: crate::protocol::opcodes::STATUS_OK,
+                payload: encode_partition_version_response(2, term, &peer_entries_srv),
+            };
+            stream.write_all(&response.encode()).unwrap();
+        });
+
+        // Peer 3 is silent (closed port): its thread re-queries until the
+        // deadline and reports absence only then.
+        let mut addrs = std::collections::HashMap::new();
+        addrs.insert(NodeId(2), fast_addr);
+        addrs.insert(NodeId(3), "127.0.0.1:1".parse().unwrap());
+        let node_addrs = Arc::new(RwLock::new(addrs));
+        let shard_table = Arc::new(ShardTableLock::new(det));
+        let inbound_bm = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+
+        let started = std::time::Instant::now();
+        let view = ClusterCoordinator::run_exchange_phase(
+            &members,
+            NodeId(1),
+            term,
+            &node_addrs,
+            &engine,
+            &shard_table,
+            &inbound_bm,
+            std::time::Duration::from_millis(3000),
+            &None,
+        );
+        let elapsed = started.elapsed();
+
+        assert!(view.contains_key(&NodeId(1)), "self report present");
+        assert_eq!(
+            view.get(&NodeId(2)),
+            Some(&peer_entries),
+            "the fast peer's report must be collected",
+        );
+        assert!(
+            !view.contains_key(&NodeId(3)),
+            "the silent peer stays honestly absent",
+        );
+        assert!(
+            elapsed < Duration::from_millis(1200),
+            "self + one peer of three IS the member quorum — the exchange \
+             must return early instead of waiting out the silent peer's \
+             deadline (took {elapsed:?})",
+        );
+    }
+
     /// W9 FIX 1 — the re-query loop must keep the F1 honest-absence
     /// semantics: a peer that rejects EVERY report within the deadline stays
     /// ABSENT from the view (never recorded as present-with-no-entries).
@@ -32789,14 +32934,36 @@ mod tests {
     #[test]
     fn det_plan_launch_due_waits_out_the_grace() {
         assert!(
-            !det_plan_launch_due(Duration::from_millis(2999)),
+            !det_plan_launch_due(Duration::from_millis(4999)),
             "the plan must stay held inside the grace window",
         );
         assert!(
-            det_plan_launch_due(Duration::from_secs(3)),
+            det_plan_launch_due(Duration::from_secs(5)),
             "the plan must launch once the grace elapses",
         );
         assert!(det_plan_launch_due(Duration::from_secs(60)));
+    }
+
+    /// W9 P1-2 — the grace must actually COVER the rescue it exists for:
+    /// the first degraded-upgrade retry fires `backoff(0)` after the
+    /// degrade (plus an event-loop tick), and its exchange may deliver the
+    /// quorum view any time inside the full exchange deadline (the quorum
+    /// early-return lands as soon as the lagging peer answers, which can
+    /// be at the very end of the window). A grace below
+    /// `backoff(0) + exchange deadline + tick slack` launches the plan
+    /// while the rescue is still legitimately in flight — the 06 lockout.
+    #[test]
+    fn det_plan_launch_grace_covers_first_retry_rescue_window() {
+        let first_retry = degraded_upgrade_retry_backoff(0);
+        let tick_slack = Duration::from_millis(200);
+        assert!(
+            DET_DEGRADE_PLAN_LAUNCH_GRACE >= first_retry + EXCHANGE_PHASE_TIMEOUT + tick_slack,
+            "the grace ({:?}) must outlast the first retry ({:?}) plus the \
+             full exchange deadline ({:?}) plus tick slack",
+            DET_DEGRADE_PLAN_LAUNCH_GRACE,
+            first_retry,
+            EXCHANGE_PHASE_TIMEOUT,
+        );
     }
 
     /// W9 FIX 3 — the upgrade gate's "no live migration wave" input.
