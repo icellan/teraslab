@@ -15,7 +15,9 @@ use teraslab::protocol::opcodes::{
     OP_GET_BATCH, STATUS_OK,
 };
 use teraslab_test_client::helpers::DockerHelpers;
-use teraslab_test_client::types::{CreateItem, FIELD_ALL, FIELD_ALL_METADATA};
+use teraslab_test_client::types::{
+    BatchItemError, CreateItem, FIELD_ALL, FIELD_ALL_METADATA, SpendBatchParams, SpendItem,
+};
 use teraslab_test_client::verifier::{Mismatch, StateVerifier, parse_metadata_fields};
 use teraslab_test_client::{Client, ClientConfig, ClientError, PoolConfig};
 
@@ -2059,6 +2061,163 @@ pub async fn seed_records(
     }
 
     Ok(txids)
+}
+
+/// What to do with the per-item errors of one spend attempt.
+#[derive(Debug, PartialEq, Eq)]
+pub enum SpendAttemptOutcome {
+    /// Every submitted item landed.
+    Done,
+    /// These indices (into the slice that was submitted) failed with a
+    /// transient code and must be re-sent.
+    Retry(Vec<usize>),
+    /// A per-item error the retry policy does not classify as transient.
+    /// Terminal — surfacing it is the whole point.
+    Fatal(u16),
+}
+
+/// Classify one spend attempt's per-item errors.
+///
+/// Transience is decided by the shared policy
+/// ([`teraslab_test_client::retry::is_transient_code`]) so spend rides out
+/// exactly the same server conditions `seed_records` does — most importantly
+/// `ERR_MIGRATION_IN_PROGRESS` (19), which a shard handoff raises for as long
+/// as the fence is up and which clears on its own.
+///
+/// A single non-transient per-item code makes the whole attempt
+/// [`SpendAttemptOutcome::Fatal`]: retrying must never be a way to make a
+/// real failure (e.g. `ERR_ALREADY_SPENT`) disappear.
+///
+/// Two cases re-send the WHOLE batch rather than the erroring subset,
+/// matching `split_partial_successes`' stance for seeds — in both, nothing
+/// in the response can be trusted to have landed, and re-sending an item
+/// that did land is a no-op because a spend is idempotent for identical
+/// `spending_data`:
+///
+/// * `degraded` — the server could not confirm the ack, so the reported
+///   successes are not durable-confirmed either.
+/// * an `item_index` at or past `submitted` — the response cannot be mapped
+///   onto the request at all.
+pub fn classify_spend_attempt(
+    errors: &[BatchItemError],
+    submitted: usize,
+    degraded: bool,
+) -> SpendAttemptOutcome {
+    if let Some(fatal) = errors
+        .iter()
+        .find(|e| !teraslab_test_client::retry::is_transient_code(e.code))
+    {
+        return SpendAttemptOutcome::Fatal(fatal.code);
+    }
+    if degraded {
+        return SpendAttemptOutcome::Retry((0..submitted).collect());
+    }
+    if errors.is_empty() {
+        return SpendAttemptOutcome::Done;
+    }
+    if errors.iter().any(|e| e.item_index as usize >= submitted) {
+        return SpendAttemptOutcome::Retry((0..submitted).collect());
+    }
+    let mut idx: Vec<usize> = errors.iter().map(|e| e.item_index as usize).collect();
+    idx.sort_unstable();
+    idx.dedup();
+    SpendAttemptOutcome::Retry(idx)
+}
+
+/// Spend every item, retrying only the ones that failed transiently.
+///
+/// The hand-rolled spend loops in the scenarios counted a transient
+/// `ERR_MIGRATION_IN_PROGRESS` as a hard failure, so a spend issued while a
+/// shard handoff fence was up failed the scenario even though the identical
+/// call two seconds later (via `seed_records`, which does retry) succeeded.
+/// Backoff, attempt budget, and the transient set all come from the shared
+/// [`teraslab_test_client::retry`] policy.
+///
+/// Returns `Ok(())` only when every item has been acknowledged, so the caller
+/// may record all of them in the verifier. Returns the terminal error (or,
+/// once the budget is exhausted, the last transient one) otherwise.
+pub async fn spend_all_with_transient_retry(
+    client: &Client,
+    params: &SpendBatchParams,
+    items: &[SpendItem],
+) -> Result<(), ClientError> {
+    use teraslab_test_client::retry::MAX_TRANSIENT_ATTEMPTS;
+
+    let mut remaining: Vec<SpendItem> = items.to_vec();
+    let mut last_transient: Option<ClientError> = None;
+
+    for attempt in 0..MAX_TRANSIENT_ATTEMPTS {
+        if remaining.is_empty() {
+            return Ok(());
+        }
+        let (errors, degraded) = match client.spend_batch(params, &remaining).await {
+            Ok(resp) => (resp.errors, false),
+            Err(ClientError::Partial(pe)) => (pe.errors, pe.degraded),
+            // Whole-op transient (connection blip during a topology change,
+            // or a single server code for the batch): nothing is known to
+            // have landed, so the whole set is re-sent. Safe because a spend
+            // is idempotent for identical `spending_data`.
+            Err(e) if teraslab_test_client::retry::is_transient_error(&e) => {
+                last_transient = Some(e);
+                spend_retry_backoff(client, attempt).await;
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
+
+        match classify_spend_attempt(&errors, remaining.len(), degraded) {
+            SpendAttemptOutcome::Done => return Ok(()),
+            SpendAttemptOutcome::Fatal(code) => {
+                return Err(ClientError::Server {
+                    code,
+                    message: format!(
+                        "spend_batch: non-transient per-item error {code} \
+                         ({} of {} items failed)",
+                        errors.len(),
+                        remaining.len()
+                    ),
+                });
+            }
+            SpendAttemptOutcome::Retry(idx) => {
+                if attempt == 0 {
+                    eprintln!(
+                        "  spend: transient error on attempt 0, retrying {} of {} items",
+                        idx.len(),
+                        remaining.len()
+                    );
+                }
+                last_transient = Some(match errors.first() {
+                    Some(e) => ClientError::Server {
+                        code: e.code,
+                        message: format!("spend_batch: {} items still transient", idx.len()),
+                    },
+                    // A degraded ack with no per-item errors: nothing is
+                    // confirmed durable, so the batch is re-sent whole.
+                    None => ClientError::Connection(format!(
+                        "spend_batch: degraded ack, {} items unconfirmed",
+                        idx.len()
+                    )),
+                });
+                remaining = idx.into_iter().map(|i| remaining[i].clone()).collect();
+                spend_retry_backoff(client, attempt).await;
+            }
+        }
+    }
+
+    Err(last_transient.unwrap_or_else(|| {
+        ClientError::Connection(format!(
+            "spend_batch: {} items still failing after {MAX_TRANSIENT_ATTEMPTS} attempts",
+            remaining.len()
+        ))
+    }))
+}
+
+/// Wait out the shared backoff for `attempt`, then refresh routing — the
+/// same shape `ClientSeedDriver::backoff` uses, because the transient codes
+/// this rides out are usually accompanied by a routing change.
+async fn spend_retry_backoff(client: &Client, attempt: u32) {
+    tokio::time::sleep(teraslab_test_client::retry::backoff_for_attempt(attempt)).await;
+    let _ = client.refresh_routing().await;
 }
 
 /// Tear down the Docker cluster for a specific scenario and wait for cleanup.
@@ -4254,6 +4413,108 @@ mod migration_failure_class_tests {
         assert!(
             sections.contains("holders=[n1:Y, n2:N]"),
             "the dump must show which nodes hold the record: {sections}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod spend_retry_tests {
+    use super::*;
+    use teraslab::protocol::opcodes::{
+        ERR_ALREADY_SPENT, ERR_MIGRATION_IN_PROGRESS, ERR_NO_QUORUM, ERR_STALE_EPOCH,
+    };
+
+    fn err(item_index: u32, code: u16) -> BatchItemError {
+        BatchItemError {
+            item_index,
+            code,
+            data: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn no_errors_completes_the_batch() {
+        assert_eq!(
+            classify_spend_attempt(&[], 50, false),
+            SpendAttemptOutcome::Done
+        );
+    }
+
+    /// A degraded ack cannot confirm durability for the items it reports as
+    /// successful either, so the whole batch is re-sent — the same stance
+    /// `split_partial_successes` takes for seeds.
+    #[test]
+    fn a_degraded_ack_retries_the_whole_batch() {
+        assert_eq!(
+            classify_spend_attempt(&[err(1, ERR_MIGRATION_IN_PROGRESS)], 4, true),
+            SpendAttemptOutcome::Retry(vec![0, 1, 2, 3]),
+        );
+        assert_eq!(
+            classify_spend_attempt(&[], 3, true),
+            SpendAttemptOutcome::Retry(vec![0, 1, 2]),
+            "a degraded ack with no per-item errors still confirms nothing",
+        );
+    }
+
+    /// Degradation must not outrank a real failure.
+    #[test]
+    fn a_degraded_ack_still_surfaces_a_non_transient_code() {
+        assert_eq!(
+            classify_spend_attempt(&[err(0, ERR_ALREADY_SPENT)], 4, true),
+            SpendAttemptOutcome::Fatal(ERR_ALREADY_SPENT),
+        );
+    }
+
+    /// The armed-04 failure: Test 4.5 spent 200 UTXOs while a shard handoff
+    /// fence was up and counted the 5 resulting `ERR_MIGRATION_IN_PROGRESS`
+    /// as hard failures. Code 19 is transient by the shared policy and only
+    /// the fenced items are re-sent.
+    #[test]
+    fn migration_in_progress_retries_only_the_failed_items() {
+        let errors = [err(3, ERR_MIGRATION_IN_PROGRESS), err(7, ERR_STALE_EPOCH)];
+        assert_eq!(
+            classify_spend_attempt(&errors, 50, false),
+            SpendAttemptOutcome::Retry(vec![3, 7]),
+            "only the fenced items are re-sent — items that landed must not be re-spent"
+        );
+    }
+
+    /// A retry must never launder a real failure. `ERR_ALREADY_SPENT` is a
+    /// genuine double-spend signal and stays terminal even when it arrives
+    /// alongside transient siblings.
+    #[test]
+    fn a_non_transient_code_is_terminal_even_when_mixed_with_transient_ones() {
+        let errors = [err(1, ERR_MIGRATION_IN_PROGRESS), err(2, ERR_ALREADY_SPENT)];
+        assert_eq!(
+            classify_spend_attempt(&errors, 50, false),
+            SpendAttemptOutcome::Fatal(ERR_ALREADY_SPENT),
+        );
+    }
+
+    /// An index the request cannot be mapped onto means nothing is known to
+    /// have landed: re-send everything (a spend is idempotent for identical
+    /// `spending_data`).
+    #[test]
+    fn an_out_of_range_item_index_retries_the_whole_batch() {
+        let errors = [err(9, ERR_NO_QUORUM)];
+        assert_eq!(
+            classify_spend_attempt(&errors, 3, false),
+            SpendAttemptOutcome::Retry(vec![0, 1, 2]),
+        );
+    }
+
+    /// Duplicate indices in a response must not duplicate items in the
+    /// retry set.
+    #[test]
+    fn duplicate_indices_are_collapsed() {
+        let errors = [
+            err(2, ERR_MIGRATION_IN_PROGRESS),
+            err(2, ERR_MIGRATION_IN_PROGRESS),
+            err(0, ERR_MIGRATION_IN_PROGRESS),
+        ];
+        assert_eq!(
+            classify_spend_attempt(&errors, 5, false),
+            SpendAttemptOutcome::Retry(vec![0, 2]),
         );
     }
 }
