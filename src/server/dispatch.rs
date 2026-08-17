@@ -10709,10 +10709,28 @@ fn decorate_get_item(
         let is_master = match mastership {
             crate::cluster::coordinator::MasterQueryResult::Yes => true,
             crate::cluster::coordinator::MasterQueryResult::Transitioning { last_known_term } => {
-                tracing::debug!(
-                    last_known_term,
-                    "dispatch: get deferring — topology in transition"
-                );
+                // W10 P2 — rate-limited WARN (1/s per reject class), the
+                // same pattern as the write-path rejects: these fire per
+                // item, but at DEBUG a full-cluster READ outage riding this
+                // path (~14k rejected reads in scenario 07) left zero
+                // evidence in INFO-level CI logs.
+                let shard = crate::cluster::shards::ShardTable::shard_for_key(&key);
+                static LAST_WARN_S: std::sync::atomic::AtomicU64 =
+                    std::sync::atomic::AtomicU64::new(0);
+                if reject_warn_due(&LAST_WARN_S) {
+                    tracing::warn!(
+                        shard,
+                        code = ERR_MIGRATION_IN_PROGRESS,
+                        last_known_term,
+                        "dispatch: get deferring — topology in transition (warn limited to 1/s)"
+                    );
+                } else {
+                    tracing::debug!(
+                        shard,
+                        last_known_term,
+                        "dispatch: get deferring — topology in transition"
+                    );
+                }
                 return WireGetResult {
                     status: ERR_MIGRATION_IN_PROGRESS as u8,
                     data: vec![],
@@ -10752,17 +10770,32 @@ fn decorate_get_item(
                             data,
                         };
                     }
-                    // F-4: routing names a master we have no address for.
-                    // An empty-address redirect is useless to the client;
+                    // F-4: routing names a master we have no address for
+                    // (including the NodeId(0) inbound sentinel). An
+                    // empty-address redirect is useless to the client;
                     // return a retryable ERR_NO_QUORUM ("master unknown,
                     // retry") so it backs off until membership converges.
                     None => {
+                        // W10 P2 — rate-limited WARN (1/s per reject
+                        // class); at DEBUG a cluster-wide read outage on
+                        // this path was invisible in INFO-level CI logs.
                         let shard = crate::cluster::shards::ShardTable::shard_for_key(&key);
-                        tracing::debug!(
-                            shard,
-                            node = ?node,
-                            "dispatch: get master address unknown — returning retryable ERR_NO_QUORUM instead of empty redirect"
-                        );
+                        static LAST_WARN_S: std::sync::atomic::AtomicU64 =
+                            std::sync::atomic::AtomicU64::new(0);
+                        if reject_warn_due(&LAST_WARN_S) {
+                            tracing::warn!(
+                                shard,
+                                code = ERR_NO_QUORUM,
+                                node = ?node,
+                                "dispatch: get master address unknown — returning retryable ERR_NO_QUORUM instead of empty redirect (warn limited to 1/s)"
+                            );
+                        } else {
+                            tracing::debug!(
+                                shard,
+                                node = ?node,
+                                "dispatch: get master address unknown — returning retryable ERR_NO_QUORUM instead of empty redirect"
+                            );
+                        }
                         return WireGetResult {
                             status: ERR_NO_QUORUM as u8,
                             data: vec![],
@@ -13408,13 +13441,22 @@ fn handle_partition_version_report(
         // Reuse the shared self-report builder so the wire response is
         // byte-identical to the in-process partition-view entries — including
         // the reverse-heal `manifest_digest` + `max_generation` recency signal
-        // (finding C1), computed in one filtered index scan off the hot path.
-        Some(c) => crate::cluster::coordinator::build_self_partition_version_entries(
-            c.self_id(),
-            engine,
-            &c.shard_table(),
-            c.inbound_bitmap(),
-        ),
+        // (finding C1). W10 FIX 1: the builder serves the engine's in-RAM
+        // recency cache — ZERO device reads — so this handler answers within
+        // the querying exchange's per-attempt frame timeout even on a fully
+        // seeded store (the old inline per-key footer scan starved every
+        // post-seed exchange). The refresh kick below keeps the served
+        // fingerprints converging off-thread.
+        Some(c) => {
+            let entries = crate::cluster::coordinator::build_self_partition_version_entries(
+                c.self_id(),
+                engine,
+                &c.shard_table(),
+                c.inbound_bitmap(),
+            );
+            c.kick_recency_refresh();
+            entries
+        }
         None => Vec::new(),
     };
 

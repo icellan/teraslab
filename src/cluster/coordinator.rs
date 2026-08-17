@@ -898,10 +898,43 @@ const EXCHANGE_PEER_RETRY_INTERVAL: Duration = Duration::from_millis(500);
 /// collection). Every spawn site uses this single value; the det-degrade
 /// plan-launch grace is derived from it
 /// ([`DET_DEGRADE_PLAN_LAUNCH_GRACE`]), so the two cannot silently drift
-/// apart. With the W9 P1-2 quorum early-return the exchange usually
-/// finishes far sooner — this bounds only the wait for a quorum that
-/// never materializes.
+/// apart. With the W9 P1-2 / W10 FIX 3 full-view early-return the
+/// exchange usually finishes far sooner — this bounds only the wait for
+/// a full member view that never materializes.
 const EXCHANGE_PHASE_TIMEOUT: Duration = Duration::from_millis(2000);
+
+/// W10 FIX 2 — per-attempt frame READ timeout for the exchange's
+/// `OP_PARTITION_VERSION_REPORT` queries, deliberately much shorter than
+/// [`EXCHANGE_PHASE_TIMEOUT`]. When the two were equal (both 2 s), one
+/// peer whose connection went silent burned the entire exchange window on
+/// its FIRST attempt — the read expired exactly at the deadline, so the
+/// W9 FIX 1 re-query loop was structurally single-attempt and a starved
+/// responder (pre-W10-FIX-1) could never be re-asked.
+///
+/// Sizing: an attempt costs at most connect
+/// ([`TOPOLOGY_FRAME_CONNECT_TIMEOUT`], 500 ms) + read (this value), so
+/// the worst first attempt fails by ~1.1 s; the 500 ms
+/// [`EXCHANGE_PEER_RETRY_INTERVAL`] gate (`1.1 s + 0.5 s < 2 s`) then
+/// admits a genuine second attempt with ~400 ms of window left — plenty
+/// for a responder that answers from RAM (W10 FIX 1). Fast failures
+/// (connection refused / instant rejection) fit three or more attempts.
+/// The `≥2 attempts` invariant is pinned by
+/// `exchange_attempt_arithmetic_fits_two_attempts_in_the_window`.
+/// Every OTHER topology frame use keeps the standard 2 s read timeout.
+///
+/// CAVEAT (W10 P2-5) — `set_read_timeout` applies PER READ SYSCALL, and a
+/// frame is read as a length prefix then a body (and the response may
+/// arrive in several chunks), so the timeout resets at each partial read:
+/// a peer DRIBBLING bytes can stretch one attempt to a small multiple of
+/// this value. The sizing above covers the observed failure mode — a
+/// peer that accepts and goes silent (exactly one blocked read) — and a
+/// dribbling peer is still bounded far below the old window-long attempt,
+/// with the exchange's total deadline capping the whole collection.
+const EXCHANGE_REPORT_READ_TIMEOUT: Duration = Duration::from_millis(600);
+
+/// Connect timeout for every topology-protocol frame (single-sourced so
+/// the exchange attempt arithmetic pin reads the real value).
+const TOPOLOGY_FRAME_CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
 
 fn debug_shard_set() -> &'static std::collections::HashSet<u16> {
     static SET: std::sync::OnceLock<std::collections::HashSet<u16>> = std::sync::OnceLock::new();
@@ -2257,18 +2290,37 @@ fn old_master_available_for_handoff(
 /// the `OP_PARTITION_VERSION_REPORT` dispatch handler).
 pub const PARTITION_FLAG_PENDING_INBOUND: u8 = 0b10;
 
+/// [`PartitionVersionEntry::flags`] bit 2 (recency-unknown, W10 P0-1): the
+/// reporting node's recency fields (`manifest_digest` + `max_generation`)
+/// carry NO EVIDENCE about the shard's current content — its recency cache
+/// has not scanned the shard since boot, or scanned it while empty and
+/// records have since arrived. `last_applied_seq` (the live record count)
+/// stays honest. Reverse-heal consumers must treat an UNKNOWN side as
+/// absent evidence: no SUSPECT flag, no direction verdict, no
+/// `max_generation` ranking (the F1 "no evidence is not evidence of
+/// divergence" posture) — without this, a node booting WITH data reported
+/// digest-of-empty/max-gen-0 for every held shard until its first
+/// whole-store scan, and the online re-heal fenced every mastered shard on
+/// each rolling restart. Kept in sync with the bit set by
+/// `build_self_partition_version_entries` (the shared responder for both
+/// the in-process self-report and the wire handler).
+pub const PARTITION_FLAG_RECENCY_UNKNOWN: u8 = 0b100;
+
 /// One node's view of a single shard's local data state.
 ///
 /// Reported by every alive peer during the post-commit exchange phase so the
 /// coordinator can build a migration plan that reflects the *actual* on-disk
 /// distribution rather than a topology-derived guess.
 ///
-/// `flags` packs two booleans:
+/// `flags` packs three booleans:
 /// - bit 0 (`0b01`): this node believes it is the master of `shard` in the
 ///   currently active shard table.
 /// - bit 1 (`0b10`): this node has a pending inbound migration for `shard`
 ///   (i.e. is a subset master receiving data). See
 ///   [`PARTITION_FLAG_PENDING_INBOUND`].
+/// - bit 2 (`0b100`): the entry's recency fields are NO EVIDENCE (recency
+///   cache unscanned / scanned-empty-then-populated). See
+///   [`PARTITION_FLAG_RECENCY_UNKNOWN`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PartitionVersionEntry {
     /// Shard number (0..NUM_SHARDS).
@@ -3083,6 +3135,11 @@ impl ClusterCoordinator {
         let loop_heartbeat = Arc::new(crate::cluster::watchdog::LoopHeartbeat::new());
         let loop_heartbeat_event = loop_heartbeat.clone();
 
+        // W10 FIX 1 — keep an engine handle for the RunningCluster so the
+        // dispatch report handler can kick the off-thread recency refresh
+        // (the event-loop closure below moves the `engine` binding).
+        let engine_for_cluster = engine.clone();
+
         // Event processing thread
         let event_handle = std::thread::spawn(move || {
             let mut last_reactivation_at = std::time::Instant::now();
@@ -3112,10 +3169,11 @@ impl ClusterCoordinator {
             // flight; cleared implicitly by advancing as the term advances.
             let mut prompt_exchange_term: u64 = 0;
             // W8-R2-1 — `Some(term)` while the ACTIVE table for `term` was
-            // installed via the det degrade (below-quorum first activation,
-            // emptied view). Lets a later same-term completion whose member
-            // view reaches quorum through the duplicate-activation gate as
-            // an upgrade; cleared by any admitted quorum activation.
+            // installed via the det degrade (incomplete-view first
+            // activation, emptied view). Lets a later same-term completion
+            // whose member view is FULL (W10 FIX 3) through the
+            // duplicate-activation gate as an upgrade; cleared by any
+            // admitted full-view activation.
             let mut degraded_activation_term: Option<u64> = None;
             // W9 FIX 2 — retry pacing for a det-degraded activation:
             // `(last_attempt, fired_rounds)`, seeded when the degrade is
@@ -4148,10 +4206,10 @@ impl ClusterCoordinator {
                 }
 
                 // W9 FIX 2 — degraded-upgrade retry. While the ACTIVE table
-                // for the committed term is the det degrade (below-quorum
-                // first activation), re-fire the exchange on a doubling
-                // backoff so a late-applying peer can still deliver the
-                // quorum view; the completion routes through the normal
+                // for the committed term is the det degrade
+                // (incomplete-view first activation), re-fire the exchange
+                // on a doubling backoff so a late-applying peer can still
+                // complete the full view; the completion routes through the normal
                 // duplicate-gate upgrade path (`degraded_term_upgrade_-
                 // admissible`). Without this the degrade was terminal: the
                 // det table matches the committed placement so no divergence
@@ -4176,7 +4234,7 @@ impl ClusterCoordinator {
                                     degraded_upgrade_retry_backoff(fired_rounds.saturating_add(1))
                                         .as_secs(),
                                 "cluster: det-degraded activation — re-running the \
-                                 exchange for a quorum upgrade view",
+                                 exchange for a full-view upgrade",
                             );
                             let exchange_tx = exchange_complete_tx.clone();
                             let node_addrs_x = node_addrs.clone();
@@ -4735,7 +4793,7 @@ impl ClusterCoordinator {
                             // term is not terminal: the commit-signal and
                             // prompt arms race two exchanges for the same
                             // term, and the LATER completion often carries
-                            // the quorum view the first one missed. Let a
+                            // the full view the first one missed. Let a
                             // strictly better same-term completion through
                             // the duplicate gate as an UPGRADE; everything
                             // else is a true duplicate. Gated on no live
@@ -4799,12 +4857,12 @@ impl ClusterCoordinator {
                                 term,
                                 member_view_size,
                                 "cluster: upgrading det-degraded activation with a \
-                                 quorum exchange view",
+                                 full-member-view exchange",
                             );
                         }
                     }
-                    // Task #73 / W8 — a table may only be REFINED from a
-                    // view covering a majority of the committed members
+                    // Task #73 / W8 / W10 FIX 3 — a table may only be
+                    // REFINED from a view covering EVERY committed member
                     // (see `admit_exchange_completion`). Below that floor:
                     // a same-term re-heal is dropped HERE — before the term
                     // stamp, the retained view, the event-repair trigger,
@@ -4820,10 +4878,25 @@ impl ClusterCoordinator {
                         member_view_size,
                         members.len(),
                     );
+                    // W10 P2-3 — the evidence a det degrade DISCARDS for
+                    // refinement is kept aside for the parked-fence
+                    // RE-SOURCE pass below: source selection reads
+                    // per-candidate evidence out of the view and never
+                    // refines the table, so a partial view is safe there
+                    // (each candidate still individually passes the
+                    // quorum-current gate; missing reporters just stay
+                    // refused/parked). Without this, every AdmitDetOnly
+                    // round handed the re-source pass an EMPTY view, and a
+                    // NodeId(0)-parked fence could stay fenced forever
+                    // under the full-view floor (which makes det degrades
+                    // more common on clusters with one silent member).
+                    let mut det_degrade_evidence_view: Option<
+                        std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>>,
+                    > = None;
                     match admission {
                         ExchangeAdmission::HoldReheal => continue,
                         ExchangeAdmission::AdmitDetOnly => {
-                            partition_view.clear();
+                            det_degrade_evidence_view = Some(std::mem::take(&mut partition_view));
                             degraded_activation_term = Some(term);
                             // W9 FIX 2 — arm the degraded-upgrade retry: the
                             // degrading completion counts as attempt zero, so
@@ -4831,8 +4904,8 @@ impl ClusterCoordinator {
                             // from NOW.
                             degraded_retry = Some((std::time::Instant::now(), 0));
                         }
-                        // Any admitted quorum activation (first, upgrade, or
-                        // re-heal) supersedes a pending det degrade.
+                        // Any admitted full-view activation (first, upgrade,
+                        // or re-heal) supersedes a pending det degrade.
                         ExchangeAdmission::Admit => {
                             degraded_activation_term = None;
                             degraded_retry = None;
@@ -5023,15 +5096,34 @@ impl ClusterCoordinator {
                     // case; gated on the reverse-heal enable and a no-op on an
                     // empty view.
                     if reverse_heal_online {
-                        let queued = trigger_online_reheal(
-                            self_id,
-                            &shard_table,
-                            &migration,
-                            &inbound_bm_event,
-                            &inbound_state_path_event,
-                            &reheal_backoff_event,
-                            &partition_view,
-                        );
+                        // W10 P2-3 — on a det degrade, run the parked-fence
+                        // RE-SOURCE pass against the evidence view the
+                        // degrade discarded for refinement (source
+                        // selection never refines the table — see
+                        // `resource_parked_heal_fences`); the emptied
+                        // `partition_view` below then makes the detection
+                        // pass a no-op, exactly as the degrade intends.
+                        let resourced = match &det_degrade_evidence_view {
+                            Some(evidence) => resource_parked_heal_fences(
+                                self_id,
+                                &shard_table,
+                                &migration,
+                                &inbound_bm_event,
+                                &inbound_state_path_event,
+                                evidence,
+                            ),
+                            None => 0,
+                        };
+                        let queued = resourced
+                            + trigger_online_reheal(
+                                self_id,
+                                &shard_table,
+                                &migration,
+                                &inbound_bm_event,
+                                &inbound_state_path_event,
+                                &reheal_backoff_event,
+                                &partition_view,
+                            );
                         if queued > 0 {
                             tracing::warn!(
                                 queued,
@@ -5484,6 +5576,7 @@ impl ClusterCoordinator {
         RunningCluster {
             self_id,
             self_addr: self.self_addr,
+            engine: Some(engine_for_cluster),
             shard_table: self.shard_table.clone(),
             migration: self.migration.clone(),
             node_addrs: self.node_addrs.clone(),
@@ -6792,12 +6885,14 @@ impl ClusterCoordinator {
     /// election's partial-view gate genuinely blocks deviation — never
     /// fabricated emptiness) and does not block the full per-peer timeout.
     ///
-    /// W9 P1-2 — the collection returns EARLY as soon as the view covers
-    /// the MEMBER quorum (after draining every answer already in the
-    /// channel), so a silent peer costs quorum-latency instead of the full
-    /// deadline; peers still silent at the early return stay honestly
-    /// absent. The total wall-clock budget is bounded by `total_timeout`
-    /// (a quorum that never materializes waits it out).
+    /// W9 P1-2 / W10 FIX 3 — the collection returns EARLY as soon as the
+    /// view covers EVERY committed member (after draining every answer
+    /// already in the channel). The floor matches the refinement
+    /// admission floor ([`member_view_is_full`]) — returning early at the
+    /// old MEMBER-quorum point would hand admission a partial view and
+    /// guarantee a det degrade. A silent peer therefore costs the full
+    /// deadline; peers still silent then stay honestly absent. The total
+    /// wall-clock budget is bounded by `total_timeout`.
     #[allow(clippy::too_many_arguments)]
     fn run_exchange_phase(
         members: &[NodeId],
@@ -6812,18 +6907,56 @@ impl ClusterCoordinator {
     ) -> std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>> {
         let mut phase = ExchangePhase::new(cluster_key, members.len(), total_timeout);
 
-        // Self-report (no TCP).
+        // W10 FIX 1 — kick an off-thread recency refresh so the NEXT report
+        // (this term's re-query cadence, or the next exchange) serves fresh
+        // fingerprints. The self-report below is served from the cache
+        // immediately — the refresh must never eat into the exchange window.
+        engine.maybe_refresh_shard_recency_cache();
+
+        // Self-report (no TCP, no device reads — see
+        // `build_self_partition_version_entries`).
         let self_entries =
             build_self_partition_version_entries(self_id, engine.as_ref(), shard_table, inbound_bm);
         phase.record(self_id, self_entries);
 
-        // Snapshot peer addresses up front.
+        // Snapshot peer addresses up front. W10 P2-4 — a committed member
+        // with NO known address can never be queried, so the FULL member
+        // view (the refinement floor since W10 FIX 3) is unreachable and
+        // every completion this exchange produces will det-degrade / hold.
+        // That is safe but silent; name the member so an operator can tell
+        // "membership not yet learned / member gone" from a healthy slow
+        // peer. Round-2 follow-up 4: gated by the same occurrence-count
+        // warn pattern as [`heal_refusal_warn_due`] — a PERMANENTLY
+        // addressless member re-trips this on every exchange (commit +
+        // cooldown + retry cadences), so warn the first few times, then
+        // periodically; every occurrence still counts.
         let peer_addrs: Vec<(NodeId, SocketAddr)> = {
+            static ADDRESSLESS_MEMBER_OCCURRENCES: std::sync::atomic::AtomicU64 =
+                std::sync::atomic::AtomicU64::new(0);
             let addrs = node_addrs.read();
             members
                 .iter()
                 .filter(|n| **n != self_id)
-                .filter_map(|n| addrs.get(n).copied().map(|a| (*n, a)))
+                .filter_map(|n| {
+                    let addr = addrs.get(n).copied();
+                    if addr.is_none() {
+                        let occurrence = ADDRESSLESS_MEMBER_OCCURRENCES
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                            .saturating_add(1);
+                        if heal_refusal_warn_due(occurrence) {
+                            tracing::warn!(
+                                member = n.0,
+                                cluster_key,
+                                occurrence,
+                                "cluster: exchange cannot query committed member — no \
+                                 known address; the full member view is unreachable \
+                                 this round (refinement will degrade/hold; warn \
+                                 rate-limited, every occurrence counted)",
+                            );
+                        }
+                    }
+                    addr.map(|a| (*n, a))
+                })
                 .collect()
         };
 
@@ -6868,12 +7001,15 @@ impl ClusterCoordinator {
                     // A rejected report (non-OK status) is a failed query
                     // by design, not an empty report — see F1 above. The
                     // full response is inspected (not discarded) so the
-                    // W9 P2-3 stale-epoch key echo is readable.
-                    match send_topology_frame_response(
+                    // W9 P2-3 stale-epoch key echo is readable. W10 FIX 2:
+                    // the short per-attempt read timeout keeps one silent
+                    // peer from burning the whole exchange window.
+                    match send_topology_frame_response_with_read_timeout(
                         addr,
                         OP_PARTITION_VERSION_REPORT,
                         &cluster_key.to_le_bytes(),
                         secret.as_deref().map(Vec::as_slice),
+                        EXCHANGE_REPORT_READ_TIMEOUT,
                     ) {
                         Ok(response) if response.status == STATUS_OK => {
                             match parse_partition_version_response(&response.payload) {
@@ -6966,7 +7102,7 @@ impl ClusterCoordinator {
         let mut received = 0usize;
         while received < peer_addrs.len() {
             // Opportunistically drain every answer ALREADY in the channel
-            // before deciding anything, so a quorum early-return never
+            // before deciding anything, so the full-view early-return never
             // discards evidence that has already arrived — only peers
             // still silent are left absent.
             while let Ok((peer, entries)) = rx.try_recv() {
@@ -6981,23 +7117,24 @@ impl ClusterCoordinator {
             if received >= peer_addrs.len() {
                 break;
             }
-            // W9 P1-2 — return EARLY once the collected view covers the
-            // MEMBER quorum (counting only reporters that are committed
-            // members; on a drain term the self report must not pad the
-            // floor). Refinement is admissible at the quorum floor, so
-            // waiting further only serves peers that have not answered —
-            // and with the FIX 1 re-query loop a silent peer reports only
-            // at the DEADLINE, which made every exchange with any lagging
-            // member burn the full budget on the commit path (eating the
-            // ~4 s FIX-A handoff window) and pushed the degraded-upgrade
-            // retry's completion past the plan-launch grace. Peers still
-            // silent at the early return stay honestly absent (F1).
+            // W9 P1-2 / W10 FIX 3 — return EARLY once the collected view
+            // covers EVERY committed member (counting only reporters that
+            // are committed members; on a drain term the self report must
+            // not pad the floor). Refinement is admissible only at the
+            // FULL-view floor ([`member_view_is_full`]) — an early return
+            // at the old quorum floor would hand admission a partial view
+            // and guarantee a det degrade even when the last member was
+            // about to answer. A silent peer therefore costs the full
+            // deadline again (the W9 P1-2 latency win now applies only to
+            // the all-answered case) — bounded, and the honest price of
+            // closing the armed-15 divergence door. Peers still silent at
+            // the deadline stay honestly absent (F1).
             let member_view_size = phase
                 .partition_view()
                 .keys()
                 .filter(|n| members.contains(n))
                 .count();
-            if member_view_reaches_quorum(member_view_size, members.len()) {
+            if member_view_is_full(member_view_size, members.len()) {
                 break;
             }
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
@@ -7018,7 +7155,6 @@ impl ClusterCoordinator {
         phase.partition_view().clone()
     }
 
-    #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_arguments)]
     fn run_migration_tasks_with_global_limit(
         tasks: Vec<MigrationTask>,
@@ -7657,29 +7793,31 @@ fn same_term_reheal_applicable(
 }
 
 /// Task #73 — count of same-term re-heal activations skipped because their
-/// exchange completed with a degenerate (below-quorum) partition view. Read
-/// via [`reheal_skipped_degenerate_view_total`] and exported as
-/// `teraslab_reheal_skipped_degenerate_view_total`.
+/// exchange completed with an incomplete partition view (below the
+/// full-member-view refinement floor since W10 FIX 3; below the member
+/// quorum before that). Read via [`reheal_skipped_degenerate_view_total`]
+/// and exported as `teraslab_reheal_skipped_degenerate_view_total`.
 static REHEAL_SKIPPED_DEGENERATE_VIEW_TOTAL: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
-/// Number of same-term re-heal activations skipped on a degenerate
-/// (below-quorum) exchange view since process start (Task #73).
+/// Number of same-term re-heal activations skipped on an incomplete
+/// exchange view since process start (Task #73; full-view floor since
+/// W10 FIX 3).
 pub fn reheal_skipped_degenerate_view_total() -> u64 {
     REHEAL_SKIPPED_DEGENERATE_VIEW_TOTAL.load(Ordering::Relaxed)
 }
 
 /// W8 — count of FIRST activations of a term that DEGRADED to the pure
-/// deterministic table because their exchange completed with a degenerate
-/// (below-quorum) partition view. Read via
+/// deterministic table because their exchange completed with an incomplete
+/// partition view (full-member-view floor since W10 FIX 3). Read via
 /// [`activation_degraded_degenerate_view_total`] and exported as
 /// `teraslab_activation_degraded_degenerate_view_total`.
 static ACTIVATION_DEGRADED_DEGENERATE_VIEW_TOTAL: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
 /// Number of first-of-term exchange-phase activations degraded to the pure
-/// deterministic (emptied-view) table on a degenerate (below-quorum)
-/// exchange view since process start (W8).
+/// deterministic (emptied-view) table on an incomplete exchange view since
+/// process start (W8; full-view floor since W10 FIX 3).
 pub fn activation_degraded_degenerate_view_total() -> u64 {
     ACTIVATION_DEGRADED_DEGENERATE_VIEW_TOTAL.load(Ordering::Relaxed)
 }
@@ -7803,46 +7941,57 @@ fn record_exchange_peer_failure(
 /// Outcome of [`admit_exchange_completion`] for an exchange-phase activation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ExchangeAdmission {
-    /// View covers a majority of the committed members: activate from it.
+    /// View covers EVERY committed member (W10 FIX 3): activate from it.
     Admit,
-    /// Below-quorum FIRST activation of a term: activate, but from an
+    /// Incomplete-view FIRST activation of a term: activate, but from an
     /// EMPTIED view — the pure deterministic table (W8).
     AdmitDetOnly,
-    /// Below-quorum same-term re-heal: drop the completion, keep the
+    /// Incomplete-view same-term re-heal: drop the completion, keep the
     /// current table, let the cooldown re-fire a fresh exchange (Task #73).
     HoldReheal,
 }
 
-/// Task #73 / W8 — view-quorum admission for exchange-phase activations.
+/// Task #73 / W8 / W10 FIX 3 — view admission for exchange-phase
+/// activations: refinement requires a FULL member view.
 ///
 /// Under migration churn the 2 s exchange frequently completes with a
-/// degenerate partial view (SELF-ONLY, or 2 members reporting in a
-/// 4-member cluster). A table REFINED from such partial evidence is the
-/// divergence generator: `apply_master_election` justifies a deviation on
-/// any shard whose candidate set happens to be fully covered by the partial
-/// view, so two nodes with different partial views deviate differently and
-/// stamp DIVERGENT tables at the SAME version (observed: two of four
+/// partial view (SELF-ONLY, or 2 members reporting in a 3- or 4-member
+/// cluster). A table REFINED from such partial evidence is the divergence
+/// generator: `apply_master_election` justifies a deviation on any shard
+/// whose candidate set happens to be fully covered by the partial view,
+/// so two nodes with different partial views deviate differently and
+/// stamp DIVERGENT tables at the SAME version (W8 observed: two of four
 /// members activated a fresh term from view-size-2 exchanges → 622 shards
-/// with contradictory masters). The two safe view shapes are a
-/// quorum-covering view (the evidence is representative) and an EMPTY view
-/// (no deviation can be justified anywhere → the byte-identical pure
-/// deterministic table on every node). `member_view_size` counts only
-/// reporters that are COMMITTED MEMBERS of `term` — the self report is
-/// recorded unconditionally by `run_exchange_phase`, but on a self-drain
-/// term `self` is not a member and must not pad the quorum arithmetic.
+/// with contradictory masters; the original floor was a majority, and CI
+/// armed-15 then proved a majority is NOT safe either — three nodes
+/// refined the same epoch from three different 2-of-3 views, each at
+/// quorum, and 36 acked records were destroyed downstream). The two safe
+/// view shapes are a FULL member view (no candidate can be covered for
+/// one elector and absent for another — see [`member_view_is_full`]) and
+/// an EMPTY view (no deviation can be justified anywhere → the
+/// byte-identical pure deterministic table on every node).
+/// `member_view_size` counts only reporters that are COMMITTED MEMBERS of
+/// `term` — the self report is recorded unconditionally by
+/// `run_exchange_phase`, but on a self-drain term `self` is not a member
+/// and must not pad the arithmetic.
 ///
-/// Below the majority floor (`member_count / 2 + 1`) the two arms differ:
+/// Below the full-view floor the two arms differ:
 ///
 /// - **same-term re-heal** → [`ExchangeAdmission::HoldReheal`]: the caller
 ///   drops the completion WITHOUT touching the shard table or any
 ///   activation bookkeeping. A re-heal exists to REFINE an already-refined
-///   table; rebuilding it from a below-quorum view would clobber refined
+///   table; rebuilding it from an incomplete view would clobber refined
 ///   masterships back to det and fight the holders every other node still
-///   sees. The term-keyed single-flight slot was already released and the
+///   sees — a re-heal from a partial view is the #73 divergence generator.
+///   W10 FIX 3 deliberately RAISES the re-heal floor from majority to full
+///   view along with first activations: a quorum-but-partial re-heal was
+///   exactly as capable of asymmetric-reachability divergence as a
+///   quorum-but-partial first activation, and holding costs only another
+///   cooldown tick (~15-30 s cadence, which also rate-limits the skip
+///   log). The term-keyed single-flight slot was already released and the
 ///   divergence counters (recomputed every tick from the unchanged table)
 ///   stay nonzero, so the normal reactivation trigger re-fires a FRESH
-///   exchange after the cooldown (~15-30 s cadence, which also rate-limits
-///   the skip log).
+///   exchange after the cooldown.
 /// - **first activation of a term** → [`ExchangeAdmission::AdmitDetOnly`]:
 ///   the caller EMPTIES the collected view and activates normally. An
 ///   empty-view activation is exactly what the startup/drain reactivation
@@ -7852,43 +8001,47 @@ enum ExchangeAdmission {
 ///   keeps serving and the two-phase handoff still protects newcomers.
 ///   The refinement this activation skipped is usually rescued within ~2 s:
 ///   the commit-signal and prompt arms race TWO exchanges for the term, and
-///   a later same-term completion whose member view reaches quorum passes
+///   a later same-term completion whose member view is FULL passes
 ///   the duplicate-activation gate as an UPGRADE (see
 ///   `degraded_term_upgrade_admissible`). Holding instead would be a
 ///   TOTAL serving outage (`table.version < committed term` fails every
 ///   serving gate) with no bounded exit: the exchange requires peers to
 ///   have APPLIED the commit (`ERR_STALE_EPOCH` on key mismatch), which
 ///   voting does not imply, and a committed term's quorum can even include
-///   non-members — so "committed ⇒ exchange reaches quorum" is NOT an
+///   non-members — so "committed ⇒ exchange completes full" is NOT an
 ///   invariant of this codebase, and formation would wedge (observed:
 ///   a 2-node formation held forever because the peer's commit apply raced
 ///   the 2 s exchange window and the term never advanced again).
 ///
 /// # Residuals
 ///
-/// - If NO same-term quorum completion ever arrives, the det table and the
+/// - If NO same-term full-view completion ever arrives (e.g. one member
+///   partitioned for the term's whole life), the det table and the
 ///   unrefined topology-derived migration plan stand for the life of the
 ///   term: a pure det table matches the committed placement exactly, so no
 ///   reactivation counter arms a same-term re-heal. This exposure is
 ///   shared with the startup reactivation path, which installs the same
-///   shape ungated.
-/// - Two DIFFERENT quorum-covering views can still justify different
-///   deviations on a shard whose candidates are covered by one view but
-///   not the other — asymmetric reachability divergence (pre-existing,
-///   documented at the `all_candidates_reported` gate). The same-term
-///   re-heal converges it.
+///   shape ungated — and is wider than under the old majority floor, the
+///   deliberate price of closing the armed-15 divergence door. A
+///   genuinely dead member exits via SWIM reap + member-set change, whose
+///   new term restores full views.
 /// - With committed-master election enabled, electing from an emptied view
 ///   observes a no-deviation round for every shard, resetting the
 ///   deviation-hysteresis streaks — each degrade delays a legitimate
 ///   deviation by up to the hysteresis depth. Inert under the default
 ///   configuration.
+///
+/// (The former "two different quorum-covering views can deviate
+/// differently" residual is CLOSED by the full-view floor: refinement now
+/// only ever runs on views every elector holds identically, up to
+/// per-reporter poll instants.)
 fn admit_exchange_completion(
     same_term_reheal: bool,
     term: u64,
     member_view_size: usize,
     member_count: usize,
 ) -> ExchangeAdmission {
-    if member_view_reaches_quorum(member_view_size, member_count) {
+    if member_view_is_full(member_view_size, member_count) {
         return ExchangeAdmission::Admit;
     }
     if same_term_reheal {
@@ -7897,8 +8050,9 @@ fn admit_exchange_completion(
             term,
             member_view_size,
             member_count,
-            "cluster: skipping same-term re-heal — degenerate exchange view below quorum; \
-             holding the current table, re-arming for the next cooldown tick",
+            "cluster: skipping same-term re-heal — incomplete exchange view (full \
+             member view required); holding the current table, re-arming for the \
+             next cooldown tick",
         );
         ExchangeAdmission::HoldReheal
     } else {
@@ -7907,18 +8061,40 @@ fn admit_exchange_completion(
             term,
             member_view_size,
             member_count,
-            "cluster: first activation of term on a below-quorum exchange view — \
-             degrading to the pure deterministic table (emptied view)",
+            "cluster: first activation of term on an incomplete exchange view (full \
+             member view required) — degrading to the pure deterministic table \
+             (emptied view)",
         );
         ExchangeAdmission::AdmitDetOnly
     }
 }
 
-/// Single source of the view-quorum floor: the collected view must cover a
-/// MAJORITY of the committed members (`member_count / 2 + 1`), counting
-/// only reporters that are members (Task #73 / W8).
-fn member_view_reaches_quorum(member_view_size: usize, member_count: usize) -> bool {
-    member_view_size > member_count / 2
+/// Single source of the refinement floor: the collected view must cover
+/// EVERY committed member, counting only reporters that are members.
+///
+/// W10 FIX 3 (CI armed-15) — this floor was a majority (`count/2 + 1`,
+/// Task #73 / W8), and that was the last open divergence door: two
+/// DIFFERENT quorum-covering views can justify different deviations on a
+/// shard whose candidates are covered by one view but not the other
+/// (asymmetric reachability). armed-15 realized it: all three nodes of a
+/// 3-member cluster activated the SAME epoch from three DIFFERENT 2-of-3
+/// views and installed three divergent refined tables at one version —
+/// 35 ownerless shards, and the divergence-unaware handoff/orphan
+/// machinery destroyed 36 acked records. A FULL view is the only shape
+/// two nodes cannot hold different copies of (same term + same member
+/// set ⇒ same reporters; per-reporter payloads may still differ by poll
+/// instant, but no CANDIDATE can be covered for one elector and absent
+/// for another). With the report served from RAM (W10 FIX 1) and the
+/// per-attempt read timeout decoupled from the window (W10 FIX 2), full
+/// views are the common case, so the narrowing costs little: an
+/// incomplete view degrades a first activation to the byte-identical
+/// pure det table and holds a same-term re-heal
+/// ([`admit_exchange_completion`]).
+///
+/// `>=` (not `==`) is defensive only: callers count reporters filtered
+/// to committed members, so the view can never exceed the member count.
+fn member_view_is_full(member_view_size: usize, member_count: usize) -> bool {
+    member_view_size >= member_count
 }
 
 /// W8-R2-1 — may a completion that failed the duplicate-activation gate
@@ -7948,7 +8124,10 @@ fn member_view_reaches_quorum(member_view_size: usize, member_count: usize) -> b
 /// - `degraded_activation_term` records exactly this term (the duplicate
 ///   gate only fires for `term == last_activated_term`, so a stale marker
 ///   for another term can never re-activate it); and
-/// - the late view reaches the member quorum — a second below-quorum view
+/// - the late view covers the FULL member set (W10 FIX 3 — the same
+///   [`member_view_is_full`] floor as first activations, single-sourced:
+///   an upgrade that refined from a mere quorum view would reopen the
+///   armed-15 divergence door this floor closed) — an incomplete view
 ///   would just reinstall the same det table.
 fn degraded_term_upgrade_admissible(
     degraded_activation_term: Option<u64>,
@@ -7959,7 +8138,7 @@ fn degraded_term_upgrade_admissible(
 ) -> bool {
     no_active_migrations
         && degraded_activation_term == Some(term)
-        && member_view_reaches_quorum(member_view_size, member_count)
+        && member_view_is_full(member_view_size, member_count)
 }
 
 /// W9 P1-1 — gate for considering an already-activated term's completion
@@ -8029,7 +8208,7 @@ fn degraded_upgrade_retry_backoff(fired_rounds: u32) -> Duration {
 ///
 /// The resulting exchange completion is routed through the EXISTING
 /// duplicate-activation upgrade gate ([`degraded_term_upgrade_admissible`])
-/// like any other same-term completion — a below-quorum retry view is
+/// like any other same-term completion — an incomplete retry view is
 /// simply discarded there and the cadence continues.
 fn degraded_upgrade_retry_due(
     degraded_activation_term: Option<u64>,
@@ -8050,9 +8229,9 @@ fn degraded_upgrade_retry_due(
 /// Sized (and pinned by `det_plan_launch_grace_covers_first_retry_rescue_window`)
 /// to outlast the first degraded-upgrade retry's WHOLE window:
 /// `degraded_upgrade_retry_backoff(0)` (2 s) until the retry fires, plus
-/// the full [`EXCHANGE_PHASE_TIMEOUT`] (2 s — the quorum early-return can
-/// land any time inside it, e.g. when the lagging peer applies the commit
-/// near the end and answers the next 500 ms re-query), plus event-loop
+/// the full [`EXCHANGE_PHASE_TIMEOUT`] (2 s — the full-view early-return
+/// can land any time inside it, e.g. when the lagging peer applies the
+/// commit near the end and answers the next 500 ms re-query), plus event-loop
 /// tick slack. The racing commit/prompt-arm exchanges (~0 s) are covered
 /// a fortiori. Serving and the shard-table install are NEVER held — only
 /// the worker launch.
@@ -8558,10 +8737,34 @@ fn send_topology_frame_response(
     payload: &[u8],
     auth_secret: Option<&[u8]>,
 ) -> Result<ResponseFrame, String> {
-    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_millis(500))
+    send_topology_frame_response_with_read_timeout(
+        addr,
+        op_code,
+        payload,
+        auth_secret,
+        Duration::from_secs(2),
+    )
+}
+
+/// [`send_topology_frame_response`] with an explicit frame READ timeout.
+///
+/// W10 FIX 2 — the exchange report path passes
+/// [`EXCHANGE_REPORT_READ_TIMEOUT`] so one silent peer costs a fraction
+/// of the exchange window instead of all of it (see the constant's doc
+/// for the sizing arithmetic). All other topology frame uses go through
+/// the 2 s wrapper above, unchanged. The 500 ms connect timeout is
+/// common to both.
+fn send_topology_frame_response_with_read_timeout(
+    addr: SocketAddr,
+    op_code: u16,
+    payload: &[u8],
+    auth_secret: Option<&[u8]>,
+    read_timeout: Duration,
+) -> Result<ResponseFrame, String> {
+    let mut stream = TcpStream::connect_timeout(&addr, TOPOLOGY_FRAME_CONNECT_TIMEOUT)
         .map_err(|e| format!("connect: {e}"))?;
     stream
-        .set_read_timeout(Some(Duration::from_secs(2)))
+        .set_read_timeout(Some(read_timeout))
         .map_err(|e| format!("set timeout: {e}"))?;
     crate::replication::tcp_transport::configure_tcp_keepalive(&stream);
 
@@ -8599,72 +8802,83 @@ fn send_topology_frame(
 /// the in-process self-report is byte-equivalent to what a peer would receive
 /// over the wire. Empty shards on which this node has no role are excluded
 /// to keep the view compact.
+///
+/// W10 FIX 1 — O(RAM), zero device reads: the per-shard record count comes
+/// from the engine's O(1) counters and the reverse-heal recency signal
+/// (`manifest_digest` + `max_generation`) from the engine's in-RAM recency
+/// cache ([`Engine::shard_recency_cached`]). The old inline computation — a
+/// full index walk plus a PER-KEY on-device footer read — took multiple
+/// seconds on a seeded store, so every `OP_PARTITION_VERSION_REPORT` query
+/// hit the peer's frame read timeout and every post-seed exchange collected
+/// a starved partial view (CI @ d3437e4). The recency fields can now trail
+/// live writes by up to one refresh cycle — safe for every consumer (the
+/// digest is a mismatch pre-filter arbitrated by the authoritative Phase-2
+/// manifest exchange; the coarse direction pre-filter tolerates transient
+/// over/under-flagging), and the value was already live-moving across
+/// responders. Callers that can (the exchange, the dispatch handler via
+/// [`RunningCluster::kick_recency_refresh`]) trigger an off-thread refresh
+/// around each report so served values converge promptly.
 pub(crate) fn build_self_partition_version_entries(
     self_id: NodeId,
     engine: &Engine,
     shard_table: &Arc<ShardTableLock<ShardTable>>,
     inbound_bm: &Arc<crate::cluster::migration::AtomicShardBitmap>,
 ) -> Vec<PartitionVersionEntry> {
-    // First pass: decide participation and per-shard record count from the
-    // O(1) shard counters, holding the shard-table read lock only briefly.
-    struct Pending {
-        shard: u16,
-        flags: u8,
-        replica_count: u8,
-        count: u64,
-    }
-    let mut pending: Vec<Pending> = Vec::with_capacity(NUM_SHARDS);
-    let mut participating: std::collections::HashSet<u16> = std::collections::HashSet::new();
-    {
-        let table = shard_table.read();
-        for shard in 0..NUM_SHARDS as u16 {
-            let count = engine.shard_record_count(shard);
-            let assignment = table.target_assignment(shard);
-            let is_master = assignment.master == self_id;
-            let is_subset = inbound_bm.test(shard);
-            let is_replica = assignment.replicas.contains(&self_id);
-            if !is_master && !is_replica && !is_subset && count == 0 {
-                continue;
-            }
-            let mut flags = 0u8;
-            if is_master {
-                flags |= 0b01;
-            }
-            if is_subset {
-                flags |= 0b10;
-            }
-            let replica_count = u8::try_from(assignment.replicas.len().min(255)).unwrap_or(255);
-            participating.insert(shard);
-            pending.push(Pending {
-                shard,
-                flags,
-                replica_count,
-                count,
-            });
+    // Decide participation from the O(1) shard counters and read the cached
+    // recency per shard — everything here is RAM, so the shard-table read
+    // lock is held only for this single pass. P2-7: ONE recency-snapshot
+    // read guard for the whole loop, not one per shard.
+    //
+    // LOCK ORDER (round-2 follow-up 1): shard_table BEFORE the recency
+    // snapshot — the codebase-wide order. Taking them inverted here would
+    // let a future caller holding the table and entering the pub cached
+    // accessors complete a cycle with a pending snapshot-publish writer
+    // (parking_lot writer preference blocks new readers behind it).
+    let mut entries: Vec<PartitionVersionEntry> = Vec::with_capacity(NUM_SHARDS);
+    let table = shard_table.read();
+    let recency = engine.recency_cache_reader();
+    let mut unknown_shards = 0u64;
+    for shard in 0..NUM_SHARDS as u16 {
+        let count = engine.shard_record_count(shard);
+        let assignment = table.target_assignment(shard);
+        let is_master = assignment.master == self_id;
+        let is_subset = inbound_bm.test(shard);
+        let is_replica = assignment.replicas.contains(&self_id);
+        if !is_master && !is_replica && !is_subset && count == 0 {
+            continue;
         }
+        let mut flags = 0u8;
+        if is_master {
+            flags |= 0b01;
+        }
+        if is_subset {
+            flags |= PARTITION_FLAG_PENDING_INBOUND;
+        }
+        // W10 P0-1 — resolve the fingerprint AND whether it is evidence at
+        // all against the live count; an unscanned (or scanned-empty but
+        // now-populated) shard is flagged RECENCY_UNKNOWN so no consumer
+        // mistakes fabricated emptiness for a real divergence signal.
+        let (value, recency_unknown) = recency.get(shard).resolve(count);
+        if recency_unknown {
+            flags |= PARTITION_FLAG_RECENCY_UNKNOWN;
+            unknown_shards += 1;
+        }
+        let replica_count = u8::try_from(assignment.replicas.len().min(255)).unwrap_or(255);
+        entries.push(PartitionVersionEntry {
+            shard,
+            flags,
+            replica_count,
+            last_applied_seq: count,
+            manifest_digest: value.digest,
+            max_generation: value.max_generation,
+        });
     }
-
-    // Second pass: ONE filtered index scan resolves the participating shards'
-    // keys; fold each shard's `(txid, generation)` into the reverse-heal
-    // recency signal. Only participating shards are read, and the whole thing
-    // runs off the hot path (post-topology-commit exchange), not per client op.
-    let (keys_by_shard, _skipped) = engine.keys_by_shard_filtered(&participating);
-    let empty: Vec<TxKey> = Vec::new();
-    pending
-        .into_iter()
-        .map(|p| {
-            let keys = keys_by_shard.get(&p.shard).unwrap_or(&empty);
-            let (_scan_count, manifest_digest, max_generation) = engine.recency_for_keys(keys);
-            PartitionVersionEntry {
-                shard: p.shard,
-                flags: p.flags,
-                replica_count: p.replica_count,
-                last_applied_seq: p.count,
-                manifest_digest,
-                max_generation,
-            }
-        })
-        .collect()
+    // Round-2 follow-up 2 — record how many of THIS report's entries were
+    // served RECENCY_UNKNOWN, for the `teraslab_recency_unknown_shards`
+    // gauge: makes the local pre-first-scan window (and, on a peer's
+    // scrape, a node stuck UNKNOWN) observable.
+    engine.note_recency_report_unknown_shards(unknown_shards);
+    entries
 }
 
 /// Serialize an `OP_PARTITION_VERSION_REPORT` response payload from a list of
@@ -8816,25 +9030,35 @@ pub struct ShardRecency {
     pub digest: u64,
     /// Maximum record generation under WRAPPING-serial ordering (0 when empty).
     pub max_generation: u32,
+    /// W10 P0-1 — `digest`/`max_generation` carry NO EVIDENCE (the
+    /// reporter's recency cache had not scanned the shard's current
+    /// content). `count` stays honest. See
+    /// [`PARTITION_FLAG_RECENCY_UNKNOWN`] for the consumer contract.
+    pub recency_unknown: bool,
 }
 
 impl ShardRecency {
-    /// Build from the `Engine::shard_recency` tuple `(count, digest, max_gen)`.
+    /// Build from the `Engine::shard_recency` tuple `(count, digest, max_gen)`
+    /// — a DIRECT scan, so the recency is always known evidence.
     pub fn from_engine(recency: (u64, u64, u32)) -> Self {
         Self {
             count: recency.0,
             digest: recency.1,
             max_generation: recency.2,
+            recency_unknown: false,
         }
     }
 
     /// Read the recency a peer reported for a shard out of its
-    /// [`PartitionVersionEntry`] (`last_applied_seq` is the record-count proxy).
+    /// [`PartitionVersionEntry`] (`last_applied_seq` is the record-count
+    /// proxy; the [`PARTITION_FLAG_RECENCY_UNKNOWN`] bit marks the
+    /// fingerprint fields as no-evidence).
     pub fn from_entry(entry: &PartitionVersionEntry) -> Self {
         Self {
             count: entry.last_applied_seq,
             digest: entry.manifest_digest,
             max_generation: entry.max_generation,
+            recency_unknown: entry.flags & PARTITION_FLAG_RECENCY_UNKNOWN != 0,
         }
     }
 }
@@ -8868,12 +9092,28 @@ impl ShardRecency {
 /// property, enforced by the authoritative, generation-aware, tombstone-aware
 /// `confirm_target_holds_superset` manifest exchange — NOT a Phase-1 detection
 /// property. An empty `replica_recencies`, or all-matching digests, never flags.
+///
+/// # W10 P0-1 — UNKNOWN recency is NO evidence
+///
+/// A side flagged [`ShardRecency::recency_unknown`] (its recency cache has
+/// not evidenced the shard's current content) contributes NOTHING here: a
+/// self-UNKNOWN shard is never SUSPECT and an UNKNOWN replica is skipped.
+/// A digest "mismatch" against a fabricated empty fingerprint is not a
+/// divergence signal — the same posture as F1's honest absence — and the
+/// classification feeds the Phase-3b path that FENCES, so a wrong flag
+/// here is destructive, not merely noisy. The shard is re-evaluated as
+/// soon as the unknown side's paced scan completes (the source-view
+/// signature includes the unknown bit, so the transition re-arms it).
 pub fn is_shard_stale_vs_replicas(
     self_recency: ShardRecency,
     replica_recencies: &[ShardRecency],
 ) -> bool {
+    if self_recency.recency_unknown {
+        return false;
+    }
     replica_recencies
         .iter()
+        .filter(|replica| !replica.recency_unknown)
         .any(|replica| replica.digest != self_recency.digest)
 }
 
@@ -8916,6 +9156,7 @@ pub(crate) fn detect_stale_shards_from_view(
             count: 0,
             digest: 0,
             max_generation: 0,
+            recency_unknown: false,
         });
         let replica_recencies: Vec<ShardRecency> = assignment
             .replicas
@@ -8949,12 +9190,38 @@ pub(crate) fn detect_stale_shards_from_view(
 /// `max_generation` + `count`, different digest) — that case is left to the
 /// authoritative per-record manifest exchange the boot heal runs. The trade is
 /// deliberate: it guarantees an ahead/equal master is never fenced online.
+///
+/// PRECISION on that guarantee with cached inputs (round-2 follow-up 5):
+/// it is HARD only through the UNKNOWN gate below — the deterministic
+/// fabricated-emptiness instance can never fence. Between two KNOWN
+/// snapshots published at independent node-local instants the comparison
+/// can still transiently invert (self's snapshot older than the replica's
+/// straddling a write burst), fencing an actually-ahead master for a
+/// no-op pull — bounded by one paced refresh cycle, self-resolving, and
+/// arbitrated per key by the authoritative confirm (the staleness
+/// contract documented in [`crate::ops::recency`]'s serving-semantics
+/// section).
+///
+/// # W10 P0-1 — UNKNOWN recency yields NO direction verdict
+///
+/// This gate is the DESTRUCTIVE consumer: a `self_behind` verdict fences
+/// the shard and queues a baseline pull. A self report whose recency is
+/// [`ShardRecency::recency_unknown`] serves `max_generation 0` as a
+/// placeholder, so any real replica would "outrank" it and every mastered
+/// shard would be fenced on each rolling restart (the armed
+/// boot-with-data shape). No verdict is therefore produced when self is
+/// UNKNOWN, and an UNKNOWN replica's placeholder fields are skipped. The
+/// verdict resumes at the unknown side's next completed scan.
 pub fn is_self_behind_any_replica_coarse(
     self_recency: ShardRecency,
     replica_recencies: &[ShardRecency],
 ) -> bool {
+    if self_recency.recency_unknown {
+        return false;
+    }
     replica_recencies
         .iter()
+        .filter(|r| !r.recency_unknown)
         .any(|r| r.max_generation > self_recency.max_generation || r.count > self_recency.count)
 }
 
@@ -8985,9 +9252,13 @@ pub(crate) struct RehealCandidate {
 /// defers a heal to the next signature change, never loses data.
 fn shard_view_signature(self_recency: ShardRecency, replica_recencies: &[ShardRecency]) -> u64 {
     use std::hash::{Hash, Hasher};
-    let mut replicas: Vec<(u64, u64, u32)> = replica_recencies
+    // W10 P0-1 — `recency_unknown` is part of the signature so an
+    // UNKNOWN→known transition (a reporter's first scan completing)
+    // changes the source-view signature and re-arms evaluation for a
+    // shard parked in the not-behind backoff cache.
+    let mut replicas: Vec<(u64, u64, u32, bool)> = replica_recencies
         .iter()
-        .map(|r| (r.count, r.digest, r.max_generation))
+        .map(|r| (r.count, r.digest, r.max_generation, r.recency_unknown))
         .collect();
     replicas.sort_unstable();
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -8995,6 +9266,7 @@ fn shard_view_signature(self_recency: ShardRecency, replica_recencies: &[ShardRe
         self_recency.count,
         self_recency.digest,
         self_recency.max_generation,
+        self_recency.recency_unknown,
     )
         .hash(&mut hasher);
     replicas.hash(&mut hasher);
@@ -9038,6 +9310,7 @@ pub(crate) fn classify_stale_mastered_shards(
             count: 0,
             digest: 0,
             max_generation: 0,
+            recency_unknown: false,
         });
         let replica_recencies: Vec<ShardRecency> = assignment
             .replicas
@@ -9407,13 +9680,20 @@ where
 /// WRAPPING-serial ordering, then higher live count, then higher node id as a
 /// deterministic final tiebreak. Returns `true` iff `a` is strictly more recent
 /// than `b`.
+///
+/// W10 P0-1 — the `max_generation` leg compares only when BOTH sides carry
+/// KNOWN recency: an UNKNOWN reporter's `max_generation` is a placeholder
+/// zero, and ranking on it made any known laggard outrank a
+/// freshly-restarted (pre-first-scan) replica holding strictly more
+/// records. With either side UNKNOWN the ranking falls through to the
+/// LIVE count (honest on every reporter), then the node-id tiebreak.
 fn heal_source_more_recent(
     a: ShardRecency,
     a_node: NodeId,
     b: ShardRecency,
     b_node: NodeId,
 ) -> bool {
-    if a.max_generation != b.max_generation {
+    if !a.recency_unknown && !b.recency_unknown && a.max_generation != b.max_generation {
         return crate::record::generation_target_ahead(b.max_generation, a.max_generation);
     }
     if a.count != b.count {
@@ -9722,29 +10002,36 @@ fn heal_refusal_warn_due(n: u64) -> bool {
 /// An empty `partition_view` (no exchange data) is a no-op. Returns the number
 /// of shards newly fenced + queued, INCLUDING previously-parked fences resolved
 /// to a concrete source this round.
-fn trigger_online_reheal(
+/// #74 — RE-SOURCE parked no-source heal fences: a shard fenced
+/// fail-closed because heal-source selection REFUSED (no quorum-current
+/// candidate — e.g. the boot heal before the first membership exchange
+/// converged a view) is re-attempted against `partition_view`. A
+/// candidate that has caught up since (replica catch-up streams until
+/// converged) now passes the quorum-current gate and the parked sentinel
+/// resolves to a concrete-source pull the existing requester loop drives.
+/// A shard that stays refused stays parked (fenced fail-closed, Phase-3c
+/// alert-and-hold) — deliberately: when every candidate is permanently
+/// behind, serving one would be the stale-resurrection double-spend #74
+/// guards against.
+///
+/// W10 P2-3 — split out of [`trigger_online_reheal`] so the det-degrade
+/// admission path can ALSO run it against the evidence view refinement
+/// discarded: this pass only SELECTS SOURCES from per-candidate evidence
+/// (each candidate individually passes the quorum-current gate) and never
+/// refines the shard table, so a below-floor / partial view is safe input
+/// here — missing reporters simply leave their shards parked. Returns the
+/// number of parked fences resolved to concrete-source pulls.
+fn resource_parked_heal_fences(
     self_id: NodeId,
     shard_table: &Arc<ShardTableLock<ShardTable>>,
     migration: &Arc<Mutex<MigrationManager>>,
     inbound_atomic: &Arc<crate::cluster::migration::AtomicShardBitmap>,
     inbound_state_path: &Option<std::path::PathBuf>,
-    reheal_backoff: &Arc<Mutex<std::collections::HashMap<u16, u64>>>,
     partition_view: &std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>>,
 ) -> usize {
     if partition_view.is_empty() {
         return 0;
     }
-    // #74 — RE-SOURCE parked no-source heal fences FIRST: a shard fenced
-    // fail-closed because heal-source selection REFUSED (no quorum-current
-    // candidate — e.g. the boot heal before the first membership exchange
-    // converged a view) is re-attempted against THIS round's fresh view. A
-    // candidate that has caught up since (replica catch-up streams until
-    // converged) now passes the quorum-current gate and the parked sentinel
-    // resolves to a concrete-source pull the existing requester loop drives.
-    // A shard that stays refused stays parked (fenced fail-closed, Phase-3c
-    // alert-and-hold) — deliberately: when every candidate is permanently
-    // behind, serving one would be the stale-resurrection double-spend #74
-    // guards against.
     let mut started = 0usize;
     let parked = migration.lock().parked_no_source_heal_shards();
     if !parked.is_empty() {
@@ -9768,6 +10055,31 @@ fn trigger_online_reheal(
             }
         }
     }
+    started
+}
+
+fn trigger_online_reheal(
+    self_id: NodeId,
+    shard_table: &Arc<ShardTableLock<ShardTable>>,
+    migration: &Arc<Mutex<MigrationManager>>,
+    inbound_atomic: &Arc<crate::cluster::migration::AtomicShardBitmap>,
+    inbound_state_path: &Option<std::path::PathBuf>,
+    reheal_backoff: &Arc<Mutex<std::collections::HashMap<u16, u64>>>,
+    partition_view: &std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>>,
+) -> usize {
+    if partition_view.is_empty() {
+        return 0;
+    }
+    // #74 — RE-SOURCE parked no-source heal fences FIRST (see
+    // `resource_parked_heal_fences`).
+    let mut started = resource_parked_heal_fences(
+        self_id,
+        shard_table,
+        migration,
+        inbound_atomic,
+        inbound_state_path,
+        partition_view,
+    );
     // DIRECTION before fencing (the P1 fix). The Tier-2 detector
     // ([`detect_stale_shards_from_view`]) flags on ANY digest mismatch and is
     // deliberately direction-BLIND — a healthy master merely AHEAD of a lagging
@@ -15148,19 +15460,26 @@ pub struct MasterCandidate {
 /// candidate descriptors.
 pub fn elect_master(_shard: u16, candidates: &[MasterCandidate]) -> Option<NodeId> {
     // DO NOT re-add max_generation / any recency signal to this ranking.
-    // Reverted twice (PR #76 / commit 3712018, then finding R4): max_generation
-    // is a LIVE-MOVING per-report value (build_self_partition_version_entries ->
-    // engine.recency_for_keys, computed at each responder's poll instant). The
-    // Task #22 gate (all_candidates_reported) only proves each candidate NODE is
-    // PRESENT in the view — it does NOT prove two electors observed the same
-    // max_generation for a live-writing peer. Any recency comparison between two
-    // equal-score candidates is therefore observer-dependent across the ~2000ms
-    // exchange skew -> two electors elect different masters -> dual-SERVING
-    // master (double-spend). "Subordinate to score" does not help: the hazard is
-    // at the score-tie level, which is exactly where recency would decide. A
+    // Reverted twice (PR #76 / commit 3712018, then finding R4), and the
+    // hazard SURVIVES the W10 FIX 1 recency cache: max_generation is now
+    // served from each responder's cache snapshot
+    // (build_self_partition_version_entries -> Engine::shard_recency_cached),
+    // which still moves between that responder's answers — refreshes
+    // complete at node-local instants on the paced background scan, a
+    // re-query can straddle a publish, and the RECENCY_UNKNOWN window
+    // additionally serves placeholder values two electors can observe
+    // DIFFERENTLY (one queried before the responder's first scan, one
+    // after). The Task #22 gate (all_candidates_reported) only proves each
+    // candidate NODE is PRESENT in the view — it does NOT prove two
+    // electors observed the same recency fields for a peer. Any recency
+    // comparison between two equal-score candidates is therefore
+    // observer-dependent across the exchange skew -> two electors elect
+    // different masters -> dual-SERVING master (double-spend).
+    // "Subordinate to score" does not help: the hazard is at the
+    // score-tie level, which is exactly where recency would decide. A
     // stale/behind elected master is the reactive online re-heal's job
-    // (trigger_online_reheal: fail-closed self-fence, never a second authority),
-    // NOT the election's.
+    // (trigger_online_reheal: fail-closed self-fence, never a second
+    // authority), NOT the election's.
     candidates
         .iter()
         .filter(|c| !c.was_evicted)
@@ -15994,6 +16313,19 @@ pub enum MasterQueryResult {
 pub struct RunningCluster {
     self_id: NodeId,
     self_addr: SocketAddr,
+    /// W10 FIX 1 — engine handle so the `OP_PARTITION_VERSION_REPORT`
+    /// dispatch handler (which only holds `&Engine`) can kick the
+    /// off-thread shard-recency refresh via
+    /// [`RunningCluster::kick_recency_refresh`].
+    ///
+    /// W10 P2-6 — `Option` so the unit-test fixture
+    /// (`new_test_running_cluster`) carries `None` instead of a DECOY
+    /// engine: dispatch tests pass their own engine to the handler, and a
+    /// decoy here would silently absorb refresh kicks a test believed it
+    /// was asserting against. Production (`ClusterCoordinator::start`)
+    /// always sets `Some`; a test that wants to observe kicks attaches a
+    /// real engine via `test_set_engine`.
+    engine: Option<Arc<Engine>>,
     shard_table: Arc<ShardTableLock<ShardTable>>,
     migration: Arc<Mutex<MigrationManager>>,
     node_addrs: Arc<RwLock<std::collections::HashMap<NodeId, SocketAddr>>>,
@@ -18456,6 +18788,29 @@ impl RunningCluster {
         &self.inbound_atomic
     }
 
+    /// W10 FIX 1 — kick an off-thread shard-recency refresh if the
+    /// engine's recency cache is due one (stale + past the P1-1 pacing
+    /// floor; no-op otherwise). Called by the
+    /// `OP_PARTITION_VERSION_REPORT` dispatch handler AFTER serving the
+    /// cached report, so a queried node's fingerprints converge for the
+    /// exchange's next 500 ms re-query without the handler ever scanning
+    /// on the request path — including on pure-replica nodes that never
+    /// run an exchange of their own. A `None` engine (unit-test fixture,
+    /// P2-6) is a no-op by construction — there is no decoy to absorb the
+    /// kick.
+    pub fn kick_recency_refresh(&self) {
+        if let Some(engine) = &self.engine {
+            engine.maybe_refresh_shard_recency_cache();
+        }
+    }
+
+    /// W10 P2-6, test-only — attach a REAL engine to a fixture-built
+    /// cluster so a test can observe `kick_recency_refresh` against it.
+    #[cfg(test)]
+    pub(crate) fn test_set_engine(&mut self, engine: Arc<Engine>) {
+        self.engine = Some(engine);
+    }
+
     /// Shut down the cluster.
     ///
     /// Persists the current topology state to disk before stopping so
@@ -18619,6 +18974,12 @@ pub(crate) fn new_test_running_cluster(
             .iter()
             .find_map(|(node, addr)| (*node == self_id).then_some(*addr))
             .unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], 0))),
+        // W10 P2-6 — NO decoy engine: `None` makes `kick_recency_refresh`
+        // a structural no-op in fixture-built clusters, so a kick can
+        // never be silently absorbed by an engine no test is looking at.
+        // Tests that assert kick behavior attach a real engine via
+        // `test_set_engine`.
+        engine: None,
         shard_table: Arc::new(ShardTableLock::new(table.clone())),
         migration,
         node_addrs: Arc::new(RwLock::new(node_addrs)),
@@ -31369,6 +31730,99 @@ mod tests {
         );
     }
 
+    /// W10 P2-6 — `kick_recency_refresh` wiring: a fixture cluster with NO
+    /// attached engine is a structural no-op (no decoy to absorb the kick),
+    /// and once a REAL engine is attached the kick drives ITS cache to
+    /// convergence — the property the dispatch handler relies on.
+    #[test]
+    fn kick_recency_refresh_reaches_the_attached_engine_only() {
+        let (mut cluster, shard, _replica) = three_node_cluster_mastering_with_replica();
+        // No engine attached: the kick is a no-op by construction.
+        cluster.kick_recency_refresh();
+
+        let engine = Arc::new(test_engine());
+        create_test_record(&engine, tx_key_for_shard(shard, 1));
+        assert!(engine.recency_cache_is_stale());
+        cluster.test_set_engine(engine.clone());
+        cluster.kick_recency_refresh();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while engine.recency_cache_is_stale() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the kicked refresh must converge the attached engine's cache",
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            engine.shard_recency_cached(shard),
+            engine.shard_recency(shard),
+            "the kick must have refreshed the ATTACHED engine's fingerprints",
+        );
+    }
+
+    /// W10 P2-3 — the parked-fence RE-SOURCE pass must work on a PARTIAL
+    /// (below-refinement-floor) view: the det-degrade admission path hands
+    /// it exactly that shape (the evidence refinement discarded), because
+    /// source selection reads per-candidate evidence and never refines the
+    /// table. Pre-fix the AdmitDetOnly arm cleared the view BEFORE the
+    /// re-source pass ran, so on a cluster with one silent member (where
+    /// det degrades are the common admission under the full-view floor) a
+    /// NodeId(0)-parked fence could stay fenced forever.
+    #[test]
+    fn parked_fence_resources_from_partial_det_degrade_evidence_view() {
+        let (cluster, shard, replica) = three_node_cluster_mastering_with_replica();
+        let key = key_for_shard(shard);
+
+        // Boot parked the shard (selection refused on the empty boot view).
+        cluster.mark_inbound_heal_fence(shard);
+
+        // The det-degrade evidence shape: a PARTIAL view (only one of the
+        // two peers reported — below the full-view refinement floor), but
+        // the reporting candidate is quorum-current for the shard.
+        let mut evidence: std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>> =
+            std::collections::HashMap::new();
+        evidence.insert(
+            replica,
+            vec![PartitionVersionEntry {
+                shard,
+                flags: 0,
+                replica_count: 1,
+                last_applied_seq: 9,
+                manifest_digest: 2,
+                max_generation: 9,
+            }],
+        );
+
+        assert_eq!(
+            resource_parked_heal_fences(
+                NodeId(1),
+                &cluster.shard_table,
+                &cluster.migration,
+                &cluster.inbound_atomic,
+                &cluster.inbound_state_path,
+                &evidence,
+            ),
+            1,
+            "a quorum-current candidate in a PARTIAL evidence view must \
+             resolve the parked fence — partial views are safe input to \
+             source selection (it never refines the table)",
+        );
+        let pending = cluster.migration.lock().pending_inbound_entries();
+        assert!(
+            pending
+                .iter()
+                .any(|(s, from)| *s == shard && *from == replica),
+            "the parked sentinel resolves to a concrete-source pull",
+        );
+        assert!(
+            matches!(
+                cluster.is_master(&key),
+                MasterQueryResult::Transitioning { .. }
+            ),
+            "the shard stays fenced while the resolved pull is in flight",
+        );
+    }
+
     /// #74 F2 — a PARK must have a production driver on a SETTLED cluster:
     /// exchanges are event-driven and every divergence detector reads zero
     /// once the topology converges, so the parked-fence count is folded into
@@ -32218,6 +32672,194 @@ mod tests {
             3,
         );
         (cluster, shard, replica)
+    }
+
+    /// W10 P0-1 — a KNOWN-recency replica entry for the fabricated-emptiness
+    /// tests: non-zero count, a real digest, and a max_generation any
+    /// pre-fix comparison would rank ahead of an unrefreshed self report.
+    fn known_replica_entry(shard: u16) -> PartitionVersionEntry {
+        PartitionVersionEntry {
+            shard,
+            flags: 0,
+            replica_count: 1,
+            last_applied_seq: 1,
+            manifest_digest: 0xBBBB,
+            max_generation: 100,
+        }
+    }
+
+    /// W10 P0-1 (trigger A — boot with data, destructive self-fence): a node
+    /// whose recency cache has NOT completed its first scan serves live
+    /// counts with NO fingerprint evidence. Driving the REAL report builder
+    /// on a seeded, UNREFRESHED engine used to produce
+    /// `count>0 + digest-of-empty + max_generation 0` for every held shard;
+    /// a replica reporting real recency then made
+    /// `is_self_behind_any_replica_coarse` flag self behind, and
+    /// `run_online_reheal` FENCED the mastered shard (heal_pending →
+    /// Transitioning — keyspace unavailable) and queued a baseline pull —
+    /// deterministically, on every rolling restart at RF≥2 with reverse-heal
+    /// on. The built entry must carry `PARTITION_FLAG_RECENCY_UNKNOWN` and
+    /// the online re-heal must treat it as NO EVIDENCE: nothing fenced,
+    /// nothing pulled, the master keeps serving.
+    #[test]
+    fn online_reheal_ignores_unrefreshed_boot_recency() {
+        let (cluster, shard, replica) = three_node_cluster_mastering_with_replica();
+        let k = key_for_shard(shard);
+        assert!(
+            matches!(cluster.is_master(&k), MasterQueryResult::Yes),
+            "precondition: the node masters + serves the shard",
+        );
+
+        // Seeded engine, recency cache NEVER refreshed (the boot shape).
+        let engine = test_engine();
+        create_test_record(&engine, tx_key_for_shard(shard, 1));
+        create_test_record(&engine, tx_key_for_shard(shard, 2));
+        assert!(engine.recency_cache_is_stale());
+
+        // The REAL production builder — not a hand-built view.
+        let self_entries = build_self_partition_version_entries(
+            NodeId(1),
+            &engine,
+            &cluster.shard_table(),
+            cluster.inbound_bitmap(),
+        );
+        let self_entry = self_entries
+            .iter()
+            .find(|e| e.shard == shard)
+            .expect("the seeded mastered shard must be reported");
+        assert_eq!(
+            self_entry.last_applied_seq, 2,
+            "the live count stays honest"
+        );
+        assert_ne!(
+            self_entry.flags & PARTITION_FLAG_RECENCY_UNKNOWN,
+            0,
+            "an unrefreshed populated shard must be flagged RECENCY_UNKNOWN — \
+             its fingerprint fields are fabricated emptiness, not evidence",
+        );
+
+        let mut view: std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>> =
+            std::collections::HashMap::new();
+        view.insert(NodeId(1), self_entries);
+        view.insert(replica, vec![known_replica_entry(shard)]);
+
+        assert_eq!(
+            cluster.run_online_reheal(&view),
+            0,
+            "no evidence is not evidence of divergence: an UNKNOWN self report \
+             must fence NOTHING (the armed rolling-restart self-fence)",
+        );
+        assert!(
+            matches!(cluster.is_master(&k), MasterQueryResult::Yes),
+            "the master keeps serving through its pre-first-scan window",
+        );
+        assert!(
+            cluster
+                .migration
+                .lock()
+                .pending_inbound_entries()
+                .is_empty(),
+            "no baseline pull may be queued from an UNKNOWN self report",
+        );
+    }
+
+    /// W10 P0-1 (trigger B — empty→populated after a scan): a shard that
+    /// gains its FIRST records after the last completed scan keeps the
+    /// scanned-empty fingerprint. Serving that as KNOWN made every
+    /// migration completion into the shard look like a divergence
+    /// (fence/unfence thrash). The entry must resolve RECENCY_UNKNOWN and
+    /// the online re-heal must skip it.
+    #[test]
+    fn online_reheal_ignores_post_scan_populated_shard() {
+        let (cluster, shard, replica) = three_node_cluster_mastering_with_replica();
+        let k = key_for_shard(shard);
+
+        // A completed scan covered the store while the shard was EMPTY…
+        let engine = test_engine();
+        engine.refresh_shard_recency_cache();
+        assert!(!engine.recency_cache_is_stale());
+        // …then the shard gained its first records (migration completion /
+        // first writes) with no rescan yet.
+        create_test_record(&engine, tx_key_for_shard(shard, 3));
+        assert!(engine.recency_cache_is_stale());
+
+        let self_entries = build_self_partition_version_entries(
+            NodeId(1),
+            &engine,
+            &cluster.shard_table(),
+            cluster.inbound_bitmap(),
+        );
+        let self_entry = self_entries
+            .iter()
+            .find(|e| e.shard == shard)
+            .expect("the populated mastered shard must be reported");
+        assert_ne!(
+            self_entry.flags & PARTITION_FLAG_RECENCY_UNKNOWN,
+            0,
+            "a shard populated AFTER the last scan must be flagged \
+             RECENCY_UNKNOWN — its scanned-empty fingerprint is not evidence \
+             about the records now present",
+        );
+
+        let mut view: std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>> =
+            std::collections::HashMap::new();
+        view.insert(NodeId(1), self_entries);
+        view.insert(replica, vec![known_replica_entry(shard)]);
+
+        assert_eq!(
+            cluster.run_online_reheal(&view),
+            0,
+            "a post-scan-populated shard must not be fenced off its \
+             scanned-empty fingerprint (migration-completion re-fence thrash)",
+        );
+        assert!(
+            matches!(cluster.is_master(&k), MasterQueryResult::Yes),
+            "the master keeps serving the freshly-populated shard",
+        );
+    }
+
+    /// W10 P0-1 (part 3) — heal-source RANKING must ignore
+    /// `max_generation` from an UNKNOWN reporter and rank on the live
+    /// count. Pre-fix, a known reporter's generation always outranked an
+    /// unknown reporter's zero, so a freshly-restarted replica holding
+    /// MORE records lost the source election to a known laggard purely on
+    /// a fabricated generation comparison.
+    #[test]
+    fn heal_source_ranking_ignores_unknown_reporter_generation() {
+        let shard = 7u16;
+        let unknown_full = NodeId(2);
+        let known_laggard = NodeId(3);
+        let mut view: std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>> =
+            std::collections::HashMap::new();
+        view.insert(
+            unknown_full,
+            vec![PartitionVersionEntry {
+                shard,
+                flags: PARTITION_FLAG_RECENCY_UNKNOWN,
+                replica_count: 1,
+                last_applied_seq: 9,
+                manifest_digest: 0,
+                max_generation: 0,
+            }],
+        );
+        view.insert(
+            known_laggard,
+            vec![PartitionVersionEntry {
+                shard,
+                flags: 0,
+                replica_count: 1,
+                last_applied_seq: 5,
+                manifest_digest: 0xCCCC,
+                max_generation: 100,
+            }],
+        );
+        assert_eq!(
+            select_heal_source(NodeId(1), &[unknown_full, known_laggard], &view, shard),
+            Some(unknown_full),
+            "an UNKNOWN reporter's max_generation is not evidence — the \
+             source ranking must fall back to the live count, picking the \
+             fuller replica",
+        );
     }
 
     /// Reverse-heal Phase 3b (RED→GREEN) — a mastered shard that becomes stale at
@@ -34703,6 +35345,225 @@ mod tests {
         );
     }
 
+    /// W10 FIX 2 — the per-attempt frame read timeout must be DECOUPLED
+    /// from the exchange window. When they were equal (both 2 s), a peer
+    /// whose first connection went silent (accepted, request read, no
+    /// reply — the CI shape while the responder was starved scanning)
+    /// burned the entire window on attempt 1: the read timed out exactly
+    /// at the deadline and the 500 ms re-query cadence was structurally
+    /// single-attempt. With the shorter per-attempt timeout the retry
+    /// fires inside the window and the peer's second connection answers.
+    #[test]
+    fn run_exchange_phase_slow_peer_burns_one_attempt_not_the_window() {
+        use std::io::{Read, Write};
+
+        let members = [NodeId(1), NodeId(2)];
+        let term = 6u64;
+        let engine = Arc::new(test_engine());
+        let det = ShardTable::compute_with_epoch(&members, 2, term, 1);
+
+        let peer_entries = vec![PartitionVersionEntry {
+            shard: 11,
+            flags: 0b01,
+            replica_count: 1,
+            last_applied_seq: 3,
+            manifest_digest: 9,
+            max_generation: 1,
+        }];
+        let peer_entries_srv = peer_entries.clone();
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        // NOT joined before the assertion: a regressed (window-long
+        // per-attempt timeout) exchange never opens the second connection,
+        // and a join would hang the test instead of failing it.
+        let _server = std::thread::spawn(move || {
+            // Connection 1: read the request, then go SILENT while keeping
+            // the socket OPEN (a closed socket would fail the read fast and
+            // sidestep the timeout under test). Held on its own thread so
+            // the listener can accept the re-query concurrently.
+            let (mut s1, _) = listener.accept().unwrap();
+            let holder = std::thread::spawn(move || {
+                let mut header = [0u8; 4];
+                s1.read_exact(&mut header).unwrap();
+                let len = u32::from_le_bytes(header) as usize;
+                let mut body = vec![0u8; len];
+                s1.read_exact(&mut body).unwrap();
+                // Outlive the whole exchange window without replying.
+                std::thread::sleep(std::time::Duration::from_millis(4000));
+                drop(s1);
+            });
+            // Connection 2 (the re-query): answer a valid report.
+            let (mut s2, _) = listener.accept().unwrap();
+            let mut header = [0u8; 4];
+            s2.read_exact(&mut header).unwrap();
+            let len = u32::from_le_bytes(header) as usize;
+            let mut body = vec![0u8; len];
+            s2.read_exact(&mut body).unwrap();
+            let mut frame_bytes = header.to_vec();
+            frame_bytes.extend_from_slice(&body);
+            let (request, _) = crate::protocol::frame::RequestFrame::decode(&frame_bytes).unwrap();
+            assert_eq!(request.op_code, OP_PARTITION_VERSION_REPORT);
+            let response = crate::protocol::frame::ResponseFrame {
+                request_id: request.request_id,
+                status: crate::protocol::opcodes::STATUS_OK,
+                payload: encode_partition_version_response(2, term, &peer_entries_srv),
+            };
+            s2.write_all(&response.encode()).unwrap();
+            let _ = holder.join();
+        });
+
+        let mut addrs = std::collections::HashMap::new();
+        addrs.insert(NodeId(2), addr);
+        let node_addrs = Arc::new(RwLock::new(addrs));
+        let shard_table = Arc::new(ShardTableLock::new(det));
+        let inbound_bm = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+
+        // The REAL exchange window (EXCHANGE_PHASE_TIMEOUT): the fix must
+        // land ≥2 attempts inside it, not a stretched test-only budget.
+        let view = ClusterCoordinator::run_exchange_phase(
+            &members,
+            NodeId(1),
+            term,
+            &node_addrs,
+            &engine,
+            &shard_table,
+            &inbound_bm,
+            EXCHANGE_PHASE_TIMEOUT,
+            &None,
+        );
+
+        assert_eq!(
+            view.get(&NodeId(2)),
+            Some(&peer_entries),
+            "a peer whose FIRST connection went silent must still be PRESENT: \
+             the per-attempt read timeout must expire well before the exchange \
+             window so the 500 ms re-query gets a real second attempt",
+        );
+    }
+
+    /// W10 P2-5 — the pure timeout arithmetic behind FIX 2, pinned so no
+    /// constant can be retuned into a structurally single-attempt exchange
+    /// again: a worst-case first attempt (full connect timeout + full
+    /// frame read timeout) plus one retry-cadence sleep must land STRICTLY
+    /// inside the exchange window, leaving a second real attempt.
+    #[test]
+    fn exchange_attempt_arithmetic_fits_two_attempts_in_the_window() {
+        let worst_attempt = TOPOLOGY_FRAME_CONNECT_TIMEOUT + EXCHANGE_REPORT_READ_TIMEOUT;
+        assert!(
+            worst_attempt + EXCHANGE_PEER_RETRY_INTERVAL < EXCHANGE_PHASE_TIMEOUT,
+            "connect ({TOPOLOGY_FRAME_CONNECT_TIMEOUT:?}) + per-attempt read \
+             ({EXCHANGE_REPORT_READ_TIMEOUT:?}) + retry cadence \
+             ({EXCHANGE_PEER_RETRY_INTERVAL:?}) must fit inside \
+             EXCHANGE_PHASE_TIMEOUT ({EXCHANGE_PHASE_TIMEOUT:?}) so a slow \
+             peer's second attempt fires within the window",
+        );
+    }
+
+    /// Counting read probe for the W10 FIX 1 zero-device-read pin: every
+    /// read routes through `pread` (no raw pointer exposed, so the engine
+    /// cannot take the direct-memory path) and is counted.
+    struct ReadCountingDevice {
+        inner: crate::device::MemoryDevice,
+        reads: std::sync::atomic::AtomicU64,
+    }
+
+    impl crate::device::BlockDevice for ReadCountingDevice {
+        fn pread(&self, buf: &mut [u8], offset: u64) -> crate::device::Result<usize> {
+            self.reads
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.inner.pread(buf, offset)
+        }
+        fn pwrite(&self, buf: &[u8], offset: u64) -> crate::device::Result<usize> {
+            self.inner.pwrite(buf, offset)
+        }
+        fn alignment(&self) -> usize {
+            self.inner.alignment()
+        }
+        fn size(&self) -> u64 {
+            self.inner.size()
+        }
+        fn sync(&self) -> crate::device::Result<()> {
+            self.inner.sync()
+        }
+    }
+
+    /// W10 FIX 1 (CI @ d3437e4) — building the partition-version report
+    /// must perform ZERO device reads. The old builder ran a per-key
+    /// on-device `read_metadata` for every key of every participating
+    /// shard on EVERY report (dispatch handler + exchange self-report);
+    /// on a seeded store that starved every post-seed exchange: peers hit
+    /// the frame read timeout, views collapsed below quorum, and the
+    /// wave-9 exchange fixes never got a real attempt. The report must be
+    /// served from the engine's in-RAM recency cache — and still carry
+    /// the honest per-shard values the direct scan would produce.
+    #[test]
+    fn partition_version_report_builds_with_zero_device_reads() {
+        let device = Arc::new(ReadCountingDevice {
+            inner: crate::device::MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap(),
+            reads: std::sync::atomic::AtomicU64::new(0),
+        });
+        let dev: Arc<dyn crate::device::BlockDevice> = device.clone();
+        let alloc = crate::allocator::SlotAllocator::new(dev.clone()).unwrap();
+        let engine = Engine::new(
+            dev,
+            crate::index::Index::new(1024).unwrap(),
+            alloc,
+            crate::locks::StripedLocks::new(64),
+            crate::index::DahIndex::new(),
+        );
+
+        // Seed a few shards with records, then converge the recency cache
+        // (the refresh is the one place device reads are allowed).
+        let keys = [
+            tx_key_for_shard(3, 1),
+            tx_key_for_shard(3, 2),
+            tx_key_for_shard(900, 1),
+        ];
+        for key in keys {
+            create_test_record(&engine, key);
+        }
+        engine.refresh_shard_recency_cache();
+        assert!(!engine.recency_cache_is_stale());
+
+        let self_id = NodeId(1);
+        let table = ShardTable::compute_with_epoch(&[self_id], 1, 1, 1);
+        let shard_table = Arc::new(ShardTableLock::new(table));
+        let inbound_bm = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+
+        let reads_before = device.reads.load(std::sync::atomic::Ordering::Relaxed);
+        let entries =
+            build_self_partition_version_entries(self_id, &engine, &shard_table, &inbound_bm);
+        let reads_after = device.reads.load(std::sync::atomic::Ordering::Relaxed);
+
+        assert_eq!(
+            reads_after, reads_before,
+            "building the partition-version report must perform ZERO device \
+             reads — the per-key footer scan starved every post-seed exchange",
+        );
+
+        // The RAM-served report still carries the honest per-shard values
+        // the direct scan computes (the store is quiescent since refresh).
+        for shard in [3u16, 900u16] {
+            let entry = entries
+                .iter()
+                .find(|e| e.shard == shard)
+                .unwrap_or_else(|| panic!("populated shard {shard} must be reported"));
+            let (count, digest, max_generation) = engine.shard_recency(shard);
+            assert_eq!(
+                entry.last_applied_seq,
+                engine.shard_record_count(shard),
+                "entry count must be the live O(1) shard count",
+            );
+            assert_eq!(entry.last_applied_seq, count);
+            assert_eq!(
+                (entry.manifest_digest, entry.max_generation),
+                (digest, max_generation),
+                "shard {shard}: served recency must equal the direct scan's answer",
+            );
+        }
+    }
+
     /// W9 P2-3 — the `ERR_STALE_EPOCH` report rejection carries the
     /// RESPONDER's local cluster key as an additive tail after the
     /// standard error envelope: standard decoders still read the
@@ -34808,17 +35669,15 @@ mod tests {
         );
     }
 
-    /// W9 P1-2 — the exchange must return EARLY once the collected view
-    /// covers the MEMBER quorum, instead of waiting out the full deadline
-    /// for peers that have not answered. The FIX 1 re-query loop made a
-    /// failing peer report only at the DEADLINE, so with one lagging
-    /// member every exchange on the commit path burned the whole budget
-    /// (eating the FIX-A handoff window) and the degraded-upgrade retry
-    /// completed at backoff + deadline — after the plan-launch grace, so
-    /// the 06 lockout never got rescued. Honest absence is preserved: the
-    /// silent peer is simply not in the returned view.
+    /// W9 P1-2 / W10 FIX 3 — the exchange must return EARLY once the
+    /// collected view covers EVERY committed member, instead of waiting
+    /// out the deadline once all evidence is in. The early-return floor
+    /// must MATCH the refinement admission floor: returning early at the
+    /// old member-quorum point would hand admission a partial view and
+    /// guarantee a det degrade even when the last member was about to
+    /// answer.
     #[test]
-    fn run_exchange_phase_returns_early_once_member_quorum_covered() {
+    fn run_exchange_phase_returns_early_once_full_member_view_covered() {
         use std::io::{Read, Write};
 
         let members = [NodeId(1), NodeId(2), NodeId(3)];
@@ -34826,7 +35685,91 @@ mod tests {
         let engine = Arc::new(test_engine());
         let det = ShardTable::compute_with_epoch(&members, 2, term, 1);
 
-        // Peer 2 answers a valid report immediately.
+        // Peers 2 and 3 both answer a valid report immediately — with the
+        // self report that is the FULL member view.
+        let mk_fast_peer = |node_id: u64| -> (SocketAddr, Vec<PartitionVersionEntry>) {
+            let entries = vec![PartitionVersionEntry {
+                shard: node_id as u16,
+                flags: 0b01,
+                replica_count: 1,
+                last_applied_seq: 5,
+                manifest_digest: node_id,
+                max_generation: 1,
+            }];
+            let entries_srv = entries.clone();
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut header = [0u8; 4];
+                stream.read_exact(&mut header).unwrap();
+                let len = u32::from_le_bytes(header) as usize;
+                let mut body = vec![0u8; len];
+                stream.read_exact(&mut body).unwrap();
+                let mut frame_bytes = header.to_vec();
+                frame_bytes.extend_from_slice(&body);
+                let (request, _) =
+                    crate::protocol::frame::RequestFrame::decode(&frame_bytes).unwrap();
+                let response = crate::protocol::frame::ResponseFrame {
+                    request_id: request.request_id,
+                    status: crate::protocol::opcodes::STATUS_OK,
+                    payload: encode_partition_version_response(node_id, term, &entries_srv),
+                };
+                stream.write_all(&response.encode()).unwrap();
+            });
+            (addr, entries)
+        };
+        let (addr2, entries2) = mk_fast_peer(2);
+        let (addr3, entries3) = mk_fast_peer(3);
+
+        let mut addrs = std::collections::HashMap::new();
+        addrs.insert(NodeId(2), addr2);
+        addrs.insert(NodeId(3), addr3);
+        let node_addrs = Arc::new(RwLock::new(addrs));
+        let shard_table = Arc::new(ShardTableLock::new(det));
+        let inbound_bm = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+
+        let started = std::time::Instant::now();
+        let view = ClusterCoordinator::run_exchange_phase(
+            &members,
+            NodeId(1),
+            term,
+            &node_addrs,
+            &engine,
+            &shard_table,
+            &inbound_bm,
+            std::time::Duration::from_millis(3000),
+            &None,
+        );
+        let elapsed = started.elapsed();
+
+        assert!(view.contains_key(&NodeId(1)), "self report present");
+        assert_eq!(view.get(&NodeId(2)), Some(&entries2));
+        assert_eq!(view.get(&NodeId(3)), Some(&entries3));
+        assert!(
+            elapsed < Duration::from_millis(1200),
+            "a full member view must return early instead of waiting out \
+             the deadline (took {elapsed:?})",
+        );
+    }
+
+    /// W10 FIX 3 — a view that reaches the old MEMBER QUORUM but is not
+    /// full must NOT return early: the exchange keeps the window open for
+    /// the last member (whose answer is the difference between refining
+    /// and det-degrading). Pins against reintroducing the quorum
+    /// early-return, which would guarantee a degrade whenever any single
+    /// member lags.
+    #[test]
+    fn run_exchange_phase_quorum_but_partial_view_waits_out_the_window() {
+        use std::io::{Read, Write};
+
+        let members = [NodeId(1), NodeId(2), NodeId(3)];
+        let term = 4u64;
+        let engine = Arc::new(test_engine());
+        let det = ShardTable::compute_with_epoch(&members, 2, term, 1);
+
+        // Peer 2 answers a valid report immediately (self + peer 2 = the
+        // old majority quorum). Peer 3 is silent (closed port).
         let peer_entries = vec![PartitionVersionEntry {
             shard: 3,
             flags: 0b01,
@@ -34856,8 +35799,6 @@ mod tests {
             stream.write_all(&response.encode()).unwrap();
         });
 
-        // Peer 3 is silent (closed port): its thread re-queries until the
-        // deadline and reports absence only then.
         let mut addrs = std::collections::HashMap::new();
         addrs.insert(NodeId(2), fast_addr);
         addrs.insert(NodeId(3), "127.0.0.1:1".parse().unwrap());
@@ -34865,6 +35806,7 @@ mod tests {
         let shard_table = Arc::new(ShardTableLock::new(det));
         let inbound_bm = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
 
+        let window = std::time::Duration::from_millis(1500);
         let started = std::time::Instant::now();
         let view = ClusterCoordinator::run_exchange_phase(
             &members,
@@ -34874,7 +35816,7 @@ mod tests {
             &engine,
             &shard_table,
             &inbound_bm,
-            std::time::Duration::from_millis(3000),
+            window,
             &None,
         );
         let elapsed = started.elapsed();
@@ -34890,10 +35832,11 @@ mod tests {
             "the silent peer stays honestly absent",
         );
         assert!(
-            elapsed < Duration::from_millis(1200),
-            "self + one peer of three IS the member quorum — the exchange \
-             must return early instead of waiting out the silent peer's \
-             deadline (took {elapsed:?})",
+            elapsed >= Duration::from_millis(1000),
+            "self + one peer of three reaches the OLD quorum but is not a \
+             full view — the exchange must keep waiting for the last member \
+             instead of returning early into a guaranteed det degrade \
+             (returned after {elapsed:?})",
         );
     }
 
@@ -35751,20 +36694,20 @@ mod tests {
         );
     }
 
-    /// Task #73 — a same-term re-heal whose exchange completed with a
-    /// degenerate (below-quorum, e.g. self-only) partition view must NOT
-    /// activate: the skip is counted, and the consumer's `continue` leaves
-    /// the shard table and every piece of trigger state untouched so the
-    /// re-heal re-fires with a fresh exchange on the next cooldown tick.
+    /// Task #73 — a same-term re-heal whose exchange completed with an
+    /// incomplete partition view (e.g. self-only) must NOT activate: the
+    /// skip is counted, and the consumer's `continue` leaves the shard
+    /// table and every piece of trigger state untouched so the re-heal
+    /// re-fires with a fresh exchange on the next cooldown tick.
     #[test]
     fn same_term_reheal_degenerate_view_skips_activation() {
         let before = reheal_skipped_degenerate_view_total();
         // Admitted completions must not count a skip. (Asserted inside this
         // test — the only incrementer — so parallel tests cannot race it.)
         assert_eq!(
-            admit_exchange_completion(true, 7, 2, 3),
+            admit_exchange_completion(true, 7, 3, 3),
             ExchangeAdmission::Admit,
-            "a majority view must be admitted",
+            "a full member view must be admitted",
         );
         assert_eq!(
             reheal_skipped_degenerate_view_total(),
@@ -35772,11 +36715,11 @@ mod tests {
             "an admitted re-heal must not count a degenerate-view skip",
         );
         // The defect shape: a 3-member cluster whose 2s exchange completed
-        // self-only (view_size 1 < quorum 2) must hold, not install.
+        // self-only (view_size 1 < full 3) must hold, not install.
         assert_eq!(
             admit_exchange_completion(true, 7, 1, 3),
             ExchangeAdmission::HoldReheal,
-            "a self-only view (1 of 3) is below quorum — the same-term re-heal must hold",
+            "a self-only view (1 of 3) is incomplete — the same-term re-heal must hold",
         );
         assert_eq!(
             reheal_skipped_degenerate_view_total(),
@@ -35785,29 +36728,39 @@ mod tests {
         );
     }
 
-    /// Task #73 — a same-term re-heal whose MEMBER view reaches the
-    /// majority quorum (len/2 + 1) activates exactly as today.
+    /// Task #73 / W10 FIX 3 — a same-term re-heal activates ONLY on a
+    /// FULL member view. The floor deliberately ROSE from the majority
+    /// quorum: a quorum-but-partial re-heal is the same
+    /// asymmetric-reachability divergence generator as a partial first
+    /// activation (armed-15), and holding costs one cooldown tick.
     #[test]
-    fn same_term_reheal_quorum_view_activates() {
-        assert_eq!(
-            admit_exchange_completion(true, 7, 2, 3),
-            ExchangeAdmission::Admit,
-            "2 of 3 is the majority quorum — the re-heal must activate",
-        );
+    fn same_term_reheal_requires_full_member_view() {
         assert_eq!(
             admit_exchange_completion(true, 7, 3, 3),
             ExchangeAdmission::Admit,
             "a full view must activate",
         );
         assert_eq!(
-            admit_exchange_completion(true, 7, 3, 5),
+            admit_exchange_completion(true, 7, 5, 5),
             ExchangeAdmission::Admit,
-            "3 of 5 is the majority quorum — the re-heal must activate",
+            "a full 5-of-5 view must activate",
+        );
+        assert_eq!(
+            admit_exchange_completion(true, 7, 2, 3),
+            ExchangeAdmission::HoldReheal,
+            "2 of 3 reaches the old majority quorum but is INCOMPLETE — the \
+             re-heal must hold (deliberate W10 FIX 3 narrowing)",
+        );
+        assert_eq!(
+            admit_exchange_completion(true, 7, 3, 5),
+            ExchangeAdmission::HoldReheal,
+            "3 of 5 reaches the old majority quorum but is INCOMPLETE — the \
+             re-heal must hold",
         );
         assert_eq!(
             admit_exchange_completion(true, 7, 2, 5),
             ExchangeAdmission::HoldReheal,
-            "2 of 5 is below the majority quorum — the re-heal must hold",
+            "2 of 5 is incomplete — the re-heal must hold",
         );
     }
 
@@ -35860,20 +36813,18 @@ mod tests {
         );
     }
 
-    /// W8 formation pin — a first activation whose member view reaches the
-    /// majority floor activates from the full view (election refinement
-    /// enabled), including the 2-member unanimity case.
+    /// W8 formation pin / W10 FIX 3 — a first activation refines ONLY
+    /// from a FULL member view; any quorum-but-incomplete view degrades
+    /// to det (armed-15: three different 2-of-3 views each reached the
+    /// old majority floor and refined divergently). Full views — the
+    /// common case with the RAM-served report — and single-node still
+    /// admit.
     #[test]
-    fn first_activation_quorum_view_proceeds() {
+    fn first_activation_requires_full_member_view() {
         assert_eq!(
             admit_exchange_completion(false, 1, 4, 4),
             ExchangeAdmission::Admit,
             "formation with a full view must activate",
-        );
-        assert_eq!(
-            admit_exchange_completion(false, 1, 3, 4),
-            ExchangeAdmission::Admit,
-            "3 of 4 is the majority quorum — the first activation must proceed",
         );
         assert_eq!(
             admit_exchange_completion(false, 1, 2, 2),
@@ -35881,28 +36832,132 @@ mod tests {
             "2-member formation with both reporting must activate",
         );
         assert_eq!(
-            admit_exchange_completion(false, 1, 2, 3),
+            admit_exchange_completion(false, 1, 1, 1),
             ExchangeAdmission::Admit,
-            "2 of 3 is the majority quorum — the first activation must proceed",
+            "single-node view is trivially full and must activate",
+        );
+        assert_eq!(
+            admit_exchange_completion(false, 1, 3, 4),
+            ExchangeAdmission::AdmitDetOnly,
+            "3 of 4 reaches the old majority quorum but is INCOMPLETE — the \
+             first activation must degrade to det (W10 FIX 3)",
+        );
+        assert_eq!(
+            admit_exchange_completion(false, 1, 2, 3),
+            ExchangeAdmission::AdmitDetOnly,
+            "2 of 3 reaches the old majority quorum but is INCOMPLETE — the \
+             first activation must degrade to det (armed-15 shape)",
         );
     }
 
-    /// W8-R2-1 — a det-degraded activation is upgraded by the racing second
-    /// exchange: a later SAME-TERM completion whose member view reaches
-    /// quorum passes the duplicate-activation gate; everything else stays a
-    /// true duplicate.
+    /// W10 FIX 3 (CI armed-15) — refinement requires a FULL member view.
+    /// The armed-15 CI shape: in a 3-member cluster all three nodes
+    /// activated the SAME epoch from three DIFFERENT 2-of-3 views — each
+    /// view reached the old majority floor, so each node refined, and the
+    /// three refinements diverged (35 ownerless shards; the
+    /// divergence-unaware handoff/orphan machinery then destroyed 36
+    /// acked records). Any incomplete view must therefore DEGRADE a first
+    /// activation to the pure deterministic table (byte-identical on
+    /// every node, no evidence-dependent deviation possible) and HOLD a
+    /// same-term re-heal.
     #[test]
-    fn degraded_term_upgrade_admits_only_same_term_quorum_views() {
-        // The rescue shape: term 5 was degraded, the late completion for
-        // term 5 carries a quorum view (3 of 4), nothing in flight → upgrade.
+    fn armed_15_three_different_two_of_three_views_all_degrade_det() {
+        let members = [NodeId(1), NodeId(2), NodeId(3)];
+        let rf = 2;
+        let term = 15u64;
+
+        // The three distinct 2-of-3 view shapes ({1,2}, {1,3}, {2,3}):
+        // every one is quorum-but-not-full and must degrade, not refine.
+        let two_of_three_views: [[NodeId; 2]; 3] = [
+            [NodeId(1), NodeId(2)],
+            [NodeId(1), NodeId(3)],
+            [NodeId(2), NodeId(3)],
+        ];
+        for view_members in &two_of_three_views {
+            assert_eq!(
+                admit_exchange_completion(false, term, view_members.len(), members.len()),
+                ExchangeAdmission::AdmitDetOnly,
+                "a first activation from the 2-of-3 view {view_members:?} must degrade \
+                 to det — refining from ANY incomplete view is the armed-15 divergence \
+                 generator",
+            );
+            assert_eq!(
+                admit_exchange_completion(true, term, view_members.len(), members.len()),
+                ExchangeAdmission::HoldReheal,
+                "a same-term re-heal from the 2-of-3 view {view_members:?} must hold",
+            );
+        }
+
+        // The degrade must actually CONVERGE: each node activates from an
+        // EMPTIED view, so all three install byte-identical pure det
+        // tables — apply_master_election on an empty view is a no-op.
+        let prev = ShardTable::compute_with_epoch(&members, rf, term - 1, 1);
+        let empty_view: std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>> =
+            std::collections::HashMap::new();
+        let pure_det = ShardTable::compute_with_epoch(&members, rf, term, 1);
+        let mut tables: Vec<Vec<(NodeId, Vec<NodeId>)>> = Vec::new();
+        for _node in &members {
+            let mut table = ShardTable::compute_with_epoch(&members, rf, term, 1);
+            apply_master_election(
+                &mut table,
+                &prev,
+                &empty_view,
+                &std::collections::HashSet::new(),
+                false,
+            );
+            tables.push(
+                (0..NUM_SHARDS as u16)
+                    .map(|s| {
+                        let a = table.target_assignment(s);
+                        (a.master, a.replicas.clone())
+                    })
+                    .collect(),
+            );
+        }
+        let det_assignments: Vec<(NodeId, Vec<NodeId>)> = (0..NUM_SHARDS as u16)
+            .map(|s| {
+                let a = pure_det.target_assignment(s);
+                (a.master, a.replicas.clone())
+            })
+            .collect();
+        for (i, t) in tables.iter().enumerate() {
+            assert_eq!(
+                t, &det_assignments,
+                "node {i}: a det-degraded activation must install the PURE \
+                 deterministic table (no deviation from an emptied view)",
+            );
+        }
         assert!(
-            degraded_term_upgrade_admissible(Some(5), 5, 3, 4, true),
-            "a same-term quorum view must upgrade a det-degraded activation",
+            tables.windows(2).all(|w| w[0] == w[1]),
+            "all det-degraded nodes must install byte-identical tables",
         );
-        // A second below-quorum view would reinstall the same det table.
+    }
+
+    /// W8-R2-1 / W10 FIX 3 — a det-degraded activation is upgraded by the
+    /// racing second exchange: a later SAME-TERM completion whose member
+    /// view is FULL passes the duplicate-activation gate (the same
+    /// single-sourced floor as first activations — a quorum-but-partial
+    /// upgrade would reopen the armed-15 divergence door); everything
+    /// else stays a true duplicate.
+    #[test]
+    fn degraded_term_upgrade_admits_only_same_term_full_views() {
+        // The rescue shape: term 5 was degraded, the late completion for
+        // term 5 carries a FULL view (4 of 4), nothing in flight → upgrade.
+        assert!(
+            degraded_term_upgrade_admissible(Some(5), 5, 4, 4, true),
+            "a same-term full view must upgrade a det-degraded activation",
+        );
+        // A quorum-but-incomplete view must NOT upgrade (W10 FIX 3): it is
+        // the same partial-evidence refinement the degrade avoided.
+        assert!(
+            !degraded_term_upgrade_admissible(Some(5), 5, 3, 4, true),
+            "a quorum-but-incomplete view must stay a duplicate — refining \
+             from it would reopen the armed-15 divergence door",
+        );
+        // A second incomplete view would reinstall the same det table.
         assert!(
             !degraded_term_upgrade_admissible(Some(5), 5, 2, 4, true),
-            "a below-quorum view must stay a duplicate — nothing to upgrade with",
+            "an incomplete view must stay a duplicate — nothing to upgrade with",
         );
         // No degrade recorded: the normal duplicate gate stands.
         assert!(
@@ -35920,7 +36975,7 @@ mod tests {
         // advance, keep streaming. The marker stays set; the det-table
         // residual applies instead.
         assert!(
-            !degraded_term_upgrade_admissible(Some(5), 5, 3, 4, false),
+            !degraded_term_upgrade_admissible(Some(5), 5, 4, 4, false),
             "an upgrade must never supersede the plan under a live migration wave",
         );
     }
@@ -36581,11 +37636,13 @@ mod tests {
             count: 5,
             digest: 0xAAAA,
             max_generation: 100,
+            recency_unknown: false,
         };
         let replica_recency = ShardRecency {
             count: 6,
             digest: 0xBBBB,
             max_generation: 101,
+            recency_unknown: false,
         };
         let stale = is_shard_stale_vs_replicas(self_recency, &[replica_recency]);
         assert!(stale, "Tier-2 catches the gap Tier-1 missed");
@@ -36606,11 +37663,13 @@ mod tests {
             count: 2,
             digest: 0xA1A1,
             max_generation: 10,
+            recency_unknown: false,
         };
         let replica_recency = ShardRecency {
             count: 2,
             digest: 0xB2B2,
             max_generation: 10,
+            recency_unknown: false,
         };
         assert!(
             is_shard_stale_vs_replicas(self_recency, &[replica_recency]),
@@ -36634,11 +37693,13 @@ mod tests {
             count: 1,
             digest: 0x1111,
             max_generation: 5,
+            recency_unknown: false,
         };
         let behind_replica = ShardRecency {
             count: 2,
             digest: 0x2222,
             max_generation: 5,
+            recency_unknown: false,
         };
         assert!(
             is_shard_stale_vs_replicas(self_recency, &[behind_replica]),
@@ -36656,6 +37717,7 @@ mod tests {
             count: 3,
             digest: 0xF00D,
             max_generation: 42,
+            recency_unknown: false,
         };
         assert!(
             !is_shard_stale_vs_replicas(self_recency, &[]),
@@ -36668,6 +37730,7 @@ mod tests {
             count: 99,
             digest: 0xF00D,
             max_generation: 7,
+            recency_unknown: false,
         };
         assert!(
             !is_shard_stale_vs_replicas(self_recency, &[matching_digest, matching_digest]),
@@ -36690,6 +37753,7 @@ mod tests {
             count: 5,
             digest: 0xAAAA,
             max_generation: 100,
+            recency_unknown: false,
         };
 
         // Empty replica set → never behind.
@@ -36700,6 +37764,7 @@ mod tests {
             count: 5,
             digest: 0xBBBB,
             max_generation: 101,
+            recency_unknown: false,
         };
         assert!(is_self_behind_any_replica_coarse(
             self_recency,
@@ -36711,6 +37776,7 @@ mod tests {
             count: 6,
             digest: 0xBBBB,
             max_generation: 100,
+            recency_unknown: false,
         };
         assert!(is_self_behind_any_replica_coarse(
             self_recency,
@@ -36723,6 +37789,7 @@ mod tests {
             count: 3,
             digest: 0xBBBB,
             max_generation: 90,
+            recency_unknown: false,
         };
         assert!(!is_self_behind_any_replica_coarse(
             self_recency,
@@ -36735,6 +37802,7 @@ mod tests {
             count: 5,
             digest: 0xCCCC,
             max_generation: 100,
+            recency_unknown: false,
         };
         assert!(!is_self_behind_any_replica_coarse(
             self_recency,
