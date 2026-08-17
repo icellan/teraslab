@@ -5181,7 +5181,13 @@ impl ClusterCoordinator {
                         // settled.
                         let cleanup_admissible = {
                             let table_version = shard_table.read().version;
-                            let pending_inbound = migration.lock().inbound_count();
+                            // W10 composition review P1-3b/P2-4 — count only
+                            // genuine in-flight MIGRATION work: a reverse-heal
+                            // fence (especially a #74 park, which holds
+                            // forever by design) is alert-and-hold state, not
+                            // inbound work, and gating on it disabled this
+                            // pass for the life of the process.
+                            let pending_inbound = migration.lock().inbound_migration_work_count();
                             event_orphan_cleanup_admissible(table_version, term, pending_inbound)
                         };
                         if cleanup_admissible
@@ -12425,6 +12431,14 @@ const EVENT_ORPHAN_CLEANUP_MIN_INTERVAL: Duration = Duration::from_secs(60);
 ///   term — so the node's first post-rejoin activation has landed), AND
 /// - `pending_inbound == 0` — its plan's inbound work has settled, so
 ///   nothing this node is still receiving can be misjudged around the pass.
+///
+/// W10 composition review P1-3b/P2-4 — `pending_inbound` is
+/// [`MigrationManager::inbound_migration_work_count`], NOT `inbound_count`:
+/// reverse-heal fences are EXCLUDED. They are alert-and-hold state rather
+/// than in-flight migration work, and a #74 parked no-source fence holds
+/// forever BY DESIGN — counting it turned a transient fence into a permanent
+/// disable of this pass (the armed-17 disk-reclaim regression). See that
+/// method's doc for the full safety argument.
 ///
 /// Refusal is fail-safe: it defers reclaim, never data. The
 /// batch-completion-site invocations of `run_orphan_cleanup` /
@@ -26065,6 +26079,81 @@ mod tests {
             assert!(event_orphan_cleanup_fire(&mut last_fired, now));
         }
         assert!(last_fired.is_some());
+    }
+
+    /// W10 composition review P1-3b/P2-4 (RED→GREEN) — a reverse-heal fence
+    /// must NOT disable the event-driven orphan cleanup. `inbound_count`
+    /// counts every uncompleted inbound entry, heal fences included, and the
+    /// admissibility gate demands zero — so ONE #74 parked no-source fence
+    /// (which alert-and-hold DESIGNS to hold forever) disabled the pass for
+    /// the life of the process and brought back the armed-17 disk-reclaim
+    /// regression. Genuine in-flight forward inbound work must still gate.
+    /// Driven through the REAL `MigrationManager` and the REAL gate.
+    #[test]
+    fn parked_heal_fence_does_not_disable_event_orphan_cleanup() {
+        let mut mgr = MigrationManager::new();
+
+        // #74: a no-source heal fence, parked on the NodeId(0) sentinel —
+        // fenced fail-closed until an operator intervenes.
+        assert!(mgr.mark_heal_fence_active(11));
+        assert_eq!(
+            mgr.parked_no_source_heal_shards(),
+            vec![11],
+            "precondition: the fence really is a #74 park",
+        );
+        assert_eq!(
+            mgr.inbound_count(),
+            1,
+            "the park IS an uncompleted inbound entry (the old gate input)",
+        );
+        assert_eq!(
+            mgr.inbound_migration_work_count(),
+            0,
+            "...but it is alert-and-hold state, not in-flight migration work",
+        );
+        assert!(
+            event_orphan_cleanup_admissible(7, 7, mgr.inbound_migration_work_count()),
+            "a node holding a parked heal fence must STILL run the event \
+             cleanup pass (pre-fix: never again, for the life of the process)",
+        );
+
+        // A concrete-source heal (a baseline reverse-pull in flight) is the
+        // same class of state — the transient-fence trickle that also kept
+        // the gate permanently shut.
+        assert!(mgr.register_heal_source(12, NodeId(2)));
+        assert_eq!(mgr.inbound_count(), 2);
+        assert_eq!(mgr.inbound_migration_work_count(), 0);
+        assert!(event_orphan_cleanup_admissible(
+            7,
+            7,
+            mgr.inbound_migration_work_count()
+        ));
+
+        // Genuine plan-driven inbound work STILL gates the pass...
+        assert!(mgr.mark_inbound_active(13));
+        assert_eq!(
+            mgr.inbound_migration_work_count(),
+            1,
+            "a forward inbound transfer is real migration work",
+        );
+        assert!(
+            !event_orphan_cleanup_admissible(7, 7, mgr.inbound_migration_work_count()),
+            "the pass must still defer while this node is receiving plan work",
+        );
+
+        // ...and stops gating the moment it completes, with the heal fences
+        // still up.
+        mgr.mark_inbound_complete_from_source(13, NodeId(0));
+        assert_eq!(mgr.inbound_migration_work_count(), 0);
+        assert!(
+            mgr.inbound_count() >= 2,
+            "the heal fences are untouched — only the WORK counter moved",
+        );
+        assert!(event_orphan_cleanup_admissible(
+            7,
+            7,
+            mgr.inbound_migration_work_count()
+        ));
     }
 
     /// W8 (defect 1) — the all-EMPTY batch path returns before the main
