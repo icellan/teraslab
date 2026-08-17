@@ -4797,12 +4797,12 @@ impl ClusterCoordinator {
                                 term,
                                 member_view_size,
                                 "cluster: upgrading det-degraded activation with a \
-                                 quorum exchange view",
+                                 full-member-view exchange",
                             );
                         }
                     }
-                    // Task #73 / W8 — a table may only be REFINED from a
-                    // view covering a majority of the committed members
+                    // Task #73 / W8 / W10 FIX 3 — a table may only be
+                    // REFINED from a view covering EVERY committed member
                     // (see `admit_exchange_completion`). Below that floor:
                     // a same-term re-heal is dropped HERE — before the term
                     // stamp, the retained view, the event-repair trigger,
@@ -6811,12 +6811,14 @@ impl ClusterCoordinator {
     /// election's partial-view gate genuinely blocks deviation — never
     /// fabricated emptiness) and does not block the full per-peer timeout.
     ///
-    /// W9 P1-2 — the collection returns EARLY as soon as the view covers
-    /// the MEMBER quorum (after draining every answer already in the
-    /// channel), so a silent peer costs quorum-latency instead of the full
-    /// deadline; peers still silent at the early return stay honestly
-    /// absent. The total wall-clock budget is bounded by `total_timeout`
-    /// (a quorum that never materializes waits it out).
+    /// W9 P1-2 / W10 FIX 3 — the collection returns EARLY as soon as the
+    /// view covers EVERY committed member (after draining every answer
+    /// already in the channel). The floor matches the refinement
+    /// admission floor ([`member_view_is_full`]) — returning early at the
+    /// old MEMBER-quorum point would hand admission a partial view and
+    /// guarantee a det degrade. A silent peer therefore costs the full
+    /// deadline; peers still silent then stay honestly absent. The total
+    /// wall-clock budget is bounded by `total_timeout`.
     #[allow(clippy::too_many_arguments)]
     fn run_exchange_phase(
         members: &[NodeId],
@@ -7010,23 +7012,24 @@ impl ClusterCoordinator {
             if received >= peer_addrs.len() {
                 break;
             }
-            // W9 P1-2 — return EARLY once the collected view covers the
-            // MEMBER quorum (counting only reporters that are committed
-            // members; on a drain term the self report must not pad the
-            // floor). Refinement is admissible at the quorum floor, so
-            // waiting further only serves peers that have not answered —
-            // and with the FIX 1 re-query loop a silent peer reports only
-            // at the DEADLINE, which made every exchange with any lagging
-            // member burn the full budget on the commit path (eating the
-            // ~4 s FIX-A handoff window) and pushed the degraded-upgrade
-            // retry's completion past the plan-launch grace. Peers still
-            // silent at the early return stay honestly absent (F1).
+            // W9 P1-2 / W10 FIX 3 — return EARLY once the collected view
+            // covers EVERY committed member (counting only reporters that
+            // are committed members; on a drain term the self report must
+            // not pad the floor). Refinement is admissible only at the
+            // FULL-view floor ([`member_view_is_full`]) — an early return
+            // at the old quorum floor would hand admission a partial view
+            // and guarantee a det degrade even when the last member was
+            // about to answer. A silent peer therefore costs the full
+            // deadline again (the W9 P1-2 latency win now applies only to
+            // the all-answered case) — bounded, and the honest price of
+            // closing the armed-15 divergence door. Peers still silent at
+            // the deadline stay honestly absent (F1).
             let member_view_size = phase
                 .partition_view()
                 .keys()
                 .filter(|n| members.contains(n))
                 .count();
-            if member_view_reaches_quorum(member_view_size, members.len()) {
+            if member_view_is_full(member_view_size, members.len()) {
                 break;
             }
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
@@ -7544,29 +7547,31 @@ fn same_term_reheal_applicable(
 }
 
 /// Task #73 — count of same-term re-heal activations skipped because their
-/// exchange completed with a degenerate (below-quorum) partition view. Read
-/// via [`reheal_skipped_degenerate_view_total`] and exported as
-/// `teraslab_reheal_skipped_degenerate_view_total`.
+/// exchange completed with an incomplete partition view (below the
+/// full-member-view refinement floor since W10 FIX 3; below the member
+/// quorum before that). Read via [`reheal_skipped_degenerate_view_total`]
+/// and exported as `teraslab_reheal_skipped_degenerate_view_total`.
 static REHEAL_SKIPPED_DEGENERATE_VIEW_TOTAL: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
-/// Number of same-term re-heal activations skipped on a degenerate
-/// (below-quorum) exchange view since process start (Task #73).
+/// Number of same-term re-heal activations skipped on an incomplete
+/// exchange view since process start (Task #73; full-view floor since
+/// W10 FIX 3).
 pub fn reheal_skipped_degenerate_view_total() -> u64 {
     REHEAL_SKIPPED_DEGENERATE_VIEW_TOTAL.load(Ordering::Relaxed)
 }
 
 /// W8 — count of FIRST activations of a term that DEGRADED to the pure
-/// deterministic table because their exchange completed with a degenerate
-/// (below-quorum) partition view. Read via
+/// deterministic table because their exchange completed with an incomplete
+/// partition view (full-member-view floor since W10 FIX 3). Read via
 /// [`activation_degraded_degenerate_view_total`] and exported as
 /// `teraslab_activation_degraded_degenerate_view_total`.
 static ACTIVATION_DEGRADED_DEGENERATE_VIEW_TOTAL: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
 /// Number of first-of-term exchange-phase activations degraded to the pure
-/// deterministic (emptied-view) table on a degenerate (below-quorum)
-/// exchange view since process start (W8).
+/// deterministic (emptied-view) table on an incomplete exchange view since
+/// process start (W8; full-view floor since W10 FIX 3).
 pub fn activation_degraded_degenerate_view_total() -> u64 {
     ACTIVATION_DEGRADED_DEGENERATE_VIEW_TOTAL.load(Ordering::Relaxed)
 }
@@ -7690,46 +7695,57 @@ fn record_exchange_peer_failure(
 /// Outcome of [`admit_exchange_completion`] for an exchange-phase activation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ExchangeAdmission {
-    /// View covers a majority of the committed members: activate from it.
+    /// View covers EVERY committed member (W10 FIX 3): activate from it.
     Admit,
-    /// Below-quorum FIRST activation of a term: activate, but from an
+    /// Incomplete-view FIRST activation of a term: activate, but from an
     /// EMPTIED view — the pure deterministic table (W8).
     AdmitDetOnly,
-    /// Below-quorum same-term re-heal: drop the completion, keep the
+    /// Incomplete-view same-term re-heal: drop the completion, keep the
     /// current table, let the cooldown re-fire a fresh exchange (Task #73).
     HoldReheal,
 }
 
-/// Task #73 / W8 — view-quorum admission for exchange-phase activations.
+/// Task #73 / W8 / W10 FIX 3 — view admission for exchange-phase
+/// activations: refinement requires a FULL member view.
 ///
 /// Under migration churn the 2 s exchange frequently completes with a
-/// degenerate partial view (SELF-ONLY, or 2 members reporting in a
-/// 4-member cluster). A table REFINED from such partial evidence is the
-/// divergence generator: `apply_master_election` justifies a deviation on
-/// any shard whose candidate set happens to be fully covered by the partial
-/// view, so two nodes with different partial views deviate differently and
-/// stamp DIVERGENT tables at the SAME version (observed: two of four
+/// partial view (SELF-ONLY, or 2 members reporting in a 3- or 4-member
+/// cluster). A table REFINED from such partial evidence is the divergence
+/// generator: `apply_master_election` justifies a deviation on any shard
+/// whose candidate set happens to be fully covered by the partial view,
+/// so two nodes with different partial views deviate differently and
+/// stamp DIVERGENT tables at the SAME version (W8 observed: two of four
 /// members activated a fresh term from view-size-2 exchanges → 622 shards
-/// with contradictory masters). The two safe view shapes are a
-/// quorum-covering view (the evidence is representative) and an EMPTY view
-/// (no deviation can be justified anywhere → the byte-identical pure
-/// deterministic table on every node). `member_view_size` counts only
-/// reporters that are COMMITTED MEMBERS of `term` — the self report is
-/// recorded unconditionally by `run_exchange_phase`, but on a self-drain
-/// term `self` is not a member and must not pad the quorum arithmetic.
+/// with contradictory masters; the original floor was a majority, and CI
+/// armed-15 then proved a majority is NOT safe either — three nodes
+/// refined the same epoch from three different 2-of-3 views, each at
+/// quorum, and 36 acked records were destroyed downstream). The two safe
+/// view shapes are a FULL member view (no candidate can be covered for
+/// one elector and absent for another — see [`member_view_is_full`]) and
+/// an EMPTY view (no deviation can be justified anywhere → the
+/// byte-identical pure deterministic table on every node).
+/// `member_view_size` counts only reporters that are COMMITTED MEMBERS of
+/// `term` — the self report is recorded unconditionally by
+/// `run_exchange_phase`, but on a self-drain term `self` is not a member
+/// and must not pad the arithmetic.
 ///
-/// Below the majority floor (`member_count / 2 + 1`) the two arms differ:
+/// Below the full-view floor the two arms differ:
 ///
 /// - **same-term re-heal** → [`ExchangeAdmission::HoldReheal`]: the caller
 ///   drops the completion WITHOUT touching the shard table or any
 ///   activation bookkeeping. A re-heal exists to REFINE an already-refined
-///   table; rebuilding it from a below-quorum view would clobber refined
+///   table; rebuilding it from an incomplete view would clobber refined
 ///   masterships back to det and fight the holders every other node still
-///   sees. The term-keyed single-flight slot was already released and the
+///   sees — a re-heal from a partial view is the #73 divergence generator.
+///   W10 FIX 3 deliberately RAISES the re-heal floor from majority to full
+///   view along with first activations: a quorum-but-partial re-heal was
+///   exactly as capable of asymmetric-reachability divergence as a
+///   quorum-but-partial first activation, and holding costs only another
+///   cooldown tick (~15-30 s cadence, which also rate-limits the skip
+///   log). The term-keyed single-flight slot was already released and the
 ///   divergence counters (recomputed every tick from the unchanged table)
 ///   stay nonzero, so the normal reactivation trigger re-fires a FRESH
-///   exchange after the cooldown (~15-30 s cadence, which also rate-limits
-///   the skip log).
+///   exchange after the cooldown.
 /// - **first activation of a term** → [`ExchangeAdmission::AdmitDetOnly`]:
 ///   the caller EMPTIES the collected view and activates normally. An
 ///   empty-view activation is exactly what the startup/drain reactivation
@@ -7739,43 +7755,47 @@ enum ExchangeAdmission {
 ///   keeps serving and the two-phase handoff still protects newcomers.
 ///   The refinement this activation skipped is usually rescued within ~2 s:
 ///   the commit-signal and prompt arms race TWO exchanges for the term, and
-///   a later same-term completion whose member view reaches quorum passes
+///   a later same-term completion whose member view is FULL passes
 ///   the duplicate-activation gate as an UPGRADE (see
 ///   `degraded_term_upgrade_admissible`). Holding instead would be a
 ///   TOTAL serving outage (`table.version < committed term` fails every
 ///   serving gate) with no bounded exit: the exchange requires peers to
 ///   have APPLIED the commit (`ERR_STALE_EPOCH` on key mismatch), which
 ///   voting does not imply, and a committed term's quorum can even include
-///   non-members — so "committed ⇒ exchange reaches quorum" is NOT an
+///   non-members — so "committed ⇒ exchange completes full" is NOT an
 ///   invariant of this codebase, and formation would wedge (observed:
 ///   a 2-node formation held forever because the peer's commit apply raced
 ///   the 2 s exchange window and the term never advanced again).
 ///
 /// # Residuals
 ///
-/// - If NO same-term quorum completion ever arrives, the det table and the
+/// - If NO same-term full-view completion ever arrives (e.g. one member
+///   partitioned for the term's whole life), the det table and the
 ///   unrefined topology-derived migration plan stand for the life of the
 ///   term: a pure det table matches the committed placement exactly, so no
 ///   reactivation counter arms a same-term re-heal. This exposure is
 ///   shared with the startup reactivation path, which installs the same
-///   shape ungated.
-/// - Two DIFFERENT quorum-covering views can still justify different
-///   deviations on a shard whose candidates are covered by one view but
-///   not the other — asymmetric reachability divergence (pre-existing,
-///   documented at the `all_candidates_reported` gate). The same-term
-///   re-heal converges it.
+///   shape ungated — and is wider than under the old majority floor, the
+///   deliberate price of closing the armed-15 divergence door. A
+///   genuinely dead member exits via SWIM reap + member-set change, whose
+///   new term restores full views.
 /// - With committed-master election enabled, electing from an emptied view
 ///   observes a no-deviation round for every shard, resetting the
 ///   deviation-hysteresis streaks — each degrade delays a legitimate
 ///   deviation by up to the hysteresis depth. Inert under the default
 ///   configuration.
+///
+/// (The former "two different quorum-covering views can deviate
+/// differently" residual is CLOSED by the full-view floor: refinement now
+/// only ever runs on views every elector holds identically, up to
+/// per-reporter poll instants.)
 fn admit_exchange_completion(
     same_term_reheal: bool,
     term: u64,
     member_view_size: usize,
     member_count: usize,
 ) -> ExchangeAdmission {
-    if member_view_reaches_quorum(member_view_size, member_count) {
+    if member_view_is_full(member_view_size, member_count) {
         return ExchangeAdmission::Admit;
     }
     if same_term_reheal {
@@ -7784,8 +7804,9 @@ fn admit_exchange_completion(
             term,
             member_view_size,
             member_count,
-            "cluster: skipping same-term re-heal — degenerate exchange view below quorum; \
-             holding the current table, re-arming for the next cooldown tick",
+            "cluster: skipping same-term re-heal — incomplete exchange view (full \
+             member view required); holding the current table, re-arming for the \
+             next cooldown tick",
         );
         ExchangeAdmission::HoldReheal
     } else {
@@ -7794,18 +7815,40 @@ fn admit_exchange_completion(
             term,
             member_view_size,
             member_count,
-            "cluster: first activation of term on a below-quorum exchange view — \
-             degrading to the pure deterministic table (emptied view)",
+            "cluster: first activation of term on an incomplete exchange view (full \
+             member view required) — degrading to the pure deterministic table \
+             (emptied view)",
         );
         ExchangeAdmission::AdmitDetOnly
     }
 }
 
-/// Single source of the view-quorum floor: the collected view must cover a
-/// MAJORITY of the committed members (`member_count / 2 + 1`), counting
-/// only reporters that are members (Task #73 / W8).
-fn member_view_reaches_quorum(member_view_size: usize, member_count: usize) -> bool {
-    member_view_size > member_count / 2
+/// Single source of the refinement floor: the collected view must cover
+/// EVERY committed member, counting only reporters that are members.
+///
+/// W10 FIX 3 (CI armed-15) — this floor was a majority (`count/2 + 1`,
+/// Task #73 / W8), and that was the last open divergence door: two
+/// DIFFERENT quorum-covering views can justify different deviations on a
+/// shard whose candidates are covered by one view but not the other
+/// (asymmetric reachability). armed-15 realized it: all three nodes of a
+/// 3-member cluster activated the SAME epoch from three DIFFERENT 2-of-3
+/// views and installed three divergent refined tables at one version —
+/// 35 ownerless shards, and the divergence-unaware handoff/orphan
+/// machinery destroyed 36 acked records. A FULL view is the only shape
+/// two nodes cannot hold different copies of (same term + same member
+/// set ⇒ same reporters; per-reporter payloads may still differ by poll
+/// instant, but no CANDIDATE can be covered for one elector and absent
+/// for another). With the report served from RAM (W10 FIX 1) and the
+/// per-attempt read timeout decoupled from the window (W10 FIX 2), full
+/// views are the common case, so the narrowing costs little: an
+/// incomplete view degrades a first activation to the byte-identical
+/// pure det table and holds a same-term re-heal
+/// ([`admit_exchange_completion`]).
+///
+/// `>=` (not `==`) is defensive only: callers count reporters filtered
+/// to committed members, so the view can never exceed the member count.
+fn member_view_is_full(member_view_size: usize, member_count: usize) -> bool {
+    member_view_size >= member_count
 }
 
 /// W8-R2-1 — may a completion that failed the duplicate-activation gate
@@ -7835,7 +7878,10 @@ fn member_view_reaches_quorum(member_view_size: usize, member_count: usize) -> b
 /// - `degraded_activation_term` records exactly this term (the duplicate
 ///   gate only fires for `term == last_activated_term`, so a stale marker
 ///   for another term can never re-activate it); and
-/// - the late view reaches the member quorum — a second below-quorum view
+/// - the late view covers the FULL member set (W10 FIX 3 — the same
+///   [`member_view_is_full`] floor as first activations, single-sourced:
+///   an upgrade that refined from a mere quorum view would reopen the
+///   armed-15 divergence door this floor closed) — an incomplete view
 ///   would just reinstall the same det table.
 fn degraded_term_upgrade_admissible(
     degraded_activation_term: Option<u64>,
@@ -7846,7 +7892,7 @@ fn degraded_term_upgrade_admissible(
 ) -> bool {
     no_active_migrations
         && degraded_activation_term == Some(term)
-        && member_view_reaches_quorum(member_view_size, member_count)
+        && member_view_is_full(member_view_size, member_count)
 }
 
 /// W9 P1-1 — gate for considering an already-activated term's completion
@@ -33507,17 +33553,15 @@ mod tests {
         );
     }
 
-    /// W9 P1-2 — the exchange must return EARLY once the collected view
-    /// covers the MEMBER quorum, instead of waiting out the full deadline
-    /// for peers that have not answered. The FIX 1 re-query loop made a
-    /// failing peer report only at the DEADLINE, so with one lagging
-    /// member every exchange on the commit path burned the whole budget
-    /// (eating the FIX-A handoff window) and the degraded-upgrade retry
-    /// completed at backoff + deadline — after the plan-launch grace, so
-    /// the 06 lockout never got rescued. Honest absence is preserved: the
-    /// silent peer is simply not in the returned view.
+    /// W9 P1-2 / W10 FIX 3 — the exchange must return EARLY once the
+    /// collected view covers EVERY committed member, instead of waiting
+    /// out the deadline once all evidence is in. The early-return floor
+    /// must MATCH the refinement admission floor: returning early at the
+    /// old member-quorum point would hand admission a partial view and
+    /// guarantee a det degrade even when the last member was about to
+    /// answer.
     #[test]
-    fn run_exchange_phase_returns_early_once_member_quorum_covered() {
+    fn run_exchange_phase_returns_early_once_full_member_view_covered() {
         use std::io::{Read, Write};
 
         let members = [NodeId(1), NodeId(2), NodeId(3)];
@@ -33525,7 +33569,91 @@ mod tests {
         let engine = Arc::new(test_engine());
         let det = ShardTable::compute_with_epoch(&members, 2, term, 1);
 
-        // Peer 2 answers a valid report immediately.
+        // Peers 2 and 3 both answer a valid report immediately — with the
+        // self report that is the FULL member view.
+        let mk_fast_peer = |node_id: u64| -> (SocketAddr, Vec<PartitionVersionEntry>) {
+            let entries = vec![PartitionVersionEntry {
+                shard: node_id as u16,
+                flags: 0b01,
+                replica_count: 1,
+                last_applied_seq: 5,
+                manifest_digest: node_id,
+                max_generation: 1,
+            }];
+            let entries_srv = entries.clone();
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut header = [0u8; 4];
+                stream.read_exact(&mut header).unwrap();
+                let len = u32::from_le_bytes(header) as usize;
+                let mut body = vec![0u8; len];
+                stream.read_exact(&mut body).unwrap();
+                let mut frame_bytes = header.to_vec();
+                frame_bytes.extend_from_slice(&body);
+                let (request, _) =
+                    crate::protocol::frame::RequestFrame::decode(&frame_bytes).unwrap();
+                let response = crate::protocol::frame::ResponseFrame {
+                    request_id: request.request_id,
+                    status: crate::protocol::opcodes::STATUS_OK,
+                    payload: encode_partition_version_response(node_id, term, &entries_srv),
+                };
+                stream.write_all(&response.encode()).unwrap();
+            });
+            (addr, entries)
+        };
+        let (addr2, entries2) = mk_fast_peer(2);
+        let (addr3, entries3) = mk_fast_peer(3);
+
+        let mut addrs = std::collections::HashMap::new();
+        addrs.insert(NodeId(2), addr2);
+        addrs.insert(NodeId(3), addr3);
+        let node_addrs = Arc::new(RwLock::new(addrs));
+        let shard_table = Arc::new(ShardTableLock::new(det));
+        let inbound_bm = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+
+        let started = std::time::Instant::now();
+        let view = ClusterCoordinator::run_exchange_phase(
+            &members,
+            NodeId(1),
+            term,
+            &node_addrs,
+            &engine,
+            &shard_table,
+            &inbound_bm,
+            std::time::Duration::from_millis(3000),
+            &None,
+        );
+        let elapsed = started.elapsed();
+
+        assert!(view.contains_key(&NodeId(1)), "self report present");
+        assert_eq!(view.get(&NodeId(2)), Some(&entries2));
+        assert_eq!(view.get(&NodeId(3)), Some(&entries3));
+        assert!(
+            elapsed < Duration::from_millis(1200),
+            "a full member view must return early instead of waiting out \
+             the deadline (took {elapsed:?})",
+        );
+    }
+
+    /// W10 FIX 3 — a view that reaches the old MEMBER QUORUM but is not
+    /// full must NOT return early: the exchange keeps the window open for
+    /// the last member (whose answer is the difference between refining
+    /// and det-degrading). Pins against reintroducing the quorum
+    /// early-return, which would guarantee a degrade whenever any single
+    /// member lags.
+    #[test]
+    fn run_exchange_phase_quorum_but_partial_view_waits_out_the_window() {
+        use std::io::{Read, Write};
+
+        let members = [NodeId(1), NodeId(2), NodeId(3)];
+        let term = 4u64;
+        let engine = Arc::new(test_engine());
+        let det = ShardTable::compute_with_epoch(&members, 2, term, 1);
+
+        // Peer 2 answers a valid report immediately (self + peer 2 = the
+        // old majority quorum). Peer 3 is silent (closed port).
         let peer_entries = vec![PartitionVersionEntry {
             shard: 3,
             flags: 0b01,
@@ -33555,8 +33683,6 @@ mod tests {
             stream.write_all(&response.encode()).unwrap();
         });
 
-        // Peer 3 is silent (closed port): its thread re-queries until the
-        // deadline and reports absence only then.
         let mut addrs = std::collections::HashMap::new();
         addrs.insert(NodeId(2), fast_addr);
         addrs.insert(NodeId(3), "127.0.0.1:1".parse().unwrap());
@@ -33564,6 +33690,7 @@ mod tests {
         let shard_table = Arc::new(ShardTableLock::new(det));
         let inbound_bm = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
 
+        let window = std::time::Duration::from_millis(1500);
         let started = std::time::Instant::now();
         let view = ClusterCoordinator::run_exchange_phase(
             &members,
@@ -33573,7 +33700,7 @@ mod tests {
             &engine,
             &shard_table,
             &inbound_bm,
-            std::time::Duration::from_millis(3000),
+            window,
             &None,
         );
         let elapsed = started.elapsed();
@@ -33589,10 +33716,11 @@ mod tests {
             "the silent peer stays honestly absent",
         );
         assert!(
-            elapsed < Duration::from_millis(1200),
-            "self + one peer of three IS the member quorum — the exchange \
-             must return early instead of waiting out the silent peer's \
-             deadline (took {elapsed:?})",
+            elapsed >= Duration::from_millis(1000),
+            "self + one peer of three reaches the OLD quorum but is not a \
+             full view — the exchange must keep waiting for the last member \
+             instead of returning early into a guaranteed det degrade \
+             (returned after {elapsed:?})",
         );
     }
 
@@ -34450,20 +34578,20 @@ mod tests {
         );
     }
 
-    /// Task #73 — a same-term re-heal whose exchange completed with a
-    /// degenerate (below-quorum, e.g. self-only) partition view must NOT
-    /// activate: the skip is counted, and the consumer's `continue` leaves
-    /// the shard table and every piece of trigger state untouched so the
-    /// re-heal re-fires with a fresh exchange on the next cooldown tick.
+    /// Task #73 — a same-term re-heal whose exchange completed with an
+    /// incomplete partition view (e.g. self-only) must NOT activate: the
+    /// skip is counted, and the consumer's `continue` leaves the shard
+    /// table and every piece of trigger state untouched so the re-heal
+    /// re-fires with a fresh exchange on the next cooldown tick.
     #[test]
     fn same_term_reheal_degenerate_view_skips_activation() {
         let before = reheal_skipped_degenerate_view_total();
         // Admitted completions must not count a skip. (Asserted inside this
         // test — the only incrementer — so parallel tests cannot race it.)
         assert_eq!(
-            admit_exchange_completion(true, 7, 2, 3),
+            admit_exchange_completion(true, 7, 3, 3),
             ExchangeAdmission::Admit,
-            "a majority view must be admitted",
+            "a full member view must be admitted",
         );
         assert_eq!(
             reheal_skipped_degenerate_view_total(),
@@ -34471,11 +34599,11 @@ mod tests {
             "an admitted re-heal must not count a degenerate-view skip",
         );
         // The defect shape: a 3-member cluster whose 2s exchange completed
-        // self-only (view_size 1 < quorum 2) must hold, not install.
+        // self-only (view_size 1 < full 3) must hold, not install.
         assert_eq!(
             admit_exchange_completion(true, 7, 1, 3),
             ExchangeAdmission::HoldReheal,
-            "a self-only view (1 of 3) is below quorum — the same-term re-heal must hold",
+            "a self-only view (1 of 3) is incomplete — the same-term re-heal must hold",
         );
         assert_eq!(
             reheal_skipped_degenerate_view_total(),
@@ -34484,29 +34612,39 @@ mod tests {
         );
     }
 
-    /// Task #73 — a same-term re-heal whose MEMBER view reaches the
-    /// majority quorum (len/2 + 1) activates exactly as today.
+    /// Task #73 / W10 FIX 3 — a same-term re-heal activates ONLY on a
+    /// FULL member view. The floor deliberately ROSE from the majority
+    /// quorum: a quorum-but-partial re-heal is the same
+    /// asymmetric-reachability divergence generator as a partial first
+    /// activation (armed-15), and holding costs one cooldown tick.
     #[test]
-    fn same_term_reheal_quorum_view_activates() {
-        assert_eq!(
-            admit_exchange_completion(true, 7, 2, 3),
-            ExchangeAdmission::Admit,
-            "2 of 3 is the majority quorum — the re-heal must activate",
-        );
+    fn same_term_reheal_requires_full_member_view() {
         assert_eq!(
             admit_exchange_completion(true, 7, 3, 3),
             ExchangeAdmission::Admit,
             "a full view must activate",
         );
         assert_eq!(
-            admit_exchange_completion(true, 7, 3, 5),
+            admit_exchange_completion(true, 7, 5, 5),
             ExchangeAdmission::Admit,
-            "3 of 5 is the majority quorum — the re-heal must activate",
+            "a full 5-of-5 view must activate",
+        );
+        assert_eq!(
+            admit_exchange_completion(true, 7, 2, 3),
+            ExchangeAdmission::HoldReheal,
+            "2 of 3 reaches the old majority quorum but is INCOMPLETE — the \
+             re-heal must hold (deliberate W10 FIX 3 narrowing)",
+        );
+        assert_eq!(
+            admit_exchange_completion(true, 7, 3, 5),
+            ExchangeAdmission::HoldReheal,
+            "3 of 5 reaches the old majority quorum but is INCOMPLETE — the \
+             re-heal must hold",
         );
         assert_eq!(
             admit_exchange_completion(true, 7, 2, 5),
             ExchangeAdmission::HoldReheal,
-            "2 of 5 is below the majority quorum — the re-heal must hold",
+            "2 of 5 is incomplete — the re-heal must hold",
         );
     }
 
@@ -34559,20 +34697,18 @@ mod tests {
         );
     }
 
-    /// W8 formation pin — a first activation whose member view reaches the
-    /// majority floor activates from the full view (election refinement
-    /// enabled), including the 2-member unanimity case.
+    /// W8 formation pin / W10 FIX 3 — a first activation refines ONLY
+    /// from a FULL member view; any quorum-but-incomplete view degrades
+    /// to det (armed-15: three different 2-of-3 views each reached the
+    /// old majority floor and refined divergently). Full views — the
+    /// common case with the RAM-served report — and single-node still
+    /// admit.
     #[test]
-    fn first_activation_quorum_view_proceeds() {
+    fn first_activation_requires_full_member_view() {
         assert_eq!(
             admit_exchange_completion(false, 1, 4, 4),
             ExchangeAdmission::Admit,
             "formation with a full view must activate",
-        );
-        assert_eq!(
-            admit_exchange_completion(false, 1, 3, 4),
-            ExchangeAdmission::Admit,
-            "3 of 4 is the majority quorum — the first activation must proceed",
         );
         assert_eq!(
             admit_exchange_completion(false, 1, 2, 2),
@@ -34580,28 +34716,132 @@ mod tests {
             "2-member formation with both reporting must activate",
         );
         assert_eq!(
-            admit_exchange_completion(false, 1, 2, 3),
+            admit_exchange_completion(false, 1, 1, 1),
             ExchangeAdmission::Admit,
-            "2 of 3 is the majority quorum — the first activation must proceed",
+            "single-node view is trivially full and must activate",
+        );
+        assert_eq!(
+            admit_exchange_completion(false, 1, 3, 4),
+            ExchangeAdmission::AdmitDetOnly,
+            "3 of 4 reaches the old majority quorum but is INCOMPLETE — the \
+             first activation must degrade to det (W10 FIX 3)",
+        );
+        assert_eq!(
+            admit_exchange_completion(false, 1, 2, 3),
+            ExchangeAdmission::AdmitDetOnly,
+            "2 of 3 reaches the old majority quorum but is INCOMPLETE — the \
+             first activation must degrade to det (armed-15 shape)",
         );
     }
 
-    /// W8-R2-1 — a det-degraded activation is upgraded by the racing second
-    /// exchange: a later SAME-TERM completion whose member view reaches
-    /// quorum passes the duplicate-activation gate; everything else stays a
-    /// true duplicate.
+    /// W10 FIX 3 (CI armed-15) — refinement requires a FULL member view.
+    /// The armed-15 CI shape: in a 3-member cluster all three nodes
+    /// activated the SAME epoch from three DIFFERENT 2-of-3 views — each
+    /// view reached the old majority floor, so each node refined, and the
+    /// three refinements diverged (35 ownerless shards; the
+    /// divergence-unaware handoff/orphan machinery then destroyed 36
+    /// acked records). Any incomplete view must therefore DEGRADE a first
+    /// activation to the pure deterministic table (byte-identical on
+    /// every node, no evidence-dependent deviation possible) and HOLD a
+    /// same-term re-heal.
     #[test]
-    fn degraded_term_upgrade_admits_only_same_term_quorum_views() {
-        // The rescue shape: term 5 was degraded, the late completion for
-        // term 5 carries a quorum view (3 of 4), nothing in flight → upgrade.
+    fn armed_15_three_different_two_of_three_views_all_degrade_det() {
+        let members = [NodeId(1), NodeId(2), NodeId(3)];
+        let rf = 2;
+        let term = 15u64;
+
+        // The three distinct 2-of-3 view shapes ({1,2}, {1,3}, {2,3}):
+        // every one is quorum-but-not-full and must degrade, not refine.
+        let two_of_three_views: [[NodeId; 2]; 3] = [
+            [NodeId(1), NodeId(2)],
+            [NodeId(1), NodeId(3)],
+            [NodeId(2), NodeId(3)],
+        ];
+        for view_members in &two_of_three_views {
+            assert_eq!(
+                admit_exchange_completion(false, term, view_members.len(), members.len()),
+                ExchangeAdmission::AdmitDetOnly,
+                "a first activation from the 2-of-3 view {view_members:?} must degrade \
+                 to det — refining from ANY incomplete view is the armed-15 divergence \
+                 generator",
+            );
+            assert_eq!(
+                admit_exchange_completion(true, term, view_members.len(), members.len()),
+                ExchangeAdmission::HoldReheal,
+                "a same-term re-heal from the 2-of-3 view {view_members:?} must hold",
+            );
+        }
+
+        // The degrade must actually CONVERGE: each node activates from an
+        // EMPTIED view, so all three install byte-identical pure det
+        // tables — apply_master_election on an empty view is a no-op.
+        let prev = ShardTable::compute_with_epoch(&members, rf, term - 1, 1);
+        let empty_view: std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>> =
+            std::collections::HashMap::new();
+        let pure_det = ShardTable::compute_with_epoch(&members, rf, term, 1);
+        let mut tables: Vec<Vec<(NodeId, Vec<NodeId>)>> = Vec::new();
+        for _node in &members {
+            let mut table = ShardTable::compute_with_epoch(&members, rf, term, 1);
+            apply_master_election(
+                &mut table,
+                &prev,
+                &empty_view,
+                &std::collections::HashSet::new(),
+                false,
+            );
+            tables.push(
+                (0..NUM_SHARDS as u16)
+                    .map(|s| {
+                        let a = table.target_assignment(s);
+                        (a.master, a.replicas.clone())
+                    })
+                    .collect(),
+            );
+        }
+        let det_assignments: Vec<(NodeId, Vec<NodeId>)> = (0..NUM_SHARDS as u16)
+            .map(|s| {
+                let a = pure_det.target_assignment(s);
+                (a.master, a.replicas.clone())
+            })
+            .collect();
+        for (i, t) in tables.iter().enumerate() {
+            assert_eq!(
+                t, &det_assignments,
+                "node {i}: a det-degraded activation must install the PURE \
+                 deterministic table (no deviation from an emptied view)",
+            );
+        }
         assert!(
-            degraded_term_upgrade_admissible(Some(5), 5, 3, 4, true),
-            "a same-term quorum view must upgrade a det-degraded activation",
+            tables.windows(2).all(|w| w[0] == w[1]),
+            "all det-degraded nodes must install byte-identical tables",
         );
-        // A second below-quorum view would reinstall the same det table.
+    }
+
+    /// W8-R2-1 / W10 FIX 3 — a det-degraded activation is upgraded by the
+    /// racing second exchange: a later SAME-TERM completion whose member
+    /// view is FULL passes the duplicate-activation gate (the same
+    /// single-sourced floor as first activations — a quorum-but-partial
+    /// upgrade would reopen the armed-15 divergence door); everything
+    /// else stays a true duplicate.
+    #[test]
+    fn degraded_term_upgrade_admits_only_same_term_full_views() {
+        // The rescue shape: term 5 was degraded, the late completion for
+        // term 5 carries a FULL view (4 of 4), nothing in flight → upgrade.
+        assert!(
+            degraded_term_upgrade_admissible(Some(5), 5, 4, 4, true),
+            "a same-term full view must upgrade a det-degraded activation",
+        );
+        // A quorum-but-incomplete view must NOT upgrade (W10 FIX 3): it is
+        // the same partial-evidence refinement the degrade avoided.
+        assert!(
+            !degraded_term_upgrade_admissible(Some(5), 5, 3, 4, true),
+            "a quorum-but-incomplete view must stay a duplicate — refining \
+             from it would reopen the armed-15 divergence door",
+        );
+        // A second incomplete view would reinstall the same det table.
         assert!(
             !degraded_term_upgrade_admissible(Some(5), 5, 2, 4, true),
-            "a below-quorum view must stay a duplicate — nothing to upgrade with",
+            "an incomplete view must stay a duplicate — nothing to upgrade with",
         );
         // No degrade recorded: the normal duplicate gate stands.
         assert!(
@@ -34619,7 +34859,7 @@ mod tests {
         // advance, keep streaming. The marker stays set; the det-table
         // residual applies instead.
         assert!(
-            !degraded_term_upgrade_admissible(Some(5), 5, 3, 4, false),
+            !degraded_term_upgrade_admissible(Some(5), 5, 4, 4, false),
             "an upgrade must never supersede the plan under a live migration wave",
         );
     }
