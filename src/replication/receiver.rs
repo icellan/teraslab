@@ -1612,6 +1612,29 @@ pub fn handle_replica_batch_with_tracker_and_master_lookup(
         } else {
             op
         };
+        // W10 FIX 1 — record the per-(source, shard) applied high-water BEFORE
+        // the apply, so the `OP_MIGRATION_COMPLETE` enumeration-cutoff prune
+        // gate can never enumerate a freshly applied key while its high-water
+        // still reads stale (bump-then-apply over-approximates on an apply
+        // failure, which only defers a prune — the safe direction). Only
+        // TRACKED ops participate: migration baselines/deltas and out-of-band
+        // compensation carry sequences outside the source's dense stream
+        // domain (`first_sequence: 0`), and their content is by construction
+        // covered by (or reconciled against) the completion manifest itself.
+        if tracked && let Some(source) = batch.source_node_id {
+            match op {
+                ReplicaOp::SetMinedBatch { txids, .. } => {
+                    for key in txids {
+                        engine.note_replica_shard_apply(source, key, seq, already_applied);
+                    }
+                }
+                _ => {
+                    if let Some(key) = op.tx_key() {
+                        engine.note_replica_shard_apply(source, &key, seq, already_applied);
+                    }
+                }
+            }
+        }
         // C15: only a steady-state, dense-sequence–tracked, non-migration batch
         // NAKs on a record it is missing (a real divergence — the master
         // committed a mutation against a record this replica never received).
@@ -3826,6 +3849,107 @@ mod tests {
         let mut txid = [0u8; 32];
         txid[0] = n;
         TxKey { txid }
+    }
+
+    /// W10 FIX 1 — a TRACKED replica-batch apply must record the op's stream
+    /// sequence in the engine's per-(source, shard) applied high-water BEFORE
+    /// applying, so the `OP_MIGRATION_COMPLETE` enumeration-cutoff prune gate
+    /// can prove which local applies postdate a source's manifest fold.
+    #[test]
+    fn tracked_apply_bumps_per_source_shard_high_water() {
+        let engine = make_engine();
+        let k = key(7);
+        let shard = crate::cluster::shards::ShardTable::shard_for_key(&k);
+        let batch = ReplicaBatch {
+            first_sequence: 1,
+            ops: vec![ReplicaOp::Create {
+                tx_key: k,
+                metadata_bytes: vec![0; 64],
+                utxo_hashes: vec![[0xAA; 32]],
+                cold_data: None,
+                is_external: false,
+            }],
+            trace_ctx: None,
+            source_node_id: Some(9),
+            cluster_key: 0,
+        };
+        let request = RequestFrame {
+            request_id: 1,
+            op_code: OP_REPLICA_BATCH,
+            flags: 0,
+            payload: batch.serialize().into(),
+        };
+        let last_applied = AtomicU64::new(0);
+        let resp = handle_replica_batch(&request, &engine, &last_applied);
+        assert_eq!(resp.status, STATUS_OK);
+
+        // The apply at seq 1 is visible past cutoff 0 for THIS source+shard…
+        assert!(engine.replica_shard_applied_after(9, shard, 0));
+        // …but not past its own sequence,
+        assert!(!engine.replica_shard_applied_after(9, shard, 1));
+        // not for another source (independent sequence domains),
+        assert!(!engine.replica_shard_applied_after(8, shard, 0));
+        // and not for an untouched shard.
+        assert!(!engine.replica_shard_applied_after(9, shard.wrapping_add(1) & 0x0FFF, 0));
+    }
+
+    /// W10 FIX 1 — migration baselines (`FLAG_MIGRATION_BATCH`) and
+    /// out-of-band compensation (`first_sequence == 0`) are OUTSIDE the dense
+    /// stream domain: their sequences are not comparable with a completion's
+    /// enumeration cutoff and their content is covered by (or reconciled
+    /// against) the completion manifest itself, so they must NOT bump the
+    /// tracker — a bump would spuriously veto the very prune their own
+    /// completion authorizes.
+    #[test]
+    fn migration_and_out_of_band_applies_do_not_bump_high_water() {
+        let engine = make_engine();
+        let k = key(8);
+        let shard = crate::cluster::shards::ShardTable::shard_for_key(&k);
+
+        let mk_batch = |first_sequence: u64, n: u8| ReplicaBatch {
+            first_sequence,
+            ops: vec![ReplicaOp::Create {
+                tx_key: key(n),
+                metadata_bytes: vec![0; 64],
+                utxo_hashes: vec![[0xAA; 32]],
+                cold_data: None,
+                is_external: false,
+            }],
+            trace_ctx: None,
+            source_node_id: Some(9),
+            cluster_key: 0,
+        };
+
+        // Migration baseline apply (flagged, seq 0).
+        let request = RequestFrame {
+            request_id: 1,
+            op_code: OP_REPLICA_BATCH,
+            flags: FLAG_MIGRATION_BATCH,
+            payload: mk_batch(0, 8).serialize().into(),
+        };
+        let last_applied = AtomicU64::new(0);
+        let resp = handle_replica_batch(&request, &engine, &last_applied);
+        assert_eq!(resp.status, STATUS_OK);
+        assert!(
+            !engine.replica_shard_applied_after(9, shard, 0),
+            "a migration baseline apply must not bump the tracked high-water",
+        );
+
+        // Out-of-band compensation apply (unflagged, first_sequence == 0).
+        let k2 = key(9);
+        let shard2 = crate::cluster::shards::ShardTable::shard_for_key(&k2);
+        let request = RequestFrame {
+            request_id: 2,
+            op_code: OP_REPLICA_BATCH,
+            flags: 0,
+            payload: mk_batch(0, 9).serialize().into(),
+        };
+        let resp = handle_replica_batch(&request, &engine, &last_applied);
+        assert_eq!(resp.status, STATUS_OK);
+        assert!(
+            !engine.replica_shard_applied_after(9, shard2, 0),
+            "an out-of-band apply must not bump the tracked high-water",
+        );
     }
 
     /// F-G7-003: the per-process inflight-bytes counter must

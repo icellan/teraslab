@@ -1186,6 +1186,22 @@ pub(crate) fn handle_request(
             } else {
                 (None, None)
             };
+            // W10 FIX 1 — optional trailing enumeration-cutoff marker (wire
+            // format change, pre-production): the source's view of this
+            // target's per-stream applied watermark at MANIFEST-FOLD time,
+            // appended after `from_node` at `[needed+8 .. needed+16]` of the
+            // exact-manifest layout. `None` (absent) means the completion
+            // carries no proof of when its manifest was enumerated relative
+            // to the replication stream — the #29 prune is then skipped
+            // entirely (fail-safe: retain and let the source re-verify).
+            let enumeration_cutoff: Option<u64> = source_entries.as_ref().and_then(|entries| {
+                let needed = 60 + entries.len() * 36;
+                if request.payload.len() >= needed + 16 {
+                    le_u64_at(&request.payload, needed + 8)
+                } else {
+                    None
+                }
+            });
 
             // Deletion-tombstone migration reconciliation has been removed: each
             // node prunes its own fully-spent records independently, so the
@@ -1467,7 +1483,51 @@ pub(crate) fn handle_request(
             // `#29` prune path (the byte-identical behavior the feature defaulted
             // to). The migration target prunes any local key the authoritative
             // source did not list.
+            //
+            // W10 FIX 1 — ENUMERATION-CUTOFF GATE (armed-05 data loss). The
+            // manifest is a snapshot folded on the source at a point in time;
+            // a record this node applied from the source's replication stream
+            // AFTER that fold is invisible to it, so "manifest omits the key"
+            // is NOT deletion evidence for such a record — pruning it deleted
+            // a LIVE, RF-ACKED copy in CI (armed-05: the PruneReplace gen-0
+            // tombstone then vetoed every heal of the created-once record
+            // forever, the tombstoned holder re-baselined its peers, and the
+            // last residual was orphan-cleaned → zero holders).
+            //
+            // The completion frame therefore carries the source's enumeration
+            // cutoff — its `last_acked` view of THIS target's per-stream
+            // applied watermark at manifest-fold time. The prune runs ONLY
+            // when this node provably applied NO tracked write to the shard
+            // from that source past the cutoff:
+            //
+            //   * `engine.replica_shard_applied_after` — the in-memory
+            //     per-(source, shard) applied high-water (bumped by the
+            //     replication receiver before every tracked apply);
+            //   * the DURABLE per-stream watermark — covers applies that
+            //     predate this process (the in-memory tracker starts empty on
+            //     restart, but a watermark past the cutoff proves SOME apply
+            //     happened after the source last learned our position, which
+            //     may postdate its fold).
+            //
+            // A completion with NO cutoff marker (legacy frame) or NO source
+            // identity carries no proof its manifest covers recent applies —
+            // the prune is skipped entirely (fail-safe). Retained extras then
+            // fail the count check with the retryable ERR_MIGRATION_IN_PROGRESS
+            // and the source re-verifies with a FRESH manifest whose cutoff
+            // covers the apply, so a skip is always a deferral, never a wedge.
+            let prune_safe_at_cutoff = match (completion_from_node, enumeration_cutoff) {
+                (Some(src), Some(cutoff)) => {
+                    let applied_after_in_memory =
+                        engine.replica_shard_applied_after(src.0, shard, cutoff);
+                    let durable_watermark_after = REPLICA_APPLIED_TRACKER
+                        .get()
+                        .is_some_and(|t| t.get(&format!("node:{}", src.0)) > cutoff);
+                    !applied_after_in_memory && !durable_watermark_after
+                }
+                _ => false,
+            };
             if source_is_authoritative_complete
+                && prune_safe_at_cutoff
                 && let Some(entries) = source_entries.as_ref()
                 && !entries.is_empty()
                 && entries.len() as u64 == expected_records
@@ -5194,6 +5254,37 @@ fn repl_slot_for(addr: SocketAddr) -> std::sync::Arc<Mutex<PerAddrSlot>> {
             }))
         })
         .clone()
+}
+
+/// W10 FIX 1 — this node's `last_acked` view of `addr`'s per-stream applied
+/// watermark: the ENUMERATION CUTOFF a migration source stamps on its
+/// `OP_MIGRATION_COMPLETE` frame at manifest-fold time.
+///
+/// Soundness contract (consumed by the target's #29 prune gate): every
+/// NEW-content replica op this node sends to `addr` is labeled strictly above
+/// the receiver's stream watermark at label time, and `last_acked` never
+/// exceeds that watermark (it only advances on a full-batch ACK). So any op
+/// this node fans out to `addr` AFTER reading this value carries a sequence
+/// STRICTLY greater than it — which is exactly what lets the target prove a
+/// local apply postdates the source's manifest enumeration and must not be
+/// pruned. Reading it BEFORE the manifest fold keeps that one-sided bound
+/// (an early read only under-approximates, deferring the prune — never
+/// authorizing a deletion).
+///
+/// Returns `0` when no replication slot exists for `addr` (nothing acked from
+/// this process yet). A `0` cutoff is still sound: the target then prunes
+/// only if it has NEVER applied a tracked op from this node's stream (its
+/// in-memory high-water and durable watermark are both empty) — in which
+/// case nothing it holds can postdate this node's fold via that stream.
+pub fn replication_stream_cutoff_for(addr: SocketAddr) -> u64 {
+    let slot = {
+        let pool = REPL_POOL.lock();
+        pool.get(&addr).cloned()
+    };
+    match slot {
+        Some(slot) => slot.lock().last_acked,
+        None => 0,
+    }
 }
 
 /// Drop the cached per-address replication state (pooled connection AND
@@ -21996,6 +22087,13 @@ mod tests {
         }
         if let Some(node) = from_node {
             payload.extend_from_slice(&node.0.to_le_bytes());
+            // W10 FIX 1 — enumeration cutoff 0: "the source has seen no acks
+            // from this target's stream". With no tracked applies recorded on
+            // the receiving engine this still permits the #29 prune, which is
+            // what the historical prune tests exercise. Tests that need a
+            // SPECIFIC cutoff build the payload via the real producer,
+            // `cluster::coordinator::encode_migration_complete_payload`.
+            payload.extend_from_slice(&0u64.to_le_bytes());
         }
         payload
     }
@@ -27339,6 +27437,218 @@ mod tests {
                 .tombstone_blocks_heal_apply(&key_b, gen_b.wrapping_add(1)),
             "a strictly-newer live copy must defeat the local prune marker",
         );
+    }
+
+    /// W10 FIX 1 (armed-05 data loss) — the enumeration-cutoff prune race.
+    ///
+    /// The source folds its completion manifest at a point in time; a record
+    /// this target applies from the source's replication stream AFTER that
+    /// fold is invisible to the manifest. Pre-fix, the #29 prune deleted such
+    /// a LIVE, RF-ACKED record and left a PruneReplace gen-0 tombstone that
+    /// vetoed every later heal of the created-once record forever (a gen-0
+    /// record can never present "strictly newer") — the proven zero-holders
+    /// chain.
+    ///
+    /// This test drives the exact shape end-to-end through the REAL producer
+    /// bytes (`encode_migration_complete_payload`) and the REAL replica-batch
+    /// apply: the create lands on the target at stream seq 1 (i.e. AFTER the
+    /// source's fold, whose cutoff — its `last_acked` view of our stream at
+    /// fold time — is 0), then the completion arrives with a manifest that
+    /// omits the key. The prune must NOT delete it; the completion still
+    /// verifies as an epoch-current superset.
+    #[test]
+    fn migration_complete_prune_skips_key_applied_after_enumeration_cutoff() {
+        let h = DispatchTestHarness::new();
+        let shard = 41u16;
+        let txid_a = txid_for_shard(shard, 7);
+        let txid_b = txid_for_shard(shard, 8);
+        assert_eq!(h.create_tx(txid_a, 1).status, STATUS_OK);
+
+        // Tombstones armed so a (wrong) prune would be visible as a
+        // PruneReplace tombstone too.
+        let tomb_log = crate::ops::tombstone::TombstoneLog::new(
+            std::path::PathBuf::from("/nonexistent/w10-cutoff-race.tombstones"),
+            h.engine.index_seed(),
+            h.engine.index_shard_count(),
+            10_000,
+        );
+        h.engine.set_tombstone_log(tomb_log);
+
+        let key_a = TxKey { txid: txid_a };
+        let key_b = TxKey { txid: txid_b };
+
+        let epoch = 49u64;
+        let members = vec![crate::cluster::shards::NodeId(1)];
+        let table = crate::cluster::shards::ShardTable::compute_with_epoch(&members, 1, epoch, 1);
+        let cluster = crate::cluster::coordinator::new_test_running_cluster(
+            crate::cluster::shards::NodeId(1),
+            table,
+            &[(
+                crate::cluster::shards::NodeId(1),
+                "127.0.0.1:4728".parse().unwrap(),
+            )],
+            &members,
+            &[shard],
+            &[],
+            &[],
+            1,
+        );
+
+        // The RACE: the source (node 1) folded its manifest while its
+        // last_acked view of this target's stream was 0 (nothing acked yet).
+        // The create of B then fans out and applies HERE at stream seq 1 —
+        // strictly past the fold's cutoff — through the REAL tracked
+        // replica-batch path.
+        let batch = ReplicaBatch {
+            first_sequence: 1,
+            ops: vec![ReplicaOp::Create {
+                tx_key: key_b,
+                metadata_bytes: vec![0; 64],
+                utxo_hashes: vec![[0xAA; 32]],
+                cold_data: None,
+                is_external: false,
+            }],
+            trace_ctx: None,
+            source_node_id: Some(1),
+            cluster_key: cluster.local_cluster_key(),
+        };
+        let req = RequestFrame {
+            request_id: 1,
+            op_code: OP_REPLICA_BATCH,
+            flags: 0,
+            payload: batch.serialize().into(),
+        };
+        let mut cs = crate::server::ConnectionState::new();
+        let resp = handle_request(&req, &h.engine, 8192, Some(&cluster), None, &mut cs, None);
+        assert_eq!(resp.status, STATUS_OK, "the acked replica create applies");
+        assert!(h.engine.read_metadata(&key_b).is_ok());
+
+        // The completion: authoritative epoch-current source, manifest folded
+        // BEFORE B landed (omits B), enumeration cutoff 0 — built by the REAL
+        // source-side encoder so producer and parser cannot drift.
+        let meta_a = h.engine.read_metadata(&key_a).unwrap();
+        let entries = vec![(key_a, meta_a.generation)];
+        let hash = compute_manifest_for_entries(&entries);
+        let payload = crate::cluster::coordinator::encode_migration_complete_payload(
+            entries.len() as u64,
+            0,
+            epoch,
+            &hash,
+            &entries,
+            crate::cluster::shards::NodeId(1),
+            0,
+        );
+        let req = RequestFrame {
+            request_id: shard as u64,
+            op_code: OP_MIGRATION_COMPLETE,
+            flags: 0,
+            payload: payload.into(),
+        };
+        let mut cs = crate::server::ConnectionState::new();
+        let resp = handle_request(&req, &h.engine, 8192, Some(&cluster), None, &mut cs, None);
+
+        // The post-fold apply is RETAINED: no delete, no PruneReplace
+        // tombstone, and the completion verifies as an epoch-current
+        // superset (every manifest key present, extras kept).
+        assert!(
+            h.engine.read_metadata(&key_b).is_ok(),
+            "a record applied past the source's enumeration cutoff must not be pruned",
+        );
+        assert_eq!(
+            h.engine.tombstone_cause(&key_b),
+            None,
+            "no tombstone may be recorded for the live post-cutoff record",
+        );
+        assert_eq!(resp.status, STATUS_OK, "verified superset still completes");
+        assert!(h.engine.read_metadata(&key_a).is_ok());
+    }
+
+    /// W10 FIX 1 companion (liveness) — a completion whose cutoff COVERS every
+    /// tracked apply to the shard keeps the historical prune: the extra local
+    /// key provably predates the manifest fold, so its omission IS deletion
+    /// evidence and the stale residue is reconciled away exactly as before.
+    #[test]
+    fn migration_complete_prune_still_runs_when_cutoff_covers_applies() {
+        let h = DispatchTestHarness::new();
+        let shard = 42u16;
+        let txid_a = txid_for_shard(shard, 7);
+        let txid_b = txid_for_shard(shard, 8);
+        assert_eq!(h.create_tx(txid_a, 1).status, STATUS_OK);
+
+        let key_a = TxKey { txid: txid_a };
+        let key_b = TxKey { txid: txid_b };
+
+        let epoch = 49u64;
+        let members = vec![crate::cluster::shards::NodeId(1)];
+        let table = crate::cluster::shards::ShardTable::compute_with_epoch(&members, 1, epoch, 1);
+        let cluster = crate::cluster::coordinator::new_test_running_cluster(
+            crate::cluster::shards::NodeId(1),
+            table,
+            &[(
+                crate::cluster::shards::NodeId(1),
+                "127.0.0.1:4729".parse().unwrap(),
+            )],
+            &members,
+            &[shard],
+            &[],
+            &[],
+            1,
+        );
+
+        // B applied from node 1's stream at seq 1 — but this time the source
+        // folded AFTER acking it (cutoff 1 >= 1), so the manifest's omission
+        // of B is authoritative: B is stale residue the source deleted.
+        let batch = ReplicaBatch {
+            first_sequence: 1,
+            ops: vec![ReplicaOp::Create {
+                tx_key: key_b,
+                metadata_bytes: vec![0; 64],
+                utxo_hashes: vec![[0xAA; 32]],
+                cold_data: None,
+                is_external: false,
+            }],
+            trace_ctx: None,
+            source_node_id: Some(1),
+            cluster_key: cluster.local_cluster_key(),
+        };
+        let req = RequestFrame {
+            request_id: 1,
+            op_code: OP_REPLICA_BATCH,
+            flags: 0,
+            payload: batch.serialize().into(),
+        };
+        let mut cs = crate::server::ConnectionState::new();
+        let resp = handle_request(&req, &h.engine, 8192, Some(&cluster), None, &mut cs, None);
+        assert_eq!(resp.status, STATUS_OK);
+
+        let meta_a = h.engine.read_metadata(&key_a).unwrap();
+        let entries = vec![(key_a, meta_a.generation)];
+        let hash = compute_manifest_for_entries(&entries);
+        let payload = crate::cluster::coordinator::encode_migration_complete_payload(
+            entries.len() as u64,
+            0,
+            epoch,
+            &hash,
+            &entries,
+            crate::cluster::shards::NodeId(1),
+            1,
+        );
+        let req = RequestFrame {
+            request_id: shard as u64,
+            op_code: OP_MIGRATION_COMPLETE,
+            flags: 0,
+            payload: payload.into(),
+        };
+        let mut cs = crate::server::ConnectionState::new();
+        let resp = handle_request(&req, &h.engine, 8192, Some(&cluster), None, &mut cs, None);
+
+        assert_eq!(resp.status, STATUS_OK);
+        assert!(
+            h.engine.read_metadata(&key_b).is_err(),
+            "an apply covered by the cutoff is provably pre-fold — the prune keeps \
+             its anti-resurrection job",
+        );
+        assert!(h.engine.read_metadata(&key_a).is_ok());
     }
 
     /// Task #29 (no-loss): a SHORT manifest stamped with a SUPERSEDED epoch

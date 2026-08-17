@@ -10829,6 +10829,17 @@ fn run_migration_batch(
                             if let Some(s) = new_conn() { stream = s; }
                             continue;
                         }
+                        // W10 FIX 1 — capture the enumeration cutoff BEFORE
+                        // the manifest fold (see `send_migration_complete`'s
+                        // contract): our `last_acked` view of the target's
+                        // stream position. Every replica op we fan out after
+                        // this read is labeled strictly above it, so the
+                        // target can prove which of its applies the manifest
+                        // below cannot have enumerated. Reused unchanged by
+                        // every retry that re-sends this same fold's
+                        // (possibly reduced) manifest.
+                        let enumeration_cutoff =
+                            crate::server::dispatch::replication_stream_cutoff_for(addr);
                         let manifest_entries = match collect_manifest_entries(&engine, task.shard, &fenced_keys) {
                             Ok(e) => e,
                             Err(e) => {
@@ -10866,6 +10877,7 @@ fn run_migration_batch(
                             &manifest_entries,
                             true,
                             auth_secret,
+                            enumeration_cutoff,
                         );
                         if let Err(e) = verify_result {
                             tracing::warn!(shard = task.shard, err = %e, "cluster: shard completion rejected");
@@ -10949,6 +10961,7 @@ fn run_migration_batch(
                                                     entries,
                                                     true,
                                                     auth_secret,
+                                                    enumeration_cutoff,
                                                 )
                                             },
                                         );
@@ -10998,6 +11011,7 @@ fn run_migration_batch(
                                                     entries,
                                                     true,
                                                     auth_secret,
+                                                    enumeration_cutoff,
                                                 )
                                             },
                                         );
@@ -11136,6 +11150,14 @@ fn run_migration_batch(
                                                     }),
                                                 )
                                                 .map_err(EscalationAttemptError::Repush)?;
+                                                // W10 FIX 1 — this is a FRESH
+                                                // fold, so recapture the
+                                                // cutoff before it (the
+                                                // original fold's cutoff
+                                                // belongs to the original
+                                                // manifest only).
+                                                let fresh_cutoff =
+                                                    crate::server::dispatch::replication_stream_cutoff_for(addr);
                                                 let mut fresh = collect_manifest_entries(
                                                     &engine,
                                                     task.shard,
@@ -11166,6 +11188,7 @@ fn run_migration_batch(
                                                     &fresh,
                                                     true,
                                                     auth_secret,
+                                                    fresh_cutoff,
                                                 )
                                                 .map_err(EscalationAttemptError::Completion)
                                             },
@@ -13144,11 +13167,60 @@ fn stream_shard_baseline(
     Ok((manifest, skipped))
 }
 
+/// Encode the `OP_MIGRATION_COMPLETE` payload [`send_migration_complete`]
+/// ships — extracted so the dispatch-side parser tests can drive the REAL
+/// producer bytes through the REAL handler and the two layouts cannot drift
+/// (the `migration_complete_rejection_error` pin pattern).
+///
+/// Wire layout (all little-endian):
+///   `[0..8]   record_count:    u64`
+///   `[8..16]  fence_sequence:  u64`
+///   `[16..24] topology_epoch:  u64`
+///   `[24..56] manifest_hash:   [u8; 32]`
+///   `[56..60] entry_count (N): u32`
+///   `[60..60+N*36]` manifest entries, each 36 bytes:
+///       `[0..32] txid: [u8; 32]`, `[32..36] generation: u32`
+///   `[60+N*36..68+N*36] from_node: u64`
+///   `[68+N*36..76+N*36] enumeration_cutoff: u64` (W10 FIX 1)
+pub(crate) fn encode_migration_complete_payload(
+    record_count: u64,
+    fence_sequence: u64,
+    topology_epoch: u64,
+    manifest_hash: &[u8; 32],
+    manifest_entries: &[(TxKey, u32)],
+    from_node: NodeId,
+    enumeration_cutoff: u64,
+) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(76 + manifest_entries.len() * 36);
+    payload.extend_from_slice(&record_count.to_le_bytes());
+    payload.extend_from_slice(&fence_sequence.to_le_bytes());
+    payload.extend_from_slice(&topology_epoch.to_le_bytes());
+    payload.extend_from_slice(manifest_hash);
+    payload.extend_from_slice(&(manifest_entries.len() as u32).to_le_bytes());
+    for (key, generation) in manifest_entries {
+        payload.extend_from_slice(&key.txid);
+        payload.extend_from_slice(&generation.to_le_bytes());
+    }
+    payload.extend_from_slice(&from_node.0.to_le_bytes());
+    payload.extend_from_slice(&enumeration_cutoff.to_le_bytes());
+    payload
+}
+
 /// Send the OP_MIGRATION_COMPLETE handshake on an existing or new stream.
 ///
 /// The payload includes the expected record count, fence sequence, and
 /// topology epoch so the target can perform a stronger verification than
 /// a simple count check.
+///
+/// `enumeration_cutoff` (W10 FIX 1) is this node's `last_acked` view of the
+/// TARGET's per-stream applied watermark, read at MANIFEST-FOLD time via
+/// [`crate::server::dispatch::replication_stream_cutoff_for`]. The target's
+/// #29 prune runs only when it applied nothing from our stream past this
+/// cutoff — the proof that the manifest's omissions are not merely
+/// enumeration staleness. It MUST be captured BEFORE the manifest fold (a
+/// pre-fold read under-approximates, which can only defer the prune, never
+/// authorize deleting a post-fold apply) and MUST be reused unchanged for
+/// every retry that re-sends the SAME (possibly reduced) manifest.
 ///
 /// If `stream` is Some, reuses it (avoids a new TCP connection).
 /// Otherwise opens a fresh connection.
@@ -13165,6 +13237,7 @@ fn send_migration_complete(
     manifest_entries: &[(TxKey, u32)],
     verify_only: bool,
     auth_secret: Option<&[u8]>,
+    enumeration_cutoff: u64,
 ) -> std::result::Result<(), String> {
     // Use existing stream or create new one.
     let mut owned;
@@ -13181,27 +13254,15 @@ fn send_migration_complete(
         }
     };
 
-    // Wire layout (all little-endian):
-    //   [0..8]   record_count:    u64
-    //   [8..16]  fence_sequence:  u64
-    //   [16..24] topology_epoch:  u64
-    //   [24..56] manifest_hash:   [u8; 32]
-    //   [56..60] entry_count (N): u32
-    //   [60..60+N*36] manifest entries, each 36 bytes:
-    //       [0..32] txid: [u8; 32]
-    //       [32..36] generation: u32
-    //   [60+N*36..68+N*36] from_node: u64
-    let mut payload = Vec::with_capacity(68 + manifest_entries.len() * 36);
-    payload.extend_from_slice(&record_count.to_le_bytes());
-    payload.extend_from_slice(&fence_sequence.to_le_bytes());
-    payload.extend_from_slice(&topology_epoch.to_le_bytes());
-    payload.extend_from_slice(manifest_hash);
-    payload.extend_from_slice(&(manifest_entries.len() as u32).to_le_bytes());
-    for (key, generation) in manifest_entries {
-        payload.extend_from_slice(&key.txid);
-        payload.extend_from_slice(&generation.to_le_bytes());
-    }
-    payload.extend_from_slice(&from_node.0.to_le_bytes());
+    let payload = encode_migration_complete_payload(
+        record_count,
+        fence_sequence,
+        topology_epoch,
+        manifest_hash,
+        manifest_entries,
+        from_node,
+        enumeration_cutoff,
+    );
 
     let request = RequestFrame {
         request_id: shard as u64,
