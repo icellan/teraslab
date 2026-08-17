@@ -889,17 +889,19 @@ impl MigrationManager {
     /// receive replica batches for `shard` while it is migrating outbound
     /// from this node. Returns an empty slice when no dual-write window is
     /// active for the shard.
+    ///
+    /// ORIGIN-BLIND — do NOT use this on the replication path. It cannot tell
+    /// a new-side handoff holder from a Phase-H repair destination, and
+    /// treating the two alike is exactly how W10 P1-2 (a repair turning into
+    /// a mandatory per-shard write ACK) happened. Use
+    /// [`Self::dual_write_targets_with_origin_for_shard`] there; this stays
+    /// for the plain "who is in the window" question (fan-out membership,
+    /// admin/tests).
     pub fn dual_write_targets_for_shard(&self, shard: u16) -> &[NodeId] {
         self.dual_write_targets
             .get(&shard)
             .map(|v| v.as_slice())
             .unwrap_or(&[])
-    }
-
-    /// Snapshot of the entire dual-write map. Used by the coordinator /
-    /// dispatch to expand replica fan-out for migrating shards.
-    pub fn dual_write_map(&self) -> &std::collections::HashMap<u16, Vec<NodeId>> {
-        &self.dual_write_targets
     }
 
     /// Phase E dual-write targets for `shard`, each paired with whether it is

@@ -7554,20 +7554,41 @@ fn split_already_serving_migration_tasks(
 /// the next re-drive. Candidates whose shard is empty are free and do not
 /// consume the budget.
 ///
-/// Sized against the migration connection fan-out this repo already
-/// tolerates: at `max_concurrent_probes` = the batch's own pool size (≤ 8 for
-/// a resync-origin run, `RESYNC_MAX_CONNECTIONS`), 32 candidates cost at most
-/// four parallel probe rounds — bounded work per batch, with the remainder
-/// re-driven rather than confirmed on no evidence.
-const ALREADY_SERVING_PROBE_BUDGET: usize = 32;
+/// The HARD bound on this phase is [`ALREADY_SERVING_VERIFY_DEADLINE`], not
+/// this count (review P2-2). A healthy probe is one round-trip
+/// ([`ALREADY_SERVING_SUPERSET_PROBE`] keeps its per-attempt timeouts short),
+/// so 512 candidates over the batch's 8-way fan-out is ~64 sequential
+/// round-trips — sub-second — while a pathological target is cut off by the
+/// deadline long before the count matters. The count remains only as a cap on
+/// the per-key manifest device reads one batch may do up front.
+///
+/// It is deliberately NOT small. A deferred candidate is parked `Failed`, and
+/// the re-drive re-enumerates its shard, so it comes back on the STREAMING
+/// path — a full data re-transfer of a shard the target already holds, which
+/// is exactly the pointless re-stream the completion-only verification exists
+/// to avoid. Deferral must therefore be the rare backstop for a sick target,
+/// not the routine outcome of a large rolling-restart batch.
+///
+/// Deferral is a PARK rather than a withhold-from-the-batch because these
+/// tasks are `start_outbound`-tracked before the batch starts: a withheld
+/// task is an UNRESOLVED task, and `retire_abandoned_batch_tasks` parks every
+/// unresolved task at each exit — with a master-side `rollback_shard`. Parking
+/// them here, with the table untouched, is the narrower disposition.
+const ALREADY_SERVING_PROBE_BUDGET: usize = 512;
 
 /// W10 composition (P1-4) — wall-clock ceiling on the pre-chunk
-/// already-serving verification phase. A candidate a worker has not STARTED
-/// by then is deferred, so a target that is answering slowly (or not at all —
-/// each probe carries ~3.1 s of retry backoff plus its I/O timeouts) cannot
-/// hold `active_count()` above zero, and with it the degraded upgrade, the
+/// already-serving verification phase, covering the enumeration and every
+/// probe START. Nothing else bounds this phase: it runs with
+/// `active_count()` above zero, which holds shut the degraded upgrade, the
 /// event-repair fire, the failed-batch redrive, reactivation and prompt
 /// re-election.
+///
+/// Worst case is this deadline PLUS one in-flight probe, because the check
+/// gates probe starts, not completions (review P2-3). With
+/// [`ALREADY_SERVING_SUPERSET_PROBE`] that in-flight tail is ≤ ~12.3 s
+/// (3 attempts × (1 s connect + 3 s read) + 0.3 s backoff), so the phase is
+/// bounded at ~22 s against a black-holing target. (With the relinquish
+/// profile's 6 × (3 s + 10 s) + 2.35 s it would have been ~90 s.)
 const ALREADY_SERVING_VERIFY_DEADLINE: Duration = Duration::from_secs(10);
 
 /// The verify-only superset check [`verify_already_serving_skips`] runs
@@ -7719,33 +7740,22 @@ fn verify_already_serving_skips(
         return out;
     }
 
-    // ONE index pass for every budgeted shard, instead of one per candidate.
+    // The deadline covers the WHOLE phase, enumeration included — everything
+    // here runs with `active_count()` above zero, which holds the convergence
+    // gates shut (review P2-1).
+    let started = std::time::Instant::now();
+    // ONE index pass for every budgeted shard, instead of one per candidate —
+    // and it keeps the skip count PER SHARD, so an issue-#46 skip is
+    // attributed to the shard it happened on WITHOUT re-scanning the index
+    // per shard (`keys_by_shard_filtered_detailed`; review P2-1: those
+    // re-scans were a full `index.for_each` each, i.e. 33 whole-index passes
+    // for one unreadable footer in a 32-shard round, outside any deadline).
     let shard_set: std::collections::HashSet<u16> = needs_verify.iter().map(|t| t.shard).collect();
-    let (mut keys_map, enum_skipped) = engine.keys_by_shard_filtered(&shard_set);
-    // `keys_by_shard_filtered` reports a TOTAL skip count, so on the (rare)
-    // skip the batched pass cannot say WHICH shard was short. Re-enumerate
-    // per shard to attribute it exactly — one unreadable footer must demote
-    // its own shard, not every budgeted one.
-    let per_shard: std::collections::HashMap<u16, (Vec<TxKey>, usize)> = if enum_skipped == 0 {
-        shard_set
-            .iter()
-            .map(|s| (*s, (keys_map.remove(s).unwrap_or_default(), 0usize)))
-            .collect()
-    } else {
-        shard_set
-            .iter()
-            .map(|&s| {
-                let one: std::collections::HashSet<u16> = [s].into_iter().collect();
-                let (mut m, skipped) = engine.keys_by_shard_filtered(&one);
-                (s, (m.remove(&s).unwrap_or_default(), skipped))
-            })
-            .collect()
-    };
+    let per_shard = engine.keys_by_shard_filtered_detailed(&shard_set);
 
     let concurrency = max_concurrent_probes.max(1).min(needs_verify.len());
     let chunk_size = needs_verify.len().div_ceil(concurrency);
     let per_shard = &per_shard;
-    let started = std::time::Instant::now();
     let mut grouped: Vec<Vec<AlreadyServingOutcome>> = Vec::with_capacity(concurrency);
     std::thread::scope(|scope| {
         let mut handles = Vec::with_capacity(concurrency);
@@ -10928,6 +10938,7 @@ fn run_migration_batch(
             topology_epoch,
             entries,
             auth_secret,
+            &ALREADY_SERVING_SUPERSET_PROBE,
         )
     };
     let verification = verify_already_serving_skips(
@@ -11590,6 +11601,7 @@ fn run_migration_batch(
                                     topology_epoch,
                                     &probe_manifest,
                                     auth_secret,
+                                    &RELINQUISH_SUPERSET_PROBE,
                                 )
                             };
                             if fail_or_relinquish_outbound_task(
@@ -12411,6 +12423,7 @@ fn run_migration_batch(
                                                 topology_epoch,
                                                 &manifest_for_probe,
                                                 auth_secret,
+                                                &RELINQUISH_SUPERSET_PROBE,
                                             )
                                         };
                                         if fail_or_relinquish_outbound_task(
@@ -14665,6 +14678,50 @@ pub(crate) fn migration_complete_rejection_error(status: u8, payload: &[u8]) -> 
     format!("target rejected: status {status}{detail}")
 }
 
+/// Retry/timeout budget for one [`confirm_target_holds_superset`] call.
+///
+/// The probe's cost is `retry_delays_ms.len()` attempts, each bounded by
+/// `connect_timeout + io_timeout`, plus the sum of all but the last delay. The
+/// two profiles below differ because the CONSEQUENCE of a false negative
+/// differs — see each constant.
+struct SupersetProbeProfile {
+    /// Backoff before each subsequent attempt; its length is the attempt
+    /// count.
+    retry_delays_ms: &'static [u64],
+    connect_timeout: Duration,
+    io_timeout: Duration,
+}
+
+/// The relinquish decision's profile (unchanged): ~80 s worst case
+/// (6 × (3 s + 10 s) + 2.35 s of backoff).
+///
+/// Generous by design. A false negative here means a phantom master KEEPS a
+/// non-empty shard it should have relinquished, so the cluster stays at
+/// serving = target + 1 until another round re-drives it — the sc09/sc05
+/// convergence stall this retry budget was added to fix. The probe runs once
+/// per failed handoff, off the pre-chunk path.
+const RELINQUISH_SUPERSET_PROBE: SupersetProbeProfile = SupersetProbeProfile {
+    retry_delays_ms: &[25, 75, 150, 300, 600, 1200],
+    connect_timeout: Duration::from_secs(3),
+    io_timeout: Duration::from_secs(10),
+};
+
+/// The already-serving verification profile (review P2-3): ≤ ~12.3 s worst
+/// case (3 × (1 s + 3 s) + 0.3 s of backoff).
+///
+/// Short by design. A false negative here only DEMOTES the candidate to the
+/// streaming path, which re-verifies end-to-end — no data decision rides on
+/// it — while the call runs on the pre-chunk phase, where every extra second
+/// is a second the batch holds `active_count()` above zero and the
+/// convergence gates shut. Three attempts still absorb the connection-cap
+/// resets the retry exists for (and unlike the relinquish probe, the batch's
+/// own migration pool has not opened its connections yet).
+const ALREADY_SERVING_SUPERSET_PROBE: SupersetProbeProfile = SupersetProbeProfile {
+    retry_delays_ms: &[50, 250, 500],
+    connect_timeout: Duration::from_secs(1),
+    io_timeout: Duration::from_secs(3),
+};
+
 /// Probe the rightful master to confirm it holds a SUPERSET of `self`'s shard
 /// records (sc09/sc05 drain convergence — transfer-then-relinquish).
 ///
@@ -14692,6 +14749,7 @@ fn confirm_target_holds_superset(
     topology_epoch: u64,
     manifest_entries: &[(TxKey, u32)],
     auth_secret: Option<&[u8]>,
+    profile: &SupersetProbeProfile,
 ) -> bool {
     if manifest_entries.is_empty() {
         return false;
@@ -14723,13 +14781,13 @@ fn confirm_target_holds_superset(
     // is a TRANSIENT connection failure (the target's per-IP connection cap
     // resetting the migration burst), which is retried below.
     let attempt = || -> std::result::Result<Option<bool>, String> {
-        let mut stream = TcpStream::connect_timeout(&target_addr, Duration::from_secs(3))
+        let mut stream = TcpStream::connect_timeout(&target_addr, profile.connect_timeout)
             .map_err(|e| format!("connect: {e}"))?;
         stream
-            .set_read_timeout(Some(Duration::from_secs(10)))
+            .set_read_timeout(Some(profile.io_timeout))
             .map_err(|e| format!("set read timeout: {e}"))?;
         stream
-            .set_write_timeout(Some(Duration::from_secs(10)))
+            .set_write_timeout(Some(profile.io_timeout))
             .map_err(|e| format!("set write timeout: {e}"))?;
         crate::replication::tcp_transport::configure_tcp_keepalive(&stream);
         let response = exchange_frame(&mut stream, &request, auth_secret)?;
@@ -14743,17 +14801,16 @@ fn confirm_target_holds_superset(
     // so the probe lands in a gap between bursts and the legitimate relinquish
     // can complete (sc09/sc05 convergence). A definitive STATUS answer (Ok) is
     // returned immediately — only transient connection errors are retried. The
-    // total budget is bounded (~3.1s of backoff plus per-attempt I/O timeouts),
-    // and on exhaustion we conservatively return `false` (keep data, roll back).
-    const RETRY_DELAYS_MS: [u64; 6] = [25, 75, 150, 300, 600, 1200];
+    // total budget is bounded by `profile` (see `SupersetProbeProfile`), and
+    // on exhaustion we conservatively return `false` (keep data, roll back).
     let mut last_err = String::new();
-    for (i, &delay_ms) in RETRY_DELAYS_MS.iter().enumerate() {
+    for (i, &delay_ms) in profile.retry_delays_ms.iter().enumerate() {
         match attempt() {
             Ok(Some(confirmed)) => return confirmed,
             Ok(None) => {}
             Err(err) => last_err = err,
         }
-        if i + 1 < RETRY_DELAYS_MS.len() {
+        if i + 1 < profile.retry_delays_ms.len() {
             std::thread::sleep(Duration::from_millis(delay_ms));
         }
     }
@@ -16372,8 +16429,12 @@ pub fn synthesize_resync_migration_tasks(
 /// just-registered tasks into the durable retry queue).
 ///
 /// W10 (armed-15 / armed-05, CI d3437e4): the tasks are registered through
-/// [`MigrationManager::start_outbound`] — the same bookkeeping as
-/// topology-plan tasks — BEFORE any data moves. Untracked resync tasks were
+/// [`MigrationManager::start_outbound_resync`] — the same bookkeeping as
+/// topology-plan tasks, except that the Phase E dual-write window it opens is
+/// tagged REPAIR-only so the replication path does not turn the backfill
+/// target into a mandatory per-shard new-side handoff ACK (W10 composition
+/// P1-2; see [`MigrationManager::dual_write_targets_with_origin_for_shard`])
+/// — BEFORE any data moves. Untracked resync tasks were
 /// invisible to `/admin/migration_status` AND their completions were
 /// discarded by the tracked-completion gate ("ignoring untracked migration
 /// completion"), so event/forced repair passes finished with `completed: 0`
@@ -19222,11 +19283,12 @@ impl RunningCluster {
     /// batches for `shard` while it is migrating outbound from this node.
     /// Returns an empty Vec when no migration is in flight for the shard.
     ///
-    /// Used by [`replicate_all_ops`](crate::server::dispatch) to fan
-    /// writes out to BOTH the old replica set (from the shard table) and
-    /// the new master / replica destinations (from the migration tracker)
-    /// during the migration window. This protects durability when the new
-    /// master is promoted before the migration has finished streaming.
+    /// TEST-ONLY since the replication path moved to
+    /// [`Self::dual_write_targets_with_origin_for_shard`] (W10 composition
+    /// P1-2). Kept `#[cfg(test)]` deliberately: this accessor is ORIGIN-BLIND,
+    /// and a production caller picking it up would re-create the defect where
+    /// a Phase-H repair destination is treated as a new-side handoff holder.
+    #[cfg(test)]
     pub fn dual_write_targets_for_shard(&self, shard: u16) -> Vec<NodeId> {
         // C31 test observability: count each migration-lock acquisition so a
         // test can pin the per-shard memoization in the batch dual-write path.
@@ -25989,21 +26051,28 @@ mod tests {
         let mut index = crate::index::Index::new(100).unwrap();
 
         // Shard A: a single record whose footer will be unreadable (M=0,
-        // N>0). Shard B: one clean + one unreadable record (0<M<N).
+        // N>0). Shard B: one clean + one unreadable record (0<M<N). Shard C:
+        // wholly readable — review P2-1: the skip must be attributed to the
+        // shard it happened on, so C keeps being probed and confirmed even
+        // though A and B enumerate short in the SAME batched index pass.
         let key_a_bad = tx_key_for_shard(101, 1);
         let key_b_clean = tx_key_for_shard(202, 2);
         let key_b_bad = tx_key_for_shard(202, 3);
+        let key_c_clean = tx_key_for_shard(303, 4);
         let shard_a = ShardTable::shard_for_key(&key_a_bad);
         let shard_b = ShardTable::shard_for_key(&key_b_clean);
+        let shard_c = ShardTable::shard_for_key(&key_c_clean);
         assert_ne!(shard_a, shard_b);
+        assert_ne!(shard_a, shard_c);
+        assert_ne!(shard_b, shard_c);
         assert_eq!(shard_b, ShardTable::shard_for_key(&key_b_bad));
 
         let utxo_count = 1u32;
         let record_size = TxMetadata::record_size_for(utxo_count);
         let mut corrupt_offsets = Vec::new();
-        for key in [key_a_bad, key_b_clean, key_b_bad] {
+        for key in [key_a_bad, key_b_clean, key_b_bad, key_c_clean] {
             let offset = alloc.allocate(record_size).unwrap();
-            if key != key_b_clean {
+            if key != key_b_clean && key != key_c_clean {
                 corrupt_offsets.push(offset);
             }
             let mut meta = TxMetadata::new(utxo_count);
@@ -26047,8 +26116,10 @@ mod tests {
         assert!(engine.read_metadata(&key_a_bad).is_err());
         assert!(engine.read_metadata(&key_b_bad).is_err());
         assert!(engine.read_metadata(&key_b_clean).is_ok());
+        assert!(engine.read_metadata(&key_c_clean).is_ok());
         assert_eq!(engine.shard_record_count(shard_a), 1);
         assert_eq!(engine.shard_record_count(shard_b), 2);
+        assert_eq!(engine.shard_record_count(shard_c), 1);
 
         let task_a = MigrationTask {
             shard: shard_a,
@@ -26062,12 +26133,20 @@ mod tests {
             to_node: NodeId(2),
             is_master: true,
         };
-        // Neither shape may probe (a demotion happens BEFORE any probe;
-        // pre-fix the empty-manifest confirm also short-circuited it).
-        let probes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let task_c = MigrationTask {
+            shard: shard_c,
+            from_node: NodeId(1),
+            to_node: NodeId(2),
+            is_master: true,
+        };
+        // Neither SKIPPED shape may probe (a demotion happens BEFORE any
+        // probe; pre-fix the empty-manifest confirm also short-circuited it).
+        // The clean shard C must still be probed — one shard's unreadable
+        // footer may not spill onto its batch-mates (review P2-1).
+        let probes: Arc<Mutex<Vec<u16>>> = Arc::new(Mutex::new(Vec::new()));
         let probes_seen = probes.clone();
-        let probe = move |_: &MigrationTask, _: &[(TxKey, u32)]| {
-            probes_seen.fetch_add(1, Ordering::Relaxed);
+        let probe = move |task: &MigrationTask, _: &[(TxKey, u32)]| {
+            probes_seen.lock().push(task.shard);
             true
         };
 
@@ -26077,25 +26156,29 @@ mod tests {
             deferred,
         } = verify_already_serving_skips(
             &engine,
-            vec![task_a, task_b.clone()],
+            vec![task_a, task_b.clone(), task_c],
             8,
             2,
             Duration::from_secs(30),
             &probe,
         );
         assert_eq!(
-            probes.load(Ordering::Relaxed),
-            0,
-            "an unreadably-enumerated shard must demote WITHOUT probing",
+            probes.lock().as_slice(),
+            &[shard_c],
+            "exactly the CLEAN shard is probed: an unreadably-enumerated \
+             shard demotes without probing, and its skip must not be \
+             attributed to a batch-mate that enumerated cleanly",
         );
         assert!(
             deferred.is_empty(),
-            "both candidates fit the budget: {deferred:?}",
+            "all candidates fit the budget: {deferred:?}",
         );
-        assert!(
-            confirmed.is_empty(),
+        assert_eq!(
+            confirmed.iter().map(|t| t.shard).collect::<Vec<u16>>(),
+            vec![shard_c],
             "an unreadably-enumerated shard must NEVER confirm a \
-             completion-only commit (confirmed: {confirmed:?})"
+             completion-only commit, and the clean one must still confirm \
+             (confirmed: {confirmed:?})"
         );
         assert_eq!(
             demoted.len(),
@@ -40586,5 +40669,51 @@ mod tests {
                  batch; deferring it must not touch the table",
             );
         }
+    }
+
+    /// W10 COMPOSITION review P2-3 — the already-serving verification phase's
+    /// stated bound must be REAL. `ALREADY_SERVING_VERIFY_DEADLINE` gates
+    /// probe STARTS, not completions, so the phase's worst case is the
+    /// deadline plus one whole in-flight probe. With the relinquish profile
+    /// (6 attempts × (3 s connect + 10 s read) + 2.35 s backoff ≈ 80 s) that
+    /// tail alone was ~8× the deadline; the verification profile must keep it
+    /// comparable to the deadline itself.
+    ///
+    /// A false negative on THIS probe only demotes a candidate to the
+    /// streaming path (which re-verifies end-to-end), so the short budget
+    /// costs no safety — unlike the relinquish probe, whose false negative
+    /// strands a phantom master and which therefore keeps its long budget.
+    #[test]
+    fn already_serving_probe_profile_keeps_the_phase_bound_real() {
+        let worst = |p: &SupersetProbeProfile| -> Duration {
+            let attempts = p.retry_delays_ms.len() as u32;
+            let backoff: u64 = p.retry_delays_ms[..p.retry_delays_ms.len() - 1]
+                .iter()
+                .sum();
+            (p.connect_timeout + p.io_timeout) * attempts + Duration::from_millis(backoff)
+        };
+        let verify_worst = worst(&ALREADY_SERVING_SUPERSET_PROBE);
+        assert!(
+            verify_worst <= Duration::from_millis(12_500),
+            "the verification probe's worst case must stay ~12.3s (got {verify_worst:?}) \
+             — it is the OVERRUN past ALREADY_SERVING_VERIFY_DEADLINE, and the phase \
+             holds active_count() above zero throughout",
+        );
+        assert!(
+            verify_worst <= ALREADY_SERVING_VERIFY_DEADLINE + Duration::from_millis(2_500),
+            "the in-flight tail must stay comparable to the deadline itself, \
+             otherwise the documented ~22s phase bound is fiction",
+        );
+        assert!(
+            !ALREADY_SERVING_SUPERSET_PROBE.retry_delays_ms.is_empty(),
+            "the probe must still retry: a single connection-cap reset must \
+             not force a pointless full re-stream",
+        );
+        // The relinquish profile is deliberately NOT shortened: its false
+        // negative leaves a phantom master holding a shard (sc09/sc05).
+        assert!(
+            worst(&RELINQUISH_SUPERSET_PROBE) > verify_worst * 4,
+            "the relinquish probe keeps its long budget",
+        );
     }
 }
