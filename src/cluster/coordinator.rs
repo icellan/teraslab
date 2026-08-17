@@ -3230,6 +3230,12 @@ impl ClusterCoordinator {
                                         "cluster: skipping duplicate self-vote activation",
                                     );
                                 } else {
+                                    // W9 P2-1 — this activation supersedes
+                                    // any still-unlaunched det plan: cancel
+                                    // it so its workerless tasks cannot be
+                                    // preserved (and later driven at a
+                                    // current epoch by the held launch).
+                                    cancel_deferred_plan_launch(&mut pending_det_plan, &migration);
                                     last_activated_term = commit.term;
                                     topology_epoch.store(commit.term, Ordering::Relaxed);
                                     Self::activate_topology(
@@ -5164,6 +5170,14 @@ impl ClusterCoordinator {
                             topology_epoch.store(committed_term, Ordering::Relaxed);
                             last_reactivation_at = std::time::Instant::now();
                             last_activation_at = std::time::Instant::now();
+                            // W9 P2-1 — same-epoch re-activation: cancel any
+                            // still-unlaunched det plan first, else a held
+                            // task the re-derived plan legitimately drops
+                            // would later be driven by the held launch at a
+                            // current epoch (target unfences and serves
+                            // while the source never commits — dual
+                            // masters).
+                            cancel_deferred_plan_launch(&mut pending_det_plan, &migration);
                             Self::activate_topology(
                                 &committed_members,
                                 committed_term,
