@@ -1448,9 +1448,13 @@ pub struct MigrationMetrics {
     /// dormant there and its anti-stale role rests on the escalation's
     /// fresh-fold path. Rising steadily = that dormancy, not a defect.
     pub migration_prune_skipped_cutoff_gate: PaddedCounter,
-    /// W11 FIX 4(a) — `OP_MIGRATION_TRANSFER_REQUEST` frames REFUSED by this
-    /// source because the requester is neither a target holder nor the
-    /// intended master for any requested shard. Counted on the SOURCE.
+    /// W11 FIX 4(a) — `OP_MIGRATION_TRANSFER_REQUEST` frames this source
+    /// refused shards for: either a WHOLE-frame refusal (the requester is
+    /// neither a target holder nor the intended master for ANY requested
+    /// shard, answered terminally) or a PARTIAL one (a mixed batch whose
+    /// unmatched shards are named in the `STATUS_OK` body while the matched
+    /// ones keep waiting). Counted on the SOURCE, once per frame carrying
+    /// any refusal — not once per refused shard.
     pub migration_transfer_request_refused: PaddedCounter,
     /// W11 FIX 4(a) — pending inbound entries this node DROPPED on the
     /// source's refusal of its transfer request. Counted on the REQUESTER.
