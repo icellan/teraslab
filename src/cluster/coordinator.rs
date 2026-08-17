@@ -3192,6 +3192,13 @@ impl ClusterCoordinator {
         let reheal_backoff = Arc::new(Mutex::new(std::collections::HashMap::<u16, u64>::new()));
         let reheal_backoff_for_cluster = reheal_backoff.clone();
         let reheal_backoff_event = reheal_backoff;
+        // W10 review P2-B — rotation cursor for the live-recency confirm's
+        // per-round admission window. Shared with the struct for the same
+        // reason as `reheal_backoff`: `run_online_reheal` drives the same
+        // path in tests. See `reheal_confirm_admission`.
+        let reheal_confirm_cursor = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let reheal_confirm_cursor_for_cluster = reheal_confirm_cursor.clone();
+        let reheal_confirm_cursor_event = reheal_confirm_cursor;
         let (topology_commit_tx, topology_commit_rx) = std::sync::mpsc::channel();
         let topology_commit_tx_event = topology_commit_tx.clone();
         // Phase H — resync request channel. The catchup loop in
@@ -5345,6 +5352,7 @@ impl ClusterCoordinator {
                                 &reheal_backoff_event,
                                 &partition_view,
                                 Some(&engine),
+                                &reheal_confirm_cursor_event,
                             );
                         if queued > 0 {
                             tracing::warn!(
@@ -5834,6 +5842,7 @@ impl ClusterCoordinator {
             startup_reactivation_needed,
             stale_suspect_shards: Arc::new(RwLock::new(std::collections::BTreeSet::new())),
             reheal_backoff: reheal_backoff_for_cluster,
+            reheal_confirm_cursor: reheal_confirm_cursor_for_cluster,
             #[cfg(any(test, feature = "fault-injection"))]
             drop_commit_signals: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
@@ -9572,17 +9581,38 @@ const REHEAL_LIVE_CONFIRM_MAX_SHARDS_PER_ROUND: usize = 64;
 /// round admits, summed over its shards from the engine's O(1) per-shard
 /// counters BEFORE any I/O is issued.
 ///
-/// This is the sizing knob that matters. Each admitted key costs ~2 device
-/// reads (the txid resolve inside [`Engine::keys_by_shard_filtered`] plus the
-/// footer read in `Engine::recency_for_keys`), so 20 000 keys is ≤ ~40 000
-/// reads — a few seconds at a conservative 100 µs/read. Rounds are paced by
-/// the exchange-completion / reactivation cooldown (15-30 s), so one round's
-/// I/O stays well inside the cadence that drives it, and it never runs inside
-/// the ~2 s exchange window itself.
+/// Each admitted key costs ~2 device reads (the txid resolve inside
+/// [`Engine::keys_by_shard_filtered`] plus the footer read in
+/// `Engine::recency_for_keys`), so a round that stays inside this budget is
+/// ≤ ~40 000 reads — a few seconds at a conservative 100 µs/read, well inside
+/// the 15-30 s exchange-completion / reactivation cooldown that paces rounds,
+/// and never inside the ~2 s exchange window itself.
+///
+/// # THE BUDGET ONLY BINDS ON A SMALL STORE (W10 review P2-A)
+///
+/// Read the paragraph above as a CEILING that a large store never reaches,
+/// not as a description of steady state. The cluster shard is 12 bits of the
+/// key hash and is near-uniform, so mean shard population is
+/// `records / 4096`: this budget binds only below roughly
+/// `20 000 × 4096 ≈ 80 M` records. At the 2 B-record design point ONE shard
+/// holds ~488 k records — about 24× the whole round budget — so the
+/// always-progress rule below fires EVERY round and the per-round bound
+/// DEGENERATES TO EXACTLY ONE SHARD, costing ~1 M device reads (~98 s at
+/// 100 µs) on the coordinator event loop.
+///
+/// That is a deliberate, documented floor, not a sizing that can be tuned
+/// away: lowering the budget cannot go below one shard, and raising it only
+/// admits more. What actually closes it is SHARD-LOCAL ENUMERATION — an index
+/// path that reads one cluster shard's keys without walking (and paying
+/// device reads for) a whole filter pass. That is tracked as follow-up work;
+/// until it lands, this cap bounds the FAN-OUT (how many shards a round can
+/// touch), not the absolute cost of the smallest possible round.
 ///
 /// A shard whose OWN record count exceeds the budget is still admitted when
-/// it is first in the deterministic order: the alternative is a permanently
-/// unconfirmable shard, i.e. a silently disarmed online re-heal.
+/// it is first in the round's rotation: the alternative is a permanently
+/// unconfirmable shard, i.e. a silently disarmed online re-heal. See
+/// [`reheal_confirm_admission`] for why the rotation, not the ordering, is
+/// what keeps that from monopolising every round.
 const REHEAL_LIVE_CONFIRM_MAX_KEYS_PER_ROUND: u64 = 20_000;
 
 /// W10 composition review P1-3a — RE-CHECK a fence verdict against SELF's
@@ -9638,29 +9668,32 @@ const REHEAL_LIVE_CONFIRM_MAX_KEYS_PER_ROUND: u64 = 20_000;
 /// transfer-request draining (the watchdog's stall threshold is 10 s and it
 /// only logs).
 ///
-/// So each round admits a deterministic, capped PREFIX of the candidate set —
-/// lowest shard id first, bounded by both
+/// So each round admits a capped, ROTATING WINDOW over the shard-ascending
+/// candidate set ([`reheal_confirm_admission`]), bounded by both
 /// [`REHEAL_LIVE_CONFIRM_MAX_SHARDS_PER_ROUND`] and
 /// [`REHEAL_LIVE_CONFIRM_MAX_KEYS_PER_ROUND`], budgeted from the engine's
 /// O(1) per-shard record counters BEFORE any I/O is issued so the cap bounds
 /// the txid-resolve reads too. The remainder is DEFERRED: not confirmed, not
 /// refuted, and (crucially) not backed off, so it is simply re-evaluated on
 /// the next round. Deferring is never a safety change — an unconfirmed shard
-/// is never fenced.
+/// is never fenced. The window's start rotates across rounds (W10 review
+/// P2-B) so a shard that consumes a whole round's budget — and, being
+/// permanently source-refused, never leaves the candidate set — cannot
+/// monopolise every round and stall the confirm entirely; see
+/// [`reheal_confirm_admission`] for that composition and its pin.
 ///
-/// RESIDUAL 1 (not closed by the cap): [`Engine::keys_by_shard_filtered`]
-/// walks the ENTIRE primary index and only FILTERS by shard, so every confirm
-/// round still pays one full in-RAM index walk (taking each index shard's
-/// read lock) regardless of how few shards it admits. The cap bounds the
-/// device I/O, not the walk. This is the same walk the background recency
-/// refresher already performs on its own ≥ 5 s pacing; here it is paid at
-/// most once per re-heal round.
-///
-/// RESIDUAL 2: the deterministic lowest-id-first order is starvation-prone if
-/// a low-numbered shard is confirmed every round but its heal source is
-/// permanently REFUSED (it takes budget without ever leaving the candidate
-/// set). `teraslab_heal_source_refused_no_quorum_total` names that state, and
-/// `teraslab_reheal_live_confirm_deferred_total` shows the backlog it causes.
+/// RESIDUAL (not closed by the cap): [`Engine::keys_by_shard_filtered`] walks
+/// the ENTIRE primary index and only FILTERS by shard, so every confirm round
+/// still pays one full in-RAM index walk (taking each index shard's read
+/// lock) regardless of how few shards it admits. The cap bounds the FAN-OUT
+/// and the device I/O, not the walk — and past ~80 M records the per-round
+/// bound degenerates to one shard anyway (see
+/// [`REHEAL_LIVE_CONFIRM_MAX_KEYS_PER_ROUND`]). Shard-local index enumeration
+/// is what actually closes this; it is tracked as follow-up work. Meanwhile
+/// the walk is the same one the background recency refresher already performs
+/// on its own ≥ 5 s pacing, and here it is paid at most once per re-heal
+/// round, with `teraslab_reheal_live_confirm_last_duration_ms` making the
+/// event-loop cost measurable.
 ///
 /// # Fail-safe returns
 ///
@@ -9691,19 +9724,6 @@ const REHEAL_LIVE_CONFIRM_MAX_KEYS_PER_ROUND: u64 = 20_000;
 /// live replica against FRESH self evidence, shards the fresh evidence clears
 /// (safe to record in the not-behind backoff cache), and the count the cap
 /// left for a later round.
-/// W10 composition review P1 — how many of `counts` (shard, live record
-/// count), ASCENDING BY SHARD, one live-recency confirm round admits.
-///
-/// A prefix, so admission is deterministic and progress is monotone: the same
-/// candidate set always admits the same shards, and the deferred remainder is
-/// re-offered next round. Bounded by `max_shards` AND `max_keys`; the FIRST
-/// candidate is admitted unconditionally so a single shard larger than the key
-/// budget defers forever-after rather than permanently disarming the confirm
-/// (an unconfirmable shard is a silently disabled online re-heal).
-///
-/// Counts come from the engine's O(1) per-shard counters and are consulted
-/// BEFORE any I/O, so the budget bounds the txid-resolve reads inside
-/// [`Engine::keys_by_shard_filtered`] as well as the footer reads after it.
 /// W10 composition review P2-1 — keep only the shards `self_id` masters in
 /// `table` RIGHT NOW.
 ///
@@ -9731,33 +9751,80 @@ fn retain_self_mastered_shards(table: &ShardTable, self_id: NodeId, shards: &[u1
         .collect()
 }
 
-fn reheal_confirm_admission_count(
+/// W10 composition review P1/P2-B — which slice of `counts` (shard, live
+/// record count), ASCENDING BY SHARD, one live-recency confirm round admits.
+///
+/// Returns `(start_index, admitted)`: a WRAPPING run of `admitted` entries
+/// beginning at `start_index`, bounded by `max_shards` AND `max_keys`. The
+/// first entry of the run is admitted unconditionally so a single shard bigger
+/// than the whole key budget is never permanently unconfirmable (that would be
+/// a silently disabled online re-heal). Counts come from the engine's O(1)
+/// per-shard counters and are consulted BEFORE any I/O, so the budget bounds
+/// the txid-resolve reads inside [`Engine::keys_by_shard_filtered`] as well as
+/// the footer reads after it.
+///
+/// # Why the start ROTATES (W10 review P2-B)
+///
+/// Admitting a fixed lowest-id-first prefix composes two otherwise-benign
+/// residuals into a FULL STALL of the online re-heal on the node:
+///
+/// 1. a CONFIRMED shard whose heal-source selection is permanently REFUSED
+///    (#74: no quorum-current candidate) is never fenced and never backed off,
+///    so it re-enters the candidate set every single round;
+/// 2. once mean shard population exceeds
+///    [`REHEAL_LIVE_CONFIRM_MAX_KEYS_PER_ROUND`] — i.e. at any realistic store
+///    size, see that constant's doc — the always-progress rule means the FIRST
+///    admitted shard consumes the entire round on its own.
+///
+/// Compose them and one stuck low-id shard is re-admitted alone, forever: the
+/// confirm never reaches any other shard, so every other divergent shard stays
+/// permanently unconfirmed and therefore permanently unfenced. The direction
+/// is benign (no fence = keep serving) and the precondition already pages the
+/// operator via `teraslab_heal_source_refused_no_quorum_total`, but the stall
+/// is otherwise invisible — two climbing counters and nothing else.
+///
+/// Rotating the start (`next = (start + admitted) mod len`, carried across
+/// rounds by the caller) means a shard that consumes a whole round is stepped
+/// PAST on the next one. Admission stays fully deterministic given
+/// `(counts, start)`, so a round is still reproducible and the function stays
+/// pure; only the cursor is state.
+///
+/// `start` is taken modulo `counts.len()`, so a cursor carried over from a
+/// larger candidate set is always in range.
+fn reheal_confirm_admission(
     counts: &[(u16, u64)],
+    start: usize,
     max_shards: usize,
     max_keys: u64,
-) -> usize {
+) -> (usize, usize) {
     debug_assert!(
         counts.windows(2).all(|w| w[0].0 <= w[1].0),
         "admission budgeting requires shard-ascending input for determinism",
     );
+    if counts.is_empty() {
+        return (0, 0);
+    }
+    let start = start % counts.len();
     let mut admitted = 0usize;
     let mut keys: u64 = 0;
-    for (_, count) in counts {
+    while admitted < counts.len() {
         if admitted >= max_shards {
             break;
         }
-        if admitted > 0 && keys.saturating_add(*count) > max_keys {
+        let (_, count) = counts[(start + admitted) % counts.len()];
+        if admitted > 0 && keys.saturating_add(count) > max_keys {
             break;
         }
-        keys = keys.saturating_add(*count);
+        keys = keys.saturating_add(count);
         admitted += 1;
     }
-    admitted
+    (start, admitted)
 }
 
 fn confirm_self_behind_with_live_recency(
     engine: &Engine,
     candidates: &[(u16, Vec<ShardRecency>)],
+    cursor: &std::sync::atomic::AtomicUsize,
 ) -> (Vec<u16>, Vec<u16>, usize) {
     let mut ordered: Vec<&(u16, Vec<ShardRecency>)> = candidates.iter().collect();
     ordered.sort_unstable_by_key(|(shard, _)| *shard);
@@ -9765,12 +9832,21 @@ fn confirm_self_behind_with_live_recency(
         .iter()
         .map(|(shard, _)| (*shard, engine.shard_record_count(*shard)))
         .collect();
-    let admit = reheal_confirm_admission_count(
+    let (start, admit) = reheal_confirm_admission(
         &counts,
+        cursor.load(Ordering::Relaxed),
         REHEAL_LIVE_CONFIRM_MAX_SHARDS_PER_ROUND,
         REHEAL_LIVE_CONFIRM_MAX_KEYS_PER_ROUND,
     );
-    let admitted: Vec<&(u16, Vec<ShardRecency>)> = ordered.into_iter().take(admit).collect();
+    // P2-B — advance the rotation so a shard that consumed a whole round is
+    // stepped PAST next round; `reheal_confirm_admission` re-normalises the
+    // stored value against whatever the next round's candidate count is.
+    if !ordered.is_empty() {
+        cursor.store((start + admit) % ordered.len(), Ordering::Relaxed);
+    }
+    let admitted: Vec<&(u16, Vec<ShardRecency>)> = (0..admit)
+        .map(|i| ordered[(start + i) % ordered.len()])
+        .collect();
     let deferred = candidates.len() - admitted.len();
 
     let shards: std::collections::HashSet<u16> = admitted.iter().map(|(s, _)| *s).collect();
@@ -9778,14 +9854,21 @@ fn confirm_self_behind_with_live_recency(
     let (keys_by_shard, total_skipped) = engine.keys_by_shard_filtered(&shards);
     let mut confirmed = Vec::new();
     let mut refuted = Vec::new();
+    // NIT 1 — an incomplete enumeration defers EVERY candidate, not just the
+    // over-cap remainder, and folds none of them; the metrics must say so.
+    let mut scanned_shards = shards.len() as u64;
+    let mut deferred = deferred;
     if total_skipped > 0 {
         tracing::warn!(
             skipped = total_skipped,
             shards = shards.len(),
+            candidates = candidates.len(),
             "reverse-heal Phase 3b: live-recency confirm read an INCOMPLETE \
-             key enumeration — deferring every fence verdict this round \
+             key enumeration — deferring EVERY fence verdict this round \
              (re-evaluated on the next partition view)",
         );
+        scanned_shards = 0;
+        deferred = candidates.len();
     } else {
         for (shard, replica_recencies) in admitted {
             let keys: &[TxKey] = keys_by_shard.get(shard).map_or(&[], |k| k.as_slice());
@@ -9819,7 +9902,7 @@ fn confirm_self_behind_with_live_recency(
     }
     if let Some(m) = crate::metrics::migration_metrics() {
         m.reheal_live_confirm_rounds.inc();
-        m.reheal_live_confirm_shards.inc_by(shards.len() as u64);
+        m.reheal_live_confirm_shards.inc_by(scanned_shards);
         m.reheal_live_confirm_deferred.inc_by(deferred as u64);
         m.reheal_live_confirm_last_duration_ms.store(
             u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX),
@@ -10562,6 +10645,11 @@ fn resource_parked_heal_fences(
 /// doc on `RunningCluster::engine`); production always supplies one. With no
 /// engine there is no recency CACHE either, so there is no cached-vs-live
 /// distinction to correct and the cached classification stands.
+///
+/// `confirm_cursor` is the live-recency confirm's rotation state (W10 review
+/// P2-B) — one `usize` carried across rounds by the event loop so no single
+/// budget-consuming shard can monopolise every round. See
+/// [`reheal_confirm_admission`].
 #[allow(clippy::too_many_arguments)]
 fn trigger_online_reheal(
     self_id: NodeId,
@@ -10572,6 +10660,7 @@ fn trigger_online_reheal(
     reheal_backoff: &Arc<Mutex<std::collections::HashMap<u16, u64>>>,
     partition_view: &std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>>,
     engine: Option<&Arc<Engine>>,
+    confirm_cursor: &Arc<std::sync::atomic::AtomicUsize>,
 ) -> usize {
     if partition_view.is_empty() {
         return 0;
@@ -10670,7 +10759,7 @@ fn trigger_online_reheal(
     let to_fence: Vec<u16> = match engine {
         Some(engine) if engine.recency_cache_is_stale() => {
             let (confirmed, refuted, deferred) =
-                confirm_self_behind_with_live_recency(engine, &to_confirm);
+                confirm_self_behind_with_live_recency(engine, &to_confirm, confirm_cursor);
             if !refuted.is_empty() {
                 let mut backoff = reheal_backoff.lock();
                 for shard in &refuted {
@@ -10702,19 +10791,10 @@ fn trigger_online_reheal(
     }
     let sources = {
         let table = shard_table.read();
-        // W10 composition review P2-1 — RE-CHECK OWNERSHIP under the final
-        // read guard. The table version is only a CHEAP EARLY-OUT, NOT a
-        // witness that the table is unchanged: `ShardTable::rollback_shard`
-        // mutates `assignments[shard]` IN PLACE without bumping `version`,
-        // and background workers call it on the live installed table — so a
-        // same-version, different-table state demonstrably exists. Today
-        // every rollback site is source-side (mastership moves TOWARD self)
-        // and `commit_shard` does not touch assignments, so the flip that
-        // would hurt cannot happen; but that rests on a non-local invariant
-        // across three call sites that nothing enforces, and the failure mode
-        // is fencing + baseline-pulling a shard this node does not own. The
-        // per-shard ownership filter below is version-independent and makes
-        // the guarantee local.
+        // W10 composition review P2-1 — the version check below is a CHEAP
+        // EARLY-OUT, NOT a witness that the table is unchanged; ownership is
+        // re-checked per shard by `retain_self_mastered_shards`, whose doc
+        // carries the full analysis of why the version cannot serve as one.
         if table.version != table_version {
             tracing::info!(
                 classified_at = table_version,
@@ -17440,6 +17520,13 @@ pub struct RunningCluster {
     /// never suppressed; a signature change (the source moved) forces a fresh
     /// evaluation. Empty in the boot path — this gates only the runtime path.
     reheal_backoff: Arc<Mutex<std::collections::HashMap<u16, u64>>>,
+    /// W10 review P2-B — the live-recency confirm's per-round admission
+    /// rotation cursor, shared with the event loop. One `usize`: the index
+    /// (into the shard-ascending candidate list) the NEXT confirm round starts
+    /// from, so a shard that consumes a whole round's budget is stepped past
+    /// on the following round instead of monopolising every round forever.
+    /// See [`reheal_confirm_admission`].
+    reheal_confirm_cursor: Arc<std::sync::atomic::AtomicUsize>,
     /// Test-only: when set, [`RunningCluster::signal_topology_committed`]
     /// drops the signal instead of queuing it. Models the production race
     /// where a node's authority commits a new term (via the dispatch
@@ -18372,6 +18459,7 @@ impl RunningCluster {
             &self.reheal_backoff,
             partition_view,
             self.engine.as_ref(),
+            &self.reheal_confirm_cursor,
         )
     }
 
@@ -20035,6 +20123,7 @@ pub(crate) fn new_test_running_cluster(
         startup_reactivation_needed: Arc::new(AtomicBool::new(false)),
         stale_suspect_shards: Arc::new(RwLock::new(std::collections::BTreeSet::new())),
         reheal_backoff: Arc::new(Mutex::new(std::collections::HashMap::new())),
+        reheal_confirm_cursor: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         #[cfg(any(test, feature = "fault-injection"))]
         drop_commit_signals: Arc::new(AtomicBool::new(false)),
         #[cfg(test)]
@@ -34612,23 +34701,23 @@ mod tests {
     /// runs SYNCHRONOUSLY in the coordinator's exchange-drain phase — where a
     /// multi-second stall stops SWIM handling, topology commits, migration
     /// completions and transfer-request draining (watchdog threshold 10 s, and
-    /// it only logs). Each round must therefore admit a bounded, deterministic
-    /// prefix and DEFER the rest un-backed-off, which is never a safety change
-    /// because an unconfirmed shard is never fenced.
+    /// it only logs). Each round must therefore admit a bounded window and
+    /// DEFER the rest un-backed-off, which is never a safety change because an
+    /// unconfirmed shard is never fenced.
     #[test]
     fn reheal_confirm_admission_is_capped_deterministic_and_always_progresses() {
-        // SHARD cap: a prefix, ascending, never the whole set.
+        // SHARD cap: a bounded window, never the whole set.
         let many: Vec<(u16, u64)> = (0..300u16).map(|s| (s, 1)).collect();
         assert_eq!(
-            reheal_confirm_admission_count(&many, 64, 20_000),
-            64,
+            reheal_confirm_admission(&many, 0, 64, 20_000),
+            (0, 64),
             "the shard cap bounds a round even when every shard is tiny",
         );
         // KEY cap: bounds the device fan-out independently of shard count.
         let heavy: Vec<(u16, u64)> = (0..64u16).map(|s| (s, 8_000)).collect();
         assert_eq!(
-            reheal_confirm_admission_count(&heavy, 64, 20_000),
-            2,
+            reheal_confirm_admission(&heavy, 0, 64, 20_000),
+            (0, 2),
             "the key budget stops the round at 16k keys — a third shard would \
              put the round's device reads over budget",
         );
@@ -34637,34 +34726,113 @@ mod tests {
         // unconfirmable — a silently disarmed online re-heal.
         let giant = [(7u16, 10_000_000u64), (8, 1), (9, 1)];
         assert_eq!(
-            reheal_confirm_admission_count(&giant, 64, 20_000),
-            1,
-            "an over-budget FIRST shard is admitted alone, never skipped",
+            reheal_confirm_admission(&giant, 0, 64, 20_000),
+            (0, 1),
+            "an over-budget shard at the window start is admitted alone, \
+             never skipped",
         );
-        // DETERMINISM: same input, same prefix — so the deferred remainder is
-        // re-offered next round rather than a different random slice.
+        // DETERMINISM: same (counts, start), same window — a round is
+        // reproducible; only the cursor is state.
         assert_eq!(
-            reheal_confirm_admission_count(&many, 64, 20_000),
-            reheal_confirm_admission_count(&many, 64, 20_000),
+            reheal_confirm_admission(&many, 5, 64, 20_000),
+            reheal_confirm_admission(&many, 5, 64, 20_000),
         );
         // Degenerate inputs stay sane.
-        assert_eq!(reheal_confirm_admission_count(&[], 64, 20_000), 0);
-        assert_eq!(reheal_confirm_admission_count(&many, 0, 20_000), 0);
+        assert_eq!(reheal_confirm_admission(&[], 0, 64, 20_000), (0, 0));
+        assert_eq!(reheal_confirm_admission(&many, 0, 0, 20_000), (0, 0));
+        // An out-of-range cursor (carried over from a larger candidate set)
+        // normalises instead of panicking or skipping the round.
+        assert_eq!(reheal_confirm_admission(&giant, 4_000, 64, 20_000).0, 1);
+        // The window WRAPS, so a late start still admits a full budget.
+        let three = [(1u16, 1u64), (2, 1), (3, 1)];
+        assert_eq!(
+            reheal_confirm_admission(&three, 2, 64, 20_000),
+            (2, 3),
+            "a window starting near the end wraps around the candidate list",
+        );
         // The shipped constants are the ones the production path uses.
         assert_eq!(
-            reheal_confirm_admission_count(
+            reheal_confirm_admission(
                 &many,
+                0,
                 REHEAL_LIVE_CONFIRM_MAX_SHARDS_PER_ROUND,
                 REHEAL_LIVE_CONFIRM_MAX_KEYS_PER_ROUND,
             ),
-            REHEAL_LIVE_CONFIRM_MAX_SHARDS_PER_ROUND,
+            (0, REHEAL_LIVE_CONFIRM_MAX_SHARDS_PER_ROUND),
+        );
+    }
+
+    /// W10 composition review P2-B (RED→GREEN) — the FULL STALL the two
+    /// accepted residuals compose into, and the rotation that breaks it.
+    ///
+    /// Compose: (1) a CONFIRMED shard whose heal-source selection is
+    /// permanently REFUSED gets neither a fence nor a backoff entry, so it
+    /// re-enters the candidate set every round; (2) past ~80 M records the
+    /// always-progress rule means the first admitted shard consumes the whole
+    /// round on its own. With a fixed lowest-id-first window, that one stuck
+    /// low-id shard is re-admitted alone FOREVER and the confirm never reaches
+    /// any other shard — online re-heal fully stalled on the node, visible
+    /// only as two climbing counters.
+    ///
+    /// The pin: across successive rounds, a permanently over-budget low-id
+    /// shard must NOT prevent every higher id from being admitted.
+    #[test]
+    fn reheal_confirm_rotation_prevents_a_stuck_shard_from_monopolising_rounds() {
+        // Shard 1 alone exceeds the whole key budget (the 2 B-record shape);
+        // shards 2..=4 are tiny. Shard 1 is also permanently source-refused in
+        // the scenario, so it never leaves the candidate set.
+        let counts = [(1u16, 10_000_000u64), (2, 1), (3, 1), (4, 1)];
+        let mut cursor = 0usize;
+        let mut admitted_shards: Vec<Vec<u16>> = Vec::new();
+        for _ in 0..4 {
+            let (start, admitted) = reheal_confirm_admission(&counts, cursor, 64, 20_000);
+            admitted_shards.push(
+                (0..admitted)
+                    .map(|i| counts[(start + i) % counts.len()].0)
+                    .collect(),
+            );
+            cursor = (start + admitted) % counts.len();
+        }
+        assert_eq!(
+            admitted_shards[0],
+            vec![1],
+            "round 1: the over-budget shard consumes the round alone",
+        );
+        assert_eq!(
+            admitted_shards[1],
+            vec![2, 3, 4],
+            "round 2: the rotation STEPS PAST it — pre-fix this round \
+             re-admitted shard 1 alone and shards 2-4 were never reached \
+             (the P2-B stall)",
+        );
+        assert_eq!(
+            admitted_shards[2],
+            vec![1],
+            "round 3: the cursor wraps back to the stuck shard",
+        );
+        assert_eq!(
+            admitted_shards[3],
+            vec![2, 3, 4],
+            "round 4: and past it again"
+        );
+
+        // The property that matters, stated directly: every candidate is
+        // admitted at least once within a bounded number of rounds.
+        let reached: std::collections::HashSet<u16> =
+            admitted_shards.iter().flatten().copied().collect();
+        assert_eq!(
+            reached,
+            counts.iter().map(|(s, _)| *s).collect(),
+            "every candidate is reached despite a permanently budget-hogging \
+             low-id shard",
         );
     }
 
     /// W10 composition review P1 (RED→GREEN) — the cap end-to-end through the
     /// REAL confirm over a REAL engine: more candidate shards than the shard
     /// cap must leave a DEFERRED remainder that is neither confirmed nor
-    /// refuted (hence never backed off, hence re-offered next round).
+    /// refuted (hence never backed off, hence re-offered next round) — and the
+    /// SECOND round must cover the shards the first one deferred (P2-B).
     #[test]
     fn live_recency_confirm_defers_candidates_past_the_per_round_cap() {
         let engine = test_engine();
@@ -34696,12 +34864,13 @@ mod tests {
             candidates.len(),
         );
 
+        let cursor = std::sync::atomic::AtomicUsize::new(0);
         let (confirmed, refuted, deferred) =
-            confirm_self_behind_with_live_recency(&engine, &candidates);
+            confirm_self_behind_with_live_recency(&engine, &candidates, &cursor);
         assert_eq!(
             confirmed.len(),
             REHEAL_LIVE_CONFIRM_MAX_SHARDS_PER_ROUND,
-            "exactly the capped prefix is scanned and confirmed",
+            "exactly the capped window is scanned and confirmed",
         );
         assert!(refuted.is_empty(), "every admitted shard really is behind");
         assert_eq!(
@@ -34714,13 +34883,28 @@ mod tests {
             candidates.len(),
             "every candidate is accounted for exactly once",
         );
-        // The prefix is the lowest shard ids — deterministic, so next round
-        // re-offers the same remainder rather than a different slice.
+        // Round 1 admits the window at the cursor (lowest ids at cursor 0).
         let mut expected: Vec<u16> = candidates.iter().map(|(s, _)| *s).collect();
         expected.truncate(REHEAL_LIVE_CONFIRM_MAX_SHARDS_PER_ROUND);
         let mut got = confirmed.clone();
         got.sort_unstable();
         assert_eq!(got, expected);
+
+        // P2-B — round 2 starts where round 1 stopped, so the 6 shards round 1
+        // deferred are the first ones it reaches.
+        let (confirmed2, _, _) =
+            confirm_self_behind_with_live_recency(&engine, &candidates, &cursor);
+        let round1: std::collections::HashSet<u16> = confirmed.into_iter().collect();
+        let deferred_ids: Vec<u16> = candidates
+            .iter()
+            .map(|(s, _)| *s)
+            .filter(|s| !round1.contains(s))
+            .collect();
+        assert!(
+            deferred_ids.iter().all(|s| confirmed2.contains(s)),
+            "every shard round 1 deferred must be covered by round 2 \
+             (rotation, not a fixed prefix)",
+        );
     }
 
     /// W10 composition review P2-1 (RED→GREEN) — the shard-table VERSION is
