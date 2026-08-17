@@ -28,6 +28,19 @@ scripts/cleanup-worktrees.sh --target
 
 Anything that orchestrates parallel agents must end its turn by calling this script. The script is idempotent and safe — it only touches `.claude/worktrees/agent-*` and never the main checkout.
 
+### `git stash` is shared across every worktree — never use it in an agent worktree
+
+The stash stack belongs to the repository, not the worktree. `git stash pop` in
+an agent worktree therefore pops whatever entry is on top of the *shared* stack —
+which may be another worktree's (or another agent's) work, landing as a conflict
+in files you never touched. This has now happened twice; the stash list carries a
+`RECOVERED (accidentally cross-worktree-popped...)` entry from the first incident.
+
+If you need to set changes aside inside a worktree, commit them to the worktree's
+own branch (amend or drop the commit later) — never `git stash`. This is the
+worktree-specific corollary of the global "never destroy the working tree" rule:
+`stash` is safe advice in a single checkout and unsafe here.
+
 ## Project structure
 
 ```
