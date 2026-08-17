@@ -942,6 +942,71 @@ fn revalidate_settled_members(
     }
 }
 
+/// W10 composition review P2-1 — must the topology debounce be RE-ARMED
+/// because propose-time re-validation collapsed the proposal into a no-op?
+///
+/// # The composition defect
+///
+/// [`TopologyDebounce::take_due`] CONSUMES the burst before the proposer
+/// re-validates it ([`revalidate_settled_members`]). When re-validation drops
+/// a member and the survivors EQUAL the committed set,
+/// [`crate::cluster::topology::TopologyAuthority::on_membership_changed`]
+/// takes its identical-membership skip and returns `None`: nothing is
+/// proposed, and the debounce that would have retried is already gone. The
+/// dropped member cannot rescue itself — only the lowest-id member may
+/// propose — so recovery depends entirely on some LATER SWIM alive-SET edge
+/// re-arming the debounce. The observed burst
+/// `{1,2}→{1,2,3}→{1,2}→{1,2,3}` records `departed=[3]`; if SWIM has 3
+/// SUSPECT at the propose instant, 3 is dropped, the proposal collapses, and
+/// a subsequent Suspect→Alive refutation changes NO alive set — so no
+/// `MembershipChanged` fires, no `observe` runs, and node 3 is permanently
+/// left out of the cluster.
+///
+/// # The re-arm condition (all three must hold)
+///
+/// 1. Re-validation actually REMOVED members — an unchanged set was already
+///    handled normally and needs no retry.
+/// 2. The surviving set equals `committed` — only then does
+///    `on_membership_changed` skip, wasting the consumed debounce. A survivor
+///    set that still differs is proposed on this pass and needs no retry.
+/// 3. Some removed member is currently `Suspect`. This is the ONLY removal
+///    reason that can resolve WITHOUT an alive-set edge (SWIM refutes the
+///    suspicion in place), i.e. the only case with no other wake-up. A `Dead`
+///    removal ends with a SWIM reap that DOES change the alive set (and fires
+///    a fresh burst), and a member with no SWIM record at all has nothing to
+///    wait for — re-arming for either would spin a no-op burst every window
+///    forever.
+///
+/// Set comparison is order-independent (sorted copies), so it cannot be
+/// defeated by a differently-ordered committed vector.
+fn revalidation_collapse_needs_rearm(
+    settled: &[NodeId],
+    revalidated: &[NodeId],
+    committed: &[NodeId],
+    state_of: impl Fn(&NodeId) -> Option<crate::cluster::membership::NodeState>,
+) -> bool {
+    use crate::cluster::membership::NodeState;
+    let removed: Vec<NodeId> = settled
+        .iter()
+        .copied()
+        .filter(|m| !revalidated.contains(m))
+        .collect();
+    if removed.is_empty() {
+        return false;
+    }
+    let sorted = |v: &[NodeId]| {
+        let mut out = v.to_vec();
+        out.sort_unstable();
+        out
+    };
+    if sorted(revalidated) != sorted(committed) {
+        return false;
+    }
+    removed
+        .iter()
+        .any(|m| state_of(m) == Some(NodeState::Suspect))
+}
+
 fn snapshot_under_replication_inputs(
     swim_membership: &Arc<Mutex<crate::cluster::membership::Membership>>,
     shard_table: &Arc<ShardTableLock<ShardTable>>,
@@ -3773,7 +3838,7 @@ impl ClusterCoordinator {
                     // suspicion is transient, and excluding it from a grow
                     // proposal would churn terms.
                     let settled_members = revalidate_settled_members(
-                        settled.members,
+                        settled.members.clone(),
                         &settled.departed_during_burst,
                         |node| {
                             swim_membership_event
@@ -3783,6 +3848,33 @@ impl ClusterCoordinator {
                         },
                         self_id,
                     );
+                    // W10 composition review P2-1 — a re-validation that
+                    // collapses the proposal back onto the committed set
+                    // consumed the debounce for NOTHING; put the burst back
+                    // (departures preserved) so the next window re-validates
+                    // against fresher SWIM state instead of losing the join
+                    // forever. See `revalidation_collapse_needs_rearm`.
+                    if revalidation_collapse_needs_rearm(
+                        &settled.members,
+                        &settled_members,
+                        &topo_authority_event.committed_members(),
+                        |node| {
+                            swim_membership_event
+                                .lock()
+                                .member_info(node)
+                                .map(|info| info.state)
+                        },
+                    ) {
+                        tracing::warn!(
+                            settled = ?settled.members.iter().map(|n| n.0).collect::<Vec<_>>(),
+                            proposed = ?settled_members.iter().map(|n| n.0).collect::<Vec<_>>(),
+                            "cluster: propose-time re-validation collapsed the settled \
+                             set onto the committed set (a SUSPECT member was dropped) \
+                             — RE-ARMING the topology debounce so the join is retried \
+                             once SWIM resolves the suspicion (W10 P2-1)",
+                        );
+                        topology_debounce.rearm(settled, std::time::Instant::now());
+                    }
                     let settled_event = ClusterEvent::MembershipChanged(settled_members);
                     Self::handle_event(
                         &settled_event,
@@ -29870,6 +29962,183 @@ mod tests {
         // dropped; the original set is returned unchanged instead.
         let out = revalidate_settled_members(settled.clone(), &departed, state_of, NodeId(9));
         assert_eq!(out, settled);
+    }
+
+    /// W10 composition review P2-1 (RED→GREEN) — the permanently-dropped
+    /// join. Drives the REAL chain — `TopologyDebounce` burst →
+    /// `take_due` → `revalidate_settled_members` →
+    /// `revalidation_collapse_needs_rearm` → `TopologyDebounce::rearm` — over
+    /// the observed shape: the burst `{1,2}→{1,2,3}→{1,2}→{1,2,3}` records
+    /// node 3 as departed, SWIM has 3 SUSPECT at the propose instant, so 3 is
+    /// dropped and the survivors `{1,2}` EQUAL the committed set. Pre-fix the
+    /// consumed debounce was simply gone: `on_membership_changed` skips on the
+    /// identical set, only the lowest-id member may propose, and a
+    /// Suspect→Alive refutation changes no alive SET so nothing ever re-armed
+    /// — node 3 never rejoined. The burst must be put BACK, still carrying the
+    /// departure, and must propose `{1,2,3}` on the retry once SWIM proves 3
+    /// Alive.
+    #[test]
+    fn revalidation_collapse_rearms_the_debounce_until_suspicion_resolves() {
+        use crate::cluster::membership::NodeState;
+        use crate::cluster::topology::TopologyDebounce;
+        let window = Duration::from_millis(500);
+        let mut deb = TopologyDebounce::from_window(window);
+        let t0 = std::time::Instant::now();
+        let committed = vec![NodeId(1), NodeId(2)];
+
+        // The observed burst: 3 joins, drops out, rejoins — all inside one
+        // debounce window, so the settled target is {1,2,3} with 3 flagged
+        // departed-during-burst.
+        deb.observe(&[NodeId(1), NodeId(2)], t0);
+        deb.observe(
+            &[NodeId(1), NodeId(2), NodeId(3)],
+            t0 + Duration::from_millis(50),
+        );
+        deb.observe(&[NodeId(1), NodeId(2)], t0 + Duration::from_millis(100));
+        deb.observe(
+            &[NodeId(1), NodeId(2), NodeId(3)],
+            t0 + Duration::from_millis(150),
+        );
+        let settled = deb
+            .take_due(t0 + Duration::from_millis(700))
+            .expect("the burst settles and fires");
+        assert_eq!(settled.members, vec![NodeId(1), NodeId(2), NodeId(3)]);
+        assert_eq!(settled.departed_during_burst, vec![NodeId(3)]);
+
+        // Propose instant: SWIM still only SUSPECTS 3 → re-validation drops it
+        // and the survivors equal the committed set (a guaranteed no-op
+        // proposal).
+        let suspect = |n: &NodeId| match n.0 {
+            2 => Some(NodeState::Alive),
+            3 => Some(NodeState::Suspect),
+            _ => None,
+        };
+        let revalidated = revalidate_settled_members(
+            settled.members.clone(),
+            &settled.departed_during_burst,
+            suspect,
+            NodeId(1),
+        );
+        assert_eq!(revalidated, committed, "the proposal collapsed to a no-op");
+        assert!(
+            revalidation_collapse_needs_rearm(&settled.members, &revalidated, &committed, suspect),
+            "a collapse caused by a SUSPECT drop must re-arm — nothing else \
+             will ever wake this join up",
+        );
+        assert!(
+            deb.rearm(settled, t0 + Duration::from_millis(700)),
+            "the consumed burst is re-installed (nothing newer was pending)",
+        );
+
+        // Retry #1 — still Suspect: it fires again (the periodic safety net)
+        // and STILL carries the departure, so the still-unproven member cannot
+        // ride the retry into a committed term.
+        let retry = deb
+            .take_due(t0 + Duration::from_millis(1400))
+            .expect("the re-armed burst becomes due again one window later");
+        assert_eq!(retry.members, vec![NodeId(1), NodeId(2), NodeId(3)]);
+        assert_eq!(
+            retry.departed_during_burst,
+            vec![NodeId(3)],
+            "the re-arm preserves the departure — the retry re-validates too",
+        );
+        assert_eq!(
+            revalidate_settled_members(
+                retry.members.clone(),
+                &retry.departed_during_burst,
+                suspect,
+                NodeId(1),
+            ),
+            committed,
+            "while 3 stays SUSPECT the retry keeps collapsing (data-safe)",
+        );
+
+        // Retry #2 — SWIM has since refuted the suspicion IN PLACE (no
+        // alive-SET change, hence no MembershipChanged, hence no fresh
+        // observe): the re-armed burst is what finally proposes {1,2,3}.
+        let alive = |n: &NodeId| match n.0 {
+            2 | 3 => Some(NodeState::Alive),
+            _ => None,
+        };
+        assert!(deb.rearm(retry, t0 + Duration::from_millis(1400)));
+        let healed = deb
+            .take_due(t0 + Duration::from_millis(2100))
+            .expect("still armed");
+        let proposal = revalidate_settled_members(
+            healed.members.clone(),
+            &healed.departed_during_burst,
+            alive,
+            NodeId(1),
+        );
+        assert_eq!(
+            proposal,
+            vec![NodeId(1), NodeId(2), NodeId(3)],
+            "once SWIM proves the member Alive the re-armed burst proposes the join",
+        );
+        assert!(
+            !revalidation_collapse_needs_rearm(&healed.members, &proposal, &committed, alive),
+            "a proposal that differs from the committed set needs no re-arm",
+        );
+    }
+
+    /// W10 composition review P2-1 — the re-arm is BOUNDED: only a SUSPECT
+    /// removal (the one SWIM can refute without an alive-set edge) re-arms. A
+    /// DEAD removal ends in a SWIM reap that changes the alive set and fires a
+    /// fresh burst anyway, and a survivor set that still DIFFERS from the
+    /// committed set is proposed on this very pass — re-arming for either
+    /// would spin a no-op burst every window forever.
+    #[test]
+    fn revalidation_collapse_rearm_is_bounded_to_refutable_suspicion() {
+        use crate::cluster::membership::NodeState;
+        let settled = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let committed = vec![NodeId(1), NodeId(2)];
+        let dead = |n: &NodeId| match n.0 {
+            2 => Some(NodeState::Alive),
+            3 => Some(NodeState::Dead),
+            _ => None,
+        };
+        assert!(
+            !revalidation_collapse_needs_rearm(&settled, &committed, &committed, dead),
+            "a DEAD removal must not re-arm — the reap changes the alive set",
+        );
+        let unknown = |n: &NodeId| match n.0 {
+            2 => Some(NodeState::Alive),
+            _ => None,
+        };
+        assert!(
+            !revalidation_collapse_needs_rearm(&settled, &committed, &committed, unknown),
+            "a removal of a member with no SWIM record has nothing to wait for",
+        );
+        let suspect = |n: &NodeId| match n.0 {
+            2 => Some(NodeState::Alive),
+            3 => Some(NodeState::Suspect),
+            _ => None,
+        };
+        assert!(
+            !revalidation_collapse_needs_rearm(&settled, &settled, &committed, suspect),
+            "no removal happened — the proposal proceeds normally",
+        );
+        assert!(
+            !revalidation_collapse_needs_rearm(
+                &settled,
+                &[NodeId(1), NodeId(2), NodeId(4)],
+                &committed,
+                suspect,
+            ),
+            "survivors that still differ from the committed set are proposed \
+             on this pass — no retry needed",
+        );
+        // Order-independence: a differently-ordered committed vector must not
+        // defeat the equality check.
+        assert!(
+            revalidation_collapse_needs_rearm(
+                &settled,
+                &committed,
+                &[NodeId(2), NodeId(1)],
+                suspect
+            ),
+            "the committed-set comparison is order-independent",
+        );
     }
 
     /// W8 review P1-3 — the reduction-round backstop: a target that names a
