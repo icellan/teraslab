@@ -362,15 +362,20 @@ impl TombstoneLog {
     /// carve-out: a WEAK cause ([`TombstoneCause::CompensatedCreate`] or
     /// [`TombstoneCause::PruneReplace`] — the generation-overridable local
     /// rollback/reconcile markers) never REPLACES an existing tombstone of a
-    /// different cause — a weak claim must not downgrade or re-scope a
-    /// stronger one (`ClientDelete`'s unconditional veto above all), nor the
-    /// other weak claim's window. The reverse direction stays plain LWW: a
-    /// later `ClientDelete` (or `Dah`) for the same key upgrades either weak
-    /// cause. In production the carve-out is defense in depth — TS-1 clears
-    /// the tombstone whenever the key comes back live, so two causes can only
-    /// collide through a delete of an already-absent record (which records
-    /// nothing) — but the downgrade must be structurally impossible, not
-    /// merely unlikely (see [`Self::blocks_heal_apply`]'s safety argument).
+    /// different cause. For the strong causes this is protection — a weak
+    /// claim must not downgrade `ClientDelete`'s (or `Dah`'s) veto. Between
+    /// the TWO weak causes, first-claim-stands is NOT a protection rule:
+    /// neither order is uniformly more conservative (each cause's window
+    /// admits what the other blocks at some generations). It is chosen
+    /// because the collision is TS-1-unreachable in production (the
+    /// tombstone clears whenever the key comes back live, and deleting an
+    /// absent record writes nothing), both causes are weak markers on a node
+    /// that never client-deleted (safety leg 3 covers either outcome), and a
+    /// fixed rule pinned in both directions beats an order-dependent one.
+    /// The reverse direction stays plain LWW: a later `ClientDelete` (or
+    /// `Dah`) for the same key upgrades either weak cause. The strong-cause
+    /// downgrade must be structurally impossible, not merely unlikely (see
+    /// [`Self::blocks_heal_apply`]'s safety argument).
     pub fn record(&self, key: &TxKey, generation: u32, height: u32, cause: TombstoneCause) {
         let value = TombValue {
             generation,
