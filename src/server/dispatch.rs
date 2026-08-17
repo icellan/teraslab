@@ -1548,6 +1548,17 @@ pub(crate) fn handle_request(
             // fail the count check with the retryable ERR_MIGRATION_IN_PROGRESS
             // and the source re-verifies with a FRESH manifest whose cutoff
             // covers the apply, so a skip is always a deferral, never a wedge.
+            //
+            // W11 FIX 2 — that last sentence was FALSE until the count
+            // decision below was taught about this gate. The gate's own
+            // precondition (`source_is_authoritative_complete`) requires
+            // `epoch_current`, and the count decision's superset arm fires on
+            // `exact_entries_verified && completion_epoch_current` — so a
+            // refused prune fell straight through to `actual >= expected`,
+            // KEPT the extras and COMMITTED the shard. Measured in ts17:
+            // 1812 gate refusals, ZERO ERR_MIGRATION_IN_PROGRESS in 5791
+            // lines. `superset_accept_admissible` restores the documented
+            // deferral; see it for the argument.
             let prune_safe_at_cutoff = match (completion_from_node, enumeration_cutoff) {
                 (Some(src), Some(cutoff)) => {
                     let stream_key = format!("node:{}", src.0);
@@ -1888,7 +1899,20 @@ pub(crate) fn handle_request(
             //
             //   * anything not epoch-current (and not reconcile_active): STRICT
             //     `actual == expected_records` (preserves #29).
+            //
+            //   * W11 FIX 2 — an AUTHORITATIVE-COMPLETE source whose #29 prune
+            //     the enumeration-cutoff gate REFUSED: STRICT, even though the
+            //     completion is exact-entries-verified and epoch-current. See
+            //     `superset_accept_admissible`.
             let actual = engine.shard_record_count(shard);
+            let superset_ok =
+                superset_accept_admissible(source_is_authoritative_complete, prune_safe_at_cutoff);
+            if !superset_ok
+                && actual > expected_records
+                && let Some(m) = crate::metrics::migration_metrics()
+            {
+                m.migration_superset_refused_cutoff_gate.inc();
+            }
             let count_ok = if is_heal_completion && exact_entries_verified {
                 // REVERSE-HEAL: the drop-aware per-key verify above IS the
                 // completeness proof. The healed target legitimately holds FEWER
@@ -1899,7 +1923,7 @@ pub(crate) fn handle_request(
                 true
             } else if expected_records == 0 && completion_epoch_current {
                 true
-            } else if exact_entries_verified && completion_epoch_current {
+            } else if exact_entries_verified && completion_epoch_current && superset_ok {
                 actual >= expected_records
             } else {
                 actual == expected_records
@@ -1910,7 +1934,10 @@ pub(crate) fn handle_request(
                     request.request_id,
                     ERR_MIGRATION_IN_PROGRESS,
                     &format!(
-                        "shard {shard} record count mismatch: expected {expected_records}, got {actual}"
+                        "shard {shard} record count mismatch: expected {expected_records}, got \
+                         {actual} (superset_accept={superset_ok}, \
+                         authoritative={source_is_authoritative_complete}, \
+                         prune_safe_at_cutoff={prune_safe_at_cutoff})"
                     ),
                 );
             }
@@ -5603,6 +5630,48 @@ fn repl_slot_for(addr: SocketAddr) -> std::sync::Arc<Mutex<PerAddrSlot>> {
 /// untracked path) leaves legs 2 and 3 unprovable; the historical behavior is
 /// preserved by falling back to leg 1 alone, which is exactly the pre-W10
 /// posture for such deployments.
+/// W11 FIX 2 — may an exact-entries-verified, epoch-current completion be
+/// accepted as a SUPERSET (`actual >= expected`, extras KEPT and the shard
+/// COMMITTED), or must it fall through to strict count equality?
+///
+/// The superset accept exists for the CONCURRENT MULTI-SOURCE shape: several
+/// current-epoch plans stream one shard into this target, so a NON-master
+/// source legitimately sees extras that belong to its peers. That case is
+/// untouched here — `source_is_authoritative_complete` is false for it.
+///
+/// The case this refuses is the other one. When the completion source IS the
+/// shard's authoritative holder, its manifest is a COMPLETE account of the
+/// shard, so every extra local key is either
+///
+///  * a record this node applied from that source's replication stream AFTER
+///    the manifest fold (live, RF-acked — must be kept), or
+///  * genuinely-stale residue the manifest deliberately omits (must not be
+///    served).
+///
+/// The #29 prune is what separates them, and the enumeration-cutoff gate
+/// ([`prune_safe_at_enumeration_cutoff`]) decides whether the manifest is
+/// even ABLE to separate them. When that gate REFUSES, nothing has
+/// distinguished the two — so committing the shard on `actual >= expected`
+/// unfences a possibly-stale extra for client reads, which is exactly the
+/// #29 anti-stale-serving property the strict count check protects.
+///
+/// The refusal is a DEFERRAL, not a wedge — the property the prune gate's own
+/// doc already claimed and did not have: the shard's inbound entry stays
+/// pending (fenced, unservable) and the source re-verifies with a FRESH fold
+/// whose cutoff covers the applies, at which point the prune runs, the extras
+/// are reconciled, and the completion commits.
+///
+/// NOT a weakening of the cutoff gate: the gate stays exactly as strict as
+/// W10 made it (it exists because the prune deleted live RF-acked copies —
+/// armed-05's zero-holder chain). This only stops the count check from
+/// silently accepting what the gate just refused to reconcile.
+fn superset_accept_admissible(
+    source_is_authoritative_complete: bool,
+    prune_safe_at_cutoff: bool,
+) -> bool {
+    !source_is_authoritative_complete || prune_safe_at_cutoff
+}
+
 fn prune_safe_at_enumeration_cutoff(
     applied_after_in_memory: bool,
     our_watermark: Option<u64>,
@@ -27865,8 +27934,15 @@ mod tests {
     /// apply: the create lands on the target at stream seq 1 (i.e. AFTER the
     /// source's fold, whose cutoff — its `last_acked` view of our stream at
     /// fold time — is 0), then the completion arrives with a manifest that
-    /// omits the key. The prune must NOT delete it; the completion still
-    /// verifies as an epoch-current superset.
+    /// omits the key. The prune must NOT delete it.
+    ///
+    /// W11 FIX 2 amended the DISPOSITION (not the retention): the completion
+    /// is now DEFERRED rather than committed. The source is the authoritative
+    /// holder and the cutoff gate refused the reconciling prune, so nothing
+    /// has distinguished "live post-fold apply" from "stale residue" — the
+    /// shard must stay fenced until the source re-folds with a covering
+    /// cutoff. The armed-05 property this test exists for is unchanged and
+    /// still asserted: the record survives, un-tombstoned.
     #[test]
     fn migration_complete_prune_skips_key_applied_after_enumeration_cutoff() {
         let h = DispatchTestHarness::new();
@@ -27959,8 +28035,7 @@ mod tests {
         let resp = handle_request(&req, &h.engine, 8192, Some(&cluster), None, &mut cs, None);
 
         // The post-fold apply is RETAINED: no delete, no PruneReplace
-        // tombstone, and the completion verifies as an epoch-current
-        // superset (every manifest key present, extras kept).
+        // tombstone (the armed-05 property — unchanged by W11 FIX 2).
         assert!(
             h.engine.read_metadata(&key_b).is_ok(),
             "a record applied past the source's enumeration cutoff must not be pruned",
@@ -27970,8 +28045,58 @@ mod tests {
             None,
             "no tombstone may be recorded for the live post-cutoff record",
         );
-        assert_eq!(resp.status, STATUS_OK, "verified superset still completes");
         assert!(h.engine.read_metadata(&key_a).is_ok());
+
+        // W11 FIX 2 — and the completion is DEFERRED, not committed: the
+        // authoritative source's prune was refused, so the extras are
+        // unreconciled and the shard must not be unfenced over them.
+        assert_eq!(resp.status, STATUS_ERROR);
+        let (code, msg) = decode_error_payload(&resp.payload).unwrap();
+        assert_eq!(
+            code, ERR_MIGRATION_IN_PROGRESS,
+            "a refused prune must defer the completion retryably, got: {msg}",
+        );
+        assert!(
+            msg.contains("prune_safe_at_cutoff=false"),
+            "the rejection must name the cutoff gate as the cause: {msg}",
+        );
+        assert!(
+            cluster.has_pending_inbound_shard(shard),
+            "a deferred completion leaves the shard's inbound entry pending",
+        );
+    }
+
+    /// W11 FIX 2 (RED→GREEN) — the enumeration-cutoff gate's doc claimed a
+    /// refused prune "is always a deferral, never a wedge" because the
+    /// retained extras fail the count check with a retryable
+    /// ERR_MIGRATION_IN_PROGRESS. That was FALSE for every
+    /// exact-entries-verified completion: the gate's own precondition
+    /// (`source_is_authoritative_complete`) requires epoch-currency, and the
+    /// count decision's superset arm fires on exactly
+    /// `exact_entries_verified && completion_epoch_current` — so the refused
+    /// prune fell through to `actual >= expected`, KEPT the extras and
+    /// COMMITTED the shard. ts17: 1812 gate refusals, zero
+    /// ERR_MIGRATION_IN_PROGRESS in 5791 lines.
+    ///
+    /// The predicate is pinned directly so the two arms cannot drift apart:
+    /// only an authoritative source with a refused prune loses the superset
+    /// accept. The concurrent-multi-source case Fix B exists for (a
+    /// NON-master source) keeps it unconditionally.
+    #[test]
+    fn superset_accept_requires_a_reconciling_prune_from_an_authoritative_source() {
+        // Authoritative source, prune ran → superset accept stands.
+        assert!(superset_accept_admissible(true, true));
+        // Authoritative source, prune REFUSED → strict count (the fix).
+        assert!(
+            !superset_accept_admissible(true, false),
+            "extras the refused prune could not reconcile must not be \
+             silently accepted and committed",
+        );
+        // Non-authoritative source (concurrent multi-source, Fix B): the
+        // extras belong to its peers and were never this source's business —
+        // the cutoff gate's verdict is irrelevant, accept either way.
+        assert!(superset_accept_admissible(false, false));
+        assert!(superset_accept_admissible(false, true));
     }
 
     /// W10 FIX 3 — a source holding WEAK tombstones for keys of a shard must
