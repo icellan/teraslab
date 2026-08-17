@@ -11508,7 +11508,12 @@ fn collect_manifest_entries(
     Ok(entries)
 }
 
-fn compute_manifest_for_entries(entries: &[(TxKey, u32)]) -> [u8; 32] {
+/// The manifest fold over exact `(txid, generation)` entries.
+///
+/// `pub(crate)` so the OP_MIGRATION_COMPLETE responder computes the SAME hash
+/// it echoes back in a superset confirmation (W12 P2-5). Two definitions of
+/// this fold would let the binding silently stop matching.
+pub(crate) fn compute_manifest_for_entries(entries: &[(TxKey, u32)]) -> [u8; 32] {
     let mut manifest = ManifestHasher::new();
     for (key, generation) in entries {
         manifest.fold(&key.txid, *generation);
@@ -12720,6 +12725,7 @@ fn run_migration_batch_with_origin(
             auth_secret,
             &ALREADY_SERVING_SUPERSET_PROBE,
         )
+        .confirmed
     };
     let verification = verify_already_serving_skips(
         &engine,
@@ -13405,7 +13411,7 @@ fn run_migration_batch_with_origin(
                                     &probe_manifest,
                                     auth_secret,
                                     &RELINQUISH_SUPERSET_PROBE,
-                                )
+                                ).confirmed
                             };
                             if fail_or_relinquish_outbound_task(
                                 &migration,
@@ -14245,7 +14251,7 @@ fn run_migration_batch_with_origin(
                                                 &manifest_for_probe,
                                                 auth_secret,
                                                 &RELINQUISH_SUPERSET_PROBE,
-                                            )
+                                            ).confirmed
                                         };
                                         if fail_or_relinquish_outbound_task(
                                             &migration,
@@ -14692,6 +14698,31 @@ fn rotate_unproven_to_cursor(unproven: &mut [(u16, Vec<NodeId>)], cursor: u16) {
 ///    only because a stale-epoch asker is additionally re-gated under the
 ///    locks (the epoch re-check after the probe) before anything is deleted.
 ///
+/// # Known limitation — generation-only containment (W12 P2-2)
+///
+/// The manifest folds `txid || generation` and nothing else, so "the holder is
+/// at a generation >= mine" is the whole containment test. On the DRAIN path
+/// that primitive was justified by transfer-THEN-relinquish: the source
+/// streams its records first, so a higher generation on the target really is a
+/// SUPERSET of what the source shipped. This path removes the transfer step,
+/// so the prefix property is ASSUMED, not established.
+///
+/// The residual case is a diverged non-owner: a partitioned ex-master that
+/// applied an acked spend (gen 4→5) while the committed holders applied some
+/// other mutation (gen 4→5) reads as `5 >= 5` from both, and the reclaim
+/// destroys the only representation of that spend. Two things bound it today:
+/// a shard suspected of divergence carries a reverse-heal fence, and fenced
+/// shards are skipped ABOVE the proof phase (`has_pending_inbound`); and the
+/// reclaim writes no tombstone, so a holder that later learns of the record
+/// can still re-ship it. Neither is a proof, and content equality is not
+/// checked anywhere on this path.
+///
+/// Closing it properly means carrying a per-record content digest in the
+/// manifest, or routing this decision through the tombstone-aware
+/// manifest-diff (`FLAG_MIGRATION_MANIFEST_DIFF`) that already resolves
+/// direction per record. Until then, treat generation containment as an
+/// assumption of this path, not a guarantee it establishes.
+///
 /// A confirmed superset is NOT "strictly stronger" than a committed handoff:
 /// a handoff is an ACKED TRANSFER, while this is an unacked OBSERVATION of
 /// another node's current state. It is a different, sufficient proof — and it
@@ -14774,7 +14805,8 @@ impl ShardHolderProof for PeerSupersetProof {
             // Fail closed: retain and re-ask next pass.
             return false;
         };
-        confirm_target_holds_superset(
+        let manifest_hash = compute_manifest_for_entries(entries);
+        let answer = confirm_target_holds_superset(
             addr,
             shard,
             self.self_id,
@@ -14782,7 +14814,37 @@ impl ShardHolderProof for PeerSupersetProof {
             entries,
             self.cluster_secret.as_deref().map(Vec::as_slice),
             &ORPHAN_RECLAIM_SUPERSET_PROBE,
-        )
+        );
+        if !answer.confirmed {
+            return false;
+        }
+        // W12 P2-5 — unanimity over several holders needs each answer
+        // ATTRIBUTED. An unbound `STATUS_OK` is enough for the single-responder
+        // drain path but never here.
+        let Some(confirmation) = answer.binding else {
+            tracing::warn!(
+                shard,
+                expected_holder = holder.0,
+                "cluster: orphan-reclaim proof DISCARDED — responder supplied                  no attestation, so its answer cannot be attributed to a holder",
+            );
+            return false;
+        };
+        // W12 P2-5 — verify the answer is bound to the node we meant to ask,
+        // the shard we asked about, the records we shipped, and a version at
+        // least our own. Anything else is not this holder's proof.
+        if !confirmation.attests(shard, holder, topology_epoch, &manifest_hash) {
+            tracing::warn!(
+                shard,
+                expected_holder = holder.0,
+                answered_by = confirmation.responder.0,
+                responder_epoch = confirmation.responder_epoch,
+                probe_epoch = topology_epoch,
+                "cluster: orphan-reclaim proof DISCARDED — confirmation not \
+                 bound to the holder/shard/manifest/version asked about",
+            );
+            return false;
+        }
+        true
     }
 }
 
@@ -15115,31 +15177,25 @@ fn run_orphan_cleanup(
             }
             let mut deleted = 0u64;
             for (key, proven_generation) in &entries {
-                // The proof covers this EXACT image. A record that mutated
-                // after the manifest was folded was never shown to the
-                // holders, so it is not proven elsewhere — skip it and let a
-                // later pass re-prove it. Re-enumerating the shard here
-                // instead would delete keys no holder ever confirmed.
-                match engine.read_metadata(key) {
-                    Ok(meta) => {
-                        // Copy out of the packed field before comparing (an
-                        // unaligned reference to a packed field is UB).
-                        let generation = meta.generation;
-                        if generation != *proven_generation {
-                            continue;
-                        }
-                    }
-                    Err(_) => continue,
-                }
-                // `reclaim_held_copy`, NOT `delete` — see the matching comment
-                // in the evidence-backed loop below for why an authority
-                // tombstone here permanently vetoes the owner's later repair.
-                match engine.reclaim_held_copy(&DeleteRequest {
-                    tx_key: *key,
-                    due_guard: None,
-                }) {
+                // The proof covers this EXACT image, so the delete is gated on
+                // that generation INSIDE the engine's per-tx stripe lock
+                // (W12 P2-3). A record that mutated after the manifest was
+                // folded was never shown to the holders and comes back
+                // `NotDue`; re-enumerating the shard here, or checking the
+                // generation out here where the check is lock-free, would both
+                // let an unconfirmed image be destroyed.
+                match engine.reclaim_held_copy_at_generation(
+                    &DeleteRequest {
+                        tx_key: *key,
+                        due_guard: None,
+                    },
+                    *proven_generation,
+                ) {
                     Ok(()) => deleted += 1,
-                    Err(crate::ops::error::SpendError::TxNotFound) => {}
+                    // Gone already, or moved past the proof — both leave the
+                    // record's fate to a later pass.
+                    Err(crate::ops::error::SpendError::TxNotFound)
+                    | Err(crate::ops::error::SpendError::NotDue) => {}
                     Err(e) => {
                         tracing::warn!(
                             shard,
@@ -17164,6 +17220,101 @@ pub(crate) fn migration_complete_rejection_error(status: u8, payload: &[u8]) -> 
     format!("target rejected: status {status}{detail}")
 }
 
+/// One superset probe's outcome.
+///
+/// Split in two because the two callers need different strengths of evidence,
+/// and collapsing them hid a real hole:
+///
+/// * the DRAIN path (`transfer-then-relinquish`) asks exactly ONE node — the
+///   rightful master, at a known address — and relinquishes only its own
+///   phantom copy. `STATUS_OK` is sufficient there, and that contract is
+///   unchanged.
+/// * the ORPHAN-RECLAIM path asks SEVERAL nodes and requires unanimity, so an
+///   answer that cannot be attributed to a specific node is worthless to it
+///   (W12 P2-5). It requires `binding`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SupersetAnswer {
+    /// The responder returned `STATUS_OK`.
+    confirmed: bool,
+    /// The responder's attestation, when it supplied one.
+    binding: Option<SupersetConfirmation>,
+}
+
+impl SupersetAnswer {
+    /// Not confirmed — rejection, timeout, unreachable, exhausted retries.
+    const fn refused() -> Self {
+        Self {
+            confirmed: false,
+            binding: None,
+        }
+    }
+}
+
+/// What a `STATUS_OK` superset answer attests, decoded from its body.
+///
+/// W12 P2-5 — the answer used to be an empty body, so it was attributable
+/// only to the ADDRESS dialled. Two holder ids resolving to one address let a
+/// single node's single answer satisfy "every holder confirmed", which is
+/// exactly the RF-1 drop unanimity exists to prevent. The responder now names
+/// itself, the shard it checked, its own shard-table version and the manifest
+/// it verified; [`SupersetConfirmation::attests`] is the matching check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SupersetConfirmation {
+    shard: u16,
+    /// The RESPONDER's shard-table version at the moment it answered.
+    responder_epoch: u64,
+    responder: NodeId,
+    manifest_hash: [u8; 32],
+}
+
+impl SupersetConfirmation {
+    /// Wire size: `[shard:u16][responder_epoch:u64][responder:u64][manifest:32]`.
+    const ENCODED_LEN: usize = 2 + 8 + 8 + 32;
+
+    /// Decode a confirmation body. `None` for any body that is absent or
+    /// short — a responder that did not attest its identity has not proven
+    /// anything, and the caller must keep its data.
+    fn decode(payload: &[u8]) -> Option<Self> {
+        if payload.len() < Self::ENCODED_LEN {
+            return None;
+        }
+        let mut manifest_hash = [0u8; 32];
+        manifest_hash.copy_from_slice(&payload[18..50]);
+        Some(Self {
+            shard: u16::from_le_bytes([payload[0], payload[1]]),
+            responder_epoch: u64::from_le_bytes(payload[2..10].try_into().ok()?),
+            responder: NodeId(u64::from_le_bytes(payload[10..18].try_into().ok()?)),
+            manifest_hash,
+        })
+    }
+
+    /// Does this answer actually attest what the asker needs?
+    ///
+    /// All four must hold: it is about the shard we asked about, it came from
+    /// the node we believe we asked (defeats the address-collision case
+    /// above), it covers the exact manifest we shipped, and the responder's
+    /// own version is at least our probe epoch — which is the ordering the
+    /// anti-mutual-reclaim argument in [`ShardHolderProof`] rests on, checked
+    /// HERE rather than delegated to the responder's own staleness gate.
+    fn attests(
+        &self,
+        shard: u16,
+        holder: NodeId,
+        topology_epoch: u64,
+        manifest_hash: &[u8; 32],
+    ) -> bool {
+        // `NodeId(0)` is what an UNCLUSTERED responder reports (it has no
+        // identity to attest) and is also the codebase's inbound sentinel, so
+        // it is never a real holder — refuse it explicitly rather than letting
+        // a zero match a zero.
+        self.responder != NodeId(0)
+            && self.shard == shard
+            && self.responder == holder
+            && self.responder_epoch >= topology_epoch
+            && &self.manifest_hash == manifest_hash
+    }
+}
+
 /// Retry/timeout budget for one [`confirm_target_holds_superset`] call.
 ///
 /// The probe's cost is `retry_delays_ms.len()` attempts, each bounded by
@@ -17236,9 +17387,9 @@ fn confirm_target_holds_superset(
     manifest_entries: &[(TxKey, u32)],
     auth_secret: Option<&[u8]>,
     profile: &SupersetProbeProfile,
-) -> bool {
+) -> SupersetAnswer {
     if manifest_entries.is_empty() {
-        return false;
+        return SupersetAnswer::refused();
     }
     // Wire layout matches `send_migration_complete`'s verify-only frame; the
     // SUPERSET flag selects the containment check on the receiver.
@@ -17266,7 +17417,7 @@ fn confirm_target_holds_superset(
     // target (confirmed superset or a logical reject); `Ok(None)` /  `Err`
     // is a TRANSIENT connection failure (the target's per-IP connection cap
     // resetting the migration burst), which is retried below.
-    let attempt = || -> std::result::Result<Option<bool>, String> {
+    let attempt = || -> std::result::Result<Option<SupersetAnswer>, String> {
         let mut stream = TcpStream::connect_timeout(&target_addr, profile.connect_timeout)
             .map_err(|e| format!("connect: {e}"))?;
         stream
@@ -17277,7 +17428,13 @@ fn confirm_target_holds_superset(
             .map_err(|e| format!("set write timeout: {e}"))?;
         crate::replication::tcp_transport::configure_tcp_keepalive(&stream);
         let response = exchange_frame(&mut stream, &request, auth_secret)?;
-        Ok(Some(response.status == STATUS_OK))
+        if response.status != STATUS_OK {
+            return Ok(Some(SupersetAnswer::refused()));
+        }
+        Ok(Some(SupersetAnswer {
+            confirmed: true,
+            binding: SupersetConfirmation::decode(&response.payload),
+        }))
     };
 
     // The probe competes with the migration pool (up to `migration_pool_size`
@@ -17306,7 +17463,7 @@ fn confirm_target_holds_superset(
         err = %last_err,
         "cluster: superset probe failed after retries — keeping data, rolling back",
     );
-    false
+    SupersetAnswer::refused()
 }
 
 /// Send batched migration-complete handshakes for multiple shards in a
@@ -27478,6 +27635,183 @@ mod tests {
 
         stop.store(true, Ordering::Relaxed);
         acceptor.join().expect("acceptor thread");
+    }
+
+    /// P2-5 — a confirmation must be BOUND to the holder, shard, manifest and
+    /// version it claims to answer for.
+    ///
+    /// The vacuous-unanimity path: two holder ids resolving to ONE address
+    /// (config error, recycled container address, stale entry after a node-id
+    /// change) means one node answers both probes. With an unbound answer that
+    /// single reply satisfies "every holder confirmed" and licenses the very
+    /// RF-1 drop unanimity exists to prevent. The `responder` field is what
+    /// makes the second probe fail.
+    #[test]
+    fn superset_confirmation_attests_only_what_it_is_bound_to() {
+        let manifest = [9u8; 32];
+        let other_manifest = [8u8; 32];
+        let confirmation = SupersetConfirmation {
+            shard: 77,
+            responder_epoch: 12,
+            responder: NodeId(2),
+            manifest_hash: manifest,
+        };
+
+        assert!(
+            confirmation.attests(77, NodeId(2), 12, &manifest),
+            "the exact answer asked for must attest",
+        );
+        assert!(
+            confirmation.attests(77, NodeId(2), 11, &manifest),
+            "a responder AHEAD of the probe epoch still attests",
+        );
+        // The address-collision case: node3's probe answered by node2.
+        assert!(
+            !confirmation.attests(77, NodeId(3), 12, &manifest),
+            "an answer from a different node must NOT satisfy another holder's \
+             probe — this is the vacuous-unanimity path",
+        );
+        assert!(
+            !confirmation.attests(78, NodeId(2), 12, &manifest),
+            "an answer about another shard must not attest",
+        );
+        assert!(
+            !confirmation.attests(77, NodeId(2), 13, &manifest),
+            "a responder BEHIND the probe epoch breaks the version ordering \
+             the anti-mutual-reclaim argument rests on",
+        );
+        assert!(
+            !confirmation.attests(77, NodeId(2), 12, &other_manifest),
+            "an answer about a different manifest must not attest",
+        );
+
+        // An UNCLUSTERED responder has no identity and reports NodeId(0),
+        // which is also the inbound sentinel — a zero must never satisfy a
+        // zero.
+        let unidentified = SupersetConfirmation {
+            responder: NodeId(0),
+            ..confirmation
+        };
+        assert!(
+            !unidentified.attests(77, NodeId(0), 12, &manifest),
+            "NodeId(0) is not an identity and must never attest, even against \
+             a NodeId(0) holder",
+        );
+    }
+
+    /// The two callers need different strengths of evidence, and the type must
+    /// keep them apart. A bare `STATUS_OK` settles the DRAIN question (one
+    /// responder, at a known address, relinquishing only the asker's own
+    /// phantom copy) but must never settle an ORPHAN holder's vote, where
+    /// unanimity is only meaningful if each answer is attributable.
+    #[test]
+    fn superset_answer_separates_bare_confirmation_from_an_attributable_one() {
+        let refused = SupersetAnswer::refused();
+        assert!(!refused.confirmed, "a refusal is not a confirmation");
+        assert!(refused.binding.is_none());
+
+        let bare = SupersetAnswer {
+            confirmed: true,
+            binding: None,
+        };
+        assert!(
+            bare.confirmed,
+            "a bare STATUS_OK still answers the drain path's question",
+        );
+        assert!(
+            bare.binding.is_none(),
+            "…but carries nothing the orphan path can attribute to a holder, \
+             so it can never count toward unanimity",
+        );
+    }
+
+    /// A confirmation body that is absent or truncated is not a proof. Pins
+    /// the fail-closed decode so a responder that never attested its identity
+    /// can never be read as a yes.
+    #[test]
+    fn superset_confirmation_decode_rejects_a_short_body() {
+        assert_eq!(SupersetConfirmation::decode(&[]), None);
+        assert_eq!(
+            SupersetConfirmation::decode(&[0u8; SupersetConfirmation::ENCODED_LEN - 1]),
+            None,
+            "a truncated binding must not decode into a confirmation",
+        );
+
+        let mut body = Vec::new();
+        body.extend_from_slice(&77u16.to_le_bytes());
+        body.extend_from_slice(&12u64.to_le_bytes());
+        body.extend_from_slice(&2u64.to_le_bytes());
+        body.extend_from_slice(&[9u8; 32]);
+        assert_eq!(
+            SupersetConfirmation::decode(&body),
+            Some(SupersetConfirmation {
+                shard: 77,
+                responder_epoch: 12,
+                responder: NodeId(2),
+                manifest_hash: [9u8; 32],
+            }),
+            "a well-formed binding must round-trip the responder's attestation",
+        );
+    }
+
+    /// P2-3 — the generation predicate must be re-validated INSIDE the stripe
+    /// lock the delete takes, not by the caller outside it.
+    ///
+    /// `reclaim_held_copy` has no generation predicate at all, so a caller
+    /// whose authority covers one exact image had no way to express it. Pins
+    /// both directions of the new entry point.
+    #[test]
+    fn reclaim_held_copy_at_generation_refuses_a_moved_record() {
+        use crate::ops::remaining::{DeleteRequest, FreezeRequest};
+
+        let engine = test_engine();
+        let key = tx_key_for_shard(123, 7);
+        create_test_record(&engine, key);
+        let proven = engine.read_metadata(&key).unwrap().generation;
+
+        engine
+            .freeze(&FreezeRequest {
+                tx_key: key,
+                offset: 0,
+                utxo_hash: [0x44u8; 32],
+            })
+            .expect("freeze bumps the generation");
+        let moved = engine.read_metadata(&key).unwrap().generation;
+        assert!(
+            moved > proven,
+            "fixture must advance the generation (proven {proven}, now {moved})",
+        );
+
+        match engine.reclaim_held_copy_at_generation(
+            &DeleteRequest {
+                tx_key: key,
+                due_guard: None,
+            },
+            proven,
+        ) {
+            Err(crate::ops::error::SpendError::NotDue) => {}
+            other => panic!("a moved record must be refused with NotDue, got {other:?}"),
+        }
+        assert!(
+            engine.read_metadata(&key).is_ok(),
+            "the refused record must be left intact",
+        );
+
+        // At the CURRENT generation the same call reclaims.
+        engine
+            .reclaim_held_copy_at_generation(
+                &DeleteRequest {
+                    tx_key: key,
+                    due_guard: None,
+                },
+                moved,
+            )
+            .expect("the proven image must be reclaimable");
+        assert_eq!(
+            engine.shard_record_count(123),
+            0,
+            "reclaiming the proven image must actually free it",
+        );
     }
 
     /// P1-1 (a) — a holder that fails once must not be re-dialled for every

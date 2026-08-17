@@ -1391,13 +1391,51 @@ pub(crate) fn handle_request(
                         );
                     }
                 }
+                // W12 P2-1 — the containment check above proves VISIBILITY,
+                // not DURABILITY: with `redo_buffered` on (the default) these
+                // records can be live in the index yet unflushed, while the
+                // asker's reclaim emits an fsynced FreeRegion. A crash inside
+                // that window loses records the asker durably deleted on the
+                // strength of this answer. Make the proof mean what the caller
+                // needs it to mean before saying yes.
+                if let Err(err) = engine.flush_all_redo() {
+                    return error_response(
+                        request.request_id,
+                        ERR_MIGRATION_IN_PROGRESS,
+                        &format!("shard {shard} superset probe: durability flush failed: {err}",),
+                    );
+                }
+                // W12 P2-5 — BIND the answer. An empty OK body is attributable
+                // only to the address that was dialled, so two holder ids
+                // resolving to one address (config error, recycled container
+                // address, stale entry after a node-id change) let ONE node's
+                // single answer satisfy "every holder confirmed" — the RF-1
+                // drop unanimity exists to prevent. Echoing the responder's
+                // identity, its shard-table version and the manifest it
+                // actually checked lets the asker verify it heard from the
+                // node it believes it asked, about the right shard and the
+                // right records. The version also lets the asker enforce the
+                // ordering that prevents mutual reclaim itself, instead of
+                // trusting this side's staleness gate.
+                // Layout: [shard:u16][responder_epoch:u64][responder:u64][manifest:32]
+                let (responder_id, responder_epoch) = match cluster {
+                    Some(c) => (c.self_id().0, c.shard_table().read().version),
+                    None => (0u64, 0u64),
+                };
+                let mut ok_payload = Vec::with_capacity(50);
+                ok_payload.extend_from_slice(&shard.to_le_bytes());
+                ok_payload.extend_from_slice(&responder_epoch.to_le_bytes());
+                ok_payload.extend_from_slice(&responder_id.to_le_bytes());
+                ok_payload.extend_from_slice(
+                    &crate::cluster::coordinator::compute_manifest_for_entries(entries),
+                );
                 // Every source entry is present locally at a generation >= the
                 // source's: the target holds a superset (equal or newer). No
                 // mutation.
                 return ResponseFrame {
                     request_id: request.request_id,
                     status: STATUS_OK,
-                    payload: Vec::new(),
+                    payload: ok_payload,
                 };
             }
 
