@@ -3804,6 +3804,29 @@ struct DebouncePending {
     first_observed: Instant,
     /// When `members` last *changed* (drives the trailing-edge `window`).
     last_changed: Instant,
+    /// W10 FIX 4 — members observed LEAVING at any point during this burst
+    /// (present in an earlier observation's target, absent from a later
+    /// one). A member later RE-ADDED by an observation (e.g. a
+    /// same-incarnation Dead→Alive revival via stale gossip) STAYS flagged:
+    /// the proposer re-validates every burst-departed member against
+    /// current SWIM state immediately before broadcast, so a
+    /// departed-and-not-directly-proven-alive member cannot ride a stale
+    /// alive-set into a committed term (the scenario-07 read-outage shape).
+    departed: Vec<NodeId>,
+}
+
+/// W10 FIX 4 — what [`TopologyDebounce::take_due`] hands the proposer: the
+/// settled member set plus every member observed departing during the burst
+/// that produced it. The proposer must re-validate `members` against current
+/// SWIM state before proposing (see the coordinator's
+/// `revalidate_settled_members`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SettledMembership {
+    /// The settled (latest-observed) member set — the proposal target.
+    pub members: Vec<NodeId>,
+    /// Members observed leaving at any point during the burst, whether or
+    /// not a later observation re-added them.
+    pub departed_during_burst: Vec<NodeId>,
 }
 
 impl TopologyDebounce {
@@ -3845,6 +3868,14 @@ impl TopologyDebounce {
                 // Same set re-observed: keep counting down, do not re-arm.
             }
             Some(p) => {
+                // W10 FIX 4 — a member of the previous target absent from
+                // the new set DEPARTED during this burst; record it (a later
+                // re-add does NOT unflag — see the field doc).
+                for m in &p.members {
+                    if !members.contains(m) && !p.departed.contains(m) {
+                        p.departed.push(*m);
+                    }
+                }
                 p.members = members.to_vec();
                 p.last_changed = now;
             }
@@ -3853,6 +3884,7 @@ impl TopologyDebounce {
                     members: members.to_vec(),
                     first_observed: now,
                     last_changed: now,
+                    departed: Vec::new(),
                 });
             }
         }
@@ -3871,12 +3903,16 @@ impl TopologyDebounce {
     }
 
     /// If a pending burst is due at `now`, consume and return its settled
-    /// member set; otherwise return `None` and leave the state intact. The
-    /// caller feeds the returned set to
+    /// membership (member set + burst departures); otherwise return `None`
+    /// and leave the state intact. The caller re-validates the set against
+    /// current SWIM state (W10 FIX 4) and feeds the result to
     /// [`TopologyAuthority::on_membership_changed`].
-    pub fn take_due(&mut self, now: Instant) -> Option<Vec<NodeId>> {
+    pub fn take_due(&mut self, now: Instant) -> Option<SettledMembership> {
         if self.is_due(now) {
-            self.pending.take().map(|p| p.members)
+            self.pending.take().map(|p| SettledMembership {
+                members: p.members,
+                departed_during_burst: p.departed,
+            })
         } else {
             None
         }
@@ -5996,7 +6032,10 @@ mod tests {
         // 500ms after the last change (t0+300 → t0+800): due, ONCE, with
         // the settled 5-member set.
         let fired = deb.take_due(t0 + Duration::from_millis(800));
-        assert_eq!(fired, Some(members(&[1, 2, 3, 4, 5])));
+        assert_eq!(
+            fired.as_ref().map(|s| s.members.clone()),
+            Some(members(&[1, 2, 3, 4, 5]))
+        );
         // Consumed: a second take returns nothing.
         assert_eq!(deb.take_due(t0 + Duration::from_millis(800)), None);
         assert!(!deb.has_pending());
@@ -6013,7 +6052,8 @@ mod tests {
         deb.observe(&members(&[1, 2]), t0);
         // Window elapses with {1,2} stable → first proposal.
         assert_eq!(
-            deb.take_due(t0 + Duration::from_millis(600)),
+            deb.take_due(t0 + Duration::from_millis(600))
+                .map(|s| s.members),
             Some(members(&[1, 2])),
         );
 
@@ -6021,7 +6061,8 @@ mod tests {
         deb.observe(&members(&[1, 2, 3]), t0 + Duration::from_millis(1000));
         assert_eq!(deb.take_due(t0 + Duration::from_millis(1400)), None);
         assert_eq!(
-            deb.take_due(t0 + Duration::from_millis(1600)),
+            deb.take_due(t0 + Duration::from_millis(1600))
+                .map(|s| s.members),
             Some(members(&[1, 2, 3])),
         );
     }
@@ -6041,9 +6082,19 @@ mod tests {
         deb.observe(&members(&[1, 2]), t0 + Duration::from_millis(100)); // 3 dies
         deb.observe(&members(&[1, 2, 3]), t0 + Duration::from_millis(200)); // 3 back
 
-        // Last change at t0+200; fires at t0+700 with the ORIGINAL set.
+        // Last change at t0+200; fires at t0+700 with the ORIGINAL set —
+        // and (W10 FIX 4) node 3's mid-burst departure is REPORTED so the
+        // proposer can re-validate it against current SWIM state.
         let fired = deb.take_due(t0 + Duration::from_millis(700));
-        assert_eq!(fired, Some(members(&[1, 2, 3])));
+        assert_eq!(
+            fired.as_ref().map(|s| s.members.clone()),
+            Some(members(&[1, 2, 3]))
+        );
+        assert_eq!(
+            fired.as_ref().map(|s| s.departed_during_burst.clone()),
+            Some(members(&[3])),
+            "the flapped-out member is reported as departed-during-burst",
+        );
 
         // Prove the net-zero property end-to-end: feeding this to an
         // authority already committed on {1,2,3} produces NO proposal.
@@ -6071,7 +6122,8 @@ mod tests {
         assert_eq!(auth.committed_members(), members(&[1, 2, 3]));
         // Now the debounced (flap-settled) set is identical → no proposal.
         assert!(
-            auth.on_membership_changed(&fired.unwrap()).is_none(),
+            auth.on_membership_changed(&fired.unwrap().members)
+                .is_none(),
             "flap that settles back to the committed set must not re-propose",
         );
     }
@@ -9034,6 +9086,7 @@ mod tests {
             under_replication_sweep_enabled: false,
             replica_abort_forced_resync_enabled: true,
             migration_vetoed_reduction_enabled: false,
+            migration_weak_veto_arbitration_enabled: true,
             probe_interval: Duration::from_millis(100),
             suspicion_timeout: Duration::from_secs(1),
             cluster_secret: None,

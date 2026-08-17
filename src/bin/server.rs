@@ -1850,6 +1850,7 @@ fn main() {
             under_replication_sweep_enabled: config.under_replication_sweep_enabled,
             replica_abort_forced_resync_enabled: config.replica_abort_forced_resync_enabled,
             migration_vetoed_reduction_enabled: config.migration_vetoed_reduction_enabled,
+            migration_weak_veto_arbitration_enabled: config.migration_weak_veto_arbitration_enabled,
             probe_interval,
             suspicion_timeout: std::time::Duration::from_millis(config.swim_suspicion_timeout_ms),
             cluster_secret: config

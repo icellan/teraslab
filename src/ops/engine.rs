@@ -405,6 +405,12 @@ pub struct Engine {
     /// protect nothing, GC unchanged.
     tombstone_gc_guard:
         std::sync::OnceLock<std::sync::Arc<crate::cluster::migration::AtomicShardBitmap>>,
+    /// W10 FIX 1 — per-(source-node, cluster-shard) high-water mark of the
+    /// replication-stream sequence this node has APPLIED, backing the
+    /// enumeration-cutoff prune gate in the `OP_MIGRATION_COMPLETE` handler.
+    /// See [`Self::note_replica_shard_apply`] /
+    /// [`Self::replica_shard_applied_after`] for the safety argument.
+    replica_shard_seq: crate::ops::engine::ReplicaShardSeqTracker,
     /// Segments the LAST checkpoint's defrag compaction pass relocated live
     /// records out of. Published by the checkpoint via
     /// [`Self::record_last_checkpoint_defrag`] and read by the `/status`
@@ -626,6 +632,86 @@ pub struct PreservationExpiry {
     pub redo_range: Option<(u64, u64)>,
 }
 
+/// W10 FIX 1 — per-(source-node, cluster-shard) high-water mark of the
+/// replication-stream sequence this node has APPLIED.
+///
+/// Backs the enumeration-cutoff gate on the `OP_MIGRATION_COMPLETE` #29 prune
+/// (armed-05 data loss): a completion's manifest is folded on the SOURCE at a
+/// point in time; any record this node applied from that source's replication
+/// stream AFTER that fold is invisible to the manifest, so pruning it deletes
+/// a live acked copy. The completion frame carries the source's stream cutoff
+/// at fold time; this tracker answers "did I apply ANY write to this shard
+/// from that source past the cutoff?".
+///
+/// Keyed by source node id because each master numbers its outbound dense
+/// replica stream independently — sequence magnitudes are NOT comparable
+/// across sources. Mixing sources under one key could report a stale high
+/// value from an old master against a new master's (lower) cutoff; keeping
+/// them separate makes a spurious skip (safe: the prune is merely deferred
+/// and retried on a fresh manifest) the only cross-source failure mode, and a
+/// missed skip (unsafe: deleting a post-fold apply) impossible — the
+/// dangerous apply always comes from the SAME source that sent the
+/// completion, in the same sequence domain as its cutoff.
+///
+/// # W10 review P2-4 — the cross-source premise this gate DEPENDS ON
+///
+/// "The dangerous apply always comes from the same source that sent the
+/// completion" is not self-evident: it holds only because a SUPERSEDED
+/// master's fan-out cannot reach this node's engine in the first place. The
+/// receiver's cluster-key / epoch gate
+/// (`replication::receiver::handle_replica_batch_with_tracker_and_master_lookup`,
+/// the `batch.cluster_key == 0 && local_cluster_key != 0` rejection and the
+/// serving-master lookup beside it) rejects a stale-epoch or misrouted batch
+/// with `ERR_STALE_EPOCH` BEFORE any op applies — so a deposed master can
+/// neither apply a record here nor bump this tracker under its own key while
+/// the current master's completion is in flight.
+///
+/// If that gate is ever LOOSENED (a wildcard cluster-key accepted in
+/// clustered mode, a stale-epoch batch admitted "just to converge"), this
+/// per-source keying silently stops being sufficient: writes from node X
+/// could land while node Y's completion is verified, and Y's cutoff says
+/// nothing about X's applies. The prune gate would then need a
+/// cross-source guard (e.g. refuse whenever ANY source applied to the shard
+/// past its own last-known position). Do not relax that gate without
+/// revisiting this.
+///
+/// Each per-source array is lazily created on first apply, initialized to the
+/// stream's persisted watermark at that moment so applies that predate this
+/// process (already folded into the watermark) are conservatively treated as
+/// at-watermark rather than at zero.
+pub struct ReplicaShardSeqTracker {
+    per_source:
+        parking_lot::RwLock<std::collections::HashMap<u64, Arc<Vec<std::sync::atomic::AtomicU64>>>>,
+}
+
+impl ReplicaShardSeqTracker {
+    fn new() -> Self {
+        Self {
+            per_source: parking_lot::RwLock::new(std::collections::HashMap::new()),
+        }
+    }
+
+    fn shard_slots(
+        &self,
+        source_node: u64,
+        init_watermark: u64,
+    ) -> Arc<Vec<std::sync::atomic::AtomicU64>> {
+        if let Some(slots) = self.per_source.read().get(&source_node) {
+            return slots.clone();
+        }
+        let mut map = self.per_source.write();
+        map.entry(source_node)
+            .or_insert_with(|| {
+                Arc::new(
+                    (0..crate::cluster::shards::NUM_SHARDS)
+                        .map(|_| std::sync::atomic::AtomicU64::new(init_watermark))
+                        .collect(),
+                )
+            })
+            .clone()
+    }
+}
+
 impl Engine {
     fn external_ref_for_create(req: &CreateRequest) -> Result<Option<ExternalRef>, CreateError> {
         if !req.is_external {
@@ -788,6 +874,7 @@ impl Engine {
             last_durable_height_path: std::sync::OnceLock::new(),
             tombstone_log: std::sync::OnceLock::new(),
             tombstone_gc_guard: std::sync::OnceLock::new(),
+            replica_shard_seq: ReplicaShardSeqTracker::new(),
             last_checkpoint_compacted: std::sync::atomic::AtomicU64::new(0),
             last_checkpoint_reclaimed: std::sync::atomic::AtomicU64::new(0),
             blob_store: None,
@@ -2225,6 +2312,97 @@ impl Engine {
         self.tombstone_log
             .get()
             .is_some_and(|log| log.blocks_heal_apply(key, incoming_generation))
+    }
+
+    /// W10 FIX 2 — weak-veto arbitration clear (the target half of the
+    /// `OP_MIGRATION_WEAK_VETO_ARBITRATE` handshake): drop `key`'s tombstone
+    /// via the TS-1 clear path ONLY when its cause is WEAK (`PruneReplace` /
+    /// `CompensatedCreate`). A strong cause (`ClientDelete` / `Dah` /
+    /// unrecognized) is refused; an absent tombstone (or a disabled tombstone
+    /// subsystem) reports `Absent` so retried rounds are idempotent. Cause
+    /// check and removal are atomic under the tombstone shard lock — see
+    /// [`crate::ops::tombstone::TombstoneLog::clear_weak`] for the full
+    /// safety argument.
+    pub fn arbitrate_clear_weak_tombstone(
+        &self,
+        key: &TxKey,
+    ) -> crate::ops::tombstone::WeakTombstoneClear {
+        match self.tombstone_log.get() {
+            Some(log) => log.clear_weak(key),
+            None => crate::ops::tombstone::WeakTombstoneClear::Absent,
+        }
+    }
+
+    /// W10 FIX 3 — the keys of CLUSTER shard `shard` this node holds
+    /// WEAK-cause tombstones for (`PruneReplace` / `CompensatedCreate`).
+    /// A migration source declares these in its completion frame so the
+    /// target does not treat their omission from the manifest as
+    /// deletion-intent (the omission may be this node's own #29 prune
+    /// damage). Empty when tombstones are disabled.
+    pub fn weak_tombstone_keys_for_shard(&self, shard: u16) -> Vec<TxKey> {
+        match self.tombstone_log.get() {
+            Some(log) => log
+                .weak_tombstone_keys()
+                .into_iter()
+                .filter(|k| crate::cluster::shards::ShardTable::shard_for_key(k) == shard)
+                .collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// W10 FIX 1 — record that a replication-stream op from `source_node` was
+    /// applied (or is about to be applied) to `key`'s cluster shard at stream
+    /// sequence `seq`.
+    ///
+    /// Called by the replication receiver for every TRACKED (dense-stream,
+    /// non-migration, non-out-of-band) op, BEFORE the engine apply — a bump
+    /// for an apply that then fails only over-approximates (a spurious prune
+    /// skip, the safe direction), while bumping after the apply would open a
+    /// window in which the `OP_MIGRATION_COMPLETE` prune enumerates the
+    /// freshly applied key but reads a stale high-water and deletes it.
+    ///
+    /// `stream_watermark` is the stream's persisted applied watermark before
+    /// the current batch; it seeds the per-source array on first contact
+    /// after boot so pre-restart applies (which the in-memory tracker never
+    /// saw) are conservatively treated as applied at the watermark.
+    pub fn note_replica_shard_apply(
+        &self,
+        source_node: u64,
+        key: &TxKey,
+        seq: u64,
+        stream_watermark: u64,
+    ) {
+        let shard = crate::cluster::shards::ShardTable::shard_for_key(key) as usize;
+        let slots = self
+            .replica_shard_seq
+            .shard_slots(source_node, stream_watermark);
+        if let Some(slot) = slots.get(shard) {
+            slot.fetch_max(seq, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    /// W10 FIX 1 — has this node applied ANY tracked replication-stream write
+    /// from `source_node` to `shard` at a sequence STRICTLY past `cutoff`?
+    ///
+    /// `true` ⇒ the source's manifest for `shard`, folded at `cutoff`, may
+    /// omit a live record this node holds — the #29 prune must be skipped
+    /// (retain-and-retry: the source re-verifies with a fresh manifest whose
+    /// cutoff covers the apply).
+    ///
+    /// Strict `>` is sound because every NEW-content op is labeled above the
+    /// receiver's stream watermark at label time, and the cutoff the source
+    /// stamps (its `last_acked` view of that watermark at fold time) is a
+    /// lower bound of the watermark — so a post-fold create always lands
+    /// strictly past the cutoff, while ops acked before the fold (which the
+    /// manifest provably covers) sit at or below it.
+    pub fn replica_shard_applied_after(&self, source_node: u64, shard: u16, cutoff: u64) -> bool {
+        let slots = match self.replica_shard_seq.per_source.read().get(&source_node) {
+            Some(slots) => slots.clone(),
+            None => return false,
+        };
+        slots
+            .get(shard as usize)
+            .is_some_and(|slot| slot.load(std::sync::atomic::Ordering::Acquire) > cutoff)
     }
 
     /// Persist the tombstone log at a checkpoint (retention GC + durable write +

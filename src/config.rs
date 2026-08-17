@@ -1557,6 +1557,27 @@ pub struct ServerConfig {
     /// `teraslab_migration_completion_manifest_reduced_vetoed_total`.
     pub migration_vetoed_reduction_enabled: bool,
 
+    /// W10 FIX 2 / review P2-6 — allow WEAK-veto ARBITRATION on the migration
+    /// completion path (`OP_MIGRATION_WEAK_VETO_ARBITRATE`).
+    ///
+    /// Default ON. A completion vetoed by a WEAK-cause tombstone
+    /// (`PruneReplace` / `CompensatedCreate`) on the target otherwise cycles
+    /// veto -> terminal abort -> delayed self-retry -> re-veto FOREVER: a
+    /// created-once record is generation 0 permanently, so the weak causes'
+    /// "a strictly-newer image heals in" window is structurally vacuous. With
+    /// this armed, the shard's epoch-authoritative source holding a LIVE copy
+    /// instructs the target to drop the weak marker and re-pushes the record
+    /// through the normal replica-create apply (generation guard intact).
+    ///
+    /// A `ClientDelete` / `Dah` veto is NEVER arbitrable regardless of this
+    /// flag — the unconditional anti-resurrection posture is not
+    /// configurable. Gates BOTH directions on the node that sets it: it
+    /// neither initiates arbitration nor honours an inbound request, so
+    /// disabling is a complete local rollback of the mechanism. Turning it
+    /// OFF restores the pre-W10 disposition: the stranded shard rolls back to
+    /// the source and stays under-replicated until operator action.
+    pub migration_weak_veto_arbitration_enabled: bool,
+
     /// SWIM probe interval in milliseconds.
     pub swim_probe_interval_ms: u64,
 
@@ -1854,6 +1875,7 @@ impl Default for ServerConfig {
             under_replication_sweep_enabled: false,
             replica_abort_forced_resync_enabled: true,
             migration_vetoed_reduction_enabled: false,
+            migration_weak_veto_arbitration_enabled: true,
             swim_probe_interval_ms: 200,
             swim_suspicion_timeout_ms: 5000,
             topology_propose_timeout_ms: 0,
