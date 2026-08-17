@@ -616,6 +616,24 @@ pub struct MigrationManager {
     /// restart, and coalescing by design — multiple failed dispositions
     /// before a drain collapse into one arm.
     failed_batch_retry_arm: bool,
+    /// W9 — pending resync arm set by a REPLICA-side terminal abort
+    /// (`terminally_abort_unshippable_task`, which retires the task WITHOUT
+    /// touching the shard table, so diff-based re-heal never re-plans the
+    /// fill) and drained by the coordinator event loop, which FORCE-arms the
+    /// event-repair trigger — deliberately NOT gated on
+    /// `under_replication_sweep_enabled`, because in sweep-off clusters this
+    /// signal is the ONLY driver that retries the fill (with the W9
+    /// CompensatedCreate tombstone the retry now succeeds instead of
+    /// re-vetoing). Same transient/coalescing shape as
+    /// [`Self::failed_batch_retry_arm`]: never persisted, reset on restart.
+    replica_abort_resync_arm: bool,
+    /// W9 Part B (review P1-2c) — whether a replica-side terminal abort may
+    /// leave the resync arm at all (see `Config`
+    /// `replica_abort_forced_resync_enabled`; default ON). Set once at
+    /// coordinator construction; carried here so the abort site (a free fn
+    /// with no config access) reads it lock-local, mirroring
+    /// [`Self::vetoed_reduction_enabled`]. Never persisted.
+    replica_abort_forced_resync_enabled: bool,
     /// W8 review P0-2 — while set, [`Self::cleanup_completed`] PRESERVES
     /// `Failed` entries (delegating to
     /// [`Self::cleanup_completed_keep_failed`]) so the durable retry queue
@@ -666,6 +684,8 @@ impl MigrationManager {
             committed_handoffs: std::collections::HashMap::new(),
             next_attempt: 1,
             failed_batch_retry_arm: false,
+            replica_abort_resync_arm: false,
+            replica_abort_forced_resync_enabled: true,
             failed_retry_hold: false,
             vetoed_reduction_enabled: false,
             manifest_mismatch_streaks: std::collections::HashMap::new(),
@@ -701,6 +721,34 @@ impl MigrationManager {
     /// with a fresh manifest and deserves fresh bookkeeping).
     pub fn clear_completion_manifest_mismatch(&mut self, shard: u16) {
         self.manifest_mismatch_streaks.remove(&shard);
+    }
+
+    /// W9 Part B — arm/disarm the replica-abort forced resync (default ON;
+    /// set once at coordinator construction from
+    /// `replica_abort_forced_resync_enabled`).
+    pub fn set_replica_abort_forced_resync_enabled(&mut self, enabled: bool) {
+        self.replica_abort_forced_resync_enabled = enabled;
+    }
+
+    /// W9 — record that a REPLICA-side migration task was terminally aborted
+    /// at this node (the outbound source), leaving its shard under-RF with no
+    /// re-planner. The coordinator event loop drains this and force-arms the
+    /// event-repair pass (not gated on the sweep flag, but gated on the
+    /// committed `replica_abort_forced_resync_enabled` policy — review
+    /// P1-2c: a disabled policy records nothing, restoring the documented
+    /// pre-W9 disposition). Idempotent / coalescing: repeated aborts before
+    /// a drain collapse into one arm.
+    pub fn arm_replica_abort_resync(&mut self) {
+        if self.replica_abort_forced_resync_enabled {
+            self.replica_abort_resync_arm = true;
+        }
+    }
+
+    /// W9 — drain the pending replica-abort resync arm. Returns `true` exactly
+    /// once per armed window ([`Self::arm_replica_abort_resync`]); subsequent
+    /// calls return `false` until a new replica-side terminal abort arms again.
+    pub fn take_replica_abort_resync_arm(&mut self) -> bool {
+        std::mem::take(&mut self.replica_abort_resync_arm)
     }
 
     /// W8 review P0-1 — arm/disarm tombstone-vetoed manifest reduction for

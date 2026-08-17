@@ -146,6 +146,25 @@ const OP_EXPIRE_PRESERVATION: u8 = 19;
 /// `OP_CHUNK` parts of at most [`CHUNK_PAYLOAD_MAX`] bytes and the receiver
 /// reassembles in bounded staging, applying the inner op on the last part.
 const OP_CHUNK: u8 = 20;
+/// W9: a COMPENSATING delete — the fan-out/re-emit of a create rollback
+/// (`server::dispatch::compensate_replication_failure`'s Create arm). Same
+/// 32-byte body as [`OP_DELETE`]; the TAG carries the
+/// [`crate::ops::tombstone::DeleteCause`], so the receiver records a
+/// generation-OVERRIDABLE `CompensatedCreate` tombstone instead of an
+/// unconditional `ClientDelete` veto (which permanently blocked every
+/// heal/migration create of the surviving client-acked copy — the CI-proven
+/// acked-write-loss chain). A distinct tag, not appended fields, for the same
+/// fail-closed rolling-upgrade reason as [`OP_EXPIRE_PRESERVATION`]: an
+/// unknown tag fails the batch instead of silently decoding a prefix.
+///
+/// Review P2-6 — rolling-upgrade noise: the fail-closed rejection means a
+/// compensation intent fanned toward a NOT-YET-UPGRADED peer keeps failing
+/// (and its durable intent keeps retrying) until that peer upgrades — visible
+/// as repeated batch errors / pending-intent retries during the upgrade
+/// window. That is the intended trade (ordered upgrade, no silent
+/// misinterpretation), not a defect; the retries converge on their own once
+/// the peer understands tag 21.
+const OP_DELETE_COMPENSATED: u8 = 21;
 
 /// Upper bound on one [`ReplicaOp::OpChunk`] payload slice.
 ///
@@ -317,10 +336,13 @@ pub enum ReplicaOp {
     /// re-emit (`cluster::coordinator::redo_entry_to_replica_op`). NOT emitted
     /// by the DAH sweep, which is per-holder local GC.
     ///
-    /// The receiver applies it via `Engine::delete`
-    /// (`RemovalAuthority::Authoritative`), so the replica also records a
-    /// deletion tombstone — the veto that stops a later reverse-heal pull
-    /// resurrecting the key.
+    /// The receiver applies it via `Engine::delete` /
+    /// `Engine::delete_compensated_create` (both
+    /// `RemovalAuthority::Authoritative`, selected by `cause`), so the replica
+    /// also records a deletion tombstone — the veto that stops a later
+    /// reverse-heal pull resurrecting the key. A `ClientDelete` tombstone
+    /// vetoes unconditionally; a `CompensatedCreate` one is overridable by a
+    /// live copy at-or-ahead of its generation (W9).
     ///
     /// Carries no `master_generation` idempotency token: it is an idempotent
     /// remove keyed on `tx_key`, and an already-absent record resolves to
@@ -330,6 +352,14 @@ pub enum ReplicaOp {
     /// generation sync (the other producer of that NAK) out of this path.
     Delete {
         tx_key: TxKey,
+        /// W9 — why the record is being removed. Selects the wire tag
+        /// ([`OP_DELETE`] for `ClientDelete`, [`OP_DELETE_COMPENSATED`] for
+        /// `CompensatedCreate`) and, on the receiver, the
+        /// [`crate::ops::tombstone::TombstoneCause`] the applying node
+        /// records: the client delete keeps its unconditional RULE-DS veto
+        /// (#78), the compensation rollback records the
+        /// generation-overridable `CompensatedCreate` instead.
+        cause: crate::ops::tombstone::DeleteCause,
     },
     PruneSlot {
         tx_key: TxKey,
@@ -773,8 +803,11 @@ impl ReplicaOp {
                 buf.extend_from_slice(&(payload.len() as u32).to_le_bytes());
                 buf.extend_from_slice(payload);
             }
-            ReplicaOp::Delete { tx_key } => {
-                buf.push(OP_DELETE);
+            ReplicaOp::Delete { tx_key, cause } => {
+                buf.push(match cause {
+                    crate::ops::tombstone::DeleteCause::ClientDelete => OP_DELETE,
+                    crate::ops::tombstone::DeleteCause::CompensatedCreate => OP_DELETE_COMPENSATED,
+                });
                 buf.extend_from_slice(&tx_key.txid);
             }
             ReplicaOp::PruneSlot { tx_key, offset } => {
@@ -1067,11 +1100,16 @@ impl ReplicaOp {
                     1 + pos,
                 ))
             }
-            OP_DELETE => {
+            OP_DELETE | OP_DELETE_COMPENSATED => {
                 need(rest, 32)?;
                 Ok((
                     ReplicaOp::Delete {
                         tx_key: read_key(rest),
+                        cause: if op_type == OP_DELETE_COMPENSATED {
+                            crate::ops::tombstone::DeleteCause::CompensatedCreate
+                        } else {
+                            crate::ops::tombstone::DeleteCause::ClientDelete
+                        },
                     },
                     33,
                 ))
@@ -1715,7 +1753,10 @@ mod tests {
 
         let batch = ReplicaBatch {
             first_sequence: 42,
-            ops: vec![ReplicaOp::Delete { tx_key: key(3) }],
+            ops: vec![ReplicaOp::Delete {
+                tx_key: key(3),
+                cause: crate::ops::tombstone::DeleteCause::ClientDelete,
+            }],
             trace_ctx: None,
             source_node_id: Some(7),
             cluster_key: 99,
@@ -1882,7 +1923,10 @@ mod tests {
                 cold_data: Some(vec![0xDD; 50]),
                 is_external: false,
             },
-            ReplicaOp::Delete { tx_key: key(12) },
+            ReplicaOp::Delete {
+                tx_key: key(12),
+                cause: crate::ops::tombstone::DeleteCause::ClientDelete,
+            },
             ReplicaOp::PruneSlot {
                 tx_key: key(13),
                 offset: 99,
@@ -2091,7 +2135,10 @@ mod tests {
 
         let tiny = ReplicaBatch {
             first_sequence: 42,
-            ops: vec![ReplicaOp::Delete { tx_key: key(6) }],
+            ops: vec![ReplicaOp::Delete {
+                tx_key: key(6),
+                cause: crate::ops::tombstone::DeleteCause::ClientDelete,
+            }],
             trace_ctx: None,
             source_node_id: None,
             cluster_key: 0,
@@ -2201,6 +2248,42 @@ mod tests {
         let (decoded, consumed) = ReplicaOp::deserialize(&bytes).unwrap();
         assert_eq!(decoded, op);
         assert_eq!(consumed, bytes.len());
+    }
+
+    /// W9 — the two delete causes round-trip on distinct tags: `ClientDelete`
+    /// stays on the legacy [`OP_DELETE`] tag 12 (byte-identical to pre-W9), and
+    /// `CompensatedCreate` travels on [`OP_DELETE_COMPENSATED`] tag 21 with the
+    /// same 32-byte body — the TAG is the cause, so an old peer fails closed
+    /// (`UnknownOp`) instead of silently applying a compensated delete as a
+    /// client delete.
+    #[test]
+    fn delete_cause_round_trips_on_distinct_tags() {
+        use crate::ops::tombstone::DeleteCause;
+
+        let client = ReplicaOp::Delete {
+            tx_key: key(5),
+            cause: DeleteCause::ClientDelete,
+        };
+        let bytes = client.serialize();
+        assert_eq!(bytes[0], OP_DELETE, "ClientDelete keeps the legacy tag");
+        assert_eq!(bytes.len(), 33);
+        let (decoded, consumed) = ReplicaOp::deserialize(&bytes).unwrap();
+        assert_eq!(decoded, client);
+        assert_eq!(consumed, 33);
+
+        let comp = ReplicaOp::Delete {
+            tx_key: key(6),
+            cause: DeleteCause::CompensatedCreate,
+        };
+        let bytes = comp.serialize();
+        assert_eq!(
+            bytes[0], OP_DELETE_COMPENSATED,
+            "CompensatedCreate travels on its own tag"
+        );
+        assert_eq!(bytes.len(), 33, "same 32-byte body as OP_DELETE");
+        let (decoded, consumed) = ReplicaOp::deserialize(&bytes).unwrap();
+        assert_eq!(decoded, comp);
+        assert_eq!(consumed, 33);
     }
 
     #[test]
@@ -2568,7 +2651,10 @@ mod tests {
     fn replication_batch_source_node_id_roundtrips() {
         let batch = ReplicaBatch {
             first_sequence: 88,
-            ops: vec![ReplicaOp::Delete { tx_key: key(8) }],
+            ops: vec![ReplicaOp::Delete {
+                tx_key: key(8),
+                cause: crate::ops::tombstone::DeleteCause::ClientDelete,
+            }],
             trace_ctx: None,
             source_node_id: Some(42),
             cluster_key: 0,
@@ -2589,7 +2675,10 @@ mod tests {
     fn replication_batch_without_trace_context_roundtrips_zero_bytes() {
         let batch = ReplicaBatch {
             first_sequence: 7,
-            ops: vec![ReplicaOp::Delete { tx_key: key(1) }],
+            ops: vec![ReplicaOp::Delete {
+                tx_key: key(1),
+                cause: crate::ops::tombstone::DeleteCause::ClientDelete,
+            }],
             trace_ctx: None,
             source_node_id: None,
             cluster_key: 0,
@@ -2611,7 +2700,10 @@ mod tests {
         // Any leading byte other than BATCH_PROTOCOL_V2 must error. We
         // construct a frame whose body would otherwise be valid for the
         // current layout.
-        let op = ReplicaOp::Delete { tx_key: key(4) };
+        let op = ReplicaOp::Delete {
+            tx_key: key(4),
+            cause: crate::ops::tombstone::DeleteCause::ClientDelete,
+        };
         let ob = op.serialize();
         let mut frame = Vec::new();
         frame.push(0xFE); // not V2
@@ -2636,7 +2728,10 @@ mod tests {
     /// decoder must now reject the V1 version byte as unknown.
     #[test]
     fn replication_batch_rejects_v1_version_byte() {
-        let op = ReplicaOp::Delete { tx_key: key(9) };
+        let op = ReplicaOp::Delete {
+            tx_key: key(9),
+            cause: crate::ops::tombstone::DeleteCause::ClientDelete,
+        };
         let ob = op.serialize();
         let mut frame = Vec::new();
         // Reconstruct what a V1 frame looked like — leading byte = 1.
@@ -2669,7 +2764,10 @@ mod tests {
                     block_height_retention: 288,
                     master_generation: 11,
                 },
-                ReplicaOp::Delete { tx_key: key(2) },
+                ReplicaOp::Delete {
+                    tx_key: key(2),
+                    cause: crate::ops::tombstone::DeleteCause::ClientDelete,
+                },
             ],
             trace_ctx: None,
             source_node_id: Some(123_456_789),

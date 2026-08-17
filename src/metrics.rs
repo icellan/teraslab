@@ -1407,6 +1407,13 @@ pub struct MigrationMetrics {
     /// re-replication after a member death/rejoin. Only ever non-zero when
     /// `under_replication_sweep_enabled` is on.
     pub under_replication_event_repairs: PaddedCounter,
+    /// W9 Part B — event-repair passes FORCE-armed by a replica-side terminal
+    /// abort (`replica_abort_forced_resync_enabled`, default ON). Counted at
+    /// the arm (the drained signal), so it is non-zero even in sweep-off
+    /// clusters — the operator-visible evidence that an abort-triggered
+    /// self-heal was scheduled rather than the shard silently serving under
+    /// RF.
+    pub replica_abort_forced_resyncs: PaddedCounter,
     /// W8 review P0-1 — manifest keys REMOVED from a migration completion
     /// because the target vetoed them with deletion tombstones (RULE-DS)
     /// and the source's LWW gate judged the veto sound. Every reduction is
@@ -1491,6 +1498,7 @@ impl MigrationMetrics {
             heal_deadline_alerts: PaddedCounter::new(),
             heal_source_refused_no_quorum: PaddedCounter::new(),
             under_replication_event_repairs: PaddedCounter::new(),
+            replica_abort_forced_resyncs: PaddedCounter::new(),
             migration_completion_manifest_reduced_vetoed: PaddedCounter::new(),
             orphan_cleanup_retained_no_evidence: AtomicU32::new(0),
         }

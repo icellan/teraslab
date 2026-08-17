@@ -1510,6 +1510,21 @@ pub struct ServerConfig {
     /// load), consistent with resync signalling toward dead or lagging peers.
     pub under_replication_sweep_enabled: bool,
 
+    /// W9 Part B (review P1-2c) — when a REPLICA-side migration task is
+    /// terminally aborted, force-arm ONE debounced under-replication
+    /// event-repair pass even with `under_replication_sweep_enabled = false`.
+    ///
+    /// Default ON, deliberately: a replica-side terminal abort retires the
+    /// task WITHOUT rolling the shard table back, so diff-based re-heal never
+    /// re-plans the fill — without this driver the shard serves under RF
+    /// PERMANENTLY in sweep-off clusters (the CI-proven armed-05/08 shape).
+    /// The fired pass is the ordinary derive with all its fences (freshness,
+    /// drain gate, in-flight dedup, debounce), scoped to one abort-triggered
+    /// arm — not the periodic sweep. Disable only if resync churn must be
+    /// strictly operator-controlled; the trade is documented permanent
+    /// under-replication after replica-abort events until a topology change.
+    pub replica_abort_forced_resync_enabled: bool,
+
     /// W8 review P0-1 — allow a migration SOURCE to REDUCE its completion
     /// manifest by keys the target vetoed with deletion tombstones
     /// (RULE-DS), letting the handoff commit without them.
@@ -1518,7 +1533,9 @@ pub struct ServerConfig {
     /// decision — after the reduced completion commits, the source's
     /// committed-handoff orphan cleanup deletes its own copy of the vetoed
     /// keys — and the veto it trusts is generation-blind for
-    /// `ClientDelete`/`PruneReplace` tombstones. A legitimately RE-CREATED
+    /// `ClientDelete` tombstones (W9: weak `CompensatedCreate`/`PruneReplace`
+    /// causes never authorize a reduction at all — the source refuses them
+    /// cause-aware). A legitimately RE-CREATED
     /// key restarts at generation 0, so a stale tombstone from the prior
     /// lineage is indistinguishable from an authoritative delete at the
     /// source (cross-lineage generations are incomparable). That window is
@@ -1835,6 +1852,7 @@ impl Default for ServerConfig {
             replication_factor: 1,
             committed_master_election_enabled: false,
             under_replication_sweep_enabled: false,
+            replica_abort_forced_resync_enabled: true,
             migration_vetoed_reduction_enabled: false,
             swim_probe_interval_ms: 200,
             swim_suspicion_timeout_ms: 5000,

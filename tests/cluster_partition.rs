@@ -241,6 +241,7 @@ fn spawn_proxied_server(
         // covered while the Docker suite qualifies them.
         committed_master_election_enabled: true,
         under_replication_sweep_enabled: true,
+        replica_abort_forced_resync_enabled: true,
         migration_vetoed_reduction_enabled: false,
         probe_interval: Duration::from_millis(100),
         suspicion_timeout: Duration::from_secs(2),

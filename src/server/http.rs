@@ -1471,6 +1471,11 @@ pub(crate) fn render_metrics_text(
         );
         prom_counter(
             &mut out,
+            "teraslab_replica_abort_forced_resyncs_total",
+            mm.replica_abort_forced_resyncs.get(),
+        );
+        prom_counter(
+            &mut out,
             "teraslab_migration_completion_manifest_reduced_vetoed_total",
             mm.migration_completion_manifest_reduced_vetoed.get(),
         );
@@ -5334,6 +5339,7 @@ mod tests {
             "teraslab_migration_phase_delta",
             "teraslab_migration_phase_serving_new",
             "teraslab_under_replication_event_repairs_total",
+            "teraslab_replica_abort_forced_resyncs_total",
             "teraslab_migration_completion_manifest_reduced_vetoed_total",
             "teraslab_orphan_cleanup_retained_no_evidence",
             "teraslab_swim_probes_sent_total",

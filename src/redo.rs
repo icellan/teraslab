@@ -629,6 +629,30 @@ const OP_SET_MINED_BATCH: u8 = 42;
 /// transition to the record's other holders.
 const OP_EXPIRE_PRESERVATION: u8 = 44;
 
+/// W9: a COMPENSATING delete — a create rolled back because its replication
+/// fan-out failed (`server::dispatch::compensate_replication_failure`).
+///
+/// Identical 48-byte payload to [`OP_DELETE`]; the opcode itself carries the
+/// [`crate::ops::tombstone::DeleteCause`] (mirrors the
+/// [`OP_FREEZE_V2`]/F-G4-008 "route by op_type, never by length" precedent).
+/// Replay is byte-identical to a plain delete — the cause matters only to the
+/// redo→replica converter (`cluster::coordinator::redo_entry_to_replica_op`),
+/// which re-emits it as a compensated `ReplicaOp::Delete` so a migration
+/// delta / crash-recovered replication intent spreads a generation-OVERRIDABLE
+/// `CompensatedCreate` tombstone instead of an unconditional `ClientDelete`
+/// veto (the CI-proven acked-write-loss chain). Old logs decode [`OP_DELETE`]
+/// as `DeleteCause::ClientDelete` unchanged.
+///
+/// Review P2-5 — the compatibility is FORWARD-only: once a compensation has
+/// journalled opcode 45, DOWNGRADING the binary is unsupported — an old
+/// build's replay does not recognize the opcode and treats the entry as a
+/// torn tail / corrupt record, truncating recovery at that point. Pre-
+/// production this is acceptable and deliberate (fail-closed beats silently
+/// replaying a compensated delete as a client delete); it is called out here
+/// so a future upgrade-path audit does not mistake "old logs decode" for
+/// bidirectional compatibility.
+const OP_DELETE_COMPENSATED: u8 = 45;
+
 /// F-G4-006-style cap: bound the allocation a corrupt-but-CRC-valid
 /// `SetMinedBatch` entry can force. A single client RPC is already capped by
 /// `Config::max_batch_size` (default 8192) before it ever reaches the redo
@@ -890,6 +914,11 @@ pub enum RedoOp {
         tx_key: TxKey,
         record_offset: u64,
         record_size: u64,
+        /// W9 — why the record was removed. Selects the serialized opcode
+        /// ([`OP_DELETE`] for `ClientDelete`, [`OP_DELETE_COMPENSATED`] for
+        /// `CompensatedCreate`); replay ignores it, the redo→replica
+        /// converter propagates it.
+        cause: crate::ops::tombstone::DeleteCause,
     },
     SetConflicting {
         tx_key: TxKey,
@@ -1194,7 +1223,10 @@ impl RedoOp {
             RedoOp::Create { .. } => OP_CREATE,
             RedoOp::CreateV2 { .. } => OP_CREATE_V2,
             RedoOp::Relocate { .. } => OP_RELOCATE,
-            RedoOp::Delete { .. } => OP_DELETE,
+            RedoOp::Delete { cause, .. } => match cause {
+                crate::ops::tombstone::DeleteCause::ClientDelete => OP_DELETE,
+                crate::ops::tombstone::DeleteCause::CompensatedCreate => OP_DELETE_COMPENSATED,
+            },
             RedoOp::SetConflicting { .. } => OP_SET_CONFLICTING,
             RedoOp::AppendConflictingChild { .. } => OP_APPEND_CONFLICTING_CHILD,
             RedoOp::RemoveConflictingChild { .. } => OP_REMOVE_CONFLICTING_CHILD,
@@ -1702,6 +1734,9 @@ impl RedoOp {
                 tx_key,
                 record_offset,
                 record_size,
+                // The cause is carried by the opcode byte (OP_DELETE vs
+                // OP_DELETE_COMPENSATED), not the payload.
+                cause: _,
             } => {
                 buf.extend_from_slice(&tx_key.txid);
                 buf.extend_from_slice(&record_offset.to_le_bytes());
@@ -2215,13 +2250,18 @@ impl RedoOp {
                     utxo_count: u32::from_le_bytes(data[41..45].try_into().unwrap()),
                 })
             }
-            OP_DELETE if data.len() >= 48 => {
+            OP_DELETE | OP_DELETE_COMPENSATED if data.len() >= 48 => {
                 let mut txid = [0u8; 32];
                 txid.copy_from_slice(&data[..32]);
                 Some(RedoOp::Delete {
                     tx_key: TxKey { txid },
                     record_offset: u64::from_le_bytes(data[32..40].try_into().unwrap()),
                     record_size: u64::from_le_bytes(data[40..48].try_into().unwrap()),
+                    cause: if op_type == OP_DELETE_COMPENSATED {
+                        crate::ops::tombstone::DeleteCause::CompensatedCreate
+                    } else {
+                        crate::ops::tombstone::DeleteCause::ClientDelete
+                    },
                 })
             }
             OP_SET_CONFLICTING if data.len() >= 41 => {
@@ -5781,6 +5821,7 @@ mod tests {
                 tx_key: k,
                 record_offset: 4096,
                 record_size: 256,
+                cause: crate::ops::tombstone::DeleteCause::ClientDelete,
             },
             RedoOp::SetConflicting {
                 tx_key: k,
@@ -6480,6 +6521,7 @@ mod tests {
                 tx_key: test_key(10),
                 record_offset: 8192,
                 record_size: 1024,
+                cause: crate::ops::tombstone::DeleteCause::ClientDelete,
             },
             RedoOp::SetConflicting {
                 tx_key: test_key(11),
@@ -7804,7 +7846,25 @@ mod tests {
             tx_key: make_txid(0x2A),
             record_offset: 0x0000_CAFE_BABE_0000,
             record_size: 4096,
+            cause: crate::ops::tombstone::DeleteCause::ClientDelete,
         });
+    }
+
+    /// W9 — a COMPENSATED delete round-trips on its own opcode
+    /// ([`OP_DELETE_COMPENSATED`], same 48-byte payload), so the cause a
+    /// redo-derived re-emit depends on survives the log. The plain
+    /// `ClientDelete` entry above stays on the legacy [`OP_DELETE`] opcode,
+    /// byte-identical to pre-W9 logs.
+    #[test]
+    fn round_trip_delete_compensated() {
+        let op = RedoOp::Delete {
+            tx_key: make_txid(0x2B),
+            record_offset: 0x0000_CAFE_BABE_1000,
+            record_size: 4096,
+            cause: crate::ops::tombstone::DeleteCause::CompensatedCreate,
+        };
+        assert_eq!(op.op_type(), OP_DELETE_COMPENSATED);
+        assert_round_trip(op);
     }
 
     /// R1: the preservation-expiry entry round-trips BOTH branches — an
@@ -8363,6 +8423,7 @@ mod tests {
                 tx_key: make_txid(appended as u8),
                 record_offset: appended as u64 * 4096,
                 record_size: 4096,
+                cause: crate::ops::tombstone::DeleteCause::ClientDelete,
             });
             match result {
                 Ok(_) => appended += 1,

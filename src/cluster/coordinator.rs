@@ -400,6 +400,18 @@ impl EventRepairTrigger {
         if !self.enabled {
             return;
         }
+        self.observe_forced(now, epoch);
+    }
+
+    /// W9 — arm REGARDLESS of `enabled` (same coalesce/replace semantics as
+    /// [`Self::observe`]). Used by the replica-abort resync signal
+    /// (`replica_abort_resync_pass`): a replica-side terminal abort leaves its
+    /// shard under-RF with NO other driver in a sweep-off cluster — the
+    /// retired task is gone, the table was deliberately not rolled back, so
+    /// diff-based re-heal never re-plans the fill. The fire path
+    /// (`event_repair_take_fire` → `run_under_replication_pass`) has no
+    /// enabled gate, so a forced arm repairs even with the periodic sweep off.
+    fn observe_forced(&mut self, now: std::time::Instant, epoch: u64) {
         match self.armed {
             Some((_, armed_epoch)) if armed_epoch == epoch => {}
             _ => self.armed = Some((now, epoch)),
@@ -665,6 +677,58 @@ fn failed_batch_retry_pass(
         return None;
     }
     Some(retry_tasks)
+}
+
+/// W9 — one event-loop pass of the replica-abort self-heal signal: drain the
+/// arm a replica-side terminal abort left on the manager
+/// ([`MigrationManager::arm_replica_abort_resync`], set off-loop by the
+/// streaming thread) and FORCE-arm the event-repair trigger
+/// ([`EventRepairTrigger::observe_forced`] — deliberately NOT gated on
+/// `under_replication_sweep_enabled`).
+///
+/// Why forced: a replica-side terminal abort retires the task WITHOUT rolling
+/// the shard table back (W3 FIX C), so diff-based re-heal never re-plans the
+/// fill; in a sweep-off cluster nothing else retries it and the shard serves
+/// under RF forever. With the W9 `CompensatedCreate` tombstone the retried
+/// fill succeeds instead of re-vetoing, so this signal is what closes the
+/// loop. It stays a SIGNAL: the fired pass is the ordinary
+/// `run_under_replication_pass` derive (freshness fence, drain gate, in-flight
+/// dedup all apply) — the event loop owns execution, never this caller.
+/// Returns whether the trigger was armed (for tests).
+///
+/// SCOPE (review P1-2a): the fired pass derives from
+/// `snapshot_under_replication_inputs`, i.e. shards this node still
+/// TARGET-MASTERS — so this signal closes the KEEPS-MASTERSHIP replica-abort
+/// shape only (the CI census shape: the master + sole holder whose replica
+/// fills abort). A replica abort on a shard whose mastership moved away
+/// mid-Copying yields a no-op pass; that case remains OPEN, owned by the
+/// failed-task re-drive (task #77/W8) and the event-repair membership arms
+/// (task #50), which re-plan on the next topology/membership edge.
+///
+/// Residual (documented, accepted): the derive judges shards against the
+/// retained exchange view (refreshed by the periodic exchange regardless of
+/// the sweep flag), so a pass fired before the next view refresh can be
+/// fenced (`stale_fenced`) or see a partially-filled target as full; the
+/// debounce window absorbs the common case and the next abort/exchange re-arms
+/// the rest.
+fn replica_abort_resync_pass(
+    migration: &Arc<Mutex<MigrationManager>>,
+    trigger: &mut EventRepairTrigger,
+    now: std::time::Instant,
+    current_epoch: u64,
+) -> bool {
+    if !migration.lock().take_replica_abort_resync_arm() {
+        return false;
+    }
+    tracing::info!(
+        "cluster: replica-side terminal abort — force-arming the under-replication \
+         event-repair pass (sweep-flag independent)",
+    );
+    if let Some(m) = crate::metrics::migration_metrics() {
+        m.replica_abort_forced_resyncs.inc();
+    }
+    trigger.observe_forced(now, current_epoch);
+    true
 }
 
 /// Task #50 review P2 — releases claimed `(replica NodeId.0, shard)`
@@ -2370,6 +2434,13 @@ pub struct ClusterConfig {
     /// `under_replication_sweep_enabled`). Default-off pending CI
     /// qualification.
     pub under_replication_sweep_enabled: bool,
+    /// W9 Part B — replica-abort forced resync arming (see `Config`
+    /// `replica_abort_forced_resync_enabled` for the full rationale).
+    /// Default ON: without it a replica-side terminal abort leaves its shard
+    /// permanently under RF in sweep-off clusters. Carried on the shared
+    /// `MigrationManager` so the abort site (a free fn with no config
+    /// access) reads it lock-local.
+    pub replica_abort_forced_resync_enabled: bool,
     /// W8 review P0-1 — allow tombstone-vetoed manifest reduction on
     /// migration completions (see `Config`
     /// `migration_vetoed_reduction_enabled` for the full rationale).
@@ -2632,6 +2703,11 @@ impl ClusterCoordinator {
                 // migration batch path (a free fn with no config access)
                 // reads it lock-local at the escalation site.
                 mgr.set_vetoed_reduction_enabled(config.migration_vetoed_reduction_enabled);
+                // W9 Part B — same carrier pattern for the replica-abort
+                // forced-resync arming (read at the terminal-abort site).
+                mgr.set_replica_abort_forced_resync_enabled(
+                    config.replica_abort_forced_resync_enabled,
+                );
                 Arc::new(Mutex::new(mgr))
             },
             replication_factor: config.replication_factor,
@@ -3583,6 +3659,16 @@ impl ClusterCoordinator {
                     event_repair_trigger.record_resync_outcome(resynced_ok, resync_failed);
                 }
                 let repair_now = std::time::Instant::now();
+                // W9 Part B — drain the replica-abort resync signal FIRST so
+                // an abort observed this iteration arms the trigger before
+                // the due-check below. Force-armed (sweep-flag independent):
+                // see `replica_abort_resync_pass`.
+                replica_abort_resync_pass(
+                    &migration,
+                    &mut event_repair_trigger,
+                    repair_now,
+                    topology_epoch.load(Ordering::Relaxed),
+                );
                 if event_repair_trigger.is_armed_and_due(repair_now)
                     && migration.lock().active_count() == 0
                     && event_repair_take_fire(
@@ -3618,9 +3704,17 @@ impl ClusterCoordinator {
                             );
                         // Task #50 review P3 — cap remainder: re-arm so the
                         // backlog converges in 1.5s steps instead of waiting
-                        // the 20s periodic fallback.
+                        // the 20s periodic fallback. W9 review P1-2b —
+                        // `observe_forced`, not `observe`: in a sweep-off
+                        // cluster the ONLY way this event pass ever fires is
+                        // a replica-abort forced arm, and the enabled-gated
+                        // `observe` silently dropped its cap remainder,
+                        // stranding the backlog past the cap. With the sweep
+                        // on, forced ≡ plain (the flag is the only
+                        // difference), so this is a strict fix, not a
+                        // behavior change for sweep-on clusters.
                         if dropped > 0 {
-                            event_repair_trigger.observe(
+                            event_repair_trigger.observe_forced(
                                 std::time::Instant::now(),
                                 topology_epoch.load(Ordering::Relaxed),
                             );
@@ -11818,7 +11912,7 @@ pub(crate) fn completion_rejection_missing_keys(
 pub(crate) fn completion_rejection_vetoed_keys(
     err: &str,
     manifest: &[(TxKey, u32)],
-) -> Vec<(TxKey, u32)> {
+) -> Vec<(TxKey, u32, Option<crate::ops::tombstone::TombstoneCause>)> {
     // The `:` keeps the match exact — see `completion_rejection_missing_keys`.
     if !err.contains(&format!(
         "(code={}:",
@@ -11827,7 +11921,7 @@ pub(crate) fn completion_rejection_vetoed_keys(
     {
         return Vec::new();
     }
-    let mut out: Vec<(TxKey, u32)> = Vec::new();
+    let mut out: Vec<(TxKey, u32, Option<crate::ops::tombstone::TombstoneCause>)> = Vec::new();
     let mut rest = err;
     while let Some(pos) = rest.find("TxKey(") {
         rest = &rest[pos + "TxKey(".len()..];
@@ -11867,15 +11961,34 @@ pub(crate) fn completion_rejection_vetoed_keys(
         let Ok(tomb_gen) = digits.parse::<u32>() else {
             continue;
         };
+        // W9 P2-3 — parse the veto's CAUSE too (the target names it as
+        // `cause=<Debug>`), so the reduction gate can refuse a WEAK local
+        // marker. An unrecognized name maps to `None` (fail-closed at the
+        // gate).
+        let cause = after_marker.find("cause=").and_then(|cause_pos| {
+            let ident = &after_marker[cause_pos + "cause=".len()..];
+            let ident = &ident[..ident
+                .find(|c: char| !c.is_ascii_alphanumeric())
+                .unwrap_or(ident.len())];
+            match ident {
+                "Dah" => Some(crate::ops::tombstone::TombstoneCause::Dah),
+                "ClientDelete" => Some(crate::ops::tombstone::TombstoneCause::ClientDelete),
+                "PruneReplace" => Some(crate::ops::tombstone::TombstoneCause::PruneReplace),
+                "CompensatedCreate" => {
+                    Some(crate::ops::tombstone::TombstoneCause::CompensatedCreate)
+                }
+                _ => None,
+            }
+        });
         // Review P2-5 — exactly-one resolution: a reduction must never touch
         // a key the target did not veto, so an ambiguous prefix is skipped.
         let mut matches = manifest
             .iter()
             .filter(|(key, _)| key.txid.starts_with(&prefix));
         if let (Some((key, _)), None) = (matches.next(), matches.next())
-            && !out.iter().any(|(k, _)| k == key)
+            && !out.iter().any(|(k, _, _)| k == key)
         {
-            out.push((*key, tomb_gen));
+            out.push((*key, tomb_gen, cause));
         }
     }
     out
@@ -12126,11 +12239,39 @@ fn escalate_missing_exact_keys(
     loop {
         // W8 — vetoed keys first, attempt-free (see the fn doc).
         let mut reduce_now: Vec<TxKey> = Vec::new();
-        for (key, tomb_gen) in completion_rejection_vetoed_keys(&last_err, manifest_entries) {
+        for (key, tomb_gen, cause) in completion_rejection_vetoed_keys(&last_err, manifest_entries)
+        {
             if vetoed_seen.contains(&key) {
                 continue;
             }
             vetoed_seen.push(key);
+            // W9 P2-3 — cause-aware reduction: only an AUTHORITATIVE deletion
+            // claim (ClientDelete / Dah) may authorize reducing the manifest,
+            // because the reduction authorizes deleting the SOURCE's copy of
+            // the key after the handoff commits. A WEAK local marker
+            // (CompensatedCreate — a create rollback; PruneReplace — a local
+            // reconcile) says nothing about the key's cluster-wide existence,
+            // and with W9 those vetoes are generation-overridable anyway —
+            // the right disposition is the historical retry path, where the
+            // re-heal's newer image defeats the marker. Unknown causes fail
+            // CLOSED the same way.
+            let authoritative_cause = matches!(
+                cause,
+                Some(crate::ops::tombstone::TombstoneCause::ClientDelete)
+                    | Some(crate::ops::tombstone::TombstoneCause::Dah)
+            );
+            if !authoritative_cause {
+                tracing::error!(
+                    key = ?key,
+                    tombstone_generation = tomb_gen,
+                    cause = ?cause,
+                    "cluster: vetoed key carries a non-authoritative tombstone \
+                     cause — refusing the manifest reduction (a rollback/reconcile \
+                     marker must never authorize deleting the source's copy); the \
+                     task fails through the historical path",
+                );
+                continue;
+            }
             // Review P2-4 — fail CLOSED on an unresolvable manifest
             // generation: a key we cannot prove the tombstone is at-or-ahead
             // of must never be reduced.
@@ -12375,6 +12516,31 @@ fn terminally_abort_unshippable_task(
                 fenced_bm.clear(task.shard);
             }
             migrating_bm.clear(task.shard);
+            // W9 Part B — a REPLICA-side terminal abort leaves the table
+            // untouched (W3 FIX C below), so diff-based re-heal never
+            // re-plans this fill and the shard serves under RF with no other
+            // driver in sweep-off clusters. Leave the resync signal (gated
+            // only on the committed `replica_abort_forced_resync_enabled`
+            // policy); the event loop drains it into a FORCE-armed
+            // event-repair pass (`replica_abort_resync_pass`), and with the
+            // W9 CompensatedCreate tombstone the retried fill succeeds
+            // instead of re-vetoing. Armed regardless of epoch currency —
+            // the derive re-judges against live state at fire time.
+            // Master-side aborts are excluded: the rollback below is their
+            // re-planner.
+            //
+            // SCOPE (review P1-2a): the fired pass derives from shards this
+            // node still TARGET-MASTERS, so the signal closes the
+            // KEEPS-MASTERSHIP shape only (the CI census shape — master +
+            // sole holder filling replicas). A replica abort on a shard
+            // whose mastership moved away mid-Copying produces a no-op pass
+            // here — that case remains OPEN, owned by the failed-task
+            // re-drive machinery (task #77/W8) and the event-repair pass's
+            // membership arms (task #50), which re-plan on the next
+            // topology/membership edge.
+            if !task.is_master {
+                mgr.arm_replica_abort_resync();
+            }
         }
         retired
     };
@@ -12393,13 +12559,14 @@ fn terminally_abort_unshippable_task(
         // assignment while the master handoff is still Copying (scenario 17's
         // single divergent shard at 4097/4096: all nine of node1's terminal
         // aborts there were replica-side). A replica task is retired above
-        // with the table untouched. NOTE: with the table unchanged, diff-based
-        // re-heal plans will NOT re-plan this replica fill — the shard serves
-        // below RF until a topology change or the under-replication repair
-        // machinery (`under_replication_sweep_enabled`, default off pending CI
-        // arming) picks it up. Strictly better than the pre-fix behavior
-        // (reverting a mid-Copying master assignment), but not self-healing
-        // on its own.
+        // with the table untouched. With the table unchanged, diff-based
+        // re-heal plans will NOT re-plan this replica fill — which is why the
+        // retire block above leaves the W9 replica-abort resync signal: the
+        // event loop force-arms the under-replication event-repair pass
+        // (sweep-flag independent) so the fill is retried instead of the
+        // shard serving below RF forever. NOTE the signal's scope (review
+        // P1-2a): it repairs only shards this node still TARGET-MASTERS —
+        // the moved-master mid-Copying case stays open (tasks #77/#50).
         //
         // (The migration mutex is NOT held across the shard-table write —
         // same lock order as `fail_migration_task_current_epoch`.)
@@ -13703,27 +13870,33 @@ fn convert_infallible_op(
             // conservatively map to None.
             None
         }
-        RedoOp::Delete { tx_key, .. } => {
+        RedoOp::Delete { tx_key, cause, .. } => {
             // A delete after the baseline snapshot must be forwarded so the
             // target removes the record. Without this, deleted records would
             // be resurrected on the target.
-            //
-            // Deletion-tombstone §6 scope note: this converter stays on the V1
-            // `ReplicaOp::Delete`. It feeds the migration-baseline catch-up
-            // (which must remain V1/unchanged this phase) AND the
-            // replication-intent crash-recovery re-emit.
             //
             // It is not the only producer of a replicated delete: a CLIENT
             // `OP_DELETE_BATCH` also emits `ReplicaOp::Delete` directly (spec
             // §3.18, `handle_delete_batch` Phase 2). This arm covers the
             // redo-derived cases instead — a migration delta, or a master that
             // crashed BETWEEN a redo commit and its fan-out. Both apply the same
-            // V1 op, and the receiver's Delete arm resolves an absent record to
+            // op, and the receiver's Delete arm resolves an absent record to
             // an idempotent `Ok(())`, so neither can resurrect the record.
+            //
+            // W9 — the CAUSE travels verbatim. A compensating delete (create
+            // rollback) re-emitted through this converter — the D-4 fan-out
+            // reconstruction, a crash-recovered replication intent, or a
+            // migration delta — must land on the applying node as a
+            // generation-OVERRIDABLE CompensatedCreate tombstone, never as the
+            // unconditional ClientDelete veto it used to spread (the CI-proven
+            // permanent acked-write-loss chain).
             if ShardTable::shard_for_key(tx_key) != shard {
                 return None;
             }
-            Some(ReplicaOp::Delete { tx_key: *tx_key })
+            Some(ReplicaOp::Delete {
+                tx_key: *tx_key,
+                cause: *cause,
+            })
         }
         RedoOp::MarkOnLongestChain {
             tx_key,
@@ -21290,6 +21463,7 @@ mod tests {
                 tx_key: deleted,
                 record_offset: 0,
                 record_size: 0,
+                cause: crate::ops::tombstone::DeleteCause::ClientDelete,
             })
             .unwrap();
         redo.lock()
@@ -26736,9 +26910,13 @@ mod tests {
     /// W8 (defect 2) — builds the target's vetoed-key rejection as the source
     /// sees it through the completion error envelope.
     fn vetoed_reject(key: TxKey, tomb_gen: u32) -> String {
+        vetoed_reject_cause(key, tomb_gen, "ClientDelete")
+    }
+
+    fn vetoed_reject_cause(key: TxKey, tomb_gen: u32, cause: &str) -> String {
         format!(
             "target rejected: status 4 (code=19: shard 227 exact key {:?} vetoed by \
-             deletion tombstone (cause=ClientDelete gen={} height=900): TxNotFound)",
+             deletion tombstone (cause={cause} gen={} height=900): TxNotFound)",
             key, tomb_gen,
         )
     }
@@ -26753,8 +26931,32 @@ mod tests {
         let manifest = vec![(tk(1), 3u32), (tk(2), 7u32)];
         assert_eq!(
             completion_rejection_vetoed_keys(&vetoed_reject(tk(2), 9), &manifest),
-            vec![(tk(2), 9u32)],
-            "the veto shape must resolve to the full key and tombstone generation",
+            vec![(
+                tk(2),
+                9u32,
+                Some(crate::ops::tombstone::TombstoneCause::ClientDelete)
+            )],
+            "the veto shape must resolve to the full key, tombstone generation, and cause",
+        );
+        // W9 P2-3 — the cause is parsed per key; an unknown name maps to None
+        // (fail-closed at the reduction gate).
+        assert_eq!(
+            completion_rejection_vetoed_keys(
+                &vetoed_reject_cause(tk(2), 9, "CompensatedCreate"),
+                &manifest,
+            ),
+            vec![(
+                tk(2),
+                9u32,
+                Some(crate::ops::tombstone::TombstoneCause::CompensatedCreate)
+            )],
+        );
+        assert_eq!(
+            completion_rejection_vetoed_keys(
+                &vetoed_reject_cause(tk(2), 9, "SomeFutureCause"),
+                &manifest,
+            ),
+            vec![(tk(2), 9u32, None)],
         );
         // The missing-key shape is NOT a veto.
         let missing = format!(
@@ -26934,6 +27136,42 @@ mod tests {
                 );
             }
             other => panic!("expected Exhausted (pre-W8 disposition), got {other:?}"),
+        }
+    }
+
+    /// W9 P2-3 — cause-aware reduction: a veto whose parsed cause is a WEAK
+    /// local marker (CompensatedCreate / PruneReplace — rollback/reconcile,
+    /// not an authoritative deletion) must NEVER authorize reducing the
+    /// manifest, because the reduction authorizes deleting the SOURCE's copy
+    /// of the key after commit. Even with the generation gate satisfied
+    /// (tombstone gen at-or-ahead of the manifest's), the escalation must
+    /// refuse the reduction and fall through to the historical path
+    /// (NotExactKey — abort/rollback, data-safe). An unknown cause fails
+    /// closed the same way.
+    #[test]
+    fn escalation_refuses_reduction_for_weak_tombstone_causes() {
+        for cause in ["CompensatedCreate", "PruneReplace", "SomeFutureCause"] {
+            let manifest = vec![(tk(1), 3u32), (tk(2), 7u32)];
+            // Gen 9 >= manifest gen 7: the OLD cause-blind gate reduces this.
+            let initial = vetoed_reject_cause(tk(2), 9, cause);
+            let mut called = false;
+            let outcome =
+                escalate_missing_exact_keys(initial.clone(), &manifest, 3, true, |action| {
+                    called = true;
+                    panic!("no reduce and no re-push may run for a weak-cause veto: {action:?}");
+                });
+            assert!(!called, "cause={cause}: the attempt closure must not run");
+            match outcome {
+                ExactKeyEscalation::NotExactKey { last_err } => {
+                    assert_eq!(
+                        last_err, initial,
+                        "cause={cause}: the historical path carries the veto rejection",
+                    );
+                }
+                other => {
+                    panic!("cause={cause}: expected NotExactKey (reduction refused), got {other:?}")
+                }
+            }
         }
     }
 
@@ -27181,6 +27419,271 @@ mod tests {
             mgr.active_migrations().is_empty(),
             "the tracking entry must be retired",
         );
+    }
+
+    /// W9 Part B — a REPLICA-side terminal abort leaves its shard under-RF
+    /// with NO re-planner (the table is deliberately not rolled back, the
+    /// task is retired, and the abort's own NOTE says nothing re-plans it).
+    /// The abort must therefore leave a resync SIGNAL that the event loop
+    /// drains into a FORCE-armed event-repair pass — working even with
+    /// `under_replication_sweep_enabled = false`, where pre-W9 the shard
+    /// stayed under-RF forever.
+    ///
+    /// Review P1-2a — the scenario is deliberately the KEEPS-MASTERSHIP
+    /// shape (this node still target-masters the shard whose replica fill
+    /// aborted — the CI census shape: n1 master + sole holder filling
+    /// replicas), and the test proves the fired pass actually EMITS the
+    /// resync for that shard through the REAL derive — not merely that the
+    /// trigger fired. The moved-master shape (abort on a shard whose
+    /// mastership left this node mid-Copying) is NOT covered by this signal
+    /// — see the scoping note on `replica_abort_resync_pass`.
+    #[test]
+    fn replica_terminal_abort_signals_forced_resync_with_sweep_disabled() {
+        let old_members = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let new_members = vec![NodeId(1), NodeId(2), NodeId(3), NodeId(4)];
+        let mut table = ShardTable::compute_with_epoch(&old_members, 2, 1, 1);
+        let new_table = ShardTable::compute_with_epoch(&new_members, 2, 2, 1);
+        // KEEPS-mastership: node1 masters the shard in BOTH epochs; the
+        // aborted task is a replica FILL toward the scale-out joiner.
+        let shard = (0..NUM_SHARDS as u16)
+            .find(|s| {
+                table.target_assignment(*s).master == NodeId(1)
+                    && new_table.target_assignment(*s).master == NodeId(1)
+            })
+            .expect("some node1 master survives the scale-out");
+        table.begin_handoff(&new_table);
+
+        let shard_table = Arc::new(ShardTableLock::new(table));
+        let migration = Arc::new(Mutex::new(MigrationManager::new()));
+        let fenced = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+        let migrating = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+        let task = MigrationTask {
+            shard,
+            from_node: NodeId(1),
+            to_node: NodeId(4),
+            is_master: false,
+        };
+        migration.lock().start_outbound(
+            std::slice::from_ref(&task),
+            NodeId(1),
+            &std::collections::HashSet::from([shard]),
+        );
+
+        assert!(terminally_abort_unshippable_task(
+            &migration,
+            &shard_table,
+            &fenced,
+            &migrating,
+            &task,
+            new_table.version,
+        ));
+
+        // The abort left the signal; the REAL event-loop pass drains it into
+        // a SWEEP-DISABLED trigger and arms it anyway (observe_forced).
+        let mut trigger = EventRepairTrigger::new(Duration::from_millis(10), false);
+        let now = std::time::Instant::now();
+        assert!(
+            replica_abort_resync_pass(&migration, &mut trigger, now, new_table.version),
+            "a replica-side terminal abort must leave a resync signal for the \
+             event loop (pre-W9: nothing — permanent under-RF in sweep-off \
+             clusters)",
+        );
+        assert!(
+            !replica_abort_resync_pass(&migration, &mut trigger, now, new_table.version),
+            "the signal is one-shot until a new abort arms it again",
+        );
+
+        // The forced arm fires through the ordinary fire path once the
+        // debounce elapses — no enabled gate anywhere downstream.
+        let later = now + Duration::from_millis(20);
+        assert!(trigger.is_armed_and_due(later));
+        let mut last_sweep = now;
+        assert!(
+            event_repair_take_fire(&mut trigger, later, new_table.version, 0, &mut last_sweep),
+            "the forced-armed pass must fire with the sweep flag off",
+        );
+
+        // Review P1-2a — the fired pass EMITS the resync for the aborted
+        // shard through the REAL derive. In the keeps-mastership shape the
+        // pass inputs are: this node still masters the (non-empty) shard,
+        // the exchange view witnesses this node's own data for it (freshness
+        // fence) and shows the alive target holding nothing — the derive
+        // must signal exactly (target -> [shard]).
+        let mut view: std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>> =
+            std::collections::HashMap::new();
+        view.insert(NodeId(1), vec![sweep_entry(shard, 5)]);
+        view.insert(NodeId(4), vec![sweep_entry(shard, 0)]);
+        let alive = std::collections::HashSet::from([NodeId(1), NodeId(4)]);
+        let mastered_nonempty = vec![(shard, vec![NodeId(1), NodeId(4)])];
+        let in_flight = std::collections::HashSet::new();
+        let (missing, signaled, dropped, dead_skipped, inflight_skipped, stale_fenced) =
+            derive_under_replication_resyncs(
+                &view,
+                &alive,
+                NodeId(1),
+                &mastered_nonempty,
+                &in_flight,
+                UNDER_REPLICATION_SWEEP_MAX_SHARDS,
+            );
+        assert_eq!(
+            missing.get(&NodeId(4)),
+            Some(&vec![shard]),
+            "the pass must emit a resync of the aborted shard toward the \
+             empty target (not merely fire)",
+        );
+        assert_eq!(
+            (
+                signaled,
+                dropped,
+                dead_skipped,
+                inflight_skipped,
+                stale_fenced
+            ),
+            (1, 0, 0, 0, 0),
+            "exactly one resync, unfenced and undropped",
+        );
+    }
+
+    /// W9 Part B review P1-2c — the forced resync is a COMMITTED config
+    /// policy (`replica_abort_forced_resync_enabled`, default ON): with the
+    /// flag disabled on the shared manager, a replica-side terminal abort
+    /// must leave NO signal — an operator who opted out of abort-triggered
+    /// resync churn gets exactly the pre-W9 disposition (documented
+    /// permanent under-RF until a topology change).
+    #[test]
+    fn replica_terminal_abort_signal_respects_config_flag() {
+        use crate::cluster::shards::ShardHandoff;
+        let old_members = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let new_members = vec![NodeId(1), NodeId(2), NodeId(3), NodeId(4)];
+        let mut table = ShardTable::compute_with_epoch(&old_members, 2, 1, 1);
+        let new_table = ShardTable::compute_with_epoch(&new_members, 2, 2, 1);
+        let shard = (0..NUM_SHARDS as u16)
+            .find(|s| {
+                table.target_assignment(*s).master == NodeId(1)
+                    && new_table.target_assignment(*s).master != NodeId(1)
+            })
+            .expect("scale-out must move some node1 master");
+        table.begin_handoff(&new_table);
+        assert_eq!(table.shard_handoff_state(shard), ShardHandoff::Copying);
+
+        let shard_table = Arc::new(ShardTableLock::new(table));
+        let migration = Arc::new(Mutex::new(MigrationManager::new()));
+        migration
+            .lock()
+            .set_replica_abort_forced_resync_enabled(false);
+        let fenced = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+        let migrating = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+        let task = MigrationTask {
+            shard,
+            from_node: NodeId(1),
+            to_node: NodeId(4),
+            is_master: false,
+        };
+        migration.lock().start_outbound(
+            std::slice::from_ref(&task),
+            NodeId(1),
+            &std::collections::HashSet::from([shard]),
+        );
+
+        assert!(terminally_abort_unshippable_task(
+            &migration,
+            &shard_table,
+            &fenced,
+            &migrating,
+            &task,
+            new_table.version,
+        ));
+        assert!(
+            !migration.lock().take_replica_abort_resync_arm(),
+            "with replica_abort_forced_resync_enabled=false the abort must \
+             leave no resync signal",
+        );
+    }
+
+    /// W9 Part B — the signal is REPLICA-side only: a MASTER-handoff terminal
+    /// abort rolls the shard back to the source, and the rolled-back table
+    /// diverging from the committed topology is what makes re-heal re-plan
+    /// it. No forced pass needed (and none armed).
+    #[test]
+    fn master_terminal_abort_does_not_signal_resync() {
+        let old_members = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let new_members = vec![NodeId(1), NodeId(2), NodeId(3), NodeId(4)];
+        let mut table = ShardTable::compute_with_epoch(&old_members, 2, 1, 1);
+        let new_table = ShardTable::compute_with_epoch(&new_members, 2, 2, 1);
+        let (shard, new_master) = (0..NUM_SHARDS as u16)
+            .find_map(|s| {
+                let old_master = table.target_assignment(s).master;
+                let new_master = new_table.target_assignment(s).master;
+                (old_master == NodeId(1) && new_master != NodeId(1)).then_some((s, new_master))
+            })
+            .expect("scale-out must move some node1 master");
+        table.begin_handoff(&new_table);
+
+        let shard_table = Arc::new(ShardTableLock::new(table));
+        let migration = Arc::new(Mutex::new(MigrationManager::new()));
+        let fenced = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+        let migrating = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+        let task = MigrationTask {
+            shard,
+            from_node: NodeId(1),
+            to_node: new_master,
+            is_master: true,
+        };
+        migration.lock().start_outbound(
+            std::slice::from_ref(&task),
+            NodeId(1),
+            &std::collections::HashSet::from([shard]),
+        );
+
+        assert!(terminally_abort_unshippable_task(
+            &migration,
+            &shard_table,
+            &fenced,
+            &migrating,
+            &task,
+            new_table.version,
+        ));
+        assert!(
+            !migration.lock().take_replica_abort_resync_arm(),
+            "a master-handoff abort rolls back the table (re-heal re-plans it) \
+             and must not force-arm the resync pass",
+        );
+    }
+
+    /// W9 Part B — `observe_forced` arms a DISABLED trigger; the plain
+    /// `observe` stays enabled-gated (the pre-existing pin
+    /// `event_trigger_disabled_never_arms` keeps guarding that side).
+    #[test]
+    fn observe_forced_arms_a_disabled_trigger() {
+        let mut trigger = EventRepairTrigger::new(Duration::from_millis(5), false);
+        let t0 = std::time::Instant::now();
+        trigger.observe(t0, 7);
+        assert!(
+            !trigger.is_armed_and_due(t0 + Duration::from_millis(10)),
+            "plain observe must stay a no-op on a disabled trigger",
+        );
+        trigger.observe_forced(t0, 7);
+        assert!(
+            trigger.is_armed_and_due(t0 + Duration::from_millis(10)),
+            "observe_forced must arm regardless of the enabled flag",
+        );
+        // Same epoch-fence semantics as observe: a stale-epoch fire re-arms
+        // under the current epoch instead of firing stale.
+        let mut last_sweep = t0;
+        assert!(!event_repair_take_fire(
+            &mut trigger,
+            t0 + Duration::from_millis(10),
+            8, // current epoch moved past the armed epoch
+            0,
+            &mut last_sweep,
+        ));
+        assert!(event_repair_take_fire(
+            &mut trigger,
+            t0 + Duration::from_millis(20),
+            8,
+            0,
+            &mut last_sweep,
+        ));
     }
 
     /// The reaper must treat `Preparing` exactly like `Fenced`.

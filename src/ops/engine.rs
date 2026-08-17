@@ -8610,7 +8610,65 @@ impl Engine {
     /// blob-store I/O path and lets the sweep batch unlinks.
     #[tracing::instrument(level = "debug", skip_all)]
     pub fn delete(&self, req: &DeleteRequest) -> Result<(), SpendError> {
-        self.delete_inner(req, RemovalAuthority::Authoritative)
+        self.delete_inner(req, RemovalAuthority::Authoritative, None)
+    }
+
+    /// W9 — compensating delete: roll back a create whose replication fan-out
+    /// failed (`server::dispatch::compensate_replication_failure`'s Create arm
+    /// locally, and the replica apply of the fanned/re-emitted
+    /// `ReplicaOp::Delete` carrying
+    /// [`crate::ops::tombstone::DeleteCause::CompensatedCreate`]).
+    ///
+    /// Physically identical to [`Self::delete`] (authoritative removal), with
+    /// ONE difference: the deletion tombstone is recorded as
+    /// [`crate::ops::tombstone::TombstoneCause::CompensatedCreate`] instead of
+    /// `ClientDelete`, so RULE-DS treats it as generation-OVERRIDABLE — a
+    /// surviving live, client-acked copy of the record at-or-ahead of the
+    /// tombstone generation may heal back in
+    /// ([`crate::ops::tombstone::TombstoneLog::blocks_heal_apply`], which also
+    /// carries the full safety argument). Recording the rollback as
+    /// `ClientDelete` gave it the unconditional #78 veto and permanently lost
+    /// the acked copy (the CI-proven armed-05/08 chain).
+    ///
+    /// # Errors
+    ///
+    /// Same contract as [`Self::delete`]: [`SpendError::TxNotFound`] when the
+    /// key is absent (benign for compensation — the create never landed or was
+    /// already rolled back), [`SpendError::NotDue`] only if `req.due_guard` is
+    /// set (compensation never sets it), and [`SpendError::StorageError`] on
+    /// index/device failures.
+    pub fn delete_compensated_create(&self, req: &DeleteRequest) -> Result<(), SpendError> {
+        self.delete_inner(
+            req,
+            RemovalAuthority::Authoritative,
+            Some(crate::ops::tombstone::TombstoneCause::CompensatedCreate),
+        )
+    }
+
+    /// W9 P1-1 — local reconcile delete: remove a record as part of a
+    /// migration reconcile that is NOT a client delete — the #29 completion
+    /// prune (dropping a key the authoritative source's manifest omitted,
+    /// `server::dispatch` OP_MIGRATION_COMPLETE) and the receiver's
+    /// replace-duplicate delete
+    /// (`replication::receiver::apply_create_replica`).
+    ///
+    /// Physically identical to [`Self::delete`], but the deletion tombstone is
+    /// recorded as [`crate::ops::tombstone::TombstoneCause::PruneReplace`] —
+    /// generation-gated in RULE-DS (Dah-style: at-or-behind images stay
+    /// dropped, a strictly-newer live copy heals back in) instead of the
+    /// unconditional `ClientDelete` veto these paths used to leave on a node
+    /// that never client-deleted the key (the third producer of the CI
+    /// acked-write-loss chain).
+    ///
+    /// # Errors
+    ///
+    /// Same contract as [`Self::delete`].
+    pub fn delete_prune_replace(&self, req: &DeleteRequest) -> Result<(), SpendError> {
+        self.delete_inner(
+            req,
+            RemovalAuthority::Authoritative,
+            Some(crate::ops::tombstone::TombstoneCause::PruneReplace),
+        )
     }
 
     /// Local prune-delete: remove a record from THIS node's store, with no
@@ -8652,7 +8710,7 @@ impl Engine {
     ///   deletion tombstone whenever a tombstone log is attached — which is the
     ///   default for RF > 1. Only [`Self::reclaim_held_copy`] skips it.
     pub fn prune_delete(&self, req: &DeleteRequest) -> Result<(), SpendError> {
-        self.delete_inner(req, RemovalAuthority::Authoritative)
+        self.delete_inner(req, RemovalAuthority::Authoritative, None)
     }
 
     /// **Held-copy reclaim**: drop the local copy of a record this node HOLDS
@@ -8711,7 +8769,7 @@ impl Engine {
     /// [`SpendError::StorageError`] on an index/device failure or when a
     /// guarded sweep delete is attempted on a write-unhealthy node.
     pub fn reclaim_held_copy(&self, req: &DeleteRequest) -> Result<(), SpendError> {
-        self.delete_inner(req, RemovalAuthority::HeldCopy)
+        self.delete_inner(req, RemovalAuthority::HeldCopy, None)
     }
 
     /// Internal delete.
@@ -8719,7 +8777,11 @@ impl Engine {
     /// `authority` selects whether the removal is the key's AUTHORITATIVE
     /// deletion (records a deletion tombstone) or a non-authoritative held-copy
     /// space reclaim (records none) — see [`RemovalAuthority`] and
-    /// [`Self::reclaim_held_copy`]. Every other step is identical.
+    /// [`Self::reclaim_held_copy`]. `cause_override` replaces the
+    /// `due_guard`-derived tombstone cause (Dah / ClientDelete) for callers
+    /// whose removal is neither — today only the compensation rollback
+    /// ([`Self::delete_compensated_create`], `CompensatedCreate`). Every other
+    /// step is identical.
     ///
     /// # Ordering (F-G2-001)
     ///
@@ -8733,6 +8795,7 @@ impl Engine {
         &self,
         req: &DeleteRequest,
         authority: RemovalAuthority,
+        cause_override: Option<crate::ops::tombstone::TombstoneCause>,
     ) -> Result<(), SpendError> {
         // P0-11 follow-up: a write-unhealthy (poisoned) node must not PRUNE. The
         // internal DAH sweep journals no redo, so poisoning the redo log does not
@@ -8956,11 +9019,11 @@ impl Engine {
             .get()
             .filter(|_| authority == RemovalAuthority::Authoritative)
         {
-            let cause = if req.due_guard.is_some() {
+            let cause = cause_override.unwrap_or(if req.due_guard.is_some() {
                 crate::ops::tombstone::TombstoneCause::Dah
             } else {
                 crate::ops::tombstone::TombstoneCause::ClientDelete
-            };
+            });
             // The delete's observed height: the DAH sweep's evaluated height
             // when guarded, else the node's current durable-height tip. Both are
             // in the same block-height space the retention GC compares against.
@@ -24415,6 +24478,7 @@ mod tests {
                                 },
                                 record_offset: i as u64 * 4096,
                                 record_size: 4096,
+                                cause: crate::ops::tombstone::DeleteCause::ClientDelete,
                             }])
                             .expect("routed write ok")
                     })

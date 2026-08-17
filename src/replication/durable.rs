@@ -2981,6 +2981,7 @@ mod tests {
             (0..n)
                 .map(|i| ReplicaOp::Delete {
                     tx_key: TxKey::from_bytes([i + 1; 32]),
+                    cause: crate::ops::tombstone::DeleteCause::ClientDelete,
                 })
                 .collect()
         };
@@ -3033,6 +3034,7 @@ mod tests {
         let ops: Vec<ReplicaOp> = (0..6u8)
             .map(|i| ReplicaOp::Delete {
                 tx_key: TxKey::from_bytes([i + 1; 32]),
+                cause: crate::ops::tombstone::DeleteCause::ClientDelete,
             })
             .collect();
         let calls = std::sync::atomic::AtomicU64::new(0);
@@ -3176,6 +3178,7 @@ mod tests {
         let addr: SocketAddr = "127.0.0.1:65531".parse().unwrap();
         let op = |b: u8| ReplicaOp::Delete {
             tx_key: TxKey::from_bytes([b; 32]),
+            cause: crate::ops::tombstone::DeleteCause::ClientDelete,
         };
 
         // Entry 10: 1 op. Entry 11: 5 ops (the multi-txid batch). Entry 12:
@@ -3258,6 +3261,7 @@ mod tests {
         let addr: SocketAddr = "127.0.0.1:65530".parse().unwrap();
         let op = |b: u8| ReplicaOp::Delete {
             tx_key: TxKey::from_bytes([b; 32]),
+            cause: crate::ops::tombstone::DeleteCause::ClientDelete,
         };
 
         // Entry 20 alone expands to 10 ops -- far over the budget of 3.

@@ -417,7 +417,16 @@ fn segment_non_spend_ops_replicate_in_place_no_relocate() {
     );
 
     // delete removes the record.
-    apply_op_journal(&replica, &ReplicaOp::Delete { tx_key: key }, true, false).unwrap();
+    apply_op_journal(
+        &replica,
+        &ReplicaOp::Delete {
+            tx_key: key,
+            cause: teraslab::ops::tombstone::DeleteCause::ClientDelete,
+        },
+        true,
+        false,
+    )
+    .unwrap();
     assert!(replica.lookup(&key).is_none(), "delete removed the record");
 }
 

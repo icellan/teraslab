@@ -45,8 +45,9 @@ use crate::index::TxKey;
 use crate::index::sharded::shard_for_key;
 use crate::record::generation_at_or_ahead;
 
-/// Why a record was deleted. Diagnostic only in Phase 2a (carried on-disk and
-/// preserved across compaction, but not consulted by any query).
+/// Why a record was deleted. Consulted by the RULE-DS heal-apply gate
+/// ([`TombstoneLog::blocks_heal_apply`]) — the cause selects the veto rule —
+/// and carried on-disk (preserved across compaction).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum TombstoneCause {
@@ -54,8 +55,70 @@ pub enum TombstoneCause {
     Dah = 0,
     /// Deleted by a direct client `OP_DELETE_BATCH` (`due_guard == None`).
     ClientDelete = 1,
-    /// Deleted as part of a migration replace-duplicate reconcile.
+    /// W9 P1-1 — a LOCAL migration reconcile, not a client delete: the #29
+    /// completion prune (the target drops a key the authoritative source's
+    /// manifest omitted, `server::dispatch` OP_MIGRATION_COMPLETE) and the
+    /// receiver's replace-duplicate delete
+    /// (`replication::receiver::apply_create_replica`). Generation-gated in
+    /// [`TombstoneLog::blocks_heal_apply`] (Dah-style): the reconcile's
+    /// anti-resurrection purpose holds for at-or-behind images, while a
+    /// strictly-newer live copy heals back in — recording these as
+    /// `ClientDelete` gave a node that never client-deleted the unconditional
+    /// veto, the same permanent acked-write-loss chain as the compensation
+    /// family. Both producers are LOCAL-ONLY deletes (no `RedoOp::Delete`
+    /// journalled, nothing replicated), so [`DeleteCause`] deliberately has
+    /// no `PruneReplace` variant — see its doc.
     PruneReplace = 2,
+    /// W9 — a create ROLLED BACK because its replication fan-out failed
+    /// (`server::dispatch::compensate_replication_failure`'s Create arm), or a
+    /// remote apply of the compensating delete that rollback fanned out /
+    /// re-emitted through a redo-derived delta.
+    ///
+    /// This cause asserts "the create THIS write attempt applied was undone" —
+    /// a claim about ONE failed write, NOT a claim that the client deleted the
+    /// key. The client saw an ERROR for that create and may well have retried
+    /// it successfully elsewhere, so a LIVE client-acked copy of the record
+    /// can legitimately exist — which is exactly why this cause must not carry
+    /// the unconditional [`Self::ClientDelete`] veto (pre-W9 it was recorded
+    /// AS `ClientDelete`, and the unconditional veto turned the crash-window
+    /// rollback into permanent acked-write loss: every heal/migration create
+    /// of the surviving live copy was vetoed forever, and orphan cleanup then
+    /// deleted the last live copy).
+    CompensatedCreate = 3,
+}
+
+/// W9 — why a JOURNALLED (`RedoOp::Delete`) or REPLICATED (`ReplicaOp::Delete`)
+/// delete removed the record, so the APPLYING node records the same
+/// [`TombstoneCause`] the originating node did (and a redo-derived re-emit —
+/// migration delta, crash-recovered replication intent — preserves it).
+///
+/// Only the two causes that ever travel: the DAH sweep is per-holder local GC
+/// (never journalled as `Delete`, never replicated), and `PruneReplace`'s two
+/// producers (the #29 completion prune, the receiver replace-duplicate
+/// reconcile) are local-only `Engine` deletes that journal no `RedoOp::Delete`
+/// and fan nothing out — a `PruneReplace` variant here would be dead wire code.
+/// If a future path ever replicates or journals one, extend the tag scheme
+/// exactly as for `CompensatedCreate` (new tag/opcode, same body).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeleteCause {
+    /// A client `OP_DELETE_BATCH` — the key's authoritative deletion; the
+    /// applying node records [`TombstoneCause::ClientDelete`] (unconditional
+    /// RULE-DS veto, the #78 anti-resurrection posture).
+    ClientDelete,
+    /// A compensating delete rolling back a create whose replication fan-out
+    /// failed; the applying node records
+    /// [`TombstoneCause::CompensatedCreate`] (generation-overridable veto).
+    CompensatedCreate,
+}
+
+impl DeleteCause {
+    /// The [`TombstoneCause`] the applying node records for this delete.
+    pub fn tombstone_cause(self) -> TombstoneCause {
+        match self {
+            Self::ClientDelete => TombstoneCause::ClientDelete,
+            Self::CompensatedCreate => TombstoneCause::CompensatedCreate,
+        }
+    }
 }
 
 /// On-disk tombstone record. Fixed 48-byte little-endian layout; the field
@@ -292,18 +355,54 @@ impl TombstoneLog {
     /// in-RAM index and buffer the on-disk append IN RAM (no file I/O, no fsync
     /// — the delete-latency floor is untouched). Durability is deferred to
     /// [`Self::persist`] at the next checkpoint (Invariant TS-1).
+    ///
+    /// # W9 cause precedence (resurrection-safety pin)
+    ///
+    /// Successive records for the same key are last-writer-wins, with ONE
+    /// carve-out: a WEAK cause ([`TombstoneCause::CompensatedCreate`] or
+    /// [`TombstoneCause::PruneReplace`] — the generation-overridable local
+    /// rollback/reconcile markers) never REPLACES an existing tombstone of a
+    /// different cause. For the strong causes this is protection — a weak
+    /// claim must not downgrade `ClientDelete`'s (or `Dah`'s) veto. Between
+    /// the TWO weak causes, first-claim-stands is NOT a protection rule:
+    /// neither order is uniformly more conservative (each cause's window
+    /// admits what the other blocks at some generations). It is chosen
+    /// because the collision is TS-1-unreachable in production (the
+    /// tombstone clears whenever the key comes back live, and deleting an
+    /// absent record writes nothing), both causes are weak markers on a node
+    /// that never client-deleted (safety leg 3 covers either outcome), and a
+    /// fixed rule pinned in both directions beats an order-dependent one.
+    /// The reverse direction stays plain LWW: a later `ClientDelete` (or
+    /// `Dah`) for the same key upgrades either weak cause. The strong-cause
+    /// downgrade must be structurally impossible, not merely unlikely (see
+    /// [`Self::blocks_heal_apply`]'s safety argument).
     pub fn record(&self, key: &TxKey, generation: u32, height: u32, cause: TombstoneCause) {
         let value = TombValue {
             generation,
             height,
             cause: cause as u8,
         };
+        let weak = matches!(
+            cause,
+            TombstoneCause::CompensatedCreate | TombstoneCause::PruneReplace
+        );
         // Two disjoint locks, never held simultaneously here: shard write drops
         // before the file lock is taken, so `persist` (file-then-shard) can
         // never invert against this path.
-        self.shards[self.shard_index(key)]
-            .write()
-            .insert(*key, value);
+        {
+            let mut shard = self.shards[self.shard_index(key)].write();
+            if weak
+                && shard
+                    .get(key)
+                    .is_some_and(|existing| existing.cause != cause as u8)
+            {
+                // The existing (different-cause) claim stands; record nothing
+                // (the existing entry is already durable-or-pending on its
+                // own).
+                return;
+            }
+            shard.insert(*key, value);
+        }
         self.file.lock().pending.push((*key, value));
     }
 
@@ -342,11 +441,11 @@ impl TombstoneLog {
     ///   gate is airtight because it rests on LWW-by-generation, not on the
     ///   (false) maximality claim (design §C, P1-3 proof).
     ///
-    /// - A [`TombstoneCause::ClientDelete`] / [`TombstoneCause::PruneReplace`]
-    ///   tombstone carries NO terminal-generation guarantee: a client may delete
-    ///   a STILL-MUTATING record whose generation a diverged source later exceeds
-    ///   (the 2a/2b-review consensus concern — a generation-only gate would miss
-    ///   it and resurrect the record). For those causes the heal drops
+    /// - A [`TombstoneCause::ClientDelete`] tombstone carries NO
+    ///   terminal-generation guarantee: a client may delete a STILL-MUTATING
+    ///   record whose generation a diverged source later exceeds (the
+    ///   2a/2b-review consensus concern — a generation-only gate would miss
+    ///   it and resurrect the record). For this cause the heal drops
     ///   UNCONDITIONALLY: a record this node explicitly removed is never brought
     ///   back by a boot heal, closing the concern under a double-spend lens. A
     ///   LEGITIMATE re-create instead flows through the client-create / normal
@@ -390,12 +489,84 @@ impl TombstoneLog {
     ///   reorg/finality horizon is the accepted mitigation instead — it lifts
     ///   the block precisely when a legitimate re-mine of the key is no longer
     ///   possible, at which point the unconditional drop stops mattering.
+    ///
+    /// - W9 P1-1 — a [`TombstoneCause::PruneReplace`] tombstone (the #29
+    ///   completion prune / the receiver replace-duplicate reconcile) uses the
+    ///   SAME generation rule as `Dah`: block iff the tombstone generation is
+    ///   at-or-ahead of the incoming image. The reconcile's purpose — keeping
+    ///   the stale copy the authoritative manifest omitted from resurrecting —
+    ///   is exactly the at-or-behind window; a strictly-newer image is a live
+    ///   copy the cluster still acknowledges, and a LOCAL reconcile marker on
+    ///   a node that never client-deleted the key must not veto it forever
+    ///   (pre-W9 these deletes recorded `ClientDelete` and re-opened the
+    ///   permanent acked-write-loss chain through a third producer).
+    ///
+    /// - W9 — a [`TombstoneCause::CompensatedCreate`] tombstone (a create
+    ///   rolled back because its replication fan-out failed) is OVERRIDABLE:
+    ///   it drops the incoming image only when the image is STRICTLY BEHIND
+    ///   the tombstone (`!generation_at_or_ahead(incoming, N)`), so a
+    ///   heal/migration create at `incoming >= N` APPLIES. The client was
+    ///   NACKed for the rolled-back create and may have retried it
+    ///   successfully elsewhere; the surviving live, client-ACKED copy — at
+    ///   the same or a later generation of the same lineage — must defeat its
+    ///   own crash-window rollback, or the acked write is permanently lost
+    ///   (the CI-proven armed-05/08 loss: the veto starved every heal until
+    ///   orphan cleanup deleted the last live copy).
+    ///
+    ///   SAFETY ARGUMENT — why this override can never resurrect a record the
+    ///   CLIENT deleted:
+    ///
+    ///   1. **Cause separation at every producer.** `CompensatedCreate` is
+    ///      recorded ONLY over a create this node just rolled back
+    ///      (`compensate_replication_failure`'s Create arm) or by applying the
+    ///      compensating delete that rollback fanned out / re-emitted
+    ///      (`DeleteCause::CompensatedCreate` on the wire + redo). Every
+    ///      client-delete path — local `OP_DELETE_BATCH`, its
+    ///      `ReplicaOp::Delete` fan-out, redo-derived delete re-emits —
+    ///      records `ClientDelete`. Neither path can produce the other's
+    ///      cause.
+    ///   2. **Precedence when both claims fire on one node.** [`Self::record`]
+    ///      refuses to let a `CompensatedCreate` replace an existing tombstone
+    ///      of any other cause, and a later `ClientDelete` replaces a
+    ///      `CompensatedCreate` by plain last-writer-wins — so wherever a
+    ///      client-delete claim exists for the key, the unconditional veto
+    ///      stands (pinned by
+    ///      `compensated_create_never_downgrades_a_stronger_tombstone`).
+    ///   3. **The override adds no exposure a bare node lacks.** A node whose
+    ///      ONLY tombstone for the key is `CompensatedCreate` never itself
+    ///      executed a client delete of the key (a client delete applying to a
+    ///      PRESENT record records `ClientDelete`; one finding the key ABSENT
+    ///      records nothing — on this node or any other). Admitting an
+    ///      at-or-ahead live image therefore leaves this node exactly as
+    ///      exposed as a node with NO tombstone — the posture RULE-DS/#78
+    ///      always accepted for non-deleting nodes ("a node that ITSELF
+    ///      client-deleted never resurrects" is the invariant, and it is
+    ///      untouched).
+    ///   4. **The generation floor is a best-effort staleness filter, NOT a
+    ///      safety guarantee** (review P2-4). A compensation tombstones a
+    ///      just-created record, so `N` is 0 in practice and `incoming >= N`
+    ///      admits essentially every image — the CompensatedCreate "veto" is
+    ///      effectively vacuous, and legs 1–3 (cause separation, precedence,
+    ///      no-worse-than-a-bare-node) are the ACTUAL safety argument. The
+    ///      floor only filters the rare provably-stale same-lineage image;
+    ///      cross-lineage generation comparability remains out of scope
+    ///      (#78), exactly as for every other generation-gated leg.
     pub fn blocks_heal_apply(&self, key: &TxKey, incoming_generation: u32) -> bool {
         match self.shards[self.shard_index(key)].read().get(key) {
             None => false,
-            Some(v) if v.cause == TombstoneCause::Dah as u8 => {
+            // Generation-gated legs (Dah-style): block a source at-or-behind
+            // the frozen generation, admit a strictly-newer one.
+            Some(v)
+                if v.cause == TombstoneCause::Dah as u8
+                    || v.cause == TombstoneCause::PruneReplace as u8 =>
+            {
                 generation_at_or_ahead(v.generation, incoming_generation)
             }
+            Some(v) if v.cause == TombstoneCause::CompensatedCreate as u8 => {
+                !generation_at_or_ahead(incoming_generation, v.generation)
+            }
+            // ClientDelete + any unrecognized future cause: unconditional
+            // (fail-closed, the #78 posture).
             Some(_) => true,
         }
     }
@@ -413,8 +584,8 @@ impl TombstoneLog {
     /// report WHY an apply was dropped. A stored byte no current cause maps to
     /// (possible only for a log written by a future version) is reported as
     /// [`TombstoneCause::ClientDelete`], matching how
-    /// [`Self::blocks_heal_apply`] treats every non-Dah cause (unconditional
-    /// block).
+    /// [`Self::blocks_heal_apply`] treats every unrecognized cause
+    /// (unconditional block — the fail-closed direction).
     pub fn lookup_cause(&self, key: &TxKey) -> Option<TombstoneCause> {
         self.shards[self.shard_index(key)]
             .read()
@@ -422,6 +593,9 @@ impl TombstoneLog {
             .map(|v| match v.cause {
                 c if c == TombstoneCause::Dah as u8 => TombstoneCause::Dah,
                 c if c == TombstoneCause::PruneReplace as u8 => TombstoneCause::PruneReplace,
+                c if c == TombstoneCause::CompensatedCreate as u8 => {
+                    TombstoneCause::CompensatedCreate
+                }
                 _ => TombstoneCause::ClientDelete,
             })
     }
@@ -930,13 +1104,182 @@ mod tests {
             "ClientDelete drops a strictly-newer source (consensus closure)",
         );
 
-        // PruneReplace: also unconditional.
+        // W9 P1-1 — PruneReplace: generation-gated like Dah (block a source
+        // at-or-behind the frozen generation, admit a strictly-newer one).
+        // The prune's anti-resurrection purpose — dropping the stale extra
+        // copy the authoritative manifest omitted — survives for at-or-behind
+        // images, while a strictly-newer live copy heals back in instead of
+        // being vetoed forever by a node that never client-deleted the key.
         let prune = tk(3);
         log.record(&prune, 5, 900, TombstoneCause::PruneReplace);
-        assert!(log.blocks_heal_apply(&prune, 99));
+        assert!(
+            log.blocks_heal_apply(&prune, 4),
+            "PruneReplace drops a source behind N (the reverse-heal window it closes)",
+        );
+        assert!(log.blocks_heal_apply(&prune, 5), "PruneReplace drops at N");
+        assert!(
+            !log.blocks_heal_apply(&prune, 6),
+            "PruneReplace ADMITS a strictly-newer source — a live copy the \
+             cluster still acks must not be vetoed by a local prune marker",
+        );
 
         // No tombstone → never blocks.
         assert!(!log.blocks_heal_apply(&tk(42), 0));
+    }
+
+    /// W9 — the CompensatedCreate leg of RULE-DS: a compensation tombstone at
+    /// generation `N` is OVERRIDABLE by an incoming heal/migration create at
+    /// `incoming >= N` (a live client-confirmed copy must defeat its own
+    /// crash-window rollback) and still blocks a strictly-stale image
+    /// (`incoming < N`). The ClientDelete veto stays unconditional — pinned
+    /// again here side by side so the two legs can never be conflated.
+    #[test]
+    fn blocks_heal_apply_compensated_create_is_generation_overridable() {
+        let log = TombstoneLog::new(PathBuf::from("/nonexistent/x.tombstones"), 0, 4, 100);
+
+        let comp = tk(1);
+        log.record(&comp, 5, 900, TombstoneCause::CompensatedCreate);
+        assert!(
+            log.blocks_heal_apply(&comp, 4),
+            "CompensatedCreate still blocks a strictly-stale source (incoming < N)",
+        );
+        assert!(
+            !log.blocks_heal_apply(&comp, 5),
+            "CompensatedCreate ADMITS a source at N: the rolled-back create's own \
+             surviving live copy carries exactly the tombstone generation",
+        );
+        assert!(
+            !log.blocks_heal_apply(&comp, 6),
+            "CompensatedCreate ADMITS a strictly-newer source (incoming > N)",
+        );
+
+        // The CI shape: compensation tombstones the fresh create at gen 0; the
+        // surviving acked copy heals back in at gen >= 0.
+        let comp_zero = tk(2);
+        log.record(&comp_zero, 0, 900, TombstoneCause::CompensatedCreate);
+        assert!(!log.blocks_heal_apply(&comp_zero, 0));
+        assert!(!log.blocks_heal_apply(&comp_zero, 3));
+
+        // Contrast pin: ClientDelete at the same generations stays an
+        // unconditional veto (the #78 posture, untouched by W9).
+        let client = tk(3);
+        log.record(&client, 0, 900, TombstoneCause::ClientDelete);
+        assert!(log.blocks_heal_apply(&client, 0));
+        assert!(log.blocks_heal_apply(&client, 99));
+    }
+
+    /// W9 resurrection-safety pin — tombstone-cause PRECEDENCE for the same
+    /// key. A later ClientDelete REPLACES a CompensatedCreate (the
+    /// authoritative client claim upgrades the rollback claim), but a later
+    /// CompensatedCreate must NOT downgrade an existing ClientDelete (or any
+    /// other cause): were it to, a compensation racing a client delete would
+    /// re-open the resurrection window #78 closed.
+    #[test]
+    fn compensated_create_never_downgrades_a_stronger_tombstone() {
+        let log = TombstoneLog::new(PathBuf::from("/nonexistent/x.tombstones"), 0, 4, 100);
+
+        // ClientDelete then CompensatedCreate → ClientDelete stands
+        // (unconditional veto retained, generation retained).
+        let k1 = tk(1);
+        log.record(&k1, 7, 900, TombstoneCause::ClientDelete);
+        log.record(&k1, 9, 901, TombstoneCause::CompensatedCreate);
+        assert_eq!(log.lookup_cause(&k1), Some(TombstoneCause::ClientDelete));
+        assert_eq!(log.lookup(&k1), Some((7, 900)));
+        assert!(
+            log.blocks_heal_apply(&k1, 99),
+            "the client delete's unconditional veto must survive a later \
+             compensation record for the same key",
+        );
+
+        // Dah then CompensatedCreate → Dah stands (defense in depth; TS-1
+        // makes this unreachable in production but the downgrade must still
+        // be structurally impossible).
+        let k2 = tk(2);
+        log.record(&k2, 7, 900, TombstoneCause::Dah);
+        log.record(&k2, 9, 901, TombstoneCause::CompensatedCreate);
+        assert_eq!(log.lookup_cause(&k2), Some(TombstoneCause::Dah));
+
+        // CompensatedCreate then ClientDelete → the client delete REPLACES it
+        // (normal last-writer-wins upgrade).
+        let k3 = tk(3);
+        log.record(&k3, 2, 900, TombstoneCause::CompensatedCreate);
+        log.record(&k3, 5, 905, TombstoneCause::ClientDelete);
+        assert_eq!(log.lookup_cause(&k3), Some(TombstoneCause::ClientDelete));
+        assert_eq!(log.lookup(&k3), Some((5, 905)));
+        assert!(log.blocks_heal_apply(&k3, 99));
+
+        // CompensatedCreate then CompensatedCreate → last writer wins within
+        // the same cause (a re-rolled-back re-create carries newer state).
+        let k4 = tk(4);
+        log.record(&k4, 2, 900, TombstoneCause::CompensatedCreate);
+        log.record(&k4, 6, 905, TombstoneCause::CompensatedCreate);
+        assert_eq!(log.lookup(&k4), Some((6, 905)));
+        assert_eq!(
+            log.lookup_cause(&k4),
+            Some(TombstoneCause::CompensatedCreate)
+        );
+
+        // W9 P1-1 — PruneReplace mirrors the CompensatedCreate rules exactly.
+        // ClientDelete then PruneReplace → ClientDelete stands.
+        let k5 = tk(5);
+        log.record(&k5, 7, 900, TombstoneCause::ClientDelete);
+        log.record(&k5, 9, 901, TombstoneCause::PruneReplace);
+        assert_eq!(log.lookup_cause(&k5), Some(TombstoneCause::ClientDelete));
+        assert_eq!(log.lookup(&k5), Some((7, 900)));
+        assert!(
+            log.blocks_heal_apply(&k5, 99),
+            "a local prune marker must never downgrade the client delete's \
+             unconditional veto",
+        );
+
+        // Dah then PruneReplace → Dah stands (defense in depth, as above).
+        let k6 = tk(6);
+        log.record(&k6, 7, 900, TombstoneCause::Dah);
+        log.record(&k6, 9, 901, TombstoneCause::PruneReplace);
+        assert_eq!(log.lookup_cause(&k6), Some(TombstoneCause::Dah));
+
+        // PruneReplace then ClientDelete → the client delete REPLACES it.
+        let k7 = tk(7);
+        log.record(&k7, 2, 900, TombstoneCause::PruneReplace);
+        log.record(&k7, 5, 905, TombstoneCause::ClientDelete);
+        assert_eq!(log.lookup_cause(&k7), Some(TombstoneCause::ClientDelete));
+        assert!(log.blocks_heal_apply(&k7, 99));
+
+        // The two WEAK causes never displace each other either — the earlier
+        // claim (and its generation) stands, so neither rollback marker can
+        // weaken or re-scope the other's veto window.
+        let k8 = tk(8);
+        log.record(&k8, 3, 900, TombstoneCause::CompensatedCreate);
+        log.record(&k8, 9, 901, TombstoneCause::PruneReplace);
+        assert_eq!(
+            log.lookup_cause(&k8),
+            Some(TombstoneCause::CompensatedCreate)
+        );
+        assert_eq!(log.lookup(&k8), Some((3, 900)));
+        let k9 = tk(9);
+        log.record(&k9, 3, 900, TombstoneCause::PruneReplace);
+        log.record(&k9, 9, 901, TombstoneCause::CompensatedCreate);
+        assert_eq!(log.lookup_cause(&k9), Some(TombstoneCause::PruneReplace));
+        assert_eq!(log.lookup(&k9), Some((3, 900)));
+    }
+
+    /// W9 — the on-disk codec round-trips the new cause byte, and
+    /// `lookup_cause` maps it back distinctly (not folded into the
+    /// ClientDelete fallback).
+    #[test]
+    fn compensated_create_cause_roundtrips_and_maps() {
+        let key = tk(7);
+        let bytes = encode_entry(&key.txid, 4, 800, TombstoneCause::CompensatedCreate as u8);
+        let (k, v) = decode_entry(&bytes).expect("roundtrip decodes");
+        assert_eq!(k, key);
+        assert_eq!(v.cause, TombstoneCause::CompensatedCreate as u8);
+
+        let log = TombstoneLog::new(PathBuf::from("/nonexistent/x.tombstones"), 0, 4, 100);
+        log.record(&key, 4, 800, TombstoneCause::CompensatedCreate);
+        assert_eq!(
+            log.lookup_cause(&key),
+            Some(TombstoneCause::CompensatedCreate)
+        );
     }
 
     #[test]

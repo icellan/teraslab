@@ -1230,6 +1230,7 @@ fn sweep_delete() {
                         tx_key: k,
                         record_offset: off,
                         record_size,
+                        cause: teraslab::ops::tombstone::DeleteCause::ClientDelete,
                     })
                     .ok();
             },

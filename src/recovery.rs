@@ -1216,6 +1216,9 @@ fn replay_one_recovery_entry(
             tx_key,
             record_offset,
             record_size,
+            // W9: the cause matters only to the redo→replica converter;
+            // physical replay is cause-agnostic.
+            cause: _,
         } => {
             let delete_outcome = replay_delete(device, index, tx_key, *record_offset, *record_size);
             if matches!(delete_outcome, ReplayResult::Failed(_)) {
@@ -2096,6 +2099,7 @@ fn replay_entry(
             tx_key,
             record_offset,
             record_size,
+            cause: _,
         } => replay_delete(device, index, tx_key, *record_offset, *record_size),
         RedoOp::AppendConflictingChild { .. } => ReplayResult::Skipped,
         RedoOp::RemoveConflictingChild { .. } => ReplayResult::Skipped,
@@ -7158,6 +7162,7 @@ mod tests {
                 tx_key: key_a,
                 record_offset: off_a,
                 record_size: base,
+                cause: crate::ops::tombstone::DeleteCause::ClientDelete,
             })
             .unwrap();
         redo0
@@ -7555,6 +7560,7 @@ mod tests {
                 tx_key: key,
                 record_offset,
                 record_size: base,
+                cause: crate::ops::tombstone::DeleteCause::ClientDelete,
             })
             .unwrap();
 
@@ -7680,6 +7686,7 @@ mod tests {
                     tx_key: key,
                     record_offset: off_a,
                     record_size: base,
+                    cause: crate::ops::tombstone::DeleteCause::ClientDelete,
                 })
                 .unwrap();
             redo1
@@ -9626,6 +9633,7 @@ mod tests {
             tx_key: key,
             record_offset: ie.record_offset,
             record_size: 1024,
+            cause: crate::ops::tombstone::DeleteCause::ClientDelete,
         })
         .unwrap();
 
@@ -9651,6 +9659,7 @@ mod tests {
             tx_key: key,
             record_offset: ie.record_offset,
             record_size,
+            cause: crate::ops::tombstone::DeleteCause::ClientDelete,
         })
         .unwrap();
 

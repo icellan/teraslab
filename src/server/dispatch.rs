@@ -1478,7 +1478,17 @@ pub(crate) fn handle_request(
                     if expected_keys.contains(&key) {
                         continue;
                     }
-                    match engine.delete(&crate::ops::remaining::DeleteRequest {
+                    // W9 P1-1 — `delete_prune_replace`, NOT `delete`: this is
+                    // a local reconcile against the authoritative manifest,
+                    // not a client delete. `delete` recorded a ClientDelete
+                    // tombstone whose unconditional RULE-DS veto permanently
+                    // blocked every later heal of a live copy through a node
+                    // that never client-deleted (the same loss chain the
+                    // orphan cleanup fixed with `reclaim_held_copy` — see
+                    // coordinator's cleanup_orphan_shards). PruneReplace keeps
+                    // the anti-resurrection window (at-or-behind images stay
+                    // vetoed) while a strictly-newer live copy heals in.
+                    match engine.delete_prune_replace(&crate::ops::remaining::DeleteRequest {
                         tx_key: key,
                         due_guard: None,
                     }) {
@@ -4864,16 +4874,33 @@ fn compensate_replication_failure(
                     // node while every replica never applied it, a silent
                     // divergence that a clean-rollback report would hide
                     // from the caller until the next restart-recovery.
-                    if let Err(e) = engine.delete(&req)
+                    //
+                    // W9 — `delete_compensated_create`, NOT `delete`: this
+                    // removal rolls back a create whose fan-out failed; it is
+                    // not a client delete of the key. Recording it as
+                    // `ClientDelete` gave the rollback tombstone the
+                    // unconditional RULE-DS veto, permanently blocking every
+                    // heal/migration create of the client-acked copy that
+                    // survived elsewhere (CI-proven acked-write loss). The
+                    // `CompensatedCreate` tombstone is overridable by a live
+                    // copy at-or-ahead of its generation.
+                    if let Err(e) = engine.delete_compensated_create(&req)
                         && !matches!(e, SpendError::TxNotFound)
                         && restore_write_err.is_none()
                     {
                         restore_write_err = Some(format!("compensate create (delete): {e}"));
                     }
+                    // The compensating redo entry carries the same cause so
+                    // the D-4 fan-out reconstruction
+                    // (`replicate_compensation_intent`), a crash-recovered
+                    // replication intent, and a migration delta all re-emit a
+                    // COMPENSATED `ReplicaOp::Delete` — never spreading an
+                    // unconditional ClientDelete tombstone to other holders.
                     comp_redo.push(RedoOp::Delete {
                         tx_key: *key,
                         record_offset: 0,
                         record_size: 0,
+                        cause: crate::ops::tombstone::DeleteCause::CompensatedCreate,
                     });
                 }
                 ReplicaOp::Delete { .. } => {
@@ -10204,7 +10231,15 @@ fn handle_delete_batch(
     let repl_ops_by_key: Vec<(TxKey, Vec<ReplicaOp>)> = if sweep_due_height.is_none() {
         staged
             .iter()
-            .map(|s| (s.key, vec![ReplicaOp::Delete { tx_key: s.key }]))
+            .map(|s| {
+                (
+                    s.key,
+                    vec![ReplicaOp::Delete {
+                        tx_key: s.key,
+                        cause: crate::ops::tombstone::DeleteCause::ClientDelete,
+                    }],
+                )
+            })
             .collect()
     } else {
         Vec::new()
@@ -18942,6 +18977,7 @@ mod tests {
                         tx_key,
                         record_offset: u64::from(byte) * 4096,
                         record_size: 4096,
+                        cause: crate::ops::tombstone::DeleteCause::ClientDelete,
                     }],
                     Duration::from_millis(50),
                 )
@@ -22022,6 +22058,7 @@ mod tests {
                 tx_key,
                 record_offset: 4096,
                 record_size: 256,
+                cause: crate::ops::tombstone::DeleteCause::ClientDelete,
             }],
         )
         .expect("redo write succeeds");
@@ -22048,7 +22085,10 @@ mod tests {
         assert_eq!(observed_ops[0].0, tx_key);
         assert!(matches!(
             observed_ops[0].1.as_slice(),
-            [ReplicaOp::Delete { tx_key: deleted }] if *deleted == tx_key
+            [ReplicaOp::Delete {
+                tx_key: deleted,
+                cause: crate::ops::tombstone::DeleteCause::ClientDelete,
+            }] if *deleted == tx_key
         ));
     }
 
@@ -22073,6 +22113,7 @@ mod tests {
                 tx_key,
                 record_offset: 4096,
                 record_size: 256,
+                cause: crate::ops::tombstone::DeleteCause::ClientDelete,
             }],
             Some(&tracker),
         )
@@ -22162,6 +22203,7 @@ mod tests {
                 tx_key,
                 record_offset: 4096,
                 record_size: 256,
+                cause: crate::ops::tombstone::DeleteCause::ClientDelete,
             }],
         )
         .expect("redo write succeeds");
@@ -22373,6 +22415,7 @@ mod tests {
                 tx_key: key0,
                 record_offset: 4096,
                 record_size: 256,
+                cause: crate::ops::tombstone::DeleteCause::ClientDelete,
             })
             .unwrap();
         let s1 = log1_arc
@@ -22381,6 +22424,7 @@ mod tests {
                 tx_key: key1,
                 record_offset: 8192,
                 record_size: 256,
+                cause: crate::ops::tombstone::DeleteCause::ClientDelete,
             })
             .unwrap();
         log0_arc.lock().flush().unwrap();
@@ -22460,6 +22504,7 @@ mod tests {
                 tx_key: k_a,
                 record_offset: 4096,
                 record_size: 256,
+                cause: crate::ops::tombstone::DeleteCause::ClientDelete,
             })
             .unwrap();
         let s_b = log1_arc
@@ -22468,6 +22513,7 @@ mod tests {
                 tx_key: k_b,
                 record_offset: 8192,
                 record_size: 256,
+                cause: crate::ops::tombstone::DeleteCause::ClientDelete,
             })
             .unwrap();
         log0_arc.lock().flush().unwrap();
@@ -22705,6 +22751,7 @@ mod tests {
                 tx_key,
                 record_offset: 4096,
                 record_size: 256,
+                cause: crate::ops::tombstone::DeleteCause::ClientDelete,
             }],
         )
         .expect("redo write succeeds");
@@ -23099,7 +23146,10 @@ mod tests {
         };
         let ops = vec![(
             tx_key,
-            vec![crate::replication::protocol::ReplicaOp::Delete { tx_key }],
+            vec![crate::replication::protocol::ReplicaOp::Delete {
+                tx_key,
+                cause: crate::ops::tombstone::DeleteCause::ClientDelete,
+            }],
         )];
 
         let plan = build_replication_targets(&cluster, &ops)
@@ -23193,7 +23243,10 @@ mod tests {
             .map(|k| {
                 (
                     *k,
-                    vec![crate::replication::protocol::ReplicaOp::Delete { tx_key: *k }],
+                    vec![crate::replication::protocol::ReplicaOp::Delete {
+                        tx_key: *k,
+                        cause: crate::ops::tombstone::DeleteCause::ClientDelete,
+                    }],
                 )
             })
             .collect();
@@ -23330,7 +23383,10 @@ mod tests {
         };
         let ops = vec![(
             tx_key,
-            vec![crate::replication::protocol::ReplicaOp::Delete { tx_key }],
+            vec![crate::replication::protocol::ReplicaOp::Delete {
+                tx_key,
+                cause: crate::ops::tombstone::DeleteCause::ClientDelete,
+            }],
         )];
 
         let plan = build_replication_targets(&cluster, &ops)
@@ -23420,7 +23476,10 @@ mod tests {
         };
         let ops = vec![(
             tx_key,
-            vec![crate::replication::protocol::ReplicaOp::Delete { tx_key }],
+            vec![crate::replication::protocol::ReplicaOp::Delete {
+                tx_key,
+                cause: crate::ops::tombstone::DeleteCause::ClientDelete,
+            }],
         )];
 
         let plan = build_replication_targets(&cluster, &ops)
@@ -23467,7 +23526,10 @@ mod tests {
 
         let ops = vec![(
             tx_key,
-            vec![crate::replication::protocol::ReplicaOp::Delete { tx_key }],
+            vec![crate::replication::protocol::ReplicaOp::Delete {
+                tx_key,
+                cause: crate::ops::tombstone::DeleteCause::ClientDelete,
+            }],
         )];
 
         let err = replicate_all_ops(Some(&cluster), &ops, (0, 0), &[])
@@ -23490,7 +23552,10 @@ mod tests {
 
         let ops = vec![(
             tx_key,
-            vec![crate::replication::protocol::ReplicaOp::Delete { tx_key }],
+            vec![crate::replication::protocol::ReplicaOp::Delete {
+                tx_key,
+                cause: crate::ops::tombstone::DeleteCause::ClientDelete,
+            }],
         )];
 
         let outcome = replicate_all_ops(Some(&cluster), &ops, (0, 0), &[])
@@ -23514,7 +23579,10 @@ mod tests {
 
         let ops = vec![(
             tx_key,
-            vec![crate::replication::protocol::ReplicaOp::Delete { tx_key }],
+            vec![crate::replication::protocol::ReplicaOp::Delete {
+                tx_key,
+                cause: crate::ops::tombstone::DeleteCause::ClientDelete,
+            }],
         )];
 
         let outcome = replicate_all_ops(Some(&cluster), &ops, (0, 0), &[]).expect(
@@ -23645,11 +23713,17 @@ mod tests {
         let ops = vec![
             (
                 key_a,
-                vec![crate::replication::protocol::ReplicaOp::Delete { tx_key: key_a }],
+                vec![crate::replication::protocol::ReplicaOp::Delete {
+                    tx_key: key_a,
+                    cause: crate::ops::tombstone::DeleteCause::ClientDelete,
+                }],
             ),
             (
                 key_b,
-                vec![crate::replication::protocol::ReplicaOp::Delete { tx_key: key_b }],
+                vec![crate::replication::protocol::ReplicaOp::Delete {
+                    tx_key: key_b,
+                    cause: crate::ops::tombstone::DeleteCause::ClientDelete,
+                }],
             ),
         ];
 
@@ -23749,11 +23823,17 @@ mod tests {
         let ops = vec![
             (
                 key_a,
-                vec![crate::replication::protocol::ReplicaOp::Delete { tx_key: key_a }],
+                vec![crate::replication::protocol::ReplicaOp::Delete {
+                    tx_key: key_a,
+                    cause: crate::ops::tombstone::DeleteCause::ClientDelete,
+                }],
             ),
             (
                 key_b,
-                vec![crate::replication::protocol::ReplicaOp::Delete { tx_key: key_b }],
+                vec![crate::replication::protocol::ReplicaOp::Delete {
+                    tx_key: key_b,
+                    cause: crate::ops::tombstone::DeleteCause::ClientDelete,
+                }],
             ),
         ];
 
@@ -23799,7 +23879,10 @@ mod tests {
         };
         let ops = vec![(
             tx_key,
-            vec![crate::replication::protocol::ReplicaOp::Delete { tx_key }],
+            vec![crate::replication::protocol::ReplicaOp::Delete {
+                tx_key,
+                cause: crate::ops::tombstone::DeleteCause::ClientDelete,
+            }],
         )];
 
         let err = replicate_all_ops(Some(&cluster), &ops, (0, 0), &[])
@@ -23848,7 +23931,10 @@ mod tests {
         };
         let ops = vec![(
             tx_key,
-            vec![crate::replication::protocol::ReplicaOp::Delete { tx_key }],
+            vec![crate::replication::protocol::ReplicaOp::Delete {
+                tx_key,
+                cause: crate::ops::tombstone::DeleteCause::ClientDelete,
+            }],
         )];
 
         let plan =
@@ -23937,7 +24023,10 @@ mod tests {
         // The compensating op for the failed write is a Delete of K.
         let ops = vec![(
             tx_key,
-            vec![crate::replication::protocol::ReplicaOp::Delete { tx_key }],
+            vec![crate::replication::protocol::ReplicaOp::Delete {
+                tx_key,
+                cause: crate::ops::tombstone::DeleteCause::ClientDelete,
+            }],
         )];
 
         let plan = build_replication_targets(&cluster, &ops)
@@ -24019,7 +24108,10 @@ mod tests {
         };
         let ops = vec![(
             tx_key,
-            vec![crate::replication::protocol::ReplicaOp::Delete { tx_key }],
+            vec![crate::replication::protocol::ReplicaOp::Delete {
+                tx_key,
+                cause: crate::ops::tombstone::DeleteCause::ClientDelete,
+            }],
         )];
 
         let plan = build_replication_targets(&cluster, &ops)
@@ -24336,7 +24428,10 @@ mod tests {
 
         let ops = vec![(
             key,
-            vec![crate::replication::protocol::ReplicaOp::Delete { tx_key: key }],
+            vec![crate::replication::protocol::ReplicaOp::Delete {
+                tx_key: key,
+                cause: crate::ops::tombstone::DeleteCause::ClientDelete,
+            }],
         )];
 
         let err = replicate_all_ops(Some(&cluster), &ops, (10, 10), &[])
@@ -24355,7 +24450,10 @@ mod tests {
 
         let ops = vec![(
             key,
-            vec![crate::replication::protocol::ReplicaOp::Delete { tx_key: key }],
+            vec![crate::replication::protocol::ReplicaOp::Delete {
+                tx_key: key,
+                cause: crate::ops::tombstone::DeleteCause::ClientDelete,
+            }],
         )];
 
         let outcome = replicate_all_ops(Some(&cluster), &ops, (10, 10), &[])
@@ -24979,6 +25077,7 @@ mod tests {
                 tx_key,
                 record_offset: 4096,
                 record_size: 256,
+                cause: crate::ops::tombstone::DeleteCause::ClientDelete,
             }],
         )
         .expect("redo write succeeds");
@@ -25084,7 +25183,10 @@ mod tests {
 
         let ops = vec![(
             key,
-            vec![crate::replication::protocol::ReplicaOp::Delete { tx_key: key }],
+            vec![crate::replication::protocol::ReplicaOp::Delete {
+                tx_key: key,
+                cause: crate::ops::tombstone::DeleteCause::ClientDelete,
+            }],
         )];
 
         let start = std::time::Instant::now();
@@ -25283,6 +25385,7 @@ mod tests {
                 tx_key: key,
                 record_offset: 0,
                 record_size: 0,
+                cause: crate::ops::tombstone::DeleteCause::ClientDelete,
             }])
             .unwrap();
         assert!(last > 0, "the buffered append drew a real sequence");
@@ -25292,7 +25395,13 @@ mod tests {
         );
         let syncs_before = data.syncs.load(Ordering::SeqCst);
 
-        let ops = vec![(key, vec![ReplicaOp::Delete { tx_key: key }])];
+        let ops = vec![(
+            key,
+            vec![ReplicaOp::Delete {
+                tx_key: key,
+                cause: crate::ops::tombstone::DeleteCause::ClientDelete,
+            }],
+        )];
         let outcome = replicate_all_ops_with_barrier(
             Some(&cluster),
             &ops,
@@ -25353,12 +25462,19 @@ mod tests {
                 tx_key: key,
                 record_offset: 0,
                 record_size: 0,
+                cause: crate::ops::tombstone::DeleteCause::ClientDelete,
             }])
             .unwrap();
         assert!(log.lock().has_pending());
         let syncs_before = data.syncs.load(Ordering::SeqCst);
 
-        let ops = vec![(key, vec![ReplicaOp::Delete { tx_key: key }])];
+        let ops = vec![(
+            key,
+            vec![ReplicaOp::Delete {
+                tx_key: key,
+                cause: crate::ops::tombstone::DeleteCause::ClientDelete,
+            }],
+        )];
         let outcome = replicate_all_ops_with_barrier(
             Some(&cluster),
             &ops,
@@ -25594,7 +25710,10 @@ mod tests {
                         is_external: false,
                     };
                     let _ = crate::replication::receiver::apply_op(writer_engine.as_ref(), &create);
-                    let del = crate::replication::protocol::ReplicaOp::Delete { tx_key };
+                    let del = crate::replication::protocol::ReplicaOp::Delete {
+                        tx_key,
+                        cause: crate::ops::tombstone::DeleteCause::ClientDelete,
+                    };
                     let _ = crate::replication::receiver::apply_op(writer_engine.as_ref(), &del);
                 }
                 round += 1;
@@ -26459,9 +26578,20 @@ mod tests {
         // instead of one write-fenced round-trip per key.
         assert_eq!(
             completion_rejection_vetoed_keys(&err, &entries),
-            vec![(key_vetoed, 9u32), (key_vetoed_b, 11u32)],
-            "the vetoed parser must resolve EVERY vetoed key + generation \
-             from a single rejection, got: {err}"
+            vec![
+                (
+                    key_vetoed,
+                    9u32,
+                    Some(crate::ops::tombstone::TombstoneCause::ClientDelete)
+                ),
+                (
+                    key_vetoed_b,
+                    11u32,
+                    Some(crate::ops::tombstone::TombstoneCause::ClientDelete)
+                ),
+            ],
+            "the vetoed parser must resolve EVERY vetoed key + generation + \
+             cause from a single rejection, got: {err}"
         );
         assert!(
             completion_rejection_missing_keys(&err, &entries).is_empty(),
@@ -26776,6 +26906,64 @@ mod tests {
         );
     }
 
+    /// W9 — the CompensatedCreate variant of the veto fixture above, at the
+    /// same engine-level gate every RULE-DS site consults (the receiver's two
+    /// apply gates AND both completion-verify branches route through
+    /// `Engine::tombstone_blocks_heal_apply`). A `CompensatedCreate` tombstone
+    /// must ADMIT a heal/migration create at-or-ahead of its generation — pre-
+    /// W9 the compensation recorded `ClientDelete` and this gate vetoed
+    /// unconditionally, which is the exact veto the fixture above pins for a
+    /// REAL client delete. A strictly-stale image still blocks.
+    #[test]
+    fn compensated_create_tombstone_admits_heal_at_or_ahead_generation() {
+        let h = DispatchTestHarness::new();
+        let shard = 54u16;
+        let key_comp = TxKey {
+            txid: txid_for_shard(shard, 34),
+        };
+        let key_client = TxKey {
+            txid: txid_for_shard(shard, 35),
+        };
+
+        let tomb_log = crate::ops::tombstone::TombstoneLog::new(
+            std::path::PathBuf::from("/nonexistent/w9-comp-gate.tombstones"),
+            h.engine.index_seed(),
+            h.engine.index_shard_count(),
+            10_000,
+        );
+        tomb_log.record(
+            &key_comp,
+            9,
+            900,
+            crate::ops::tombstone::TombstoneCause::CompensatedCreate,
+        );
+        tomb_log.record(
+            &key_client,
+            9,
+            900,
+            crate::ops::tombstone::TombstoneCause::ClientDelete,
+        );
+        h.engine.set_tombstone_log(tomb_log);
+
+        // CompensatedCreate: overridable at >= its generation.
+        assert!(
+            h.engine.tombstone_blocks_heal_apply(&key_comp, 8),
+            "a strictly-stale image is still vetoed",
+        );
+        assert!(
+            !h.engine.tombstone_blocks_heal_apply(&key_comp, 9),
+            "the surviving copy at the tombstone generation heals (pre-W9: vetoed)",
+        );
+        assert!(
+            !h.engine.tombstone_blocks_heal_apply(&key_comp, 10),
+            "a newer surviving copy heals (pre-W9: vetoed)",
+        );
+
+        // The fixture's ClientDelete posture is untouched.
+        assert!(h.engine.tombstone_blocks_heal_apply(&key_client, 9));
+        assert!(h.engine.tombstone_blocks_heal_apply(&key_client, 10));
+    }
+
     /// Fix B (no-loss). A generation MISMATCH on a source key (target holds the
     /// key at a different generation) must REJECT — the superset proof requires
     /// the matching generation.
@@ -27056,6 +27244,101 @@ mod tests {
         assert_eq!(h.engine.shard_record_count(shard), 1);
         assert!(h.engine.read_metadata(&key_a).is_ok());
         assert!(h.engine.read_metadata(&TxKey { txid: txid_b }).is_err());
+    }
+
+    /// W9 P1-1 (third producer) — the #29 prune deletes a local key the
+    /// authoritative source's manifest omitted via a plain `engine.delete`,
+    /// which recorded a ClientDelete tombstone on a node that never
+    /// client-deleted anything — re-opening the exact CI loss chain the
+    /// compensation family was fixed for (unconditional permanent veto on
+    /// every later heal of a live copy). The prune must record PruneReplace,
+    /// whose RULE-DS leg is generation-gated: an at-or-behind image (the
+    /// stale-resurrection window the prune exists to close) stays vetoed, a
+    /// strictly-newer live copy heals back in.
+    #[test]
+    fn migration_complete_prune_records_prune_replace_and_admits_newer_heal() {
+        let h = DispatchTestHarness::new();
+        let shard = 38u16;
+        let txid_a = txid_for_shard(shard, 7);
+        let txid_b = txid_for_shard(shard, 8);
+        assert_eq!(h.create_tx(txid_a, 1).status, STATUS_OK);
+        assert_eq!(h.create_tx(txid_b, 1).status, STATUS_OK);
+
+        // Tombstones armed (RF>1 shape) BEFORE the completion so the prune's
+        // delete records one.
+        let tomb_log = crate::ops::tombstone::TombstoneLog::new(
+            std::path::PathBuf::from("/nonexistent/w9-prune-cause.tombstones"),
+            h.engine.index_seed(),
+            h.engine.index_shard_count(),
+            10_000,
+        );
+        h.engine.set_tombstone_log(tomb_log);
+
+        let key_a = TxKey { txid: txid_a };
+        let key_b = TxKey { txid: txid_b };
+        let meta_a = h.engine.read_metadata(&key_a).unwrap();
+        let gen_b = { h.engine.read_metadata(&key_b).unwrap().generation };
+        // Manifest omits B → the authoritative completion prunes it.
+        let entries = vec![(key_a, meta_a.generation)];
+
+        let epoch = 49u64;
+        let members = vec![crate::cluster::shards::NodeId(1)];
+        let table = crate::cluster::shards::ShardTable::compute_with_epoch(&members, 1, epoch, 1);
+        let cluster = crate::cluster::coordinator::new_test_running_cluster(
+            crate::cluster::shards::NodeId(1),
+            table,
+            &[(
+                crate::cluster::shards::NodeId(1),
+                "127.0.0.1:4718".parse().unwrap(),
+            )],
+            &members,
+            &[shard],
+            &[],
+            &[],
+            1,
+        );
+        let payload = build_migration_complete_payload(
+            1,
+            0,
+            epoch,
+            None,
+            Some(&entries),
+            Some(crate::cluster::shards::NodeId(1)),
+        );
+        let req = RequestFrame {
+            request_id: shard as u64,
+            op_code: OP_MIGRATION_COMPLETE,
+            flags: 0,
+            payload: payload.into(),
+        };
+        let mut conn_state = crate::server::ConnectionState::new();
+        let resp = handle_request(
+            &req,
+            &h.engine,
+            8192,
+            Some(&cluster),
+            None,
+            &mut conn_state,
+            None,
+        );
+        assert_eq!(resp.status, STATUS_OK);
+        assert!(h.engine.read_metadata(&key_b).is_err(), "B is pruned");
+
+        // The prune's tombstone: PruneReplace, at B's frozen generation.
+        assert_eq!(
+            h.engine.tombstone_cause(&key_b),
+            Some(crate::ops::tombstone::TombstoneCause::PruneReplace),
+            "the #29 prune is a local reconcile, not a client delete",
+        );
+        // At-or-behind: still vetoed (the prune's legitimate purpose).
+        assert!(h.engine.tombstone_blocks_heal_apply(&key_b, gen_b));
+        // Strictly newer: the live copy heals back in (pre-fix: vetoed
+        // forever by the mislabeled ClientDelete tombstone).
+        assert!(
+            !h.engine
+                .tombstone_blocks_heal_apply(&key_b, gen_b.wrapping_add(1)),
+            "a strictly-newer live copy must defeat the local prune marker",
+        );
     }
 
     /// Task #29 (no-loss): a SHORT manifest stamped with a SUPERSEDED epoch
@@ -30268,6 +30551,7 @@ mod tests {
                     tx_key: TxKey { txid: [0xFE; 32] },
                     record_offset: i * 4096,
                     record_size: 4096,
+                    cause: crate::ops::tombstone::DeleteCause::ClientDelete,
                 }],
             );
             if r.is_err() {
@@ -33411,6 +33695,7 @@ mod tests {
                     tx_key: TxKey { txid: [n; 32] },
                     record_offset: u64::from(n) * 4096,
                     record_size: 4096,
+                    cause: crate::ops::tombstone::DeleteCause::ClientDelete,
                 });
                 if result.is_err() {
                     break;
@@ -34468,6 +34753,130 @@ mod tests {
                 .iter()
                 .any(|e| matches!(&e.op, RedoOp::Delete { tx_key, .. } if *tx_key == key)),
             "compensating delete redo entry must still be written on the benign TxNotFound path"
+        );
+    }
+
+    /// W9 — the compensation-cause chain, end to end on the master side. A
+    /// create rollback (`compensate_replication_failure`'s Create arm) must:
+    ///
+    /// 1. record a `CompensatedCreate` deletion tombstone locally — NOT the
+    ///    `ClientDelete` it used to write, whose unconditional RULE-DS veto
+    ///    permanently blocked every heal of the client-acked copy surviving
+    ///    elsewhere (CI runs 31971906387/31971908443);
+    /// 2. journal the compensating `RedoOp::Delete` with the SAME cause; and
+    /// 3. have `redo_entry_to_replica_op` re-emit it as a COMPENSATED
+    ///    `ReplicaOp::Delete` — the one conversion behind the D-4 fan-out,
+    ///    crash-recovered replication intents, AND migration deltas, so the
+    ///    cause provably survives every re-emission path through the single
+    ///    converter they share.
+    #[test]
+    fn compensation_create_records_compensated_cause_and_reemits_it() {
+        use crate::ops::create::CreateRequest;
+        use crate::ops::tombstone::{DeleteCause, TombstoneCause};
+
+        let (engine, redo_log, _fail, _guard) = write_failing_engine();
+        let mut txid = [0u8; 32];
+        txid[0] = 0xC7;
+        let key = TxKey { txid };
+
+        // Attach a tombstone log so delete_inner records causes (RF>1 shape).
+        let tomb_log = crate::ops::tombstone::TombstoneLog::new(
+            std::path::PathBuf::from("/nonexistent/w9-comp-cause.tombstones"),
+            engine.index_seed(),
+            engine.index_shard_count(),
+            10_000,
+        );
+        engine.set_tombstone_log(tomb_log);
+
+        engine
+            .create(&CreateRequest {
+                tx_id: txid,
+                tx_version: 1,
+                locktime: 0,
+                fee: 0,
+                size_in_bytes: 0,
+                extended_size: 0,
+                is_coinbase: false,
+                spending_height: 0,
+                utxo_hashes: &[[0x11u8; 32]],
+                inputs: None,
+                outputs: None,
+                inpoints: None,
+                is_external: false,
+                created_at: 0,
+                block_height: 0,
+                mined_block_infos: &[],
+                frozen: false,
+                conflicting: false,
+                locked: false,
+                external_ref: None,
+                parent_txids: &[],
+            })
+            .expect("seed create");
+
+        let repl_ops = vec![(
+            key,
+            vec![ReplicaOp::Create {
+                tx_key: key,
+                metadata_bytes: Vec::new(),
+                utxo_hashes: Vec::new(),
+                cold_data: None,
+                is_external: false,
+            }],
+        )];
+        let before_images = vec![(key, vec![BeforeImage::None])];
+        compensate_replication_failure(&engine, &repl_ops, &before_images, Some(&redo_log))
+            .expect("compensation succeeds");
+
+        // (1) local rollback happened and left the OVERRIDABLE cause.
+        assert!(engine.lookup(&key).is_none(), "the create is rolled back");
+        assert_eq!(
+            engine.tombstone_cause(&key),
+            Some(TombstoneCause::CompensatedCreate),
+            "the rollback must record CompensatedCreate, not ClientDelete",
+        );
+        // The overridable veto: a live copy at-or-ahead of the tombstone's
+        // generation heals back in; a strictly-stale image still drops.
+        let (tomb_gen, _) = engine.tombstone_lookup(&key).expect("tombstone recorded");
+        assert!(
+            !engine.tombstone_blocks_heal_apply(&key, tomb_gen),
+            "a live copy at the tombstone generation must be admitted",
+        );
+        assert!(
+            !engine.tombstone_blocks_heal_apply(&key, tomb_gen.wrapping_add(1)),
+            "a strictly-newer live copy must be admitted",
+        );
+
+        // (2) the compensating redo entry carries the cause.
+        let entries = redo_log.lock().recover().expect("recover redo entries");
+        let comp_entry = entries
+            .iter()
+            .find(|e| {
+                matches!(
+                    &e.op,
+                    RedoOp::Delete {
+                        tx_key,
+                        cause: DeleteCause::CompensatedCreate,
+                        ..
+                    } if *tx_key == key
+                )
+            })
+            .expect("the compensating RedoOp::Delete must carry CompensatedCreate");
+
+        // (3) the redo→replica converter re-emits the compensated op.
+        let shard = ShardTable::shard_for_key(&key);
+        let reemitted =
+            crate::cluster::coordinator::redo_entry_to_replica_op(comp_entry, shard, &engine)
+                .expect("conversion succeeds")
+                .expect("a delete converts to a replica op");
+        assert_eq!(
+            reemitted,
+            ReplicaOp::Delete {
+                tx_key: key,
+                cause: DeleteCause::CompensatedCreate,
+            },
+            "every redo-derived re-emission (D-4 fan-out, intent recovery, \
+             migration delta) must spread the OVERRIDABLE cause",
         );
     }
 
