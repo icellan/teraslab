@@ -1478,7 +1478,17 @@ pub(crate) fn handle_request(
                     if expected_keys.contains(&key) {
                         continue;
                     }
-                    match engine.delete(&crate::ops::remaining::DeleteRequest {
+                    // W9 P1-1 — `delete_prune_replace`, NOT `delete`: this is
+                    // a local reconcile against the authoritative manifest,
+                    // not a client delete. `delete` recorded a ClientDelete
+                    // tombstone whose unconditional RULE-DS veto permanently
+                    // blocked every later heal of a live copy through a node
+                    // that never client-deleted (the same loss chain the
+                    // orphan cleanup fixed with `reclaim_held_copy` — see
+                    // coordinator's cleanup_orphan_shards). PruneReplace keeps
+                    // the anti-resurrection window (at-or-behind images stay
+                    // vetoed) while a strictly-newer live copy heals in.
+                    match engine.delete_prune_replace(&crate::ops::remaining::DeleteRequest {
                         tx_key: key,
                         due_guard: None,
                     }) {
@@ -26443,9 +26453,20 @@ mod tests {
         // instead of one write-fenced round-trip per key.
         assert_eq!(
             completion_rejection_vetoed_keys(&err, &entries),
-            vec![(key_vetoed, 9u32), (key_vetoed_b, 11u32)],
-            "the vetoed parser must resolve EVERY vetoed key + generation \
-             from a single rejection, got: {err}"
+            vec![
+                (
+                    key_vetoed,
+                    9u32,
+                    Some(crate::ops::tombstone::TombstoneCause::ClientDelete)
+                ),
+                (
+                    key_vetoed_b,
+                    11u32,
+                    Some(crate::ops::tombstone::TombstoneCause::ClientDelete)
+                ),
+            ],
+            "the vetoed parser must resolve EVERY vetoed key + generation + \
+             cause from a single rejection, got: {err}"
         );
         assert!(
             completion_rejection_missing_keys(&err, &entries).is_empty(),
@@ -26791,6 +26812,101 @@ mod tests {
         assert_eq!(h.engine.shard_record_count(shard), 1);
         assert!(h.engine.read_metadata(&key_a).is_ok());
         assert!(h.engine.read_metadata(&TxKey { txid: txid_b }).is_err());
+    }
+
+    /// W9 P1-1 (third producer) — the #29 prune deletes a local key the
+    /// authoritative source's manifest omitted via a plain `engine.delete`,
+    /// which recorded a ClientDelete tombstone on a node that never
+    /// client-deleted anything — re-opening the exact CI loss chain the
+    /// compensation family was fixed for (unconditional permanent veto on
+    /// every later heal of a live copy). The prune must record PruneReplace,
+    /// whose RULE-DS leg is generation-gated: an at-or-behind image (the
+    /// stale-resurrection window the prune exists to close) stays vetoed, a
+    /// strictly-newer live copy heals back in.
+    #[test]
+    fn migration_complete_prune_records_prune_replace_and_admits_newer_heal() {
+        let h = DispatchTestHarness::new();
+        let shard = 38u16;
+        let txid_a = txid_for_shard(shard, 7);
+        let txid_b = txid_for_shard(shard, 8);
+        assert_eq!(h.create_tx(txid_a, 1).status, STATUS_OK);
+        assert_eq!(h.create_tx(txid_b, 1).status, STATUS_OK);
+
+        // Tombstones armed (RF>1 shape) BEFORE the completion so the prune's
+        // delete records one.
+        let tomb_log = crate::ops::tombstone::TombstoneLog::new(
+            std::path::PathBuf::from("/nonexistent/w9-prune-cause.tombstones"),
+            h.engine.index_seed(),
+            h.engine.index_shard_count(),
+            10_000,
+        );
+        h.engine.set_tombstone_log(tomb_log);
+
+        let key_a = TxKey { txid: txid_a };
+        let key_b = TxKey { txid: txid_b };
+        let meta_a = h.engine.read_metadata(&key_a).unwrap();
+        let gen_b = { h.engine.read_metadata(&key_b).unwrap().generation };
+        // Manifest omits B → the authoritative completion prunes it.
+        let entries = vec![(key_a, meta_a.generation)];
+
+        let epoch = 49u64;
+        let members = vec![crate::cluster::shards::NodeId(1)];
+        let table = crate::cluster::shards::ShardTable::compute_with_epoch(&members, 1, epoch, 1);
+        let cluster = crate::cluster::coordinator::new_test_running_cluster(
+            crate::cluster::shards::NodeId(1),
+            table,
+            &[(
+                crate::cluster::shards::NodeId(1),
+                "127.0.0.1:4718".parse().unwrap(),
+            )],
+            &members,
+            &[shard],
+            &[],
+            &[],
+            1,
+        );
+        let payload = build_migration_complete_payload(
+            1,
+            0,
+            epoch,
+            None,
+            Some(&entries),
+            Some(crate::cluster::shards::NodeId(1)),
+        );
+        let req = RequestFrame {
+            request_id: shard as u64,
+            op_code: OP_MIGRATION_COMPLETE,
+            flags: 0,
+            payload: payload.into(),
+        };
+        let mut conn_state = crate::server::ConnectionState::new();
+        let resp = handle_request(
+            &req,
+            &h.engine,
+            8192,
+            Some(&cluster),
+            None,
+            &mut conn_state,
+            None,
+        );
+        assert_eq!(resp.status, STATUS_OK);
+        assert!(h.engine.read_metadata(&key_b).is_err(), "B is pruned");
+
+        // The prune's tombstone: PruneReplace, at B's frozen generation.
+        assert_eq!(
+            h.engine.tombstone_cause(&key_b),
+            Some(crate::ops::tombstone::TombstoneCause::PruneReplace),
+            "the #29 prune is a local reconcile, not a client delete",
+        );
+        // At-or-behind: still vetoed (the prune's legitimate purpose).
+        assert!(h.engine.tombstone_blocks_heal_apply(&key_b, gen_b));
+        // Strictly newer: the live copy heals back in (pre-fix: vetoed
+        // forever by the mislabeled ClientDelete tombstone).
+        assert!(
+            !h.engine
+                .tombstone_blocks_heal_apply(&key_b, gen_b.wrapping_add(1)),
+            "a strictly-newer live copy must defeat the local prune marker",
+        );
     }
 
     /// Task #29 (no-loss): a SHORT manifest stamped with a SUPERSEDED epoch

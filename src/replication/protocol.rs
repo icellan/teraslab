@@ -156,6 +156,14 @@ const OP_CHUNK: u8 = 20;
 /// acked-write-loss chain). A distinct tag, not appended fields, for the same
 /// fail-closed rolling-upgrade reason as [`OP_EXPIRE_PRESERVATION`]: an
 /// unknown tag fails the batch instead of silently decoding a prefix.
+///
+/// Review P2-6 — rolling-upgrade noise: the fail-closed rejection means a
+/// compensation intent fanned toward a NOT-YET-UPGRADED peer keeps failing
+/// (and its durable intent keeps retrying) until that peer upgrades — visible
+/// as repeated batch errors / pending-intent retries during the upgrade
+/// window. That is the intended trade (ordered upgrade, no silent
+/// misinterpretation), not a defect; the retries converge on their own once
+/// the peer understands tag 21.
 const OP_DELETE_COMPENSATED: u8 = 21;
 
 /// Upper bound on one [`ReplicaOp::OpChunk`] payload slice.

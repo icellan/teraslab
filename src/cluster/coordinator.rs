@@ -10846,7 +10846,7 @@ pub(crate) fn completion_rejection_missing_keys(
 pub(crate) fn completion_rejection_vetoed_keys(
     err: &str,
     manifest: &[(TxKey, u32)],
-) -> Vec<(TxKey, u32)> {
+) -> Vec<(TxKey, u32, Option<crate::ops::tombstone::TombstoneCause>)> {
     // The `:` keeps the match exact — see `completion_rejection_missing_keys`.
     if !err.contains(&format!(
         "(code={}:",
@@ -10855,7 +10855,7 @@ pub(crate) fn completion_rejection_vetoed_keys(
     {
         return Vec::new();
     }
-    let mut out: Vec<(TxKey, u32)> = Vec::new();
+    let mut out: Vec<(TxKey, u32, Option<crate::ops::tombstone::TombstoneCause>)> = Vec::new();
     let mut rest = err;
     while let Some(pos) = rest.find("TxKey(") {
         rest = &rest[pos + "TxKey(".len()..];
@@ -10895,15 +10895,34 @@ pub(crate) fn completion_rejection_vetoed_keys(
         let Ok(tomb_gen) = digits.parse::<u32>() else {
             continue;
         };
+        // W9 P2-3 — parse the veto's CAUSE too (the target names it as
+        // `cause=<Debug>`), so the reduction gate can refuse a WEAK local
+        // marker. An unrecognized name maps to `None` (fail-closed at the
+        // gate).
+        let cause = after_marker.find("cause=").and_then(|cause_pos| {
+            let ident = &after_marker[cause_pos + "cause=".len()..];
+            let ident = &ident[..ident
+                .find(|c: char| !c.is_ascii_alphanumeric())
+                .unwrap_or(ident.len())];
+            match ident {
+                "Dah" => Some(crate::ops::tombstone::TombstoneCause::Dah),
+                "ClientDelete" => Some(crate::ops::tombstone::TombstoneCause::ClientDelete),
+                "PruneReplace" => Some(crate::ops::tombstone::TombstoneCause::PruneReplace),
+                "CompensatedCreate" => {
+                    Some(crate::ops::tombstone::TombstoneCause::CompensatedCreate)
+                }
+                _ => None,
+            }
+        });
         // Review P2-5 — exactly-one resolution: a reduction must never touch
         // a key the target did not veto, so an ambiguous prefix is skipped.
         let mut matches = manifest
             .iter()
             .filter(|(key, _)| key.txid.starts_with(&prefix));
         if let (Some((key, _)), None) = (matches.next(), matches.next())
-            && !out.iter().any(|(k, _)| k == key)
+            && !out.iter().any(|(k, _, _)| k == key)
         {
-            out.push((*key, tomb_gen));
+            out.push((*key, tomb_gen, cause));
         }
     }
     out
@@ -11053,11 +11072,39 @@ fn escalate_missing_exact_keys(
     loop {
         // W8 — vetoed keys first, attempt-free (see the fn doc).
         let mut reduce_now: Vec<TxKey> = Vec::new();
-        for (key, tomb_gen) in completion_rejection_vetoed_keys(&last_err, manifest_entries) {
+        for (key, tomb_gen, cause) in completion_rejection_vetoed_keys(&last_err, manifest_entries)
+        {
             if vetoed_seen.contains(&key) {
                 continue;
             }
             vetoed_seen.push(key);
+            // W9 P2-3 — cause-aware reduction: only an AUTHORITATIVE deletion
+            // claim (ClientDelete / Dah) may authorize reducing the manifest,
+            // because the reduction authorizes deleting the SOURCE's copy of
+            // the key after the handoff commits. A WEAK local marker
+            // (CompensatedCreate — a create rollback; PruneReplace — a local
+            // reconcile) says nothing about the key's cluster-wide existence,
+            // and with W9 those vetoes are generation-overridable anyway —
+            // the right disposition is the historical retry path, where the
+            // re-heal's newer image defeats the marker. Unknown causes fail
+            // CLOSED the same way.
+            let authoritative_cause = matches!(
+                cause,
+                Some(crate::ops::tombstone::TombstoneCause::ClientDelete)
+                    | Some(crate::ops::tombstone::TombstoneCause::Dah)
+            );
+            if !authoritative_cause {
+                tracing::error!(
+                    key = ?key,
+                    tombstone_generation = tomb_gen,
+                    cause = ?cause,
+                    "cluster: vetoed key carries a non-authoritative tombstone \
+                     cause — refusing the manifest reduction (a rollback/reconcile \
+                     marker must never authorize deleting the source's copy); the \
+                     task fails through the historical path",
+                );
+                continue;
+            }
             // Review P2-4 — fail CLOSED on an unresolvable manifest
             // generation: a key we cannot prove the tombstone is at-or-ahead
             // of must never be reduced.
@@ -25267,9 +25314,13 @@ mod tests {
     /// W8 (defect 2) — builds the target's vetoed-key rejection as the source
     /// sees it through the completion error envelope.
     fn vetoed_reject(key: TxKey, tomb_gen: u32) -> String {
+        vetoed_reject_cause(key, tomb_gen, "ClientDelete")
+    }
+
+    fn vetoed_reject_cause(key: TxKey, tomb_gen: u32, cause: &str) -> String {
         format!(
             "target rejected: status 4 (code=19: shard 227 exact key {:?} vetoed by \
-             deletion tombstone (cause=ClientDelete gen={} height=900): TxNotFound)",
+             deletion tombstone (cause={cause} gen={} height=900): TxNotFound)",
             key, tomb_gen,
         )
     }
@@ -25284,8 +25335,32 @@ mod tests {
         let manifest = vec![(tk(1), 3u32), (tk(2), 7u32)];
         assert_eq!(
             completion_rejection_vetoed_keys(&vetoed_reject(tk(2), 9), &manifest),
-            vec![(tk(2), 9u32)],
-            "the veto shape must resolve to the full key and tombstone generation",
+            vec![(
+                tk(2),
+                9u32,
+                Some(crate::ops::tombstone::TombstoneCause::ClientDelete)
+            )],
+            "the veto shape must resolve to the full key, tombstone generation, and cause",
+        );
+        // W9 P2-3 — the cause is parsed per key; an unknown name maps to None
+        // (fail-closed at the reduction gate).
+        assert_eq!(
+            completion_rejection_vetoed_keys(
+                &vetoed_reject_cause(tk(2), 9, "CompensatedCreate"),
+                &manifest,
+            ),
+            vec![(
+                tk(2),
+                9u32,
+                Some(crate::ops::tombstone::TombstoneCause::CompensatedCreate)
+            )],
+        );
+        assert_eq!(
+            completion_rejection_vetoed_keys(
+                &vetoed_reject_cause(tk(2), 9, "SomeFutureCause"),
+                &manifest,
+            ),
+            vec![(tk(2), 9u32, None)],
         );
         // The missing-key shape is NOT a veto.
         let missing = format!(
@@ -25465,6 +25540,42 @@ mod tests {
                 );
             }
             other => panic!("expected Exhausted (pre-W8 disposition), got {other:?}"),
+        }
+    }
+
+    /// W9 P2-3 — cause-aware reduction: a veto whose parsed cause is a WEAK
+    /// local marker (CompensatedCreate / PruneReplace — rollback/reconcile,
+    /// not an authoritative deletion) must NEVER authorize reducing the
+    /// manifest, because the reduction authorizes deleting the SOURCE's copy
+    /// of the key after commit. Even with the generation gate satisfied
+    /// (tombstone gen at-or-ahead of the manifest's), the escalation must
+    /// refuse the reduction and fall through to the historical path
+    /// (NotExactKey — abort/rollback, data-safe). An unknown cause fails
+    /// closed the same way.
+    #[test]
+    fn escalation_refuses_reduction_for_weak_tombstone_causes() {
+        for cause in ["CompensatedCreate", "PruneReplace", "SomeFutureCause"] {
+            let manifest = vec![(tk(1), 3u32), (tk(2), 7u32)];
+            // Gen 9 >= manifest gen 7: the OLD cause-blind gate reduces this.
+            let initial = vetoed_reject_cause(tk(2), 9, cause);
+            let mut called = false;
+            let outcome =
+                escalate_missing_exact_keys(initial.clone(), &manifest, 3, true, |action| {
+                    called = true;
+                    panic!("no reduce and no re-push may run for a weak-cause veto: {action:?}");
+                });
+            assert!(!called, "cause={cause}: the attempt closure must not run");
+            match outcome {
+                ExactKeyEscalation::NotExactKey { last_err } => {
+                    assert_eq!(
+                        last_err, initial,
+                        "cause={cause}: the historical path carries the veto rejection",
+                    );
+                }
+                other => {
+                    panic!("cause={cause}: expected NotExactKey (reduction refused), got {other:?}")
+                }
+            }
         }
     }
 

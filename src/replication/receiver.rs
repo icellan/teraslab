@@ -1943,7 +1943,14 @@ fn apply_create_replica(
             }
         }
         Err(CreateError::DuplicateTxId) => {
-            match engine.delete(&DeleteRequest {
+            // W9 P1-1 / expert P2-2 — `delete_prune_replace`, NOT `delete`:
+            // this destructive replace is a local reconcile. If the re-create
+            // below FAILS, the delete stands and its tombstone strands over an
+            // absent key — as a ClientDelete that stranded an unconditional
+            // permanent veto; as PruneReplace a strictly-newer heal/migration
+            // image self-heals the strand while at-or-behind images stay
+            // dropped.
+            match engine.delete_prune_replace(&DeleteRequest {
                 tx_key: *tx_key,
                 due_guard: None,
             }) {
@@ -12198,6 +12205,72 @@ mod tests {
             matches!(engine.read_metadata(&k2), Err(SpendError::TxNotFound)),
             "a client-deleted record must stay absent whatever the source \
              generation (the #78 anti-resurrection posture)",
+        );
+    }
+
+    /// W9 P1-1 / expert P2-2 — the replace-duplicate strand shape. A
+    /// non-migration duplicate create whose payload mismatches takes the
+    /// destructive delete+recreate path; when the RE-CREATE fails, the delete
+    /// stands and its tombstone strands over an absent key. Pre-fix that
+    /// tombstone was ClientDelete — an unconditional veto on a node that never
+    /// client-deleted, permanently blocking every later heal of the live copy.
+    /// With PruneReplace it self-heals: a strictly-newer migration/heal image
+    /// applies (and an at-or-behind one stays dropped, the reconcile's
+    /// legitimate anti-resurrection window).
+    #[test]
+    fn failed_replace_duplicate_strand_self_heals_via_prune_replace_cause() {
+        use crate::ops::tombstone::TombstoneCause;
+
+        let engine = make_engine();
+        enable_tombstones(&engine);
+
+        // Live record at gen 1.
+        let k = key(170);
+        apply_op(&engine, &baseline_create(k, 1, 0)).unwrap();
+
+        // A mismatched duplicate whose re-create FAILS deterministically.
+        // `engine.create` checks DuplicateTxId BEFORE the external-ref
+        // requirement, so an EXTERNAL-flagged image with no ExternalRef wire
+        // section (1) hits DuplicateTxId on first delivery, (2) mismatches the
+        // existing payload (different hash + external flag) → replace path →
+        // delete runs, then (3) the re-create fails `MissingExternalRef` —
+        // the delete stood, the tombstone strands.
+        let bad_dup = ReplicaOp::Create {
+            tx_key: k,
+            metadata_bytes: build_full_metadata(1, false, 0, 2, 0, &[], &[]),
+            utxo_hashes: vec![[0xBB; 32]],
+            cold_data: None,
+            is_external: true,
+        };
+        apply_op(&engine, &bad_dup).expect_err("the re-create must fail (missing external ref)");
+        assert!(
+            matches!(engine.read_metadata(&k), Err(SpendError::TxNotFound)),
+            "precondition: the delete stood and the re-create failed (strand)",
+        );
+        assert_eq!(
+            engine.tombstone_cause(&k),
+            Some(TombstoneCause::PruneReplace),
+            "the replace-duplicate delete is a local reconcile, not a client delete",
+        );
+
+        // At-or-behind migration image: still dropped (anti-resurrection).
+        apply_op_journal(&engine, &baseline_create(k, 1, 0), false, true).unwrap();
+        assert!(
+            matches!(engine.read_metadata(&k), Err(SpendError::TxNotFound)),
+            "an at-or-behind image stays vetoed",
+        );
+
+        // Strictly-newer live copy: SELF-HEALS (pre-fix: ClientDelete vetoed
+        // it forever).
+        apply_op_journal(&engine, &baseline_create(k, 2, 0), false, true).unwrap();
+        assert_eq!(
+            { engine.read_metadata(&k).unwrap().generation },
+            2,
+            "a strictly-newer heal/migration image must repair the strand",
+        );
+        assert!(
+            engine.tombstone_lookup(&k).is_none(),
+            "the admitted create clears the stranded tombstone (TS-1)",
         );
     }
 

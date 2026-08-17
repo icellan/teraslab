@@ -8645,6 +8645,32 @@ impl Engine {
         )
     }
 
+    /// W9 P1-1 — local reconcile delete: remove a record as part of a
+    /// migration reconcile that is NOT a client delete — the #29 completion
+    /// prune (dropping a key the authoritative source's manifest omitted,
+    /// `server::dispatch` OP_MIGRATION_COMPLETE) and the receiver's
+    /// replace-duplicate delete
+    /// (`replication::receiver::apply_create_replica`).
+    ///
+    /// Physically identical to [`Self::delete`], but the deletion tombstone is
+    /// recorded as [`crate::ops::tombstone::TombstoneCause::PruneReplace`] —
+    /// generation-gated in RULE-DS (Dah-style: at-or-behind images stay
+    /// dropped, a strictly-newer live copy heals back in) instead of the
+    /// unconditional `ClientDelete` veto these paths used to leave on a node
+    /// that never client-deleted the key (the third producer of the CI
+    /// acked-write-loss chain).
+    ///
+    /// # Errors
+    ///
+    /// Same contract as [`Self::delete`].
+    pub fn delete_prune_replace(&self, req: &DeleteRequest) -> Result<(), SpendError> {
+        self.delete_inner(
+            req,
+            RemovalAuthority::Authoritative,
+            Some(crate::ops::tombstone::TombstoneCause::PruneReplace),
+        )
+    }
+
     /// Local prune-delete: remove a record from THIS node's store, with no
     /// replayable deletion record.
     ///

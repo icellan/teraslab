@@ -642,6 +642,15 @@ const OP_EXPIRE_PRESERVATION: u8 = 44;
 /// `CompensatedCreate` tombstone instead of an unconditional `ClientDelete`
 /// veto (the CI-proven acked-write-loss chain). Old logs decode [`OP_DELETE`]
 /// as `DeleteCause::ClientDelete` unchanged.
+///
+/// Review P2-5 — the compatibility is FORWARD-only: once a compensation has
+/// journalled opcode 45, DOWNGRADING the binary is unsupported — an old
+/// build's replay does not recognize the opcode and treats the entry as a
+/// torn tail / corrupt record, truncating recovery at that point. Pre-
+/// production this is acceptable and deliberate (fail-closed beats silently
+/// replaying a compensated delete as a client delete); it is called out here
+/// so a future upgrade-path audit does not mistake "old logs decode" for
+/// bidirectional compatibility.
 const OP_DELETE_COMPENSATED: u8 = 45;
 
 /// F-G4-006-style cap: bound the allocation a corrupt-but-CRC-valid
