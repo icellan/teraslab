@@ -6134,29 +6134,72 @@ impl ClusterCoordinator {
                                 // scenario-17 three-holder bug). Orphan
                                 // cleanup reclaims the records and the
                                 // ordinary prune then drops the entry.
-                                let retire = |refused: &[u16], source: NodeId| -> usize {
-                                    if refused.is_empty() {
-                                        return 0;
-                                    }
-                                    let dropped = {
-                                        // LOCK ORDER (W8): table before migration.
-                                        let table = refusal_st.read();
-                                        let mut mgr = refusal_mig.lock();
-                                        mgr.drop_refused_inbound(refused, source, |s| {
-                                            inbound_entry_must_be_kept(
-                                                &table,
-                                                self_id,
-                                                s,
-                                                refusal_eng.shard_record_count(s),
-                                            )
-                                        })
+                                //
+                                // W12 TAIL 2 — the KEPT entries are marked
+                                // `refused_by_source` inside
+                                // `drop_refused_inbound` and reported back
+                                // here: they are a fixpoint (no source will
+                                // ever send them, and only the
+                                // committed-handoff-gated orphan cleanup can
+                                // remove the records holding their fence up),
+                                // so they are gauged and NAMED. Armed scenario
+                                // 08 @ fc5e5f7 re-sent this request 29 times
+                                // over 300 s with `kept=2` every round and the
+                                // requester's log never once printed which two
+                                // shards they were.
+                                let retire =
+                                    |refused: &[u16], source: NodeId| -> (usize, Vec<u16>) {
+                                        if refused.is_empty() {
+                                            return (0, Vec::new());
+                                        }
+                                        let (dropped, kept) = {
+                                            // LOCK ORDER (W8): table before migration.
+                                            let table = refusal_st.read();
+                                            let mut mgr = refusal_mig.lock();
+                                            let dropped =
+                                                mgr.drop_refused_inbound(refused, source, |s| {
+                                                    inbound_entry_must_be_kept(
+                                                        &table,
+                                                        self_id,
+                                                        s,
+                                                        refusal_eng.shard_record_count(s),
+                                                    )
+                                                });
+                                            let kept: Vec<u16> = mgr
+                                                .refused_retained_inbound_entries()
+                                                .into_iter()
+                                                .map(|(shard, _)| shard)
+                                                .collect();
+                                            (dropped, kept)
+                                        };
+                                        if let Some(m) = crate::metrics::migration_metrics() {
+                                            if dropped > 0 {
+                                                m.migration_dangling_inbound_dropped
+                                                    .inc_by(dropped as u64);
+                                            }
+                                            m.migration_inbound_refused_retained
+                                                .store(kept.len() as u32, Ordering::Relaxed);
+                                        }
+                                        (dropped, kept)
                                     };
-                                    if dropped > 0
-                                        && let Some(m) = crate::metrics::migration_metrics()
-                                    {
-                                        m.migration_dangling_inbound_dropped.inc_by(dropped as u64);
+                                // Bound the shard list a single log line can
+                                // carry — a refusal can name thousands.
+                                const MAX_NAMED_KEPT_SHARDS: usize = 32;
+                                let name_kept = |kept: &[u16]| -> String {
+                                    let head: Vec<String> = kept
+                                        .iter()
+                                        .take(MAX_NAMED_KEPT_SHARDS)
+                                        .map(|s| s.to_string())
+                                        .collect();
+                                    if kept.len() > MAX_NAMED_KEPT_SHARDS {
+                                        format!(
+                                            "[{}, … {} more]",
+                                            head.join(", "),
+                                            kept.len() - MAX_NAMED_KEPT_SHARDS
+                                        )
+                                    } else {
+                                        format!("[{}]", head.join(", "))
                                     }
-                                    dropped
                                 };
                                 for (source, shards) in by_source {
                                     let Some(addr) = addrs.get(&source).copied() else {
@@ -6191,7 +6234,7 @@ impl ClusterCoordinator {
                                             // nothing.
                                             let refused =
                                                 parse_transfer_request_unmatched(&resp.payload);
-                                            let dropped = retire(&refused, source);
+                                            let (dropped, kept) = retire(&refused, source);
                                             if refused.is_empty() {
                                                 tracing::info!(
                                                     source = source.0,
@@ -6205,6 +6248,8 @@ impl ClusterCoordinator {
                                                     shards = shards.len(),
                                                     refused = refused.len(),
                                                     dropped,
+                                                    kept = kept.len(),
+                                                    kept_shards = %name_kept(&kept),
                                                     epoch = committed_term,
                                                     "cluster: shard transfer request PARTIALLY \
                                                      refused — the source will never send the \
@@ -6223,12 +6268,13 @@ impl ClusterCoordinator {
                                             // epoch we both activated. Retire
                                             // them rather than re-asking every
                                             // 10 s forever.
-                                            let dropped = retire(&shards, source);
+                                            let (dropped, kept) = retire(&shards, source);
                                             tracing::warn!(
                                                 source = source.0,
                                                 shards = shards.len(),
                                                 dropped,
-                                                kept = shards.len().saturating_sub(dropped),
+                                                kept = kept.len(),
+                                                kept_shards = %name_kept(&kept),
                                                 epoch = committed_term,
                                                 "cluster: shard transfer request REFUSED — the \
                                                  source has no tasks for us; dangling inbound \
@@ -21874,6 +21920,16 @@ impl RunningCluster {
     /// Snapshot the pending inbound migration entries.
     pub fn pending_inbound_entries(&self) -> Vec<(u16, NodeId)> {
         self.migration.lock().pending_inbound_entries()
+    }
+
+    /// W12 TAIL 2 — the subset of [`Self::pending_inbound_entries`] whose own
+    /// source has TERMINALLY refused them and which the fail-closed record
+    /// guard retained anyway. See
+    /// [`MigrationManager::refused_retained_inbound_entries`] — these entries
+    /// cannot progress, so a "are migrations still running?" question must
+    /// exclude them and a "is anything wrong?" question must report them.
+    pub fn refused_retained_inbound_entries(&self) -> Vec<(u16, NodeId)> {
+        self.migration.lock().refused_retained_inbound_entries()
     }
 
     /// Number of shards with write fences active.
