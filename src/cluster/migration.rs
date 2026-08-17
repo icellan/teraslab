@@ -1568,6 +1568,38 @@ impl MigrationManager {
         }
     }
 
+    /// W9 nit — exact-task variant of [`mark_failed`]: resolves the entry
+    /// by the FULL task identity INCLUDING `is_master`, where
+    /// `mark_failed`'s (shard, from, to) lookup can hit the twin entry
+    /// when a master and a replica task share the same endpoints. Used by
+    /// the det-degrade cancel path
+    /// (`cancel_deferred_plan_launch`), which iterates the held plan's
+    /// task list and must fail exactly the tasks it names — a twin left
+    /// active would be preservable as a workerless task. Fence-lift,
+    /// dual-write close, and metrics bookkeeping match [`mark_failed`].
+    pub fn mark_failed_exact(&mut self, task: &MigrationTask) {
+        let Some(idx) = self.active.iter().position(|p| {
+            p.shard == task.shard
+                && p.from_node == task.from_node
+                && p.to_node == task.to_node
+                && p.is_master == task.is_master
+        }) else {
+            return;
+        };
+        let prev_state = self.active[idx].state.clone();
+        self.active[idx].state = MigrationState::Failed;
+        if !self.has_other_fenced_task(task.shard, task) {
+            self.unfence_shard(task.shard);
+        }
+        if !self.has_other_active_outbound(task.shard, task) {
+            self.dual_write_remove(task.shard);
+        }
+        if let Some(m) = migration_metrics() {
+            dec_phase_gauge(m, &prev_state);
+            dec_active(m);
+        }
+    }
+
     /// Check if any active migration task for the given shard (other than
     /// the specified task) is still in the Fenced state.
     fn has_other_fenced_task(&self, shard: u16, exclude: &MigrationTask) -> bool {
@@ -2790,6 +2822,57 @@ mod tests {
         bm.clear_all();
         assert_eq!(bm.count(), 0);
         assert!(!bm.test(0));
+    }
+
+    /// W9 nit — `mark_failed` resolves by (shard, from, to) and can hit
+    /// the TWIN entry when a master and a replica task share the same
+    /// endpoints; the det-degrade cancel path must fail exactly the task
+    /// it names. `mark_failed_exact` matches `is_master` too.
+    #[test]
+    fn mark_failed_exact_fails_only_the_named_twin() {
+        let mut mgr = MigrationManager::new();
+        let master = MigrationTask {
+            shard: 9,
+            from_node: NodeId(1),
+            to_node: NodeId(2),
+            is_master: true,
+        };
+        let replica = MigrationTask {
+            is_master: false,
+            ..master
+        };
+        mgr.start_outbound(
+            &[master.clone(), replica.clone()],
+            NodeId(1),
+            &std::collections::HashSet::new(),
+        );
+        assert_eq!(mgr.active_count(), 2, "both twins registered");
+
+        mgr.mark_failed_exact(&replica);
+
+        let state_of = |mgr: &MigrationManager, is_master: bool| {
+            mgr.active_migrations()
+                .iter()
+                .find(|p| p.shard == 9 && p.is_master == is_master)
+                .map(|p| p.state.clone())
+                .expect("twin entry present")
+        };
+        assert_eq!(
+            state_of(&mgr, false),
+            MigrationState::Failed,
+            "the NAMED twin (replica) must be failed",
+        );
+        assert_eq!(
+            state_of(&mgr, true),
+            MigrationState::Preparing,
+            "the other twin (master) must be untouched — the 3-tuple \
+             lookup would have hit it first",
+        );
+
+        // Failing the remaining twin exactly works too.
+        mgr.mark_failed_exact(&master);
+        assert_eq!(state_of(&mgr, true), MigrationState::Failed);
+        assert_eq!(mgr.active_count(), 0);
     }
 
     #[test]

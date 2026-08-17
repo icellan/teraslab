@@ -13355,11 +13355,18 @@ fn handle_partition_version_report(
     };
 
     if cluster.is_some() && request_cluster_key != local_cluster_key {
-        return error_response(
-            req.request_id,
-            ERR_STALE_EPOCH,
-            "partition version report: cluster_key mismatch",
-        );
+        // W9 P2-3 — echo THIS node's local cluster key after the error
+        // envelope so the querying exchange can tell peer-behind (keep
+        // re-querying) from self-behind (stop and let topology catch-up
+        // converge). See `encode_stale_epoch_report_rejection` for the
+        // layout and the wire-format note.
+        return ResponseFrame {
+            request_id: req.request_id,
+            status: STATUS_ERROR,
+            payload: crate::cluster::coordinator::encode_stale_epoch_report_rejection(
+                local_cluster_key,
+            ),
+        };
     }
 
     let entries: Vec<crate::cluster::coordinator::PartitionVersionEntry> = match cluster {
@@ -28585,6 +28592,61 @@ mod tests {
         assert!(
             cluster.has_pending_inbound_shard(shard),
             "a rejected completion must not clear inbound migration state"
+        );
+    }
+
+    /// W9 P2-3 — the partition-report STALE_EPOCH rejection must ECHO the
+    /// responder's local cluster key (additive tail on the error
+    /// envelope), so the querying exchange can tell peer-behind (keep
+    /// re-querying) from self-behind (stop; topology catch-up converges
+    /// us). Without it every rejection was indistinguishable.
+    #[test]
+    fn partition_report_stale_epoch_echoes_responder_key() {
+        let h = DispatchTestHarness::new();
+        let members = vec![
+            crate::cluster::shards::NodeId(1),
+            crate::cluster::shards::NodeId(2),
+        ];
+        let table = crate::cluster::shards::ShardTable::compute_with_epoch(&members, 2, 7, 1);
+        let cluster = crate::cluster::coordinator::new_test_running_cluster(
+            crate::cluster::shards::NodeId(1),
+            table,
+            &[(
+                crate::cluster::shards::NodeId(1),
+                "127.0.0.1:4712".parse().unwrap(),
+            )],
+            &members,
+            &[],
+            &[],
+            &[],
+            2,
+        );
+        let local_key = cluster.local_cluster_key();
+
+        let req = RequestFrame {
+            request_id: 0,
+            op_code: OP_PARTITION_VERSION_REPORT,
+            flags: 0,
+            payload: (local_key + 3).to_le_bytes().to_vec().into(),
+        };
+        let mut conn_state = crate::server::ConnectionState::new();
+        let resp = handle_request(
+            &req,
+            &h.engine,
+            8192,
+            Some(&cluster),
+            None,
+            &mut conn_state,
+            None,
+        );
+
+        assert_eq!(resp.status, STATUS_ERROR);
+        let (code, _msg) = decode_error_payload(&resp.payload).unwrap();
+        assert_eq!(code, ERR_STALE_EPOCH);
+        assert_eq!(
+            crate::cluster::coordinator::parse_stale_epoch_report_rejection(&resp.payload),
+            Some(local_key),
+            "the rejection must echo the RESPONDER's local cluster key",
         );
     }
 

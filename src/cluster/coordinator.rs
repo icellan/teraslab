@@ -821,6 +821,23 @@ const SAME_TERM_REACTIVATION_COOLDOWN: Duration = Duration::from_secs(30);
 
 const DRAIN_REACTIVATION_INTERVAL: Duration = Duration::from_secs(2);
 
+/// W9 FIX 1 — cadence on which the exchange phase RE-QUERIES a peer whose
+/// `OP_PARTITION_VERSION_REPORT` query failed (rejected, unreachable, or
+/// garbled), bounded by the exchange's total deadline. Short, because the
+/// dominant failure is a fast `STALE_EPOCH` rejection from a peer that has
+/// not yet applied the just-committed term (commit propagation takes 1-7 s
+/// in CI while the exchange fires ~100 ms after the local commit).
+const EXCHANGE_PEER_RETRY_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Total wall-clock budget for one exchange phase (Phase D partition-view
+/// collection). Every spawn site uses this single value; the det-degrade
+/// plan-launch grace is derived from it
+/// ([`DET_DEGRADE_PLAN_LAUNCH_GRACE`]), so the two cannot silently drift
+/// apart. With the W9 P1-2 quorum early-return the exchange usually
+/// finishes far sooner — this bounds only the wait for a quorum that
+/// never materializes.
+const EXCHANGE_PHASE_TIMEOUT: Duration = Duration::from_millis(2000);
+
 fn debug_shard_set() -> &'static std::collections::HashSet<u16> {
     static SET: std::sync::OnceLock<std::collections::HashSet<u16>> = std::sync::OnceLock::new();
     SET.get_or_init(|| {
@@ -3002,6 +3019,25 @@ impl ClusterCoordinator {
             // view reaches quorum through the duplicate-activation gate as
             // an upgrade; cleared by any admitted quorum activation.
             let mut degraded_activation_term: Option<u64> = None;
+            // W9 FIX 2 — retry pacing for a det-degraded activation:
+            // `(last_attempt, fired_rounds)`, seeded when the degrade is
+            // admitted (the degrading completion counts as attempt zero)
+            // and cleared with the marker on any admitted quorum
+            // activation. While `degraded_activation_term` records the
+            // current committed term, the loop re-fires the exchange on the
+            // `degraded_upgrade_retry_backoff` cadence so the degrade is
+            // never terminal; completions route through the normal
+            // duplicate-gate upgrade path.
+            let mut degraded_retry: Option<(std::time::Instant, u32)> = None;
+            // W9 FIX 3 — the det-degraded activation's migration plan with
+            // its worker launch HELD for `DET_DEGRADE_PLAN_LAUNCH_GRACE`,
+            // so a racing same-term quorum completion can upgrade the table
+            // before thousands of holder-blind tasks start streaming (and
+            // lock the upgrade out via `active_count`). Launched by the
+            // grace tick below, or cancelled by whichever superseding
+            // activation lands first. All transitions happen on THIS
+            // thread — no launch/upgrade race is possible.
+            let mut pending_det_plan: Option<DeferredPlanLaunch> = None;
             // Task #47 — term-keyed single-flight slot for the same-term
             // re-heal exchange spawned by the normal reactivation repair.
             // `Some(term)` while an exchange for that term is in flight;
@@ -3208,6 +3244,12 @@ impl ClusterCoordinator {
                                         "cluster: skipping duplicate self-vote activation",
                                     );
                                 } else {
+                                    // W9 P2-1 — this activation supersedes
+                                    // any still-unlaunched det plan: cancel
+                                    // it so its workerless tasks cannot be
+                                    // preserved (and later driven at a
+                                    // current epoch by the held launch).
+                                    cancel_deferred_plan_launch(&mut pending_det_plan, &migration);
                                     last_activated_term = commit.term;
                                     topology_epoch.store(commit.term, Ordering::Relaxed);
                                     Self::activate_topology(
@@ -3979,11 +4021,73 @@ impl ClusterCoordinator {
                                 &engine_x,
                                 &shard_table_x,
                                 &inbound_bm_x,
-                                std::time::Duration::from_millis(2000),
+                                EXCHANGE_PHASE_TIMEOUT,
                                 &secret_x,
                             );
                             let _ = exchange_tx.send((members_x, committed_term, view, false));
                         });
+                    }
+                }
+
+                // W9 FIX 2 — degraded-upgrade retry. While the ACTIVE table
+                // for the committed term is the det degrade (below-quorum
+                // first activation), re-fire the exchange on a doubling
+                // backoff so a late-applying peer can still deliver the
+                // quorum view; the completion routes through the normal
+                // duplicate-gate upgrade path (`degraded_term_upgrade_-
+                // admissible`). Without this the degrade was terminal: the
+                // det table matches the committed placement so no divergence
+                // counter arms the same-term re-heal, and the prompt arm is
+                // dead because committed == activated.
+                if !activation_held && let Some((last_attempt, fired_rounds)) = degraded_retry {
+                    let committed_term = topo_authority_event.committed_term();
+                    if degraded_upgrade_retry_due(
+                        degraded_activation_term,
+                        committed_term,
+                        last_attempt.elapsed(),
+                        fired_rounds,
+                    ) {
+                        let committed_members = topo_authority_event.committed_members();
+                        if committed_members.len() > 1 {
+                            degraded_retry =
+                                Some((std::time::Instant::now(), fired_rounds.saturating_add(1)));
+                            tracing::info!(
+                                term = committed_term,
+                                round = fired_rounds.saturating_add(1),
+                                next_backoff_secs =
+                                    degraded_upgrade_retry_backoff(fired_rounds.saturating_add(1))
+                                        .as_secs(),
+                                "cluster: det-degraded activation — re-running the \
+                                 exchange for a quorum upgrade view",
+                            );
+                            let exchange_tx = exchange_complete_tx.clone();
+                            let node_addrs_x = node_addrs.clone();
+                            let engine_x = engine.clone();
+                            let shard_table_x = shard_table.clone();
+                            let inbound_bm_x = inbound_bm_event.clone();
+                            let secret_x = cluster_secret_event.clone();
+                            let members_x = committed_members.clone();
+                            std::thread::spawn(move || {
+                                let view = Self::run_exchange_phase(
+                                    &members_x,
+                                    self_id,
+                                    committed_term,
+                                    &node_addrs_x,
+                                    &engine_x,
+                                    &shard_table_x,
+                                    &inbound_bm_x,
+                                    EXCHANGE_PHASE_TIMEOUT,
+                                    &secret_x,
+                                );
+                                let _ = exchange_tx.send((members_x, committed_term, view, false));
+                            });
+                        } else {
+                            // Membership contracted to single-node while the
+                            // marker stood; there is no peer view to upgrade
+                            // from — stop retrying (the marker itself stays,
+                            // it is inert without a multi-node term).
+                            degraded_retry = None;
+                        }
                     }
                 }
 
@@ -4262,7 +4366,7 @@ impl ClusterCoordinator {
                                             &engine_x,
                                             &shard_table_x,
                                             &inbound_bm_x,
-                                            std::time::Duration::from_millis(2000),
+                                            EXCHANGE_PHASE_TIMEOUT,
                                             &secret_x,
                                         );
                                         let _ = exchange_tx.send((
@@ -4305,6 +4409,15 @@ impl ClusterCoordinator {
                                 }
                                 last_reactivation_at = std::time::Instant::now();
                                 last_activation_at = std::time::Instant::now();
+                                // W9 FIX 3 — defensive: these arms are gated
+                                // on `active_count() == 0`, which a pending
+                                // det plan's registered tasks keep non-zero
+                                // (except the startup arm ≥5 s after
+                                // activation, beyond the 3 s grace). If one
+                                // ever fires while a plan is pending, it
+                                // supersedes it — cancel so the workerless
+                                // tasks cannot be preserved.
+                                cancel_deferred_plan_launch(&mut pending_det_plan, &migration);
                                 Self::activate_topology(
                                     &committed_members,
                                     committed_term,
@@ -4400,7 +4513,7 @@ impl ClusterCoordinator {
                                 &engine_x,
                                 &shard_table_x,
                                 &inbound_bm_x,
-                                std::time::Duration::from_millis(2000),
+                                EXCHANGE_PHASE_TIMEOUT,
                                 &secret_x,
                             );
                             let _ = exchange_tx.send((members_x, term, view, false));
@@ -4409,6 +4522,10 @@ impl ClusterCoordinator {
                     }
 
                     // Single-node cluster: activate immediately.
+                    // W9 FIX 3 — a pending det plan from a superseded
+                    // multi-node term must not outlive this activation (its
+                    // workerless tasks would otherwise be preservable).
+                    cancel_deferred_plan_launch(&mut pending_det_plan, &migration);
                     last_activated_term = term;
                     topology_epoch.store(term, Ordering::Relaxed);
                     tracing::info!(
@@ -4509,12 +4626,48 @@ impl ClusterCoordinator {
                             // self-abort without an epoch advance (see the
                             // helper's doc). A refused upgrade leaves the
                             // marker set — the det-table residual applies.
+                            //
+                            // W9 P1-1 — an upgrade may only re-activate a
+                            // term that is STILL the committed topology
+                            // (same rule as the same-term re-heal): a retry
+                            // completion for a superseded term would
+                            // activate without a committed assignment and
+                            // fall into per-node refinement.
+                            if !duplicate_completion_upgrade_applicable(
+                                term,
+                                topo_authority_event.committed_term(),
+                                &members,
+                                &topo_authority_event.committed_members(),
+                            ) {
+                                tracing::debug!(
+                                    term,
+                                    committed_term = topo_authority_event.committed_term(),
+                                    "cluster: dropping stale duplicate exchange \
+                                     completion — topology moved past its term",
+                                );
+                                continue;
+                            }
+                            // W9 FIX 3 — the det plan whose launch is still
+                            // HELD (grace window) has no workers: its tasks
+                            // are registered but the launch closure is
+                            // un-run and owned by this thread, so the
+                            // active set is provably worker-less and safe
+                            // to supersede (verified task-by-task).
+                            let no_live_workers = {
+                                let mgr = migration.lock();
+                                no_live_migration_workers_for_upgrade(
+                                    mgr.active_count(),
+                                    pending_det_plan.as_ref().is_some_and(|p| {
+                                        p.term == term && active_migrations_all_held(&mgr, &p.tasks)
+                                    }),
+                                )
+                            };
                             if !degraded_term_upgrade_admissible(
                                 degraded_activation_term,
                                 term,
                                 member_view_size,
                                 members.len(),
-                                migration.lock().active_count() == 0,
+                                no_live_workers,
                             ) {
                                 tracing::debug!(
                                     term,
@@ -4543,21 +4696,37 @@ impl ClusterCoordinator {
                     // view, installing the byte-identical pure det table
                     // (the startup-path shape) so the node keeps serving
                     // and no partial-evidence refinement can diverge.
-                    match admit_exchange_completion(
+                    let admission = admit_exchange_completion(
                         same_term_reheal,
                         term,
                         member_view_size,
                         members.len(),
-                    ) {
+                    );
+                    match admission {
                         ExchangeAdmission::HoldReheal => continue,
                         ExchangeAdmission::AdmitDetOnly => {
                             partition_view.clear();
                             degraded_activation_term = Some(term);
+                            // W9 FIX 2 — arm the degraded-upgrade retry: the
+                            // degrading completion counts as attempt zero, so
+                            // the first retry fires a full starting backoff
+                            // from NOW.
+                            degraded_retry = Some((std::time::Instant::now(), 0));
                         }
                         // Any admitted quorum activation (first, upgrade, or
                         // re-heal) supersedes a pending det degrade.
-                        ExchangeAdmission::Admit => degraded_activation_term = None,
+                        ExchangeAdmission::Admit => {
+                            degraded_activation_term = None;
+                            degraded_retry = None;
+                        }
                     }
+                    // W9 FIX 3 — this admitted completion is about to
+                    // activate, superseding any still-unlaunched det plan
+                    // (its own term's quorum upgrade, or a newer term).
+                    // Cancel it FIRST: its tasks have no workers, and
+                    // leaving them Active would let the same-epoch preserve
+                    // below keep workerless tasks alive forever.
+                    cancel_deferred_plan_launch(&mut pending_det_plan, &migration);
                     last_activated_term = term;
                     topology_epoch.store(term, Ordering::Relaxed);
                     // §8 — retain the freshest cluster-wide holder view for
@@ -4666,7 +4835,7 @@ impl ClusterCoordinator {
                         view_size = partition_view.len(),
                         "cluster: activating topology after exchange phase",
                     );
-                    Self::activate_topology_with_view(
+                    let deferred = Self::activate_topology_with_view(
                         &members,
                         term,
                         topo_authority_event.committed_placement_version(),
@@ -4693,7 +4862,21 @@ impl ClusterCoordinator {
                         // term's exchange activation must keep the det plan so
                         // the rebalance can fill its still-empty newcomers.
                         same_term_reheal,
+                        // W9 FIX 3 — hold the det degrade's worker launch for
+                        // the upgrade grace; every other admission launches
+                        // immediately.
+                        admission == ExchangeAdmission::AdmitDetOnly,
                     );
+                    if let Some(pending) = deferred {
+                        tracing::info!(
+                            term = pending.term,
+                            tasks = pending.tasks.len(),
+                            grace_secs = DET_DEGRADE_PLAN_LAUNCH_GRACE.as_secs(),
+                            "cluster: holding the det-degraded migration plan's \
+                             launch so a racing quorum completion can upgrade first",
+                        );
+                        pending_det_plan = Some(pending);
+                    }
                     // Reverse-heal Phase 3b — RUNTIME online re-heal. The
                     // partition view just refreshed carries every peer's per-shard
                     // generation digest, so re-run the Tier-2 detector against this
@@ -4751,6 +4934,28 @@ impl ClusterCoordinator {
                     if let Some(ref path) = outbound_state_path_event {
                         crate::cluster::migration::persist_outbound_state(path, &migration.lock());
                     }
+                }
+
+                // W9 FIX 3 — launch a det-degraded migration plan whose
+                // upgrade grace has elapsed with no quorum completion
+                // arriving. Runs AFTER the exchange drain above so a
+                // same-iteration upgrade always supersedes the plan before
+                // this tick can fire it; ≤100 ms tick granularity on top of
+                // the grace is noise against migration timescales.
+                if !activation_held
+                    && pending_det_plan
+                        .as_ref()
+                        .is_some_and(|p| det_plan_launch_due(p.armed_at.elapsed()))
+                    && let Some(pending) = pending_det_plan.take()
+                {
+                    tracing::info!(
+                        term = pending.term,
+                        tasks = pending.tasks.len(),
+                        held_ms = pending.armed_at.elapsed().as_millis() as u64,
+                        "cluster: launching the det-degraded migration plan — no \
+                         quorum upgrade arrived within the launch grace",
+                    );
+                    std::thread::spawn(pending.launch);
                 }
 
                 // Phase H — drain resync requests posted by the catchup
@@ -5037,6 +5242,14 @@ impl ClusterCoordinator {
                             topology_epoch.store(committed_term, Ordering::Relaxed);
                             last_reactivation_at = std::time::Instant::now();
                             last_activation_at = std::time::Instant::now();
+                            // W9 P2-1 — same-epoch re-activation: cancel any
+                            // still-unlaunched det plan first, else a held
+                            // task the re-derived plan legitimately drops
+                            // would later be driven by the held launch at a
+                            // current epoch (target unfences and serves
+                            // while the source never commits — dual
+                            // masters).
+                            cancel_deferred_plan_launch(&mut pending_det_plan, &migration);
                             Self::activate_topology(
                                 &committed_members,
                                 committed_term,
@@ -5878,6 +6091,10 @@ impl ClusterCoordinator {
             // Empty view — the election's holder extension has nothing to
             // read anyway; this path is never a same-term re-heal.
             false,
+            // Never deferred: this wrapper serves the single-node commit
+            // path and the reactivation repairs, none of which is the
+            // det-degrade first activation (W9 FIX 3).
+            false,
         );
     }
 
@@ -5890,6 +6107,15 @@ impl ClusterCoordinator {
     /// uses the per-node `last_applied_seq` data to skip migrations whose
     /// destination already has the data, and to retarget the source onto a
     /// replica when the planned source has none.
+    ///
+    /// W9 FIX 3 — with `defer_plan_launch`, the table install, handoff
+    /// begin, task registration, and bitmap sync all still run
+    /// synchronously (serving semantics and the hot-path fences are never
+    /// held), but the Phase-2 worker launch is NOT spawned: it is returned
+    /// as a [`DeferredPlanLaunch`] for the event loop to fire after
+    /// [`DET_DEGRADE_PLAN_LAUNCH_GRACE`] — or to cancel if a quorum
+    /// completion upgrades the det table first. Returns `None` when the
+    /// launch was spawned (or there was nothing to launch).
     #[allow(clippy::too_many_arguments)]
     fn activate_topology_with_view(
         members: &[NodeId],
@@ -5919,7 +6145,12 @@ impl ClusterCoordinator {
         // pass false — its newcomers are legitimately empty mid-rebalance and
         // must keep their det masterships so the migration can fill them.
         adopt_view_holders: bool,
-    ) {
+        // W9 FIX 3 — true ONLY for the det-degrade first activation
+        // (`ExchangeAdmission::AdmitDetOnly`): hold the Phase-2 worker
+        // launch and return it as a `DeferredPlanLaunch` instead of
+        // spawning it.
+        defer_plan_launch: bool,
+    ) -> Option<DeferredPlanLaunch> {
         *active_topology_members.write() = members.to_vec();
 
         // Fast path: when the engine has zero records AND the current shard
@@ -5956,7 +6187,7 @@ impl ClusterCoordinator {
                 fenced_bm.clear_all();
                 migrating_bm.clear_all();
                 inbound_bm.clear_all();
-                return;
+                return None;
             }
         }
 
@@ -6383,7 +6614,10 @@ impl ClusterCoordinator {
                 })
             };
 
-            std::thread::spawn(move || {
+            // W9 FIX 3 — keep the outbound task list for the deferred
+            // launch's cancel bookkeeping before the closure takes it.
+            let deferred_tasks = defer_plan_launch.then(|| outbound_tasks.clone());
+            let launch = move || {
                 let (pre_swap_keys_by_shard, skipped) =
                     engine_w.keys_by_shard_filtered(&outbound_shard_set);
                 // Issue #46 fail-safe: this is the primary activation handoff.
@@ -6428,8 +6662,21 @@ impl ClusterCoordinator {
                     secret_w,
                     Some(relinquish_ctx),
                 );
-            });
+            };
+            // W9 FIX 3 — the det-degrade path HOLDS the worker launch (the
+            // event loop fires or cancels it); every other path spawns it
+            // immediately, exactly as before.
+            if let Some(tasks) = deferred_tasks {
+                return Some(DeferredPlanLaunch {
+                    term: epoch,
+                    armed_at: std::time::Instant::now(),
+                    tasks,
+                    launch: Box::new(launch),
+                });
+            }
+            std::thread::spawn(launch);
         }
+        None
     }
 
     /// Phase D: collect `OP_PARTITION_VERSION_REPORT` from every alive peer
@@ -6437,10 +6684,22 @@ impl ClusterCoordinator {
     ///
     /// Self-report is computed locally without TCP. Peers are queried in
     /// parallel; a peer whose query fails — unreachable, rejected (non-OK
-    /// status), or unparseable — is left ABSENT from the returned view (F1,
-    /// so election's partial-view gate genuinely blocks deviation) and does
-    /// not block the full per-peer timeout. The total wall-clock budget is
-    /// bounded by `total_timeout`.
+    /// status), or unparseable — is RE-QUERIED on a short cadence
+    /// ([`EXCHANGE_PEER_RETRY_INTERVAL`]) until it answers or the total
+    /// deadline elapses (W9 FIX 1, CI run 31971906387: the exchange fires
+    /// within ~100 ms of the local commit while peers take 1-7 s to APPLY
+    /// it, so a one-shot query chronically collected a below-quorum view and
+    /// det-degraded every first activation). A peer that never answers
+    /// within the deadline is left ABSENT from the returned view (F1, so
+    /// election's partial-view gate genuinely blocks deviation — never
+    /// fabricated emptiness) and does not block the full per-peer timeout.
+    ///
+    /// W9 P1-2 — the collection returns EARLY as soon as the view covers
+    /// the MEMBER quorum (after draining every answer already in the
+    /// channel), so a silent peer costs quorum-latency instead of the full
+    /// deadline; peers still silent at the early return stay honestly
+    /// absent. The total wall-clock budget is bounded by `total_timeout`
+    /// (a quorum that never materializes waits it out).
     #[allow(clippy::too_many_arguments)]
     fn run_exchange_phase(
         members: &[NodeId],
@@ -6493,42 +6752,167 @@ impl ClusterCoordinator {
         // exits via SWIM reap + member-set change.
         type PeerResult = (NodeId, Option<Vec<PartitionVersionEntry>>);
         let (tx, rx) = std::sync::mpsc::channel::<PeerResult>();
+        let deadline = std::time::Instant::now() + total_timeout;
         for (peer, addr) in &peer_addrs {
             let tx = tx.clone();
             let peer = *peer;
             let addr = *addr;
             let secret = auth_secret.clone();
+            // One thread per peer with an internal retry loop (bounded by
+            // the shared deadline) — never a thread per attempt. Each thread
+            // sends EXACTLY ONE final result: the first successful report,
+            // or `None` at the deadline.
             std::thread::spawn(move || {
-                // `_ok`: a rejected report (non-OK status) is a failed query
-                // by design, not an empty report — see F1 above.
-                let entries = match send_topology_frame_ok(
-                    addr,
-                    OP_PARTITION_VERSION_REPORT,
-                    &cluster_key.to_le_bytes(),
-                    secret.as_deref().map(Vec::as_slice),
-                ) {
-                    Ok(payload) => parse_partition_version_response(&payload),
-                    Err(_) => None,
-                };
-                let _ = tx.send((peer, entries));
+                let mut attempts = 0u32;
+                let mut last_failure: String;
+                loop {
+                    attempts += 1;
+                    // A rejected report (non-OK status) is a failed query
+                    // by design, not an empty report — see F1 above. The
+                    // full response is inspected (not discarded) so the
+                    // W9 P2-3 stale-epoch key echo is readable.
+                    match send_topology_frame_response(
+                        addr,
+                        OP_PARTITION_VERSION_REPORT,
+                        &cluster_key.to_le_bytes(),
+                        secret.as_deref().map(Vec::as_slice),
+                    ) {
+                        Ok(response) if response.status == STATUS_OK => {
+                            match parse_partition_version_response(&response.payload) {
+                                Some(entries) => {
+                                    let _ = tx.send((peer, Some(entries)));
+                                    return;
+                                }
+                                None => {
+                                    let detail = "unparseable report payload";
+                                    record_exchange_peer_failure(
+                                        peer,
+                                        addr,
+                                        ExchangePeerFailureKind::Garbled,
+                                        detail,
+                                    );
+                                    last_failure = detail.to_string();
+                                }
+                            }
+                        }
+                        Ok(response) => {
+                            let err = format!("peer replied status {}", response.status);
+                            record_exchange_peer_failure(
+                                peer,
+                                addr,
+                                classify_exchange_peer_error(&err),
+                                &err,
+                            );
+                            // W9 P2-3 — the STALE_EPOCH rejection echoes the
+                            // responder's local cluster key. HIGHER than
+                            // ours means THIS node is the stale side: the
+                            // peer keeps rejecting until OUR key changes,
+                            // which only topology catch-up does — re-querying
+                            // is pointless, give up now (honest absence). A
+                            // LOWER key (peer still applying the commit) or
+                            // a keyless/other error keeps the cadence.
+                            if let Some(responder_key) =
+                                parse_stale_epoch_report_rejection(&response.payload)
+                                && responder_key > cluster_key
+                            {
+                                tracing::warn!(
+                                    peer = peer.0,
+                                    %addr,
+                                    our_key = cluster_key,
+                                    responder_key,
+                                    attempts,
+                                    "cluster: exchange peer reports a HIGHER \
+                                     cluster key — this node is the stale side; \
+                                     abandoning the re-query (topology catch-up \
+                                     converges us)",
+                                );
+                                let _ = tx.send((peer, None));
+                                return;
+                            }
+                            last_failure = err;
+                        }
+                        Err(err) => {
+                            record_exchange_peer_failure(
+                                peer,
+                                addr,
+                                classify_exchange_peer_error(&err),
+                                &err,
+                            );
+                            last_failure = err;
+                        }
+                    }
+                    // W9 FIX 1 — re-query on a short cadence until the total
+                    // deadline: the dominant failure is a fast STALE_EPOCH
+                    // rejection from a peer that has not yet applied the
+                    // commit, and it typically starts answering within the
+                    // window. Give up (honest absence) once a full retry
+                    // interval no longer fits before the deadline.
+                    if std::time::Instant::now() + EXCHANGE_PEER_RETRY_INTERVAL >= deadline {
+                        tracing::warn!(
+                            peer = peer.0,
+                            %addr,
+                            attempts,
+                            last_failure,
+                            "cluster: exchange peer ABSENT — every report \
+                             query failed within the exchange deadline",
+                        );
+                        let _ = tx.send((peer, None));
+                        return;
+                    }
+                    std::thread::sleep(EXCHANGE_PEER_RETRY_INTERVAL);
+                }
             });
         }
         drop(tx);
 
-        let deadline = std::time::Instant::now() + total_timeout;
-        for _ in 0..peer_addrs.len() {
+        let mut received = 0usize;
+        while received < peer_addrs.len() {
+            // Opportunistically drain every answer ALREADY in the channel
+            // before deciding anything, so a quorum early-return never
+            // discards evidence that has already arrived — only peers
+            // still silent are left absent.
+            while let Ok((peer, entries)) = rx.try_recv() {
+                received += 1;
+                // A failed query (`None`) is consumed so the drain still
+                // exits as soon as every peer reported, but the peer stays
+                // out of the view (F1).
+                if let Some(entries) = entries {
+                    phase.record(peer, entries);
+                }
+            }
+            if received >= peer_addrs.len() {
+                break;
+            }
+            // W9 P1-2 — return EARLY once the collected view covers the
+            // MEMBER quorum (counting only reporters that are committed
+            // members; on a drain term the self report must not pad the
+            // floor). Refinement is admissible at the quorum floor, so
+            // waiting further only serves peers that have not answered —
+            // and with the FIX 1 re-query loop a silent peer reports only
+            // at the DEADLINE, which made every exchange with any lagging
+            // member burn the full budget on the commit path (eating the
+            // ~4 s FIX-A handoff window) and pushed the degraded-upgrade
+            // retry's completion past the plan-launch grace. Peers still
+            // silent at the early return stay honestly absent (F1).
+            let member_view_size = phase
+                .partition_view()
+                .keys()
+                .filter(|n| members.contains(n))
+                .count();
+            if member_view_reaches_quorum(member_view_size, members.len()) {
+                break;
+            }
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             if remaining.is_zero() {
                 break;
             }
             match rx.recv_timeout(remaining) {
-                Ok((peer, Some(entries))) => {
-                    phase.record(peer, entries);
+                Ok((peer, entries)) => {
+                    received += 1;
+                    if let Some(entries) = entries {
+                        phase.record(peer, entries);
+                    }
                 }
-                // Failed query or unparseable payload: consume the reply so
-                // the drain loop still exits as soon as every peer answered,
-                // but leave the peer out of the view.
-                Ok((_, None)) => {}
                 Err(_) => break,
             }
         }
@@ -7060,6 +7444,122 @@ pub fn activation_degraded_degenerate_view_total() -> u64 {
     ACTIVATION_DEGRADED_DEGENERATE_VIEW_TOTAL.load(Ordering::Relaxed)
 }
 
+/// W9 P2 — outcome classification for a failed exchange report query
+/// (`OP_PARTITION_VERSION_REPORT`). One counter per outcome, because the
+/// chronic view starvation (CI run 31971906387) was undiagnosable while
+/// every failure was silently discarded: `Status` rising means peers are
+/// alive but rejecting (the STALE_EPOCH commit-propagation race), while
+/// `Connect`/`Transport` point at reachability.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExchangePeerFailureKind {
+    /// TCP connect failed (peer down or unreachable).
+    Connect,
+    /// The peer answered with a non-OK status (e.g. `ERR_STALE_EPOCH`
+    /// while it has not yet applied the commit).
+    Status,
+    /// The connection was established but the round-trip failed: a read or
+    /// write error (including read TIMEOUTS), frame decode, or response
+    /// authentication.
+    Transport,
+    /// The peer answered `STATUS_OK` but the report payload failed the
+    /// stride check.
+    Garbled,
+}
+
+/// W9 P2 — classify an exchange report-query failure string. The prefixes
+/// are authored in this same file — by [`send_topology_frame_response`]
+/// (connect/transport errors) and by the exchange's retry loop itself
+/// (the `"peer replied status N"` line for a non-OK reply) — so the match
+/// is deterministic; anything unrecognized is a transport failure.
+fn classify_exchange_peer_error(err: &str) -> ExchangePeerFailureKind {
+    if err.starts_with("connect:") {
+        ExchangePeerFailureKind::Connect
+    } else if err.starts_with("peer replied status") {
+        ExchangePeerFailureKind::Status
+    } else {
+        ExchangePeerFailureKind::Transport
+    }
+}
+
+/// W9 P2 — exchange report queries that failed with a TCP connect error.
+static EXCHANGE_PEER_FAILURE_CONNECT_TOTAL: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+/// W9 P2 — exchange report queries rejected with a non-OK status.
+static EXCHANGE_PEER_FAILURE_STATUS_TOTAL: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+/// W9 P2 — exchange report queries that failed mid-round-trip.
+static EXCHANGE_PEER_FAILURE_TRANSPORT_TOTAL: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+/// W9 P2 — exchange report replies whose payload failed to parse.
+static EXCHANGE_PEER_FAILURE_GARBLED_TOTAL: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Exchange report queries failed on TCP connect since process start
+/// (W9 P2). Exported as `teraslab_exchange_peer_failure_connect_total`.
+pub fn exchange_peer_failure_connect_total() -> u64 {
+    EXCHANGE_PEER_FAILURE_CONNECT_TOTAL.load(Ordering::Relaxed)
+}
+
+/// Exchange report queries rejected with a non-OK status since process
+/// start (W9 P2). Exported as
+/// `teraslab_exchange_peer_failure_status_total`.
+pub fn exchange_peer_failure_status_total() -> u64 {
+    EXCHANGE_PEER_FAILURE_STATUS_TOTAL.load(Ordering::Relaxed)
+}
+
+/// Exchange report queries failed mid-round-trip (read/write/decode/auth,
+/// including read timeouts) since process start (W9 P2). Exported as
+/// `teraslab_exchange_peer_failure_transport_total`.
+pub fn exchange_peer_failure_transport_total() -> u64 {
+    EXCHANGE_PEER_FAILURE_TRANSPORT_TOTAL.load(Ordering::Relaxed)
+}
+
+/// Exchange report replies with an unparseable payload since process start
+/// (W9 P2). Exported as `teraslab_exchange_peer_failure_garbled_total`.
+pub fn exchange_peer_failure_garbled_total() -> u64 {
+    EXCHANGE_PEER_FAILURE_GARBLED_TOTAL.load(Ordering::Relaxed)
+}
+
+/// W9 P2 — whether the `n`th exchange report-query failure (1-based,
+/// process-wide) emits its warn: the first 10 all do, then every 100th.
+/// The re-query cadence retries every 500 ms against a peer that may stay
+/// down for minutes; the counters still count every failure.
+fn exchange_peer_failure_warn_due(n: u64) -> bool {
+    const WARN_FIRST: u64 = 10;
+    const WARN_EVERY: u64 = 100;
+    n <= WARN_FIRST || n.is_multiple_of(WARN_EVERY)
+}
+
+/// W9 P2 — meter + (rate-limited) warn one discarded exchange report
+/// query, naming the peer, address, and failure kind/detail so chronic
+/// view starvation is diagnosable from the log and `/metrics`.
+fn record_exchange_peer_failure(
+    peer: NodeId,
+    addr: SocketAddr,
+    kind: ExchangePeerFailureKind,
+    detail: &str,
+) {
+    let counter = match kind {
+        ExchangePeerFailureKind::Connect => &EXCHANGE_PEER_FAILURE_CONNECT_TOTAL,
+        ExchangePeerFailureKind::Status => &EXCHANGE_PEER_FAILURE_STATUS_TOTAL,
+        ExchangePeerFailureKind::Transport => &EXCHANGE_PEER_FAILURE_TRANSPORT_TOTAL,
+        ExchangePeerFailureKind::Garbled => &EXCHANGE_PEER_FAILURE_GARBLED_TOTAL,
+    };
+    counter.fetch_add(1, Ordering::Relaxed);
+    static FAILURES_SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = FAILURES_SEEN.fetch_add(1, Ordering::Relaxed) + 1;
+    if exchange_peer_failure_warn_due(n) {
+        tracing::warn!(
+            peer = peer.0,
+            %addr,
+            kind = ?kind,
+            detail,
+            "cluster: exchange report query failed — re-querying until the \
+             exchange deadline (warn rate-limited; counters count every failure)",
+        );
+    }
+}
+
 /// Outcome of [`admit_exchange_completion`] for an exchange-phase activation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ExchangeAdmission {
@@ -7220,6 +7720,221 @@ fn degraded_term_upgrade_admissible(
     no_active_migrations
         && degraded_activation_term == Some(term)
         && member_view_reaches_quorum(member_view_size, member_count)
+}
+
+/// W9 P1-1 — gate for considering an already-activated term's completion
+/// as a det-degrade UPGRADE: applicable only while the completion's term
+/// and member set still match the CURRENT committed topology — the
+/// identical rule the same-term re-heal applies
+/// ([`same_term_reheal_applicable`], which this delegates to).
+///
+/// Without it, a retry completion for degraded term T landing after T+1
+/// committed passes `topology_commit_already_activated` (the last
+/// activated term is still T) and the upgrade gate, and re-activates T:
+/// `committed_assignment_for_activation` returns `None` (the authority
+/// moved to T+1), so the activation falls into per-node
+/// `apply_master_election` refinement — the divergent-refinement path the
+/// det degrade exists to avoid — while overwriting the retained exchange
+/// view and arming event-repair under a stale term.
+fn duplicate_completion_upgrade_applicable(
+    view_term: u64,
+    committed_term: u64,
+    view_members: &[NodeId],
+    committed_members: &[NodeId],
+) -> bool {
+    same_term_reheal_applicable(view_term, committed_term, view_members, committed_members)
+}
+
+/// W9 FIX 2 — interval between retry exchanges for a det-degraded
+/// activation, as a function of how many retries have already FIRED for
+/// this degrade. Doubles from 2 s to the 5-minute cap (the
+/// [`park_reheal_backoff`] doubling-to-cap model): the common rescue is a
+/// peer applying the commit within a few seconds, while a
+/// permanently-partitioned peer must not be probed every 30 s forever —
+/// after ~8 fruitless rounds the cadence settles at the same 5-minute
+/// ceiling the park re-heal uses.
+///
+/// The 2 s floor equals [`EXCHANGE_PHASE_TIMEOUT`], which makes the
+/// retry single-flight BY CONSTRUCTION: an exchange thread always sends
+/// its (possibly partial) result within its deadline, so the previous
+/// retry's exchange has completed before the next one can fire — no
+/// separate in-flight slot to release (a slot released on "any same-term
+/// completion" would be freed early by the racing commit/prompt-arm
+/// exchanges for the same term).
+fn degraded_upgrade_retry_backoff(fired_rounds: u32) -> Duration {
+    const START: Duration = Duration::from_secs(2);
+    const CAP: Duration = Duration::from_secs(300);
+    CAP.min(START.saturating_mul(1u32 << fired_rounds.min(8)))
+}
+
+/// W9 FIX 2 — should the event loop re-fire the exchange phase for a
+/// det-degraded activation this tick?
+///
+/// A det-degraded activation used to be TERMINAL when the racing second
+/// exchange also missed quorum (CI run 31971906387, default-09: node2
+/// degraded term 6, peers applied the commit ~7 s later, and no third
+/// exchange EVER fired — the det table matches the committed placement so
+/// no divergence counter arms the same-term re-heal, and the prompt arm is
+/// dead because committed == activated). Due iff BOTH hold:
+///
+/// - `degraded_activation_term` records exactly the CURRENT committed
+///   term. This encodes every stop condition: the marker is cleared when
+///   the term is upgraded (any [`ExchangeAdmission::Admit`]), and a newly
+///   committed term makes `committed_term` move past the marker (the new
+///   term's own activation path owns the table); and
+/// - the backoff for the current round has elapsed since the last attempt
+///   (the degrade itself counts as attempt zero — the completion that
+///   degraded IS an exchange result, so the first retry waits the full
+///   starting backoff).
+///
+/// The resulting exchange completion is routed through the EXISTING
+/// duplicate-activation upgrade gate ([`degraded_term_upgrade_admissible`])
+/// like any other same-term completion — a below-quorum retry view is
+/// simply discarded there and the cadence continues.
+fn degraded_upgrade_retry_due(
+    degraded_activation_term: Option<u64>,
+    committed_term: u64,
+    since_last_attempt: Duration,
+    fired_rounds: u32,
+) -> bool {
+    degraded_activation_term == Some(committed_term)
+        && since_last_attempt >= degraded_upgrade_retry_backoff(fired_rounds)
+}
+
+/// W9 FIX 3 — how long a det-degraded activation holds its migration-plan
+/// LAUNCH so a racing same-term quorum completion can upgrade the table
+/// first (scenario 06: the degrade's 3869 holder-blind tasks started
+/// streaming immediately, locking `degraded_term_upgrade_admissible`'s
+/// `active_count() == 0` gate for the plan's whole lifetime).
+///
+/// Sized (and pinned by `det_plan_launch_grace_covers_first_retry_rescue_window`)
+/// to outlast the first degraded-upgrade retry's WHOLE window:
+/// `degraded_upgrade_retry_backoff(0)` (2 s) until the retry fires, plus
+/// the full [`EXCHANGE_PHASE_TIMEOUT`] (2 s — the quorum early-return can
+/// land any time inside it, e.g. when the lagging peer applies the commit
+/// near the end and answers the next 500 ms re-query), plus event-loop
+/// tick slack. The racing commit/prompt-arm exchanges (~0 s) are covered
+/// a fortiori. Serving and the shard-table install are NEVER held — only
+/// the worker launch.
+const DET_DEGRADE_PLAN_LAUNCH_GRACE: Duration = Duration::from_secs(5);
+
+/// W9 FIX 3 — a migration-plan launch deferred by the det-degrade grace.
+///
+/// Produced by [`ClusterCoordinator::activate_topology_with_view`] when
+/// called with `defer_plan_launch` and the activation has outbound work.
+/// The activation has ALREADY installed the shard table, begun the
+/// handoffs, registered the tasks, and synced the hot-path bitmaps — only
+/// the Phase-2 worker launch (`launch`) is held. Owned by the event loop,
+/// which either spawns `launch` once [`det_plan_launch_due`] holds, or
+/// cancels the whole plan via [`cancel_deferred_plan_launch`] when a
+/// superseding activation (typically the quorum upgrade) lands first.
+struct DeferredPlanLaunch {
+    /// The term the deferred plan was built for.
+    term: u64,
+    /// When the deferral was armed (the activation instant).
+    armed_at: std::time::Instant,
+    /// The outbound tasks `launch` would drive — kept so a cancel can fail
+    /// them (they have no workers; see [`cancel_deferred_plan_launch`]).
+    tasks: Vec<MigrationTask>,
+    /// The held Phase-2 body: key enumeration + worker spawn.
+    launch: Box<dyn FnOnce() + Send>,
+}
+
+/// W9 FIX 3 — has a deferred det plan been held long enough to launch?
+/// Pure so the grace boundary is unit-testable.
+fn det_plan_launch_due(held_for: Duration) -> bool {
+    held_for >= DET_DEGRADE_PLAN_LAUNCH_GRACE
+}
+
+/// W9 FIX 3 — the "no live migration wave" input to
+/// [`degraded_term_upgrade_admissible`].
+///
+/// The round-4 review blocked the same-epoch supersede under LIVE WORKERS:
+/// tasks absent from the refined plan are failed mid-flight while the
+/// superseded plan's workers, seeing no epoch advance, keep streaming.
+/// Tasks registered by a det plan whose launch is still HELD have no
+/// workers at all — the launch closure is un-run and owned by the same
+/// event-loop thread doing this admissibility check, so nothing can start
+/// streaming concurrently. They are therefore safe to supersede; any other
+/// active migration still locks the upgrade out.
+///
+/// KNOWN EXCEPTION (W9 P2-4, pre-existing): the Phase-H resync backfill
+/// deliberately does NOT `start_outbound`-track its tasks, so its workers
+/// are invisible to `active_count()` — to BOTH the strict and the relaxed
+/// form of this gate, exactly as they were before the det-degrade work.
+/// A resync stream racing an upgrade is therefore not excluded here; the
+/// exposure is unchanged by this helper and tracked as a residual, not
+/// papered over by registering resync tasks (which would change Phase-H's
+/// failure semantics).
+fn no_live_migration_workers_for_upgrade(
+    active_count: usize,
+    det_plan_launch_held_for_term: bool,
+) -> bool {
+    active_count == 0 || det_plan_launch_held_for_term
+}
+
+/// W9 FIX 3 — TRUE iff every ACTIVE migration is one of the held det
+/// plan's registered outbound tasks, still in `Preparing` (no worker has
+/// touched it). Anything else in the active set — e.g. a FIX-B
+/// transfer-request resend spawned with live workers during the grace, or
+/// a held task something began driving — means the active set is NOT
+/// provably worker-less, and the upgrade must fall back to the strict
+/// `active_count() == 0` gate. (A FIX-B resend never matches a held task:
+/// its idempotency filter drops any task matching a live tracked entry,
+/// and the held tasks are exactly such entries.)
+fn active_migrations_all_held(mgr: &MigrationManager, held: &[MigrationTask]) -> bool {
+    let held_set: std::collections::HashSet<(u16, NodeId, NodeId, bool)> = held
+        .iter()
+        .map(|t| (t.shard, t.from_node, t.to_node, t.is_master))
+        .collect();
+    mgr.active_migrations()
+        .iter()
+        .filter(|p| {
+            p.state != crate::cluster::migration::MigrationState::Complete
+                && p.state != crate::cluster::migration::MigrationState::Failed
+        })
+        .all(|p| {
+            p.state == crate::cluster::migration::MigrationState::Preparing
+                && held_set.contains(&(p.shard, p.from_node, p.to_node, p.is_master))
+        })
+}
+
+/// W9 FIX 3 — cancel a still-unlaunched det plan because a superseding
+/// activation is about to run (same-epoch quorum upgrade, a newer term, or
+/// a single-node re-activation).
+///
+/// Fails every outbound task the held launch would have driven: they have
+/// no workers, so this is pure bookkeeping — and it is REQUIRED, because a
+/// same-epoch superseding activation preserves matching active tasks on
+/// the assumption their workers keep running; preserving a workerless task
+/// would strand its shard in Copying forever. MUST be immediately followed
+/// by the superseding activation in the same event-loop iteration (its
+/// supersede reaps the failed entries and re-registers/re-drives whatever
+/// its plan needs).
+fn cancel_deferred_plan_launch(
+    slot: &mut Option<DeferredPlanLaunch>,
+    migration: &Arc<Mutex<MigrationManager>>,
+) {
+    if let Some(pending) = slot.take() {
+        {
+            let mut mgr = migration.lock();
+            for task in &pending.tasks {
+                // Exact (4-tuple) resolution, matching
+                // `active_migrations_all_held`'s key: `mark_failed`'s
+                // (shard, from, to) lookup could fail the wrong twin when
+                // a master and a replica task share endpoints, leaving
+                // the named one active — and preservable — workerless.
+                mgr.mark_failed_exact(task);
+            }
+        }
+        tracing::info!(
+            term = pending.term,
+            tasks = pending.tasks.len(),
+            held_ms = pending.armed_at.elapsed().as_millis() as u64,
+            "cluster: cancelled an UNLAUNCHED det-degraded migration plan — \
+             superseded before its launch grace elapsed",
+        );
+    }
 }
 
 /// Topology proposer thread: broadcasts a proposal to all peers, collects
@@ -7619,8 +8334,12 @@ fn send_topology_frame_response(
 /// Send a topology-protocol frame to a peer and return the response payload
 /// regardless of status. Callers that need to distinguish rejection decode
 /// the error envelope from the payload themselves (e.g. the propose/commit
-/// paths); callers that must treat rejection as failure use
-/// [`send_topology_frame_ok`].
+/// paths). The exchange report path uses [`send_topology_frame_response`]
+/// directly: a non-OK status is failure BY DESIGN (F1 — the peer stays
+/// absent from the partition view rather than the error envelope failing
+/// `parse_partition_version_response`'s stride check by accident), and the
+/// W9 P2-3 stale-epoch key echo must remain readable from the rejection
+/// payload.
 fn send_topology_frame(
     addr: SocketAddr,
     op_code: u16,
@@ -7628,26 +8347,6 @@ fn send_topology_frame(
     auth_secret: Option<&[u8]>,
 ) -> Result<Vec<u8>, String> {
     Ok(send_topology_frame_response(addr, op_code, payload, auth_secret)?.payload)
-}
-
-/// Like [`send_topology_frame`], but a non-`STATUS_OK` response is an `Err`.
-///
-/// F1 — used by the exchange report path so a REJECTED report query (e.g.
-/// `ERR_STALE_EPOCH` on a cluster_key mismatch) is failure BY DESIGN — the
-/// peer stays absent from the partition view — rather than by the accident
-/// of the error envelope failing `parse_partition_version_response`'s
-/// stride check.
-fn send_topology_frame_ok(
-    addr: SocketAddr,
-    op_code: u16,
-    payload: &[u8],
-    auth_secret: Option<&[u8]>,
-) -> Result<Vec<u8>, String> {
-    let response = send_topology_frame_response(addr, op_code, payload, auth_secret)?;
-    if response.status != STATUS_OK {
-        return Err(format!("peer replied status {}", response.status));
-    }
-    Ok(response.payload)
 }
 
 /// Phase D: build this node's `PartitionVersionEntry` list by reading the
@@ -7752,6 +8451,56 @@ pub(crate) fn encode_partition_version_response(
         payload.extend_from_slice(&e.max_generation.to_le_bytes());
     }
     payload
+}
+
+/// W9 P2-3 — encode the `ERR_STALE_EPOCH` rejection payload for a
+/// partition-version report, echoing the RESPONDER's local cluster key so
+/// the querying exchange can tell peer-behind (keep re-querying) from
+/// self-behind (stop; topology catch-up converges us).
+///
+/// Layout: the standard error envelope
+/// (`[code:u16][msg_len:u16][msg]`, [`crate::protocol::codec::encode_error_payload`])
+/// followed by `local_cluster_key: u64 LE`. The tail is ADDITIVE —
+/// `decode_error_payload` tolerates trailing bytes, so envelope-only
+/// consumers are unaffected.
+///
+/// WIRE-FORMAT NOTE: this changes the `OP_PARTITION_VERSION_REPORT`
+/// STALE_EPOCH reply on the wire (previously envelope-only). Deliberate,
+/// no migration: TeraSlab is pre-production and formats are free to
+/// change (2026-08-02 decision); a mixed-version cluster merely loses the
+/// self-behind fast-stop (the parser returns `None` and the re-query
+/// cadence continues, exactly the pre-change behavior).
+pub(crate) fn encode_stale_epoch_report_rejection(local_cluster_key: u64) -> Vec<u8> {
+    let mut payload = crate::protocol::codec::encode_error_payload(
+        ERR_STALE_EPOCH,
+        "partition version report: cluster_key mismatch",
+    );
+    payload.extend_from_slice(&local_cluster_key.to_le_bytes());
+    payload
+}
+
+/// W9 P2-3 — parse the responder's local cluster key out of a rejected
+/// report reply. Returns `Some(key)` iff the payload is a well-formed
+/// error envelope with code [`ERR_STALE_EPOCH`] carrying the 8-byte key
+/// tail; a legacy envelope-only rejection, any other error code, or a
+/// malformed payload parses as `None` (callers keep the re-query cadence).
+pub(crate) fn parse_stale_epoch_report_rejection(payload: &[u8]) -> Option<u64> {
+    if payload.len() < 4 {
+        return None;
+    }
+    let code = u16::from_le_bytes(payload[0..2].try_into().ok()?);
+    if code != ERR_STALE_EPOCH {
+        return None;
+    }
+    let msg_len = u16::from_le_bytes(payload[2..4].try_into().ok()?) as usize;
+    let key_off = 4usize.checked_add(msg_len)?;
+    let key_end = key_off.checked_add(8)?;
+    if payload.len() < key_end {
+        return None;
+    }
+    Some(u64::from_le_bytes(
+        payload[key_off..key_end].try_into().ok()?,
+    ))
 }
 
 /// Phase D: parse an `OP_PARTITION_VERSION_REPORT` response payload into a
@@ -30163,6 +30912,7 @@ mod tests {
             &cluster.cluster_secret,
             None,
             false,
+            false,
         );
 
         // The manager retained the unproven lost entry across the supersede (C17).
@@ -30183,6 +30933,150 @@ mod tests {
                 "a supersede that preserves a LOST inbound shard must NOT serve it as full \
                  authority on the production `activate_topology_with_view` path; got {other:?}",
             ),
+        }
+    }
+
+    /// W9 FIX 3 (CI run 31971906387, default-06) — a det-degraded
+    /// activation's migration plan (thousands of holder-blind tasks on a
+    /// member-add: 3869 in scenario 06) used to start streaming
+    /// immediately, so `degraded_term_upgrade_admissible`'s
+    /// `active_count() == 0` gate locked the quorum rescue out for the
+    /// plan's whole lifetime. With `defer_plan_launch`, the activation must:
+    ///
+    /// - install the shard table and REGISTER the tasks synchronously
+    ///   (serving semantics and the inbound/handoff fences are never held),
+    /// - but NOT launch any migration worker — the launch closure is
+    ///   returned to the caller, to fire only after the grace, and
+    /// - on cancel (a quorum upgrade superseded the plan inside the grace),
+    ///   fail every unlaunched outbound task so the upgrade's same-epoch
+    ///   activation cannot "preserve" a workerless task forever.
+    ///
+    /// The launch closure body is the SAME code the `defer_plan_launch:
+    /// false` path spawns (covered by the surrounding activation tests);
+    /// this test pins the deferral seam itself.
+    #[test]
+    fn det_degrade_defers_plan_launch_but_not_table_install() {
+        let _guard = migration_metrics_test_guard();
+        let _metrics = install_test_migration_metrics();
+
+        let members = vec![NodeId(1), NodeId(2)];
+        let old_members = vec![NodeId(1)];
+        let rf = 1u8;
+        let placement_version = 1u16;
+        let old_table = ShardTable::compute_with_epoch(&old_members, rf, 1, placement_version);
+        let new_epoch = 2u64;
+        let new_table = ShardTable::compute_with_epoch(&members, rf, new_epoch, placement_version);
+
+        // Data on a shard the new det table masters to node 2, so node 1's
+        // plan carries at least one OUTBOUND master handoff.
+        let engine = Arc::new(test_engine());
+        let moving_shard = (0..NUM_SHARDS as u16)
+            .find(|&s| new_table.target_assignment(s).master == NodeId(2))
+            .expect("some shard mastered by N2 in a 2-member ring");
+        create_test_record(&engine, tx_key_for_shard(moving_shard, 1));
+
+        let cluster = new_test_running_cluster(
+            NodeId(1),
+            old_table,
+            &[
+                (NodeId(1), "127.0.0.1:1".parse().unwrap()),
+                (NodeId(2), "127.0.0.1:1".parse().unwrap()),
+            ],
+            &members,
+            &[],
+            &[],
+            &[],
+            2,
+        );
+
+        // The det-degrade shape: EMPTIED partition view, defer_plan_launch.
+        let view: std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>> =
+            std::collections::HashMap::new();
+        let pending = ClusterCoordinator::activate_topology_with_view(
+            &members,
+            new_epoch,
+            placement_version,
+            NodeId(1),
+            rf,
+            &cluster.shard_table,
+            &cluster.migration,
+            &cluster.node_addrs,
+            &engine,
+            &None,
+            1,
+            1,
+            1,
+            &cluster.fenced_bitmap,
+            &cluster.migrating_bitmap,
+            &cluster.inbound_atomic,
+            &cluster.active_topology_members,
+            &view,
+            &cluster.migration_throttle,
+            &cluster.cluster_secret,
+            None,
+            false,
+            true,
+        )
+        .expect("a det activation with outbound tasks must return its deferred launch");
+
+        assert_eq!(pending.term, new_epoch);
+        assert!(
+            !pending.tasks.is_empty(),
+            "the deferred launch must carry the outbound task list for cancel bookkeeping",
+        );
+        // Serving is NOT held: the table is installed at the new epoch.
+        assert_eq!(
+            cluster.shard_table.read().version,
+            new_epoch,
+            "deferral must hold ONLY the plan launch, never the table install",
+        );
+        // The tasks are REGISTERED (fences/dual-write bookkeeping live)...
+        assert!(
+            cluster.migration.lock().active_count() > 0,
+            "deferral must not skip task registration",
+        );
+        // ...but NOTHING is launched: no worker exists, so no task can have
+        // left Preparing (against these closed-port peers a launched worker
+        // fails tasks within milliseconds).
+        std::thread::sleep(Duration::from_millis(150));
+        {
+            let mgr = cluster.migration.lock();
+            assert_eq!(
+                mgr.failed_count(),
+                0,
+                "no worker may run before the deferred launch is invoked",
+            );
+            assert!(
+                mgr.active_migrations()
+                    .iter()
+                    .all(|p| p.state == crate::cluster::migration::MigrationState::Preparing),
+                "every registered task must still be Preparing while the launch is held",
+            );
+        }
+
+        // Cancel (the upgrade-superseded path): every unlaunched OUTBOUND
+        // task must be failed so a same-epoch re-activation re-registers
+        // and re-drives it instead of preserving a workerless task.
+        let outbound_tasks = pending.tasks.clone();
+        let mut slot = Some(pending);
+        cancel_deferred_plan_launch(&mut slot, &cluster.migration);
+        assert!(slot.is_none(), "cancel must consume the pending launch");
+        {
+            let mgr = cluster.migration.lock();
+            for task in &outbound_tasks {
+                assert!(
+                    !mgr.active_migrations().iter().any(|p| {
+                        p.shard == task.shard
+                            && p.from_node == task.from_node
+                            && p.to_node == task.to_node
+                            && p.is_master == task.is_master
+                            && p.state != crate::cluster::migration::MigrationState::Failed
+                            && p.state != crate::cluster::migration::MigrationState::Complete
+                    }),
+                    "cancelled task for shard {} must not remain active",
+                    task.shard,
+                );
+            }
         }
     }
 
@@ -30279,6 +31173,7 @@ mod tests {
             &cluster.migration_throttle,
             &cluster.cluster_secret,
             None,
+            false,
             false,
         );
 
@@ -30380,6 +31275,7 @@ mod tests {
             &cluster.migration_throttle,
             &cluster.cluster_secret,
             None,
+            false,
             false,
         );
 
@@ -31626,6 +32522,372 @@ mod tests {
         );
     }
 
+    /// W9 FIX 1 (CI run 31971906387) — a peer that REJECTS the report query
+    /// (non-OK status, e.g. `ERR_STALE_EPOCH` because it has not yet APPLIED
+    /// the just-committed term) must be RE-QUERIED on a short cadence until
+    /// it answers or the total exchange deadline elapses. The one-shot query
+    /// raced commit propagation (1-7 s in CI) against an exchange fired
+    /// ~100 ms after the local commit, so the view chronically collected
+    /// 1-2 of 3-4 members and every first activation det-degraded.
+    ///
+    /// The stub peer rejects the FIRST report and accepts the SECOND; the
+    /// exchange must record the peer's entries within the deadline.
+    #[test]
+    fn run_exchange_phase_requeries_rejecting_peer_until_it_answers() {
+        use std::io::{Read, Write};
+
+        let members = [NodeId(1), NodeId(2)];
+        let term = 4u64;
+        let engine = Arc::new(test_engine());
+        let det = ShardTable::compute_with_epoch(&members, 2, term, 1);
+
+        let peer_entries = vec![PartitionVersionEntry {
+            shard: 9,
+            flags: 0b01,
+            replica_count: 1,
+            last_applied_seq: 7,
+            manifest_digest: 3,
+            max_generation: 2,
+        }];
+        let peer_entries_srv = peer_entries.clone();
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        // NOT joined before the assertion: a regressed (one-shot) exchange
+        // never opens the second connection, and a join would hang the test
+        // instead of failing it. The thread exits with the process.
+        let _server = std::thread::spawn(move || {
+            // Connection 1: reject with a non-OK status (the STALE_EPOCH
+            // shape). Connection 2: answer a valid report.
+            for served in 0..2u32 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut header = [0u8; 4];
+                stream.read_exact(&mut header).unwrap();
+                let len = u32::from_le_bytes(header) as usize;
+                let mut body = vec![0u8; len];
+                stream.read_exact(&mut body).unwrap();
+                let mut frame_bytes = header.to_vec();
+                frame_bytes.extend_from_slice(&body);
+                let (request, _) =
+                    crate::protocol::frame::RequestFrame::decode(&frame_bytes).unwrap();
+                assert_eq!(request.op_code, OP_PARTITION_VERSION_REPORT);
+                let response = if served == 0 {
+                    crate::protocol::frame::ResponseFrame {
+                        request_id: request.request_id,
+                        status: crate::protocol::opcodes::STATUS_ERROR,
+                        // The production rejection shape: STALE_EPOCH with
+                        // the responder's key echoed — LOWER than ours, so
+                        // the peer is the behind side and the re-query
+                        // cadence must continue (W9 P2-3 stops only on a
+                        // HIGHER responder key).
+                        payload: encode_stale_epoch_report_rejection(term - 1),
+                    }
+                } else {
+                    crate::protocol::frame::ResponseFrame {
+                        request_id: request.request_id,
+                        status: crate::protocol::opcodes::STATUS_OK,
+                        payload: encode_partition_version_response(2, term, &peer_entries_srv),
+                    }
+                };
+                stream.write_all(&response.encode()).unwrap();
+            }
+        });
+
+        let mut addrs = std::collections::HashMap::new();
+        addrs.insert(NodeId(2), addr);
+        let node_addrs = Arc::new(RwLock::new(addrs));
+        let shard_table = Arc::new(ShardTableLock::new(det));
+        let inbound_bm = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+
+        let view = ClusterCoordinator::run_exchange_phase(
+            &members,
+            NodeId(1),
+            term,
+            &node_addrs,
+            &engine,
+            &shard_table,
+            &inbound_bm,
+            std::time::Duration::from_millis(3000),
+            &None,
+        );
+
+        assert_eq!(
+            view.get(&NodeId(2)),
+            Some(&peer_entries),
+            "a peer that rejected the first report but accepted the re-query \
+             must be PRESENT in the view with its reported entries",
+        );
+    }
+
+    /// W9 P2-3 — the `ERR_STALE_EPOCH` report rejection carries the
+    /// RESPONDER's local cluster key as an additive tail after the
+    /// standard error envelope: standard decoders still read the
+    /// envelope, the dedicated parser reads the key, and a legacy
+    /// envelope (no tail) or a different error code parses as `None`.
+    #[test]
+    fn stale_epoch_report_rejection_round_trips_responder_key() {
+        let payload = encode_stale_epoch_report_rejection(42);
+        let (code, _msg) = crate::protocol::codec::decode_error_payload(&payload)
+            .expect("the standard error decoder must still read the envelope");
+        assert_eq!(code, ERR_STALE_EPOCH);
+        assert_eq!(parse_stale_epoch_report_rejection(&payload), Some(42));
+
+        // A different error code must not yield a key.
+        let mut other = crate::protocol::codec::encode_error_payload(ERR_PAYLOAD_MALFORMED, "x");
+        other.extend_from_slice(&42u64.to_le_bytes());
+        assert_eq!(parse_stale_epoch_report_rejection(&other), None);
+
+        // A legacy STALE_EPOCH envelope without the trailing key.
+        let legacy =
+            crate::protocol::codec::encode_error_payload(ERR_STALE_EPOCH, "cluster_key mismatch");
+        assert_eq!(parse_stale_epoch_report_rejection(&legacy), None);
+    }
+
+    /// W9 P2-3 — a peer whose STALE_EPOCH rejection reports a HIGHER local
+    /// cluster key means THIS node is the stale side: the peer will keep
+    /// rejecting until OUR key changes (which only topology catch-up
+    /// does), so the re-query loop must give up immediately — honest
+    /// absence — instead of burning 500 ms re-queries until the deadline.
+    /// (The 2-member shape keeps the quorum early-return out of play: the
+    /// collector needs the peer's result to finish.)
+    #[test]
+    fn run_exchange_phase_stops_requerying_peer_that_reports_higher_key() {
+        use std::io::{Read, Write};
+
+        let members = [NodeId(1), NodeId(2)];
+        let term = 4u64;
+        let engine = Arc::new(test_engine());
+        let det = ShardTable::compute_with_epoch(&members, 2, term, 1);
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        // Reject every query with a HIGHER responder key. Bounded and NOT
+        // joined — one connection suffices post-fix; a regressed loop
+        // opens a handful before its deadline.
+        std::thread::spawn(move || {
+            for _ in 0..8u32 {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                let mut header = [0u8; 4];
+                if stream.read_exact(&mut header).is_err() {
+                    continue;
+                }
+                let len = u32::from_le_bytes(header) as usize;
+                let mut body = vec![0u8; len];
+                if stream.read_exact(&mut body).is_err() {
+                    continue;
+                }
+                let mut frame_bytes = header.to_vec();
+                frame_bytes.extend_from_slice(&body);
+                let Ok((request, _)) = crate::protocol::frame::RequestFrame::decode(&frame_bytes)
+                else {
+                    continue;
+                };
+                let response = crate::protocol::frame::ResponseFrame {
+                    request_id: request.request_id,
+                    status: crate::protocol::opcodes::STATUS_ERROR,
+                    payload: encode_stale_epoch_report_rejection(term + 1),
+                };
+                let _ = stream.write_all(&response.encode());
+            }
+        });
+
+        let mut addrs = std::collections::HashMap::new();
+        addrs.insert(NodeId(2), addr);
+        let node_addrs = Arc::new(RwLock::new(addrs));
+        let shard_table = Arc::new(ShardTableLock::new(det));
+        let inbound_bm = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+
+        let started = std::time::Instant::now();
+        let view = ClusterCoordinator::run_exchange_phase(
+            &members,
+            NodeId(1),
+            term,
+            &node_addrs,
+            &engine,
+            &shard_table,
+            &inbound_bm,
+            std::time::Duration::from_millis(2500),
+            &None,
+        );
+        let elapsed = started.elapsed();
+
+        assert!(
+            !view.contains_key(&NodeId(2)),
+            "the higher-key peer stays honestly absent",
+        );
+        assert!(
+            elapsed < Duration::from_millis(1000),
+            "a higher responder key means WE are stale — the re-query loop \
+             must give up immediately, not wait out the deadline (took {elapsed:?})",
+        );
+    }
+
+    /// W9 P1-2 — the exchange must return EARLY once the collected view
+    /// covers the MEMBER quorum, instead of waiting out the full deadline
+    /// for peers that have not answered. The FIX 1 re-query loop made a
+    /// failing peer report only at the DEADLINE, so with one lagging
+    /// member every exchange on the commit path burned the whole budget
+    /// (eating the FIX-A handoff window) and the degraded-upgrade retry
+    /// completed at backoff + deadline — after the plan-launch grace, so
+    /// the 06 lockout never got rescued. Honest absence is preserved: the
+    /// silent peer is simply not in the returned view.
+    #[test]
+    fn run_exchange_phase_returns_early_once_member_quorum_covered() {
+        use std::io::{Read, Write};
+
+        let members = [NodeId(1), NodeId(2), NodeId(3)];
+        let term = 4u64;
+        let engine = Arc::new(test_engine());
+        let det = ShardTable::compute_with_epoch(&members, 2, term, 1);
+
+        // Peer 2 answers a valid report immediately.
+        let peer_entries = vec![PartitionVersionEntry {
+            shard: 3,
+            flags: 0b01,
+            replica_count: 1,
+            last_applied_seq: 5,
+            manifest_digest: 1,
+            max_generation: 1,
+        }];
+        let peer_entries_srv = peer_entries.clone();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let fast_addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut header = [0u8; 4];
+            stream.read_exact(&mut header).unwrap();
+            let len = u32::from_le_bytes(header) as usize;
+            let mut body = vec![0u8; len];
+            stream.read_exact(&mut body).unwrap();
+            let mut frame_bytes = header.to_vec();
+            frame_bytes.extend_from_slice(&body);
+            let (request, _) = crate::protocol::frame::RequestFrame::decode(&frame_bytes).unwrap();
+            let response = crate::protocol::frame::ResponseFrame {
+                request_id: request.request_id,
+                status: crate::protocol::opcodes::STATUS_OK,
+                payload: encode_partition_version_response(2, term, &peer_entries_srv),
+            };
+            stream.write_all(&response.encode()).unwrap();
+        });
+
+        // Peer 3 is silent (closed port): its thread re-queries until the
+        // deadline and reports absence only then.
+        let mut addrs = std::collections::HashMap::new();
+        addrs.insert(NodeId(2), fast_addr);
+        addrs.insert(NodeId(3), "127.0.0.1:1".parse().unwrap());
+        let node_addrs = Arc::new(RwLock::new(addrs));
+        let shard_table = Arc::new(ShardTableLock::new(det));
+        let inbound_bm = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+
+        let started = std::time::Instant::now();
+        let view = ClusterCoordinator::run_exchange_phase(
+            &members,
+            NodeId(1),
+            term,
+            &node_addrs,
+            &engine,
+            &shard_table,
+            &inbound_bm,
+            std::time::Duration::from_millis(3000),
+            &None,
+        );
+        let elapsed = started.elapsed();
+
+        assert!(view.contains_key(&NodeId(1)), "self report present");
+        assert_eq!(
+            view.get(&NodeId(2)),
+            Some(&peer_entries),
+            "the fast peer's report must be collected",
+        );
+        assert!(
+            !view.contains_key(&NodeId(3)),
+            "the silent peer stays honestly absent",
+        );
+        assert!(
+            elapsed < Duration::from_millis(1200),
+            "self + one peer of three IS the member quorum — the exchange \
+             must return early instead of waiting out the silent peer's \
+             deadline (took {elapsed:?})",
+        );
+    }
+
+    /// W9 FIX 1 — the re-query loop must keep the F1 honest-absence
+    /// semantics: a peer that rejects EVERY report within the deadline stays
+    /// ABSENT from the view (never recorded as present-with-no-entries).
+    #[test]
+    fn run_exchange_phase_leaves_always_rejecting_peer_absent() {
+        use std::io::{Read, Write};
+
+        let members = [NodeId(1), NodeId(2)];
+        let term = 4u64;
+        let engine = Arc::new(test_engine());
+        let det = ShardTable::compute_with_epoch(&members, 2, term, 1);
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        // Reject every query. Bounded (the ~1.2 s deadline fits at most a
+        // handful of 500 ms-cadence attempts); NOT joined — the thread parks
+        // in accept() once the exchange gives up and exits with the process.
+        std::thread::spawn(move || {
+            for _ in 0..8u32 {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                let mut header = [0u8; 4];
+                if stream.read_exact(&mut header).is_err() {
+                    continue;
+                }
+                let len = u32::from_le_bytes(header) as usize;
+                let mut body = vec![0u8; len];
+                if stream.read_exact(&mut body).is_err() {
+                    continue;
+                }
+                let mut frame_bytes = header.to_vec();
+                frame_bytes.extend_from_slice(&body);
+                let Ok((request, _)) = crate::protocol::frame::RequestFrame::decode(&frame_bytes)
+                else {
+                    continue;
+                };
+                let response = crate::protocol::frame::ResponseFrame {
+                    request_id: request.request_id,
+                    status: crate::protocol::opcodes::STATUS_ERROR,
+                    payload: Vec::new(),
+                };
+                let _ = stream.write_all(&response.encode());
+            }
+        });
+
+        let mut addrs = std::collections::HashMap::new();
+        addrs.insert(NodeId(2), addr);
+        let node_addrs = Arc::new(RwLock::new(addrs));
+        let shard_table = Arc::new(ShardTableLock::new(det));
+        let inbound_bm = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+
+        let view = ClusterCoordinator::run_exchange_phase(
+            &members,
+            NodeId(1),
+            term,
+            &node_addrs,
+            &engine,
+            &shard_table,
+            &inbound_bm,
+            std::time::Duration::from_millis(1200),
+            &None,
+        );
+
+        assert!(
+            view.contains_key(&NodeId(1)),
+            "the in-process self-report must always be present",
+        );
+        assert!(
+            !view.contains_key(&NodeId(2)),
+            "a peer that rejected every re-query must stay ABSENT — the \
+             retry loop must never record fabricated emptiness",
+        );
+    }
+
     /// F2 helper — 2-member ring, deterministic master N1 reporting
     /// `det_count` and its replica N2 reporting `holder_count` for one
     /// shard; runs the election and returns
@@ -32577,6 +33839,317 @@ mod tests {
             !degraded_term_upgrade_admissible(Some(5), 5, 3, 4, false),
             "an upgrade must never supersede the plan under a live migration wave",
         );
+    }
+
+    /// W9 FIX 2 — the degraded-upgrade retry interval doubles from 2 s to
+    /// the 5-minute cap (the `park_reheal_backoff` doubling-to-cap model:
+    /// a permanently-partitioned peer must not be probed every 30 s
+    /// forever, while the early rounds stay prompt).
+    #[test]
+    fn degraded_upgrade_retry_backoff_doubles_from_start_to_cap() {
+        assert_eq!(degraded_upgrade_retry_backoff(0), Duration::from_secs(2));
+        assert_eq!(degraded_upgrade_retry_backoff(1), Duration::from_secs(4));
+        assert_eq!(degraded_upgrade_retry_backoff(2), Duration::from_secs(8));
+        assert_eq!(degraded_upgrade_retry_backoff(3), Duration::from_secs(16));
+        assert_eq!(degraded_upgrade_retry_backoff(4), Duration::from_secs(32));
+        assert_eq!(degraded_upgrade_retry_backoff(7), Duration::from_secs(256));
+        assert_eq!(
+            degraded_upgrade_retry_backoff(8),
+            Duration::from_secs(300),
+            "the doubling tops out at the 5-minute cap",
+        );
+        assert_eq!(
+            degraded_upgrade_retry_backoff(u32::MAX),
+            Duration::from_secs(300),
+            "the cap must hold without overflow",
+        );
+    }
+
+    /// W9 FIX 2 (CI run 31971906387, default-09) — a det-degraded
+    /// activation was TERMINAL: node2 degraded term 6, peers applied the
+    /// commit ~7 s later, and no third exchange ever fired (a pure det
+    /// table matches the committed placement so no divergence counter arms
+    /// the re-heal, and the prompt arm is dead because
+    /// committed == activated). The retry arm re-fires the exchange on the
+    /// backoff cadence while the degrade marker stands, and stops the
+    /// moment the term is upgraded (marker cleared on Admit), a new term
+    /// commits, or the node is no longer degraded.
+    #[test]
+    fn degraded_upgrade_retry_due_only_while_term_degraded_and_backoff_elapsed() {
+        // Degraded for the committed term, first-round backoff elapsed → due.
+        assert!(
+            degraded_upgrade_retry_due(Some(6), 6, Duration::from_secs(2), 0),
+            "a degraded term must re-fire once the 2 s starting backoff elapses",
+        );
+        assert!(
+            !degraded_upgrade_retry_due(Some(6), 6, Duration::from_millis(1900), 0),
+            "the retry must pace itself — not due before the backoff elapses",
+        );
+        // Later rounds pace on the doubled interval.
+        assert!(
+            !degraded_upgrade_retry_due(Some(6), 6, Duration::from_millis(3900), 1),
+            "round 1 paces on 4 s",
+        );
+        assert!(degraded_upgrade_retry_due(
+            Some(6),
+            6,
+            Duration::from_secs(4),
+            1
+        ));
+        // Stop: the term was upgraded (marker cleared on Admit) / the node
+        // is no longer degraded.
+        assert!(
+            !degraded_upgrade_retry_due(None, 6, Duration::from_secs(60), 0),
+            "an upgraded (or never-degraded) term must never re-fire",
+        );
+        // Stop: a new term committed — its own activation path owns the
+        // table now; a retry for the stale term would be dropped anyway.
+        assert!(
+            !degraded_upgrade_retry_due(Some(6), 7, Duration::from_secs(60), 0),
+            "a new committed term must stop the stale term's retry",
+        );
+    }
+
+    /// W9 P1-1 — a retry completion for degraded term T that lands AFTER
+    /// T+1 committed still passes `topology_commit_already_activated`
+    /// (last_activated_term is still T), so without its own applicability
+    /// gate the upgrade path would re-activate T: the authority is at T+1,
+    /// `committed_assignment_for_activation` returns None, and the
+    /// activation falls into per-node election refinement — the divergent
+    /// path the det degrade exists to avoid — while clobbering the
+    /// retained view and arming event-repair under a stale term. The
+    /// upgrade branch must apply the SAME current-topology rule as the
+    /// same-term re-heal.
+    #[test]
+    fn stale_term_upgrade_completion_is_dropped() {
+        let members = vec![NodeId(1), NodeId(2)];
+        // The rescue shape: completion term matches the committed topology.
+        assert!(
+            duplicate_completion_upgrade_applicable(5, 5, &members, &members),
+            "a completion for the still-committed term may be considered as an upgrade",
+        );
+        // A newer term committed while the retry exchange was in flight:
+        // the completion is STALE and must be dropped, never upgraded.
+        assert!(
+            !duplicate_completion_upgrade_applicable(5, 6, &members, &members),
+            "a completion for a superseded term must be dropped before the upgrade gate",
+        );
+        // Same term but the committed member set moved.
+        assert!(
+            !duplicate_completion_upgrade_applicable(
+                5,
+                5,
+                &members,
+                &[NodeId(1), NodeId(2), NodeId(3)],
+            ),
+            "a completion whose member set no longer matches the committed set must be dropped",
+        );
+    }
+
+    /// W9 FIX 3 — the det-degrade plan-launch grace: the deferred migration
+    /// plan launches only once the grace has fully elapsed.
+    #[test]
+    fn det_plan_launch_due_waits_out_the_grace() {
+        assert!(
+            !det_plan_launch_due(Duration::from_millis(4999)),
+            "the plan must stay held inside the grace window",
+        );
+        assert!(
+            det_plan_launch_due(Duration::from_secs(5)),
+            "the plan must launch once the grace elapses",
+        );
+        assert!(det_plan_launch_due(Duration::from_secs(60)));
+    }
+
+    /// W9 P1-2 — the grace must actually COVER the rescue it exists for:
+    /// the first degraded-upgrade retry fires `backoff(0)` after the
+    /// degrade (plus an event-loop tick), and its exchange may deliver the
+    /// quorum view any time inside the full exchange deadline (the quorum
+    /// early-return lands as soon as the lagging peer answers, which can
+    /// be at the very end of the window). A grace below
+    /// `backoff(0) + exchange deadline + tick slack` launches the plan
+    /// while the rescue is still legitimately in flight — the 06 lockout.
+    #[test]
+    fn det_plan_launch_grace_covers_first_retry_rescue_window() {
+        let first_retry = degraded_upgrade_retry_backoff(0);
+        let tick_slack = Duration::from_millis(200);
+        assert!(
+            DET_DEGRADE_PLAN_LAUNCH_GRACE >= first_retry + EXCHANGE_PHASE_TIMEOUT + tick_slack,
+            "the grace ({:?}) must outlast the first retry ({:?}) plus the \
+             full exchange deadline ({:?}) plus tick slack",
+            DET_DEGRADE_PLAN_LAUNCH_GRACE,
+            first_retry,
+            EXCHANGE_PHASE_TIMEOUT,
+        );
+    }
+
+    /// W9 FIX 3 — the upgrade gate's "no live migration wave" input.
+    /// Registered-but-UNLAUNCHED det-plan tasks are not a live wave: their
+    /// launch closure is still owned (un-run) by the event loop, so no
+    /// worker exists to keep streaming through a same-epoch supersede — the
+    /// exact hazard the round-4 review blocked. Any OTHER source of active
+    /// migrations still locks the upgrade out.
+    #[test]
+    fn no_live_migration_workers_for_upgrade_truth_table() {
+        assert!(
+            no_live_migration_workers_for_upgrade(0, false),
+            "no registered migrations at all — upgrade admissible as before",
+        );
+        assert!(
+            !no_live_migration_workers_for_upgrade(7, false),
+            "active migrations without a held det plan are (or may be) live \
+             workers — the upgrade must stay locked out",
+        );
+        assert!(
+            no_live_migration_workers_for_upgrade(7, true),
+            "tasks registered by a det plan whose launch is still HELD have \
+             no workers — the upgrade may supersede them",
+        );
+        assert!(no_live_migration_workers_for_upgrade(0, true));
+    }
+
+    /// W9 FIX 3 — the held-plan check behind the relaxed upgrade gate: the
+    /// active set must consist EXCLUSIVELY of the held plan's registered
+    /// tasks, all still `Preparing`. A task some worker began driving, or a
+    /// task outside the held plan (the FIX-B transfer-request resend shape,
+    /// which spawns live workers immediately), must fail the check so the
+    /// upgrade falls back to the strict `active_count() == 0` gate.
+    #[test]
+    fn active_migrations_all_held_detects_foreign_or_driven_tasks() {
+        let held = vec![MigrationTask {
+            shard: 1,
+            from_node: NodeId(1),
+            to_node: NodeId(2),
+            is_master: true,
+        }];
+
+        // Registered, untouched → provably worker-less.
+        let mut mgr = MigrationManager::new();
+        mgr.start_outbound(&held, NodeId(1), &std::collections::HashSet::new());
+        assert!(
+            active_migrations_all_held(&mgr, &held),
+            "freshly registered held tasks are provably worker-less",
+        );
+
+        // A worker began driving the held task → no longer provably held.
+        mgr.set_snapshot_sequence(&held[0], 7);
+        assert!(
+            !active_migrations_all_held(&mgr, &held),
+            "a held task that left Preparing must fail the check",
+        );
+
+        // A live task OUTSIDE the held plan → not admissible.
+        let mut mgr2 = MigrationManager::new();
+        mgr2.start_outbound(&held, NodeId(1), &std::collections::HashSet::new());
+        let foreign = MigrationTask {
+            shard: 2,
+            from_node: NodeId(1),
+            to_node: NodeId(3),
+            is_master: false,
+        };
+        mgr2.start_outbound(
+            std::slice::from_ref(&foreign),
+            NodeId(1),
+            &std::collections::HashSet::new(),
+        );
+        assert!(
+            !active_migrations_all_held(&mgr2, &held),
+            "an active task outside the held plan must fail the check",
+        );
+
+        // An empty active set trivially holds.
+        let mgr3 = MigrationManager::new();
+        assert!(active_migrations_all_held(&mgr3, &held));
+    }
+
+    /// W9 P2 — the exchange discard-site failure classifier. The prefixes
+    /// are authored by `send_topology_frame_response` /
+    /// `send_topology_frame_ok` in this same file; anything else (read or
+    /// write errors — including read TIMEOUTS — decode, auth) is a
+    /// transport failure.
+    #[test]
+    fn classify_exchange_peer_error_maps_connect_status_transport() {
+        assert_eq!(
+            classify_exchange_peer_error("connect: Connection refused (os error 61)"),
+            ExchangePeerFailureKind::Connect,
+        );
+        assert_eq!(
+            classify_exchange_peer_error("peer replied status 24"),
+            ExchangePeerFailureKind::Status,
+        );
+        assert_eq!(
+            classify_exchange_peer_error("read length: Resource temporarily unavailable"),
+            ExchangePeerFailureKind::Transport,
+        );
+        assert_eq!(
+            classify_exchange_peer_error("write: Broken pipe (os error 32)"),
+            ExchangePeerFailureKind::Transport,
+        );
+        assert_eq!(
+            classify_exchange_peer_error("decode: truncated frame"),
+            ExchangePeerFailureKind::Transport,
+        );
+    }
+
+    /// W9 P2 — per-attempt exchange failure warns are rate-limited (first
+    /// 10 all log, then every 100th): the chronic degrade re-queries every
+    /// 500 ms, and an unreachable peer must not flood the log while the
+    /// counters still count every failure.
+    #[test]
+    fn exchange_peer_failure_warn_due_rate_limits() {
+        for n in 1..=10u64 {
+            assert!(exchange_peer_failure_warn_due(n), "failure {n} must log");
+        }
+        assert!(!exchange_peer_failure_warn_due(11));
+        assert!(!exchange_peer_failure_warn_due(99));
+        assert!(exchange_peer_failure_warn_due(100));
+        assert!(!exchange_peer_failure_warn_due(101));
+        assert!(exchange_peer_failure_warn_due(200));
+    }
+
+    /// W9 P2 — every discarded exchange report query increments the counter
+    /// for ITS outcome (the chronic view starvation was undiagnosable
+    /// because every failure was silently discarded).
+    #[test]
+    fn exchange_peer_failures_are_counted_per_outcome() {
+        let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let peer = NodeId(9);
+
+        let before = exchange_peer_failure_connect_total();
+        record_exchange_peer_failure(
+            peer,
+            addr,
+            ExchangePeerFailureKind::Connect,
+            "connect: Connection refused",
+        );
+        assert_eq!(exchange_peer_failure_connect_total(), before + 1);
+
+        let before = exchange_peer_failure_status_total();
+        record_exchange_peer_failure(
+            peer,
+            addr,
+            ExchangePeerFailureKind::Status,
+            "peer replied status 24",
+        );
+        assert_eq!(exchange_peer_failure_status_total(), before + 1);
+
+        let before = exchange_peer_failure_transport_total();
+        record_exchange_peer_failure(
+            peer,
+            addr,
+            ExchangePeerFailureKind::Transport,
+            "read length: timed out",
+        );
+        assert_eq!(exchange_peer_failure_transport_total(), before + 1);
+
+        let before = exchange_peer_failure_garbled_total();
+        record_exchange_peer_failure(
+            peer,
+            addr,
+            ExchangePeerFailureKind::Garbled,
+            "unparseable report payload",
+        );
+        assert_eq!(exchange_peer_failure_garbled_total(), before + 1);
     }
 
     // ── Phase I: cluster startup readiness ───────────────────────────────

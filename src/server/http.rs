@@ -1568,6 +1568,32 @@ pub(crate) fn render_metrics_text(
         "teraslab_activation_degraded_degenerate_view_total",
         crate::cluster::coordinator::activation_degraded_degenerate_view_total(),
     );
+    // W9 P2 — exchange report-query failures by outcome. `status` rising
+    // means peers are alive but rejecting (the STALE_EPOCH commit-
+    // propagation race the re-query cadence exists for); `connect` /
+    // `transport` point at reachability. The chronic below-quorum views
+    // behind the det degrades were undiagnosable while these were
+    // silently discarded.
+    prom_counter(
+        &mut out,
+        "teraslab_exchange_peer_failure_connect_total",
+        crate::cluster::coordinator::exchange_peer_failure_connect_total(),
+    );
+    prom_counter(
+        &mut out,
+        "teraslab_exchange_peer_failure_status_total",
+        crate::cluster::coordinator::exchange_peer_failure_status_total(),
+    );
+    prom_counter(
+        &mut out,
+        "teraslab_exchange_peer_failure_transport_total",
+        crate::cluster::coordinator::exchange_peer_failure_transport_total(),
+    );
+    prom_counter(
+        &mut out,
+        "teraslab_exchange_peer_failure_garbled_total",
+        crate::cluster::coordinator::exchange_peer_failure_garbled_total(),
+    );
     // §9 arm 1 — persistent-divergence gauge: consecutive quorum-backed
     // higher-term commits refused since the last apply. Non-zero and rising
     // means this node is on the losing side of an attestation split.
@@ -5322,6 +5348,10 @@ mod tests {
             "teraslab_assignment_master_count_alerts_total",
             "teraslab_reheal_skipped_degenerate_view_total",
             "teraslab_activation_degraded_degenerate_view_total",
+            "teraslab_exchange_peer_failure_connect_total",
+            "teraslab_exchange_peer_failure_status_total",
+            "teraslab_exchange_peer_failure_transport_total",
+            "teraslab_exchange_peer_failure_garbled_total",
             "teraslab_topology_refused_higher_term_streak",
             "teraslab_alloc_total",
             "teraslab_alloc_bytes_total",
