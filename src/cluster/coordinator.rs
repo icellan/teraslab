@@ -850,6 +850,81 @@ fn run_under_replication_pass(
 /// peer death; self is implicitly alive) and this node's mastered,
 /// non-empty shards with their committed replica sets. Shared by the
 /// periodic sweep and the Task #50 event trigger.
+/// W10 FIX 4 — re-validate a debounce-settled member set against CURRENT SWIM
+/// state immediately before proposing a topology term.
+///
+/// The settled set is a snapshot that can be seconds stale by the time the
+/// trailing-edge debounce fires; committing a term whose member set still
+/// contains a just-removed node guarantees an immediate follow-up term and a
+/// long activation gap (the scenario-07 total read-outage window: BOTH runs
+/// committed such a term because SWIM only SUSPECTED the removed node at
+/// propose time and the proposal used the stale alive-set — the removed node
+/// had ridden a same-incarnation Dead→Alive gossip revival back into the
+/// observed set).
+///
+/// The rule, chosen so transient suspicion cannot churn terms:
+///
+///  * a member SWIM currently reports **Dead** is dropped unconditionally
+///    (death is definitive; re-check immediately before broadcast);
+///  * a member observed **departing during the burst** that produced this
+///    proposal is dropped unless SWIM currently proves it **Alive** — a
+///    departed member still Suspect (or unknown) at propose time is
+///    overwhelmingly the node whose removal triggered the proposal, and it
+///    must not be in the proposed set;
+///  * a member that never departed and is not Dead is RETAINED even when
+///    Suspect — suspicion is transient, and excluding a suspected-but-alive
+///    member from a grow proposal would churn terms;
+///  * `self_id` is never dropped (a node does not propose itself away), and
+///    a member with no SWIM record that did not depart is retained
+///    (fail-open to the historical behavior — e.g. bootstrap sets observed
+///    before first contact).
+///
+/// If the filter would empty the set, the original set is returned unchanged
+/// (never propose an empty cluster; matches `on_membership_changed`'s
+/// empty-set refusal).
+fn revalidate_settled_members(
+    settled: Vec<NodeId>,
+    departed_during_burst: &[NodeId],
+    state_of: impl Fn(&NodeId) -> Option<crate::cluster::membership::NodeState>,
+    self_id: NodeId,
+) -> Vec<NodeId> {
+    use crate::cluster::membership::NodeState;
+    let filtered: Vec<NodeId> = settled
+        .iter()
+        .copied()
+        .filter(|m| {
+            if *m == self_id {
+                return true;
+            }
+            let state = state_of(m);
+            if state == Some(NodeState::Dead) {
+                tracing::warn!(
+                    node = m.0,
+                    "cluster: dropping now-DEAD member from settled topology \
+                     proposal (W10 FIX 4 pre-broadcast re-validation)",
+                );
+                return false;
+            }
+            if departed_during_burst.contains(m) && state != Some(NodeState::Alive) {
+                tracing::warn!(
+                    node = m.0,
+                    ?state,
+                    "cluster: dropping burst-departed, not-currently-Alive member \
+                     from settled topology proposal (W10 FIX 4 — a departure-\
+                     triggered proposal must not contain the departed node)",
+                );
+                return false;
+            }
+            true
+        })
+        .collect();
+    if filtered.is_empty() {
+        settled
+    } else {
+        filtered
+    }
+}
+
 fn snapshot_under_replication_inputs(
     swim_membership: &Arc<Mutex<crate::cluster::membership::Membership>>,
     shard_table: &Arc<ShardTableLock<ShardTable>>,
@@ -3580,7 +3655,31 @@ impl ClusterCoordinator {
                 if let Some(settled) = topology_debounce.take_due(std::time::Instant::now()) {
                     loop_heartbeat_event
                         .stamp(crate::cluster::watchdog::LoopPhase::DebouncePropose);
-                    let settled_event = ClusterEvent::MembershipChanged(settled);
+                    // W10 FIX 4 — re-validate the SETTLED set against CURRENT
+                    // SWIM state immediately before proposing. The settled
+                    // set can be seconds stale: in both scenario-07 runs the
+                    // committed term still CONTAINED the just-removed node
+                    // (SWIM only suspected it at propose time), guaranteeing
+                    // an immediate follow-up term and a long activation gap
+                    // (the total read outage). Rule: a member that DEPARTED
+                    // during this burst must not be proposed unless SWIM
+                    // currently proves it Alive; a member SWIM has since
+                    // declared Dead is dropped unconditionally. A
+                    // suspected-but-never-departed member is RETAINED —
+                    // suspicion is transient, and excluding it from a grow
+                    // proposal would churn terms.
+                    let settled_members = revalidate_settled_members(
+                        settled.members,
+                        &settled.departed_during_burst,
+                        |node| {
+                            swim_membership_event
+                                .lock()
+                                .member_info(node)
+                                .map(|info| info.state)
+                        },
+                        self_id,
+                    );
+                    let settled_event = ClusterEvent::MembershipChanged(settled_members);
                     Self::handle_event(
                         &settled_event,
                         self_id,
@@ -27630,6 +27729,101 @@ mod tests {
         }
     }
 
+    /// W10 FIX 4 — the scenario-07 red pin: a proposal triggered by node X's
+    /// departure must NOT contain X even when SWIM still lists X as merely
+    /// SUSPECTED at propose time. The debounce reports X as
+    /// departed-during-burst (it was observed leaving, then rode a stale
+    /// alive-set back in); the pre-broadcast re-validation drops it because
+    /// SWIM cannot currently prove it Alive.
+    #[test]
+    fn revalidation_drops_burst_departed_member_still_suspected() {
+        use crate::cluster::membership::NodeState;
+        let settled = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let departed = vec![NodeId(3)];
+        let state_of = |n: &NodeId| match n.0 {
+            2 => Some(NodeState::Alive),
+            3 => Some(NodeState::Suspect),
+            _ => None,
+        };
+        let out = revalidate_settled_members(settled, &departed, state_of, NodeId(1));
+        assert_eq!(
+            out,
+            vec![NodeId(1), NodeId(2)],
+            "the departure-triggered proposal must not contain the departed, \
+             still-suspected node",
+        );
+    }
+
+    /// W10 FIX 4 — the GROW caution: a member that never departed during the
+    /// burst is RETAINED even while SWIM suspects it (suspicion is transient;
+    /// excluding a suspected-but-alive member from a grow proposal would
+    /// churn terms).
+    #[test]
+    fn revalidation_retains_suspected_member_that_never_departed() {
+        use crate::cluster::membership::NodeState;
+        let settled = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let state_of = |n: &NodeId| match n.0 {
+            2 => Some(NodeState::Alive),
+            3 => Some(NodeState::Suspect),
+            _ => None,
+        };
+        let out = revalidate_settled_members(settled.clone(), &[], state_of, NodeId(1));
+        assert_eq!(
+            out, settled,
+            "transient suspicion of a never-departed member must not shrink \
+             the proposal",
+        );
+    }
+
+    /// W10 FIX 4 — a member SWIM has since declared DEAD is dropped
+    /// unconditionally (burst-departed or not): death is definitive and
+    /// proposing a dead member guarantees the immediate follow-up term.
+    #[test]
+    fn revalidation_drops_dead_member_even_without_burst_departure() {
+        use crate::cluster::membership::NodeState;
+        let settled = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let state_of = |n: &NodeId| match n.0 {
+            2 => Some(NodeState::Alive),
+            3 => Some(NodeState::Dead),
+            _ => None,
+        };
+        let out = revalidate_settled_members(settled, &[], state_of, NodeId(1));
+        assert_eq!(out, vec![NodeId(1), NodeId(2)]);
+    }
+
+    /// W10 FIX 4 — a burst-departed member that SWIM currently proves ALIVE
+    /// (a genuine flap-back: direct probe ACK / higher-incarnation rejoin) is
+    /// retained; and self is never dropped regardless of reported state.
+    #[test]
+    fn revalidation_retains_directly_alive_flapback_and_self() {
+        use crate::cluster::membership::NodeState;
+        let settled = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let departed = vec![NodeId(3), NodeId(1)];
+        let state_of = |n: &NodeId| match n.0 {
+            2 => Some(NodeState::Alive),
+            3 => Some(NodeState::Alive), // flapped back, directly proven
+            _ => None,                   // self has no SWIM record of itself
+        };
+        let out = revalidate_settled_members(settled.clone(), &departed, state_of, NodeId(1));
+        assert_eq!(
+            out, settled,
+            "a directly-proven-alive flapback stays; self is never dropped",
+        );
+    }
+
+    /// W10 FIX 4 — a filter that would empty the set falls back to the
+    /// original settled set (never propose an empty cluster).
+    #[test]
+    fn revalidation_never_returns_an_empty_set() {
+        use crate::cluster::membership::NodeState;
+        let settled = vec![NodeId(2), NodeId(3)];
+        let departed = vec![NodeId(2), NodeId(3)];
+        let state_of = |_: &NodeId| Some(NodeState::Dead);
+        // Self (node 9) is not even in the settled set — everything would be
+        // dropped; the original set is returned unchanged instead.
+        let out = revalidate_settled_members(settled.clone(), &departed, state_of, NodeId(9));
+        assert_eq!(out, settled);
+    }
 
     /// W8 review P1-3 — the reduction-round backstop: a target that names a
     /// NEW vetoed key on every completion retry (instead of the full set at
