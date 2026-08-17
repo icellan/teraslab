@@ -13408,13 +13408,22 @@ fn handle_partition_version_report(
         // Reuse the shared self-report builder so the wire response is
         // byte-identical to the in-process partition-view entries — including
         // the reverse-heal `manifest_digest` + `max_generation` recency signal
-        // (finding C1), computed in one filtered index scan off the hot path.
-        Some(c) => crate::cluster::coordinator::build_self_partition_version_entries(
-            c.self_id(),
-            engine,
-            &c.shard_table(),
-            c.inbound_bitmap(),
-        ),
+        // (finding C1). W10 FIX 1: the builder serves the engine's in-RAM
+        // recency cache — ZERO device reads — so this handler answers within
+        // the querying exchange's per-attempt frame timeout even on a fully
+        // seeded store (the old inline per-key footer scan starved every
+        // post-seed exchange). The refresh kick below keeps the served
+        // fingerprints converging off-thread.
+        Some(c) => {
+            let entries = crate::cluster::coordinator::build_self_partition_version_entries(
+                c.self_id(),
+                engine,
+                &c.shard_table(),
+                c.inbound_bitmap(),
+            );
+            c.kick_recency_refresh();
+            entries
+        }
         None => Vec::new(),
     };
 

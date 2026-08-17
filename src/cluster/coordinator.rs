@@ -3061,6 +3061,11 @@ impl ClusterCoordinator {
         let loop_heartbeat = Arc::new(crate::cluster::watchdog::LoopHeartbeat::new());
         let loop_heartbeat_event = loop_heartbeat.clone();
 
+        // W10 FIX 1 — keep an engine handle for the RunningCluster so the
+        // dispatch report handler can kick the off-thread recency refresh
+        // (the event-loop closure below moves the `engine` binding).
+        let engine_for_cluster = engine.clone();
+
         // Event processing thread
         let event_handle = std::thread::spawn(move || {
             let mut last_reactivation_at = std::time::Instant::now();
@@ -5480,6 +5485,7 @@ impl ClusterCoordinator {
         RunningCluster {
             self_id,
             self_addr: self.self_addr,
+            engine: engine_for_cluster,
             shard_table: self.shard_table.clone(),
             migration: self.migration.clone(),
             node_addrs: self.node_addrs.clone(),
@@ -6808,7 +6814,14 @@ impl ClusterCoordinator {
     ) -> std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>> {
         let mut phase = ExchangePhase::new(cluster_key, members.len(), total_timeout);
 
-        // Self-report (no TCP).
+        // W10 FIX 1 — kick an off-thread recency refresh so the NEXT report
+        // (this term's re-query cadence, or the next exchange) serves fresh
+        // fingerprints. The self-report below is served from the cache
+        // immediately — the refresh must never eat into the exchange window.
+        engine.maybe_refresh_shard_recency_cache();
+
+        // Self-report (no TCP, no device reads — see
+        // `build_self_partition_version_entries`).
         let self_entries =
             build_self_partition_version_entries(self_id, engine.as_ref(), shard_table, inbound_bm);
         phase.record(self_id, self_entries);
@@ -8450,72 +8463,61 @@ fn send_topology_frame(
 /// the in-process self-report is byte-equivalent to what a peer would receive
 /// over the wire. Empty shards on which this node has no role are excluded
 /// to keep the view compact.
+///
+/// W10 FIX 1 — O(RAM), zero device reads: the per-shard record count comes
+/// from the engine's O(1) counters and the reverse-heal recency signal
+/// (`manifest_digest` + `max_generation`) from the engine's in-RAM recency
+/// cache ([`Engine::shard_recency_cached`]). The old inline computation — a
+/// full index walk plus a PER-KEY on-device footer read — took multiple
+/// seconds on a seeded store, so every `OP_PARTITION_VERSION_REPORT` query
+/// hit the peer's frame read timeout and every post-seed exchange collected
+/// a starved partial view (CI @ d3437e4). The recency fields can now trail
+/// live writes by up to one refresh cycle — safe for every consumer (the
+/// digest is a mismatch pre-filter arbitrated by the authoritative Phase-2
+/// manifest exchange; the coarse direction pre-filter tolerates transient
+/// over/under-flagging), and the value was already live-moving across
+/// responders. Callers that can (the exchange, the dispatch handler via
+/// [`RunningCluster::kick_recency_refresh`]) trigger an off-thread refresh
+/// around each report so served values converge promptly.
 pub(crate) fn build_self_partition_version_entries(
     self_id: NodeId,
     engine: &Engine,
     shard_table: &Arc<ShardTableLock<ShardTable>>,
     inbound_bm: &Arc<crate::cluster::migration::AtomicShardBitmap>,
 ) -> Vec<PartitionVersionEntry> {
-    // First pass: decide participation and per-shard record count from the
-    // O(1) shard counters, holding the shard-table read lock only briefly.
-    struct Pending {
-        shard: u16,
-        flags: u8,
-        replica_count: u8,
-        count: u64,
-    }
-    let mut pending: Vec<Pending> = Vec::with_capacity(NUM_SHARDS);
-    let mut participating: std::collections::HashSet<u16> = std::collections::HashSet::new();
-    {
-        let table = shard_table.read();
-        for shard in 0..NUM_SHARDS as u16 {
-            let count = engine.shard_record_count(shard);
-            let assignment = table.target_assignment(shard);
-            let is_master = assignment.master == self_id;
-            let is_subset = inbound_bm.test(shard);
-            let is_replica = assignment.replicas.contains(&self_id);
-            if !is_master && !is_replica && !is_subset && count == 0 {
-                continue;
-            }
-            let mut flags = 0u8;
-            if is_master {
-                flags |= 0b01;
-            }
-            if is_subset {
-                flags |= 0b10;
-            }
-            let replica_count = u8::try_from(assignment.replicas.len().min(255)).unwrap_or(255);
-            participating.insert(shard);
-            pending.push(Pending {
-                shard,
-                flags,
-                replica_count,
-                count,
-            });
+    // Decide participation from the O(1) shard counters and read the cached
+    // recency per shard — everything here is RAM, so the shard-table read
+    // lock is held only for this single pass.
+    let mut entries: Vec<PartitionVersionEntry> = Vec::with_capacity(NUM_SHARDS);
+    let table = shard_table.read();
+    for shard in 0..NUM_SHARDS as u16 {
+        let count = engine.shard_record_count(shard);
+        let assignment = table.target_assignment(shard);
+        let is_master = assignment.master == self_id;
+        let is_subset = inbound_bm.test(shard);
+        let is_replica = assignment.replicas.contains(&self_id);
+        if !is_master && !is_replica && !is_subset && count == 0 {
+            continue;
         }
+        let mut flags = 0u8;
+        if is_master {
+            flags |= 0b01;
+        }
+        if is_subset {
+            flags |= 0b10;
+        }
+        let replica_count = u8::try_from(assignment.replicas.len().min(255)).unwrap_or(255);
+        let (_cached_count, manifest_digest, max_generation) = engine.shard_recency_cached(shard);
+        entries.push(PartitionVersionEntry {
+            shard,
+            flags,
+            replica_count,
+            last_applied_seq: count,
+            manifest_digest,
+            max_generation,
+        });
     }
-
-    // Second pass: ONE filtered index scan resolves the participating shards'
-    // keys; fold each shard's `(txid, generation)` into the reverse-heal
-    // recency signal. Only participating shards are read, and the whole thing
-    // runs off the hot path (post-topology-commit exchange), not per client op.
-    let (keys_by_shard, _skipped) = engine.keys_by_shard_filtered(&participating);
-    let empty: Vec<TxKey> = Vec::new();
-    pending
-        .into_iter()
-        .map(|p| {
-            let keys = keys_by_shard.get(&p.shard).unwrap_or(&empty);
-            let (_scan_count, manifest_digest, max_generation) = engine.recency_for_keys(keys);
-            PartitionVersionEntry {
-                shard: p.shard,
-                flags: p.flags,
-                replica_count: p.replica_count,
-                last_applied_seq: p.count,
-                manifest_digest,
-                max_generation,
-            }
-        })
-        .collect()
+    entries
 }
 
 /// Serialize an `OP_PARTITION_VERSION_REPORT` response payload from a list of
@@ -15586,6 +15588,11 @@ pub enum MasterQueryResult {
 pub struct RunningCluster {
     self_id: NodeId,
     self_addr: SocketAddr,
+    /// W10 FIX 1 — engine handle so the `OP_PARTITION_VERSION_REPORT`
+    /// dispatch handler (which only holds `&Engine`) can kick the
+    /// off-thread shard-recency refresh via
+    /// [`RunningCluster::kick_recency_refresh`].
+    engine: Arc<Engine>,
     shard_table: Arc<ShardTableLock<ShardTable>>,
     migration: Arc<Mutex<MigrationManager>>,
     node_addrs: Arc<RwLock<std::collections::HashMap<NodeId, SocketAddr>>>,
@@ -18048,6 +18055,17 @@ impl RunningCluster {
         &self.inbound_atomic
     }
 
+    /// W10 FIX 1 — kick an off-thread shard-recency refresh if the
+    /// engine's recency cache is stale (no-op otherwise). Called by the
+    /// `OP_PARTITION_VERSION_REPORT` dispatch handler AFTER serving the
+    /// cached report, so a queried node's fingerprints converge for the
+    /// exchange's next 500 ms re-query without the handler ever scanning
+    /// on the request path — including on pure-replica nodes that never
+    /// run an exchange of their own.
+    pub fn kick_recency_refresh(&self) {
+        self.engine.maybe_refresh_shard_recency_cache();
+    }
+
     /// Shut down the cluster.
     ///
     /// Persists the current topology state to disk before stopping so
@@ -18211,6 +18229,23 @@ pub(crate) fn new_test_running_cluster(
             .iter()
             .find_map(|(node, addr)| (*node == self_id).then_some(*addr))
             .unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], 0))),
+        // W10 FIX 1 — a minimal in-memory engine backing
+        // `kick_recency_refresh`; tests that exercise real engine state
+        // pass their own engine to the dispatch layer separately.
+        engine: {
+            let dev: Arc<dyn crate::device::BlockDevice> = Arc::new(
+                crate::device::MemoryDevice::new(4 * 1024 * 1024, 4096)
+                    .expect("test memory device"),
+            );
+            let alloc = crate::allocator::SlotAllocator::new(dev.clone()).expect("test allocator");
+            Arc::new(Engine::new(
+                dev,
+                crate::index::Index::new(64).expect("test index"),
+                alloc,
+                crate::locks::StripedLocks::new(8),
+                crate::index::DahIndex::new(),
+            ))
+        },
         shard_table: Arc::new(ShardTableLock::new(table.clone())),
         migration,
         node_addrs: Arc::new(RwLock::new(node_addrs)),
@@ -33120,6 +33155,110 @@ mod tests {
             "a peer that rejected the first report but accepted the re-query \
              must be PRESENT in the view with its reported entries",
         );
+    }
+
+    /// Counting read probe for the W10 FIX 1 zero-device-read pin: every
+    /// read routes through `pread` (no raw pointer exposed, so the engine
+    /// cannot take the direct-memory path) and is counted.
+    struct ReadCountingDevice {
+        inner: crate::device::MemoryDevice,
+        reads: std::sync::atomic::AtomicU64,
+    }
+
+    impl crate::device::BlockDevice for ReadCountingDevice {
+        fn pread(&self, buf: &mut [u8], offset: u64) -> crate::device::Result<usize> {
+            self.reads
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.inner.pread(buf, offset)
+        }
+        fn pwrite(&self, buf: &[u8], offset: u64) -> crate::device::Result<usize> {
+            self.inner.pwrite(buf, offset)
+        }
+        fn alignment(&self) -> usize {
+            self.inner.alignment()
+        }
+        fn size(&self) -> u64 {
+            self.inner.size()
+        }
+        fn sync(&self) -> crate::device::Result<()> {
+            self.inner.sync()
+        }
+    }
+
+    /// W10 FIX 1 (CI @ d3437e4) — building the partition-version report
+    /// must perform ZERO device reads. The old builder ran a per-key
+    /// on-device `read_metadata` for every key of every participating
+    /// shard on EVERY report (dispatch handler + exchange self-report);
+    /// on a seeded store that starved every post-seed exchange: peers hit
+    /// the frame read timeout, views collapsed below quorum, and the
+    /// wave-9 exchange fixes never got a real attempt. The report must be
+    /// served from the engine's in-RAM recency cache — and still carry
+    /// the honest per-shard values the direct scan would produce.
+    #[test]
+    fn partition_version_report_builds_with_zero_device_reads() {
+        let device = Arc::new(ReadCountingDevice {
+            inner: crate::device::MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap(),
+            reads: std::sync::atomic::AtomicU64::new(0),
+        });
+        let dev: Arc<dyn crate::device::BlockDevice> = device.clone();
+        let alloc = crate::allocator::SlotAllocator::new(dev.clone()).unwrap();
+        let engine = Engine::new(
+            dev,
+            crate::index::Index::new(1024).unwrap(),
+            alloc,
+            crate::locks::StripedLocks::new(64),
+            crate::index::DahIndex::new(),
+        );
+
+        // Seed a few shards with records, then converge the recency cache
+        // (the refresh is the one place device reads are allowed).
+        let keys = [
+            tx_key_for_shard(3, 1),
+            tx_key_for_shard(3, 2),
+            tx_key_for_shard(900, 1),
+        ];
+        for key in keys {
+            create_test_record(&engine, key);
+        }
+        engine.refresh_shard_recency_cache();
+        assert!(!engine.recency_cache_is_stale());
+
+        let self_id = NodeId(1);
+        let table = ShardTable::compute_with_epoch(&[self_id], 1, 1, 1);
+        let shard_table = Arc::new(ShardTableLock::new(table));
+        let inbound_bm = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+
+        let reads_before = device.reads.load(std::sync::atomic::Ordering::Relaxed);
+        let entries =
+            build_self_partition_version_entries(self_id, &engine, &shard_table, &inbound_bm);
+        let reads_after = device.reads.load(std::sync::atomic::Ordering::Relaxed);
+
+        assert_eq!(
+            reads_after, reads_before,
+            "building the partition-version report must perform ZERO device \
+             reads — the per-key footer scan starved every post-seed exchange",
+        );
+
+        // The RAM-served report still carries the honest per-shard values
+        // the direct scan computes (the store is quiescent since refresh).
+        for shard in [3u16, 900u16] {
+            let entry = entries
+                .iter()
+                .find(|e| e.shard == shard)
+                .unwrap_or_else(|| panic!("populated shard {shard} must be reported"));
+            let (count, digest, max_generation) = engine.shard_recency(shard);
+            assert_eq!(
+                entry.last_applied_seq,
+                engine.shard_record_count(shard),
+                "entry count must be the live O(1) shard count",
+            );
+            assert_eq!(entry.last_applied_seq, count);
+            assert_eq!(
+                (entry.manifest_digest, entry.max_generation),
+                (digest, max_generation),
+                "shard {shard}: served recency must equal the direct scan's answer",
+            );
+        }
     }
 
     /// W9 P2-3 — the `ERR_STALE_EPOCH` report rejection carries the

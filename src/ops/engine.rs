@@ -431,6 +431,22 @@ pub struct Engine {
     /// maintain them atomically while holding the primary-index shard write
     /// lock — counts never drift from the primary index.
     shard_counts: Vec<std::sync::atomic::AtomicU64>,
+    /// W10 FIX 1 — in-RAM per-shard recency fingerprints backing the
+    /// cluster partition-version report, so building/serving a report
+    /// performs ZERO device reads (see [`crate::ops::recency`]).
+    ///
+    /// Kept stale-marked by [`Self::note_record_mutation`], which every
+    /// path that can change a record's `(txid, generation)` membership
+    /// calls: the primary-index register/unregister choke points
+    /// (create/delete), [`Self::write_metadata_fast`], the explicit
+    /// direct-memory footer writes, and [`Self::relocate_record`]
+    /// (log-structured stores persist the mutated footer inside the
+    /// relocated image, never through a footer-write helper). A NEW
+    /// record-persist path must call it too, or served fingerprints go
+    /// stale until an existing path fires — degrading reverse-heal
+    /// detection to a false mismatch (extra no-op confirms), never to a
+    /// wrong heal.
+    recency_cache: crate::ops::recency::ShardRecencyCache,
     /// Cached wall-clock time in milliseconds since Unix epoch.
     ///
     /// Avoids a `clock_gettime` syscall on every mutation. The dispatch
@@ -777,6 +793,7 @@ impl Engine {
             blob_store: None,
             blob_pins: crate::storage::blobstore::BlobPinSet::new(),
             shard_counts,
+            recency_cache: crate::ops::recency::ShardRecencyCache::new(),
             cached_millis: std::sync::atomic::AtomicU64::new(sys_millis()),
             conflicting_children_dropped: std::sync::atomic::AtomicU64::new(0),
             enumeration_unreadable: std::sync::atomic::AtomicU64::new(0),
@@ -3152,6 +3169,108 @@ impl Engine {
         (count, digest, max_generation)
     }
 
+    /// W10 FIX 1 — mark the shard-recency cache stale. Called by every
+    /// path that can change any record's `(txid, generation)` membership;
+    /// see the field doc on [`Self::recency_cache`] for the inventory and
+    /// the consequence of a missed site. One relaxed atomic add — safe on
+    /// the write hot path.
+    #[inline(always)]
+    fn note_record_mutation(&self) {
+        self.recency_cache.note_mutation();
+    }
+
+    /// W10 FIX 1 — the partition-version report's recency for `shard`,
+    /// served ENTIRELY from RAM: the live O(1) record count plus the
+    /// cached `(digest, max_generation)` fingerprint from the last
+    /// completed [`Self::refresh_shard_recency_cache`]. Same tuple shape
+    /// as [`Self::shard_recency`] — `(count, digest, max_generation)` —
+    /// but NEVER walks the index or reads the device.
+    ///
+    /// The fingerprint can trail live writes by up to one refresh cycle
+    /// (see the staleness rationale in [`crate::ops::recency`]); the
+    /// count is always current.
+    pub fn shard_recency_cached(&self, shard: u16) -> (u64, u64, u32) {
+        let value = self.recency_cache.get(shard);
+        (
+            self.shard_record_count(shard),
+            value.digest,
+            value.max_generation,
+        )
+    }
+
+    /// W10 FIX 1 — has any record mutation landed since the last
+    /// completed recency refresh?
+    pub fn recency_cache_is_stale(&self) -> bool {
+        self.recency_cache.is_stale()
+    }
+
+    /// W10 FIX 1 — recompute the shard-recency cache from the index and
+    /// device, BLOCKING the calling thread for the full scan (one
+    /// filtered index walk plus a per-key on-device footer read — the
+    /// exact work the report builder used to do inline per request).
+    /// Never call this from a dispatch handler or inside the exchange
+    /// window; production paths go through
+    /// [`Self::maybe_refresh_shard_recency_cache`], which runs this on a
+    /// background thread.
+    ///
+    /// The mutation stamp is captured BEFORE the scan, so a write racing
+    /// the scan leaves the published snapshot stale and the next trigger
+    /// refreshes again — the cache can under-report freshness, never
+    /// over-report it.
+    pub fn refresh_shard_recency_cache(&self) {
+        let stamp = self.recency_cache.stamp_for_refresh();
+        // Scan every shard that currently holds records; a shard with no
+        // records has the constant empty fingerprint (no keys to read).
+        let populated: std::collections::HashSet<u16> = (0..crate::cluster::shards::NUM_SHARDS
+            as u16)
+            .filter(|s| self.shard_record_count(*s) > 0)
+            .collect();
+        let mut table =
+            vec![crate::ops::recency::empty_shard_recency(); crate::cluster::shards::NUM_SHARDS];
+        if !populated.is_empty() {
+            let (keys_by_shard, _skipped) = self.keys_by_shard_filtered(&populated);
+            for (shard, keys) in keys_by_shard {
+                let (_count, digest, max_generation) = self.recency_for_keys(&keys);
+                if let Some(slot) = table.get_mut(shard as usize) {
+                    *slot = crate::ops::recency::ShardRecencyValue {
+                        digest,
+                        max_generation,
+                    };
+                }
+            }
+        }
+        self.recency_cache.publish(stamp, table);
+    }
+
+    /// W10 FIX 1 — kick an off-thread [`Self::refresh_shard_recency_cache`]
+    /// if the cache is stale and no refresh is already in flight. Returns
+    /// `true` when a refresh thread was spawned. Non-blocking; callers
+    /// serve the current snapshot immediately and rely on a later report
+    /// (e.g. the exchange's 500 ms re-query cadence) observing the
+    /// refreshed values.
+    pub fn maybe_refresh_shard_recency_cache(self: &Arc<Self>) -> bool {
+        if !self.recency_cache.is_stale() {
+            return false;
+        }
+        if !self.recency_cache.claim_refresh_slot() {
+            return false;
+        }
+        let engine = Arc::clone(self);
+        std::thread::spawn(move || {
+            /// Unwind-safe release: the single-flight slot is freed even
+            /// if the scan panics, so a failed refresh can be retried.
+            struct ReleaseSlot(Arc<Engine>);
+            impl Drop for ReleaseSlot {
+                fn drop(&mut self) {
+                    self.0.recency_cache.release_refresh_slot();
+                }
+            }
+            let _release = ReleaseSlot(Arc::clone(&engine));
+            engine.refresh_shard_recency_cache();
+        });
+        true
+    }
+
     /// Populate `shard_counts` from the fully-built primary index.
     ///
     /// Called EXACTLY ONCE from `new_inner` while the engine is still
@@ -3229,6 +3348,7 @@ impl Engine {
         // atomicity (fix #1).
         if inserted {
             self.shard_counts[shard].fetch_add(1, std::sync::atomic::Ordering::Release);
+            self.note_record_mutation();
         }
         // Per-shard resize UNDER the held guard: rehashes only this shard's
         // ~count/N entries without dropping and re-acquiring the lock (leaving
@@ -3318,6 +3438,7 @@ impl Engine {
         // (only on an actual insert) under the still-held write guard for the
         // newly inserted key, preserving insert-then-count atomicity (fix #1).
         self.shard_counts[shard].fetch_add(1, std::sync::atomic::Ordering::Release);
+        self.note_record_mutation();
         // Resize UNDER the held guard (no drop-then-reacquire).
         guard.resize_if_needed()?;
         Ok(true)
@@ -3385,6 +3506,7 @@ impl Engine {
         let removed = guard.unregister_checked(key)?;
         if removed.is_some() {
             self.shard_counts[shard].fetch_sub(1, std::sync::atomic::Ordering::Release);
+            self.note_record_mutation();
         }
         drop(guard);
         Ok(removed)
@@ -3495,6 +3617,10 @@ impl Engine {
         record_offset: u64,
         metadata: &TxMetadata,
     ) -> std::result::Result<(), SpendError> {
+        // W10 FIX 1 — every footer persist can change the record's
+        // generation; stale-mark the recency cache unconditionally (a
+        // failed write over-invalidates, which is harmless).
+        self.note_record_mutation();
         let device_ptr = self.device_ptr_for(device_id);
         if !device_ptr.is_null() {
             // SAFETY: `device_ptr` is non-null (checked above) and is the live
@@ -4517,6 +4643,9 @@ impl Engine {
                         &metadata,
                     )
                 };
+                // W10 FIX 1 — direct footer persist bypasses
+                // `write_metadata_fast`; stale-mark the recency cache.
+                self.note_record_mutation();
             } else {
                 self.write_metadata_fast(device_id, record_offset, &metadata)?;
             }
@@ -4721,6 +4850,9 @@ impl Engine {
                         &metadata,
                     )
                 };
+                // W10 FIX 1 — direct footer persist bypasses
+                // `write_metadata_fast`; stale-mark the recency cache.
+                self.note_record_mutation();
             } else if let Err(meta_err) =
                 self.write_metadata_fast(device_id, record_offset, &metadata)
             {
@@ -5163,6 +5295,9 @@ impl Engine {
             unsafe {
                 io::write_metadata_direct(self.device_ptr_for(device_id), record_offset, &metadata)
             };
+            // W10 FIX 1 — direct footer persist bypasses
+            // `write_metadata_fast`; stale-mark the recency cache.
+            self.note_record_mutation();
         } else {
             self.write_metadata_fast(device_id, record_offset, &metadata)?;
         }
@@ -6052,6 +6187,10 @@ impl Engine {
         metadata: &TxMetadata,
         slot_mutations: &[(u32, UtxoSlot)],
     ) -> Result<u64, SpendError> {
+        // W10 FIX 1 — a relocation persists the mutated footer inside the
+        // relocated image (no footer-write helper runs); stale-mark the
+        // recency cache here so log-structured mutations invalidate too.
+        self.note_record_mutation();
         // Re-fetch the old offset here rather than threading it from the caller:
         // it keeps this consensus-critical primitive self-contained (it validates
         // the key exists AND reads its offset atomically under the caller's stripe
@@ -8071,6 +8210,9 @@ impl Engine {
             unsafe {
                 io::write_metadata_direct(self.device_ptr_for(device_id), ro, &meta);
             }
+            // W10 FIX 1 — direct footer persist bypasses
+            // `write_metadata_fast`; stale-mark the recency cache.
+            self.note_record_mutation();
 
             // followup-1 dual-write: mirror CONFLICTING (req.value) and any
             // LAST_SPENT_ALL transition (set on `tf` above) into the DE-flag
@@ -8273,6 +8415,9 @@ impl Engine {
                 io::write_metadata_direct(self.device_ptr_for(device_id), ro, &meta);
                 (generation, prior_locked)
             };
+            // W10 FIX 1 — direct footer persist bypasses
+            // `write_metadata_fast`; stale-mark the recency cache.
+            self.note_record_mutation();
 
             // Update DAH secondary index (two-phase durable): locking evicts the
             // authoritative DAH; unlocking leaves it untouched (old == new).
@@ -11630,6 +11775,9 @@ impl PreparedSpend {
                 // `write_metadata_direct` takes the per-offset `io_locks()` write
                 // side for torn-read-safe publication.
                 unsafe { io::write_metadata_direct(device_ptr, record_offset, &metadata) };
+                // W10 FIX 1 — direct footer persist bypasses
+                // `write_metadata_fast`; stale-mark the recency cache.
+                engine.note_record_mutation();
             } else {
                 engine.write_metadata_fast(device_id, record_offset, &metadata)?;
             }
@@ -29841,6 +29989,135 @@ mod tests {
         assert_ne!(
             digest_after, digest_before,
             "a divergent generation flips the shard fingerprint",
+        );
+    }
+
+    /// W10 FIX 1 — the served (cached) recency must equal the direct
+    /// scan's answer after every refresh, across the record lifecycle:
+    /// create, spend (generation bump), delete, and the absolute
+    /// generation write the replica/heal/migration apply paths use. Each
+    /// mutation must also stale-mark the cache so the next refresh runs.
+    #[test]
+    fn shard_recency_cache_matches_direct_scan_across_lifecycle() {
+        let engine = create_engine();
+
+        let assert_cache_equals_scan = |label: &str| {
+            for shard in 0..crate::cluster::shards::NUM_SHARDS as u16 {
+                assert_eq!(
+                    engine.shard_recency_cached(shard),
+                    engine.shard_recency(shard),
+                    "cached recency must equal the direct scan for shard {shard} after {label}",
+                );
+            }
+        };
+
+        // A brand-new (empty) engine: the initial snapshot IS the empty
+        // fingerprint for every shard, so cache == scan before any refresh.
+        assert_cache_equals_scan("construction (empty engine)");
+
+        // CREATE — must stale-mark; refresh converges cache to the scan.
+        let (hashes_a, req_a) = make_create_req(101, 2);
+        let (_hashes_b, req_b) = make_create_req(102, 2);
+        engine.create(&req_a).unwrap();
+        engine.create(&req_b).unwrap();
+        assert!(
+            engine.recency_cache_is_stale(),
+            "create must stale-mark the recency cache",
+        );
+        engine.refresh_shard_recency_cache();
+        assert!(!engine.recency_cache_is_stale(), "refresh clears staleness");
+        assert_cache_equals_scan("create");
+        let shard_a = crate::cluster::shards::ShardTable::shard_for_key(&req_a.tx_key());
+        let digest_after_create = engine.shard_recency_cached(shard_a).1;
+
+        // SPEND — a generation bump with unchanged membership must
+        // stale-mark, and the refreshed digest must move.
+        engine
+            .spend(&SpendRequest {
+                tx_key: req_a.tx_key(),
+                offset: 0,
+                utxo_hash: hashes_a[0],
+                spending_data: [0xAB; 36],
+                ignore_conflicting: false,
+                ignore_locked: false,
+                current_block_height: 1000,
+                block_height_retention: 288,
+            })
+            .unwrap();
+        assert!(
+            engine.recency_cache_is_stale(),
+            "spend (generation bump) must stale-mark the recency cache",
+        );
+        engine.refresh_shard_recency_cache();
+        assert_cache_equals_scan("spend");
+        assert_ne!(
+            engine.shard_recency_cached(shard_a).1,
+            digest_after_create,
+            "the refreshed cached digest must reflect the spend's generation bump",
+        );
+
+        // Absolute generation write — the replica/heal/migration apply
+        // primitive — must stale-mark too.
+        assert!(
+            engine
+                .set_record_generation(&req_b.tx_key(), 41)
+                .expect("generation write")
+        );
+        assert!(
+            engine.recency_cache_is_stale(),
+            "set_record_generation must stale-mark the recency cache",
+        );
+        engine.refresh_shard_recency_cache();
+        assert_cache_equals_scan("set_record_generation");
+
+        // DELETE — membership change back down; cache must converge to the
+        // (possibly empty-again) scan fingerprint.
+        engine
+            .delete(&DeleteRequest {
+                tx_key: req_a.tx_key(),
+                due_guard: None,
+            })
+            .unwrap();
+        assert!(
+            engine.recency_cache_is_stale(),
+            "delete must stale-mark the recency cache",
+        );
+        engine.refresh_shard_recency_cache();
+        assert_cache_equals_scan("delete");
+    }
+
+    /// W10 FIX 1 — `maybe_refresh_shard_recency_cache` spawns exactly one
+    /// off-thread refresh when stale, converging the cache to the scan
+    /// without ever blocking the caller, and is a no-op when fresh.
+    #[test]
+    fn maybe_refresh_recency_cache_spawns_once_and_converges() {
+        let engine = create_engine();
+        let (_hashes, req) = make_create_req(103, 2);
+        engine.create(&req).unwrap();
+        assert!(engine.recency_cache_is_stale());
+
+        assert!(
+            engine.maybe_refresh_shard_recency_cache(),
+            "a stale cache must spawn a refresh",
+        );
+        // Wait for the background refresh to publish (bounded).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while engine.recency_cache_is_stale() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "background recency refresh did not complete in time",
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let shard = crate::cluster::shards::ShardTable::shard_for_key(&req.tx_key());
+        assert_eq!(
+            engine.shard_recency_cached(shard),
+            engine.shard_recency(shard),
+            "the background refresh must converge the cache to the scan",
+        );
+        assert!(
+            !engine.maybe_refresh_shard_recency_cache(),
+            "a fresh cache must not spawn a refresh",
         );
     }
 
