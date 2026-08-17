@@ -13,6 +13,12 @@ mkdir -p "$OUTPUT_DIR"
 TIMEOUT_CMD="timeout"
 command -v timeout >/dev/null 2>&1 || TIMEOUT_CMD="gtimeout"
 
+# Bearer token for the nodes' gated /admin/* and /debug/* routes. Must match
+# `DOCKER_TEST_ADMIN_TOKEN` in teraslab-tests/client/src/helpers.rs, which is
+# what the generated node configs set as `admin_token`. Test-only credential
+# on a private docker network — see that constant's doc comment.
+ADMIN_TOKEN=${TERASLAB_DOCKER_ADMIN_TOKEN:-teraslab-docker-test-token}
+
 # Collect from scenario containers (ts{NN}-node{N}). Skip if docker is slow.
 containers=$($TIMEOUT_CMD 10 docker ps -a --filter "name=ts" --format '{{.Names}}' 2>/dev/null || true)
 for c in $containers; do
@@ -33,6 +39,14 @@ done
 # Ask Docker for the actual mapping instead of guessing, and only keep a file
 # when the scrape really returned something — an absent file is honest, an empty
 # one is not.
+#
+# The same loop also captures the per-node cluster state the in-test dump
+# (`collect_failure_diagnostics` in tests/common/mod.rs) writes: /status and
+# /admin/migration_status. Without these the two capture paths disagree — a
+# scenario that dies on a panic (which bypasses the in-test dump entirely,
+# since a panic never reaches the `Ok(Err(..))` / timeout arms that call it)
+# left a diag directory with container logs but no cluster state at all, and
+# a post-mortem had to guess at term/epoch/migration state.
 for c in $containers; do
     hostport=$($TIMEOUT_CMD 10 docker port "$c" 9100/tcp 2>/dev/null | head -1 | sed 's/.*://')
     if [ -z "$hostport" ]; then
@@ -44,6 +58,18 @@ for c in $containers; do
         rm -f "$OUTPUT_DIR/${c}_final_metrics.txt"
         echo "  warning: metrics scrape failed for $c on host port $hostport"
     fi
+
+    # `status` is public; `admin/migration_status` needs the bearer token.
+    # As with metrics: keep the file only when the scrape really returned
+    # something, so an absent file means "not collected" rather than "empty".
+    for ep in status admin/migration_status; do
+        out="$OUTPUT_DIR/${c}_$(echo "$ep" | tr '/' '_').json"
+        if ! curl --max-time 3 -sf -H "Authorization: Bearer $ADMIN_TOKEN" \
+            "http://localhost:$hostport/$ep" > "$out" 2>/dev/null; then
+            rm -f "$out"
+            echo "  warning: /$ep scrape failed for $c on host port $hostport"
+        fi
+    done
 done
 
 # Docker resource usage — only if we actually have scenario containers; an

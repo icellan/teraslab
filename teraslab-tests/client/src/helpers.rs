@@ -564,6 +564,9 @@ services:
     /// unreachable via ICMP unreachable rather than silent UDP timeouts.
     pub async fn remove_node(&self, name: &str) -> Result<(), ClientError> {
         let container = self.container_name(name);
+        // Removing the container destroys its log forever, so archive it
+        // first — see `archive_container_log`.
+        archive_container_log(&container).await;
         run_docker_cmd(&["rm", "-f", &container]).await?;
         Ok(())
     }
@@ -933,6 +936,65 @@ services:
 /// # Errors
 /// Returns `ClientError::Connection` if the process cannot be spawned or
 /// if the command exits with a non-zero status.
+/// Environment variable naming the directory failure diagnostics are
+/// written to. Set per scenario by `teraslab-tests/run_all.sh`; unset for a
+/// bare `cargo test`, in which case nothing is archived.
+pub const ENV_DIAG_DIR: &str = "TERASLAB_DIAG_DIR";
+
+/// The bytes worth writing as a container's captured log, or `None` when
+/// nothing should be written.
+///
+/// Shared by both capture paths (`DockerHelpers::remove_node`'s pre-removal
+/// archive and `collect_failure_diagnostics`' post-failure dump) so they
+/// agree on what a captured log is.
+///
+/// A failed `docker logs` returns `None` — that is load-bearing, not
+/// tidiness. When the container is gone, `docker logs` still prints
+/// "No such container" on stderr; writing that would both fabricate a
+/// log file that looks like an empty node and overwrite a copy an earlier
+/// pre-removal archive had already saved under the same name.
+pub fn captured_log_bytes(status_ok: bool, stdout: Vec<u8>, stderr: &[u8]) -> Option<Vec<u8>> {
+    if !status_ok {
+        return None;
+    }
+    let mut buf = stdout;
+    buf.extend_from_slice(stderr);
+    if buf.is_empty() { None } else { Some(buf) }
+}
+
+/// Archive a container's Docker log before the container is destroyed.
+///
+/// `docker rm` deletes the log with the container, so a node removed
+/// mid-scenario is invisible to *every* post-mortem capture path — both the
+/// in-test dump in `tests/common/mod.rs` and `scripts/collect_logs.sh` can
+/// only read logs of containers that still exist. Scenario 07 removes node4
+/// at Test 7.3 and node4 is that scenario's whole subject, so an armed
+/// nightly failure after 7.3 left no way to tell what node4 had done.
+///
+/// Best-effort by design: no diag dir configured, an unreadable container,
+/// or a failed write are all silently skipped. This must never turn a
+/// diagnostic into a test failure.
+async fn archive_container_log(container: &str) {
+    let Ok(dir) = std::env::var(ENV_DIAG_DIR) else {
+        return;
+    };
+    if dir.is_empty() || tokio::fs::create_dir_all(&dir).await.is_err() {
+        return;
+    }
+    let Ok(out) = tokio::process::Command::new("docker")
+        .args(["logs", container])
+        .output()
+        .await
+    else {
+        return;
+    };
+    let Some(buf) = captured_log_bytes(out.status.success(), out.stdout, &out.stderr) else {
+        return;
+    };
+    let path = std::path::Path::new(&dir).join(format!("{container}.log"));
+    let _ = tokio::fs::write(&path, &buf).await;
+}
+
 async fn run_docker_cmd(args: &[&str]) -> Result<String, ClientError> {
     let output = tokio::process::Command::new("docker")
         .args(args)
@@ -1188,6 +1250,43 @@ mod tests {
             "rendered docker node config must pass safe-defaults validation under the \
              F-X-002 production default (strict_auth = true) via the explicit \
              `strict_auth = false` opt-out",
+        );
+    }
+
+    /// A failed `docker logs` must capture NOTHING.
+    ///
+    /// This is what makes the pre-removal archive survive: scenario 07
+    /// removes node4 at Test 7.3, and the post-failure dump then runs
+    /// `docker logs ts07-node4` and gets "No such container" on stderr with
+    /// a non-zero exit. Writing that would replace the archived node4 log —
+    /// the only record of the scenario's own subject — with an error string.
+    #[test]
+    fn a_failed_docker_logs_captures_nothing() {
+        assert_eq!(
+            captured_log_bytes(
+                false,
+                Vec::new(),
+                b"Error response from daemon: No such container: ts07-node4",
+            ),
+            None,
+        );
+    }
+
+    #[test]
+    fn a_successful_docker_logs_captures_stdout_then_stderr() {
+        assert_eq!(
+            captured_log_bytes(true, b"out".to_vec(), b"err"),
+            Some(b"outerr".to_vec()),
+            "the daemon writes tracing output to stderr, so both halves are kept",
+        );
+    }
+
+    #[test]
+    fn a_successful_but_empty_docker_logs_captures_nothing() {
+        assert_eq!(
+            captured_log_bytes(true, Vec::new(), b""),
+            None,
+            "an absent file is honest; a 0-byte one looks like a collected log",
         );
     }
 

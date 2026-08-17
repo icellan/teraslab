@@ -2442,7 +2442,7 @@ pub async fn teardown_all(scenario_id: u16) {
 /// harness-side collect_logs.sh cannot do this: the in-test teardown on the
 /// failure path removes the containers before it runs.
 pub async fn collect_failure_diagnostics(scenario_id: u16) {
-    let Ok(dir) = std::env::var("TERASLAB_DIAG_DIR") else {
+    let Ok(dir) = std::env::var(teraslab_test_client::helpers::ENV_DIAG_DIR) else {
         return;
     };
     let dir = std::path::PathBuf::from(dir);
@@ -2455,9 +2455,16 @@ pub async fn collect_failure_diagnostics(scenario_id: u16) {
             .args(["logs", &name])
             .output()
         {
-            let mut buf = out.stdout;
-            buf.extend_from_slice(&out.stderr);
-            if !buf.is_empty() {
+            // A node removed mid-scenario (scenario 07 removes node4 at
+            // Test 7.3) makes `docker logs` fail with "No such container";
+            // `captured_log_bytes` rejects that so the copy
+            // `DockerHelpers::remove_node` archived here before the removal
+            // survives.
+            if let Some(buf) = teraslab_test_client::helpers::captured_log_bytes(
+                out.status.success(),
+                out.stdout,
+                &out.stderr,
+            ) {
                 let _ = std::fs::write(dir.join(format!("{name}.log")), &buf);
             }
         }
