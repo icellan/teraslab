@@ -699,7 +699,7 @@ async fn handle_metrics(
     let span = http_span_for(&headers, "/metrics");
     let _entered = span.enter();
     let backup = state.backup.status();
-    let out = render_metrics_text(
+    let mut out = render_metrics_text(
         state.metrics,
         state.histograms,
         state.engine.index_len() as u64,
@@ -714,6 +714,9 @@ async fn handle_metrics(
         u64::from(state.engine.is_segment_lifecycle_pinned()),
         state.engine.enumeration_unreadable(),
     );
+    // W10 P1-1 — recency-cache scan observability (appended here rather
+    // than threaded through `render_metrics_text`'s positional signature).
+    append_recency_metrics(&mut out, state.engine.recency_scan_stats());
 
     let mut resp_headers = HeaderMap::new();
     resp_headers.insert(
@@ -1717,6 +1720,48 @@ fn prom_gauge(out: &mut String, name: &str, val: u64) {
     use std::fmt::Write;
     let _ = writeln!(out, "# TYPE {name} gauge");
     let _ = writeln!(out, "{name} {val}");
+}
+
+/// W10 P1-1 — append the recency-cache scan series to the metrics payload.
+///
+/// The whole-store recency scan is the heaviest background I/O the cluster
+/// layer triggers (one index walk + a per-key footer read), so operators
+/// need its rate, its duration, and how stale the served snapshot is:
+///
+/// - `teraslab_recency_scan_total` — completed scans since boot;
+/// - `teraslab_recency_scan_last_duration_ms` — duration of the most
+///   recent completed scan;
+/// - `teraslab_recency_scan_last_age_seconds` — seconds since the most
+///   recent completed scan; emitted only once a scan has completed (an
+///   absent series + `scan_total == 0` reads as "never scanned yet",
+///   which the reports surface per shard as `RECENCY_UNKNOWN`);
+/// - `teraslab_recency_scan_skipped_keys_total` — keys skipped by scans
+///   (unreadable footer / raced deletion, P2-8; aggregate across shards);
+/// - `teraslab_recency_refresh_spawn_failed_total` — refresh threads that
+///   failed to spawn (P1-2; each released the single-flight slot).
+pub(crate) fn append_recency_metrics(
+    out: &mut String,
+    stats: crate::ops::recency::RecencyScanStats,
+) {
+    prom_counter(out, "teraslab_recency_scan_total", stats.scans_completed);
+    prom_gauge(
+        out,
+        "teraslab_recency_scan_last_duration_ms",
+        stats.last_scan_duration_ms,
+    );
+    if let Some(age) = stats.last_scan_age_secs {
+        prom_gauge(out, "teraslab_recency_scan_last_age_seconds", age);
+    }
+    prom_counter(
+        out,
+        "teraslab_recency_scan_skipped_keys_total",
+        stats.skipped_keys_total,
+    );
+    prom_counter(
+        out,
+        "teraslab_recency_refresh_spawn_failed_total",
+        stats.spawn_failures,
+    );
 }
 
 /// Emit a `LatencyHistogram` as a Prometheus histogram.
@@ -6879,6 +6924,50 @@ mod tests {
             text.lines()
                 .any(|l| l == "teraslab_index_enumeration_unreadable_total 3"),
             "missing value line for enumeration counter; output:\n{text}"
+        );
+    }
+
+    /// W10 P1-1 — the recency-cache scan series appended by the metrics
+    /// handler: totals, last duration, last-completed age (emitted only
+    /// once a scan HAS completed), skip meter (P2-8), and spawn-failure
+    /// meter (P1-2).
+    #[test]
+    fn metrics_appends_recency_scan_series() {
+        let stats = crate::ops::recency::RecencyScanStats {
+            scans_completed: 4,
+            last_scan_duration_ms: 250,
+            last_scan_age_secs: Some(9),
+            skipped_keys_total: 2,
+            spawn_failures: 1,
+        };
+        let mut text = String::new();
+        append_recency_metrics(&mut text, stats);
+        for expected in [
+            "# TYPE teraslab_recency_scan_total counter",
+            "teraslab_recency_scan_total 4",
+            "teraslab_recency_scan_last_duration_ms 250",
+            "teraslab_recency_scan_last_age_seconds 9",
+            "teraslab_recency_scan_skipped_keys_total 2",
+            "teraslab_recency_refresh_spawn_failed_total 1",
+        ] {
+            assert!(
+                text.lines()
+                    .any(|l| l == expected || l.starts_with("# TYPE") && l == expected),
+                "missing metrics line {expected:?}; output:\n{text}"
+            );
+        }
+
+        // Never-scanned: the age gauge is ABSENT (not zero — zero would
+        // read as "scanned just now"), while the totals still emit.
+        let mut never = String::new();
+        append_recency_metrics(&mut never, crate::ops::recency::RecencyScanStats::default());
+        assert!(
+            never.lines().any(|l| l == "teraslab_recency_scan_total 0"),
+            "never-scanned must still emit the zero scan total; output:\n{never}"
+        );
+        assert!(
+            !never.contains("teraslab_recency_scan_last_age_seconds"),
+            "never-scanned must omit the age gauge; output:\n{never}"
         );
     }
 }

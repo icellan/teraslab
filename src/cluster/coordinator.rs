@@ -910,14 +910,30 @@ const EXCHANGE_PHASE_TIMEOUT: Duration = Duration::from_millis(2000);
 /// W9 FIX 1 re-query loop was structurally single-attempt and a starved
 /// responder (pre-W10-FIX-1) could never be re-asked.
 ///
-/// Sizing: an attempt costs at most connect (500 ms) + read (this value),
-/// so the worst first attempt fails by ~1.1 s; the 500 ms
+/// Sizing: an attempt costs at most connect
+/// ([`TOPOLOGY_FRAME_CONNECT_TIMEOUT`], 500 ms) + read (this value), so
+/// the worst first attempt fails by ~1.1 s; the 500 ms
 /// [`EXCHANGE_PEER_RETRY_INTERVAL`] gate (`1.1 s + 0.5 s < 2 s`) then
 /// admits a genuine second attempt with ~400 ms of window left — plenty
 /// for a responder that answers from RAM (W10 FIX 1). Fast failures
 /// (connection refused / instant rejection) fit three or more attempts.
+/// The `≥2 attempts` invariant is pinned by
+/// `exchange_attempt_arithmetic_fits_two_attempts_in_the_window`.
 /// Every OTHER topology frame use keeps the standard 2 s read timeout.
+///
+/// CAVEAT (W10 P2-5) — `set_read_timeout` applies PER READ SYSCALL, and a
+/// frame is read as a length prefix then a body (and the response may
+/// arrive in several chunks), so the timeout resets at each partial read:
+/// a peer DRIBBLING bytes can stretch one attempt to a small multiple of
+/// this value. The sizing above covers the observed failure mode — a
+/// peer that accepts and goes silent (exactly one blocked read) — and a
+/// dribbling peer is still bounded far below the old window-long attempt,
+/// with the exchange's total deadline capping the whole collection.
 const EXCHANGE_REPORT_READ_TIMEOUT: Duration = Duration::from_millis(600);
+
+/// Connect timeout for every topology-protocol frame (single-sourced so
+/// the exchange attempt arithmetic pin reads the real value).
+const TOPOLOGY_FRAME_CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
 
 fn debug_shard_set() -> &'static std::collections::HashSet<u16> {
     static SET: std::sync::OnceLock<std::collections::HashSet<u16>> = std::sync::OnceLock::new();
@@ -4838,10 +4854,25 @@ impl ClusterCoordinator {
                         member_view_size,
                         members.len(),
                     );
+                    // W10 P2-3 — the evidence a det degrade DISCARDS for
+                    // refinement is kept aside for the parked-fence
+                    // RE-SOURCE pass below: source selection reads
+                    // per-candidate evidence out of the view and never
+                    // refines the table, so a partial view is safe there
+                    // (each candidate still individually passes the
+                    // quorum-current gate; missing reporters just stay
+                    // refused/parked). Without this, every AdmitDetOnly
+                    // round handed the re-source pass an EMPTY view, and a
+                    // NodeId(0)-parked fence could stay fenced forever
+                    // under the full-view floor (which makes det degrades
+                    // more common on clusters with one silent member).
+                    let mut det_degrade_evidence_view: Option<
+                        std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>>,
+                    > = None;
                     match admission {
                         ExchangeAdmission::HoldReheal => continue,
                         ExchangeAdmission::AdmitDetOnly => {
-                            partition_view.clear();
+                            det_degrade_evidence_view = Some(std::mem::take(&mut partition_view));
                             degraded_activation_term = Some(term);
                             // W9 FIX 2 — arm the degraded-upgrade retry: the
                             // degrading completion counts as attempt zero, so
@@ -4849,8 +4880,8 @@ impl ClusterCoordinator {
                             // from NOW.
                             degraded_retry = Some((std::time::Instant::now(), 0));
                         }
-                        // Any admitted quorum activation (first, upgrade, or
-                        // re-heal) supersedes a pending det degrade.
+                        // Any admitted full-view activation (first, upgrade,
+                        // or re-heal) supersedes a pending det degrade.
                         ExchangeAdmission::Admit => {
                             degraded_activation_term = None;
                             degraded_retry = None;
@@ -5024,15 +5055,34 @@ impl ClusterCoordinator {
                     // case; gated on the reverse-heal enable and a no-op on an
                     // empty view.
                     if reverse_heal_online {
-                        let queued = trigger_online_reheal(
-                            self_id,
-                            &shard_table,
-                            &migration,
-                            &inbound_bm_event,
-                            &inbound_state_path_event,
-                            &reheal_backoff_event,
-                            &partition_view,
-                        );
+                        // W10 P2-3 — on a det degrade, run the parked-fence
+                        // RE-SOURCE pass against the evidence view the
+                        // degrade discarded for refinement (source
+                        // selection never refines the table — see
+                        // `resource_parked_heal_fences`); the emptied
+                        // `partition_view` below then makes the detection
+                        // pass a no-op, exactly as the degrade intends.
+                        let resourced = match &det_degrade_evidence_view {
+                            Some(evidence) => resource_parked_heal_fences(
+                                self_id,
+                                &shard_table,
+                                &migration,
+                                &inbound_bm_event,
+                                &inbound_state_path_event,
+                                evidence,
+                            ),
+                            None => 0,
+                        };
+                        let queued = resourced
+                            + trigger_online_reheal(
+                                self_id,
+                                &shard_table,
+                                &migration,
+                                &inbound_bm_event,
+                                &inbound_state_path_event,
+                                &reheal_backoff_event,
+                                &partition_view,
+                            );
                         if queued > 0 {
                             tracing::warn!(
                                 queued,
@@ -5522,7 +5572,7 @@ impl ClusterCoordinator {
         RunningCluster {
             self_id,
             self_addr: self.self_addr,
-            engine: engine_for_cluster,
+            engine: Some(engine_for_cluster),
             shard_table: self.shard_table.clone(),
             migration: self.migration.clone(),
             node_addrs: self.node_addrs.clone(),
@@ -6865,13 +6915,32 @@ impl ClusterCoordinator {
             build_self_partition_version_entries(self_id, engine.as_ref(), shard_table, inbound_bm);
         phase.record(self_id, self_entries);
 
-        // Snapshot peer addresses up front.
+        // Snapshot peer addresses up front. W10 P2-4 — a committed member
+        // with NO known address can never be queried, so the FULL member
+        // view (the refinement floor since W10 FIX 3) is unreachable and
+        // every completion this exchange produces will det-degrade / hold.
+        // That is safe but silent; name the member so an operator can tell
+        // "membership not yet learned / member gone" from a healthy slow
+        // peer. Once per exchange, not rate-limited — exchanges are
+        // low-rate (commit + cooldown cadence).
         let peer_addrs: Vec<(NodeId, SocketAddr)> = {
             let addrs = node_addrs.read();
             members
                 .iter()
                 .filter(|n| **n != self_id)
-                .filter_map(|n| addrs.get(n).copied().map(|a| (*n, a)))
+                .filter_map(|n| {
+                    let addr = addrs.get(n).copied();
+                    if addr.is_none() {
+                        tracing::warn!(
+                            member = n.0,
+                            cluster_key,
+                            "cluster: exchange cannot query committed member — no \
+                             known address; the full member view is unreachable \
+                             this round (refinement will degrade/hold)",
+                        );
+                    }
+                    addr.map(|a| (*n, a))
+                })
                 .collect()
         };
 
@@ -7070,7 +7139,6 @@ impl ClusterCoordinator {
         phase.partition_view().clone()
     }
 
-    #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_arguments)]
     fn run_migration_tasks_with_global_limit(
         tasks: Vec<MigrationTask>,
@@ -8532,7 +8600,7 @@ fn send_topology_frame_response_with_read_timeout(
     auth_secret: Option<&[u8]>,
     read_timeout: Duration,
 ) -> Result<ResponseFrame, String> {
-    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_millis(500))
+    let mut stream = TcpStream::connect_timeout(&addr, TOPOLOGY_FRAME_CONNECT_TIMEOUT)
         .map_err(|e| format!("connect: {e}"))?;
     stream
         .set_read_timeout(Some(read_timeout))
@@ -9749,29 +9817,36 @@ fn heal_refusal_warn_due(n: u64) -> bool {
 /// An empty `partition_view` (no exchange data) is a no-op. Returns the number
 /// of shards newly fenced + queued, INCLUDING previously-parked fences resolved
 /// to a concrete source this round.
-fn trigger_online_reheal(
+/// #74 — RE-SOURCE parked no-source heal fences: a shard fenced
+/// fail-closed because heal-source selection REFUSED (no quorum-current
+/// candidate — e.g. the boot heal before the first membership exchange
+/// converged a view) is re-attempted against `partition_view`. A
+/// candidate that has caught up since (replica catch-up streams until
+/// converged) now passes the quorum-current gate and the parked sentinel
+/// resolves to a concrete-source pull the existing requester loop drives.
+/// A shard that stays refused stays parked (fenced fail-closed, Phase-3c
+/// alert-and-hold) — deliberately: when every candidate is permanently
+/// behind, serving one would be the stale-resurrection double-spend #74
+/// guards against.
+///
+/// W10 P2-3 — split out of [`trigger_online_reheal`] so the det-degrade
+/// admission path can ALSO run it against the evidence view refinement
+/// discarded: this pass only SELECTS SOURCES from per-candidate evidence
+/// (each candidate individually passes the quorum-current gate) and never
+/// refines the shard table, so a below-floor / partial view is safe input
+/// here — missing reporters simply leave their shards parked. Returns the
+/// number of parked fences resolved to concrete-source pulls.
+fn resource_parked_heal_fences(
     self_id: NodeId,
     shard_table: &Arc<ShardTableLock<ShardTable>>,
     migration: &Arc<Mutex<MigrationManager>>,
     inbound_atomic: &Arc<crate::cluster::migration::AtomicShardBitmap>,
     inbound_state_path: &Option<std::path::PathBuf>,
-    reheal_backoff: &Arc<Mutex<std::collections::HashMap<u16, u64>>>,
     partition_view: &std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>>,
 ) -> usize {
     if partition_view.is_empty() {
         return 0;
     }
-    // #74 — RE-SOURCE parked no-source heal fences FIRST: a shard fenced
-    // fail-closed because heal-source selection REFUSED (no quorum-current
-    // candidate — e.g. the boot heal before the first membership exchange
-    // converged a view) is re-attempted against THIS round's fresh view. A
-    // candidate that has caught up since (replica catch-up streams until
-    // converged) now passes the quorum-current gate and the parked sentinel
-    // resolves to a concrete-source pull the existing requester loop drives.
-    // A shard that stays refused stays parked (fenced fail-closed, Phase-3c
-    // alert-and-hold) — deliberately: when every candidate is permanently
-    // behind, serving one would be the stale-resurrection double-spend #74
-    // guards against.
     let mut started = 0usize;
     let parked = migration.lock().parked_no_source_heal_shards();
     if !parked.is_empty() {
@@ -9795,6 +9870,31 @@ fn trigger_online_reheal(
             }
         }
     }
+    started
+}
+
+fn trigger_online_reheal(
+    self_id: NodeId,
+    shard_table: &Arc<ShardTableLock<ShardTable>>,
+    migration: &Arc<Mutex<MigrationManager>>,
+    inbound_atomic: &Arc<crate::cluster::migration::AtomicShardBitmap>,
+    inbound_state_path: &Option<std::path::PathBuf>,
+    reheal_backoff: &Arc<Mutex<std::collections::HashMap<u16, u64>>>,
+    partition_view: &std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>>,
+) -> usize {
+    if partition_view.is_empty() {
+        return 0;
+    }
+    // #74 — RE-SOURCE parked no-source heal fences FIRST (see
+    // `resource_parked_heal_fences`).
+    let mut started = resource_parked_heal_fences(
+        self_id,
+        shard_table,
+        migration,
+        inbound_atomic,
+        inbound_state_path,
+        partition_view,
+    );
     // DIRECTION before fencing (the P1 fix). The Tier-2 detector
     // ([`detect_stale_shards_from_view`]) flags on ANY digest mismatch and is
     // deliberately direction-BLIND — a healthy master merely AHEAD of a lagging
@@ -15041,19 +15141,26 @@ pub struct MasterCandidate {
 /// candidate descriptors.
 pub fn elect_master(_shard: u16, candidates: &[MasterCandidate]) -> Option<NodeId> {
     // DO NOT re-add max_generation / any recency signal to this ranking.
-    // Reverted twice (PR #76 / commit 3712018, then finding R4): max_generation
-    // is a LIVE-MOVING per-report value (build_self_partition_version_entries ->
-    // engine.recency_for_keys, computed at each responder's poll instant). The
-    // Task #22 gate (all_candidates_reported) only proves each candidate NODE is
-    // PRESENT in the view — it does NOT prove two electors observed the same
-    // max_generation for a live-writing peer. Any recency comparison between two
-    // equal-score candidates is therefore observer-dependent across the ~2000ms
-    // exchange skew -> two electors elect different masters -> dual-SERVING
-    // master (double-spend). "Subordinate to score" does not help: the hazard is
-    // at the score-tie level, which is exactly where recency would decide. A
+    // Reverted twice (PR #76 / commit 3712018, then finding R4), and the
+    // hazard SURVIVES the W10 FIX 1 recency cache: max_generation is now
+    // served from each responder's cache snapshot
+    // (build_self_partition_version_entries -> Engine::shard_recency_cached),
+    // which still moves between that responder's answers — refreshes
+    // complete at node-local instants on the paced background scan, a
+    // re-query can straddle a publish, and the RECENCY_UNKNOWN window
+    // additionally serves placeholder values two electors can observe
+    // DIFFERENTLY (one queried before the responder's first scan, one
+    // after). The Task #22 gate (all_candidates_reported) only proves each
+    // candidate NODE is PRESENT in the view — it does NOT prove two
+    // electors observed the same recency fields for a peer. Any recency
+    // comparison between two equal-score candidates is therefore
+    // observer-dependent across the exchange skew -> two electors elect
+    // different masters -> dual-SERVING master (double-spend).
+    // "Subordinate to score" does not help: the hazard is at the
+    // score-tie level, which is exactly where recency would decide. A
     // stale/behind elected master is the reactive online re-heal's job
-    // (trigger_online_reheal: fail-closed self-fence, never a second authority),
-    // NOT the election's.
+    // (trigger_online_reheal: fail-closed self-fence, never a second
+    // authority), NOT the election's.
     candidates
         .iter()
         .filter(|c| !c.was_evicted)
@@ -15766,7 +15873,15 @@ pub struct RunningCluster {
     /// dispatch handler (which only holds `&Engine`) can kick the
     /// off-thread shard-recency refresh via
     /// [`RunningCluster::kick_recency_refresh`].
-    engine: Arc<Engine>,
+    ///
+    /// W10 P2-6 — `Option` so the unit-test fixture
+    /// (`new_test_running_cluster`) carries `None` instead of a DECOY
+    /// engine: dispatch tests pass their own engine to the handler, and a
+    /// decoy here would silently absorb refresh kicks a test believed it
+    /// was asserting against. Production (`ClusterCoordinator::start`)
+    /// always sets `Some`; a test that wants to observe kicks attaches a
+    /// real engine via `test_set_engine`.
+    engine: Option<Arc<Engine>>,
     shard_table: Arc<ShardTableLock<ShardTable>>,
     migration: Arc<Mutex<MigrationManager>>,
     node_addrs: Arc<RwLock<std::collections::HashMap<NodeId, SocketAddr>>>,
@@ -18230,14 +18345,26 @@ impl RunningCluster {
     }
 
     /// W10 FIX 1 — kick an off-thread shard-recency refresh if the
-    /// engine's recency cache is stale (no-op otherwise). Called by the
+    /// engine's recency cache is due one (stale + past the P1-1 pacing
+    /// floor; no-op otherwise). Called by the
     /// `OP_PARTITION_VERSION_REPORT` dispatch handler AFTER serving the
     /// cached report, so a queried node's fingerprints converge for the
     /// exchange's next 500 ms re-query without the handler ever scanning
     /// on the request path — including on pure-replica nodes that never
-    /// run an exchange of their own.
+    /// run an exchange of their own. A `None` engine (unit-test fixture,
+    /// P2-6) is a no-op by construction — there is no decoy to absorb the
+    /// kick.
     pub fn kick_recency_refresh(&self) {
-        self.engine.maybe_refresh_shard_recency_cache();
+        if let Some(engine) = &self.engine {
+            engine.maybe_refresh_shard_recency_cache();
+        }
+    }
+
+    /// W10 P2-6, test-only — attach a REAL engine to a fixture-built
+    /// cluster so a test can observe `kick_recency_refresh` against it.
+    #[cfg(test)]
+    pub(crate) fn test_set_engine(&mut self, engine: Arc<Engine>) {
+        self.engine = Some(engine);
     }
 
     /// Shut down the cluster.
@@ -18403,23 +18530,12 @@ pub(crate) fn new_test_running_cluster(
             .iter()
             .find_map(|(node, addr)| (*node == self_id).then_some(*addr))
             .unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], 0))),
-        // W10 FIX 1 — a minimal in-memory engine backing
-        // `kick_recency_refresh`; tests that exercise real engine state
-        // pass their own engine to the dispatch layer separately.
-        engine: {
-            let dev: Arc<dyn crate::device::BlockDevice> = Arc::new(
-                crate::device::MemoryDevice::new(4 * 1024 * 1024, 4096)
-                    .expect("test memory device"),
-            );
-            let alloc = crate::allocator::SlotAllocator::new(dev.clone()).expect("test allocator");
-            Arc::new(Engine::new(
-                dev,
-                crate::index::Index::new(64).expect("test index"),
-                alloc,
-                crate::locks::StripedLocks::new(8),
-                crate::index::DahIndex::new(),
-            ))
-        },
+        // W10 P2-6 — NO decoy engine: `None` makes `kick_recency_refresh`
+        // a structural no-op in fixture-built clusters, so a kick can
+        // never be silently absorbed by an engine no test is looking at.
+        // Tests that assert kick behavior attach a real engine via
+        // `test_set_engine`.
+        engine: None,
         shard_table: Arc::new(ShardTableLock::new(table.clone())),
         migration,
         node_addrs: Arc::new(RwLock::new(node_addrs)),
@@ -29997,6 +30113,99 @@ mod tests {
         );
     }
 
+    /// W10 P2-6 — `kick_recency_refresh` wiring: a fixture cluster with NO
+    /// attached engine is a structural no-op (no decoy to absorb the kick),
+    /// and once a REAL engine is attached the kick drives ITS cache to
+    /// convergence — the property the dispatch handler relies on.
+    #[test]
+    fn kick_recency_refresh_reaches_the_attached_engine_only() {
+        let (mut cluster, shard, _replica) = three_node_cluster_mastering_with_replica();
+        // No engine attached: the kick is a no-op by construction.
+        cluster.kick_recency_refresh();
+
+        let engine = Arc::new(test_engine());
+        create_test_record(&engine, tx_key_for_shard(shard, 1));
+        assert!(engine.recency_cache_is_stale());
+        cluster.test_set_engine(engine.clone());
+        cluster.kick_recency_refresh();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while engine.recency_cache_is_stale() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the kicked refresh must converge the attached engine's cache",
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            engine.shard_recency_cached(shard),
+            engine.shard_recency(shard),
+            "the kick must have refreshed the ATTACHED engine's fingerprints",
+        );
+    }
+
+    /// W10 P2-3 — the parked-fence RE-SOURCE pass must work on a PARTIAL
+    /// (below-refinement-floor) view: the det-degrade admission path hands
+    /// it exactly that shape (the evidence refinement discarded), because
+    /// source selection reads per-candidate evidence and never refines the
+    /// table. Pre-fix the AdmitDetOnly arm cleared the view BEFORE the
+    /// re-source pass ran, so on a cluster with one silent member (where
+    /// det degrades are the common admission under the full-view floor) a
+    /// NodeId(0)-parked fence could stay fenced forever.
+    #[test]
+    fn parked_fence_resources_from_partial_det_degrade_evidence_view() {
+        let (cluster, shard, replica) = three_node_cluster_mastering_with_replica();
+        let key = key_for_shard(shard);
+
+        // Boot parked the shard (selection refused on the empty boot view).
+        cluster.mark_inbound_heal_fence(shard);
+
+        // The det-degrade evidence shape: a PARTIAL view (only one of the
+        // two peers reported — below the full-view refinement floor), but
+        // the reporting candidate is quorum-current for the shard.
+        let mut evidence: std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>> =
+            std::collections::HashMap::new();
+        evidence.insert(
+            replica,
+            vec![PartitionVersionEntry {
+                shard,
+                flags: 0,
+                replica_count: 1,
+                last_applied_seq: 9,
+                manifest_digest: 2,
+                max_generation: 9,
+            }],
+        );
+
+        assert_eq!(
+            resource_parked_heal_fences(
+                NodeId(1),
+                &cluster.shard_table,
+                &cluster.migration,
+                &cluster.inbound_atomic,
+                &cluster.inbound_state_path,
+                &evidence,
+            ),
+            1,
+            "a quorum-current candidate in a PARTIAL evidence view must \
+             resolve the parked fence — partial views are safe input to \
+             source selection (it never refines the table)",
+        );
+        let pending = cluster.migration.lock().pending_inbound_entries();
+        assert!(
+            pending
+                .iter()
+                .any(|(s, from)| *s == shard && *from == replica),
+            "the parked sentinel resolves to a concrete-source pull",
+        );
+        assert!(
+            matches!(
+                cluster.is_master(&key),
+                MasterQueryResult::Transitioning { .. }
+            ),
+            "the shard stays fenced while the resolved pull is in flight",
+        );
+    }
+
     /// #74 F2 — a PARK must have a production driver on a SETTLED cluster:
     /// exchanges are event-driven and every divergence detector reads zero
     /// once the topology converges, so the parked-fence count is folded into
@@ -33613,6 +33822,24 @@ mod tests {
             "a peer whose FIRST connection went silent must still be PRESENT: \
              the per-attempt read timeout must expire well before the exchange \
              window so the 500 ms re-query gets a real second attempt",
+        );
+    }
+
+    /// W10 P2-5 — the pure timeout arithmetic behind FIX 2, pinned so no
+    /// constant can be retuned into a structurally single-attempt exchange
+    /// again: a worst-case first attempt (full connect timeout + full
+    /// frame read timeout) plus one retry-cadence sleep must land STRICTLY
+    /// inside the exchange window, leaving a second real attempt.
+    #[test]
+    fn exchange_attempt_arithmetic_fits_two_attempts_in_the_window() {
+        let worst_attempt = TOPOLOGY_FRAME_CONNECT_TIMEOUT + EXCHANGE_REPORT_READ_TIMEOUT;
+        assert!(
+            worst_attempt + EXCHANGE_PEER_RETRY_INTERVAL < EXCHANGE_PHASE_TIMEOUT,
+            "connect ({TOPOLOGY_FRAME_CONNECT_TIMEOUT:?}) + per-attempt read \
+             ({EXCHANGE_REPORT_READ_TIMEOUT:?}) + retry cadence \
+             ({EXCHANGE_PEER_RETRY_INTERVAL:?}) must fit inside \
+             EXCHANGE_PHASE_TIMEOUT ({EXCHANGE_PHASE_TIMEOUT:?}) so a slow \
+             peer's second attempt fires within the window",
         );
     }
 
