@@ -6746,6 +6746,7 @@ impl ClusterCoordinator {
             &populated_shards,
             &new_table,
             self_id,
+            partition_view,
         );
 
         // Build a set of (shard, from, to, is_master) for the new plan.
@@ -8231,23 +8232,115 @@ fn build_topology_activation_tasks(
     populated_shards: &std::collections::HashSet<u16>,
     new_table: &ShardTable,
     self_id: NodeId,
+    partition_view: &std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>>,
 ) -> Vec<MigrationTask> {
     let mut tasks = new_plan.to_vec();
     tasks.extend(new_replica_plan.iter().cloned());
-    add_local_holder_backfill_tasks(&mut tasks, populated_shards, new_table, self_id);
+    add_local_holder_backfill_tasks(
+        &mut tasks,
+        populated_shards,
+        new_table,
+        self_id,
+        partition_view,
+    );
     tasks
 }
 
+/// W11 FIX 1 — count of local-holder backfill tasks NOT emitted because the
+/// shared partition view proved the destination holder already holds the
+/// shard. Read via [`backfill_tasks_skipped_view_owned_total`] and exported as
+/// `teraslab_backfill_tasks_skipped_view_owned_total`.
+static BACKFILL_TASKS_SKIPPED_VIEW_OWNED_TOTAL: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Number of local-holder backfill tasks elided on view evidence since
+/// process start (W11 FIX 1). A large value on a re-activation is the
+/// intended steady state: it is the whole-store re-stream that used to run on
+/// every same-term repair round.
+pub fn backfill_tasks_skipped_view_owned_total() -> u64 {
+    BACKFILL_TASKS_SKIPPED_VIEW_OWNED_TOTAL.load(Ordering::Relaxed)
+}
+
+/// W11 FIX 1 — is a `self -> holder` backfill of `shard` provably redundant?
+///
+/// `view_by_node_shard` is the flattened partition view
+/// (`(node, shard) -> (last_applied_seq, flags)`); `local_count` is THIS
+/// node's own reported record count for `shard` (the evidence anchor — see
+/// the caller).
+///
+/// The predicate is the [`build_plan_from_partition_view`] `holder_owns_shard`
+/// rule (`seq > 0` AND the [`PARTITION_FLAG_PENDING_INBOUND`] subset bit
+/// clear) STRENGTHENED by the F2 material-lag test: a holder whose count is
+/// less than half of this node's is treated as NOT holding the shard. The
+/// strengthening matters because `last_applied_seq` is a record COUNT, and
+/// this file already records (F2, CI run 31787458246 scenario 09) that
+/// `seq > 0` alone wrongly classifies a node holding ONE record of thousands
+/// as a full holder — precisely the aborted-mid-stream shape a backfill
+/// exists to repair. The `2x` threshold (not `>=`) is the same
+/// skew-stability choice `classify_shard_candidates` makes: peer counts are
+/// sampled at different instants inside the ~2 s exchange window, so a strict
+/// comparison would re-emit the whole store's worth of tasks under any write
+/// load, which is the defect this gate removes.
+///
+/// Absent evidence NEVER skips: a holder missing from the view (or reporting
+/// nothing for the shard) keeps the unconditional pre-W11 behaviour.
+fn holder_backfill_is_redundant(
+    view_by_node_shard: &std::collections::HashMap<(NodeId, u16), (u64, u8)>,
+    holder: NodeId,
+    shard: u16,
+    local_count: u64,
+) -> bool {
+    match view_by_node_shard.get(&(holder, shard)) {
+        Some(&(seq, flags)) => {
+            seq > 0
+                && (flags & PARTITION_FLAG_PENDING_INBOUND) == 0
+                && seq.saturating_mul(2) >= local_count
+        }
+        None => false,
+    }
+}
+
+/// Emit a `self -> holder` stream for every populated shard × every OTHER
+/// holder the new table assigns it to, skipping the pairs the partition view
+/// proves are already satisfied.
+///
+/// # Why the view gate exists (W11 FIX 1)
+///
+/// Without it this function emits one task per populated shard per foreign
+/// holder UNCONDITIONALLY, so every re-activation re-streams the entire local
+/// store regardless of how little the topology actually moved. Measured on CI
+/// run @ 3a38dc2: scenario 07 node1's SECOND activation round carried
+/// `outbound=1921, backfill=1914` against SEVEN cluster-wide master moves,
+/// and streamed exactly as many records as the store holds (3325 of 3325).
+/// Two such waves cannot fit the harness budget, and the write fence they
+/// raise (1209 shards) is charged to client traffic for the duration.
+///
+/// The gate is one-sided by construction: it only ever removes work the view
+/// affirmatively proves is unnecessary. An empty view (exchange skipped,
+/// timed out, or emptied by a det degrade) reduces to the pre-W11 behaviour
+/// exactly, as does any holder or shard the view does not cover.
 fn add_local_holder_backfill_tasks(
     tasks: &mut Vec<MigrationTask>,
     populated_shards: &std::collections::HashSet<u16>,
     new_table: &ShardTable,
     self_id: NodeId,
+    partition_view: &std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>>,
 ) {
     let mut existing: std::collections::HashSet<(u16, NodeId, NodeId)> = tasks
         .iter()
         .map(|t| (t.shard, t.from_node, t.to_node))
         .collect();
+
+    // Flatten the view once: (node, shard) -> (record count, flags).
+    let view_by_node_shard: std::collections::HashMap<(NodeId, u16), (u64, u8)> = partition_view
+        .iter()
+        .flat_map(|(node, entries)| {
+            entries
+                .iter()
+                .map(move |e| ((*node, e.shard), (e.last_applied_seq, e.flags)))
+        })
+        .collect();
+    let mut skipped: u64 = 0;
 
     for &shard in populated_shards {
         let target = new_table.target_assignment(shard);
@@ -8258,8 +8351,22 @@ fn add_local_holder_backfill_tasks(
         holders.sort_by_key(|node| node.0);
         holders.dedup();
 
+        // The evidence anchor: how much THIS node reported for the shard in
+        // the same exchange the holder counts came from. Its absence means the
+        // view predates the shard's population (or this node did not report at
+        // all), so no comparison is possible and nothing may be skipped.
+        let local_count = view_by_node_shard
+            .get(&(self_id, shard))
+            .map(|&(seq, _)| seq);
+
         for holder in holders {
             if holder == self_id {
+                continue;
+            }
+            if let Some(local) = local_count
+                && holder_backfill_is_redundant(&view_by_node_shard, holder, shard, local)
+            {
+                skipped = skipped.saturating_add(1);
                 continue;
             }
             if existing.insert((shard, self_id, holder)) {
@@ -8271,6 +8378,16 @@ fn add_local_holder_backfill_tasks(
                 });
             }
         }
+    }
+
+    if skipped > 0 {
+        BACKFILL_TASKS_SKIPPED_VIEW_OWNED_TOTAL.fetch_add(skipped, Ordering::Relaxed);
+        tracing::debug!(
+            skipped,
+            emitted = tasks.len(),
+            "cluster: local-holder backfill elided — the partition view proves \
+             the holder already holds the shard",
+        );
     }
 }
 
@@ -24031,6 +24148,7 @@ mod tests {
             &populated,
             &new_table,
             NodeId(1),
+            &std::collections::HashMap::new(),
         );
         let mut expected = vec![target.master];
         expected.extend(target.replicas.iter().copied());
@@ -24062,7 +24180,13 @@ mod tests {
         let populated = std::collections::HashSet::from([shard]);
         let mut tasks = Vec::new();
 
-        add_local_holder_backfill_tasks(&mut tasks, &populated, &new_table, NodeId(1));
+        add_local_holder_backfill_tasks(
+            &mut tasks,
+            &populated,
+            &new_table,
+            NodeId(1),
+            &std::collections::HashMap::new(),
+        );
 
         let target = new_table.target_assignment(shard);
         let mut expected = vec![target.master];
@@ -24101,7 +24225,13 @@ mod tests {
         let populated = std::collections::HashSet::from([shard]);
         let mut tasks = Vec::new();
 
-        add_local_holder_backfill_tasks(&mut tasks, &populated, &new_table, NodeId(1));
+        add_local_holder_backfill_tasks(
+            &mut tasks,
+            &populated,
+            &new_table,
+            NodeId(1),
+            &std::collections::HashMap::new(),
+        );
 
         let target = new_table.target_assignment(shard);
         let mut expected = target.replicas.clone();
@@ -24111,6 +24241,154 @@ mod tests {
 
         assert_eq!(actual, expected);
         assert!(tasks.iter().all(|t| !t.is_master));
+    }
+
+    /// W11 FIX 1 test helper — one `PartitionVersionEntry` for `shard`.
+    fn backfill_view_entry(shard: u16, seq: u64, flags: u8) -> Vec<PartitionVersionEntry> {
+        vec![PartitionVersionEntry {
+            shard,
+            flags,
+            replica_count: 1,
+            last_applied_seq: seq,
+            manifest_digest: 0,
+            max_generation: 0,
+        }]
+    }
+
+    /// W11 FIX 1 test helper — 4-member rf=3 table plus a shard node1 masters
+    /// with at least two replicas, so one replica can be view-covered and the
+    /// other left absent in the same run.
+    fn backfill_fixture() -> (ShardTable, u16, NodeId, NodeId) {
+        let new_table =
+            ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2), NodeId(3), NodeId(4)], 3, 11, 1);
+        let shard = (0..NUM_SHARDS as u16)
+            .find(|&s| {
+                let target = new_table.target_assignment(s);
+                target.master == NodeId(1) && target.replicas.len() >= 2
+            })
+            .expect("node1 should master a shard with two replicas at rf=3");
+        let target = new_table.target_assignment(shard);
+        (
+            new_table.clone(),
+            shard,
+            target.replicas[0],
+            target.replicas[1],
+        )
+    }
+
+    /// W11 FIX 1 (CI @ 3a38dc2, scenarios 06/07) — the local-holder backfill
+    /// used to emit a stream for EVERY populated shard × every foreign holder
+    /// with no evidence whatsoever, so each same-term repair round re-streamed
+    /// the whole store (07 node1 round 2: `outbound=1921, backfill=1914`
+    /// against seven cluster-wide master moves; 3325 of 3325 records
+    /// re-streamed). A holder the shared view proves already holds the shard
+    /// must get NO task.
+    #[test]
+    fn local_holder_backfill_skips_a_holder_the_view_proves_already_holds_the_shard() {
+        let (new_table, shard, covered, absent) = backfill_fixture();
+        let populated = std::collections::HashSet::from([shard]);
+
+        // Control: with no view at all the pre-W11 behaviour stands — both
+        // replicas are streamed unconditionally.
+        let mut blind = Vec::new();
+        add_local_holder_backfill_tasks(
+            &mut blind,
+            &populated,
+            &new_table,
+            NodeId(1),
+            &std::collections::HashMap::new(),
+        );
+        let blind_targets: std::collections::HashSet<NodeId> =
+            blind.iter().map(|t| t.to_node).collect();
+        assert!(
+            blind_targets.contains(&covered) && blind_targets.contains(&absent),
+            "an empty view must keep the unconditional backfill (fail-safe)",
+        );
+
+        // Evidence: self and `covered` both report the full shard; `absent`
+        // never reported.
+        let mut view: std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>> =
+            std::collections::HashMap::new();
+        view.insert(NodeId(1), backfill_view_entry(shard, 500, 0));
+        view.insert(covered, backfill_view_entry(shard, 500, 0));
+
+        let mut gated = Vec::new();
+        add_local_holder_backfill_tasks(&mut gated, &populated, &new_table, NodeId(1), &view);
+        let gated_targets: std::collections::HashSet<NodeId> =
+            gated.iter().map(|t| t.to_node).collect();
+        assert!(
+            !gated_targets.contains(&covered),
+            "a holder the view proves already holds the shard must not be re-streamed",
+        );
+        assert!(
+            gated_targets.contains(&absent),
+            "a holder ABSENT from the view carries no evidence and must still be streamed",
+        );
+    }
+
+    /// W11 FIX 1 — the skip is evidence-gated in both directions. A holder
+    /// still receiving an inbound migration (subset bit set), a holder
+    /// materially behind this node's own count (the F2 one-record-of-thousands
+    /// shape), and a shard this node did not itself report all keep the
+    /// unconditional stream.
+    #[test]
+    fn local_holder_backfill_never_skips_on_partial_or_missing_evidence() {
+        let (new_table, shard, covered, _absent) = backfill_fixture();
+        let populated = std::collections::HashSet::from([shard]);
+
+        let run = |view: &std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>>| {
+            let mut tasks = Vec::new();
+            add_local_holder_backfill_tasks(&mut tasks, &populated, &new_table, NodeId(1), view);
+            tasks
+                .iter()
+                .map(|t| t.to_node)
+                .collect::<std::collections::HashSet<NodeId>>()
+        };
+
+        // Subset holder: non-zero count but still receiving inbound data.
+        let mut subset: std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>> =
+            std::collections::HashMap::new();
+        subset.insert(NodeId(1), backfill_view_entry(shard, 500, 0));
+        subset.insert(
+            covered,
+            backfill_view_entry(shard, 500, PARTITION_FLAG_PENDING_INBOUND),
+        );
+        assert!(
+            run(&subset).contains(&covered),
+            "a subset holder (pending inbound) must still receive the backfill",
+        );
+
+        // Materially behind: 1 record against this node's 500 — the exact
+        // aborted-mid-stream shape the backfill exists to repair.
+        let mut behind: std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>> =
+            std::collections::HashMap::new();
+        behind.insert(NodeId(1), backfill_view_entry(shard, 500, 0));
+        behind.insert(covered, backfill_view_entry(shard, 1, 0));
+        assert!(
+            run(&behind).contains(&covered),
+            "a holder materially behind this node must still receive the backfill",
+        );
+
+        // Within the material threshold (250*2 >= 500) is a skew tie: skip.
+        let mut near: std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>> =
+            std::collections::HashMap::new();
+        near.insert(NodeId(1), backfill_view_entry(shard, 500, 0));
+        near.insert(covered, backfill_view_entry(shard, 250, 0));
+        assert!(
+            !run(&near).contains(&covered),
+            "exchange-window skew must not re-arm the whole-store re-stream",
+        );
+
+        // No self report for the shard: no anchor, so no comparison and no
+        // skip, even though the holder looks full.
+        let mut anchorless: std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>> =
+            std::collections::HashMap::new();
+        anchorless.insert(NodeId(1), Vec::new());
+        anchorless.insert(covered, backfill_view_entry(shard, 500, 0));
+        assert!(
+            run(&anchorless).contains(&covered),
+            "without this node's own report there is no anchor to compare against",
+        );
     }
 
     #[test]
