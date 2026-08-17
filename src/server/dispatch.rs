@@ -1550,12 +1550,12 @@ pub(crate) fn handle_request(
             // covers the apply, so a skip is always a deferral, never a wedge.
             let prune_safe_at_cutoff = match (completion_from_node, enumeration_cutoff) {
                 (Some(src), Some(cutoff)) => {
-                    let applied_after_in_memory =
-                        engine.replica_shard_applied_after(src.0, shard, cutoff);
-                    let durable_watermark_after = REPLICA_APPLIED_TRACKER
-                        .get()
-                        .is_some_and(|t| t.get(&format!("node:{}", src.0)) > cutoff);
-                    !applied_after_in_memory && !durable_watermark_after
+                    let stream_key = format!("node:{}", src.0);
+                    prune_safe_at_enumeration_cutoff(
+                        engine.replica_shard_applied_after(src.0, shard, cutoff),
+                        REPLICA_APPLIED_TRACKER.get().map(|t| t.get(&stream_key)),
+                        cutoff,
+                    )
                 }
                 _ => false,
             };
@@ -1577,7 +1577,28 @@ pub(crate) fn handle_request(
                     // accept below still verifies the completion; the
                     // record stays under-replicated until repair restores
                     // the source's copy, but it stays ALIVE.
+                    //
+                    // ACCEPTED RESIDUAL (W10 review P2-2 — documented, not
+                    // fixed here). This exclusion is UNCONDITIONAL for a
+                    // declared key, so it also permanently removes the
+                    // prune's INCIDENTAL cleanup for that key: if this
+                    // node's copy is genuinely stale (the source's weak
+                    // tombstone really did supersede it), nothing on this
+                    // path removes it anymore — it survives until an
+                    // authoritative current-epoch migration or the
+                    // committed-handoff-gated orphan cleanup (#28) reclaims
+                    // it. That is the deliberate bias: never delete a
+                    // possibly-last live copy on a source's own prune
+                    // damage. It COMPOSES with the W9 concern-A residual
+                    // (a delete that finds the record ABSENT records no
+                    // tombstone, so the declaration can never be complete
+                    // for such keys) — together they mean declared-key
+                    // residue is reconciled by repair, not by this prune.
+                    // Metered so the volume is operator-visible.
                     if source_weak_tombstone_keys.contains(&key) {
+                        if let Some(m) = crate::metrics::migration_metrics() {
+                            m.migration_prune_weak_declared_retained.inc();
+                        }
                         continue;
                     }
                     // W9 P1-1 — `delete_prune_replace`, NOT `delete`: this is
@@ -2272,6 +2293,17 @@ pub(crate) fn handle_request(
                     return error_response(request.request_id, ERR_NOT_CLUSTERED, "not clustered");
                 }
             };
+            // W10 review P2-6 — a node with arbitration disarmed neither
+            // initiates NOR honours it, so disabling the flag is a complete
+            // local rollback of the mechanism (its tombstones keep vetoing).
+            if !cluster.weak_veto_arbitration_enabled() {
+                return error_response(
+                    request.request_id,
+                    ERR_INVARIANT_VIOLATION,
+                    "weak-veto arbitration is disabled on this node \
+                     (migration_weak_veto_arbitration_enabled=false)",
+                );
+            }
             let (Some(shard), Some(from_node), Some(migration_epoch), Some(key_count)) = (
                 le_u16_at(&request.payload, 0),
                 le_u64_at(&request.payload, 2),
@@ -5492,6 +5524,67 @@ fn repl_slot_for(addr: SocketAddr) -> std::sync::Arc<Mutex<PerAddrSlot>> {
             }))
         })
         .clone()
+}
+
+/// W10 FIX 1 — may the #29 completion prune run, given the source's
+/// enumeration cutoff?
+///
+/// Three independent proofs, ALL of which must hold:
+///
+///  1. `applied_after_in_memory == false` — this process recorded no tracked
+///     apply from that source to the shard past the cutoff
+///     ([`Engine::replica_shard_applied_after`]).
+///  2. `our_watermark <= cutoff` — the DURABLE per-stream watermark does not
+///     exceed the cutoff. Covers applies that predate this process (the
+///     in-memory tracker starts empty on restart), which the source may not
+///     have learned about before folding.
+///  3. **W10 review P1-1 — STALE-VIEW FAIL-SAFE.** `our_watermark >= cutoff`:
+///     if the source's cutoff sits ABOVE our own current watermark for its
+///     stream, the source's view of us is provably STALE and the prune is
+///     refused.
+///
+/// Leg 3 closes a real data-loss hole in the original two-leg gate, whose
+/// soundness rested on "`last_acked` never exceeds the receiver's watermark".
+/// That premise is FALSE across a receiver watermark REGRESSION:
+/// `send_replica_ops_loop` assigns `*last_acked` only in the exact-match ACK
+/// arm and never lowers it, while `next_sequence` IS relabeled downward (probe
+/// → `through + 1`, desync → `through_sequence + 1`, `Gap` →
+/// `expected_sequence`), and [`crate::replication::durable::ReplicaAppliedTracker::load`]
+/// treats a MISSING file as an empty tracker. So a restore-from-backup, a lost
+/// tracker file, or a rebuilt same-identity node regresses the watermark to
+/// `W` while a long-lived source process still holds `last_acked = L > W`.
+/// The source then stamps `cutoff = L`; a fresh client create for `k` fans
+/// out; the target NAKs `Gap { expected: W + 1 }`; the source relabels DOWN to
+/// `W + 1 <= L` and re-sends; the target applies `k` at `W + 1`. Both of the
+/// original legs read `<= cutoff` and the prune would delete that live, acked
+/// copy — re-arming the entire armed-05 chain (PruneReplace gen-0 tombstone →
+/// vetoed heals → re-baselined peers → zero holders).
+///
+/// Leg 3 is strictly stronger than sender-side bookkeeping hygiene: it catches
+/// EVERY regression source, including ones no sender can observe (an operator
+/// restoring the target from a backup, a wiped state directory). A refused
+/// prune is only ever a deferral — the retained extras fail the retryable
+/// count check and the source re-folds against a fresh, non-stale cutoff.
+///
+/// `our_watermark == None` (no durable tracker configured — the test-harness /
+/// untracked path) leaves legs 2 and 3 unprovable; the historical behavior is
+/// preserved by falling back to leg 1 alone, which is exactly the pre-W10
+/// posture for such deployments.
+fn prune_safe_at_enumeration_cutoff(
+    applied_after_in_memory: bool,
+    our_watermark: Option<u64>,
+    cutoff: u64,
+) -> bool {
+    if applied_after_in_memory {
+        return false;
+    }
+    match our_watermark {
+        // Leg 2 (watermark past the cutoff → an apply the fold may have
+        // missed) and leg 3 (watermark BELOW the cutoff → the source's view of
+        // us regressed / is stale) collapse to a single equality requirement.
+        Some(watermark) => watermark == cutoff,
+        None => true,
+    }
 }
 
 /// W10 FIX 1 — this node's `last_acked` view of `addr`'s per-stream applied
@@ -28120,6 +28213,104 @@ mod tests {
         assert_eq!(resp.status, STATUS_OK, "the strand converges");
     }
 
+    /// W10 review P2-6 — the target half of the ops rollback: with the flag
+    /// disarmed, a node REFUSES an otherwise fully-proven arbitration and its
+    /// weak tombstone keeps vetoing. Together with
+    /// `escalation_flag_off_weak_veto_is_not_arbitrated` (the source half)
+    /// this pins the flag as a complete local disable of the mechanism.
+    #[test]
+    fn weak_veto_arbitration_refused_when_flag_disarmed() {
+        let h = DispatchTestHarness::new();
+        let epoch = 49u64;
+        let members = vec![
+            crate::cluster::shards::NodeId(1),
+            crate::cluster::shards::NodeId(2),
+        ];
+        let table = crate::cluster::shards::ShardTable::compute_with_epoch(&members, 1, epoch, 1);
+        let shard = (0..crate::cluster::shards::NUM_SHARDS as u16)
+            .find(|s| table.target_assignment(*s).master == crate::cluster::shards::NodeId(1))
+            .expect("some shard is mastered by node 1");
+        let key_k = TxKey {
+            txid: txid_for_shard(shard, 7),
+        };
+        let tomb_log = crate::ops::tombstone::TombstoneLog::new(
+            std::path::PathBuf::from("/nonexistent/w10-arbitration-flagoff.tombstones"),
+            h.engine.index_seed(),
+            h.engine.index_shard_count(),
+            10_000,
+        );
+        tomb_log.record(
+            &key_k,
+            0,
+            900,
+            crate::ops::tombstone::TombstoneCause::PruneReplace,
+        );
+        h.engine.set_tombstone_log(tomb_log);
+
+        let cluster = crate::cluster::coordinator::new_test_running_cluster(
+            crate::cluster::shards::NodeId(2),
+            table,
+            &[
+                (
+                    crate::cluster::shards::NodeId(1),
+                    "127.0.0.1:4788".parse().unwrap(),
+                ),
+                (
+                    crate::cluster::shards::NodeId(2),
+                    "127.0.0.1:4789".parse().unwrap(),
+                ),
+            ],
+            &members,
+            &[shard],
+            &[],
+            &[],
+            2,
+        );
+        // Every other proof is present — only the flag is off.
+        cluster.register_inbound_source(shard, crate::cluster::shards::NodeId(1));
+        cluster.set_test_weak_veto_arbitration_enabled(false);
+
+        let payload = crate::cluster::coordinator::encode_weak_veto_arbitration_payload(
+            shard,
+            crate::cluster::shards::NodeId(1),
+            epoch,
+            &[key_k],
+        );
+        let req = RequestFrame {
+            request_id: shard as u64,
+            op_code: OP_MIGRATION_WEAK_VETO_ARBITRATE,
+            flags: 0,
+            payload: payload.into(),
+        };
+        let mut cs = crate::server::ConnectionState::new();
+        let resp = handle_request(&req, &h.engine, 8192, Some(&cluster), None, &mut cs, None);
+        assert_ne!(resp.status, STATUS_OK, "disarmed node refuses arbitration");
+        assert_eq!(
+            h.engine.tombstone_cause(&key_k),
+            Some(crate::ops::tombstone::TombstoneCause::PruneReplace),
+            "the weak tombstone is untouched while the flag is off",
+        );
+
+        // Re-arming (the shipped default) makes the same request succeed —
+        // proving the refusal was the flag, not a missing proof.
+        cluster.set_test_weak_veto_arbitration_enabled(true);
+        let payload = crate::cluster::coordinator::encode_weak_veto_arbitration_payload(
+            shard,
+            crate::cluster::shards::NodeId(1),
+            epoch,
+            &[key_k],
+        );
+        let req = RequestFrame {
+            request_id: shard as u64,
+            op_code: OP_MIGRATION_WEAK_VETO_ARBITRATE,
+            flags: 0,
+            payload: payload.into(),
+        };
+        let resp = handle_request(&req, &h.engine, 8192, Some(&cluster), None, &mut cs, None);
+        assert_eq!(resp.status, STATUS_OK);
+        assert_eq!(h.engine.tombstone_cause(&key_k), None);
+    }
+
     /// W10 FIX 2 — the arbitration verification matrix: a ClientDelete veto
     /// is NEVER arbitrable, and a request missing any of the three
     /// authority/fence/epoch proofs is refused untouched.
@@ -28278,6 +28469,136 @@ mod tests {
             Some(crate::ops::tombstone::TombstoneCause::PruneReplace),
             "the weak tombstone is untouched without the fence proof",
         );
+    }
+
+    /// W10 review P1-1 (red pin) — the receiver-watermark REGRESSION shape.
+    ///
+    /// The original two-leg gate rested on "`last_acked` never exceeds the
+    /// receiver's watermark". That premise breaks across a regression: the
+    /// sender assigns `last_acked` only in the exact-match ACK arm and never
+    /// lowers it, while `next_sequence` IS relabeled downward on `Gap`, and a
+    /// MISSING applied-tracker file loads as an EMPTY tracker (restore from
+    /// backup / lost state dir / rebuilt same-identity node).
+    ///
+    /// Sequence reproduced here: the target's watermark regresses to `W` while
+    /// the long-lived source still holds `last_acked = L > W`; the source
+    /// stamps `cutoff = L`; a fresh client create for `k` fans out; the target
+    /// NAKs `Gap { expected: W + 1 }`; the source relabels DOWN to `W + 1 <= L`
+    /// and re-sends; the target applies `k` at `W + 1`. Both original legs read
+    /// `<= cutoff`, so the prune would delete that LIVE, ACKED copy and re-arm
+    /// the whole armed-05 chain.
+    ///
+    /// The test drives the relabeled apply through the REAL receiver path
+    /// (proving leg 1 — the in-memory high-water — does NOT catch it, because
+    /// the apply landed BELOW the cutoff) and then pins the REAL gate function
+    /// the handler calls: with the stale-view leg it refuses, without it (the
+    /// two legs alone) it would have permitted the deletion.
+    #[test]
+    fn prune_refused_when_source_cutoff_is_above_our_regressed_watermark() {
+        let h = DispatchTestHarness::new();
+        let shard = 45u16;
+        let txid_a = txid_for_shard(shard, 7);
+        let txid_k = txid_for_shard(shard, 8);
+        assert_eq!(h.create_tx(txid_a, 1).status, STATUS_OK);
+        let key_k = TxKey { txid: txid_k };
+
+        // The target's durable watermark for the source's stream regressed to
+        // W (e.g. restored from backup / tracker file lost); the source's
+        // process still holds last_acked = L, far ahead.
+        const W: u64 = 4;
+        const L: u64 = 900;
+
+        let epoch = 49u64;
+        let members = vec![crate::cluster::shards::NodeId(1)];
+        let table = crate::cluster::shards::ShardTable::compute_with_epoch(&members, 1, epoch, 1);
+        let cluster = crate::cluster::coordinator::new_test_running_cluster(
+            crate::cluster::shards::NodeId(1),
+            table,
+            &[(
+                crate::cluster::shards::NodeId(1),
+                "127.0.0.1:4778".parse().unwrap(),
+            )],
+            &members,
+            &[shard],
+            &[],
+            &[],
+            1,
+        );
+
+        // The Gap-relabelled re-send: the create for k is applied at W + 1,
+        // BELOW the source's stale cutoff L, through the REAL tracked
+        // replica-batch path.
+        let batch = ReplicaBatch {
+            first_sequence: W + 1,
+            ops: vec![ReplicaOp::Create {
+                tx_key: key_k,
+                metadata_bytes: vec![0; 64],
+                utxo_hashes: vec![[0xAA; 32]],
+                cold_data: None,
+                is_external: false,
+            }],
+            trace_ctx: None,
+            source_node_id: Some(1),
+            cluster_key: cluster.local_cluster_key(),
+        };
+        let req = RequestFrame {
+            request_id: W + 1,
+            op_code: OP_REPLICA_BATCH,
+            flags: 0,
+            payload: batch.serialize().into(),
+        };
+        let mut cs = crate::server::ConnectionState::new();
+        let resp = handle_request(&req, &h.engine, 8192, Some(&cluster), None, &mut cs, None);
+        assert_eq!(resp.status, STATUS_OK, "the relabeled acked create applies");
+        assert!(h.engine.read_metadata(&key_k).is_ok());
+
+        // Leg 1 (in-memory high-water) does NOT catch it: the apply landed at
+        // W + 1, strictly BELOW the stale cutoff L.
+        let applied_after = h.engine.replica_shard_applied_after(1, shard, L);
+        assert!(
+            !applied_after,
+            "the relabeled apply sits below the stale cutoff, so the in-memory \
+             high-water alone cannot prove it postdates the fold",
+        );
+
+        // The REAL gate the handler calls. With our watermark regressed to W
+        // and the source claiming a cutoff of L > W, its view of us is
+        // provably stale → the prune must be REFUSED.
+        assert!(
+            !prune_safe_at_enumeration_cutoff(applied_after, Some(W), L),
+            "a cutoff above our own watermark proves the source's view of us \
+             is stale — pruning would delete the live acked copy (P1-1)",
+        );
+        // Pre-fix control: the two original legs (apply-after + watermark >
+        // cutoff) both read false here, i.e. they would have PERMITTED the
+        // deletion. This is the exact regression the stale-view leg closes.
+        let two_leg_verdict = !applied_after && !(W > L);
+        assert!(
+            two_leg_verdict,
+            "pre-fix control: the original two-leg gate permitted the prune",
+        );
+    }
+
+    /// W10 review P1-1 — the gate's full truth table, including the legs that
+    /// must NOT change: an equal watermark permits the prune (the steady state,
+    /// since the stream key is per-source), a watermark ABOVE the cutoff
+    /// refuses (an apply the fold may have missed), an in-memory apply past the
+    /// cutoff refuses regardless, and an absent durable tracker falls back to
+    /// leg 1 alone (the historical untracked-deployment posture).
+    #[test]
+    fn prune_gate_truth_table() {
+        // Steady state: our watermark exactly matches the source's view.
+        assert!(prune_safe_at_enumeration_cutoff(false, Some(10), 10));
+        // Leg 2 — we applied past what the source knew when it folded.
+        assert!(!prune_safe_at_enumeration_cutoff(false, Some(11), 10));
+        // Leg 3 — the source's view of us is ahead of reality (regression).
+        assert!(!prune_safe_at_enumeration_cutoff(false, Some(9), 10));
+        // Leg 1 dominates: an in-memory apply past the cutoff always refuses.
+        assert!(!prune_safe_at_enumeration_cutoff(true, Some(10), 10));
+        assert!(!prune_safe_at_enumeration_cutoff(true, None, 10));
+        // No durable tracker: leg 1 alone (historical posture).
+        assert!(prune_safe_at_enumeration_cutoff(false, None, 10));
+        assert!(prune_safe_at_enumeration_cutoff(false, None, 0));
     }
 
     /// W10 FIX 1 companion (liveness) — a completion whose cutoff COVERS every

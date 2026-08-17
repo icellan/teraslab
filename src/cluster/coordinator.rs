@@ -919,6 +919,22 @@ fn revalidate_settled_members(
         })
         .collect();
     if filtered.is_empty() {
+        // W10 review P2-5 — the never-propose-an-empty-cluster fallback. Not
+        // reachable in practice (self is retained unconditionally and a
+        // proposal always contains self), but if it ever fires the proposer
+        // is shipping a set it just judged entirely dead/departed — an
+        // operator must see that rather than have it pass silently.
+        if let Some(m) = crate::metrics::migration_metrics() {
+            m.topology_proposal_revalidation_emptied.inc();
+        }
+        tracing::warn!(
+            settled = settled.len(),
+            departed = departed_during_burst.len(),
+            "cluster: propose-time re-validation would have emptied the member \
+             set — falling back to the settled set unchanged (never propose an \
+             empty cluster). Every member reads dead-or-departed; investigate \
+             SWIM state.",
+        );
         settled
     } else {
         filtered
@@ -2527,6 +2543,11 @@ pub struct ClusterConfig {
     /// `MigrationManager` so the migration batch path reads it without
     /// signature plumbing.
     pub migration_vetoed_reduction_enabled: bool,
+
+    /// W10 review P2-6 — arm weak-veto ARBITRATION (default ON; see
+    /// `Config::migration_weak_veto_arbitration_enabled` for the rationale
+    /// and the never-arbitrable ClientDelete/Dah carve-out).
+    pub migration_weak_veto_arbitration_enabled: bool,
     pub probe_interval: Duration,
     pub suspicion_timeout: Duration,
     /// Shared secret for HMAC authentication of SWIM and inter-node traffic.
@@ -2778,6 +2799,9 @@ impl ClusterCoordinator {
                 // migration batch path (a free fn with no config access)
                 // reads it lock-local at the escalation site.
                 mgr.set_vetoed_reduction_enabled(config.migration_vetoed_reduction_enabled);
+                mgr.set_weak_veto_arbitration_enabled(
+                    config.migration_weak_veto_arbitration_enabled,
+                );
                 // W9 Part B — same carrier pattern for the replica-abort
                 // forced-resync arming (read at the terminal-abort site).
                 mgr.set_replica_abort_forced_resync_enabled(
@@ -10939,14 +10963,22 @@ fn run_migration_batch(
                         // (possibly reduced) manifest.
                         let enumeration_cutoff =
                             crate::server::dispatch::replication_stream_cutoff_for(addr);
-                        // W10 FIX 3 — declare THIS node's weak-tombstone keys
-                        // for the shard alongside the manifest, so the target
-                        // never treats their omission as deletion-intent
-                        // (they are omissions caused by our own local
-                        // reconcile/rollback markers, and the target's copy
-                        // may be the last live one).
-                        let weak_tombstone_keys =
-                            engine.weak_tombstone_keys_for_shard(task.shard);
+                        // W10 FIX 3 — every completion send declares THIS
+                        // node's weak-tombstone keys for the shard, so the
+                        // target never treats their omission as
+                        // deletion-intent (they are omissions caused by our
+                        // own local reconcile/rollback markers, and the
+                        // target's copy may be the last live one).
+                        //
+                        // W10 review P2-1 — the declaration is captured FRESH
+                        // at each `send_migration_complete` (see the call
+                        // sites), never snapshotted once before the fold: a
+                        // weak tombstone recorded DURING the escalation (our
+                        // own compensation or #29 prune landing mid-round)
+                        // would be missing from a stale snapshot, and the
+                        // target could then prune the very key it names. The
+                        // capture is a cheap read off the weak accelerator
+                        // (`TombstoneLog::weak_keys`, review P2-3).
                         let manifest_entries = match collect_manifest_entries(&engine, task.shard, &fenced_keys) {
                             Ok(e) => e,
                             Err(e) => {
@@ -10985,7 +11017,7 @@ fn run_migration_batch(
                             true,
                             auth_secret,
                             enumeration_cutoff,
-                            &weak_tombstone_keys,
+                            &engine.weak_tombstone_keys_for_shard(task.shard),
                         );
                         if let Err(e) = verify_result {
                             tracing::warn!(shard = task.shard, err = %e, "cluster: shard completion rejected");
@@ -11019,11 +11051,17 @@ fn run_migration_batch(
                             // on the shared manager.
                             let vetoed_reduction_enabled =
                                 migration.lock().vetoed_reduction_enabled();
+                            // W10 review P2-6 — arbitration is armed by config
+                            // (default ON); disarmed, a weak-cause veto keeps
+                            // the pre-W10 disposition.
+                            let weak_veto_arbitration_enabled =
+                                migration.lock().weak_veto_arbitration_enabled();
                             let escalation = escalate_missing_exact_keys(
                                 e,
                                 &manifest_entries,
                                 MAX_EXACT_KEY_ESCALATIONS,
                                 vetoed_reduction_enabled,
+                                weak_veto_arbitration_enabled,
                                 |action| match action {
                                     EscalationAction::Repush(missing) => {
                                         tracing::info!(
@@ -11070,7 +11108,7 @@ fn run_migration_batch(
                                                     true,
                                                     auth_secret,
                                                     enumeration_cutoff,
-                                                    &weak_tombstone_keys,
+                                                    &engine.weak_tombstone_keys_for_shard(task.shard),
                                                 )
                                             },
                                         );
@@ -11121,7 +11159,7 @@ fn run_migration_batch(
                                                     true,
                                                     auth_secret,
                                                     enumeration_cutoff,
-                                                    &weak_tombstone_keys,
+                                                    &engine.weak_tombstone_keys_for_shard(task.shard),
                                                 )
                                             },
                                         );
@@ -11236,7 +11274,7 @@ fn run_migration_batch(
                                                     true,
                                                     auth_secret,
                                                     enumeration_cutoff,
-                                                    &weak_tombstone_keys,
+                                                    &engine.weak_tombstone_keys_for_shard(task.shard),
                                                 )
                                             },
                                         )
@@ -11359,8 +11397,6 @@ fn run_migration_batch(
                                                 // manifest only).
                                                 let fresh_cutoff =
                                                     crate::server::dispatch::replication_stream_cutoff_for(addr);
-                                                let fresh_weak_keys = engine
-                                                    .weak_tombstone_keys_for_shard(task.shard);
                                                 let mut fresh = collect_manifest_entries(
                                                     &engine,
                                                     task.shard,
@@ -11392,7 +11428,7 @@ fn run_migration_batch(
                                                     true,
                                                     auth_secret,
                                                     fresh_cutoff,
-                                                    &fresh_weak_keys,
+                                                    &engine.weak_tombstone_keys_for_shard(task.shard),
                                                 )
                                                 .map_err(EscalationAttemptError::Completion)
                                             },
@@ -12465,6 +12501,7 @@ fn escalate_missing_exact_keys(
     manifest_entries: &[(TxKey, u32)],
     max_attempts: usize,
     vetoed_reduction_enabled: bool,
+    weak_veto_arbitration_enabled: bool,
     mut attempt: impl FnMut(EscalationAction<'_>) -> std::result::Result<(), EscalationAttemptError>,
 ) -> ExactKeyEscalation {
     let mut last_err = initial_err;
@@ -12519,6 +12556,21 @@ fn escalate_missing_exact_keys(
                     | Some(crate::ops::tombstone::TombstoneCause::CompensatedCreate)
             );
             if weak_cause {
+                // W10 review P2-6 — disarmed: keep the pre-W10 disposition
+                // (refuse; the historical fail/rollback path owns it). The
+                // veto NAMING and every safety gate stay active regardless.
+                if !weak_veto_arbitration_enabled {
+                    tracing::warn!(
+                        key = ?key,
+                        tombstone_generation = tomb_gen,
+                        cause = ?cause,
+                        "cluster: weak-cause veto and arbitration is DISABLED \
+                         (migration_weak_veto_arbitration_enabled=false) — \
+                         refusing; the task fails through the historical path \
+                         and the shard stays under-replicated",
+                    );
+                    continue;
+                }
                 arbitrate_now.push(key);
                 continue;
             }
@@ -16838,10 +16890,28 @@ impl RunningCluster {
     /// this node hold ANY active (uncompleted) inbound entry for `shard`
     /// sourced from `from_node` (forward migration or reverse-heal)? See
     /// [`crate::cluster::migration::MigrationManager::has_pending_inbound_from_source`].
+    /// W10 review P2-6 — is weak-veto arbitration armed on this node? The
+    /// `OP_MIGRATION_WEAK_VETO_ARBITRATE` handler consults it so a disabled
+    /// node neither initiates NOR honours an arbitration (a complete local
+    /// rollback of the mechanism).
+    pub fn weak_veto_arbitration_enabled(&self) -> bool {
+        self.migration.lock().weak_veto_arbitration_enabled()
+    }
+
     pub fn has_pending_inbound_from_source(&self, shard: u16, from_node: NodeId) -> bool {
         self.migration
             .lock()
             .has_pending_inbound_from_source(shard, from_node)
+    }
+
+    /// W10 review P2-6 — disarm/arm weak-veto arbitration on a test cluster
+    /// so the target-side handler gate can be driven without a full config
+    /// round-trip (production wires it once at coordinator construction).
+    #[cfg(test)]
+    pub(crate) fn set_test_weak_veto_arbitration_enabled(&self, enabled: bool) {
+        self.migration
+            .lock()
+            .set_weak_veto_arbitration_enabled(enabled);
     }
 
     #[cfg(test)]
@@ -27053,7 +27123,7 @@ mod tests {
             tk(2),
         );
         let mut pushed: Vec<Vec<TxKey>> = Vec::new();
-        let outcome = escalate_missing_exact_keys(initial, &manifest, 3, true, |action| {
+        let outcome = escalate_missing_exact_keys(initial, &manifest, 3, true, true, |action| {
             let EscalationAction::Repush(missing) = action else {
                 panic!("this shape must re-push, not reduce: {action:?}");
             };
@@ -27078,14 +27148,15 @@ mod tests {
             tk(2),
         );
         let mut attempts = 0usize;
-        let outcome = escalate_missing_exact_keys(reject.clone(), &manifest, 3, true, |action| {
-            let EscalationAction::Repush(missing) = action else {
-                panic!("this shape must re-push, not reduce: {action:?}");
-            };
-            attempts += 1;
-            assert_eq!(missing, [tk(2)]);
-            Err(EscalationAttemptError::Completion(reject.clone()))
-        });
+        let outcome =
+            escalate_missing_exact_keys(reject.clone(), &manifest, 3, true, true, |action| {
+                let EscalationAction::Repush(missing) = action else {
+                    panic!("this shape must re-push, not reduce: {action:?}");
+                };
+                attempts += 1;
+                assert_eq!(missing, [tk(2)]);
+                Err(EscalationAttemptError::Completion(reject.clone()))
+            });
         assert_eq!(attempts, 3, "escalation must stop at the attempt bound");
         match outcome {
             ExactKeyEscalation::Exhausted { last_err } => {
@@ -27109,7 +27180,7 @@ mod tests {
             tk(2),
         );
         let mut attempts = 0usize;
-        let outcome = escalate_missing_exact_keys(initial, &manifest, 3, true, |action| {
+        let outcome = escalate_missing_exact_keys(initial, &manifest, 3, true, true, |action| {
             let EscalationAction::Repush(missing) = action else {
                 panic!("this shape must re-push, not reduce: {action:?}");
             };
@@ -27146,10 +27217,11 @@ mod tests {
                    expected 5, got 9)"
             .to_string();
         let mut called = false;
-        let outcome = escalate_missing_exact_keys(err.clone(), &manifest, 3, true, |_action| {
-            called = true;
-            Ok(())
-        });
+        let outcome =
+            escalate_missing_exact_keys(err.clone(), &manifest, 3, true, true, |_action| {
+                called = true;
+                Ok(())
+            });
         assert_eq!(outcome, ExactKeyEscalation::NotExactKey { last_err: err });
         assert!(
             !called,
@@ -27168,7 +27240,7 @@ mod tests {
             tk(2),
         );
         let mut attempts = 0usize;
-        let outcome = escalate_missing_exact_keys(initial, &manifest, 3, true, |_action| {
+        let outcome = escalate_missing_exact_keys(initial, &manifest, 3, true, true, |_action| {
             attempts += 1;
             Err(EscalationAttemptError::Completion(
                 "target rejected: status 4 (code=37: target not on epoch)".to_string(),
@@ -27273,7 +27345,7 @@ mod tests {
         let mut reduced = manifest.clone();
         let mut hash = compute_manifest_for_entries(&reduced);
         let mut completions: Vec<Vec<(TxKey, u32)>> = Vec::new();
-        let outcome = escalate_missing_exact_keys(initial, &manifest, 3, true, |action| {
+        let outcome = escalate_missing_exact_keys(initial, &manifest, 3, true, true, |action| {
             let EscalationAction::Repush(missing) = action else {
                 panic!("this shape must re-push, not reduce: {action:?}");
             };
@@ -27322,7 +27394,7 @@ mod tests {
         let mut hash = compute_manifest_for_entries(&reduced);
         let mut attempts = 0usize;
         let mut completion_sent = false;
-        let outcome = escalate_missing_exact_keys(initial, &manifest, 3, true, |action| {
+        let outcome = escalate_missing_exact_keys(initial, &manifest, 3, true, true, |action| {
             let EscalationAction::Repush(missing) = action else {
                 panic!("this shape must re-push, not reduce: {action:?}");
             };
@@ -27463,7 +27535,7 @@ mod tests {
         let mut repushes = 0usize;
         let mut completions: Vec<Vec<(TxKey, u32)>> = Vec::new();
         let outcome =
-            escalate_missing_exact_keys(initial, &manifest, 3, true, |action| match action {
+            escalate_missing_exact_keys(initial, &manifest, 3, true, true, |action| match action {
                 EscalationAction::Repush(_) => {
                     repushes += 1;
                     Ok(())
@@ -27507,10 +27579,11 @@ mod tests {
         let manifest = vec![(tk(2), 7u32)];
         let initial = vetoed_reject(tk(2), 3); // tombstone BEHIND gen 7: unsound
         let mut called = false;
-        let outcome = escalate_missing_exact_keys(initial.clone(), &manifest, 3, true, |_action| {
-            called = true;
-            Ok(())
-        });
+        let outcome =
+            escalate_missing_exact_keys(initial.clone(), &manifest, 3, true, true, |_action| {
+                called = true;
+                Ok(())
+            });
         assert_eq!(
             outcome,
             ExactKeyEscalation::NotExactKey { last_err: initial }
@@ -27533,7 +27606,7 @@ mod tests {
         let mut hash = compute_manifest_for_entries(&reduced);
         let mut completion_sent = false;
         let outcome =
-            escalate_missing_exact_keys(initial, &manifest, 3, true, |action| match action {
+            escalate_missing_exact_keys(initial, &manifest, 3, true, true, |action| match action {
                 EscalationAction::Repush(_) => panic!("a veto must never be re-pushed"),
                 EscalationAction::ArbitrateWeakVeto(_) => {
                     panic!("a strong-cause veto must never arbitrate")
@@ -27574,7 +27647,7 @@ mod tests {
         let initial = vetoed_reject(tk(2), 9); // sound veto — would reduce if armed
         let mut called = false;
         let outcome =
-            escalate_missing_exact_keys(initial.clone(), &manifest, 3, false, |_action| {
+            escalate_missing_exact_keys(initial.clone(), &manifest, 3, false, true, |_action| {
                 called = true;
                 Ok(())
             });
@@ -27612,7 +27685,7 @@ mod tests {
             let initial = vetoed_reject_cause(tk(2), 9, cause);
             let mut arbitrated: Vec<TxKey> = Vec::new();
             let outcome =
-                escalate_missing_exact_keys(initial.clone(), &manifest, 3, true, |action| {
+                escalate_missing_exact_keys(initial.clone(), &manifest, 3, true, true, |action| {
                     match action {
                         EscalationAction::ArbitrateWeakVeto(keys) => {
                             arbitrated.extend_from_slice(keys);
@@ -27636,6 +27709,37 @@ mod tests {
         }
     }
 
+    /// W10 review P2-6 — with arbitration DISARMED, a weak-cause veto takes
+    /// the pre-W10 disposition: no arbitration, no reduction, no re-push —
+    /// the historical fail/rollback path (NotExactKey) owns it. Proves the
+    /// flag is a real ops rollback of the source half.
+    #[test]
+    fn escalation_flag_off_weak_veto_is_not_arbitrated() {
+        for cause in ["CompensatedCreate", "PruneReplace"] {
+            let manifest = vec![(tk(1), 3u32), (tk(2), 7u32)];
+            let initial = vetoed_reject_cause(tk(2), 9, cause);
+            let mut called = false;
+            let outcome = escalate_missing_exact_keys(
+                initial.clone(),
+                &manifest,
+                3,
+                true,
+                /* weak_veto_arbitration_enabled */ false,
+                |action| {
+                    called = true;
+                    panic!("cause={cause}: arbitration is disarmed; no action may run: {action:?}");
+                },
+            );
+            assert!(!called, "cause={cause}: the attempt closure must not run");
+            match outcome {
+                ExactKeyEscalation::NotExactKey { last_err } => {
+                    assert_eq!(last_err, initial);
+                }
+                other => panic!("cause={cause}: expected NotExactKey, got {other:?}"),
+            }
+        }
+    }
+
     /// W10 FIX 2 — an UNKNOWN tombstone cause keeps the W9 fail-closed
     /// refusal: neither reduced nor arbitrated nor re-pushed; the escalation
     /// falls through to the historical path (NotExactKey — abort/rollback,
@@ -27645,10 +27749,11 @@ mod tests {
         let manifest = vec![(tk(1), 3u32), (tk(2), 7u32)];
         let initial = vetoed_reject_cause(tk(2), 9, "SomeFutureCause");
         let mut called = false;
-        let outcome = escalate_missing_exact_keys(initial.clone(), &manifest, 3, true, |action| {
-            called = true;
-            panic!("no action may run for an unknown-cause veto: {action:?}");
-        });
+        let outcome =
+            escalate_missing_exact_keys(initial.clone(), &manifest, 3, true, true, |action| {
+                called = true;
+                panic!("no action may run for an unknown-cause veto: {action:?}");
+            });
         assert!(!called, "the attempt closure must not run");
         match outcome {
             ExactKeyEscalation::NotExactKey { last_err } => {
@@ -27670,7 +27775,7 @@ mod tests {
         let manifest = vec![(tk(2), 7u32)];
         let initial = vetoed_reject_cause(tk(2), 9, "PruneReplace");
         let mut rounds = 0usize;
-        let outcome = escalate_missing_exact_keys(initial, &manifest, 3, true, |action| {
+        let outcome = escalate_missing_exact_keys(initial, &manifest, 3, true, true, |action| {
             let EscalationAction::ArbitrateWeakVeto(_) = action else {
                 panic!("only arbitration may run: {action:?}");
             };
@@ -27701,7 +27806,7 @@ mod tests {
         let manifest: Vec<(TxKey, u32)> = (1..=6).map(|i| (tk(i), 3u32)).collect();
         let initial = vetoed_reject_cause(tk(1), 9, "PruneReplace");
         let mut rounds = 0usize;
-        let outcome = escalate_missing_exact_keys(initial, &manifest, 3, true, |action| {
+        let outcome = escalate_missing_exact_keys(initial, &manifest, 3, true, true, |action| {
             let EscalationAction::ArbitrateWeakVeto(_) = action else {
                 panic!("only arbitration may run: {action:?}");
             };
@@ -27836,7 +27941,7 @@ mod tests {
         let mut reduced = manifest.clone();
         let mut hash = compute_manifest_for_entries(&reduced);
         let mut rounds = 0usize;
-        let outcome = escalate_missing_exact_keys(initial, &manifest, 3, true, |action| {
+        let outcome = escalate_missing_exact_keys(initial, &manifest, 3, true, true, |action| {
             let EscalationAction::ReduceVetoed(vetoed) = action else {
                 panic!("a veto must never be re-pushed: {action:?}");
             };
@@ -27879,7 +27984,7 @@ mod tests {
         let mut hash = compute_manifest_for_entries(&reduced);
         let mut actions: Vec<String> = Vec::new();
         let outcome =
-            escalate_missing_exact_keys(initial, &manifest, 3, true, |action| match action {
+            escalate_missing_exact_keys(initial, &manifest, 3, true, true, |action| match action {
                 EscalationAction::ArbitrateWeakVeto(_) => {
                     panic!("a strong-cause veto must never arbitrate")
                 }

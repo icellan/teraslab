@@ -243,6 +243,7 @@ fn spawn_proxied_server(
         under_replication_sweep_enabled: true,
         replica_abort_forced_resync_enabled: true,
         migration_vetoed_reduction_enabled: false,
+        migration_weak_veto_arbitration_enabled: true,
         probe_interval: Duration::from_millis(100),
         suspicion_timeout: Duration::from_secs(2),
         cluster_secret: Some(CLUSTER_SECRET.as_bytes().to_vec()),

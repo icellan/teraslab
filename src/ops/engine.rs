@@ -637,6 +637,28 @@ pub struct PreservationExpiry {
 /// dangerous apply always comes from the SAME source that sent the
 /// completion, in the same sequence domain as its cutoff.
 ///
+/// # W10 review P2-4 — the cross-source premise this gate DEPENDS ON
+///
+/// "The dangerous apply always comes from the same source that sent the
+/// completion" is not self-evident: it holds only because a SUPERSEDED
+/// master's fan-out cannot reach this node's engine in the first place. The
+/// receiver's cluster-key / epoch gate
+/// (`replication::receiver::handle_replica_batch_with_tracker_and_master_lookup`,
+/// the `batch.cluster_key == 0 && local_cluster_key != 0` rejection and the
+/// serving-master lookup beside it) rejects a stale-epoch or misrouted batch
+/// with `ERR_STALE_EPOCH` BEFORE any op applies — so a deposed master can
+/// neither apply a record here nor bump this tracker under its own key while
+/// the current master's completion is in flight.
+///
+/// If that gate is ever LOOSENED (a wildcard cluster-key accepted in
+/// clustered mode, a stale-epoch batch admitted "just to converge"), this
+/// per-source keying silently stops being sufficient: writes from node X
+/// could land while node Y's completion is verified, and Y's cutoff says
+/// nothing about X's applies. The prune gate would then need a
+/// cross-source guard (e.g. refuse whenever ANY source applied to the shard
+/// past its own last-known position). Do not relax that gate without
+/// revisiting this.
+///
 /// Each per-source array is lazily created on first apply, initialized to the
 /// stream's persisted watermark at that moment so applies that predate this
 /// process (already folded into the watermark) are conservatively treated as

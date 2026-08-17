@@ -657,6 +657,11 @@ pub struct MigrationManager {
     /// Set once at coordinator construction; carried here so the batch
     /// migration path reads it without signature plumbing. Never persisted.
     vetoed_reduction_enabled: bool,
+    /// W10 review P2-6 — whether weak-veto ARBITRATION is armed on this node
+    /// (see `Config` `migration_weak_veto_arbitration_enabled`; default ON).
+    /// Set once at coordinator construction; gates both the source-side
+    /// escalation and the target-side handler. Never persisted.
+    weak_veto_arbitration_enabled: bool,
     /// GAP 1 (armed scenario 06) — per-shard streak of CONSECUTIVE code-22
     /// "manifest hash mismatch (count matched)" completion rejections, keyed
     /// by the rejected manifest's hash. Lives on the manager (not the batch
@@ -688,6 +693,7 @@ impl MigrationManager {
             replica_abort_forced_resync_enabled: true,
             failed_retry_hold: false,
             vetoed_reduction_enabled: false,
+            weak_veto_arbitration_enabled: true,
             manifest_mismatch_streaks: std::collections::HashMap::new(),
         }
     }
@@ -762,6 +768,19 @@ impl MigrationManager {
     /// armed ([`Self::set_vetoed_reduction_enabled`]).
     pub fn vetoed_reduction_enabled(&self) -> bool {
         self.vetoed_reduction_enabled
+    }
+
+    /// W10 review P2-6 — arm/disarm weak-veto arbitration on this node
+    /// (default ON; set once at coordinator construction from
+    /// `migration_weak_veto_arbitration_enabled`).
+    pub fn set_weak_veto_arbitration_enabled(&mut self, enabled: bool) {
+        self.weak_veto_arbitration_enabled = enabled;
+    }
+
+    /// W10 review P2-6 — whether weak-veto arbitration is armed
+    /// ([`Self::set_weak_veto_arbitration_enabled`]).
+    pub fn weak_veto_arbitration_enabled(&self) -> bool {
+        self.weak_veto_arbitration_enabled
     }
 
     /// W8 — record that a migration batch finished with failed tasks at a

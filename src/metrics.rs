@@ -1432,6 +1432,19 @@ pub struct MigrationMetrics {
     /// consensus-relevant override of a local anti-resurrection marker, so it
     /// stays operator-visible.
     pub migration_weak_veto_arbitrations: PaddedCounter,
+    /// W10 review P2-2 — local keys the #29 completion prune RETAINED because
+    /// the source declared them as its own WEAK-tombstone omissions (FIX 3).
+    /// Each exclusion is a deliberate refusal to delete on the source's
+    /// omission; it also means the prune's incidental cleanup of a genuinely
+    /// stale local copy of that key no longer happens here (see the residual
+    /// documented at the exclusion site), so the count is the operator's
+    /// visibility into how much residue is being deferred to repair.
+    pub migration_prune_weak_declared_retained: PaddedCounter,
+    /// W10 review P2-5 — times propose-time member re-validation would have
+    /// emptied the settled set and fell back to it unchanged. Expected to
+    /// stay ZERO (self is retained unconditionally); a non-zero value means
+    /// the proposer judged every member dead-or-departed.
+    pub topology_proposal_revalidation_emptied: PaddedCounter,
     /// GAP 2 (armed scenario 17) — gauge: non-owned shards the LAST orphan-
     /// cleanup pass RETAINED because the #28 committed-handoff evidence is
     /// missing (fail-closed: without positive evidence the data is safe
@@ -1510,6 +1523,8 @@ impl MigrationMetrics {
             replica_abort_forced_resyncs: PaddedCounter::new(),
             migration_completion_manifest_reduced_vetoed: PaddedCounter::new(),
             migration_weak_veto_arbitrations: PaddedCounter::new(),
+            migration_prune_weak_declared_retained: PaddedCounter::new(),
+            topology_proposal_revalidation_emptied: PaddedCounter::new(),
             orphan_cleanup_retained_no_evidence: AtomicU32::new(0),
         }
     }

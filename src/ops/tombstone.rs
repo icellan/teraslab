@@ -260,6 +260,25 @@ pub struct TombstoneLog {
     shard_count: usize,
     retention_blocks: u32,
     shards: Vec<RwLock<HashMap<TxKey, TombValue>>>,
+    /// W10 review P2-3 — secondary index over the WEAK-cause entries
+    /// (`PruneReplace` / `CompensatedCreate`) only.
+    ///
+    /// [`Self::weak_tombstone_keys`] is read once per completion SEND (W10
+    /// review P2-1 requires a FRESH capture per attempt, not a stale
+    /// pre-fold snapshot), so it must not cost a full scan of every live
+    /// tombstone. Weak entries are a small subset — local reconcile /
+    /// rollback markers, not the client-delete population — so this set is
+    /// typically tiny and the per-send read is O(weak) instead of O(all live
+    /// tombstones).
+    ///
+    /// Maintained in lockstep with `shards` by EVERY mutation path
+    /// ([`Self::record`], [`Self::clear`], [`Self::clear_weak`],
+    /// [`Self::gc`], [`Self::reconcile_against_live`], and the [`Self::load`]
+    /// replay). It is a pure accelerator: `shards` remains the authority, and
+    /// [`Self::weak_tombstone_keys`] re-verifies each candidate's cause
+    /// against `shards` before returning it, so a stale entry here can only
+    /// cost a wasted lookup — never a wrong answer.
+    weak_keys: RwLock<std::collections::HashSet<TxKey>>,
     file: Mutex<FileState>,
     /// Test-only deterministic seam for the P1 compaction-window race repro: a
     /// `(key, generation, height, cause)` injected as a `record()` INSIDE
@@ -286,6 +305,7 @@ impl TombstoneLog {
             shard_count,
             retention_blocks,
             shards,
+            weak_keys: RwLock::new(std::collections::HashSet::new()),
             file: Mutex::new(FileState {
                 pending: Vec::new(),
                 needs_compaction: false,
@@ -337,6 +357,14 @@ impl TombstoneLog {
                 Ok((key, value)) => {
                     let idx = shard_for_key(log.seed, &key, log.shard_count);
                     log.shards[idx].write().insert(key, value);
+                    // P2-3: keep the weak accelerator in step with the
+                    // replay (append order = time order, so the LAST entry
+                    // for a re-deleted key decides its membership).
+                    if is_weak_cause(value.cause) {
+                        log.weak_keys.write().insert(key);
+                    } else {
+                        log.weak_keys.write().remove(&key);
+                    }
                 }
                 Err(e) => {
                     skipped += 1;
@@ -415,6 +443,14 @@ impl TombstoneLog {
                 return;
             }
             shard.insert(*key, value);
+        }
+        // P2-3: a weak cause joins the accelerator; a STRONG cause that
+        // last-writer-wins over a weak one must LEAVE it (the strong claim now
+        // governs, and a stale weak entry would be re-declared to peers).
+        if weak {
+            self.weak_keys.write().insert(*key);
+        } else {
+            self.weak_keys.write().remove(key);
         }
         self.file.lock().pending.push((*key, value));
     }
@@ -621,17 +657,20 @@ impl TombstoneLog {
     /// population is bounded by deletes within the retention horizon, and
     /// the caller filters to one cluster shard.
     pub fn weak_tombstone_keys(&self) -> Vec<TxKey> {
-        let mut out = Vec::new();
-        for shard in &self.shards {
-            for (k, v) in shard.read().iter() {
-                if v.cause == TombstoneCause::PruneReplace as u8
-                    || v.cause == TombstoneCause::CompensatedCreate as u8
-                {
-                    out.push(*k);
-                }
-            }
-        }
-        out
+        // W10 review P2-3 — read the weak ACCELERATOR (small), then re-verify
+        // each candidate's cause against `shards` (the authority). A stale
+        // accelerator entry therefore costs one wasted lookup and is dropped
+        // from the result, never mis-declared to a peer.
+        let candidates: Vec<TxKey> = self.weak_keys.read().iter().copied().collect();
+        candidates
+            .into_iter()
+            .filter(|k| {
+                self.shards[self.shard_index(k)]
+                    .read()
+                    .get(k)
+                    .is_some_and(|v| is_weak_cause(v.cause))
+            })
+            .collect()
     }
 
     /// Total live tombstone count across all shards.
@@ -665,12 +704,27 @@ impl TombstoneLog {
     pub fn gc(&self, last_durable_height: u32, is_protected: impl Fn(&TxKey) -> bool) -> usize {
         let retention = self.retention_blocks;
         let mut dropped = 0usize;
+        // P2-3: collect the weak keys this pass removes so the accelerator
+        // cannot retain entries whose tombstone is gone.
+        let mut dropped_weak: Vec<TxKey> = Vec::new();
         for shard in &self.shards {
             let mut g = shard.write();
             let before = g.len();
             // Drop only when BOTH past retention AND not heal-protected.
-            g.retain(|k, v| !expired(v.height, retention, last_durable_height) || is_protected(k));
+            g.retain(|k, v| {
+                let keep = !expired(v.height, retention, last_durable_height) || is_protected(k);
+                if !keep && is_weak_cause(v.cause) {
+                    dropped_weak.push(*k);
+                }
+                keep
+            });
             dropped += before - g.len();
+        }
+        if !dropped_weak.is_empty() {
+            let mut weak = self.weak_keys.write();
+            for k in &dropped_weak {
+                weak.remove(k);
+            }
         }
         if dropped > 0 {
             self.file.lock().needs_compaction = true;
@@ -685,11 +739,24 @@ impl TombstoneLog {
     /// removed.
     pub fn reconcile_against_live<F: Fn(&TxKey) -> bool>(&self, is_live: F) -> usize {
         let mut dropped = 0usize;
+        let mut dropped_weak: Vec<TxKey> = Vec::new();
         for shard in &self.shards {
             let mut g = shard.write();
             let before = g.len();
-            g.retain(|k, _| !is_live(k));
+            g.retain(|k, v| {
+                let keep = !is_live(k);
+                if !keep && is_weak_cause(v.cause) {
+                    dropped_weak.push(*k);
+                }
+                keep
+            });
             dropped += before - g.len();
+        }
+        if !dropped_weak.is_empty() {
+            let mut weak = self.weak_keys.write();
+            for k in &dropped_weak {
+                weak.remove(k);
+            }
         }
         if dropped > 0 {
             self.file.lock().needs_compaction = true;
@@ -715,6 +782,7 @@ impl TombstoneLog {
             .remove(key)
             .is_some();
         if removed {
+            self.weak_keys.write().remove(key);
             let mut fs = self.file.lock();
             fs.pending.retain(|(pk, _)| pk != key);
             fs.needs_compaction = true;
@@ -759,6 +827,7 @@ impl TombstoneLog {
                 Some(_) => return WeakTombstoneClear::RefusedStrongCause,
             }
         }
+        self.weak_keys.write().remove(key);
         // Drain the un-persisted append exactly as `clear` does, so a later
         // compaction cannot re-append the cleared tombstone (Invariant TS-1).
         let mut fs = self.file.lock();
@@ -898,6 +967,13 @@ impl TombstoneLog {
         }
         Ok(())
     }
+}
+
+/// W10 review P2-3 — is this stored cause byte one of the WEAK
+/// (generation-overridable, locally-produced) markers? Unrecognized bytes are
+/// NOT weak (fail-closed, matching [`TombstoneLog::blocks_heal_apply`]).
+fn is_weak_cause(cause: u8) -> bool {
+    cause == TombstoneCause::PruneReplace as u8 || cause == TombstoneCause::CompensatedCreate as u8
 }
 
 /// A tombstone at `height` is expired once `height + retention <= floor`.
@@ -1145,6 +1221,96 @@ mod tests {
         assert!(
             reloaded.lookup(&tk(1)).is_none(),
             "a cleared tombstone must not be re-appended by compaction",
+        );
+    }
+
+    /// W10 review P2-3 — the weak-key accelerator must stay in lockstep with
+    /// the authoritative shard maps across EVERY mutation path, so a
+    /// per-send `weak_tombstone_keys()` capture is both cheap and exact:
+    /// record (weak in / strong-upgrade out), clear, clear_weak, gc,
+    /// reconcile_against_live, and the on-disk load replay.
+    #[test]
+    fn weak_key_index_tracks_every_mutation_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.tombstones");
+        let sorted = |mut v: Vec<TxKey>| {
+            v.sort_by_key(|k| k.txid);
+            v
+        };
+
+        let log = TombstoneLog::new(path.clone(), 0, 4, 10);
+        // record: weak entries join, strong ones do not.
+        log.record(&tk(1), 0, 100, TombstoneCause::PruneReplace);
+        log.record(&tk(2), 0, 100, TombstoneCause::CompensatedCreate);
+        log.record(&tk(3), 5, 100, TombstoneCause::ClientDelete);
+        assert_eq!(
+            sorted(log.weak_tombstone_keys()),
+            sorted(vec![tk(1), tk(2)]),
+            "weak causes are indexed, strong ones are not",
+        );
+
+        // record: a STRONG cause that LWW-upgrades a weak one must leave the
+        // index (the strong claim governs; re-declaring it would be wrong).
+        log.record(&tk(1), 7, 100, TombstoneCause::ClientDelete);
+        assert_eq!(
+            sorted(log.weak_tombstone_keys()),
+            vec![tk(2)],
+            "a strong upgrade removes the key from the weak set",
+        );
+        assert_eq!(
+            log.lookup_cause(&tk(1)),
+            Some(TombstoneCause::ClientDelete),
+            "and the authority records the upgrade",
+        );
+
+        // clear_weak on a weak key drops it; on a strong key it is refused
+        // and the index is unchanged.
+        log.record(&tk(4), 0, 100, TombstoneCause::PruneReplace);
+        assert_eq!(log.clear_weak(&tk(4)), WeakTombstoneClear::Cleared);
+        assert_eq!(
+            log.clear_weak(&tk(1)),
+            WeakTombstoneClear::RefusedStrongCause
+        );
+        assert_eq!(sorted(log.weak_tombstone_keys()), vec![tk(2)]);
+
+        // clear() drops a weak entry from the index too.
+        log.record(&tk(5), 0, 100, TombstoneCause::CompensatedCreate);
+        assert!(log.clear(&tk(5)));
+        assert_eq!(sorted(log.weak_tombstone_keys()), vec![tk(2)]);
+
+        // gc(): a weak entry dropped past retention leaves the index.
+        log.record(&tk(6), 0, 100, TombstoneCause::PruneReplace);
+        assert_eq!(
+            sorted(log.weak_tombstone_keys()),
+            sorted(vec![tk(2), tk(6)])
+        );
+        assert!(log.gc(200, |_| false) >= 1);
+        assert!(
+            log.weak_tombstone_keys().is_empty(),
+            "GC'd weak entries must not linger in the accelerator",
+        );
+
+        // reconcile_against_live(): a weak entry whose key came back LIVE
+        // leaves the index (Invariant TS-1).
+        log.record(&tk(7), 0, 900, TombstoneCause::PruneReplace);
+        assert_eq!(sorted(log.weak_tombstone_keys()), vec![tk(7)]);
+        assert_eq!(log.reconcile_against_live(|k| *k == tk(7)), 1);
+        assert!(log.weak_tombstone_keys().is_empty());
+
+        // load(): the replay rebuilds the index from disk, and the LAST
+        // entry for a re-deleted key decides membership.
+        let fresh = TombstoneLog::new(path.clone(), 0, 4, 10_000);
+        fresh.record(&tk(8), 0, 900, TombstoneCause::PruneReplace);
+        fresh.record(&tk(9), 0, 900, TombstoneCause::PruneReplace);
+        // tk(9) is later upgraded to a strong cause — the replay must honour
+        // the newest entry and keep it OUT of the weak set.
+        fresh.record(&tk(9), 4, 900, TombstoneCause::ClientDelete);
+        fresh.persist(0, |_| false).unwrap();
+        let reloaded = TombstoneLog::load(path, 0, 4, 10_000).unwrap();
+        assert_eq!(
+            sorted(reloaded.weak_tombstone_keys()),
+            vec![tk(8)],
+            "the load replay rebuilds the weak index with last-writer-wins",
         );
     }
 
