@@ -80,6 +80,20 @@ pub(crate) struct ConnPool {
     robin: AtomicU64,
     /// Whether the pool has been closed.
     closed: AtomicBool,
+    /// W11 FIX 4 — whether the LAST dial attempt to `addr` failed.
+    ///
+    /// Set by every dial site (`create_conn` and the health loop's
+    /// replenish) and cleared by the next successful one, so it reads as
+    /// "this node is currently unreachable, and we know because we tried".
+    /// Shared with the health task so a node that comes back clears the flag
+    /// on the next health tick even while no request is routed to it.
+    ///
+    /// The cluster router consults this ONLY for a node the partition map
+    /// advertises dead ([`crate::cluster::Cluster::pool_for_shard`]): an
+    /// advertised-dead master is usually just SUSPECT and perfectly
+    /// reachable, so observed unreachability — not the advertised flag — is
+    /// what licenses refusing to route to it.
+    dial_failing: Arc<AtomicBool>,
     /// Handle to the background health check task.
     _health_task: JoinHandle<()>,
     /// Channel to signal the health task to stop.
@@ -95,12 +109,21 @@ impl ConnPool {
         let (close_tx, close_rx) = tokio::sync::watch::channel(false);
 
         let conns: Arc<Mutex<Vec<Arc<PipeConn>>>> = Arc::new(Mutex::new(Vec::new()));
+        let dial_failing = Arc::new(AtomicBool::new(false));
         let health_conns = Arc::clone(&conns);
+        let health_failing = Arc::clone(&dial_failing);
         let health_addr = addr.clone();
         let health_config = config.clone();
 
         let health_task = tokio::spawn(async move {
-            health_loop(health_addr, health_config, health_conns, close_rx).await;
+            health_loop(
+                health_addr,
+                health_config,
+                health_conns,
+                health_failing,
+                close_rx,
+            )
+            .await;
         });
 
         Self {
@@ -109,6 +132,7 @@ impl ConnPool {
             conns,
             robin: AtomicU64::new(0),
             closed: AtomicBool::new(false),
+            dial_failing,
             _health_task: health_task,
             close_tx,
         }
@@ -132,6 +156,15 @@ impl ConnPool {
     /// The per-request round-trip timeout configured for this pool.
     pub fn request_timeout(&self) -> std::time::Duration {
         self.config.request_timeout
+    }
+
+    /// W11 FIX 4 — whether the most recent dial to this pool's address
+    /// FAILED (and no dial has succeeded since).
+    ///
+    /// `false` before the first dial: absence of proof is not proof of
+    /// unreachability, so a fresh pool is always given one chance.
+    pub fn dial_failing(&self) -> bool {
+        self.dial_failing.load(Ordering::Acquire)
     }
 
     /// Get a healthy connection from the pool, creating one if needed.
@@ -182,14 +215,16 @@ impl ConnPool {
             }
         }
 
-        let c = Arc::new(
-            PipeConn::dial(
-                &self.addr,
-                self.config.dial_timeout,
-                self.config.request_timeout,
-            )
-            .await?,
-        );
+        let dialed = PipeConn::dial(
+            &self.addr,
+            self.config.dial_timeout,
+            self.config.request_timeout,
+        )
+        .await;
+        // W11 FIX 4 — record the outcome before propagating it, so the
+        // cluster router can stop re-dialling a node proven unreachable.
+        self.dial_failing.store(dialed.is_err(), Ordering::Release);
+        let c = Arc::new(dialed?);
 
         {
             let mut conns = self.conns.lock();
@@ -222,6 +257,7 @@ async fn health_loop(
     addr: String,
     config: PoolConfig,
     conns: Arc<Mutex<Vec<Arc<PipeConn>>>>,
+    dial_failing: Arc<AtomicBool>,
     mut close_rx: tokio::sync::watch::Receiver<bool>,
 ) {
     let mut interval = tokio::time::interval(config.health_check);
@@ -229,7 +265,7 @@ async fn health_loop(
     loop {
         tokio::select! {
             _ = interval.tick() => {
-                check_health(&addr, &config, &conns).await;
+                check_health(&addr, &config, &conns, &dial_failing).await;
             }
             _ = close_rx.changed() => {
                 return;
@@ -245,7 +281,12 @@ async fn health_loop(
 /// surface those, each live connection is probed with an `OP_PING` round-trip
 /// (matching the Go pool's `checkHealth`); a failed ping or non-OK status
 /// marks the connection dead and it is dropped.
-async fn check_health(addr: &str, config: &PoolConfig, conns: &Arc<Mutex<Vec<Arc<PipeConn>>>>) {
+async fn check_health(
+    addr: &str,
+    config: &PoolConfig,
+    conns: &Arc<Mutex<Vec<Arc<PipeConn>>>>,
+    dial_failing: &Arc<AtomicBool>,
+) {
     // Snapshot connections so the ping round-trips happen without holding the
     // pool lock.
     let snapshot: Vec<Arc<PipeConn>> = {
@@ -282,13 +323,23 @@ async fn check_health(addr: &str, config: &PoolConfig, conns: &Arc<Mutex<Vec<Arc
     };
 
     // Replenish to min_conns.
+    //
+    // W11 FIX 4 — this loop is what CLEARS a `dial_failing` node that has
+    // come back: the cluster router refuses to route to a proven-unreachable
+    // dead-advertised master, so no request-path dial would ever retry it.
+    // A zero deficit means the pool is healthy and the flag already reads
+    // false, so leaving it untouched is correct.
     for _ in 0..deficit {
         match PipeConn::dial(addr, config.dial_timeout, config.request_timeout).await {
             Ok(c) => {
+                dial_failing.store(false, Ordering::Release);
                 let mut guard = conns.lock();
                 guard.push(Arc::new(c));
             }
-            Err(_) => break,
+            Err(_) => {
+                dial_failing.store(true, Ordering::Release);
+                break;
+            }
         }
     }
 }
