@@ -856,6 +856,9 @@ pub async fn wait_migrations_complete(
     // poll sees it right, re-armed when the agreed version moves. See
     // `divergence_fail_due` and the check below the node loop.
     let mut divergent_since: Option<(std::time::Instant, u64)> = None;
+    // Retained divergence verdict for the timeout dump (diagnostic only —
+    // see the demotion note at the check site).
+    let mut divergence_note: Option<String> = None;
     loop {
         let mut all_idle = true;
         let mut total_masters: u64 = 0;
@@ -950,16 +953,31 @@ pub async fn wait_migrations_complete(
                 divergent.is_some(),
                 Duration::from_secs(5),
             ) {
+                // DIAGNOSTIC ONLY — never an early bail. Run 32010681108
+                // proved persistent same-version wrong sums occur inside
+                // legitimately-converging windows: the degraded-term
+                // UPGRADE re-activates at the SAME version (its 2s-backoff
+                // + 2s-exchange rescue sits exactly at this 5s bound), and
+                // live handoff waves keep per-node targets disagreeing for
+                // longer still — the early bail killed five scenarios
+                // including durably-green 11. The verdict is retained and
+                // stamped onto the timeout error below, so a genuinely
+                // wedged divergence is still named instead of reading as
+                // slow migration.
                 let sum = divergent.unwrap_or(0);
                 let wrong_for = divergent_since
                     .map(|(since, _)| since.elapsed().as_secs_f64())
                     .unwrap_or(0.0);
-                return Err(ClientError::Connection(format!(
-                    "DIVERGENT TARGET TABLES: targets sum to {sum} != 4096 at agreed \
-                     shard_table_version {agreed_version} (wrong for {wrong_for:.1}s across \
-                     consecutive polls) [{}]",
-                    node_details.join(", ")
-                )));
+                divergence_note = Some(format!(
+                    " [DIVERGENT TARGET TABLES: targets sum to {sum} != 4096 at agreed \
+                     shard_table_version {agreed_version}, wrong for {wrong_for:.1}s across \
+                     consecutive polls]"
+                ));
+            } else if divergent.is_none() {
+                // A correct sum at an agreed version clears any stale note:
+                // the timeout dump must only name divergence that was live
+                // in the final observed state.
+                divergence_note = None;
             }
         }
         let activation_reason = shard_activation_gate_reason(&shard_views, node_count);
@@ -1028,9 +1046,10 @@ pub async fn wait_migrations_complete(
             // so a gate held ONLY by an unactivated table names the nodes
             // holding it instead of leaving `masters=4096` looking settled.
             return Err(ClientError::Connection(format!(
-                "migrations still active after {timeout:?} [masters={total_masters}/4096, handoffs={total_pending_handoffs}, inbound={total_inbound_pending}, activation={}] [{}]{overlap_detail}",
+                "migrations still active after {timeout:?} [masters={total_masters}/4096, handoffs={total_pending_handoffs}, inbound={total_inbound_pending}, activation={}] [{}]{overlap_detail}{}",
                 activation_reason.as_deref().unwrap_or("ok"),
-                node_details.join(", ")
+                node_details.join(", "),
+                divergence_note.as_deref().unwrap_or("")
             )));
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
