@@ -4571,6 +4571,26 @@ impl ClusterCoordinator {
                             // helper's doc). A refused upgrade leaves the
                             // marker set — the det-table residual applies.
                             //
+                            // W9 P1-1 — an upgrade may only re-activate a
+                            // term that is STILL the committed topology
+                            // (same rule as the same-term re-heal): a retry
+                            // completion for a superseded term would
+                            // activate without a committed assignment and
+                            // fall into per-node refinement.
+                            if !duplicate_completion_upgrade_applicable(
+                                term,
+                                topo_authority_event.committed_term(),
+                                &members,
+                                &topo_authority_event.committed_members(),
+                            ) {
+                                tracing::debug!(
+                                    term,
+                                    committed_term = topo_authority_event.committed_term(),
+                                    "cluster: dropping stale duplicate exchange \
+                                     completion — topology moved past its term",
+                                );
+                                continue;
+                            }
                             // W9 FIX 3 — the det plan whose launch is still
                             // HELD (grace window) has no workers: its tasks
                             // are registered but the launch closure is
@@ -7524,6 +7544,29 @@ fn degraded_term_upgrade_admissible(
     no_active_migrations
         && degraded_activation_term == Some(term)
         && member_view_reaches_quorum(member_view_size, member_count)
+}
+
+/// W9 P1-1 — gate for considering an already-activated term's completion
+/// as a det-degrade UPGRADE: applicable only while the completion's term
+/// and member set still match the CURRENT committed topology — the
+/// identical rule the same-term re-heal applies
+/// ([`same_term_reheal_applicable`], which this delegates to).
+///
+/// Without it, a retry completion for degraded term T landing after T+1
+/// committed passes `topology_commit_already_activated` (the last
+/// activated term is still T) and the upgrade gate, and re-activates T:
+/// `committed_assignment_for_activation` returns `None` (the authority
+/// moved to T+1), so the activation falls into per-node
+/// `apply_master_election` refinement — the divergent-refinement path the
+/// det degrade exists to avoid — while overwriting the retained exchange
+/// view and arming event-repair under a stale term.
+fn duplicate_completion_upgrade_applicable(
+    view_term: u64,
+    committed_term: u64,
+    view_members: &[NodeId],
+    committed_members: &[NodeId],
+) -> bool {
+    same_term_reheal_applicable(view_term, committed_term, view_members, committed_members)
 }
 
 /// W9 FIX 2 — interval between retry exchanges for a det-degraded
@@ -32702,6 +32745,42 @@ mod tests {
         assert!(
             !degraded_upgrade_retry_due(Some(6), 7, Duration::from_secs(60), 0),
             "a new committed term must stop the stale term's retry",
+        );
+    }
+
+    /// W9 P1-1 — a retry completion for degraded term T that lands AFTER
+    /// T+1 committed still passes `topology_commit_already_activated`
+    /// (last_activated_term is still T), so without its own applicability
+    /// gate the upgrade path would re-activate T: the authority is at T+1,
+    /// `committed_assignment_for_activation` returns None, and the
+    /// activation falls into per-node election refinement — the divergent
+    /// path the det degrade exists to avoid — while clobbering the
+    /// retained view and arming event-repair under a stale term. The
+    /// upgrade branch must apply the SAME current-topology rule as the
+    /// same-term re-heal.
+    #[test]
+    fn stale_term_upgrade_completion_is_dropped() {
+        let members = vec![NodeId(1), NodeId(2)];
+        // The rescue shape: completion term matches the committed topology.
+        assert!(
+            duplicate_completion_upgrade_applicable(5, 5, &members, &members),
+            "a completion for the still-committed term may be considered as an upgrade",
+        );
+        // A newer term committed while the retry exchange was in flight:
+        // the completion is STALE and must be dropped, never upgraded.
+        assert!(
+            !duplicate_completion_upgrade_applicable(5, 6, &members, &members),
+            "a completion for a superseded term must be dropped before the upgrade gate",
+        );
+        // Same term but the committed member set moved.
+        assert!(
+            !duplicate_completion_upgrade_applicable(
+                5,
+                5,
+                &members,
+                &[NodeId(1), NodeId(2), NodeId(3)],
+            ),
+            "a completion whose member set no longer matches the committed set must be dropped",
         );
     }
 
