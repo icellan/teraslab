@@ -1309,38 +1309,94 @@ impl Drop for TopologyCatchUpGuard {
     }
 }
 
-/// Scenario 09 (quiesce revert) — the catch-up thread's re-proposal fallback,
-/// behind a commit-freshness re-check.
+/// Scenario 09 (quiesce revert) / W11 FIX 1 (scenario 07 total read outage) —
+/// the catch-up thread's re-proposal fallback, behind a commit-freshness
+/// re-check AND a hard never-widen constraint on the member set.
 ///
 /// The fallback exists for the genuinely-stale case: the catch-up was
 /// triggered by `remote_term`, no peer handed over the newer committed
 /// topology, and proposing a fresh term is the only remaining way to converge
 /// (the proposal collects votes from peers that already committed the higher
-/// term). Its membership comes from the ADDRESS BOOK — every node this one
-/// knows an address for — because the newer term's membership is precisely
-/// what this node failed to learn.
+/// term).
 ///
-/// But the direct-fetch loop RACES the normal commit broadcast. If the
-/// broadcast landed while we were fetching (the dispatch worker applied it,
-/// so the committed term reached `remote_term`, and the fetch loop then saw
-/// the peer's commit as `NotApplied` — leaving `caught_up` false), the
-/// catch-up's goal is already achieved — and the address book is a strictly
-/// WORSE membership source than the just-committed topology: it still names
-/// nodes that term deliberately excluded. Observed in e2e scenario 09: node2
-/// quiesced itself out at term 5, and this fallback re-proposed term 6 from
-/// the address book 1 ms later, putting node2 straight back in — double
-/// activation, 3134 cancelled migrations, node2 re-assigned all 1365 of its
-/// master shards and never drained.
+/// # Guard 1 — commit freshness (scenario 09)
 ///
-/// Returns `None` (skip — nothing stale left to fix, no state touched) once
-/// the committed term has caught up to `remote_term`; otherwise the proposal
-/// to run, built exactly as before. The freshness window is re-read here, at
-/// the last moment before proposing, not from the term captured when the
-/// catch-up began.
+/// The direct-fetch loop RACES the normal commit broadcast. If the broadcast
+/// landed while we were fetching (the dispatch worker applied it, so the
+/// committed term reached `remote_term`, and the fetch loop then saw the
+/// peer's commit as `NotApplied` — leaving `caught_up` false), the catch-up's
+/// goal is already achieved. Observed in e2e scenario 09: node2 quiesced
+/// itself out at term 5, and this fallback re-proposed term 6 one millisecond
+/// later, putting node2 straight back in — double activation, 3134 cancelled
+/// migrations, node2 re-assigned all 1365 of its master shards and never
+/// drained. Returns `None` (no state touched) once the committed term has
+/// caught up to `remote_term`; the freshness window is re-read HERE, at the
+/// last moment before proposing, not from the term captured when the catch-up
+/// began.
+///
+/// # Guard 2 — never widen membership (W11 FIX 1, P0)
+///
+/// This function used to source its members from the ADDRESS BOOK
+/// (`node_addrs.keys()`), which never forgets a node. That is a
+/// RESURRECTION channel: a node deliberately quiesced out of term N is still
+/// addressable, so the fallback re-proposed it into term N+1. The scenario-09
+/// case above is one instance; CI @ 3a38dc2 scenario 07 is the other, and the
+/// freshness re-check does not cover it — term 3 had deliberately committed 3
+/// members (node4 quiesced out at 18:43:26), the survivors saw `remote_term
+/// 4` at 18:44:20.723, node1 fell back and re-proposed `{term: 4, members:
+/// 4}`. Its propose to node4 TIMED OUT (`connect: connection timed out`) and
+/// it committed node4 as a member anyway 0 ms later, whose container had been
+/// removed 400 ms earlier. That put 1024 of 4096 shards on a dead node and
+/// produced a 3.11 s total read outage (3193 failed GETs).
+///
+/// So the member set now comes from the COMMITTED TERM — the only membership
+/// this node has consensus proof of — run through the SAME
+/// [`revalidate_settled_members`] filter the debounce-settled proposer uses,
+/// so both proposer paths share ONE rule (wave 10 wired that filter into the
+/// debounce path only, leaving this one unguarded). Note the ordering of
+/// defences: SWIM still reported node4 ALIVE at propose time, so a
+/// SWIM-liveness filter alone would NOT have saved that run — the committed
+/// set is what does the work, and the liveness filter only additionally drops
+/// members SWIM has since proved Dead.
+///
+/// The constraint is on the MEMBER SET, not on term adoption: the catch-up
+/// still targets `remote_term`, and the proposal still derives its term from
+/// the authority as before.
+///
+/// Consequences, all deliberate:
+///
+///  * When every committed member is healthy the constrained set EQUALS
+///    `committed_members`, so [`TopologyAuthority::on_membership_changed`]
+///    takes its identical-membership skip and this returns `None`. That is
+///    correct: re-proposing a term number the cluster may already have
+///    committed with a DIFFERENT membership is exactly the equivocation this
+///    fix exists to stop. Convergence to `remote_term` then rests on the
+///    catch-up's direct fetch, which every fresh `TopologyStale` observation
+///    retries once the in-flight slot clears (see
+///    [`try_begin_topology_catch_up`]) — a retry-until-reachable loop, not a
+///    wedge.
+///  * When a committed member is SWIM-Dead the filter drops it and a genuine
+///    SHRINK proposal fires — the useful half of the old behaviour, kept.
+///  * When this node is not itself in the committed set, the proposal is not
+///    ours to make (`on_membership_changed` requires `members[0] == self`);
+///    self is deliberately NOT re-added, since adding it would be the same
+///    resurrection bug pointed inward.
+///
+/// `committed_members` empty is the one case that still reads the address
+/// book: this node has never committed a topology, so there is no
+/// deliberately-excluded member it could resurrect and no committed set to
+/// preserve. That mirrors the catch-up's own peer list, which likewise falls
+/// back to the whole address book when `committed_members` is empty.
+///
+/// `state_of` reports the CURRENT SWIM state of a node (`None` = no SWIM
+/// record); it is read at the last moment before proposing, exactly as in the
+/// debounce path.
 fn catch_up_fallback_proposal(
     topology_authority: &crate::cluster::topology::TopologyAuthority,
     node_addrs: &RwLock<std::collections::HashMap<NodeId, SocketAddr>>,
     remote_term: u64,
+    self_id: NodeId,
+    state_of: impl Fn(&NodeId) -> Option<crate::cluster::membership::NodeState>,
 ) -> Option<crate::cluster::topology::TopologyTerm> {
     let committed = topology_authority.committed_term();
     if committed >= remote_term {
@@ -1351,14 +1407,41 @@ fn catch_up_fallback_proposal(
         );
         return None;
     }
-    let members: Vec<NodeId> = {
+    let committed_members = topology_authority.committed_members();
+    let members: Vec<NodeId> = if committed_members.is_empty() {
+        // Never committed a topology — nothing to preserve, and the address
+        // book is the only membership source this node has.
         let addrs = node_addrs.read();
         let mut m: Vec<NodeId> = addrs.keys().copied().collect();
         m.sort();
         m
+    } else {
+        // No `departed_during_burst` list exists on this path (there is no
+        // debounce burst behind a catch-up), so the filter reduces to its
+        // strongest, most conservative rule: drop only members SWIM currently
+        // proves DEAD, retain everything else — including Suspect members,
+        // whose suspicion is transient and must not churn the member set.
+        let mut m = revalidate_settled_members(committed_members, &[], state_of, self_id);
+        m.sort();
+        m
     };
     topology_authority.reset_membership_timer();
-    topology_authority.on_membership_changed(&members)
+    let proposal = topology_authority.on_membership_changed(&members);
+    if proposal.is_none() {
+        if let Some(m) = crate::metrics::migration_metrics() {
+            m.topology_catch_up_reproposal_skipped.inc();
+        }
+        tracing::info!(
+            committed,
+            remote_term,
+            members = ?members.iter().map(|n| n.0).collect::<Vec<_>>(),
+            "cluster: catch-up: no re-proposal — the member set is constrained to \
+             the committed term and the authority had nothing to propose from it \
+             (W11 FIX 1: the address book must never widen membership); \
+             converging via the direct fetch on the next TopologyStale observation",
+        );
+    }
+    proposal
 }
 
 /// Whether a pending inbound entry for `shard` must be KEPT (and the shard left
@@ -6437,6 +6520,8 @@ impl ClusterCoordinator {
                                 topology_authority,
                                 node_addrs_for_topo,
                                 remote_term,
+                                self_id,
+                                |node| swim_membership.lock().member_info(node).map(|i| i.state),
                             )
                         {
                             tracing::info!(
@@ -32328,6 +32413,183 @@ mod tests {
         ]))
     }
 
+    fn four_node_addr_book() -> RwLock<std::collections::HashMap<NodeId, SocketAddr>> {
+        RwLock::new(std::collections::HashMap::from([
+            (NodeId(1), "127.0.0.1:7101".parse().unwrap()),
+            (NodeId(2), "127.0.0.1:7102".parse().unwrap()),
+            (NodeId(3), "127.0.0.1:7103".parse().unwrap()),
+            (NodeId(4), "127.0.0.1:7104".parse().unwrap()),
+        ]))
+    }
+
+    /// W11 FIX 1 fixture — the scenario-07 shape. Committed history is term 4
+    /// = {1,2,3,4} (so every id is an ever-seen committed voter) followed by
+    /// term 5 = {1,3,4}: node 2 was DELIBERATELY quiesced out, exactly as
+    /// node4 was in the CI run. Self is node 1, the lowest-id proposer.
+    fn authority_with_quiesce_out_of_four() -> crate::cluster::topology::TopologyAuthority {
+        use crate::cluster::topology::{
+            ASSIGNMENT_ABSENT_DIGEST, ClusterId, TopologyAuthority, TopologyCommit, TopologyTerm,
+        };
+        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1), 2);
+        let full = vec![NodeId(1), NodeId(2), NodeId(3), NodeId(4)];
+        let term4 = TopologyCommit {
+            term: 4,
+            proposer: NodeId(1),
+            members: full.clone(),
+            cluster_id: ClusterId::UNSET,
+            placement_version: 1,
+            committed_peak: 4,
+            digest: TopologyTerm::compute_digest(
+                4,
+                &ClusterId::UNSET,
+                &full,
+                1,
+                4,
+                2,
+                ASSIGNMENT_ABSENT_DIGEST,
+            ),
+            voters: full.clone(),
+            rf: 2,
+            assignment: None,
+        };
+        assert_eq!(
+            auth.handle_commit(&term4),
+            Some(4),
+            "fixture: the full-membership term applies"
+        );
+        let quiesced = vec![NodeId(1), NodeId(3), NodeId(4)];
+        let term5 = TopologyCommit {
+            term: 5,
+            proposer: NodeId(1),
+            members: quiesced.clone(),
+            cluster_id: ClusterId::UNSET,
+            placement_version: 1,
+            committed_peak: 4,
+            digest: TopologyTerm::compute_digest(
+                5,
+                &ClusterId::UNSET,
+                &quiesced,
+                1,
+                4,
+                2,
+                ASSIGNMENT_ABSENT_DIGEST,
+            ),
+            voters: quiesced.clone(),
+            rf: 2,
+            assignment: None,
+        };
+        assert_eq!(
+            auth.handle_commit(&term5),
+            Some(5),
+            "fixture: the quiesce term applies"
+        );
+        auth
+    }
+
+    /// W11 FIX 1 (P0) — the catch-up fallback must NEVER WIDEN MEMBERSHIP.
+    ///
+    /// CI @ 3a38dc2 scenario 07: term 3 deliberately committed 3 members
+    /// (node4 quiesced out at 18:43:26). At 18:44:20.723 the survivors saw
+    /// `remote_term 4`, node1 fell back, and the fallback rebuilt its member
+    /// set from the ADDRESS BOOK — which never forgets a quiesced node — so
+    /// it re-proposed `{term: 4, members: 4}` and committed the already-
+    /// removed node4 back in even though its own propose to node4 had TIMED
+    /// OUT 0 ms earlier. That put 1024 of 4096 shards on a dead node.
+    ///
+    /// SWIM still reported the resurrected node ALIVE at propose time, so
+    /// this test deliberately makes every address-book node Alive: a
+    /// SWIM-liveness filter alone must NOT be what saves the run. The member
+    /// set has to come from the COMMITTED TERM.
+    ///
+    /// Node 4 is SWIM-Dead here so a proposal actually fires (the shared
+    /// [`revalidate_settled_members`] filter drops it), which lets the test
+    /// assert on real proposal contents rather than on a skip.
+    #[test]
+    fn catch_up_fallback_never_widens_membership_past_the_committed_term() {
+        use crate::cluster::membership::NodeState;
+        let auth = authority_with_quiesce_out_of_four();
+        let addrs = four_node_addr_book();
+
+        // Quiesced node 2 is still in the address book AND still Alive in
+        // SWIM — the exact combination that resurrected node4 in CI.
+        let state_of = |n: &NodeId| match n.0 {
+            4 => Some(NodeState::Dead),
+            _ => Some(NodeState::Alive),
+        };
+
+        let proposal = catch_up_fallback_proposal(&auth, &addrs, 6, NodeId(1), state_of)
+            .expect("committed_term 5 < remote_term 6 and a member died — must propose");
+        assert_eq!(proposal.term, 6, "proposes the next term above committed");
+        assert_eq!(
+            proposal.members,
+            vec![NodeId(1), NodeId(3)],
+            "members come from the COMMITTED term {{1,3,4}} minus the SWIM-dead \
+             node 4 — quiesced node 2 is NOT resurrected from the address book \
+             despite being Alive and addressable",
+        );
+        assert!(
+            !proposal.members.contains(&NodeId(2)),
+            "a node deliberately quiesced out of term 5 must not reappear in term 6",
+        );
+    }
+
+    /// The catch-up fallback constrains the MEMBER SET, not term adoption:
+    /// with every committed member healthy there is nothing to change, so the
+    /// re-proposal collapses to a no-op instead of fabricating a competing
+    /// term at a number the cluster may already have used. Convergence then
+    /// rests on the catch-up's direct fetch, which every fresh `TopologyStale`
+    /// observation retries.
+    ///
+    /// This REPLACES the old `catch_up_fallback_still_reproposes_when_
+    /// genuinely_stale`, whose assertion (`members == address book`) encoded
+    /// precisely the widening defect above.
+    #[test]
+    fn catch_up_fallback_declines_to_repropose_when_the_committed_set_is_intact() {
+        use crate::cluster::membership::NodeState;
+        let auth = authority_with_quiesce_out_of_four();
+        let addrs = four_node_addr_book();
+        let state_of = |_: &NodeId| Some(NodeState::Alive);
+
+        let proposal = catch_up_fallback_proposal(&auth, &addrs, 6, NodeId(1), state_of);
+        assert!(
+            proposal.is_none(),
+            "the committed set {{1,3,4}} is intact, so the constrained member \
+             set equals the committed one and there is nothing to propose",
+        );
+        assert_eq!(auth.committed_term(), 5, "committed term untouched");
+        assert_eq!(
+            auth.committed_members(),
+            vec![NodeId(1), NodeId(3), NodeId(4)],
+            "the quiesce is NOT reverted",
+        );
+    }
+
+    /// A node that has never committed a topology has no committed set to
+    /// preserve — there is no deliberately-excluded member it could
+    /// resurrect — so the address book stays its only membership source
+    /// (this mirrors the catch-up peer list, which also falls back to the
+    /// whole address book when `committed_members` is empty).
+    #[test]
+    fn catch_up_fallback_uses_the_address_book_only_before_any_commit() {
+        use crate::cluster::membership::NodeState;
+        let auth =
+            crate::cluster::topology::TopologyAuthority::new(NodeId(1), Duration::from_secs(1), 2);
+        let addrs = three_node_addr_book();
+        let state_of = |_: &NodeId| Some(NodeState::Alive);
+
+        assert!(
+            auth.committed_members().is_empty(),
+            "fixture: nothing committed yet"
+        );
+        let proposal = catch_up_fallback_proposal(&auth, &addrs, 2, NodeId(1), state_of)
+            .expect("a never-committed node still forms a cluster from its address book");
+        assert_eq!(
+            proposal.members,
+            vec![NodeId(1), NodeId(2), NodeId(3)],
+            "pre-commit bootstrap keeps the address-book source",
+        );
+    }
+
     /// Scenario 09 (quiesce revert) — node2 quiesced itself out at term 5,
     /// and the commit broadcast landed WHILE this node's catch-up thread was
     /// still direct-fetching (the dispatch worker applied it, so the fetch
@@ -32338,12 +32600,14 @@ mod tests {
     /// catch-up, the fallback must SKIP: no proposal, membership untouched.
     #[test]
     fn catch_up_fallback_skips_reproposal_when_commit_already_caught_up() {
+        use crate::cluster::membership::NodeState;
         let auth = authority_with_committed_quiesce();
         let addrs = three_node_addr_book();
 
         // The catch-up was triggered by remote_term 5 — the very term the
         // broadcast just committed locally.
-        let proposal = catch_up_fallback_proposal(&auth, &addrs, 5);
+        let proposal =
+            catch_up_fallback_proposal(&auth, &addrs, 5, NodeId(1), |_| Some(NodeState::Alive));
         assert!(
             proposal.is_none(),
             "no re-proposal once committed_term >= remote_term — the \
@@ -32354,26 +32618,6 @@ mod tests {
             auth.committed_members(),
             vec![NodeId(1), NodeId(3)],
             "the quiesce is NOT reverted — node2 stays excluded"
-        );
-    }
-
-    /// The genuinely-stale case must keep converging: the catch-up target is
-    /// STRICTLY ahead of the committed term and no peer handed the newer
-    /// topology over, so the fallback still re-proposes from the address book
-    /// (the newer membership is unknown by definition here) and the votes of
-    /// already-caught-up peers resolve it.
-    #[test]
-    fn catch_up_fallback_still_reproposes_when_genuinely_stale() {
-        let auth = authority_with_committed_quiesce();
-        let addrs = three_node_addr_book();
-
-        let proposal = catch_up_fallback_proposal(&auth, &addrs, 6)
-            .expect("committed_term 5 < remote_term 6 — the fallback must still propose");
-        assert_eq!(proposal.term, 6, "proposes the next term above committed");
-        assert_eq!(
-            proposal.members,
-            vec![NodeId(1), NodeId(2), NodeId(3)],
-            "membership assembled from the address book, exactly as before"
         );
     }
 

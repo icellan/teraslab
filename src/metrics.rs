@@ -1453,6 +1453,15 @@ pub struct MigrationMetrics {
     /// stay ZERO (self is retained unconditionally); a non-zero value means
     /// the proposer judged every member dead-or-departed.
     pub topology_proposal_revalidation_emptied: PaddedCounter,
+    /// W11 FIX 1 — times the topology catch-up's re-proposal fallback
+    /// produced NO proposal because its member set is constrained to the
+    /// committed term (it may no longer widen from the address book) and the
+    /// authority had nothing to propose from that set. Expected to rise
+    /// whenever a node is genuinely behind on a term whose membership it
+    /// cannot fetch; convergence then comes from the catch-up's direct fetch.
+    /// A steadily climbing value alongside a stalled `committed_term` means
+    /// peers are unreachable, not that membership is churning.
+    pub topology_catch_up_reproposal_skipped: PaddedCounter,
     /// GAP 2 (armed scenario 17) — gauge: non-owned shards the LAST orphan-
     /// cleanup pass RETAINED because the #28 committed-handoff evidence is
     /// missing (fail-closed: without positive evidence the data is safe
@@ -1556,6 +1565,7 @@ impl MigrationMetrics {
             migration_prune_weak_declared_retained: PaddedCounter::new(),
             migration_prune_skipped_cutoff_gate: PaddedCounter::new(),
             topology_proposal_revalidation_emptied: PaddedCounter::new(),
+            topology_catch_up_reproposal_skipped: PaddedCounter::new(),
             orphan_cleanup_retained_no_evidence: AtomicU32::new(0),
             reheal_live_confirm_rounds: PaddedCounter::new(),
             reheal_live_confirm_shards: PaddedCounter::new(),
