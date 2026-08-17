@@ -26462,6 +26462,313 @@ mod tests {
         );
     }
 
+    /// GAP 1 cross-module contract, following the
+    /// `missing_exact_key_rejection_is_recognised_by_the_repush_parser`
+    /// precedent: the REAL code-22 manifest-hash-mismatch rejection this
+    /// handler emits, decoded through the REAL `send_migration_complete`
+    /// error envelope, must be recognised by the source's mismatch parser —
+    /// and must NOT be matched by the exact-key re-push parser. If the
+    /// producer message, the envelope, or the parser drifts, this fails
+    /// instead of the livelock breaker silently never engaging again.
+    #[test]
+    fn manifest_mismatch_rejection_is_recognised_by_the_mismatch_parser() {
+        use crate::cluster::coordinator::{
+            completion_rejection_manifest_mismatch, completion_rejection_missing_keys,
+            migration_complete_rejection_error,
+        };
+
+        let h = DispatchTestHarness::new();
+        let shard = 55u16;
+        let txid = txid_for_shard(shard, 40);
+        assert_eq!(h.create_tx(txid, 1).status, STATUS_OK);
+
+        let members = vec![crate::cluster::shards::NodeId(1)];
+        let table = crate::cluster::shards::ShardTable::compute_with_epoch(&members, 1, 64, 1);
+        let cluster = crate::cluster::coordinator::new_test_running_cluster(
+            crate::cluster::shards::NodeId(1),
+            table,
+            &[(
+                crate::cluster::shards::NodeId(1),
+                "127.0.0.1:4715".parse().unwrap(),
+            )],
+            &members,
+            &[shard],
+            &[],
+            &[],
+            1,
+        );
+
+        // Hash-only completion with MATCHING count but divergent content —
+        // the armed-06 shape.
+        let wrong_manifest = [0xEEu8; 32];
+        let payload = build_migration_complete_payload(1, 0, 0, Some(wrong_manifest), None, None);
+        let req = RequestFrame {
+            request_id: shard as u64,
+            op_code: OP_MIGRATION_COMPLETE,
+            flags: 0,
+            payload: payload.into(),
+        };
+        let mut conn_state = crate::server::ConnectionState::new();
+        let resp = handle_request(
+            &req,
+            &h.engine,
+            8192,
+            Some(&cluster),
+            None,
+            &mut conn_state,
+            None,
+        );
+        assert_eq!(resp.status, STATUS_ERROR);
+        let err_code = u16::from_le_bytes(resp.payload[..2].try_into().unwrap());
+        assert_eq!(err_code, ERR_MIGRATION_MANIFEST_MISMATCH);
+
+        let err = migration_complete_rejection_error(resp.status, &resp.payload);
+        assert!(
+            completion_rejection_manifest_mismatch(&err),
+            "the real code-22 rejection must engage the mismatch parser: {err}"
+        );
+        let key = TxKey { txid };
+        assert!(
+            completion_rejection_missing_keys(&err, &[(key, 1)]).is_empty(),
+            "the exact-key re-push parser must NOT match a hash mismatch: {err}"
+        );
+    }
+
+    /// GAP 1 integration shape (armed scenario 06: shards 437/439/448 wedged
+    /// 90+s re-sending the identical manifest every ~12s) — a client write
+    /// raced the migration under a dual-authority window, leaving source and
+    /// target with DIVERGENT copies of the same record (source one generation
+    /// ahead). The hash-only completion rejects code-22 forever. This drives
+    /// the full repaired loop against the REAL target dispatch code:
+    ///
+    ///  1. the identical manifest is sent (and rejected) exactly TWICE —
+    ///     the streak tracker proves the second rejection is the same content;
+    ///  2. escalation re-pushes the divergent record's FULL BYTES through the
+    ///     normal migration-batch apply path (tombstone checks + the
+    ///     embedded-generation guard intact: higher generation wins);
+    ///  3. the retried completion (exact entries) verifies within the
+    ///     3-attempt bound and the target converges to the source's state.
+    #[test]
+    fn manifest_mismatch_escalation_resyncs_divergent_record_through_real_completion() {
+        use crate::cluster::coordinator::{
+            EscalationAttemptError, ManifestMismatchEscalation, build_record_replay_ops,
+            completion_rejection_manifest_mismatch, escalate_manifest_mismatch,
+            migration_complete_rejection_error,
+        };
+        use crate::cluster::migration::MigrationManager;
+
+        // TARGET — holds the record at its create-time generation.
+        let h = DispatchTestHarness::new();
+        let shard = 56u16;
+        let txid = txid_for_shard(shard, 41);
+        assert_eq!(h.create_tx(txid, 1).status, STATUS_OK);
+        let key = TxKey { txid };
+        let dst_gen_before = { h.engine.read_metadata(&key).unwrap().generation };
+
+        // SOURCE — same record, then a raced client spend bumped its
+        // generation: byte-divergent copies of the same txid.
+        let src_dev: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let src_alloc = SlotAllocator::new(src_dev.clone()).unwrap();
+        let src_engine = Engine::new(
+            src_dev,
+            Index::new(10000).unwrap(),
+            src_alloc,
+            StripedLocks::new(1024),
+            DahIndex::new(),
+        );
+        {
+            let item = WireCreateItem {
+                txid,
+                tx_version: 1,
+                locktime: 0,
+                fee: 500,
+                size_in_bytes: 250,
+                extended_size: 250,
+                is_coinbase: false,
+                spending_height: 0,
+                created_at: 1700000000000,
+                flags: 0,
+                utxo_hashes: vec![{
+                    let mut hh = [0u8; 32];
+                    hh[0] = 0;
+                    hh
+                }],
+                cold_data: vec![],
+                block_height: 0,
+                mined_block_id: None,
+                mined_block_height: None,
+                mined_subtree_idx: None,
+                parent_txids: vec![],
+            };
+            let payload = encode_create_batch(&[item]);
+            let req = RequestFrame {
+                request_id: 1,
+                op_code: OP_CREATE_BATCH,
+                flags: 0,
+                payload: payload.into(),
+            };
+            let mut cs = crate::server::ConnectionState::new();
+            let resp = handle_request(&req, &src_engine, 8192, None, None, &mut cs, None);
+            assert_eq!(resp.status, STATUS_OK, "source create");
+        }
+        let slot0 = src_engine.read_slot(&key, 0).expect("source slot 0");
+        src_engine
+            .spend(&SpendRequest {
+                tx_key: key,
+                offset: 0,
+                utxo_hash: slot0.hash,
+                spending_data: [0xC7; 36],
+                ignore_conflicting: false,
+                ignore_locked: false,
+                current_block_height: 900_000,
+                block_height_retention: 50,
+            })
+            .expect("raced client spend on the source");
+        let src_gen = { src_engine.read_metadata(&key).unwrap().generation };
+        assert!(
+            src_gen > dst_gen_before,
+            "precondition: the raced write left the source AHEAD \
+             (src {src_gen} vs dst {dst_gen_before})",
+        );
+
+        let members = vec![crate::cluster::shards::NodeId(1)];
+        let table = crate::cluster::shards::ShardTable::compute_with_epoch(&members, 1, 65, 1);
+        let cluster = crate::cluster::coordinator::new_test_running_cluster(
+            crate::cluster::shards::NodeId(1),
+            table,
+            &[(
+                crate::cluster::shards::NodeId(1),
+                "127.0.0.1:4716".parse().unwrap(),
+            )],
+            &members,
+            &[shard],
+            &[],
+            &[],
+            1,
+        );
+
+        // The source's fence-time manifest: count matches the target's (1),
+        // content differs (generation ahead).
+        let entries = vec![(key, src_gen)];
+        let manifest_hash = compute_manifest_for_entries(&entries);
+        let mut identical_sends = 0usize;
+        let mut send_hash_only_completion = || {
+            identical_sends += 1;
+            let payload =
+                build_migration_complete_payload(1, 0, 0, Some(manifest_hash), None, None);
+            let req = RequestFrame {
+                request_id: shard as u64,
+                op_code: OP_MIGRATION_COMPLETE,
+                flags: 0,
+                payload: payload.into(),
+            };
+            let mut cs = crate::server::ConnectionState::new();
+            handle_request(&req, &h.engine, 8192, Some(&cluster), None, &mut cs, None)
+        };
+
+        // Blind send #1 — rejected code-22; the streak tracker notes it.
+        let mut mgr = MigrationManager::new();
+        let resp1 = send_hash_only_completion();
+        assert_eq!(resp1.status, STATUS_ERROR);
+        let err1 = migration_complete_rejection_error(resp1.status, &resp1.payload);
+        assert!(completion_rejection_manifest_mismatch(&err1), "got: {err1}");
+        assert_eq!(
+            mgr.note_completion_manifest_mismatch(shard, &manifest_hash),
+            1
+        );
+
+        // Blind send #2 (the re-drive rebuilding the identical manifest) —
+        // rejected again; streak reaches 2 → escalate, never a third blind send.
+        let resp2 = send_hash_only_completion();
+        assert_eq!(resp2.status, STATUS_ERROR);
+        let err2 = migration_complete_rejection_error(resp2.status, &resp2.payload);
+        assert!(completion_rejection_manifest_mismatch(&err2), "got: {err2}");
+        assert_eq!(
+            mgr.note_completion_manifest_mismatch(shard, &manifest_hash),
+            2,
+            "the identical manifest was rejected twice — escalation threshold",
+        );
+        assert_eq!(identical_sends, 2, "identical manifest sent exactly twice");
+
+        // Record-level re-sync escalation: every attempt re-pushes the full
+        // record bytes through the REAL migration-batch apply, then retries
+        // the completion with the exact-entry manifest.
+        let mut attempts = 0usize;
+        let outcome = escalate_manifest_mismatch(err2, 3, || {
+            attempts += 1;
+            // Re-push: the record's full current state, through the normal
+            // replica-create apply (generation guard + tombstone checks).
+            let replay = build_record_replay_ops(&src_engine, &key)
+                .map_err(EscalationAttemptError::Repush)?
+                .ok_or_else(|| {
+                    EscalationAttemptError::Repush("source record vanished".to_string())
+                })?;
+            let batch = crate::replication::protocol::ReplicaBatch {
+                first_sequence: 0,
+                ops: replay.ops,
+                trace_ctx: crate::observability::WireTraceContext::from_current_span(),
+                source_node_id: Some(9),
+                cluster_key: cluster.local_cluster_key(),
+            };
+            let req = RequestFrame {
+                request_id: shard as u64,
+                op_code: OP_REPLICA_BATCH,
+                flags: FLAG_MIGRATION_BATCH,
+                payload: batch.serialize().into(),
+            };
+            let mut cs = crate::server::ConnectionState::new();
+            let resp = handle_request(&req, &h.engine, 8192, Some(&cluster), None, &mut cs, None);
+            if resp.status != STATUS_OK {
+                return Err(EscalationAttemptError::Repush(format!(
+                    "re-push failed with status {}",
+                    resp.status
+                )));
+            }
+            // Retry the completion with the exact-entry manifest.
+            let payload = build_migration_complete_payload(
+                1,
+                0,
+                0,
+                Some(manifest_hash),
+                Some(&entries),
+                Some(NodeId(9)),
+            );
+            let req = RequestFrame {
+                request_id: shard as u64,
+                op_code: OP_MIGRATION_COMPLETE,
+                flags: 0,
+                payload: payload.into(),
+            };
+            let mut cs = crate::server::ConnectionState::new();
+            let resp = handle_request(&req, &h.engine, 8192, Some(&cluster), None, &mut cs, None);
+            if resp.status == STATUS_OK {
+                Ok(())
+            } else {
+                Err(EscalationAttemptError::Completion(
+                    migration_complete_rejection_error(resp.status, &resp.payload),
+                ))
+            }
+        });
+
+        assert_eq!(
+            outcome,
+            ManifestMismatchEscalation::Verified,
+            "the record-level re-sync must converge",
+        );
+        assert_eq!(
+            attempts, 1,
+            "one re-sync round suffices for one divergent record"
+        );
+        mgr.clear_completion_manifest_mismatch(shard);
+        let dst_gen_after = { h.engine.read_metadata(&key).unwrap().generation };
+        assert_eq!(
+            dst_gen_after, src_gen,
+            "the embedded-generation guard applied the newer copy — higher \
+             generation wins, target converged to the source's state",
+        );
+    }
+
     /// Fix B (no-loss). A generation MISMATCH on a source key (target holds the
     /// key at a different generation) must REJECT — the superset proof requires
     /// the matching generation.

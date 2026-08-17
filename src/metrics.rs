@@ -1416,6 +1416,16 @@ pub struct MigrationMetrics {
     /// Only ever non-zero when `migration_vetoed_reduction_enabled` is on
     /// (default OFF).
     pub migration_completion_manifest_reduced_vetoed: PaddedCounter,
+    /// GAP 2 (armed scenario 17) — gauge: non-owned shards the LAST orphan-
+    /// cleanup pass RETAINED because the #28 committed-handoff evidence is
+    /// missing (fail-closed: without positive evidence the data is safe
+    /// elsewhere, the local copy may be the last one and is never dropped).
+    /// Epoch churn can strip the evidence PERMANENTLY, leaving a third copy
+    /// the census would otherwise silently over-count forever — this gauge
+    /// makes that gap operator-visible. Updated on every completed cleanup
+    /// pass (event-driven or batch-completion); a pass that reclaims (or
+    /// finds no retained shard) resets it to the new census.
+    pub orphan_cleanup_retained_no_evidence: AtomicU32,
 }
 
 /// Number of {direction, role} buckets for migration byte counters.
@@ -1482,6 +1492,7 @@ impl MigrationMetrics {
             heal_source_refused_no_quorum: PaddedCounter::new(),
             under_replication_event_repairs: PaddedCounter::new(),
             migration_completion_manifest_reduced_vetoed: PaddedCounter::new(),
+            orphan_cleanup_retained_no_evidence: AtomicU32::new(0),
         }
     }
 

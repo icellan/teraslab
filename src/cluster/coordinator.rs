@@ -227,7 +227,17 @@ fn derive_under_replication_resyncs(
     let mut full: std::collections::HashSet<(NodeId, u16)> = std::collections::HashSet::new();
     for (node, entries) in view {
         for entry in entries {
-            if entry.last_applied_seq > 0 {
+            // GAP 3b (armed scenario 07) — a PENDING_INBOUND-flagged entry is
+            // a subset/incomplete copy (a LOST or fenced inbound entry keeps
+            // the fence bit set, so the flag rides every report). Its
+            // non-zero count must not count as a full-replica witness: the
+            // partial copy would witness ITSELF and suppress the very resync
+            // that repairs it. Excluding it here is conservative in both
+            // roles of `full` — as a replica witness (the shard becomes
+            // resync-eligible) and as the self freshness witness (a master
+            // holding only a partial fenced copy never sources repair; the
+            // shard is stale_fenced-skipped whole).
+            if entry.last_applied_seq > 0 && entry.flags & PARTITION_FLAG_PENDING_INBOUND == 0 {
                 full.insert((*node, entry.shard));
             }
         }
@@ -3046,6 +3056,10 @@ impl ClusterCoordinator {
             // the sweep flag: default-mode runs have no event repair, so
             // this re-drive is their only settled-cluster retry path.
             let mut failed_batch_redrive = FailedBatchRedrive::new();
+            // GAP 2 (armed scenario 17) — last time the exchange-completion
+            // consumer fired an event-driven orphan-cleanup pass
+            // (`event_orphan_cleanup_fire` rate-limits the cadence).
+            let mut last_event_orphan_cleanup: Option<std::time::Instant> = None;
             while !shutdown.load(Ordering::Relaxed) {
                 // Task #75 — heartbeat: every iteration passes here. The
                 // phase stamps below (one per loop section) refresh the
@@ -3836,6 +3850,33 @@ impl ClusterCoordinator {
                                      re-runs on the re-heal cadence (#74)",
                                 );
                             }
+                            // GAP 3a (armed scenario 07) — the PLAIN-entry
+                            // sibling of the heal re-park above: a pending or
+                            // LOST forward inbound entry pinned to a source
+                            // that has LEFT the committed membership can never
+                            // complete from it ("no address for
+                            // transfer-request source" forever). Re-park it to
+                            // the plain NodeId(0) sentinel — fence kept, kinds
+                            // kept — so the committed master's
+                            // under-replication resync can complete it.
+                            let committed_member_set: std::collections::HashSet<NodeId> =
+                                topo_authority_event
+                                    .committed_members()
+                                    .into_iter()
+                                    .collect();
+                            let departed_reparked =
+                                mgr.repark_departed_source_inbound(&committed_member_set);
+                            if departed_reparked > 0 {
+                                if let Some(ref path) = inbound_state_path_event {
+                                    crate::cluster::migration::persist_inbound_state(path, &mgr);
+                                }
+                                tracing::warn!(
+                                    reparked = departed_reparked,
+                                    "cluster: re-PARKED plain inbound entr(ies) whose source \
+                                     left the committed membership — shard(s) stay fenced; \
+                                     the committed master's resync re-acquires them",
+                                );
+                            }
                             mgr.mark_inbound_lost(&orphaned_shards)
                         } else {
                             mgr.clear_stale_inbound(Duration::from_secs(30))
@@ -4540,6 +4581,37 @@ impl ClusterCoordinator {
                     // timer for nothing.
                     if !partition_view.is_empty() {
                         event_repair_trigger.observe(std::time::Instant::now(), term);
+                        // GAP 2 (armed scenario 17) — drive orphan cleanup
+                        // from the exchange-completion event, alongside the
+                        // repair arm above. `run_orphan_cleanup` used to run
+                        // only from batch-completion sites, so once the
+                        // cluster settled nothing ever re-evaluated and a
+                        // third copy whose committed-handoff evidence
+                        // postdated the last batch stayed forever (242
+                        // records at 3 holders under RF=2). Rate-limited
+                        // (~60s) and spawned off the loop; the pass reads
+                        // the CURRENT table version at run time and carries
+                        // its own epoch/task/#28 guards, so racing the
+                        // activation below at worst no-ops until the next
+                        // exchange completion.
+                        if event_orphan_cleanup_fire(
+                            &mut last_event_orphan_cleanup,
+                            std::time::Instant::now(),
+                        ) {
+                            let cleanup_engine = engine.clone();
+                            let cleanup_st = shard_table.clone();
+                            let cleanup_mig = migration.clone();
+                            std::thread::spawn(move || {
+                                let epoch = cleanup_st.read().version;
+                                run_orphan_cleanup(
+                                    self_id,
+                                    &cleanup_engine,
+                                    &cleanup_st,
+                                    &cleanup_mig,
+                                    epoch,
+                                );
+                            });
+                        }
                     }
                     // §9 Q3 — prompt re-election. The fresh view may
                     // contradict the committed assignment (the canonical
@@ -10154,51 +10226,214 @@ fn run_migration_batch(
                                     continue;
                                 }
                                 ExactKeyEscalation::NotExactKey { last_err } => {
-                                    tracing::warn!(shard = task.shard, err = %last_err, "cluster: shard completion failed");
-                                    send_migration_abort_completion_best_effort(
-                                        addr,
-                                        task,
-                                        "manifest verification failed",
-                                        auth_secret,
-                                    );
-                                    // sc09/sc05 drain convergence — the completion was
-                                    // rejected (the rightful master already serves the
-                                    // shard and holds MORE records, so the exact-count
-                                    // completion mismatches). We just streamed our full
-                                    // manifest to that master, and the abort above only
-                                    // cleared the target's inbound fence — it RETAINS the
-                                    // streamed records. So a verify-only superset probe
-                                    // can now prove the rightful master holds every one
-                                    // of our records; if it does, relinquish the phantom
-                                    // (transfer-then-relinquish, no-loss). If the probe
-                                    // fails or is inconclusive, the non-empty copy rolls
-                                    // back to self exactly as before.
-                                    let manifest_for_probe = manifest_entries.clone();
-                                    let probe = || {
-                                        confirm_target_holds_superset(
-                                            addr,
+                                    // GAP 1 (armed scenario 06: shards
+                                    // 437/439/448 wedged 90+s) — code-22
+                                    // manifest-mismatch livelock breaker. A
+                                    // "manifest hash mismatch (count
+                                    // matched)" rejection means source and
+                                    // target agree on the record COUNT but
+                                    // hold byte-divergent copies (a client
+                                    // write raced the migration under a
+                                    // dual-authority window). The historical
+                                    // path below re-drives the IDENTICAL
+                                    // manifest every ~12s forever. Once the
+                                    // manager's streak proves the same
+                                    // content was already rejected
+                                    // (MAX_IDENTICAL_MANIFEST_SENDS blind
+                                    // sends), escalate to a bounded
+                                    // record-level re-sync: re-push the
+                                    // shard's full record bytes under the
+                                    // still-held write fence through the
+                                    // normal baseline apply (tombstone
+                                    // checks + embedded-generation guard
+                                    // intact — higher generation wins),
+                                    // rebuild a fresh exact-entry manifest,
+                                    // and retry the verify.
+                                    let is_mismatch =
+                                        completion_rejection_manifest_mismatch(&last_err);
+                                    let mismatch_streak = if is_mismatch {
+                                        migration.lock().note_completion_manifest_mismatch(
                                             task.shard,
-                                            task.from_node,
-                                            topology_epoch,
-                                            &manifest_for_probe,
-                                            auth_secret,
+                                            &reduced_hash,
                                         )
+                                    } else {
+                                        0
                                     };
-                                    if fail_or_relinquish_outbound_task(
-                                        &migration,
-                                        shard_table,
-                                        &fenced_bm,
-                                        &migrating_bm,
-                                        task,
-                                        topology_epoch,
-                                        relinquish_ctx,
-                                        Some(&probe),
-                                    ) {
-                                        failed.fetch_add(1, Ordering::Relaxed);
+                                    let mut verified_after_resync = false;
+                                    let mut historical_err = last_err;
+                                    if is_mismatch
+                                        && mismatch_streak >= MAX_IDENTICAL_MANIFEST_SENDS
+                                    {
+                                        tracing::warn!(
+                                            shard = task.shard,
+                                            streak = mismatch_streak,
+                                            "cluster: identical completion manifest rejected \
+                                             (code=22) repeatedly — escalating to record-level \
+                                             re-sync",
+                                        );
+                                        let resync = escalate_manifest_mismatch(
+                                            historical_err.clone(),
+                                            MAX_MANIFEST_MISMATCH_RESYNCS,
+                                            || {
+                                                let key_refs: Vec<&TxKey> =
+                                                    fenced_keys.iter().collect();
+                                                let (_manifest, skipped) = stream_shard_baseline(
+                                                    task,
+                                                    &key_refs,
+                                                    &engine,
+                                                    &mut stream,
+                                                    batch_size,
+                                                    topology_epoch,
+                                                    auth_secret,
+                                                    Some(&|| {
+                                                        migration_epoch_current(
+                                                            shard_table,
+                                                            topology_epoch,
+                                                        )
+                                                    }),
+                                                )
+                                                .map_err(EscalationAttemptError::Repush)?;
+                                                let mut fresh = collect_manifest_entries(
+                                                    &engine,
+                                                    task.shard,
+                                                    &fenced_keys,
+                                                )
+                                                .map_err(EscalationAttemptError::Repush)?;
+                                                if !skipped.is_empty() {
+                                                    fresh.retain(|(k, _)| !skipped.contains(k));
+                                                }
+                                                if fresh.is_empty() {
+                                                    return Err(EscalationAttemptError::Repush(
+                                                        "manifest reduced to zero shippable \
+                                                         records during mismatch re-sync"
+                                                            .to_string(),
+                                                    ));
+                                                }
+                                                let fresh_hash =
+                                                    compute_manifest_for_entries(&fresh);
+                                                send_migration_complete(
+                                                    addr,
+                                                    task.shard,
+                                                    task.from_node,
+                                                    fresh.len() as u64,
+                                                    fence_seq,
+                                                    topology_epoch,
+                                                    Some(&mut stream),
+                                                    &fresh_hash,
+                                                    &fresh,
+                                                    true,
+                                                    auth_secret,
+                                                )
+                                                .map_err(EscalationAttemptError::Completion)
+                                            },
+                                        );
+                                        match resync {
+                                            ManifestMismatchEscalation::Verified => {
+                                                migration
+                                                    .lock()
+                                                    .clear_completion_manifest_mismatch(task.shard);
+                                                tracing::info!(
+                                                    shard = task.shard,
+                                                    "cluster: completion verified after \
+                                                     record-level manifest-mismatch re-sync",
+                                                );
+                                                verified_after_resync = true;
+                                            }
+                                            ManifestMismatchEscalation::Exhausted { last_err } => {
+                                                migration
+                                                    .lock()
+                                                    .clear_completion_manifest_mismatch(task.shard);
+                                                tracing::warn!(
+                                                    shard = task.shard,
+                                                    err = %last_err,
+                                                    "cluster: shard completion terminally failed — \
+                                                     manifest-mismatch re-sync exhausted; rolling \
+                                                     back to source",
+                                                );
+                                                send_migration_abort_completion_best_effort(
+                                                    addr,
+                                                    task,
+                                                    "manifest-mismatch re-sync exhausted",
+                                                    auth_secret,
+                                                );
+                                                // The target provably diverges after bounded
+                                                // reconciliation — terminal, so the re-drive
+                                                // cannot re-send the doomed handshake forever;
+                                                // the shard rolls back to self and a later
+                                                // re-plan re-streams from a fresh baseline.
+                                                if terminally_abort_unshippable_task(
+                                                    &migration,
+                                                    shard_table,
+                                                    &fenced_bm,
+                                                    &migrating_bm,
+                                                    task,
+                                                    topology_epoch,
+                                                ) {
+                                                    failed.fetch_add(1, Ordering::Relaxed);
+                                                }
+                                                // Reconnect — stream may be broken.
+                                                if let Some(s) = new_conn() { stream = s; }
+                                                continue;
+                                            }
+                                            ManifestMismatchEscalation::NotMismatch {
+                                                last_err,
+                                            } => {
+                                                // The retry now fails differently (e.g. exact
+                                                // keys reached the target and one was named):
+                                                // the historical handling below owns it, and
+                                                // the next re-drive's own machinery handles
+                                                // the new shape.
+                                                historical_err = last_err;
+                                            }
+                                        }
                                     }
-                                    // Reconnect — stream may be broken.
-                                    if let Some(s) = new_conn() { stream = s; }
-                                    continue;
+                                    if !verified_after_resync {
+                                        tracing::warn!(shard = task.shard, err = %historical_err, "cluster: shard completion failed");
+                                        send_migration_abort_completion_best_effort(
+                                            addr,
+                                            task,
+                                            "manifest verification failed",
+                                            auth_secret,
+                                        );
+                                        // sc09/sc05 drain convergence — the completion was
+                                        // rejected (the rightful master already serves the
+                                        // shard and holds MORE records, so the exact-count
+                                        // completion mismatches). We just streamed our full
+                                        // manifest to that master, and the abort above only
+                                        // cleared the target's inbound fence — it RETAINS the
+                                        // streamed records. So a verify-only superset probe
+                                        // can now prove the rightful master holds every one
+                                        // of our records; if it does, relinquish the phantom
+                                        // (transfer-then-relinquish, no-loss). If the probe
+                                        // fails or is inconclusive, the non-empty copy rolls
+                                        // back to self exactly as before.
+                                        let manifest_for_probe = manifest_entries.clone();
+                                        let probe = || {
+                                            confirm_target_holds_superset(
+                                                addr,
+                                                task.shard,
+                                                task.from_node,
+                                                topology_epoch,
+                                                &manifest_for_probe,
+                                                auth_secret,
+                                            )
+                                        };
+                                        if fail_or_relinquish_outbound_task(
+                                            &migration,
+                                            shard_table,
+                                            &fenced_bm,
+                                            &migrating_bm,
+                                            task,
+                                            topology_epoch,
+                                            relinquish_ctx,
+                                            Some(&probe),
+                                        ) {
+                                            failed.fetch_add(1, Ordering::Relaxed);
+                                        }
+                                        // Reconnect — stream may be broken.
+                                        if let Some(s) = new_conn() { stream = s; }
+                                        continue;
+                                    }
                                 }
                             }
                         }
@@ -10404,6 +10639,33 @@ fn run_migration_batch(
     (c, f)
 }
 
+/// GAP 2 (armed scenario 17) — minimum interval between EVENT-DRIVEN orphan-
+/// cleanup passes fired from the exchange-completion consumer. Exchange
+/// completions can arrive in bursts (commit-signal + prompt re-heal arms
+/// racing per term); the cleanup pass scans every shard, so it is
+/// rate-limited to one per interval — a settled cluster still converges to
+/// exactly RF within one exchange completion, which is the contract.
+const EVENT_ORPHAN_CLEANUP_MIN_INTERVAL: Duration = Duration::from_secs(60);
+
+/// GAP 2 — the rate-limit gate for the event-driven orphan-cleanup pass.
+///
+/// Returns `true` (and stamps `last_fired`) when no pass has fired yet or
+/// the previous one is at least [`EVENT_ORPHAN_CLEANUP_MIN_INTERVAL`] old;
+/// `false` refuses without consuming anything — the next exchange completion
+/// after the interval fires normally. Pure so the cadence is unit-testable.
+fn event_orphan_cleanup_fire(
+    last_fired: &mut Option<std::time::Instant>,
+    now: std::time::Instant,
+) -> bool {
+    if let Some(at) = *last_fired
+        && now.duration_since(at) < EVENT_ORPHAN_CLEANUP_MIN_INTERVAL
+    {
+        return false;
+    }
+    *last_fired = Some(now);
+    true
+}
+
 /// Delete records for shards this node no longer owns after migration.
 ///
 /// After outbound migrations complete, some records remain on the source
@@ -10443,6 +10705,11 @@ fn run_orphan_cleanup(
     }
 
     let mut orphaned_shards: Vec<u16> = Vec::new();
+    // GAP 2 — census of non-owned shards this pass RETAINS because the #28
+    // committed-handoff evidence is missing. When epoch churn stripped the
+    // evidence permanently, the guard (correctly, fail-closed) never passes;
+    // the gauge makes that census gap visible instead of silent.
+    let mut retained_no_evidence = 0u32;
     {
         let table = shard_table.read();
         let mgr = migration.lock();
@@ -10476,6 +10743,7 @@ fn run_orphan_cleanup(
             // copy. Delete only with positive evidence the data is safe
             // elsewhere: a committed handoff of this shard from this node.
             if !mgr.has_committed_handoff(shard, topology_epoch) {
+                retained_no_evidence = retained_no_evidence.saturating_add(1);
                 debug_shard_log(
                     shard,
                     format!(
@@ -10500,6 +10768,22 @@ fn run_orphan_cleanup(
             );
             orphaned_shards.push(shard);
         }
+    }
+
+    // GAP 2 — publish the retained-without-evidence census for THIS pass
+    // (including zero, so a reclaimed shard leaves the gauge). Stored before
+    // the empty-early-return: a pass that retains everything still reports.
+    if let Some(m) = crate::metrics::migration_metrics() {
+        m.orphan_cleanup_retained_no_evidence
+            .store(retained_no_evidence, Ordering::Relaxed);
+    }
+    if retained_no_evidence > 0 {
+        tracing::warn!(
+            shards = retained_no_evidence,
+            "cluster: orphan cleanup RETAINED non-owned shard(s) without \
+             committed-handoff evidence (fail-closed, #28) — census gap is \
+             gauged as teraslab_orphan_cleanup_retained_no_evidence",
+        );
     }
 
     if orphaned_shards.is_empty() {
@@ -10848,6 +11132,107 @@ pub(crate) fn completion_rejection_vetoed_keys(
     out
 }
 
+/// GAP 1 (armed scenario 06) — how many times a shard's completion may carry
+/// the IDENTICAL manifest before the source must reconcile at record level:
+/// the fence-time send plus one re-drive. A second consecutive code-22
+/// rejection of the same content proves a blind retry can never succeed (the
+/// divergence is in the data, not the channel), so the third send is only
+/// ever made AFTER a record-level re-sync.
+const MAX_IDENTICAL_MANIFEST_SENDS: u32 = 2;
+
+/// GAP 1 — how many record-level re-sync rounds
+/// ([`escalate_manifest_mismatch`]) a code-22 manifest-mismatch rejection is
+/// granted before the shard's migration is terminally aborted
+/// (`terminally_abort_unshippable_task`, the existing rollback-to-source
+/// disposition). Mirrors [`MAX_EXACT_KEY_ESCALATIONS`].
+const MAX_MANIFEST_MISMATCH_RESYNCS: usize = 3;
+
+/// GAP 1 — is `err` the target's code-22 "manifest hash mismatch (count
+/// matched ...)" completion rejection?
+///
+/// The dispatch verifier emits this exact shape only AFTER the record-count
+/// gate passed — source and target agree on HOW MANY records the shard holds
+/// but not on their content (a client write raced the migration under a
+/// dual-authority window and left byte-divergent copies). Re-sending the
+/// identical manifest can never succeed; the caller escalates to a
+/// record-level re-sync ([`escalate_manifest_mismatch`]) once the streak
+/// tracker (`MigrationManager::note_completion_manifest_mismatch`) proves
+/// the same content was already rejected. Every other code-22 shape (e.g. a
+/// count mismatch) and every other code keep their historical handling.
+///
+/// The dispatch producer, the [`migration_complete_rejection_error`]
+/// envelope and this parser are pinned together by the cross-module contract
+/// test `manifest_mismatch_rejection_is_recognised_by_the_mismatch_parser`
+/// (`server::dispatch` tests), so the formats cannot drift apart.
+pub(crate) fn completion_rejection_manifest_mismatch(err: &str) -> bool {
+    // The `:` keeps the match exact — see `completion_rejection_missing_keys`.
+    err.contains(&format!(
+        "(code={}:",
+        crate::protocol::opcodes::ERR_MIGRATION_MANIFEST_MISMATCH
+    )) && err.contains("manifest hash mismatch")
+        && err.contains("count matched")
+}
+
+/// GAP 1 — outcome of the bounded manifest-mismatch record-level re-sync
+/// ([`escalate_manifest_mismatch`]).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ManifestMismatchEscalation {
+    /// A re-sync round landed and its completion retry verified — proceed to
+    /// commit.
+    Verified,
+    /// Every granted round either failed its RE-PUSH on the source side or
+    /// its completion retry still rejected code-22: terminally abort via
+    /// `terminally_abort_unshippable_task` (rollback to source — the cluster
+    /// converges to one serving master instead of livelocking).
+    Exhausted { last_err: String },
+    /// A completion retry failed with something OTHER than a code-22
+    /// mismatch (e.g. an exact-key rejection now that exact entries reached
+    /// the target): the historical failure handling applies with this error,
+    /// and the next re-drive's own machinery owns the new shape.
+    NotMismatch { last_err: String },
+}
+
+/// GAP 1 (armed scenario 06: shards 437/439/448 wedged 90+s re-sending the
+/// identical manifest every ~12s) — bounded record-level re-sync for a
+/// code-22 manifest-mismatch completion rejection.
+///
+/// `attempt` is one full re-sync round BY CONTRACT: it must re-push the
+/// shard's current record bytes through the existing baseline machinery
+/// (`stream_shard_baseline` → the target's normal replica-create apply, so
+/// RULE-DS tombstone checks and the embedded-generation guard stay intact —
+/// a re-push never blind-overwrites, and between two LIVE generations of one
+/// txid the higher generation wins) and THEN retry the completion with a
+/// freshly rebuilt exact-entry manifest. Because the re-push precedes every
+/// retry, no identical manifest is ever re-sent blind. Up to `max_attempts`
+/// rounds; a still-code-22 retry or a source-side re-push failure burns the
+/// round, any other completion error falls back to the historical handling
+/// ([`ManifestMismatchEscalation::NotMismatch`]).
+pub(crate) fn escalate_manifest_mismatch(
+    initial_err: String,
+    max_attempts: usize,
+    mut attempt: impl FnMut() -> std::result::Result<(), EscalationAttemptError>,
+) -> ManifestMismatchEscalation {
+    let mut last_err = initial_err;
+    for _ in 0..max_attempts {
+        match attempt() {
+            Ok(()) => return ManifestMismatchEscalation::Verified,
+            Err(EscalationAttemptError::Repush(e)) => {
+                // Source-side re-sync failure: the divergence stands. Burn
+                // the round so an unshippable shard still exhausts terminally.
+                last_err = e;
+            }
+            Err(EscalationAttemptError::Completion(e)) => {
+                if completion_rejection_manifest_mismatch(&e) {
+                    last_err = e;
+                } else {
+                    return ManifestMismatchEscalation::NotMismatch { last_err: e };
+                }
+            }
+        }
+    }
+    ManifestMismatchEscalation::Exhausted { last_err }
+}
+
 /// F3 — outcome of the bounded missing-exact-key completion escalation
 /// ([`escalate_missing_exact_keys`]).
 #[derive(Debug, PartialEq, Eq)]
@@ -10871,7 +11256,7 @@ enum ExactKeyEscalation {
 /// F3 — which phase of an escalation attempt failed
 /// ([`escalate_missing_exact_keys`]'s `repush_and_retry`).
 #[derive(Debug, PartialEq, Eq)]
-enum EscalationAttemptError {
+pub(crate) enum EscalationAttemptError {
     /// The re-push of the named record(s) failed on the SOURCE side — the
     /// record is unreadable (an indexed key whose blob is missing returns a
     /// read `Err`, not `Ok(None)`, from `build_record_replay_ops`) or the
@@ -17145,6 +17530,82 @@ mod tests {
         assert_eq!(dead_skipped, 0);
     }
 
+    /// GAP 3b (armed scenario 07, runs 31971906387/31971908443) — a replica
+    /// whose exchange report carries the PENDING_INBOUND flag holds only a
+    /// PARTIAL, fenced copy (a LOST inbound entry keeps the fence bit set, so
+    /// the flag rides every report). Its non-zero `last_applied_seq` must NOT
+    /// let the partial copy witness itself as a full replica — that
+    /// self-witness suppressed the very resync that would repair it (370-487
+    /// LOST inbound entries never re-acquired). The shard must be signaled
+    /// resync-eligible.
+    #[test]
+    fn sweep_signals_resync_for_fenced_partial_inbound_replica() {
+        let master = NodeId(1);
+        let replica = NodeId(2);
+        let mut view = std::collections::HashMap::new();
+        view.insert(master, vec![sweep_entry(7, 5)]);
+        // The replica reports RECORDS (a partial copy is non-empty) but the
+        // pending-inbound flag marks it subset/incomplete.
+        let mut partial = sweep_entry(7, 3);
+        partial.flags = PARTITION_FLAG_PENDING_INBOUND;
+        view.insert(replica, vec![partial]);
+        let alive: std::collections::HashSet<NodeId> = [master, replica].into_iter().collect();
+        let mastered = vec![(7u16, vec![replica])];
+
+        let (missing, signaled, _dropped, _dead_skipped, _inflight_skipped, _stale_fenced) =
+            derive_under_replication_resyncs(
+                &view,
+                &alive,
+                master,
+                &mastered,
+                &std::collections::HashSet::new(),
+                1024,
+            );
+
+        assert_eq!(
+            missing.get(&replica).map(|s| s.as_slice()),
+            Some(&[7u16][..]),
+            "a fenced partial (LOST/pending-inbound) copy must not witness \
+             itself — the shard is under-replicated and must be signaled",
+        );
+        assert_eq!(signaled, 1);
+    }
+
+    /// GAP 3b companion (fail-safe direction): when SELF's own report for a
+    /// mastered shard carries the PENDING_INBOUND flag, self holds only a
+    /// partial fenced copy — it must never push that partial state to
+    /// replicas as "repair". The shard is skipped whole via the freshness
+    /// fence (counted, never silent).
+    #[test]
+    fn sweep_never_repairs_from_a_fenced_partial_self_copy() {
+        let master = NodeId(1);
+        let replica = NodeId(2);
+        let mut view = std::collections::HashMap::new();
+        let mut self_partial = sweep_entry(7, 5);
+        self_partial.flags = PARTITION_FLAG_PENDING_INBOUND;
+        view.insert(master, vec![self_partial]);
+        view.insert(replica, vec![sweep_entry(7, 0)]);
+        let alive: std::collections::HashSet<NodeId> = [master, replica].into_iter().collect();
+        let mastered = vec![(7u16, vec![replica])];
+
+        let (missing, signaled, _dropped, _dead_skipped, _inflight_skipped, stale_fenced) =
+            derive_under_replication_resyncs(
+                &view,
+                &alive,
+                master,
+                &mastered,
+                &std::collections::HashSet::new(),
+                1024,
+            );
+
+        assert!(
+            missing.is_empty(),
+            "a master holding only a partial fenced copy must not source repair",
+        );
+        assert_eq!(signaled, 0);
+        assert_eq!(stale_fenced, 1, "the whole-shard skip must be counted");
+    }
+
     /// A replica that never reported in the exchange is unreachable at the
     /// replication layer — the sweep has no evidence to act on and must
     /// not signal it. The view is otherwise fresh (self witness present),
@@ -20571,6 +21032,143 @@ mod tests {
             engine.shard_record_count(shard),
             0,
             "run_orphan_cleanup must reclaim a non-owned shard after a committed handoff",
+        );
+    }
+
+    /// GAP 2 (armed scenario 17: 242 records stuck at 3 holders) — the
+    /// event-driven orphan-cleanup pass. `run_orphan_cleanup` used to be
+    /// invoked only from batch-completion sites; once the cluster settled,
+    /// nothing ever re-evaluated, so a third copy whose committed-handoff
+    /// evidence arrived AFTER the last batch stayed forever. The
+    /// exchange-completion consumer now drives a rate-limited pass: one
+    /// exchange completion with evidence present reclaims the shard to RF.
+    #[test]
+    fn event_orphan_cleanup_pass_reclaims_settled_shard_to_rf() {
+        let old_table =
+            ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2), NodeId(3)], 2, 10, 1);
+        let new_table = ShardTable::compute_with_epoch(&[NodeId(2), NodeId(3)], 2, 11, 1);
+        let shard = (0..NUM_SHARDS as u16)
+            .find(|&s| {
+                let old = old_table.target_assignment(s);
+                let new = new_table.target_assignment(s);
+                (old.master == NodeId(1) || old.replicas.contains(&NodeId(1)))
+                    && new.master != NodeId(1)
+                    && !new.replicas.contains(&NodeId(1))
+            })
+            .expect("node1 should hold a shard it no longer owns after removal");
+        let engine = Arc::new(test_engine());
+        let key = tx_key_for_shard(shard, 51);
+        create_test_record(&engine, key);
+        assert_eq!(engine.shard_record_count(shard), 1, "the stale third copy");
+
+        let shard_table = Arc::new(ShardTableLock::new(new_table.clone()));
+        let migration = Arc::new(Mutex::new(MigrationManager::new()));
+        // Evidence present, cluster settled, NO further batch completion will
+        // ever run — only the event-driven pass can reclaim.
+        migration
+            .lock()
+            .record_committed_handoff(shard, new_table.version);
+
+        let mut last_fired: Option<std::time::Instant> = None;
+        let now = std::time::Instant::now();
+        assert!(
+            event_orphan_cleanup_fire(&mut last_fired, now),
+            "the first exchange completion must fire the pass",
+        );
+        run_orphan_cleanup(
+            NodeId(1),
+            &engine,
+            &shard_table,
+            &migration,
+            new_table.version,
+        );
+        assert_eq!(
+            engine.shard_record_count(shard),
+            0,
+            "one event-driven pass must reclaim the settled shard to RF",
+        );
+
+        // Rate limit: a second exchange completion inside the min interval
+        // must NOT fire another pass; after the interval it fires again.
+        assert!(
+            !event_orphan_cleanup_fire(&mut last_fired, now + Duration::from_secs(5)),
+            "a pass within the min interval is refused",
+        );
+        assert!(
+            event_orphan_cleanup_fire(
+                &mut last_fired,
+                now + EVENT_ORPHAN_CLEANUP_MIN_INTERVAL + Duration::from_secs(1),
+            ),
+            "after the min interval the next exchange completion fires again",
+        );
+    }
+
+    /// GAP 2 — the fail-closed #28 guard stays untouched: a non-owned shard
+    /// with PERMANENTLY missing handoff evidence is retained — but it must be
+    /// COUNTED in `teraslab_orphan_cleanup_retained_no_evidence` so the
+    /// census gap is visible, and the gauge must drop back once evidence
+    /// arrives and the copy is reclaimed.
+    #[test]
+    fn orphan_cleanup_counts_retained_no_evidence_shards() {
+        let _guard = migration_metrics_test_guard();
+        let metrics = install_test_migration_metrics();
+        let old_table =
+            ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2), NodeId(3)], 2, 10, 1);
+        let new_table = ShardTable::compute_with_epoch(&[NodeId(2), NodeId(3)], 2, 11, 1);
+        let shard = (0..NUM_SHARDS as u16)
+            .find(|&s| {
+                let old = old_table.target_assignment(s);
+                let new = new_table.target_assignment(s);
+                (old.master == NodeId(1) || old.replicas.contains(&NodeId(1)))
+                    && new.master != NodeId(1)
+                    && !new.replicas.contains(&NodeId(1))
+            })
+            .expect("node1 should hold a shard it no longer owns after removal");
+        let engine = Arc::new(test_engine());
+        let key = tx_key_for_shard(shard, 52);
+        create_test_record(&engine, key);
+
+        let shard_table = Arc::new(ShardTableLock::new(new_table.clone()));
+        let migration = Arc::new(Mutex::new(MigrationManager::new()));
+        metrics
+            .orphan_cleanup_retained_no_evidence
+            .store(0, Ordering::Relaxed);
+
+        // Evidence missing → retained AND counted.
+        run_orphan_cleanup(
+            NodeId(1),
+            &engine,
+            &shard_table,
+            &migration,
+            new_table.version,
+        );
+        assert_eq!(engine.shard_record_count(shard), 1, "fail-closed: retained");
+        assert_eq!(
+            metrics
+                .orphan_cleanup_retained_no_evidence
+                .load(Ordering::Relaxed),
+            1,
+            "the retained-without-evidence shard must be visible in the gauge",
+        );
+
+        // Evidence arrives → reclaimed, gauge drops to zero.
+        migration
+            .lock()
+            .record_committed_handoff(shard, new_table.version);
+        run_orphan_cleanup(
+            NodeId(1),
+            &engine,
+            &shard_table,
+            &migration,
+            new_table.version,
+        );
+        assert_eq!(engine.shard_record_count(shard), 0);
+        assert_eq!(
+            metrics
+                .orphan_cleanup_retained_no_evidence
+                .load(Ordering::Relaxed),
+            0,
+            "a reclaimed shard leaves the retained census",
         );
     }
 
@@ -24942,6 +25540,135 @@ mod tests {
             completion_rejection_missing_keys(&code_190, &manifest).is_empty(),
             "code=190 must not match the code=19 discriminator",
         );
+    }
+
+    /// GAP 1 — build a realistic code-22 manifest-mismatch rejection string
+    /// (the `migration_complete_rejection_error` envelope around the dispatch
+    /// producer's message).
+    fn mismatch_err() -> String {
+        format!(
+            "target rejected: status 4 (code={}: shard 437 manifest hash mismatch \
+             (count matched at 3 records but content differs; exact_entries=absent, \
+             expected=3, epoch_current=true))",
+            crate::protocol::opcodes::ERR_MIGRATION_MANIFEST_MISMATCH,
+        )
+    }
+
+    /// GAP 1 — the code-22 discriminator: only a manifest-hash-mismatch
+    /// rejection with MATCHING COUNTS engages the record-level re-sync.
+    /// Other codes (and code-22x lookalikes) keep their own handling.
+    #[test]
+    fn manifest_mismatch_rejection_parser_matches_only_code_22_count_matched() {
+        assert!(completion_rejection_manifest_mismatch(&mismatch_err()));
+        let code19 = format!(
+            "target rejected: status 4 (code=19: shard 227 missing exact key {:?}: TxNotFound)",
+            tk(2),
+        );
+        assert!(
+            !completion_rejection_manifest_mismatch(&code19),
+            "a code-19 rejection is not a manifest mismatch",
+        );
+        let code220 = "target rejected: status 4 (code=220: shard 1 manifest hash mismatch \
+                       (count matched at 1 records but content differs))";
+        assert!(
+            !completion_rejection_manifest_mismatch(code220),
+            "code=220 must not match the code=22 discriminator",
+        );
+        let count_mismatch = format!(
+            "target rejected: status 4 (code={}: shard 1 record count mismatch: expected 5, got 9)",
+            crate::protocol::opcodes::ERR_MIGRATION_MANIFEST_MISMATCH,
+        );
+        assert!(
+            !completion_rejection_manifest_mismatch(&count_mismatch),
+            "only the count-matched content-divergence shape escalates",
+        );
+    }
+
+    /// GAP 1 (armed scenario 06: shards 437/439/448 wedged 90+s) — the
+    /// bounded record-level re-sync driver. Every attempt the driver makes
+    /// re-pushes the shard's records BEFORE retrying the completion (the
+    /// attempt closure is repush+retry by contract), so an identical
+    /// manifest is never blindly re-sent; a still-mismatching retry burns an
+    /// attempt and re-syncs again, converging within the bound.
+    #[test]
+    fn manifest_mismatch_escalation_verifies_after_bounded_resyncs() {
+        let mut attempts = 0usize;
+        let outcome = escalate_manifest_mismatch(mismatch_err(), 3, || {
+            attempts += 1;
+            if attempts < 3 {
+                Err(EscalationAttemptError::Completion(mismatch_err()))
+            } else {
+                Ok(())
+            }
+        });
+        assert_eq!(outcome, ManifestMismatchEscalation::Verified);
+        assert_eq!(attempts, 3, "converged within the attempt bound");
+    }
+
+    /// GAP 1 — a target that keeps rejecting code-22 after every re-sync
+    /// exhausts the bounded escalation (terminal abort for the task — the
+    /// existing rollback-to-source path — never an infinite retry).
+    #[test]
+    fn manifest_mismatch_escalation_exhausts_after_bounded_attempts() {
+        let mut attempts = 0usize;
+        let outcome = escalate_manifest_mismatch(mismatch_err(), 3, || {
+            attempts += 1;
+            Err(EscalationAttemptError::Completion(mismatch_err()))
+        });
+        assert_eq!(attempts, 3, "escalation must stop at the attempt bound");
+        match outcome {
+            ManifestMismatchEscalation::Exhausted { last_err } => {
+                assert!(
+                    last_err.contains("manifest hash mismatch"),
+                    "got: {last_err}"
+                );
+            }
+            other => panic!("expected Exhausted, got {other:?}"),
+        }
+    }
+
+    /// GAP 1 — a completion retry that fails with anything OTHER than a
+    /// code-22 mismatch (e.g. a code-19 exact-key rejection now that exact
+    /// entries reached the target) returns to the historical handling with
+    /// the newest error; the next re-drive's own machinery owns that shape.
+    #[test]
+    fn manifest_mismatch_escalation_falls_back_on_non_mismatch_error() {
+        let other = format!(
+            "target rejected: status 4 (code=19: shard 437 missing exact key {:?}: TxNotFound)",
+            tk(1),
+        );
+        let mut attempts = 0usize;
+        let outcome = escalate_manifest_mismatch(mismatch_err(), 3, || {
+            attempts += 1;
+            Err(EscalationAttemptError::Completion(other.clone()))
+        });
+        assert_eq!(
+            attempts, 1,
+            "a non-mismatch rejection stops the re-sync loop"
+        );
+        assert_eq!(
+            outcome,
+            ManifestMismatchEscalation::NotMismatch { last_err: other },
+        );
+    }
+
+    /// GAP 1 — a re-push that fails on the SOURCE side (stream broke, record
+    /// unreadable) burns the attempt: a source that can never complete the
+    /// re-sync still exhausts to the terminal path instead of looping.
+    #[test]
+    fn manifest_mismatch_escalation_burns_attempts_on_repush_failure() {
+        let mut attempts = 0usize;
+        let outcome = escalate_manifest_mismatch(mismatch_err(), 3, || {
+            attempts += 1;
+            Err(EscalationAttemptError::Repush("stream broke".to_string()))
+        });
+        assert_eq!(attempts, 3);
+        match outcome {
+            ManifestMismatchEscalation::Exhausted { last_err } => {
+                assert!(last_err.contains("stream broke"), "got: {last_err}");
+            }
+            other => panic!("expected Exhausted, got {other:?}"),
+        }
     }
 
     /// F3 (a) — a completion rejection naming a missing exact key triggers a
