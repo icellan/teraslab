@@ -16226,7 +16226,15 @@ fn prepare_resync_backfill(
         .copied()
         .filter(|&s| engine.shard_record_count(s) > 0)
         .collect();
-    migration.lock().start_outbound(&tasks, self_id, &populated);
+    // W10 composition (P1-2) — registered as a REPAIR: identical bookkeeping,
+    // except the Phase E dual-write window it opens is tagged repair-only so
+    // the target (a node the committed table already names as a holder) does
+    // not become a mandatory new-side handoff ACK for every client write to
+    // these shards. See
+    // `MigrationManager::dual_write_targets_with_origin_for_shard`.
+    migration
+        .lock()
+        .start_outbound_resync(&tasks, self_id, &populated);
     let (keys_map, skipped) = engine.keys_by_shard_filtered(&target_shards);
     // Issue #46 fail-safe: an unreadable-footer skip means this resync key
     // set is incomplete — do not backfill a short set. The tasks are tracked,
@@ -18994,6 +19002,26 @@ impl RunningCluster {
             .to_vec()
     }
 
+    /// Phase E dual-write targets for `shard`, each paired with whether it is
+    /// a NEW-SIDE HANDOFF holder (`true`) or a repair-only Phase-H resync
+    /// backfill destination (`false`).
+    ///
+    /// Used by `build_replication_targets` in place of
+    /// [`Self::dual_write_targets_for_shard`] so one migration-lock
+    /// acquisition yields both the fan-out set and the handoff-ACK gating
+    /// (W10 composition P1-2). See
+    /// [`MigrationManager::dual_write_targets_with_origin_for_shard`].
+    pub fn dual_write_targets_with_origin_for_shard(&self, shard: u16) -> Vec<(NodeId, bool)> {
+        // C31 test observability: this replaces the plain lookup on the batch
+        // dual-write path, so it must keep counting the lock acquisition.
+        #[cfg(test)]
+        self.dual_write_lookup_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.migration
+            .lock()
+            .dual_write_targets_with_origin_for_shard(shard)
+    }
+
     /// C31 test observability: number of [`Self::dual_write_targets_for_shard`]
     /// calls (== migration-lock acquisitions) since construction.
     #[cfg(test)]
@@ -19018,6 +19046,24 @@ impl RunningCluster {
             is_master: true,
         };
         self.migration.lock().start_outbound(
+            std::slice::from_ref(&task),
+            self.self_id,
+            &std::collections::HashSet::new(),
+        );
+    }
+
+    /// Test-only: register a Phase-H RESYNC backfill task (replica-side
+    /// repair toward `dest`, which the committed table already names as a
+    /// holder) so the repair-only dual-write window opens for `shard`.
+    #[cfg(test)]
+    pub(crate) fn test_open_resync_dual_write_window(&self, shard: u16, dest: NodeId) {
+        let task = MigrationTask {
+            shard,
+            from_node: self.self_id,
+            to_node: dest,
+            is_master: false,
+        };
+        self.migration.lock().start_outbound_resync(
             std::slice::from_ref(&task),
             self.self_id,
             &std::collections::HashSet::new(),
@@ -40006,6 +40052,71 @@ mod tests {
         assert!(
             demoted_shard_keys(&demoted_rev).is_empty(),
             "order must not matter — the fail-safe empty contribution wins",
+        );
+    }
+
+    /// W10 COMPOSITION FIX 2 (P1-2) — the drain's registration path itself:
+    /// `prepare_resync_backfill` must open a REPAIR-only dual-write window,
+    /// otherwise the R2/P7b gate in `build_replication_targets` turns the
+    /// repair target into a mandatory per-shard write ACK (see
+    /// `resync_dual_write_target_is_not_a_mandatory_handoff_ack`).
+    #[test]
+    fn prepare_resync_backfill_opens_a_repair_only_dual_write_window() {
+        let members = vec![NodeId(1), NodeId(2)];
+        let table = ShardTable::compute_with_epoch(&members, 2, 3, 1);
+        let shard = (0..NUM_SHARDS as u16)
+            .find(|&s| {
+                table.target_assignment(s).master == NodeId(1)
+                    && table.target_assignment(s).replicas.contains(&NodeId(2))
+            })
+            .expect("node 1 must master a shard with node 2 as replica");
+        let epoch = table.version;
+        let shard_table = Arc::new(ShardTableLock::new(table));
+
+        let engine = Arc::new(test_engine());
+        create_test_record(&engine, tx_key_for_shard(shard, 11));
+
+        let migration = Arc::new(Mutex::new(MigrationManager::new()));
+        let resync_inflight: Arc<Mutex<std::collections::HashSet<(u64, u16)>>> =
+            Arc::new(Mutex::new(std::collections::HashSet::new()));
+        let fenced_bm = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+        let migrating_bm = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+
+        let req = crate::replication::manager::ResyncRequest {
+            node_id: 2,
+            shards: vec![shard],
+        };
+        let (tasks, _keys) = prepare_resync_backfill(
+            &req,
+            NodeId(1),
+            &shard_table,
+            &migration,
+            &engine,
+            &resync_inflight,
+            &fenced_bm,
+            &migrating_bm,
+            epoch,
+        )
+        .expect("the resync request must resolve to runnable backfill work");
+        assert_eq!(tasks.len(), 1);
+        assert!(!tasks[0].is_master, "a resync backfill is replica-side");
+
+        let mgr = migration.lock();
+        assert_eq!(
+            mgr.active_count(),
+            1,
+            "the backfill stays start_outbound-tracked (W10 defect 1)",
+        );
+        assert_eq!(
+            mgr.dual_write_targets_for_shard(shard),
+            &[NodeId(2)],
+            "the repair target must still receive the dual-write fan-out",
+        );
+        assert_eq!(
+            mgr.dual_write_targets_with_origin_for_shard(shard),
+            vec![(NodeId(2), false)],
+            "the window must be tagged REPAIR-only — a resync toward an \
+             existing replica is not a new-side handoff holder",
         );
     }
 }

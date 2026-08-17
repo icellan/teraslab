@@ -568,6 +568,18 @@ impl Drop for MigrationToken {
     }
 }
 
+/// Why a Phase E dual-write window was opened — see
+/// [`MigrationManager::dual_write_targets_with_origin_for_shard`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DualWriteOrigin {
+    /// A handoff: `to_node` is a NEW-SIDE holder that is becoming
+    /// authoritative for the shard.
+    Handoff,
+    /// A Phase-H resync backfill: `to_node` is an EXISTING holder being
+    /// repaired. No ownership transition happens.
+    Resync,
+}
+
 /// Manages active migrations for this node.
 pub struct MigrationManager {
     active: Vec<MigrationProgress>,
@@ -588,6 +600,13 @@ pub struct MigrationManager {
     /// new replicas) that must also receive replica batches while the
     /// migration is in flight. Cleared on `mark_complete` / `mark_failed`.
     dual_write_targets: std::collections::HashMap<u16, Vec<NodeId>>,
+    /// W10 composition (P1-2) — the subset of [`Self::dual_write_targets`]
+    /// entries opened by a REPAIR (Phase-H resync backfill) rather than by a
+    /// handoff. Repair targets still receive the dual-write fan-out, but they
+    /// are NOT new-side handoff holders, so the per-shard "≥1 ACK from the
+    /// new side" write invariant must not name them. See
+    /// [`Self::dual_write_targets_with_origin_for_shard`].
+    resync_dual_write: std::collections::HashMap<u16, std::collections::HashSet<NodeId>>,
     /// Data-loss guard (task #28): shards this node has POSITIVELY,
     /// COMMITTED-ly handed off as the outbound source, mapped to the
     /// topology epoch at which the master move was committed to the
@@ -686,6 +705,7 @@ impl MigrationManager {
             inbound_bitmap: ShardBitmap::new(),
             fenced_shards: ShardBitmap::new(),
             dual_write_targets: std::collections::HashMap::new(),
+            resync_dual_write: std::collections::HashMap::new(),
             committed_handoffs: std::collections::HashMap::new(),
             next_attempt: 1,
             failed_batch_retry_arm: false,
@@ -882,15 +902,72 @@ impl MigrationManager {
         &self.dual_write_targets
     }
 
-    fn dual_write_add(&mut self, shard: u16, node: NodeId) {
+    /// Phase E dual-write targets for `shard`, each paired with whether it is
+    /// a NEW-SIDE HANDOFF holder (`true`) or a repair-only backfill
+    /// destination (`false`).
+    ///
+    /// W10 composition (P1-2): the replication path turns every new-side
+    /// handoff target into a hard per-shard write requirement ("≥1 ACK from
+    /// this shard's new side"). That invariant protects a MASTERSHIP /
+    /// holder-set TRANSITION — the target is about to become authoritative,
+    /// so it must observe the writes that land during the window. A Phase-H
+    /// resync backfill performs no transition: it is a repair toward a node
+    /// the committed table ALREADY names as a holder (so it is already in the
+    /// regular quorum set and governed by the normal ACK policy), and its
+    /// task is `is_master = false` — nothing commits. Counting it as a
+    /// handoff target promoted "R must ACK" into a per-shard WriteAll for the
+    /// life of the backfill; a `shards: []` "I don't know" resync expands to
+    /// EVERY shard R owns, so every client write to any of them would require
+    /// an ACK from the very node the repair is catching up.
+    pub fn dual_write_targets_with_origin_for_shard(&self, shard: u16) -> Vec<(NodeId, bool)> {
+        let repair = self.resync_dual_write.get(&shard);
+        self.dual_write_targets
+            .get(&shard)
+            .map(|v| {
+                v.iter()
+                    .map(|n| (*n, !repair.is_some_and(|r| r.contains(n))))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn dual_write_add(&mut self, shard: u16, node: NodeId, origin: DualWriteOrigin) {
         let entry = self.dual_write_targets.entry(shard).or_default();
-        if !entry.contains(&node) {
+        let already_present = entry.contains(&node);
+        if !already_present {
             entry.push(node);
+        }
+        match origin {
+            DualWriteOrigin::Handoff => {
+                // A genuine handoff always UPGRADES the entry: the new-side
+                // ACK invariant must hold even if a repair opened the window
+                // first.
+                if let Some(r) = self.resync_dual_write.get_mut(&shard) {
+                    r.remove(&node);
+                    if r.is_empty() {
+                        self.resync_dual_write.remove(&shard);
+                    }
+                }
+            }
+            DualWriteOrigin::Resync => {
+                // Never DOWNGRADE an entry a handoff already opened — that
+                // would drop the genuine invariant. Only a window this repair
+                // opened (or one an earlier repair already marked) is
+                // repair-only.
+                let already_repair = self
+                    .resync_dual_write
+                    .get(&shard)
+                    .is_some_and(|r| r.contains(&node));
+                if !already_present || already_repair {
+                    self.resync_dual_write.entry(shard).or_default().insert(node);
+                }
+            }
         }
     }
 
     fn dual_write_remove(&mut self, shard: u16) {
         self.dual_write_targets.remove(&shard);
+        self.resync_dual_write.remove(&shard);
     }
 
     /// Start migrations from a list of tasks.
@@ -904,7 +981,39 @@ impl MigrationManager {
         &mut self,
         tasks: &[MigrationTask],
         self_id: NodeId,
+        populated_shards: &std::collections::HashSet<u16>,
+    ) {
+        self.start_outbound_with_origin(
+            tasks,
+            self_id,
+            populated_shards,
+            DualWriteOrigin::Handoff,
+        );
+    }
+
+    /// Register Phase-H RESYNC backfill tasks (a repair toward a node the
+    /// committed table already names as a holder).
+    ///
+    /// Identical to [`Self::start_outbound`] except that the dual-write
+    /// window it opens is tagged repair-only, so the replication path does
+    /// NOT turn the repair target into a mandatory per-shard new-side ACK —
+    /// see [`Self::dual_write_targets_with_origin_for_shard`] for why that
+    /// distinction is the sound one.
+    pub fn start_outbound_resync(
+        &mut self,
+        tasks: &[MigrationTask],
+        self_id: NodeId,
+        populated_shards: &std::collections::HashSet<u16>,
+    ) {
+        self.start_outbound_with_origin(tasks, self_id, populated_shards, DualWriteOrigin::Resync);
+    }
+
+    fn start_outbound_with_origin(
+        &mut self,
+        tasks: &[MigrationTask],
+        self_id: NodeId,
         _populated_shards: &std::collections::HashSet<u16>,
+        origin: DualWriteOrigin,
     ) {
         for task in tasks {
             if task.from_node == self_id {
@@ -915,7 +1024,7 @@ impl MigrationManager {
                 // Phase E: open dual-write window so writes during the
                 // migration land on the new master / replica destination
                 // as well as the old replica set.
-                self.dual_write_add(task.shard, task.to_node);
+                self.dual_write_add(task.shard, task.to_node, origin);
                 if let Some(m) = migration_metrics() {
                     m.migration_active.fetch_add(1, Ordering::Relaxed);
                     m.migration_phase_preparing.fetch_add(1, Ordering::Relaxed);
