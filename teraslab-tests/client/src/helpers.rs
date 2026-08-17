@@ -913,15 +913,23 @@ services:
         for i in 1..=5 {
             let name = format!("node{i}");
             let container = self.container_name(&name);
-            let log_output = run_docker_cmd(&["logs", &container])
-                .await
-                .unwrap_or_default();
+            // A scenario that runs fewer than 5 nodes — or that removed one
+            // mid-run — makes `docker logs` fail here. This used to write the
+            // output anyway, producing a 0-byte file that reads as "this node
+            // logged nothing" rather than "this node was never collected" —
+            // the exact fabrication `captured_log_bytes` exists to prevent.
+            //
+            // `docker_logs_bytes` (not `run_docker_cmd`) is what keeps this
+            // honest in the other direction too: `run_docker_cmd` returns
+            // stdout ONLY, and the daemon writes its tracing output to
+            // stderr, so every log collected here was near-empty regardless.
+            let Some(buf) = docker_logs_bytes(&container).await else {
+                continue;
+            };
             let log_path = format!("{output_dir}/{container}.log");
-            tokio::fs::write(&log_path, log_output.as_bytes())
-                .await
-                .map_err(|e| {
-                    ClientError::Connection(format!("{log_path}: failed to write log file: {e}"))
-                })?;
+            tokio::fs::write(&log_path, &buf).await.map_err(|e| {
+                ClientError::Connection(format!("{log_path}: failed to write log file: {e}"))
+            })?;
         }
 
         Ok(())
@@ -936,10 +944,30 @@ services:
 /// # Errors
 /// Returns `ClientError::Connection` if the process cannot be spawned or
 /// if the command exits with a non-zero status.
+async fn run_docker_cmd(args: &[&str]) -> Result<String, ClientError> {
+    let output = tokio::process::Command::new("docker")
+        .args(args)
+        .output()
+        .await
+        .map_err(|e| ClientError::Connection(format!("docker: {e}")))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(ClientError::Connection(format!("docker: {stderr}")));
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
 /// Environment variable naming the directory failure diagnostics are
 /// written to. Set per scenario by `teraslab-tests/run_all.sh`; unset for a
 /// bare `cargo test`, in which case nothing is archived.
 pub const ENV_DIAG_DIR: &str = "TERASLAB_DIAG_DIR";
+
+/// Ceiling on the pre-removal log archive (see [`archive_container_log`]).
+/// Generous enough for a multi-MB container log, short enough that a wedged
+/// daemon cannot stall a node removal.
+const ARCHIVE_LOG_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// The bytes worth writing as a container's captured log, or `None` when
 /// nothing should be written.
@@ -974,6 +1002,12 @@ pub fn captured_log_bytes(status_ok: bool, stdout: Vec<u8>, stderr: &[u8]) -> Op
 /// Best-effort by design: no diag dir configured, an unreadable container,
 /// or a failed write are all silently skipped. This must never turn a
 /// diagnostic into a test failure.
+///
+/// It sits directly in front of a `docker rm -f` whose whole purpose is to
+/// release the container's network interface promptly, so — like every other
+/// docker call on the destruction path — it is bounded by
+/// [`ARCHIVE_LOG_TIMEOUT`] and reaps the child on drop. A hung Docker daemon
+/// costs the removal at most that long.
 async fn archive_container_log(container: &str) {
     let Ok(dir) = std::env::var(ENV_DIAG_DIR) else {
         return;
@@ -981,33 +1015,29 @@ async fn archive_container_log(container: &str) {
     if dir.is_empty() || tokio::fs::create_dir_all(&dir).await.is_err() {
         return;
     }
-    let Ok(out) = tokio::process::Command::new("docker")
-        .args(["logs", container])
-        .output()
-        .await
-    else {
-        return;
-    };
-    let Some(buf) = captured_log_bytes(out.status.success(), out.stdout, &out.stderr) else {
+    let Some(buf) = docker_logs_bytes(container).await else {
         return;
     };
     let path = std::path::Path::new(&dir).join(format!("{container}.log"));
     let _ = tokio::fs::write(&path, &buf).await;
 }
 
-async fn run_docker_cmd(args: &[&str]) -> Result<String, ClientError> {
-    let output = tokio::process::Command::new("docker")
-        .args(args)
-        .output()
+/// Run `docker logs <container>` and return the bytes worth keeping.
+///
+/// The single log-capture primitive for the whole harness: bounded by
+/// [`ARCHIVE_LOG_TIMEOUT`], reaps the child on drop, keeps BOTH streams (the
+/// daemon's tracing output goes to stderr), and applies
+/// [`captured_log_bytes`] so a failed or empty capture yields no file rather
+/// than a misleading one.
+async fn docker_logs_bytes(container: &str) -> Option<Vec<u8>> {
+    let mut cmd = tokio::process::Command::new("docker");
+    cmd.kill_on_drop(true);
+    cmd.args(["logs", container]);
+    let out = tokio::time::timeout(ARCHIVE_LOG_TIMEOUT, cmd.output())
         .await
-        .map_err(|e| ClientError::Connection(format!("docker: {e}")))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(ClientError::Connection(format!("docker: {stderr}")));
-    }
-
-    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+        .ok()?
+        .ok()?;
+    captured_log_bytes(out.status.success(), out.stdout, &out.stderr)
 }
 
 #[cfg(test)]

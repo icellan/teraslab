@@ -423,8 +423,15 @@ async fn run_scenario() -> Result<(), ClientError> {
             };
 
             let op_start = std::time::Instant::now();
-            match client.spend_batch(&params, &spend_targets).await {
-                Ok(_) => {
+            // This workload runs across a node restart, so the shard handoff
+            // fence answers some spends with ERR_MIGRATION_IN_PROGRESS. The
+            // old code logged that and moved on, silently dropping the op
+            // from the workload it exists to generate; retry the transient
+            // codes the same way the seed path does. Terminal errors keep
+            // the previous tolerant treatment — already-spent slots are an
+            // expected outcome here.
+            match common::spend_all_with_transient_retry(&client, &params, &spend_targets).await {
+                Ok(()) => {
                     reporter.record("spend", op_start.elapsed());
                     for item in &spend_targets {
                         verifier.record_spend(item.txid, item.vout);

@@ -423,7 +423,12 @@ async fn test_partition_plus_kill() -> Result<(), ClientError> {
     eprintln!("[12.3] Cluster restored to 3 nodes");
 
     // Full consistency check — use a fresh client to avoid stale connections
-    // from the partition + kill phase.
+    // from the partition + kill phase. The superseded client is finished;
+    // close it instead of letting it drop, because this scenario pauses and
+    // partitions nodes and a dropped client's health loop can keep its
+    // sockets — and their share of the server's per-IP budget — alive for a
+    // long time against an unreachable peer (see `Client::drop`).
+    client.close().await;
     let fresh_client = common::create_client(&docker, 3).await?;
     fresh_client.refresh_routing().await?;
     let mismatches = common::verify_consistency(&fresh_client, &verifier).await?;
@@ -557,6 +562,8 @@ async fn test_kill_during_migration() -> Result<(), ClientError> {
         .unwrap_or_else(|e| eprintln!("[12.4] final migration wait: {e}"));
 
     common::wait_replication_settled(&docker_5, cluster_size, Duration::from_secs(30)).await?;
+    // Superseded client — closed rather than dropped, see 12.3 above.
+    client.close().await;
     let fresh_client = common::create_client(&docker_5, cluster_size as usize).await?;
     fresh_client.refresh_routing().await?;
     eprintln!("[12.4] Cluster restored to {cluster_size} nodes");
@@ -725,6 +732,8 @@ async fn test_rolling_restart_plus_partition() -> Result<(), ClientError> {
     // client avoids stale client-side connections. The longer settle
     // time allows the server's replication pool to reconnect.
     common::wait_replication_settled(&docker, 3, Duration::from_secs(5)).await?;
+    // Superseded client — closed rather than dropped, see 12.3 above.
+    client.close().await;
     let fresh_client = common::create_client(&docker, 3).await?;
     fresh_client.refresh_routing().await?;
     let new_txids = common::seed_records(&fresh_client, &verifier, 100, 2).await?;

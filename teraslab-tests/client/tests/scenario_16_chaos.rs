@@ -1039,6 +1039,11 @@ async fn run_scenario() -> Result<(), ClientError> {
             {
                 let check_client = common::create_client(&docker, 5).await?;
                 resolve_timeouts(&check_client, &verifier, &ws).await;
+                // Chaos pauses and blackholes nodes; a dropped client's
+                // health loop can hold its sockets for a long time against
+                // such a peer (see `Client::drop`), and this block runs at
+                // every checkpoint.
+                check_client.close().await;
             }
 
             // Full consistency check on ALL records
@@ -1184,6 +1189,7 @@ async fn run_scenario() -> Result<(), ClientError> {
     {
         let check_client = common::create_client(&docker, 5).await?;
         resolve_timeouts(&check_client, &verifier, &ws).await;
+        check_client.close().await;
     }
 
     // Full consistency check on ALL records

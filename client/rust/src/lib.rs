@@ -3100,9 +3100,19 @@ impl Drop for Client {
     /// reference to the pooled `PipeConn`s, and `Drop for PipeConn` aborts
     /// the read task and drops the write half, closing the socket.
     ///
-    /// This complements — it does not replace — [`Client::close`], which
-    /// still exists for callers that want to await an orderly shutdown
-    /// instead of a best-effort one on drop.
+    /// This complements — it does not replace — [`Client::close`], and for a
+    /// client-churning caller `close()` is materially better. Drop only
+    /// *starts* the teardown: a health loop parked inside `check_health`
+    /// does not re-poll its close channel until the round finishes, and that
+    /// round pings each pooled connection sequentially with a
+    /// `request_timeout` (30s default) ceiling apiece, up to `max_conns`
+    /// (16), before replenishing at `dial_timeout` each. Against a PAUSED
+    /// peer — scenarios 12 and 16 pause containers, and a paused peer
+    /// neither answers nor RSTs — every ping burns the full timeout, so a
+    /// dropped client's sockets can hold their per-IP budget for minutes.
+    /// `close()` has none of that: it flips `closed`, signals the watch
+    /// channel, `mem::take`s the connection vector and closes each entry
+    /// immediately.
     fn drop(&mut self) {
         if let Some(task) = self._refresh_task.take() {
             task.abort();

@@ -73,8 +73,14 @@ async fn try_create_on_port(
         mined_subtree_idx: None,
         parent_txids: vec![],
     };
-    client.create_batch(&[item]).await?;
-    Ok(())
+    // This probe runs once per partition check, so it churns clients against
+    // nodes that are partitioned or paused. Close explicitly on BOTH paths:
+    // a dropped client only starts its teardown, and against an unreachable
+    // peer the health loop can hold its sockets for a long time (see
+    // `Client::drop`).
+    let result = client.create_batch(&[item]).await.map(|_| ());
+    client.close().await;
+    result
 }
 
 /// Read a sample of txids from the cluster and verify they are all accessible.

@@ -291,9 +291,15 @@ async fn run_scenario() -> Result<(), ClientError> {
         // Counting it as a hard failure here made 4.5 fail on the very same
         // condition 4.4 had just survived, so use the shared transient-retry
         // policy. Non-transient per-item errors still fail the scenario.
+        // Return the error instead of panicking: only the `Ok(Err(..))` and
+        // timeout arms of the test fn call `collect_failure_diagnostics`, so
+        // a panic here loses every container log and cluster snapshot for
+        // the failure — the exact gap this branch's diagnostics fix closes.
         common::spend_all_with_transient_retry(&client, &spend_params, &items)
             .await
-            .unwrap_or_else(|e| panic!("Test 4.5: spend batch failed on 2-node cluster: {e}"));
+            .map_err(|e| {
+                ClientError::Connection(format!("Test 4.5: spend failed on 2-node cluster: {e}"))
+            })?;
         // The helper returns Ok only once EVERY item has been acknowledged.
         for item in &items {
             verifier.record_spend(item.txid, 0);
