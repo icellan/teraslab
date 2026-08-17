@@ -23577,6 +23577,93 @@ mod tests {
         assert_eq!(engine.shard_record_count(shard), 1);
     }
 
+    /// W10 composition review P2-6 (RED→GREEN) — the armed-05 chain past the
+    /// retention horizon, at the CONSUMER the migration completion builder
+    /// actually calls (`Engine::weak_tombstone_keys_for_shard`).
+    ///
+    /// The source pruned key K locally (#29 prune damage → a WEAK
+    /// `PruneReplace` tombstone), so every manifest it ships omits K; the
+    /// declaration is what stops the target's prune from reading that omission
+    /// as deletion-intent and deleting its LAST LIVE COPY. Pre-fix the weak
+    /// tombstone expired on the block-height retention clock, so a repair
+    /// slower than `tombstone_retention_blocks` silently withdrew the
+    /// declaration while the omission persisted. A genuine client delete must
+    /// still expire on schedule.
+    #[test]
+    fn weak_tombstone_declaration_survives_the_retention_horizon() {
+        use crate::ops::remaining::DeleteRequest;
+        let engine = Arc::new(test_engine());
+        // A DELIBERATELY short retention so the horizon is reachable in-test;
+        // production sizes this at the reorg/finality horizon.
+        engine.set_tombstone_log(crate::ops::tombstone::TombstoneLog::new(
+            std::path::PathBuf::from("/nonexistent/w10-p2-6.tombstones"),
+            engine.index_seed(),
+            engine.index_shard_count(),
+            10,
+        ));
+
+        let pruned = tx_key_for_shard(64, 70);
+        let client_deleted = tx_key_for_shard(64, 71);
+        let shard = ShardTable::shard_for_key(&pruned);
+        assert_eq!(
+            ShardTable::shard_for_key(&client_deleted),
+            shard,
+            "fixture: both keys must live in the same cluster shard",
+        );
+        create_test_record(&engine, pruned);
+        create_test_record(&engine, client_deleted);
+        engine.observe_block_height(100);
+
+        // Our OWN reconcile damage (the #29 completion prune) …
+        engine
+            .delete_prune_replace(&DeleteRequest {
+                tx_key: pruned,
+                due_guard: None,
+            })
+            .expect("prune-replace delete must succeed");
+        // … versus a real, authoritative client delete.
+        engine
+            .delete(&DeleteRequest {
+                tx_key: client_deleted,
+                due_guard: None,
+            })
+            .expect("client delete must succeed");
+        assert_eq!(
+            engine.weak_tombstone_keys_for_shard(shard),
+            vec![pruned],
+            "precondition: only the prune damage is a weak omission claim",
+        );
+
+        // Repair is delayed far past the retention horizon, and a checkpoint
+        // GC runs.
+        engine.observe_block_height(100_000);
+        assert_eq!(
+            engine.gc_tombstones(),
+            1,
+            "the authoritative client delete still expires on schedule",
+        );
+        assert!(
+            engine.tombstone_lookup(&client_deleted).is_none(),
+            "the expired client delete really is gone",
+        );
+        assert_eq!(
+            engine.weak_tombstone_keys_for_shard(shard),
+            vec![pruned],
+            "the source must KEEP declaring the omission it can no longer \
+             otherwise justify — withdrawing it turns 'my own prune damage' \
+             into 'deletion-intent' and the target's #29 prune deletes its \
+             last live copy (armed-05, past the horizon)",
+        );
+
+        // The declaration drains when the repair actually lands (Invariant
+        // TS-1: the key comes back LIVE).
+        create_test_record(&engine, pruned);
+        assert!(
+            engine.weak_tombstone_keys_for_shard(shard).is_empty(),
+            "a repaired key leaves no lingering claim",
+        );
+    }
+
     /// Broad-sweep mirror of
     /// [`per_shard_orphan_cleanup_reclaims_without_authority_tombstone_and_repair_lands`]:
     /// `run_orphan_cleanup` produced the same `ClientDelete` authority

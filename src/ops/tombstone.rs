@@ -711,30 +711,63 @@ impl TombstoneLog {
     /// `|_| false` when no heal can be in flight (the retention bound is then the
     /// sole horizon). Protection only DEFERS GC; it never retains a tombstone
     /// past the point the shard stops being referenced, so it cannot leak.
+    ///
+    /// # W10 composition review P2-6 — WEAK causes have NO retention horizon
+    ///
+    /// A WEAK-cause tombstone ([`TombstoneCause::PruneReplace`] /
+    /// [`TombstoneCause::CompensatedCreate`]) plays a SECOND role the
+    /// block-height retention clock does not measure: it is this node's only
+    /// proof that a key MISSING from the migration manifest it ships is its
+    /// own local prune/rollback damage rather than deletion-intent
+    /// ([`Self::weak_tombstone_keys`] → `Engine::weak_tombstone_keys_for_shard`
+    /// → the completion frame's declaration). A migration target RETAINS its
+    /// live copy of a DECLARED omission and PRUNES an undeclared one.
+    ///
+    /// Expiring a weak tombstone on the retention clock therefore silently
+    /// converts "my own damage" into "deletion-intent" the moment repair is
+    /// slower than `retention_blocks`: the source keeps omitting key K from
+    /// its manifest, stops declaring it, and the target's #29 prune deletes
+    /// its LAST LIVE COPY — the armed-05 loss chain, recurring past the
+    /// horizon. The claim's lifetime must be bounded by the REPAIR, not by
+    /// block height, so weak causes are never expired here.
+    ///
+    /// This does not strand a weak veto. Three drains clear one, and every one
+    /// of them IS the repair landing:
+    ///
+    /// * [`Self::clear`] — Invariant TS-1: the key comes back LIVE (client
+    ///   create, replica create, migration baseline apply);
+    /// * [`Self::clear_weak`] — the `OP_MIGRATION_WEAK_VETO_ARBITRATE`
+    ///   handshake: the shard's authoritative epoch-current source, holding a
+    ///   LIVE copy, instructs this node to drop the marker and re-pushes;
+    /// * [`Self::reconcile_against_live`] — the boot reconcile.
+    ///
+    /// ACCEPTED RESIDUALS (documented, not fixed here):
+    /// 1. A key that is NEVER repaired keeps one tombstone entry (in RAM and
+    ///    in the durable file) indefinitely. Weak causes are produced only by
+    ///    the exceptional prune/rollback paths, never by steady-state deletes,
+    ///    and the population is observable through [`Self::len`].
+    /// 2. With `migration_weak_veto_arbitration_enabled = false` the
+    ///    arbitration drain is disarmed, so a retained weak veto can keep
+    ///    blocking an at-or-behind same-generation re-push that retention GC
+    ///    used to eventually unblock. That mode already accepts an
+    ///    indefinitely under-replicated shard (see the config doc); the trade
+    ///    is a stalled repair, never a deleted last copy.
     pub fn gc(&self, last_durable_height: u32, is_protected: impl Fn(&TxKey) -> bool) -> usize {
         let retention = self.retention_blocks;
         let mut dropped = 0usize;
-        // P2-3: collect the weak keys this pass removes so the accelerator
-        // cannot retain entries whose tombstone is gone.
-        let mut dropped_weak: Vec<TxKey> = Vec::new();
         for shard in &self.shards {
             let mut g = shard.write();
             let before = g.len();
-            // Drop only when BOTH past retention AND not heal-protected.
+            // Drop only when past retention, NOT heal-protected, and NOT a
+            // weak-cause omission claim (see the doc above). Since no weak
+            // entry can be dropped here, the weak accelerator cannot go stale
+            // through this path and needs no pruning.
             g.retain(|k, v| {
-                let keep = !expired(v.height, retention, last_durable_height) || is_protected(k);
-                if !keep && is_weak_cause(v.cause) {
-                    dropped_weak.push(*k);
-                }
-                keep
+                is_weak_cause(v.cause)
+                    || !expired(v.height, retention, last_durable_height)
+                    || is_protected(k)
             });
             dropped += before - g.len();
-        }
-        if !dropped_weak.is_empty() {
-            let mut weak = self.weak_keys.write();
-            for k in &dropped_weak {
-                weak.remove(k);
-            }
         }
         if dropped > 0 {
             self.file.lock().needs_compaction = true;
@@ -1115,6 +1148,82 @@ mod tests {
         assert!(log.is_empty());
     }
 
+    /// W10 composition review P2-6 (RED→GREEN) — the armed-05 loss chain
+    /// recurring past the retention horizon.
+    ///
+    /// A WEAK tombstone is the source's ONLY proof that a key missing from
+    /// the manifest it ships is its own prune/rollback damage rather than
+    /// deletion-intent. Pre-fix it expired on the block-height retention
+    /// clock, so a repair slower than `retention_blocks` turned the source's
+    /// omission into an undeclared one and the target's #29 prune deleted its
+    /// LAST LIVE COPY. Weak causes must therefore survive the horizon while
+    /// strong ones still expire on schedule, and the weak claim must still
+    /// drain through every REPAIR path.
+    #[test]
+    fn gc_never_expires_weak_cause_omission_claims() {
+        let log = TombstoneLog::new(PathBuf::from("/nonexistent/x.tombstones"), 0, 4, 10);
+        let pruned = tk(1); // #29 prune damage — an omission claim
+        let rolled_back = tk(2); // create rollback — an omission claim
+        let client_deleted = tk(3); // real deletion-intent
+        let dah = tk(4); // real deletion-intent
+        log.record(&pruned, 6, 100, TombstoneCause::PruneReplace);
+        log.record(&rolled_back, 0, 100, TombstoneCause::CompensatedCreate);
+        log.record(&client_deleted, 6, 100, TombstoneCause::ClientDelete);
+        log.record(&dah, 6, 100, TombstoneCause::Dah);
+
+        // Every entry is past retention (100 + 10 <= 200) and nothing is
+        // heal-protected: only the two DELETION-INTENT claims may expire.
+        assert_eq!(
+            log.gc(200, |_| false),
+            2,
+            "strong causes still expire on the retention clock",
+        );
+        assert!(log.lookup(&client_deleted).is_none());
+        assert!(log.lookup(&dah).is_none());
+        assert!(
+            log.lookup(&pruned).is_some() && log.lookup(&rolled_back).is_some(),
+            "a weak omission claim must outlive the retention horizon — its \
+             lifetime is bounded by the REPAIR, not by block height",
+        );
+        let mut declared = log.weak_tombstone_keys();
+        declared.sort_by_key(|k| k.txid);
+        assert_eq!(
+            declared,
+            vec![pruned, rolled_back],
+            "the source keeps DECLARING both omissions, so a migration target \
+             retains its live copies instead of pruning them (armed-05)",
+        );
+        // Repeated passes do not erode it either.
+        assert_eq!(log.gc(10_000, |_| false), 0);
+        assert_eq!(log.weak_tombstone_keys().len(), 2);
+        // The veto is still live for an at-or-behind image (anti-resurrection
+        // is unchanged) and still admits a strictly-newer one.
+        assert!(log.blocks_heal_apply(&pruned, 6));
+        assert!(!log.blocks_heal_apply(&pruned, 7));
+
+        // The repair paths — and only they — drain the claim.
+        assert_eq!(
+            log.clear_weak(&pruned),
+            WeakTombstoneClear::Cleared,
+            "the OP_MIGRATION_WEAK_VETO_ARBITRATE drain",
+        );
+        assert!(
+            log.clear(&rolled_back),
+            "the Invariant TS-1 re-create drain"
+        );
+        assert!(
+            log.weak_tombstone_keys().is_empty() && log.is_empty(),
+            "a repaired key leaves no residue",
+        );
+
+        // The boot reconcile is the third drain.
+        let revived = tk(5);
+        log.record(&revived, 0, 100, TombstoneCause::PruneReplace);
+        assert_eq!(log.gc(200, |_| false), 0);
+        assert_eq!(log.reconcile_against_live(|k| *k == revived), 1);
+        assert!(log.weak_tombstone_keys().is_empty());
+    }
+
     #[test]
     fn persist_then_load_roundtrips_via_append() {
         let dir = tempfile::tempdir().unwrap();
@@ -1288,23 +1397,42 @@ mod tests {
         assert!(log.clear(&tk(5)));
         assert_eq!(sorted(log.weak_tombstone_keys()), vec![tk(2)]);
 
-        // gc(): a weak entry dropped past retention leaves the index.
+        // gc(): W10 composition review P2-6 — a weak entry SURVIVES the
+        // retention horizon (its omission claim is bounded by the repair, not
+        // by block height), so the accelerator keeps declaring it. This
+        // assertion previously required the opposite; that was the defect.
         log.record(&tk(6), 0, 100, TombstoneCause::PruneReplace);
         assert_eq!(
             sorted(log.weak_tombstone_keys()),
             sorted(vec![tk(2), tk(6)])
         );
-        assert!(log.gc(200, |_| false) >= 1);
-        assert!(
-            log.weak_tombstone_keys().is_empty(),
-            "GC'd weak entries must not linger in the accelerator",
+        assert_eq!(
+            log.gc(200, |_| false),
+            2,
+            "the two past-retention STRONG entries (tk1, tk3) expire; no weak \
+             entry may expire on the retention clock",
         );
+        assert_eq!(
+            sorted(log.weak_tombstone_keys()),
+            sorted(vec![tk(2), tk(6)]),
+            "the omission claim outlives the retention horizon",
+        );
+        // …and the accelerator still drains through the repair paths.
+        assert_eq!(log.clear_weak(&tk(6)), WeakTombstoneClear::Cleared);
+        assert_eq!(sorted(log.weak_tombstone_keys()), vec![tk(2)]);
 
         // reconcile_against_live(): a weak entry whose key came back LIVE
         // leaves the index (Invariant TS-1).
         log.record(&tk(7), 0, 900, TombstoneCause::PruneReplace);
-        assert_eq!(sorted(log.weak_tombstone_keys()), vec![tk(7)]);
-        assert_eq!(log.reconcile_against_live(|k| *k == tk(7)), 1);
+        assert_eq!(
+            sorted(log.weak_tombstone_keys()),
+            sorted(vec![tk(2), tk(7)]),
+            "tk(2) is still declared — weak claims survive the GC above",
+        );
+        assert_eq!(
+            log.reconcile_against_live(|k| *k == tk(7) || *k == tk(2)),
+            2
+        );
         assert!(log.weak_tombstone_keys().is_empty());
 
         // load(): the replay rebuilds the index from disk, and the LAST
