@@ -267,7 +267,6 @@ async fn run_scenario() -> Result<(), ClientError> {
 
     // Use records starting from index 2000 which haven't been spent yet
     let spend_after_kill: Vec<[u8; 32]> = txids[2000..2200].to_vec();
-    let mut spend_errors = 0u32;
     for chunk in spend_after_kill.chunks(50) {
         let items: Vec<SpendItem> = chunk
             .iter()
@@ -284,35 +283,28 @@ async fn run_scenario() -> Result<(), ClientError> {
             })
             .collect();
 
-        match client.spend_batch(&spend_params, &items).await {
-            Ok(resp) => {
-                if !resp.errors.is_empty() {
-                    spend_errors += resp.errors.len() as u32;
-                }
-                for item in &items {
-                    verifier.record_spend(item.txid, 0);
-                }
-            }
-            Err(ClientError::Partial(pe)) => {
-                spend_errors += pe.errors.len() as u32;
-                // Record successful spends
-                let error_indices: std::collections::HashSet<u32> =
-                    pe.errors.iter().map(|e| e.item_index).collect();
-                for (i, item) in items.iter().enumerate() {
-                    if !error_indices.contains(&(i as u32)) {
-                        verifier.record_spend(item.txid, 0);
-                    }
-                }
-            }
-            Err(e) => {
-                panic!("Test 4.5: spend batch failed: {e}");
-            }
+        // This runs seconds after node2 was SIGKILLed, i.e. right in the
+        // middle of the shard handoff the kill triggers, so the fence answers
+        // some items with `ERR_MIGRATION_IN_PROGRESS`. That code is transient
+        // (it clears when the handoff completes) and Test 4.4 above already
+        // rides it out — only because `seed_records` retries internally.
+        // Counting it as a hard failure here made 4.5 fail on the very same
+        // condition 4.4 had just survived, so use the shared transient-retry
+        // policy. Non-transient per-item errors still fail the scenario.
+        // Return the error instead of panicking: only the `Ok(Err(..))` and
+        // timeout arms of the test fn call `collect_failure_diagnostics`, so
+        // a panic here loses every container log and cluster snapshot for
+        // the failure — the exact gap this branch's diagnostics fix closes.
+        common::spend_all_with_transient_retry(&client, &spend_params, &items)
+            .await
+            .map_err(|e| {
+                ClientError::Connection(format!("Test 4.5: spend failed on 2-node cluster: {e}"))
+            })?;
+        // The helper returns Ok only once EVERY item has been acknowledged.
+        for item in &items {
+            verifier.record_spend(item.txid, 0);
         }
     }
-    assert_eq!(
-        spend_errors, 0,
-        "Test 4.5: {spend_errors}/200 spends failed on 2-node cluster"
-    );
     eprintln!("[4.5] OK -- all 200 spends succeeded on 2-node cluster");
     tlog!(t0, "test 4.5 done");
 

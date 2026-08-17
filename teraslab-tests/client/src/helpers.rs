@@ -1,14 +1,40 @@
 use crate::ClientError;
 use std::collections::HashMap;
 
-// Must stay BELOW the server's default `max_connections_per_ip` (64): a
-// migration burst opens up to `migration_pool_size` parallel connections to a
-// SINGLE target, so a pool >= the per-IP cap self-DoSes (the target resets the
-// overflow with "Connection reset by peer", baseline streaming fails, the
-// handoff rolls back, and rebalances never converge). 48 leaves headroom for
-// the node's other inter-node connections (SWIM, replication, status).
+// Must stay BELOW the target's `max_connections_per_ip` (now
+// `DOCKER_MAX_CONNECTIONS_PER_IP`; it was the server default of 64 when this
+// value was chosen): a migration burst opens up to `migration_pool_size`
+// parallel connections to a SINGLE target from a SINGLE source IP (the
+// sending container's), so a pool >= the per-IP cap self-DoSes (the target
+// resets the overflow with "Connection reset by peer", baseline streaming
+// fails, the handoff rolls back, and rebalances never converge). 48 leaves
+// headroom for the node's other inter-node connections (SWIM, replication,
+// status) and is kept as-is even though the cap has been lifted — the
+// tested-good value, not the newly-permitted maximum.
 const DEFAULT_DOCKER_MIGRATION_POOL_SIZE: usize = 48;
 const DEFAULT_DOCKER_MIGRATION_BATCH_SIZE: usize = 1000;
+
+/// Per-IP connection cap written into every generated docker node config.
+///
+/// The shipped production default is 64, sized for clients that arrive from
+/// many distinct source IPs. In the docker harness they do not: the host
+/// reaches every node through the published port mapping, so *all* harness
+/// traffic is NATed to a single source — the compose bridge gateway
+/// (`172.<30+scenario_id>.0.1`). Under the production default the entire
+/// harness shares one 64-connection budget per node, and a scenario that
+/// keeps several clients alive at once (each cluster-mode client opens a
+/// pool of up to `PoolConfig::max_conns` = 16 connections *per node*) trips
+/// `rejecting connection: per-IP cap reached` — which surfaces as a bogus
+/// "sub-batch to unreachable node" panic while the cluster is perfectly
+/// healthy.
+///
+/// 256 = 16 concurrent cluster-mode clients at full pool depth against one
+/// node, ~5x the observed peak. It matches the value the legacy static
+/// `docker/config/node*.toml` overlay already used, and deliberately stays
+/// well below `max_connections` (1024) so the cap remains a real bound: a
+/// future connection leak should still be caught by a rejection rather than
+/// silently eating the global budget.
+const DOCKER_MAX_CONNECTIONS_PER_IP: usize = 256;
 const ENV_DOCKER_MIGRATION_POOL_SIZE: &str = "TERASLAB_DOCKER_MIGRATION_POOL_SIZE";
 const ENV_DOCKER_MIGRATION_BATCH_SIZE: &str = "TERASLAB_DOCKER_MIGRATION_BATCH_SIZE";
 
@@ -145,6 +171,10 @@ expected_records = 1000000
 lock_stripes = 65536
 max_batch_size = 8192
 max_connections = 1024
+# All harness traffic is NATed to ONE source IP (the compose bridge
+# gateway), so the shipped per-IP default of 64 caps the whole harness.
+# See `DOCKER_MAX_CONNECTIONS_PER_IP` for the sizing rationale.
+max_connections_per_ip = {max_connections_per_ip}
 block_height_retention = 288
 
 # Required for the Docker test cluster: nodes bind to per-scenario subnet
@@ -188,6 +218,7 @@ committed_master_election_enabled = {committed_master_election_enabled}
 under_replication_sweep_enabled = {under_replication_sweep_enabled}
 "#,
         admin_token = DOCKER_TEST_ADMIN_TOKEN,
+        max_connections_per_ip = DOCKER_MAX_CONNECTIONS_PER_IP,
     )
 }
 
@@ -533,6 +564,9 @@ services:
     /// unreachable via ICMP unreachable rather than silent UDP timeouts.
     pub async fn remove_node(&self, name: &str) -> Result<(), ClientError> {
         let container = self.container_name(name);
+        // Removing the container destroys its log forever, so archive it
+        // first — see `archive_container_log`.
+        archive_container_log(&container).await;
         run_docker_cmd(&["rm", "-f", &container]).await?;
         Ok(())
     }
@@ -879,15 +913,23 @@ services:
         for i in 1..=5 {
             let name = format!("node{i}");
             let container = self.container_name(&name);
-            let log_output = run_docker_cmd(&["logs", &container])
-                .await
-                .unwrap_or_default();
+            // A scenario that runs fewer than 5 nodes — or that removed one
+            // mid-run — makes `docker logs` fail here. This used to write the
+            // output anyway, producing a 0-byte file that reads as "this node
+            // logged nothing" rather than "this node was never collected" —
+            // the exact fabrication `captured_log_bytes` exists to prevent.
+            //
+            // `docker_logs_bytes` (not `run_docker_cmd`) is what keeps this
+            // honest in the other direction too: `run_docker_cmd` returns
+            // stdout ONLY, and the daemon writes its tracing output to
+            // stderr, so every log collected here was near-empty regardless.
+            let Some(buf) = docker_logs_bytes(&container).await else {
+                continue;
+            };
             let log_path = format!("{output_dir}/{container}.log");
-            tokio::fs::write(&log_path, log_output.as_bytes())
-                .await
-                .map_err(|e| {
-                    ClientError::Connection(format!("{log_path}: failed to write log file: {e}"))
-                })?;
+            tokio::fs::write(&log_path, &buf).await.map_err(|e| {
+                ClientError::Connection(format!("{log_path}: failed to write log file: {e}"))
+            })?;
         }
 
         Ok(())
@@ -915,6 +957,87 @@ async fn run_docker_cmd(args: &[&str]) -> Result<String, ClientError> {
     }
 
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+/// Environment variable naming the directory failure diagnostics are
+/// written to. Set per scenario by `teraslab-tests/run_all.sh`; unset for a
+/// bare `cargo test`, in which case nothing is archived.
+pub const ENV_DIAG_DIR: &str = "TERASLAB_DIAG_DIR";
+
+/// Ceiling on the pre-removal log archive (see [`archive_container_log`]).
+/// Generous enough for a multi-MB container log, short enough that a wedged
+/// daemon cannot stall a node removal.
+const ARCHIVE_LOG_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// The bytes worth writing as a container's captured log, or `None` when
+/// nothing should be written.
+///
+/// Shared by both capture paths (`DockerHelpers::remove_node`'s pre-removal
+/// archive and `collect_failure_diagnostics`' post-failure dump) so they
+/// agree on what a captured log is.
+///
+/// A failed `docker logs` returns `None` — that is load-bearing, not
+/// tidiness. When the container is gone, `docker logs` still prints
+/// "No such container" on stderr; writing that would both fabricate a
+/// log file that looks like an empty node and overwrite a copy an earlier
+/// pre-removal archive had already saved under the same name.
+pub fn captured_log_bytes(status_ok: bool, stdout: Vec<u8>, stderr: &[u8]) -> Option<Vec<u8>> {
+    if !status_ok {
+        return None;
+    }
+    let mut buf = stdout;
+    buf.extend_from_slice(stderr);
+    if buf.is_empty() { None } else { Some(buf) }
+}
+
+/// Archive a container's Docker log before the container is destroyed.
+///
+/// `docker rm` deletes the log with the container, so a node removed
+/// mid-scenario is invisible to *every* post-mortem capture path — both the
+/// in-test dump in `tests/common/mod.rs` and `scripts/collect_logs.sh` can
+/// only read logs of containers that still exist. Scenario 07 removes node4
+/// at Test 7.3 and node4 is that scenario's whole subject, so an armed
+/// nightly failure after 7.3 left no way to tell what node4 had done.
+///
+/// Best-effort by design: no diag dir configured, an unreadable container,
+/// or a failed write are all silently skipped. This must never turn a
+/// diagnostic into a test failure.
+///
+/// It sits directly in front of a `docker rm -f` whose whole purpose is to
+/// release the container's network interface promptly, so — like every other
+/// docker call on the destruction path — it is bounded by
+/// [`ARCHIVE_LOG_TIMEOUT`] and reaps the child on drop. A hung Docker daemon
+/// costs the removal at most that long.
+async fn archive_container_log(container: &str) {
+    let Ok(dir) = std::env::var(ENV_DIAG_DIR) else {
+        return;
+    };
+    if dir.is_empty() || tokio::fs::create_dir_all(&dir).await.is_err() {
+        return;
+    }
+    let Some(buf) = docker_logs_bytes(container).await else {
+        return;
+    };
+    let path = std::path::Path::new(&dir).join(format!("{container}.log"));
+    let _ = tokio::fs::write(&path, &buf).await;
+}
+
+/// Run `docker logs <container>` and return the bytes worth keeping.
+///
+/// The single log-capture primitive for the whole harness: bounded by
+/// [`ARCHIVE_LOG_TIMEOUT`], reaps the child on drop, keeps BOTH streams (the
+/// daemon's tracing output goes to stderr), and applies
+/// [`captured_log_bytes`] so a failed or empty capture yields no file rather
+/// than a misleading one.
+async fn docker_logs_bytes(container: &str) -> Option<Vec<u8>> {
+    let mut cmd = tokio::process::Command::new("docker");
+    cmd.kill_on_drop(true);
+    cmd.args(["logs", container]);
+    let out = tokio::time::timeout(ARCHIVE_LOG_TIMEOUT, cmd.output())
+        .await
+        .ok()?
+        .ok()?;
+    captured_log_bytes(out.status.success(), out.stdout, &out.stderr)
 }
 
 #[cfg(test)]
@@ -1157,6 +1280,84 @@ mod tests {
             "rendered docker node config must pass safe-defaults validation under the \
              F-X-002 production default (strict_auth = true) via the explicit \
              `strict_auth = false` opt-out",
+        );
+    }
+
+    /// A failed `docker logs` must capture NOTHING.
+    ///
+    /// This is what makes the pre-removal archive survive: scenario 07
+    /// removes node4 at Test 7.3, and the post-failure dump then runs
+    /// `docker logs ts07-node4` and gets "No such container" on stderr with
+    /// a non-zero exit. Writing that would replace the archived node4 log —
+    /// the only record of the scenario's own subject — with an error string.
+    #[test]
+    fn a_failed_docker_logs_captures_nothing() {
+        assert_eq!(
+            captured_log_bytes(
+                false,
+                Vec::new(),
+                b"Error response from daemon: No such container: ts07-node4",
+            ),
+            None,
+        );
+    }
+
+    #[test]
+    fn a_successful_docker_logs_captures_stdout_then_stderr() {
+        assert_eq!(
+            captured_log_bytes(true, b"out".to_vec(), b"err"),
+            Some(b"outerr".to_vec()),
+            "the daemon writes tracing output to stderr, so both halves are kept",
+        );
+    }
+
+    #[test]
+    fn a_successful_but_empty_docker_logs_captures_nothing() {
+        assert_eq!(
+            captured_log_bytes(true, Vec::new(), b""),
+            None,
+            "an absent file is honest; a 0-byte one looks like a collected log",
+        );
+    }
+
+    /// W11.1 regression: every harness connection arrives from ONE source
+    /// IP (the compose bridge gateway, e.g. `172.45.0.1`, because the host
+    /// reaches the nodes through the published port mapping). The shipped
+    /// production default `max_connections_per_ip = 64` assumes clients
+    /// spread across many IPs, so under that default the whole harness
+    /// shares a 64-connection budget per node and starts getting
+    /// `rejecting connection: per-IP cap reached` once a few clients are
+    /// live at once. The rendered config must lift the cap explicitly.
+    #[test]
+    fn rendered_node_config_lifts_the_per_ip_cap_for_the_shared_gateway_ip() {
+        use teraslab::config::ServerConfig;
+
+        let rendered = render_node_config(
+            1,
+            "172.45.0.11",
+            "\"172.45.0.12:3301\", \"172.45.0.13:3301\"",
+            48,
+            1000,
+            150,
+            1000,
+            false,
+            false,
+        );
+        let cfg: ServerConfig = toml::from_str(&rendered)
+            .expect("rendered docker node config must be a valid ServerConfig TOML payload");
+        assert_eq!(
+            cfg.max_connections_per_ip, DOCKER_MAX_CONNECTIONS_PER_IP,
+            "the rendered config must pin the per-IP cap; without the key the daemon \
+             applies the production default (64) and the whole harness — which shares \
+             the compose gateway IP — is capped at 64 connections per node",
+        );
+        assert!(
+            cfg.max_connections_per_ip > ServerConfig::default().max_connections_per_ip,
+            "the docker value must actually LIFT the shipped default, not restate it",
+        );
+        assert!(
+            cfg.max_connections_per_ip < cfg.max_connections,
+            "the per-IP cap must stay below the global cap so it is still a real bound",
         );
     }
 

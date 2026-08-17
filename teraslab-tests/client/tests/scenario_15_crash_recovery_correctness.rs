@@ -422,6 +422,13 @@ async fn test_kill_during_writes() -> Result<(), ClientError> {
             .await
             .unwrap_or_else(|e| eprintln!("[15.2/15.3] replication settle wait: {e}"));
 
+        // The pre-kill client is finished: its pools point at a cluster that
+        // has since lost and regained a node. Close it rather than letting it
+        // linger — a dropped client only STARTS its teardown, and a health
+        // loop mid-round can hold its sockets (and their share of the
+        // server's per-IP connection budget) for a long time when a peer is
+        // unreachable. See `Client::drop`.
+        client.close().await;
         let client = common::create_client(&docker, 3).await?;
         client.refresh_routing().await?;
 
@@ -438,6 +445,12 @@ async fn test_kill_during_writes() -> Result<(), ClientError> {
 
         eprintln!("[15.2/15.3] Iteration {iteration}: OK -- zero mismatches");
 
+        // Ten iterations x three clients each, all in ONE process: without
+        // these the accumulated pools kept re-dialing every node every 15s
+        // and, since all harness traffic shares the compose gateway IP,
+        // exhausted `max_connections_per_ip` around iteration 8.
+        client.close().await;
+        _client.close().await;
         common::teardown_all(SID).await;
     }
 

@@ -3076,6 +3076,50 @@ impl Client {
     }
 }
 
+impl Drop for Client {
+    /// Abort the cluster refresh task so a dropped client actually releases
+    /// its sockets.
+    ///
+    /// A dropped `tokio::task::JoinHandle` **detaches** its task rather than
+    /// cancelling it, and [`Cluster::start_refresh`] moves an `Arc<Cluster>`
+    /// into that task. Without this abort, dropping a cluster-mode `Client`
+    /// left the refresh task alive holding the last `Arc<Cluster>`, so the
+    /// whole tree below it — every per-node [`ConnPool`] and its health
+    /// task — stayed alive forever and kept re-dialing `min_conns`
+    /// connections every `health_check` interval. A test or service that
+    /// creates clients in a loop therefore accumulated live connections
+    /// until the server's `max_connections_per_ip` cap started rejecting
+    /// *new* connections from that IP.
+    ///
+    /// Aborting drops the task's future, which releases its `Arc<Cluster>`.
+    /// `Client` is not `Clone` and holds the only other `Arc<Cluster>`, so
+    /// the `Cluster` is then dropped, which drops each `Arc<ConnPool>`.
+    /// Dropping a `ConnPool` drops its `close_tx` watch sender, which makes
+    /// the health loop's `close_rx.changed()` resolve (with the
+    /// sender-dropped error) and return; that in turn drops the last
+    /// reference to the pooled `PipeConn`s, and `Drop for PipeConn` aborts
+    /// the read task and drops the write half, closing the socket.
+    ///
+    /// This complements — it does not replace — [`Client::close`], and for a
+    /// client-churning caller `close()` is materially better. Drop only
+    /// *starts* the teardown: a health loop parked inside `check_health`
+    /// does not re-poll its close channel until the round finishes, and that
+    /// round pings each pooled connection sequentially with a
+    /// `request_timeout` (30s default) ceiling apiece, up to `max_conns`
+    /// (16), before replenishing at `dial_timeout` each. Against a PAUSED
+    /// peer — scenarios 12 and 16 pause containers, and a paused peer
+    /// neither answers nor RSTs — every ping burns the full timeout, so a
+    /// dropped client's sockets can hold their per-IP budget for minutes.
+    /// `close()` has none of that: it flips `closed`, signals the watch
+    /// channel, `mem::take`s the connection vector and closes each entry
+    /// immediately.
+    fn drop(&mut self) {
+        if let Some(task) = self._refresh_task.take() {
+            task.abort();
+        }
+    }
+}
+
 // ===========================================================================
 // Payload encoding helpers (client types -> wire bytes)
 // ===========================================================================
@@ -3589,6 +3633,72 @@ mod tests {
         let port = socket.local_addr().unwrap().port();
         drop(socket);
         port
+    }
+
+    /// Regression: dropping a `Client` must ABORT the cluster refresh task,
+    /// not detach it.
+    ///
+    /// A dropped `JoinHandle` detaches, and the refresh task owns an
+    /// `Arc<Cluster>` — hence every `ConnPool` and every pooled `PipeConn`
+    /// below it. A detached refresh task therefore kept the pools' health
+    /// loops re-dialing `min_conns` connections every 15s for the rest of the
+    /// process's life. Scenario 15 creates three clients per iteration, so by
+    /// iteration 8 the accumulated ghost pools exhausted the server's
+    /// `max_connections_per_ip` cap (all harness traffic shares the compose
+    /// gateway IP) and legitimate new connections were rejected.
+    ///
+    /// The task's payload here stands in for that `Arc<Cluster>`: its `Drop`
+    /// can only run once the task's *future* is dropped, which happens on
+    /// abort and never on detach.
+    #[tokio::test]
+    async fn dropping_a_client_aborts_the_refresh_task_and_releases_what_it_owns() {
+        struct OwnedByTask(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for OwnedByTask {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let released = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let owned = OwnedByTask(Arc::clone(&released));
+        let refresh_task = tokio::spawn(async move {
+            let _owned = owned;
+            // Park the way the real refresh loop parks between ticks.
+            loop {
+                tokio::time::sleep(Duration::from_secs(3600)).await;
+            }
+        });
+
+        let client = Client {
+            cluster: None,
+            pool: None,
+            cluster_secret: None,
+            blob_upload_threshold: BLOB_UPLOAD_THRESHOLD,
+            negotiated_version: AtomicU16::new(0),
+            _refresh_task: Some(refresh_task),
+        };
+
+        // Let the task reach its first await point so it genuinely owns the
+        // value while the client is alive.
+        tokio::task::yield_now().await;
+        assert!(
+            !released.load(Ordering::SeqCst),
+            "the refresh task must still own its state while the client is alive"
+        );
+
+        drop(client);
+
+        // The runtime drops an aborted task's future asynchronously.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !released.load(Ordering::SeqCst) && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            released.load(Ordering::SeqCst),
+            "dropping the Client must abort the refresh task so it releases its Arc<Cluster>; \
+             a detached task keeps every ConnPool — and its re-dialing health loop — alive \
+             for the rest of the process"
+        );
     }
 
     #[test]

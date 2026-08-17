@@ -506,7 +506,6 @@ async fn test_writes_during_migration_recovery() -> Result<(), ClientError> {
         block_height_retention: 100,
     };
 
-    let mut spend_errors = 0u32;
     for chunk in txids[..200].chunks(50) {
         let items: Vec<SpendItem> = chunk
             .iter()
@@ -521,35 +520,24 @@ async fn test_writes_during_migration_recovery() -> Result<(), ClientError> {
             })
             .collect();
 
-        match client_2.spend_batch(&spend_params, &items).await {
-            Ok(resp) => {
-                if !resp.errors.is_empty() {
-                    spend_errors += resp.errors.len() as u32;
-                }
-                for item in &items {
-                    verifier.record_spend(item.txid, 0);
-                }
-            }
-            Err(ClientError::Partial(pe)) => {
-                spend_errors += pe.errors.len() as u32;
-                let error_indices: std::collections::HashSet<u32> =
-                    pe.errors.iter().map(|e| e.item_index).collect();
-                for (i, item) in items.iter().enumerate() {
-                    if !error_indices.contains(&(i as u32)) {
-                        verifier.record_spend(item.txid, 0);
-                    }
-                }
-            }
-            Err(e) => {
-                eprintln!("[17.5] spend batch error: {e}");
-                spend_errors += chunk.len() as u32;
-            }
+        // Same fix as scenario 04 Test 4.5: this spends INSIDE the migration
+        // window the sub-test is named for, so the handoff fence answers some
+        // items with ERR_MIGRATION_IN_PROGRESS. That is transient by the
+        // shared policy and clears on its own; counting it as a hard failure
+        // failed the scenario on the very condition it is meant to survive.
+        // Non-transient per-item errors still fail here.
+        common::spend_all_with_transient_retry(&client_2, &spend_params, &items)
+            .await
+            .map_err(|e| {
+                ClientError::Connection(format!(
+                    "Test 17.5: spend failed during migration window: {e}"
+                ))
+            })?;
+        // The helper returns Ok only once EVERY item has been acknowledged.
+        for item in &items {
+            verifier.record_spend(item.txid, 0);
         }
     }
-    assert_eq!(
-        spend_errors, 0,
-        "Test 17.5: {spend_errors}/200 spends failed during migration window"
-    );
 
     common::wait_specific_replication_settled(&docker, &[1, 3], Duration::from_secs(5)).await?;
 
