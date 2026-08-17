@@ -1787,6 +1787,25 @@ pub struct ServerConfig {
     /// Default: 500.
     pub migration_batch_size: usize,
 
+    /// Allow a node whose shard table LAGS the committed topology term to keep
+    /// serving the shards whose master is unchanged between its active table
+    /// and the committed term, instead of withholding authority for every key
+    /// until activation completes.
+    ///
+    /// Default `false` — the fail-closed posture: one un-activated commit
+    /// withholds every key, which is a short but total read outage during a
+    /// membership change. Setting `true` trades that for availability.
+    ///
+    /// KNOWN LIMIT before enabling: the check cannot distinguish "one term
+    /// behind, about to activate" from "missed several terms while
+    /// partitioned". In the second case a node can serve a shard whose master
+    /// never moved but whose contents went stale during the terms it missed,
+    /// and the reverse-heal fence that would have covered it is planned only
+    /// AFTER activation. For a UTXO store that reads as a spent output
+    /// reported unspent. Leave this off unless you have accepted that
+    /// trade-off for your deployment.
+    pub stale_table_partial_serving: bool,
+
     /// Interval in seconds between replica lag checks. Default: 30.
     /// Set to 0 to disable lag monitoring.
     pub replica_lag_check_interval_secs: u64,
@@ -1924,6 +1943,8 @@ impl Default for ServerConfig {
             replication_degraded_mode: "reject".to_string(),
             migration_pool_size: 128,
             migration_batch_size: 500,
+            // Fail-closed by default: a stale table withholds every key.
+            stale_table_partial_serving: false,
             replica_lag_check_interval_secs: 30,
             replica_lag_warn_threshold_ops: 10_000,
             recovery_missing_primary_tolerance: 65_536,

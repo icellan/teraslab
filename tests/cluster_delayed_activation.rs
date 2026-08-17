@@ -132,6 +132,7 @@ fn create_node(node_id: u64, seed_swim_ports: &[u16], hold_activation: bool) -> 
         reverse_heal_online: false,
         heal_deadline: Duration::from_secs(300),
         heal_deadline_action: teraslab::config::HealDeadlineAction::AlertAndHold,
+        stale_table_partial_serving: false,
     };
 
     let coordinator = ClusterCoordinator::new(cluster_config, 1);

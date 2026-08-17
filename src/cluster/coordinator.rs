@@ -2918,6 +2918,18 @@ pub struct ClusterConfig {
     /// [`crate::config::HealDeadlineAction::AlertAndHold`] (keep the shard fenced
     /// fail-closed and alert; never auto-move it).
     pub heal_deadline_action: crate::config::HealDeadlineAction,
+    /// W11 FIX 3 / P1-B — allow a shard table that LAGS the committed
+    /// topology term to keep serving the shards whose master is unchanged
+    /// between the active table and the committed term's deterministic
+    /// baseline, instead of withholding authority for EVERY key.
+    ///
+    /// `false` (default) is the fail-closed posture the store has always had:
+    /// one un-activated commit withholds every key until activation. `true`
+    /// trades that for availability during the activation window and is an
+    /// OPERATOR choice — see [`stale_table_may_serve_shard`] for the safety
+    /// argument AND the case it cannot discriminate (a table stale from MISSED
+    /// TERMS rather than from a not-yet-activated fresh commit).
+    pub stale_table_partial_serving: bool,
 }
 
 /// Runtime replication policy passed to a started cluster coordinator.
@@ -2995,6 +3007,10 @@ pub struct ClusterCoordinator {
     /// [`ClusterConfig::reverse_heal_online`]). Captured into the event loop so
     /// each partition-view refresh runs the online re-detect + reverse-pull.
     reverse_heal_online: bool,
+    /// W11 FIX 3 / P1-B — operator opt-in for partial serving from a stale
+    /// shard table. Captured from [`ClusterConfig::stale_table_partial_serving`]
+    /// so `start()` can hand it to the [`RunningCluster`].
+    stale_table_partial_serving: bool,
     /// Reverse-heal Phase 3c — fenced-heal deadline (see
     /// [`ClusterConfig::heal_deadline`]). Captured into the event loop so each
     /// partition-view refresh enforces the deadline on stuck heals.
@@ -3161,6 +3177,7 @@ impl ClusterCoordinator {
             activation_hold: Arc::new(AtomicBool::new(false)),
             topology_debounce: config.topology_debounce,
             reverse_heal_online: config.reverse_heal_online,
+            stale_table_partial_serving: config.stale_table_partial_serving,
             heal_deadline: config.heal_deadline,
             heal_deadline_action: config.heal_deadline_action,
         }
@@ -6021,6 +6038,7 @@ impl ClusterCoordinator {
                 term: 0,
                 masters: Arc::new(Vec::new()),
             })),
+            stale_table_partial_serving: self.stale_table_partial_serving,
             active_topology_members: active_topology_members_for_cluster,
             inbound_state_path,
             outbound_state_path,
@@ -18190,6 +18208,11 @@ pub struct RunningCluster {
     /// gate ([`stale_table_may_serve_shard`]). Recomputed only when the
     /// committed term advances.
     committed_master_cache: Arc<RwLock<CommittedMasterCache>>,
+    /// W11 FIX 3 / P1-B — operator opt-in for partial serving from a shard
+    /// table that lags the committed term ([`ClusterConfig::stale_table_partial_serving`]).
+    /// `false` (default) keeps the historical fail-closed posture: a stale
+    /// table withholds authority for EVERY key.
+    stale_table_partial_serving: bool,
     /// Atomic mirror of `topology_authority.committed_term()` — the
     /// cluster_key value stamped on outbound `OP_REPLICA_BATCH` traffic and
     /// gated on inbound traffic.
@@ -18313,8 +18336,10 @@ pub struct RunningCluster {
 pub struct MasterSnapshot {
     /// Per-shard authoritative master, indexed by shard id (`0..NUM_SHARDS`).
     /// An entry is `NodeId(0)` when the local shard table lags the committed
-    /// topology term AND that shard's ownership actually moves between the
-    /// two (W11 FIX 3) — the same sentinel
+    /// topology term — for EVERY shard by default, and only for shards whose
+    /// ownership actually moves when
+    /// [`ClusterConfig::stale_table_partial_serving`] is enabled (W11 FIX 3)
+    /// — the same sentinel
     /// [`RunningCluster::authoritative_master_for_shard`] returns, so the
     /// dispatcher redirects with `NodeId(0)` and the client refetches its
     /// partition map.
@@ -18365,16 +18390,37 @@ struct CommittedMasterCache {
 /// exchange phase to arrive. Most of those keys belonged to shards the new
 /// term does not move at all.
 ///
-/// # Safety argument
+/// **OPERATOR OPT-IN, DEFAULT OFF** — this predicate is only consulted when
+/// [`ClusterConfig::stale_table_partial_serving`] is set. With the flag at its
+/// default the gate stays wholesale-closed, exactly as before W11. Read the
+/// two sections below IN FULL before enabling it: the argument is bounded,
+/// and one case it cannot discriminate is a correctness hazard, not merely an
+/// availability one.
+///
+/// # What the relaxation is and is not
 ///
 /// The gate exists because the active table's MEMBER SET is superseded, so
-/// its ownership answers may be wrong. For a shard whose master is
-/// IDENTICAL under the active table and the committed term's deterministic
-/// baseline, that answer is not wrong: there is no ownership transition in
-/// flight for it, no migration is planned for it (a handoff is generated
-/// exactly for shards whose master moves), and the node that serves it now
-/// is the node that will still serve it after activation. Serving it from
-/// the active table therefore cannot create a second master.
+/// its ownership answers may be wrong about WHO OWNS a shard. For a shard
+/// whose master is IDENTICAL under the active table and the committed term's
+/// deterministic baseline, that particular answer is not wrong: there is no
+/// ownership transition in flight for it, and the node that serves it now is
+/// the node that will still serve it after activation. In OWNERSHIP terms,
+/// serving it from the active table does not create a second master.
+///
+/// That is a claim about ownership ONLY. It is expressly NOT a claim that no
+/// work is pending for the shard — an earlier draft of this comment asserted
+/// "no migration is planned for it (a handoff is generated exactly for shards
+/// whose master moves)", and that is FALSE of the activation as a whole. It
+/// holds only of [`ShardTable::migration_plan`]. The REVERSE-HEAL
+/// ([`RunningCluster::begin_reverse_heal`], sourced by
+/// [`select_reverse_heal_sources_for`] and driven by [`trigger_online_reheal`]
+/// from the POST-activation partition view) registers an inbound fence for a
+/// shard this node MASTERS whose copy is behind a live replica — its entire
+/// purpose is the master-unchanged-but-stale case, and it is enabled by
+/// default for RF > 1. Because it is planned AFTER activation, a node inside
+/// the `committed > version` window has not yet learned it needs a heal, and
+/// this predicate serves exactly those shards. That is why the relaxation is
+/// a flag.
 ///
 /// Three conditions, all required:
 ///
@@ -18385,6 +18431,38 @@ struct CommittedMasterCache {
 ///    shard exactly where it is.
 ///  * `committed_master != NodeId(0)` — never serve from the unassigned
 ///    sentinel.
+///
+/// # The case this predicate CANNOT discriminate (why it is off by default)
+///
+/// `version < committed` covers two different states, and the comparison
+/// above tells them apart in neither:
+///
+///  * **one term behind, about to activate** — a fresh commit landed and the
+///    exchange phase has not finished. This is the state the relaxation is
+///    for, and for an unmoved shard the local copy is current.
+///  * **behind by MISSED TERMS** — this node was partitioned while the
+///    cluster committed AND ACTIVATED terms it never saw. Node A is
+///    partitioned; the cluster commits and activates `T-1 = {1,3}` and takes
+///    WRITES for shard `s`; the partition heals after `T = {1,2,3}` is
+///    committed but before anyone activates it. A's table is at `T-2` over
+///    `{1,2,3}` and the committed term `T` is ALSO over `{1,2,3}` — so every
+///    shard reads "unmoved", the gate opens for all `NUM_SHARDS`, and A
+///    serves `s` from a copy that missed the whole `T-1` window. The
+///    reverse-heal fence that exists for exactly this cannot help: it is
+///    planned from the post-activation view, which A has not reached. For a
+///    UTXO store that is a SPENT OUTPUT REPORTED UNSPENT.
+///
+/// That cuts against two postures this repo states explicitly:
+/// [`select_reverse_heal_sources_for`] ("serving one IS the double-spend, so
+/// alert-and-hold is correct") and [`RunningCluster::is_master`]
+/// ("Fail-closed (unavailable beats dual-authority)"). Hence: operator
+/// opt-in, default off.
+///
+/// FOLLOW-UP (tracked) — the cheapest sound discriminator is to stamp the
+/// shard table with the committed term it was last RECONCILED against (not
+/// merely computed for), so "one term behind, reconciled" is distinguishable
+/// from "missed terms". With that stamp the relaxation could be safe enough
+/// to default on; without it, it cannot.
 ///
 /// # Residual, stated deliberately
 ///
@@ -18397,23 +18475,21 @@ struct CommittedMasterCache {
 /// activated the term could, in principle, have elected itself master of a
 /// shard this predicate is willing to serve.
 ///
-/// That is not a hazard this predicate introduces:
-///  * the ONLY mastership it ever serves is the deterministic one every node
-///    derives identically — never a superseded or invented assignment — and
-///    election deviation is defined to DECAY back to exactly that pick (see
-///    `apply_master_election`'s Task #47 rules);
-///  * election divergence is a pre-existing, per-node condition that the
-///    stale-table gate never guarded: two nodes BOTH at `version ==
-///    committed` can already elect different masters for one shard (Task
-///    #22, the `masters = 4671/4096` case), which is why the phantom-master
-///    detector exists;
-///  * the deviation needs the baseline master to look data-poor in the
-///    peer's view, and the baseline master here is also the node that has
-///    been serving and replicating the shard under the previous term — the
-///    most likely FULL holder. W11 FIX 2 (apply-before-broadcast) removes
-///    the specific way it went missing from that view in CI, where a stale
-///    `local_cluster_key` made it answer `STATUS_ERROR` to every exchange
-///    query.
+/// Two earlier arguments for tolerating that were REJECTED on review and are
+/// recorded here so they are not re-derived:
+///  * "it only ever serves the deterministic pick that deviation decays back
+///    to" — insufficient: the deviation exists precisely BECAUSE that master
+///    looked data-poor in the shared view, so routing to it during the window
+///    IS the failure mode, not a benign detour.
+///  * "election divergence is pre-existing and was never guarded" — false
+///    since Task #47 made the election a pure function of (round-robin table,
+///    shared view): same-view nodes now agree, and this stale-table gate was
+///    the remaining guard for the disagreeing-views case.
+///
+/// What does hold: W11 FIX 2 (apply-before-broadcast) removes the specific
+/// way the baseline master went missing from peers' exchange views in CI,
+/// where a stale `local_cluster_key` made it answer `STATUS_ERROR` to every
+/// `OP_PARTITION_VERSION_REPORT` query.
 fn stale_table_may_serve_shard(
     active_effective_master: NodeId,
     active_target_master: NodeId,
@@ -18569,11 +18645,14 @@ impl RunningCluster {
     /// The authoritative master for `shard`, or the `NodeId(0)` sentinel when
     /// this node's view is not trustworthy for it.
     ///
-    /// W11 FIX 3 — when the local table lags the committed term, the sentinel
-    /// is returned only for shards whose ownership actually MOVES between the
-    /// active table and the committed term's deterministic baseline; a shard
-    /// both agree on is answered from the active table. See
-    /// [`stale_table_may_serve_shard`] for the safety argument.
+    /// W11 FIX 3 — when the local table lags the committed term the sentinel
+    /// is returned for EVERY shard, unless
+    /// [`ClusterConfig::stale_table_partial_serving`] is enabled (operator
+    /// opt-in, default OFF), in which case it is returned only for shards
+    /// whose ownership actually MOVES between the active table and the
+    /// committed term's deterministic baseline. See
+    /// [`stale_table_may_serve_shard`] for the argument AND its stated
+    /// limits.
     fn authoritative_master_for_shard(&self, shard: u16) -> NodeId {
         let (version, rf, effective, target, preferred) = {
             let table = self.shard_table.read();
@@ -18588,12 +18667,13 @@ impl RunningCluster {
         };
         let committed = self.topology_authority.committed_term();
         if version < committed {
-            let serviceable = self
-                .committed_masters(committed, rf)
-                .and_then(|masters| masters.get(shard as usize).copied())
-                .is_some_and(|committed_master| {
-                    stale_table_may_serve_shard(effective, target, committed_master)
-                });
+            let serviceable = self.stale_table_partial_serving
+                && self
+                    .committed_masters(committed, rf)
+                    .and_then(|masters| masters.get(shard as usize).copied())
+                    .is_some_and(|committed_master| {
+                        stale_table_may_serve_shard(effective, target, committed_master)
+                    });
             if !serviceable {
                 return NodeId(0);
             }
@@ -18817,9 +18897,10 @@ impl RunningCluster {
     ///
     /// Each shard resolves exactly as [`Self::authoritative_master_for_shard`]
     /// would: the per-shard preferred master, or `NodeId(0)` for a shard the
-    /// stale-table gate withholds (W11 FIX 3 — only shards whose ownership
-    /// moves between the active table and the committed term). Take one per
-    /// batch immediately before the per-item ownership loop.
+    /// stale-table gate withholds — every shard by default, and only the
+    /// shards whose ownership moves when
+    /// [`ClusterConfig::stale_table_partial_serving`] is enabled (W11 FIX 3).
+    /// Take one per batch immediately before the per-item ownership loop.
     pub fn master_snapshot(&self) -> MasterSnapshot {
         let committed = self.topology_authority.committed_term();
         let table = self.shard_table.read();
@@ -18828,7 +18909,7 @@ impl RunningCluster {
         // is judged against one committed row (and one memoized lookup),
         // rather than per shard. `None` keeps the pre-fix behaviour: withhold
         // every shard.
-        let committed_masters = if version < committed {
+        let committed_masters = if version < committed && self.stale_table_partial_serving {
             self.committed_masters(committed, table.replication_factor())
         } else {
             None
@@ -18990,15 +19071,21 @@ impl RunningCluster {
     ///
     /// If the local shard table is behind the committed topology, returns a
     /// redirect with `NodeId(0)` to signal the client should re-fetch the
-    /// partition map — but W11 FIX 3 narrows that to the shards whose
-    /// ownership actually MOVES between the active table and the committed
-    /// term. A shard both agree on has no ownership transition in flight and
-    /// is routed normally; see [`stale_table_may_serve_shard`].
+    /// partition map.
     ///
-    /// Before that narrowing, one un-activated commit meant a TOTAL routing
-    /// outage: CI @ 3a38dc2 scenario 07 measured a 3.11 s union window in
-    /// which the survivors answered `ERR_NO_QUORUM` to every key (3193 failed
-    /// GETs) while most shards had not moved at all.
+    /// With [`ClusterConfig::stale_table_partial_serving`] enabled (OPERATOR
+    /// OPT-IN, default OFF) that is narrowed to the shards whose ownership
+    /// actually MOVES between the active table and the committed term; a
+    /// shard both agree on is routed normally. Read
+    /// [`stale_table_may_serve_shard`] before enabling it — including the
+    /// missed-terms case it cannot discriminate.
+    ///
+    /// Un-narrowed, one un-activated commit is a TOTAL routing outage: CI @
+    /// 3a38dc2 scenario 07 measured a 3.11 s union window in which the
+    /// survivors answered `ERR_NO_QUORUM` to every key (3193 failed GETs)
+    /// while most shards had not moved at all. W11 FIX 1 + FIX 2 remove the
+    /// cause of that particular window; this knob is defence-in-depth for the
+    /// general membership-change window.
     pub fn route(&self, key: &TxKey) -> RouteDecision {
         let shard = ShardTable::shard_for_key(key);
         let (version, rf, effective, target, master) = {
@@ -19014,12 +19101,13 @@ impl RunningCluster {
         };
         let committed = self.topology_authority.committed_term();
         if version < committed {
-            let serviceable = self
-                .committed_masters(committed, rf)
-                .and_then(|masters| masters.get(shard as usize).copied())
-                .is_some_and(|committed_master| {
-                    stale_table_may_serve_shard(effective, target, committed_master)
-                });
+            let serviceable = self.stale_table_partial_serving
+                && self
+                    .committed_masters(committed, rf)
+                    .and_then(|masters| masters.get(shard as usize).copied())
+                    .is_some_and(|committed_master| {
+                        stale_table_may_serve_shard(effective, target, committed_master)
+                    });
             if !serviceable {
                 return RouteDecision::RedirectTo {
                     node: NodeId(0),
@@ -20940,6 +21028,14 @@ impl RunningCluster {
         self.engine = Some(engine);
     }
 
+    /// Test-only — flip the W11 P1-B partial-serving opt-in
+    /// ([`ClusterConfig::stale_table_partial_serving`]) on a fixture-built
+    /// cluster. Production sets it once from config.
+    #[cfg(test)]
+    pub(crate) fn test_set_stale_table_partial_serving(&mut self, enabled: bool) {
+        self.stale_table_partial_serving = enabled;
+    }
+
     /// Test-only — apply a quorum commit for `members` at `term`, so a test
     /// can drive the authority's committed term AND membership forward
     /// together (as production always does) instead of poking the
@@ -21175,6 +21271,10 @@ pub(crate) fn new_test_running_cluster(
             term: 0,
             masters: Arc::new(Vec::new()),
         })),
+        // W11 P1-B — fixtures default to the shipped (fail-closed) posture;
+        // tests that exercise partial serving flip it via
+        // `test_set_stale_table_partial_serving`.
+        stale_table_partial_serving: false,
         active_topology_members,
         inbound_state_path: None,
         outbound_state_path: None,
@@ -38414,6 +38514,66 @@ mod tests {
         );
     }
 
+    /// W11 P1-B — partial serving is OFF by default, and the default is the
+    /// historical fail-closed posture: a table that lags the committed term
+    /// withholds authority for EVERY key, moved or not.
+    ///
+    /// The relaxation cannot distinguish "one term behind, about to activate"
+    /// from "missed several terms while partitioned" — in the second case a
+    /// shard whose master never moved can still have gone stale during the
+    /// terms this node missed, and the reverse-heal fence that would cover it
+    /// is only planned AFTER activation. That is a spent-output-reported-
+    /// unspent hazard for a UTXO store, so the operator opts in, not the
+    /// build. Same fixture as
+    /// `stale_table_serves_unmoved_shards_and_fences_the_moved_ones`, flag
+    /// left at its default.
+    #[test]
+    fn stale_table_withholds_every_shard_when_partial_serving_is_off() {
+        let members = vec![NodeId(1), NodeId(2)];
+        let table = ShardTable::compute_with_epoch(&members, 1, 5, 1);
+        let cluster = new_test_running_cluster(
+            NodeId(1),
+            table,
+            &[
+                (NodeId(1), "127.0.0.1:4881".parse().unwrap()),
+                (NodeId(2), "127.0.0.1:4882".parse().unwrap()),
+            ],
+            &members,
+            &[],
+            &[],
+            &[],
+            2,
+        );
+        cluster.test_commit_topology(&[NodeId(1), NodeId(2), NodeId(3)], 6);
+        cluster.topology_epoch.store(6, Ordering::Release);
+
+        let snap = cluster.master_snapshot();
+        // Shard 0 does NOT move (node 1 under both tables) — the very shard
+        // the opt-in would serve. With the flag off it is still withheld.
+        for shard in [0u16, 1, 2, 3] {
+            let key = key_for_shard(shard);
+            assert_eq!(
+                cluster.route(&key),
+                RouteDecision::RedirectTo {
+                    node: NodeId(0),
+                    shard_table_version: 5,
+                },
+                "shard {shard} must fall back to the NodeId(0) refetch sentinel \
+                 while partial serving is disabled",
+            );
+            assert_eq!(
+                cluster.is_master(&key),
+                MasterQueryResult::No,
+                "shard {shard} must claim no authority from a stale table",
+            );
+            assert_eq!(
+                cluster.is_master_snapshot(&snap, &key),
+                cluster.is_master(&key),
+                "the batch snapshot must agree for shard {shard}",
+            );
+        }
+    }
+
     /// W11 FIX 3 (P2) — a local shard table that lags the committed topology
     /// term must withhold only the shards whose ownership actually MOVES.
     ///
@@ -38431,7 +38591,7 @@ mod tests {
     fn stale_table_serves_unmoved_shards_and_fences_the_moved_ones() {
         let members = vec![NodeId(1), NodeId(2)];
         let table = ShardTable::compute_with_epoch(&members, 1, 5, 1);
-        let cluster = new_test_running_cluster(
+        let mut cluster = new_test_running_cluster(
             NodeId(1),
             table,
             &[
@@ -38444,6 +38604,9 @@ mod tests {
             &[],
             2,
         );
+        // W11 P1-B — partial serving is an operator opt-in; this test is
+        // about what the relaxation does once it is ON.
+        cluster.test_set_stale_table_partial_serving(true);
         // A quorum commit this node has NOT activated: term 6 grows the
         // cluster to {1,2,3}. The local table stays at version 5.
         cluster.test_commit_topology(&[NodeId(1), NodeId(2), NodeId(3)], 6);
@@ -38527,7 +38690,7 @@ mod tests {
     fn master_snapshot_goes_stale_when_commit_lands_after_capture() {
         let members = vec![NodeId(1), NodeId(2)];
         let table = ShardTable::compute_with_epoch(&members, 1, 5, 1);
-        let cluster = new_test_running_cluster(
+        let mut cluster = new_test_running_cluster(
             NodeId(1),
             table,
             &[
@@ -38540,6 +38703,7 @@ mod tests {
             &[],
             2,
         );
+        cluster.test_set_stale_table_partial_serving(true);
 
         // Snapshot captured while the local table is CURRENT (version ==
         // committed term == 5): under round-robin over {1,2} this node

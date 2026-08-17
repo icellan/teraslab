@@ -9305,6 +9305,7 @@ mod tests {
             reverse_heal_online: false,
             heal_deadline: Duration::from_secs(60),
             heal_deadline_action: crate::config::HealDeadlineAction::AlertAndHold,
+            stale_table_partial_serving: false,
         };
 
         // The EXACT production sequence (bin/server.rs): `initial_peak`
