@@ -3321,14 +3321,33 @@ impl ClusterCoordinator {
         // rule: the classification "replica R holds nothing for shard S" comes
         // ONLY from the view, so a re-signal against an unchanged view is a
         // decision made on evidence that has not moved since the repair was
-        // dispatched. It is also self-unblocking — the sweep going quiet lets
-        // `active_count()` reach zero, which lets reactivation run, which
-        // completes an exchange, which clears this set with a fresh view.
+        // dispatched.
         //
-        // Fail direction: a repair that failed silently waits for the next
-        // exchange instead of being re-dispatched immediately — deferred
-        // repair, never deferred data. The replication catch-up loop's own
-        // resync requests bypass the derive entirely and are unaffected.
+        // W11 review P2-1 — what bounds the wait is NOT "the sweep going quiet
+        // lets reactivation run". `should_trigger_topology_reactivation` also
+        // requires `mismatched_shards > 0 || pending_handoffs > 0`, and
+        // under-replication contributes to neither, so on a settled cluster
+        // with a converged table the exchange may never fire and this set may
+        // never clear. Two other properties do the work:
+        //
+        //  * a CAP-DROPPED pair is never recorded (only `missing` — the
+        //    within-cap signals — is), so successive passes keep draining the
+        //    backlog in cap-sized steps and only go quiet once every derivable
+        //    pair has had a repair dispatched;
+        //  * a FAILED repair is re-driven by the durable failed-batch queue,
+        //    which bypasses the derive entirely — so failure retry does not
+        //    depend on this set clearing at all.
+        //
+        // The genuinely uncovered case is a repair that COMPLETES but does not
+        // fix the replica: it waits for an unrelated topology event, possibly
+        // indefinitely. Deferred repair, never deferred data — the shard is
+        // still served by its master and still replicated to live — and the
+        // alternative (arming the same-term re-heal on a non-zero
+        // under-replication backlog) is deliberately left out of this wave
+        // because that install is owned elsewhere. Tracked as a follow-up.
+        //
+        // The replication catch-up loop's own resync requests bypass the
+        // derive entirely and are unaffected.
         let resync_signaled: Arc<Mutex<std::collections::HashSet<(u64, u16)>>> =
             Arc::new(Mutex::new(std::collections::HashSet::new()));
         // sc08 — outcome accumulator for finished resync backfill runs.
@@ -5317,27 +5336,14 @@ impl ClusterCoordinator {
                         let cleanup_admissible = {
                             // LOCK ORDER (W8) — shard_table before migration.
                             let table = shard_table.read();
-                            let table_version = table.version;
-                            // W10 composition review P1-3b/P2-4 — count only
-                            // genuine in-flight MIGRATION work: a reverse-heal
-                            // fence (especially a #74 park, which holds
-                            // forever by design) is alert-and-hold state, not
-                            // inbound work, and gating on it disabled this
-                            // pass for the life of the process.
-                            //
-                            // W11 FIX 1 — and count only work for shards this
-                            // node is a TARGET HOLDER of. A non-held inbound
-                            // entry is the orphan candidate this pass exists
-                            // to reclaim, and the fail-closed inbound prune
-                            // keeps it alive exactly while the records it
-                            // guards are still here — so counting it made the
-                            // entry wait on the pass and the pass wait on the
-                            // entry (default-09, CI 32055073890: node1 stuck
-                            // on shards 1024/2902 from node3 with zero tasks
-                            // anywhere). See `inbound_plan_work_count`.
-                            let pending_inbound =
-                                migration.lock().inbound_plan_work_count(&table, self_id);
-                            event_orphan_cleanup_admissible(table_version, term, pending_inbound)
+                            let mgr = migration.lock();
+                            event_orphan_cleanup_admissible_here(
+                                &table,
+                                &mgr,
+                                self_id,
+                                table.version,
+                                term,
+                            )
                         };
                         if cleanup_admissible
                             && event_orphan_cleanup_fire(
@@ -5668,7 +5674,10 @@ impl ClusterCoordinator {
                         );
                         continue;
                     }
-                    let (mut resend_tasks, diverged) = {
+                    // The unmatched shards were already answered to the
+                    // requester by the dispatch handler (W11 FIX 4(a)), which
+                    // ran this same split before queuing; nothing to do here.
+                    let (mut resend_tasks, diverged, _unmatched) = {
                         let table = shard_table.read();
                         split_transfer_request_tasks(&table, self_id, req.requester, &req.shards)
                     };
@@ -5913,6 +5922,40 @@ impl ClusterCoordinator {
                                 "cluster: requesting missing shard transfers from sources",
                             );
                             std::thread::spawn(move || {
+                                // W11 FIX 4(a) — retire the inbound entries a
+                                // source has told us it will NEVER satisfy,
+                                // judged by the SAME fail-closed predicate the
+                                // periodic not-held prune applies: an entry
+                                // whose shard still has local records is KEPT
+                                // and stays fenced (dropping the fence would
+                                // expose those orphans to local reads — the
+                                // scenario-17 three-holder bug). Orphan
+                                // cleanup reclaims the records and the
+                                // ordinary prune then drops the entry.
+                                let retire = |refused: &[u16], source: NodeId| -> usize {
+                                    if refused.is_empty() {
+                                        return 0;
+                                    }
+                                    let dropped = {
+                                        // LOCK ORDER (W8): table before migration.
+                                        let table = refusal_st.read();
+                                        let mut mgr = refusal_mig.lock();
+                                        mgr.drop_refused_inbound(refused, source, |s| {
+                                            inbound_entry_must_be_kept(
+                                                &table,
+                                                self_id,
+                                                s,
+                                                refusal_eng.shard_record_count(s),
+                                            )
+                                        })
+                                    };
+                                    if dropped > 0
+                                        && let Some(m) = crate::metrics::migration_metrics()
+                                    {
+                                        m.migration_dangling_inbound_dropped.inc_by(dropped as u64);
+                                    }
+                                    dropped
+                                };
                                 for (source, shards) in by_source {
                                     let Some(addr) = addrs.get(&source).copied() else {
                                         tracing::warn!(
@@ -5933,50 +5976,52 @@ impl ClusterCoordinator {
                                         &payload,
                                         secret.as_deref().map(Vec::as_slice),
                                     ) {
-                                        Ok(resp) if resp.status == STATUS_OK => tracing::info!(
-                                            source = source.0,
-                                            shards = shards.len(),
-                                            epoch = committed_term,
-                                            "cluster: shard transfer request accepted",
-                                        ),
+                                        Ok(resp) if resp.status == STATUS_OK => {
+                                            // W11 review P2-2 — a PARTIAL
+                                            // refusal: the matched shards are
+                                            // queued on the source and the
+                                            // unmatched ones ride the OK body,
+                                            // so a mixed batch retires exactly
+                                            // its dangling members instead of
+                                            // polling for them forever. An
+                                            // empty body (every shard matched,
+                                            // or a pre-W11 source) retires
+                                            // nothing.
+                                            let refused =
+                                                parse_transfer_request_unmatched(&resp.payload);
+                                            let dropped = retire(&refused, source);
+                                            if refused.is_empty() {
+                                                tracing::info!(
+                                                    source = source.0,
+                                                    shards = shards.len(),
+                                                    epoch = committed_term,
+                                                    "cluster: shard transfer request accepted",
+                                                );
+                                            } else {
+                                                tracing::warn!(
+                                                    source = source.0,
+                                                    shards = shards.len(),
+                                                    refused = refused.len(),
+                                                    dropped,
+                                                    epoch = committed_term,
+                                                    "cluster: shard transfer request PARTIALLY \
+                                                     refused — the source will never send the \
+                                                     named shard(s); dangling inbound entries \
+                                                     dropped (entries whose records are still \
+                                                     local stay fenced for orphan cleanup)",
+                                                );
+                                            }
+                                        }
                                         Ok(resp) if transfer_request_was_refused(&resp.payload) => {
                                             // W11 FIX 4(a) — the source says
-                                            // it will NEVER send these: we are
-                                            // neither a target holder nor its
-                                            // intended master at the epoch we
-                                            // both activated. Retire the
-                                            // entries rather than re-asking
-                                            // every 10 s forever.
-                                            //
-                                            // Judged by the SAME fail-closed
-                                            // predicate the periodic prune
-                                            // uses: an entry whose records are
-                                            // still local is KEPT and stays
-                                            // fenced (dropping it would expose
-                                            // orphans to local reads — the
-                                            // scenario-17 three-holder bug);
-                                            // orphan cleanup reclaims those
-                                            // and the prune then drops it.
-                                            let dropped = {
-                                                // LOCK ORDER (W8): table
-                                                // before migration.
-                                                let table = refusal_st.read();
-                                                let mut mgr = refusal_mig.lock();
-                                                mgr.drop_refused_inbound(&shards, source, |s| {
-                                                    inbound_entry_must_be_kept(
-                                                        &table,
-                                                        self_id,
-                                                        s,
-                                                        refusal_eng.shard_record_count(s),
-                                                    )
-                                                })
-                                            };
-                                            if dropped > 0
-                                                && let Some(m) = crate::metrics::migration_metrics()
-                                            {
-                                                m.migration_dangling_inbound_dropped
-                                                    .inc_by(dropped as u64);
-                                            }
+                                            // it will NEVER send ANY of these:
+                                            // we are neither a target holder
+                                            // nor its intended master for a
+                                            // single requested shard at the
+                                            // epoch we both activated. Retire
+                                            // them rather than re-asking every
+                                            // 10 s forever.
+                                            let dropped = retire(&shards, source);
                                             tracing::warn!(
                                                 source = source.0,
                                                 shards = shards.len(),
@@ -13536,11 +13581,16 @@ const EVENT_ORPHAN_CLEANUP_MIN_INTERVAL: Duration = Duration::from_secs(60);
 /// * entries for shards this node is NOT a target holder of — those are the
 ///   very orphan candidates the pass reclaims, and the fail-closed inbound
 ///   prune (`inbound_entry_must_be_kept`) keeps such an entry alive for
-///   exactly as long as the records survive, so counting it made the entry
-///   wait on the pass while the pass waited on the entry (default-09,
-///   CI 32055073890).
+///   exactly as long as the records survive, so ONE of them disabled
+///   reclamation for every OTHER shard, for the life of the process.
 ///
-/// See that method's doc for the full safety argument.
+/// W11 review P1-2 — that second exclusion recovers the other ~4095 shards;
+/// it does NOT unwedge the excluded entry's own shard (the pass skips it one
+/// gate lower on [`MigrationManager::has_pending_inbound`], and #28 retains
+/// past that without committed-handoff evidence), and it is NOT what the
+/// default-09 hang needed. See
+/// [`MigrationManager::inbound_plan_work_count`] for both the full safety
+/// argument and the CI evidence that re-attributes that hang.
 ///
 /// Refusal is fail-safe: it defers reclaim, never data. The
 /// batch-completion-site invocations of `run_orphan_cleanup` /
@@ -13552,6 +13602,32 @@ fn event_orphan_cleanup_admissible(
     pending_inbound: usize,
 ) -> bool {
     active_table_version >= completed_term && pending_inbound == 0
+}
+
+/// The exchange-completion arm's admissibility decision, as one function.
+///
+/// W11 review TEST GAP — this exists so the CALL SITE is testable, not just
+/// the two predicates it composes. Pinning
+/// [`event_orphan_cleanup_admissible`] and
+/// [`MigrationManager::inbound_plan_work_count`] separately left the arm free
+/// to go on feeding the gate `inbound_migration_work_count()` with every test
+/// still green; a test on this function fails on exactly that revert.
+///
+/// The caller holds the shard-table read guard and the migration lock (in
+/// that order — W8) and passes `active_table_version` from the same guard, so
+/// the version and the plan-work count are read from one consistent snapshot.
+fn event_orphan_cleanup_admissible_here(
+    table: &ShardTable,
+    mgr: &MigrationManager,
+    self_id: NodeId,
+    active_table_version: u64,
+    completed_term: u64,
+) -> bool {
+    event_orphan_cleanup_admissible(
+        active_table_version,
+        completed_term,
+        mgr.inbound_plan_work_count(table, self_id),
+    )
 }
 
 /// GAP 2 — the rate-limit gate for the event-driven orphan-cleanup pass.
@@ -17380,6 +17456,27 @@ pub fn elect_master(_shard: u16, candidates: &[MasterCandidate]) -> Option<NodeI
 /// The tasks plug into the existing migration pipeline so resync
 /// inherits Phase E dual-write protection, Phase G throttling, and
 /// the same retry / cleanup machinery as a topology-driven backfill.
+///
+/// # W11 review P2-3 — an EXPLICIT shard list is filtered the same way
+///
+/// The empty-list branch has always resolved to `shards_owned_by(target)`, so
+/// the target is a committed holder of every shard it produces. An explicit
+/// list was NOT filtered, and could therefore name shards the target does not
+/// hold. That is now the same filter, for a reason that only became load
+/// bearing with W11 FIX 3(b): a repair no longer write-fences the source, and
+/// the argument for that rests entirely on the target being a committed
+/// holder — a holder receives every concurrent write through its ordinary
+/// replica fan-out, so the writes admitted past `fence_seq` (which this
+/// batch's delta cannot carry) still reach it. A NON-holder gets only the
+/// Phase E dual-write copy, whose ACK is deliberately NOT required for a
+/// repair-origin window (W10 composition P1-2) — so such a write could be
+/// silently dropped and lost to the backfill entirely.
+///
+/// Filtering is the safer of the two available cuts (the other being "fence
+/// when the target is not a holder"): a repair toward a node the committed
+/// table does not name as a holder has no addressee, and streaming a shard to
+/// it creates the very extra-holder state the orphan sweep then has to
+/// reclaim.
 pub fn synthesize_resync_migration_tasks(
     req: &crate::replication::manager::ResyncRequest,
     self_id: NodeId,
@@ -17389,14 +17486,31 @@ pub fn synthesize_resync_migration_tasks(
     if target == self_id {
         return Vec::new();
     }
+    let owned = shard_table.shards_owned_by(target);
     let shards: Vec<u16> = if req.shards.is_empty() {
-        let mut owned: Vec<u16> = shard_table.shards_owned_by(target).into_iter().collect();
+        let mut owned: Vec<u16> = owned.into_iter().collect();
         owned.sort_unstable();
         owned
     } else {
         let mut s = req.shards.clone();
         s.sort_unstable();
         s.dedup();
+        let before = s.len();
+        // W11 review P2-3 — same holder filter as the empty-list branch; see
+        // the fn doc for why an unfenced repair toward a NON-holder can lose
+        // a concurrently-admitted write.
+        s.retain(|shard| owned.contains(shard));
+        if s.len() < before {
+            tracing::warn!(
+                target_node = target.0,
+                dropped = before - s.len(),
+                requested = before,
+                "cluster: resync request named shard(s) the committed table \
+                 does not give the target — dropped (a repair has no addressee \
+                 on a non-holder, and streaming there only creates an extra \
+                 holder for the orphan sweep to reclaim)",
+            );
+        }
         s
     };
     shards
@@ -17610,17 +17724,63 @@ pub(crate) fn transfer_request_was_refused(payload: &[u8]) -> bool {
 /// loop applies, so the two cannot disagree: this is a thin projection of the
 /// real splitter, not a second implementation.
 ///
-/// Returns `(matched_tasks, diverged)`. `(0, 0)` — and only `(0, 0)` — means
-/// "the requester is neither a target holder nor the intended master for any
-/// requested shard", the refusal condition.
+/// W11 review P2-2 — requests are BATCHED per source (the requester sends
+/// every pending inbound shard naming that source in one frame), so an
+/// all-or-nothing verdict was not enough: a batch of one live shard plus
+/// three dangling ones matched, replied `STATUS_OK`, and the three kept
+/// polling forever — the exact default-17 shape. The unmatched list is
+/// therefore returned in BOTH outcomes, so the requester can retire exactly
+/// the shards this source refuses while the matched ones proceed.
+///
+/// Returns `(matched_tasks, diverged, unmatched)`. `matched == 0 && diverged
+/// == 0` is the whole-request refusal; a non-empty `unmatched` alongside a
+/// non-empty match set is the PARTIAL refusal.
 pub(crate) fn transfer_request_match_counts(
     table: &ShardTable,
     self_id: NodeId,
     requester: NodeId,
     shards: &[u16],
-) -> (usize, u32) {
-    let (tasks, diverged) = split_transfer_request_tasks(table, self_id, requester, shards);
-    (tasks.len(), diverged)
+) -> (usize, u32, Vec<u16>) {
+    let (tasks, diverged, unmatched) =
+        split_transfer_request_tasks(table, self_id, requester, shards);
+    (tasks.len(), diverged, unmatched)
+}
+
+/// W11 FIX 4(a) — encode the shards a transfer request named that this source
+/// will NEVER send, as `[count:u32][shard:u16 × count]`.
+///
+/// Carried in the `STATUS_OK` response body for a PARTIAL refusal (some
+/// shards matched, some did not). Purely additive: the response body was
+/// empty before, so a pre-W11 requester ignores it and a pre-W11 source
+/// returns nothing, which [`parse_transfer_request_unmatched`] reads as "no
+/// shards refused" — the historical behaviour in both directions.
+pub(crate) fn encode_transfer_request_unmatched(shards: &[u16]) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(4 + shards.len() * 2);
+    payload.extend_from_slice(&(shards.len() as u32).to_le_bytes());
+    for &shard in shards {
+        payload.extend_from_slice(&shard.to_le_bytes());
+    }
+    payload
+}
+
+/// W11 FIX 4(a) — decode [`encode_transfer_request_unmatched`].
+///
+/// Fail-safe on every malformed shape (empty body, truncated header,
+/// truncated list, a count larger than the body carries): returns only the
+/// shards actually present, so a garbled reply can retire fewer entries than
+/// intended but never more.
+pub(crate) fn parse_transfer_request_unmatched(payload: &[u8]) -> Vec<u16> {
+    if payload.len() < 4 {
+        return Vec::new();
+    }
+    let count = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]) as usize;
+    let available = (payload.len() - 4) / 2;
+    (0..count.min(available))
+        .map(|i| {
+            let at = 4 + i * 2;
+            u16::from_le_bytes([payload[at], payload[at + 1]])
+        })
+        .collect()
 }
 
 /// W1.1 FIX B — translate an inbound [`ShardTransferRequest`] into the
@@ -17641,20 +17801,23 @@ pub(crate) fn transfer_request_match_counts(
 ///   caller repairs divergence by re-running the full topology
 ///   activation, which rebuilds the handoff and re-pushes.
 /// - Shards where the requester is neither a current target holder nor
-///   the intended master are ignored (stale or malicious request). W11
-///   FIX 4(a): that verdict — `(0 tasks, 0 diverged)` for the WHOLE
-///   request — is what the dispatch handler refuses on, via
-///   [`transfer_request_match_counts`].
+///   the intended master are UNMATCHED — this source will never send them.
+///   W11 FIX 4(a) returns them as the third element so the handler can tell
+///   the requester per shard, instead of the requester polling for them every
+///   10 s forever. Out-of-range shard ids are unmatched too: they name
+///   nothing this node can ever hold.
 fn split_transfer_request_tasks(
     table: &ShardTable,
     self_id: NodeId,
     requester: NodeId,
     shards: &[u16],
-) -> (Vec<MigrationTask>, u32) {
+) -> (Vec<MigrationTask>, u32, Vec<u16>) {
     let mut tasks = Vec::new();
     let mut diverged = 0u32;
+    let mut unmatched = Vec::new();
     for &shard in shards {
         if (shard as usize) >= NUM_SHARDS {
+            unmatched.push(shard);
             continue;
         }
         let assignment = table.target_assignment(shard);
@@ -17667,9 +17830,11 @@ fn split_transfer_request_tasks(
             });
         } else if table.intended_master(shard) == requester {
             diverged += 1;
+        } else {
+            unmatched.push(shard);
         }
     }
-    (tasks, diverged)
+    (tasks, diverged, unmatched)
 }
 
 /// F2/W3 — classify `nodes` into [`MasterCandidate`]s for `shard`, relative
@@ -26835,6 +27000,86 @@ mod tests {
         target.join().unwrap();
     }
 
+    /// W11 review P2-3 (RED→GREEN) — an EXPLICIT resync shard list must be
+    /// filtered to shards the committed table actually gives the target, the
+    /// same way the empty-list branch already was.
+    ///
+    /// This only became load-bearing with FIX 3(b): a repair no longer
+    /// write-fences the source, and that argument rests entirely on the
+    /// target being a committed holder (so the ordinary replica fan-out
+    /// carries the writes admitted past `fence_seq`, which the batch's delta
+    /// cannot). A non-holder gets only the repair-origin dual-write copy,
+    /// whose ACK is deliberately not required — so a concurrent write could
+    /// be dropped and never reach the backfill at all.
+    #[test]
+    fn resync_tasks_never_target_a_node_the_table_does_not_give_the_shard() {
+        let members = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let table = ShardTable::compute_with_epoch(&members, 2, 3, 1);
+        let target = NodeId(2);
+        let owned = table.shards_owned_by(target);
+        let held = *owned.iter().min().expect("node 2 holds shards");
+        let not_held = (0..NUM_SHARDS as u16)
+            .find(|s| !owned.contains(s))
+            .expect("RF=2 over 3 members leaves node 2 out of some shard");
+
+        let req = crate::replication::manager::ResyncRequest {
+            node_id: target.0,
+            shards: vec![held, not_held],
+        };
+        let tasks = synthesize_resync_migration_tasks(&req, NodeId(1), &table);
+        assert_eq!(
+            tasks.iter().map(|t| t.shard).collect::<Vec<_>>(),
+            vec![held],
+            "an explicitly-requested shard the target does not hold must be \
+             dropped — an unfenced repair toward a non-holder can silently \
+             lose a concurrently-admitted write",
+        );
+
+        // The empty-list branch's contract is unchanged: every owned shard.
+        let all = crate::replication::manager::ResyncRequest {
+            node_id: target.0,
+            shards: Vec::new(),
+        };
+        let tasks = synthesize_resync_migration_tasks(&all, NodeId(1), &table);
+        assert_eq!(tasks.len(), owned.len());
+        assert!(tasks.iter().all(|t| owned.contains(&t.shard)));
+
+        // A request naming ONLY non-held shards resolves to nothing runnable
+        // rather than to a task with no addressee.
+        let none = crate::replication::manager::ResyncRequest {
+            node_id: target.0,
+            shards: vec![not_held],
+        };
+        assert!(synthesize_resync_migration_tasks(&none, NodeId(1), &table).is_empty());
+    }
+
+    /// W11 review P2-2 — the unmatched-shard list rides the transfer-request
+    /// OK body, so producer and consumer are pinned together here, including
+    /// every malformed shape a peer could send.
+    #[test]
+    fn transfer_request_unmatched_round_trips_and_fails_safe() {
+        assert_eq!(
+            parse_transfer_request_unmatched(&encode_transfer_request_unmatched(&[7, 4096, 0])),
+            vec![7, 4096, 0],
+        );
+        assert!(
+            parse_transfer_request_unmatched(&encode_transfer_request_unmatched(&[])).is_empty(),
+            "an all-matched reply names nothing",
+        );
+        // Pre-W11 source: empty body → retire nothing (historical behaviour).
+        assert!(parse_transfer_request_unmatched(&[]).is_empty());
+        // Truncated header, truncated list, and a count larger than the body
+        // carries: never invent a shard to retire.
+        assert!(parse_transfer_request_unmatched(&[1, 0, 0]).is_empty());
+        let mut lying = 9u32.to_le_bytes().to_vec();
+        lying.extend_from_slice(&5u16.to_le_bytes());
+        assert_eq!(
+            parse_transfer_request_unmatched(&lying),
+            vec![5],
+            "a count past the end yields only the shards actually present",
+        );
+    }
+
     /// W11 FIX 3(b) (RED→GREEN) — a Phase-H RESYNC backfill must NOT raise
     /// the SOURCE's client write fence, while a topology-plan HANDOFF still
     /// must.
@@ -28124,15 +28369,26 @@ mod tests {
         ));
     }
 
-    /// W11 FIX 1 (RED→GREEN) — the default-09 CIRCULAR WAIT. A node holding
-    /// an inbound entry for a shard it is NOT a target holder of must still
-    /// run the event-driven orphan-cleanup pass. Pre-fix the gate consumed
-    /// `inbound_migration_work_count`, which counts that entry — and the only
-    /// thing that can retire the entry is the cleanup the entry itself was
-    /// blocking (the prune keeps it while records remain; the settled GC
-    /// needs a SWIM-dead source). Driven through the REAL manager, the REAL
-    /// table and the REAL gate, with the pre-fix counter asserted alongside
-    /// so the regression cannot silently return.
+    /// W11 FIX 1 (RED→GREEN) — a node holding an inbound entry for a shard it
+    /// is NOT a target holder of must still run the event-driven
+    /// orphan-cleanup pass FOR EVERY OTHER SHARD. Pre-fix the gate consumed
+    /// `inbound_migration_work_count`, which counts that entry, and the entry
+    /// cannot retire on its own (the prune keeps it while records remain; the
+    /// settled GC needs a SWIM-dead source) — so one such entry disabled
+    /// reclamation cluster-wide for the life of the process.
+    ///
+    /// W11 review TEST GAP — driven through
+    /// `event_orphan_cleanup_admissible_here`, which IS the exchange-completion
+    /// arm's decision. Pinning the two predicates separately (the first cut of
+    /// this test) left the arm free to keep calling
+    /// `inbound_migration_work_count()` with every test green; this fails on
+    /// exactly that revert.
+    ///
+    /// W11 review P1-2 — this is NOT the default-09 hang. Those entries were
+    /// held up by the 10 s transfer-request loop against a live source with no
+    /// tasks, with the records already reclaimed; see
+    /// `inbound_plan_work_count`'s doc and
+    /// `refused_transfer_request_drops_only_its_own_dangling_inbounds`.
     #[test]
     fn non_held_inbound_does_not_disable_event_orphan_cleanup() {
         let members = [NodeId(1), NodeId(2), NodeId(3)];
@@ -28146,8 +28402,8 @@ mod tests {
         let source = a.master;
 
         let mut mgr = MigrationManager::new();
-        // The exact default-09 shape: a pending inbound naming a live source,
-        // for a shard this node does not hold, with no task anywhere.
+        // A pending inbound naming a live source, for a shard this node does
+        // not hold, with no task anywhere.
         assert!(mgr.register_inbound_source(shard, source));
         assert_eq!(mgr.active_count(), 0, "no outbound/inbound task exists");
 
@@ -28156,9 +28412,10 @@ mod tests {
             "precondition: the pre-fix counter closes the gate forever",
         );
         assert!(
-            event_orphan_cleanup_admissible(9, 9, mgr.inbound_plan_work_count(&table, self_id)),
-            "the pass must run so the orphaned records can be reclaimed — \
-             removing them is what finally lets the prune drop this entry",
+            event_orphan_cleanup_admissible_here(&table, &mgr, self_id, 9, 9),
+            "the exchange-completion arm must still fire the pass so the other \
+             ~4095 shards can be reclaimed (this entry's OWN shard stays \
+             skipped one gate lower, by design)",
         );
 
         // The gate must NOT be weakened for a shard this node really is
@@ -28171,8 +28428,17 @@ mod tests {
             .expect("the node holds some shard");
         assert!(mgr.register_inbound_source(held, NodeId(9)));
         assert!(
-            !event_orphan_cleanup_admissible(9, 9, mgr.inbound_plan_work_count(&table, self_id)),
+            !event_orphan_cleanup_admissible_here(&table, &mgr, self_id, 9, 9),
             "genuine plan-driven inbound work must still defer the pass",
+        );
+
+        // And the pre-activation refusal is unchanged by the counter swap.
+        let mut settled = MigrationManager::new();
+        assert!(settled.register_inbound_source(shard, source));
+        assert!(
+            !event_orphan_cleanup_admissible_here(&table, &settled, self_id, 8, 9),
+            "a completion for a term this node has not activated is still \
+             refused (armed-11), regardless of which entries are counted",
         );
     }
 
@@ -29953,7 +30219,7 @@ mod tests {
         table.begin_handoff_with(&new_table, |s| s == master_shard || s == rolled_back_shard);
         table.rollback_shard(rolled_back_shard);
 
-        let (tasks, diverged) = split_transfer_request_tasks(
+        let (tasks, diverged, unmatched) = split_transfer_request_tasks(
             &table,
             NodeId(1),
             NodeId(3),
@@ -29966,6 +30232,15 @@ mod tests {
         );
         assert_eq!(diverged, 1, "the rolled-back shard must count as diverged");
         assert_eq!(tasks.len(), 2);
+        // W11 review P2-2 — the unrelated shard is the one this source will
+        // never send, and it is now reported per shard rather than folded
+        // into an all-or-nothing verdict.
+        assert_eq!(
+            unmatched,
+            vec![unrelated_shard],
+            "only the shard the requester neither holds nor is intended master \
+             of is refused; the diverged one is repaired by re-activation",
+        );
         let master_task = tasks.iter().find(|t| t.shard == master_shard).unwrap();
         assert!(master_task.is_master);
         assert_eq!(master_task.from_node, NodeId(1));
@@ -35263,11 +35538,16 @@ mod tests {
             .find(|&s| table.target_assignment(s).master == exmaster)
             .expect("some shard is mastered by NodeId(1)");
 
-        let (tasks, diverged) = split_transfer_request_tasks(&table, source, exmaster, &[shard]);
+        let (tasks, diverged, unmatched) =
+            split_transfer_request_tasks(&table, source, exmaster, &[shard]);
 
         assert_eq!(
             diverged, 0,
             "the requester is the current master, not diverged"
+        );
+        assert!(
+            unmatched.is_empty(),
+            "a shard the requester masters is never refused"
         );
         assert_eq!(tasks.len(), 1);
         let t = &tasks[0];

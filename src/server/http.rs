@@ -1502,11 +1502,6 @@ pub(crate) fn render_metrics_text(
         );
         prom_counter(
             &mut out,
-            "teraslab_migration_superset_refused_cutoff_gate_total",
-            mm.migration_superset_refused_cutoff_gate.get(),
-        );
-        prom_counter(
-            &mut out,
             "teraslab_migration_transfer_request_refused_total",
             mm.migration_transfer_request_refused.get(),
         );
@@ -5499,7 +5494,6 @@ mod tests {
             "teraslab_migration_weak_veto_arbitrations_total",
             "teraslab_migration_prune_weak_declared_retained_total",
             "teraslab_migration_prune_skipped_cutoff_gate_total",
-            "teraslab_migration_superset_refused_cutoff_gate_total",
             "teraslab_migration_transfer_request_refused_total",
             "teraslab_migration_dangling_inbound_dropped_total",
             "teraslab_orphan_cleanup_skipped_pending_inbound",

@@ -2264,29 +2264,41 @@ impl MigrationManager {
     /// work: uncompleted, non-heal inbound entries for shards `table`'s
     /// TARGET assignment actually gives `self_id`.
     ///
-    /// # The deadlock this exists to break
+    /// # The starvation this exists to break
     ///
     /// The event-driven orphan-cleanup admissibility gate
     /// (`event_orphan_cleanup_admissible`) requires the pending-inbound count
-    /// to be ZERO. Feeding it [`Self::inbound_migration_work_count`] closed a
-    /// cycle with the inbound-prune's fail-closed keep rule
-    /// (`inbound_entry_must_be_kept`):
+    /// to be ZERO. Feeding it [`Self::inbound_migration_work_count`] let ONE
+    /// entry the fail-closed inbound prune deliberately keeps
+    /// (`inbound_entry_must_be_kept`: a shard this node does not hold but
+    /// still has RECORDS for — dropping the fence would expose those orphans
+    /// to local reads, the scenario-17 three-holder bug) disable the pass for
+    /// EVERY OTHER SHARD. The entry cannot retire on its own either: the
+    /// settled-inbound GC needs a SWIM-DEAD source
+    /// ([`Self::orphaned_inbound_shards`]) and the 10 s pull requester
+    /// re-stamps [`Self::mark_inbound_requested`] anyway.
     ///
-    /// 1. the prune KEEPS an inbound entry for a shard this node does not hold
-    ///    but still has RECORDS for (dropping the fence would expose those
-    ///    orphans to local reads — the scenario-17 three-holder bug);
-    /// 2. the only thing that removes those records is the orphan-cleanup
-    ///    pass — which the gate refuses to run while that very entry is
-    ///    counted;
-    /// 3. the settled-inbound GC cannot reap it either
-    ///    ([`Self::orphaned_inbound_shards`] needs a SWIM-DEAD source, and the
-    ///    10 s pull requester re-stamps [`Self::mark_inbound_requested`]
-    ///    anyway).
+    /// # Scope of the claim (W11 review P1-2 — corrected attribution)
     ///
-    /// Observed at CI 32055073890 (default-09): everything converged except
-    /// two inbound entries on node1 (shards 1024 and 2902, from node3, zero
-    /// active/failed tasks, no matching outbound on node3), and the run
-    /// panicked at `migrations still active after 120s`.
+    /// This does NOT unwedge the entry's own shard, and it never could: the
+    /// pass skips any shard with a pending inbound entry one gate lower
+    /// (`run_orphan_cleanup` / `cleanup_orphaned_shard_if_settled` both gate
+    /// on [`Self::has_pending_inbound`]), and past that gate a node holding a
+    /// merely-pushed copy has no committed-handoff evidence and is retained by
+    /// #28. What it recovers is reclamation of the other ~4095 shards, which
+    /// one such entry used to disable for the life of the process.
+    ///
+    /// The default-09 hang (CI 32055073890) is NOT this case and is not fixed
+    /// here — the run's own artifacts settle it: node1 logged "per-shard
+    /// orphan cleanup complete shard=1024 deleted=1" at 18:49:52, three
+    /// minutes BEFORE the 18:52:51 hang, and `node1_migration_status.json` at
+    /// the hang shows `active_count 0, failed_count 0, fenced_shards 0` with
+    /// exactly the two entries `{from_node: 3, shard: 1024}` and
+    /// `{from_node: 3, shard: 2902}`. The records were already gone; the
+    /// entries survived because the 10 s transfer-request loop kept
+    /// re-stamping them against a live node3 that had no tasks to send. The
+    /// fix for that is the source's terminal refusal
+    /// ([`Self::drop_refused_inbound`]).
     ///
     /// # Why excluding a NON-HELD inbound is the sound cut
     ///
@@ -2842,6 +2854,13 @@ impl MigrationManager {
     /// the ordinary prune then drops the entry. The refusal therefore buys
     /// promptness for the safe case and changes nothing about the unsafe one.
     ///
+    /// W11 review NIT — a `heal_pending` entry is never dropped either, no
+    /// matter what the source says. A reverse-heal fence is designed to
+    /// SURVIVE [`Self::clear_inbound`] precisely so a runtime topology commit
+    /// cannot serve an un-healed tail as authority (the P0 double-spend); a
+    /// peer's opinion about its own outbound tasks is weaker evidence than
+    /// that, and it is not what the fence is waiting for.
+    ///
     /// Returns how many entries were removed.
     pub fn drop_refused_inbound(
         &mut self,
@@ -2853,6 +2872,7 @@ impl MigrationManager {
         let before = self.inbound_migrations.len();
         self.inbound_migrations.retain(|m| {
             m.completed
+                || m.heal_pending
                 || m.from_node != source
                 || !refused.contains(&m.shard)
                 || must_be_kept(m.shard)
@@ -5394,6 +5414,17 @@ mod tests {
             "a refusal from one source must never cancel another source's \
              live transfer for the same shard",
         );
+
+        // W11 review NIT — a reverse-heal fence outranks a peer's opinion
+        // about its own outbound tasks: it survives even a `clear_inbound`
+        // topology commit, so a refusal must not retire it either.
+        assert!(mgr.register_heal_source(13, refuser));
+        assert_eq!(
+            mgr.drop_refused_inbound(&[13], refuser, |_| false),
+            0,
+            "a heal_pending entry is never dropped by a source refusal",
+        );
+        assert!(mgr.has_pending_inbound(13), "the heal fence stays up");
         // Shard 10 still has the other source's entry, so it stays fenced;
         // the bitmap must agree with the entries it shadows.
         assert!(mgr.has_pending_inbound(10));

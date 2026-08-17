@@ -1448,16 +1448,6 @@ pub struct MigrationMetrics {
     /// dormant there and its anti-stale role rests on the escalation's
     /// fresh-fold path. Rising steadily = that dormancy, not a defect.
     pub migration_prune_skipped_cutoff_gate: PaddedCounter,
-    /// W11 FIX 2 — completions from an AUTHORITATIVE-COMPLETE source that
-    /// held MORE records locally than the manifest declared while the
-    /// enumeration-cutoff gate had refused the reconciling #29 prune. Such a
-    /// completion is rejected as retryable (`ERR_MIGRATION_IN_PROGRESS`)
-    /// instead of committing the shard over unreconciled extras. Each tick is
-    /// one deferred completion; the source re-folds with a fresh cutoff and
-    /// the next round commits, so a rising-then-flat count is normal churn
-    /// and a monotonically climbing one means some source never produces a
-    /// cutoff-current fold for that shard.
-    pub migration_superset_refused_cutoff_gate: PaddedCounter,
     /// W11 FIX 4(a) — `OP_MIGRATION_TRANSFER_REQUEST` frames REFUSED by this
     /// source because the requester is neither a target holder nor the
     /// intended master for any requested shard. Counted on the SOURCE.
@@ -1587,7 +1577,6 @@ impl MigrationMetrics {
             migration_weak_veto_arbitrations: PaddedCounter::new(),
             migration_prune_weak_declared_retained: PaddedCounter::new(),
             migration_prune_skipped_cutoff_gate: PaddedCounter::new(),
-            migration_superset_refused_cutoff_gate: PaddedCounter::new(),
             migration_transfer_request_refused: PaddedCounter::new(),
             migration_dangling_inbound_dropped: PaddedCounter::new(),
             orphan_cleanup_skipped_pending_inbound: AtomicU32::new(0),
