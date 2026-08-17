@@ -37520,6 +37520,132 @@ mod tests {
         assert_eq!(version, 5, "the re-heal installs at the committed term");
     }
 
+    /// W11 FIX 2 (re-review P1-1) — end-to-end pin for the exemption WIRING:
+    /// the pre-image is the deterministic table of the PREVIOUS activation's
+    /// member set, taken from the snapshot captured before
+    /// `active_topology_members` is overwritten.
+    ///
+    /// Scale-up shape: a 2-member cluster grows to 3, the newcomer is empty
+    /// mid-rebalance, and the shard's previous deterministic master reports it
+    /// full. The activation must leave the newcomer as master (its emptiness
+    /// is this plan's precondition). The control seeds the prior member set
+    /// EQUAL to the new one — the same-term re-activation shape, where no
+    /// pre-image is available — and there the election deviates exactly as it
+    /// did before W11.
+    #[test]
+    fn scale_up_activation_keeps_the_newcomer_master_via_the_previous_member_pre_image() {
+        let run = |prior_members: Vec<NodeId>| -> (NodeId, NodeId) {
+            let _guard = migration_metrics_test_guard();
+            let _metrics_guard = crate::metrics::migration_metrics_test_lock();
+            let _metrics = install_test_migration_metrics();
+
+            let rf = 2u8;
+            let pv = 1u16;
+            let old_members = vec![NodeId(1), NodeId(2)];
+            let new_members = vec![NodeId(1), NodeId(2), NodeId(3)];
+            let old_table = ShardTable::compute_with_epoch(&old_members, rf, 1, pv);
+            let new_det = ShardTable::compute_with_epoch(&new_members, rf, 2, pv);
+            // A shard the newcomer takes over, whose PREVIOUS det master is a
+            // survivor that still holds it.
+            let shard = (0..NUM_SHARDS as u16)
+                .find(|&s| {
+                    new_det.target_assignment(s).master == NodeId(3)
+                        && old_table.target_assignment(s).master != NodeId(3)
+                })
+                .expect("some shard moves its master to the newcomer");
+            let prev_master = old_table.target_assignment(shard).master;
+
+            let engine = Arc::new(test_engine());
+            create_test_record(&engine, tx_key_for_shard(shard, 3));
+            let cluster = new_test_running_cluster(
+                NodeId(1),
+                old_table,
+                &[
+                    (NodeId(1), "127.0.0.1:1".parse().unwrap()),
+                    (NodeId(2), "127.0.0.1:1".parse().unwrap()),
+                    (NodeId(3), "127.0.0.1:1".parse().unwrap()),
+                ],
+                // Seeds `active_topology_members` — the prior-member source.
+                &prior_members,
+                &[],
+                &[],
+                &[],
+                3,
+            );
+
+            let entry = |seq: u64| {
+                vec![PartitionVersionEntry {
+                    shard,
+                    flags: 0,
+                    replica_count: 1,
+                    last_applied_seq: seq,
+                    manifest_digest: 0,
+                    max_generation: 0,
+                }]
+            };
+            let mut view: std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>> =
+                std::collections::HashMap::new();
+            for node in &new_members {
+                view.insert(
+                    *node,
+                    if *node == prev_master {
+                        entry(500)
+                    } else {
+                        entry(0)
+                    },
+                );
+            }
+
+            let outcome = ClusterCoordinator::activate_topology_with_view(
+                &new_members,
+                2,
+                pv,
+                NodeId(1),
+                rf,
+                &cluster.shard_table,
+                &cluster.migration,
+                &cluster.node_addrs,
+                &engine,
+                &None,
+                1,
+                1,
+                1,
+                &cluster.fenced_bitmap,
+                &cluster.migrating_bitmap,
+                &cluster.inbound_atomic,
+                &cluster.active_topology_members,
+                &view,
+                &cluster.migration_throttle,
+                &cluster.cluster_secret,
+                None,
+                // Fresh activation of a new term, worker launch held.
+                false,
+                true,
+                false,
+            );
+            drop(outcome);
+            let master = cluster.shard_table.read().target_assignment(shard).master;
+            (master, prev_master)
+        };
+
+        let (with_pre_image, _) = run(vec![NodeId(1), NodeId(2)]);
+        assert_eq!(
+            with_pre_image,
+            NodeId(3),
+            "the newcomer's emptiness is this activation's own plan's precondition — the \
+             deterministic master must stand",
+        );
+
+        // Control: no usable pre-image (prior members == new members, the
+        // same-term re-activation shape) — the pre-W11 deviation returns.
+        let (without_pre_image, prev_master) = run(vec![NodeId(1), NodeId(2), NodeId(3)]);
+        assert_eq!(
+            without_pre_image, prev_master,
+            "without a prior member set there is no exemption and the election deviates to \
+             the holder, exactly as before W11 (the fail-safe direction)",
+        );
+    }
+
     /// W11 FIX 3 (re-review P0-1) — the decline must be a DELAY, not a
     /// terminal state. Once the per-term budget is spent the SAME inputs that
     /// declined must INSTALL, so the node lands on the deterministic table
