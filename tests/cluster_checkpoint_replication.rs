@@ -139,6 +139,7 @@ fn create_checkpointing_segment_node(
         reverse_heal_online: false,
         heal_deadline: Duration::from_secs(300),
         heal_deadline_action: teraslab::config::HealDeadlineAction::AlertAndHold,
+        stale_table_partial_serving: false,
     };
 
     let replication = ReplicationRuntimeConfig {

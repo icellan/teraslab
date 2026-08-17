@@ -1526,6 +1526,11 @@ pub(crate) fn render_metrics_text(
             "teraslab_topology_proposal_revalidation_emptied_total",
             mm.topology_proposal_revalidation_emptied.get(),
         );
+        prom_counter(
+            &mut out,
+            "teraslab_topology_catch_up_reproposal_skipped_total",
+            mm.topology_catch_up_reproposal_skipped.get(),
+        );
         prom_gauge(
             &mut out,
             "teraslab_orphan_cleanup_retained_no_evidence",
@@ -5529,6 +5534,7 @@ mod tests {
             "teraslab_orphan_cleanup_skipped_pending_inbound",
             "teraslab_orphan_cleanup_shard_skipped_total",
             "teraslab_topology_proposal_revalidation_emptied_total",
+            "teraslab_topology_catch_up_reproposal_skipped_total",
             "teraslab_orphan_cleanup_retained_no_evidence",
             "teraslab_reheal_live_confirm_rounds_total",
             "teraslab_reheal_live_confirm_shards_total",

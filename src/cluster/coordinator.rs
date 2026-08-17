@@ -1345,38 +1345,136 @@ impl Drop for TopologyCatchUpGuard {
     }
 }
 
-/// Scenario 09 (quiesce revert) — the catch-up thread's re-proposal fallback,
-/// behind a commit-freshness re-check.
+/// Scenario 09 (quiesce revert) / W11 FIX 1 (scenario 07 total read outage) —
+/// the catch-up thread's re-proposal fallback, behind a commit-freshness
+/// re-check AND a hard never-widen constraint on the member set.
 ///
 /// The fallback exists for the genuinely-stale case: the catch-up was
 /// triggered by `remote_term`, no peer handed over the newer committed
 /// topology, and proposing a fresh term is the only remaining way to converge
 /// (the proposal collects votes from peers that already committed the higher
-/// term). Its membership comes from the ADDRESS BOOK — every node this one
-/// knows an address for — because the newer term's membership is precisely
-/// what this node failed to learn.
+/// term).
 ///
-/// But the direct-fetch loop RACES the normal commit broadcast. If the
-/// broadcast landed while we were fetching (the dispatch worker applied it,
-/// so the committed term reached `remote_term`, and the fetch loop then saw
-/// the peer's commit as `NotApplied` — leaving `caught_up` false), the
-/// catch-up's goal is already achieved — and the address book is a strictly
-/// WORSE membership source than the just-committed topology: it still names
-/// nodes that term deliberately excluded. Observed in e2e scenario 09: node2
-/// quiesced itself out at term 5, and this fallback re-proposed term 6 from
-/// the address book 1 ms later, putting node2 straight back in — double
-/// activation, 3134 cancelled migrations, node2 re-assigned all 1365 of its
-/// master shards and never drained.
+/// # Guard 1 — commit freshness (scenario 09)
 ///
-/// Returns `None` (skip — nothing stale left to fix, no state touched) once
-/// the committed term has caught up to `remote_term`; otherwise the proposal
-/// to run, built exactly as before. The freshness window is re-read here, at
-/// the last moment before proposing, not from the term captured when the
-/// catch-up began.
+/// The direct-fetch loop RACES the normal commit broadcast. If the broadcast
+/// landed while we were fetching (the dispatch worker applied it, so the
+/// committed term reached `remote_term`, and the fetch loop then saw the
+/// peer's commit as `NotApplied` — leaving `caught_up` false), the catch-up's
+/// goal is already achieved. Observed in e2e scenario 09: node2 quiesced
+/// itself out at term 5, and this fallback re-proposed term 6 one millisecond
+/// later, putting node2 straight back in — double activation, 3134 cancelled
+/// migrations, node2 re-assigned all 1365 of its master shards and never
+/// drained. Returns `None` (no state touched) once the committed term has
+/// caught up to `remote_term`; the freshness window is re-read HERE, at the
+/// last moment before proposing, not from the term captured when the catch-up
+/// began.
+///
+/// # Guard 2 — never widen membership (W11 FIX 1, P0)
+///
+/// This function used to source its members from the ADDRESS BOOK
+/// (`node_addrs.keys()`), which never forgets a node. That is a
+/// RESURRECTION channel: a node deliberately quiesced out of term N is still
+/// addressable, so the fallback re-proposed it into term N+1. The scenario-09
+/// case above is one instance; CI @ 3a38dc2 scenario 07 is the other, and the
+/// freshness re-check does not cover it — term 3 had deliberately committed 3
+/// members (node4 quiesced out at 18:43:26), the survivors saw `remote_term
+/// 4` at 18:44:20.723, node1 fell back and re-proposed `{term: 4, members:
+/// 4}`. Its propose to node4 TIMED OUT (`connect: connection timed out`) and
+/// it committed node4 as a member anyway 0 ms later, whose container had been
+/// removed 400 ms earlier. That put 1024 of 4096 shards on a dead node and
+/// produced a 3.11 s total read outage (3193 failed GETs).
+///
+/// So the member set now comes from the COMMITTED TERM — the only membership
+/// this node has consensus proof of — run through the SAME
+/// [`revalidate_settled_members`] filter the debounce-settled proposer uses,
+/// so both proposer paths share ONE rule (wave 10 wired that filter into the
+/// debounce path only, leaving this one unguarded). Note the ordering of
+/// defences: SWIM still reported node4 ALIVE at propose time, so a
+/// SWIM-liveness filter alone would NOT have saved that run — the committed
+/// set is what does the work, and the liveness filter only additionally drops
+/// members SWIM has since proved Dead.
+///
+/// The constraint is on the MEMBER SET, not on term adoption: the catch-up
+/// still targets `remote_term`, and the proposal still derives its term from
+/// the authority as before.
+///
+/// Consequences, all deliberate:
+///
+///  * When every committed member is healthy the constrained set EQUALS
+///    `committed_members`, so [`TopologyAuthority::on_membership_changed`]
+///    takes its identical-membership skip and this returns `None`. That is
+///    correct: re-proposing a term number the cluster may already have
+///    committed with a DIFFERENT membership is exactly the equivocation this
+///    fix exists to stop. Convergence to `remote_term` then rests on the
+///    catch-up's direct fetch, which every fresh `TopologyStale` observation
+///    retries once the in-flight slot clears (see
+///    [`try_begin_topology_catch_up`]) — a retry-until-reachable loop, not a
+///    wedge.
+///  * When a committed member is SWIM-Dead the filter drops it and a genuine
+///    SHRINK proposal fires — the useful half of the old behaviour, kept.
+///  * When this node is not itself in the committed set, the proposal is not
+///    ours to make (`on_membership_changed` requires `members[0] == self`);
+///    self is deliberately NOT re-added, since adding it would be the same
+///    resurrection bug pointed inward.
+///
+/// `committed_members` empty is the one case that still reads the address
+/// book: this node has never committed a topology, so there is no
+/// deliberately-excluded member it could resurrect and no committed set to
+/// preserve. That mirrors the catch-up's own peer list, which likewise falls
+/// back to the whole address book when `committed_members` is empty.
+///
+/// # Guard 3 — the monotonic two-step repair, re-seeded (W11 P1-A)
+///
+/// Constraining the member set to `committed_members` also removed the ONLY
+/// way this node could propose the monotonic UNION that repairs a COMPRESSED
+/// TWO-STEP (pre-fix the address book happened to BE that union). That matters
+/// because a commit refused by a gate is refused FOREVER — the fetch loop
+/// treats `NotApplied` as "try the next peer", and every peer returns the same
+/// commit. `revalidate_settled_members(committed_members, …)` can only SHRINK,
+/// so the union could never be reached again and a node in that shape would
+/// stall permanently.
+///
+/// `repair_target` re-seeds it from the refused commit itself: the caller
+/// passes [`crate::cluster::topology::TopologyAuthority::monotonic_repair_for_refused_commit`]'s
+/// output. That is the SECOND-CHOICE path — it only runs when `cluster_id` is
+/// UNSET, because with a configured, matching id the commit is ADOPTED
+/// DIRECTLY (`commit_membership_is_acceptable`), which proposes nothing at all
+/// and is therefore strictly safer.
+///
+/// The repair target is NOT `committed_members ∪ commit.members` (W11 P1-D).
+/// Both halves are consensus-proven, but only the commit is CURRENT: our
+/// committed half is stale by at least the term that removed a member, so a
+/// plain union re-adds exactly what the fresh term deliberately dropped. It
+/// contributes ONLY members the commit dropped that SWIM does not currently
+/// report ALIVE — an alive dropped member is a graceful drain in progress
+/// ([`RunningCluster::quiesce`] keeps the node running to serve two-phase
+/// handoffs, keeps SWIM up, and stays in `node_addrs`), and re-adding it is
+/// scenario 09 verbatim with nothing to reverse it. When that exclusion leaves
+/// the set non-monotonic the helper returns `None` and this node STALLS —
+/// which is the correct trade, because a stall is observable
+/// (`topology_catch_up_reproposal_skipped` plus the `refused_higher_term`
+/// ERROR) and reversible, while an undone drain is neither.
+///
+/// Whatever the helper does return is used VERBATIM here — deliberately NOT
+/// re-filtered through this function's own SWIM-Dead rule, which would drop
+/// the dead member whose re-inclusion is the entire point and rebuild the
+/// non-monotonic set being refused. It is a transient stepping stone: for a
+/// genuinely DEAD member the SWIM reap fires `NodeLeft`, `node_addrs` loses
+/// it, and [`crate::cluster::topology::TopologyAuthority::check_timeout`]'s
+/// strict-subset drop removes it — the step-2 path that exists only for dead
+/// members, which is why an alive one must never enter the set.
+///
+/// `state_of` reports the CURRENT SWIM state of a node (`None` = no SWIM
+/// record); it is read at the last moment before proposing, exactly as in the
+/// debounce path.
 fn catch_up_fallback_proposal(
     topology_authority: &crate::cluster::topology::TopologyAuthority,
     node_addrs: &RwLock<std::collections::HashMap<NodeId, SocketAddr>>,
     remote_term: u64,
+    self_id: NodeId,
+    state_of: impl Fn(&NodeId) -> Option<crate::cluster::membership::NodeState>,
+    repair_target: Option<&[NodeId]>,
 ) -> Option<crate::cluster::topology::TopologyTerm> {
     let committed = topology_authority.committed_term();
     if committed >= remote_term {
@@ -1387,12 +1485,72 @@ fn catch_up_fallback_proposal(
         );
         return None;
     }
-    let members: Vec<NodeId> = {
+    let committed_members = topology_authority.committed_members();
+    let members: Vec<NodeId> = if let Some(repair) = repair_target {
+        // W11 P1-A — a quorum-proven monotonic union. Used verbatim: it is
+        // already safety-checked, and re-filtering it would drop the very
+        // member whose re-inclusion makes the change monotonic.
+        let mut m = repair.to_vec();
+        m.sort();
+        m.dedup();
+        m
+    } else if committed_members.is_empty() {
+        // Never committed a topology — nothing to preserve, and the address
+        // book is the only membership source this node has.
         let addrs = node_addrs.read();
         let mut m: Vec<NodeId> = addrs.keys().copied().collect();
         m.sort();
         m
+    } else {
+        // No `departed_during_burst` list exists on this path (there is no
+        // debounce burst behind a catch-up), so the filter reduces to its
+        // strongest, most conservative rule: drop only members SWIM currently
+        // proves DEAD, retain everything else — including Suspect members,
+        // whose suspicion is transient and must not churn the member set.
+        let mut m = revalidate_settled_members(committed_members.clone(), &[], state_of, self_id);
+        m.sort();
+        m
     };
+
+    // W11 P2-A — decide BEFORE touching any authority state.
+    //
+    // `on_membership_changed` unconditionally writes `last_membership_change`
+    // and `observed_membership` before it reaches its identical-membership
+    // skip. Under Guard 2 the healthy case now ALWAYS lands on that skip, once
+    // per gossip-driven catch-up (sub-second), so calling through would:
+    //
+    //   * STARVE `check_timeout`, which needs
+    //     `last_membership_change.elapsed() >= propose_timeout` and carries
+    //     the strict-subset drop and the never-seen-joiner add — the other
+    //     half of the two-step repair; and
+    //   * CLOBBER `observed_membership` down to the committed set, which
+    //     `retry_proposal` reads and returns `None` on, silently cancelling an
+    //     in-flight grow.
+    //
+    // Neither is a change this function is entitled to make when it has
+    // nothing to propose, so return before `reset_membership_timer` too.
+    let sorted = |v: &[NodeId]| {
+        let mut out = v.to_vec();
+        out.sort_unstable();
+        out
+    };
+    if sorted(&members) == sorted(&committed_members) {
+        if let Some(m) = crate::metrics::migration_metrics() {
+            m.topology_catch_up_reproposal_skipped.inc();
+        }
+        tracing::info!(
+            committed,
+            remote_term,
+            members = ?members.iter().map(|n| n.0).collect::<Vec<_>>(),
+            "cluster: catch-up: no re-proposal — the member set is constrained to \
+             the committed term and nothing about it changed (W11 FIX 1: the \
+             address book must never widen membership); converging via the \
+             direct fetch on the next TopologyStale observation. Authority state \
+             left untouched (W11 P2-A)",
+        );
+        return None;
+    }
+
     topology_authority.reset_membership_timer();
     topology_authority.on_membership_changed(&members)
 }
@@ -2812,6 +2970,18 @@ pub struct ClusterConfig {
     /// [`crate::config::HealDeadlineAction::AlertAndHold`] (keep the shard fenced
     /// fail-closed and alert; never auto-move it).
     pub heal_deadline_action: crate::config::HealDeadlineAction,
+    /// W11 FIX 3 / P1-B — allow a shard table that LAGS the committed
+    /// topology term to keep serving the shards whose master is unchanged
+    /// between the active table and the committed term's deterministic
+    /// baseline, instead of withholding authority for EVERY key.
+    ///
+    /// `false` (default) is the fail-closed posture the store has always had:
+    /// one un-activated commit withholds every key until activation. `true`
+    /// trades that for availability during the activation window and is an
+    /// OPERATOR choice — see [`stale_table_may_serve_shard`] for the safety
+    /// argument AND the case it cannot discriminate (a table stale from MISSED
+    /// TERMS rather than from a not-yet-activated fresh commit).
+    pub stale_table_partial_serving: bool,
 }
 
 /// Runtime replication policy passed to a started cluster coordinator.
@@ -2889,6 +3059,10 @@ pub struct ClusterCoordinator {
     /// [`ClusterConfig::reverse_heal_online`]). Captured into the event loop so
     /// each partition-view refresh runs the online re-detect + reverse-pull.
     reverse_heal_online: bool,
+    /// W11 FIX 3 / P1-B — operator opt-in for partial serving from a stale
+    /// shard table. Captured from [`ClusterConfig::stale_table_partial_serving`]
+    /// so `start()` can hand it to the [`RunningCluster`].
+    stale_table_partial_serving: bool,
     /// Reverse-heal Phase 3c — fenced-heal deadline (see
     /// [`ClusterConfig::heal_deadline`]). Captured into the event loop so each
     /// partition-view refresh enforces the deadline on stuck heals.
@@ -3055,6 +3229,7 @@ impl ClusterCoordinator {
             activation_hold: Arc::new(AtomicBool::new(false)),
             topology_debounce: config.topology_debounce,
             reverse_heal_online: config.reverse_heal_online,
+            stale_table_partial_serving: config.stale_table_partial_serving,
             heal_deadline: config.heal_deadline,
             heal_deadline_action: config.heal_deadline_action,
         }
@@ -6121,6 +6296,11 @@ impl ClusterCoordinator {
             cluster_secret,
             committed_cluster_key: self.committed_cluster_key.clone(),
             topology_authority: self.topology_authority.clone(),
+            committed_master_cache: Arc::new(RwLock::new(CommittedMasterCache {
+                term: 0,
+                masters: Arc::new(Vec::new()),
+            })),
+            stale_table_partial_serving: self.stale_table_partial_serving,
             active_topology_members: active_topology_members_for_cluster,
             inbound_state_path,
             outbound_state_path,
@@ -6606,6 +6786,14 @@ impl ClusterCoordinator {
 
                         let local_term = topology_authority.committed_term();
                         let mut caught_up = false;
+                        // W11 P1-A — the monotonic UNION repair for a commit a
+                        // GATE refused. `NotApplied` below is treated as "try
+                        // the next peer", but every peer returns the SAME
+                        // commit, so a gate refusal is permanent, not
+                        // per-peer. Capture the repair from the HIGHEST such
+                        // term so the fallback can propose the stepping stone
+                        // instead of stalling forever.
+                        let mut repair_target: Option<(u64, Vec<NodeId>)> = None;
                         for peer_addr in &peers {
                             if let Ok(payload) = send_topology_frame(
                                 *peer_addr,
@@ -6665,7 +6853,43 @@ impl ClusterCoordinator {
                                         continue;
                                     }
                                     crate::cluster::topology::DurableCommitOutcome::NotApplied => {
-                                        // Raced / no longer acceptable — try next peer.
+                                        // Raced, superseded, OR refused by a
+                                        // gate. Only the last is permanent —
+                                        // and only the compressed-two-step
+                                        // shape has a safe repair, which
+                                        // `monotonic_repair_for_refused_commit`
+                                        // returns `None` for in every other
+                                        // case (W11 P1-A).
+                                        if let Some(union) = topology_authority
+                                            .monotonic_repair_for_refused_commit(&commit, |node| {
+                                                swim_membership
+                                                    .lock()
+                                                    .member_info(node)
+                                                    .map(|i| i.state)
+                                            })
+                                        {
+                                            tracing::warn!(
+                                                term = commit.term,
+                                                %peer_addr,
+                                                refused = ?commit.members.iter().map(|n| n.0).collect::<Vec<_>>(),
+                                                union = ?union.iter().map(|n| n.0).collect::<Vec<_>>(),
+                                                "cluster: catch-up: peer's committed term is \
+                                                 non-monotonic against our committed set (a \
+                                                 compressed two-step); every peer will refuse \
+                                                 identically, so proposing the quorum-proven \
+                                                 monotonic union as the repair step (W11 P1-A)",
+                                            );
+                                            if repair_target
+                                                .as_ref()
+                                                .is_none_or(|(term, _)| *term < commit.term)
+                                            {
+                                                repair_target = Some((commit.term, union));
+                                            }
+                                        }
+                                        // Try next peer regardless — a
+                                        // genuinely newer, ACCEPTABLE commit
+                                        // from another peer is still better
+                                        // than any re-proposal.
                                         continue;
                                     }
                                 }
@@ -6685,6 +6909,9 @@ impl ClusterCoordinator {
                                 topology_authority,
                                 node_addrs_for_topo,
                                 remote_term,
+                                self_id,
+                                |node| swim_membership.lock().member_info(node).map(|i| i.state),
+                                repair_target.as_ref().map(|(_, union)| union.as_slice()),
                             )
                         {
                             tracing::info!(
@@ -9660,6 +9887,52 @@ fn run_topology_proposer(
     );
 }
 
+/// W11 FIX 2 — what one peer's `OP_TOPOLOGY_PROPOSE` round-trip told us
+/// about that peer's reachability, as opposed to its vote.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProposeOutcome {
+    /// The peer answered with a decodable vote.
+    Voted,
+    /// The peer answered, but the response was not a decodable vote
+    /// (malformed, or a rejection envelope). It is REACHABLE.
+    Answered,
+    /// The TCP CONNECT to the peer failed: it is unreachable right now.
+    ///
+    /// Classified at the single site that produces the error string —
+    /// [`send_topology_frame_response_with_read_timeout`] maps only
+    /// `TcpStream::connect_timeout` failures to the `connect: ` prefix; a
+    /// timed-out or malformed frame READ produces a different message and is
+    /// therefore `Answered`, not `Unreachable`.
+    Unreachable,
+}
+
+/// W11 FIX 2 — the peers the commit broadcast's FIRST parallel pass should
+/// dial.
+///
+/// A peer whose propose could not even CONNECT milliseconds ago is unlikely
+/// to connect for the commit either, and each attempt costs a
+/// `TOPOLOGY_FRAME_CONNECT_TIMEOUT` (500 ms) slot in that pass.
+///
+/// W11 P2-B — this is a FIRST-PASS filter only, never a drop. Once the
+/// broadcast moved off the proposer thread, permanently excluding a peer
+/// bought nothing on any critical path while costing real propagation
+/// latency to a peer that merely BLIPPED: a 200 ms `ECONNREFUSED` during a
+/// rolling restart classifies as `Unreachable`, and dropping it outright
+/// would make that peer wait for the next gossip round instead of the 50 ms
+/// retry. [`spawn_commit_broadcast`] therefore re-includes every skipped peer
+/// in the two sequential retries.
+///
+/// A peer that ANSWERED — even with a rejection or a malformed frame — is
+/// reachable and stays in the first pass; dropping it would turn a vote-level
+/// disagreement into a missed commit.
+fn commit_broadcast_targets(outcomes: &[(SocketAddr, ProposeOutcome)]) -> Vec<SocketAddr> {
+    outcomes
+        .iter()
+        .filter(|(_, outcome)| *outcome != ProposeOutcome::Unreachable)
+        .map(|(addr, _)| *addr)
+        .collect()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn try_run_topology_proposal(
     proposal: &crate::cluster::topology::TopologyTerm,
@@ -9691,38 +9964,62 @@ fn try_run_topology_proposal(
     // Send proposals to ALL peers in parallel. Each thread handles one
     // peer's TCP round-trip independently. This reduces topology change
     // latency from O(peers × timeout) to O(timeout).
-    let votes: Vec<Option<crate::cluster::topology::TopologyVote>> = std::thread::scope(|scope| {
+    //
+    // W11 FIX 2 — each round-trip also reports the peer's REACHABILITY
+    // ([`ProposeOutcome`]), classified where the error is produced rather
+    // than re-derived later, so the commit broadcast can skip a peer it just
+    // failed to connect to.
+    type ProposeResult = (
+        ProposeOutcome,
+        Option<crate::cluster::topology::TopologyVote>,
+    );
+    let results: Vec<ProposeResult> = std::thread::scope(|scope| {
         let handles: Vec<_> = peers.iter().map(|(peer_id, peer_addr)| {
             let payload = &propose_payload;
             let pid = *peer_id;
             let paddr = *peer_addr;
-            scope.spawn(move || -> Option<crate::cluster::topology::TopologyVote> {
+            scope.spawn(move || -> ProposeResult {
                 match send_topology_frame(paddr, OP_TOPOLOGY_PROPOSE, payload, auth_secret) {
                     Ok(response_payload) => {
                         match crate::cluster::topology::TopologyVote::deserialize(&response_payload) {
-                            Some(v) => Some(v),
+                            Some(v) => (ProposeOutcome::Voted, Some(v)),
                             None => {
                                 tracing::warn!(?pid, %paddr, "cluster: topology propose — malformed vote");
-                                None
+                                (ProposeOutcome::Answered, None)
                             }
                         }
                     }
                     Err(e) => {
-                        tracing::warn!(?pid, %paddr, err = %e, "cluster: topology propose failed");
-                        None
+                        // Only a failed TCP connect proves unreachability; a
+                        // read timeout or a garbled frame means the peer
+                        // answered the dial and must still receive the commit.
+                        let outcome = if e.starts_with("connect: ") {
+                            ProposeOutcome::Unreachable
+                        } else {
+                            ProposeOutcome::Answered
+                        };
+                        tracing::warn!(?pid, %paddr, err = %e, ?outcome, "cluster: topology propose failed");
+                        (outcome, None)
                     }
                 }
             })
         }).collect();
         handles
             .into_iter()
-            .map(|h| h.join().unwrap_or(None))
+            // A panicked propose thread proves nothing about reachability:
+            // fail OPEN (`Answered`) so the peer still receives the commit.
+            .map(|h| h.join().unwrap_or((ProposeOutcome::Answered, None)))
             .collect()
     });
+    let broadcast_outcomes: Vec<(SocketAddr, ProposeOutcome)> = peers
+        .iter()
+        .zip(results.iter())
+        .map(|((_, addr), (outcome, _))| (*addr, *outcome))
+        .collect();
 
     // Feed all collected votes to the topology authority.
     let mut commit_result = None;
-    for vote in votes.into_iter().flatten() {
+    for vote in results.into_iter().filter_map(|(_, vote)| vote) {
         if let Some(commit) = topology_authority.handle_vote(&vote) {
             commit_result = Some(commit);
             break; // Quorum reached
@@ -9741,66 +10038,55 @@ fn try_run_topology_proposal(
         }
     };
 
-    tracing::info!(
-        term = commit.term,
-        "cluster: quorum reached — broadcasting commit"
-    );
+    tracing::info!(term = commit.term, "cluster: quorum reached — committing");
 
-    // Broadcast OP_TOPOLOGY_COMMIT to all peers in parallel with retry.
-    let commit_payload = commit.serialize();
-    let failed_addrs: Vec<SocketAddr> = std::thread::scope(|scope| {
-        let handles: Vec<_> = peers.iter().map(|(_, addr)| {
-            let payload = &commit_payload;
-            let a = *addr;
-            scope.spawn(move || -> Option<SocketAddr> {
-                if let Err(e) = send_topology_frame(a, OP_TOPOLOGY_COMMIT, payload, auth_secret) {
-                    tracing::warn!(addr = %a, err = %e, "cluster: topology commit broadcast failed");
-                    Some(a)
-                } else {
-                    None
-                }
-            })
-        }).collect();
-        handles
-            .into_iter()
-            .filter_map(|h| h.join().unwrap_or(None))
-            .collect()
-    });
-
-    // Retry failed broadcasts sequentially (transient failures).
-    let mut still_failed = failed_addrs;
-    for (retry, delay_ms) in [(1u32, 50u64), (2, 200)] {
-        if still_failed.is_empty() {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(delay_ms));
-        still_failed.retain(|addr| {
-            if let Err(e) =
-                send_topology_frame(*addr, OP_TOPOLOGY_COMMIT, &commit_payload, auth_secret)
-            {
-                tracing::warn!(retry, %addr, err = %e, "cluster: topology commit retry failed");
-                true
-            } else {
-                false
-            }
-        });
-    }
-    if !still_failed.is_empty() {
-        tracing::warn!(
-            unreachable = still_failed.len(),
-            "cluster: topology commit: nodes unreachable after retries",
-        );
-    }
-
-    // G9 — apply the commit locally only AFTER its committed term is durable.
-    // The proposer already broadcast the commit to peers; if its own persist
-    // fails it must NOT begin serving/activating under the new term (a crash
-    // would revert it to T-1 while peers hold T). Fail-closed: stay on the
-    // prior term and let a later TopologyStale catch-up re-drive activation.
+    // ── W11 FIX 2 (P1): APPLY LOCALLY FIRST, THEN DISSEMINATE ───────────
+    //
+    // This block used to run AFTER the peer broadcast and its two sequential
+    // retries. CI @ 3a38dc2 scenario 07 measured the cost: the broadcast (and
+    // both retries) blocked on a node whose container had already been
+    // removed, so for 1.75 s the proposer's own `local_cluster_key` was still
+    // the PREVIOUS term's and it answered STATUS_ERROR to every
+    // `OP_PARTITION_VERSION_REPORT` query
+    // (`teraslab_exchange_peer_failure_status_total` = 8 on n2 and n3). The
+    // post-commit exchange fires ~100 ms after the commit, so it collected 2
+    // of 4 views, both survivors det-degraded, and 1024 shards landed on a
+    // dead node.
+    //
+    // # Why the old order was NOT a safety requirement (verified in-code)
+    //
+    //  1. **The decision is already made.** `handle_vote` returned a
+    //     `TopologyCommit` only once a quorum of voters ACCEPTED, and each of
+    //     those voters persisted its `voted_term` before replying
+    //     (`handle_propose`'s persist-before-reply contract). The broadcast
+    //     disseminates a decided term; it is not part of deciding it.
+    //  2. **The broadcast fed nothing back into the local decision.** Its
+    //     only output was `still_failed`, consumed by a `warn!` and nothing
+    //     else — the old code applied the commit locally whether the
+    //     broadcast reached zero peers or all of them.
+    //  3. **Persist-before-apply is preserved, because it lives INSIDE
+    //     `handle_commit_durable`** (gate → persist → apply, all under the
+    //     `commit_apply` lock). Moving the call earlier relative to the
+    //     broadcast cannot reorder anything within it; G9's fail-closed
+    //     `PersistFailed` branch is untouched.
+    //  4. **Neither order is a durability barrier for the peers.** Under the
+    //     OLD order a proposer whose persist failed had already pushed the
+    //     commit to peers and stayed on T-1 itself; under the NEW order a
+    //     proposer that dies right after applying leaves peers to learn T
+    //     from the gossip `committed_term` piggyback and the `TopologyStale`
+    //     catch-up (`OP_GET_COMMITTED_TOPOLOGY`) — the same mechanism that
+    //     already had to cover a broadcast that failed against every peer.
+    //     A quorum of voters holds the term durably in both orders.
+    //
+    // So broadcast-then-apply was a LIVENESS choice (peers learn a touch
+    // sooner) paid for with a serving-authority stall on the one node that
+    // must be authoritative first. Applied-first is strictly better: the
+    // proposer is the node whose cluster key every peer's exchange query is
+    // about to test.
     let peak = peak_size.load(Ordering::Relaxed) as u64;
     let inc = swim_incarnation.load(Ordering::Relaxed);
     let path = topology_state_path.as_deref();
-    match topology_authority.handle_commit_durable(&commit, peak, inc, |state| {
+    let applied = match topology_authority.handle_commit_durable(&commit, peak, inc, |state| {
         persist_topology_state_durable(path, state)
     }) {
         crate::cluster::topology::DurableCommitOutcome::Applied(_) => {
@@ -9809,6 +10095,12 @@ fn try_run_topology_proposal(
             true
         }
         crate::cluster::topology::DurableCommitOutcome::PersistFailed => {
+            // G9 — fail closed: this node must NOT begin serving/activating
+            // under a term it could not persist (a crash would revert it to
+            // T-1 while peers hold T). The commit is still BROADCAST below:
+            // it is quorum-decided and the other members must learn it
+            // regardless of this node's local persist failure (the old order
+            // had already broadcast it by this point, so this is unchanged).
             tracing::error!(
                 term = commit.term,
                 "cluster: proposer NOT activating committed term — durable persist \
@@ -9821,7 +10113,107 @@ fn try_run_topology_proposal(
             // advanced past this term). No local activation needed.
             true
         }
+    };
+
+    // Disseminate OP_TOPOLOGY_COMMIT off the proposer thread. `run_topology_-
+    // proposer` may re-enter this function up to five times, so a broadcast
+    // that blocks for seconds against a dead peer would otherwise delay the
+    // NEXT proposal attempt as well.
+    spawn_commit_broadcast(
+        commit.serialize(),
+        commit_broadcast_targets(&broadcast_outcomes),
+        broadcast_outcomes.iter().map(|(addr, _)| *addr).collect(),
+        commit.term,
+        auth_secret.map(|s| s.to_vec()),
+    );
+
+    applied
+}
+
+/// W11 FIX 2 — disseminate a decided `TopologyCommit` on a detached thread:
+/// one parallel fan-out over `first_pass` followed by two sequential retries.
+///
+/// Detached because dissemination is pure liveness (see the safety argument
+/// at the call site): the term is already quorum-decided and locally applied,
+/// and every peer that misses the broadcast still converges through the
+/// gossip `committed_term` piggyback and the `TopologyStale` catch-up. Costs
+/// one thread plus one per target per commit — the same fan-out as before,
+/// just no longer on the proposer's critical path. Topology commits are rare
+/// (one per term), so the spawn is not a hot-path allocation.
+///
+/// W11 P2-B — `first_pass` is [`commit_broadcast_targets`]'s reachability
+/// filter, but `all_peers` is what the RETRIES cover: a peer skipped for an
+/// unreachable propose is re-included there, so a peer that merely blipped
+/// (a 200 ms `ECONNREFUSED` mid rolling-restart) still gets the commit ~50 ms
+/// later instead of waiting for the next gossip round.
+///
+/// The payload and secret are owned copies so the thread can outlive the
+/// proposal attempt that produced them.
+fn spawn_commit_broadcast(
+    commit_payload: Vec<u8>,
+    first_pass: Vec<SocketAddr>,
+    all_peers: Vec<SocketAddr>,
+    term: u64,
+    auth_secret: Option<Vec<u8>>,
+) {
+    if all_peers.is_empty() {
+        return;
     }
+    std::thread::spawn(move || {
+        let secret = auth_secret.as_deref();
+        let failed: Vec<SocketAddr> = std::thread::scope(|scope| {
+            let handles: Vec<_> = first_pass.iter().map(|addr| {
+                let payload = &commit_payload;
+                let a = *addr;
+                scope.spawn(move || -> Option<SocketAddr> {
+                    if let Err(e) = send_topology_frame(a, OP_TOPOLOGY_COMMIT, payload, secret) {
+                        tracing::warn!(term, addr = %a, err = %e, "cluster: topology commit broadcast failed");
+                        Some(a)
+                    } else {
+                        None
+                    }
+                })
+            }).collect();
+            handles
+                .into_iter()
+                .filter_map(|h| h.join().unwrap_or(None))
+                .collect()
+        });
+
+        // Retry sequentially (transient failures). W11 P2-B — the retry set
+        // is the first pass's failures PLUS every peer the reachability
+        // filter skipped, so an `Unreachable` classification delays a peer by
+        // one pass rather than excluding it from the commit entirely.
+        let mut still_failed: Vec<SocketAddr> = failed;
+        for addr in &all_peers {
+            if !first_pass.contains(addr) && !still_failed.contains(addr) {
+                still_failed.push(*addr);
+            }
+        }
+        for (retry, delay_ms) in [(1u32, 50u64), (2, 200)] {
+            if still_failed.is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(delay_ms));
+            still_failed.retain(|addr| {
+                if let Err(e) =
+                    send_topology_frame(*addr, OP_TOPOLOGY_COMMIT, &commit_payload, secret)
+                {
+                    tracing::warn!(term, retry, %addr, err = %e, "cluster: topology commit retry failed");
+                    true
+                } else {
+                    false
+                }
+            });
+        }
+        if !still_failed.is_empty() {
+            tracing::warn!(
+                term,
+                unreachable = still_failed.len(),
+                "cluster: topology commit: nodes unreachable after retries",
+            );
+        }
+    });
 }
 
 /// G8 stage 3 — react to a commit this node just durably applied, in case it
@@ -19162,6 +19554,15 @@ pub struct RunningCluster {
     cluster_secret: Option<Arc<Vec<u8>>>,
     /// Topology authority for quorum-committed term management.
     topology_authority: Arc<crate::cluster::topology::TopologyAuthority>,
+    /// W11 FIX 3 — memoized committed-term master row for the stale-table
+    /// gate ([`stale_table_may_serve_shard`]). Recomputed only when the
+    /// committed term advances.
+    committed_master_cache: Arc<RwLock<CommittedMasterCache>>,
+    /// W11 FIX 3 / P1-B — operator opt-in for partial serving from a shard
+    /// table that lags the committed term ([`ClusterConfig::stale_table_partial_serving`]).
+    /// `false` (default) keeps the historical fail-closed posture: a stale
+    /// table withholds authority for EVERY key.
+    stale_table_partial_serving: bool,
     /// Atomic mirror of `topology_authority.committed_term()` — the
     /// cluster_key value stamped on outbound `OP_REPLICA_BATCH` traffic and
     /// gated on inbound traffic.
@@ -19284,21 +19685,169 @@ pub struct RunningCluster {
 /// topology writers.
 pub struct MasterSnapshot {
     /// Per-shard authoritative master, indexed by shard id (`0..NUM_SHARDS`).
-    /// Every entry is `NodeId(0)` when the local shard table lags the
-    /// committed topology term — the same sentinel
+    /// An entry is `NodeId(0)` when the local shard table lags the committed
+    /// topology term — for EVERY shard by default, and only for shards whose
+    /// ownership actually moves when
+    /// [`ClusterConfig::stale_table_partial_serving`] is enabled (W11 FIX 3)
+    /// — the same sentinel
     /// [`RunningCluster::authoritative_master_for_shard`] returns, so the
     /// dispatcher redirects with `NodeId(0)` and the client refetches its
     /// partition map.
     masters: Vec<NodeId>,
-    /// The `shard_table.version` these masters were captured at. A commit that
-    /// lands AFTER capture advances `committed_term` beyond this value while
-    /// the local table has not yet been installed; in that window the frozen
-    /// `masters` are stale and [`RunningCluster::is_master_snapshot`] must fall
-    /// back to the `NodeId(0)` sentinel, exactly as a live
-    /// [`RunningCluster::authoritative_master_for_shard`] does once
-    /// `table.version < committed_term`. See
+    /// W11 FIX 3 — the `committed_term` the per-shard fence decisions above
+    /// were made against. (This replaces the captured `shard_table.version`:
+    /// the staleness question is no longer "is the frozen table behind?" but
+    /// "has the term those per-shard decisions were judged against moved?")
+    ///
+    /// The masters vector already encodes "stale table, but this shard's
+    /// owner does not move" per shard. That judgement is only valid for the
+    /// committed term it was computed from: a commit that lands AFTER capture
+    /// advances `committed_term` past this value and re-opens the question
+    /// for every shard, so [`RunningCluster::is_master_snapshot`] falls back
+    /// wholesale to `No` rather than trusting decisions made against a
+    /// superseded term. See
     /// `master_snapshot_goes_stale_when_commit_lands_after_capture`.
-    version: u64,
+    committed_at_capture: u64,
+}
+
+/// W11 FIX 3 — memoized per-shard MASTER row of the committed term's
+/// deterministic baseline table.
+///
+/// The stale-table gate needs "who does the COMMITTED term say masters this
+/// shard?" on the routing hot path, and the answer costs a full
+/// `NUM_SHARDS`-wide placement computation. It only changes when the
+/// committed term does, so it is computed once per term and reused.
+struct CommittedMasterCache {
+    /// The committed term `masters` was computed for. `0` = nothing cached
+    /// (no committed term can be `0` once a topology exists).
+    term: u64,
+    /// Indexed by shard id (`0..NUM_SHARDS`). `Arc` so a snapshot capture
+    /// can hold the whole row without copying 4096 ids.
+    masters: Arc<Vec<NodeId>>,
+}
+
+/// W11 FIX 3 — may a shard be served from a shard table that LAGS the
+/// committed topology term?
+///
+/// # The outage this opens up
+///
+/// [`RunningCluster::route`] and
+/// [`RunningCluster::authoritative_master_for_shard`] used to reject EVERY
+/// key while `table.version < committed_term`, returning the `NodeId(0)`
+/// sentinel. CI @ 3a38dc2 scenario 07 shows the cost: 3.11 s in which the
+/// union of the survivors answered `ERR_NO_QUORUM` to everything (3193
+/// failed GETs), because the activation of a freshly committed term takes an
+/// exchange phase to arrive. Most of those keys belonged to shards the new
+/// term does not move at all.
+///
+/// **OPERATOR OPT-IN, DEFAULT OFF** — this predicate is only consulted when
+/// [`ClusterConfig::stale_table_partial_serving`] is set. With the flag at its
+/// default the gate stays wholesale-closed, exactly as before W11. Read the
+/// two sections below IN FULL before enabling it: the argument is bounded,
+/// and one case it cannot discriminate is a correctness hazard, not merely an
+/// availability one.
+///
+/// # What the relaxation is and is not
+///
+/// The gate exists because the active table's MEMBER SET is superseded, so
+/// its ownership answers may be wrong about WHO OWNS a shard. For a shard
+/// whose master is IDENTICAL under the active table and the committed term's
+/// deterministic baseline, that particular answer is not wrong: there is no
+/// ownership transition in flight for it, and the node that serves it now is
+/// the node that will still serve it after activation. In OWNERSHIP terms,
+/// serving it from the active table does not create a second master.
+///
+/// That is a claim about ownership ONLY. It is expressly NOT a claim that no
+/// work is pending for the shard — an earlier draft of this comment asserted
+/// "no migration is planned for it (a handoff is generated exactly for shards
+/// whose master moves)", and that is FALSE of the activation as a whole. It
+/// holds only of [`ShardTable::migration_plan`]. The REVERSE-HEAL
+/// ([`RunningCluster::begin_reverse_heal`], sourced by
+/// [`select_reverse_heal_sources_for`] and driven by [`trigger_online_reheal`]
+/// from the POST-activation partition view) registers an inbound fence for a
+/// shard this node MASTERS whose copy is behind a live replica — its entire
+/// purpose is the master-unchanged-but-stale case, and it is enabled by
+/// default for RF > 1. Because it is planned AFTER activation, a node inside
+/// the `committed > version` window has not yet learned it needs a heal, and
+/// this predicate serves exactly those shards. That is why the relaxation is
+/// a flag.
+///
+/// Three conditions, all required:
+///
+///  * `active_effective == active_target` — the LOCAL table has no handoff
+///    in flight for the shard. A shard mid-handoff has two candidate owners
+///    already; the stale-table gate is not the place to arbitrate that.
+///  * `active_target == committed_master` — the committed term keeps the
+///    shard exactly where it is.
+///  * `committed_master != NodeId(0)` — never serve from the unassigned
+///    sentinel.
+///
+/// # The case this predicate CANNOT discriminate (why it is off by default)
+///
+/// `version < committed` covers two different states, and the comparison
+/// above tells them apart in neither:
+///
+///  * **one term behind, about to activate** — a fresh commit landed and the
+///    exchange phase has not finished. This is the state the relaxation is
+///    for, and for an unmoved shard the local copy is current.
+///  * **behind by MISSED TERMS** — this node was partitioned while the
+///    cluster committed AND ACTIVATED terms it never saw. Node A is
+///    partitioned; the cluster commits and activates `T-1 = {1,3}` and takes
+///    WRITES for shard `s`; the partition heals after `T = {1,2,3}` is
+///    committed but before anyone activates it. A's table is at `T-2` over
+///    `{1,2,3}` and the committed term `T` is ALSO over `{1,2,3}` — so every
+///    shard reads "unmoved", the gate opens for all `NUM_SHARDS`, and A
+///    serves `s` from a copy that missed the whole `T-1` window. The
+///    reverse-heal fence that exists for exactly this cannot help: it is
+///    planned from the post-activation view, which A has not reached. For a
+///    UTXO store that is a SPENT OUTPUT REPORTED UNSPENT.
+///
+/// That cuts against two postures this repo states explicitly:
+/// [`select_reverse_heal_sources_for`] ("serving one IS the double-spend, so
+/// alert-and-hold is correct") and [`RunningCluster::is_master`]
+/// ("Fail-closed (unavailable beats dual-authority)"). Hence: operator
+/// opt-in, default off.
+///
+/// FOLLOW-UP (tracked) — the cheapest sound discriminator is to stamp the
+/// shard table with the committed term it was last RECONCILED against (not
+/// merely computed for), so "one term behind, reconciled" is distinguishable
+/// from "missed terms". With that stamp the relaxation could be safe enough
+/// to default on; without it, it cannot.
+///
+/// # Residual, stated deliberately
+///
+/// The committed baseline is the DETERMINISTIC assignment for the committed
+/// term (round-robin/HRW, with the committed §8 assignment overlaid when the
+/// term carries one). When a term carries no assignment, each node's own
+/// activation may additionally run [`apply_master_election`], which can
+/// deviate from that baseline for a shard whose baseline master looks like a
+/// subset holder in that node's partition view. So a peer that already
+/// activated the term could, in principle, have elected itself master of a
+/// shard this predicate is willing to serve.
+///
+/// Two earlier arguments for tolerating that were REJECTED on review and are
+/// recorded here so they are not re-derived:
+///  * "it only ever serves the deterministic pick that deviation decays back
+///    to" — insufficient: the deviation exists precisely BECAUSE that master
+///    looked data-poor in the shared view, so routing to it during the window
+///    IS the failure mode, not a benign detour.
+///  * "election divergence is pre-existing and was never guarded" — false
+///    since Task #47 made the election a pure function of (round-robin table,
+///    shared view): same-view nodes now agree, and this stale-table gate was
+///    the remaining guard for the disagreeing-views case.
+///
+/// What does hold: W11 FIX 2 (apply-before-broadcast) removes the specific
+/// way the baseline master went missing from peers' exchange views in CI,
+/// where a stale `local_cluster_key` made it answer `STATUS_ERROR` to every
+/// `OP_PARTITION_VERSION_REPORT` query.
+fn stale_table_may_serve_shard(
+    active_effective_master: NodeId,
+    active_target_master: NodeId,
+    committed_master: NodeId,
+) -> bool {
+    committed_master != NodeId(0)
+        && active_effective_master == active_target_master
+        && active_target_master == committed_master
 }
 
 /// Per-shard "this node HOLDS a copy of this shard's records" view, captured
@@ -19379,14 +19928,124 @@ impl RunningCluster {
         }
     }
 
-    fn authoritative_master_for_shard(&self, shard: u16) -> NodeId {
-        let table = self.shard_table.read();
-        let committed = self.topology_authority.committed_term();
-        if table.version < committed {
-            return NodeId(0);
+    /// W11 FIX 3 — the committed term's deterministic per-shard MASTER row,
+    /// memoized per term (see [`CommittedMasterCache`]).
+    ///
+    /// `committed_term` is the value the caller already read; passing it in
+    /// keeps the caller's gate decision and this lookup on the SAME term.
+    ///
+    /// Returns `None` — and the caller must then fence wholesale, exactly as
+    /// before this fix — when the baseline cannot be trusted:
+    ///
+    ///  * `committed_members` is empty (nothing committed yet), or
+    ///  * a commit landed while this function was reading the authority's
+    ///    committed state. Terms are strictly increasing and members /
+    ///    placement version / assignment advance WITH the term under the
+    ///    authority's `commit_apply` lock, so re-reading the term after the
+    ///    other three and finding it unchanged proves the four belong to the
+    ///    same term. Any change fails closed rather than caching a mixed row.
+    ///
+    /// `rf` only shapes the REPLICA columns — the master row of
+    /// `ShardTable::compute_with_epoch` is `members[shard % n]` at placement
+    /// v1 and the HRW argmax over `members` at v2, neither of which reads
+    /// `rf` — so passing the active table's rf cannot skew the comparison.
+    ///
+    /// LOCKING: callers hold the `shard_table` read guard across this call
+    /// (W11 P2-D), and this takes `committed_master_cache` plus the
+    /// authority's own read locks. That order — `shard_table` →
+    /// `committed_master_cache` → authority — is the only one in the process;
+    /// nothing acquires the cache or the authority before `shard_table`. A
+    /// miss therefore holds a shard-table READ across one
+    /// `NUM_SHARDS`-wide placement computation, which delays (never
+    /// deadlocks) a queued activation writer, and happens at most ONCE per
+    /// committed term thanks to the single-flight below.
+    fn committed_masters(&self, committed_term: u64, rf: u8) -> Option<Arc<Vec<NodeId>>> {
+        {
+            let cache = self.committed_master_cache.read();
+            if cache.term == committed_term {
+                return Some(cache.masters.clone());
+            }
         }
-        let addrs = self.node_addrs.read();
-        Self::preferred_master_for_shard(&table, self.self_id, &addrs, shard)
+        // W11 P2-C — SINGLE-FLIGHT the miss. `route()` calls this per request,
+        // so without the write lock held across the computation every
+        // concurrent request on a behind node misses simultaneously and each
+        // computes its own `NUM_SHARDS`-wide placement — a thundering herd at
+        // exactly the moment the node is already struggling. Taking the write
+        // lock FIRST makes the losers block on the winner and then hit the
+        // re-check below.
+        let mut cache = self.committed_master_cache.write();
+        if cache.term == committed_term {
+            return Some(cache.masters.clone());
+        }
+        let members = self.topology_authority.committed_members();
+        if members.is_empty() {
+            return None;
+        }
+        let placement_version = self.topology_authority.committed_placement_version();
+        let assignment = self.topology_authority.committed_assignment();
+        if self.topology_authority.committed_term() != committed_term {
+            // Raced a commit — the members/placement/assignment just read may
+            // straddle two terms. Fail closed; the next call recomputes.
+            return None;
+        }
+        let baseline = committed_baseline_table(
+            &members,
+            rf,
+            committed_term,
+            placement_version,
+            assignment.as_ref(),
+        );
+        let masters: Arc<Vec<NodeId>> = Arc::new(
+            (0..NUM_SHARDS as u16)
+                .map(|shard| baseline.target_assignment(shard).master)
+                .collect(),
+        );
+        // Never let a slower thread's older row overwrite a newer one.
+        if cache.term <= committed_term {
+            *cache = CommittedMasterCache {
+                term: committed_term,
+                masters: masters.clone(),
+            };
+        }
+        Some(masters)
+    }
+
+    /// The authoritative master for `shard`, or the `NodeId(0)` sentinel when
+    /// this node's view is not trustworthy for it.
+    ///
+    /// W11 FIX 3 — when the local table lags the committed term the sentinel
+    /// is returned for EVERY shard, unless
+    /// [`ClusterConfig::stale_table_partial_serving`] is enabled (operator
+    /// opt-in, default OFF), in which case it is returned only for shards
+    /// whose ownership actually MOVES between the active table and the
+    /// committed term's deterministic baseline. See
+    /// [`stale_table_may_serve_shard`] for the argument AND its stated
+    /// limits.
+    fn authoritative_master_for_shard(&self, shard: u16) -> NodeId {
+        // W11 P2-D — guard held across the `committed_term` read (see
+        // `route`): dropping it first admits a torn table-vs-term read.
+        let table = self.shard_table.read();
+        let version = table.version;
+        let effective = table.effective_assignment(shard).master;
+        let target = table.target_assignment(shard).master;
+        let preferred = {
+            let addrs = self.node_addrs.read();
+            Self::preferred_master_for_shard(&table, self.self_id, &addrs, shard)
+        };
+        let committed = self.topology_authority.committed_term();
+        if version < committed {
+            let serviceable = self.stale_table_partial_serving
+                && self
+                    .committed_masters(committed, table.replication_factor())
+                    .and_then(|masters| masters.get(shard as usize).copied())
+                    .is_some_and(|committed_master| {
+                        stale_table_may_serve_shard(effective, target, committed_master)
+                    });
+            if !serviceable {
+                return NodeId(0);
+            }
+        }
+        preferred
     }
 
     /// This node's ID.
@@ -19604,26 +20263,51 @@ impl RunningCluster {
     /// [`Self::is_master_snapshot`] without re-locking for each item.
     ///
     /// Each shard resolves exactly as [`Self::authoritative_master_for_shard`]
-    /// would: `NodeId(0)` for every shard when the local table lags the
-    /// committed term, otherwise the per-shard preferred master. Take one per
-    /// batch immediately before the per-item ownership loop.
+    /// would: the per-shard preferred master, or `NodeId(0)` for a shard the
+    /// stale-table gate withholds — every shard by default, and only the
+    /// shards whose ownership moves when
+    /// [`ClusterConfig::stale_table_partial_serving`] is enabled (W11 FIX 3).
+    /// Take one per batch immediately before the per-item ownership loop.
     pub fn master_snapshot(&self) -> MasterSnapshot {
+        // W11 P2-D — take the table guard FIRST and read `committed_term`
+        // under it, as the pre-W11 code did, so the captured version and the
+        // committed term cannot straddle an activation.
         let table = self.shard_table.read();
         let committed = self.topology_authority.committed_term();
         let version = table.version;
-        if version < committed {
-            // Stale local table: `authoritative_master_for_shard` returns the
-            // `NodeId(0)` sentinel for every shard — match that exactly.
+        // W11 FIX 3 — resolved BEFORE the per-shard loop so the whole snapshot
+        // is judged against one committed row (and one memoized lookup),
+        // rather than per shard. `None` keeps the pre-fix behaviour: withhold
+        // every shard.
+        let committed_masters = if version < committed && self.stale_table_partial_serving {
+            self.committed_masters(committed, table.replication_factor())
+        } else {
+            None
+        };
+        if version < committed && committed_masters.is_none() {
             return MasterSnapshot {
                 masters: vec![NodeId(0); NUM_SHARDS],
-                version,
+                committed_at_capture: committed,
             };
         }
         let addrs = self.node_addrs.read();
         let masters = (0..NUM_SHARDS as u16)
-            .map(|shard| Self::preferred_master_for_shard(&table, self.self_id, &addrs, shard))
+            .map(|shard| {
+                if let Some(row) = committed_masters.as_deref() {
+                    let effective = table.effective_assignment(shard).master;
+                    let target = table.target_assignment(shard).master;
+                    let committed_master = row.get(shard as usize).copied().unwrap_or(NodeId(0));
+                    if !stale_table_may_serve_shard(effective, target, committed_master) {
+                        return NodeId(0);
+                    }
+                }
+                Self::preferred_master_for_shard(&table, self.self_id, &addrs, shard)
+            })
             .collect();
-        MasterSnapshot { masters, version }
+        MasterSnapshot {
+            masters,
+            committed_at_capture: committed,
+        }
     }
 
     /// Like [`Self::is_master`], but resolves the key's shard master from a
@@ -19655,14 +20339,21 @@ impl RunningCluster {
                 last_known_term: committed,
             };
         }
-        // Stale-table gate: a quorum commit that landed AFTER this snapshot was
-        // captured advances `committed_term` past the `shard_table.version`
-        // the snapshot froze, while the new table has not yet been installed.
-        // In that window a live `authoritative_master_for_shard` returns the
-        // `NodeId(0)` sentinel (→ `No`/redirect); the frozen `masters` would
-        // otherwise answer from the pre-commit assignment. Mirror the sentinel
-        // exactly rather than trust the stale snapshot.
-        if committed > snap.version {
+        // Stale-table gate: a quorum commit that landed AFTER this snapshot
+        // was captured re-opens the ownership question for every shard, while
+        // the new table has not yet been installed. The frozen `masters`
+        // would otherwise answer from the pre-commit assignment.
+        //
+        // W11 FIX 3 — the snapshot already encodes the per-shard stale-table
+        // decision (`NodeId(0)` for shards whose ownership moves between the
+        // active table and the committed term it was captured against), so
+        // the gate here is no longer `committed > snap.version` but
+        // `committed > snap.committed_at_capture`: it fires only when the
+        // committed term has moved PAST the one those decisions were made
+        // for, and then still falls back wholesale to `No`. For a snapshot
+        // captured while current, `committed_at_capture == snap.version` and
+        // this is bit-for-bit the old condition.
+        if committed > snap.committed_at_capture {
             return MasterQueryResult::No;
         }
         let shard = ShardTable::shard_for_key(key);
@@ -19689,10 +20380,16 @@ impl RunningCluster {
         let table = self.shard_table.read();
         let committed = self.topology_authority.committed_term();
         if table.version < committed {
-            // Stale local table: the master snapshot degrades to the `NodeId(0)`
-            // sentinel (nothing is locally mastered) and holdership is equally
-            // untrustworthy. Claim nothing — the sweep skips every candidate
-            // until the committed table is installed.
+            // Stale local table: holdership is untrustworthy. Claim nothing —
+            // the sweep skips every candidate until the committed table is
+            // installed.
+            //
+            // W11 FIX 3 deliberately did NOT relax this alongside the master
+            // gates. Withholding holdership only postpones a DAH space
+            // reclaim (no client-visible outage, which is what that fix was
+            // about), and holdership is the EFFECTIVE ∪ TARGET union rather
+            // than a single owner, so the "master unchanged ⇒ no transition
+            // in flight" argument does not transfer to it. Fail closed.
             return HolderSnapshot {
                 holds: vec![false; NUM_SHARDS],
             };
@@ -19742,22 +20439,57 @@ impl RunningCluster {
 
     /// Determine how to route a request for the given key.
     ///
-    /// If the local shard table is behind the committed topology, returns
-    /// a redirect with `NodeId(0)` to signal the client should re-fetch
-    /// the partition map.
+    /// If the local shard table is behind the committed topology, returns a
+    /// redirect with `NodeId(0)` to signal the client should re-fetch the
+    /// partition map.
+    ///
+    /// With [`ClusterConfig::stale_table_partial_serving`] enabled (OPERATOR
+    /// OPT-IN, default OFF) that is narrowed to the shards whose ownership
+    /// actually MOVES between the active table and the committed term; a
+    /// shard both agree on is routed normally. Read
+    /// [`stale_table_may_serve_shard`] before enabling it — including the
+    /// missed-terms case it cannot discriminate.
+    ///
+    /// Un-narrowed, one un-activated commit is a TOTAL routing outage: CI @
+    /// 3a38dc2 scenario 07 measured a 3.11 s union window in which the
+    /// survivors answered `ERR_NO_QUORUM` to every key (3193 failed GETs)
+    /// while most shards had not moved at all. W11 FIX 1 + FIX 2 remove the
+    /// cause of that particular window; this knob is defence-in-depth for the
+    /// general membership-change window.
     pub fn route(&self, key: &TxKey) -> RouteDecision {
         let shard = ShardTable::shard_for_key(key);
+        // W11 P2-D — the `shard_table` read guard is held ACROSS the
+        // `committed_term` read and the stale-table decision, exactly as it
+        // was pre-W11. Capturing the table's fields and dropping the guard
+        // first admits a torn read: an activation landing in between would
+        // leave `version`/`master` describing the OLD table while `committed`
+        // describes the new term, and the decision would then route from a
+        // superseded assignment.
         let table = self.shard_table.read();
-        let committed = self.topology_authority.committed_term();
-        if table.version < committed {
-            return RouteDecision::RedirectTo {
-                node: NodeId(0),
-                shard_table_version: table.version,
-            };
-        }
         let version = table.version;
-        let addrs = self.node_addrs.read();
-        let master = Self::preferred_master_for_shard(&table, self.self_id, &addrs, shard);
+        let effective = table.effective_assignment(shard).master;
+        let target = table.target_assignment(shard).master;
+        let master = {
+            let addrs = self.node_addrs.read();
+            Self::preferred_master_for_shard(&table, self.self_id, &addrs, shard)
+        };
+        let committed = self.topology_authority.committed_term();
+        if version < committed {
+            let serviceable = self.stale_table_partial_serving
+                && self
+                    .committed_masters(committed, table.replication_factor())
+                    .and_then(|masters| masters.get(shard as usize).copied())
+                    .is_some_and(|committed_master| {
+                        stale_table_may_serve_shard(effective, target, committed_master)
+                    });
+            if !serviceable {
+                return RouteDecision::RedirectTo {
+                    node: NodeId(0),
+                    shard_table_version: version,
+                };
+            }
+        }
+        drop(table);
 
         if master == self.self_id {
             RouteDecision::HandleLocally
@@ -21671,6 +22403,57 @@ impl RunningCluster {
         self.engine = Some(engine);
     }
 
+    /// Test-only — flip the W11 P1-B partial-serving opt-in
+    /// ([`ClusterConfig::stale_table_partial_serving`]) on a fixture-built
+    /// cluster. Production sets it once from config.
+    #[cfg(test)]
+    pub(crate) fn test_set_stale_table_partial_serving(&mut self, enabled: bool) {
+        self.stale_table_partial_serving = enabled;
+    }
+
+    /// Test-only — apply a quorum commit for `members` at `term`, so a test
+    /// can drive the authority's committed term AND membership forward
+    /// together (as production always does) instead of poking the
+    /// `committed_term` atomic and leaving `committed_members` behind.
+    ///
+    /// The stale-table gate ([`stale_table_may_serve_shard`]) compares the
+    /// active table against the COMMITTED term's membership, so a test that
+    /// desynchronizes the two exercises a state that cannot occur.
+    #[cfg(test)]
+    pub(crate) fn test_commit_topology(&self, members: &[NodeId], term: u64) {
+        let rf = self.shard_table.read().replication_factor();
+        let placement_version = self.shard_table.read().placement_version();
+        let cluster_id = self.topology_authority.cluster_id();
+        let peak = (members.len() as u64).max(self.topology_authority.peak_cluster_size());
+        self.topology_authority
+            .set_committed_voter_ever_seen(members);
+        let commit = crate::cluster::topology::TopologyCommit {
+            term,
+            proposer: self.self_id,
+            members: members.to_vec(),
+            cluster_id,
+            placement_version,
+            committed_peak: peak,
+            digest: crate::cluster::topology::TopologyTerm::compute_digest(
+                term,
+                &cluster_id,
+                members,
+                placement_version,
+                peak,
+                rf,
+                crate::cluster::topology::ASSIGNMENT_ABSENT_DIGEST,
+            ),
+            voters: members.to_vec(),
+            rf,
+            assignment: None,
+        };
+        assert_eq!(
+            self.topology_authority.handle_commit(&commit),
+            Some(term),
+            "fixture: the seeded commit must apply (rf / digest / gate mismatch?)",
+        );
+    }
+
     /// Shut down the cluster.
     ///
     /// Persists the current topology state to disk before stopping so
@@ -21859,6 +22642,14 @@ pub(crate) fn new_test_running_cluster(
         cluster_secret: None,
         committed_cluster_key: topology_authority.committed_term_shared(),
         topology_authority,
+        committed_master_cache: Arc::new(RwLock::new(CommittedMasterCache {
+            term: 0,
+            masters: Arc::new(Vec::new()),
+        })),
+        // W11 P1-B — fixtures default to the shipped (fail-closed) posture;
+        // tests that exercise partial serving flip it via
+        // `test_set_stale_table_partial_serving`.
+        stale_table_partial_serving: false,
         active_topology_members,
         inbound_state_path: None,
         outbound_state_path: None,
@@ -34503,6 +35294,756 @@ mod tests {
         ]))
     }
 
+    fn four_node_addr_book() -> RwLock<std::collections::HashMap<NodeId, SocketAddr>> {
+        RwLock::new(std::collections::HashMap::from([
+            (NodeId(1), "127.0.0.1:7101".parse().unwrap()),
+            (NodeId(2), "127.0.0.1:7102".parse().unwrap()),
+            (NodeId(3), "127.0.0.1:7103".parse().unwrap()),
+            (NodeId(4), "127.0.0.1:7104".parse().unwrap()),
+        ]))
+    }
+
+    /// W11 FIX 1 fixture — the scenario-07 shape. Committed history is term 4
+    /// = {1,2,3,4} (so every id is an ever-seen committed voter) followed by
+    /// term 5 = {1,3,4}: node 2 was DELIBERATELY quiesced out, exactly as
+    /// node4 was in the CI run. Self is node 1, the lowest-id proposer.
+    fn authority_with_quiesce_out_of_four() -> crate::cluster::topology::TopologyAuthority {
+        use crate::cluster::topology::{
+            ASSIGNMENT_ABSENT_DIGEST, ClusterId, TopologyAuthority, TopologyCommit, TopologyTerm,
+        };
+        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1), 2);
+        let full = vec![NodeId(1), NodeId(2), NodeId(3), NodeId(4)];
+        let term4 = TopologyCommit {
+            term: 4,
+            proposer: NodeId(1),
+            members: full.clone(),
+            cluster_id: ClusterId::UNSET,
+            placement_version: 1,
+            committed_peak: 4,
+            digest: TopologyTerm::compute_digest(
+                4,
+                &ClusterId::UNSET,
+                &full,
+                1,
+                4,
+                2,
+                ASSIGNMENT_ABSENT_DIGEST,
+            ),
+            voters: full.clone(),
+            rf: 2,
+            assignment: None,
+        };
+        assert_eq!(
+            auth.handle_commit(&term4),
+            Some(4),
+            "fixture: the full-membership term applies"
+        );
+        let quiesced = vec![NodeId(1), NodeId(3), NodeId(4)];
+        let term5 = TopologyCommit {
+            term: 5,
+            proposer: NodeId(1),
+            members: quiesced.clone(),
+            cluster_id: ClusterId::UNSET,
+            placement_version: 1,
+            committed_peak: 4,
+            digest: TopologyTerm::compute_digest(
+                5,
+                &ClusterId::UNSET,
+                &quiesced,
+                1,
+                4,
+                2,
+                ASSIGNMENT_ABSENT_DIGEST,
+            ),
+            voters: quiesced.clone(),
+            rf: 2,
+            assignment: None,
+        };
+        assert_eq!(
+            auth.handle_commit(&term5),
+            Some(5),
+            "fixture: the quiesce term applies"
+        );
+        auth
+    }
+
+    /// W11 FIX 1 (P0) — the catch-up fallback must NEVER WIDEN MEMBERSHIP.
+    ///
+    /// CI @ 3a38dc2 scenario 07: term 3 deliberately committed 3 members
+    /// (node4 quiesced out at 18:43:26). At 18:44:20.723 the survivors saw
+    /// `remote_term 4`, node1 fell back, and the fallback rebuilt its member
+    /// set from the ADDRESS BOOK — which never forgets a quiesced node — so
+    /// it re-proposed `{term: 4, members: 4}` and committed the already-
+    /// removed node4 back in even though its own propose to node4 had TIMED
+    /// OUT 0 ms earlier. That put 1024 of 4096 shards on a dead node.
+    ///
+    /// SWIM still reported the resurrected node ALIVE at propose time, so
+    /// this test deliberately makes every address-book node Alive: a
+    /// SWIM-liveness filter alone must NOT be what saves the run. The member
+    /// set has to come from the COMMITTED TERM.
+    ///
+    /// Node 4 is SWIM-Dead here so a proposal actually fires (the shared
+    /// [`revalidate_settled_members`] filter drops it), which lets the test
+    /// assert on real proposal contents rather than on a skip.
+    #[test]
+    fn catch_up_fallback_never_widens_membership_past_the_committed_term() {
+        use crate::cluster::membership::NodeState;
+        let auth = authority_with_quiesce_out_of_four();
+        let addrs = four_node_addr_book();
+
+        // Quiesced node 2 is still in the address book AND still Alive in
+        // SWIM — the exact combination that resurrected node4 in CI.
+        let state_of = |n: &NodeId| match n.0 {
+            4 => Some(NodeState::Dead),
+            _ => Some(NodeState::Alive),
+        };
+
+        let proposal = catch_up_fallback_proposal(&auth, &addrs, 6, NodeId(1), state_of, None)
+            .expect("committed_term 5 < remote_term 6 and a member died — must propose");
+        assert_eq!(proposal.term, 6, "proposes the next term above committed");
+        assert_eq!(
+            proposal.members,
+            vec![NodeId(1), NodeId(3)],
+            "members come from the COMMITTED term {{1,3,4}} minus the SWIM-dead \
+             node 4 — quiesced node 2 is NOT resurrected from the address book \
+             despite being Alive and addressable",
+        );
+        assert!(
+            !proposal.members.contains(&NodeId(2)),
+            "a node deliberately quiesced out of term 5 must not reappear in term 6",
+        );
+    }
+
+    /// The catch-up fallback constrains the MEMBER SET, not term adoption:
+    /// with every committed member healthy there is nothing to change, so the
+    /// re-proposal collapses to a no-op instead of fabricating a competing
+    /// term at a number the cluster may already have used. Convergence then
+    /// rests on the catch-up's direct fetch, which every fresh `TopologyStale`
+    /// observation retries.
+    ///
+    /// This REPLACES the old `catch_up_fallback_still_reproposes_when_
+    /// genuinely_stale`, whose assertion (`members == address book`) encoded
+    /// precisely the widening defect above.
+    #[test]
+    fn catch_up_fallback_declines_to_repropose_when_the_committed_set_is_intact() {
+        use crate::cluster::membership::NodeState;
+        let auth = authority_with_quiesce_out_of_four();
+        let addrs = four_node_addr_book();
+        let state_of = |_: &NodeId| Some(NodeState::Alive);
+
+        let proposal = catch_up_fallback_proposal(&auth, &addrs, 6, NodeId(1), state_of, None);
+        assert!(
+            proposal.is_none(),
+            "the committed set {{1,3,4}} is intact, so the constrained member \
+             set equals the committed one and there is nothing to propose",
+        );
+        assert_eq!(auth.committed_term(), 5, "committed term untouched");
+        assert_eq!(
+            auth.committed_members(),
+            vec![NodeId(1), NodeId(3), NodeId(4)],
+            "the quiesce is NOT reverted",
+        );
+    }
+
+    /// A node that has never committed a topology has no committed set to
+    /// preserve — there is no deliberately-excluded member it could
+    /// resurrect — so the address book stays its only membership source
+    /// (this mirrors the catch-up peer list, which also falls back to the
+    /// whole address book when `committed_members` is empty).
+    #[test]
+    fn catch_up_fallback_uses_the_address_book_only_before_any_commit() {
+        use crate::cluster::membership::NodeState;
+        let auth =
+            crate::cluster::topology::TopologyAuthority::new(NodeId(1), Duration::from_secs(1), 2);
+        let addrs = three_node_addr_book();
+        let state_of = |_: &NodeId| Some(NodeState::Alive);
+
+        assert!(
+            auth.committed_members().is_empty(),
+            "fixture: nothing committed yet"
+        );
+        let proposal = catch_up_fallback_proposal(&auth, &addrs, 2, NodeId(1), state_of, None)
+            .expect("a never-committed node still forms a cluster from its address book");
+        assert_eq!(
+            proposal.members,
+            vec![NodeId(1), NodeId(2), NodeId(3)],
+            "pre-commit bootstrap keeps the address-book source",
+        );
+    }
+
+    /// W11 P1-A fixture — node 1 committed `{1,2,3}` at term 5 under a
+    /// CONFIGURED `cluster_id` (the production shape: `cluster_id` is required
+    /// for clustered nodes under `strict_auth`, so the F-G8-001 ever-seen
+    /// heuristic is not what gates these commits).
+    ///
+    /// It then MISSES term 6 = `{1,3}` (node 2 drained) — the compressed
+    /// two-step.
+    fn authority_that_missed_a_drain_step(
+        cluster_id: crate::cluster::topology::ClusterId,
+    ) -> crate::cluster::topology::TopologyAuthority {
+        use crate::cluster::topology::{
+            ASSIGNMENT_ABSENT_DIGEST, TopologyAuthority, TopologyCommit, TopologyTerm,
+        };
+        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1), 2);
+        auth.set_cluster_id(cluster_id);
+        let members = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let term5 = TopologyCommit {
+            term: 5,
+            proposer: NodeId(1),
+            members: members.clone(),
+            cluster_id,
+            placement_version: 1,
+            committed_peak: 3,
+            digest: TopologyTerm::compute_digest(
+                5,
+                &cluster_id,
+                &members,
+                1,
+                3,
+                2,
+                ASSIGNMENT_ABSENT_DIGEST,
+            ),
+            voters: members.clone(),
+            rf: 2,
+            assignment: None,
+        };
+        assert_eq!(
+            auth.handle_commit(&term5),
+            Some(5),
+            "fixture: the pre-drain term applies"
+        );
+        auth
+    }
+
+    fn commit_over(
+        cluster_id: crate::cluster::topology::ClusterId,
+        term: u64,
+        members: &[NodeId],
+    ) -> crate::cluster::topology::TopologyCommit {
+        use crate::cluster::topology::{ASSIGNMENT_ABSENT_DIGEST, TopologyCommit, TopologyTerm};
+        TopologyCommit {
+            term,
+            proposer: members[0],
+            members: members.to_vec(),
+            cluster_id,
+            placement_version: 1,
+            committed_peak: 3,
+            digest: TopologyTerm::compute_digest(
+                term,
+                &cluster_id,
+                members,
+                1,
+                3,
+                2,
+                ASSIGNMENT_ABSENT_DIGEST,
+            ),
+            voters: members.to_vec(),
+            rf: 2,
+            assignment: None,
+        }
+    }
+
+    const UNSET_ID: crate::cluster::topology::ClusterId =
+        crate::cluster::topology::ClusterId::UNSET;
+    const CONFIGURED_ID: crate::cluster::topology::ClusterId =
+        crate::cluster::topology::ClusterId([7u8; 16]);
+
+    /// W11 P1-D / path (B) — with a CONFIGURED, matching `cluster_id` the
+    /// compressed two-step converges by DIRECT ADOPTION: no new term, no
+    /// proposal, and nothing re-added.
+    ///
+    /// Node 1 is in committed `{1,2,3}`; it misses term 6 = `{1,3}` (node 2
+    /// drained); the cluster commits term 7 = `{1,3,4}`. Relative to node 1's
+    /// committed set that both ADDS 4 and REMOVES 2, so the MONOTONICITY rule
+    /// alone would refuse it forever — the fetch loop treats the refusal as
+    /// "try the next peer", but every peer hands back the same commit.
+    ///
+    /// Monotonicity is only a PROXY for "foreign merge", and a matching
+    /// configured `cluster_id` is the direct evidence — which is why the
+    /// existing code already lets a `cluster_id` match skip the ever-seen
+    /// half. `cluster_id` has been required under `strict_auth` since v0.6.1,
+    /// so this is the validated configuration.
+    ///
+    /// Node 2 is ALIVE here (a quiesced node keeps running to serve two-phase
+    /// handoffs): adoption must respect its removal regardless.
+    #[test]
+    fn configured_cluster_id_adopts_a_compressed_two_step_directly() {
+        let auth = authority_that_missed_a_drain_step(CONFIGURED_ID);
+        let term7 = commit_over(CONFIGURED_ID, 7, &[NodeId(1), NodeId(3), NodeId(4)]);
+
+        assert_eq!(
+            auth.handle_commit(&term7),
+            Some(7),
+            "a quorum-proven commit whose configured cluster_id matches ours \
+             is adopted directly, non-monotonic or not",
+        );
+        assert_eq!(auth.committed_term(), 7, "the node caught up");
+        assert_eq!(
+            auth.committed_members(),
+            vec![NodeId(1), NodeId(3), NodeId(4)],
+            "the CURRENT membership is adopted verbatim — drained node 2 stays \
+             out, and no repair proposal was needed",
+        );
+    }
+
+    /// A commit whose `cluster_id` does NOT match ours is still refused —
+    /// direct adoption is gated on the id being the split-brain evidence it
+    /// claims to be.
+    #[test]
+    fn direct_adoption_still_refuses_a_foreign_cluster_id() {
+        let auth = authority_that_missed_a_drain_step(CONFIGURED_ID);
+        let foreign = crate::cluster::topology::ClusterId([9u8; 16]);
+        let term7 = commit_over(foreign, 7, &[NodeId(1), NodeId(3), NodeId(4)]);
+
+        assert_eq!(
+            auth.handle_commit(&term7),
+            None,
+            "a mismatched cluster_id is the split-brain signature — refuse",
+        );
+        assert_eq!(auth.committed_term(), 5, "committed state untouched");
+    }
+
+    /// W11 P1-A / path (A), the `cluster_id: UNSET` fallback — a DEAD dropped
+    /// member is folded back in, restoring monotonicity so the stalled node
+    /// can propose a stepping stone.
+    ///
+    /// The ever-seen set is pre-seeded with node 4 so this test isolates the
+    /// LIVENESS rule rather than the separate F-G8-001 unseen-joiner rule
+    /// (which, with `cluster_id` unset, would refuse an unknown joiner on its
+    /// own — the correct fail-closed posture, just not what is under test).
+    #[test]
+    fn unset_cluster_id_repairs_a_two_step_around_a_dead_member() {
+        use crate::cluster::membership::NodeState;
+        let auth = authority_that_missed_a_drain_step(UNSET_ID);
+        auth.set_committed_voter_ever_seen(&[NodeId(1), NodeId(2), NodeId(3), NodeId(4)]);
+        let term7 = commit_over(UNSET_ID, 7, &[NodeId(1), NodeId(3), NodeId(4)]);
+
+        assert_eq!(
+            auth.handle_commit(&term7),
+            None,
+            "without a configured cluster_id the monotonicity rule still fires",
+        );
+
+        // Node 2 is SWIM-Dead: it really is gone, so folding it back in is a
+        // transient stepping stone that step 2 (check_timeout's strict-subset
+        // drop, driven by the SWIM reap) removes.
+        let state_of = |n: &NodeId| match n.0 {
+            2 => Some(NodeState::Dead),
+            _ => Some(NodeState::Alive),
+        };
+        let repair = auth
+            .monotonic_repair_for_refused_commit(&term7, state_of)
+            .expect("a DEAD dropped member may be folded back in");
+        assert_eq!(
+            repair,
+            vec![NodeId(1), NodeId(2), NodeId(3), NodeId(4)],
+            "the commit's CURRENT membership plus the dead dropped member",
+        );
+
+        let addrs = four_node_addr_book();
+        let proposal =
+            catch_up_fallback_proposal(&auth, &addrs, 7, NodeId(1), state_of, Some(&repair))
+                .expect("the repair step must be proposed, not skipped");
+        assert_eq!(
+            proposal.members,
+            vec![NodeId(1), NodeId(2), NodeId(3), NodeId(4)],
+            "the repair is proposed verbatim — the dead member's re-inclusion \
+             is what makes the change monotonic",
+        );
+    }
+
+    /// W11 P1-D — the case the first cut of P1-A got WRONG: a member the
+    /// newer term dropped that SWIM still reports ALIVE must NEVER be folded
+    /// back in.
+    ///
+    /// A quiesced node is alive BY CONSTRUCTION: `RunningCluster::quiesce`
+    /// fabricates a commit excluding itself and then KEEPS RUNNING to serve
+    /// two-phase handoffs — it does not stop SWIM and does not leave
+    /// `node_addrs`. So the union `committed ∪ commit.members` re-adds a node
+    /// that is mid-drain. Peers already at `{1,3,4}` see that proposal as a
+    /// PURE ADD, so `membership_change_is_safe` passes and
+    /// `drops_a_live_member` is false: they ACCEPT, the drained node is a
+    /// member again, and the activation hands its data back — scenario 09
+    /// verbatim ("node2 re-assigned all 1365 of its master shards and never
+    /// drained"). Nothing reverses it: `check_timeout`'s strict-subset drop
+    /// needs the member DEAD, and the debounce path proposes the SWIM-alive
+    /// set, which still contains it.
+    ///
+    /// Consensus provenance was never what made the address book a
+    /// resurrection channel — its entries are real nodes too. STALENESS was,
+    /// and our committed half is stale by at least the term that removed the
+    /// member. So the refusal STANDS, and the resulting stall is the correct
+    /// trade: a stall is observable and reversible, an undone drain is
+    /// neither.
+    #[test]
+    fn unset_cluster_id_never_resurrects_a_quiesced_but_alive_member() {
+        use crate::cluster::membership::NodeState;
+        let auth = authority_that_missed_a_drain_step(UNSET_ID);
+        auth.set_committed_voter_ever_seen(&[NodeId(1), NodeId(2), NodeId(3), NodeId(4)]);
+        let term7 = commit_over(UNSET_ID, 7, &[NodeId(1), NodeId(3), NodeId(4)]);
+        assert_eq!(auth.handle_commit(&term7), None, "refused as non-monotonic");
+
+        // The ONLY difference from the dead-member test: node 2 is draining,
+        // hence ALIVE.
+        let state_of = |_: &NodeId| Some(NodeState::Alive);
+
+        let repair = auth.monotonic_repair_for_refused_commit(&term7, state_of);
+        assert!(
+            repair.is_none(),
+            "a dropped member SWIM reports ALIVE is a graceful drain in \
+             progress; folding it back in undoes the drain, so no repair is \
+             offered: {repair:?}",
+        );
+
+        // And the fallback must not manufacture one from anywhere else.
+        let addrs = four_node_addr_book();
+        let proposal =
+            catch_up_fallback_proposal(&auth, &addrs, 7, NodeId(1), state_of, repair.as_deref());
+        assert!(
+            proposal.is_none(),
+            "the node stalls rather than proposing the drained member back in",
+        );
+        assert_eq!(auth.committed_term(), 5, "stalled, as intended");
+        assert_eq!(
+            auth.committed_members(),
+            vec![NodeId(1), NodeId(2), NodeId(3)],
+            "and nothing was committed that re-adds the draining node",
+        );
+    }
+
+    /// Shared body for the three non-DEAD states. Asserts that a member the
+    /// newer term dropped is NOT folded back into the repair, and that the
+    /// node stalls rather than proposing it back in.
+    fn assert_no_resurrection_for_dropped_member_state(
+        state: Option<crate::cluster::membership::NodeState>,
+        what: &str,
+    ) {
+        let auth = authority_that_missed_a_drain_step(UNSET_ID);
+        auth.set_committed_voter_ever_seen(&[NodeId(1), NodeId(2), NodeId(3), NodeId(4)]);
+        let term7 = commit_over(UNSET_ID, 7, &[NodeId(1), NodeId(3), NodeId(4)]);
+        assert_eq!(auth.handle_commit(&term7), None, "refused as non-monotonic");
+
+        // Node 2 is the dropped member; everyone else is plainly Alive.
+        let state_of = move |n: &NodeId| {
+            if n.0 == 2 {
+                state
+            } else {
+                Some(crate::cluster::membership::NodeState::Alive)
+            }
+        };
+
+        let repair = auth.monotonic_repair_for_refused_commit(&term7, state_of);
+        assert!(
+            repair.is_none(),
+            "{what}: only POSITIVE PROOF OF DEATH may license folding a \
+             dropped member back in — got {repair:?}",
+        );
+
+        let addrs = four_node_addr_book();
+        let proposal =
+            catch_up_fallback_proposal(&auth, &addrs, 7, NodeId(1), state_of, repair.as_deref());
+        assert!(
+            proposal.is_none(),
+            "{what}: the node must stall rather than propose the dropped \
+             member back in",
+        );
+        assert_eq!(auth.committed_term(), 5, "{what}: stalled, as intended");
+        assert_eq!(
+            auth.committed_members(),
+            vec![NodeId(1), NodeId(2), NodeId(3)],
+            "{what}: nothing was committed that re-adds the dropped node",
+        );
+    }
+
+    /// W11 P1-D follow-up — SUSPECT is not death.
+    ///
+    /// `NodeState` is `{Alive, Suspect, Dead}`, so an `== Alive` exclusion let
+    /// `Suspect` fall through to the union: absence of an ACK read as LICENCE
+    /// to re-add a member the cluster deliberately dropped. That is the
+    /// opposite polarity from every other liveness test in this module
+    /// (`revalidate_settled_members`: "death is definitive… a member that
+    /// never departed and is not Dead is RETAINED even when Suspect —
+    /// suspicion is transient").
+    ///
+    /// It is reachable, not theoretical: a quiescing node is alive and serving
+    /// two-phase handoffs, and needs to miss ONE probe
+    /// (`swim_probe_interval_ms` 200) to be Suspect for the whole
+    /// `swim_suspicion_timeout_ms` (5000) window. The catch-up is re-armed per
+    /// GOSSIP MESSAGE, not edge-triggered, so a single observation landing
+    /// inside that 5 s window would have folded the draining node back in and
+    /// proposed it — peers see a pure ADD, `drops_a_live_member` is false,
+    /// they accept, and nothing reverses it.
+    #[test]
+    fn unset_cluster_id_never_resurrects_a_suspect_member() {
+        assert_no_resurrection_for_dropped_member_state(
+            Some(crate::cluster::membership::NodeState::Suspect),
+            "SUSPECT (one missed probe on a draining node)",
+        );
+    }
+
+    /// W11 P1-D follow-up — NO SWIM RECORD is not death either.
+    ///
+    /// `state_of` returns `None` when SWIM has never had an entry for the
+    /// node. Treating that as "gone" would make a cold or freshly-restarted
+    /// SWIM view a resurrection channel; fail closed instead.
+    #[test]
+    fn unset_cluster_id_never_resurrects_a_member_with_no_swim_record() {
+        assert_no_resurrection_for_dropped_member_state(None, "NO SWIM RECORD");
+    }
+
+    /// The same alive-drained shape under a CONFIGURED `cluster_id` converges
+    /// instead of stalling — via direct adoption, which cannot resurrect
+    /// anything because it proposes nothing. This is why (B) is the primary
+    /// path and (A) only the `UNSET` fallback.
+    #[test]
+    fn configured_cluster_id_converges_where_the_unset_fallback_must_stall() {
+        let auth = authority_that_missed_a_drain_step(CONFIGURED_ID);
+        let term7 = commit_over(CONFIGURED_ID, 7, &[NodeId(1), NodeId(3), NodeId(4)]);
+
+        assert_eq!(auth.handle_commit(&term7), Some(7), "adopted directly");
+        assert!(
+            !auth.committed_members().contains(&NodeId(2)),
+            "the draining node stays out",
+        );
+    }
+
+    /// Without the repair target the same node produces NOTHING — the
+    /// permanent stall P1-A identified. Pins that the repair path is what
+    /// rescues it, and that the constrained source alone cannot.
+    #[test]
+    fn catch_up_without_a_repair_target_cannot_escape_a_compressed_two_step() {
+        use crate::cluster::membership::NodeState;
+        let auth = authority_that_missed_a_drain_step(UNSET_ID);
+        let term7 = commit_over(UNSET_ID, 7, &[NodeId(1), NodeId(3), NodeId(4)]);
+        assert_eq!(auth.handle_commit(&term7), None, "refused as non-monotonic");
+
+        let addrs = four_node_addr_book();
+        let proposal = catch_up_fallback_proposal(
+            &auth,
+            &addrs,
+            7,
+            NodeId(1),
+            |_| Some(NodeState::Alive),
+            None,
+        );
+        assert!(
+            proposal.is_none(),
+            "the committed set is intact, so the constrained source proposes \
+             nothing — this is the stall the repair target exists to break",
+        );
+        assert_eq!(auth.committed_term(), 5, "still stuck without the repair");
+    }
+
+    /// W11 P2-A — when the fallback has nothing to propose it must leave the
+    /// authority's proposer state ALONE.
+    ///
+    /// `on_membership_changed` writes `last_membership_change` and
+    /// `observed_membership` BEFORE its identical-membership skip, and under
+    /// FIX 1 the healthy case now always lands on that skip — once per
+    /// gossip-driven catch-up (sub-second). Calling through would starve
+    /// `check_timeout` (which needs `last_membership_change.elapsed() >=
+    /// propose_timeout` and carries the strict-subset drop and never-seen
+    /// joiner add) and clobber `observed_membership`, which `retry_proposal`
+    /// reads and returns `None` on — silently cancelling an in-flight grow.
+    #[test]
+    fn catch_up_skip_leaves_the_proposer_state_untouched() {
+        use crate::cluster::membership::NodeState;
+        let auth = authority_with_quiesce_out_of_four();
+        let addrs = four_node_addr_book();
+
+        // An in-flight GROW: the observed set is wider than the committed one.
+        let growing = vec![NodeId(1), NodeId(2), NodeId(3), NodeId(4)];
+        auth.test_set_observed_membership(&growing);
+        auth.reset_membership_timer();
+        std::thread::sleep(Duration::from_millis(30));
+        let idle_before = auth.test_membership_idle_millis();
+        assert!(idle_before >= 30, "fixture: the timer has been running");
+
+        let proposal = catch_up_fallback_proposal(
+            &auth,
+            &addrs,
+            9,
+            NodeId(1),
+            |_| Some(NodeState::Alive),
+            None,
+        );
+        assert!(proposal.is_none(), "nothing to propose from the intact set");
+        assert!(
+            auth.test_membership_idle_millis() >= idle_before,
+            "the membership timer must NOT be reset by a skipped re-proposal, \
+             or check_timeout — the other half of the two-step repair — is \
+             starved by sub-second gossip",
+        );
+        assert_eq!(
+            auth.test_observed_membership(),
+            growing,
+            "the in-flight grow must survive: retry_proposal reads \
+             observed_membership and returns None once it is clobbered down to \
+             the committed set",
+        );
+    }
+
+    /// W11 FIX 2 (P1) — a peer whose PROPOSE round-trip failed at TCP
+    /// CONNECT is unreachable right now; re-dialling it for the commit
+    /// broadcast only buys another `connect_timeout`. Peers that answered
+    /// (with a vote or with anything else) stay on the broadcast list — a
+    /// rejection is not unreachability, and that node still needs the commit.
+    #[test]
+    fn commit_broadcast_skips_only_the_peers_whose_propose_could_not_connect() {
+        let a1: SocketAddr = "127.0.0.1:7101".parse().unwrap();
+        let a2: SocketAddr = "127.0.0.1:7102".parse().unwrap();
+        let a3: SocketAddr = "127.0.0.1:7103".parse().unwrap();
+        let outcomes = vec![
+            (a1, ProposeOutcome::Voted),
+            (a2, ProposeOutcome::Unreachable),
+            (a3, ProposeOutcome::Answered),
+        ];
+
+        assert_eq!(
+            commit_broadcast_targets(&outcomes),
+            vec![a1, a3],
+            "the unreachable peer is skipped in the FIRST pass; the voter and \
+             the non-voting responder both stay in it",
+        );
+        // W11 P2-B — and the skip must be a DELAY, not a drop: the retry set
+        // `spawn_commit_broadcast` builds re-includes it, so a peer that
+        // merely blipped still gets the commit ~50 ms later.
+        let all: Vec<SocketAddr> = outcomes.iter().map(|(addr, _)| *addr).collect();
+        assert!(
+            all.contains(&a2),
+            "the unreachable peer must remain in the full peer set the \
+             sequential retries cover",
+        );
+    }
+
+    /// W11 FIX 2 (P1) — the commit-apply must not be serialized behind
+    /// dead-peer TCP.
+    ///
+    /// CI @ 3a38dc2 scenario 07 (~coordinator.rs:9021-9096): the proposer
+    /// broadcast the commit and ran TWO sequential retries against a node
+    /// whose container had been removed BEFORE calling
+    /// `handle_commit_durable`. For 1.75 s node1's `local_cluster_key` was
+    /// still the previous term's, so it answered STATUS_ERROR to every
+    /// exchange query (`teraslab_exchange_peer_failure_status_total` = 8 on
+    /// n2 and n3); the exchange collected 2 of 4 views and both survivors
+    /// det-degraded onto a table that put 1024 shards on the dead node.
+    ///
+    /// Here the peer votes YES and then accepts the commit connection
+    /// without ever answering it — the dead-peer TCP shape. The local
+    /// committed term must advance anyway, promptly.
+    #[test]
+    fn topology_commit_applies_locally_before_a_blocked_broadcast() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let peer_addr = listener.local_addr().unwrap();
+
+        let read_frame =
+            |stream: &mut std::net::TcpStream| -> crate::protocol::frame::RequestFrame {
+                let mut header = [0u8; 4];
+                stream.read_exact(&mut header).unwrap();
+                let len = u32::from_le_bytes(header) as usize;
+                let mut body = vec![0u8; len];
+                stream.read_exact(&mut body).unwrap();
+                let mut bytes = header.to_vec();
+                bytes.extend_from_slice(&body);
+                crate::protocol::frame::RequestFrame::decode(&bytes)
+                    .unwrap()
+                    .0
+            };
+
+        let peer = std::thread::spawn(move || {
+            // 1. The proposal: answer with an accepting vote so quorum forms.
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_frame(&mut stream);
+            assert_eq!(request.op_code, OP_TOPOLOGY_PROPOSE);
+            let term =
+                crate::cluster::topology::TopologyTerm::deserialize(&request.payload).unwrap();
+            let vote = crate::cluster::topology::TopologyVote {
+                term: term.term,
+                digest: term.digest,
+                voter: NodeId(2),
+                accepted: true,
+                voter_current_term: 0,
+                voter_placement_support: crate::cluster::shards::MAX_SUPPORTED_PLACEMENT_VERSION,
+            };
+            stream
+                .write_all(
+                    &crate::protocol::frame::ResponseFrame {
+                        request_id: request.request_id,
+                        status: crate::protocol::opcodes::STATUS_OK,
+                        payload: vote.serialize(),
+                    }
+                    .encode(),
+                )
+                .unwrap();
+            drop(stream);
+
+            // 2. The commit broadcast: accept, read, and NEVER answer —
+            //    the connection a removed container leaves behind.
+            let (mut blocked, _) = listener.accept().unwrap();
+            let _ = read_frame(&mut blocked);
+            std::thread::sleep(Duration::from_secs(3));
+            // Listener dropped here so the off-thread retries fail fast
+            // instead of outliving the test.
+        });
+
+        let auth = Arc::new(crate::cluster::topology::TopologyAuthority::new(
+            NodeId(1),
+            Duration::from_secs(1),
+            1,
+        ));
+        auth.set_committed_voter_ever_seen(&[NodeId(1), NodeId(2)]);
+        let proposal = auth
+            .on_membership_changed(&[NodeId(1), NodeId(2)])
+            .expect("node 1 is the lowest-id proposer for {1,2}");
+        let proposal_term = proposal.term;
+
+        let addrs = Arc::new(RwLock::new(std::collections::HashMap::from([
+            (NodeId(1), "127.0.0.1:7999".parse::<SocketAddr>().unwrap()),
+            (NodeId(2), peer_addr),
+        ])));
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        let started = std::time::Instant::now();
+        assert!(
+            try_run_topology_proposal(
+                &proposal,
+                &auth,
+                &addrs,
+                NodeId(1),
+                &tx,
+                &None,
+                &Arc::new(std::sync::atomic::AtomicUsize::new(2)),
+                &Arc::new(std::sync::atomic::AtomicU64::new(1)),
+                None,
+            ),
+            "quorum was reached and the local persist (path None) succeeded",
+        );
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            auth.committed_term(),
+            proposal_term,
+            "the proposer must have applied its own committed term",
+        );
+        assert!(
+            elapsed < Duration::from_millis(1500),
+            "the commit-apply must not sit behind the broadcast's read timeout \
+             (2 s) or its two retries (+2.25 s): took {elapsed:?}",
+        );
+        let (members, term) = rx
+            .recv_timeout(Duration::from_millis(500))
+            .expect("the event loop must be signalled to activate");
+        assert_eq!(term, proposal_term, "signalled the committed term");
+        assert_eq!(
+            members,
+            vec![NodeId(1), NodeId(2)],
+            "signalled the committed members",
+        );
+
+        peer.join().unwrap();
+    }
+
     /// Scenario 09 (quiesce revert) — node2 quiesced itself out at term 5,
     /// and the commit broadcast landed WHILE this node's catch-up thread was
     /// still direct-fetching (the dispatch worker applied it, so the fetch
@@ -34513,12 +36054,20 @@ mod tests {
     /// catch-up, the fallback must SKIP: no proposal, membership untouched.
     #[test]
     fn catch_up_fallback_skips_reproposal_when_commit_already_caught_up() {
+        use crate::cluster::membership::NodeState;
         let auth = authority_with_committed_quiesce();
         let addrs = three_node_addr_book();
 
         // The catch-up was triggered by remote_term 5 — the very term the
         // broadcast just committed locally.
-        let proposal = catch_up_fallback_proposal(&auth, &addrs, 5);
+        let proposal = catch_up_fallback_proposal(
+            &auth,
+            &addrs,
+            5,
+            NodeId(1),
+            |_| Some(NodeState::Alive),
+            None,
+        );
         assert!(
             proposal.is_none(),
             "no re-proposal once committed_term >= remote_term — the \
@@ -34529,26 +36078,6 @@ mod tests {
             auth.committed_members(),
             vec![NodeId(1), NodeId(3)],
             "the quiesce is NOT reverted — node2 stays excluded"
-        );
-    }
-
-    /// The genuinely-stale case must keep converging: the catch-up target is
-    /// STRICTLY ahead of the committed term and no peer handed the newer
-    /// topology over, so the fallback still re-proposes from the address book
-    /// (the newer membership is unknown by definition here) and the votes of
-    /// already-caught-up peers resolve it.
-    #[test]
-    fn catch_up_fallback_still_reproposes_when_genuinely_stale() {
-        let auth = authority_with_committed_quiesce();
-        let addrs = three_node_addr_book();
-
-        let proposal = catch_up_fallback_proposal(&auth, &addrs, 6)
-            .expect("committed_term 5 < remote_term 6 — the fallback must still propose");
-        assert_eq!(proposal.term, 6, "proposes the next term above committed");
-        assert_eq!(
-            proposal.members,
-            vec![NodeId(1), NodeId(2), NodeId(3)],
-            "membership assembled from the address book, exactly as before"
         );
     }
 
@@ -39798,112 +41327,273 @@ mod tests {
         }
     }
 
-    /// A local shard table that lags the committed topology term must resolve
-    /// every shard's master to the `NodeId(0)` sentinel through the snapshot,
-    /// exactly as `authoritative_master_for_shard` does — so the dispatcher
-    /// redirects with `NodeId(0)` (client refetches its map) rather than
-    /// trusting a stale local view. Here that surfaces as `No` for every
-    /// shard (self is NodeId(1), never NodeId(0)), matching `is_master`.
+    /// W11 FIX 3 — the pure per-shard predicate behind the narrowed
+    /// stale-table gate.
     #[test]
-    fn master_snapshot_stale_table_resolves_sentinel_like_is_master() {
-        let members = vec![NodeId(1)];
+    fn stale_table_serves_only_shards_with_no_ownership_transition() {
+        // Master identical in the active table and the committed baseline,
+        // no local handoff: serve it.
+        assert!(
+            stale_table_may_serve_shard(NodeId(7), NodeId(7), NodeId(7)),
+            "a shard both tables agree on has no ownership transition in flight",
+        );
+        // The committed term moves the shard: fence it — the data has to
+        // migrate before the new owner may serve.
+        assert!(
+            !stale_table_may_serve_shard(NodeId(7), NodeId(7), NodeId(8)),
+            "a shard whose master differs between the two tables must fence",
+        );
+        // A local handoff is already in flight for the shard (effective !=
+        // target): two candidate owners exist and the stale-table gate is not
+        // the place to arbitrate them, even though the target agrees with the
+        // committed baseline.
+        assert!(
+            !stale_table_may_serve_shard(NodeId(7), NodeId(8), NodeId(8)),
+            "an in-flight handoff must keep the shard fenced",
+        );
+        // Never serve from the unassigned sentinel.
+        assert!(
+            !stale_table_may_serve_shard(NodeId(0), NodeId(0), NodeId(0)),
+            "NodeId(0) is the unassigned sentinel, never a servable master",
+        );
+    }
+
+    /// W11 P1-B — partial serving is OFF by default, and the default is the
+    /// historical fail-closed posture: a table that lags the committed term
+    /// withholds authority for EVERY key, moved or not.
+    ///
+    /// The relaxation cannot distinguish "one term behind, about to activate"
+    /// from "missed several terms while partitioned" — in the second case a
+    /// shard whose master never moved can still have gone stale during the
+    /// terms this node missed, and the reverse-heal fence that would cover it
+    /// is only planned AFTER activation. That is a spent-output-reported-
+    /// unspent hazard for a UTXO store, so the operator opts in, not the
+    /// build. Same fixture as
+    /// `stale_table_serves_unmoved_shards_and_fences_the_moved_ones`, flag
+    /// left at its default.
+    #[test]
+    fn stale_table_withholds_every_shard_when_partial_serving_is_off() {
+        let members = vec![NodeId(1), NodeId(2)];
         let table = ShardTable::compute_with_epoch(&members, 1, 5, 1);
         let cluster = new_test_running_cluster(
             NodeId(1),
             table,
-            &[(NodeId(1), "127.0.0.1:4861".parse().unwrap())],
+            &[
+                (NodeId(1), "127.0.0.1:4881".parse().unwrap()),
+                (NodeId(2), "127.0.0.1:4882".parse().unwrap()),
+            ],
             &members,
             &[],
             &[],
             &[],
-            1,
+            2,
         );
-        // Force the committed term AHEAD of the local shard table's version
-        // (version 5): a freshly-rejoined node whose table trails the quorum.
-        let committed = cluster.shard_table.read().version + 1;
-        cluster
-            .topology_authority
-            .committed_term_shared()
-            .store(committed, Ordering::Relaxed);
-        // Keep topology_epoch at the committed term so the transitioning gate
-        // does not pre-empt the stale-table path we are exercising.
-        cluster.topology_epoch.store(committed, Ordering::Release);
+        cluster.test_commit_topology(&[NodeId(1), NodeId(2), NodeId(3)], 6);
+        cluster.topology_epoch.store(6, Ordering::Release);
 
         let snap = cluster.master_snapshot();
-        for shard in [0u16, 1, 1234, (NUM_SHARDS - 1) as u16] {
+        // Shard 0 does NOT move (node 1 under both tables) — the very shard
+        // the opt-in would serve. With the flag off it is still withheld.
+        for shard in [0u16, 1, 2, 3] {
+            let key = key_for_shard(shard);
+            assert_eq!(
+                cluster.route(&key),
+                RouteDecision::RedirectTo {
+                    node: NodeId(0),
+                    shard_table_version: 5,
+                },
+                "shard {shard} must fall back to the NodeId(0) refetch sentinel \
+                 while partial serving is disabled",
+            );
+            assert_eq!(
+                cluster.is_master(&key),
+                MasterQueryResult::No,
+                "shard {shard} must claim no authority from a stale table",
+            );
+            assert_eq!(
+                cluster.is_master_snapshot(&snap, &key),
+                cluster.is_master(&key),
+                "the batch snapshot must agree for shard {shard}",
+            );
+        }
+    }
+
+    /// W11 FIX 3 (P2) — a local shard table that lags the committed topology
+    /// term must withhold only the shards whose ownership actually MOVES.
+    ///
+    /// CI @ 3a38dc2 scenario 07: `route()` rejected EVERY key while
+    /// `table.version < committed`, so one un-activated commit produced a
+    /// 3.11 s TOTAL read outage across the survivors (3193 failed GETs) even
+    /// though a quarter of the shards were not moving at all.
+    ///
+    /// Fixture: the active table is the term-5 round-robin over `{1,2}`; the
+    /// cluster then commits term 6 over `{1,2,3}` without activating it.
+    /// Under v1 round-robin (`members[shard % n]`) that leaves shard 0 on
+    /// node 1 and shard 1 on node 2 — unchanged, servable — while shards 2
+    /// and 3 move (1→3 and 2→1) and must still fence.
+    #[test]
+    fn stale_table_serves_unmoved_shards_and_fences_the_moved_ones() {
+        let members = vec![NodeId(1), NodeId(2)];
+        let table = ShardTable::compute_with_epoch(&members, 1, 5, 1);
+        let mut cluster = new_test_running_cluster(
+            NodeId(1),
+            table,
+            &[
+                (NodeId(1), "127.0.0.1:4861".parse().unwrap()),
+                (NodeId(2), "127.0.0.1:4862".parse().unwrap()),
+            ],
+            &members,
+            &[],
+            &[],
+            &[],
+            2,
+        );
+        // W11 P1-B — partial serving is an operator opt-in; this test is
+        // about what the relaxation does once it is ON.
+        cluster.test_set_stale_table_partial_serving(true);
+        // A quorum commit this node has NOT activated: term 6 grows the
+        // cluster to {1,2,3}. The local table stays at version 5.
+        cluster.test_commit_topology(&[NodeId(1), NodeId(2), NodeId(3)], 6);
+        assert_eq!(cluster.shard_table.read().version, 5, "table not activated");
+        // Keep topology_epoch at the committed term so the transitioning gate
+        // does not pre-empt the stale-table path we are exercising.
+        cluster.topology_epoch.store(6, Ordering::Release);
+
+        let snap = cluster.master_snapshot();
+
+        // Shard 0: master is node 1 (self) under BOTH tables → served.
+        assert_eq!(
+            cluster.route(&key_for_shard(0)),
+            RouteDecision::HandleLocally,
+            "shard 0 does not move (node 1 in both tables) — serve it locally",
+        );
+        assert_eq!(
+            cluster.is_master(&key_for_shard(0)),
+            MasterQueryResult::Yes,
+            "shard 0 is still this node's",
+        );
+
+        // Shard 1: master is node 2 under BOTH tables → routed, not fenced.
+        assert_eq!(
+            cluster.route(&key_for_shard(1)),
+            RouteDecision::RedirectTo {
+                node: NodeId(2),
+                shard_table_version: 5,
+            },
+            "shard 1 does not move (node 2 in both tables) — redirect to it, \
+             NOT to the NodeId(0) refetch sentinel",
+        );
+
+        // Shards 2 and 3 DO move under term 6 — still fenced.
+        for shard in [2u16, 3] {
+            assert_eq!(
+                cluster.route(&key_for_shard(shard)),
+                RouteDecision::RedirectTo {
+                    node: NodeId(0),
+                    shard_table_version: 5,
+                },
+                "shard {shard} changes owner under the committed term — it must \
+                 stay fenced until the table activates",
+            );
+            assert_eq!(
+                cluster.is_master(&key_for_shard(shard)),
+                MasterQueryResult::No,
+                "shard {shard} must not be claimed while its ownership moves",
+            );
+        }
+
+        // The batch snapshot must agree with the per-item path on every one.
+        for shard in [0u16, 1, 2, 3] {
             let key = key_for_shard(shard);
             assert_eq!(
                 cluster.is_master_snapshot(&snap, &key),
                 cluster.is_master(&key),
                 "stale-table snapshot must match per-item is_master for shard {shard}",
             );
-            assert_eq!(
-                cluster.is_master_snapshot(&snap, &key),
-                MasterQueryResult::No,
-                "stale-table shard {shard} must resolve to No via the NodeId(0) sentinel",
-            );
         }
     }
 
     /// FU#1 regression: a batch snapshot must not answer from a pre-commit
-    /// assignment after a quorum commit lands mid-batch. The snapshot freezes
-    /// the `shard_table.version` it was captured at; once `committed_term`
-    /// advances beyond that version — the same condition under which a live
-    /// `authoritative_master_for_shard` returns the `NodeId(0)` sentinel — the
-    /// frozen masters are stale, so `is_master_snapshot` must resolve to `No`
-    /// (redirect / refetch), NOT trust a stale `self == Yes` assignment. This
-    /// window is distinct from `master_snapshot_stale_table_resolves_sentinel_*`
-    /// (table already stale AT capture): here the snapshot is captured while
-    /// current, then the commit lands under it.
+    /// assignment after a quorum commit lands mid-batch. The snapshot records
+    /// the `committed_term` its per-shard decisions were judged against; once
+    /// `committed_term` moves past that value the frozen masters are stale, so
+    /// `is_master_snapshot` must resolve to `No` (redirect / refetch), NOT
+    /// trust a stale `self == Yes` assignment. This window is distinct from
+    /// `stale_table_serves_unmoved_shards_and_fences_the_moved_ones` (table
+    /// already stale AT capture): here the snapshot is captured while current,
+    /// then the commit lands under it.
+    ///
+    /// W11 FIX 3 leaves this gate WHOLESALE on purpose: a commit landing after
+    /// capture re-opens the ownership question for every shard at once, and
+    /// the snapshot cannot re-judge itself. Shard 0 below pins that — it does
+    /// NOT move under the new term, so the live path serves it while the
+    /// snapshot still refuses. That conservative divergence is the price of
+    /// lock-free per-item resolution and is pinned again by
+    /// `stale_snapshot_stays_conservative_even_after_table_catches_up`.
     #[test]
     fn master_snapshot_goes_stale_when_commit_lands_after_capture() {
-        let members = vec![NodeId(1)];
+        let members = vec![NodeId(1), NodeId(2)];
         let table = ShardTable::compute_with_epoch(&members, 1, 5, 1);
-        let cluster = new_test_running_cluster(
+        let mut cluster = new_test_running_cluster(
             NodeId(1),
             table,
-            &[(NodeId(1), "127.0.0.1:4871".parse().unwrap())],
+            &[
+                (NodeId(1), "127.0.0.1:4871".parse().unwrap()),
+                (NodeId(2), "127.0.0.1:4872".parse().unwrap()),
+            ],
             &members,
             &[],
             &[],
             &[],
-            1,
+            2,
         );
+        cluster.test_set_stale_table_partial_serving(true);
 
         // Snapshot captured while the local table is CURRENT (version ==
-        // committed term == 5): this single-node cluster masters shard 0
-        // itself, so the fresh snapshot answers Yes.
+        // committed term == 5): under round-robin over {1,2} this node
+        // masters shard 0, so the fresh snapshot answers Yes.
         let snap = cluster.master_snapshot();
-        let key = key_for_shard(0);
+        let unmoved = key_for_shard(0);
+        let moved = key_for_shard(2);
         assert_eq!(
-            cluster.is_master_snapshot(&snap, &key),
+            cluster.is_master_snapshot(&snap, &unmoved),
             MasterQueryResult::Yes,
             "precondition: a snapshot captured while current owns shard 0",
         );
 
-        // A quorum commit lands AFTER the snapshot: committed_term advances to
-        // 6 while the local shard table (still version 5) has not yet been
-        // installed. topology_epoch is kept AT the committed term so the
+        // A quorum commit lands AFTER the snapshot: term 6 grows the cluster
+        // to {1,2,3} while the local shard table (still version 5) has not
+        // been installed. topology_epoch is kept AT the committed term so the
         // transitioning gate (observed > committed) does NOT fire — isolating
-        // the stale-table window this fix closes.
-        cluster
-            .topology_authority
-            .committed_term_shared()
-            .store(6, Ordering::Relaxed);
+        // the stale-table window this test covers.
+        cluster.test_commit_topology(&[NodeId(1), NodeId(2), NodeId(3)], 6);
         cluster.topology_epoch.store(6, Ordering::Release);
 
-        // Live is_master now sees table.version (5) < committed (6) → the
-        // NodeId(0) sentinel → No. The snapshot path MUST agree.
+        // Shard 2 MOVES under term 6 (node 1 → node 3): both paths refuse.
         assert_eq!(
-            cluster.is_master(&key),
+            cluster.is_master(&moved),
             MasterQueryResult::No,
-            "live is_master must redirect once the local table trails the commit",
+            "live is_master must refuse a shard whose owner the commit moves",
         );
         assert_eq!(
-            cluster.is_master_snapshot(&snap, &key),
+            cluster.is_master_snapshot(&snap, &moved),
             MasterQueryResult::No,
             "a snapshot gone stale under a mid-batch commit must resolve to No \
              (NodeId(0) sentinel), not a pre-commit Yes",
+        );
+
+        // Shard 0 does NOT move — the live path serves it, the snapshot still
+        // refuses, because its decisions were judged against term 5.
+        assert_eq!(
+            cluster.is_master(&unmoved),
+            MasterQueryResult::Yes,
+            "the live path serves a shard the commit leaves in place (W11 FIX 3)",
+        );
+        assert_eq!(
+            cluster.is_master_snapshot(&snap, &unmoved),
+            MasterQueryResult::No,
+            "the snapshot's per-shard decisions predate the commit, so it falls \
+             back wholesale rather than re-judging itself",
         );
     }
 

@@ -1877,6 +1877,10 @@ fn main() {
             // deadline escalates to a fresher master (default) or alert-and-holds.
             heal_deadline: config.reverse_heal.resolved_heal_deadline(),
             heal_deadline_action: config.reverse_heal.heal_deadline_action,
+            // W11 FIX 3 / P1-B — partial serving from a stale shard table is
+            // an operator opt-in (default OFF = the historical fail-closed
+            // posture).
+            stale_table_partial_serving: config.stale_table_partial_serving,
         };
         if initial_peak > 1 {
             tracing::info!(

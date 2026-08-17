@@ -501,15 +501,53 @@ impl Cluster {
     }
 
     /// Return the connection pool for the master of the given shard.
+    ///
+    /// # W11 FIX 4 — do not keep dialling a master that is gone
+    ///
+    /// CI @ 3a38dc2 scenario 07: the adopted map named a REMOVED node master
+    /// of 1024 of 4096 shards at its dead address. [`Self::routable_ids`]
+    /// unions in every master, so the client kept a pool for it and every
+    /// request to those shards paid a full dial timeout before failing.
+    ///
+    /// A master the map advertises DEAD is therefore refused here — but only
+    /// once a dial to it has actually been OBSERVED to fail
+    /// ([`ConnPool::dial_failing`]). The advertised flag alone is not
+    /// sufficient evidence: the server's `is_alive` is its STRICTLY-Alive
+    /// SWIM view, so a merely SUSPECT master is advertised dead for the whole
+    /// suspicion window while staying perfectly reachable, and refusing it on
+    /// the flag alone would turn every request to ~1/N of the shards into an
+    /// error — the P0 that [`Self::routable_ids`] and
+    /// `dead_advertised_master_keeps_its_pool` exist to prevent. Requiring
+    /// observed unreachability keeps the suspect case routing untouched and
+    /// costs the removed case exactly ONE dial before it fails fast.
+    ///
+    /// The map carries only MASTERS (no replicas), so there is no alternative
+    /// holder to fall back to: the only options are the master's pool or an
+    /// error, and an immediate error beats one burnt dial timeout per
+    /// request. The pool's own health loop keeps re-dialling in the
+    /// background, so a node that comes back clears the flag and starts
+    /// routing again without waiting for a new map.
     fn pool_for_shard(&self, shard: u16) -> Result<Arc<ConnPool>, ClientError> {
         let pm = self.part_map.read();
         let pm = pm.as_ref().ok_or(ClientError::NoPartitionMap)?;
 
         let node_id = pm.assignments[shard as usize];
+        let advertised_dead = pm
+            .nodes
+            .iter()
+            .find(|n| n.id == node_id)
+            .is_some_and(|n| !n.is_alive);
         let pools = self.pools.read();
-        pools.get(&node_id).cloned().ok_or_else(|| {
+        let pool = pools.get(&node_id).cloned().ok_or_else(|| {
             ClientError::Connection(format!("no pool for node {} (shard {})", node_id, shard))
-        })
+        })?;
+        if advertised_dead && pool.dial_failing() {
+            return Err(ClientError::Connection(format!(
+                "node {node_id} is advertised dead and unreachable (shard {shard}); \
+                 refusing to re-dial — refresh the partition map"
+            )));
+        }
+        Ok(pool)
     }
 
     /// Refresh the partition map by polling EVERY known node concurrently
@@ -1187,6 +1225,97 @@ mod tests {
         s1.kill();
         s2.kill();
         s3.kill();
+    }
+
+    /// W11 FIX 4 — a master the adopted map advertises DEAD and that the
+    /// client has PROVEN unreachable must stop being handed out for routing.
+    ///
+    /// CI @ 3a38dc2 scenario 07: the adopted v4 map named node4 master of
+    /// 1024 of 4096 shards at its (removed) address. `routable_ids` unions in
+    /// every master, so the client kept a pool for it and every request to
+    /// those shards paid a full dial timeout before failing — the chunk loop
+    /// in `scenario_07_scale_down_graceful.rs` broke on the first one with
+    /// `checked = 0`.
+    ///
+    /// The gate is `advertised dead` AND `a dial to it has been observed to
+    /// fail`, never the advertised flag alone: `is_alive` is the server's
+    /// STRICTLY-Alive SWIM view, so a merely SUSPECT master is advertised
+    /// dead while still perfectly reachable, and refusing it outright would
+    /// re-open the P0 that `dead_advertised_master_keeps_its_pool` pins.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn proven_unreachable_dead_advertised_master_is_not_dialled_again() {
+        let s1 = spawn_map_server().await;
+        let s2 = spawn_map_server().await;
+        let s3 = spawn_map_server().await;
+        let all_alive_v2 = encode_map(
+            2,
+            &[
+                (1, &s1.addr, true),
+                (2, &s2.addr, true),
+                (3, &s3.addr, true),
+            ],
+            &[1, 2, 3],
+        );
+        for s in [&s1, &s2, &s3] {
+            s.set_map(all_alive_v2.clone());
+        }
+        let cluster = new_test_cluster(vec![s1.addr.clone()]).await;
+
+        // Node 3 is REMOVED: gone from the network, advertised dead, but the
+        // committed table this map carries still names it master.
+        s3.kill();
+        let dead3_v3 = encode_map(
+            3,
+            &[
+                (1, &s1.addr, true),
+                (2, &s2.addr, true),
+                (3, &s3.addr, false),
+            ],
+            &[1, 2, 3],
+        );
+        for s in [&s1, &s2] {
+            s.set_map(dead3_v3.clone());
+        }
+        cluster
+            .refresh_partition_map()
+            .await
+            .expect("refresh must succeed from the two survivors");
+        assert_eq!(cluster.cached_partition_map().expect("cached").version, 3);
+
+        // The pool is still RETAINED — the P0 rule is unchanged, and the
+        // client cannot know a node is gone without trying it once.
+        let pool3 = cluster
+            .pools
+            .read()
+            .get(&3)
+            .cloned()
+            .expect("a dead-advertised master keeps its pool");
+        assert!(
+            pool3.get().await.is_err(),
+            "node 3 is gone — dialling it must fail",
+        );
+        assert!(
+            pool3.dial_failing(),
+            "the failed dial must be recorded on the pool",
+        );
+
+        // Shard 2 round-robins to node 3. With proof in hand the client must
+        // surface a routing error instead of burning another dial timeout.
+        match cluster.pool_for_shard(2) {
+            Err(ClientError::Connection(msg)) => assert!(
+                msg.contains("advertised dead") && msg.contains("shard 2"),
+                "the error must name the reason and the shard, got: {msg}",
+            ),
+            Err(other) => panic!("expected a Connection routing error, got {other:?}"),
+            Ok(_) => panic!(
+                "a proven-unreachable dead-advertised master must not be handed \
+                 out for routing"
+            ),
+        }
+
+        cluster.close().await;
+        s1.kill();
+        s2.kill();
     }
 
     /// The freshest-map selection is a pure function; drive BOTH answer

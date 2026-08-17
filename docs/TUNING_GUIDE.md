@@ -40,6 +40,23 @@
 | `max_migration_threads` | 16 | Max concurrent migration threads per topology change. Prevents resource exhaustion during rapid churn. |
 | `migration_pool_size` | 128 | Parallel TCP connections per migration target. More connections = higher throughput for large migrations. |
 | `migration_batch_size` | 500 | Records per baseline streaming batch during migration. Larger batches reduce round-trip overhead. |
+| `stale_table_partial_serving` | `false` | Let a node whose shard table lags the committed topology term keep serving the shards whose master is unchanged, instead of withholding every key until activation. Availability-vs-fail-closed trade-off — **read the caveat below before enabling.** |
+
+**`stale_table_partial_serving` caveat.** Default `false` is the fail-closed
+posture: one un-activated topology commit withholds authority for every key
+(a short but total read outage during a membership change). Enabling it
+recovers the shards the new term does not move.
+
+The check compares the active table's master against the committed term's
+deterministic master, and it cannot tell "one term behind, about to activate"
+from "missed several terms while partitioned". In the second case a node can
+serve a shard whose master never moved but whose contents went stale during
+the terms it missed — and the reverse-heal fence that covers exactly that is
+planned only *after* activation, so it does not exist yet. For a UTXO store
+that reads as a spent output reported unspent. Leave it off unless you have
+accepted that trade-off. A follow-up (stamping the shard table with the
+committed term it was last *reconciled* against) would make the two states
+distinguishable; until then this knob stays opt-in.
 
 ### Server
 
