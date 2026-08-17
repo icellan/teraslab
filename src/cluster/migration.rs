@@ -1108,7 +1108,21 @@ impl MigrationManager {
     /// Since we may not know the source node at dispatch time, register
     /// with `NodeId(0)` as a sentinel if no existing entry matches.
     pub fn mark_inbound_active(&mut self, shard: u16) -> bool {
-        if self.inbound_migrations.iter().any(|m| m.shard == shard) {
+        // W12 TAIL 2 — records are arriving for this shard, so any entry
+        // previously marked as terminally refused is live again and must
+        // re-enter the in-flight count. Done BEFORE the early return: this
+        // path no-ops on an existing entry, and leaving the mark set would
+        // exclude a shard that is actually receiving.
+        let mut existed = false;
+        for m in self
+            .inbound_migrations
+            .iter_mut()
+            .filter(|m| m.shard == shard)
+        {
+            existed = true;
+            m.refused_by_source = false;
+        }
+        if existed {
             return false;
         }
         self.inbound_migrations
@@ -5568,6 +5582,36 @@ mod tests {
         assert!(
             mgr.refused_retained_inbound_entries().is_empty(),
             "re-registering the source clears the terminal-refusal mark",
+        );
+    }
+
+    /// W12 TAIL 2 — data actually ARRIVING for a previously-refused shard
+    /// must clear the mark even when the batch carries no source identity.
+    ///
+    /// The receive path stamps the concrete sender when it can
+    /// (`register_inbound_source`) and falls back to `mark_inbound_active`
+    /// when the batch does not name one. That fallback early-returns on any
+    /// existing entry for the shard, so without an explicit clear a marked
+    /// entry would stay excluded from the in-flight count while records were
+    /// streaming into it — the gate would stop waiting on a live transfer.
+    #[test]
+    fn an_unstamped_inbound_batch_clears_the_refusal_mark() {
+        let refuser = NodeId(3);
+        let mut mgr = MigrationManager::new();
+        assert!(mgr.register_inbound_source(30, refuser));
+        assert_eq!(mgr.drop_refused_inbound(&[30], refuser, |_| true), 0);
+        assert_eq!(mgr.refused_retained_inbound_entries(), vec![(30, refuser)]);
+
+        // The source-less receive path: no new entry is created (one already
+        // exists) but the shard is demonstrably receiving again.
+        assert!(!mgr.mark_inbound_active(30));
+        assert!(
+            mgr.refused_retained_inbound_entries().is_empty(),
+            "records arriving for the shard mean the entry is live again",
+        );
+        assert!(
+            mgr.has_pending_inbound(30),
+            "clearing the mark must not drop the fence",
         );
     }
 
