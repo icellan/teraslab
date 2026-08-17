@@ -1907,12 +1907,6 @@ pub(crate) fn handle_request(
             let actual = engine.shard_record_count(shard);
             let superset_ok =
                 superset_accept_admissible(source_is_authoritative_complete, prune_safe_at_cutoff);
-            if !superset_ok
-                && actual > expected_records
-                && let Some(m) = crate::metrics::migration_metrics()
-            {
-                m.migration_superset_refused_cutoff_gate.inc();
-            }
             let count_ok = if is_heal_completion && exact_entries_verified {
                 // REVERSE-HEAL: the drop-aware per-key verify above IS the
                 // completeness proof. The healed target legitimately holds FEWER
@@ -1930,6 +1924,17 @@ pub(crate) fn handle_request(
             };
 
             if !count_ok {
+                // W11 FIX 2 — metered ONLY where the withheld superset accept
+                // is what caused the rejection (`actual > expected` with the
+                // accept refused), so the counter measures deferrals this fix
+                // introduced and nothing else. A heal completion never reaches
+                // here on this account: its arm above short-circuits `true`.
+                if !superset_ok
+                    && actual > expected_records
+                    && let Some(m) = crate::metrics::migration_metrics()
+                {
+                    m.migration_superset_refused_cutoff_gate.inc();
+                }
                 return error_response(
                     request.request_id,
                     ERR_MIGRATION_IN_PROGRESS,
@@ -2266,13 +2271,12 @@ pub(crate) fn handle_request(
             let matched_nothing = {
                 let shard_table = cluster.shard_table();
                 let table = shard_table.read();
-                let (tasks, diverged) =
-                    crate::cluster::coordinator::transfer_request_match_counts(
-                        &table,
-                        cluster.self_id(),
-                        NodeId(requester_id),
-                        &shards,
-                    );
+                let (tasks, diverged) = crate::cluster::coordinator::transfer_request_match_counts(
+                    &table,
+                    cluster.self_id(),
+                    NodeId(requester_id),
+                    &shards,
+                );
                 tasks == 0 && diverged == 0
             };
             if matched_nothing {
@@ -30653,7 +30657,11 @@ mod tests {
             })
             .take(3)
             .collect();
-        assert_eq!(unheld.len(), 3, "RF=2 over 3 members leaves node 3 out of some shards");
+        assert_eq!(
+            unheld.len(),
+            3,
+            "RF=2 over 3 members leaves node 3 out of some shards"
+        );
 
         let mut cluster = crate::cluster::coordinator::new_test_running_cluster(
             crate::cluster::shards::NodeId(1),
@@ -30707,7 +30715,7 @@ mod tests {
         // Producer/consumer pinned together: the requester's refusal detector
         // must read THIS envelope, not a hand-written one.
         assert!(
-            crate::cluster::coordinator::transfer_request_rejection_is_no_tasks(&resp.payload),
+            crate::cluster::coordinator::transfer_request_was_refused(&resp.payload),
             "the requester-side detector must recognise the real envelope",
         );
     }
