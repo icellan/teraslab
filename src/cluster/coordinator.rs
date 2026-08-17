@@ -5234,14 +5234,28 @@ impl ClusterCoordinator {
                         // by the pre-rejoin table) and its inbound work has
                         // settled.
                         let cleanup_admissible = {
-                            let table_version = shard_table.read().version;
+                            // LOCK ORDER (W8) — shard_table before migration.
+                            let table = shard_table.read();
+                            let table_version = table.version;
                             // W10 composition review P1-3b/P2-4 — count only
                             // genuine in-flight MIGRATION work: a reverse-heal
                             // fence (especially a #74 park, which holds
                             // forever by design) is alert-and-hold state, not
                             // inbound work, and gating on it disabled this
                             // pass for the life of the process.
-                            let pending_inbound = migration.lock().inbound_migration_work_count();
+                            //
+                            // W11 FIX 1 — and count only work for shards this
+                            // node is a TARGET HOLDER of. A non-held inbound
+                            // entry is the orphan candidate this pass exists
+                            // to reclaim, and the fail-closed inbound prune
+                            // keeps it alive exactly while the records it
+                            // guards are still here — so counting it made the
+                            // entry wait on the pass and the pass wait on the
+                            // entry (default-09, CI 32055073890: node1 stuck
+                            // on shards 1024/2902 from node3 with zero tasks
+                            // anywhere). See `inbound_plan_work_count`.
+                            let pending_inbound =
+                                migration.lock().inbound_plan_work_count(&table, self_id);
                             event_orphan_cleanup_admissible(table_version, term, pending_inbound)
                         };
                         if cleanup_admissible
@@ -13229,13 +13243,22 @@ const EVENT_ORPHAN_CLEANUP_MIN_INTERVAL: Duration = Duration::from_secs(60);
 /// - `pending_inbound == 0` — its plan's inbound work has settled, so
 ///   nothing this node is still receiving can be misjudged around the pass.
 ///
-/// W10 composition review P1-3b/P2-4 — `pending_inbound` is
-/// [`MigrationManager::inbound_migration_work_count`], NOT `inbound_count`:
-/// reverse-heal fences are EXCLUDED. They are alert-and-hold state rather
-/// than in-flight migration work, and a #74 parked no-source fence holds
-/// forever BY DESIGN — counting it turned a transient fence into a permanent
-/// disable of this pass (the armed-17 disk-reclaim regression). See that
-/// method's doc for the full safety argument.
+/// W10 composition review P1-3b/P2-4 + W11 FIX 1 — `pending_inbound` is
+/// [`MigrationManager::inbound_plan_work_count`], NOT `inbound_count`. Two
+/// classes of inbound entry are EXCLUDED, for two different reasons:
+///
+/// * reverse-heal fences — alert-and-hold state rather than in-flight
+///   migration work, and a #74 parked no-source fence holds forever BY
+///   DESIGN, so counting it turned a transient fence into a permanent
+///   disable of this pass (the armed-17 disk-reclaim regression);
+/// * entries for shards this node is NOT a target holder of — those are the
+///   very orphan candidates the pass reclaims, and the fail-closed inbound
+///   prune (`inbound_entry_must_be_kept`) keeps such an entry alive for
+///   exactly as long as the records survive, so counting it made the entry
+///   wait on the pass while the pass waited on the entry (default-09,
+///   CI 32055073890).
+///
+/// See that method's doc for the full safety argument.
 ///
 /// Refusal is fail-safe: it defers reclaim, never data. The
 /// batch-completion-site invocations of `run_orphan_cleanup` /
@@ -27306,6 +27329,66 @@ mod tests {
             7,
             mgr.inbound_migration_work_count()
         ));
+    }
+
+    /// W11 FIX 1 (RED→GREEN) — the default-09 CIRCULAR WAIT. A node holding
+    /// an inbound entry for a shard it is NOT a target holder of must still
+    /// run the event-driven orphan-cleanup pass. Pre-fix the gate consumed
+    /// `inbound_migration_work_count`, which counts that entry — and the only
+    /// thing that can retire the entry is the cleanup the entry itself was
+    /// blocking (the prune keeps it while records remain; the settled GC
+    /// needs a SWIM-dead source). Driven through the REAL manager, the REAL
+    /// table and the REAL gate, with the pre-fix counter asserted alongside
+    /// so the regression cannot silently return.
+    #[test]
+    fn non_held_inbound_does_not_disable_event_orphan_cleanup() {
+        let members = [NodeId(1), NodeId(2), NodeId(3)];
+        let table = ShardTable::compute(&members, 2);
+        let shard = 1024u16;
+        let a = table.target_assignment(shard);
+        let self_id = *members
+            .iter()
+            .find(|n| a.master != **n && !a.replicas.contains(n))
+            .expect("RF=2 over 3 members leaves one node out of every shard");
+        let source = a.master;
+
+        let mut mgr = MigrationManager::new();
+        // The exact default-09 shape: a pending inbound naming a live source,
+        // for a shard this node does not hold, with no task anywhere.
+        assert!(mgr.register_inbound_source(shard, source));
+        assert_eq!(mgr.active_count(), 0, "no outbound/inbound task exists");
+
+        assert!(
+            !event_orphan_cleanup_admissible(9, 9, mgr.inbound_migration_work_count()),
+            "precondition: the pre-fix counter closes the gate forever",
+        );
+        assert!(
+            event_orphan_cleanup_admissible(
+                9,
+                9,
+                mgr.inbound_plan_work_count(&table, self_id)
+            ),
+            "the pass must run so the orphaned records can be reclaimed — \
+             removing them is what finally lets the prune drop this entry",
+        );
+
+        // The gate must NOT be weakened for a shard this node really is
+        // receiving under its own plan.
+        let held = (0..crate::cluster::shards::NUM_SHARDS as u16)
+            .find(|s| {
+                let a = table.target_assignment(*s);
+                a.master == self_id || a.replicas.contains(&self_id)
+            })
+            .expect("the node holds some shard");
+        assert!(mgr.register_inbound_source(held, NodeId(9)));
+        assert!(
+            !event_orphan_cleanup_admissible(
+                9,
+                9,
+                mgr.inbound_plan_work_count(&table, self_id)
+            ),
+            "genuine plan-driven inbound work must still defer the pass",
+        );
     }
 
     /// W8 (defect 1) — the all-EMPTY batch path returns before the main

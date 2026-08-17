@@ -2225,6 +2225,78 @@ impl MigrationManager {
             .count()
     }
 
+    /// W11 FIX 1 (default-09 CIRCULAR WAIT) — the subset of
+    /// [`Self::inbound_migration_work_count`] that is this node's OWN PLAN
+    /// work: uncompleted, non-heal inbound entries for shards `table`'s
+    /// TARGET assignment actually gives `self_id`.
+    ///
+    /// # The deadlock this exists to break
+    ///
+    /// The event-driven orphan-cleanup admissibility gate
+    /// (`event_orphan_cleanup_admissible`) requires the pending-inbound count
+    /// to be ZERO. Feeding it [`Self::inbound_migration_work_count`] closed a
+    /// cycle with the inbound-prune's fail-closed keep rule
+    /// (`inbound_entry_must_be_kept`):
+    ///
+    /// 1. the prune KEEPS an inbound entry for a shard this node does not hold
+    ///    but still has RECORDS for (dropping the fence would expose those
+    ///    orphans to local reads — the scenario-17 three-holder bug);
+    /// 2. the only thing that removes those records is the orphan-cleanup
+    ///    pass — which the gate refuses to run while that very entry is
+    ///    counted;
+    /// 3. the settled-inbound GC cannot reap it either
+    ///    ([`Self::orphaned_inbound_shards`] needs a SWIM-DEAD source, and the
+    ///    10 s pull requester re-stamps [`Self::mark_inbound_requested`]
+    ///    anyway).
+    ///
+    /// Observed at CI 32055073890 (default-09): everything converged except
+    /// two inbound entries on node1 (shards 1024 and 2902, from node3, zero
+    /// active/failed tasks, no matching outbound on node3), and the run
+    /// panicked at `migrations still active after 120s`.
+    ///
+    /// # Why excluding a NON-HELD inbound is the sound cut
+    ///
+    /// This is the mirror of the argument commit 39603fc already made for
+    /// heal fences, inverted. A heal-fenced shard is structurally NOT an
+    /// orphan candidate, so counting it could only ever block a pass that had
+    /// nothing to do with it. A NON-HELD inbound is the exact opposite: the
+    /// shard is not assigned here, so it IS precisely the orphan candidate
+    /// the pass exists to reclaim — counting it is self-defeating.
+    ///
+    /// The gate's stated purpose survives intact: "nothing this node is still
+    /// RECEIVING as part of its topology plan may be misjudged around the
+    /// pass". An entry for a shard the target assignment does not give this
+    /// node is, by definition, not plan work — nothing will ever be sent for
+    /// it (the source refuses to hand off to a non-holder), which is why the
+    /// prune's only reason to keep it is the leftover records.
+    ///
+    /// Safety is unchanged and does NOT rest on this counter:
+    ///
+    /// * the pass skips any shard with a pending inbound entry outright
+    ///   (`run_orphan_cleanup` / `cleanup_orphaned_shard_if_settled` both gate
+    ///   on [`Self::has_pending_inbound`]), so the excluded entry's own shard
+    ///   is still never touched while the entry stands — the cut only lets the
+    ///   pass judge the OTHER 4094 shards;
+    /// * the per-shard #28 committed-handoff evidence guard is untouched.
+    ///
+    /// Uses `target_assignment` (not `effective_assignment`) so the predicate
+    /// matches `inbound_entry_must_be_kept` exactly — the two must agree on
+    /// "holder" or the cycle reopens under a mid-handoff table.
+    pub fn inbound_plan_work_count(
+        &self,
+        table: &crate::cluster::shards::ShardTable,
+        self_id: NodeId,
+    ) -> usize {
+        self.inbound_migrations
+            .iter()
+            .filter(|m| !m.completed && !m.heal_pending)
+            .filter(|m| {
+                let a = table.target_assignment(m.shard);
+                a.master == self_id || a.replicas.contains(&self_id)
+            })
+            .count()
+    }
+
     /// Snapshot the currently pending inbound migrations.
     pub fn pending_inbound_entries(&self) -> Vec<(u16, NodeId)> {
         self.inbound_migrations
@@ -5197,6 +5269,67 @@ mod tests {
         assert!(mgr.has_pending_inbound(10));
         assert!(mgr.has_pending_inbound(20));
         assert_eq!(mgr.inbound_count(), 2);
+    }
+
+    /// W11 FIX 1 (RED→GREEN) — an inbound entry for a shard this node is NOT
+    /// a target holder of is not PLAN work: it is the orphan candidate the
+    /// cleanup pass exists to reclaim, so counting it at the admissibility
+    /// gate deadlocks the pass against the fail-closed inbound prune that
+    /// keeps the entry alive precisely because the records are still there.
+    #[test]
+    fn non_held_inbound_is_not_plan_work() {
+        use crate::cluster::shards::ShardTable;
+
+        let members = [NodeId(1), NodeId(2), NodeId(3)];
+        let table = ShardTable::compute(&members, 2);
+        // With RF=2 over 3 members exactly one node is left out of each
+        // shard's target assignment — pick it as `self`.
+        let shard = 0u16;
+        let a = table.target_assignment(shard);
+        let outsider = *members
+            .iter()
+            .find(|n| a.master != **n && !a.replicas.contains(n))
+            .expect("RF=2 over 3 members always leaves one node out");
+        let holder = a.master;
+
+        let mut mgr = MigrationManager::new();
+        assert!(mgr.register_inbound_source(shard, NodeId(9)));
+        assert_eq!(
+            mgr.inbound_migration_work_count(),
+            1,
+            "precondition: the old counter sees this entry as in-flight work",
+        );
+        assert_eq!(
+            mgr.inbound_plan_work_count(&table, outsider),
+            0,
+            "a non-held inbound is an orphan candidate, not plan work — it \
+             must not be able to disable the orphan-cleanup pass",
+        );
+        assert_eq!(
+            mgr.inbound_plan_work_count(&table, holder),
+            1,
+            "the SAME entry on a target holder is genuine plan work and must \
+             still gate the pass",
+        );
+
+        // The heal-fence exclusion composes: a heal fence on a HELD shard is
+        // still excluded (39603fc), so the two rules are independent.
+        let held_shard = (0..crate::cluster::shards::NUM_SHARDS as u16)
+            .find(|s| {
+                let a = table.target_assignment(*s);
+                a.master == outsider || a.replicas.contains(&outsider)
+            })
+            .expect("the outsider holds some shard");
+        assert!(mgr.register_heal_source(held_shard, NodeId(9)));
+        assert_eq!(
+            mgr.inbound_plan_work_count(&table, outsider),
+            0,
+            "a heal fence on a held shard is alert-and-hold state, not work",
+        );
+
+        // A completed non-held entry never counted and still does not.
+        mgr.mark_inbound_complete_from_source(shard, NodeId(9));
+        assert_eq!(mgr.inbound_plan_work_count(&table, holder), 0);
     }
 
     /// W1.1 residual fix (FIX 1) — the settled-inbound fast-path GC must
