@@ -3413,6 +3413,10 @@ impl ClusterCoordinator {
             // `exchange_complete_rx`. Keyed by term, not a bare busy flag, so
             // a term advance never wedges the slot.
             let mut reheal_exchange_term: Option<u64> = None;
+            // W11 FIX 3 — `(term, consecutive refinement-revert declines)`.
+            // Cleared by any install (and by a term change), so the budget
+            // only ever bounds an UNBROKEN run of declines.
+            let mut reheal_declines: Option<(u64, u32)> = None;
             // Re-election pacing: prompt (event-driven off a fresh exchange
             // view) but never a storm. Seeded in the past so the FIRST
             // contradiction after boot can fire immediately.
@@ -5318,7 +5322,13 @@ impl ClusterCoordinator {
                         view_size = partition_view.len(),
                         "cluster: activating topology after exchange phase",
                     );
-                    let deferred = Self::activate_topology_with_view(
+                    // W11 FIX 3 (re-review P0-1) — the per-term decline
+                    // budget. Once spent the install MUST proceed, so a
+                    // declined table can never outlive the wave it was
+                    // protecting (see `reheal_decline_allowed`).
+                    let may_decline_reheal =
+                        same_term_reheal && reheal_decline_allowed(reheal_declines, term);
+                    let outcome = Self::activate_topology_with_view(
                         &members,
                         term,
                         topo_authority_event.committed_placement_version(),
@@ -5349,8 +5359,25 @@ impl ClusterCoordinator {
                         // the upgrade grace; every other admission launches
                         // immediately.
                         admission == ExchangeAdmission::AdmitDetOnly,
+                        may_decline_reheal,
                     );
-                    if let Some(pending) = deferred {
+                    if outcome.declined_refinement_revert {
+                        let spent = match reheal_declines {
+                            Some((t, n)) if t == term => n.saturating_add(1),
+                            _ => 1,
+                        };
+                        reheal_declines = Some((term, spent));
+                        tracing::info!(
+                            term,
+                            declines = spent,
+                            budget = REHEAL_MAX_CONSECUTIVE_DECLINES,
+                            "cluster: same-term re-heal install declined — the next round \
+                             installs once the budget is spent",
+                        );
+                    } else {
+                        reheal_declines = None;
+                    }
+                    if let Some(pending) = outcome.deferred {
                         tracing::info!(
                             term = pending.term,
                             tasks = pending.tasks.len(),
@@ -6564,6 +6591,10 @@ impl ClusterCoordinator {
             // path and the reactivation repairs, none of which is the
             // det-degrade first activation (W9 FIX 3).
             false,
+            // Irrelevant on the empty-view path: the W11 FIX 3 decline is
+            // reachable only from a same-term re-heal, which this wrapper
+            // never is.
+            false,
         );
     }
 
@@ -6619,7 +6650,21 @@ impl ClusterCoordinator {
         // launch and return it as a `DeferredPlanLaunch` instead of
         // spawning it.
         defer_plan_launch: bool,
-    ) -> Option<DeferredPlanLaunch> {
+        // W11 FIX 3 — whether this node may still DECLINE a same-term
+        // re-heal install as refinement-revert-only. The caller withdraws it
+        // once `REHEAL_MAX_CONSECUTIVE_DECLINES` is spent, which is what
+        // keeps the decline a delay rather than a terminal divergence (see
+        // `reheal_decline_allowed`).
+        may_decline_reheal: bool,
+    ) -> ActivationOutcome {
+        // W11 FIX 2 (re-review P1-1) — the member set of the PREVIOUS
+        // activation, captured BEFORE the overwrite below. This is the
+        // cluster-agreed pre-image the election exemption is derived from;
+        // the local shard TABLE must never be used for it (see
+        // `plan_filled_master_shards`). The topology authority exposes only
+        // the CURRENT committed member set, so this snapshot is the
+        // available prior-member source.
+        let prev_activation_members: Vec<NodeId> = active_topology_members.read().clone();
         *active_topology_members.write() = members.to_vec();
 
         // Fast path: when the engine has zero records AND the current shard
@@ -6656,7 +6701,7 @@ impl ClusterCoordinator {
                 fenced_bm.clear_all();
                 migrating_bm.clear_all();
                 inbound_bm.clear_all();
-                return None;
+                return ActivationOutcome::activated(None);
             }
         }
 
@@ -6675,6 +6720,41 @@ impl ClusterCoordinator {
         // computing election here still removes ghost-master scenarios
         // when the partition view is populated.
         let evicted: std::collections::HashSet<NodeId> = std::collections::HashSet::new();
+        // W11 FIX 2 — the shards whose deterministic master this activation's
+        // own plan hands off from a source that keeps serving throughout,
+        // derived from the DETERMINISTIC pre-image of the previous
+        // activation's member set (never the node-local table — re-review
+        // P1-1). An unknown or unchanged prior member set yields no
+        // exemptions at all: the pre-W11 behaviour. NOTE the same-term
+        // det-degrade UPGRADE re-activates with `prev_activation_members ==
+        // members`, so it takes that fail-safe path and its election runs
+        // unexempted, exactly as before this fix.
+        let det_plan_master_shards =
+            if prev_activation_members.is_empty() || prev_activation_members == members {
+                std::collections::HashSet::new()
+            } else {
+                let prev_det = ShardTable::compute_with_epoch(
+                    &prev_activation_members,
+                    rf,
+                    old_epoch,
+                    old_table_snap.placement_version(),
+                );
+                plan_filled_master_shards(&prev_det, &new_table, partition_view)
+            };
+        // W11 FIX 3 — the pure deterministic masters, kept for the same-term
+        // re-heal's refinement-revert gate below. Only the re-heal without a
+        // committed assignment can revert refinement, so nothing else pays for
+        // the snapshot.
+        let det_masters: Option<Vec<NodeId>> =
+            if adopt_view_holders && committed_assignment.is_none() {
+                Some(
+                    (0..NUM_SHARDS as u16)
+                        .map(|shard| new_table.target_assignment(shard).master)
+                        .collect(),
+                )
+            } else {
+                None
+            };
         match &committed_assignment {
             // §8 — a committed assignment IS the authority on mastership:
             // install it verbatim (through set_master_for_shard, which
@@ -6697,9 +6777,51 @@ impl ClusterCoordinator {
                     partition_view,
                     &evicted,
                     adopt_view_holders,
+                    &det_plan_master_shards,
                 );
             }
         }
+
+        // W11 FIX 3 — DECIDE (but do not yet act on) whether this same-term
+        // re-heal install would do nothing but revert live, view-justified
+        // refinement at the SAME shard-table version. The decision needs
+        // `old_table_snap`, which is dropped a few lines below; the RETURN is
+        // deferred past the reverse-heal Tier-2 detection so a decline does
+        // not freeze `stale_suspect_shards` (re-review P2-3).
+        let decline_reheal_install = match &det_masters {
+            Some(det_masters) if may_decline_reheal => {
+                let local_repair_pending = {
+                    let rolled_back = (0..NUM_SHARDS as u16).any(|shard| {
+                        old_table_snap.target_assignment(shard).master
+                            != old_table_snap.intended_master(shard)
+                    });
+                    // LOCK ORDER — `old_table_snap` is a detached clone, so no
+                    // shard-table guard is held across this migration lock.
+                    let mgr = migration.lock();
+                    rolled_back
+                        || old_table_snap.pending_handoff_count() > 0
+                        || mgr.active_count() > 0
+                        // re-review P2-2 — `active_count` only counts tasks
+                        // this node SOURCES and `stuck_subset_master_count`
+                        // deliberately excludes shards with a pending inbound,
+                        // so neither sees inbound work. Without this a node
+                        // mid-receive could decline the round that would have
+                        // rebuilt its inbound plan.
+                        || mgr.inbound_migration_work_count() > 0
+                        || stuck_subset_master_count(&old_table_snap, &mgr, self_id) > 0
+                };
+                reheal_install_reverts_refinement_only(
+                    &old_table_snap,
+                    &new_table,
+                    det_masters,
+                    partition_view,
+                    epoch,
+                    local_repair_pending,
+                )
+            }
+            _ => false,
+        };
+
         // Phase D: when a partition view is available, use it to skip
         // migrations whose destination already has the data and to redirect
         // the source onto a replica when the planned source has none.
@@ -6736,6 +6858,26 @@ impl ClusterCoordinator {
             }
         }
 
+        // W11 FIX 3 — act on the decision taken above. Returning here leaves
+        // the shard table, the migration manager and every fence exactly as
+        // they were, and the caller's post-activation passes (the runtime
+        // reverse-heal, the #74 parked-fence re-source) still run, so no
+        // repair arc is swallowed. The caller counts this against the
+        // per-term decline budget and stops permitting it once spent.
+        if decline_reheal_install {
+            REHEAL_SKIPPED_REFINEMENT_REVERT_TOTAL.fetch_add(1, Ordering::Relaxed);
+            tracing::info!(
+                term = epoch,
+                "cluster: declining same-term re-heal install — it would only revert \
+                 refinement the current partition view still justifies; the per-term \
+                 decline budget bounds this to a delay (W11 FIX 3)",
+            );
+            return ActivationOutcome {
+                deferred: None,
+                declined_refinement_revert: true,
+            };
+        }
+
         let populated_shards: std::collections::HashSet<u16> = (0..NUM_SHARDS as u16)
             .filter(|&s| engine.shard_record_count(s) > 0)
             .collect();
@@ -6746,6 +6888,7 @@ impl ClusterCoordinator {
             &populated_shards,
             &new_table,
             self_id,
+            partition_view,
         );
 
         // Build a set of (shard, from, to, is_master) for the new plan.
@@ -7136,16 +7279,16 @@ impl ClusterCoordinator {
             // event loop fires or cancels it); every other path spawns it
             // immediately, exactly as before.
             if let Some(tasks) = deferred_tasks {
-                return Some(DeferredPlanLaunch {
+                return ActivationOutcome::activated(Some(DeferredPlanLaunch {
                     term: epoch,
                     armed_at: std::time::Instant::now(),
                     tasks,
                     launch: Box::new(launch),
-                });
+                }));
             }
             std::thread::spawn(launch);
         }
-        None
+        ActivationOutcome::activated(None)
     }
 
     /// Phase D: collect `OP_PARTITION_VERSION_REPORT` from every alive peer
@@ -8231,23 +8374,154 @@ fn build_topology_activation_tasks(
     populated_shards: &std::collections::HashSet<u16>,
     new_table: &ShardTable,
     self_id: NodeId,
+    partition_view: &std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>>,
 ) -> Vec<MigrationTask> {
     let mut tasks = new_plan.to_vec();
     tasks.extend(new_replica_plan.iter().cloned());
-    add_local_holder_backfill_tasks(&mut tasks, populated_shards, new_table, self_id);
+    add_local_holder_backfill_tasks(
+        &mut tasks,
+        populated_shards,
+        new_table,
+        self_id,
+        partition_view,
+    );
     tasks
 }
 
+/// W11 FIX 1 — count of local-holder backfill tasks NOT emitted because the
+/// shared partition view proved the destination holder already holds the
+/// shard. Read via [`backfill_tasks_skipped_view_owned_total`] and exported as
+/// `teraslab_backfill_tasks_skipped_view_owned_total`.
+static BACKFILL_TASKS_SKIPPED_VIEW_OWNED_TOTAL: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Number of local-holder backfill tasks elided on view evidence since
+/// process start (W11 FIX 1). A large value on a re-activation is the
+/// intended steady state: it is the whole-store re-stream that used to run on
+/// every same-term repair round.
+pub fn backfill_tasks_skipped_view_owned_total() -> u64 {
+    BACKFILL_TASKS_SKIPPED_VIEW_OWNED_TOTAL.load(Ordering::Relaxed)
+}
+
+/// W11 FIX 1 — flatten a partition view to `(node, shard) -> entry` for
+/// per-(node, shard) lookups. Borrowing keeps the whole entry (digest and
+/// recency bits included) available to the consumers below without cloning.
+fn flatten_partition_view(
+    partition_view: &std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>>,
+) -> std::collections::HashMap<(NodeId, u16), &PartitionVersionEntry> {
+    partition_view
+        .iter()
+        .flat_map(|(node, entries)| entries.iter().map(move |e| ((*node, e.shard), e)))
+        .collect()
+}
+
+/// W11 FIX 1 — does the shared view PROVE a `self -> holder` backfill of
+/// `shard` is redundant?
+///
+/// `view_by_node_shard` is [`flatten_partition_view`]'s index; `local` is
+/// THIS node's own entry for `shard` (the evidence anchor — see the caller).
+///
+/// # Digest equality is the only sound suppression (W11 re-review P1-3)
+///
+/// The backfill exists to push local records to a holder that may be missing
+/// them, and — for a holder that is ALREADY an assignment member — nothing
+/// else repairs the gap: `replica_migration_plan` only emits for NEWLY
+/// assigned replicas, the under-replication sweep is default-off, and
+/// reverse-heal repairs the opposite direction. Skipping wrongly under RF=2
+/// is therefore a durability regression, so the skip needs a proof, and
+/// COUNTS ARE NOT A PROOF: two nodes can report identical
+/// `last_applied_seq` over disjoint content. This codebase already fixes the
+/// standard for exactly this judgement — see [`is_shard_stale_vs_replicas`]
+/// and the [`PARTITION_FLAG_RECENCY_UNKNOWN`] doctrine: an order-independent
+/// fingerprint of the shard's `(txid, generation)` set is the evidence, and a
+/// side whose recency is UNKNOWN carries NO evidence at all.
+///
+/// So the skip requires ALL of:
+/// - both sides report the shard with a KNOWN recency
+///   (`PARTITION_FLAG_RECENCY_UNKNOWN` clear) and a non-zero
+///   `manifest_digest` (`0` is also what a legacy peer reports, i.e. absence);
+/// - the two digests are EQUAL — byte-identical shard state, so there is
+///   nothing to push;
+/// - the holder is not a subset holder still receiving inbound data
+///   ([`PARTITION_FLAG_PENDING_INBOUND`] clear) and reports a non-zero count.
+///
+/// Absent or weaker evidence NEVER skips: a holder missing from the view, an
+/// unknown recency on either side, or any digest difference keeps the
+/// unconditional pre-W11 stream. Under write load the digests of a live shard
+/// diverge and the backfill is emitted exactly as before — the elision is
+/// claimed only for the settled holders that make up the whole-store
+/// re-stream this gate exists to remove.
+fn holder_backfill_is_redundant(
+    view_by_node_shard: &std::collections::HashMap<(NodeId, u16), &PartitionVersionEntry>,
+    holder: NodeId,
+    shard: u16,
+    local: &PartitionVersionEntry,
+) -> bool {
+    if !partition_entry_carries_recency(local) {
+        return false;
+    }
+    match view_by_node_shard.get(&(holder, shard)) {
+        Some(entry) => {
+            partition_entry_carries_recency(entry)
+                && (entry.flags & PARTITION_FLAG_PENDING_INBOUND) == 0
+                && entry.manifest_digest == local.manifest_digest
+        }
+        None => false,
+    }
+}
+
+/// W11 FIX 1 — does `entry` carry usable recency evidence for its shard?
+///
+/// Requires a non-empty shard (`last_applied_seq > 0`), a KNOWN recency
+/// ([`PARTITION_FLAG_RECENCY_UNKNOWN`] clear — an unscanned cache reports a
+/// fabricated empty fingerprint) and a non-zero digest (`0` is
+/// indistinguishable from a legacy peer's absent report). A zero count is
+/// explicitly NOT an anchor: a shard populated by writes landing inside the
+/// ~2 s exchange window reports `0` here while holding records at activation
+/// time, and treating that as evidence would skip every holder.
+fn partition_entry_carries_recency(entry: &PartitionVersionEntry) -> bool {
+    entry.last_applied_seq > 0
+        && (entry.flags & PARTITION_FLAG_RECENCY_UNKNOWN) == 0
+        && entry.manifest_digest != 0
+}
+
+/// Emit a `self -> holder` stream for every populated shard × every OTHER
+/// holder the new table assigns it to, skipping the pairs the partition view
+/// proves are already satisfied.
+///
+/// # Why the view gate exists (W11 FIX 1)
+///
+/// Without it this function emits one task per populated shard per foreign
+/// holder UNCONDITIONALLY, so every re-activation re-streams the entire local
+/// store regardless of how little the topology actually moved. Measured on CI
+/// run @ 3a38dc2: scenario 07 node1's SECOND activation round carried
+/// `outbound=1921, backfill=1914` against SEVEN cluster-wide master moves,
+/// and streamed exactly as many records as the store holds (3325 of 3325).
+/// Two such waves cannot fit the harness budget, and the write fence they
+/// raise (1209 shards) is charged to client traffic for the duration.
+///
+/// The gate is one-sided by construction: it only ever removes work the view
+/// affirmatively proves is unnecessary, and the proof is DIGEST EQUALITY, not
+/// a count comparison (see [`holder_backfill_is_redundant`] — for an existing
+/// assignment member this push is the only repair path, so a wrong skip is a
+/// durability regression under RF=2). An empty view (exchange skipped, timed
+/// out, or emptied by a det degrade) reduces to the pre-W11 behaviour exactly,
+/// as does any holder or shard the view does not cover, any unknown recency,
+/// and any digest difference.
 fn add_local_holder_backfill_tasks(
     tasks: &mut Vec<MigrationTask>,
     populated_shards: &std::collections::HashSet<u16>,
     new_table: &ShardTable,
     self_id: NodeId,
+    partition_view: &std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>>,
 ) {
     let mut existing: std::collections::HashSet<(u16, NodeId, NodeId)> = tasks
         .iter()
         .map(|t| (t.shard, t.from_node, t.to_node))
         .collect();
+
+    let view_by_node_shard = flatten_partition_view(partition_view);
+    let mut skipped: u64 = 0;
 
     for &shard in populated_shards {
         let target = new_table.target_assignment(shard);
@@ -8258,8 +8532,21 @@ fn add_local_holder_backfill_tasks(
         holders.sort_by_key(|node| node.0);
         holders.dedup();
 
+        // The evidence anchor: THIS node's OWN report for the shard, from the
+        // same exchange the holder entries came from. Absent — or present but
+        // carrying no recency evidence, e.g. the `seq == 0` report of a shard
+        // populated by writes inside the exchange window — nothing may be
+        // skipped (`holder_backfill_is_redundant` re-checks this).
+        let local_entry = view_by_node_shard.get(&(self_id, shard)).copied();
+
         for holder in holders {
             if holder == self_id {
+                continue;
+            }
+            if let Some(local) = local_entry
+                && holder_backfill_is_redundant(&view_by_node_shard, holder, shard, local)
+            {
+                skipped = skipped.saturating_add(1);
                 continue;
             }
             if existing.insert((shard, self_id, holder)) {
@@ -8271,6 +8558,16 @@ fn add_local_holder_backfill_tasks(
                 });
             }
         }
+    }
+
+    if skipped > 0 {
+        BACKFILL_TASKS_SKIPPED_VIEW_OWNED_TOTAL.fetch_add(skipped, Ordering::Relaxed);
+        tracing::debug!(
+            skipped,
+            emitted = tasks.len(),
+            "cluster: local-holder backfill elided — the partition view proves \
+             the holder already holds the shard",
+        );
     }
 }
 
@@ -8298,6 +8595,209 @@ fn same_term_reheal_applicable(
     committed_members: &[NodeId],
 ) -> bool {
     view_term == committed_term && view_members == committed_members
+}
+
+/// Outcome of [`ClusterCoordinator::activate_topology_with_view`].
+#[derive(Default)]
+struct ActivationOutcome {
+    /// W9 FIX 3 — the HELD Phase-2 worker launch, when `defer_plan_launch`
+    /// was requested and the plan carries outbound work.
+    deferred: Option<DeferredPlanLaunch>,
+    /// W11 FIX 3 — this same-term re-heal install was DECLINED as
+    /// refinement-revert-only. The caller counts consecutive declines per
+    /// term and withdraws `may_decline` once the budget is spent, which is
+    /// what keeps the decline a delay rather than a terminal state.
+    declined_refinement_revert: bool,
+}
+
+impl ActivationOutcome {
+    fn activated(deferred: Option<DeferredPlanLaunch>) -> Self {
+        Self {
+            deferred,
+            declined_refinement_revert: false,
+        }
+    }
+}
+
+/// W11 FIX 3 (re-review P0-1) — consecutive same-term re-heal declines a node
+/// may take before the install MUST proceed.
+///
+/// Two rounds. Each declined round costs at least
+/// [`SAME_TERM_REACTIVATION_COOLDOWN`] before the next one can arm, so the
+/// budget covers roughly a minute — comfortably more than the 41-65 ms
+/// idle-to-re-heal latency measured on CI @ 3a38dc2 that opened the
+/// divergence window in the first place, and bounded enough that a node
+/// cannot sit on a divergent table for the life of the term.
+const REHEAL_MAX_CONSECUTIVE_DECLINES: u32 = 2;
+
+/// W11 FIX 3 (re-review P0-1) — may this node still DECLINE a same-term
+/// re-heal install?
+///
+/// # Why the decline must be bounded
+///
+/// For a node that is a MEMBER of the committed topology, the fresh-view
+/// same-term re-heal is the ONLY path that rewrites the shard table inside a
+/// term: `drain_reactivation_due` short-circuits to `false` on
+/// `self_is_member`, `install_active_routing_snapshot` requires a strictly
+/// NEWER table version, and a committed assignment needs the master election
+/// armed (default off). An unbounded decline is therefore TERMINAL — and the
+/// state it freezes is not benign. Run CI @ 3a38dc2's own shape forward: n1
+/// and n4 go idle first and re-heal to the deterministic table; the wave then
+/// finishes, so the deterministic masters hold their data and EVERY node's
+/// recomputed answer becomes pure deterministic; on n2/n3 the differing
+/// shards' local masters still fully hold them (their own orphan cleanup
+/// reads their own table, which says they own the shard, so it never
+/// deletes). Every conjunct of the decline holds forever. For a shard whose
+/// refined master is n2, n2's table says `master == self` and answers `Yes`,
+/// while n1/n4 route to the deterministic master, whose inbound fence cleared
+/// when its fill completed, so it ALSO answers `Yes`: two nodes serving the
+/// same shard as authority at the same version, indefinitely — a double-spend
+/// window, and exactly the "sticky dual-master state" this file already names.
+/// A permanently declining node ALSO stops rebuilding its migration plan, so
+/// it loses the local-holder backfill and the replica/under-replication work
+/// for the rest of the term: it diverges AND stops doing anti-entropy.
+///
+/// The divergence being targeted is a WAVE artifact, so a bounded window
+/// covers it and the file's stated contract is preserved: the repair
+/// re-arming is "the deliberate price of making third-party divergence
+/// SELF-CORRECTING RATHER THAN PERMANENT".
+///
+/// `declines` is the caller's `(term, consecutive declines)` tally; a tally
+/// for any other term does not constrain this term.
+fn reheal_decline_allowed(declines: Option<(u64, u32)>, term: u64) -> bool {
+    match declines {
+        Some((tallied_term, count)) if tallied_term == term => {
+            count < REHEAL_MAX_CONSECUTIVE_DECLINES
+        }
+        _ => true,
+    }
+}
+
+/// W11 FIX 3 — count of same-term re-heal table installs declined because
+/// the install would ONLY have reverted live, view-justified refinement.
+/// Read via [`reheal_skipped_refinement_revert_total`] and exported as
+/// `teraslab_reheal_skipped_refinement_revert_total`.
+static REHEAL_SKIPPED_REFINEMENT_REVERT_TOTAL: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Number of same-term re-heal installs declined as refinement-revert-only
+/// since process start (W11 FIX 3).
+pub fn reheal_skipped_refinement_revert_total() -> u64 {
+    REHEAL_SKIPPED_REFINEMENT_REVERT_TOTAL.load(Ordering::Relaxed)
+}
+
+/// W11 FIX 3 — would this same-term re-heal install do NOTHING but revert
+/// live, view-justified master refinement?
+///
+/// # The defect
+///
+/// The same-term re-heal replaces the shard table AT THE SAME
+/// `shard_table_version` with a locally recomputed answer, gated only on this
+/// node being idle (`active_count() == 0`; both cooldowns have long expired
+/// during a 60-100 s rebalance wave — measured latency from "last batch
+/// finished" to "re-activating topology" was 41 ms on 06 node1 and 65 ms on 07
+/// node1). That answer is TIME-DEPENDENT: run the election before the
+/// migration fills the deterministic masters and it refines; run it after and
+/// the Task #47 strict-superiority rule decays every deviation back to the
+/// deterministic pick. Two nodes that go idle at different moments therefore
+/// install DIFFERENT tables at the SAME version. CI @ 3a38dc2 default-06 is
+/// the proof: all four nodes activated term 2 with byte-identical refined
+/// tables, then n1 and n4 re-healed to 1024/1024 deterministic while n2 and n3
+/// had not, and the cluster-wide master target sum went to 4408 against 4096.
+/// The ARMED 06 run is the same-commit control — all four re-healed within
+/// 2.8 s of each other and the sum stayed at 4097 — which isolates the
+/// divergence to re-heal TIMING, not to the answer itself.
+///
+/// # The rule
+///
+/// Decline the install exactly when it carries no information the
+/// deterministic activation paths do not already carry, and every local
+/// difference it would erase is a refinement the CURRENT view still justifies:
+///
+/// 1. `recomputed` reproduces the deterministic masters shard for shard —
+///    i.e. the re-heal's own answer carries NO refinement. This is the
+///    "late" half of the time-dependence; a re-heal that DOES refine is
+///    installed as before, because equal views compute it identically on every
+///    node and installing it converges them.
+/// 2. The local table is on the committed term (`local.version ==
+///    committed_term`) and has no repair work outstanding
+///    (`local_repair_pending`: a rolled-back handoff, a pending handoff, a
+///    live migration, or a stuck subset master). Any of those is real work the
+///    activation must re-drive, and the skip must never swallow it.
+/// 3. At least one shard actually differs — otherwise the install is not a
+///    revert and the caller's ordinary path applies.
+/// 4. EVERY differing shard's LOCAL master still fully holds the shard per the
+///    fresh view (`last_applied_seq > 0` with the
+///    [`PARTITION_FLAG_PENDING_INBOUND`] subset bit clear). This is what
+///    separates a refinement from a phantom: a stale table mastering a shard
+///    whose data moved away fails this test on that shard, so the phantom
+///    repair — the reason the re-heal exists — still installs.
+///
+/// # The decline is a DELAY, never a terminal state (re-review P0-1)
+///
+/// This predicate says only "the install would revert refinement"; the CALLER
+/// owns whether declining is still permitted, via
+/// [`reheal_decline_allowed`]. That budget is load-bearing, not hygiene: for
+/// a committed member the same-term re-heal is the only path that rewrites
+/// the table inside a term, so an unbounded decline freezes the local table
+/// for the term — and post-fill the divergence it freezes is a DUAL-SERVING
+/// MASTER (both the refined and the deterministic master answer `Yes` for the
+/// same shard, since the deterministic master's inbound fence clears when its
+/// fill completes). See [`reheal_decline_allowed`] for the full walk-through.
+/// With the budget spent the install proceeds, every node lands on the
+/// deterministic table, and the divergence self-corrects within the term —
+/// the contract [`third_party_deviation_shard_count`] states.
+///
+/// The declines this gate does buy are the ones that matter: the divergence
+/// window is a WAVE artifact (41-65 ms from last batch to re-activation on CI
+/// @ 3a38dc2), and two cooldowns cover it.
+fn reheal_install_reverts_refinement_only(
+    local_table: &ShardTable,
+    recomputed: &ShardTable,
+    det_masters: &[NodeId],
+    partition_view: &std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>>,
+    committed_term: u64,
+    local_repair_pending: bool,
+) -> bool {
+    // The length check is a totality guard, not a reachable case: the sole
+    // producer builds `det_masters` by mapping over `0..NUM_SHARDS`. It keeps
+    // the indexing below panic-free for any future caller.
+    if local_repair_pending
+        || partition_view.is_empty()
+        || local_table.version != committed_term
+        || det_masters.len() != NUM_SHARDS
+    {
+        return false;
+    }
+
+    // (1) the recomputed answer must itself carry no refinement.
+    for shard in 0..NUM_SHARDS as u16 {
+        if recomputed.target_assignment(shard).master != det_masters[shard as usize] {
+            return false;
+        }
+    }
+
+    // (4) every difference must be a refinement the fresh view still backs.
+    let holders = flatten_partition_view(partition_view);
+    let mut differing = 0usize;
+    for shard in 0..NUM_SHARDS as u16 {
+        let local_master = local_table.target_assignment(shard).master;
+        if local_master == recomputed.target_assignment(shard).master {
+            continue;
+        }
+        differing += 1;
+        match holders.get(&(local_master, shard)) {
+            Some(entry)
+                if entry.last_applied_seq > 0
+                    && (entry.flags & PARTITION_FLAG_PENDING_INBOUND) == 0 => {}
+            // The local master holds nothing (or only a subset) — this is a
+            // phantom, not a refinement. Install and repair it.
+            _ => return false,
+        }
+    }
+
+    // (3) a genuine revert, not a no-diff activation.
+    differing > 0
 }
 
 /// Task #73 — count of same-term re-heal activations skipped because their
@@ -17267,6 +17767,120 @@ fn classify_shard_candidates(
     (max_reported, candidates)
 }
 
+/// W11 FIX 2 — the shards whose deterministic master an activation's own plan
+/// is about to fill FROM A SOURCE THAT KEEPS SERVING MEANWHILE.
+///
+/// Fed to [`apply_master_election`] as the set exempt from data-lag demotion
+/// on a fresh activation.
+///
+/// # The pre-image must be cluster-agreed (re-review P1-1)
+///
+/// `prev_det_table` is the DETERMINISTIC table of the PREVIOUS committed
+/// activation (previous member set + placement version), NOT this node's
+/// previous shard table. Local previous tables diverge by construction —
+/// `rollback_shard` fires only on the failing source, and prior refinements
+/// are per-node — and [`apply_master_election`]'s own contract forbids
+/// feeding node-local history into the outcome for exactly this reason. With
+/// the local table as the pre-image, two nodes holding IDENTICAL views
+/// computed DIFFERENT exemption sets: node A's table says shard S is mastered
+/// by replica R, so `migration_plan` emits `R -> M` and A exempts S; node B's
+/// table says M, so no master task exists and B deviates to R. Same term,
+/// same view, different tables. Deriving the pre-image from the previous
+/// committed member set removes that channel: every node that followed the
+/// same committed-term sequence computes the same set.
+///
+/// # Conditions
+///
+/// 1. the DETERMINISTIC plan (`prev det -> det`) carries a MASTER task for
+///    the shard — the destination's emptiness is that task's precondition,
+///    not evidence of a wrong placement;
+/// 2. the task's source is the shard's PREVIOUS DETERMINISTIC master, i.e.
+///    equivalently `old_master ∈ new_members`: `migration_plan` picks a
+///    surviving replica as the source when the old master is DEAD, and that
+///    is precisely the case where suppressing the deviation costs
+///    availability — nobody is serving the shard, and only promoting the
+///    surviving holder restores it (pinned by
+///    `segment_cluster_master_failover_preserves_replicated_record`, which
+///    fails outright without this condition). With a live old master the
+///    handoff protocol keeps it serving until the destination commits
+///    (`begin_handoff_with`; see the no-loss note on
+///    [`phantom_master_shard_count`]), so the deviation buys nothing;
+/// 3. the shared view shows that source holding the shard WITHOUT MATERIAL
+///    LAG — `seq > 0`, subset bit clear, and `seq * 2 >= max` over every node
+///    reporting the shard, the same threshold
+///    [`classify_shard_candidates`] uses. `seq > 0` alone is not enough
+///    (re-review P1-2): an old master holding 1 record while a replica holds
+///    3000 would satisfy it, the exemption would keep the empty
+///    deterministic master, and after the fill that master would serve as
+///    authority holding 1 of 3001 records — every read for the other 3000
+///    returning NOT_FOUND from the authoritative master.
+///    `build_plan_from_partition_view` uses the same weak `seq > 0`
+///    predicate downstream, so nothing else would have caught it.
+///
+/// # Shapes this deliberately does NOT cover
+///
+/// - A source ALIVE at exchange time but dead before the fill completes
+///   passes all three conditions. The deterministic master then stays fenced
+///   and unserved until the next same-term re-heal re-elects (~30 s), rather
+///   than the holder being promoted immediately. Conditions (2) and (3) are
+///   evidence AT EXCHANGE TIME, not a liveness guarantee.
+/// - The set is derived from the RAW deterministic plan, not the view-refined
+///   plan actually installed (`build_plan_from_partition_view` may skip or
+///   re-source tasks afterwards), so it is a SUPERSET of the master handoffs
+///   that finally run.
+/// - An empty or partial view yields an empty (or smaller) exemption set,
+///   i.e. the pre-W11 behaviour — the fail-safe direction.
+///
+/// # Availability delta (re-review P2-4)
+///
+/// Suppressing a deviation means the shard answers retryable
+/// `MIGRATION_IN_PROGRESS` for the length of its fill, where before the fix
+/// the view-evidenced holder was promoted and simply served it. That is
+/// correct — the deterministic master is the placement every node agrees on,
+/// and the source keeps serving reads routed to it — but it is a real
+/// behavioural delta for the wave's duration on roughly the shards that used
+/// to deviate (~1/3 in scenario 06).
+fn plan_filled_master_shards(
+    prev_det_table: &ShardTable,
+    det_table: &ShardTable,
+    partition_view: &std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>>,
+) -> std::collections::HashSet<u16> {
+    if partition_view.is_empty() {
+        return std::collections::HashSet::new();
+    }
+    let by_node_shard = flatten_partition_view(partition_view);
+    // Per-shard maximum reported count over every node that reported it —
+    // the `classify_shard_candidates` yardstick for material lag. Taking the
+    // max over ALL reporters (rather than only the shard's candidates) can
+    // only RAISE the bar, so it shrinks the exemption set: the fail-safe
+    // direction.
+    let mut max_by_shard: std::collections::HashMap<u16, u64> = std::collections::HashMap::new();
+    for entries in partition_view.values() {
+        for e in entries {
+            let slot = max_by_shard.entry(e.shard).or_insert(0);
+            *slot = (*slot).max(e.last_applied_seq);
+        }
+    }
+    ShardTable::migration_plan(prev_det_table, det_table)
+        .into_iter()
+        .filter(|task| {
+            if !task.is_master
+                || task.from_node != prev_det_table.target_assignment(task.shard).master
+            {
+                return false;
+            }
+            let Some(entry) = by_node_shard.get(&(task.from_node, task.shard)) else {
+                return false;
+            };
+            let max_reported = max_by_shard.get(&task.shard).copied().unwrap_or(0);
+            entry.last_applied_seq > 0
+                && (entry.flags & PARTITION_FLAG_PENDING_INBOUND) == 0
+                && entry.last_applied_seq.saturating_mul(2) >= max_reported
+        })
+        .map(|task| task.shard)
+        .collect()
+}
+
 /// Phase F — apply election scoring on top of the round-robin
 /// `compute_with_epoch` result.
 ///
@@ -17325,12 +17939,49 @@ fn classify_shard_candidates(
 /// reactivation paths (`activate_topology` on startup/drain repair) rely on
 /// this to install the deterministic round-robin table identically on every
 /// node.
+///
+/// # This activation's own plan is not evidence of loss — W11 FIX 2
+///
+/// `plan_master_shards` names the shards whose deterministic master is about
+/// to be filled BY THIS ACTIVATION's own plan, from a source that keeps
+/// serving throughout — see [`plan_filled_master_shards`], which is the only
+/// producer and which carries the availability conditions. On a fresh
+/// activation (`adopt_view_holders == false`) those shards are exempt from
+/// deviation entirely.
+///
+/// The reasoning is the one already applied to view-evidenced EXTERNAL
+/// holders a few lines below, extended to the assignment-internal case. A
+/// deviation exists to route reads to a node that demonstrably has the data.
+/// Mid-rebalance the deterministic master is empty *because this very
+/// activation's plan is what fills it*, so the emptiness is not evidence of a
+/// stale or lost placement — it is the plan's precondition. Deviating on it
+/// buys nothing (the handoff protocol, not the table, is what keeps the
+/// current master serving until the new master holds the data — see
+/// `begin_handoff_with` and the no-loss note on
+/// [`phantom_master_shard_count`]) and costs a great deal: the deviation is
+/// transient by construction, so its only lasting effect is to arm the
+/// same-term re-heal, which reverts it once the fill lands (the Task #47
+/// strict-superiority decay) — a second whole rebalance, and, because each
+/// node reaches that point at its own moment, two nodes can install DIFFERENT
+/// tables at the SAME shard-table version. Measured on CI @ 3a38dc2:
+/// 1240 shards deviated by construction in scenario 06 and 978 in
+/// scenario 07, and in default-06 all four nodes activated term 2 with
+/// byte-identical refined tables, after which n1/n4 re-healed to pure
+/// deterministic while n2/n3 had not — masters summing 4408 against 4096.
+///
+/// The exemption is deliberately NOT applied when the deterministic master is
+/// in `evicted` (a known-dead node cannot be filled by any plan) and NOT
+/// applied on the same-term re-heal, whose whole job is to re-decide
+/// mastership from settled evidence: `plan_master_shards` is empty there by
+/// construction (the re-heal re-plans against an already-installed table),
+/// but the `adopt_view_holders` guard states the intent independently of that.
 pub fn apply_master_election(
     table: &mut ShardTable,
     _prev_table: &ShardTable,
     partition_view: &std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>>,
     evicted: &std::collections::HashSet<NodeId>,
     adopt_view_holders: bool,
+    plan_master_shards: &std::collections::HashSet<u16>,
 ) {
     let view_empty = partition_view.is_empty();
     // Task #22 — an empty view carries no ownership signal. Returning here
@@ -17409,8 +18060,25 @@ pub fn apply_master_election(
         }
     }
 
+    let mut suppressed_by_plan: u64 = 0;
     for shard in 0..NUM_SHARDS as u16 {
         let assignment = table.target_assignment(shard);
+
+        // W11 FIX 2 — this activation's OWN plan fills the deterministic
+        // master for this shard, so its current emptiness proves nothing about
+        // placement. Leave the deterministic pick alone (see the fn doc for the
+        // full argument). An evicted deterministic master is exempt from the
+        // exemption: no plan can fill a dead node. (That carve-out is inert
+        // today — the production call site passes an always-empty `evicted`
+        // set pending the Phase-I wiring — but it states the rule for when
+        // eviction is populated.)
+        if !adopt_view_holders
+            && plan_master_shards.contains(&shard)
+            && !evicted.contains(&assignment.master)
+        {
+            suppressed_by_plan = suppressed_by_plan.saturating_add(1);
+            continue;
+        }
 
         let mut candidate_nodes: Vec<NodeId> = Vec::with_capacity(1 + assignment.replicas.len());
         candidate_nodes.push(assignment.master);
@@ -17609,6 +18277,31 @@ pub fn apply_master_election(
             }
         }
     }
+
+    if suppressed_by_plan > 0 {
+        ELECTION_DEVIATIONS_SUPPRESSED_PLAN_FILL_TOTAL
+            .fetch_add(suppressed_by_plan, Ordering::Relaxed);
+        tracing::debug!(
+            shards = suppressed_by_plan,
+            "cluster: master election left the deterministic pick for shards this \
+             activation's own plan fills",
+        );
+    }
+}
+
+/// W11 FIX 2 — count of shards whose master election was left at the
+/// deterministic pick because this activation's own plan carries their master
+/// handoff. Read via [`election_deviations_suppressed_plan_fill_total`] and
+/// exported as `teraslab_election_deviations_suppressed_plan_fill_total`.
+static ELECTION_DEVIATIONS_SUPPRESSED_PLAN_FILL_TOTAL: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Number of election deviations declined because the shard's deterministic
+/// master is being filled by the same activation's plan (W11 FIX 2). The
+/// counter is process-global bookkeeping only — the election's OUTPUT stays a
+/// pure function of its inputs.
+pub fn election_deviations_suppressed_plan_fill_total() -> u64 {
+    ELECTION_DEVIATIONS_SUPPRESSED_PLAN_FILL_TOTAL.load(Ordering::Relaxed)
 }
 
 /// Phase H — `Send`-able handle for posting resync requests from a
@@ -24031,6 +24724,7 @@ mod tests {
             &populated,
             &new_table,
             NodeId(1),
+            &std::collections::HashMap::new(),
         );
         let mut expected = vec![target.master];
         expected.extend(target.replicas.iter().copied());
@@ -24062,7 +24756,13 @@ mod tests {
         let populated = std::collections::HashSet::from([shard]);
         let mut tasks = Vec::new();
 
-        add_local_holder_backfill_tasks(&mut tasks, &populated, &new_table, NodeId(1));
+        add_local_holder_backfill_tasks(
+            &mut tasks,
+            &populated,
+            &new_table,
+            NodeId(1),
+            &std::collections::HashMap::new(),
+        );
 
         let target = new_table.target_assignment(shard);
         let mut expected = vec![target.master];
@@ -24101,7 +24801,13 @@ mod tests {
         let populated = std::collections::HashSet::from([shard]);
         let mut tasks = Vec::new();
 
-        add_local_holder_backfill_tasks(&mut tasks, &populated, &new_table, NodeId(1));
+        add_local_holder_backfill_tasks(
+            &mut tasks,
+            &populated,
+            &new_table,
+            NodeId(1),
+            &std::collections::HashMap::new(),
+        );
 
         let target = new_table.target_assignment(shard);
         let mut expected = target.replicas.clone();
@@ -24111,6 +24817,227 @@ mod tests {
 
         assert_eq!(actual, expected);
         assert!(tasks.iter().all(|t| !t.is_master));
+    }
+
+    /// W11 FIX 1 test helper — one `PartitionVersionEntry` for `shard`, with
+    /// an explicit recency digest (the evidence the skip requires).
+    fn backfill_view_entry(
+        shard: u16,
+        seq: u64,
+        flags: u8,
+        digest: u64,
+    ) -> Vec<PartitionVersionEntry> {
+        vec![PartitionVersionEntry {
+            shard,
+            flags,
+            replica_count: 1,
+            last_applied_seq: seq,
+            manifest_digest: digest,
+            max_generation: 0,
+        }]
+    }
+
+    /// W11 FIX 1 test helper — 4-member rf=3 table plus a shard node1 masters
+    /// with at least two replicas, so one replica can be view-covered and the
+    /// other left absent in the same run.
+    fn backfill_fixture() -> (ShardTable, u16, NodeId, NodeId) {
+        let new_table =
+            ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2), NodeId(3), NodeId(4)], 3, 11, 1);
+        let shard = (0..NUM_SHARDS as u16)
+            .find(|&s| {
+                let target = new_table.target_assignment(s);
+                target.master == NodeId(1) && target.replicas.len() >= 2
+            })
+            .expect("node1 should master a shard with two replicas at rf=3");
+        let target = new_table.target_assignment(shard);
+        (
+            new_table.clone(),
+            shard,
+            target.replicas[0],
+            target.replicas[1],
+        )
+    }
+
+    /// W11 FIX 1 (CI @ 3a38dc2, scenarios 06/07) — the local-holder backfill
+    /// used to emit a stream for EVERY populated shard × every foreign holder
+    /// with no evidence whatsoever, so each same-term repair round re-streamed
+    /// the whole store (07 node1 round 2: `outbound=1921, backfill=1914`
+    /// against seven cluster-wide master moves; 3325 of 3325 records
+    /// re-streamed). A holder whose recency digest EQUALS this node's — the
+    /// only sound proof that there is nothing to push — must get NO task.
+    #[test]
+    fn local_holder_backfill_skips_a_holder_whose_digest_matches() {
+        let (new_table, shard, covered, absent) = backfill_fixture();
+        let populated = std::collections::HashSet::from([shard]);
+
+        // Control: with no view at all the pre-W11 behaviour stands — both
+        // replicas are streamed unconditionally.
+        let mut blind = Vec::new();
+        add_local_holder_backfill_tasks(
+            &mut blind,
+            &populated,
+            &new_table,
+            NodeId(1),
+            &std::collections::HashMap::new(),
+        );
+        let blind_targets: std::collections::HashSet<NodeId> =
+            blind.iter().map(|t| t.to_node).collect();
+        assert!(
+            blind_targets.contains(&covered) && blind_targets.contains(&absent),
+            "an empty view must keep the unconditional backfill (fail-safe)",
+        );
+
+        // Evidence: self and `covered` report the same digest; `absent` never
+        // reported.
+        let mut view: std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>> =
+            std::collections::HashMap::new();
+        view.insert(NodeId(1), backfill_view_entry(shard, 500, 0, 0xABCD));
+        view.insert(covered, backfill_view_entry(shard, 500, 0, 0xABCD));
+
+        let mut gated = Vec::new();
+        add_local_holder_backfill_tasks(&mut gated, &populated, &new_table, NodeId(1), &view);
+        let gated_targets: std::collections::HashSet<NodeId> =
+            gated.iter().map(|t| t.to_node).collect();
+        assert!(
+            !gated_targets.contains(&covered),
+            "a holder whose shard digest matches holds byte-identical state — nothing to push",
+        );
+        assert!(
+            gated_targets.contains(&absent),
+            "a holder ABSENT from the view carries no evidence and must still be streamed",
+        );
+    }
+
+    /// W11 FIX 1 (re-review P1-3) — counts are NOT a proof: two nodes can
+    /// report identical `last_applied_seq` over disjoint content, and for a
+    /// holder that is already an assignment member this push is the only
+    /// repair path (`replica_migration_plan` only emits for NEWLY assigned
+    /// replicas, the under-replication sweep is default-off, reverse-heal
+    /// repairs the other direction), so a wrong skip is a durability
+    /// regression under RF=2. Every shape short of digest equality with known
+    /// recency on both sides must keep the unconditional stream.
+    #[test]
+    fn local_holder_backfill_never_skips_without_digest_equality() {
+        let (new_table, shard, covered, _absent) = backfill_fixture();
+        let populated = std::collections::HashSet::from([shard]);
+
+        let run = |view: &std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>>| {
+            let mut tasks = Vec::new();
+            add_local_holder_backfill_tasks(&mut tasks, &populated, &new_table, NodeId(1), view);
+            tasks
+                .iter()
+                .map(|t| t.to_node)
+                .collect::<std::collections::HashSet<NodeId>>()
+        };
+        let case = |local: Vec<PartitionVersionEntry>, holder: Vec<PartitionVersionEntry>| {
+            let mut view: std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>> =
+                std::collections::HashMap::new();
+            view.insert(NodeId(1), local);
+            view.insert(covered, holder);
+            view
+        };
+
+        // EQUAL COUNTS, DIFFERENT CONTENT — the shape a count comparison
+        // cannot see.
+        assert!(
+            run(&case(
+                backfill_view_entry(shard, 500, 0, 0xAAAA),
+                backfill_view_entry(shard, 500, 0, 0xBBBB),
+            ))
+            .contains(&covered),
+            "equal counts over disjoint content must still be repaired",
+        );
+
+        // Subset holder: matching digest but still receiving inbound data.
+        assert!(
+            run(&case(
+                backfill_view_entry(shard, 500, 0, 0xABCD),
+                backfill_view_entry(shard, 500, PARTITION_FLAG_PENDING_INBOUND, 0xABCD),
+            ))
+            .contains(&covered),
+            "a subset holder (pending inbound) must still receive the backfill",
+        );
+
+        // Materially behind: 1 record against this node's 500 — the exact
+        // aborted-mid-stream shape the backfill exists to repair.
+        assert!(
+            run(&case(
+                backfill_view_entry(shard, 500, 0, 0xABCD),
+                backfill_view_entry(shard, 1, 0, 0x1111),
+            ))
+            .contains(&covered),
+            "a holder materially behind this node must still receive the backfill",
+        );
+
+        // UNKNOWN recency on either side is NO evidence.
+        assert!(
+            run(&case(
+                backfill_view_entry(shard, 500, PARTITION_FLAG_RECENCY_UNKNOWN, 0xABCD),
+                backfill_view_entry(shard, 500, 0, 0xABCD),
+            ))
+            .contains(&covered),
+            "an unknown LOCAL recency is a fabricated fingerprint, not evidence",
+        );
+        assert!(
+            run(&case(
+                backfill_view_entry(shard, 500, 0, 0xABCD),
+                backfill_view_entry(shard, 500, PARTITION_FLAG_RECENCY_UNKNOWN, 0xABCD),
+            ))
+            .contains(&covered),
+            "an unknown HOLDER recency is a fabricated fingerprint, not evidence",
+        );
+
+        // A zero digest is what a legacy peer reports — absence, not a match.
+        assert!(
+            run(&case(
+                backfill_view_entry(shard, 500, 0, 0),
+                backfill_view_entry(shard, 500, 0, 0),
+            ))
+            .contains(&covered),
+            "two absent digests are not a digest match",
+        );
+
+        // No self report for the shard at all: no anchor, no skip.
+        assert!(
+            run(&case(
+                Vec::new(),
+                backfill_view_entry(shard, 500, 0, 0xABCD)
+            ))
+            .contains(&covered),
+            "without this node's own report there is no anchor to compare against",
+        );
+    }
+
+    /// W11 FIX 1 (re-review P1-3b) — the ZERO ANCHOR. A shard populated by
+    /// writes landing inside the ~2 s exchange window is reported with
+    /// `last_applied_seq == 0` yet is in `populated_shards` at activation
+    /// time. A PRESENT ZERO must be treated as no anchor exactly like a
+    /// missing entry; the pre-fix `seq*2 >= local` arithmetic made it
+    /// trivially true, so ANY holder reporting a single record was skipped —
+    /// routine under precisely the write load this gate targets.
+    #[test]
+    fn local_holder_backfill_treats_a_zero_self_report_as_no_anchor() {
+        let (new_table, shard, covered, absent) = backfill_fixture();
+        let populated = std::collections::HashSet::from([shard]);
+
+        let mut view: std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>> =
+            std::collections::HashMap::new();
+        // Self reported the shard EMPTY (writes landed after the report);
+        // the holder reports a single record with a digest of its own.
+        view.insert(NodeId(1), backfill_view_entry(shard, 0, 0, 0xABCD));
+        view.insert(covered, backfill_view_entry(shard, 1, 0, 0xABCD));
+
+        let mut tasks = Vec::new();
+        add_local_holder_backfill_tasks(&mut tasks, &populated, &new_table, NodeId(1), &view);
+        let targets: std::collections::HashSet<NodeId> = tasks.iter().map(|t| t.to_node).collect();
+        assert!(
+            targets.contains(&covered),
+            "a zero self report is not an anchor — the holder must still be streamed",
+        );
+        assert!(
+            targets.contains(&absent),
+            "the uncovered holder is streamed as always",
+        );
     }
 
     #[test]
@@ -28855,6 +29782,7 @@ mod tests {
             &view,
             &std::collections::HashSet::new(),
             false,
+            &std::collections::HashSet::new(),
         );
 
         // Sanity: the election actually deviated from round-robin,
@@ -29652,6 +30580,7 @@ mod tests {
             &view,
             &std::collections::HashSet::new(),
             false,
+            &std::collections::HashSet::new(),
         );
 
         // Election must have deviated from round-robin (otherwise the test
@@ -33296,6 +34225,18 @@ mod tests {
         GUARD.get_or_init(|| Mutex::new(())).lock()
     }
 
+    /// Serializes the tests that assert on the PROCESS-GLOBAL
+    /// `REHEAL_SKIPPED_DEGENERATE_VIEW_TOTAL` counter. Every
+    /// `admit_exchange_completion(true, ..)` call below the full-member-view
+    /// floor bumps it, and more than one test makes such calls, so an
+    /// absolute `before + 1` assertion raced with a sibling test and failed
+    /// intermittently (reproduced 2 runs in 3 under a narrow test filter).
+    fn reheal_skip_counter_test_guard() -> parking_lot::MutexGuard<'static, ()> {
+        use std::sync::OnceLock;
+        static GUARD: OnceLock<Mutex<()>> = OnceLock::new();
+        GUARD.get_or_init(|| Mutex::new(())).lock()
+    }
+
     fn make_outbound_master_task(shard: u16, from: NodeId, to: NodeId) -> MigrationTask {
         MigrationTask {
             shard,
@@ -36392,6 +37333,7 @@ mod tests {
             None,
             false,
             false,
+            false,
         );
 
         // The manager retained the unproven lost entry across the supersede (C17).
@@ -36413,6 +37355,376 @@ mod tests {
                  authority on the production `activate_topology_with_view` path; got {other:?}",
             ),
         }
+    }
+
+    /// W11 FIX 3 test driver — run a SAME-TERM RE-HEAL activation
+    /// (`adopt_view_holders = true`, no committed assignment) for a 2-member
+    /// rf=2 cluster whose local table deviates one shard's master onto the
+    /// replica, with the fresh view reporting `local_master_count` for the
+    /// deviant master and 500 for the deterministic one. Returns
+    /// `(deterministic master, deviant master, master after the activation,
+    ///  table version after, registered migration count after, whether a plan
+    ///  launch was produced)`.
+    fn reheal_refinement_revert_probe(
+        local_master_count: u64,
+        may_decline: bool,
+    ) -> (NodeId, NodeId, NodeId, u64, usize, bool) {
+        let _guard = migration_metrics_test_guard();
+        // The control arm of this probe REGISTERS a migration plan, which
+        // bumps the process-global `migration_active` gauge; hold the shared
+        // metrics lock so a neighbour's gauge assertion cannot read our
+        // registration as its own (the 3a38dc2 bulk-registration race).
+        let _metrics_guard = crate::metrics::migration_metrics_test_lock();
+        let _metrics = install_test_migration_metrics();
+
+        let members = vec![NodeId(1), NodeId(2)];
+        let rf = 2u8;
+        let placement_version = 1u16;
+        let term = 5u64;
+        let det_table = ShardTable::compute_with_epoch(&members, rf, term, placement_version);
+        let shard = (0..NUM_SHARDS as u16)
+            .find(|&s| {
+                let a = det_table.target_assignment(s);
+                a.master == NodeId(1) && a.replicas.contains(&NodeId(2))
+            })
+            .expect("some shard has det master N1 and replica N2");
+
+        // The locally refined table: mastership deviated onto the replica,
+        // still stamped with the committed term.
+        let mut local_table = det_table.clone();
+        local_table.set_master_for_shard(shard, NodeId(2));
+        assert_eq!(local_table.version, term);
+        assert_eq!(local_table.target_assignment(shard).master, NodeId(2));
+
+        let engine = Arc::new(test_engine());
+        create_test_record(&engine, tx_key_for_shard(shard, 7));
+
+        let cluster = new_test_running_cluster(
+            NodeId(1),
+            local_table,
+            &[
+                (NodeId(1), "127.0.0.1:1".parse().unwrap()),
+                (NodeId(2), "127.0.0.1:1".parse().unwrap()),
+            ],
+            &members,
+            &[],
+            &[],
+            &[],
+            2,
+        );
+
+        let entry = |seq: u64| {
+            vec![PartitionVersionEntry {
+                shard,
+                flags: 0,
+                replica_count: 1,
+                last_applied_seq: seq,
+                manifest_digest: 0,
+                max_generation: 0,
+            }]
+        };
+        let mut view: std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>> =
+            std::collections::HashMap::new();
+        view.insert(NodeId(1), entry(500));
+        view.insert(NodeId(2), entry(local_master_count));
+
+        // `defer_plan_launch` keeps any plan this activation DOES build off
+        // the wire; the assertions read the registered task count, not worker
+        // side effects.
+        let outcome = ClusterCoordinator::activate_topology_with_view(
+            &members,
+            term,
+            placement_version,
+            NodeId(1),
+            rf,
+            &cluster.shard_table,
+            &cluster.migration,
+            &cluster.node_addrs,
+            &engine,
+            &None,
+            1,
+            1,
+            1,
+            &cluster.fenced_bitmap,
+            &cluster.migrating_bitmap,
+            &cluster.inbound_atomic,
+            &cluster.active_topology_members,
+            &view,
+            &cluster.migration_throttle,
+            &cluster.cluster_secret,
+            None,
+            true,
+            true,
+            may_decline,
+        );
+        // The launch closure is dropped un-run, so no worker ever touches the
+        // (unroutable) peer address; the registered task count below is what
+        // the assertions read.
+        let launched = outcome.deferred.is_some();
+        drop(outcome);
+
+        let table = cluster.shard_table.read();
+        let after = table.target_assignment(shard).master;
+        let version = table.version;
+        drop(table);
+        let active = cluster.migration.lock().active_count();
+        (NodeId(1), NodeId(2), after, version, active, launched)
+    }
+
+    /// W11 FIX 3 (CI @ 3a38dc2, default-06) — the same-term re-heal replaces
+    /// the shard table AT THE SAME VERSION with a locally recomputed,
+    /// TIME-DEPENDENT answer, gated only on this node being idle (measured
+    /// 41 ms after the last batch on 06 node1, 65 ms on 07 node1). Run the
+    /// election before the migration fills the deterministic masters and it
+    /// refines; run it after and the Task #47 strict-superiority rule decays
+    /// every deviation back. Nodes that go idle at different moments therefore
+    /// install DIFFERENT tables at the SAME version — default-06 had all four
+    /// nodes on byte-identical refined tables, then n1/n4 decayed to
+    /// deterministic while n2/n3 had not, summing 4408 masters against 4096.
+    /// A re-heal whose recomputed answer is the deterministic baseline, and
+    /// whose only local difference is refinement the fresh view still
+    /// justifies, must therefore install NOTHING.
+    #[test]
+    fn same_term_reheal_declines_an_install_that_only_reverts_refinement() {
+        // The deviant master still holds the shard: a live refinement.
+        let (_det, deviant, after, version, active, launched) =
+            reheal_refinement_revert_probe(500, true);
+        assert_eq!(
+            after, deviant,
+            "a re-heal that would only revert live refinement must leave the table alone",
+        );
+        assert_eq!(version, 5, "the shard table version must be untouched");
+        assert_eq!(
+            active, 0,
+            "a declined re-heal must not register a migration plan",
+        );
+        assert!(
+            !launched,
+            "a declined re-heal must not produce a migration plan launch",
+        );
+    }
+
+    /// W11 FIX 3 — the phantom repair the re-heal exists for must survive the
+    /// decline. When the locally deviating master reports NO data for the
+    /// shard, the deviation is a stale claim rather than a refinement, and the
+    /// recomputed table must be installed exactly as before.
+    #[test]
+    fn same_term_reheal_still_installs_when_the_local_master_holds_nothing() {
+        let (det, _deviant, after, version, _active, _launched) =
+            reheal_refinement_revert_probe(0, true);
+        assert_eq!(
+            after, det,
+            "a local master holding nothing is a phantom, not a refinement — the re-heal must \
+             still repair it",
+        );
+        assert_eq!(version, 5, "the re-heal installs at the committed term");
+    }
+
+    /// W11 FIX 2 (re-review P1-1) — end-to-end pin for the exemption WIRING:
+    /// the pre-image is the deterministic table of the PREVIOUS activation's
+    /// member set, taken from the snapshot captured before
+    /// `active_topology_members` is overwritten.
+    ///
+    /// Scale-up shape: a 2-member cluster grows to 3, the newcomer is empty
+    /// mid-rebalance, and the shard's previous deterministic master reports it
+    /// full. The activation must leave the newcomer as master (its emptiness
+    /// is this plan's precondition). The control seeds the prior member set
+    /// EQUAL to the new one — the same-term re-activation shape, where no
+    /// pre-image is available — and there the election deviates exactly as it
+    /// did before W11.
+    #[test]
+    fn scale_up_activation_keeps_the_newcomer_master_via_the_previous_member_pre_image() {
+        let run = |prior_members: Vec<NodeId>| -> (NodeId, NodeId) {
+            let _guard = migration_metrics_test_guard();
+            let _metrics_guard = crate::metrics::migration_metrics_test_lock();
+            let _metrics = install_test_migration_metrics();
+
+            let rf = 2u8;
+            let pv = 1u16;
+            let old_members = vec![NodeId(1), NodeId(2)];
+            let new_members = vec![NodeId(1), NodeId(2), NodeId(3)];
+            let old_table = ShardTable::compute_with_epoch(&old_members, rf, 1, pv);
+            let new_det = ShardTable::compute_with_epoch(&new_members, rf, 2, pv);
+            // A shard the newcomer takes over, whose PREVIOUS det master is a
+            // survivor that still holds it.
+            let shard = (0..NUM_SHARDS as u16)
+                .find(|&s| {
+                    new_det.target_assignment(s).master == NodeId(3)
+                        && old_table.target_assignment(s).master != NodeId(3)
+                })
+                .expect("some shard moves its master to the newcomer");
+            let prev_master = old_table.target_assignment(shard).master;
+
+            let engine = Arc::new(test_engine());
+            create_test_record(&engine, tx_key_for_shard(shard, 3));
+            let cluster = new_test_running_cluster(
+                NodeId(1),
+                old_table,
+                &[
+                    (NodeId(1), "127.0.0.1:1".parse().unwrap()),
+                    (NodeId(2), "127.0.0.1:1".parse().unwrap()),
+                    (NodeId(3), "127.0.0.1:1".parse().unwrap()),
+                ],
+                // Seeds `active_topology_members` — the prior-member source.
+                &prior_members,
+                &[],
+                &[],
+                &[],
+                3,
+            );
+
+            let entry = |seq: u64| {
+                vec![PartitionVersionEntry {
+                    shard,
+                    flags: 0,
+                    replica_count: 1,
+                    last_applied_seq: seq,
+                    manifest_digest: 0,
+                    max_generation: 0,
+                }]
+            };
+            let mut view: std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>> =
+                std::collections::HashMap::new();
+            for node in &new_members {
+                view.insert(
+                    *node,
+                    if *node == prev_master {
+                        entry(500)
+                    } else {
+                        entry(0)
+                    },
+                );
+            }
+
+            let outcome = ClusterCoordinator::activate_topology_with_view(
+                &new_members,
+                2,
+                pv,
+                NodeId(1),
+                rf,
+                &cluster.shard_table,
+                &cluster.migration,
+                &cluster.node_addrs,
+                &engine,
+                &None,
+                1,
+                1,
+                1,
+                &cluster.fenced_bitmap,
+                &cluster.migrating_bitmap,
+                &cluster.inbound_atomic,
+                &cluster.active_topology_members,
+                &view,
+                &cluster.migration_throttle,
+                &cluster.cluster_secret,
+                None,
+                // Fresh activation of a new term, worker launch held.
+                false,
+                true,
+                false,
+            );
+            drop(outcome);
+            let master = cluster.shard_table.read().target_assignment(shard).master;
+            (master, prev_master)
+        };
+
+        let (with_pre_image, _) = run(vec![NodeId(1), NodeId(2)]);
+        assert_eq!(
+            with_pre_image,
+            NodeId(3),
+            "the newcomer's emptiness is this activation's own plan's precondition — the \
+             deterministic master must stand",
+        );
+
+        // Control: no usable pre-image (prior members == new members, the
+        // same-term re-activation shape) — the pre-W11 deviation returns.
+        let (without_pre_image, prev_master) = run(vec![NodeId(1), NodeId(2), NodeId(3)]);
+        assert_eq!(
+            without_pre_image, prev_master,
+            "without a prior member set there is no exemption and the election deviates to \
+             the holder, exactly as before W11 (the fail-safe direction)",
+        );
+    }
+
+    /// W11 FIX 3 (re-review P0-1) — the decline must be a DELAY, not a
+    /// terminal state. Once the per-term budget is spent the SAME inputs that
+    /// declined must INSTALL, so the node lands on the deterministic table
+    /// and rejoins its peers inside the term.
+    #[test]
+    fn same_term_reheal_installs_once_the_decline_budget_is_spent() {
+        let (det, deviant, declined_master, _v, _a, _l) = reheal_refinement_revert_probe(500, true);
+        assert_eq!(
+            declined_master, deviant,
+            "precondition: with budget remaining these inputs decline",
+        );
+        let (_det, _deviant, installed_master, version, _a, _l) =
+            reheal_refinement_revert_probe(500, false);
+        assert_eq!(
+            installed_master, det,
+            "with the decline budget spent the identical inputs must INSTALL — an unbounded \
+             decline freezes a divergent table for the term (dual-serving masters)",
+        );
+        assert_eq!(version, 5, "the install stays at the committed term");
+    }
+
+    /// W11 FIX 3 (re-review P0-1) — CONVERGENCE WITHOUT A NEW TERM.
+    ///
+    /// The CI @ 3a38dc2 shape: some nodes re-healed to the deterministic
+    /// table while others still carry the refined one, at the SAME
+    /// `shard_table_version`. For a committed MEMBER the fresh-view same-term
+    /// re-heal is the only path that rewrites the table inside a term
+    /// (`drain_reactivation_due` short-circuits on `self_is_member`,
+    /// `install_active_routing_snapshot` needs a strictly newer version, a
+    /// committed assignment needs the election armed), so if the refined node
+    /// could decline forever the split would be permanent — and post-fill
+    /// BOTH masters answer `Yes` for the shard, which is a double-spend
+    /// window. Drive both nodes through the re-heal with the budget spent and
+    /// assert they hold the SAME master, with no term change anywhere.
+    #[test]
+    fn same_term_reheal_converges_det_and_refined_nodes_without_a_new_term() {
+        // The already-deterministic node: nothing differs, so it installs
+        // (and its master is the deterministic one) whatever the budget says.
+        let (det, _deviant, det_node_master, det_version, _a, _l) =
+            reheal_refinement_revert_probe(0, true);
+        // The refined node, budget spent.
+        let (_det, _deviant, refined_node_master, refined_version, _a, _l) =
+            reheal_refinement_revert_probe(500, false);
+
+        assert_eq!(
+            det_node_master, refined_node_master,
+            "a det node and a refined node at the same term must converge on ONE master",
+        );
+        assert_eq!(
+            refined_node_master, det,
+            "they converge on the DETERMINISTIC master — the only assignment every node \
+             derives identically",
+        );
+        assert_eq!(
+            (det_version, refined_version),
+            (5, 5),
+            "convergence must happen INSIDE the term — no version change on either node",
+        );
+    }
+
+    /// W11 FIX 3 (re-review P0-1) — the decline budget's own arithmetic.
+    #[test]
+    fn reheal_decline_budget_is_bounded_and_term_scoped() {
+        assert!(
+            reheal_decline_allowed(None, 7),
+            "a term with no declines yet may decline",
+        );
+        assert!(
+            reheal_decline_allowed(Some((7, REHEAL_MAX_CONSECUTIVE_DECLINES - 1)), 7),
+            "the last budgeted round may still decline",
+        );
+        assert!(
+            !reheal_decline_allowed(Some((7, REHEAL_MAX_CONSECUTIVE_DECLINES)), 7),
+            "a spent budget must force the install — the decline is a delay, never terminal",
+        );
+        assert!(
+            reheal_decline_allowed(Some((6, REHEAL_MAX_CONSECUTIVE_DECLINES)), 7),
+            "a spent budget from an OLDER term must not constrain a new term",
+        );
     }
 
     /// W9 FIX 3 (CI run 31971906387, default-06) — a det-degraded
@@ -36471,7 +37783,7 @@ mod tests {
         // The det-degrade shape: EMPTIED partition view, defer_plan_launch.
         let view: std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>> =
             std::collections::HashMap::new();
-        let pending = ClusterCoordinator::activate_topology_with_view(
+        let outcome = ClusterCoordinator::activate_topology_with_view(
             &members,
             new_epoch,
             placement_version,
@@ -36495,8 +37807,11 @@ mod tests {
             None,
             false,
             true,
-        )
-        .expect("a det activation with outbound tasks must return its deferred launch");
+            false,
+        );
+        let pending = outcome
+            .deferred
+            .expect("a det activation with outbound tasks must return its deferred launch");
 
         assert_eq!(pending.term, new_epoch);
         assert!(
@@ -36654,6 +37969,7 @@ mod tests {
             None,
             false,
             false,
+            false,
         );
 
         // The heal entry must survive the supersede (manager + hot-path atomic).
@@ -36754,6 +38070,7 @@ mod tests {
             &cluster.migration_throttle,
             &cluster.cluster_secret,
             None,
+            false,
             false,
             false,
         );
@@ -37914,6 +39231,7 @@ mod tests {
             &view,
             &std::collections::HashSet::new(),
             false,
+            &std::collections::HashSet::new(),
         );
 
         assert_eq!(
@@ -37993,6 +39311,7 @@ mod tests {
             &view,
             &std::collections::HashSet::new(),
             false,
+            &std::collections::HashSet::new(),
         );
         assert_eq!(
             table.target_assignment(shard).master,
@@ -38701,6 +40020,7 @@ mod tests {
             &view,
             &std::collections::HashSet::new(),
             false,
+            &std::collections::HashSet::new(),
         );
         (NodeId(1), NodeId(2), table.target_assignment(shard).master)
     }
@@ -38761,6 +40081,253 @@ mod tests {
         assert_eq!(
             elected, det,
             "equal reported counts are a data tie; the deterministic master must be preserved",
+        );
+    }
+
+    /// W11 FIX 2 — the exemption set must cover a LIVE handoff (the old master
+    /// keeps serving until the destination commits) and must NOT cover a
+    /// failover (the old master is dead, the plan sources from a surviving
+    /// replica, and nobody serves the shard until the fill lands — so the
+    /// election MUST still promote the holder). Regression pin for
+    /// `segment_cluster_master_failover_preserves_replicated_record`, which
+    /// fails outright when the failover shape is exempted.
+    #[test]
+    fn plan_filled_master_shards_covers_live_handoffs_but_never_failovers() {
+        let old_members = [NodeId(1), NodeId(2), NodeId(3)];
+        let old = ShardTable::compute_with_epoch(&old_members, 2, 1, 1);
+
+        // Scale-up: N4 joins, the old master stays alive.
+        let grown = [NodeId(1), NodeId(2), NodeId(3), NodeId(4)];
+        let up = ShardTable::compute_with_epoch(&grown, 2, 2, 1);
+        let moved = (0..NUM_SHARDS as u16)
+            .find(|&s| {
+                up.target_assignment(s).master == NodeId(4)
+                    && old.target_assignment(s).master != NodeId(4)
+            })
+            .expect("some shard moves its master to the newcomer");
+        let live_source = old.target_assignment(moved).master;
+        let entry = |shard: u16, seq: u64, flags: u8| {
+            vec![PartitionVersionEntry {
+                shard,
+                flags,
+                replica_count: 1,
+                last_applied_seq: seq,
+                manifest_digest: 0,
+                max_generation: 0,
+            }]
+        };
+        let mut view: std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>> =
+            std::collections::HashMap::new();
+        view.insert(live_source, entry(moved, 500, 0));
+        assert!(
+            plan_filled_master_shards(&old, &up, &view).contains(&moved),
+            "a live handoff keeps its source serving — the destination's emptiness is the \
+             plan's precondition",
+        );
+
+        // Same shape, but the source reports NOTHING: it cannot serve during
+        // the fill either, so no exemption.
+        let mut empty_source: std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>> =
+            std::collections::HashMap::new();
+        empty_source.insert(live_source, entry(moved, 0, 0));
+        assert!(
+            !plan_filled_master_shards(&old, &up, &empty_source).contains(&moved),
+            "a source holding nothing cannot serve the shard during the fill",
+        );
+        assert!(
+            plan_filled_master_shards(&old, &up, &std::collections::HashMap::new()).is_empty(),
+            "an empty view yields no exemptions — the pre-W11 behaviour",
+        );
+
+        // Failover: the master of `dead_shard` is killed, so the plan sources
+        // from a surviving replica and NOBODY serves the shard meanwhile.
+        let dead = NodeId(3);
+        let survivors = [NodeId(1), NodeId(2)];
+        let after = ShardTable::compute_with_epoch(&survivors, 2, 3, 1);
+        let failover_shard = (0..NUM_SHARDS as u16)
+            .find(|&s| {
+                let o = old.target_assignment(s);
+                o.master == dead
+                    && !o.replicas.is_empty()
+                    && !o.replicas.contains(&after.target_assignment(s).master)
+            })
+            .expect("some shard mastered by the killed node lands on a non-replica");
+        let source = old.target_assignment(failover_shard).replicas[0];
+        let mut failover_view: std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>> =
+            std::collections::HashMap::new();
+        failover_view.insert(source, entry(failover_shard, 500, 0));
+        failover_view.insert(dead, entry(failover_shard, 500, 0));
+        assert!(
+            !plan_filled_master_shards(&old, &after, &failover_view).contains(&failover_shard),
+            "a failover sources from a replica, not the (dead) master — the election must \
+             still promote the surviving holder or the shard is unserved until the fill lands",
+        );
+    }
+
+    /// W11 FIX 2 (re-review P1-2) — the source test must be MATERIAL LAG, not
+    /// `seq > 0`.
+    ///
+    /// Shape: the old master X is alive and in the new member set but holds
+    /// ONE record; the deterministic destination E holds none; a replica R
+    /// holds 3000. Under `seq > 0` the plan task `X -> E` exempts the shard,
+    /// the election keeps E, and once E's fill of X's single record completes
+    /// it serves as AUTHORITY holding 1 of 3001 records — every read for the
+    /// other 3000 returning NOT_FOUND from the authoritative master.
+    /// `build_plan_from_partition_view` uses the same weak predicate
+    /// downstream, so nothing else compensates.
+    #[test]
+    fn plan_filled_master_shards_requires_a_source_without_material_lag() {
+        let old_members = [NodeId(1), NodeId(2), NodeId(3)];
+        let old = ShardTable::compute_with_epoch(&old_members, 2, 1, 1);
+        let grown = [NodeId(1), NodeId(2), NodeId(3), NodeId(4)];
+        let up = ShardTable::compute_with_epoch(&grown, 2, 2, 1);
+        let moved = (0..NUM_SHARDS as u16)
+            .find(|&s| {
+                up.target_assignment(s).master == NodeId(4)
+                    && old.target_assignment(s).master != NodeId(4)
+                    && !old.target_assignment(s).replicas.is_empty()
+            })
+            .expect("some shard moves its master to the newcomer and had a replica");
+        let source = old.target_assignment(moved).master;
+        let replica = old.target_assignment(moved).replicas[0];
+        let entry = |seq: u64| {
+            vec![PartitionVersionEntry {
+                shard: moved,
+                flags: 0,
+                replica_count: 1,
+                last_applied_seq: seq,
+                manifest_digest: 0,
+                max_generation: 0,
+            }]
+        };
+
+        // Source holds 1, a replica holds 3000 — material lag.
+        let mut lagging: std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>> =
+            std::collections::HashMap::new();
+        lagging.insert(source, entry(1));
+        lagging.insert(replica, entry(3000));
+        assert!(
+            !plan_filled_master_shards(&old, &up, &lagging).contains(&moved),
+            "a source holding 1 record of 3001 cannot keep the shard served — the election \
+             must stay free to promote the real holder",
+        );
+
+        // Source within the material threshold (1500*2 >= 3000) — exempt.
+        let mut healthy: std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>> =
+            std::collections::HashMap::new();
+        healthy.insert(source, entry(1500));
+        healthy.insert(replica, entry(3000));
+        assert!(
+            plan_filled_master_shards(&old, &up, &healthy).contains(&moved),
+            "exchange-window skew (within the 2x threshold) must not withdraw the exemption",
+        );
+    }
+
+    /// W11 FIX 2 (CI @ 3a38dc2, scenarios 06 scale-up / 07 scale-down) — a
+    /// fresh activation must not demote a deterministic master whose fill is
+    /// carried by its OWN plan.
+    ///
+    /// Mid-rebalance the deterministic master is empty *because this
+    /// activation's plan has not run yet*, so the material-lag demotion fires
+    /// by construction: 1240 shards deviated in scenario 06, 978 in scenario
+    /// 07. Every one of those deviations is transient — the plan fills the
+    /// deterministic master, the Task #47 strict-superiority rule then decays
+    /// the deviation back, and the same-term re-heal that performs the decay
+    /// re-plans the whole store a second time. Worse, nodes reach the decay at
+    /// different moments, so two nodes install DIFFERENT tables at the SAME
+    /// shard-table version (default-06: n1/n4 decayed, n2/n3 had not, masters
+    /// summing 4408 against 4096).
+    ///
+    /// The mechanism itself must survive for its real purpose, so the
+    /// same-term re-heal with identical inputs still deviates, as does a fresh
+    /// activation whose plan does NOT carry the shard (a genuinely stale
+    /// placement) and one whose deterministic master has been evicted (no plan
+    /// can fill a dead node).
+    #[test]
+    fn apply_master_election_keeps_det_master_this_activations_plan_fills() {
+        let members = [NodeId(1), NodeId(2)];
+        let prev_table = ShardTable::compute_with_epoch(&members, 2, 1, 1);
+        let table = ShardTable::compute_with_epoch(&members, 2, 2, 1);
+        let shard = (0..NUM_SHARDS as u16)
+            .find(|&s| table.target_assignment(s).master == NodeId(1))
+            .expect("at least one shard mastered by N1 in a 2-member ring");
+        assert!(
+            table.target_assignment(shard).replicas.contains(&NodeId(2)),
+            "precondition: N2 is the shard's replica",
+        );
+
+        let entry = |seq: u64| {
+            vec![PartitionVersionEntry {
+                shard,
+                flags: 0,
+                replica_count: 1,
+                last_applied_seq: seq,
+                manifest_digest: 0,
+                max_generation: 0,
+            }]
+        };
+        let view_for = |det_count: u64| {
+            let mut view: std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>> =
+                std::collections::HashMap::new();
+            view.insert(NodeId(1), entry(det_count));
+            view.insert(NodeId(2), entry(500));
+            view
+        };
+        let in_plan = std::collections::HashSet::from([shard]);
+        let no_evictions = std::collections::HashSet::new();
+        let elect = |view: &std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>>,
+                     evicted: &std::collections::HashSet<NodeId>,
+                     adopt: bool,
+                     plan: &std::collections::HashSet<u16>| {
+            let mut t = table.clone();
+            apply_master_election(&mut t, &prev_table, view, evicted, adopt, plan);
+            t.target_assignment(shard).master
+        };
+
+        // Empty deterministic master, full replica, shard in this
+        // activation's plan → the deterministic pick stands.
+        assert_eq!(
+            elect(&view_for(0), &no_evictions, false, &in_plan),
+            NodeId(1),
+            "an empty det master this activation's own plan fills must not be demoted",
+        );
+        // Same for the material-lag shape (1 record of 500) — a partly filled
+        // destination is still mid-plan.
+        assert_eq!(
+            elect(&view_for(1), &no_evictions, false, &in_plan),
+            NodeId(1),
+            "a partially filled det master mid-plan must not be demoted",
+        );
+
+        // The mechanism survives where it belongs: the SAME-TERM RE-HEAL
+        // re-decides mastership from settled evidence and still deviates.
+        assert_eq!(
+            elect(&view_for(0), &no_evictions, true, &in_plan),
+            NodeId(2),
+            "the same-term re-heal must still promote the node holding the data",
+        );
+        // A fresh activation whose plan does NOT carry the shard still
+        // deviates — that emptiness is genuine evidence, not a precondition.
+        assert_eq!(
+            elect(
+                &view_for(0),
+                &no_evictions,
+                false,
+                &std::collections::HashSet::new()
+            ),
+            NodeId(2),
+            "a det master no plan fills is genuinely stale and must be demoted",
+        );
+        // An EVICTED deterministic master cannot be filled by any plan.
+        assert_eq!(
+            elect(
+                &view_for(0),
+                &std::collections::HashSet::from([NodeId(1)]),
+                false,
+                &in_plan,
+            ),
+            NodeId(2),
+            "no plan can fill a dead node; eviction overrides the plan exemption",
         );
     }
 
@@ -38825,6 +40392,7 @@ mod tests {
             &view,
             &std::collections::HashSet::new(),
             true,
+            &std::collections::HashSet::new(),
         );
         let mut table_node4 = ShardTable::compute_with_epoch(&members, rf, term, 1);
         apply_master_election(
@@ -38833,6 +40401,7 @@ mod tests {
             &view,
             &std::collections::HashSet::new(),
             true,
+            &std::collections::HashSet::new(),
         );
 
         assert_eq!(
@@ -38889,6 +40458,7 @@ mod tests {
             &view,
             &std::collections::HashSet::new(),
             false,
+            &std::collections::HashSet::new(),
         );
         assert_eq!(
             table.target_assignment(shard).master,
@@ -38916,6 +40486,7 @@ mod tests {
             &view,
             &std::collections::HashSet::new(),
             false,
+            &std::collections::HashSet::new(),
         );
         assert_eq!(
             table.target_assignment(7),
@@ -38940,7 +40511,14 @@ mod tests {
         let mut evicted = std::collections::HashSet::new();
         evicted.insert(NodeId(1));
 
-        apply_master_election(&mut table, &prev_table, &view, &evicted, false);
+        apply_master_election(
+            &mut table,
+            &prev_table,
+            &view,
+            &evicted,
+            false,
+            &std::collections::HashSet::new(),
+        );
         assert_ne!(
             table.target_assignment(shard).master,
             NodeId(1),
@@ -39016,6 +40594,7 @@ mod tests {
             &view,
             &std::collections::HashSet::new(),
             true,
+            &std::collections::HashSet::new(),
         );
         let mut table_node4 = ShardTable::compute_with_epoch(&members, rf, term, 1);
         apply_master_election(
@@ -39024,6 +40603,7 @@ mod tests {
             &view,
             &std::collections::HashSet::new(),
             true,
+            &std::collections::HashSet::new(),
         );
 
         assert_eq!(
@@ -39093,6 +40673,7 @@ mod tests {
             &view,
             &std::collections::HashSet::new(),
             true,
+            &std::collections::HashSet::new(),
         );
         let mut reheal_node4 = ShardTable::compute_with_epoch(&members, rf, term, 1);
         apply_master_election(
@@ -39101,6 +40682,7 @@ mod tests {
             &view,
             &std::collections::HashSet::new(),
             true,
+            &std::collections::HashSet::new(),
         );
 
         assert_eq!(
@@ -39174,6 +40756,7 @@ mod tests {
             &view,
             &std::collections::HashSet::new(),
             true,
+            &std::collections::HashSet::new(),
         );
         let mut table_node4 = ShardTable::compute_with_epoch(&members, rf, term, 1);
         apply_master_election(
@@ -39182,6 +40765,7 @@ mod tests {
             &view,
             &std::collections::HashSet::new(),
             true,
+            &std::collections::HashSet::new(),
         );
 
         assert_eq!(
@@ -39263,6 +40847,7 @@ mod tests {
             &view,
             &std::collections::HashSet::new(),
             false,
+            &std::collections::HashSet::new(),
         );
         assert_eq!(
             table.target_assignment(shard).master,
@@ -39330,6 +40915,7 @@ mod tests {
             &forward,
             &std::collections::HashSet::new(),
             true,
+            &std::collections::HashSet::new(),
         );
         let mut table_rev = ShardTable::compute_with_epoch(&members, rf, term, 1);
         apply_master_election(
@@ -39338,6 +40924,7 @@ mod tests {
             &reversed,
             &std::collections::HashSet::new(),
             true,
+            &std::collections::HashSet::new(),
         );
 
         assert_eq!(
@@ -39403,6 +40990,7 @@ mod tests {
             &view,
             &std::collections::HashSet::new(),
             true,
+            &std::collections::HashSet::new(),
         );
 
         assert_ne!(
@@ -39429,6 +41017,165 @@ mod tests {
     /// Task #47 — a same-term re-heal exchange result may only be applied
     /// while the committed topology it was collected for is still current;
     /// a term advance or member-set change during the exchange invalidates it.
+    /// W11 FIX 3 — every guard on the refinement-revert decline, exercised
+    /// one at a time on the pure predicate. Each guard exists because
+    /// declining under it would swallow real work: an outstanding repair, a
+    /// stale table version, a re-heal that DOES refine (equal views compute it
+    /// identically everywhere, so installing it converges), a no-diff
+    /// activation, and a phantom whose local master holds nothing.
+    #[test]
+    fn reheal_refinement_revert_predicate_guards() {
+        let members = [NodeId(1), NodeId(2)];
+        let term = 5u64;
+        let det = ShardTable::compute_with_epoch(&members, 2, term, 1);
+        let shard = (0..NUM_SHARDS as u16)
+            .find(|&s| {
+                let a = det.target_assignment(s);
+                a.master == NodeId(1) && a.replicas.contains(&NodeId(2))
+            })
+            .expect("some shard has det master N1 and replica N2");
+        let det_masters: Vec<NodeId> = (0..NUM_SHARDS as u16)
+            .map(|s| det.target_assignment(s).master)
+            .collect();
+
+        let mut local = det.clone();
+        local.set_master_for_shard(shard, NodeId(2));
+
+        let view_with = |seq: u64, flags: u8| {
+            let mut view: std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>> =
+                std::collections::HashMap::new();
+            view.insert(
+                NodeId(2),
+                vec![PartitionVersionEntry {
+                    shard,
+                    flags,
+                    replica_count: 1,
+                    last_applied_seq: seq,
+                    manifest_digest: 0,
+                    max_generation: 0,
+                }],
+            );
+            view
+        };
+
+        // Baseline: recomputed == deterministic, one differing shard whose
+        // local master still holds the data → decline.
+        assert!(
+            reheal_install_reverts_refinement_only(
+                &local,
+                &det,
+                &det_masters,
+                &view_with(500, 0),
+                term,
+                false,
+            ),
+            "a live refinement revert with no outstanding work must be declined",
+        );
+
+        // Guard: outstanding local repair work.
+        assert!(
+            !reheal_install_reverts_refinement_only(
+                &local,
+                &det,
+                &det_masters,
+                &view_with(500, 0),
+                term,
+                true,
+            ),
+            "outstanding repair work must always be re-driven",
+        );
+
+        // Guard: the local table is not on the committed term.
+        assert!(
+            !reheal_install_reverts_refinement_only(
+                &local,
+                &det,
+                &det_masters,
+                &view_with(500, 0),
+                term + 1,
+                false,
+            ),
+            "a stale table version mandates the install",
+        );
+
+        // Guard: empty view — no evidence, no decline.
+        assert!(
+            !reheal_install_reverts_refinement_only(
+                &local,
+                &det,
+                &det_masters,
+                &std::collections::HashMap::new(),
+                term,
+                false,
+            ),
+            "an empty view justifies nothing",
+        );
+
+        // Guard: the local master reports only a SUBSET of the shard.
+        assert!(
+            !reheal_install_reverts_refinement_only(
+                &local,
+                &det,
+                &det_masters,
+                &view_with(500, PARTITION_FLAG_PENDING_INBOUND),
+                term,
+                false,
+            ),
+            "a subset holder is not a justified refinement",
+        );
+
+        // Guard: the local master holds nothing — a phantom, must install.
+        assert!(
+            !reheal_install_reverts_refinement_only(
+                &local,
+                &det,
+                &det_masters,
+                &view_with(0, 0),
+                term,
+                false,
+            ),
+            "a phantom master is exactly what the re-heal exists to repair",
+        );
+
+        // Guard: nothing differs — not a revert at all.
+        assert!(
+            !reheal_install_reverts_refinement_only(
+                &det,
+                &det,
+                &det_masters,
+                &view_with(500, 0),
+                term,
+                false,
+            ),
+            "an install that changes nothing is not a refinement revert",
+        );
+
+        // Guard: the recomputed answer ITSELF refines — install it, since
+        // equal views produce it identically on every node.
+        let mut refined = det.clone();
+        refined.set_master_for_shard(shard, NodeId(2));
+        let other = (0..NUM_SHARDS as u16)
+            .find(|&s| {
+                s != shard
+                    && det.target_assignment(s).master == NodeId(1)
+                    && det.target_assignment(s).replicas.contains(&NodeId(2))
+            })
+            .expect("a second N1-mastered shard exists");
+        let mut local_two = det.clone();
+        local_two.set_master_for_shard(other, NodeId(2));
+        assert!(
+            !reheal_install_reverts_refinement_only(
+                &local_two,
+                &refined,
+                &det_masters,
+                &view_with(500, 0),
+                term,
+                false,
+            ),
+            "a re-heal that installs its own refinement must not be declined",
+        );
+    }
+
     #[test]
     fn same_term_reheal_applicable_only_for_current_term_and_members() {
         let members = vec![NodeId(1), NodeId(2), NodeId(3)];
@@ -39454,6 +41201,7 @@ mod tests {
     /// re-fires with a fresh exchange on the next cooldown tick.
     #[test]
     fn same_term_reheal_degenerate_view_skips_activation() {
+        let _guard = reheal_skip_counter_test_guard();
         let before = reheal_skipped_degenerate_view_total();
         // Admitted completions must not count a skip. (Asserted inside this
         // test — the only incrementer — so parallel tests cannot race it.)
@@ -39488,6 +41236,7 @@ mod tests {
     /// activation (armed-15), and holding costs one cooldown tick.
     #[test]
     fn same_term_reheal_requires_full_member_view() {
+        let _guard = reheal_skip_counter_test_guard();
         assert_eq!(
             admit_exchange_completion(true, 7, 3, 3),
             ExchangeAdmission::Admit,
@@ -39615,6 +41364,7 @@ mod tests {
     /// same-term re-heal.
     #[test]
     fn armed_15_three_different_two_of_three_views_all_degrade_det() {
+        let _guard = reheal_skip_counter_test_guard();
         let members = [NodeId(1), NodeId(2), NodeId(3)];
         let rf = 2;
         let term = 15u64;
@@ -39657,6 +41407,7 @@ mod tests {
                 &empty_view,
                 &std::collections::HashSet::new(),
                 false,
+                &std::collections::HashSet::new(),
             );
             tables.push(
                 (0..NUM_SHARDS as u16)

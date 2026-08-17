@@ -1612,6 +1612,36 @@ pub(crate) fn render_metrics_text(
         "teraslab_reheal_skipped_degenerate_view_total",
         crate::cluster::coordinator::reheal_skipped_degenerate_view_total(),
     );
+    // W11 FIX 3 — same-term re-heal installs declined because the install
+    // would have done nothing but revert refinement the fresh partition view
+    // still justifies. That revert is the time-dependent half of the re-heal:
+    // nodes that go idle at different moments used to install DIFFERENT
+    // tables at the SAME shard-table version.
+    prom_counter(
+        &mut out,
+        "teraslab_reheal_skipped_refinement_revert_total",
+        crate::cluster::coordinator::reheal_skipped_refinement_revert_total(),
+    );
+    // W11 FIX 1 — local-holder backfill streams elided because the shared
+    // partition view proved the destination already holds the shard. A
+    // rising value is the fix working: it counts the whole-store re-stream
+    // that used to be re-planned on every same-term repair round.
+    prom_counter(
+        &mut out,
+        "teraslab_backfill_tasks_skipped_view_owned_total",
+        crate::cluster::coordinator::backfill_tasks_skipped_view_owned_total(),
+    );
+    // W11 FIX 2 — shards whose master election was left at the deterministic
+    // pick because the same activation's own plan carries their fill. A
+    // rising value on a rebalance is the fix working: those deviations were
+    // transient by construction and only served to arm a second whole-store
+    // repair round (and, when nodes decayed at different moments, same-version
+    // divergent tables).
+    prom_counter(
+        &mut out,
+        "teraslab_election_deviations_suppressed_plan_fill_total",
+        crate::cluster::coordinator::election_deviations_suppressed_plan_fill_total(),
+    );
     // W8 — first-of-term activations that degraded to the pure
     // deterministic (emptied-view) table because their exchange completed
     // below the member-view quorum. Usually rescued within ~2 s by the
@@ -5490,6 +5520,9 @@ mod tests {
             "teraslab_assignment_rejected_total",
             "teraslab_assignment_master_count_alerts_total",
             "teraslab_reheal_skipped_degenerate_view_total",
+            "teraslab_reheal_skipped_refinement_revert_total",
+            "teraslab_backfill_tasks_skipped_view_owned_total",
+            "teraslab_election_deviations_suppressed_plan_fill_total",
             "teraslab_activation_degraded_degenerate_view_total",
             "teraslab_exchange_peer_failure_connect_total",
             "teraslab_exchange_peer_failure_status_total",
