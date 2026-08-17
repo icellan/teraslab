@@ -1284,10 +1284,14 @@ fn fail_migration_task_current_epoch(
 ///
 /// This gate treats ANY skip (`skipped > 0`) as "enumeration incomplete this
 /// round": the caller must NOT finalize / hand off the affected shards. Every
-/// outbound task in the round is FAILED and rolled back to `self`
-/// ([`FailedTaskTableAction::Rollback`] — the historical no-loss-safe outcome,
-/// never a relinquish, so a record we could not read is never handed to a peer
-/// that might not hold it). Rolling the shards back to `self` leaves the local
+/// outbound task in the round is FAILED; a MASTER handoff is additionally
+/// rolled back to `self` ([`FailedTaskTableAction::Rollback`] — the historical
+/// no-loss-safe outcome, never a relinquish, so a record we could not read is
+/// never handed to a peer that might not hold it), while a replica-side task
+/// leaves the table untouched ([`FailedTaskTableAction::None`], the W3 FIX C
+/// disposition — re-review P2-1: `rollback_shard` is shard-scoped, so a
+/// replica-round rollback would revert an unrelated in-flight master handoff
+/// of the same shard). Rolling a master shard back to `self` leaves the local
 /// table diverged from the committed topology, which the periodic reactivation
 /// loop (and the rejoin `take_failed_tasks` re-drive) re-runs next pass — when
 /// the record may read cleanly.
@@ -1327,7 +1331,22 @@ fn finalize_enumeration_round(
             migrating_bm,
             task,
             topology_epoch,
-            FailedTaskTableAction::Rollback,
+            // W10 re-review P2-1: the table action follows the W3 FIX C
+            // disposition PER TASK — only a MASTER handoff rolls the table
+            // back to self; a replica-side task (every Phase-H resync
+            // task) leaves the table untouched. `rollback_shard` is
+            // shard-scoped, not task-scoped: a blanket Rollback here let a
+            // failed replica-only resync round revert a CONCURRENT
+            // mid-Copying master handoff of the same shard (different
+            // to_node, so the drain's dedup admits both) under its
+            // still-streaming worker. Pre-W10 the untracked check bailed
+            // before the action; start_outbound registration made the
+            // hazard reachable.
+            if task.is_master {
+                FailedTaskTableAction::Rollback
+            } else {
+                FailedTaskTableAction::None
+            },
         );
     }
     false
@@ -15204,10 +15223,10 @@ fn prepare_resync_backfill(
     let (keys_map, skipped) = engine.keys_by_shard_filtered(&target_shards);
     // Issue #46 fail-safe: an unreadable-footer skip means this resync key
     // set is incomplete — do not backfill a short set. The tasks are tracked,
-    // so the fail parks them in the durable retry queue (the table rollback
-    // is a no-op for a replica backfill on a settled table); the failed-batch
-    // re-drive and the catchup loop's next resync re-request both re-drive
-    // once the record reads cleanly.
+    // so the fail parks them in the durable retry queue; being replica-side,
+    // they take the W3 FIX C table disposition (no table action — re-review
+    // P2-1). The failed-batch re-drive and the catchup loop's next resync
+    // re-request both re-drive once the record reads cleanly.
     if !finalize_enumeration_round(
         skipped,
         &tasks,
@@ -24093,6 +24112,113 @@ mod tests {
             migration.lock().active_count(),
             1,
             "the pre-existing tracked entry must remain the only registration"
+        );
+    }
+
+    /// W10 re-review P2-1 — a failed enumeration round must apply the W3
+    /// FIX C table disposition PER TASK: only a MASTER handoff rolls the
+    /// table back to self; a replica-side task (every Phase-H resync task)
+    /// leaves the table untouched. `rollback_shard` is shard-scoped, not
+    /// task-scoped, so the blanket Rollback let a failed replica-only
+    /// resync round revert a CONCURRENT mid-Copying master handoff of the
+    /// same shard (different to_node, so the drain's dedup admits both)
+    /// under its still-streaming worker. Pre-W10 the untracked check
+    /// bailed before the table action — registration made the hazard
+    /// reachable.
+    #[test]
+    fn enumeration_fail_keeps_table_for_replica_tasks_rolls_back_masters() {
+        let old_members = vec![NodeId(1), NodeId(2)];
+        let new_members = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let old_table = ShardTable::compute_with_epoch(&old_members, 2, 1, 1);
+        let new_table = ShardTable::compute_with_epoch(&new_members, 2, 2, 1);
+        let shard = (0..NUM_SHARDS as u16)
+            .find(|&s| {
+                old_table.target_assignment(s).master == NodeId(1)
+                    && new_table.target_assignment(s).master == NodeId(3)
+            })
+            .expect("a shard whose master moves 1 -> 3");
+
+        // The shard is mid-Copying under a live master handoff 1 -> 3.
+        let mut handoff = old_table.clone();
+        handoff.begin_handoff_with(&new_table, |s| s == shard);
+        assert_eq!(handoff.shard_handoff_state(shard), ShardHandoff::Copying);
+        let epoch = handoff.version;
+        let shard_table = Arc::new(ShardTableLock::new(handoff));
+        let migration = Arc::new(Mutex::new(MigrationManager::new()));
+        let fenced_bm = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+        let migrating_bm = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+
+        // A REPLICA-side round for the same shard toward a DIFFERENT
+        // target (the resync shape: is_master = false, so the
+        // (shard -> target) dedup admits it beside the live 1 -> 3
+        // handoff).
+        let replica_task = MigrationTask {
+            shard,
+            from_node: NodeId(1),
+            to_node: NodeId(2),
+            is_master: false,
+        };
+        migration.lock().start_outbound(
+            std::slice::from_ref(&replica_task),
+            NodeId(1),
+            &std::collections::HashSet::new(),
+        );
+        assert!(!finalize_enumeration_round(
+            1,
+            std::slice::from_ref(&replica_task),
+            &migration,
+            &shard_table,
+            &fenced_bm,
+            &migrating_bm,
+            epoch,
+        ));
+        {
+            let table = shard_table.read();
+            assert_eq!(
+                table.shard_handoff_state(shard),
+                ShardHandoff::Copying,
+                "a failed REPLICA-side round must leave the in-flight master \
+                 handoff untouched (W3 FIX C)"
+            );
+            assert_eq!(
+                table.target_assignment(shard).master,
+                NodeId(3),
+                "the mid-Copying handoff's target assignment must survive"
+            );
+        }
+        assert_eq!(
+            migration.lock().failed_count(),
+            1,
+            "the replica task must still park Failed in the retry queue"
+        );
+
+        // A MASTER task in a failed round keeps the historical no-loss
+        // rollback-to-self.
+        let master_task = MigrationTask {
+            shard,
+            from_node: NodeId(1),
+            to_node: NodeId(3),
+            is_master: true,
+        };
+        migration.lock().start_outbound(
+            std::slice::from_ref(&master_task),
+            NodeId(1),
+            &std::collections::HashSet::new(),
+        );
+        assert!(!finalize_enumeration_round(
+            1,
+            std::slice::from_ref(&master_task),
+            &migration,
+            &shard_table,
+            &fenced_bm,
+            &migrating_bm,
+            epoch,
+        ));
+        let table = shard_table.read();
+        assert_eq!(
+            table.target_assignment(shard).master,
+            NodeId(1),
+            "a failed MASTER handoff must still roll back to self"
         );
     }
 
