@@ -303,7 +303,17 @@ async fn check_health(
             continue;
         }
         match c.round_trip(OP_PING, 0, Vec::new()).await {
-            Ok(resp) if resp.status == STATUS_OK => {}
+            Ok(resp) if resp.status == STATUS_OK => {
+                // W11 P1-C — a successful PING is PROOF of reachability and
+                // must clear `dial_failing`, not just a successful dial. A
+                // transiently-failed replacement dial can latch the flag while
+                // live connections remain; from then on `deficit` is 0, the
+                // replenish loop below never runs, and the flag would stay set
+                // forever — so the first time SWIM suspects this node and the
+                // map advertises it dead, the router would refuse a perfectly
+                // reachable master for the whole suspicion window.
+                dial_failing.store(false, Ordering::Release);
+            }
             _ => {
                 // Failed or non-OK ping: the peer is gone. Close so the
                 // background read loop is aborted and waiters wake.
@@ -324,11 +334,15 @@ async fn check_health(
 
     // Replenish to min_conns.
     //
-    // W11 FIX 4 — this loop is what CLEARS a `dial_failing` node that has
-    // come back: the cluster router refuses to route to a proven-unreachable
-    // dead-advertised master, so no request-path dial would ever retry it.
-    // A zero deficit means the pool is healthy and the flag already reads
-    // false, so leaving it untouched is correct.
+    // W11 FIX 4 — together with the PING arm above, this is what CLEARS a
+    // `dial_failing` node that has come back: the cluster router refuses to
+    // route to a proven-unreachable dead-advertised master, so no
+    // request-path dial would ever retry it.
+    //
+    // W11 P1-C — a zero deficit does NOT imply the flag already reads false
+    // (a failed replacement dial can latch it while live connections remain),
+    // which is exactly why the successful-PING arm above clears it and this
+    // loop is not the only clearing path.
     for _ in 0..deficit {
         match PipeConn::dial(addr, config.dial_timeout, config.request_timeout).await {
             Ok(c) => {
@@ -341,5 +355,129 @@ async fn check_health(
                 break;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Minimal server that answers every frame with `STATUS_OK` and an empty
+    /// payload — enough for the health loop's `OP_PING` round-trip.
+    async fn spawn_ping_server() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    loop {
+                        let mut len_buf = [0u8; 4];
+                        if sock.read_exact(&mut len_buf).await.is_err() {
+                            return;
+                        }
+                        let total = u32::from_le_bytes(len_buf) as usize;
+                        if total < 12 {
+                            return;
+                        }
+                        let mut body = vec![0u8; total];
+                        if sock.read_exact(&mut body).await.is_err() {
+                            return;
+                        }
+                        let request_id = u64::from_le_bytes(body[0..8].try_into().unwrap());
+                        let mut out = 9u32.to_le_bytes().to_vec();
+                        out.extend_from_slice(&request_id.to_le_bytes());
+                        out.push(STATUS_OK);
+                        if sock.write_all(&out).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        addr
+    }
+
+    fn test_pool_config(min_conns: usize) -> PoolConfig {
+        PoolConfig {
+            min_conns,
+            max_conns: 16,
+            dial_timeout: Duration::from_millis(300),
+            request_timeout: Duration::from_secs(5),
+            // Long enough that the background loop never races the explicit
+            // `check_health` calls these tests drive.
+            health_check: Duration::from_secs(3600),
+        }
+    }
+
+    /// W11 P1-C — `dial_failing` must be cleared by a SUCCESSFUL PING, not
+    /// only by a successful dial.
+    ///
+    /// Reachable staleness: a pool holding several connections loses one,
+    /// `create_conn` dials a replacement, and THAT dial fails transiently (a
+    /// server-side per-IP rejection under load, a brief ECONNREFUSED during a
+    /// rolling restart) — so `dial_failing` latches true while live
+    /// connections remain. Every later health tick then finds `deficit == 0`,
+    /// never enters the replenish loop, and the flag never clears. Minutes
+    /// later SWIM suspects that node, the map advertises `is_alive = 0`, and
+    /// `Cluster::pool_for_shard` refuses a perfectly reachable master for the
+    /// whole suspicion window — the P0 that
+    /// `dead_advertised_master_keeps_its_pool` pins, re-opened via a stale
+    /// flag.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn successful_ping_clears_a_stale_dial_failing_flag() {
+        let addr = spawn_ping_server().await;
+        // min_conns = 1 so a single live connection leaves deficit == 0 and
+        // the replenish loop — the ONLY pre-fix clearing path — never runs.
+        let config = test_pool_config(1);
+        let pool = ConnPool::new(addr.clone(), config.clone());
+
+        // One healthy connection, established by a successful dial.
+        pool.get().await.expect("the ping server is reachable");
+        assert!(
+            !pool.dial_failing(),
+            "a successful dial leaves the flag clear"
+        );
+        assert_eq!(pool.conns.lock().len(), 1, "one live connection is pooled");
+
+        // A transient replacement dial fails while that connection stays live.
+        pool.dial_failing.store(true, Ordering::Release);
+
+        check_health(&addr, &config, &pool.conns, &pool.dial_failing).await;
+
+        assert_eq!(
+            pool.conns.lock().len(),
+            1,
+            "the live connection pinged OK, so deficit stayed 0 and the \
+             replenish loop never ran — the pre-fix clearing path is absent",
+        );
+        assert!(
+            !pool.dial_failing(),
+            "a successful health PING proves the node is reachable and MUST \
+             clear the flag, or routing to it stays refused forever",
+        );
+        pool.close().await;
+    }
+
+    /// The flag must still LATCH when the node is genuinely gone: no live
+    /// connection to ping, and the replenish dial fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn health_check_latches_dial_failing_when_the_node_is_unreachable() {
+        // Bind then drop, so the port is closed and dials are refused.
+        let addr = {
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            l.local_addr().unwrap().to_string()
+        };
+        let config = test_pool_config(1);
+        let pool = ConnPool::new(addr.clone(), config.clone());
+        assert!(!pool.dial_failing(), "a fresh pool is given one chance");
+
+        check_health(&addr, &config, &pool.conns, &pool.dial_failing).await;
+
+        assert!(
+            pool.dial_failing(),
+            "a failed replenish dial must record unreachability",
+        );
+        pool.close().await;
     }
 }
