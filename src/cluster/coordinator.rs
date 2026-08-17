@@ -13954,7 +13954,7 @@ fn run_migration_batch_with_origin(
                                         )
                                         .map_err(|e| {
                                             EscalationAttemptError::Repush(format!(
-                                                "weak-veto arbitration rejected by target: {e}"
+                                                "{WEAK_VETO_ARBITRATION_REJECTED_PREFIX} {e}"
                                             ))
                                         })?;
                                         if let Some(m) = crate::metrics::migration_metrics() {
@@ -15251,6 +15251,47 @@ pub(crate) fn completion_rejection_manifest_mismatch(err: &str) -> bool {
         && err.contains("count matched")
 }
 
+/// W12 TAIL 3 — is `err` a WEAK-VETO ARBITRATION the target refused on
+/// AUTHORITY grounds, i.e. a refusal that re-sending the identical frame can
+/// never overcome?
+///
+/// The arbitration handler answers `ERR_INVARIANT_VIOLATION` for exactly the
+/// structural refusals: the requester is not the shard's target-or-effective
+/// master in the target's table; the target has no open inbound transfer from
+/// the requester; the key carries a ClientDelete/Dah tombstone (never
+/// arbitrable); arbitration is disarmed on the target; or the key is not in
+/// the named shard. None of those change by asking again at the same epoch.
+///
+/// Deliberately NOT matched:
+/// * `ERR_STALE_EPOCH` — the two sides are on different activated versions
+///   and the epoch-current re-drive is the mechanism that fixes it, so the
+///   task must stay retryable;
+/// * a SOURCE-side arbitration failure ("none of the vetoed key(s) held live
+///   on the source"), which never reached the target at all;
+/// * a bare completion rejection carrying the same code — the
+///   `weak-veto arbitration rejected by target:` prefix
+///   ([`EscalationAction::ArbitrateWeakVeto`]'s `map_err`) is what scopes
+///   this to an arbitration.
+///
+/// The producer, the [`migration_complete_rejection_error`] envelope and this
+/// parser are pinned together by the cross-module contract test
+/// `weak_veto_authority_refusal_is_recognised_by_the_terminal_parser`
+/// (`server::dispatch` tests), so the formats cannot drift apart.
+pub(crate) fn weak_veto_arbitration_terminally_refused(err: &str) -> bool {
+    err.contains(WEAK_VETO_ARBITRATION_REJECTED_PREFIX)
+        && err.contains(&format!(
+            "(code={}:",
+            crate::protocol::opcodes::ERR_INVARIANT_VIOLATION
+        ))
+}
+
+/// The prefix [`EscalationAction::ArbitrateWeakVeto`] wraps a TARGET refusal
+/// of `OP_MIGRATION_WEAK_VETO_ARBITRATE` in. Shared with
+/// [`weak_veto_arbitration_terminally_refused`] so the producer and the
+/// parser cannot drift.
+pub(crate) const WEAK_VETO_ARBITRATION_REJECTED_PREFIX: &str =
+    "weak-veto arbitration rejected by target:";
+
 /// GAP 1 — outcome of the bounded manifest-mismatch record-level re-sync
 /// ([`escalate_manifest_mismatch`]).
 #[derive(Debug, PartialEq, Eq)]
@@ -15591,12 +15632,42 @@ fn escalate_missing_exact_keys(
             match attempt(EscalationAction::ArbitrateWeakVeto(&arbitrate_now)) {
                 Ok(()) => return ExactKeyEscalation::Verified,
                 Err(EscalationAttemptError::Repush(e)) => {
-                    // Arbitration unavailable (no live copy to push, the
-                    // target refused the clear, or the stream broke). The
-                    // next pass parses this message: it names no vetoed and
-                    // no missing keys, so the escalation falls through to
-                    // the historical fail/rollback handling — data-safe,
-                    // exactly the pre-W10 disposition.
+                    // W12 TAIL 3 — an AUTHORITY-class refusal is terminal.
+                    // The target has told us we are not entitled to clear
+                    // its weak marker at this epoch (we are not the shard's
+                    // master in its table, it has no open inbound from us,
+                    // the key is never arbitrable, or arbitration is
+                    // disarmed there). Re-sending the identical frame can
+                    // never change that, and the historical path below
+                    // leaves the task RETRYABLE — which is how armed
+                    // scenario 09 @ fc5e5f7 re-drove the same doomed
+                    // handshake for shards 1563/3957 every ~12 s until the
+                    // gate gave up, with no escalation, no abort and no
+                    // reap on any branch. Terminate instead: the caller
+                    // rolls back to source and RETIRES the task, so the
+                    // condition becomes loud and finite rather than silent
+                    // and eternal.
+                    if weak_veto_arbitration_terminally_refused(&e) {
+                        if let Some(m) = crate::metrics::migration_metrics() {
+                            m.migration_weak_veto_arbitration_refused.inc();
+                        }
+                        tracing::warn!(
+                            keys = arbitrate_now.len(),
+                            err = %e,
+                            "cluster: weak-veto arbitration REFUSED on authority \
+                             grounds — the target will never accept this source's \
+                             clear at this epoch; terminal abort instead of \
+                             re-driving the identical handshake",
+                        );
+                        return ExactKeyEscalation::Exhausted { last_err: e };
+                    }
+                    // Arbitration unavailable for a non-terminal reason (no
+                    // live copy to push, a stale epoch, or the stream
+                    // broke). The next pass parses this message: it names
+                    // no vetoed and no missing keys, so the escalation
+                    // falls through to the historical fail/rollback
+                    // handling — data-safe, exactly the pre-W10
+                    // disposition.
                     last_err = e;
                     reparse_missing = true;
                     continue;
@@ -33990,6 +34061,153 @@ mod tests {
             }
             other => panic!("expected NotExactKey fallback, got {other:?}"),
         }
+    }
+
+    /// W12 TAIL 3 (RED→GREEN) — an arbitration the target refuses on
+    /// AUTHORITY grounds (`ERR_INVARIANT_VIOLATION`) can never succeed by
+    /// being re-sent, so it must terminate the task instead of dropping it
+    /// back on the retryable historical path.
+    ///
+    /// Armed scenario 09 @ fc5e5f7 is the whole failure in one loop. Node3
+    /// was a PHANTOM master of shards 1563/3957 — still serving them while
+    /// the epoch-6 table gave both to node1 — and tried to complete the
+    /// handoff. Node1 vetoed one exact key per shard with a WEAK
+    /// `PruneReplace` tombstone, so the source escalated to arbitration; and
+    /// node1's authority gate (`dispatch`: `from_node` must be the shard's
+    /// target-or-effective master in MY table) refused, because at epoch 6
+    /// node1 is itself that master and the phantom source is nobody:
+    ///
+    ///   code=33: weak-veto arbitration: node 3 is not shard 1563's
+    ///            authoritative holder at epoch 6
+    ///
+    /// The refusal names no vetoed and no missing keys, so the escalation
+    /// returned `NotExactKey`, the historical path left the task RETRYABLE,
+    /// and the delayed-self-retry re-drove the identical doomed handshake
+    /// every ~12 s. Seven rounds per shard were logged before the 120 s gate
+    /// fired with `overlapping=2 [1563(n1+n3), 3957(n1+n3)]`; the code-22
+    /// livelock breaker and the exact-key terminal abort both sit on
+    /// branches a code-33 refusal never enters.
+    ///
+    /// Terminating does NOT converge the phantom mastership — that needs the
+    /// arbitration gates to be reachable for a phantom source, which is a
+    /// separate design question — but it stops the unbounded re-drive and
+    /// makes the condition terminal and loud instead of silent and eternal.
+    #[test]
+    fn escalation_terminates_when_the_target_refuses_arbitration_authority() {
+        let manifest = vec![(tk(2), 7u32)];
+        let initial = vetoed_reject_cause(tk(2), 9, "PruneReplace");
+        let mut rounds = 0usize;
+        let outcome = escalate_missing_exact_keys(initial, &manifest, 3, true, true, |action| {
+            let EscalationAction::ArbitrateWeakVeto(_) = action else {
+                panic!("only arbitration may run: {action:?}");
+            };
+            rounds += 1;
+            Err(EscalationAttemptError::Repush(format!(
+                "weak-veto arbitration rejected by target: {}",
+                migration_complete_rejection_error(
+                    1,
+                    &crate::protocol::codec::encode_error_payload(
+                        crate::protocol::opcodes::ERR_INVARIANT_VIOLATION,
+                        "weak-veto arbitration: node 3 is not shard 1563's \
+                         authoritative holder at epoch 6",
+                    ),
+                ),
+            )))
+        });
+        assert_eq!(rounds, 1, "exactly one arbitration round is attempted");
+        match outcome {
+            ExactKeyEscalation::Exhausted { last_err } => {
+                assert!(
+                    last_err.contains("is not shard 1563's authoritative holder"),
+                    "the terminal error must carry the refusal that ended it: {last_err}",
+                );
+            }
+            other => panic!(
+                "an authority refusal is unwinnable by re-sending — expected \
+                 Exhausted (terminal abort), got {other:?}"
+            ),
+        }
+    }
+
+    /// W12 TAIL 3 — the counterpart: a STALE-EPOCH arbitration refusal is
+    /// NOT terminal. The target is simply on a different activated version;
+    /// the epoch-current re-drive is exactly the mechanism that resolves it,
+    /// so the task must stay retryable.
+    #[test]
+    fn a_stale_epoch_arbitration_refusal_stays_retryable() {
+        let manifest = vec![(tk(2), 7u32)];
+        let initial = vetoed_reject_cause(tk(2), 9, "PruneReplace");
+        let refusal = format!(
+            "weak-veto arbitration rejected by target: {}",
+            migration_complete_rejection_error(
+                1,
+                &crate::protocol::codec::encode_error_payload(
+                    crate::protocol::opcodes::ERR_STALE_EPOCH,
+                    "weak-veto arbitration: epoch 5 is not the activated version 6",
+                ),
+            ),
+        );
+        let outcome = escalate_missing_exact_keys(initial, &manifest, 3, true, true, |action| {
+            let EscalationAction::ArbitrateWeakVeto(_) = action else {
+                panic!("only arbitration may run: {action:?}");
+            };
+            Err(EscalationAttemptError::Repush(refusal.clone()))
+        });
+        match outcome {
+            ExactKeyEscalation::NotExactKey { last_err } => {
+                assert!(
+                    last_err.contains("is not the activated version"),
+                    "the historical path carries the stale-epoch refusal: {last_err}",
+                );
+            }
+            other => panic!("expected the retryable historical path, got {other:?}"),
+        }
+    }
+
+    /// W12 TAIL 3 — the classifier itself: it must fire ONLY on an
+    /// authority-class refusal of an ARBITRATION, never on a completion
+    /// rejection that merely happens to carry the same code, and never on a
+    /// source-side arbitration failure (no live copy to push).
+    #[test]
+    fn arbitration_authority_refusal_classifier_is_narrow() {
+        let wrap = |code: u16, msg: &str| {
+            format!(
+                "weak-veto arbitration rejected by target: {}",
+                migration_complete_rejection_error(
+                    1,
+                    &crate::protocol::codec::encode_error_payload(code, msg)
+                ),
+            )
+        };
+        assert!(weak_veto_arbitration_terminally_refused(&wrap(
+            crate::protocol::opcodes::ERR_INVARIANT_VIOLATION,
+            "weak-veto arbitration: node 3 is not shard 1563's authoritative holder at epoch 6",
+        )));
+        assert!(weak_veto_arbitration_terminally_refused(&wrap(
+            crate::protocol::opcodes::ERR_INVARIANT_VIOLATION,
+            "weak-veto arbitration: no active inbound transfer for shard 70 from node 3",
+        )));
+        assert!(
+            !weak_veto_arbitration_terminally_refused(&wrap(
+                crate::protocol::opcodes::ERR_STALE_EPOCH,
+                "weak-veto arbitration: epoch 5 is not the activated version 6",
+            )),
+            "a stale epoch clears on its own — the re-drive owns it",
+        );
+        assert!(
+            !weak_veto_arbitration_terminally_refused(
+                "weak-veto arbitration: none of the 2 vetoed key(s) held live on the \
+                 source — falling back to the historical disposition",
+            ),
+            "a SOURCE-side arbitration failure is not a target refusal",
+        );
+        assert!(
+            !weak_veto_arbitration_terminally_refused(&format!(
+                "target rejected: status 1 (code={}: something else entirely)",
+                crate::protocol::opcodes::ERR_INVARIANT_VIOLATION,
+            )),
+            "a bare completion rejection is not an arbitration refusal",
+        );
     }
 
     /// W10 FIX 2 — the arbitration-round backstop: a target that names a NEW

@@ -1432,6 +1432,15 @@ pub struct MigrationMetrics {
     /// consensus-relevant override of a local anti-resurrection marker, so it
     /// stays operator-visible.
     pub migration_weak_veto_arbitrations: PaddedCounter,
+    /// W12 TAIL 3 — weak-veto arbitrations the TARGET refused on AUTHORITY
+    /// grounds (`ERR_INVARIANT_VIOLATION`), which terminally abort the
+    /// handoff instead of re-driving it. Counted per refused round at the
+    /// source. A non-zero value means a source is trying to complete a
+    /// handoff of a shard the target's table does not credit it with — the
+    /// PHANTOM-master shape armed scenario 09 @ fc5e5f7 livelocked on — and
+    /// the shard will stay dual-mastered until the ownership disagreement is
+    /// resolved elsewhere.
+    pub migration_weak_veto_arbitration_refused: PaddedCounter,
     /// W10 review P2-2 — local keys the #29 completion prune RETAINED because
     /// the source declared them as its own WEAK-tombstone omissions (FIX 3).
     /// Each exclusion is a deliberate refusal to delete on the source's
@@ -1598,6 +1607,7 @@ impl MigrationMetrics {
             replica_abort_forced_resyncs: PaddedCounter::new(),
             migration_completion_manifest_reduced_vetoed: PaddedCounter::new(),
             migration_weak_veto_arbitrations: PaddedCounter::new(),
+            migration_weak_veto_arbitration_refused: PaddedCounter::new(),
             migration_prune_weak_declared_retained: PaddedCounter::new(),
             migration_prune_skipped_cutoff_gate: PaddedCounter::new(),
             migration_transfer_request_refused: PaddedCounter::new(),
