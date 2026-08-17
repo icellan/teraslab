@@ -3097,7 +3097,12 @@ pub(crate) fn build_replication_targets(
     // orphan-cleaned. So even a migration-window flip between two keys of a
     // same-shard batch stays within the pre-existing plan-vs-send tolerance and
     // cannot mis-route a quorum-bearing write.
-    let mut dual_write_by_shard: HashMap<u16, Vec<NodeId>> = HashMap::new();
+    //
+    // W10 composition (P1-2): the memo carries each extra's ORIGIN alongside
+    // it (`true` = new-side handoff holder, `false` = repair-only Phase-H
+    // resync backfill destination) so the one lock acquisition serves both
+    // the fan-out and the handoff-ACK gating below.
+    let mut dual_write_by_shard: HashMap<u16, Vec<(NodeId, bool)>> = HashMap::new();
 
     for (key, ops) in ops_by_key {
         let shard = ShardTable::shard_for_key(key);
@@ -3125,9 +3130,9 @@ pub(crate) fn build_replication_targets(
         // is silently skipped rather than failing the write, because the
         // migration stream itself will deliver baseline+deltas to the
         // destination once the address is known.
-        let dual_write_extras: &[NodeId] = dual_write_by_shard
+        let dual_write_extras: &[(NodeId, bool)] = dual_write_by_shard
             .entry(shard)
-            .or_insert_with(|| cluster.dual_write_targets_for_shard(shard));
+            .or_insert_with(|| cluster.dual_write_targets_with_origin_for_shard(shard));
         for replica_id in &assignment.replicas {
             // A node never makes a NETWORK replication connection to its own
             // address. When the shard's replica set names THIS node (which
@@ -3205,7 +3210,7 @@ pub(crate) fn build_replication_targets(
                 None => {}
             }
         }
-        for extra in dual_write_extras {
+        for (extra, is_handoff_holder) in dual_write_extras {
             if *extra == self_id {
                 continue;
             }
@@ -3218,7 +3223,23 @@ pub(crate) fn build_replication_targets(
             // `target_assignment` is updated before the migration finishes
             // streaming). `dual_write_addrs` keeps its existing
             // exclusion-based population untouched.
-            if let Some(addr) = extra_addr {
+            //
+            // W10 composition (P1-2): only a NEW-SIDE HANDOFF holder. A
+            // Phase-H resync backfill opens the same dual-write window
+            // toward a node the committed table ALREADY names as a holder
+            // (so it is in the regular quorum set, governed by the normal
+            // per-key ACK policy) and commits nothing — there is no
+            // transition for this invariant to protect. Counting it here
+            // turned a background repair into a hard per-shard "the node
+            // being repaired must ACK" requirement for every client write,
+            // and a `shards: []` resync expands to every shard that node
+            // owns. The distinction is the window's ORIGIN, never its
+            // position in the table: a genuine handoff's `to_node` is
+            // routinely already in the assignment (that is exactly what R2
+            // fixed), so a positional exclusion would kill the invariant.
+            if let Some(addr) = extra_addr
+                && *is_handoff_holder
+            {
                 handoff_targets.entry(shard).or_default().insert(addr);
             }
             if *extra == current_master || assignment.replicas.contains(extra) {
@@ -36907,6 +36928,185 @@ mod tests {
             cached_min_ns < cached_limit,
             "cached-device setMined burst must stay below the old ~2450 ns/tx RMW path, \
              got {cached_min_ns:.1} ns/tx (limit {cached_limit})"
+        );
+    }
+
+    /// W10 COMPOSITION FIX 2 (P1-2) — a Phase-H resync backfill toward an
+    /// ALREADY-COMMITTED replica must not make that replica's ACK mandatory
+    /// for client writes to the shard.
+    ///
+    /// Wave 10's `prepare_resync_backfill` began registering resyncs through
+    /// `start_outbound`, which opens a Phase E dual-write window
+    /// (`dual_write_add`). The R2/P7b handoff-ACK gate populates
+    /// `handoff_targets[shard]` from every dual-write extra BEFORE the
+    /// regular-replica exclusion, and `replicate_all_ops` then hard-requires
+    /// ≥1 ACK from that set per shard. So repairing replica R turned "R must
+    /// ACK" into a per-shard WriteAll for the life of the backfill — and a
+    /// `ResyncRequest { shards: [] }` (the NeedsResync "I don't know" signal)
+    /// expands to EVERY shard R owns, so every client write to any of them
+    /// would require an ACK from the very node the repair is catching up.
+    #[test]
+    fn resync_dual_write_target_is_not_a_mandatory_handoff_ack() {
+        let n1 = crate::cluster::shards::NodeId(1);
+        let n2 = crate::cluster::shards::NodeId(2);
+        let n3 = crate::cluster::shards::NodeId(3);
+        let members = vec![n1, n2, n3];
+        let table = crate::cluster::shards::ShardTable::compute_with_epoch(&members, 2, 210, 1);
+        let shard = (0..crate::cluster::shards::NUM_SHARDS as u16)
+            .find(|&s| {
+                let a = table.target_assignment(s);
+                a.master == n1 && a.replicas.contains(&n2) && !a.replicas.contains(&n3)
+            })
+            .expect("expected shard mastered by n1 with n2 (not n3) as replica");
+
+        let n1_addr: SocketAddr = "127.0.0.1:8931".parse().unwrap();
+        let n2_addr: SocketAddr = "127.0.0.1:8932".parse().unwrap();
+        let n3_addr: SocketAddr = "127.0.0.1:8933".parse().unwrap();
+        let cluster = crate::cluster::coordinator::new_test_running_cluster(
+            n1,
+            table,
+            &[(n1, n1_addr), (n2, n2_addr), (n3, n3_addr)],
+            &members,
+            &[],
+            &[],
+            &[],
+            3,
+        );
+        // Repair the EXISTING replica n2 — no ownership transition.
+        cluster.test_open_resync_dual_write_window(shard, n2);
+
+        let tx_key = TxKey {
+            txid: txid_for_shard(shard, 23),
+        };
+        let ops = vec![(
+            tx_key,
+            vec![crate::replication::protocol::ReplicaOp::Delete {
+                tx_key,
+                cause: crate::ops::tombstone::DeleteCause::ClientDelete,
+            }],
+        )];
+        let plan =
+            build_replication_targets(&cluster, &ops).expect("target resolution should succeed");
+
+        assert!(
+            plan.by_addr.contains_key(&n2_addr),
+            "the repair target must still receive the dual-write fan-out: {:?}",
+            plan.by_addr,
+        );
+        assert!(
+            plan.handoff_targets
+                .get(&shard)
+                .is_none_or(|t| !t.contains(&n2_addr)),
+            "a REPAIR target is not a new-side handoff holder — naming it here \
+             makes its ACK a hard per-shard write requirement (cluster-wide \
+             write outage while the repair runs): {:?}",
+            plan.handoff_targets,
+        );
+    }
+
+    /// W10 COMPOSITION FIX 2 — control: a GENUINE handoff whose `to_node` is
+    /// ALSO already in the shard's committed assignment must keep the R2/P7b
+    /// invariant. That is the real handoff order (the table's
+    /// `target_assignment` is updated before the migration finishes
+    /// streaming), so the exclusion may not be positional — it must follow
+    /// the window's ORIGIN.
+    #[test]
+    fn genuine_handoff_target_already_in_the_assignment_still_requires_its_ack() {
+        let n1 = crate::cluster::shards::NodeId(1);
+        let n2 = crate::cluster::shards::NodeId(2);
+        let n3 = crate::cluster::shards::NodeId(3);
+        let members = vec![n1, n2, n3];
+        let table = crate::cluster::shards::ShardTable::compute_with_epoch(&members, 2, 211, 1);
+        let shard = (0..crate::cluster::shards::NUM_SHARDS as u16)
+            .find(|&s| {
+                let a = table.target_assignment(s);
+                a.master == n1 && a.replicas.contains(&n2) && !a.replicas.contains(&n3)
+            })
+            .expect("expected shard mastered by n1 with n2 (not n3) as replica");
+
+        let n1_addr: SocketAddr = "127.0.0.1:8941".parse().unwrap();
+        let n2_addr: SocketAddr = "127.0.0.1:8942".parse().unwrap();
+        let n3_addr: SocketAddr = "127.0.0.1:8943".parse().unwrap();
+        let cluster = crate::cluster::coordinator::new_test_running_cluster(
+            n1,
+            table,
+            &[(n1, n1_addr), (n2, n2_addr), (n3, n3_addr)],
+            &members,
+            &[],
+            &[],
+            &[],
+            3,
+        );
+        cluster.test_open_dual_write_window(shard, n2);
+
+        let tx_key = TxKey {
+            txid: txid_for_shard(shard, 29),
+        };
+        let ops = vec![(
+            tx_key,
+            vec![crate::replication::protocol::ReplicaOp::Delete {
+                tx_key,
+                cause: crate::ops::tombstone::DeleteCause::ClientDelete,
+            }],
+        )];
+        let plan =
+            build_replication_targets(&cluster, &ops).expect("target resolution should succeed");
+
+        assert!(
+            plan.handoff_targets
+                .get(&shard)
+                .is_some_and(|t| t.contains(&n2_addr)),
+            "a genuine handoff keeps the new-side ACK invariant even when \
+             `to_node` is already in the assignment: {:?}",
+            plan.handoff_targets,
+        );
+    }
+
+    /// W10 COMPOSITION FIX 2 — a repair window must never DOWNGRADE a
+    /// handoff window already open for the same (shard, node), and a later
+    /// handoff must UPGRADE a repair window. Fail-safe in both directions:
+    /// the genuine invariant wins.
+    #[test]
+    fn handoff_origin_wins_over_resync_origin_for_the_same_target() {
+        let n1 = crate::cluster::shards::NodeId(1);
+        let n2 = crate::cluster::shards::NodeId(2);
+        let shard = 77u16;
+
+        let mut mgr = crate::cluster::migration::MigrationManager::new();
+        let handoff = crate::cluster::shards::MigrationTask {
+            shard,
+            from_node: n1,
+            to_node: n2,
+            is_master: true,
+        };
+        let resync = crate::cluster::shards::MigrationTask {
+            shard,
+            from_node: n1,
+            to_node: n2,
+            is_master: false,
+        };
+        let empty = std::collections::HashSet::new();
+
+        mgr.start_outbound(std::slice::from_ref(&handoff), n1, &empty);
+        mgr.start_outbound_resync(std::slice::from_ref(&resync), n1, &empty);
+        assert_eq!(
+            mgr.dual_write_targets_with_origin_for_shard(shard),
+            vec![(n2, true)],
+            "a repair must not downgrade an open handoff window",
+        );
+
+        let mut mgr2 = crate::cluster::migration::MigrationManager::new();
+        mgr2.start_outbound_resync(std::slice::from_ref(&resync), n1, &empty);
+        assert_eq!(
+            mgr2.dual_write_targets_with_origin_for_shard(shard),
+            vec![(n2, false)],
+            "a repair-only window is not a new-side handoff",
+        );
+        mgr2.start_outbound(std::slice::from_ref(&handoff), n1, &empty);
+        assert_eq!(
+            mgr2.dual_write_targets_with_origin_for_shard(shard),
+            vec![(n2, true)],
+            "a later genuine handoff must upgrade the window",
         );
     }
 }

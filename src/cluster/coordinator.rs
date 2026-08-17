@@ -1140,6 +1140,34 @@ impl From<bool> for FailedTaskTableAction {
     }
 }
 
+/// The W3 FIX C table disposition for a failed outbound task, PER TASK.
+///
+/// A MASTER handoff rolls the shard back to `self` — the historical
+/// no-loss-safe outcome. A REPLICA-side push leaves the table untouched: it
+/// never table-committed anything, and `rollback_shard` is SHARD-scoped, not
+/// task-scoped, so rolling back on a replica failure reverts whatever else is
+/// happening to that shard.
+///
+/// W10 composition (P1-1) — why every fail site must use this. Before wave
+/// 10, `prepare_resync_backfill` left Phase-H resync tasks untracked, so
+/// `fail_migration_task_current_epoch` returned at its `!tracked` guard
+/// BEFORE any table action and a resync hitting a fail site was a no-op.
+/// Registering resyncs through `start_outbound` made every fail site
+/// reachable by a replica-side task, and the sites that still passed a
+/// blanket `true`/`Rollback` became a dual-serving-master hazard: node1
+/// hands shard S off to node3 (S `Copying`, worker streaming), a resync task
+/// for node2 on the SAME shard passes both dedups (different `to_node`), its
+/// stream fails, the blanket rollback reverts S's assignment to node1 and
+/// stamps `ServingNew` under node3's still-streaming worker — and node3 then
+/// commits mastership too.
+fn failed_task_table_action(task: &MigrationTask) -> FailedTaskTableAction {
+    if task.is_master {
+        FailedTaskTableAction::Rollback
+    } else {
+        FailedTaskTableAction::None
+    }
+}
+
 /// Claim the single topology-catch-up slot.
 ///
 /// `ClusterEvent::TopologyStale` fires once per gossip observation, so in a
@@ -1456,21 +1484,8 @@ fn finalize_enumeration_round(
             task,
             topology_epoch,
             // W10 re-review P2-1: the table action follows the W3 FIX C
-            // disposition PER TASK — only a MASTER handoff rolls the table
-            // back to self; a replica-side task (every Phase-H resync
-            // task) leaves the table untouched. `rollback_shard` is
-            // shard-scoped, not task-scoped: a blanket Rollback here let a
-            // failed replica-only resync round revert a CONCURRENT
-            // mid-Copying master handoff of the same shard (different
-            // to_node, so the drain's dedup admits both) under its
-            // still-streaming worker. Pre-W10 the untracked check bailed
-            // before the action; start_outbound registration made the
-            // hazard reachable.
-            if task.is_master {
-                FailedTaskTableAction::Rollback
-            } else {
-                FailedTaskTableAction::None
-            },
+            // disposition PER TASK (see `failed_task_table_action`).
+            failed_task_table_action(task),
         );
     }
     false
@@ -1504,8 +1519,15 @@ struct RelinquishContext {
 /// (an EMPTY local shard whose committed master is a live, different member);
 /// otherwise roll back to `self` exactly as before.
 ///
+/// A REPLICA-side task never reaches the relinquish oracle at all: its table
+/// disposition is [`failed_task_table_action`] (leave the table untouched),
+/// which is also what `failed_handoff_disposition` would degrade to via
+/// `RollbackToSelf` — except that a rollback is SHARD-scoped and would revert
+/// a concurrent master handoff of the same shard (W10 composition P1-1).
+///
 /// `ctx` is `None` when the caller has no committed-topology snapshot (legacy
-/// / test paths) — in that case this is identical to a `rollback = true` call.
+/// / test paths, and the Phase-H resync drain) — a MASTER handoff then keeps
+/// the historical `rollback = true` behaviour.
 ///
 /// `superset_probe`, when present, is a verify-only network probe of the
 /// rightful master that returns `true` iff that master provably holds a
@@ -1525,6 +1547,25 @@ fn fail_or_relinquish_outbound_task(
     ctx: Option<&RelinquishContext>,
     superset_probe: Option<&dyn Fn() -> bool>,
 ) -> bool {
+    // W10 composition (P1-1) — the W3 FIX C gate comes FIRST: a replica-side
+    // push never table-committed anything, so neither the relinquish oracle
+    // (which returns `RollbackToSelf` for every `!is_master` task anyway) nor
+    // the `None`-context legacy arm may touch the SHARD-scoped table state.
+    // The Phase-H resync drain passes `ctx = None`, and since wave 10 its
+    // tasks are `start_outbound`-tracked, so this arm decides whether a failed
+    // backfill reverts a concurrent mid-Copying master handoff of the same
+    // shard. It must not.
+    if !task.is_master {
+        return fail_migration_task_current_epoch(
+            migration,
+            shard_table,
+            fenced_bm,
+            migrating_bm,
+            task,
+            topology_epoch,
+            failed_task_table_action(task),
+        );
+    }
     let action = match ctx {
         Some(ctx) => {
             let has_pending_inbound = migration.lock().has_pending_inbound(task.shard);
@@ -4039,7 +4080,13 @@ impl ClusterCoordinator {
                                 &migrating_bm_event,
                                 task,
                                 topology_epoch.load(Ordering::Relaxed),
-                                FailedTaskTableAction::Rollback,
+                                // W10 composition (P1-1) — per-task W3 FIX C
+                                // disposition. The reaper walks EVERY active
+                                // migration, which since wave 10 includes
+                                // `start_outbound`-tracked Phase-H resync
+                                // backfills; a stranded replica task must not
+                                // roll back the shard.
+                                failed_task_table_action(task),
                             );
                         }
                     }
@@ -7502,6 +7549,76 @@ fn split_already_serving_migration_tasks(
     (active, skipped)
 }
 
+/// W10 composition (P1-4) — how many already-serving candidates one
+/// migration batch may VERIFY (superset-probe) before deferring the rest to
+/// the next re-drive. Candidates whose shard is empty are free and do not
+/// consume the budget.
+///
+/// The HARD bound on this phase is [`ALREADY_SERVING_VERIFY_DEADLINE`], not
+/// this count (review P2-2). A healthy probe is one round-trip
+/// ([`ALREADY_SERVING_SUPERSET_PROBE`] keeps its per-attempt timeouts short),
+/// so 512 candidates over the batch's 8-way fan-out is ~64 sequential
+/// round-trips — sub-second — while a pathological target is cut off by the
+/// deadline long before the count matters. The count remains only as a cap on
+/// the per-key manifest device reads one batch may do up front.
+///
+/// It is deliberately NOT small. A deferred candidate is parked `Failed`, and
+/// the re-drive re-enumerates its shard, so it comes back on the STREAMING
+/// path — a full data re-transfer of a shard the target already holds, which
+/// is exactly the pointless re-stream the completion-only verification exists
+/// to avoid. Deferral must therefore be the rare backstop for a sick target,
+/// not the routine outcome of a large rolling-restart batch.
+///
+/// Deferral is a PARK rather than a withhold-from-the-batch because these
+/// tasks are `start_outbound`-tracked before the batch starts: a withheld
+/// task is an UNRESOLVED task, and `retire_abandoned_batch_tasks` parks every
+/// unresolved task at each exit — with a master-side `rollback_shard`. Parking
+/// them here, with the table untouched, is the narrower disposition.
+const ALREADY_SERVING_PROBE_BUDGET: usize = 512;
+
+/// W10 composition (P1-4) — wall-clock ceiling on the pre-chunk
+/// already-serving verification phase, covering the enumeration and every
+/// probe START. Nothing else bounds this phase: it runs with
+/// `active_count()` above zero, which holds shut the degraded upgrade, the
+/// event-repair fire, the failed-batch redrive, reactivation and prompt
+/// re-election.
+///
+/// Worst case is this deadline PLUS one in-flight probe, because the check
+/// gates probe starts, not completions (review P2-3). With
+/// [`ALREADY_SERVING_SUPERSET_PROBE`] that in-flight tail is ≤ ~12.3 s
+/// (3 attempts × (1 s connect + 3 s read) + 0.3 s backoff), so the phase is
+/// bounded at ~22 s against a black-holing target. (With the relinquish
+/// profile's 6 × (3 s + 10 s) + 2.35 s it would have been ~90 s.)
+const ALREADY_SERVING_VERIFY_DEADLINE: Duration = Duration::from_secs(10);
+
+/// The verify-only superset check [`verify_already_serving_skips`] runs
+/// against the migration target — `confirm_target_holds_superset` in
+/// production, a counting stub in tests. Injected so the probe BUDGET this
+/// phase enforces is observable without a network.
+type SupersetProbe<'a> = dyn Fn(&MigrationTask, &[(TxKey, u32)]) -> bool + Sync + 'a;
+
+/// Per-candidate dispositions produced by [`verify_already_serving_skips`].
+#[derive(Default)]
+struct AlreadyServingVerification {
+    /// Verified (or trivially empty) — keep the cheap completion-only path.
+    confirmed: Vec<MigrationTask>,
+    /// Not verified: stream instead, carrying the live keys to send (an
+    /// EMPTY list routes the task onto the empty path's skip-aware fenced
+    /// recheck — see `verify_one_already_serving_skip`).
+    demoted: Vec<(MigrationTask, Vec<TxKey>)>,
+    /// Beyond this batch's verification budget/deadline. NOT confirmed and
+    /// NOT streamed: the caller parks these Failed so the durable retry queue
+    /// re-drives them, keeping the pre-chunk phase bounded.
+    deferred: Vec<MigrationTask>,
+}
+
+/// One candidate's outcome, as produced on a verification worker.
+enum AlreadyServingOutcome {
+    Confirmed(MigrationTask),
+    Demoted(MigrationTask, Vec<TxKey>),
+    Deferred(MigrationTask),
+}
+
 /// W10 (armed-11, CI d3437e4) — verify each completion-only "already
 /// serving" candidate before its handshake is allowed to COMMIT mastership
 /// on the target.
@@ -7549,99 +7666,259 @@ fn split_already_serving_migration_tasks(
 ///   non-empty shard; those keys are a complete skip-free enumeration, so
 ///   the streaming path's own error handling owns the outcome).
 ///
-/// Returns `(confirmed_completion_only, demoted)` where each demoted entry
-/// carries the live keys to stream.
+/// Returns the per-candidate dispositions — see [`AlreadyServingVerification`].
+///
+/// # W10 composition (P1-4) — why this phase is BOUNDED and PARALLEL
+///
+/// This runs at the head of [`run_migration_batch`], before any chunking, and
+/// `should_skip_already_serving_migration` is not `is_master`-gated: on a
+/// settled cluster ANY task whose shard has no keys in the batch snapshot
+/// becomes a candidate. Each candidate holding records costs a full
+/// `keys_by_shard_filtered` index pass, a per-key device-footer manifest
+/// collection, and a `confirm_target_holds_superset` probe that opens its OWN
+/// connection OUTSIDE the migration pool with six retries on top of the
+/// 3 s connect / 10 s read timeouts — competing for the target's per-IP
+/// connection cap, which this repo has a documented history of exhausting.
+///
+/// Meanwhile every task in the batch is `start_outbound`-tracked (Phase-H
+/// resync backfills included, since wave 10), so `active_count() > 0` holds
+/// shut the degraded upgrade, the event-repair fire, the failed-batch
+/// redrive, normal/drain reactivation and prompt re-election. A det-degraded
+/// plan with hundreds of already-serving candidates toward one target could
+/// therefore park the node's whole convergence machinery for tens of minutes
+/// before one record moved.
+///
+/// Three bounds close that:
+///
+/// 1. **Free candidates stay free.** A shard with zero live records needs no
+///    probe at all (fresh clusters hand off thousands of empty shards this
+///    way), so the budget is spent only on candidates that genuinely need
+///    verification.
+/// 2. **`probe_budget` caps the verified candidates per batch.** The rest are
+///    DEFERRED — never confirmed on no evidence: the caller parks them Failed
+///    (durable retry queue) and the next re-drive verifies them, so the batch
+///    makes bounded forward progress per round instead of stalling.
+/// 3. **One index pass, and the probes run concurrently** (up to
+///    `max_concurrent_probes`, the batch's own connection fan-out) under a
+///    wall-clock `deadline` — so the pre-chunk phase costs about one probe
+///    round-trip, not one per candidate. Candidates a worker has not started
+///    when the deadline passes are deferred.
+///
+/// The `probe` callback is the verify-only superset check
+/// ([`confirm_target_holds_superset`] in production); it is invoked at most
+/// `probe_budget` times per call.
 fn verify_already_serving_skips(
     engine: &Arc<Engine>,
-    target_addr: SocketAddr,
     candidates: Vec<MigrationTask>,
-    topology_epoch: u64,
-    auth_secret: Option<&[u8]>,
-) -> (Vec<MigrationTask>, Vec<(MigrationTask, Vec<TxKey>)>) {
-    let mut confirmed = Vec::with_capacity(candidates.len());
-    let mut demoted = Vec::new();
+    probe_budget: usize,
+    max_concurrent_probes: usize,
+    deadline: Duration,
+    probe: &SupersetProbe<'_>,
+) -> AlreadyServingVerification {
+    let mut out = AlreadyServingVerification::default();
+    // Split the free candidates (empty shard: nothing could be streamed
+    // anyway, and a genuinely empty shard must keep committing
+    // completion-only) from the ones that need real evidence.
+    let mut needs_verify: Vec<MigrationTask> = Vec::new();
     for task in candidates {
         if engine.shard_record_count(task.shard) == 0 {
-            confirmed.push(task);
-            continue;
-        }
-        // W10 re-review P1-1: enumerate skip-AWARE. `keys_for_shard`
-        // discards the unreadable-footer count, so a shard whose records
-        // are transiently unreadable (relocation churn / torn CRC) would
-        // enumerate SHORT: with zero readable keys the empty-manifest
-        // branch below would confirm the completion-only commit with NO
-        // verification (the armed-11 commit shape relabeled "stale keys"),
-        // and with a partial set the probe would confirm a superset of the
-        // READABLE SUBSET only. Every streaming path is skip-aware
-        // (`finalize_enumeration_round`); this path must be too: ANY skip
-        // demotes — never commit completion-only on partial evidence. The
-        // streaming path's own issue-#46 machinery owns the outcome.
-        let shard_set: std::collections::HashSet<u16> = [task.shard].into_iter().collect();
-        let (mut keys_map, enum_skipped) = engine.keys_by_shard_filtered(&shard_set);
-        let keys = keys_map.remove(&task.shard).unwrap_or_default();
-        if enum_skipped > 0 {
-            tracing::warn!(
-                shard = task.shard,
-                skipped = enum_skipped,
-                readable = keys.len(),
-                %target_addr,
-                "cluster: already-serving verification enumerated unreadable \
-                 record(s) — routing to the empty path's fenced recheck (issue #46)",
-            );
-            // P1 residual: demote with an EMPTY key list, NOT the readable
-            // subset. Carrying the M readable keys would move the acked
-            // loss onto the streaming path: the no-churn manifest is built
-            // from the demoted set, the target verifies M/M, the
-            // completion COMMITS and records #28 evidence — and orphan
-            // cleanup may then delete the N−M records never shipped. The
-            // empty list routes the task onto the EMPTY path, whose
-            // skip-aware fenced recheck owns the disposition: a persistent
-            // skip refuses and parks the task Failed (visible, re-driven);
-            // a healed skip promotes back to the data path, where the
-            // short-snapshot guard re-verifies the manifest against the
-            // live count before any completion.
-            demoted.push((task, Vec::new()));
-            continue;
-        }
-        let target_holds = match collect_manifest_entries(engine, task.shard, &keys) {
-            Ok(entries) if !entries.is_empty() => confirm_target_holds_superset(
-                target_addr,
-                task.shard,
-                task.from_node,
-                topology_epoch,
-                &entries,
-                auth_secret,
-            ),
-            // Every live key resolved stale mid-collection: nothing real
-            // to move — same disposition as the empty case.
-            Ok(_) => {
-                confirmed.push(task);
-                continue;
-            }
-            Err(err) => {
-                tracing::warn!(
-                    shard = task.shard,
-                    err = %err,
-                    "cluster: already-serving verification could not collect the \
-                     shard manifest — demoting to the streaming path (issue #46)",
-                );
-                false
-            }
-        };
-        if target_holds {
-            confirmed.push(task);
+            out.confirmed.push(task);
         } else {
-            tracing::warn!(
-                shard = task.shard,
-                records = keys.len(),
-                %target_addr,
-                "cluster: already-serving completion REFUSED — the target does not \
-                 provably hold this shard's records; streaming instead (armed-11)",
-            );
-            demoted.push((task, keys));
+            needs_verify.push(task);
         }
     }
-    (confirmed, demoted)
+    if needs_verify.len() > probe_budget {
+        out.deferred = needs_verify.split_off(probe_budget);
+        tracing::info!(
+            deferred = out.deferred.len(),
+            budget = probe_budget,
+            "cluster: already-serving verification budget reached — deferring the \
+             remaining candidates to the next re-drive (W10 P1-4)",
+        );
+    }
+    if needs_verify.is_empty() {
+        return out;
+    }
+
+    // The deadline covers the WHOLE phase, enumeration included — everything
+    // here runs with `active_count()` above zero, which holds the convergence
+    // gates shut (review P2-1).
+    let started = std::time::Instant::now();
+    // ONE index pass for every budgeted shard, instead of one per candidate —
+    // and it keeps the skip count PER SHARD, so an issue-#46 skip is
+    // attributed to the shard it happened on WITHOUT re-scanning the index
+    // per shard (`keys_by_shard_filtered_detailed`; review P2-1: those
+    // re-scans were a full `index.for_each` each, i.e. 33 whole-index passes
+    // for one unreadable footer in a 32-shard round, outside any deadline).
+    let shard_set: std::collections::HashSet<u16> = needs_verify.iter().map(|t| t.shard).collect();
+    let per_shard = engine.keys_by_shard_filtered_detailed(&shard_set);
+
+    let concurrency = max_concurrent_probes.max(1).min(needs_verify.len());
+    let chunk_size = needs_verify.len().div_ceil(concurrency);
+    let per_shard = &per_shard;
+    let mut grouped: Vec<Vec<AlreadyServingOutcome>> = Vec::with_capacity(concurrency);
+    std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(concurrency);
+        for group in needs_verify.chunks(chunk_size) {
+            handles.push((
+                group,
+                scope.spawn(move || {
+                    let mut results = Vec::with_capacity(group.len());
+                    for task in group {
+                        if started.elapsed() >= deadline {
+                            // Not started before the phase deadline: defer
+                            // rather than hold the batch (and every gate
+                            // `active_count()` guards) open any longer.
+                            results.push(AlreadyServingOutcome::Deferred(task.clone()));
+                            continue;
+                        }
+                        results.push(verify_one_already_serving_skip(
+                            engine, task, per_shard, probe,
+                        ));
+                    }
+                    results
+                }),
+            ));
+        }
+        for (group, handle) in handles {
+            match handle.join() {
+                Ok(results) => grouped.push(results),
+                // A panicking worker must not silently drop its candidates
+                // (they would stay unresolved and hold `active_count()`
+                // above zero). Defer them: the caller parks them Failed.
+                Err(_) => {
+                    tracing::error!(
+                        candidates = group.len(),
+                        "cluster: already-serving verification worker panicked — \
+                         deferring its candidates",
+                    );
+                    grouped.push(
+                        group
+                            .iter()
+                            .map(|t| AlreadyServingOutcome::Deferred(t.clone()))
+                            .collect(),
+                    );
+                }
+            }
+        }
+    });
+    for outcome in grouped.into_iter().flatten() {
+        match outcome {
+            AlreadyServingOutcome::Confirmed(task) => out.confirmed.push(task),
+            AlreadyServingOutcome::Demoted(task, keys) => out.demoted.push((task, keys)),
+            AlreadyServingOutcome::Deferred(task) => out.deferred.push(task),
+        }
+    }
+    out
+}
+
+/// One candidate's disposition — the per-task body of
+/// [`verify_already_serving_skips`], run on the verification worker pool.
+///
+/// `per_shard` carries the shard's skip-AWARE enumeration
+/// `(keys, enumeration_skips)` from the batched index pass.
+fn verify_one_already_serving_skip(
+    engine: &Arc<Engine>,
+    task: &MigrationTask,
+    per_shard: &std::collections::HashMap<u16, (Vec<TxKey>, usize)>,
+    probe: &SupersetProbe<'_>,
+) -> AlreadyServingOutcome {
+    let empty = (Vec::new(), 0usize);
+    let (keys, enum_skipped) = per_shard.get(&task.shard).unwrap_or(&empty);
+    // W10 re-review P1-1: enumerate skip-AWARE. `keys_for_shard`
+    // discards the unreadable-footer count, so a shard whose records
+    // are transiently unreadable (relocation churn / torn CRC) would
+    // enumerate SHORT: with zero readable keys the empty-manifest
+    // branch below would confirm the completion-only commit with NO
+    // verification (the armed-11 commit shape relabeled "stale keys"),
+    // and with a partial set the probe would confirm a superset of the
+    // READABLE SUBSET only. Every streaming path is skip-aware
+    // (`finalize_enumeration_round`); this path must be too: ANY skip
+    // demotes — never commit completion-only on partial evidence. The
+    // streaming path's own issue-#46 machinery owns the outcome.
+    if *enum_skipped > 0 {
+        tracing::warn!(
+            shard = task.shard,
+            skipped = enum_skipped,
+            readable = keys.len(),
+            "cluster: already-serving verification enumerated unreadable \
+             record(s) — routing to the empty path's fenced recheck (issue #46)",
+        );
+        // P1 residual: demote with an EMPTY key list, NOT the readable
+        // subset. Carrying the M readable keys would move the acked
+        // loss onto the streaming path: the no-churn manifest is built
+        // from the demoted set, the target verifies M/M, the
+        // completion COMMITS and records #28 evidence — and orphan
+        // cleanup may then delete the N−M records never shipped. The
+        // empty list routes the task onto the EMPTY path, whose
+        // skip-aware fenced recheck owns the disposition: a persistent
+        // skip refuses and parks the task Failed (visible, re-driven);
+        // a healed skip promotes back to the data path, where the
+        // short-snapshot guard re-verifies the manifest against the
+        // live count before any completion.
+        return AlreadyServingOutcome::Demoted(task.clone(), Vec::new());
+    }
+    let target_holds = match collect_manifest_entries(engine, task.shard, keys) {
+        Ok(entries) if !entries.is_empty() => probe(task, &entries),
+        // Every live key resolved stale mid-collection: nothing real
+        // to move — same disposition as the empty case.
+        Ok(_) => return AlreadyServingOutcome::Confirmed(task.clone()),
+        Err(err) => {
+            tracing::warn!(
+                shard = task.shard,
+                err = %err,
+                "cluster: already-serving verification could not collect the \
+                 shard manifest — demoting to the streaming path (issue #46)",
+            );
+            false
+        }
+    };
+    if target_holds {
+        AlreadyServingOutcome::Confirmed(task.clone())
+    } else {
+        tracing::warn!(
+            shard = task.shard,
+            records = keys.len(),
+            "cluster: already-serving completion REFUSED — the target does not \
+             provably hold this shard's records; streaming instead (armed-11)",
+        );
+        AlreadyServingOutcome::Demoted(task.clone(), keys.clone())
+    }
+}
+
+/// W10 composition review P2-9 — flatten the demoted already-serving
+/// candidates' live key lists into one owned buffer, contributing each
+/// shard's keys AT MOST ONCE.
+///
+/// `verify_already_serving_skips` demotes PER TASK, and one shard can carry
+/// two candidates (the master handoff and a replica push toward the same
+/// `to_node` — the shape a Phase-H resync backfill adds on top of a
+/// topology-plan task). A flat concatenation then pushed that shard's N keys
+/// into `keys_by_shard` twice, so the streaming path built a 2N-entry
+/// manifest against an N-record target and the exact-count completion check
+/// rejected it every round.
+///
+/// A shard with ANY empty demotion contributes NOTHING, whatever its
+/// siblings carry: the empty list is the issue-#46 skip demotion, whose whole
+/// point is to route the shard onto the empty path's skip-aware fenced
+/// recheck instead of streaming (and committing) a readable subset. Making
+/// the fail-safe contribution win is also order-independent, so the result
+/// does not depend on candidate ordering.
+fn demoted_shard_keys(demoted: &[(MigrationTask, Vec<TxKey>)]) -> Vec<TxKey> {
+    let suppressed: std::collections::HashSet<u16> = demoted
+        .iter()
+        .filter(|(_, keys)| keys.is_empty())
+        .map(|(task, _)| task.shard)
+        .collect();
+    let mut seen: std::collections::HashSet<u16> = std::collections::HashSet::new();
+    let mut out: Vec<TxKey> = Vec::new();
+    for (task, keys) in demoted {
+        if suppressed.contains(&task.shard) || !seen.insert(task.shard) {
+            continue;
+        }
+        out.extend(keys.iter().copied());
+    }
+    out
 }
 
 fn should_trigger_topology_reactivation(
@@ -10590,7 +10867,8 @@ fn run_migration_batch(
                     &migrating_bm,
                     task,
                     topology_epoch,
-                    true,
+                    // W10 composition (P1-1) — per-task W3 FIX C disposition.
+                    failed_task_table_action(task),
                 ) {
                     addr_failed += 1;
                 }
@@ -10646,14 +10924,65 @@ fn run_migration_batch(
     // candidates carry an EMPTY key list so they route onto the empty
     // path's skip-aware fenced recheck (P1 residual — a readable SUBSET
     // must never be streamed-and-committed).
-    let (skipped_tasks, demoted) =
-        verify_already_serving_skips(&engine, addr, skip_candidates, topology_epoch, auth_secret);
+    //
+    // W10 composition (P1-4) — BOUNDED and PARALLEL: at most
+    // `ALREADY_SERVING_PROBE_BUDGET` candidates are probed per batch, over at
+    // most this batch's own connection fan-out, under a wall-clock deadline.
+    // Everything else is DEFERRED (parked Failed below, re-driven next
+    // round) — never confirmed without evidence.
+    let superset_probe = |task: &MigrationTask, entries: &[(TxKey, u32)]| {
+        confirm_target_holds_superset(
+            addr,
+            task.shard,
+            task.from_node,
+            topology_epoch,
+            entries,
+            auth_secret,
+            &ALREADY_SERVING_SUPERSET_PROBE,
+        )
+    };
+    let verification = verify_already_serving_skips(
+        &engine,
+        skip_candidates,
+        ALREADY_SERVING_PROBE_BUDGET,
+        pool_size.max(1),
+        ALREADY_SERVING_VERIFY_DEADLINE,
+        &superset_probe,
+    );
+    let AlreadyServingVerification {
+        confirmed: skipped_tasks,
+        demoted,
+        deferred,
+    } = verification;
+    if !deferred.is_empty() {
+        tracing::warn!(
+            deferred = deferred.len(),
+            %addr,
+            "cluster: already-serving candidates left unverified this batch — \
+             parking them for the re-drive (W10 P1-4)",
+        );
+        for task in &deferred {
+            if fail_migration_task_current_epoch(
+                migration,
+                shard_table,
+                &fenced_bm,
+                &migrating_bm,
+                task,
+                topology_epoch,
+                // Same disposition as the undelivered already-serving
+                // completion below: these candidates are ServingNew skips
+                // that this batch never table-committed, so the table is
+                // left untouched.
+                FailedTaskTableAction::None,
+            ) {
+                failed.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
     // Owned storage for the demoted shards' live keys; must outlive
-    // `keys_by_shard`, which borrows from it.
-    let demoted_keys: Vec<TxKey> = demoted
-        .iter()
-        .flat_map(|(_, keys)| keys.iter().copied())
-        .collect();
+    // `keys_by_shard`, which borrows from it. Deduped per shard — see
+    // `demoted_shard_keys`.
+    let demoted_keys: Vec<TxKey> = demoted_shard_keys(&demoted);
     let mut tasks = tasks;
     tasks.extend(demoted.into_iter().map(|(task, _)| task));
 
@@ -10800,18 +11129,10 @@ fn run_migration_batch(
                     task,
                     topology_epoch,
                     // W10 (reviewer P2): W3 FIX C table disposition per task,
-                    // matching the other fail sites — only a MASTER handoff
-                    // rolls the table back to self; a replica-side task
-                    // (including every skip-demoted already-serving
-                    // candidate the empty-list demotion routes here) leaves
-                    // it untouched, since `rollback_shard` is shard-scoped
-                    // and would revert an unrelated in-flight master handoff
-                    // of the same shard.
-                    if task.is_master {
-                        FailedTaskTableAction::Rollback
-                    } else {
-                        FailedTaskTableAction::None
-                    },
+                    // matching the other fail sites — including every
+                    // skip-demoted already-serving candidate the empty-list
+                    // demotion routes here (see `failed_task_table_action`).
+                    failed_task_table_action(task),
                 ) {
                     failed.fetch_add(1, Ordering::Relaxed);
                 }
@@ -11037,7 +11358,12 @@ fn run_migration_batch(
                                 &migrating_bm,
                                 task,
                                 topology_epoch,
-                                true,
+                                // W10 composition (P1-1) — per-task W3 FIX C
+                                // disposition. Highest-reachability site for a
+                                // resync task: sc08 recorded 46-48 connections
+                                // per resync run exhausting the target's
+                                // per-IP cap, so this arm fires routinely.
+                                failed_task_table_action(task),
                             ) {
                                 failed.fetch_add(1, Ordering::Relaxed);
                             }
@@ -11248,10 +11574,22 @@ fn run_migration_batch(
                             // missing a record, or unreachable) the non-empty copy
                             // rolls back to self (no-loss) and the next re-drive
                             // retries.
-                            let probe_keys = engine.keys_for_shard(task.shard);
-                            let probe_manifest =
+                            // W10 composition (P1-1/P1-4) — build the probe
+                            // manifest ONLY for a master handoff. A
+                            // replica-side task (every Phase-H resync
+                            // backfill) can never relinquish, so the probe is
+                            // never consulted for it — and the collection is
+                            // a full shard enumeration plus a per-key device
+                            // footer read, i.e. exactly the unbounded work
+                            // the sc08 resync failure loop repeated per
+                            // stream failure.
+                            let probe_manifest = if task.is_master {
+                                let probe_keys = engine.keys_for_shard(task.shard);
                                 collect_manifest_entries(&engine, task.shard, &probe_keys)
-                                    .unwrap_or_default();
+                                    .unwrap_or_default()
+                            } else {
+                                Vec::new()
+                            };
                             let probe = || {
                                 if probe_manifest.is_empty() {
                                     return false;
@@ -11263,6 +11601,7 @@ fn run_migration_batch(
                                     topology_epoch,
                                     &probe_manifest,
                                     auth_secret,
+                                    &RELINQUISH_SUPERSET_PROBE,
                                 )
                             };
                             if fail_or_relinquish_outbound_task(
@@ -11301,7 +11640,9 @@ fn run_migration_batch(
                                 &migrating_bm,
                                 task,
                                 topology_epoch,
-                                true,
+                                // W10 composition (P1-1) — per-task W3 FIX C
+                                // disposition.
+                                failed_task_table_action(task),
                             ) {
                                 failed.fetch_add(1, Ordering::Relaxed);
                             }
@@ -11380,11 +11721,7 @@ fn run_migration_batch(
                                 // W3 FIX C disposition (re-review P2-1): only a
                                 // MASTER handoff rolls the table back to self;
                                 // a replica-side task leaves it untouched.
-                                if task.is_master {
-                                    FailedTaskTableAction::Rollback
-                                } else {
-                                    FailedTaskTableAction::None
-                                },
+                                failed_task_table_action(task),
                             ) {
                                 failed.fetch_add(1, Ordering::Relaxed);
                             }
@@ -11441,7 +11778,9 @@ fn run_migration_batch(
                                     &migrating_bm,
                                     task,
                                     topology_epoch,
-                                    true,
+                                    // W10 composition (P1-1) — per-task W3
+                                    // FIX C disposition.
+                                    failed_task_table_action(task),
                                 ) {
                                     failed.fetch_add(1, Ordering::Relaxed);
                                 }
@@ -11503,7 +11842,9 @@ fn run_migration_batch(
                                 &migrating_bm,
                                 task,
                                 topology_epoch,
-                                true,
+                                // W10 composition (P1-1) — per-task W3 FIX C
+                                // disposition.
+                                failed_task_table_action(task),
                             ) {
                                 failed.fetch_add(1, Ordering::Relaxed);
                             }
@@ -11554,7 +11895,9 @@ fn run_migration_batch(
                                     &migrating_bm,
                                     task,
                                     topology_epoch,
-                                    true,
+                                    // W10 composition (P1-1) — per-task W3
+                                    // FIX C disposition.
+                                    failed_task_table_action(task),
                                 ) {
                                     failed.fetch_add(1, Ordering::Relaxed);
                                 }
@@ -12080,6 +12423,7 @@ fn run_migration_batch(
                                                 topology_epoch,
                                                 &manifest_for_probe,
                                                 auth_secret,
+                                                &RELINQUISH_SUPERSET_PROBE,
                                             )
                                         };
                                         if fail_or_relinquish_outbound_task(
@@ -14334,6 +14678,50 @@ pub(crate) fn migration_complete_rejection_error(status: u8, payload: &[u8]) -> 
     format!("target rejected: status {status}{detail}")
 }
 
+/// Retry/timeout budget for one [`confirm_target_holds_superset`] call.
+///
+/// The probe's cost is `retry_delays_ms.len()` attempts, each bounded by
+/// `connect_timeout + io_timeout`, plus the sum of all but the last delay. The
+/// two profiles below differ because the CONSEQUENCE of a false negative
+/// differs — see each constant.
+struct SupersetProbeProfile {
+    /// Backoff before each subsequent attempt; its length is the attempt
+    /// count.
+    retry_delays_ms: &'static [u64],
+    connect_timeout: Duration,
+    io_timeout: Duration,
+}
+
+/// The relinquish decision's profile (unchanged): ~80 s worst case
+/// (6 × (3 s + 10 s) + 2.35 s of backoff).
+///
+/// Generous by design. A false negative here means a phantom master KEEPS a
+/// non-empty shard it should have relinquished, so the cluster stays at
+/// serving = target + 1 until another round re-drives it — the sc09/sc05
+/// convergence stall this retry budget was added to fix. The probe runs once
+/// per failed handoff, off the pre-chunk path.
+const RELINQUISH_SUPERSET_PROBE: SupersetProbeProfile = SupersetProbeProfile {
+    retry_delays_ms: &[25, 75, 150, 300, 600, 1200],
+    connect_timeout: Duration::from_secs(3),
+    io_timeout: Duration::from_secs(10),
+};
+
+/// The already-serving verification profile (review P2-3): ≤ ~12.3 s worst
+/// case (3 × (1 s + 3 s) + 0.3 s of backoff).
+///
+/// Short by design. A false negative here only DEMOTES the candidate to the
+/// streaming path, which re-verifies end-to-end — no data decision rides on
+/// it — while the call runs on the pre-chunk phase, where every extra second
+/// is a second the batch holds `active_count()` above zero and the
+/// convergence gates shut. Three attempts still absorb the connection-cap
+/// resets the retry exists for (and unlike the relinquish probe, the batch's
+/// own migration pool has not opened its connections yet).
+const ALREADY_SERVING_SUPERSET_PROBE: SupersetProbeProfile = SupersetProbeProfile {
+    retry_delays_ms: &[50, 250, 500],
+    connect_timeout: Duration::from_secs(1),
+    io_timeout: Duration::from_secs(3),
+};
+
 /// Probe the rightful master to confirm it holds a SUPERSET of `self`'s shard
 /// records (sc09/sc05 drain convergence — transfer-then-relinquish).
 ///
@@ -14361,6 +14749,7 @@ fn confirm_target_holds_superset(
     topology_epoch: u64,
     manifest_entries: &[(TxKey, u32)],
     auth_secret: Option<&[u8]>,
+    profile: &SupersetProbeProfile,
 ) -> bool {
     if manifest_entries.is_empty() {
         return false;
@@ -14392,13 +14781,13 @@ fn confirm_target_holds_superset(
     // is a TRANSIENT connection failure (the target's per-IP connection cap
     // resetting the migration burst), which is retried below.
     let attempt = || -> std::result::Result<Option<bool>, String> {
-        let mut stream = TcpStream::connect_timeout(&target_addr, Duration::from_secs(3))
+        let mut stream = TcpStream::connect_timeout(&target_addr, profile.connect_timeout)
             .map_err(|e| format!("connect: {e}"))?;
         stream
-            .set_read_timeout(Some(Duration::from_secs(10)))
+            .set_read_timeout(Some(profile.io_timeout))
             .map_err(|e| format!("set read timeout: {e}"))?;
         stream
-            .set_write_timeout(Some(Duration::from_secs(10)))
+            .set_write_timeout(Some(profile.io_timeout))
             .map_err(|e| format!("set write timeout: {e}"))?;
         crate::replication::tcp_transport::configure_tcp_keepalive(&stream);
         let response = exchange_frame(&mut stream, &request, auth_secret)?;
@@ -14412,17 +14801,16 @@ fn confirm_target_holds_superset(
     // so the probe lands in a gap between bursts and the legitimate relinquish
     // can complete (sc09/sc05 convergence). A definitive STATUS answer (Ok) is
     // returned immediately — only transient connection errors are retried. The
-    // total budget is bounded (~3.1s of backoff plus per-attempt I/O timeouts),
-    // and on exhaustion we conservatively return `false` (keep data, roll back).
-    const RETRY_DELAYS_MS: [u64; 6] = [25, 75, 150, 300, 600, 1200];
+    // total budget is bounded by `profile` (see `SupersetProbeProfile`), and
+    // on exhaustion we conservatively return `false` (keep data, roll back).
     let mut last_err = String::new();
-    for (i, &delay_ms) in RETRY_DELAYS_MS.iter().enumerate() {
+    for (i, &delay_ms) in profile.retry_delays_ms.iter().enumerate() {
         match attempt() {
             Ok(Some(confirmed)) => return confirmed,
             Ok(None) => {}
             Err(err) => last_err = err,
         }
-        if i + 1 < RETRY_DELAYS_MS.len() {
+        if i + 1 < profile.retry_delays_ms.len() {
             std::thread::sleep(Duration::from_millis(delay_ms));
         }
     }
@@ -16041,8 +16429,12 @@ pub fn synthesize_resync_migration_tasks(
 /// just-registered tasks into the durable retry queue).
 ///
 /// W10 (armed-15 / armed-05, CI d3437e4): the tasks are registered through
-/// [`MigrationManager::start_outbound`] — the same bookkeeping as
-/// topology-plan tasks — BEFORE any data moves. Untracked resync tasks were
+/// [`MigrationManager::start_outbound_resync`] — the same bookkeeping as
+/// topology-plan tasks, except that the Phase E dual-write window it opens is
+/// tagged REPAIR-only so the replication path does not turn the backfill
+/// target into a mandatory per-shard new-side handoff ACK (W10 composition
+/// P1-2; see [`MigrationManager::dual_write_targets_with_origin_for_shard`])
+/// — BEFORE any data moves. Untracked resync tasks were
 /// invisible to `/admin/migration_status` AND their completions were
 /// discarded by the tracked-completion gate ("ignoring untracked migration
 /// completion"), so event/forced repair passes finished with `completed: 0`
@@ -16132,7 +16524,15 @@ fn prepare_resync_backfill(
         .copied()
         .filter(|&s| engine.shard_record_count(s) > 0)
         .collect();
-    migration.lock().start_outbound(&tasks, self_id, &populated);
+    // W10 composition (P1-2) — registered as a REPAIR: identical bookkeeping,
+    // except the Phase E dual-write window it opens is tagged repair-only so
+    // the target (a node the committed table already names as a holder) does
+    // not become a mandatory new-side handoff ACK for every client write to
+    // these shards. See
+    // `MigrationManager::dual_write_targets_with_origin_for_shard`.
+    migration
+        .lock()
+        .start_outbound_resync(&tasks, self_id, &populated);
     let (keys_map, skipped) = engine.keys_by_shard_filtered(&target_shards);
     // Issue #46 fail-safe: an unreadable-footer skip means this resync key
     // set is incomplete — do not backfill a short set. The tasks are tracked,
@@ -18883,11 +19283,12 @@ impl RunningCluster {
     /// batches for `shard` while it is migrating outbound from this node.
     /// Returns an empty Vec when no migration is in flight for the shard.
     ///
-    /// Used by [`replicate_all_ops`](crate::server::dispatch) to fan
-    /// writes out to BOTH the old replica set (from the shard table) and
-    /// the new master / replica destinations (from the migration tracker)
-    /// during the migration window. This protects durability when the new
-    /// master is promoted before the migration has finished streaming.
+    /// TEST-ONLY since the replication path moved to
+    /// [`Self::dual_write_targets_with_origin_for_shard`] (W10 composition
+    /// P1-2). Kept `#[cfg(test)]` deliberately: this accessor is ORIGIN-BLIND,
+    /// and a production caller picking it up would re-create the defect where
+    /// a Phase-H repair destination is treated as a new-side handoff holder.
+    #[cfg(test)]
     pub fn dual_write_targets_for_shard(&self, shard: u16) -> Vec<NodeId> {
         // C31 test observability: count each migration-lock acquisition so a
         // test can pin the per-shard memoization in the batch dual-write path.
@@ -18898,6 +19299,26 @@ impl RunningCluster {
             .lock()
             .dual_write_targets_for_shard(shard)
             .to_vec()
+    }
+
+    /// Phase E dual-write targets for `shard`, each paired with whether it is
+    /// a NEW-SIDE HANDOFF holder (`true`) or a repair-only Phase-H resync
+    /// backfill destination (`false`).
+    ///
+    /// Used by `build_replication_targets` in place of
+    /// [`Self::dual_write_targets_for_shard`] so one migration-lock
+    /// acquisition yields both the fan-out set and the handoff-ACK gating
+    /// (W10 composition P1-2). See
+    /// [`MigrationManager::dual_write_targets_with_origin_for_shard`].
+    pub fn dual_write_targets_with_origin_for_shard(&self, shard: u16) -> Vec<(NodeId, bool)> {
+        // C31 test observability: this replaces the plain lookup on the batch
+        // dual-write path, so it must keep counting the lock acquisition.
+        #[cfg(test)]
+        self.dual_write_lookup_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.migration
+            .lock()
+            .dual_write_targets_with_origin_for_shard(shard)
     }
 
     /// C31 test observability: number of [`Self::dual_write_targets_for_shard`]
@@ -18924,6 +19345,24 @@ impl RunningCluster {
             is_master: true,
         };
         self.migration.lock().start_outbound(
+            std::slice::from_ref(&task),
+            self.self_id,
+            &std::collections::HashSet::new(),
+        );
+    }
+
+    /// Test-only: register a Phase-H RESYNC backfill task (replica-side
+    /// repair toward `dest`, which the committed table already names as a
+    /// holder) so the repair-only dual-write window opens for `shard`.
+    #[cfg(test)]
+    pub(crate) fn test_open_resync_dual_write_window(&self, shard: u16, dest: NodeId) {
+        let task = MigrationTask {
+            shard,
+            from_node: self.self_id,
+            to_node: dest,
+            is_master: false,
+        };
+        self.migration.lock().start_outbound_resync(
             std::slice::from_ref(&task),
             self.self_id,
             &std::collections::HashSet::new(),
@@ -25612,21 +26051,28 @@ mod tests {
         let mut index = crate::index::Index::new(100).unwrap();
 
         // Shard A: a single record whose footer will be unreadable (M=0,
-        // N>0). Shard B: one clean + one unreadable record (0<M<N).
+        // N>0). Shard B: one clean + one unreadable record (0<M<N). Shard C:
+        // wholly readable — review P2-1: the skip must be attributed to the
+        // shard it happened on, so C keeps being probed and confirmed even
+        // though A and B enumerate short in the SAME batched index pass.
         let key_a_bad = tx_key_for_shard(101, 1);
         let key_b_clean = tx_key_for_shard(202, 2);
         let key_b_bad = tx_key_for_shard(202, 3);
+        let key_c_clean = tx_key_for_shard(303, 4);
         let shard_a = ShardTable::shard_for_key(&key_a_bad);
         let shard_b = ShardTable::shard_for_key(&key_b_clean);
+        let shard_c = ShardTable::shard_for_key(&key_c_clean);
         assert_ne!(shard_a, shard_b);
+        assert_ne!(shard_a, shard_c);
+        assert_ne!(shard_b, shard_c);
         assert_eq!(shard_b, ShardTable::shard_for_key(&key_b_bad));
 
         let utxo_count = 1u32;
         let record_size = TxMetadata::record_size_for(utxo_count);
         let mut corrupt_offsets = Vec::new();
-        for key in [key_a_bad, key_b_clean, key_b_bad] {
+        for key in [key_a_bad, key_b_clean, key_b_bad, key_c_clean] {
             let offset = alloc.allocate(record_size).unwrap();
-            if key != key_b_clean {
+            if key != key_b_clean && key != key_c_clean {
                 corrupt_offsets.push(offset);
             }
             let mut meta = TxMetadata::new(utxo_count);
@@ -25670,8 +26116,10 @@ mod tests {
         assert!(engine.read_metadata(&key_a_bad).is_err());
         assert!(engine.read_metadata(&key_b_bad).is_err());
         assert!(engine.read_metadata(&key_b_clean).is_ok());
+        assert!(engine.read_metadata(&key_c_clean).is_ok());
         assert_eq!(engine.shard_record_count(shard_a), 1);
         assert_eq!(engine.shard_record_count(shard_b), 2);
+        assert_eq!(engine.shard_record_count(shard_c), 1);
 
         let task_a = MigrationTask {
             shard: shard_a,
@@ -25685,19 +26133,52 @@ mod tests {
             to_node: NodeId(2),
             is_master: true,
         };
-        // A bound-then-dropped address: neither shape may touch the network
-        // (a demotion happens BEFORE any probe; pre-fix the empty-manifest
-        // confirm also short-circuited the probe).
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let dead_addr = listener.local_addr().unwrap();
-        drop(listener);
+        let task_c = MigrationTask {
+            shard: shard_c,
+            from_node: NodeId(1),
+            to_node: NodeId(2),
+            is_master: true,
+        };
+        // Neither SKIPPED shape may probe (a demotion happens BEFORE any
+        // probe; pre-fix the empty-manifest confirm also short-circuited it).
+        // The clean shard C must still be probed — one shard's unreadable
+        // footer may not spill onto its batch-mates (review P2-1).
+        let probes: Arc<Mutex<Vec<u16>>> = Arc::new(Mutex::new(Vec::new()));
+        let probes_seen = probes.clone();
+        let probe = move |task: &MigrationTask, _: &[(TxKey, u32)]| {
+            probes_seen.lock().push(task.shard);
+            true
+        };
 
-        let (confirmed, demoted) =
-            verify_already_serving_skips(&engine, dead_addr, vec![task_a, task_b.clone()], 3, None);
+        let AlreadyServingVerification {
+            confirmed,
+            demoted,
+            deferred,
+        } = verify_already_serving_skips(
+            &engine,
+            vec![task_a, task_b.clone(), task_c],
+            8,
+            2,
+            Duration::from_secs(30),
+            &probe,
+        );
+        assert_eq!(
+            probes.lock().as_slice(),
+            &[shard_c],
+            "exactly the CLEAN shard is probed: an unreadably-enumerated \
+             shard demotes without probing, and its skip must not be \
+             attributed to a batch-mate that enumerated cleanly",
+        );
         assert!(
-            confirmed.is_empty(),
+            deferred.is_empty(),
+            "all candidates fit the budget: {deferred:?}",
+        );
+        assert_eq!(
+            confirmed.iter().map(|t| t.shard).collect::<Vec<u16>>(),
+            vec![shard_c],
             "an unreadably-enumerated shard must NEVER confirm a \
-             completion-only commit (confirmed: {confirmed:?})"
+             completion-only commit, and the clean one must still confirm \
+             (confirmed: {confirmed:?})"
         );
         assert_eq!(
             demoted.len(),
@@ -39628,5 +40109,611 @@ mod tests {
         for h in [t1, t2, t3] {
             h.join().expect("worker joins");
         }
+    }
+
+    /// W10 COMPOSITION FIX 1 (P1-1) — fixture: shard `S` is mid-handoff
+    /// `node1 -> node3` (state `Copying`, the master's worker still
+    /// streaming), and a REPLICA-side task (the shape every Phase-H resync
+    /// backfill has) exists for the SAME shard toward a different node.
+    ///
+    /// Returns `(shard, epoch, shard_table)`.
+    fn mid_copying_master_handoff_fixture() -> (u16, u64, Arc<ShardTableLock<ShardTable>>) {
+        let old_members = vec![NodeId(1), NodeId(2)];
+        let new_members = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let mut table = ShardTable::compute_with_epoch(&old_members, 2, 3, 1);
+        let new_table = ShardTable::compute_with_epoch(&new_members, 2, 4, 1);
+        let shard = (0..NUM_SHARDS as u16)
+            .find(|&s| {
+                table.target_assignment(s).master == NodeId(1)
+                    && new_table.target_assignment(s).master == NodeId(3)
+            })
+            .expect("a shard whose mastership moves node1 -> node3");
+        table.begin_handoff_with(&new_table, |s| s == shard);
+        assert_eq!(
+            table.shard_handoff_state(shard),
+            ShardHandoff::Copying,
+            "fixture must leave the master handoff mid-Copying",
+        );
+        assert_eq!(table.target_assignment(shard).master, NodeId(3));
+        let epoch = table.version;
+        (shard, epoch, Arc::new(ShardTableLock::new(table)))
+    }
+
+    /// W10 COMPOSITION FIX 1 (P1-1) — the "no address for target" fail site
+    /// blanket-rolled the shard back. Pre-W10 a resync task was untracked, so
+    /// `fail_migration_task_current_epoch` returned at the `!tracked` guard
+    /// BEFORE any table action; `prepare_resync_backfill`'s `start_outbound`
+    /// registration made every fail site reachable by a REPLICA-side task.
+    /// `rollback_shard` is shard-scoped, so the replica task's failure
+    /// reverted the CONCURRENT master handoff of the same shard under its
+    /// still-streaming worker and stamped `ServingNew` — node1 and node3 then
+    /// both believe they master `S` (dual-serving master = double-spend).
+    #[test]
+    fn replica_task_failure_without_target_address_leaves_master_handoff_intact() {
+        let (shard, epoch, shard_table) = mid_copying_master_handoff_fixture();
+        let engine = Arc::new(test_engine());
+        let migration = Arc::new(Mutex::new(MigrationManager::new()));
+        let fenced_bm = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+        let migrating_bm = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+        let inbound_bm = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+
+        // The Phase-H resync backfill shape: replica-side, different to_node,
+        // so both the drain's in-flight dedup and the tracked-active dedup
+        // admit it alongside the master handoff.
+        let resync_task = MigrationTask {
+            shard,
+            from_node: NodeId(1),
+            to_node: NodeId(2),
+            is_master: false,
+        };
+        migration.lock().start_outbound(
+            std::slice::from_ref(&resync_task),
+            NodeId(1),
+            &std::collections::HashSet::new(),
+        );
+
+        let (completed, failed) = run_migration_batch(
+            vec![resync_task],
+            None, // no resolved address for the target
+            &[],
+            engine,
+            &migration,
+            &shard_table,
+            &None,
+            epoch,
+            1,
+            100,
+            fenced_bm,
+            migrating_bm,
+            inbound_bm,
+            NodeId(1),
+            None,
+            None,
+        );
+        assert_eq!(
+            (completed, failed),
+            (0, 1),
+            "the unroutable replica task must still be parked Failed",
+        );
+
+        let table = shard_table.read();
+        assert_eq!(
+            table.shard_handoff_state(shard),
+            ShardHandoff::Copying,
+            "a REPLICA task's failure must not touch the shard table: the \
+             concurrent master handoff is still mid-Copying",
+        );
+        assert_eq!(
+            table.target_assignment(shard).master,
+            NodeId(3),
+            "the master handoff's target assignment must survive a \
+             replica-side failure (rollback here re-installs node1 as master \
+             while node3's worker still streams -> two serving masters)",
+        );
+    }
+
+    /// W10 COMPOSITION FIX 1 (P1-1) — same hazard through
+    /// `fail_or_relinquish_outbound_task`, the site the baseline-streaming
+    /// failure (:11268) and the empty-path completion failure (:10858) use.
+    /// The resync drain passes `relinquish_ctx = None`, which took the
+    /// unconditional `FailedTaskTableAction::Rollback` arm.
+    #[test]
+    fn replica_task_stream_failure_leaves_master_handoff_intact() {
+        let (shard, epoch, shard_table) = mid_copying_master_handoff_fixture();
+        let migration = Arc::new(Mutex::new(MigrationManager::new()));
+        let fenced_bm = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+        let migrating_bm = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+
+        let resync_task = MigrationTask {
+            shard,
+            from_node: NodeId(1),
+            to_node: NodeId(2),
+            is_master: false,
+        };
+        migration.lock().start_outbound(
+            std::slice::from_ref(&resync_task),
+            NodeId(1),
+            &std::collections::HashSet::new(),
+        );
+
+        assert!(
+            fail_or_relinquish_outbound_task(
+                &migration,
+                &shard_table,
+                &fenced_bm,
+                &migrating_bm,
+                &resync_task,
+                epoch,
+                None, // the resync drain's context
+                None,
+            ),
+            "the tracked replica task must be retired as Failed",
+        );
+
+        let table = shard_table.read();
+        assert_eq!(
+            table.shard_handoff_state(shard),
+            ShardHandoff::Copying,
+            "a replica-side stream failure must leave the concurrent master \
+             handoff mid-Copying",
+        );
+        assert_eq!(table.target_assignment(shard).master, NodeId(3));
+    }
+
+    /// W10 COMPOSITION FIX 1 — control: the MASTER handoff's own failure
+    /// keeps the historical no-loss rollback-to-self disposition. The
+    /// per-task gate must narrow the blast radius to replica tasks only.
+    #[test]
+    fn master_task_failure_still_rolls_the_shard_back_to_self() {
+        let (shard, epoch, shard_table) = mid_copying_master_handoff_fixture();
+        let migration = Arc::new(Mutex::new(MigrationManager::new()));
+        let fenced_bm = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+        let migrating_bm = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+
+        let master_task = MigrationTask {
+            shard,
+            from_node: NodeId(1),
+            to_node: NodeId(3),
+            is_master: true,
+        };
+        migration.lock().start_outbound(
+            std::slice::from_ref(&master_task),
+            NodeId(1),
+            &std::collections::HashSet::new(),
+        );
+
+        assert!(fail_or_relinquish_outbound_task(
+            &migration,
+            &shard_table,
+            &fenced_bm,
+            &migrating_bm,
+            &master_task,
+            epoch,
+            None,
+            None,
+        ));
+
+        let table = shard_table.read();
+        assert_eq!(
+            table.target_assignment(shard).master,
+            NodeId(1),
+            "a failed MASTER handoff still rolls back to self (no-loss)",
+        );
+        assert_eq!(table.shard_handoff_state(shard), ShardHandoff::ServingNew);
+    }
+
+    /// W10 COMPOSITION FIX 4 (P2-9) — two demoted already-serving candidates
+    /// for the SAME shard (the master task and a replica task toward the same
+    /// `to_node`) each carry that shard's full live key list. Flattening them
+    /// concatenated the list twice into `keys_by_shard`, so the shard streamed
+    /// a 2N-entry manifest against an N-record target and the completion was
+    /// rejected on the exact-count check every round.
+    #[test]
+    fn demoted_shard_keys_dedups_two_candidates_for_one_shard() {
+        let shard = 42u16;
+        let keys: Vec<TxKey> = (0..3).map(|i| tx_key_for_shard(shard, i)).collect();
+        let master = MigrationTask {
+            shard,
+            from_node: NodeId(1),
+            to_node: NodeId(2),
+            is_master: true,
+        };
+        let replica = MigrationTask {
+            shard,
+            from_node: NodeId(1),
+            to_node: NodeId(2),
+            is_master: false,
+        };
+        let demoted = vec![(master, keys.clone()), (replica, keys.clone())];
+        // Pin the defect shape the fixture reproduces: the pre-fix flat
+        // concatenation contributed the shard's keys once PER TASK.
+        let pre_fix_concat: Vec<TxKey> = demoted
+            .iter()
+            .flat_map(|(_, k)| k.iter().copied())
+            .collect();
+        assert_eq!(
+            pre_fix_concat.len(),
+            keys.len() * 2,
+            "fixture must reproduce the pre-fix doubling",
+        );
+        let flattened = demoted_shard_keys(&demoted);
+        assert_eq!(
+            flattened, keys,
+            "one shard contributes its key set ONCE, however many demoted \
+             tasks name it (a doubled list = guaranteed count-mismatch)",
+        );
+    }
+
+    /// W10 COMPOSITION FIX 4 (P2-9) — an EMPTY demotion (the issue-#46
+    /// skip-aware demotion) for a shard must win over a non-empty sibling:
+    /// contributing keys would route the shard onto the data path, where a
+    /// short manifest can be streamed-verified-and-COMMITTED. The empty
+    /// contribution routes it to the empty path's skip-aware fenced recheck.
+    #[test]
+    fn demoted_shard_keys_empty_demotion_wins_over_a_sibling_key_list() {
+        let shard = 7u16;
+        let keys: Vec<TxKey> = (0..2).map(|i| tx_key_for_shard(shard, i)).collect();
+        let a = MigrationTask {
+            shard,
+            from_node: NodeId(1),
+            to_node: NodeId(2),
+            is_master: true,
+        };
+        let b = MigrationTask {
+            shard,
+            from_node: NodeId(1),
+            to_node: NodeId(3),
+            is_master: false,
+        };
+        let demoted = vec![(a, keys.clone()), (b, Vec::new())];
+        assert!(
+            demoted_shard_keys(&demoted).is_empty(),
+            "a skip demotion (empty key list) must suppress the shard's keys",
+        );
+        let demoted_rev = vec![
+            (
+                MigrationTask {
+                    shard,
+                    from_node: NodeId(1),
+                    to_node: NodeId(3),
+                    is_master: false,
+                },
+                Vec::new(),
+            ),
+            (
+                MigrationTask {
+                    shard,
+                    from_node: NodeId(1),
+                    to_node: NodeId(2),
+                    is_master: true,
+                },
+                keys,
+            ),
+        ];
+        assert!(
+            demoted_shard_keys(&demoted_rev).is_empty(),
+            "order must not matter — the fail-safe empty contribution wins",
+        );
+    }
+
+    /// W10 COMPOSITION FIX 2 (P1-2) — the drain's registration path itself:
+    /// `prepare_resync_backfill` must open a REPAIR-only dual-write window,
+    /// otherwise the R2/P7b gate in `build_replication_targets` turns the
+    /// repair target into a mandatory per-shard write ACK (see
+    /// `resync_dual_write_target_is_not_a_mandatory_handoff_ack`).
+    #[test]
+    fn prepare_resync_backfill_opens_a_repair_only_dual_write_window() {
+        let members = vec![NodeId(1), NodeId(2)];
+        let table = ShardTable::compute_with_epoch(&members, 2, 3, 1);
+        let shard = (0..NUM_SHARDS as u16)
+            .find(|&s| {
+                table.target_assignment(s).master == NodeId(1)
+                    && table.target_assignment(s).replicas.contains(&NodeId(2))
+            })
+            .expect("node 1 must master a shard with node 2 as replica");
+        let epoch = table.version;
+        let shard_table = Arc::new(ShardTableLock::new(table));
+
+        let engine = Arc::new(test_engine());
+        create_test_record(&engine, tx_key_for_shard(shard, 11));
+
+        let migration = Arc::new(Mutex::new(MigrationManager::new()));
+        let resync_inflight: Arc<Mutex<std::collections::HashSet<(u64, u16)>>> =
+            Arc::new(Mutex::new(std::collections::HashSet::new()));
+        let fenced_bm = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+        let migrating_bm = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+
+        let req = crate::replication::manager::ResyncRequest {
+            node_id: 2,
+            shards: vec![shard],
+        };
+        let (tasks, _keys) = prepare_resync_backfill(
+            &req,
+            NodeId(1),
+            &shard_table,
+            &migration,
+            &engine,
+            &resync_inflight,
+            &fenced_bm,
+            &migrating_bm,
+            epoch,
+        )
+        .expect("the resync request must resolve to runnable backfill work");
+        assert_eq!(tasks.len(), 1);
+        assert!(!tasks[0].is_master, "a resync backfill is replica-side");
+
+        let mgr = migration.lock();
+        assert_eq!(
+            mgr.active_count(),
+            1,
+            "the backfill stays start_outbound-tracked (W10 defect 1)",
+        );
+        assert_eq!(
+            mgr.dual_write_targets_for_shard(shard),
+            &[NodeId(2)],
+            "the repair target must still receive the dual-write fan-out",
+        );
+        assert_eq!(
+            mgr.dual_write_targets_with_origin_for_shard(shard),
+            vec![(NodeId(2), false)],
+            "the window must be tagged REPAIR-only — a resync toward an \
+             existing replica is not a new-side handoff holder",
+        );
+    }
+
+    /// W10 COMPOSITION FIX 3 (P1-4) — the already-serving verification phase
+    /// runs SERIALLY at the head of `run_migration_batch`, before any
+    /// chunking, and `should_skip_already_serving_migration` is not
+    /// `is_master`-gated, so on a settled cluster every task whose shard has
+    /// no keys in the batch snapshot becomes a candidate. Each candidate
+    /// holding records cost a full index enumeration, a per-key device-footer
+    /// manifest collection and a `confirm_target_holds_superset` probe that
+    /// opens its OWN connection outside the migration pool with six retries.
+    /// Meanwhile every task in the batch is `start_outbound`-tracked, so
+    /// `active_count() > 0` holds shut the degraded upgrade, the event-repair
+    /// fire, the failed-batch redrive, reactivation and prompt re-election.
+    ///
+    /// Pins both bounds: N candidates cost at most K probes, and those probes
+    /// run CONCURRENTLY (peak observed in-flight == the requested
+    /// concurrency), so the phase is one probe round-trip deep, not N.
+    #[test]
+    fn already_serving_verification_is_probe_bounded_and_parallel() {
+        const CANDIDATES: u16 = 64;
+        const BUDGET: usize = 8;
+        const CONCURRENCY: usize = 4;
+
+        let engine = Arc::new(test_engine());
+        let mut tasks = Vec::new();
+        for shard in 0..CANDIDATES {
+            // Every candidate holds a record, so every one needs evidence.
+            create_test_record(&engine, tx_key_for_shard(shard, 3));
+            assert_eq!(engine.shard_record_count(shard), 1);
+            tasks.push(MigrationTask {
+                shard,
+                from_node: NodeId(1),
+                to_node: NodeId(2),
+                is_master: true,
+            });
+        }
+
+        // The probe records how many calls happen and how many overlap. Each
+        // call waits (bounded) for the others so a PARALLEL implementation
+        // reaches `CONCURRENCY` in flight; a serial one never exceeds 1 and
+        // simply times out of the wait instead of hanging.
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let live = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let peak = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (calls_p, live_p, peak_p) = (calls.clone(), live.clone(), peak.clone());
+        let probe = move |_: &MigrationTask, entries: &[(TxKey, u32)]| {
+            assert!(!entries.is_empty(), "the probe gets a real manifest");
+            calls_p.fetch_add(1, Ordering::Relaxed);
+            let now = live_p.fetch_add(1, Ordering::SeqCst) + 1;
+            peak_p.fetch_max(now, Ordering::SeqCst);
+            let wait_until = std::time::Instant::now() + Duration::from_secs(2);
+            while live_p.load(Ordering::SeqCst) < CONCURRENCY
+                && std::time::Instant::now() < wait_until
+            {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            live_p.fetch_sub(1, Ordering::SeqCst);
+            true
+        };
+
+        let AlreadyServingVerification {
+            confirmed,
+            demoted,
+            deferred,
+        } = verify_already_serving_skips(
+            &engine,
+            tasks,
+            BUDGET,
+            CONCURRENCY,
+            Duration::from_secs(60),
+            &probe,
+        );
+
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            BUDGET,
+            "N candidates must cost at most K probes — an unbounded phase \
+             stalls the whole batch (and every gate active_count() holds) \
+             for tens of minutes",
+        );
+        assert_eq!(
+            peak.load(Ordering::SeqCst),
+            CONCURRENCY,
+            "the probes must run concurrently: a serial pre-chunk phase \
+             never has more than one in flight",
+        );
+        assert_eq!(confirmed.len(), BUDGET, "every probed candidate confirmed");
+        assert!(demoted.is_empty(), "no candidate was refused: {demoted:?}");
+        assert_eq!(
+            deferred.len(),
+            CANDIDATES as usize - BUDGET,
+            "over-budget candidates must be DEFERRED — never confirmed on \
+             no evidence, and never silently dropped",
+        );
+        let mut all: Vec<u16> = confirmed
+            .iter()
+            .chain(deferred.iter())
+            .map(|t| t.shard)
+            .collect();
+        all.sort_unstable();
+        assert_eq!(
+            all,
+            (0..CANDIDATES).collect::<Vec<u16>>(),
+            "every candidate must come back with exactly one disposition",
+        );
+    }
+
+    /// W10 COMPOSITION FIX 3 (P1-4) — a deferred candidate must be PARKED
+    /// (Failed, durable retry queue) by the batch, never confirmed and never
+    /// left unresolved holding `active_count()` above zero. The shard table
+    /// is untouched: an already-serving skip was never table-committed by
+    /// this batch.
+    #[test]
+    fn deferred_already_serving_candidates_are_parked_for_the_redrive() {
+        let members = vec![NodeId(1), NodeId(2)];
+        let table = ShardTable::compute_with_epoch(&members, 2, 3, 1);
+        let engine = Arc::new(test_engine());
+        // More record-holding already-serving candidates than the budget.
+        let shards: Vec<u16> = (0..NUM_SHARDS as u16)
+            .filter(|&s| {
+                table.target_assignment(s).master == NodeId(1)
+                    && table.shard_handoff_state(s) == ShardHandoff::ServingNew
+            })
+            .take(ALREADY_SERVING_PROBE_BUDGET + 3)
+            .collect();
+        assert_eq!(shards.len(), ALREADY_SERVING_PROBE_BUDGET + 3);
+        for &shard in &shards {
+            create_test_record(&engine, tx_key_for_shard(shard, 5));
+        }
+        let epoch = table.version;
+        let shard_table = Arc::new(ShardTableLock::new(table));
+        let migration = Arc::new(Mutex::new(MigrationManager::new()));
+        let tasks: Vec<MigrationTask> = shards
+            .iter()
+            .map(|&shard| MigrationTask {
+                shard,
+                from_node: NodeId(1),
+                to_node: NodeId(2),
+                is_master: true,
+            })
+            .collect();
+        migration.lock().start_outbound(
+            &tasks,
+            NodeId(1),
+            &shards
+                .iter()
+                .copied()
+                .collect::<std::collections::HashSet<u16>>(),
+        );
+
+        let fenced_bm = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+        let migrating_bm = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+        let inbound_bm = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+        let (addr, _op_rx, stop, target) = spawn_ack_all_target(false);
+
+        // `all_keys` is EMPTY (the batch snapshot holds nothing for these
+        // shards) — exactly the split that makes every task an
+        // already-serving candidate.
+        let (completed, failed) = run_migration_batch(
+            tasks.clone(),
+            Some(addr),
+            &[],
+            engine,
+            &migration,
+            &shard_table,
+            &None,
+            epoch,
+            4,
+            100,
+            fenced_bm,
+            migrating_bm,
+            inbound_bm,
+            NodeId(1),
+            None,
+            None,
+        );
+        stop.store(true, Ordering::Relaxed);
+        let _ = target.join();
+
+        assert_eq!(
+            failed as usize, 3,
+            "the over-budget candidates must be parked Failed (completed \
+             {completed}, failed {failed})",
+        );
+        assert_eq!(
+            completed as usize, ALREADY_SERVING_PROBE_BUDGET,
+            "the budgeted candidates still commit their completion-only \
+             handshake",
+        );
+        let mgr = migration.lock();
+        assert_eq!(
+            mgr.active_count(),
+            0,
+            "no task may be left unresolved — a non-terminal entry holds \
+             active_count() above zero and every gate it guards shut",
+        );
+        assert!(
+            mgr.failed_count() >= 3,
+            "the deferred candidates sit in the durable retry queue",
+        );
+        drop(mgr);
+        let table = shard_table.read();
+        for &shard in &shards {
+            assert_eq!(
+                table.target_assignment(shard).master,
+                NodeId(1),
+                "an already-serving skip is not table-committed by this \
+                 batch; deferring it must not touch the table",
+            );
+        }
+    }
+
+    /// W10 COMPOSITION review P2-3 — the already-serving verification phase's
+    /// stated bound must be REAL. `ALREADY_SERVING_VERIFY_DEADLINE` gates
+    /// probe STARTS, not completions, so the phase's worst case is the
+    /// deadline plus one whole in-flight probe. With the relinquish profile
+    /// (6 attempts × (3 s connect + 10 s read) + 2.35 s backoff ≈ 80 s) that
+    /// tail alone was ~8× the deadline; the verification profile must keep it
+    /// comparable to the deadline itself.
+    ///
+    /// A false negative on THIS probe only demotes a candidate to the
+    /// streaming path (which re-verifies end-to-end), so the short budget
+    /// costs no safety — unlike the relinquish probe, whose false negative
+    /// strands a phantom master and which therefore keeps its long budget.
+    #[test]
+    fn already_serving_probe_profile_keeps_the_phase_bound_real() {
+        let worst = |p: &SupersetProbeProfile| -> Duration {
+            let attempts = p.retry_delays_ms.len() as u32;
+            let backoff: u64 = p.retry_delays_ms[..p.retry_delays_ms.len() - 1]
+                .iter()
+                .sum();
+            (p.connect_timeout + p.io_timeout) * attempts + Duration::from_millis(backoff)
+        };
+        let verify_worst = worst(&ALREADY_SERVING_SUPERSET_PROBE);
+        assert!(
+            verify_worst <= Duration::from_millis(12_500),
+            "the verification probe's worst case must stay ~12.3s (got {verify_worst:?}) \
+             — it is the OVERRUN past ALREADY_SERVING_VERIFY_DEADLINE, and the phase \
+             holds active_count() above zero throughout",
+        );
+        assert!(
+            verify_worst <= ALREADY_SERVING_VERIFY_DEADLINE + Duration::from_millis(2_500),
+            "the in-flight tail must stay comparable to the deadline itself, \
+             otherwise the documented ~22s phase bound is fiction",
+        );
+        assert!(
+            !ALREADY_SERVING_SUPERSET_PROBE.retry_delays_ms.is_empty(),
+            "the probe must still retry: a single connection-cap reset must \
+             not force a pointless full re-stream",
+        );
+        // The relinquish profile is deliberately NOT shortened: its false
+        // negative leaves a phantom master holding a shard (sc09/sc05).
+        assert!(
+            worst(&RELINQUISH_SUPERSET_PROBE) > verify_worst * 4,
+            "the relinquish probe keeps its long budget",
+        );
     }
 }

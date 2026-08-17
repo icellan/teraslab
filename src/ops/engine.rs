@@ -4270,6 +4270,37 @@ impl Engine {
         &self,
         shard_filter: &std::collections::HashSet<u16>,
     ) -> (std::collections::HashMap<u16, Vec<TxKey>>, usize) {
+        let detailed = self.keys_by_shard_filtered_detailed(shard_filter);
+        let mut total_skipped = 0usize;
+        let map = detailed
+            .into_iter()
+            .map(|(shard, (keys, skipped))| {
+                total_skipped += skipped;
+                (shard, keys)
+            })
+            .collect();
+        (map, total_skipped)
+    }
+
+    /// [`Self::keys_by_shard_filtered`] with the skip count kept PER SHARD
+    /// instead of summed.
+    ///
+    /// Same single index pass and same per-shard footer resolution — the
+    /// per-shard counts already exist inside that fold; this variant simply
+    /// does not throw them away. Returns `shard -> (keys, skipped)` for every
+    /// filtered shard that has index entries; a shard absent from the map has
+    /// no records at all.
+    ///
+    /// Callers that must attribute an issue-#46 skip to the SHARD it happened
+    /// on need this: with only the total, the sole way to tell which shard was
+    /// short was to re-enumerate each one separately — one whole-index pass
+    /// per shard, which on a 32-shard round is 33 full scans for a single
+    /// unreadable footer (and `resolve_full_keys` documents stale-offset skips
+    /// as routine churn, so that path is not rare).
+    pub fn keys_by_shard_filtered_detailed(
+        &self,
+        shard_filter: &std::collections::HashSet<u16>,
+    ) -> std::collections::HashMap<u16, (Vec<TxKey>, usize)> {
         let mut by_shard: std::collections::HashMap<u16, Vec<(TxKey, u8, u64)>> =
             std::collections::HashMap::new();
         self.index.for_each(|k, e| {
@@ -4281,16 +4312,10 @@ impl Engine {
                     .push((k, e.device_id, e.record_offset));
             }
         });
-        let mut total_skipped = 0usize;
-        let map = by_shard
+        by_shard
             .into_iter()
-            .map(|(shard, locs)| {
-                let (keys, skipped) = self.resolve_full_keys(locs);
-                total_skipped += skipped;
-                (shard, keys)
-            })
-            .collect();
-        (map, total_skipped)
+            .map(|(shard, locs)| (shard, self.resolve_full_keys(locs)))
+            .collect()
     }
 
     /// Execute a batch of spends on a single transaction.
@@ -30498,6 +30523,35 @@ mod tests {
             "the enumeration_unreadable counter must bump by exactly one skip"
         );
 
+        // The DETAILED variant keeps the skip PER SHARD from the SAME single
+        // index pass: key_b's shard is the only one reported short, so a
+        // caller can attribute an issue-#46 skip without re-enumerating each
+        // shard separately (W10 composition review P2-1 — those re-scans were
+        // a full index pass EACH).
+        let before_detailed = engine.enumeration_unreadable();
+        let detailed = engine.keys_by_shard_filtered_detailed(&filter);
+        assert_eq!(
+            detailed
+                .get(&sh(&key_b))
+                .map(|(keys, sk)| (keys.len(), *sk)),
+            Some((0, 1)),
+            "the corrupt record's shard must carry the skip, with no keys",
+        );
+        for key in [key_a, key_c] {
+            assert_eq!(
+                detailed.get(&sh(&key)).map(|(keys, sk)| (keys.len(), *sk)),
+                Some((1, 0)),
+                "a clean shard must report ZERO skips — a batch-mate's \
+                 unreadable footer must not spill onto it",
+            );
+        }
+        assert_eq!(
+            engine.enumeration_unreadable(),
+            before_detailed + 1,
+            "the detailed variant does exactly one enumeration, bumping the \
+             counter once — not once per shard",
+        );
+
         // all_keys keeps its Vec signature but still resolves + bumps the metric.
         let all = engine.all_keys();
         let all_set: std::collections::HashSet<TxKey> = all.iter().copied().collect();
@@ -30506,8 +30560,9 @@ mod tests {
         assert!(!all_set.contains(&key_b));
         assert_eq!(
             engine.enumeration_unreadable(),
-            before + 2,
-            "all_keys must bump the counter for its own skip too"
+            before + 3,
+            "all_keys must bump the counter for its own skip too (after the \
+             filtered and detailed passes)"
         );
     }
 
