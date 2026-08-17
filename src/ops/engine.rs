@@ -3229,6 +3229,13 @@ impl Engine {
         self.recency_cache.scan_stats()
     }
 
+    /// Round-2 follow-up 2 — record how many entries of the
+    /// partition-version report just built were served RECENCY-UNKNOWN
+    /// (feeds the `teraslab_recency_unknown_shards` gauge).
+    pub fn note_recency_report_unknown_shards(&self, unknown: u64) {
+        self.recency_cache.record_report_unknown_shards(unknown);
+    }
+
     /// W10 FIX 1 — recompute the shard-recency cache from the index and
     /// device, BLOCKING the calling thread for the full scan (one
     /// filtered index walk plus a per-key on-device footer read — the

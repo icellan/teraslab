@@ -1738,7 +1738,12 @@ fn prom_gauge(out: &mut String, name: &str, val: u64) {
 /// - `teraslab_recency_scan_skipped_keys_total` — keys skipped by scans
 ///   (unreadable footer / raced deletion, P2-8; aggregate across shards);
 /// - `teraslab_recency_refresh_spawn_failed_total` — refresh threads that
-///   failed to spawn (P1-2; each released the single-flight slot).
+///   failed to spawn (P1-2; each released the single-flight slot);
+/// - `teraslab_recency_unknown_shards` — entries of the most recent
+///   partition-version report served RECENCY-UNKNOWN (round-2 follow-up
+///   2): non-zero during the boot pre-first-scan window; a value that
+///   never returns to zero means the node's scans are not converging and
+///   peers are skipping its reverse-heal evidence.
 pub(crate) fn append_recency_metrics(
     out: &mut String,
     stats: crate::ops::recency::RecencyScanStats,
@@ -1761,6 +1766,11 @@ pub(crate) fn append_recency_metrics(
         out,
         "teraslab_recency_refresh_spawn_failed_total",
         stats.spawn_failures,
+    );
+    prom_gauge(
+        out,
+        "teraslab_recency_unknown_shards",
+        stats.unknown_shards_last_report,
     );
 }
 
@@ -6939,6 +6949,7 @@ mod tests {
             last_scan_age_secs: Some(9),
             skipped_keys_total: 2,
             spawn_failures: 1,
+            unknown_shards_last_report: 6,
         };
         let mut text = String::new();
         append_recency_metrics(&mut text, stats);
@@ -6949,6 +6960,7 @@ mod tests {
             "teraslab_recency_scan_last_age_seconds 9",
             "teraslab_recency_scan_skipped_keys_total 2",
             "teraslab_recency_refresh_spawn_failed_total 1",
+            "teraslab_recency_unknown_shards 6",
         ] {
             assert!(
                 text.lines()

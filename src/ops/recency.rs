@@ -221,6 +221,12 @@ pub struct RecencyScanStats {
     /// Refresh threads that FAILED to spawn (W10 P1-2) — each such
     /// failure released the single-flight slot so a later trigger retries.
     pub spawn_failures: u64,
+    /// How many entries of the most recently BUILT partition-version
+    /// report were served RECENCY-UNKNOWN (round-2 follow-up 2). Non-zero
+    /// during the boot pre-first-scan window and after empty→populated
+    /// transitions; a value that never returns to zero means this node's
+    /// scans are not converging (and peers are skipping its evidence).
+    pub unknown_shards_last_report: u64,
 }
 
 /// See the module doc. Owned by the engine; one per engine.
@@ -244,6 +250,8 @@ pub struct ShardRecencyCache {
     last_scan_duration_ms: AtomicU64,
     skipped_keys_total: AtomicU64,
     spawn_failures: AtomicU64,
+    /// See [`RecencyScanStats::unknown_shards_last_report`].
+    last_report_unknown_shards: AtomicU64,
 }
 
 impl ShardRecencyCache {
@@ -263,6 +271,7 @@ impl ShardRecencyCache {
             last_scan_duration_ms: AtomicU64::new(0),
             skipped_keys_total: AtomicU64::new(0),
             spawn_failures: AtomicU64::new(0),
+            last_report_unknown_shards: AtomicU64::new(0),
         }
     }
 
@@ -325,11 +334,25 @@ impl ShardRecencyCache {
     pub fn publish(
         &self,
         stamp: u64,
-        mut per_shard: Vec<CachedShardRecency>,
+        per_shard: Vec<CachedShardRecency>,
         scan_duration: std::time::Duration,
         skipped_keys: u64,
     ) {
         debug_assert_eq!(per_shard.len(), crate::cluster::shards::NUM_SHARDS);
+        self.publish_inner(stamp, per_shard, scan_duration, skipped_keys);
+    }
+
+    /// The assert-free body of [`Self::publish`] (round-2 follow-up 3):
+    /// split out so the release-mode pad path is testable under the
+    /// default (debug) test profile too — a `cfg(not(debug_assertions))`
+    /// test is functionally an `#[ignore]`.
+    fn publish_inner(
+        &self,
+        stamp: u64,
+        mut per_shard: Vec<CachedShardRecency>,
+        scan_duration: std::time::Duration,
+        skipped_keys: u64,
+    ) {
         per_shard.resize(
             crate::cluster::shards::NUM_SHARDS,
             CachedShardRecency::Unscanned,
@@ -368,6 +391,13 @@ impl ShardRecencyCache {
         self.spawn_failures.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Round-2 follow-up 2 — record how many entries of the report just
+    /// built were served RECENCY-UNKNOWN (a gauge: last report wins).
+    pub fn record_report_unknown_shards(&self, unknown: u64) {
+        self.last_report_unknown_shards
+            .store(unknown, Ordering::Relaxed);
+    }
+
     /// Point-in-time scan statistics (W10 P1-1).
     pub fn scan_stats(&self) -> RecencyScanStats {
         RecencyScanStats {
@@ -379,6 +409,7 @@ impl ShardRecencyCache {
                 .map(|at| at.elapsed().as_secs()),
             skipped_keys_total: self.skipped_keys_total.load(Ordering::Relaxed),
             spawn_failures: self.spawn_failures.load(Ordering::Relaxed),
+            unknown_shards_last_report: self.last_report_unknown_shards.load(Ordering::Relaxed),
         }
     }
 }
@@ -538,13 +569,15 @@ mod tests {
 
     /// W10 P2-9 — a short published vector must not degrade the missing
     /// high shards to a wrong "known" state in release builds: they pad
-    /// to Unscanned (no evidence → UNKNOWN).
+    /// to Unscanned (no evidence → UNKNOWN). Exercises `publish_inner`
+    /// directly (the assert-free body `publish` delegates to) so the pad
+    /// path runs under BOTH profiles (round-2 follow-up 3) — via `publish`
+    /// the debug assertion would fire first in the default test profile.
     #[test]
-    #[cfg(not(debug_assertions))]
     fn publish_pads_short_vectors_to_unscanned() {
         let cache = ShardRecencyCache::new();
         let stamp = cache.stamp_for_refresh();
-        cache.publish(
+        cache.publish_inner(
             stamp,
             vec![scanned(1, 1, true); 8],
             std::time::Duration::ZERO,

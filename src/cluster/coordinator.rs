@@ -6921,9 +6921,14 @@ impl ClusterCoordinator {
         // every completion this exchange produces will det-degrade / hold.
         // That is safe but silent; name the member so an operator can tell
         // "membership not yet learned / member gone" from a healthy slow
-        // peer. Once per exchange, not rate-limited — exchanges are
-        // low-rate (commit + cooldown cadence).
+        // peer. Round-2 follow-up 4: gated by the same occurrence-count
+        // warn pattern as [`heal_refusal_warn_due`] — a PERMANENTLY
+        // addressless member re-trips this on every exchange (commit +
+        // cooldown + retry cadences), so warn the first few times, then
+        // periodically; every occurrence still counts.
         let peer_addrs: Vec<(NodeId, SocketAddr)> = {
+            static ADDRESSLESS_MEMBER_OCCURRENCES: std::sync::atomic::AtomicU64 =
+                std::sync::atomic::AtomicU64::new(0);
             let addrs = node_addrs.read();
             members
                 .iter()
@@ -6931,13 +6936,20 @@ impl ClusterCoordinator {
                 .filter_map(|n| {
                     let addr = addrs.get(n).copied();
                     if addr.is_none() {
-                        tracing::warn!(
-                            member = n.0,
-                            cluster_key,
-                            "cluster: exchange cannot query committed member — no \
-                             known address; the full member view is unreachable \
-                             this round (refinement will degrade/hold)",
-                        );
+                        let occurrence = ADDRESSLESS_MEMBER_OCCURRENCES
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                            .saturating_add(1);
+                        if heal_refusal_warn_due(occurrence) {
+                            tracing::warn!(
+                                member = n.0,
+                                cluster_key,
+                                occurrence,
+                                "cluster: exchange cannot query committed member — no \
+                                 known address; the full member view is unreachable \
+                                 this round (refinement will degrade/hold; warn \
+                                 rate-limited, every occurrence counted)",
+                            );
+                        }
                     }
                     addr.map(|a| (*n, a))
                 })
@@ -8667,9 +8679,16 @@ pub(crate) fn build_self_partition_version_entries(
     // recency per shard — everything here is RAM, so the shard-table read
     // lock is held only for this single pass. P2-7: ONE recency-snapshot
     // read guard for the whole loop, not one per shard.
+    //
+    // LOCK ORDER (round-2 follow-up 1): shard_table BEFORE the recency
+    // snapshot — the codebase-wide order. Taking them inverted here would
+    // let a future caller holding the table and entering the pub cached
+    // accessors complete a cycle with a pending snapshot-publish writer
+    // (parking_lot writer preference blocks new readers behind it).
     let mut entries: Vec<PartitionVersionEntry> = Vec::with_capacity(NUM_SHARDS);
-    let recency = engine.recency_cache_reader();
     let table = shard_table.read();
+    let recency = engine.recency_cache_reader();
+    let mut unknown_shards = 0u64;
     for shard in 0..NUM_SHARDS as u16 {
         let count = engine.shard_record_count(shard);
         let assignment = table.target_assignment(shard);
@@ -8693,6 +8712,7 @@ pub(crate) fn build_self_partition_version_entries(
         let (value, recency_unknown) = recency.get(shard).resolve(count);
         if recency_unknown {
             flags |= PARTITION_FLAG_RECENCY_UNKNOWN;
+            unknown_shards += 1;
         }
         let replica_count = u8::try_from(assignment.replicas.len().min(255)).unwrap_or(255);
         entries.push(PartitionVersionEntry {
@@ -8704,6 +8724,11 @@ pub(crate) fn build_self_partition_version_entries(
             max_generation: value.max_generation,
         });
     }
+    // Round-2 follow-up 2 — record how many of THIS report's entries were
+    // served RECENCY_UNKNOWN, for the `teraslab_recency_unknown_shards`
+    // gauge: makes the local pre-first-scan window (and, on a peer's
+    // scrape, a node stuck UNKNOWN) observable.
+    engine.note_recency_report_unknown_shards(unknown_shards);
     entries
 }
 
@@ -9016,6 +9041,17 @@ pub(crate) fn detect_stale_shards_from_view(
 /// `max_generation` + `count`, different digest) — that case is left to the
 /// authoritative per-record manifest exchange the boot heal runs. The trade is
 /// deliberate: it guarantees an ahead/equal master is never fenced online.
+///
+/// PRECISION on that guarantee with cached inputs (round-2 follow-up 5):
+/// it is HARD only through the UNKNOWN gate below — the deterministic
+/// fabricated-emptiness instance can never fence. Between two KNOWN
+/// snapshots published at independent node-local instants the comparison
+/// can still transiently invert (self's snapshot older than the replica's
+/// straddling a write burst), fencing an actually-ahead master for a
+/// no-op pull — bounded by one paced refresh cycle, self-resolving, and
+/// arbitrated per key by the authoritative confirm (the staleness
+/// contract documented in [`crate::ops::recency`]'s serving-semantics
+/// section).
 ///
 /// # W10 P0-1 — UNKNOWN recency yields NO direction verdict
 ///
