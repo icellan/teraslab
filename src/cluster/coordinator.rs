@@ -7243,16 +7243,23 @@ fn split_already_serving_migration_tasks(
 ///   candidate is confirmed without a probe.
 /// - Source LIVE record count > 0 (the snapshot was stale or scoped past
 ///   this shard): completion-only is safe ONLY if the target provably
-///   retains the data. Reuse the verify-only superset probe
-///   ([`confirm_target_holds_superset`] — the manifest machinery the
-///   completion handshake already carries): a confirmed superset keeps the
-///   cheap completion-only path (no pointless full re-stream on the routine
-///   FIX-B / re-drive handshake resends); anything else — target holds
-///   nothing, rejects, or is unreachable — DEMOTES the task to the normal
-///   streaming path with its live keys, whose count+manifest completion
-///   re-verifies end-to-end. An unreadable-footer manifest failure also
-///   demotes (issue-#46 posture: never commit an unverified non-empty
-///   shard; the streaming path's own error handling owns the outcome).
+///   retains the data. The shard is re-enumerated skip-AWARE
+///   ([`Engine::keys_by_shard_filtered`], re-review P1-1 — `shard_record_count`
+///   is an O(1) counter independent of footer readability, so a shard with
+///   unreadable records enumerates SHORT and an unread-aware manifest
+///   would either be empty, "confirming" with zero verification, or
+///   partial, probing a superset of the readable subset only): ANY
+///   enumeration skip demotes immediately. Otherwise the verify-only
+///   superset probe runs ([`confirm_target_holds_superset`] — the manifest
+///   machinery the completion handshake already carries): a confirmed
+///   superset keeps the cheap completion-only path (no pointless full
+///   re-stream on the routine FIX-B / re-drive handshake resends);
+///   anything else — target holds nothing, rejects, or is unreachable —
+///   DEMOTES the task to the normal streaming path with its readable live
+///   keys, whose count+manifest completion re-verifies end-to-end. An
+///   unreadable-footer manifest-collection failure also demotes (issue-#46
+///   posture: never commit an unverified non-empty shard; the streaming
+///   path's own error handling owns the outcome).
 ///
 /// Returns `(confirmed_completion_only, demoted)` where each demoted entry
 /// carries the live keys to stream.
@@ -7270,7 +7277,32 @@ fn verify_already_serving_skips(
             confirmed.push(task);
             continue;
         }
-        let keys = engine.keys_for_shard(task.shard);
+        // W10 re-review P1-1: enumerate skip-AWARE. `keys_for_shard`
+        // discards the unreadable-footer count, so a shard whose records
+        // are transiently unreadable (relocation churn / torn CRC) would
+        // enumerate SHORT: with zero readable keys the empty-manifest
+        // branch below would confirm the completion-only commit with NO
+        // verification (the armed-11 commit shape relabeled "stale keys"),
+        // and with a partial set the probe would confirm a superset of the
+        // READABLE SUBSET only. Every streaming path is skip-aware
+        // (`finalize_enumeration_round`); this path must be too: ANY skip
+        // demotes — never commit completion-only on partial evidence. The
+        // streaming path's own issue-#46 machinery owns the outcome.
+        let shard_set: std::collections::HashSet<u16> = [task.shard].into_iter().collect();
+        let (mut keys_map, enum_skipped) = engine.keys_by_shard_filtered(&shard_set);
+        let keys = keys_map.remove(&task.shard).unwrap_or_default();
+        if enum_skipped > 0 {
+            tracing::warn!(
+                shard = task.shard,
+                skipped = enum_skipped,
+                readable = keys.len(),
+                %target_addr,
+                "cluster: already-serving verification enumerated unreadable \
+                 record(s) — demoting to the streaming path (issue #46)",
+            );
+            demoted.push((task, keys));
+            continue;
+        }
         let target_holds = match collect_manifest_entries(engine, task.shard, &keys) {
             Ok(entries) if !entries.is_empty() => confirm_target_holds_superset(
                 target_addr,
@@ -24298,6 +24330,130 @@ mod tests {
         );
         stop.store(true, Ordering::Relaxed);
         target.join().unwrap();
+    }
+
+    /// W10 re-review P1-1 — the already-serving verification must be
+    /// skip-AWARE: `keys_for_shard` discards the unreadable-footer count,
+    /// so a shard whose live count is positive but whose records read
+    /// unreadable (relocation churn / torn CRC) enumerates SHORT. With
+    /// zero readable keys the empty-manifest branch then confirmed the
+    /// completion-only commit with NO verification at all — the exact
+    /// armed-11 commit shape, relabeled "every live key resolved stale" —
+    /// and with a partial set the probe confirmed a superset of the
+    /// READABLE SUBSET only. Both shapes must DEMOTE to the streaming
+    /// path, whose issue-#46 machinery owns the outcome.
+    #[test]
+    fn already_serving_verification_demotes_on_unreadable_footer() {
+        use crate::index::TxIndexEntry;
+        use crate::record::{METADATA_SIZE, TxMetadata, UtxoSlot};
+
+        let dev: Arc<dyn crate::device::BlockDevice> =
+            Arc::new(crate::device::MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let mut alloc = crate::allocator::SlotAllocator::new(dev.clone()).unwrap();
+        let mut index = crate::index::Index::new(100).unwrap();
+
+        // Shard A: a single record whose footer will be unreadable (M=0,
+        // N>0). Shard B: one clean + one unreadable record (0<M<N).
+        let key_a_bad = tx_key_for_shard(101, 1);
+        let key_b_clean = tx_key_for_shard(202, 2);
+        let key_b_bad = tx_key_for_shard(202, 3);
+        let shard_a = ShardTable::shard_for_key(&key_a_bad);
+        let shard_b = ShardTable::shard_for_key(&key_b_clean);
+        assert_ne!(shard_a, shard_b);
+        assert_eq!(shard_b, ShardTable::shard_for_key(&key_b_bad));
+
+        let utxo_count = 1u32;
+        let record_size = TxMetadata::record_size_for(utxo_count);
+        let mut corrupt_offsets = Vec::new();
+        for key in [key_a_bad, key_b_clean, key_b_bad] {
+            let offset = alloc.allocate(record_size).unwrap();
+            if key != key_b_clean {
+                corrupt_offsets.push(offset);
+            }
+            let mut meta = TxMetadata::new(utxo_count);
+            meta.tx_id = key.txid;
+            let slots: Vec<UtxoSlot> = (0..utxo_count)
+                .map(|_| UtxoSlot::new_unspent([0u8; 32]))
+                .collect();
+            crate::io::write_full_record(&*dev, offset, &meta, &slots).unwrap();
+            index
+                .register(
+                    key,
+                    TxIndexEntry {
+                        device_id: 0,
+                        record_offset: offset,
+                        mined_slot: crate::index::mined_index::NO_MINED_SLOT,
+                    },
+                )
+                .unwrap();
+        }
+        // Engine::new seeds shard_counts from the index (prefix keys, no
+        // footer reads), so the corrupted records still count.
+        let engine = Arc::new(Engine::new(
+            dev,
+            index,
+            alloc,
+            crate::locks::StripedLocks::new(64),
+            crate::index::DahIndex::new(),
+        ));
+        let ptr = engine.device_ptr_for(0);
+        assert!(!ptr.is_null());
+        // SAFETY: `ptr` is the live base of store 0's device buffer; each
+        // offset is an allocator-issued in-bounds record offset and
+        // METADATA_SIZE stays within that record, so this overwrites only
+        // the targeted records' header bytes (the engine-test fixture for
+        // issue #46, `key_enumeration_skips_unreadable_footer_and_bumps_metric`).
+        for offset in corrupt_offsets {
+            unsafe {
+                std::ptr::write_bytes(ptr.add(offset as usize), 0xFF, METADATA_SIZE);
+            }
+        }
+        assert!(engine.read_metadata(&key_a_bad).is_err());
+        assert!(engine.read_metadata(&key_b_bad).is_err());
+        assert!(engine.read_metadata(&key_b_clean).is_ok());
+        assert_eq!(engine.shard_record_count(shard_a), 1);
+        assert_eq!(engine.shard_record_count(shard_b), 2);
+
+        let task_a = MigrationTask {
+            shard: shard_a,
+            from_node: NodeId(1),
+            to_node: NodeId(2),
+            is_master: true,
+        };
+        let task_b = MigrationTask {
+            shard: shard_b,
+            from_node: NodeId(1),
+            to_node: NodeId(2),
+            is_master: true,
+        };
+        // A bound-then-dropped address: neither shape may touch the network
+        // (a demotion happens BEFORE any probe; pre-fix the empty-manifest
+        // confirm also short-circuited the probe).
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let dead_addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let (confirmed, demoted) =
+            verify_already_serving_skips(&engine, dead_addr, vec![task_a, task_b], 3, None);
+        assert!(
+            confirmed.is_empty(),
+            "an unreadably-enumerated shard must NEVER confirm a \
+             completion-only commit (confirmed: {confirmed:?})"
+        );
+        assert_eq!(
+            demoted.len(),
+            2,
+            "both skip shapes (M=0 and 0<M<N) must demote to streaming"
+        );
+        let demoted_b = demoted
+            .iter()
+            .find(|(t, _)| t.shard == shard_b)
+            .expect("shard B must be demoted");
+        assert_eq!(
+            demoted_b.1,
+            vec![key_b_clean],
+            "the demoted stream must carry the READABLE keys"
+        );
     }
 
     /// W10 DEFECT 3 (armed-11) — the event-driven orphan-cleanup pass is
