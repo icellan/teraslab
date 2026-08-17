@@ -1512,6 +1512,13 @@ pub struct MigrationMetrics {
     /// `orphan_cleanup_proof_reclaimed` stays flat means the holders are not
     /// converging, not that reclamation is broken.
     pub orphan_cleanup_proof_refused: PaddedCounter,
+    /// W12 P2-4 — shards the holders DID vouch for, but which gave up no
+    /// records because every one had moved past the proven generation. Neither
+    /// a refusal (the holders agreed) nor a reclaim (the third copy remains),
+    /// so it gets its own counter instead of inflating either. A steadily
+    /// climbing value means the shard is taking writes faster than a pass can
+    /// prove-and-delete it — the copies are safe, just never drained.
+    pub orphan_cleanup_proof_stale_no_delete: PaddedCounter,
     /// W10 composition review P1 — completed LIVE-RECENCY CONFIRM rounds
     /// (`confirm_self_behind_with_live_recency`). Each round costs one
     /// filtered primary-index walk plus the device reads for the shards it
@@ -1613,6 +1620,7 @@ impl MigrationMetrics {
             orphan_cleanup_retained_no_evidence: AtomicU32::new(0),
             orphan_cleanup_proof_reclaimed: PaddedCounter::new(),
             orphan_cleanup_proof_refused: PaddedCounter::new(),
+            orphan_cleanup_proof_stale_no_delete: PaddedCounter::new(),
             reheal_live_confirm_rounds: PaddedCounter::new(),
             reheal_live_confirm_shards: PaddedCounter::new(),
             reheal_live_confirm_deferred: PaddedCounter::new(),
