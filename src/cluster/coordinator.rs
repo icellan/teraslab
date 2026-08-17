@@ -7549,6 +7549,49 @@ fn split_already_serving_migration_tasks(
     (active, skipped)
 }
 
+/// W10 composition (P1-4) — how many already-serving candidates one
+/// migration batch may VERIFY (superset-probe) before deferring the rest to
+/// the next re-drive. Candidates whose shard is empty are free and do not
+/// consume the budget.
+///
+/// Sized against the migration connection fan-out this repo already
+/// tolerates: at `max_concurrent_probes` = the batch's own pool size (≤ 8 for
+/// a resync-origin run, `RESYNC_MAX_CONNECTIONS`), 32 candidates cost at most
+/// four parallel probe rounds — bounded work per batch, with the remainder
+/// re-driven rather than confirmed on no evidence.
+const ALREADY_SERVING_PROBE_BUDGET: usize = 32;
+
+/// W10 composition (P1-4) — wall-clock ceiling on the pre-chunk
+/// already-serving verification phase. A candidate a worker has not STARTED
+/// by then is deferred, so a target that is answering slowly (or not at all —
+/// each probe carries ~3.1 s of retry backoff plus its I/O timeouts) cannot
+/// hold `active_count()` above zero, and with it the degraded upgrade, the
+/// event-repair fire, the failed-batch redrive, reactivation and prompt
+/// re-election.
+const ALREADY_SERVING_VERIFY_DEADLINE: Duration = Duration::from_secs(10);
+
+/// Per-candidate dispositions produced by [`verify_already_serving_skips`].
+#[derive(Default)]
+struct AlreadyServingVerification {
+    /// Verified (or trivially empty) — keep the cheap completion-only path.
+    confirmed: Vec<MigrationTask>,
+    /// Not verified: stream instead, carrying the live keys to send (an
+    /// EMPTY list routes the task onto the empty path's skip-aware fenced
+    /// recheck — see `verify_one_already_serving_skip`).
+    demoted: Vec<(MigrationTask, Vec<TxKey>)>,
+    /// Beyond this batch's verification budget/deadline. NOT confirmed and
+    /// NOT streamed: the caller parks these Failed so the durable retry queue
+    /// re-drives them, keeping the pre-chunk phase bounded.
+    deferred: Vec<MigrationTask>,
+}
+
+/// One candidate's outcome, as produced on a verification worker.
+enum AlreadyServingOutcome {
+    Confirmed(MigrationTask),
+    Demoted(MigrationTask, Vec<TxKey>),
+    Deferred(MigrationTask),
+}
+
 /// W10 (armed-11, CI d3437e4) — verify each completion-only "already
 /// serving" candidate before its handshake is allowed to COMMIT mastership
 /// on the target.
@@ -7596,99 +7639,236 @@ fn split_already_serving_migration_tasks(
 ///   non-empty shard; those keys are a complete skip-free enumeration, so
 ///   the streaming path's own error handling owns the outcome).
 ///
-/// Returns `(confirmed_completion_only, demoted)` where each demoted entry
-/// carries the live keys to stream.
+/// Returns the per-candidate dispositions — see [`AlreadyServingVerification`].
+///
+/// # W10 composition (P1-4) — why this phase is BOUNDED and PARALLEL
+///
+/// This runs at the head of [`run_migration_batch`], before any chunking, and
+/// `should_skip_already_serving_migration` is not `is_master`-gated: on a
+/// settled cluster ANY task whose shard has no keys in the batch snapshot
+/// becomes a candidate. Each candidate holding records costs a full
+/// `keys_by_shard_filtered` index pass, a per-key device-footer manifest
+/// collection, and a `confirm_target_holds_superset` probe that opens its OWN
+/// connection OUTSIDE the migration pool with six retries on top of the
+/// 3 s connect / 10 s read timeouts — competing for the target's per-IP
+/// connection cap, which this repo has a documented history of exhausting.
+///
+/// Meanwhile every task in the batch is `start_outbound`-tracked (Phase-H
+/// resync backfills included, since wave 10), so `active_count() > 0` holds
+/// shut the degraded upgrade, the event-repair fire, the failed-batch
+/// redrive, normal/drain reactivation and prompt re-election. A det-degraded
+/// plan with hundreds of already-serving candidates toward one target could
+/// therefore park the node's whole convergence machinery for tens of minutes
+/// before one record moved.
+///
+/// Three bounds close that:
+///
+/// 1. **Free candidates stay free.** A shard with zero live records needs no
+///    probe at all (fresh clusters hand off thousands of empty shards this
+///    way), so the budget is spent only on candidates that genuinely need
+///    verification.
+/// 2. **`probe_budget` caps the verified candidates per batch.** The rest are
+///    DEFERRED — never confirmed on no evidence: the caller parks them Failed
+///    (durable retry queue) and the next re-drive verifies them, so the batch
+///    makes bounded forward progress per round instead of stalling.
+/// 3. **One index pass, and the probes run concurrently** (up to
+///    `max_concurrent_probes`, the batch's own connection fan-out) under a
+///    wall-clock `deadline` — so the pre-chunk phase costs about one probe
+///    round-trip, not one per candidate. Candidates a worker has not started
+///    when the deadline passes are deferred.
+///
+/// The `probe` callback is the verify-only superset check
+/// ([`confirm_target_holds_superset`] in production); it is invoked at most
+/// `probe_budget` times per call.
 fn verify_already_serving_skips(
     engine: &Arc<Engine>,
-    target_addr: SocketAddr,
     candidates: Vec<MigrationTask>,
-    topology_epoch: u64,
-    auth_secret: Option<&[u8]>,
-) -> (Vec<MigrationTask>, Vec<(MigrationTask, Vec<TxKey>)>) {
-    let mut confirmed = Vec::with_capacity(candidates.len());
-    let mut demoted = Vec::new();
+    probe_budget: usize,
+    max_concurrent_probes: usize,
+    deadline: Duration,
+    probe: &(dyn Fn(&MigrationTask, &[(TxKey, u32)]) -> bool + Sync),
+) -> AlreadyServingVerification {
+    let mut out = AlreadyServingVerification::default();
+    // Split the free candidates (empty shard: nothing could be streamed
+    // anyway, and a genuinely empty shard must keep committing
+    // completion-only) from the ones that need real evidence.
+    let mut needs_verify: Vec<MigrationTask> = Vec::new();
     for task in candidates {
         if engine.shard_record_count(task.shard) == 0 {
-            confirmed.push(task);
-            continue;
-        }
-        // W10 re-review P1-1: enumerate skip-AWARE. `keys_for_shard`
-        // discards the unreadable-footer count, so a shard whose records
-        // are transiently unreadable (relocation churn / torn CRC) would
-        // enumerate SHORT: with zero readable keys the empty-manifest
-        // branch below would confirm the completion-only commit with NO
-        // verification (the armed-11 commit shape relabeled "stale keys"),
-        // and with a partial set the probe would confirm a superset of the
-        // READABLE SUBSET only. Every streaming path is skip-aware
-        // (`finalize_enumeration_round`); this path must be too: ANY skip
-        // demotes — never commit completion-only on partial evidence. The
-        // streaming path's own issue-#46 machinery owns the outcome.
-        let shard_set: std::collections::HashSet<u16> = [task.shard].into_iter().collect();
-        let (mut keys_map, enum_skipped) = engine.keys_by_shard_filtered(&shard_set);
-        let keys = keys_map.remove(&task.shard).unwrap_or_default();
-        if enum_skipped > 0 {
-            tracing::warn!(
-                shard = task.shard,
-                skipped = enum_skipped,
-                readable = keys.len(),
-                %target_addr,
-                "cluster: already-serving verification enumerated unreadable \
-                 record(s) — routing to the empty path's fenced recheck (issue #46)",
-            );
-            // P1 residual: demote with an EMPTY key list, NOT the readable
-            // subset. Carrying the M readable keys would move the acked
-            // loss onto the streaming path: the no-churn manifest is built
-            // from the demoted set, the target verifies M/M, the
-            // completion COMMITS and records #28 evidence — and orphan
-            // cleanup may then delete the N−M records never shipped. The
-            // empty list routes the task onto the EMPTY path, whose
-            // skip-aware fenced recheck owns the disposition: a persistent
-            // skip refuses and parks the task Failed (visible, re-driven);
-            // a healed skip promotes back to the data path, where the
-            // short-snapshot guard re-verifies the manifest against the
-            // live count before any completion.
-            demoted.push((task, Vec::new()));
-            continue;
-        }
-        let target_holds = match collect_manifest_entries(engine, task.shard, &keys) {
-            Ok(entries) if !entries.is_empty() => confirm_target_holds_superset(
-                target_addr,
-                task.shard,
-                task.from_node,
-                topology_epoch,
-                &entries,
-                auth_secret,
-            ),
-            // Every live key resolved stale mid-collection: nothing real
-            // to move — same disposition as the empty case.
-            Ok(_) => {
-                confirmed.push(task);
-                continue;
-            }
-            Err(err) => {
-                tracing::warn!(
-                    shard = task.shard,
-                    err = %err,
-                    "cluster: already-serving verification could not collect the \
-                     shard manifest — demoting to the streaming path (issue #46)",
-                );
-                false
-            }
-        };
-        if target_holds {
-            confirmed.push(task);
+            out.confirmed.push(task);
         } else {
-            tracing::warn!(
-                shard = task.shard,
-                records = keys.len(),
-                %target_addr,
-                "cluster: already-serving completion REFUSED — the target does not \
-                 provably hold this shard's records; streaming instead (armed-11)",
-            );
-            demoted.push((task, keys));
+            needs_verify.push(task);
         }
     }
-    (confirmed, demoted)
+    if needs_verify.len() > probe_budget {
+        out.deferred = needs_verify.split_off(probe_budget);
+        tracing::info!(
+            deferred = out.deferred.len(),
+            budget = probe_budget,
+            "cluster: already-serving verification budget reached — deferring the \
+             remaining candidates to the next re-drive (W10 P1-4)",
+        );
+    }
+    if needs_verify.is_empty() {
+        return out;
+    }
+
+    // ONE index pass for every budgeted shard, instead of one per candidate.
+    let shard_set: std::collections::HashSet<u16> =
+        needs_verify.iter().map(|t| t.shard).collect();
+    let (mut keys_map, enum_skipped) = engine.keys_by_shard_filtered(&shard_set);
+    // `keys_by_shard_filtered` reports a TOTAL skip count, so on the (rare)
+    // skip the batched pass cannot say WHICH shard was short. Re-enumerate
+    // per shard to attribute it exactly — one unreadable footer must demote
+    // its own shard, not every budgeted one.
+    let per_shard: std::collections::HashMap<u16, (Vec<TxKey>, usize)> = if enum_skipped == 0 {
+        shard_set
+            .iter()
+            .map(|s| (*s, (keys_map.remove(s).unwrap_or_default(), 0usize)))
+            .collect()
+    } else {
+        shard_set
+            .iter()
+            .map(|&s| {
+                let one: std::collections::HashSet<u16> = [s].into_iter().collect();
+                let (mut m, skipped) = engine.keys_by_shard_filtered(&one);
+                (s, (m.remove(&s).unwrap_or_default(), skipped))
+            })
+            .collect()
+    };
+
+    let concurrency = max_concurrent_probes.max(1).min(needs_verify.len());
+    let chunk_size = needs_verify.len().div_ceil(concurrency);
+    let per_shard = &per_shard;
+    let started = std::time::Instant::now();
+    let mut grouped: Vec<Vec<AlreadyServingOutcome>> = Vec::with_capacity(concurrency);
+    std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(concurrency);
+        for group in needs_verify.chunks(chunk_size) {
+            handles.push((
+                group,
+                scope.spawn(move || {
+                    let mut results = Vec::with_capacity(group.len());
+                    for task in group {
+                        if started.elapsed() >= deadline {
+                            // Not started before the phase deadline: defer
+                            // rather than hold the batch (and every gate
+                            // `active_count()` guards) open any longer.
+                            results.push(AlreadyServingOutcome::Deferred(task.clone()));
+                            continue;
+                        }
+                        results.push(verify_one_already_serving_skip(
+                            engine, task, per_shard, probe,
+                        ));
+                    }
+                    results
+                }),
+            ));
+        }
+        for (group, handle) in handles {
+            match handle.join() {
+                Ok(results) => grouped.push(results),
+                // A panicking worker must not silently drop its candidates
+                // (they would stay unresolved and hold `active_count()`
+                // above zero). Defer them: the caller parks them Failed.
+                Err(_) => {
+                    tracing::error!(
+                        candidates = group.len(),
+                        "cluster: already-serving verification worker panicked — \
+                         deferring its candidates",
+                    );
+                    grouped.push(
+                        group
+                            .iter()
+                            .map(|t| AlreadyServingOutcome::Deferred(t.clone()))
+                            .collect(),
+                    );
+                }
+            }
+        }
+    });
+    for outcome in grouped.into_iter().flatten() {
+        match outcome {
+            AlreadyServingOutcome::Confirmed(task) => out.confirmed.push(task),
+            AlreadyServingOutcome::Demoted(task, keys) => out.demoted.push((task, keys)),
+            AlreadyServingOutcome::Deferred(task) => out.deferred.push(task),
+        }
+    }
+    out
+}
+
+/// One candidate's disposition — the per-task body of
+/// [`verify_already_serving_skips`], run on the verification worker pool.
+///
+/// `per_shard` carries the shard's skip-AWARE enumeration
+/// `(keys, enumeration_skips)` from the batched index pass.
+fn verify_one_already_serving_skip(
+    engine: &Arc<Engine>,
+    task: &MigrationTask,
+    per_shard: &std::collections::HashMap<u16, (Vec<TxKey>, usize)>,
+    probe: &(dyn Fn(&MigrationTask, &[(TxKey, u32)]) -> bool + Sync),
+) -> AlreadyServingOutcome {
+    let empty = (Vec::new(), 0usize);
+    let (keys, enum_skipped) = per_shard.get(&task.shard).unwrap_or(&empty);
+    // W10 re-review P1-1: enumerate skip-AWARE. `keys_for_shard`
+    // discards the unreadable-footer count, so a shard whose records
+    // are transiently unreadable (relocation churn / torn CRC) would
+    // enumerate SHORT: with zero readable keys the empty-manifest
+    // branch below would confirm the completion-only commit with NO
+    // verification (the armed-11 commit shape relabeled "stale keys"),
+    // and with a partial set the probe would confirm a superset of the
+    // READABLE SUBSET only. Every streaming path is skip-aware
+    // (`finalize_enumeration_round`); this path must be too: ANY skip
+    // demotes — never commit completion-only on partial evidence. The
+    // streaming path's own issue-#46 machinery owns the outcome.
+    if *enum_skipped > 0 {
+        tracing::warn!(
+            shard = task.shard,
+            skipped = enum_skipped,
+            readable = keys.len(),
+            "cluster: already-serving verification enumerated unreadable \
+             record(s) — routing to the empty path's fenced recheck (issue #46)",
+        );
+        // P1 residual: demote with an EMPTY key list, NOT the readable
+        // subset. Carrying the M readable keys would move the acked
+        // loss onto the streaming path: the no-churn manifest is built
+        // from the demoted set, the target verifies M/M, the
+        // completion COMMITS and records #28 evidence — and orphan
+        // cleanup may then delete the N−M records never shipped. The
+        // empty list routes the task onto the EMPTY path, whose
+        // skip-aware fenced recheck owns the disposition: a persistent
+        // skip refuses and parks the task Failed (visible, re-driven);
+        // a healed skip promotes back to the data path, where the
+        // short-snapshot guard re-verifies the manifest against the
+        // live count before any completion.
+        return AlreadyServingOutcome::Demoted(task.clone(), Vec::new());
+    }
+    let target_holds = match collect_manifest_entries(engine, task.shard, keys) {
+        Ok(entries) if !entries.is_empty() => probe(task, &entries),
+        // Every live key resolved stale mid-collection: nothing real
+        // to move — same disposition as the empty case.
+        Ok(_) => return AlreadyServingOutcome::Confirmed(task.clone()),
+        Err(err) => {
+            tracing::warn!(
+                shard = task.shard,
+                err = %err,
+                "cluster: already-serving verification could not collect the \
+                 shard manifest — demoting to the streaming path (issue #46)",
+            );
+            false
+        }
+    };
+    if target_holds {
+        AlreadyServingOutcome::Confirmed(task.clone())
+    } else {
+        tracing::warn!(
+            shard = task.shard,
+            records = keys.len(),
+            "cluster: already-serving completion REFUSED — the target does not \
+             provably hold this shard's records; streaming instead (armed-11)",
+        );
+        AlreadyServingOutcome::Demoted(task.clone(), keys.clone())
+    }
 }
 
 /// W10 composition review P2-9 — flatten the demoted already-serving
@@ -10729,8 +10909,60 @@ fn run_migration_batch(
     // candidates carry an EMPTY key list so they route onto the empty
     // path's skip-aware fenced recheck (P1 residual — a readable SUBSET
     // must never be streamed-and-committed).
-    let (skipped_tasks, demoted) =
-        verify_already_serving_skips(&engine, addr, skip_candidates, topology_epoch, auth_secret);
+    //
+    // W10 composition (P1-4) — BOUNDED and PARALLEL: at most
+    // `ALREADY_SERVING_PROBE_BUDGET` candidates are probed per batch, over at
+    // most this batch's own connection fan-out, under a wall-clock deadline.
+    // Everything else is DEFERRED (parked Failed below, re-driven next
+    // round) — never confirmed without evidence.
+    let superset_probe = |task: &MigrationTask, entries: &[(TxKey, u32)]| {
+        confirm_target_holds_superset(
+            addr,
+            task.shard,
+            task.from_node,
+            topology_epoch,
+            entries,
+            auth_secret,
+        )
+    };
+    let verification = verify_already_serving_skips(
+        &engine,
+        skip_candidates,
+        ALREADY_SERVING_PROBE_BUDGET,
+        pool_size.max(1),
+        ALREADY_SERVING_VERIFY_DEADLINE,
+        &superset_probe,
+    );
+    let AlreadyServingVerification {
+        confirmed: skipped_tasks,
+        demoted,
+        deferred,
+    } = verification;
+    if !deferred.is_empty() {
+        tracing::warn!(
+            deferred = deferred.len(),
+            %addr,
+            "cluster: already-serving candidates left unverified this batch — \
+             parking them for the re-drive (W10 P1-4)",
+        );
+        for task in &deferred {
+            if fail_migration_task_current_epoch(
+                migration,
+                shard_table,
+                &fenced_bm,
+                &migrating_bm,
+                task,
+                topology_epoch,
+                // Same disposition as the undelivered already-serving
+                // completion below: these candidates are ServingNew skips
+                // that this batch never table-committed, so the table is
+                // left untouched.
+                FailedTaskTableAction::None,
+            ) {
+                failed.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
     // Owned storage for the demoted shards' live keys; must outlive
     // `keys_by_shard`, which borrows from it. Deduped per shard — see
     // `demoted_shard_keys`.
@@ -25825,15 +26057,36 @@ mod tests {
             to_node: NodeId(2),
             is_master: true,
         };
-        // A bound-then-dropped address: neither shape may touch the network
-        // (a demotion happens BEFORE any probe; pre-fix the empty-manifest
-        // confirm also short-circuited the probe).
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let dead_addr = listener.local_addr().unwrap();
-        drop(listener);
+        // Neither shape may probe (a demotion happens BEFORE any probe;
+        // pre-fix the empty-manifest confirm also short-circuited it).
+        let probes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let probes_seen = probes.clone();
+        let probe = move |_: &MigrationTask, _: &[(TxKey, u32)]| {
+            probes_seen.fetch_add(1, Ordering::Relaxed);
+            true
+        };
 
-        let (confirmed, demoted) =
-            verify_already_serving_skips(&engine, dead_addr, vec![task_a, task_b.clone()], 3, None);
+        let AlreadyServingVerification {
+            confirmed,
+            demoted,
+            deferred,
+        } = verify_already_serving_skips(
+            &engine,
+            vec![task_a, task_b.clone()],
+            8,
+            2,
+            Duration::from_secs(30),
+            &probe,
+        );
+        assert_eq!(
+            probes.load(Ordering::Relaxed),
+            0,
+            "an unreadably-enumerated shard must demote WITHOUT probing",
+        );
+        assert!(
+            deferred.is_empty(),
+            "both candidates fit the budget: {deferred:?}",
+        );
         assert!(
             confirmed.is_empty(),
             "an unreadably-enumerated shard must NEVER confirm a \
@@ -40118,5 +40371,212 @@ mod tests {
             "the window must be tagged REPAIR-only — a resync toward an \
              existing replica is not a new-side handoff holder",
         );
+    }
+
+    /// W10 COMPOSITION FIX 3 (P1-4) — the already-serving verification phase
+    /// runs SERIALLY at the head of `run_migration_batch`, before any
+    /// chunking, and `should_skip_already_serving_migration` is not
+    /// `is_master`-gated, so on a settled cluster every task whose shard has
+    /// no keys in the batch snapshot becomes a candidate. Each candidate
+    /// holding records cost a full index enumeration, a per-key device-footer
+    /// manifest collection and a `confirm_target_holds_superset` probe that
+    /// opens its OWN connection outside the migration pool with six retries.
+    /// Meanwhile every task in the batch is `start_outbound`-tracked, so
+    /// `active_count() > 0` holds shut the degraded upgrade, the event-repair
+    /// fire, the failed-batch redrive, reactivation and prompt re-election.
+    ///
+    /// Pins both bounds: N candidates cost at most K probes, and those probes
+    /// run CONCURRENTLY (peak observed in-flight == the requested
+    /// concurrency), so the phase is one probe round-trip deep, not N.
+    #[test]
+    fn already_serving_verification_is_probe_bounded_and_parallel() {
+        const CANDIDATES: u16 = 64;
+        const BUDGET: usize = 8;
+        const CONCURRENCY: usize = 4;
+
+        let engine = Arc::new(test_engine());
+        let mut tasks = Vec::new();
+        for shard in 0..CANDIDATES {
+            // Every candidate holds a record, so every one needs evidence.
+            create_test_record(&engine, tx_key_for_shard(shard, 3));
+            assert_eq!(engine.shard_record_count(shard), 1);
+            tasks.push(MigrationTask {
+                shard,
+                from_node: NodeId(1),
+                to_node: NodeId(2),
+                is_master: true,
+            });
+        }
+
+        // The probe records how many calls happen and how many overlap. Each
+        // call waits (bounded) for the others so a PARALLEL implementation
+        // reaches `CONCURRENCY` in flight; a serial one never exceeds 1 and
+        // simply times out of the wait instead of hanging.
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let live = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let peak = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (calls_p, live_p, peak_p) = (calls.clone(), live.clone(), peak.clone());
+        let probe = move |_: &MigrationTask, entries: &[(TxKey, u32)]| {
+            assert!(!entries.is_empty(), "the probe gets a real manifest");
+            calls_p.fetch_add(1, Ordering::Relaxed);
+            let now = live_p.fetch_add(1, Ordering::SeqCst) + 1;
+            peak_p.fetch_max(now, Ordering::SeqCst);
+            let wait_until = std::time::Instant::now() + Duration::from_secs(2);
+            while live_p.load(Ordering::SeqCst) < CONCURRENCY
+                && std::time::Instant::now() < wait_until
+            {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            live_p.fetch_sub(1, Ordering::SeqCst);
+            true
+        };
+
+        let AlreadyServingVerification {
+            confirmed,
+            demoted,
+            deferred,
+        } = verify_already_serving_skips(
+            &engine,
+            tasks,
+            BUDGET,
+            CONCURRENCY,
+            Duration::from_secs(60),
+            &probe,
+        );
+
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            BUDGET,
+            "N candidates must cost at most K probes — an unbounded phase \
+             stalls the whole batch (and every gate active_count() holds) \
+             for tens of minutes",
+        );
+        assert_eq!(
+            peak.load(Ordering::SeqCst),
+            CONCURRENCY,
+            "the probes must run concurrently: a serial pre-chunk phase \
+             never has more than one in flight",
+        );
+        assert_eq!(confirmed.len(), BUDGET, "every probed candidate confirmed");
+        assert!(demoted.is_empty(), "no candidate was refused: {demoted:?}");
+        assert_eq!(
+            deferred.len(),
+            CANDIDATES as usize - BUDGET,
+            "over-budget candidates must be DEFERRED — never confirmed on \
+             no evidence, and never silently dropped",
+        );
+        let mut all: Vec<u16> = confirmed
+            .iter()
+            .chain(deferred.iter())
+            .map(|t| t.shard)
+            .collect();
+        all.sort_unstable();
+        assert_eq!(
+            all,
+            (0..CANDIDATES).collect::<Vec<u16>>(),
+            "every candidate must come back with exactly one disposition",
+        );
+    }
+
+    /// W10 COMPOSITION FIX 3 (P1-4) — a deferred candidate must be PARKED
+    /// (Failed, durable retry queue) by the batch, never confirmed and never
+    /// left unresolved holding `active_count()` above zero. The shard table
+    /// is untouched: an already-serving skip was never table-committed by
+    /// this batch.
+    #[test]
+    fn deferred_already_serving_candidates_are_parked_for_the_redrive() {
+        let members = vec![NodeId(1), NodeId(2)];
+        let table = ShardTable::compute_with_epoch(&members, 2, 3, 1);
+        let engine = Arc::new(test_engine());
+        // More record-holding already-serving candidates than the budget.
+        let shards: Vec<u16> = (0..NUM_SHARDS as u16)
+            .filter(|&s| {
+                table.target_assignment(s).master == NodeId(1)
+                    && table.shard_handoff_state(s) == ShardHandoff::ServingNew
+            })
+            .take(ALREADY_SERVING_PROBE_BUDGET + 3)
+            .collect();
+        assert_eq!(shards.len(), ALREADY_SERVING_PROBE_BUDGET + 3);
+        for &shard in &shards {
+            create_test_record(&engine, tx_key_for_shard(shard, 5));
+        }
+        let epoch = table.version;
+        let shard_table = Arc::new(ShardTableLock::new(table));
+        let migration = Arc::new(Mutex::new(MigrationManager::new()));
+        let tasks: Vec<MigrationTask> = shards
+            .iter()
+            .map(|&shard| MigrationTask {
+                shard,
+                from_node: NodeId(1),
+                to_node: NodeId(2),
+                is_master: true,
+            })
+            .collect();
+        migration.lock().start_outbound(
+            &tasks,
+            NodeId(1),
+            &shards.iter().copied().collect::<std::collections::HashSet<u16>>(),
+        );
+
+        let fenced_bm = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+        let migrating_bm = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+        let inbound_bm = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+        let (addr, _op_rx, stop, target) = spawn_ack_all_target(false);
+
+        // `all_keys` is EMPTY (the batch snapshot holds nothing for these
+        // shards) — exactly the split that makes every task an
+        // already-serving candidate.
+        let (completed, failed) = run_migration_batch(
+            tasks.clone(),
+            Some(addr),
+            &[],
+            engine,
+            &migration,
+            &shard_table,
+            &None,
+            epoch,
+            4,
+            100,
+            fenced_bm,
+            migrating_bm,
+            inbound_bm,
+            NodeId(1),
+            None,
+            None,
+        );
+        stop.store(true, Ordering::Relaxed);
+        let _ = target.join();
+
+        assert_eq!(
+            failed as usize, 3,
+            "the over-budget candidates must be parked Failed (completed \
+             {completed}, failed {failed})",
+        );
+        assert_eq!(
+            completed as usize, ALREADY_SERVING_PROBE_BUDGET,
+            "the budgeted candidates still commit their completion-only \
+             handshake",
+        );
+        let mgr = migration.lock();
+        assert_eq!(
+            mgr.active_count(),
+            0,
+            "no task may be left unresolved — a non-terminal entry holds \
+             active_count() above zero and every gate it guards shut",
+        );
+        assert!(
+            mgr.failed_count() >= 3,
+            "the deferred candidates sit in the durable retry queue",
+        );
+        drop(mgr);
+        let table = shard_table.read();
+        for &shard in &shards {
+            assert_eq!(
+                table.target_assignment(shard).master,
+                NodeId(1),
+                "an already-serving skip is not table-committed by this \
+                 batch; deferring it must not touch the table",
+            );
+        }
     }
 }
