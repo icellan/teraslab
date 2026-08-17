@@ -688,6 +688,20 @@ impl TombstoneLog {
         self.shards.iter().map(|s| s.read().len()).sum()
     }
 
+    /// W10 composition review P2-3 — live WEAK-cause tombstones
+    /// (`PruneReplace` / `CompensatedCreate`), O(1) off the weak accelerator.
+    ///
+    /// This is the population [`Self::gc`] deliberately no longer bounds by
+    /// the retention clock, so it must be operator-visible: it drains only
+    /// when each key's repair lands, and a value that keeps climbing means
+    /// repairs are not landing. Read off the accelerator rather than the
+    /// authority, so it can transiently over-count a stale accelerator entry
+    /// by exactly the amount [`Self::weak_tombstone_keys`] would drop on its
+    /// re-verification pass — a gauge, not a decision input.
+    pub fn weak_len(&self) -> usize {
+        self.weak_keys.read().len()
+    }
+
     /// Whether the in-RAM index holds no tombstones.
     pub fn is_empty(&self) -> bool {
         self.shards.iter().all(|s| s.read().is_empty())
@@ -744,14 +758,21 @@ impl TombstoneLog {
     /// ACCEPTED RESIDUALS (documented, not fixed here):
     /// 1. A key that is NEVER repaired keeps one tombstone entry (in RAM and
     ///    in the durable file) indefinitely. Weak causes are produced only by
-    ///    the exceptional prune/rollback paths, never by steady-state deletes,
-    ///    and the population is observable through [`Self::len`].
+    ///    the exceptional prune/rollback paths, never by steady-state deletes.
+    ///    Because this trades a block-height bound for a repair bound, the
+    ///    population is EXPORTED (W10 composition review P2-3): the metrics
+    ///    endpoint renders `teraslab_tombstone_entries` and
+    ///    `teraslab_tombstone_weak_entries` from [`Self::len`] /
+    ///    [`Self::weak_len`]; a weak gauge that keeps climbing means repairs
+    ///    are not landing.
     /// 2. With `migration_weak_veto_arbitration_enabled = false` the
     ///    arbitration drain is disarmed, so a retained weak veto can keep
     ///    blocking an at-or-behind same-generation re-push that retention GC
     ///    used to eventually unblock. That mode already accepts an
-    ///    indefinitely under-replicated shard (see the config doc); the trade
-    ///    is a stalled repair, never a deleted last copy.
+    ///    indefinitely under-replicated shard, but it USED to self-heal on the
+    ///    retention clock and no longer does — the change note lives at the
+    ///    flag itself (`Config::migration_weak_veto_arbitration_enabled`).
+    ///    The trade is a stalled repair, never a deleted last copy.
     pub fn gc(&self, last_durable_height: u32, is_protected: impl Fn(&TxKey) -> bool) -> usize {
         let retention = self.retention_blocks;
         let mut dropped = 0usize;

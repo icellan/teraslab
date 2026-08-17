@@ -2236,6 +2236,22 @@ impl Engine {
         self.tombstone_log.get().is_some()
     }
 
+    /// W10 composition review P2-3 — the live tombstone population as
+    /// `(total, weak)`, or `None` when tombstones are disabled.
+    ///
+    /// `weak` counts the `PruneReplace` / `CompensatedCreate` entries that
+    /// [`crate::ops::tombstone::TombstoneLog::gc`] deliberately does NOT
+    /// expire on the retention clock (their manifest-omission claim is
+    /// bounded by the key's repair, not by block height). Converting a
+    /// block-height-bounded population into a repair-bounded one is only
+    /// safe if the population is watched, so both feed the metrics endpoint
+    /// as `teraslab_tombstone_entries` / `teraslab_tombstone_weak_entries`.
+    pub fn tombstone_population(&self) -> Option<(u64, u64)> {
+        self.tombstone_log
+            .get()
+            .map(|log| (log.len() as u64, log.weak_len() as u64))
+    }
+
     /// Attach the reverse-heal tombstone-GC-vs-heal race guard (Phase 2d): the
     /// cluster's inbound-fence bitmap. While a cluster shard is inbound-fenced (a
     /// reverse-heal pull or a forward migration in flight), the checkpoint

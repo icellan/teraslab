@@ -2091,14 +2091,18 @@ impl MigrationManager {
     /// part of its topology plan can be misjudged around the pass". A
     /// `heal_pending` entry is not plan-driven inbound work:
     ///
-    /// * it is raised only for a shard this node MASTERS
-    ///   (`trigger_online_reheal` classifies mastered shards; the boot heal
-    ///   likewise), and the cleanup pass only ever considers shards this node
-    ///   does NOT own (`master != self && !replicas.contains(self)`), so a
-    ///   heal-fenced shard is structurally not an orphan candidate;
-    /// * should a later table version move such a shard away, the pass still
-    ///   refuses to delete without positive committed-handoff evidence for it
-    ///   (#28) — the per-shard data-loss guard is unchanged by this counter;
+    /// * the cleanup pass SKIPS any shard with a pending inbound entry
+    ///   outright — `run_orphan_cleanup` and
+    ///   `cleanup_orphaned_shard_if_settled` both gate on
+    ///   [`Self::has_pending_inbound`] (W10 composition review P2-2), so a
+    ///   heal-fenced shard is never an orphan candidate whether or not this
+    ///   node masters it. Ownership alone would NOT be enough: the boot G3
+    ///   path fences shards derived from lost create keys with no ownership
+    ///   filter, and a persisted heal fence can be restored after a topology
+    ///   change moved the shard away (#74 F1);
+    /// * independently of that, the pass still refuses to delete without
+    ///   positive committed-handoff evidence (#28) — the per-shard data-loss
+    ///   guard is unchanged by this counter;
     /// * a park is ALERT-AND-HOLD state, not progress: waiting on it is
     ///   waiting on an operator, which is exactly the unbounded wait that
     ///   turned a transient A-side fence into a permanent B-side stall.
