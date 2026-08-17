@@ -221,6 +221,19 @@ fn decode_entry(src: &[u8]) -> Result<(TxKey, TombValue), TombstoneDecodeError> 
     ))
 }
 
+/// W10 FIX 2 — outcome of a weak-veto arbitration clear
+/// ([`TombstoneLog::clear_weak`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WeakTombstoneClear {
+    /// A weak-cause tombstone was present and has been cleared.
+    Cleared,
+    /// No tombstone covers the key (idempotent success for a retried round).
+    Absent,
+    /// The tombstone carries a STRONG cause (`ClientDelete` / `Dah` / an
+    /// unrecognized future byte) — never arbitrable; nothing was changed.
+    RefusedStrongCause,
+}
+
 /// In-RAM per-key tombstone state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct TombValue {
@@ -600,6 +613,27 @@ impl TombstoneLog {
             })
     }
 
+    /// W10 FIX 3 — every key currently covered by a WEAK-cause tombstone
+    /// (`PruneReplace` / `CompensatedCreate`). Consumed by the migration
+    /// completion builder so a source can declare which of its manifest
+    /// omissions are its OWN local reconcile/rollback markers rather than
+    /// deletion-intent. O(live tombstones) full scan — the tombstone
+    /// population is bounded by deletes within the retention horizon, and
+    /// the caller filters to one cluster shard.
+    pub fn weak_tombstone_keys(&self) -> Vec<TxKey> {
+        let mut out = Vec::new();
+        for shard in &self.shards {
+            for (k, v) in shard.read().iter() {
+                if v.cause == TombstoneCause::PruneReplace as u8
+                    || v.cause == TombstoneCause::CompensatedCreate as u8
+                {
+                    out.push(*k);
+                }
+            }
+        }
+        out
+    }
+
     /// Total live tombstone count across all shards.
     pub fn len(&self) -> usize {
         self.shards.iter().map(|s| s.read().len()).sum()
@@ -686,6 +720,51 @@ impl TombstoneLog {
             fs.needs_compaction = true;
         }
         removed
+    }
+
+    /// W10 FIX 2 — weak-veto arbitration clear: drop `key`'s tombstone via the
+    /// TS-1 clear path ([`Self::clear`]) ONLY when its recorded cause is WEAK
+    /// ([`TombstoneCause::PruneReplace`] or
+    /// [`TombstoneCause::CompensatedCreate`]).
+    ///
+    /// The cause check and the removal happen under ONE shard write lock, so
+    /// a concurrent strong-cause upgrade (a client delete landing between a
+    /// caller's lookup and this clear) can never be clobbered: whatever cause
+    /// is present AT CLEAR TIME decides. A strong cause (`ClientDelete`,
+    /// `Dah`, or any unrecognized future byte — fail closed) is REFUSED; an
+    /// absent tombstone reports [`WeakTombstoneClear::Absent`] so retried
+    /// arbitration rounds are idempotent.
+    ///
+    /// SAFETY ARGUMENT (why this can never resurrect a client-deleted
+    /// record): a weak cause is only ever produced by this node's own LOCAL
+    /// rollback/reconcile markers, never by a client delete (cause separation
+    /// at every producer — see [`Self::record`]); [`Self::record`]'s
+    /// precedence never lets a weak cause REPLACE a strong one, while a later
+    /// strong cause LWW-upgrades a weak one — so wherever a client-delete
+    /// claim exists for the key, the cause read here is `ClientDelete` and
+    /// the clear is refused. Clearing a weak marker leaves this node exactly
+    /// as exposed as a node that never recorded one (the posture RULE-DS/#78
+    /// always accepted for non-deleting nodes).
+    pub fn clear_weak(&self, key: &TxKey) -> WeakTombstoneClear {
+        {
+            let mut shard = self.shards[self.shard_index(key)].write();
+            match shard.get(key) {
+                None => return WeakTombstoneClear::Absent,
+                Some(v)
+                    if v.cause == TombstoneCause::PruneReplace as u8
+                        || v.cause == TombstoneCause::CompensatedCreate as u8 =>
+                {
+                    shard.remove(key);
+                }
+                Some(_) => return WeakTombstoneClear::RefusedStrongCause,
+            }
+        }
+        // Drain the un-persisted append exactly as `clear` does, so a later
+        // compaction cannot re-append the cleared tombstone (Invariant TS-1).
+        let mut fs = self.file.lock();
+        fs.pending.retain(|(pk, _)| pk != key);
+        fs.needs_compaction = true;
+        WeakTombstoneClear::Cleared
     }
 
     /// Make the tombstone set durable at a checkpoint: GC past the retention
@@ -1067,6 +1146,56 @@ mod tests {
             reloaded.lookup(&tk(1)).is_none(),
             "a cleared tombstone must not be re-appended by compaction",
         );
+    }
+
+    /// W10 FIX 2 — `clear_weak` drops ONLY weak-cause tombstones
+    /// (PruneReplace / CompensatedCreate): a strong cause (ClientDelete /
+    /// Dah) is refused untouched, an absent key is idempotent, and — like
+    /// `clear` — the un-persisted pending append is drained so a later
+    /// compaction cannot resurrect the cleared marker.
+    #[test]
+    fn clear_weak_clears_weak_causes_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.tombstones");
+        let log = TombstoneLog::new(path.clone(), 0, 4, 100);
+        log.record(&tk(1), 0, 500, TombstoneCause::PruneReplace);
+        log.record(&tk(2), 0, 500, TombstoneCause::CompensatedCreate);
+        log.record(&tk(3), 5, 500, TombstoneCause::ClientDelete);
+        log.record(&tk(4), 5, 500, TombstoneCause::Dah);
+
+        assert_eq!(log.clear_weak(&tk(1)), WeakTombstoneClear::Cleared);
+        assert_eq!(log.clear_weak(&tk(2)), WeakTombstoneClear::Cleared);
+        assert_eq!(
+            log.clear_weak(&tk(3)),
+            WeakTombstoneClear::RefusedStrongCause,
+            "a ClientDelete veto is never arbitrable",
+        );
+        assert_eq!(
+            log.clear_weak(&tk(4)),
+            WeakTombstoneClear::RefusedStrongCause,
+            "a Dah veto is never arbitrable",
+        );
+        assert_eq!(
+            log.clear_weak(&tk(1)),
+            WeakTombstoneClear::Absent,
+            "a retried clear of an already-cleared key is idempotent",
+        );
+        assert_eq!(log.clear_weak(&tk(99)), WeakTombstoneClear::Absent);
+
+        // The cleared weak markers no longer veto; the strong ones still do.
+        assert!(!log.blocks_heal_apply(&tk(1), 0));
+        assert!(!log.blocks_heal_apply(&tk(2), 0));
+        assert!(log.blocks_heal_apply(&tk(3), 99));
+        assert!(log.blocks_heal_apply(&tk(4), 5));
+
+        // TS-1: the pending append is drained, so compaction cannot
+        // re-append the cleared markers; the refused strong ones persist.
+        log.persist(0, |_| false).unwrap();
+        let reloaded = TombstoneLog::load(path, 0, 4, 100).unwrap();
+        assert!(reloaded.lookup(&tk(1)).is_none());
+        assert!(reloaded.lookup(&tk(2)).is_none());
+        assert!(reloaded.lookup(&tk(3)).is_some());
+        assert!(reloaded.lookup(&tk(4)).is_some());
     }
 
     /// Reverse-heal Phase 2c RULE-DS gate is CAUSE-AWARE: a `Dah` (terminal)

@@ -1321,6 +1321,23 @@ impl MigrationManager {
         })
     }
 
+    /// W10 FIX 2 — is there ANY active (uncompleted) inbound entry for `shard`
+    /// sourced from exactly `from_node` (forward migration OR reverse-heal)?
+    ///
+    /// This is the target-side "fence still held" check of the weak-veto
+    /// arbitration (`OP_MIGRATION_WEAK_VETO_ARBITRATE`): an arbitration is
+    /// only honored while the source's transfer for the shard is still open
+    /// on this node — i.e. the completion whose rejection prompted the
+    /// arbitration has not resolved and the shard is still inbound-fenced
+    /// against client serving. The `NodeId(0)` sentinel (a parked no-source
+    /// fence) matches no source, mirroring
+    /// [`Self::has_pending_heal_from_source`].
+    pub fn has_pending_inbound_from_source(&self, shard: u16, from_node: NodeId) -> bool {
+        self.inbound_migrations.iter().any(|m| {
+            !m.completed && m.shard == shard && m.from_node == from_node && m.from_node != NodeId(0)
+        })
+    }
+
     /// Reverse-heal Phase 3c (design §E3) — the shards whose `heal_pending` fence
     /// has been up (uncompleted) for at least `deadline` — i.e. STUCK heals whose
     /// deadline fallback (escalate / alert-and-hold) is due.

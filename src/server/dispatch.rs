@@ -1202,6 +1202,39 @@ pub(crate) fn handle_request(
                     None
                 }
             });
+            // W10 FIX 3 — optional trailing weak-tombstone key section (after
+            // the enumeration cutoff): keys of this shard the SOURCE holds
+            // WEAK-cause tombstones for. The source's manifest omits them
+            // because its OWN local reconcile/rollback deleted its copy —
+            // that omission is NOT deletion-intent, so the #29 prune below
+            // must exclude these keys (a peer's live copy may be the last
+            // one; armed-05's re-baselining leg deleted exactly such copies).
+            // Layout: `[weak_count: u32][txid: 32 × count]`. Absent / short =
+            // no exclusions (historical behavior).
+            let source_weak_tombstone_keys: std::collections::HashSet<TxKey> = source_entries
+                .as_ref()
+                .map(|entries| {
+                    let base = 60 + entries.len() * 36 + 16;
+                    let mut keys = std::collections::HashSet::new();
+                    if let Some(count) = le_u32_at(&request.payload, base) {
+                        let count = count as usize;
+                        if let Some(end) = 32usize
+                            .checked_mul(count)
+                            .and_then(|n| n.checked_add(base + 4))
+                            && request.payload.len() >= end
+                        {
+                            for i in 0..count {
+                                let mut txid = [0u8; 32];
+                                txid.copy_from_slice(
+                                    &request.payload[base + 4 + i * 32..base + 4 + (i + 1) * 32],
+                                );
+                                keys.insert(TxKey { txid });
+                            }
+                        }
+                    }
+                    keys
+                })
+                .unwrap_or_default();
 
             // Deletion-tombstone migration reconciliation has been removed: each
             // node prunes its own fully-spent records independently, so the
@@ -1536,6 +1569,15 @@ pub(crate) fn handle_request(
                     entries.iter().map(|(key, _)| *key).collect();
                 for key in engine.keys_for_shard(shard) {
                     if expected_keys.contains(&key) {
+                        continue;
+                    }
+                    // W10 FIX 3 — the source declared this key's omission as
+                    // its OWN weak-tombstone reconcile marker, not
+                    // deletion-intent: retain the local copy. The superset
+                    // accept below still verifies the completion; the
+                    // record stays under-replicated until repair restores
+                    // the source's copy, but it stays ALIVE.
+                    if source_weak_tombstone_keys.contains(&key) {
                         continue;
                     }
                     // W9 P1-1 — `delete_prune_replace`, NOT `delete`: this is
@@ -2162,6 +2204,202 @@ pub(crate) fn handle_request(
                     ERR_INTERNAL,
                     "transfer-request: coordinator shutting down",
                 );
+            }
+            ResponseFrame {
+                request_id: request.request_id,
+                status: STATUS_OK,
+                payload: Vec::new(),
+            }
+        }
+        OP_MIGRATION_WEAK_VETO_ARBITRATE => {
+            // W10 FIX 2 — weak-veto arbitration (the armed-05 strand
+            // unblocker). The pushing source's completion verify failed
+            // because THIS node vetoed manifest key(s) with WEAK-cause
+            // deletion tombstones (PruneReplace / CompensatedCreate — local
+            // rollback/reconcile markers). For a created-once record both
+            // sides sit at generation 0 forever, so the PruneReplace
+            // "strictly-newer heals in" window is structurally vacuous and
+            // the veto→terminal-abort→retry loop never converges. The
+            // epoch-authoritative source holding a LIVE copy therefore wins
+            // an explicit arbitration: this handler drops the weak tombstone
+            // via the TS-1 clear path, and the source re-pushes the record
+            // through the NORMAL replica-create apply (generation guard
+            // included) before retrying the completion.
+            //
+            // SAFETY ARGUMENT — why this can never resurrect a
+            // client-deleted record, and why a stale source cannot clobber:
+            //
+            //  * CAUSE GATING. Only a WEAK cause is cleared, decided
+            //    atomically at clear time under the tombstone shard lock
+            //    (`Engine::arbitrate_clear_weak_tombstone`). Weak causes are
+            //    produced exclusively by this node's own local
+            //    rollback/reconcile paths — never by a client delete — and
+            //    the tombstone log's precedence rules guarantee a key with
+            //    ANY client-delete claim reads `ClientDelete` here (a weak
+            //    record never replaces a strong cause; a later strong cause
+            //    LWW-upgrades a weak one). A ClientDelete/Dah veto is
+            //    refused unconditionally, keeping the #78 posture intact.
+            //    Clearing a weak marker leaves this node exactly as exposed
+            //    as a node that never recorded one — the bare-node posture
+            //    RULE-DS always accepted for non-deleting nodes.
+            //
+            //  * AUTHORITY + FENCE + EPOCH. The request is honored only when
+            //    (a) it is stamped with this node's currently-activated
+            //    epoch, (b) `from_node` is that epoch's authoritative holder
+            //    (committed target master or still-authoritative effective
+            //    master — the same predicate as the #29 prune's
+            //    `source_is_authoritative_complete`), and (c) the source's
+            //    transfer for the shard is STILL OPEN here (an active
+            //    uncompleted inbound entry from `from_node`, i.e. the write
+            //    fence that accompanied the rejected completion is still
+            //    held and the shard is not client-serving). A superseded or
+            //    never-streamed source fails (a)/(b)/(c) and changes
+            //    nothing.
+            //
+            //  * NO BLIND APPLY. This handler clears a marker; it applies no
+            //    record. The record arrives through the normal replica-create
+            //    apply whose per-record generation guard still rejects a
+            //    stale image regressing a newer local copy. Worst case (a
+            //    source that clears but never re-pushes) this node is a bare
+            //    holder without the key — under-replication repair territory,
+            //    never resurrection.
+            //
+            // Wire: [shard:2][from_node:8][migration_epoch:8][key_count:4]
+            //       [txid:32 × count]
+            let cluster = match cluster {
+                Some(c) => c,
+                None => {
+                    return error_response(request.request_id, ERR_NOT_CLUSTERED, "not clustered");
+                }
+            };
+            let (Some(shard), Some(from_node), Some(migration_epoch), Some(key_count)) = (
+                le_u16_at(&request.payload, 0),
+                le_u64_at(&request.payload, 2),
+                le_u64_at(&request.payload, 10),
+                le_u32_at(&request.payload, 18),
+            ) else {
+                return error_response(
+                    request.request_id,
+                    ERR_PAYLOAD_MALFORMED,
+                    "weak-veto arbitration: truncated header",
+                );
+            };
+            let key_count = key_count as usize;
+            // The vetoed set a completion rejection names is bounded (512 per
+            // round); anything past the full-manifest scale is malformed.
+            if key_count == 0 || key_count > 65_536 {
+                return error_response(
+                    request.request_id,
+                    ERR_PAYLOAD_MALFORMED,
+                    &format!("weak-veto arbitration: key count {key_count} out of range"),
+                );
+            }
+            let needed = match 32usize
+                .checked_mul(key_count)
+                .and_then(|n| n.checked_add(22))
+            {
+                Some(n) => n,
+                None => {
+                    return error_response(
+                        request.request_id,
+                        ERR_PAYLOAD_MALFORMED,
+                        "weak-veto arbitration: key count overflow",
+                    );
+                }
+            };
+            if request.payload.len() < needed {
+                return error_response(
+                    request.request_id,
+                    ERR_PAYLOAD_MALFORMED,
+                    &format!(
+                        "weak-veto arbitration: need {needed} bytes, got {}",
+                        request.payload.len()
+                    ),
+                );
+            }
+            let from_node = NodeId(from_node);
+            // (a) EPOCH-CURRENT: stamped with the currently-activated table
+            // version (a legacy epoch-0 frame cannot be proven current).
+            // (b) AUTHORITATIVE: from_node is the committed target master or
+            // the still-authoritative effective master for the shard.
+            {
+                let shard_table = cluster.shard_table();
+                let table = shard_table.read();
+                if migration_epoch == 0 || migration_epoch != table.version {
+                    return error_response(
+                        request.request_id,
+                        ERR_STALE_EPOCH,
+                        &format!(
+                            "weak-veto arbitration: epoch {migration_epoch} is not the \
+                             activated version {}",
+                            table.version
+                        ),
+                    );
+                }
+                let authoritative = table.target_assignment(shard).master == from_node
+                    || table.effective_assignment(shard).master == from_node;
+                if !authoritative {
+                    return error_response(
+                        request.request_id,
+                        ERR_INVARIANT_VIOLATION,
+                        &format!(
+                            "weak-veto arbitration: node {} is not shard {shard}'s \
+                             authoritative holder at epoch {migration_epoch}",
+                            from_node.0
+                        ),
+                    );
+                }
+            }
+            // (c) FENCE HELD: the source's transfer for this shard is still
+            // open here.
+            if !cluster.has_pending_inbound_from_source(shard, from_node) {
+                return error_response(
+                    request.request_id,
+                    ERR_INVARIANT_VIOLATION,
+                    &format!(
+                        "weak-veto arbitration: no active inbound transfer for shard \
+                         {shard} from node {}",
+                        from_node.0
+                    ),
+                );
+            }
+            // Clear each key's WEAK tombstone; refuse the frame on the first
+            // strong-cause key (already-cleared keys stay cleared — clearing
+            // a weak marker is idempotent-safe, and the source's bounded
+            // retry re-sends only still-vetoed keys).
+            for i in 0..key_count {
+                let mut txid = [0u8; 32];
+                txid.copy_from_slice(&request.payload[22 + i * 32..22 + (i + 1) * 32]);
+                let key = TxKey { txid };
+                if crate::cluster::shards::ShardTable::shard_for_key(&key) != shard {
+                    return error_response(
+                        request.request_id,
+                        ERR_INVARIANT_VIOLATION,
+                        &format!("weak-veto arbitration: key {key:?} is not in shard {shard}"),
+                    );
+                }
+                match engine.arbitrate_clear_weak_tombstone(&key) {
+                    crate::ops::tombstone::WeakTombstoneClear::Cleared => {
+                        tracing::info!(
+                            shard,
+                            from_node = from_node.0,
+                            key = ?key,
+                            "weak-veto arbitration: cleared weak tombstone for the \
+                             authoritative source's live copy",
+                        );
+                    }
+                    crate::ops::tombstone::WeakTombstoneClear::Absent => {}
+                    crate::ops::tombstone::WeakTombstoneClear::RefusedStrongCause => {
+                        return error_response(
+                            request.request_id,
+                            ERR_INVARIANT_VIOLATION,
+                            &format!(
+                                "weak-veto arbitration: key {key:?} carries a \
+                                 ClientDelete/Dah tombstone — never arbitrable",
+                            ),
+                        );
+                    }
+                }
             }
             ResponseFrame {
                 request_id: request.request_id,
@@ -27561,6 +27799,485 @@ mod tests {
         );
         assert_eq!(resp.status, STATUS_OK, "verified superset still completes");
         assert!(h.engine.read_metadata(&key_a).is_ok());
+    }
+
+    /// W10 FIX 3 — a source holding WEAK tombstones for keys of a shard must
+    /// not have their omission from its manifest treated as deletion-intent:
+    /// those omissions are potentially the source's own #29 prune damage
+    /// (the armed-05 re-baselining leg: the tombstoned holder acted as
+    /// authoritative-complete source, its manifest omitted the pruned key,
+    /// and every peer deleted its live copy). The completion frame therefore
+    /// carries the source's weak-tombstone keys for the shard; the target
+    /// EXCLUDES them from the #29 prune (retaining its live copy) while the
+    /// epoch-current superset accept still lets the completion verify.
+    #[test]
+    fn migration_complete_prune_excludes_source_weak_tombstone_keys() {
+        let h = DispatchTestHarness::new();
+        let shard = 43u16;
+        let txid_a = txid_for_shard(shard, 7);
+        let txid_b = txid_for_shard(shard, 8);
+        assert_eq!(h.create_tx(txid_a, 1).status, STATUS_OK);
+        // B: the target's LIVE ACKED copy of a key the SOURCE prune-damaged
+        // (the source holds a weak tombstone instead of the record).
+        assert_eq!(h.create_tx(txid_b, 1).status, STATUS_OK);
+
+        let tomb_log = crate::ops::tombstone::TombstoneLog::new(
+            std::path::PathBuf::from("/nonexistent/w10-weak-manifest.tombstones"),
+            h.engine.index_seed(),
+            h.engine.index_shard_count(),
+            10_000,
+        );
+        h.engine.set_tombstone_log(tomb_log);
+
+        let key_a = TxKey { txid: txid_a };
+        let key_b = TxKey { txid: txid_b };
+        let meta_a = h.engine.read_metadata(&key_a).unwrap();
+        // The source's manifest OMITS B (its own prune deleted its copy).
+        let entries = vec![(key_a, meta_a.generation)];
+        let hash = compute_manifest_for_entries(&entries);
+
+        let epoch = 49u64;
+        let members = vec![crate::cluster::shards::NodeId(1)];
+        let table = crate::cluster::shards::ShardTable::compute_with_epoch(&members, 1, epoch, 1);
+        let cluster = crate::cluster::coordinator::new_test_running_cluster(
+            crate::cluster::shards::NodeId(1),
+            table,
+            &[(
+                crate::cluster::shards::NodeId(1),
+                "127.0.0.1:4768".parse().unwrap(),
+            )],
+            &members,
+            &[shard],
+            &[],
+            &[],
+            1,
+        );
+
+        // The completion declares B as a weak-tombstone key: "my omission of
+        // B is my own reconcile marker, not deletion-intent".
+        let payload = crate::cluster::coordinator::encode_migration_complete_payload_with_weak_keys(
+            entries.len() as u64,
+            0,
+            epoch,
+            &hash,
+            &entries,
+            crate::cluster::shards::NodeId(1),
+            u64::MAX,
+            &[key_b],
+        );
+        let req = RequestFrame {
+            request_id: shard as u64,
+            op_code: OP_MIGRATION_COMPLETE,
+            flags: 0,
+            payload: payload.into(),
+        };
+        let mut cs = crate::server::ConnectionState::new();
+        let resp = handle_request(&req, &h.engine, 8192, Some(&cluster), None, &mut cs, None);
+
+        assert!(
+            h.engine.read_metadata(&key_b).is_ok(),
+            "a key the source holds a WEAK tombstone for must never be pruned on \
+             its omission — the omission may be the source's own prune damage",
+        );
+        assert_eq!(
+            h.engine.tombstone_cause(&key_b),
+            None,
+            "no local tombstone may be recorded for the declared weak key",
+        );
+        assert_eq!(
+            resp.status, STATUS_OK,
+            "the epoch-current superset accept still verifies the completion",
+        );
+        assert!(h.engine.read_metadata(&key_a).is_ok());
+    }
+
+    /// W10 FIX 3 companion — keys NOT in the weak-tombstone section keep the
+    /// historical prune (the declaration is per-key, not a blanket skip).
+    #[test]
+    fn migration_complete_prune_still_runs_for_undeclared_keys() {
+        let h = DispatchTestHarness::new();
+        let shard = 44u16;
+        let txid_a = txid_for_shard(shard, 7);
+        let txid_b = txid_for_shard(shard, 8);
+        let txid_c = txid_for_shard(shard, 9);
+        assert_eq!(h.create_tx(txid_a, 1).status, STATUS_OK);
+        assert_eq!(h.create_tx(txid_b, 1).status, STATUS_OK);
+        assert_eq!(h.create_tx(txid_c, 1).status, STATUS_OK);
+
+        let key_a = TxKey { txid: txid_a };
+        let key_b = TxKey { txid: txid_b };
+        let key_c = TxKey { txid: txid_c };
+        let meta_a = h.engine.read_metadata(&key_a).unwrap();
+        let entries = vec![(key_a, meta_a.generation)];
+        let hash = compute_manifest_for_entries(&entries);
+
+        let epoch = 49u64;
+        let members = vec![crate::cluster::shards::NodeId(1)];
+        let table = crate::cluster::shards::ShardTable::compute_with_epoch(&members, 1, epoch, 1);
+        let cluster = crate::cluster::coordinator::new_test_running_cluster(
+            crate::cluster::shards::NodeId(1),
+            table,
+            &[(
+                crate::cluster::shards::NodeId(1),
+                "127.0.0.1:4769".parse().unwrap(),
+            )],
+            &members,
+            &[shard],
+            &[],
+            &[],
+            1,
+        );
+
+        // B declared weak — retained; C undeclared — pruned as stale residue.
+        let payload = crate::cluster::coordinator::encode_migration_complete_payload_with_weak_keys(
+            entries.len() as u64,
+            0,
+            epoch,
+            &hash,
+            &entries,
+            crate::cluster::shards::NodeId(1),
+            u64::MAX,
+            &[key_b],
+        );
+        let req = RequestFrame {
+            request_id: shard as u64,
+            op_code: OP_MIGRATION_COMPLETE,
+            flags: 0,
+            payload: payload.into(),
+        };
+        let mut cs = crate::server::ConnectionState::new();
+        let resp = handle_request(&req, &h.engine, 8192, Some(&cluster), None, &mut cs, None);
+
+        assert_eq!(resp.status, STATUS_OK);
+        assert!(h.engine.read_metadata(&key_b).is_ok(), "declared key kept");
+        assert!(
+            h.engine.read_metadata(&key_c).is_err(),
+            "an undeclared extra key keeps the historical prune",
+        );
+    }
+
+    /// W10 FIX 2 (armed-05 strand) — end-to-end weak-veto arbitration.
+    ///
+    /// The stranded shape: the target holds a PruneReplace gen-0 tombstone
+    /// for a key it no longer holds live; the epoch-authoritative source
+    /// holds the LIVE gen-0 copy. Every completion is rejected naming the
+    /// veto, every re-push is dropped by RULE-DS (a created-once record is
+    /// gen 0 FOREVER, so "strictly newer heals in" is structurally vacuous),
+    /// and pre-W10 the loop cycled veto → terminal abort → delayed-self-retry
+    /// → re-veto without ever converging. With FIX 2 the source arbitrates:
+    /// `OP_MIGRATION_WEAK_VETO_ARBITRATE` (fence held + epoch current +
+    /// authoritative source + weak cause) clears the tombstone via the TS-1
+    /// clear path, the re-push applies through the normal replica-create
+    /// path, and the completion verifies.
+    #[test]
+    fn weak_veto_arbitration_unstrands_prune_replace_gen0_veto() {
+        let h = DispatchTestHarness::new();
+        let epoch = 49u64;
+        let members = vec![
+            crate::cluster::shards::NodeId(1),
+            crate::cluster::shards::NodeId(2),
+        ];
+        let table = crate::cluster::shards::ShardTable::compute_with_epoch(&members, 1, epoch, 1);
+        // A shard mastered by node 1 (the source); this node is 2 (the target).
+        let shard = (0..crate::cluster::shards::NUM_SHARDS as u16)
+            .find(|s| table.target_assignment(*s).master == crate::cluster::shards::NodeId(1))
+            .expect("some shard is mastered by node 1");
+        let txid_k = txid_for_shard(shard, 7);
+        let key_k = TxKey { txid: txid_k };
+
+        // The strand: a PruneReplace gen-0 tombstone over an absent key.
+        let tomb_log = crate::ops::tombstone::TombstoneLog::new(
+            std::path::PathBuf::from("/nonexistent/w10-arbitration.tombstones"),
+            h.engine.index_seed(),
+            h.engine.index_shard_count(),
+            10_000,
+        );
+        tomb_log.record(
+            &key_k,
+            0,
+            900,
+            crate::ops::tombstone::TombstoneCause::PruneReplace,
+        );
+        h.engine.set_tombstone_log(tomb_log);
+        assert!(h.engine.tombstone_blocks_heal_apply(&key_k, 0));
+
+        let cluster = crate::cluster::coordinator::new_test_running_cluster(
+            crate::cluster::shards::NodeId(2),
+            table,
+            &[
+                (
+                    crate::cluster::shards::NodeId(1),
+                    "127.0.0.1:4738".parse().unwrap(),
+                ),
+                (
+                    crate::cluster::shards::NodeId(2),
+                    "127.0.0.1:4739".parse().unwrap(),
+                ),
+            ],
+            &members,
+            &[shard],
+            &[],
+            &[],
+            2,
+        );
+        // The source's transfer is open: concrete inbound entry from node 1.
+        cluster.register_inbound_source(shard, crate::cluster::shards::NodeId(1));
+
+        let mut cs = crate::server::ConnectionState::new();
+
+        // (1) The source's completion names (K, gen 0) — vetoed.
+        let entries = vec![(key_k, 0u32)];
+        let hash = compute_manifest_for_entries(&entries);
+        let completion = |cs: &mut crate::server::ConnectionState| {
+            let payload = crate::cluster::coordinator::encode_migration_complete_payload(
+                1,
+                0,
+                epoch,
+                &hash,
+                &entries,
+                crate::cluster::shards::NodeId(1),
+                u64::MAX,
+            );
+            let req = RequestFrame {
+                request_id: shard as u64,
+                op_code: OP_MIGRATION_COMPLETE,
+                flags: 0,
+                payload: payload.into(),
+            };
+            handle_request(&req, &h.engine, 8192, Some(&cluster), None, cs, None)
+        };
+        let resp = completion(&mut cs);
+        assert_ne!(resp.status, STATUS_OK);
+        let err = crate::cluster::coordinator::migration_complete_rejection_error(
+            resp.status,
+            &resp.payload,
+        );
+        assert!(
+            err.contains("vetoed by deletion tombstone") && err.contains("PruneReplace"),
+            "the rejection names the weak veto: {err}",
+        );
+
+        // (2) Today's futile re-push: RULE-DS drops the gen-0 create — the
+        // strand never converges through the push path alone.
+        let repush = |cs: &mut crate::server::ConnectionState| {
+            let batch = ReplicaBatch {
+                first_sequence: 0,
+                ops: vec![ReplicaOp::Create {
+                    tx_key: key_k,
+                    metadata_bytes: vec![0; 64],
+                    utxo_hashes: vec![[0xAA; 32]],
+                    cold_data: None,
+                    is_external: false,
+                }],
+                trace_ctx: None,
+                source_node_id: Some(1),
+                cluster_key: cluster.local_cluster_key(),
+            };
+            let req = RequestFrame {
+                request_id: shard as u64,
+                op_code: OP_REPLICA_BATCH,
+                flags: FLAG_MIGRATION_BATCH,
+                payload: batch.serialize().into(),
+            };
+            handle_request(&req, &h.engine, 8192, Some(&cluster), None, cs, None)
+        };
+        assert_eq!(repush(&mut cs).status, STATUS_OK);
+        assert!(
+            h.engine.read_metadata(&key_k).is_err(),
+            "RULE-DS drops the re-pushed gen-0 create while the veto stands",
+        );
+
+        // (3) THE FIX — the authoritative source arbitrates the weak veto.
+        let arb_payload = crate::cluster::coordinator::encode_weak_veto_arbitration_payload(
+            shard,
+            crate::cluster::shards::NodeId(1),
+            epoch,
+            &[key_k],
+        );
+        let req = RequestFrame {
+            request_id: shard as u64,
+            op_code: OP_MIGRATION_WEAK_VETO_ARBITRATE,
+            flags: 0,
+            payload: arb_payload.into(),
+        };
+        let resp = handle_request(&req, &h.engine, 8192, Some(&cluster), None, &mut cs, None);
+        assert_eq!(resp.status, STATUS_OK, "arbitration accepted");
+        assert_eq!(
+            h.engine.tombstone_cause(&key_k),
+            None,
+            "the weak tombstone is cleared via the TS-1 path",
+        );
+
+        // (4) The re-push now applies…
+        assert_eq!(repush(&mut cs).status, STATUS_OK);
+        assert!(
+            h.engine.read_metadata(&key_k).is_ok(),
+            "the live copy reaches the target once the weak veto is arbitrated",
+        );
+
+        // (5) …and the completion verifies: the record reaches RF.
+        let resp = completion(&mut cs);
+        assert_eq!(resp.status, STATUS_OK, "the strand converges");
+    }
+
+    /// W10 FIX 2 — the arbitration verification matrix: a ClientDelete veto
+    /// is NEVER arbitrable, and a request missing any of the three
+    /// authority/fence/epoch proofs is refused untouched.
+    #[test]
+    fn weak_veto_arbitration_refuses_strong_cause_and_unproven_requests() {
+        let h = DispatchTestHarness::new();
+        let epoch = 49u64;
+        let members = vec![
+            crate::cluster::shards::NodeId(1),
+            crate::cluster::shards::NodeId(2),
+        ];
+        let table = crate::cluster::shards::ShardTable::compute_with_epoch(&members, 1, epoch, 1);
+        let shard = (0..crate::cluster::shards::NUM_SHARDS as u16)
+            .find(|s| table.target_assignment(*s).master == crate::cluster::shards::NodeId(1))
+            .expect("some shard is mastered by node 1");
+        let key_k = TxKey {
+            txid: txid_for_shard(shard, 7),
+        };
+
+        let tomb_log = crate::ops::tombstone::TombstoneLog::new(
+            std::path::PathBuf::from("/nonexistent/w10-arbitration-matrix.tombstones"),
+            h.engine.index_seed(),
+            h.engine.index_shard_count(),
+            10_000,
+        );
+        tomb_log.record(
+            &key_k,
+            0,
+            900,
+            crate::ops::tombstone::TombstoneCause::ClientDelete,
+        );
+        h.engine.set_tombstone_log(tomb_log);
+
+        let cluster = crate::cluster::coordinator::new_test_running_cluster(
+            crate::cluster::shards::NodeId(2),
+            table,
+            &[
+                (
+                    crate::cluster::shards::NodeId(1),
+                    "127.0.0.1:4748".parse().unwrap(),
+                ),
+                (
+                    crate::cluster::shards::NodeId(2),
+                    "127.0.0.1:4749".parse().unwrap(),
+                ),
+            ],
+            &members,
+            &[shard],
+            &[],
+            &[],
+            2,
+        );
+        cluster.register_inbound_source(shard, crate::cluster::shards::NodeId(1));
+
+        let send = |from: u64, ep: u64| {
+            let payload = crate::cluster::coordinator::encode_weak_veto_arbitration_payload(
+                shard,
+                crate::cluster::shards::NodeId(from),
+                ep,
+                &[key_k],
+            );
+            let req = RequestFrame {
+                request_id: shard as u64,
+                op_code: OP_MIGRATION_WEAK_VETO_ARBITRATE,
+                flags: 0,
+                payload: payload.into(),
+            };
+            let mut cs = crate::server::ConnectionState::new();
+            handle_request(&req, &h.engine, 8192, Some(&cluster), None, &mut cs, None)
+        };
+
+        // Stale / unproven epoch.
+        assert_ne!(send(1, epoch + 1).status, STATUS_OK);
+        assert_ne!(send(1, 0).status, STATUS_OK);
+        // Non-authoritative source (node 2 is not the shard's master).
+        assert_ne!(send(2, epoch).status, STATUS_OK);
+        // Authoritative + epoch-current + fence held, but the cause is
+        // ClientDelete: NEVER arbitrable — the unconditional posture stands.
+        assert_ne!(send(1, epoch).status, STATUS_OK);
+        assert_eq!(
+            h.engine.tombstone_cause(&key_k),
+            Some(crate::ops::tombstone::TombstoneCause::ClientDelete),
+            "a ClientDelete tombstone survives every arbitration attempt",
+        );
+        assert!(h.engine.tombstone_blocks_heal_apply(&key_k, u32::MAX));
+    }
+
+    /// W10 FIX 2 — without an OPEN inbound transfer from the source (no fence
+    /// proof), an otherwise well-formed arbitration is refused and the weak
+    /// tombstone is untouched. Separate test (not folded into the matrix
+    /// above): `DispatchTestHarness` holds the global metrics test lock for
+    /// its lifetime, so a second harness in the same test self-deadlocks.
+    #[test]
+    fn weak_veto_arbitration_refused_without_open_inbound_transfer() {
+        let h = DispatchTestHarness::new();
+        let epoch = 49u64;
+        let members = vec![
+            crate::cluster::shards::NodeId(1),
+            crate::cluster::shards::NodeId(2),
+        ];
+        let table = crate::cluster::shards::ShardTable::compute_with_epoch(&members, 1, epoch, 1);
+        let shard = (0..crate::cluster::shards::NUM_SHARDS as u16)
+            .find(|s| table.target_assignment(*s).master == crate::cluster::shards::NodeId(1))
+            .expect("some shard is mastered by node 1");
+        let key_k = TxKey {
+            txid: txid_for_shard(shard, 7),
+        };
+        let tomb_log = crate::ops::tombstone::TombstoneLog::new(
+            std::path::PathBuf::from("/nonexistent/w10-arbitration-nofence.tombstones"),
+            h.engine.index_seed(),
+            h.engine.index_shard_count(),
+            10_000,
+        );
+        tomb_log.record(
+            &key_k,
+            0,
+            900,
+            crate::ops::tombstone::TombstoneCause::PruneReplace,
+        );
+        h.engine.set_tombstone_log(tomb_log);
+        // NOTE: no inbound shards registered and no register_inbound_source —
+        // the fence proof is absent.
+        let cluster = crate::cluster::coordinator::new_test_running_cluster(
+            crate::cluster::shards::NodeId(2),
+            table,
+            &[(
+                crate::cluster::shards::NodeId(1),
+                "127.0.0.1:4758".parse().unwrap(),
+            )],
+            &members,
+            &[],
+            &[],
+            &[],
+            2,
+        );
+        let payload = crate::cluster::coordinator::encode_weak_veto_arbitration_payload(
+            shard,
+            crate::cluster::shards::NodeId(1),
+            epoch,
+            &[key_k],
+        );
+        let req = RequestFrame {
+            request_id: shard as u64,
+            op_code: OP_MIGRATION_WEAK_VETO_ARBITRATE,
+            flags: 0,
+            payload: payload.into(),
+        };
+        let mut cs = crate::server::ConnectionState::new();
+        let resp = handle_request(&req, &h.engine, 8192, Some(&cluster), None, &mut cs, None);
+        assert_ne!(
+            resp.status, STATUS_OK,
+            "no open inbound transfer from the source — the fence proof is missing",
+        );
+        assert_eq!(
+            h.engine.tombstone_cause(&key_k),
+            Some(crate::ops::tombstone::TombstoneCause::PruneReplace),
+            "the weak tombstone is untouched without the fence proof",
+        );
     }
 
     /// W10 FIX 1 companion (liveness) — a completion whose cutoff COVERS every

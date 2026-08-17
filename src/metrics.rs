@@ -1423,6 +1423,15 @@ pub struct MigrationMetrics {
     /// Only ever non-zero when `migration_vetoed_reduction_enabled` is on
     /// (default OFF).
     pub migration_completion_manifest_reduced_vetoed: PaddedCounter,
+    /// W10 FIX 2 — manifest keys whose WEAK-cause tombstone veto
+    /// (`PruneReplace` / `CompensatedCreate`) was ARBITRATED: the
+    /// epoch-authoritative source instructed the target to drop the weak
+    /// marker and re-pushed its live copy (`OP_MIGRATION_WEAK_VETO_ARBITRATE`).
+    /// Counted per key at the source when the target accepts the clear.
+    /// Restores data (never authorizes deletion), but each arbitration is a
+    /// consensus-relevant override of a local anti-resurrection marker, so it
+    /// stays operator-visible.
+    pub migration_weak_veto_arbitrations: PaddedCounter,
     /// GAP 2 (armed scenario 17) — gauge: non-owned shards the LAST orphan-
     /// cleanup pass RETAINED because the #28 committed-handoff evidence is
     /// missing (fail-closed: without positive evidence the data is safe
@@ -1500,6 +1509,7 @@ impl MigrationMetrics {
             under_replication_event_repairs: PaddedCounter::new(),
             replica_abort_forced_resyncs: PaddedCounter::new(),
             migration_completion_manifest_reduced_vetoed: PaddedCounter::new(),
+            migration_weak_veto_arbitrations: PaddedCounter::new(),
             orphan_cleanup_retained_no_evidence: AtomicU32::new(0),
         }
     }

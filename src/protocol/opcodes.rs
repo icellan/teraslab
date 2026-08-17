@@ -287,6 +287,23 @@ pub const OP_MIGRATION_BATCH_COMPLETE: u16 = 243;
 /// version and re-runs the normal outbound migration (or re-sends the
 /// completion handshake) for the listed shards. Fully idempotent.
 pub const OP_MIGRATION_TRANSFER_REQUEST: u16 = 244;
+/// W10 FIX 2 — weak-veto arbitration (the armed-05 strand unblocker). A
+/// migration/resync SOURCE whose completion verify was rejected because the
+/// target vetoed a manifest key with a WEAK-cause deletion tombstone
+/// (`PruneReplace` / `CompensatedCreate` — local rollback/reconcile markers,
+/// NOT client deletes) — and which is the shard's epoch-authoritative holder
+/// of a LIVE copy of that key — instructs the target to drop the weak
+/// tombstone so the subsequent re-push (the normal replica-create apply,
+/// generation guard included) can land. Payload:
+/// `[shard:2][from_node:8][migration_epoch:8][key_count:4][txid:32 × count]`.
+/// The target verifies: the fence is still held (an active inbound entry from
+/// `from_node` for `shard`), the epoch is current, `from_node` is the shard's
+/// committed/effective master, and each key's tombstone cause is WEAK — a
+/// `ClientDelete`/`Dah` veto is NEVER arbitrable (unconditional posture
+/// unchanged). All-or-nothing per frame: the first refused key rejects the
+/// request (keys already cleared stay cleared — clearing a weak marker is
+/// idempotent-safe, see `Engine::arbitrate_clear_weak_tombstone`).
+pub const OP_MIGRATION_WEAK_VETO_ARBITRATE: u16 = 245;
 
 // Cluster (inter-node)
 pub const OP_HEARTBEAT: u16 = 250;
@@ -828,6 +845,7 @@ pub fn is_inter_node_auth_opcode(op_code: u16) -> bool {
             | OP_MIGRATION_COMPLETE
             | OP_MIGRATION_BATCH_COMPLETE
             | OP_MIGRATION_TRANSFER_REQUEST
+            | OP_MIGRATION_WEAK_VETO_ARBITRATE
             | OP_TOPOLOGY_PROPOSE
             | OP_TOPOLOGY_VOTE
             | OP_TOPOLOGY_COMMIT

@@ -2275,6 +2275,42 @@ impl Engine {
             .is_some_and(|log| log.blocks_heal_apply(key, incoming_generation))
     }
 
+    /// W10 FIX 2 — weak-veto arbitration clear (the target half of the
+    /// `OP_MIGRATION_WEAK_VETO_ARBITRATE` handshake): drop `key`'s tombstone
+    /// via the TS-1 clear path ONLY when its cause is WEAK (`PruneReplace` /
+    /// `CompensatedCreate`). A strong cause (`ClientDelete` / `Dah` /
+    /// unrecognized) is refused; an absent tombstone (or a disabled tombstone
+    /// subsystem) reports `Absent` so retried rounds are idempotent. Cause
+    /// check and removal are atomic under the tombstone shard lock — see
+    /// [`crate::ops::tombstone::TombstoneLog::clear_weak`] for the full
+    /// safety argument.
+    pub fn arbitrate_clear_weak_tombstone(
+        &self,
+        key: &TxKey,
+    ) -> crate::ops::tombstone::WeakTombstoneClear {
+        match self.tombstone_log.get() {
+            Some(log) => log.clear_weak(key),
+            None => crate::ops::tombstone::WeakTombstoneClear::Absent,
+        }
+    }
+
+    /// W10 FIX 3 — the keys of CLUSTER shard `shard` this node holds
+    /// WEAK-cause tombstones for (`PruneReplace` / `CompensatedCreate`).
+    /// A migration source declares these in its completion frame so the
+    /// target does not treat their omission from the manifest as
+    /// deletion-intent (the omission may be this node's own #29 prune
+    /// damage). Empty when tombstones are disabled.
+    pub fn weak_tombstone_keys_for_shard(&self, shard: u16) -> Vec<TxKey> {
+        match self.tombstone_log.get() {
+            Some(log) => log
+                .weak_tombstone_keys()
+                .into_iter()
+                .filter(|k| crate::cluster::shards::ShardTable::shard_for_key(k) == shard)
+                .collect(),
+            None => Vec::new(),
+        }
+    }
+
     /// W10 FIX 1 — record that a replication-stream op from `source_node` was
     /// applied (or is about to be applied) to `key`'s cluster shard at stream
     /// sequence `seq`.
