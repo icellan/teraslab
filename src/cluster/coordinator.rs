@@ -6695,30 +6695,70 @@ impl ClusterCoordinator {
                 let mut last_failure: String;
                 loop {
                     attempts += 1;
-                    // `_ok`: a rejected report (non-OK status) is a failed
-                    // query by design, not an empty report — see F1 above.
-                    match send_topology_frame_ok(
+                    // A rejected report (non-OK status) is a failed query
+                    // by design, not an empty report — see F1 above. The
+                    // full response is inspected (not discarded) so the
+                    // W9 P2-3 stale-epoch key echo is readable.
+                    match send_topology_frame_response(
                         addr,
                         OP_PARTITION_VERSION_REPORT,
                         &cluster_key.to_le_bytes(),
                         secret.as_deref().map(Vec::as_slice),
                     ) {
-                        Ok(payload) => match parse_partition_version_response(&payload) {
-                            Some(entries) => {
-                                let _ = tx.send((peer, Some(entries)));
+                        Ok(response) if response.status == STATUS_OK => {
+                            match parse_partition_version_response(&response.payload) {
+                                Some(entries) => {
+                                    let _ = tx.send((peer, Some(entries)));
+                                    return;
+                                }
+                                None => {
+                                    let detail = "unparseable report payload";
+                                    record_exchange_peer_failure(
+                                        peer,
+                                        addr,
+                                        ExchangePeerFailureKind::Garbled,
+                                        detail,
+                                    );
+                                    last_failure = detail.to_string();
+                                }
+                            }
+                        }
+                        Ok(response) => {
+                            let err = format!("peer replied status {}", response.status);
+                            record_exchange_peer_failure(
+                                peer,
+                                addr,
+                                classify_exchange_peer_error(&err),
+                                &err,
+                            );
+                            // W9 P2-3 — the STALE_EPOCH rejection echoes the
+                            // responder's local cluster key. HIGHER than
+                            // ours means THIS node is the stale side: the
+                            // peer keeps rejecting until OUR key changes,
+                            // which only topology catch-up does — re-querying
+                            // is pointless, give up now (honest absence). A
+                            // LOWER key (peer still applying the commit) or
+                            // a keyless/other error keeps the cadence.
+                            if let Some(responder_key) =
+                                parse_stale_epoch_report_rejection(&response.payload)
+                                && responder_key > cluster_key
+                            {
+                                tracing::warn!(
+                                    peer = peer.0,
+                                    %addr,
+                                    our_key = cluster_key,
+                                    responder_key,
+                                    attempts,
+                                    "cluster: exchange peer reports a HIGHER \
+                                     cluster key — this node is the stale side; \
+                                     abandoning the re-query (topology catch-up \
+                                     converges us)",
+                                );
+                                let _ = tx.send((peer, None));
                                 return;
                             }
-                            None => {
-                                let detail = "unparseable report payload";
-                                record_exchange_peer_failure(
-                                    peer,
-                                    addr,
-                                    ExchangePeerFailureKind::Garbled,
-                                    detail,
-                                );
-                                last_failure = detail.to_string();
-                            }
-                        },
+                            last_failure = err;
+                        }
                         Err(err) => {
                             record_exchange_peer_failure(
                                 peer,
@@ -7354,11 +7394,11 @@ enum ExchangePeerFailureKind {
     Garbled,
 }
 
-/// W9 P2 — classify a [`send_topology_frame_ok`] error string. The
-/// prefixes are authored by `send_topology_frame_response` /
-/// `send_topology_frame_ok` in this same file (the exchange is their only
-/// `_ok` caller), so the match is deterministic; anything unrecognized is
-/// a transport failure.
+/// W9 P2 — classify an exchange report-query failure string. The prefixes
+/// are authored in this same file — by [`send_topology_frame_response`]
+/// (connect/transport errors) and by the exchange's retry loop itself
+/// (the `"peer replied status N"` line for a non-OK reply) — so the match
+/// is deterministic; anything unrecognized is a transport failure.
 fn classify_exchange_peer_error(err: &str) -> ExchangePeerFailureKind {
     if err.starts_with("connect:") {
         ExchangePeerFailureKind::Connect
@@ -8207,8 +8247,12 @@ fn send_topology_frame_response(
 /// Send a topology-protocol frame to a peer and return the response payload
 /// regardless of status. Callers that need to distinguish rejection decode
 /// the error envelope from the payload themselves (e.g. the propose/commit
-/// paths); callers that must treat rejection as failure use
-/// [`send_topology_frame_ok`].
+/// paths). The exchange report path uses [`send_topology_frame_response`]
+/// directly: a non-OK status is failure BY DESIGN (F1 — the peer stays
+/// absent from the partition view rather than the error envelope failing
+/// `parse_partition_version_response`'s stride check by accident), and the
+/// W9 P2-3 stale-epoch key echo must remain readable from the rejection
+/// payload.
 fn send_topology_frame(
     addr: SocketAddr,
     op_code: u16,
@@ -8216,26 +8260,6 @@ fn send_topology_frame(
     auth_secret: Option<&[u8]>,
 ) -> Result<Vec<u8>, String> {
     Ok(send_topology_frame_response(addr, op_code, payload, auth_secret)?.payload)
-}
-
-/// Like [`send_topology_frame`], but a non-`STATUS_OK` response is an `Err`.
-///
-/// F1 — used by the exchange report path so a REJECTED report query (e.g.
-/// `ERR_STALE_EPOCH` on a cluster_key mismatch) is failure BY DESIGN — the
-/// peer stays absent from the partition view — rather than by the accident
-/// of the error envelope failing `parse_partition_version_response`'s
-/// stride check.
-fn send_topology_frame_ok(
-    addr: SocketAddr,
-    op_code: u16,
-    payload: &[u8],
-    auth_secret: Option<&[u8]>,
-) -> Result<Vec<u8>, String> {
-    let response = send_topology_frame_response(addr, op_code, payload, auth_secret)?;
-    if response.status != STATUS_OK {
-        return Err(format!("peer replied status {}", response.status));
-    }
-    Ok(response.payload)
 }
 
 /// Phase D: build this node's `PartitionVersionEntry` list by reading the
@@ -8340,6 +8364,56 @@ pub(crate) fn encode_partition_version_response(
         payload.extend_from_slice(&e.max_generation.to_le_bytes());
     }
     payload
+}
+
+/// W9 P2-3 — encode the `ERR_STALE_EPOCH` rejection payload for a
+/// partition-version report, echoing the RESPONDER's local cluster key so
+/// the querying exchange can tell peer-behind (keep re-querying) from
+/// self-behind (stop; topology catch-up converges us).
+///
+/// Layout: the standard error envelope
+/// (`[code:u16][msg_len:u16][msg]`, [`crate::protocol::codec::encode_error_payload`])
+/// followed by `local_cluster_key: u64 LE`. The tail is ADDITIVE —
+/// `decode_error_payload` tolerates trailing bytes, so envelope-only
+/// consumers are unaffected.
+///
+/// WIRE-FORMAT NOTE: this changes the `OP_PARTITION_VERSION_REPORT`
+/// STALE_EPOCH reply on the wire (previously envelope-only). Deliberate,
+/// no migration: TeraSlab is pre-production and formats are free to
+/// change (2026-08-02 decision); a mixed-version cluster merely loses the
+/// self-behind fast-stop (the parser returns `None` and the re-query
+/// cadence continues, exactly the pre-change behavior).
+pub(crate) fn encode_stale_epoch_report_rejection(local_cluster_key: u64) -> Vec<u8> {
+    let mut payload = crate::protocol::codec::encode_error_payload(
+        ERR_STALE_EPOCH,
+        "partition version report: cluster_key mismatch",
+    );
+    payload.extend_from_slice(&local_cluster_key.to_le_bytes());
+    payload
+}
+
+/// W9 P2-3 — parse the responder's local cluster key out of a rejected
+/// report reply. Returns `Some(key)` iff the payload is a well-formed
+/// error envelope with code [`ERR_STALE_EPOCH`] carrying the 8-byte key
+/// tail; a legacy envelope-only rejection, any other error code, or a
+/// malformed payload parses as `None` (callers keep the re-query cadence).
+pub(crate) fn parse_stale_epoch_report_rejection(payload: &[u8]) -> Option<u64> {
+    if payload.len() < 4 {
+        return None;
+    }
+    let code = u16::from_le_bytes(payload[0..2].try_into().ok()?);
+    if code != ERR_STALE_EPOCH {
+        return None;
+    }
+    let msg_len = u16::from_le_bytes(payload[2..4].try_into().ok()?) as usize;
+    let key_off = 4usize.checked_add(msg_len)?;
+    let key_end = key_off.checked_add(8)?;
+    if payload.len() < key_end {
+        return None;
+    }
+    Some(u64::from_le_bytes(
+        payload[key_off..key_end].try_into().ok()?,
+    ))
 }
 
 /// Phase D: parse an `OP_PARTITION_VERSION_REPORT` response payload into a
@@ -31686,7 +31760,12 @@ mod tests {
                     crate::protocol::frame::ResponseFrame {
                         request_id: request.request_id,
                         status: crate::protocol::opcodes::STATUS_ERROR,
-                        payload: Vec::new(),
+                        // The production rejection shape: STALE_EPOCH with
+                        // the responder's key echoed — LOWER than ours, so
+                        // the peer is the behind side and the re-query
+                        // cadence must continue (W9 P2-3 stops only on a
+                        // HIGHER responder key).
+                        payload: encode_stale_epoch_report_rejection(term - 1),
                     }
                 } else {
                     crate::protocol::frame::ResponseFrame {
@@ -31722,6 +31801,111 @@ mod tests {
             Some(&peer_entries),
             "a peer that rejected the first report but accepted the re-query \
              must be PRESENT in the view with its reported entries",
+        );
+    }
+
+    /// W9 P2-3 — the `ERR_STALE_EPOCH` report rejection carries the
+    /// RESPONDER's local cluster key as an additive tail after the
+    /// standard error envelope: standard decoders still read the
+    /// envelope, the dedicated parser reads the key, and a legacy
+    /// envelope (no tail) or a different error code parses as `None`.
+    #[test]
+    fn stale_epoch_report_rejection_round_trips_responder_key() {
+        let payload = encode_stale_epoch_report_rejection(42);
+        let (code, _msg) = crate::protocol::codec::decode_error_payload(&payload)
+            .expect("the standard error decoder must still read the envelope");
+        assert_eq!(code, ERR_STALE_EPOCH);
+        assert_eq!(parse_stale_epoch_report_rejection(&payload), Some(42));
+
+        // A different error code must not yield a key.
+        let mut other = crate::protocol::codec::encode_error_payload(ERR_PAYLOAD_MALFORMED, "x");
+        other.extend_from_slice(&42u64.to_le_bytes());
+        assert_eq!(parse_stale_epoch_report_rejection(&other), None);
+
+        // A legacy STALE_EPOCH envelope without the trailing key.
+        let legacy =
+            crate::protocol::codec::encode_error_payload(ERR_STALE_EPOCH, "cluster_key mismatch");
+        assert_eq!(parse_stale_epoch_report_rejection(&legacy), None);
+    }
+
+    /// W9 P2-3 — a peer whose STALE_EPOCH rejection reports a HIGHER local
+    /// cluster key means THIS node is the stale side: the peer will keep
+    /// rejecting until OUR key changes (which only topology catch-up
+    /// does), so the re-query loop must give up immediately — honest
+    /// absence — instead of burning 500 ms re-queries until the deadline.
+    /// (The 2-member shape keeps the quorum early-return out of play: the
+    /// collector needs the peer's result to finish.)
+    #[test]
+    fn run_exchange_phase_stops_requerying_peer_that_reports_higher_key() {
+        use std::io::{Read, Write};
+
+        let members = [NodeId(1), NodeId(2)];
+        let term = 4u64;
+        let engine = Arc::new(test_engine());
+        let det = ShardTable::compute_with_epoch(&members, 2, term, 1);
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        // Reject every query with a HIGHER responder key. Bounded and NOT
+        // joined — one connection suffices post-fix; a regressed loop
+        // opens a handful before its deadline.
+        std::thread::spawn(move || {
+            for _ in 0..8u32 {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                let mut header = [0u8; 4];
+                if stream.read_exact(&mut header).is_err() {
+                    continue;
+                }
+                let len = u32::from_le_bytes(header) as usize;
+                let mut body = vec![0u8; len];
+                if stream.read_exact(&mut body).is_err() {
+                    continue;
+                }
+                let mut frame_bytes = header.to_vec();
+                frame_bytes.extend_from_slice(&body);
+                let Ok((request, _)) = crate::protocol::frame::RequestFrame::decode(&frame_bytes)
+                else {
+                    continue;
+                };
+                let response = crate::protocol::frame::ResponseFrame {
+                    request_id: request.request_id,
+                    status: crate::protocol::opcodes::STATUS_ERROR,
+                    payload: encode_stale_epoch_report_rejection(term + 1),
+                };
+                let _ = stream.write_all(&response.encode());
+            }
+        });
+
+        let mut addrs = std::collections::HashMap::new();
+        addrs.insert(NodeId(2), addr);
+        let node_addrs = Arc::new(RwLock::new(addrs));
+        let shard_table = Arc::new(ShardTableLock::new(det));
+        let inbound_bm = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+
+        let started = std::time::Instant::now();
+        let view = ClusterCoordinator::run_exchange_phase(
+            &members,
+            NodeId(1),
+            term,
+            &node_addrs,
+            &engine,
+            &shard_table,
+            &inbound_bm,
+            std::time::Duration::from_millis(2500),
+            &None,
+        );
+        let elapsed = started.elapsed();
+
+        assert!(
+            !view.contains_key(&NodeId(2)),
+            "the higher-key peer stays honestly absent",
+        );
+        assert!(
+            elapsed < Duration::from_millis(1000),
+            "a higher responder key means WE are stale — the re-query loop \
+             must give up immediately, not wait out the deadline (took {elapsed:?})",
         );
     }
 
