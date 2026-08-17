@@ -173,10 +173,11 @@ fn resync_migration_pool_size(configured_pool_size: usize) -> usize {
 /// current SWIM-`alive` set, `mastered_nonempty` — the `(shard, committed
 /// replicas)` pairs for shards this node masters that hold records — and
 /// `in_flight`, the `(replica NodeId.0, shard)` pairs whose full-shard
-/// resync backfill is still running (review P2: resync tasks are not
-/// `start_outbound`-tracked, so `active_count` cannot see them; without
-/// this skip a re-armed pass re-signals a shard mid-stream and spawns a
-/// DUPLICATE concurrent backfill at the same replica). Returns
+/// resync backfill is still running (review P2; resync tasks are
+/// `start_outbound`-tracked since W10, but this per-pair set remains the
+/// derive-side dedup — without this skip a re-armed pass re-signals a
+/// shard mid-stream and spawns a DUPLICATE concurrent backfill at the
+/// same replica). Returns
 /// `(missing, signaled, dropped, dead_skipped, inflight_skipped,
 /// stale_fenced)`: the per-replica shard lists to signal, how many were
 /// signaled, how many the `cap` dropped (re-derived next sweep; the
@@ -1293,11 +1294,11 @@ fn fail_migration_task_current_epoch(
 ///
 /// Returns `true` when the round is complete (`skipped == 0`) and the caller
 /// should proceed with the migration spawn; `false` when it was incomplete and
-/// the caller MUST abort the spawn. Tasks that are not currently tracked as
-/// active (e.g. a replica-resync backfill that was never `start_outbound`'d)
-/// make the per-task fail a no-op — for those non-handoff paths the ERROR log
-/// plus the metric bump plus the skipped spawn is the effective behaviour, and
-/// the natural resync re-request re-drives them.
+/// the caller MUST abort the spawn. Every production caller registers its
+/// tasks via `start_outbound` before enumerating (the Phase-H resync drain
+/// included, since W10), so the per-task fail parks the tasks in the durable
+/// retry queue; a task somehow untracked still degrades to the ERROR log plus
+/// the metric bump plus the skipped spawn.
 fn finalize_enumeration_round(
     skipped: usize,
     tasks: &[MigrationTask],
@@ -2971,12 +2972,14 @@ impl ClusterCoordinator {
         let resync_request_tx_event = resync_request_tx.clone();
         // Task #50 review P2 — (replica NodeId.0, shard) pairs whose
         // full-shard resync backfill is currently streaming. Resync tasks
-        // are deliberately not `start_outbound`-tracked, so `active_count`
-        // cannot gate them; this set is what prevents a re-armed repair
-        // pass (or a catchup-loop re-request) from spawning a DUPLICATE
-        // concurrent backfill for the same shard at the same replica.
-        // Inserted by the Phase H drain right before it spawns a run;
-        // cleared by [`ResyncInflightGuard`] when that run finishes.
+        // are `start_outbound`-tracked since W10, but this per-pair set
+        // stays the dedup enforcement point (it filters BEFORE
+        // registration and at (target, shard) granularity): it prevents a
+        // re-armed repair pass (or a catchup-loop re-request) from
+        // spawning a DUPLICATE concurrent backfill for the same shard at
+        // the same replica. Inserted by the Phase H drain right before it
+        // spawns a run; cleared by [`ResyncInflightGuard`] when that run
+        // finishes.
         let resync_inflight: Arc<Mutex<std::collections::HashSet<(u64, u16)>>> =
             Arc::new(Mutex::new(std::collections::HashSet::new()));
         // sc08 — outcome accumulator for finished resync backfill runs.
@@ -3635,10 +3638,12 @@ impl ClusterCoordinator {
                 // BEFORE `take_due` so a pass that cannot run yet stays
                 // ARMED and fires when the tracked migrations (topology
                 // plans — which ARE the repair for reassigned shards)
-                // drain. NOTE the resync backfills this pass itself spawns
-                // are NOT in `active_count` (Phase H tasks are not
-                // start_outbound-tracked); concurrent duplicates toward
-                // them are prevented by the `resync_inflight` set, and
+                // drain. Since W10 the resync backfills this pass itself
+                // spawns are start_outbound-tracked too, so a streaming
+                // backfill holds this same gate closed until it resolves
+                // (previously only the drain gate below did); concurrent
+                // duplicates toward them are prevented by the
+                // `resync_inflight` set, and
                 // sc04's pass STACKING (8 armed re-fires piling 971
                 // concurrent shard streams onto a starved pipeline) is
                 // prevented by the drain gate inside
@@ -5078,61 +5083,24 @@ impl ClusterCoordinator {
                 // throttling.
                 while let Ok(req) = resync_request_rx.try_recv() {
                     loop_heartbeat_event.stamp(crate::cluster::watchdog::LoopPhase::ResyncDrain);
-                    let table = shard_table.read().clone();
-                    let mut tasks = synthesize_resync_migration_tasks(&req, self_id, &table);
-                    // Task #50 review P2 — drop tasks whose (target, shard)
-                    // backfill is still streaming. This is the enforcement
-                    // point for ALL resync origins (event/periodic passes
-                    // AND catchup-loop re-requests): the drain is the only
-                    // inserter into `resync_inflight`, so a filter here
-                    // followed by an insert below cannot race another
-                    // spawner. Without it, a re-derive against the
-                    // still-stale retained view would spawn a DUPLICATE
-                    // concurrent full-shard stream at the same replica.
-                    let before = tasks.len();
-                    {
-                        let inflight = resync_inflight.lock();
-                        tasks.retain(|t| !inflight.contains(&(t.to_node.0, t.shard)));
-                    }
-                    let in_flight_filtered = before - tasks.len();
-                    if tasks.is_empty() {
-                        tracing::debug!(
-                            target_node = req.node_id,
-                            in_flight_filtered,
-                            "cluster: resync request resolved to no tasks \
-                             (self-target, empty owned set, or all in flight)",
-                        );
-                        continue;
-                    }
-                    let target_shards: std::collections::HashSet<u16> =
-                        tasks.iter().map(|t| t.shard).collect();
-                    tracing::info!(
-                        target_node = req.node_id,
-                        shard_count = tasks.len(),
-                        in_flight_filtered,
-                        "cluster: synthesizing full-shard resync tasks",
-                    );
-                    let (keys_map, skipped) = engine.keys_by_shard_filtered(&target_shards);
                     let epoch = topology_epoch.load(Ordering::Relaxed);
-                    // Issue #46 fail-safe: an unreadable-footer skip means this
-                    // resync key set is incomplete — do not backfill a short set.
-                    // These resync tasks are not start_outbound-tracked, so the
-                    // fail is a no-op; the skipped spawn + the catchup loop's
-                    // next resync re-request re-drive it once the record reads
-                    // cleanly.
-                    if !finalize_enumeration_round(
-                        skipped,
-                        &tasks,
-                        &migration,
+                    // W10 — filter, REGISTER (start_outbound-tracked, so the
+                    // completions commit through the tracked path and
+                    // /admin/migration_status sees the backfill), and
+                    // enumerate. `None` = nothing runnable this drain.
+                    let Some((tasks, all_keys)) = prepare_resync_backfill(
+                        &req,
+                        self_id,
                         &shard_table,
+                        &migration,
+                        &engine,
+                        &resync_inflight,
                         &fenced_bm_event,
                         &migrating_bm_event,
                         epoch,
-                    ) {
+                    ) else {
                         continue;
-                    }
-                    let all_keys: Vec<TxKey> =
-                        keys_map.values().flat_map(|v| v.iter().copied()).collect();
+                    };
                     // Task #50 review P2 — claim the pairs this run will
                     // stream; the guard (moved into the thread) releases
                     // them when the run returns or unwinds.
@@ -7969,14 +7937,17 @@ fn det_plan_launch_due(held_for: Duration) -> bool {
 /// streaming concurrently. They are therefore safe to supersede; any other
 /// active migration still locks the upgrade out.
 ///
-/// KNOWN EXCEPTION (W9 P2-4, pre-existing): the Phase-H resync backfill
-/// deliberately does NOT `start_outbound`-track its tasks, so its workers
-/// are invisible to `active_count()` — to BOTH the strict and the relaxed
-/// form of this gate, exactly as they were before the det-degrade work.
-/// A resync stream racing an upgrade is therefore not excluded here; the
-/// exposure is unchanged by this helper and tracked as a residual, not
-/// papered over by registering resync tasks (which would change Phase-H's
-/// failure semantics).
+/// W9 P2-4 RESOLVED (W10): the Phase-H resync backfill now
+/// `start_outbound`-tracks its tasks (`prepare_resync_backfill`), so a
+/// streaming backfill holds `active_count()` above zero and this gate —
+/// both forms — correctly refuses the degraded upgrade until the stream
+/// resolves. That is the fail-safe disposition the residual asked for: an
+/// upgrade activation superseding an invisible mid-flight full-shard
+/// stream was the exposure, and deferral (not exclusion) closes it. The
+/// Phase-H failure semantics the old exception guarded are preserved
+/// explicitly: the issue-#46 enumeration fail now parks tracked tasks in
+/// the durable retry queue instead of no-oping, which is a strict upgrade
+/// (visible + re-driven) over the silent skip.
 fn no_live_migration_workers_for_upgrade(
     active_count: usize,
     det_plan_launch_held_for_term: bool,
@@ -14992,6 +14963,131 @@ pub fn synthesize_resync_migration_tasks(
         .collect()
 }
 
+/// Phase H — turn one drained [`ResyncRequest`](crate::replication::manager::ResyncRequest)
+/// into REGISTERED, enumerated, ready-to-stream backfill work for the
+/// standard migration pipeline.
+///
+/// Returns `Some((tasks, keys))` — the filtered task list and the full key
+/// set to stream — or `None` when the request resolves to nothing runnable
+/// (self-target, empty owned set, every task already in flight or already
+/// tracked, or an issue-#46 incomplete enumeration, which fails the
+/// just-registered tasks into the durable retry queue).
+///
+/// W10 (armed-15 / armed-05, CI d3437e4): the tasks are registered through
+/// [`MigrationManager::start_outbound`] — the same bookkeeping as
+/// topology-plan tasks — BEFORE any data moves. Untracked resync tasks were
+/// invisible to `/admin/migration_status` AND their completions were
+/// discarded by the tracked-completion gate ("ignoring untracked migration
+/// completion"), so event/forced repair passes finished with `completed: 0`
+/// and never committed anything. Tracking restores the normal contract:
+/// completions commit through `complete_migration_task_current_epoch`,
+/// failures park in the durable retry queue, the sc08 outcome counts are
+/// real, and `active_count()` sees the stream — which also (deliberately)
+/// holds the degraded-upgrade gate and the re-heal/re-election gates closed
+/// while a backfill is mid-flight. A resync stream racing the degraded
+/// upgrade was the previously-tracked W9 P2-4 residual; fail-safe deferral
+/// of the upgrade until the stream resolves is the correct disposition, not
+/// an unwanted side effect.
+///
+/// Dedup remains two-layered: `resync_inflight` (single inserter — the
+/// drain) still prevents a re-derived duplicate toward a still-streaming
+/// `(target, shard)`, and the tracked active set additionally drops any
+/// task that would double-register a live tracked migration for the same
+/// `(shard, target)` — mirroring the FIX-B transfer-request resend filter.
+#[allow(clippy::too_many_arguments)]
+fn prepare_resync_backfill(
+    req: &crate::replication::manager::ResyncRequest,
+    self_id: NodeId,
+    shard_table: &Arc<ShardTableLock<ShardTable>>,
+    migration: &Arc<Mutex<MigrationManager>>,
+    engine: &Arc<Engine>,
+    resync_inflight: &Arc<Mutex<std::collections::HashSet<(u64, u16)>>>,
+    fenced_bm: &Arc<crate::cluster::migration::AtomicShardBitmap>,
+    migrating_bm: &Arc<crate::cluster::migration::AtomicShardBitmap>,
+    topology_epoch: u64,
+) -> Option<(Vec<MigrationTask>, Vec<TxKey>)> {
+    let table = shard_table.read().clone();
+    let mut tasks = synthesize_resync_migration_tasks(req, self_id, &table);
+    // Task #50 review P2 — drop tasks whose (target, shard) backfill is
+    // still streaming. This is the enforcement point for ALL resync
+    // origins (event/periodic passes AND catchup-loop re-requests): the
+    // drain is the only inserter into `resync_inflight`, so a filter here
+    // followed by the drain's insert cannot race another spawner. Without
+    // it, a re-derive against the still-stale retained view would spawn a
+    // DUPLICATE concurrent full-shard stream at the same replica.
+    let before = tasks.len();
+    {
+        let inflight = resync_inflight.lock();
+        tasks.retain(|t| !inflight.contains(&(t.to_node.0, t.shard)));
+    }
+    let in_flight_filtered = before - tasks.len();
+    // W10 — resync tasks are `start_outbound`-tracked now, so the same
+    // idempotency filter the FIX-B transfer-request resend applies is
+    // required here too: never double-register a live tracked migration
+    // for the same (shard → target).
+    let before_tracked = tasks.len();
+    {
+        let mgr = migration.lock();
+        tasks.retain(|t| {
+            !mgr.active_migrations().iter().any(|p| {
+                p.shard == t.shard
+                    && p.to_node == t.to_node
+                    && p.state != crate::cluster::migration::MigrationState::Complete
+                    && p.state != crate::cluster::migration::MigrationState::Failed
+            })
+        });
+    }
+    let tracked_filtered = before_tracked - tasks.len();
+    if tasks.is_empty() {
+        tracing::debug!(
+            target_node = req.node_id,
+            in_flight_filtered,
+            tracked_filtered,
+            "cluster: resync request resolved to no tasks \
+             (self-target, empty owned set, or all in flight)",
+        );
+        return None;
+    }
+    let target_shards: std::collections::HashSet<u16> = tasks.iter().map(|t| t.shard).collect();
+    tracing::info!(
+        target_node = req.node_id,
+        shard_count = tasks.len(),
+        in_flight_filtered,
+        tracked_filtered,
+        "cluster: synthesizing full-shard resync tasks",
+    );
+    // W10 — register BEFORE enumeration, mirroring the transfer-request
+    // resend path, so the issue-#46 fail-safe below can actually FAIL the
+    // tasks into the durable retry queue instead of no-oping on untracked
+    // identities.
+    let populated: std::collections::HashSet<u16> = target_shards
+        .iter()
+        .copied()
+        .filter(|&s| engine.shard_record_count(s) > 0)
+        .collect();
+    migration.lock().start_outbound(&tasks, self_id, &populated);
+    let (keys_map, skipped) = engine.keys_by_shard_filtered(&target_shards);
+    // Issue #46 fail-safe: an unreadable-footer skip means this resync key
+    // set is incomplete — do not backfill a short set. The tasks are tracked,
+    // so the fail parks them in the durable retry queue (the table rollback
+    // is a no-op for a replica backfill on a settled table); the failed-batch
+    // re-drive and the catchup loop's next resync re-request both re-drive
+    // once the record reads cleanly.
+    if !finalize_enumeration_round(
+        skipped,
+        &tasks,
+        migration,
+        shard_table,
+        fenced_bm,
+        migrating_bm,
+        topology_epoch,
+    ) {
+        return None;
+    }
+    let all_keys: Vec<TxKey> = keys_map.values().flat_map(|v| v.iter().copied()).collect();
+    Some((tasks, all_keys))
+}
+
 /// W1.1 FIX B — a pull-based migration repair request.
 ///
 /// Posted by the dispatch handler for [`OP_MIGRATION_TRANSFER_REQUEST`]
@@ -19180,10 +19276,11 @@ mod tests {
     }
 
     /// Task #50 review P2 — the derivation skips a (replica, shard) pair
-    /// whose full-shard resync backfill is still IN FLIGHT (resync tasks
-    /// are not `start_outbound`-tracked, so `active_count` cannot gate
-    /// them), counting the skip separately from the cap and the dead-peer
-    /// guard. The skipped pair does not consume cap budget.
+    /// whose full-shard resync backfill is still IN FLIGHT (the per-pair
+    /// `resync_inflight` set stays the derive-side dedup even though W10
+    /// made resync tasks `start_outbound`-tracked), counting the skip
+    /// separately from the cap and the dead-peer guard. The skipped pair
+    /// does not consume cap budget.
     #[test]
     fn derive_skips_in_flight_resyncs_and_counts_them() {
         let master = NodeId(1);
@@ -23566,6 +23663,301 @@ mod tests {
         assert!(
             !mgr.take_failed_batch_retry_arm(),
             "the arm is one-shot until the next failed disposition"
+        );
+    }
+
+    /// W10 test stub — a migration target that ACKs every frame with
+    /// `STATUS_OK`, except (when `reject_superset_probe` is set) the
+    /// verify-only superset presence probe (`OP_MIGRATION_COMPLETE` with
+    /// `FLAG_MIGRATION_VERIFY_ONLY | FLAG_MIGRATION_SUPERSET_OK`), which is
+    /// rejected with `STATUS_ERROR` to model a target holding NO data for
+    /// the probed shard (armed-11: its copies were just orphan-cleaned).
+    /// Every received `(op_code, flags)` pair is reported on the returned
+    /// channel. The accept loop exits when `stop` is raised (or after a
+    /// 20 s safety deadline).
+    #[allow(clippy::type_complexity)]
+    fn spawn_ack_all_target(
+        reject_superset_probe: bool,
+    ) -> (
+        SocketAddr,
+        std::sync::mpsc::Receiver<(u16, u16)>,
+        Arc<std::sync::atomic::AtomicBool>,
+        std::thread::JoinHandle<()>,
+    ) {
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_thread = stop.clone();
+        let (op_tx, op_rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            listener.set_nonblocking(true).unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(20);
+            while !stop_thread.load(Ordering::Relaxed) && std::time::Instant::now() < deadline {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(pair) => pair,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(_) => continue,
+                };
+                stream.set_nonblocking(false).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                loop {
+                    let mut header = [0u8; 4];
+                    if stream.read_exact(&mut header).is_err() {
+                        break;
+                    }
+                    let payload_len = u32::from_le_bytes(header) as usize;
+                    let mut rest = vec![0u8; payload_len];
+                    if stream.read_exact(&mut rest).is_err() {
+                        break;
+                    }
+                    let mut frame_bytes = header.to_vec();
+                    frame_bytes.extend_from_slice(&rest);
+                    let Ok((request, _)) = RequestFrame::decode(&frame_bytes) else {
+                        break;
+                    };
+                    let _ = op_tx.send((request.op_code, request.flags));
+                    let is_superset_probe = request.op_code == OP_MIGRATION_COMPLETE
+                        && request.flags & FLAG_MIGRATION_VERIFY_ONLY != 0
+                        && request.flags & FLAG_MIGRATION_SUPERSET_OK != 0;
+                    let status = if is_superset_probe && reject_superset_probe {
+                        STATUS_ERROR
+                    } else {
+                        STATUS_OK
+                    };
+                    let response = ResponseFrame {
+                        request_id: request.request_id,
+                        status,
+                        payload: Vec::new(),
+                    };
+                    if stream.write_all(&response.encode()).is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+        (addr, op_rx, stop, handle)
+    }
+
+    /// W10 DEFECT 1 (armed-15 / armed-05, CI d3437e4) — a Phase-H resync
+    /// backfill must be REGISTERED through `start_outbound` so its
+    /// completion commits through the tracked path. Pre-fix, the drain
+    /// spawned `synthesize_resync_migration_tasks` output untracked: the
+    /// worker's completion was dropped by the tracked-completion gate
+    /// ("ignoring untracked migration completion"), both armed-15 forced
+    /// passes ended `completed: 0`, and `/admin/migration_status` — which
+    /// serves `active_migrations()` verbatim — never showed the backfill,
+    /// defeating every harness settle-wait.
+    #[test]
+    fn resync_backfill_is_tracked_and_its_completion_commits() {
+        let members = vec![NodeId(1), NodeId(2)];
+        let table = ShardTable::compute_with_epoch(&members, 2, 3, 1);
+        let shard = (0..NUM_SHARDS as u16)
+            .find(|&s| {
+                table.target_assignment(s).master == NodeId(1)
+                    && table.target_assignment(s).replicas.contains(&NodeId(2))
+            })
+            .expect("node 1 must master a shard with node 2 as replica");
+        let epoch = table.version;
+        let shard_table = Arc::new(ShardTableLock::new(table));
+
+        let engine = Arc::new(test_engine());
+        let key = tx_key_for_shard(shard, 9);
+        create_test_record(&engine, key);
+
+        let migration = Arc::new(Mutex::new(MigrationManager::new()));
+        let resync_inflight: Arc<Mutex<std::collections::HashSet<(u64, u16)>>> =
+            Arc::new(Mutex::new(std::collections::HashSet::new()));
+        let fenced_bm = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+        let migrating_bm = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+        let inbound_bm = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+
+        let req = crate::replication::manager::ResyncRequest {
+            node_id: 2,
+            shards: vec![shard],
+        };
+        let (tasks, keys) = prepare_resync_backfill(
+            &req,
+            NodeId(1),
+            &shard_table,
+            &migration,
+            &engine,
+            &resync_inflight,
+            &fenced_bm,
+            &migrating_bm,
+            epoch,
+        )
+        .expect("a runnable backfill must be prepared");
+        assert_eq!(
+            tasks,
+            vec![MigrationTask {
+                shard,
+                from_node: NodeId(1),
+                to_node: NodeId(2),
+                is_master: false,
+            }]
+        );
+        assert_eq!(keys, vec![key]);
+        {
+            let mgr = migration.lock();
+            assert_eq!(
+                mgr.active_count(),
+                1,
+                "the resync task must be start_outbound-tracked so \
+                 /admin/migration_status (= active_migrations) can see it"
+            );
+            let p = &mgr.active_migrations()[0];
+            assert_eq!(
+                (p.shard, p.from_node, p.to_node, p.is_master),
+                (shard, NodeId(1), NodeId(2), false)
+            );
+        }
+
+        let (addr, op_rx, stop, target) = spawn_ack_all_target(false);
+        let (completed, failed) = run_migration_batch(
+            tasks,
+            Some(addr),
+            &keys,
+            engine,
+            &migration,
+            &shard_table,
+            &None,
+            epoch,
+            1,
+            100,
+            fenced_bm,
+            migrating_bm,
+            inbound_bm,
+            NodeId(1),
+            None,
+            None,
+        );
+        assert_eq!(
+            (completed, failed),
+            (1, 0),
+            "the tracked resync completion must COMMIT — pre-fix it was \
+             dropped as 'ignoring untracked migration completion' and the \
+             run ended completed:0",
+        );
+        {
+            let mgr = migration.lock();
+            assert_eq!(mgr.active_count(), 0, "the completed task must resolve");
+            assert_eq!(mgr.failed_count(), 0);
+            assert!(
+                mgr.dual_write_targets_for_shard(shard).is_empty(),
+                "the dual-write window must close on completion"
+            );
+        }
+        // The record actually streamed: the target saw the baseline batch
+        // and the count+manifest completion handshake.
+        let seen: Vec<(u16, u16)> = op_rx.try_iter().collect();
+        assert!(
+            seen.iter()
+                .any(|(op, _)| *op == crate::protocol::opcodes::OP_REPLICA_BATCH),
+            "the baseline batch must reach the replica (saw: {seen:?})"
+        );
+        assert!(
+            seen.iter().any(|(op, flags)| *op == OP_MIGRATION_COMPLETE
+                && *flags & FLAG_MIGRATION_VERIFY_ONLY != 0
+                && *flags & FLAG_MIGRATION_SUPERSET_OK == 0),
+            "the count+manifest verification must reach the replica (saw: {seen:?})"
+        );
+        assert!(
+            seen.iter()
+                .any(|(op, _)| *op == OP_MIGRATION_BATCH_COMPLETE),
+            "the commit handshake must reach the replica (saw: {seen:?})"
+        );
+        stop.store(true, Ordering::Relaxed);
+        target.join().unwrap();
+    }
+
+    /// W10 DEFECT 1 — `prepare_resync_backfill` must never double-register:
+    /// a pair still streaming (in `resync_inflight`) or a live tracked
+    /// migration for the same (shard → target) drops the task, and an
+    /// all-filtered request prepares nothing and registers nothing.
+    #[test]
+    fn prepare_resync_backfill_dedups_inflight_and_tracked() {
+        let members = vec![NodeId(1), NodeId(2)];
+        let table = ShardTable::compute_with_epoch(&members, 2, 3, 1);
+        let shard = (0..NUM_SHARDS as u16)
+            .find(|&s| {
+                table.target_assignment(s).master == NodeId(1)
+                    && table.target_assignment(s).replicas.contains(&NodeId(2))
+            })
+            .expect("node 1 must master a shard with node 2 as replica");
+        let epoch = table.version;
+        let shard_table = Arc::new(ShardTableLock::new(table));
+        let engine = Arc::new(test_engine());
+        let migration = Arc::new(Mutex::new(MigrationManager::new()));
+        let fenced_bm = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+        let migrating_bm = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+        let req = crate::replication::manager::ResyncRequest {
+            node_id: 2,
+            shards: vec![shard],
+        };
+
+        // Case A: the (target, shard) pair is still streaming.
+        let resync_inflight: Arc<Mutex<std::collections::HashSet<(u64, u16)>>> =
+            Arc::new(Mutex::new([(2u64, shard)].into_iter().collect()));
+        assert!(
+            prepare_resync_backfill(
+                &req,
+                NodeId(1),
+                &shard_table,
+                &migration,
+                &engine,
+                &resync_inflight,
+                &fenced_bm,
+                &migrating_bm,
+                epoch,
+            )
+            .is_none(),
+            "an in-flight pair must not be re-prepared"
+        );
+        assert_eq!(
+            migration.lock().active_count(),
+            0,
+            "a fully-filtered request must register nothing"
+        );
+
+        // Case B: a live tracked migration for the same (shard → target).
+        resync_inflight.lock().clear();
+        let live = MigrationTask {
+            shard,
+            from_node: NodeId(1),
+            to_node: NodeId(2),
+            is_master: false,
+        };
+        migration.lock().start_outbound(
+            std::slice::from_ref(&live),
+            NodeId(1),
+            &std::collections::HashSet::new(),
+        );
+        assert!(
+            prepare_resync_backfill(
+                &req,
+                NodeId(1),
+                &shard_table,
+                &migration,
+                &engine,
+                &resync_inflight,
+                &fenced_bm,
+                &migrating_bm,
+                epoch,
+            )
+            .is_none(),
+            "a live tracked migration for the same (shard → target) must not \
+             be double-registered"
+        );
+        assert_eq!(
+            migration.lock().active_count(),
+            1,
+            "the pre-existing tracked entry must remain the only registration"
         );
     }
 
