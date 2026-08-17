@@ -542,6 +542,26 @@ pub const ERR_MIGRATION_TARGET_NOT_READY: u16 = 37;
 /// streaming read path is a documented follow-up.
 pub const ERR_RESPONSE_TOO_LARGE: u16 = 38;
 
+/// W11 FIX 4 — an `OP_MIGRATION_TRANSFER_REQUEST` at the correct, mutually
+/// activated epoch matched NO outbound work on this source: the requester is
+/// neither a target holder nor the intended master for any of the shards it
+/// asked for.
+///
+/// NEGATIVE by design. The handler used to reply `STATUS_OK` (it queues the
+/// request; the "matched no tasks" verdict was reached asynchronously in the
+/// coordinator event loop, long after the reply went out), so the requester
+/// logged "shard transfer request accepted" and re-asked every 10 s forever
+/// for shards this node was never going to send — the most misleading signal
+/// in this subsystem, and the source of dangling inbound entries that nothing
+/// retires (default-17).
+///
+/// TERMINAL for the named shards, not retryable: the verdict is derived from
+/// the shard table both sides have activated, so re-asking cannot change it
+/// without a new topology term (which re-derives the request from scratch).
+/// The requester drops the entries it may safely drop — one whose records are
+/// still local is kept fenced fail-closed until orphan cleanup reclaims them.
+pub const ERR_MIGRATION_NO_TASKS: u16 = 39;
+
 /// P3.10 / F-G5-017 — wire protocol revision.
 ///
 /// `1` is the historical implicit version: legacy clients and servers do

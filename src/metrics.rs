@@ -1448,6 +1448,28 @@ pub struct MigrationMetrics {
     /// dormant there and its anti-stale role rests on the escalation's
     /// fresh-fold path. Rising steadily = that dormancy, not a defect.
     pub migration_prune_skipped_cutoff_gate: PaddedCounter,
+    /// W11 FIX 4(a) — `OP_MIGRATION_TRANSFER_REQUEST` frames REFUSED by this
+    /// source because the requester is neither a target holder nor the
+    /// intended master for any requested shard. Counted on the SOURCE.
+    pub migration_transfer_request_refused: PaddedCounter,
+    /// W11 FIX 4(a) — pending inbound entries this node DROPPED on the
+    /// source's refusal of its transfer request. Counted on the REQUESTER.
+    /// Entries whose records are still local are not counted here: they are
+    /// kept fenced fail-closed until orphan cleanup reclaims the records.
+    pub migration_dangling_inbound_dropped: PaddedCounter,
+    /// W11 FIX 4(b) — gauge: shards the LAST orphan-cleanup pass skipped
+    /// before it could even reach the #28 evidence check, because they still
+    /// carry a pending inbound entry (a forward transfer, a reverse-heal
+    /// pull, or a #74 parked fence). Without this, a node sitting on stale
+    /// copies reported `orphan_cleanup_retained_no_evidence = 0` and looked
+    /// healthy while nothing was being reclaimed at all.
+    pub orphan_cleanup_skipped_pending_inbound: AtomicU32,
+    /// W11 FIX 4(b) — the per-shard (`cleanup_orphaned_shard_if_settled`)
+    /// sibling of the gauge above: reclaim attempts that returned before the
+    /// #28 evidence check because the shard still had an unresolved task or a
+    /// pending inbound entry. A counter, not a gauge: this site fires once
+    /// per completed shard rather than once per sweep.
+    pub orphan_cleanup_shard_skipped: PaddedCounter,
     /// W10 review P2-5 — times propose-time member re-validation would have
     /// emptied the settled set and fell back to it unchanged. Expected to
     /// stay ZERO (self is retained unconditionally); a non-zero value means
@@ -1555,6 +1577,10 @@ impl MigrationMetrics {
             migration_weak_veto_arbitrations: PaddedCounter::new(),
             migration_prune_weak_declared_retained: PaddedCounter::new(),
             migration_prune_skipped_cutoff_gate: PaddedCounter::new(),
+            migration_transfer_request_refused: PaddedCounter::new(),
+            migration_dangling_inbound_dropped: PaddedCounter::new(),
+            orphan_cleanup_skipped_pending_inbound: AtomicU32::new(0),
+            orphan_cleanup_shard_skipped: PaddedCounter::new(),
             topology_proposal_revalidation_emptied: PaddedCounter::new(),
             orphan_cleanup_retained_no_evidence: AtomicU32::new(0),
             reheal_live_confirm_rounds: PaddedCounter::new(),

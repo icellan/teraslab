@@ -1648,12 +1648,46 @@ impl MigrationManager {
 
     /// Transition a migration to the Fenced state and record the fence sequence.
     pub fn mark_fenced(&mut self, task: &MigrationTask, fence_sequence: u64) {
+        self.mark_fenced_with_origin(task, fence_sequence, true);
+    }
+
+    /// W11 FIX 3(b) — [`Self::mark_fenced`] with the CLIENT WRITE FENCE made
+    /// optional.
+    ///
+    /// The delta-phase transition itself (state, `fence_sequence`, phase
+    /// gauges) is identical for every migration origin: `fence_sequence` is
+    /// just a redo position, and the delta replay of
+    /// `[snapshot_sequence, fence_sequence)` is driven off it either way.
+    ///
+    /// `raise_write_fence == false` is the Phase-H RESYNC backfill: a repair
+    /// toward a node the committed table already names as a holder. No
+    /// ownership transition happens, so the source stays the authority
+    /// throughout and must keep serving writes; the writes it admits past
+    /// `fence_sequence` reach the repair target through the Phase E
+    /// dual-write window (opened by [`Self::start_outbound_resync`] BEFORE
+    /// any data moved) and the target's ordinary replica fan-out, instead of
+    /// through this batch's delta. Fencing them instead was a pure
+    /// availability loss (armed-04: 128/4096 shards per node write-fenced
+    /// continuously, 5/200 spends rejected).
+    ///
+    /// The task still enters `Fenced` state, so an unfenced repair on a shard
+    /// that ALSO has a live handoff keeps that handoff's fence up until the
+    /// repair resolves (`has_other_fenced_task`) — bounded by the run, and
+    /// the fail-safe direction.
+    pub fn mark_fenced_with_origin(
+        &mut self,
+        task: &MigrationTask,
+        fence_sequence: u64,
+        raise_write_fence: bool,
+    ) {
         let prev_state = self.find_task_mut(task).map(|p| p.state.clone());
         if let Some(p) = self.find_task_mut(task) {
             p.state = MigrationState::Fenced;
             p.fence_sequence = fence_sequence;
         }
-        self.fence_shard(task.shard);
+        if raise_write_fence {
+            self.fence_shard(task.shard);
+        }
         if let Some(m) = migration_metrics() {
             if let Some(prev) = prev_state {
                 dec_phase_gauge(m, &prev);
@@ -2225,6 +2259,90 @@ impl MigrationManager {
             .count()
     }
 
+    /// W11 FIX 1 (default-09 CIRCULAR WAIT) — the subset of
+    /// [`Self::inbound_migration_work_count`] that is this node's OWN PLAN
+    /// work: uncompleted, non-heal inbound entries for shards `table`'s
+    /// TARGET assignment actually gives `self_id`.
+    ///
+    /// # The starvation this exists to break
+    ///
+    /// The event-driven orphan-cleanup admissibility gate
+    /// (`event_orphan_cleanup_admissible`) requires the pending-inbound count
+    /// to be ZERO. Feeding it [`Self::inbound_migration_work_count`] let ONE
+    /// entry the fail-closed inbound prune deliberately keeps
+    /// (`inbound_entry_must_be_kept`: a shard this node does not hold but
+    /// still has RECORDS for — dropping the fence would expose those orphans
+    /// to local reads, the scenario-17 three-holder bug) disable the pass for
+    /// EVERY OTHER SHARD. The entry cannot retire on its own either: the
+    /// settled-inbound GC needs a SWIM-DEAD source
+    /// ([`Self::orphaned_inbound_shards`]) and the 10 s pull requester
+    /// re-stamps [`Self::mark_inbound_requested`] anyway.
+    ///
+    /// # Scope of the claim (W11 review P1-2 — corrected attribution)
+    ///
+    /// This does NOT unwedge the entry's own shard, and it never could: the
+    /// pass skips any shard with a pending inbound entry one gate lower
+    /// (`run_orphan_cleanup` / `cleanup_orphaned_shard_if_settled` both gate
+    /// on [`Self::has_pending_inbound`]), and past that gate a node holding a
+    /// merely-pushed copy has no committed-handoff evidence and is retained by
+    /// #28. What it recovers is reclamation of the other ~4095 shards, which
+    /// one such entry used to disable for the life of the process.
+    ///
+    /// The default-09 hang (CI 32055073890) is NOT this case and is not fixed
+    /// here — the run's own artifacts settle it: node1 logged "per-shard
+    /// orphan cleanup complete shard=1024 deleted=1" at 18:49:52, three
+    /// minutes BEFORE the 18:52:51 hang, and `node1_migration_status.json` at
+    /// the hang shows `active_count 0, failed_count 0, fenced_shards 0` with
+    /// exactly the two entries `{from_node: 3, shard: 1024}` and
+    /// `{from_node: 3, shard: 2902}`. The records were already gone; the
+    /// entries survived because the 10 s transfer-request loop kept
+    /// re-stamping them against a live node3 that had no tasks to send. The
+    /// fix for that is the source's terminal refusal
+    /// ([`Self::drop_refused_inbound`]).
+    ///
+    /// # Why excluding a NON-HELD inbound is the sound cut
+    ///
+    /// This is the mirror of the argument commit 39603fc already made for
+    /// heal fences, inverted. A heal-fenced shard is structurally NOT an
+    /// orphan candidate, so counting it could only ever block a pass that had
+    /// nothing to do with it. A NON-HELD inbound is the exact opposite: the
+    /// shard is not assigned here, so it IS precisely the orphan candidate
+    /// the pass exists to reclaim — counting it is self-defeating.
+    ///
+    /// The gate's stated purpose survives intact: "nothing this node is still
+    /// RECEIVING as part of its topology plan may be misjudged around the
+    /// pass". An entry for a shard the target assignment does not give this
+    /// node is, by definition, not plan work — nothing will ever be sent for
+    /// it (the source refuses to hand off to a non-holder), which is why the
+    /// prune's only reason to keep it is the leftover records.
+    ///
+    /// Safety is unchanged and does NOT rest on this counter:
+    ///
+    /// * the pass skips any shard with a pending inbound entry outright
+    ///   (`run_orphan_cleanup` / `cleanup_orphaned_shard_if_settled` both gate
+    ///   on [`Self::has_pending_inbound`]), so the excluded entry's own shard
+    ///   is still never touched while the entry stands — the cut only lets the
+    ///   pass judge the OTHER 4094 shards;
+    /// * the per-shard #28 committed-handoff evidence guard is untouched.
+    ///
+    /// Uses `target_assignment` (not `effective_assignment`) so the predicate
+    /// matches `inbound_entry_must_be_kept` exactly — the two must agree on
+    /// "holder" or the cycle reopens under a mid-handoff table.
+    pub fn inbound_plan_work_count(
+        &self,
+        table: &crate::cluster::shards::ShardTable,
+        self_id: NodeId,
+    ) -> usize {
+        self.inbound_migrations
+            .iter()
+            .filter(|m| !m.completed && !m.heal_pending)
+            .filter(|m| {
+                let a = table.target_assignment(m.shard);
+                a.master == self_id || a.replicas.contains(&self_id)
+            })
+            .count()
+    }
+
     /// Snapshot the currently pending inbound migrations.
     pub fn pending_inbound_entries(&self) -> Vec<(u16, NodeId)> {
         self.inbound_migrations
@@ -2705,6 +2823,60 @@ impl MigrationManager {
         let before = self.inbound_migrations.len();
         self.inbound_migrations
             .retain(|m| m.completed || is_held(m.shard));
+        let removed = before - self.inbound_migrations.len();
+        if removed > 0 {
+            self.inbound_bitmap.clear_all();
+            for m in &self.inbound_migrations {
+                if !m.completed {
+                    self.inbound_bitmap.set(m.shard);
+                }
+            }
+        }
+        removed
+    }
+
+    /// W11 FIX 4(a) — drop pending inbound entries for `shards` that `source`
+    /// has TERMINALLY REFUSED (`ERR_MIGRATION_NO_TASKS`: the requester is
+    /// neither a target holder nor its intended master at the epoch both
+    /// sides activated).
+    ///
+    /// Scoped exactly to the refusal: only entries naming THAT source, only
+    /// the listed shards, only uncompleted ones. Every other inbound entry —
+    /// including one for the same shard from a different source — is
+    /// untouched, so a refusal from a stale peer cannot cancel a live
+    /// transfer.
+    ///
+    /// `must_be_kept` is the SAME fail-closed predicate the periodic
+    /// not-held prune applies (`inbound_entry_must_be_kept`): an entry whose
+    /// shard still has local records is KEPT and stays fenced, because
+    /// dropping the fence would expose those orphans to local reads (the
+    /// scenario-17 three-holder bug). Orphan cleanup reclaims the records and
+    /// the ordinary prune then drops the entry. The refusal therefore buys
+    /// promptness for the safe case and changes nothing about the unsafe one.
+    ///
+    /// W11 review NIT — a `heal_pending` entry is never dropped either, no
+    /// matter what the source says. A reverse-heal fence is designed to
+    /// SURVIVE [`Self::clear_inbound`] precisely so a runtime topology commit
+    /// cannot serve an un-healed tail as authority (the P0 double-spend); a
+    /// peer's opinion about its own outbound tasks is weaker evidence than
+    /// that, and it is not what the fence is waiting for.
+    ///
+    /// Returns how many entries were removed.
+    pub fn drop_refused_inbound(
+        &mut self,
+        shards: &[u16],
+        source: NodeId,
+        must_be_kept: impl Fn(u16) -> bool,
+    ) -> usize {
+        let refused: std::collections::HashSet<u16> = shards.iter().copied().collect();
+        let before = self.inbound_migrations.len();
+        self.inbound_migrations.retain(|m| {
+            m.completed
+                || m.heal_pending
+                || m.from_node != source
+                || !refused.contains(&m.shard)
+                || must_be_kept(m.shard)
+        });
         let removed = before - self.inbound_migrations.len();
         if removed > 0 {
             self.inbound_bitmap.clear_all();
@@ -5197,6 +5369,135 @@ mod tests {
         assert!(mgr.has_pending_inbound(10));
         assert!(mgr.has_pending_inbound(20));
         assert_eq!(mgr.inbound_count(), 2);
+    }
+
+    /// W11 FIX 4(a) (RED→GREEN) — a source's terminal
+    /// `ERR_MIGRATION_NO_TASKS` refusal retires the dangling inbound entries
+    /// it names, and NOTHING else.
+    ///
+    /// Scoping matters: a refusal from one source must not cancel a live
+    /// transfer for the same shard from another, and an entry whose records
+    /// are still local must be KEPT fenced — dropping it would expose those
+    /// orphans to local reads (the scenario-17 three-holder bug), which is
+    /// why the drop reuses the periodic prune's fail-closed predicate rather
+    /// than trusting the refusal blindly.
+    #[test]
+    fn refused_transfer_request_drops_only_its_own_dangling_inbounds() {
+        let refuser = NodeId(3);
+        let other = NodeId(4);
+
+        let mut mgr = MigrationManager::new();
+        assert!(mgr.register_inbound_source(10, refuser)); // refused, no records
+        assert!(mgr.register_inbound_source(11, refuser)); // refused, HAS records
+        assert!(mgr.register_inbound_source(12, refuser)); // not in the request
+        assert!(mgr.register_inbound_source(10, other)); // same shard, live peer
+
+        // Shard 11 still holds local records → fail-closed keep.
+        let dropped = mgr.drop_refused_inbound(&[10, 11], refuser, |shard| shard == 11);
+
+        assert_eq!(dropped, 1, "only the record-free refused entry is retired");
+        assert!(
+            !mgr.pending_inbound_entries().contains(&(10, refuser)),
+            "the dangling entry the source will never satisfy must go",
+        );
+        assert!(
+            mgr.pending_inbound_entries().contains(&(11, refuser)),
+            "an entry whose records are still local stays fenced fail-closed \
+             until orphan cleanup reclaims them",
+        );
+        assert!(
+            mgr.pending_inbound_entries().contains(&(12, refuser)),
+            "a shard the refusal did not name is untouched",
+        );
+        assert!(
+            mgr.pending_inbound_entries().contains(&(10, other)),
+            "a refusal from one source must never cancel another source's \
+             live transfer for the same shard",
+        );
+
+        // W11 review NIT — a reverse-heal fence outranks a peer's opinion
+        // about its own outbound tasks: it survives even a `clear_inbound`
+        // topology commit, so a refusal must not retire it either.
+        assert!(mgr.register_heal_source(13, refuser));
+        assert_eq!(
+            mgr.drop_refused_inbound(&[13], refuser, |_| false),
+            0,
+            "a heal_pending entry is never dropped by a source refusal",
+        );
+        assert!(mgr.has_pending_inbound(13), "the heal fence stays up");
+        // Shard 10 still has the other source's entry, so it stays fenced;
+        // the bitmap must agree with the entries it shadows.
+        assert!(mgr.has_pending_inbound(10));
+        assert!(mgr.has_pending_inbound(11));
+        assert!(mgr.has_pending_inbound(12));
+
+        // Once the last entry for a shard goes, the fence bit goes with it.
+        assert_eq!(mgr.drop_refused_inbound(&[10], other, |_| false), 1);
+        assert!(
+            !mgr.has_pending_inbound(10),
+            "the inbound bitmap must be rebuilt from the surviving entries",
+        );
+    }
+
+    /// W11 FIX 1 (RED→GREEN) — an inbound entry for a shard this node is NOT
+    /// a target holder of is not PLAN work: it is the orphan candidate the
+    /// cleanup pass exists to reclaim, so counting it at the admissibility
+    /// gate deadlocks the pass against the fail-closed inbound prune that
+    /// keeps the entry alive precisely because the records are still there.
+    #[test]
+    fn non_held_inbound_is_not_plan_work() {
+        use crate::cluster::shards::ShardTable;
+
+        let members = [NodeId(1), NodeId(2), NodeId(3)];
+        let table = ShardTable::compute(&members, 2);
+        // With RF=2 over 3 members exactly one node is left out of each
+        // shard's target assignment — pick it as `self`.
+        let shard = 0u16;
+        let a = table.target_assignment(shard);
+        let outsider = *members
+            .iter()
+            .find(|n| a.master != **n && !a.replicas.contains(n))
+            .expect("RF=2 over 3 members always leaves one node out");
+        let holder = a.master;
+
+        let mut mgr = MigrationManager::new();
+        assert!(mgr.register_inbound_source(shard, NodeId(9)));
+        assert_eq!(
+            mgr.inbound_migration_work_count(),
+            1,
+            "precondition: the old counter sees this entry as in-flight work",
+        );
+        assert_eq!(
+            mgr.inbound_plan_work_count(&table, outsider),
+            0,
+            "a non-held inbound is an orphan candidate, not plan work — it \
+             must not be able to disable the orphan-cleanup pass",
+        );
+        assert_eq!(
+            mgr.inbound_plan_work_count(&table, holder),
+            1,
+            "the SAME entry on a target holder is genuine plan work and must \
+             still gate the pass",
+        );
+
+        // The heal-fence exclusion composes: a heal fence on a HELD shard is
+        // still excluded (39603fc), so the two rules are independent.
+        let held_shard = (0..crate::cluster::shards::NUM_SHARDS as u16)
+            .find(|s| {
+                let a = table.target_assignment(*s);
+                a.master == outsider || a.replicas.contains(&outsider)
+            })
+            .expect("the outsider holds some shard");
+        assert!(mgr.register_heal_source(held_shard, NodeId(9)));
+        assert_eq!(
+            mgr.inbound_plan_work_count(&table, outsider),
+            0,
+            "a heal fence on a held shard is alert-and-hold state, not work",
+        );
+
+        // A completed non-held entry never counted and still does not.
+        mgr.mark_inbound_complete_from_source(shard, NodeId(9));
+        assert_eq!(mgr.inbound_plan_work_count(&table, holder), 0);
     }
 
     /// W1.1 residual fix (FIX 1) — the settled-inbound fast-path GC must
