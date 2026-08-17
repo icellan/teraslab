@@ -4857,10 +4857,27 @@ impl ClusterCoordinator {
                         // its own epoch/task/#28 guards, so racing the
                         // activation below at worst no-ops until the next
                         // exchange completion.
-                        if event_orphan_cleanup_fire(
-                            &mut last_event_orphan_cleanup,
-                            std::time::Instant::now(),
-                        ) {
+                        //
+                        // W10 DEFECT 3 (armed-11) — admissibility FIRST,
+                        // rate limit second (a refused pass must not consume
+                        // the stamp): the pass is deferred until this node
+                        // has activated the completed term (a first
+                        // activation of `term` runs BELOW this point, so a
+                        // freshly-rejoined node's boot completion is always
+                        // refused — its pre-kill copies must not be judged
+                        // by the pre-rejoin table) and its inbound work has
+                        // settled.
+                        let cleanup_admissible = {
+                            let table_version = shard_table.read().version;
+                            let pending_inbound = migration.lock().inbound_count();
+                            event_orphan_cleanup_admissible(table_version, term, pending_inbound)
+                        };
+                        if cleanup_admissible
+                            && event_orphan_cleanup_fire(
+                                &mut last_event_orphan_cleanup,
+                                std::time::Instant::now(),
+                            )
+                        {
                             let cleanup_engine = engine.clone();
                             let cleanup_st = shard_table.clone();
                             let cleanup_mig = migration.clone();
@@ -11490,12 +11507,49 @@ fn run_migration_batch(
 /// exactly RF within one exchange completion, which is the contract.
 const EVENT_ORPHAN_CLEANUP_MIN_INTERVAL: Duration = Duration::from_secs(60);
 
+/// W10 DEFECT 3 (armed-11, CI d3437e4) — admissibility gate for the
+/// event-driven orphan-cleanup pass, checked BEFORE the rate limit so a
+/// refused pass never consumes the rate-limit stamp.
+///
+/// A freshly-rejoined node's FIRST exchange completion precedes its own
+/// re-plan: the completion for term `T` fires on the event loop BEFORE the
+/// activation below it installs the term-`T` table, so a pass fired there
+/// judges ownership by the PRE-rejoin table — under which the node's
+/// pre-kill copies look like orphans. armed-11: the boot-time event pass
+/// deleted a rejoining node's copies for ~23 shards ~2 s before epoch 3
+/// handed those shards back, and the completion-only handshake then
+/// committed the node as a serving master over zero records.
+///
+/// The gate is STATE-based, not time-based (a boot-seconds window would
+/// re-introduce a machine-load-dependent race): the pass is admissible only
+/// when
+/// - `active_table_version >= completed_term` — this node has already
+///   ACTIVATED the term whose exchange just completed (i.e. the completion
+///   is a same-term re-heal, never the pre-activation completion of a new
+///   term — so the node's first post-rejoin activation has landed), AND
+/// - `pending_inbound == 0` — its plan's inbound work has settled, so
+///   nothing this node is still receiving can be misjudged around the pass.
+///
+/// Refusal is fail-safe: it defers reclaim, never data. The
+/// batch-completion-site invocations of `run_orphan_cleanup` /
+/// `cleanup_orphaned_shard_if_settled` are deliberately NOT gated — they
+/// run after this node's own outbound work with per-task #28 evidence.
+fn event_orphan_cleanup_admissible(
+    active_table_version: u64,
+    completed_term: u64,
+    pending_inbound: usize,
+) -> bool {
+    active_table_version >= completed_term && pending_inbound == 0
+}
+
 /// GAP 2 — the rate-limit gate for the event-driven orphan-cleanup pass.
 ///
 /// Returns `true` (and stamps `last_fired`) when no pass has fired yet or
 /// the previous one is at least [`EVENT_ORPHAN_CLEANUP_MIN_INTERVAL`] old;
 /// `false` refuses without consuming anything — the next exchange completion
 /// after the interval fires normally. Pure so the cadence is unit-testable.
+/// Callers must check [`event_orphan_cleanup_admissible`] FIRST — an
+/// inadmissible pass must not consume the rate-limit stamp.
 fn event_orphan_cleanup_fire(
     last_fired: &mut Option<std::time::Instant>,
     now: std::time::Instant,
@@ -23513,6 +23567,50 @@ mod tests {
             !mgr.take_failed_batch_retry_arm(),
             "the arm is one-shot until the next failed disposition"
         );
+    }
+
+    /// W10 DEFECT 3 (armed-11) — the event-driven orphan-cleanup pass is
+    /// inadmissible in the pre-first-activation window (a rejoining node's
+    /// table still behind the just-completed exchange term) and while the
+    /// node's own inbound work is unsettled; it opens once both have
+    /// landed. The call site checks admissibility BEFORE the rate-limit
+    /// stamp, so a refused pass never consumes the cadence.
+    #[test]
+    fn event_orphan_cleanup_defers_in_boot_window() {
+        // Rejoining node: boot table restored at term 2, exchange completes
+        // for term 3, activation has not run yet — the armed-11 window.
+        assert!(
+            !event_orphan_cleanup_admissible(2, 3, 0),
+            "the pass must not fire before the node activates the completed term"
+        );
+        // Activated, but the re-plan's inbound hand-backs are streaming.
+        assert!(
+            !event_orphan_cleanup_admissible(3, 3, 23),
+            "the pass must not fire while the node's inbound work is unsettled"
+        );
+        // Activated + settled: the same-term re-heal completion may fire it.
+        assert!(event_orphan_cleanup_admissible(3, 3, 0));
+        // A stale completion for an older term on an already-advanced table
+        // stays admissible — the pass re-reads current state and carries its
+        // own epoch guard.
+        assert!(event_orphan_cleanup_admissible(4, 3, 0));
+
+        // The refused window must not consume the rate-limit stamp: the
+        // fire-side gate is only reached when admissible (short-circuit at
+        // the call site), so the first ADMISSIBLE completion still fires.
+        let mut last_fired = None;
+        let now = std::time::Instant::now();
+        if event_orphan_cleanup_admissible(2, 3, 0) {
+            let _ = event_orphan_cleanup_fire(&mut last_fired, now);
+        }
+        assert!(
+            last_fired.is_none(),
+            "an inadmissible pass must leave the rate limit unstamped"
+        );
+        if event_orphan_cleanup_admissible(3, 3, 0) {
+            assert!(event_orphan_cleanup_fire(&mut last_fired, now));
+        }
+        assert!(last_fired.is_some());
     }
 
     /// W8 (defect 1) — the all-EMPTY batch path returns before the main
