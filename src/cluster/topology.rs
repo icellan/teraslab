@@ -2201,6 +2201,68 @@ impl TopologyAuthority {
             .then_some(union)
     }
 
+    /// W11 P1-D — the membership gate for ADOPTING a received commit.
+    ///
+    /// # Why this is looser than the proposer-side gate
+    ///
+    /// [`Self::membership_change_is_safe`] enforces two rules: a MONOTONICITY
+    /// rule (the change must be a pure superset or a pure subset of our
+    /// committed set) and, when either side's `cluster_id` is UNSET, the
+    /// F-G8-001 ever-seen heuristic. Both exist to catch ONE thing — a
+    /// split-brain heal, i.e. a foreign cluster's membership leaking into
+    /// ours. Monotonicity is a PROXY for that; a matching configured
+    /// `cluster_id` is the direct evidence, which is why the existing code
+    /// already lets a `cluster_id` match skip the ever-seen half.
+    ///
+    /// So when a commit carries a quorum voter proof AND its `cluster_id`
+    /// matches ours EXACTLY and ours is CONFIGURED (non-UNSET), the proxy has
+    /// nothing left to add: the commit is proven to come from a majority of
+    /// our own cluster, and it is the CURRENT membership by definition. Adopt
+    /// it directly.
+    ///
+    /// # What this replaces, and why the alternative was worse
+    ///
+    /// Without this, a legitimate COMPRESSED TWO-STEP is refused forever (the
+    /// catch-up's fetch loop treats the refusal as "try the next peer", but
+    /// every peer returns the same commit): node A is in committed `{1,2,3}`,
+    /// misses `T-1 = {1,3}`, and the cluster commits `T = {1,3,4}` — which
+    /// relative to A both ADDS 4 and REMOVES 2.
+    ///
+    /// The first attempt at repairing that proposed the monotonic UNION
+    /// `committed ∪ commit.members`. That was WRONG, and the reason is worth
+    /// recording: both halves are consensus-proven, but only ONE is CURRENT.
+    /// Our committed half is proven as of an OLDER term, and the precondition
+    /// of the whole path is that it is stale by at least the term that removed
+    /// the member — so unioning re-adds exactly what the fresh term
+    /// deliberately dropped. Consensus provenance was never what made the
+    /// address book a resurrection channel (its entries are real nodes too);
+    /// STALENESS was, and the union has the same defect with a shorter memory.
+    /// Concretely: node 2 QUIESCES — and [`crate::cluster::coordinator::RunningCluster::quiesce`]
+    /// keeps the process running to serve two-phase handoffs, does not stop
+    /// SWIM, and does not leave `node_addrs`, so node 2 is ALIVE by
+    /// construction — the cluster commits `T-1 = {1,3}`, node 4 joins at
+    /// `T = {1,3,4}`, and A proposes `{1,2,3,4}`. Peers at `{1,3,4}` see a
+    /// PURE ADD, so `membership_change_is_safe` passes and
+    /// `drops_a_live_member` is false: they ACCEPT, node 2 is a member again
+    /// mid-drain, and the activation hands its data back — scenario 09
+    /// verbatim. Nothing reverses it: [`Self::check_timeout`]'s strict-subset
+    /// drop needs the member to be DEAD, and the debounce path proposes the
+    /// SWIM-alive set, which still contains it.
+    ///
+    /// Direct adoption has none of that: no new term, no proposal, nothing
+    /// re-added. `cluster_id` has been REQUIRED for clustered nodes under
+    /// `strict_auth` since v0.6.1, so this covers the validated configuration.
+    ///
+    /// A commit with an UNSET id on either side, or a mismatched one, falls
+    /// through to the unchanged [`Self::membership_change_is_safe`].
+    fn commit_membership_is_acceptable(&self, commit: &TopologyCommit) -> bool {
+        let my_id = self.cluster_id();
+        if !my_id.is_unset() && commit.cluster_id == my_id && commit.has_quorum_voter_proof() {
+            return true;
+        }
+        self.membership_change_is_safe(&commit.members, Some(commit.cluster_id))
+    }
+
     /// W11 P1-A — the monotonic UNION repair for a QUORUM-COMMITTED term this
     /// node had to REFUSE, seeded from the commit itself instead of from a
     /// live SWIM set.
@@ -2226,30 +2288,103 @@ impl TopologyAuthority {
     /// path, seeded from a live SWIM view. This entry point makes it
     /// reachable from the catch-up.
     ///
-    /// # Why the union cannot widen membership
+    /// # SECOND-CHOICE PATH (W11 P1-D)
     ///
-    /// The union is `committed_members ∪ commit.members` — our own committed
-    /// set (consensus-proven) unioned with a quorum-committed term's set
-    /// (consensus-proven). Neither half is an address book, so a node
-    /// deliberately quiesced out of BOTH is still never resurrected, which is
-    /// the invariant W11 FIX 1 established. The union is then put through the
-    /// FULL [`Self::membership_change_is_safe`] check against the commit's own
+    /// This is the FALLBACK for `cluster_id: UNSET` only. When both sides
+    /// carry a configured, matching `cluster_id`,
+    /// [`Self::commit_membership_is_acceptable`] adopts the commit DIRECTLY
+    /// and this is never reached — which is strictly better, because it
+    /// proposes nothing and therefore cannot re-add anything.
+    ///
+    /// # What the union may and may not contain
+    ///
+    /// The union is NOT `committed_members ∪ commit.members`. Both halves are
+    /// consensus-proven, but only the commit is CURRENT: our committed half is
+    /// proven as of an OLDER term, and the precondition of this path is that
+    /// it is stale by at least the term that removed a member. A plain union
+    /// therefore re-adds exactly what the fresh term deliberately dropped —
+    /// the same resurrection defect as the address book, with a shorter
+    /// memory. (Provenance was never the issue: address-book entries are real
+    /// nodes too. STALENESS was.)
+    ///
+    /// So only members our committed set names, the commit dropped, and SWIM
+    /// does NOT currently report ALIVE are folded back in:
+    ///
+    ///  * a DEAD dropped member is the compressed two-step this exists for —
+    ///    the union restores monotonicity, and step 2
+    ///    ([`Self::check_timeout`]'s strict-subset drop) removes it once the
+    ///    SWIM reap fires;
+    ///  * an ALIVE dropped member is a GRACEFUL DRAIN in progress —
+    ///    [`crate::cluster::coordinator::RunningCluster::quiesce`] keeps the
+    ///    node running to serve two-phase handoffs, keeps SWIM up, and stays
+    ///    in `node_addrs`, so it is alive BY CONSTRUCTION. Re-adding it is
+    ///    scenario 09 ("node2 re-assigned all 1365 of its master shards and
+    ///    never drained"), and nothing reverses it: the strict-subset drop
+    ///    needs it dead, and the debounce path proposes the SWIM-alive set
+    ///    that still contains it. Excluding it leaves the union non-monotonic,
+    ///    so this returns `None` and the commit stays refused.
+    ///
+    /// That refusal is a STALL, and it is the correct trade: a stall is
+    /// observable (`topology_catch_up_reproposal_skipped` plus the
+    /// `refused_higher_term` ERROR) and reversible; an undone drain is
+    /// neither. Configuring `cluster_id` — already required under
+    /// `strict_auth` — removes the stall entirely via direct adoption.
+    ///
+    /// Whatever survives is still put through the FULL
+    /// [`Self::membership_change_is_safe`] check against the commit's own
     /// `cluster_id`, so it can no more launder a foreign merge (P1.1) or an
     /// unseen NodeId (F-G8-001) than the proposer-side repair can.
     ///
     /// Returns `None` unless the commit carries a quorum voter proof, the
-    /// commit's own membership is currently refused, and the union is
-    /// accepted — i.e. only for the compressed-two-step shape.
+    /// commit's own membership is currently refused, and the restricted union
+    /// is accepted.
     pub fn monotonic_repair_for_refused_commit(
         &self,
         commit: &TopologyCommit,
+        state_of: impl Fn(&NodeId) -> Option<crate::cluster::membership::NodeState>,
     ) -> Option<Vec<NodeId>> {
         // Unproven membership is not evidence of anything; never fold it into
         // our own committed set.
         if !commit.has_quorum_voter_proof() {
             return None;
         }
-        self.monotonic_repair_target_with(&commit.members, commit.cluster_id)
+        // Only a currently-REFUSED commit needs repairing.
+        if self.membership_change_is_safe(&commit.members, Some(commit.cluster_id)) {
+            return None;
+        }
+        let committed = self.committed_members.read().unwrap().clone();
+        if committed.is_empty() {
+            return None;
+        }
+        // The commit is the CURRENT membership; our committed set contributes
+        // ONLY its dropped-and-not-alive members (see above).
+        let mut union: Vec<NodeId> = commit.members.clone();
+        for node in &committed {
+            if commit.members.contains(node) {
+                continue;
+            }
+            if state_of(node) == Some(crate::cluster::membership::NodeState::Alive) {
+                tracing::warn!(
+                    node = node.0,
+                    term = commit.term,
+                    "topology: NOT folding a committed member back into the \
+                     catch-up repair — the newer term dropped it and SWIM still \
+                     reports it ALIVE, which is a graceful drain in progress. \
+                     Re-adding it would undo the drain (W11 P1-D); the commit \
+                     stays refused until the drain completes or a configured \
+                     cluster_id enables direct adoption.",
+                );
+                continue;
+            }
+            union.push(*node);
+        }
+        union.sort_unstable_by_key(|node| node.0);
+        union.dedup();
+        if union == committed || union.len() > MAX_TOPOLOGY_MEMBERS {
+            return None;
+        }
+        self.membership_change_is_safe(&union, Some(commit.cluster_id))
+            .then_some(union)
     }
 
     /// Called when SWIM reports a membership change.
@@ -2875,7 +3010,7 @@ impl TopologyAuthority {
         //     NodeId never seen as a committed voter here (F-G8-001).
         // The commit carries its own `cluster_id`, so we pass it through;
         // the local side is read from `self.cluster_id()`.
-        if !self.membership_change_is_safe(&commit.members, Some(commit.cluster_id)) {
+        if !self.commit_membership_is_acceptable(commit) {
             let committed_members = self.committed_members.read().unwrap();
             tracing::error!(
                 self_id = self.self_id.0,
@@ -6028,9 +6163,219 @@ mod tests {
             voters: merged_members.clone(),
         };
 
+        // W11 P1-D — CONTRACT CHANGE, deliberate. Under a CONFIGURED,
+        // MATCHING cluster_id this commit is now ADOPTED rather than refused;
+        // the assertions below pin what still refuses. See
+        // `commit_membership_is_acceptable` for the full rationale. In short:
+        // monotonicity is only a PROXY for "foreign merge", the matching
+        // configured cluster_id is the direct evidence, and the peak-derived
+        // quorum floor (`activation_quorum_needed` / Gate B) already makes it
+        // impossible for a MINORITY side of a partition to produce any commit
+        // at all — so under the documented honest-but-partitioned threat model
+        // this shape is a compressed multi-step this node is simply behind on,
+        // not a merge. Refusing it instead stalled such a node FOREVER, since
+        // the catch-up's fetch loop gets the identical commit from every peer.
+        //
+        // CONTAINMENT: only the COMMIT-ADOPTION path is relaxed. A conforming
+        // node still refuses to PROPOSE (`on_membership_changed`) or to VOTE
+        // FOR (`handle_propose`) a non-monotonic member set, so this shape can
+        // never be manufactured — only adopted once some quorum already
+        // committed it.
+        assert_eq!(
+            auth.handle_commit(&merged_commit),
+            Some(7),
+            "a quorum-proven commit under a matching configured cluster_id is \
+             adopted even when non-monotonic (W11 P1-D)",
+        );
+        assert_eq!(auth.committed_term(), 7);
+        assert_eq!(auth.committed_members(), merged_members);
+    }
+
+    /// W11 P1-D — the half of the old pin that MUST still hold: the relaxation
+    /// is gated on a quorum voter proof, so a non-monotonic commit without one
+    /// is still refused even under a matching cluster_id.
+    #[test]
+    fn handle_commit_rejects_non_monotonic_change_without_a_quorum_proof() {
+        let cid = ClusterId([0xCE; 16]);
+        let auth = TopologyAuthority::new(NodeId(2), Duration::from_secs(1), 2);
+        auth.set_cluster_id(cid);
+
+        let local_members = members(&[1, 2, 3]);
+        let local_commit = TopologyCommit {
+            term: 5,
+            rf: 2,
+            assignment: None,
+            proposer: NodeId(1),
+            members: local_members.clone(),
+            cluster_id: cid,
+            placement_version: 1,
+            committed_peak: (local_members.clone()).len() as u64,
+            digest: TopologyTerm::compute_digest(
+                5,
+                &cid,
+                &local_members,
+                1,
+                (local_members).len() as u64,
+                2,
+                ASSIGNMENT_ABSENT_DIGEST,
+            ),
+            voters: local_members.clone(),
+        };
+        assert_eq!(auth.handle_commit(&local_commit), Some(5));
+
+        // {1,2,3} → {3,4,5} again, but carrying ONE voter where a majority of
+        // three needs two: no quorum proof, so nothing licenses adoption.
+        let merged_members = members(&[3, 4, 5]);
+        let merged_commit = TopologyCommit {
+            term: 7,
+            rf: 2,
+            assignment: None,
+            proposer: NodeId(3),
+            members: merged_members.clone(),
+            cluster_id: cid,
+            placement_version: 1,
+            committed_peak: (merged_members.clone()).len() as u64,
+            digest: TopologyTerm::compute_digest(
+                7,
+                &cid,
+                &merged_members,
+                1,
+                (merged_members).len() as u64,
+                2,
+                ASSIGNMENT_ABSENT_DIGEST,
+            ),
+            voters: members(&[3]),
+        };
+
         assert!(
             auth.handle_commit(&merged_commit).is_none(),
-            "non-monotonic same-cluster merge must be rejected",
+            "an unproven non-monotonic commit must still be rejected",
+        );
+        assert_eq!(auth.committed_term(), 5);
+        assert_eq!(auth.committed_members(), local_members);
+    }
+
+    /// W11 P1-D — and the other half: a MISMATCHED cluster_id is the
+    /// split-brain signature the relaxation is explicitly gated on, so it is
+    /// still refused (falling through to the unchanged
+    /// `membership_change_is_safe`).
+    #[test]
+    fn handle_commit_rejects_non_monotonic_change_from_a_foreign_cluster_id() {
+        let cid = ClusterId([0xCF; 16]);
+        let foreign = ClusterId([0xAB; 16]);
+        let auth = TopologyAuthority::new(NodeId(2), Duration::from_secs(1), 2);
+        auth.set_cluster_id(cid);
+
+        let local_members = members(&[1, 2, 3]);
+        let local_commit = TopologyCommit {
+            term: 5,
+            rf: 2,
+            assignment: None,
+            proposer: NodeId(1),
+            members: local_members.clone(),
+            cluster_id: cid,
+            placement_version: 1,
+            committed_peak: (local_members.clone()).len() as u64,
+            digest: TopologyTerm::compute_digest(
+                5,
+                &cid,
+                &local_members,
+                1,
+                (local_members).len() as u64,
+                2,
+                ASSIGNMENT_ABSENT_DIGEST,
+            ),
+            voters: local_members.clone(),
+        };
+        assert_eq!(auth.handle_commit(&local_commit), Some(5));
+
+        let merged_members = members(&[3, 4, 5]);
+        let merged_commit = TopologyCommit {
+            term: 7,
+            rf: 2,
+            assignment: None,
+            proposer: NodeId(3),
+            members: merged_members.clone(),
+            cluster_id: foreign,
+            placement_version: 1,
+            committed_peak: (merged_members.clone()).len() as u64,
+            digest: TopologyTerm::compute_digest(
+                7,
+                &foreign,
+                &merged_members,
+                1,
+                (merged_members).len() as u64,
+                2,
+                ASSIGNMENT_ABSENT_DIGEST,
+            ),
+            voters: merged_members.clone(),
+        };
+
+        assert!(
+            auth.handle_commit(&merged_commit).is_none(),
+            "a foreign cluster_id must still be rejected — the relaxation is \
+             gated on an EXACT match against a configured id",
+        );
+        assert_eq!(auth.committed_term(), 5);
+        assert_eq!(auth.committed_members(), local_members);
+    }
+
+    /// W11 P1-D — with `cluster_id: UNSET` there is no direct evidence, so the
+    /// monotonicity rule still governs and the merge is still refused. This is
+    /// the configuration option (A)'s liveness-restricted repair exists for.
+    #[test]
+    fn handle_commit_rejects_non_monotonic_change_when_cluster_id_is_unset() {
+        let auth = TopologyAuthority::new(NodeId(2), Duration::from_secs(1), 2);
+
+        let local_members = members(&[1, 2, 3]);
+        let local_commit = TopologyCommit {
+            term: 5,
+            rf: 2,
+            assignment: None,
+            proposer: NodeId(1),
+            members: local_members.clone(),
+            cluster_id: ClusterId::UNSET,
+            placement_version: 1,
+            committed_peak: (local_members.clone()).len() as u64,
+            digest: TopologyTerm::compute_digest(
+                5,
+                &ClusterId::UNSET,
+                &local_members,
+                1,
+                (local_members).len() as u64,
+                2,
+                ASSIGNMENT_ABSENT_DIGEST,
+            ),
+            voters: local_members.clone(),
+        };
+        assert_eq!(auth.handle_commit(&local_commit), Some(5));
+
+        let merged_members = members(&[3, 4, 5]);
+        let merged_commit = TopologyCommit {
+            term: 7,
+            rf: 2,
+            assignment: None,
+            proposer: NodeId(3),
+            members: merged_members.clone(),
+            cluster_id: ClusterId::UNSET,
+            placement_version: 1,
+            committed_peak: (merged_members.clone()).len() as u64,
+            digest: TopologyTerm::compute_digest(
+                7,
+                &ClusterId::UNSET,
+                &merged_members,
+                1,
+                (merged_members).len() as u64,
+                2,
+                ASSIGNMENT_ABSENT_DIGEST,
+            ),
+            voters: merged_members.clone(),
+        };
+
+        assert!(
+            auth.handle_commit(&merged_commit).is_none(),
+            "without a configured cluster_id the monotonicity proxy is all \
+             there is — refuse",
         );
         assert_eq!(auth.committed_term(), 5);
         assert_eq!(auth.committed_members(), local_members);

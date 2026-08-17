@@ -1401,17 +1401,33 @@ impl Drop for TopologyCatchUpGuard {
 ///
 /// `repair_target` re-seeds it from the refused commit itself: the caller
 /// passes [`crate::cluster::topology::TopologyAuthority::monotonic_repair_for_refused_commit`]'s
-/// output, which is `committed_members ∪ commit.members` after the FULL
-/// `membership_change_is_safe` check. Both halves are consensus-proven, so
-/// this does not re-open the address-book widening channel.
+/// output. That is the SECOND-CHOICE path — it only runs when `cluster_id` is
+/// UNSET, because with a configured, matching id the commit is ADOPTED
+/// DIRECTLY (`commit_membership_is_acceptable`), which proposes nothing at all
+/// and is therefore strictly safer.
 ///
-/// A repair target is used VERBATIM — deliberately NOT passed through the
-/// SWIM-Dead filter. The whole point of the union is to re-include a member
-/// the newer term dropped (typically a drained node that is legitimately gone,
-/// hence Dead) so the change is monotonic again; filtering it back out would
-/// reproduce the very non-monotonic set that is being refused. It is a
-/// transient stepping stone: the next membership event drops the dead node
-/// normally.
+/// The repair target is NOT `committed_members ∪ commit.members` (W11 P1-D).
+/// Both halves are consensus-proven, but only the commit is CURRENT: our
+/// committed half is stale by at least the term that removed a member, so a
+/// plain union re-adds exactly what the fresh term deliberately dropped. It
+/// contributes ONLY members the commit dropped that SWIM does not currently
+/// report ALIVE — an alive dropped member is a graceful drain in progress
+/// ([`RunningCluster::quiesce`] keeps the node running to serve two-phase
+/// handoffs, keeps SWIM up, and stays in `node_addrs`), and re-adding it is
+/// scenario 09 verbatim with nothing to reverse it. When that exclusion leaves
+/// the set non-monotonic the helper returns `None` and this node STALLS —
+/// which is the correct trade, because a stall is observable
+/// (`topology_catch_up_reproposal_skipped` plus the `refused_higher_term`
+/// ERROR) and reversible, while an undone drain is neither.
+///
+/// Whatever the helper does return is used VERBATIM here — deliberately NOT
+/// re-filtered through this function's own SWIM-Dead rule, which would drop
+/// the dead member whose re-inclusion is the entire point and rebuild the
+/// non-monotonic set being refused. It is a transient stepping stone: for a
+/// genuinely DEAD member the SWIM reap fires `NodeLeft`, `node_addrs` loses
+/// it, and [`crate::cluster::topology::TopologyAuthority::check_timeout`]'s
+/// strict-subset drop removes it — the step-2 path that exists only for dead
+/// members, which is why an alive one must never enter the set.
 ///
 /// `state_of` reports the CURRENT SWIM state of a node (`None` = no SWIM
 /// record); it is read at the last moment before proposing, exactly as in the
@@ -6597,7 +6613,12 @@ impl ClusterCoordinator {
                                         // returns `None` for in every other
                                         // case (W11 P1-A).
                                         if let Some(union) = topology_authority
-                                            .monotonic_repair_for_refused_commit(&commit)
+                                            .monotonic_repair_for_refused_commit(&commit, |node| {
+                                                swim_membership
+                                                    .lock()
+                                                    .member_info(node)
+                                                    .map(|i| i.state)
+                                            })
                                         {
                                             tracing::warn!(
                                                 term = commit.term,
@@ -33282,14 +33303,12 @@ mod tests {
     ///
     /// It then MISSES term 6 = `{1,3}` (node 2 drained) — the compressed
     /// two-step.
-    fn authority_that_missed_a_drain_step() -> (
-        crate::cluster::topology::TopologyAuthority,
-        crate::cluster::topology::ClusterId,
-    ) {
+    fn authority_that_missed_a_drain_step(
+        cluster_id: crate::cluster::topology::ClusterId,
+    ) -> crate::cluster::topology::TopologyAuthority {
         use crate::cluster::topology::{
-            ASSIGNMENT_ABSENT_DIGEST, ClusterId, TopologyAuthority, TopologyCommit, TopologyTerm,
+            ASSIGNMENT_ABSENT_DIGEST, TopologyAuthority, TopologyCommit, TopologyTerm,
         };
-        let cluster_id = ClusterId([7u8; 16]);
         let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1), 2);
         auth.set_cluster_id(cluster_id);
         let members = vec![NodeId(1), NodeId(2), NodeId(3)];
@@ -33318,7 +33337,7 @@ mod tests {
             Some(5),
             "fixture: the pre-drain term applies"
         );
-        (auth, cluster_id)
+        auth
     }
 
     fn commit_over(
@@ -33349,62 +33368,187 @@ mod tests {
         }
     }
 
-    /// W11 P1-A — a COMPRESSED TWO-STEP must still converge.
+    const UNSET_ID: crate::cluster::topology::ClusterId =
+        crate::cluster::topology::ClusterId::UNSET;
+    const CONFIGURED_ID: crate::cluster::topology::ClusterId =
+        crate::cluster::topology::ClusterId([7u8; 16]);
+
+    /// W11 P1-D / path (B) — with a CONFIGURED, matching `cluster_id` the
+    /// compressed two-step converges by DIRECT ADOPTION: no new term, no
+    /// proposal, and nothing re-added.
     ///
     /// Node 1 is in committed `{1,2,3}`; it misses term 6 = `{1,3}` (node 2
     /// drained); the cluster commits term 7 = `{1,3,4}`. Relative to node 1's
-    /// committed set that both ADDS 4 and REMOVES 2 — non-monotonic — so
-    /// `membership_change_is_safe` refuses it. The catch-up's fetch loop treats
-    /// that refusal as "try the next peer", but EVERY peer hands back the same
-    /// commit, so the refusal is permanent: `refused_higher_term` climbs and
-    /// node 1 never advances.
+    /// committed set that both ADDS 4 and REMOVES 2, so the MONOTONICITY rule
+    /// alone would refuse it forever — the fetch loop treats the refusal as
+    /// "try the next peer", but every peer hands back the same commit.
     ///
-    /// Pre-W11 the address-book source happened to BE the monotonic union
-    /// `{1,2,3,4}`, which `monotonic_repair_target` then accepted (the design
-    /// comment on `on_membership_changed` names this the intended repair).
-    /// FIX 1's committed-set source can only SHRINK, so the union had to be
-    /// re-seeded — from the refused commit, whose members are quorum-proven.
+    /// Monotonicity is only a PROXY for "foreign merge", and a matching
+    /// configured `cluster_id` is the direct evidence — which is why the
+    /// existing code already lets a `cluster_id` match skip the ever-seen
+    /// half. `cluster_id` has been required under `strict_auth` since v0.6.1,
+    /// so this is the validated configuration.
+    ///
+    /// Node 2 is ALIVE here (a quiesced node keeps running to serve two-phase
+    /// handoffs): adoption must respect its removal regardless.
     #[test]
-    fn catch_up_repairs_a_compressed_two_step_from_the_refused_commit() {
-        use crate::cluster::membership::NodeState;
-        let (auth, cluster_id) = authority_that_missed_a_drain_step();
-        let term7 = commit_over(cluster_id, 7, &[NodeId(1), NodeId(3), NodeId(4)]);
+    fn configured_cluster_id_adopts_a_compressed_two_step_directly() {
+        let auth = authority_that_missed_a_drain_step(CONFIGURED_ID);
+        let term7 = commit_over(CONFIGURED_ID, 7, &[NodeId(1), NodeId(3), NodeId(4)]);
 
-        // 1. The direct fetch is refused, and would be by every peer alike.
+        assert_eq!(
+            auth.handle_commit(&term7),
+            Some(7),
+            "a quorum-proven commit whose configured cluster_id matches ours \
+             is adopted directly, non-monotonic or not",
+        );
+        assert_eq!(auth.committed_term(), 7, "the node caught up");
+        assert_eq!(
+            auth.committed_members(),
+            vec![NodeId(1), NodeId(3), NodeId(4)],
+            "the CURRENT membership is adopted verbatim — drained node 2 stays \
+             out, and no repair proposal was needed",
+        );
+    }
+
+    /// A commit whose `cluster_id` does NOT match ours is still refused —
+    /// direct adoption is gated on the id being the split-brain evidence it
+    /// claims to be.
+    #[test]
+    fn direct_adoption_still_refuses_a_foreign_cluster_id() {
+        let auth = authority_that_missed_a_drain_step(CONFIGURED_ID);
+        let foreign = crate::cluster::topology::ClusterId([9u8; 16]);
+        let term7 = commit_over(foreign, 7, &[NodeId(1), NodeId(3), NodeId(4)]);
+
         assert_eq!(
             auth.handle_commit(&term7),
             None,
-            "term 7 is non-monotonic against committed {{1,2,3}} — refused",
+            "a mismatched cluster_id is the split-brain signature — refuse",
         );
-        assert_eq!(auth.committed_term(), 5, "node 1 is stuck on term 5");
+        assert_eq!(auth.committed_term(), 5, "committed state untouched");
+    }
 
-        // 2. The refusal yields a quorum-proven monotonic stepping stone.
-        let repair = auth
-            .monotonic_repair_for_refused_commit(&term7)
-            .expect("committed ∪ refused = {1,2,3,4} is monotonic and safe");
+    /// W11 P1-A / path (A), the `cluster_id: UNSET` fallback — a DEAD dropped
+    /// member is folded back in, restoring monotonicity so the stalled node
+    /// can propose a stepping stone.
+    ///
+    /// The ever-seen set is pre-seeded with node 4 so this test isolates the
+    /// LIVENESS rule rather than the separate F-G8-001 unseen-joiner rule
+    /// (which, with `cluster_id` unset, would refuse an unknown joiner on its
+    /// own — the correct fail-closed posture, just not what is under test).
+    #[test]
+    fn unset_cluster_id_repairs_a_two_step_around_a_dead_member() {
+        use crate::cluster::membership::NodeState;
+        let auth = authority_that_missed_a_drain_step(UNSET_ID);
+        auth.set_committed_voter_ever_seen(&[NodeId(1), NodeId(2), NodeId(3), NodeId(4)]);
+        let term7 = commit_over(UNSET_ID, 7, &[NodeId(1), NodeId(3), NodeId(4)]);
+
         assert_eq!(
-            repair,
-            vec![NodeId(1), NodeId(2), NodeId(3), NodeId(4)],
-            "the union of two consensus-proven sets — no address book involved",
+            auth.handle_commit(&term7),
+            None,
+            "without a configured cluster_id the monotonicity rule still fires",
         );
 
-        // 3. The fallback proposes it. Node 2 is SWIM-Dead (it drained), and
-        //    the repair must NOT be filtered by liveness: dropping 2 rebuilds
-        //    the very non-monotonic set that is being refused.
-        let addrs = four_node_addr_book();
+        // Node 2 is SWIM-Dead: it really is gone, so folding it back in is a
+        // transient stepping stone that step 2 (check_timeout's strict-subset
+        // drop, driven by the SWIM reap) removes.
         let state_of = |n: &NodeId| match n.0 {
             2 => Some(NodeState::Dead),
             _ => Some(NodeState::Alive),
         };
+        let repair = auth
+            .monotonic_repair_for_refused_commit(&term7, state_of)
+            .expect("a DEAD dropped member may be folded back in");
+        assert_eq!(
+            repair,
+            vec![NodeId(1), NodeId(2), NodeId(3), NodeId(4)],
+            "the commit's CURRENT membership plus the dead dropped member",
+        );
+
+        let addrs = four_node_addr_book();
         let proposal =
             catch_up_fallback_proposal(&auth, &addrs, 7, NodeId(1), state_of, Some(&repair))
                 .expect("the repair step must be proposed, not skipped");
         assert_eq!(
             proposal.members,
             vec![NodeId(1), NodeId(2), NodeId(3), NodeId(4)],
-            "the monotonic union is proposed verbatim — SWIM-Dead node 2 is \
-             retained because its re-inclusion is what makes the change \
-             monotonic",
+            "the repair is proposed verbatim — the dead member's re-inclusion \
+             is what makes the change monotonic",
+        );
+    }
+
+    /// W11 P1-D — the case the first cut of P1-A got WRONG: a member the
+    /// newer term dropped that SWIM still reports ALIVE must NEVER be folded
+    /// back in.
+    ///
+    /// A quiesced node is alive BY CONSTRUCTION: `RunningCluster::quiesce`
+    /// fabricates a commit excluding itself and then KEEPS RUNNING to serve
+    /// two-phase handoffs — it does not stop SWIM and does not leave
+    /// `node_addrs`. So the union `committed ∪ commit.members` re-adds a node
+    /// that is mid-drain. Peers already at `{1,3,4}` see that proposal as a
+    /// PURE ADD, so `membership_change_is_safe` passes and
+    /// `drops_a_live_member` is false: they ACCEPT, the drained node is a
+    /// member again, and the activation hands its data back — scenario 09
+    /// verbatim ("node2 re-assigned all 1365 of its master shards and never
+    /// drained"). Nothing reverses it: `check_timeout`'s strict-subset drop
+    /// needs the member DEAD, and the debounce path proposes the SWIM-alive
+    /// set, which still contains it.
+    ///
+    /// Consensus provenance was never what made the address book a
+    /// resurrection channel — its entries are real nodes too. STALENESS was,
+    /// and our committed half is stale by at least the term that removed the
+    /// member. So the refusal STANDS, and the resulting stall is the correct
+    /// trade: a stall is observable and reversible, an undone drain is
+    /// neither.
+    #[test]
+    fn unset_cluster_id_never_resurrects_a_quiesced_but_alive_member() {
+        use crate::cluster::membership::NodeState;
+        let auth = authority_that_missed_a_drain_step(UNSET_ID);
+        auth.set_committed_voter_ever_seen(&[NodeId(1), NodeId(2), NodeId(3), NodeId(4)]);
+        let term7 = commit_over(UNSET_ID, 7, &[NodeId(1), NodeId(3), NodeId(4)]);
+        assert_eq!(auth.handle_commit(&term7), None, "refused as non-monotonic");
+
+        // The ONLY difference from the dead-member test: node 2 is draining,
+        // hence ALIVE.
+        let state_of = |_: &NodeId| Some(NodeState::Alive);
+
+        let repair = auth.monotonic_repair_for_refused_commit(&term7, state_of);
+        assert!(
+            repair.is_none(),
+            "a dropped member SWIM reports ALIVE is a graceful drain in \
+             progress; folding it back in undoes the drain, so no repair is \
+             offered: {repair:?}",
+        );
+
+        // And the fallback must not manufacture one from anywhere else.
+        let addrs = four_node_addr_book();
+        let proposal =
+            catch_up_fallback_proposal(&auth, &addrs, 7, NodeId(1), state_of, repair.as_deref());
+        assert!(
+            proposal.is_none(),
+            "the node stalls rather than proposing the drained member back in",
+        );
+        assert_eq!(auth.committed_term(), 5, "stalled, as intended");
+        assert_eq!(
+            auth.committed_members(),
+            vec![NodeId(1), NodeId(2), NodeId(3)],
+            "and nothing was committed that re-adds the draining node",
+        );
+    }
+
+    /// The same alive-drained shape under a CONFIGURED `cluster_id` converges
+    /// instead of stalling — via direct adoption, which cannot resurrect
+    /// anything because it proposes nothing. This is why (B) is the primary
+    /// path and (A) only the `UNSET` fallback.
+    #[test]
+    fn configured_cluster_id_converges_where_the_unset_fallback_must_stall() {
+        let auth = authority_that_missed_a_drain_step(CONFIGURED_ID);
+        let term7 = commit_over(CONFIGURED_ID, 7, &[NodeId(1), NodeId(3), NodeId(4)]);
+
+        assert_eq!(auth.handle_commit(&term7), Some(7), "adopted directly");
+        assert!(
+            !auth.committed_members().contains(&NodeId(2)),
+            "the draining node stays out",
         );
     }
 
@@ -33414,8 +33558,8 @@ mod tests {
     #[test]
     fn catch_up_without_a_repair_target_cannot_escape_a_compressed_two_step() {
         use crate::cluster::membership::NodeState;
-        let (auth, cluster_id) = authority_that_missed_a_drain_step();
-        let term7 = commit_over(cluster_id, 7, &[NodeId(1), NodeId(3), NodeId(4)]);
+        let auth = authority_that_missed_a_drain_step(UNSET_ID);
+        let term7 = commit_over(UNSET_ID, 7, &[NodeId(1), NodeId(3), NodeId(4)]);
         assert_eq!(auth.handle_commit(&term7), None, "refused as non-monotonic");
 
         let addrs = four_node_addr_book();
