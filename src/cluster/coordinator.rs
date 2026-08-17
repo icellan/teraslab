@@ -686,8 +686,18 @@ fn failed_batch_retry_pass(
 /// dedup all apply) — the event loop owns execution, never this caller.
 /// Returns whether the trigger was armed (for tests).
 ///
+/// SCOPE (review P1-2a): the fired pass derives from
+/// `snapshot_under_replication_inputs`, i.e. shards this node still
+/// TARGET-MASTERS — so this signal closes the KEEPS-MASTERSHIP replica-abort
+/// shape only (the CI census shape: the master + sole holder whose replica
+/// fills abort). A replica abort on a shard whose mastership moved away
+/// mid-Copying yields a no-op pass; that case remains OPEN, owned by the
+/// failed-task re-drive (task #77/W8) and the event-repair membership arms
+/// (task #50), which re-plan on the next topology/membership edge.
+///
 /// Residual (documented, accepted): the derive judges shards against the
-/// retained exchange view, so a pass fired before the next view refresh can be
+/// retained exchange view (refreshed by the periodic exchange regardless of
+/// the sweep flag), so a pass fired before the next view refresh can be
 /// fenced (`stale_fenced`) or see a partially-filled target as full; the
 /// debounce window absorbs the common case and the next abort/exchange re-arms
 /// the rest.
@@ -704,6 +714,9 @@ fn replica_abort_resync_pass(
         "cluster: replica-side terminal abort — force-arming the under-replication \
          event-repair pass (sweep-flag independent)",
     );
+    if let Some(m) = crate::metrics::migration_metrics() {
+        m.replica_abort_forced_resyncs.inc();
+    }
     trigger.observe_forced(now, current_epoch);
     true
 }
@@ -2394,6 +2407,13 @@ pub struct ClusterConfig {
     /// `under_replication_sweep_enabled`). Default-off pending CI
     /// qualification.
     pub under_replication_sweep_enabled: bool,
+    /// W9 Part B — replica-abort forced resync arming (see `Config`
+    /// `replica_abort_forced_resync_enabled` for the full rationale).
+    /// Default ON: without it a replica-side terminal abort leaves its shard
+    /// permanently under RF in sweep-off clusters. Carried on the shared
+    /// `MigrationManager` so the abort site (a free fn with no config
+    /// access) reads it lock-local.
+    pub replica_abort_forced_resync_enabled: bool,
     /// W8 review P0-1 — allow tombstone-vetoed manifest reduction on
     /// migration completions (see `Config`
     /// `migration_vetoed_reduction_enabled` for the full rationale).
@@ -2656,6 +2676,11 @@ impl ClusterCoordinator {
                 // migration batch path (a free fn with no config access)
                 // reads it lock-local at the escalation site.
                 mgr.set_vetoed_reduction_enabled(config.migration_vetoed_reduction_enabled);
+                // W9 Part B — same carrier pattern for the replica-abort
+                // forced-resync arming (read at the terminal-abort site).
+                mgr.set_replica_abort_forced_resync_enabled(
+                    config.replica_abort_forced_resync_enabled,
+                );
                 Arc::new(Mutex::new(mgr))
             },
             replication_factor: config.replication_factor,
@@ -3623,9 +3648,17 @@ impl ClusterCoordinator {
                             );
                         // Task #50 review P3 — cap remainder: re-arm so the
                         // backlog converges in 1.5s steps instead of waiting
-                        // the 20s periodic fallback.
+                        // the 20s periodic fallback. W9 review P1-2b —
+                        // `observe_forced`, not `observe`: in a sweep-off
+                        // cluster the ONLY way this event pass ever fires is
+                        // a replica-abort forced arm, and the enabled-gated
+                        // `observe` silently dropped its cap remainder,
+                        // stranding the backlog past the cap. With the sweep
+                        // on, forced ≡ plain (the flag is the only
+                        // difference), so this is a strict fix, not a
+                        // behavior change for sweep-on clusters.
                         if dropped > 0 {
-                            event_repair_trigger.observe(
+                            event_repair_trigger.observe_forced(
                                 std::time::Instant::now(),
                                 topology_epoch.load(Ordering::Relaxed),
                             );
@@ -11352,13 +11385,25 @@ fn terminally_abort_unshippable_task(
             // W9 Part B — a REPLICA-side terminal abort leaves the table
             // untouched (W3 FIX C below), so diff-based re-heal never
             // re-plans this fill and the shard serves under RF with no other
-            // driver in sweep-off clusters. Leave the resync signal; the
-            // event loop drains it into a FORCE-armed event-repair pass
-            // (`replica_abort_resync_pass`), and with the W9
-            // CompensatedCreate tombstone the retried fill succeeds instead
-            // of re-vetoing. Armed regardless of epoch currency — the derive
-            // re-judges against live state at fire time. Master-side aborts
-            // are excluded: the rollback below is their re-planner.
+            // driver in sweep-off clusters. Leave the resync signal (gated
+            // only on the committed `replica_abort_forced_resync_enabled`
+            // policy); the event loop drains it into a FORCE-armed
+            // event-repair pass (`replica_abort_resync_pass`), and with the
+            // W9 CompensatedCreate tombstone the retried fill succeeds
+            // instead of re-vetoing. Armed regardless of epoch currency —
+            // the derive re-judges against live state at fire time.
+            // Master-side aborts are excluded: the rollback below is their
+            // re-planner.
+            //
+            // SCOPE (review P1-2a): the fired pass derives from shards this
+            // node still TARGET-MASTERS, so the signal closes the
+            // KEEPS-MASTERSHIP shape only (the CI census shape — master +
+            // sole holder filling replicas). A replica abort on a shard
+            // whose mastership moved away mid-Copying produces a no-op pass
+            // here — that case remains OPEN, owned by the failed-task
+            // re-drive machinery (task #77/W8) and the event-repair pass's
+            // membership arms (task #50), which re-plan on the next
+            // topology/membership edge.
             if !task.is_master {
                 mgr.arm_replica_abort_resync();
             }
@@ -11385,7 +11430,9 @@ fn terminally_abort_unshippable_task(
         // retire block above leaves the W9 replica-abort resync signal: the
         // event loop force-arms the under-replication event-repair pass
         // (sweep-flag independent) so the fill is retried instead of the
-        // shard serving below RF forever.
+        // shard serving below RF forever. NOTE the signal's scope (review
+        // P1-2a): it repairs only shards this node still TARGET-MASTERS —
+        // the moved-master mid-Copying case stays open (tasks #77/#50).
         //
         // (The migration mutex is NOT held across the shard-table write —
         // same lock order as `fail_migration_task_current_epoch`.)
@@ -25832,21 +25879,30 @@ mod tests {
     /// drains into a FORCE-armed event-repair pass — working even with
     /// `under_replication_sweep_enabled = false`, where pre-W9 the shard
     /// stayed under-RF forever.
+    ///
+    /// Review P1-2a — the scenario is deliberately the KEEPS-MASTERSHIP
+    /// shape (this node still target-masters the shard whose replica fill
+    /// aborted — the CI census shape: n1 master + sole holder filling
+    /// replicas), and the test proves the fired pass actually EMITS the
+    /// resync for that shard through the REAL derive — not merely that the
+    /// trigger fired. The moved-master shape (abort on a shard whose
+    /// mastership left this node mid-Copying) is NOT covered by this signal
+    /// — see the scoping note on `replica_abort_resync_pass`.
     #[test]
     fn replica_terminal_abort_signals_forced_resync_with_sweep_disabled() {
-        use crate::cluster::shards::ShardHandoff;
         let old_members = vec![NodeId(1), NodeId(2), NodeId(3)];
         let new_members = vec![NodeId(1), NodeId(2), NodeId(3), NodeId(4)];
         let mut table = ShardTable::compute_with_epoch(&old_members, 2, 1, 1);
         let new_table = ShardTable::compute_with_epoch(&new_members, 2, 2, 1);
+        // KEEPS-mastership: node1 masters the shard in BOTH epochs; the
+        // aborted task is a replica FILL toward the scale-out joiner.
         let shard = (0..NUM_SHARDS as u16)
             .find(|s| {
                 table.target_assignment(*s).master == NodeId(1)
-                    && new_table.target_assignment(*s).master != NodeId(1)
+                    && new_table.target_assignment(*s).master == NodeId(1)
             })
-            .expect("scale-out must move some node1 master");
+            .expect("some node1 master survives the scale-out");
         table.begin_handoff(&new_table);
-        assert_eq!(table.shard_handoff_state(shard), ShardHandoff::Copying);
 
         let shard_table = Arc::new(ShardTableLock::new(table));
         let migration = Arc::new(Mutex::new(MigrationManager::new()));
@@ -25896,6 +25952,102 @@ mod tests {
         assert!(
             event_repair_take_fire(&mut trigger, later, new_table.version, 0, &mut last_sweep),
             "the forced-armed pass must fire with the sweep flag off",
+        );
+
+        // Review P1-2a — the fired pass EMITS the resync for the aborted
+        // shard through the REAL derive. In the keeps-mastership shape the
+        // pass inputs are: this node still masters the (non-empty) shard,
+        // the exchange view witnesses this node's own data for it (freshness
+        // fence) and shows the alive target holding nothing — the derive
+        // must signal exactly (target -> [shard]).
+        let mut view: std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>> =
+            std::collections::HashMap::new();
+        view.insert(NodeId(1), vec![sweep_entry(shard, 5)]);
+        view.insert(NodeId(4), vec![sweep_entry(shard, 0)]);
+        let alive = std::collections::HashSet::from([NodeId(1), NodeId(4)]);
+        let mastered_nonempty = vec![(shard, vec![NodeId(1), NodeId(4)])];
+        let in_flight = std::collections::HashSet::new();
+        let (missing, signaled, dropped, dead_skipped, inflight_skipped, stale_fenced) =
+            derive_under_replication_resyncs(
+                &view,
+                &alive,
+                NodeId(1),
+                &mastered_nonempty,
+                &in_flight,
+                UNDER_REPLICATION_SWEEP_MAX_SHARDS,
+            );
+        assert_eq!(
+            missing.get(&NodeId(4)),
+            Some(&vec![shard]),
+            "the pass must emit a resync of the aborted shard toward the \
+             empty target (not merely fire)",
+        );
+        assert_eq!(
+            (
+                signaled,
+                dropped,
+                dead_skipped,
+                inflight_skipped,
+                stale_fenced
+            ),
+            (1, 0, 0, 0, 0),
+            "exactly one resync, unfenced and undropped",
+        );
+    }
+
+    /// W9 Part B review P1-2c — the forced resync is a COMMITTED config
+    /// policy (`replica_abort_forced_resync_enabled`, default ON): with the
+    /// flag disabled on the shared manager, a replica-side terminal abort
+    /// must leave NO signal — an operator who opted out of abort-triggered
+    /// resync churn gets exactly the pre-W9 disposition (documented
+    /// permanent under-RF until a topology change).
+    #[test]
+    fn replica_terminal_abort_signal_respects_config_flag() {
+        use crate::cluster::shards::ShardHandoff;
+        let old_members = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let new_members = vec![NodeId(1), NodeId(2), NodeId(3), NodeId(4)];
+        let mut table = ShardTable::compute_with_epoch(&old_members, 2, 1, 1);
+        let new_table = ShardTable::compute_with_epoch(&new_members, 2, 2, 1);
+        let shard = (0..NUM_SHARDS as u16)
+            .find(|s| {
+                table.target_assignment(*s).master == NodeId(1)
+                    && new_table.target_assignment(*s).master != NodeId(1)
+            })
+            .expect("scale-out must move some node1 master");
+        table.begin_handoff(&new_table);
+        assert_eq!(table.shard_handoff_state(shard), ShardHandoff::Copying);
+
+        let shard_table = Arc::new(ShardTableLock::new(table));
+        let migration = Arc::new(Mutex::new(MigrationManager::new()));
+        migration
+            .lock()
+            .set_replica_abort_forced_resync_enabled(false);
+        let fenced = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+        let migrating = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+        let task = MigrationTask {
+            shard,
+            from_node: NodeId(1),
+            to_node: NodeId(4),
+            is_master: false,
+        };
+        migration.lock().start_outbound(
+            std::slice::from_ref(&task),
+            NodeId(1),
+            &std::collections::HashSet::from([shard]),
+        );
+
+        assert!(terminally_abort_unshippable_task(
+            &migration,
+            &shard_table,
+            &fenced,
+            &migrating,
+            &task,
+            new_table.version,
+        ));
+        assert!(
+            !migration.lock().take_replica_abort_resync_arm(),
+            "with replica_abort_forced_resync_enabled=false the abort must \
+             leave no resync signal",
         );
     }
 

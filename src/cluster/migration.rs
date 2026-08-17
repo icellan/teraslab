@@ -627,6 +627,13 @@ pub struct MigrationManager {
     /// re-vetoing). Same transient/coalescing shape as
     /// [`Self::failed_batch_retry_arm`]: never persisted, reset on restart.
     replica_abort_resync_arm: bool,
+    /// W9 Part B (review P1-2c) — whether a replica-side terminal abort may
+    /// leave the resync arm at all (see `Config`
+    /// `replica_abort_forced_resync_enabled`; default ON). Set once at
+    /// coordinator construction; carried here so the abort site (a free fn
+    /// with no config access) reads it lock-local, mirroring
+    /// [`Self::vetoed_reduction_enabled`]. Never persisted.
+    replica_abort_forced_resync_enabled: bool,
     /// W8 review P0-2 — while set, [`Self::cleanup_completed`] PRESERVES
     /// `Failed` entries (delegating to
     /// [`Self::cleanup_completed_keep_failed`]) so the durable retry queue
@@ -665,18 +672,31 @@ impl MigrationManager {
             next_attempt: 1,
             failed_batch_retry_arm: false,
             replica_abort_resync_arm: false,
+            replica_abort_forced_resync_enabled: true,
             failed_retry_hold: false,
             vetoed_reduction_enabled: false,
         }
     }
 
+    /// W9 Part B — arm/disarm the replica-abort forced resync (default ON;
+    /// set once at coordinator construction from
+    /// `replica_abort_forced_resync_enabled`).
+    pub fn set_replica_abort_forced_resync_enabled(&mut self, enabled: bool) {
+        self.replica_abort_forced_resync_enabled = enabled;
+    }
+
     /// W9 — record that a REPLICA-side migration task was terminally aborted
     /// at this node (the outbound source), leaving its shard under-RF with no
     /// re-planner. The coordinator event loop drains this and force-arms the
-    /// event-repair pass (not gated on the sweep flag). Idempotent /
-    /// coalescing: repeated aborts before a drain collapse into one arm.
+    /// event-repair pass (not gated on the sweep flag, but gated on the
+    /// committed `replica_abort_forced_resync_enabled` policy — review
+    /// P1-2c: a disabled policy records nothing, restoring the documented
+    /// pre-W9 disposition). Idempotent / coalescing: repeated aborts before
+    /// a drain collapse into one arm.
     pub fn arm_replica_abort_resync(&mut self) {
-        self.replica_abort_resync_arm = true;
+        if self.replica_abort_forced_resync_enabled {
+            self.replica_abort_resync_arm = true;
+        }
     }
 
     /// W9 — drain the pending replica-abort resync arm. Returns `true` exactly

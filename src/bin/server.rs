@@ -1848,6 +1848,7 @@ fn main() {
             replication_factor: config.replication_factor,
             committed_master_election_enabled: config.committed_master_election_enabled,
             under_replication_sweep_enabled: config.under_replication_sweep_enabled,
+            replica_abort_forced_resync_enabled: config.replica_abort_forced_resync_enabled,
             migration_vetoed_reduction_enabled: config.migration_vetoed_reduction_enabled,
             probe_interval,
             suspicion_timeout: std::time::Duration::from_millis(config.swim_suspicion_timeout_ms),
