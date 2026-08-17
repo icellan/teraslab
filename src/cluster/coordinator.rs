@@ -1140,6 +1140,34 @@ impl From<bool> for FailedTaskTableAction {
     }
 }
 
+/// The W3 FIX C table disposition for a failed outbound task, PER TASK.
+///
+/// A MASTER handoff rolls the shard back to `self` — the historical
+/// no-loss-safe outcome. A REPLICA-side push leaves the table untouched: it
+/// never table-committed anything, and `rollback_shard` is SHARD-scoped, not
+/// task-scoped, so rolling back on a replica failure reverts whatever else is
+/// happening to that shard.
+///
+/// W10 composition (P1-1) — why every fail site must use this. Before wave
+/// 10, `prepare_resync_backfill` left Phase-H resync tasks untracked, so
+/// `fail_migration_task_current_epoch` returned at its `!tracked` guard
+/// BEFORE any table action and a resync hitting a fail site was a no-op.
+/// Registering resyncs through `start_outbound` made every fail site
+/// reachable by a replica-side task, and the sites that still passed a
+/// blanket `true`/`Rollback` became a dual-serving-master hazard: node1
+/// hands shard S off to node3 (S `Copying`, worker streaming), a resync task
+/// for node2 on the SAME shard passes both dedups (different `to_node`), its
+/// stream fails, the blanket rollback reverts S's assignment to node1 and
+/// stamps `ServingNew` under node3's still-streaming worker — and node3 then
+/// commits mastership too.
+fn failed_task_table_action(task: &MigrationTask) -> FailedTaskTableAction {
+    if task.is_master {
+        FailedTaskTableAction::Rollback
+    } else {
+        FailedTaskTableAction::None
+    }
+}
+
 /// Claim the single topology-catch-up slot.
 ///
 /// `ClusterEvent::TopologyStale` fires once per gossip observation, so in a
@@ -1456,21 +1484,8 @@ fn finalize_enumeration_round(
             task,
             topology_epoch,
             // W10 re-review P2-1: the table action follows the W3 FIX C
-            // disposition PER TASK — only a MASTER handoff rolls the table
-            // back to self; a replica-side task (every Phase-H resync
-            // task) leaves the table untouched. `rollback_shard` is
-            // shard-scoped, not task-scoped: a blanket Rollback here let a
-            // failed replica-only resync round revert a CONCURRENT
-            // mid-Copying master handoff of the same shard (different
-            // to_node, so the drain's dedup admits both) under its
-            // still-streaming worker. Pre-W10 the untracked check bailed
-            // before the action; start_outbound registration made the
-            // hazard reachable.
-            if task.is_master {
-                FailedTaskTableAction::Rollback
-            } else {
-                FailedTaskTableAction::None
-            },
+            // disposition PER TASK (see `failed_task_table_action`).
+            failed_task_table_action(task),
         );
     }
     false
@@ -1504,8 +1519,15 @@ struct RelinquishContext {
 /// (an EMPTY local shard whose committed master is a live, different member);
 /// otherwise roll back to `self` exactly as before.
 ///
+/// A REPLICA-side task never reaches the relinquish oracle at all: its table
+/// disposition is [`failed_task_table_action`] (leave the table untouched),
+/// which is also what `failed_handoff_disposition` would degrade to via
+/// `RollbackToSelf` — except that a rollback is SHARD-scoped and would revert
+/// a concurrent master handoff of the same shard (W10 composition P1-1).
+///
 /// `ctx` is `None` when the caller has no committed-topology snapshot (legacy
-/// / test paths) — in that case this is identical to a `rollback = true` call.
+/// / test paths, and the Phase-H resync drain) — a MASTER handoff then keeps
+/// the historical `rollback = true` behaviour.
 ///
 /// `superset_probe`, when present, is a verify-only network probe of the
 /// rightful master that returns `true` iff that master provably holds a
@@ -1525,6 +1547,25 @@ fn fail_or_relinquish_outbound_task(
     ctx: Option<&RelinquishContext>,
     superset_probe: Option<&dyn Fn() -> bool>,
 ) -> bool {
+    // W10 composition (P1-1) — the W3 FIX C gate comes FIRST: a replica-side
+    // push never table-committed anything, so neither the relinquish oracle
+    // (which returns `RollbackToSelf` for every `!is_master` task anyway) nor
+    // the `None`-context legacy arm may touch the SHARD-scoped table state.
+    // The Phase-H resync drain passes `ctx = None`, and since wave 10 its
+    // tasks are `start_outbound`-tracked, so this arm decides whether a failed
+    // backfill reverts a concurrent mid-Copying master handoff of the same
+    // shard. It must not.
+    if !task.is_master {
+        return fail_migration_task_current_epoch(
+            migration,
+            shard_table,
+            fenced_bm,
+            migrating_bm,
+            task,
+            topology_epoch,
+            failed_task_table_action(task),
+        );
+    }
     let action = match ctx {
         Some(ctx) => {
             let has_pending_inbound = migration.lock().has_pending_inbound(task.shard);
@@ -4039,7 +4080,13 @@ impl ClusterCoordinator {
                                 &migrating_bm_event,
                                 task,
                                 topology_epoch.load(Ordering::Relaxed),
-                                FailedTaskTableAction::Rollback,
+                                // W10 composition (P1-1) — per-task W3 FIX C
+                                // disposition. The reaper walks EVERY active
+                                // migration, which since wave 10 includes
+                                // `start_outbound`-tracked Phase-H resync
+                                // backfills; a stranded replica task must not
+                                // roll back the shard.
+                                failed_task_table_action(task),
                             );
                         }
                     }
@@ -7644,6 +7691,41 @@ fn verify_already_serving_skips(
     (confirmed, demoted)
 }
 
+/// W10 composition review P2-9 — flatten the demoted already-serving
+/// candidates' live key lists into one owned buffer, contributing each
+/// shard's keys AT MOST ONCE.
+///
+/// `verify_already_serving_skips` demotes PER TASK, and one shard can carry
+/// two candidates (the master handoff and a replica push toward the same
+/// `to_node` — the shape a Phase-H resync backfill adds on top of a
+/// topology-plan task). A flat concatenation then pushed that shard's N keys
+/// into `keys_by_shard` twice, so the streaming path built a 2N-entry
+/// manifest against an N-record target and the exact-count completion check
+/// rejected it every round.
+///
+/// A shard with ANY empty demotion contributes NOTHING, whatever its
+/// siblings carry: the empty list is the issue-#46 skip demotion, whose whole
+/// point is to route the shard onto the empty path's skip-aware fenced
+/// recheck instead of streaming (and committing) a readable subset. Making
+/// the fail-safe contribution win is also order-independent, so the result
+/// does not depend on candidate ordering.
+fn demoted_shard_keys(demoted: &[(MigrationTask, Vec<TxKey>)]) -> Vec<TxKey> {
+    let suppressed: std::collections::HashSet<u16> = demoted
+        .iter()
+        .filter(|(_, keys)| keys.is_empty())
+        .map(|(task, _)| task.shard)
+        .collect();
+    let mut seen: std::collections::HashSet<u16> = std::collections::HashSet::new();
+    let mut out: Vec<TxKey> = Vec::new();
+    for (task, keys) in demoted {
+        if suppressed.contains(&task.shard) || !seen.insert(task.shard) {
+            continue;
+        }
+        out.extend(keys.iter().copied());
+    }
+    out
+}
+
 fn should_trigger_topology_reactivation(
     startup_reactivation_due: bool,
     normal_reactivation_due: bool,
@@ -10590,7 +10672,8 @@ fn run_migration_batch(
                     &migrating_bm,
                     task,
                     topology_epoch,
-                    true,
+                    // W10 composition (P1-1) — per-task W3 FIX C disposition.
+                    failed_task_table_action(task),
                 ) {
                     addr_failed += 1;
                 }
@@ -10649,11 +10732,9 @@ fn run_migration_batch(
     let (skipped_tasks, demoted) =
         verify_already_serving_skips(&engine, addr, skip_candidates, topology_epoch, auth_secret);
     // Owned storage for the demoted shards' live keys; must outlive
-    // `keys_by_shard`, which borrows from it.
-    let demoted_keys: Vec<TxKey> = demoted
-        .iter()
-        .flat_map(|(_, keys)| keys.iter().copied())
-        .collect();
+    // `keys_by_shard`, which borrows from it. Deduped per shard — see
+    // `demoted_shard_keys`.
+    let demoted_keys: Vec<TxKey> = demoted_shard_keys(&demoted);
     let mut tasks = tasks;
     tasks.extend(demoted.into_iter().map(|(task, _)| task));
 
@@ -10800,18 +10881,10 @@ fn run_migration_batch(
                     task,
                     topology_epoch,
                     // W10 (reviewer P2): W3 FIX C table disposition per task,
-                    // matching the other fail sites — only a MASTER handoff
-                    // rolls the table back to self; a replica-side task
-                    // (including every skip-demoted already-serving
-                    // candidate the empty-list demotion routes here) leaves
-                    // it untouched, since `rollback_shard` is shard-scoped
-                    // and would revert an unrelated in-flight master handoff
-                    // of the same shard.
-                    if task.is_master {
-                        FailedTaskTableAction::Rollback
-                    } else {
-                        FailedTaskTableAction::None
-                    },
+                    // matching the other fail sites — including every
+                    // skip-demoted already-serving candidate the empty-list
+                    // demotion routes here (see `failed_task_table_action`).
+                    failed_task_table_action(task),
                 ) {
                     failed.fetch_add(1, Ordering::Relaxed);
                 }
@@ -11037,7 +11110,12 @@ fn run_migration_batch(
                                 &migrating_bm,
                                 task,
                                 topology_epoch,
-                                true,
+                                // W10 composition (P1-1) — per-task W3 FIX C
+                                // disposition. Highest-reachability site for a
+                                // resync task: sc08 recorded 46-48 connections
+                                // per resync run exhausting the target's
+                                // per-IP cap, so this arm fires routinely.
+                                failed_task_table_action(task),
                             ) {
                                 failed.fetch_add(1, Ordering::Relaxed);
                             }
@@ -11248,10 +11326,22 @@ fn run_migration_batch(
                             // missing a record, or unreachable) the non-empty copy
                             // rolls back to self (no-loss) and the next re-drive
                             // retries.
-                            let probe_keys = engine.keys_for_shard(task.shard);
-                            let probe_manifest =
+                            // W10 composition (P1-1/P1-4) — build the probe
+                            // manifest ONLY for a master handoff. A
+                            // replica-side task (every Phase-H resync
+                            // backfill) can never relinquish, so the probe is
+                            // never consulted for it — and the collection is
+                            // a full shard enumeration plus a per-key device
+                            // footer read, i.e. exactly the unbounded work
+                            // the sc08 resync failure loop repeated per
+                            // stream failure.
+                            let probe_manifest = if task.is_master {
+                                let probe_keys = engine.keys_for_shard(task.shard);
                                 collect_manifest_entries(&engine, task.shard, &probe_keys)
-                                    .unwrap_or_default();
+                                    .unwrap_or_default()
+                            } else {
+                                Vec::new()
+                            };
                             let probe = || {
                                 if probe_manifest.is_empty() {
                                     return false;
@@ -11301,7 +11391,9 @@ fn run_migration_batch(
                                 &migrating_bm,
                                 task,
                                 topology_epoch,
-                                true,
+                                // W10 composition (P1-1) — per-task W3 FIX C
+                                // disposition.
+                                failed_task_table_action(task),
                             ) {
                                 failed.fetch_add(1, Ordering::Relaxed);
                             }
@@ -11380,11 +11472,7 @@ fn run_migration_batch(
                                 // W3 FIX C disposition (re-review P2-1): only a
                                 // MASTER handoff rolls the table back to self;
                                 // a replica-side task leaves it untouched.
-                                if task.is_master {
-                                    FailedTaskTableAction::Rollback
-                                } else {
-                                    FailedTaskTableAction::None
-                                },
+                                failed_task_table_action(task),
                             ) {
                                 failed.fetch_add(1, Ordering::Relaxed);
                             }
@@ -11441,7 +11529,9 @@ fn run_migration_batch(
                                     &migrating_bm,
                                     task,
                                     topology_epoch,
-                                    true,
+                                    // W10 composition (P1-1) — per-task W3
+                                    // FIX C disposition.
+                                    failed_task_table_action(task),
                                 ) {
                                     failed.fetch_add(1, Ordering::Relaxed);
                                 }
@@ -11503,7 +11593,9 @@ fn run_migration_batch(
                                 &migrating_bm,
                                 task,
                                 topology_epoch,
-                                true,
+                                // W10 composition (P1-1) — per-task W3 FIX C
+                                // disposition.
+                                failed_task_table_action(task),
                             ) {
                                 failed.fetch_add(1, Ordering::Relaxed);
                             }
@@ -11554,7 +11646,9 @@ fn run_migration_batch(
                                     &migrating_bm,
                                     task,
                                     topology_epoch,
-                                    true,
+                                    // W10 composition (P1-1) — per-task W3
+                                    // FIX C disposition.
+                                    failed_task_table_action(task),
                                 ) {
                                     failed.fetch_add(1, Ordering::Relaxed);
                                 }
@@ -39628,5 +39722,290 @@ mod tests {
         for h in [t1, t2, t3] {
             h.join().expect("worker joins");
         }
+    }
+
+    /// W10 COMPOSITION FIX 1 (P1-1) — fixture: shard `S` is mid-handoff
+    /// `node1 -> node3` (state `Copying`, the master's worker still
+    /// streaming), and a REPLICA-side task (the shape every Phase-H resync
+    /// backfill has) exists for the SAME shard toward a different node.
+    ///
+    /// Returns `(shard, epoch, shard_table)`.
+    fn mid_copying_master_handoff_fixture() -> (u16, u64, Arc<ShardTableLock<ShardTable>>) {
+        let old_members = vec![NodeId(1), NodeId(2)];
+        let new_members = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let mut table = ShardTable::compute_with_epoch(&old_members, 2, 3, 1);
+        let new_table = ShardTable::compute_with_epoch(&new_members, 2, 4, 1);
+        let shard = (0..NUM_SHARDS as u16)
+            .find(|&s| {
+                table.target_assignment(s).master == NodeId(1)
+                    && new_table.target_assignment(s).master == NodeId(3)
+            })
+            .expect("a shard whose mastership moves node1 -> node3");
+        table.begin_handoff_with(&new_table, |s| s == shard);
+        assert_eq!(
+            table.shard_handoff_state(shard),
+            ShardHandoff::Copying,
+            "fixture must leave the master handoff mid-Copying",
+        );
+        assert_eq!(table.target_assignment(shard).master, NodeId(3));
+        let epoch = table.version;
+        (shard, epoch, Arc::new(ShardTableLock::new(table)))
+    }
+
+    /// W10 COMPOSITION FIX 1 (P1-1) — the "no address for target" fail site
+    /// blanket-rolled the shard back. Pre-W10 a resync task was untracked, so
+    /// `fail_migration_task_current_epoch` returned at the `!tracked` guard
+    /// BEFORE any table action; `prepare_resync_backfill`'s `start_outbound`
+    /// registration made every fail site reachable by a REPLICA-side task.
+    /// `rollback_shard` is shard-scoped, so the replica task's failure
+    /// reverted the CONCURRENT master handoff of the same shard under its
+    /// still-streaming worker and stamped `ServingNew` — node1 and node3 then
+    /// both believe they master `S` (dual-serving master = double-spend).
+    #[test]
+    fn replica_task_failure_without_target_address_leaves_master_handoff_intact() {
+        let (shard, epoch, shard_table) = mid_copying_master_handoff_fixture();
+        let engine = Arc::new(test_engine());
+        let migration = Arc::new(Mutex::new(MigrationManager::new()));
+        let fenced_bm = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+        let migrating_bm = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+        let inbound_bm = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+
+        // The Phase-H resync backfill shape: replica-side, different to_node,
+        // so both the drain's in-flight dedup and the tracked-active dedup
+        // admit it alongside the master handoff.
+        let resync_task = MigrationTask {
+            shard,
+            from_node: NodeId(1),
+            to_node: NodeId(2),
+            is_master: false,
+        };
+        migration.lock().start_outbound(
+            std::slice::from_ref(&resync_task),
+            NodeId(1),
+            &std::collections::HashSet::new(),
+        );
+
+        let (completed, failed) = run_migration_batch(
+            vec![resync_task],
+            None, // no resolved address for the target
+            &[],
+            engine,
+            &migration,
+            &shard_table,
+            &None,
+            epoch,
+            1,
+            100,
+            fenced_bm,
+            migrating_bm,
+            inbound_bm,
+            NodeId(1),
+            None,
+            None,
+        );
+        assert_eq!(
+            (completed, failed),
+            (0, 1),
+            "the unroutable replica task must still be parked Failed",
+        );
+
+        let table = shard_table.read();
+        assert_eq!(
+            table.shard_handoff_state(shard),
+            ShardHandoff::Copying,
+            "a REPLICA task's failure must not touch the shard table: the \
+             concurrent master handoff is still mid-Copying",
+        );
+        assert_eq!(
+            table.target_assignment(shard).master,
+            NodeId(3),
+            "the master handoff's target assignment must survive a \
+             replica-side failure (rollback here re-installs node1 as master \
+             while node3's worker still streams -> two serving masters)",
+        );
+    }
+
+    /// W10 COMPOSITION FIX 1 (P1-1) — same hazard through
+    /// `fail_or_relinquish_outbound_task`, the site the baseline-streaming
+    /// failure (:11268) and the empty-path completion failure (:10858) use.
+    /// The resync drain passes `relinquish_ctx = None`, which took the
+    /// unconditional `FailedTaskTableAction::Rollback` arm.
+    #[test]
+    fn replica_task_stream_failure_leaves_master_handoff_intact() {
+        let (shard, epoch, shard_table) = mid_copying_master_handoff_fixture();
+        let migration = Arc::new(Mutex::new(MigrationManager::new()));
+        let fenced_bm = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+        let migrating_bm = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+
+        let resync_task = MigrationTask {
+            shard,
+            from_node: NodeId(1),
+            to_node: NodeId(2),
+            is_master: false,
+        };
+        migration.lock().start_outbound(
+            std::slice::from_ref(&resync_task),
+            NodeId(1),
+            &std::collections::HashSet::new(),
+        );
+
+        assert!(
+            fail_or_relinquish_outbound_task(
+                &migration,
+                &shard_table,
+                &fenced_bm,
+                &migrating_bm,
+                &resync_task,
+                epoch,
+                None, // the resync drain's context
+                None,
+            ),
+            "the tracked replica task must be retired as Failed",
+        );
+
+        let table = shard_table.read();
+        assert_eq!(
+            table.shard_handoff_state(shard),
+            ShardHandoff::Copying,
+            "a replica-side stream failure must leave the concurrent master \
+             handoff mid-Copying",
+        );
+        assert_eq!(table.target_assignment(shard).master, NodeId(3));
+    }
+
+    /// W10 COMPOSITION FIX 1 — control: the MASTER handoff's own failure
+    /// keeps the historical no-loss rollback-to-self disposition. The
+    /// per-task gate must narrow the blast radius to replica tasks only.
+    #[test]
+    fn master_task_failure_still_rolls_the_shard_back_to_self() {
+        let (shard, epoch, shard_table) = mid_copying_master_handoff_fixture();
+        let migration = Arc::new(Mutex::new(MigrationManager::new()));
+        let fenced_bm = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+        let migrating_bm = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+
+        let master_task = MigrationTask {
+            shard,
+            from_node: NodeId(1),
+            to_node: NodeId(3),
+            is_master: true,
+        };
+        migration.lock().start_outbound(
+            std::slice::from_ref(&master_task),
+            NodeId(1),
+            &std::collections::HashSet::new(),
+        );
+
+        assert!(fail_or_relinquish_outbound_task(
+            &migration,
+            &shard_table,
+            &fenced_bm,
+            &migrating_bm,
+            &master_task,
+            epoch,
+            None,
+            None,
+        ));
+
+        let table = shard_table.read();
+        assert_eq!(
+            table.target_assignment(shard).master,
+            NodeId(1),
+            "a failed MASTER handoff still rolls back to self (no-loss)",
+        );
+        assert_eq!(table.shard_handoff_state(shard), ShardHandoff::ServingNew);
+    }
+
+    /// W10 COMPOSITION FIX 4 (P2-9) — two demoted already-serving candidates
+    /// for the SAME shard (the master task and a replica task toward the same
+    /// `to_node`) each carry that shard's full live key list. Flattening them
+    /// concatenated the list twice into `keys_by_shard`, so the shard streamed
+    /// a 2N-entry manifest against an N-record target and the completion was
+    /// rejected on the exact-count check every round.
+    #[test]
+    fn demoted_shard_keys_dedups_two_candidates_for_one_shard() {
+        let shard = 42u16;
+        let keys: Vec<TxKey> = (0..3).map(|i| tx_key_for_shard(shard, i)).collect();
+        let master = MigrationTask {
+            shard,
+            from_node: NodeId(1),
+            to_node: NodeId(2),
+            is_master: true,
+        };
+        let replica = MigrationTask {
+            shard,
+            from_node: NodeId(1),
+            to_node: NodeId(2),
+            is_master: false,
+        };
+        let demoted = vec![(master, keys.clone()), (replica, keys.clone())];
+        // Pin the defect shape the fixture reproduces: the pre-fix flat
+        // concatenation contributed the shard's keys once PER TASK.
+        let pre_fix_concat: Vec<TxKey> = demoted
+            .iter()
+            .flat_map(|(_, k)| k.iter().copied())
+            .collect();
+        assert_eq!(
+            pre_fix_concat.len(),
+            keys.len() * 2,
+            "fixture must reproduce the pre-fix doubling",
+        );
+        let flattened = demoted_shard_keys(&demoted);
+        assert_eq!(
+            flattened, keys,
+            "one shard contributes its key set ONCE, however many demoted \
+             tasks name it (a doubled list = guaranteed count-mismatch)",
+        );
+    }
+
+    /// W10 COMPOSITION FIX 4 (P2-9) — an EMPTY demotion (the issue-#46
+    /// skip-aware demotion) for a shard must win over a non-empty sibling:
+    /// contributing keys would route the shard onto the data path, where a
+    /// short manifest can be streamed-verified-and-COMMITTED. The empty
+    /// contribution routes it to the empty path's skip-aware fenced recheck.
+    #[test]
+    fn demoted_shard_keys_empty_demotion_wins_over_a_sibling_key_list() {
+        let shard = 7u16;
+        let keys: Vec<TxKey> = (0..2).map(|i| tx_key_for_shard(shard, i)).collect();
+        let a = MigrationTask {
+            shard,
+            from_node: NodeId(1),
+            to_node: NodeId(2),
+            is_master: true,
+        };
+        let b = MigrationTask {
+            shard,
+            from_node: NodeId(1),
+            to_node: NodeId(3),
+            is_master: false,
+        };
+        let demoted = vec![(a, keys.clone()), (b, Vec::new())];
+        assert!(
+            demoted_shard_keys(&demoted).is_empty(),
+            "a skip demotion (empty key list) must suppress the shard's keys",
+        );
+        let demoted_rev = vec![
+            (
+                MigrationTask {
+                    shard,
+                    from_node: NodeId(1),
+                    to_node: NodeId(3),
+                    is_master: false,
+                },
+                Vec::new(),
+            ),
+            (
+                MigrationTask {
+                    shard,
+                    from_node: NodeId(1),
+                    to_node: NodeId(2),
+                    is_master: true,
+                },
+                keys,
+            ),
+        ];
+        assert!(
+            demoted_shard_keys(&demoted_rev).is_empty(),
+            "order must not matter — the fail-safe empty contribution wins",
+        );
     }
 }
