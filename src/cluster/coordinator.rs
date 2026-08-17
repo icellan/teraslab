@@ -2254,18 +2254,37 @@ fn old_master_available_for_handoff(
 /// the `OP_PARTITION_VERSION_REPORT` dispatch handler).
 pub const PARTITION_FLAG_PENDING_INBOUND: u8 = 0b10;
 
+/// [`PartitionVersionEntry::flags`] bit 2 (recency-unknown, W10 P0-1): the
+/// reporting node's recency fields (`manifest_digest` + `max_generation`)
+/// carry NO EVIDENCE about the shard's current content — its recency cache
+/// has not scanned the shard since boot, or scanned it while empty and
+/// records have since arrived. `last_applied_seq` (the live record count)
+/// stays honest. Reverse-heal consumers must treat an UNKNOWN side as
+/// absent evidence: no SUSPECT flag, no direction verdict, no
+/// `max_generation` ranking (the F1 "no evidence is not evidence of
+/// divergence" posture) — without this, a node booting WITH data reported
+/// digest-of-empty/max-gen-0 for every held shard until its first
+/// whole-store scan, and the online re-heal fenced every mastered shard on
+/// each rolling restart. Kept in sync with the bit set by
+/// `build_self_partition_version_entries` (the shared responder for both
+/// the in-process self-report and the wire handler).
+pub const PARTITION_FLAG_RECENCY_UNKNOWN: u8 = 0b100;
+
 /// One node's view of a single shard's local data state.
 ///
 /// Reported by every alive peer during the post-commit exchange phase so the
 /// coordinator can build a migration plan that reflects the *actual* on-disk
 /// distribution rather than a topology-derived guess.
 ///
-/// `flags` packs two booleans:
+/// `flags` packs three booleans:
 /// - bit 0 (`0b01`): this node believes it is the master of `shard` in the
 ///   currently active shard table.
 /// - bit 1 (`0b10`): this node has a pending inbound migration for `shard`
 ///   (i.e. is a subset master receiving data). See
 ///   [`PARTITION_FLAG_PENDING_INBOUND`].
+/// - bit 2 (`0b100`): the entry's recency fields are NO EVIDENCE (recency
+///   cache unscanned / scanned-empty-then-populated). See
+///   [`PARTITION_FLAG_RECENCY_UNKNOWN`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PartitionVersionEntry {
     /// Shard number (0..NUM_SHARDS).
@@ -8578,8 +8597,10 @@ pub(crate) fn build_self_partition_version_entries(
 ) -> Vec<PartitionVersionEntry> {
     // Decide participation from the O(1) shard counters and read the cached
     // recency per shard — everything here is RAM, so the shard-table read
-    // lock is held only for this single pass.
+    // lock is held only for this single pass. P2-7: ONE recency-snapshot
+    // read guard for the whole loop, not one per shard.
     let mut entries: Vec<PartitionVersionEntry> = Vec::with_capacity(NUM_SHARDS);
+    let recency = engine.recency_cache_reader();
     let table = shard_table.read();
     for shard in 0..NUM_SHARDS as u16 {
         let count = engine.shard_record_count(shard);
@@ -8595,17 +8616,24 @@ pub(crate) fn build_self_partition_version_entries(
             flags |= 0b01;
         }
         if is_subset {
-            flags |= 0b10;
+            flags |= PARTITION_FLAG_PENDING_INBOUND;
+        }
+        // W10 P0-1 — resolve the fingerprint AND whether it is evidence at
+        // all against the live count; an unscanned (or scanned-empty but
+        // now-populated) shard is flagged RECENCY_UNKNOWN so no consumer
+        // mistakes fabricated emptiness for a real divergence signal.
+        let (value, recency_unknown) = recency.get(shard).resolve(count);
+        if recency_unknown {
+            flags |= PARTITION_FLAG_RECENCY_UNKNOWN;
         }
         let replica_count = u8::try_from(assignment.replicas.len().min(255)).unwrap_or(255);
-        let (_cached_count, manifest_digest, max_generation) = engine.shard_recency_cached(shard);
         entries.push(PartitionVersionEntry {
             shard,
             flags,
             replica_count,
             last_applied_seq: count,
-            manifest_digest,
-            max_generation,
+            manifest_digest: value.digest,
+            max_generation: value.max_generation,
         });
     }
     entries
@@ -8760,25 +8788,35 @@ pub struct ShardRecency {
     pub digest: u64,
     /// Maximum record generation under WRAPPING-serial ordering (0 when empty).
     pub max_generation: u32,
+    /// W10 P0-1 — `digest`/`max_generation` carry NO EVIDENCE (the
+    /// reporter's recency cache had not scanned the shard's current
+    /// content). `count` stays honest. See
+    /// [`PARTITION_FLAG_RECENCY_UNKNOWN`] for the consumer contract.
+    pub recency_unknown: bool,
 }
 
 impl ShardRecency {
-    /// Build from the `Engine::shard_recency` tuple `(count, digest, max_gen)`.
+    /// Build from the `Engine::shard_recency` tuple `(count, digest, max_gen)`
+    /// — a DIRECT scan, so the recency is always known evidence.
     pub fn from_engine(recency: (u64, u64, u32)) -> Self {
         Self {
             count: recency.0,
             digest: recency.1,
             max_generation: recency.2,
+            recency_unknown: false,
         }
     }
 
     /// Read the recency a peer reported for a shard out of its
-    /// [`PartitionVersionEntry`] (`last_applied_seq` is the record-count proxy).
+    /// [`PartitionVersionEntry`] (`last_applied_seq` is the record-count
+    /// proxy; the [`PARTITION_FLAG_RECENCY_UNKNOWN`] bit marks the
+    /// fingerprint fields as no-evidence).
     pub fn from_entry(entry: &PartitionVersionEntry) -> Self {
         Self {
             count: entry.last_applied_seq,
             digest: entry.manifest_digest,
             max_generation: entry.max_generation,
+            recency_unknown: entry.flags & PARTITION_FLAG_RECENCY_UNKNOWN != 0,
         }
     }
 }
@@ -8812,12 +8850,28 @@ impl ShardRecency {
 /// property, enforced by the authoritative, generation-aware, tombstone-aware
 /// `confirm_target_holds_superset` manifest exchange — NOT a Phase-1 detection
 /// property. An empty `replica_recencies`, or all-matching digests, never flags.
+///
+/// # W10 P0-1 — UNKNOWN recency is NO evidence
+///
+/// A side flagged [`ShardRecency::recency_unknown`] (its recency cache has
+/// not evidenced the shard's current content) contributes NOTHING here: a
+/// self-UNKNOWN shard is never SUSPECT and an UNKNOWN replica is skipped.
+/// A digest "mismatch" against a fabricated empty fingerprint is not a
+/// divergence signal — the same posture as F1's honest absence — and the
+/// classification feeds the Phase-3b path that FENCES, so a wrong flag
+/// here is destructive, not merely noisy. The shard is re-evaluated as
+/// soon as the unknown side's paced scan completes (the source-view
+/// signature includes the unknown bit, so the transition re-arms it).
 pub fn is_shard_stale_vs_replicas(
     self_recency: ShardRecency,
     replica_recencies: &[ShardRecency],
 ) -> bool {
+    if self_recency.recency_unknown {
+        return false;
+    }
     replica_recencies
         .iter()
+        .filter(|replica| !replica.recency_unknown)
         .any(|replica| replica.digest != self_recency.digest)
 }
 
@@ -8860,6 +8914,7 @@ pub(crate) fn detect_stale_shards_from_view(
             count: 0,
             digest: 0,
             max_generation: 0,
+            recency_unknown: false,
         });
         let replica_recencies: Vec<ShardRecency> = assignment
             .replicas
@@ -8893,12 +8948,27 @@ pub(crate) fn detect_stale_shards_from_view(
 /// `max_generation` + `count`, different digest) — that case is left to the
 /// authoritative per-record manifest exchange the boot heal runs. The trade is
 /// deliberate: it guarantees an ahead/equal master is never fenced online.
+///
+/// # W10 P0-1 — UNKNOWN recency yields NO direction verdict
+///
+/// This gate is the DESTRUCTIVE consumer: a `self_behind` verdict fences
+/// the shard and queues a baseline pull. A self report whose recency is
+/// [`ShardRecency::recency_unknown`] serves `max_generation 0` as a
+/// placeholder, so any real replica would "outrank" it and every mastered
+/// shard would be fenced on each rolling restart (the armed
+/// boot-with-data shape). No verdict is therefore produced when self is
+/// UNKNOWN, and an UNKNOWN replica's placeholder fields are skipped. The
+/// verdict resumes at the unknown side's next completed scan.
 pub fn is_self_behind_any_replica_coarse(
     self_recency: ShardRecency,
     replica_recencies: &[ShardRecency],
 ) -> bool {
+    if self_recency.recency_unknown {
+        return false;
+    }
     replica_recencies
         .iter()
+        .filter(|r| !r.recency_unknown)
         .any(|r| r.max_generation > self_recency.max_generation || r.count > self_recency.count)
 }
 
@@ -8929,9 +8999,13 @@ pub(crate) struct RehealCandidate {
 /// defers a heal to the next signature change, never loses data.
 fn shard_view_signature(self_recency: ShardRecency, replica_recencies: &[ShardRecency]) -> u64 {
     use std::hash::{Hash, Hasher};
-    let mut replicas: Vec<(u64, u64, u32)> = replica_recencies
+    // W10 P0-1 — `recency_unknown` is part of the signature so an
+    // UNKNOWN→known transition (a reporter's first scan completing)
+    // changes the source-view signature and re-arms evaluation for a
+    // shard parked in the not-behind backoff cache.
+    let mut replicas: Vec<(u64, u64, u32, bool)> = replica_recencies
         .iter()
-        .map(|r| (r.count, r.digest, r.max_generation))
+        .map(|r| (r.count, r.digest, r.max_generation, r.recency_unknown))
         .collect();
     replicas.sort_unstable();
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -8939,6 +9013,7 @@ fn shard_view_signature(self_recency: ShardRecency, replica_recencies: &[ShardRe
         self_recency.count,
         self_recency.digest,
         self_recency.max_generation,
+        self_recency.recency_unknown,
     )
         .hash(&mut hasher);
     replicas.hash(&mut hasher);
@@ -8982,6 +9057,7 @@ pub(crate) fn classify_stale_mastered_shards(
             count: 0,
             digest: 0,
             max_generation: 0,
+            recency_unknown: false,
         });
         let replica_recencies: Vec<ShardRecency> = assignment
             .replicas
@@ -9351,13 +9427,20 @@ where
 /// WRAPPING-serial ordering, then higher live count, then higher node id as a
 /// deterministic final tiebreak. Returns `true` iff `a` is strictly more recent
 /// than `b`.
+///
+/// W10 P0-1 — the `max_generation` leg compares only when BOTH sides carry
+/// KNOWN recency: an UNKNOWN reporter's `max_generation` is a placeholder
+/// zero, and ranking on it made any known laggard outrank a
+/// freshly-restarted (pre-first-scan) replica holding strictly more
+/// records. With either side UNKNOWN the ranking falls through to the
+/// LIVE count (honest on every reporter), then the node-id tiebreak.
 fn heal_source_more_recent(
     a: ShardRecency,
     a_node: NodeId,
     b: ShardRecency,
     b_node: NodeId,
 ) -> bool {
-    if a.max_generation != b.max_generation {
+    if !a.recency_unknown && !b.recency_unknown && a.max_generation != b.max_generation {
         return crate::record::generation_target_ahead(b.max_generation, a.max_generation);
     }
     if a.count != b.count {
@@ -30765,6 +30848,194 @@ mod tests {
         (cluster, shard, replica)
     }
 
+    /// W10 P0-1 — a KNOWN-recency replica entry for the fabricated-emptiness
+    /// tests: non-zero count, a real digest, and a max_generation any
+    /// pre-fix comparison would rank ahead of an unrefreshed self report.
+    fn known_replica_entry(shard: u16) -> PartitionVersionEntry {
+        PartitionVersionEntry {
+            shard,
+            flags: 0,
+            replica_count: 1,
+            last_applied_seq: 1,
+            manifest_digest: 0xBBBB,
+            max_generation: 100,
+        }
+    }
+
+    /// W10 P0-1 (trigger A — boot with data, destructive self-fence): a node
+    /// whose recency cache has NOT completed its first scan serves live
+    /// counts with NO fingerprint evidence. Driving the REAL report builder
+    /// on a seeded, UNREFRESHED engine used to produce
+    /// `count>0 + digest-of-empty + max_generation 0` for every held shard;
+    /// a replica reporting real recency then made
+    /// `is_self_behind_any_replica_coarse` flag self behind, and
+    /// `run_online_reheal` FENCED the mastered shard (heal_pending →
+    /// Transitioning — keyspace unavailable) and queued a baseline pull —
+    /// deterministically, on every rolling restart at RF≥2 with reverse-heal
+    /// on. The built entry must carry `PARTITION_FLAG_RECENCY_UNKNOWN` and
+    /// the online re-heal must treat it as NO EVIDENCE: nothing fenced,
+    /// nothing pulled, the master keeps serving.
+    #[test]
+    fn online_reheal_ignores_unrefreshed_boot_recency() {
+        let (cluster, shard, replica) = three_node_cluster_mastering_with_replica();
+        let k = key_for_shard(shard);
+        assert!(
+            matches!(cluster.is_master(&k), MasterQueryResult::Yes),
+            "precondition: the node masters + serves the shard",
+        );
+
+        // Seeded engine, recency cache NEVER refreshed (the boot shape).
+        let engine = test_engine();
+        create_test_record(&engine, tx_key_for_shard(shard, 1));
+        create_test_record(&engine, tx_key_for_shard(shard, 2));
+        assert!(engine.recency_cache_is_stale());
+
+        // The REAL production builder — not a hand-built view.
+        let self_entries = build_self_partition_version_entries(
+            NodeId(1),
+            &engine,
+            &cluster.shard_table(),
+            cluster.inbound_bitmap(),
+        );
+        let self_entry = self_entries
+            .iter()
+            .find(|e| e.shard == shard)
+            .expect("the seeded mastered shard must be reported");
+        assert_eq!(
+            self_entry.last_applied_seq, 2,
+            "the live count stays honest"
+        );
+        assert_ne!(
+            self_entry.flags & PARTITION_FLAG_RECENCY_UNKNOWN,
+            0,
+            "an unrefreshed populated shard must be flagged RECENCY_UNKNOWN — \
+             its fingerprint fields are fabricated emptiness, not evidence",
+        );
+
+        let mut view: std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>> =
+            std::collections::HashMap::new();
+        view.insert(NodeId(1), self_entries);
+        view.insert(replica, vec![known_replica_entry(shard)]);
+
+        assert_eq!(
+            cluster.run_online_reheal(&view),
+            0,
+            "no evidence is not evidence of divergence: an UNKNOWN self report \
+             must fence NOTHING (the armed rolling-restart self-fence)",
+        );
+        assert!(
+            matches!(cluster.is_master(&k), MasterQueryResult::Yes),
+            "the master keeps serving through its pre-first-scan window",
+        );
+        assert!(
+            cluster
+                .migration
+                .lock()
+                .pending_inbound_entries()
+                .is_empty(),
+            "no baseline pull may be queued from an UNKNOWN self report",
+        );
+    }
+
+    /// W10 P0-1 (trigger B — empty→populated after a scan): a shard that
+    /// gains its FIRST records after the last completed scan keeps the
+    /// scanned-empty fingerprint. Serving that as KNOWN made every
+    /// migration completion into the shard look like a divergence
+    /// (fence/unfence thrash). The entry must resolve RECENCY_UNKNOWN and
+    /// the online re-heal must skip it.
+    #[test]
+    fn online_reheal_ignores_post_scan_populated_shard() {
+        let (cluster, shard, replica) = three_node_cluster_mastering_with_replica();
+        let k = key_for_shard(shard);
+
+        // A completed scan covered the store while the shard was EMPTY…
+        let engine = test_engine();
+        engine.refresh_shard_recency_cache();
+        assert!(!engine.recency_cache_is_stale());
+        // …then the shard gained its first records (migration completion /
+        // first writes) with no rescan yet.
+        create_test_record(&engine, tx_key_for_shard(shard, 3));
+        assert!(engine.recency_cache_is_stale());
+
+        let self_entries = build_self_partition_version_entries(
+            NodeId(1),
+            &engine,
+            &cluster.shard_table(),
+            cluster.inbound_bitmap(),
+        );
+        let self_entry = self_entries
+            .iter()
+            .find(|e| e.shard == shard)
+            .expect("the populated mastered shard must be reported");
+        assert_ne!(
+            self_entry.flags & PARTITION_FLAG_RECENCY_UNKNOWN,
+            0,
+            "a shard populated AFTER the last scan must be flagged \
+             RECENCY_UNKNOWN — its scanned-empty fingerprint is not evidence \
+             about the records now present",
+        );
+
+        let mut view: std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>> =
+            std::collections::HashMap::new();
+        view.insert(NodeId(1), self_entries);
+        view.insert(replica, vec![known_replica_entry(shard)]);
+
+        assert_eq!(
+            cluster.run_online_reheal(&view),
+            0,
+            "a post-scan-populated shard must not be fenced off its \
+             scanned-empty fingerprint (migration-completion re-fence thrash)",
+        );
+        assert!(
+            matches!(cluster.is_master(&k), MasterQueryResult::Yes),
+            "the master keeps serving the freshly-populated shard",
+        );
+    }
+
+    /// W10 P0-1 (part 3) — heal-source RANKING must ignore
+    /// `max_generation` from an UNKNOWN reporter and rank on the live
+    /// count. Pre-fix, a known reporter's generation always outranked an
+    /// unknown reporter's zero, so a freshly-restarted replica holding
+    /// MORE records lost the source election to a known laggard purely on
+    /// a fabricated generation comparison.
+    #[test]
+    fn heal_source_ranking_ignores_unknown_reporter_generation() {
+        let shard = 7u16;
+        let unknown_full = NodeId(2);
+        let known_laggard = NodeId(3);
+        let mut view: std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>> =
+            std::collections::HashMap::new();
+        view.insert(
+            unknown_full,
+            vec![PartitionVersionEntry {
+                shard,
+                flags: PARTITION_FLAG_RECENCY_UNKNOWN,
+                replica_count: 1,
+                last_applied_seq: 9,
+                manifest_digest: 0,
+                max_generation: 0,
+            }],
+        );
+        view.insert(
+            known_laggard,
+            vec![PartitionVersionEntry {
+                shard,
+                flags: 0,
+                replica_count: 1,
+                last_applied_seq: 5,
+                manifest_digest: 0xCCCC,
+                max_generation: 100,
+            }],
+        );
+        assert_eq!(
+            select_heal_source(NodeId(1), &[unknown_full, known_laggard], &view, shard),
+            Some(unknown_full),
+            "an UNKNOWN reporter's max_generation is not evidence — the \
+             source ranking must fall back to the live count, picking the \
+             fuller replica",
+        );
+    }
+
     /// Reverse-heal Phase 3b (RED→GREEN) — a mastered shard that becomes stale at
     /// RUNTIME (a live replica reports a divergent digest in the freshest
     /// partition view, NOT at boot) is detected and healed via the ONLINE path:
@@ -35521,11 +35792,13 @@ mod tests {
             count: 5,
             digest: 0xAAAA,
             max_generation: 100,
+            recency_unknown: false,
         };
         let replica_recency = ShardRecency {
             count: 6,
             digest: 0xBBBB,
             max_generation: 101,
+            recency_unknown: false,
         };
         let stale = is_shard_stale_vs_replicas(self_recency, &[replica_recency]);
         assert!(stale, "Tier-2 catches the gap Tier-1 missed");
@@ -35546,11 +35819,13 @@ mod tests {
             count: 2,
             digest: 0xA1A1,
             max_generation: 10,
+            recency_unknown: false,
         };
         let replica_recency = ShardRecency {
             count: 2,
             digest: 0xB2B2,
             max_generation: 10,
+            recency_unknown: false,
         };
         assert!(
             is_shard_stale_vs_replicas(self_recency, &[replica_recency]),
@@ -35574,11 +35849,13 @@ mod tests {
             count: 1,
             digest: 0x1111,
             max_generation: 5,
+            recency_unknown: false,
         };
         let behind_replica = ShardRecency {
             count: 2,
             digest: 0x2222,
             max_generation: 5,
+            recency_unknown: false,
         };
         assert!(
             is_shard_stale_vs_replicas(self_recency, &[behind_replica]),
@@ -35596,6 +35873,7 @@ mod tests {
             count: 3,
             digest: 0xF00D,
             max_generation: 42,
+            recency_unknown: false,
         };
         assert!(
             !is_shard_stale_vs_replicas(self_recency, &[]),
@@ -35608,6 +35886,7 @@ mod tests {
             count: 99,
             digest: 0xF00D,
             max_generation: 7,
+            recency_unknown: false,
         };
         assert!(
             !is_shard_stale_vs_replicas(self_recency, &[matching_digest, matching_digest]),
@@ -35630,6 +35909,7 @@ mod tests {
             count: 5,
             digest: 0xAAAA,
             max_generation: 100,
+            recency_unknown: false,
         };
 
         // Empty replica set → never behind.
@@ -35640,6 +35920,7 @@ mod tests {
             count: 5,
             digest: 0xBBBB,
             max_generation: 101,
+            recency_unknown: false,
         };
         assert!(is_self_behind_any_replica_coarse(
             self_recency,
@@ -35651,6 +35932,7 @@ mod tests {
             count: 6,
             digest: 0xBBBB,
             max_generation: 100,
+            recency_unknown: false,
         };
         assert!(is_self_behind_any_replica_coarse(
             self_recency,
@@ -35663,6 +35945,7 @@ mod tests {
             count: 3,
             digest: 0xBBBB,
             max_generation: 90,
+            recency_unknown: false,
         };
         assert!(!is_self_behind_any_replica_coarse(
             self_recency,
@@ -35675,6 +35958,7 @@ mod tests {
             count: 5,
             digest: 0xCCCC,
             max_generation: 100,
+            recency_unknown: false,
         };
         assert!(!is_self_behind_any_replica_coarse(
             self_recency,

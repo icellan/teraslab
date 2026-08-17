@@ -3188,20 +3188,45 @@ impl Engine {
     ///
     /// The fingerprint can trail live writes by up to one refresh cycle
     /// (see the staleness rationale in [`crate::ops::recency`]); the
-    /// count is always current.
+    /// count is always current. Whether the fingerprint is EVIDENCE at
+    /// all is a separate question — see [`Self::shard_recency_unknown`];
+    /// bulk callers (the report builder) use
+    /// [`Self::recency_cache_reader`] and resolve both together under one
+    /// lock.
     pub fn shard_recency_cached(&self, shard: u16) -> (u64, u64, u32) {
-        let value = self.recency_cache.get(shard);
-        (
-            self.shard_record_count(shard),
-            value.digest,
-            value.max_generation,
-        )
+        let live_count = self.shard_record_count(shard);
+        let (value, _unknown) = self.recency_cache.get(shard).resolve(live_count);
+        (live_count, value.digest, value.max_generation)
+    }
+
+    /// W10 P0-1 — is the cached recency for `shard` NO EVIDENCE about its
+    /// current content (records exist now, but no scan since boot has
+    /// evidenced any record for the shard)? An UNKNOWN shard's
+    /// fingerprint must not feed reverse-heal suspicion, direction, or
+    /// source ranking — see [`crate::ops::recency`]'s serving-semantics
+    /// doc for why fabricated emptiness is destructive there.
+    pub fn shard_recency_unknown(&self, shard: u16) -> bool {
+        let live_count = self.shard_record_count(shard);
+        self.recency_cache.get(shard).resolve(live_count).1
+    }
+
+    /// W10 FIX 1 — one read guard over the recency snapshot, for callers
+    /// that resolve many shards (the report builder): one lock instead of
+    /// one per shard (P2-7).
+    pub fn recency_cache_reader(&self) -> crate::ops::recency::SnapshotReader<'_> {
+        self.recency_cache.read()
     }
 
     /// W10 FIX 1 — has any record mutation landed since the last
     /// completed recency refresh?
     pub fn recency_cache_is_stale(&self) -> bool {
         self.recency_cache.is_stale()
+    }
+
+    /// W10 P1-1 — point-in-time recency scan statistics for the metrics
+    /// endpoint.
+    pub fn recency_scan_stats(&self) -> crate::ops::recency::RecencyScanStats {
+        self.recency_cache.scan_stats()
     }
 
     /// W10 FIX 1 — recompute the shard-recency cache from the index and
@@ -3211,64 +3236,111 @@ impl Engine {
     /// Never call this from a dispatch handler or inside the exchange
     /// window; production paths go through
     /// [`Self::maybe_refresh_shard_recency_cache`], which runs this on a
-    /// background thread.
+    /// background thread and paces it
+    /// ([`crate::ops::recency::RECENCY_REFRESH_MIN_INTERVAL`]).
     ///
     /// The mutation stamp is captured BEFORE the scan, so a write racing
     /// the scan leaves the published snapshot stale and the next trigger
     /// refreshes again — the cache can under-report freshness, never
     /// over-report it.
+    ///
+    /// Skipped keys (unreadable footer / raced deletion — P2-8): the
+    /// enumeration reports ONE aggregate skip count, so a partially
+    /// skipped shard cannot be individually marked; the count is metered
+    /// ([`crate::ops::recency::RecencyScanStats::skipped_keys_total`]),
+    /// and the direction of the error is fail-safe for detection (a
+    /// missing record makes OUR digest differ from a peer actually
+    /// holding it → SUSPECT → the authoritative Phase-2 confirm
+    /// arbitrates). A shard whose EVERY record was skipped publishes
+    /// `had_records == false` and resolves recency-UNKNOWN whenever its
+    /// live count is non-zero.
     pub fn refresh_shard_recency_cache(&self) {
+        let started = std::time::Instant::now();
         let stamp = self.recency_cache.stamp_for_refresh();
         // Scan every shard that currently holds records; a shard with no
-        // records has the constant empty fingerprint (no keys to read).
+        // records at scan time publishes the scanned-empty state (honest
+        // while its live count stays zero; UNKNOWN the moment records
+        // arrive — see `CachedShardRecency::resolve`).
         let populated: std::collections::HashSet<u16> = (0..crate::cluster::shards::NUM_SHARDS
             as u16)
             .filter(|s| self.shard_record_count(*s) > 0)
             .collect();
-        let mut table =
-            vec![crate::ops::recency::empty_shard_recency(); crate::cluster::shards::NUM_SHARDS];
+        let mut table = vec![
+            crate::ops::recency::CachedShardRecency::Scanned {
+                value: crate::ops::recency::empty_shard_recency(),
+                had_records: false,
+            };
+            crate::cluster::shards::NUM_SHARDS
+        ];
+        let mut skipped_total = 0u64;
         if !populated.is_empty() {
-            let (keys_by_shard, _skipped) = self.keys_by_shard_filtered(&populated);
+            let (keys_by_shard, skipped) = self.keys_by_shard_filtered(&populated);
+            skipped_total = skipped as u64;
             for (shard, keys) in keys_by_shard {
-                let (_count, digest, max_generation) = self.recency_for_keys(&keys);
+                let (scan_count, digest, max_generation) = self.recency_for_keys(&keys);
                 if let Some(slot) = table.get_mut(shard as usize) {
-                    *slot = crate::ops::recency::ShardRecencyValue {
-                        digest,
-                        max_generation,
+                    *slot = crate::ops::recency::CachedShardRecency::Scanned {
+                        value: crate::ops::recency::ShardRecencyValue {
+                            digest,
+                            max_generation,
+                        },
+                        had_records: scan_count > 0,
                     };
                 }
             }
         }
-        self.recency_cache.publish(stamp, table);
+        self.recency_cache
+            .publish(stamp, table, started.elapsed(), skipped_total);
     }
 
     /// W10 FIX 1 — kick an off-thread [`Self::refresh_shard_recency_cache`]
-    /// if the cache is stale and no refresh is already in flight. Returns
-    /// `true` when a refresh thread was spawned. Non-blocking; callers
-    /// serve the current snapshot immediately and rely on a later report
-    /// (e.g. the exchange's 500 ms re-query cadence) observing the
-    /// refreshed values.
+    /// if a refresh is DUE (stale AND past the P1-1 minimum interval
+    /// since the last completed scan) and none is already in flight.
+    /// Returns `true` when a refresh thread was spawned. Non-blocking;
+    /// callers serve the current snapshot immediately and rely on a later
+    /// report (e.g. the exchange's 500 ms re-query cadence, or the next
+    /// re-heal round) observing the refreshed values.
+    ///
+    /// W10 P1-2 — a FAILED thread spawn (resource exhaustion) releases
+    /// the single-flight slot inline, meters
+    /// [`crate::ops::recency::RecencyScanStats::spawn_failures`], and
+    /// returns `false` — it never panics the calling dispatch worker and
+    /// never freezes the cache.
     pub fn maybe_refresh_shard_recency_cache(self: &Arc<Self>) -> bool {
-        if !self.recency_cache.is_stale() {
+        if !self.recency_cache.refresh_due() {
             return false;
         }
         if !self.recency_cache.claim_refresh_slot() {
             return false;
         }
         let engine = Arc::clone(self);
-        std::thread::spawn(move || {
-            /// Unwind-safe release: the single-flight slot is freed even
-            /// if the scan panics, so a failed refresh can be retried.
-            struct ReleaseSlot(Arc<Engine>);
-            impl Drop for ReleaseSlot {
-                fn drop(&mut self) {
-                    self.0.recency_cache.release_refresh_slot();
+        let spawned = std::thread::Builder::new()
+            .name("teraslab-recency-refresh".to_string())
+            .spawn(move || {
+                /// Unwind-safe release: the single-flight slot is freed even
+                /// if the scan panics, so a failed refresh can be retried.
+                struct ReleaseSlot(Arc<Engine>);
+                impl Drop for ReleaseSlot {
+                    fn drop(&mut self) {
+                        self.0.recency_cache.release_refresh_slot();
+                    }
                 }
+                let _release = ReleaseSlot(Arc::clone(&engine));
+                engine.refresh_shard_recency_cache();
+            });
+        match spawned {
+            Ok(_handle) => true,
+            Err(e) => {
+                self.recency_cache.release_refresh_slot();
+                self.recency_cache.note_spawn_failure();
+                tracing::warn!(
+                    err = %e,
+                    "recency refresh thread failed to spawn — slot released, \
+                     a later trigger retries",
+                );
+                false
             }
-            let _release = ReleaseSlot(Arc::clone(&engine));
-            engine.refresh_shard_recency_cache();
-        });
-        true
+        }
     }
 
     /// Populate `shard_counts` from the fully-built primary index.
