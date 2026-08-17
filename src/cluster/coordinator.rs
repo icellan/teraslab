@@ -6676,17 +6676,12 @@ impl ClusterCoordinator {
         // when the partition view is populated.
         let evicted: std::collections::HashSet<NodeId> = std::collections::HashSet::new();
         // W11 FIX 2 — the shards whose master this activation's own
-        // DETERMINISTIC plan is about to hand off. Computed BEFORE the
-        // election (the plan below is built against the refined table, which
-        // is exactly the circularity being broken): for these shards the
-        // deterministic master's current emptiness is the plan's precondition,
-        // never evidence that the placement is wrong.
-        let det_plan_master_shards: std::collections::HashSet<u16> =
-            ShardTable::migration_plan(&old_table_snap, &new_table)
-                .iter()
-                .filter(|task| task.is_master)
-                .map(|task| task.shard)
-                .collect();
+        // DETERMINISTIC plan hands off from a holder that keeps serving
+        // throughout. Computed BEFORE the election (the plan below is built
+        // against the REFINED table, which is exactly the circularity being
+        // broken).
+        let det_plan_master_shards =
+            plan_filled_master_shards(&old_table_snap, &new_table, partition_view);
         match &committed_assignment {
             // §8 — a committed assignment IS the authority on mastership:
             // install it verbatim (through set_master_for_shard, which
@@ -6713,6 +6708,7 @@ impl ClusterCoordinator {
                 );
             }
         }
+
         // Phase D: when a partition view is available, use it to skip
         // migrations whose destination already has the data and to redirect
         // the source onto a replica when the planned source has none.
@@ -17397,6 +17393,60 @@ fn classify_shard_candidates(
     (max_reported, candidates)
 }
 
+/// W11 FIX 2 — the shards whose deterministic master an activation's own plan
+/// is about to fill FROM A SOURCE THAT KEEPS SERVING MEANWHILE.
+///
+/// Fed to [`apply_master_election`] as the set exempt from data-lag demotion
+/// on a fresh activation. Three conditions, each load-bearing:
+///
+/// 1. the DETERMINISTIC plan (`old -> det`, computed before any election)
+///    carries a MASTER task for the shard — the destination's emptiness is
+///    that task's precondition, not evidence of a wrong placement;
+/// 2. the task's source is the shard's CURRENT master. `migration_plan` picks
+///    a surviving replica as the source when the old master is DEAD, and that
+///    is precisely the case where suppressing the deviation costs
+///    availability: nobody is serving the shard, and only promoting the
+///    surviving holder restores it (pinned by
+///    `segment_cluster_master_failover_preserves_replicated_record`, which
+///    fails outright without this condition). With a live old master the
+///    handoff protocol keeps it serving until the destination commits
+///    (`begin_handoff_with`; see the no-loss note on
+///    [`phantom_master_shard_count`]), so the deviation buys nothing;
+/// 3. the shared view shows that source actually holding the shard
+///    (`last_applied_seq > 0`, subset bit clear). A source that holds nothing
+///    cannot serve during the fill either, and absent evidence — an empty or
+///    partial view — yields an empty exemption set, i.e. the pre-W11
+///    behaviour.
+fn plan_filled_master_shards(
+    old_table: &ShardTable,
+    det_table: &ShardTable,
+    partition_view: &std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>>,
+) -> std::collections::HashSet<u16> {
+    if partition_view.is_empty() {
+        return std::collections::HashSet::new();
+    }
+    let mut holders: std::collections::HashMap<(NodeId, u16), (u64, u8)> =
+        std::collections::HashMap::new();
+    for (node, entries) in partition_view {
+        for e in entries {
+            holders.insert((*node, e.shard), (e.last_applied_seq, e.flags));
+        }
+    }
+    ShardTable::migration_plan(old_table, det_table)
+        .into_iter()
+        .filter(|task| {
+            task.is_master
+                && task.from_node == old_table.target_assignment(task.shard).master
+                && matches!(
+                    holders.get(&(task.from_node, task.shard)),
+                    Some(&(seq, flags))
+                        if seq > 0 && (flags & PARTITION_FLAG_PENDING_INBOUND) == 0
+                )
+        })
+        .map(|task| task.shard)
+        .collect()
+}
+
 /// Phase F — apply election scoring on top of the round-robin
 /// `compute_with_epoch` result.
 ///
@@ -17458,11 +17508,12 @@ fn classify_shard_candidates(
 ///
 /// # This activation's own plan is not evidence of loss — W11 FIX 2
 ///
-/// `plan_master_shards` names the shards for which the caller's freshly
-/// computed DETERMINISTIC plan already carries a master task, i.e. the shards
-/// whose deterministic master is about to be filled BY THIS ACTIVATION. On a
-/// fresh activation (`adopt_view_holders == false`) those shards are exempt
-/// from deviation entirely.
+/// `plan_master_shards` names the shards whose deterministic master is about
+/// to be filled BY THIS ACTIVATION's own plan, from a source that keeps
+/// serving throughout — see [`plan_filled_master_shards`], which is the only
+/// producer and which carries the availability conditions. On a fresh
+/// activation (`adopt_view_holders == false`) those shards are exempt from
+/// deviation entirely.
 ///
 /// The reasoning is the one already applied to view-evidenced EXTERNAL
 /// holders a few lines below, extended to the assignment-internal case. A
@@ -39132,6 +39183,86 @@ mod tests {
         assert_eq!(
             elected, det,
             "equal reported counts are a data tie; the deterministic master must be preserved",
+        );
+    }
+
+    /// W11 FIX 2 — the exemption set must cover a LIVE handoff (the old master
+    /// keeps serving until the destination commits) and must NOT cover a
+    /// failover (the old master is dead, the plan sources from a surviving
+    /// replica, and nobody serves the shard until the fill lands — so the
+    /// election MUST still promote the holder). Regression pin for
+    /// `segment_cluster_master_failover_preserves_replicated_record`, which
+    /// fails outright when the failover shape is exempted.
+    #[test]
+    fn plan_filled_master_shards_covers_live_handoffs_but_never_failovers() {
+        let old_members = [NodeId(1), NodeId(2), NodeId(3)];
+        let old = ShardTable::compute_with_epoch(&old_members, 2, 1, 1);
+
+        // Scale-up: N4 joins, the old master stays alive.
+        let grown = [NodeId(1), NodeId(2), NodeId(3), NodeId(4)];
+        let up = ShardTable::compute_with_epoch(&grown, 2, 2, 1);
+        let moved = (0..NUM_SHARDS as u16)
+            .find(|&s| {
+                up.target_assignment(s).master == NodeId(4)
+                    && old.target_assignment(s).master != NodeId(4)
+            })
+            .expect("some shard moves its master to the newcomer");
+        let live_source = old.target_assignment(moved).master;
+        let entry = |shard: u16, seq: u64, flags: u8| {
+            vec![PartitionVersionEntry {
+                shard,
+                flags,
+                replica_count: 1,
+                last_applied_seq: seq,
+                manifest_digest: 0,
+                max_generation: 0,
+            }]
+        };
+        let mut view: std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>> =
+            std::collections::HashMap::new();
+        view.insert(live_source, entry(moved, 500, 0));
+        assert!(
+            plan_filled_master_shards(&old, &up, &view).contains(&moved),
+            "a live handoff keeps its source serving — the destination's emptiness is the \
+             plan's precondition",
+        );
+
+        // Same shape, but the source reports NOTHING: it cannot serve during
+        // the fill either, so no exemption.
+        let mut empty_source: std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>> =
+            std::collections::HashMap::new();
+        empty_source.insert(live_source, entry(moved, 0, 0));
+        assert!(
+            !plan_filled_master_shards(&old, &up, &empty_source).contains(&moved),
+            "a source holding nothing cannot serve the shard during the fill",
+        );
+        assert!(
+            plan_filled_master_shards(&old, &up, &std::collections::HashMap::new()).is_empty(),
+            "an empty view yields no exemptions — the pre-W11 behaviour",
+        );
+
+        // Failover: the master of `dead_shard` is killed, so the plan sources
+        // from a surviving replica and NOBODY serves the shard meanwhile.
+        let dead = NodeId(3);
+        let survivors = [NodeId(1), NodeId(2)];
+        let after = ShardTable::compute_with_epoch(&survivors, 2, 3, 1);
+        let failover_shard = (0..NUM_SHARDS as u16)
+            .find(|&s| {
+                let o = old.target_assignment(s);
+                o.master == dead
+                    && !o.replicas.is_empty()
+                    && !o.replicas.contains(&after.target_assignment(s).master)
+            })
+            .expect("some shard mastered by the killed node lands on a non-replica");
+        let source = old.target_assignment(failover_shard).replicas[0];
+        let mut failover_view: std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>> =
+            std::collections::HashMap::new();
+        failover_view.insert(source, entry(failover_shard, 500, 0));
+        failover_view.insert(dead, entry(failover_shard, 500, 0));
+        assert!(
+            !plan_filled_master_shards(&old, &after, &failover_view).contains(&failover_shard),
+            "a failover sources from a replica, not the (dead) master — the election must \
+             still promote the surviving holder or the shard is unserved until the fill lands",
         );
     }
 
