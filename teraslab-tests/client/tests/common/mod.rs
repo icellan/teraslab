@@ -2159,7 +2159,9 @@ pub async fn spend_all_with_transient_retry(
             // is idempotent for identical `spending_data`.
             Err(e) if teraslab_test_client::retry::is_transient_error(&e) => {
                 last_transient = Some(e);
-                spend_retry_backoff(client, attempt).await;
+                if attempt + 1 < MAX_TRANSIENT_ATTEMPTS {
+                    spend_retry_backoff(client, attempt).await;
+                }
                 continue;
             }
             Err(e) => return Err(e),
@@ -2199,6 +2201,9 @@ pub async fn spend_all_with_transient_retry(
                     )),
                 });
                 remaining = idx.into_iter().map(|i| remaining[i].clone()).collect();
+                if attempt + 1 >= MAX_TRANSIENT_ATTEMPTS {
+                    break;
+                }
                 spend_retry_backoff(client, attempt).await;
             }
         }
