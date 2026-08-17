@@ -902,6 +902,23 @@ const EXCHANGE_PEER_RETRY_INTERVAL: Duration = Duration::from_millis(500);
 /// never materializes.
 const EXCHANGE_PHASE_TIMEOUT: Duration = Duration::from_millis(2000);
 
+/// W10 FIX 2 — per-attempt frame READ timeout for the exchange's
+/// `OP_PARTITION_VERSION_REPORT` queries, deliberately much shorter than
+/// [`EXCHANGE_PHASE_TIMEOUT`]. When the two were equal (both 2 s), one
+/// peer whose connection went silent burned the entire exchange window on
+/// its FIRST attempt — the read expired exactly at the deadline, so the
+/// W9 FIX 1 re-query loop was structurally single-attempt and a starved
+/// responder (pre-W10-FIX-1) could never be re-asked.
+///
+/// Sizing: an attempt costs at most connect (500 ms) + read (this value),
+/// so the worst first attempt fails by ~1.1 s; the 500 ms
+/// [`EXCHANGE_PEER_RETRY_INTERVAL`] gate (`1.1 s + 0.5 s < 2 s`) then
+/// admits a genuine second attempt with ~400 ms of window left — plenty
+/// for a responder that answers from RAM (W10 FIX 1). Fast failures
+/// (connection refused / instant rejection) fit three or more attempts.
+/// Every OTHER topology frame use keeps the standard 2 s read timeout.
+const EXCHANGE_REPORT_READ_TIMEOUT: Duration = Duration::from_millis(600);
+
 fn debug_shard_set() -> &'static std::collections::HashSet<u16> {
     static SET: std::sync::OnceLock<std::collections::HashSet<u16>> = std::sync::OnceLock::new();
     SET.get_or_init(|| {
@@ -6877,12 +6894,15 @@ impl ClusterCoordinator {
                     // A rejected report (non-OK status) is a failed query
                     // by design, not an empty report — see F1 above. The
                     // full response is inspected (not discarded) so the
-                    // W9 P2-3 stale-epoch key echo is readable.
-                    match send_topology_frame_response(
+                    // W9 P2-3 stale-epoch key echo is readable. W10 FIX 2:
+                    // the short per-attempt read timeout keeps one silent
+                    // peer from burning the whole exchange window.
+                    match send_topology_frame_response_with_read_timeout(
                         addr,
                         OP_PARTITION_VERSION_REPORT,
                         &cluster_key.to_le_bytes(),
                         secret.as_deref().map(Vec::as_slice),
+                        EXCHANGE_REPORT_READ_TIMEOUT,
                     ) {
                         Ok(response) if response.status == STATUS_OK => {
                             match parse_partition_version_response(&response.payload) {
@@ -8422,10 +8442,34 @@ fn send_topology_frame_response(
     payload: &[u8],
     auth_secret: Option<&[u8]>,
 ) -> Result<ResponseFrame, String> {
+    send_topology_frame_response_with_read_timeout(
+        addr,
+        op_code,
+        payload,
+        auth_secret,
+        Duration::from_secs(2),
+    )
+}
+
+/// [`send_topology_frame_response`] with an explicit frame READ timeout.
+///
+/// W10 FIX 2 — the exchange report path passes
+/// [`EXCHANGE_REPORT_READ_TIMEOUT`] so one silent peer costs a fraction
+/// of the exchange window instead of all of it (see the constant's doc
+/// for the sizing arithmetic). All other topology frame uses go through
+/// the 2 s wrapper above, unchanged. The 500 ms connect timeout is
+/// common to both.
+fn send_topology_frame_response_with_read_timeout(
+    addr: SocketAddr,
+    op_code: u16,
+    payload: &[u8],
+    auth_secret: Option<&[u8]>,
+    read_timeout: Duration,
+) -> Result<ResponseFrame, String> {
     let mut stream = TcpStream::connect_timeout(&addr, Duration::from_millis(500))
         .map_err(|e| format!("connect: {e}"))?;
     stream
-        .set_read_timeout(Some(Duration::from_secs(2)))
+        .set_read_timeout(Some(read_timeout))
         .map_err(|e| format!("set timeout: {e}"))?;
     crate::replication::tcp_transport::configure_tcp_keepalive(&stream);
 
@@ -33154,6 +33198,103 @@ mod tests {
             Some(&peer_entries),
             "a peer that rejected the first report but accepted the re-query \
              must be PRESENT in the view with its reported entries",
+        );
+    }
+
+    /// W10 FIX 2 — the per-attempt frame read timeout must be DECOUPLED
+    /// from the exchange window. When they were equal (both 2 s), a peer
+    /// whose first connection went silent (accepted, request read, no
+    /// reply — the CI shape while the responder was starved scanning)
+    /// burned the entire window on attempt 1: the read timed out exactly
+    /// at the deadline and the 500 ms re-query cadence was structurally
+    /// single-attempt. With the shorter per-attempt timeout the retry
+    /// fires inside the window and the peer's second connection answers.
+    #[test]
+    fn run_exchange_phase_slow_peer_burns_one_attempt_not_the_window() {
+        use std::io::{Read, Write};
+
+        let members = [NodeId(1), NodeId(2)];
+        let term = 6u64;
+        let engine = Arc::new(test_engine());
+        let det = ShardTable::compute_with_epoch(&members, 2, term, 1);
+
+        let peer_entries = vec![PartitionVersionEntry {
+            shard: 11,
+            flags: 0b01,
+            replica_count: 1,
+            last_applied_seq: 3,
+            manifest_digest: 9,
+            max_generation: 1,
+        }];
+        let peer_entries_srv = peer_entries.clone();
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        // NOT joined before the assertion: a regressed (window-long
+        // per-attempt timeout) exchange never opens the second connection,
+        // and a join would hang the test instead of failing it.
+        let _server = std::thread::spawn(move || {
+            // Connection 1: read the request, then go SILENT while keeping
+            // the socket OPEN (a closed socket would fail the read fast and
+            // sidestep the timeout under test). Held on its own thread so
+            // the listener can accept the re-query concurrently.
+            let (mut s1, _) = listener.accept().unwrap();
+            let holder = std::thread::spawn(move || {
+                let mut header = [0u8; 4];
+                s1.read_exact(&mut header).unwrap();
+                let len = u32::from_le_bytes(header) as usize;
+                let mut body = vec![0u8; len];
+                s1.read_exact(&mut body).unwrap();
+                // Outlive the whole exchange window without replying.
+                std::thread::sleep(std::time::Duration::from_millis(4000));
+                drop(s1);
+            });
+            // Connection 2 (the re-query): answer a valid report.
+            let (mut s2, _) = listener.accept().unwrap();
+            let mut header = [0u8; 4];
+            s2.read_exact(&mut header).unwrap();
+            let len = u32::from_le_bytes(header) as usize;
+            let mut body = vec![0u8; len];
+            s2.read_exact(&mut body).unwrap();
+            let mut frame_bytes = header.to_vec();
+            frame_bytes.extend_from_slice(&body);
+            let (request, _) = crate::protocol::frame::RequestFrame::decode(&frame_bytes).unwrap();
+            assert_eq!(request.op_code, OP_PARTITION_VERSION_REPORT);
+            let response = crate::protocol::frame::ResponseFrame {
+                request_id: request.request_id,
+                status: crate::protocol::opcodes::STATUS_OK,
+                payload: encode_partition_version_response(2, term, &peer_entries_srv),
+            };
+            s2.write_all(&response.encode()).unwrap();
+            let _ = holder.join();
+        });
+
+        let mut addrs = std::collections::HashMap::new();
+        addrs.insert(NodeId(2), addr);
+        let node_addrs = Arc::new(RwLock::new(addrs));
+        let shard_table = Arc::new(ShardTableLock::new(det));
+        let inbound_bm = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+
+        // The REAL exchange window (EXCHANGE_PHASE_TIMEOUT): the fix must
+        // land ≥2 attempts inside it, not a stretched test-only budget.
+        let view = ClusterCoordinator::run_exchange_phase(
+            &members,
+            NodeId(1),
+            term,
+            &node_addrs,
+            &engine,
+            &shard_table,
+            &inbound_bm,
+            EXCHANGE_PHASE_TIMEOUT,
+            &None,
+        );
+
+        assert_eq!(
+            view.get(&NodeId(2)),
+            Some(&peer_entries),
+            "a peer whose FIRST connection went silent must still be PRESENT: \
+             the per-attempt read timeout must expire well before the exchange \
+             window so the 500 ms re-query gets a real second attempt",
         );
     }
 
