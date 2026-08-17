@@ -172,19 +172,33 @@ fn resync_migration_pool_size(configured_pool_size: usize) -> usize {
 /// exchange `view` (peer self-reports; survives peer death by design), the
 /// current SWIM-`alive` set, `mastered_nonempty` — the `(shard, committed
 /// replicas)` pairs for shards this node masters that hold records — and
-/// `in_flight`, the `(replica NodeId.0, shard)` pairs whose full-shard
-/// resync backfill is still running (review P2; resync tasks are
-/// `start_outbound`-tracked since W10, but this per-pair set remains the
-/// derive-side dedup — without this skip a re-armed pass re-signals a
-/// shard mid-stream and spawns a DUPLICATE concurrent backfill at the
-/// same replica). Returns
-/// `(missing, signaled, dropped, dead_skipped, inflight_skipped,
+/// `already_dispatched`, the `(replica NodeId.0, shard)` pairs whose repair
+/// has already been dispatched against the CURRENT evidence. That set is the
+/// union of two things the caller holds:
+///
+///  * pairs whose full-shard resync backfill is still running (review P2;
+///    resync tasks are `start_outbound`-tracked since W10, but this per-pair
+///    set remains the derive-side dedup — without this skip a re-armed pass
+///    re-signals a shard mid-stream and spawns a DUPLICATE concurrent
+///    backfill at the same replica), and
+///  * W11 FIX 3(a) — pairs already signaled since the last exchange view was
+///    retained. The classification "replica R holds no data for shard S"
+///    comes ONLY from `view`, so re-signaling a pair against an UNCHANGED
+///    view re-decides on evidence that has not moved since the repair was
+///    dispatched — which is what made this sweep structurally
+///    non-convergent (armed-04: identical `signaled:128, dropped:820` and
+///    identical record totals every 1.55 s, indefinitely). See the
+///    `resync_signaled` set at its declaration for the full argument.
+///
+/// Returns
+/// `(missing, signaled, dropped, dead_skipped, dispatched_skipped,
 /// stale_fenced)`: the per-replica shard lists to signal, how many were
 /// signaled, how many the `cap` dropped (re-derived next sweep; the
 /// caller logs the count), how many candidates were skipped because their
-/// replica is SWIM-dead, how many were skipped as already in flight, and
-/// how many SHARDS the freshness fence skipped whole. In-flight and
-/// fence skips do not consume cap budget.
+/// replica is SWIM-dead, how many were skipped as already dispatched, and
+/// how many SHARDS the freshness fence skipped whole. Already-dispatched
+/// and fence skips do not consume cap budget — a suppressed pair must
+/// never starve a shard whose repair has not been dispatched at all.
 ///
 /// FRESHNESS FENCE (run 31904714169): the derive compares LIVE local
 /// counts (`mastered_nonempty`) against the RETAINED exchange view — a
@@ -215,7 +229,7 @@ fn derive_under_replication_resyncs(
     alive: &std::collections::HashSet<NodeId>,
     self_id: NodeId,
     mastered_nonempty: &[(u16, Vec<NodeId>)],
-    in_flight: &std::collections::HashSet<(u64, u16)>,
+    already_dispatched: &std::collections::HashSet<(u64, u16)>,
     cap: usize,
 ) -> (
     std::collections::HashMap<NodeId, Vec<u16>>,
@@ -247,7 +261,7 @@ fn derive_under_replication_resyncs(
     let mut signaled = 0usize;
     let mut dropped = 0usize;
     let mut dead_skipped = 0usize;
-    let mut inflight_skipped = 0usize;
+    let mut dispatched_skipped = 0usize;
     let mut stale_fenced = 0usize;
     for (shard, replicas) in mastered_nonempty {
         // Freshness fence (see the doc comment): the shard is locally
@@ -268,8 +282,8 @@ fn derive_under_replication_resyncs(
                 dead_skipped += 1;
                 continue;
             }
-            if in_flight.contains(&(replica.0, *shard)) {
-                inflight_skipped += 1;
+            if already_dispatched.contains(&(replica.0, *shard)) {
+                dispatched_skipped += 1;
                 continue;
             }
             if signaled < cap {
@@ -285,7 +299,7 @@ fn derive_under_replication_resyncs(
         signaled,
         dropped,
         dead_skipped,
-        inflight_skipped,
+        dispatched_skipped,
         stale_fenced,
     )
 }
@@ -794,10 +808,15 @@ impl ResyncRunOutcome {
 /// signals inherit the full-shard backfill pipeline with Phase E
 /// dual-write protection and Phase G throttling). Shared verbatim by the
 /// periodic sweep and the Task #50 event trigger — the two differ only in
-/// WHEN they run. `in_flight` is a snapshot of the shared resync
-/// in-flight set: pairs already streaming are skipped (and counted), not
-/// re-signaled. `origin` labels the log line. Returns
-/// `(signaled, dropped, dead_skipped, inflight_skipped)`; the dropped
+/// WHEN they run. `already_dispatched` is the caller's union of the shared
+/// resync in-flight set and the W11 FIX 3(a) `resync_signaled` set: pairs
+/// already streaming, or already signaled against this same retained
+/// exchange view, are skipped (and counted), not re-signaled. Every pair
+/// this pass DOES signal is recorded into `signaled_set` so the next pass
+/// against the same view suppresses it — the record happens here, at the
+/// single point where a signal is emitted, so no caller can forget it.
+/// `origin` labels the log line. Returns
+/// `(signaled, dropped, dead_skipped, dispatched_skipped)`; the dropped
 /// remainder is logged, never silent, and re-derived by the next pass.
 #[allow(clippy::too_many_arguments)]
 fn run_under_replication_pass(
@@ -805,20 +824,28 @@ fn run_under_replication_pass(
     alive: &std::collections::HashSet<NodeId>,
     self_id: NodeId,
     mastered_nonempty: &[(u16, Vec<NodeId>)],
-    in_flight: &std::collections::HashSet<(u64, u16)>,
+    already_dispatched: &std::collections::HashSet<(u64, u16)>,
     cap: usize,
     origin: &'static str,
     resync_tx: &std::sync::mpsc::Sender<crate::replication::manager::ResyncRequest>,
+    signaled_set: &Mutex<std::collections::HashSet<(u64, u16)>>,
 ) -> (usize, usize, usize, usize) {
-    let (missing, signaled, dropped, dead_skipped, inflight_skipped, stale_fenced) =
-        derive_under_replication_resyncs(view, alive, self_id, mastered_nonempty, in_flight, cap);
-    if signaled > 0 || dropped > 0 || dead_skipped > 0 || inflight_skipped > 0 {
+    let (missing, signaled, dropped, dead_skipped, dispatched_skipped, stale_fenced) =
+        derive_under_replication_resyncs(
+            view,
+            alive,
+            self_id,
+            mastered_nonempty,
+            already_dispatched,
+            cap,
+        );
+    if signaled > 0 || dropped > 0 || dead_skipped > 0 || dispatched_skipped > 0 {
         tracing::info!(
             origin,
             signaled,
             dropped,
             dead_skipped,
-            in_flight_skipped = inflight_skipped,
+            already_dispatched_skipped = dispatched_skipped,
             stale_fenced,
             targets = missing.len(),
             "cluster: under-replication pass signaling resyncs \
@@ -837,12 +864,21 @@ fn run_under_replication_pass(
         );
     }
     for (replica, shards) in missing {
+        // W11 FIX 3(a) — record BEFORE the send: the pair's repair is
+        // dispatched from this pass's point of view either way, and a send
+        // failure (the drain is gone) must not leave the pass free to spin.
+        {
+            let mut recorded = signaled_set.lock();
+            for &shard in &shards {
+                recorded.insert((replica.0, shard));
+            }
+        }
         let _ = resync_tx.send(crate::replication::manager::ResyncRequest {
             node_id: replica.0,
             shards,
         });
     }
-    (signaled, dropped, dead_skipped, inflight_skipped)
+    (signaled, dropped, dead_skipped, dispatched_skipped)
 }
 
 /// Snapshot the live inputs an under-replication pass derives from:
@@ -3265,6 +3301,36 @@ impl ClusterCoordinator {
         // finishes.
         let resync_inflight: Arc<Mutex<std::collections::HashSet<(u64, u16)>>> =
             Arc::new(Mutex::new(std::collections::HashSet::new()));
+        // W11 FIX 3(a) — `(replica NodeId.0, shard)` pairs an under-replication
+        // pass has ALREADY signaled against the CURRENT retained exchange
+        // view. Cleared, and only cleared, when a completed exchange stores a
+        // NEW view (the single writer of `retained_exchange_view`).
+        //
+        // The sweep judges replicas against the retained view; a repair never
+        // writes back into that view, so re-deriving from it re-signals the
+        // identical pairs forever. Measured (armed-04): `signaled:128,
+        // dropped:820` with identical record totals every 1.55 s, ~77% duty
+        // cycle, 128/4096 shards per node write-fenced by the backfills —
+        // which is what rejected 5/200 spends in Test 4.5. Wave 10 closed the
+        // loop's own escape hatch: registered resyncs hold `active_count()>0`,
+        // and `normal_reactivation_due` needs `no_active_migrations`, so the
+        // reactivation that would have refreshed the view could never run
+        // (baseline armed sc05: 8 passes/13 s; wave 10: 33 passes/64 s).
+        //
+        // Suppressing a pair until NEW evidence arrives is the minimal correct
+        // rule: the classification "replica R holds nothing for shard S" comes
+        // ONLY from the view, so a re-signal against an unchanged view is a
+        // decision made on evidence that has not moved since the repair was
+        // dispatched. It is also self-unblocking — the sweep going quiet lets
+        // `active_count()` reach zero, which lets reactivation run, which
+        // completes an exchange, which clears this set with a fresh view.
+        //
+        // Fail direction: a repair that failed silently waits for the next
+        // exchange instead of being re-dispatched immediately — deferred
+        // repair, never deferred data. The replication catch-up loop's own
+        // resync requests bypass the derive entirely and are unaffected.
+        let resync_signaled: Arc<Mutex<std::collections::HashSet<(u64, u16)>>> =
+            Arc::new(Mutex::new(std::collections::HashSet::new()));
         // sc08 — outcome accumulator for finished resync backfill runs.
         // The Phase H spawn threads record each run's (completed, failed)
         // task counts; the event loop harvests them each iteration to
@@ -3783,17 +3849,24 @@ impl ClusterCoordinator {
                                     &engine,
                                     self_id,
                                 );
-                                let in_flight = resync_inflight.lock().clone();
-                                let (_signaled, dropped, _dead_skipped, _inflight_skipped) =
+                                // W11 FIX 3(a) — repair is "already
+                                // dispatched" if it is streaming now OR was
+                                // signaled against this same retained view.
+                                let mut already_dispatched =
+                                    resync_inflight.lock().clone();
+                                already_dispatched
+                                    .extend(resync_signaled.lock().iter().copied());
+                                let (_signaled, dropped, _dead_skipped, _dispatched_skipped) =
                                     run_under_replication_pass(
                                         &view,
                                         &alive,
                                         self_id,
                                         &mastered_nonempty,
-                                        &in_flight,
+                                        &already_dispatched,
                                         UNDER_REPLICATION_SWEEP_MAX_SHARDS,
                                         "periodic",
                                         &resync_request_tx_event,
+                                        &resync_signaled,
                                     );
                                 // Task #50 review P3 — cap remainder: arm the
                                 // event trigger so the backlog converges in
@@ -4035,17 +4108,20 @@ impl ClusterCoordinator {
                             &engine,
                             self_id,
                         );
-                        let in_flight = resync_inflight.lock().clone();
-                        let (_signaled, dropped, _dead_skipped, _inflight_skipped) =
+                        // W11 FIX 3(a) — see the periodic sweep site.
+                        let mut already_dispatched = resync_inflight.lock().clone();
+                        already_dispatched.extend(resync_signaled.lock().iter().copied());
+                        let (_signaled, dropped, _dead_skipped, _dispatched_skipped) =
                             run_under_replication_pass(
                                 &view,
                                 &alive,
                                 self_id,
                                 &mastered_nonempty,
-                                &in_flight,
+                                &already_dispatched,
                                 UNDER_REPLICATION_SWEEP_MAX_SHARDS,
                                 "event",
                                 &resync_request_tx_event,
+                                &resync_signaled,
                             );
                         // Task #50 review P3 — cap remainder: re-arm so the
                         // backlog converges in 1.5s steps instead of waiting
@@ -5197,6 +5273,13 @@ impl ClusterCoordinator {
                     // no-ops on an empty view rather than misreading it as
                     // "nobody holds anything".
                     *retained_exchange_view_event.lock() = partition_view.clone();
+                    // W11 FIX 3(a) — NEW evidence: every under-replication
+                    // signal suppressed against the PREVIOUS view may now be
+                    // re-decided. This is the one and only clear, deliberately
+                    // co-located with the one and only writer of the view the
+                    // derive judges against — including the det-degrade path,
+                    // whose EMPTY view makes every pass a no-op anyway.
+                    resync_signaled.lock().clear();
                     // Task #50 — a completed exchange is the moment the
                     // retained view first reflects a rejoined/emptied peer's
                     // TRUE holdings (the 15.3 shape: the restarted node
@@ -5554,6 +5637,12 @@ impl ClusterCoordinator {
                                 // Replica resync backfill — never a master handoff,
                                 // so relinquish never applies here.
                                 None,
+                                // W11 FIX 3(b) — REPAIR toward a node the
+                                // committed table already names as a holder:
+                                // the source keeps serving writes throughout,
+                                // and the dual-write window this registration
+                                // already opened carries them to the target.
+                                MigrationRunOrigin::Resync,
                             );
                         // sc08 — feed the failure-streak backoff: harvested by
                         // the event loop before its next fire decision.
@@ -5707,6 +5796,11 @@ impl ClusterCoordinator {
                                     throttle_ref,
                                     secret_ref,
                                     Some(relinquish_ctx),
+                                    // The pull-based repair re-runs the
+                                    // requester's OUTBOUND HANDOFF plan, so
+                                    // the source fence applies exactly as it
+                                    // does on the push path.
+                                    MigrationRunOrigin::Handoff,
                                 );
                             });
                         }
@@ -6024,6 +6118,8 @@ impl ClusterCoordinator {
                 throttle_ref,
                 secret_ref,
                 Some(relinquish_ctx),
+                // The failed-task retry re-drives topology-plan handoffs.
+                MigrationRunOrigin::Handoff,
             );
         });
     }
@@ -7144,6 +7240,8 @@ impl ClusterCoordinator {
                     throttle_w,
                     secret_w,
                     Some(relinquish_ctx),
+                    // The activation's own outbound plan: genuine handoffs.
+                    MigrationRunOrigin::Handoff,
                 );
             };
             // W9 FIX 3 — the det-degrade path HOLDS the worker launch (the
@@ -7467,6 +7565,10 @@ impl ClusterCoordinator {
         throttle: Arc<crate::cluster::migration::MigrationThrottle>,
         cluster_secret: Option<Arc<Vec<u8>>>,
         relinquish_ctx: Option<Arc<RelinquishContext>>,
+        // W11 FIX 3(b) — `Resync` runs a repair toward an already-committed
+        // holder and therefore never write-fences the source. See
+        // `MigrationRunOrigin`.
+        origin: MigrationRunOrigin,
     ) -> (u32, u32) {
         // Aggregate `(completed, failed)` task resolutions across every
         // target batch — sc08's resync failure-streak input. Callers that
@@ -7561,7 +7663,7 @@ impl ClusterCoordinator {
                     let total_completed = &total_completed;
                     let total_failed = &total_failed;
                     scope.spawn(move || {
-                        let (c, f) = run_migration_batch(
+                        let (c, f) = run_migration_batch_with_origin(
                             target_tasks.clone(),
                             target_addr,
                             &target_keys,
@@ -7578,6 +7680,7 @@ impl ClusterCoordinator {
                             self_id,
                             secret,
                             relinquish_ctx.as_deref(),
+                            origin,
                         );
                         total_completed.fetch_add(c, Ordering::Relaxed);
                         total_failed.fetch_add(f, Ordering::Relaxed);
@@ -11415,6 +11518,79 @@ fn run_migration_batch(
     cluster_secret: Option<Arc<Vec<u8>>>,
     relinquish_ctx: Option<&RelinquishContext>,
 ) -> (u32, u32) {
+    run_migration_batch_with_origin(
+        tasks,
+        target_addr,
+        all_keys,
+        engine,
+        migration,
+        shard_table,
+        redo_log,
+        topology_epoch,
+        pool_size,
+        batch_size,
+        fenced_bm,
+        migrating_bm,
+        inbound_bm,
+        self_id,
+        cluster_secret,
+        relinquish_ctx,
+        MigrationRunOrigin::Handoff,
+    )
+}
+
+/// W11 FIX 3(b) — why a batch of migration tasks is running, which decides
+/// whether the SOURCE raises its client write fence for the delta window.
+///
+/// The two share every other mechanism: baseline stream, fence-sequence
+/// capture, redo-delta replay, manifest fold, completion handshake.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MigrationRunOrigin {
+    /// A topology-plan handoff. `to_node` is becoming authoritative for the
+    /// shard, so the source MUST stop accepting writes for the delta window:
+    /// a write admitted after the manifest fold would be authoritative on a
+    /// node that is about to stop being the authority for it.
+    Handoff,
+    /// A Phase-H resync backfill toward a node the committed table ALREADY
+    /// names as a holder. No ownership transition happens, so fencing the
+    /// source is a pure availability loss: the source stays the authority
+    /// throughout, and every write admitted during the backfill reaches the
+    /// repair target anyway through the Phase E dual-write window that
+    /// `start_outbound_resync` opened BEFORE any data moved (plus the
+    /// target's ordinary replica fan-out — it is a committed holder).
+    ///
+    /// armed-04 Test 4.5 rejected 5/200 spends because these repairs
+    /// write-fenced 128/4096 shards per node, continuously, while the sweep
+    /// re-derived the same repairs forever (see FIX 3(a)).
+    Resync,
+}
+
+/// [`run_migration_batch`] with the run's [`MigrationRunOrigin`] made
+/// explicit. `run_migration_batch` is the `Handoff` wrapper — the historical
+/// behaviour, byte-for-byte, for every topology-plan caller.
+#[allow(clippy::too_many_arguments)]
+fn run_migration_batch_with_origin(
+    tasks: Vec<MigrationTask>,
+    target_addr: Option<SocketAddr>,
+    all_keys: &[TxKey],
+    engine: Arc<Engine>,
+    migration: &Arc<Mutex<MigrationManager>>,
+    shard_table: &Arc<ShardTableLock<ShardTable>>,
+    redo_log: &Option<Arc<ParkingMutex<RedoLog>>>,
+    topology_epoch: u64,
+    pool_size: usize,
+    batch_size: usize,
+    fenced_bm: Arc<crate::cluster::migration::AtomicShardBitmap>,
+    migrating_bm: Arc<crate::cluster::migration::AtomicShardBitmap>,
+    inbound_bm: Arc<crate::cluster::migration::AtomicShardBitmap>,
+    self_id: NodeId,
+    cluster_secret: Option<Arc<Vec<u8>>>,
+    relinquish_ctx: Option<&RelinquishContext>,
+    origin: MigrationRunOrigin,
+) -> (u32, u32) {
+    // W11 FIX 3(b) — a repair toward an already-committed holder never
+    // fences the source; see `MigrationRunOrigin::Resync`.
+    let raise_write_fence = origin == MigrationRunOrigin::Handoff;
     let auth_secret = cluster_secret.as_deref().map(Vec::as_slice);
     let addr = match target_addr {
         Some(a) => a,
@@ -11624,7 +11800,7 @@ fn run_migration_batch(
         let mut ready_empty_tasks: Vec<MigrationTask> = Vec::new();
         let empty_shards: std::collections::HashSet<u16> =
             empty_tasks.iter().map(|t| t.shard).collect();
-        {
+        if raise_write_fence {
             let mut mgr = migration.lock();
             for task in &empty_tasks {
                 mgr.fence_shard(task.shard);
@@ -11635,6 +11811,11 @@ fn run_migration_batch(
         // was raised, so the emptiness recheck below cannot miss an
         // in-flight straggler create (released between locks — see
         // `drain_in_flight_mutations` for the lock-order constraint).
+        // Unfenced (RESYNC) runs still drain: it makes the recheck see every
+        // create already admitted, and a create admitted AFTER it is carried
+        // to the repair target by the dual-write window rather than by this
+        // batch — nothing is lost, the shard simply is not proven empty for
+        // one more round.
         drain_in_flight_mutations(&engine);
         let mut empty_recheck_incomplete = false;
         {
@@ -12048,7 +12229,7 @@ fn run_migration_batch(
                         );
                         return;
                     }
-                    {
+                    if raise_write_fence {
                         let mut mgr = migration.lock();
                         for (i, task) in sub_batch.iter().enumerate() {
                             if streamed[i] {
@@ -12073,7 +12254,15 @@ fn run_migration_batch(
                         let mut mgr = migration.lock();
                         for (i, task) in sub_batch.iter().enumerate() {
                             if streamed[i] {
-                                mgr.mark_fenced(task, fence_seq);
+                                // W11 FIX 3(b) — the DELTA-PHASE transition is
+                                // origin-independent (state, fence sequence,
+                                // gauges); only the client write fence it
+                                // normally raises is origin-gated.
+                                mgr.mark_fenced_with_origin(
+                                    task,
+                                    fence_seq,
+                                    raise_write_fence,
+                                );
                             }
                         }
                     }
@@ -20794,6 +20983,152 @@ mod tests {
         assert_eq!(dead_skipped, 0);
     }
 
+    /// W11 FIX 3(a) (RED→GREEN) — the under-replication sweep must CONVERGE.
+    ///
+    /// The derive judges replicas against the retained exchange view, whose
+    /// only writer is the exchange-completion arm — so a repair never updates
+    /// the evidence it was derived from, and re-running the pass against that
+    /// unchanged view re-signals the identical pairs forever (armed-04:
+    /// identical `signaled:128, dropped:820` and identical record totals every
+    /// 1.55 s, ~77% duty cycle). Wave 10 closed the loop's own escape hatch:
+    /// registered resyncs hold `active_count()>0` and reactivation — the only
+    /// thing that refreshes the view — requires `no_active_migrations`.
+    ///
+    /// Driven through the REAL pass so the record-on-signal is exercised at
+    /// the point signals are emitted, not at a call site that could forget it.
+    #[test]
+    fn under_replication_pass_does_not_re_signal_against_an_unchanged_view() {
+        let master = NodeId(1);
+        let replica = NodeId(2);
+        let mut view = std::collections::HashMap::new();
+        view.insert(master, vec![sweep_entry(7, 42), sweep_entry(8, 42)]);
+        view.insert(replica, vec![sweep_entry(7, 0), sweep_entry(8, 0)]);
+        let alive: std::collections::HashSet<NodeId> = [master, replica].into_iter().collect();
+        let mastered = vec![(7u16, vec![replica]), (8u16, vec![replica])];
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let signaled_set: Mutex<std::collections::HashSet<(u64, u16)>> =
+            Mutex::new(std::collections::HashSet::new());
+
+        let dispatched = |set: &Mutex<std::collections::HashSet<(u64, u16)>>| {
+            let mut d: std::collections::HashSet<(u64, u16)> =
+                std::collections::HashSet::new();
+            d.extend(set.lock().iter().copied());
+            d
+        };
+
+        // Pass 1: both under-replicated shards are signaled.
+        let (signaled, _dropped, _dead, dispatched_skipped) = run_under_replication_pass(
+            &view,
+            &alive,
+            master,
+            &mastered,
+            &dispatched(&signaled_set),
+            1024,
+            "test",
+            &tx,
+            &signaled_set,
+        );
+        assert_eq!(signaled, 2);
+        assert_eq!(dispatched_skipped, 0);
+        let first: Vec<u16> = rx
+            .try_iter()
+            .flat_map(|r| r.shards.into_iter())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        assert_eq!(first, vec![7, 8]);
+
+        // Pass 2 against the SAME view — the evidence has not moved, so
+        // nothing may be re-signaled. Pre-fix this re-sent both shards, and
+        // kept doing so on every 1.55s pass for the life of the cluster.
+        let (signaled, dropped, _dead, dispatched_skipped) = run_under_replication_pass(
+            &view,
+            &alive,
+            master,
+            &mastered,
+            &dispatched(&signaled_set),
+            1024,
+            "test",
+            &tx,
+            &signaled_set,
+        );
+        assert_eq!(
+            signaled, 0,
+            "a repair already dispatched against this view must not be \
+             re-derived from the same view",
+        );
+        assert_eq!(dispatched_skipped, 2);
+        assert_eq!(
+            dropped, 0,
+            "suppressed pairs must not consume cap budget either",
+        );
+        assert_eq!(rx.try_iter().count(), 0);
+
+        // A NEW exchange view is new evidence: the coordinator clears the set
+        // at the single site that stores the view, and the pass re-derives.
+        signaled_set.lock().clear();
+        let (signaled, _dropped, _dead, dispatched_skipped) = run_under_replication_pass(
+            &view,
+            &alive,
+            master,
+            &mastered,
+            &dispatched(&signaled_set),
+            1024,
+            "test",
+            &tx,
+            &signaled_set,
+        );
+        assert_eq!(
+            signaled, 2,
+            "fresh evidence must re-enable repair — the suppression is scoped \
+             to one view, not permanent",
+        );
+        assert_eq!(dispatched_skipped, 0);
+
+        // Suppression must not starve a shard whose repair was never
+        // dispatched: a pair still streaming and a pair already signaled both
+        // skip WITHOUT consuming cap, so a third shard still gets in.
+        signaled_set.lock().clear();
+        signaled_set.lock().insert((replica.0, 7));
+        let mut streaming: std::collections::HashSet<(u64, u16)> =
+            std::collections::HashSet::new();
+        streaming.insert((replica.0, 8));
+        let mut all = streaming;
+        all.extend(signaled_set.lock().iter().copied());
+        let mastered3 = vec![
+            (7u16, vec![replica]),
+            (8u16, vec![replica]),
+            (9u16, vec![replica]),
+        ];
+        let mut view3 = view.clone();
+        view3.insert(
+            master,
+            vec![sweep_entry(7, 42), sweep_entry(8, 42), sweep_entry(9, 42)],
+        );
+        view3.insert(
+            replica,
+            vec![sweep_entry(7, 0), sweep_entry(8, 0), sweep_entry(9, 0)],
+        );
+        let (signaled, _dropped, _dead, dispatched_skipped) = run_under_replication_pass(
+            &view3,
+            &alive,
+            master,
+            &mastered3,
+            &all,
+            1,
+            "test",
+            &tx,
+            &signaled_set,
+        );
+        assert_eq!(
+            (signaled, dispatched_skipped),
+            (1, 2),
+            "the cap-1 budget must reach shard 9, not be eaten by the two \
+             already-dispatched pairs",
+        );
+    }
+
     /// GAP 3b (armed scenario 07, runs 31971906387/31971908443) — a replica
     /// whose exchange report carries the PENDING_INBOUND flag holds only a
     /// PARTIAL, fenced copy (a LOST inbound entry keeps the fence bit set, so
@@ -21209,6 +21544,7 @@ mod tests {
             1024,
             "event",
             &tx,
+            &Mutex::new(std::collections::HashSet::new()),
         );
         assert_eq!(signaled, 2, "both dataless shards must be signaled");
         assert_eq!(dropped, 0);
@@ -21325,7 +21661,15 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
 
         let (signaled, dropped, dead_skipped, inflight_skipped) = run_under_replication_pass(
-            &view, &alive, master, &mastered, &in_flight, 1024, "event", &tx,
+            &view,
+            &alive,
+            master,
+            &mastered,
+            &in_flight,
+            1024,
+            "event",
+            &tx,
+            &Mutex::new(std::collections::HashSet::new()),
         );
 
         assert_eq!(signaled, 0);
@@ -26250,6 +26594,200 @@ mod tests {
         );
         stop.store(true, Ordering::Relaxed);
         target.join().unwrap();
+    }
+
+    /// W11 FIX 3(b) (RED→GREEN) — a Phase-H RESYNC backfill must NOT raise
+    /// the SOURCE's client write fence, while a topology-plan HANDOFF still
+    /// must.
+    ///
+    /// A resync repairs a node the committed table ALREADY names as a holder:
+    /// no ownership transition happens, the source stays the authority
+    /// throughout, and every write it admits during the backfill reaches the
+    /// target through the Phase E dual-write window `start_outbound_resync`
+    /// opened before any data moved. Fencing it is pure availability loss —
+    /// armed-04 Test 4.5 rejected 5/200 spends with 128/4096 shards per node
+    /// write-fenced by these repairs, continuously (see FIX 3(a) for why the
+    /// repairs never stopped).
+    ///
+    /// The fence is raised and dropped INSIDE the run, so it is observed
+    /// mid-flight: the target stalls at the completion handshake — which is
+    /// strictly after the Phase-2 fence — and the test samples both the
+    /// manager's fence state and the atomic bitmap dispatch actually reads.
+    #[test]
+    fn resync_backfill_does_not_write_fence_the_source() {
+        let observe = |origin: MigrationRunOrigin| -> (bool, bool) {
+            let members = vec![NodeId(1), NodeId(2)];
+            let table = ShardTable::compute_with_epoch(&members, 2, 3, 1);
+            let shard = (0..NUM_SHARDS as u16)
+                .find(|&s| {
+                    table.target_assignment(s).master == NodeId(1)
+                        && table.target_assignment(s).replicas.contains(&NodeId(2))
+                })
+                .expect("node 1 must master a shard with node 2 as replica");
+            let epoch = table.version;
+            let shard_table = Arc::new(ShardTableLock::new(table));
+
+            let engine = Arc::new(test_engine());
+            let key = tx_key_for_shard(shard, 9);
+            create_test_record(&engine, key);
+
+            let migration = Arc::new(Mutex::new(MigrationManager::new()));
+            let fenced_bm = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+            let migrating_bm = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+            let inbound_bm = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+
+            let tasks = vec![MigrationTask {
+                shard,
+                from_node: NodeId(1),
+                to_node: NodeId(2),
+                is_master: false,
+            }];
+            let populated: std::collections::HashSet<u16> = [shard].into_iter().collect();
+            match origin {
+                MigrationRunOrigin::Resync => migration
+                    .lock()
+                    .start_outbound_resync(&tasks, NodeId(1), &populated),
+                MigrationRunOrigin::Handoff => {
+                    migration
+                        .lock()
+                        .start_outbound(&tasks, NodeId(1), &populated)
+                }
+            }
+
+            // A target that STALLS on the verification handshake so the
+            // source's fence state can be sampled while it is still up.
+            let gate = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let (addr, op_rx, stop, target) = spawn_gated_target(gate.clone());
+
+            let keys = vec![key];
+            let mig = migration.clone();
+            let st = shard_table.clone();
+            let fb = fenced_bm.clone();
+            let mb = migrating_bm.clone();
+            let ib = inbound_bm.clone();
+            let eng = engine.clone();
+            let run = std::thread::spawn(move || {
+                run_migration_batch_with_origin(
+                    tasks, Some(addr), &keys, eng, &mig, &st, &None, epoch, 1, 100, fb, mb, ib,
+                    NodeId(1), None, None, origin,
+                )
+            });
+
+            // Wait for the completion frame — strictly after the Phase-2
+            // fence point — then sample.
+            let deadline = std::time::Instant::now() + Duration::from_secs(20);
+            let mut saw_completion = false;
+            while std::time::Instant::now() < deadline {
+                match op_rx.recv_timeout(Duration::from_millis(200)) {
+                    Ok((op, _)) if op == OP_MIGRATION_COMPLETE => {
+                        saw_completion = true;
+                        break;
+                    }
+                    Ok(_) => continue,
+                    Err(_) => continue,
+                }
+            }
+            assert!(saw_completion, "the verification handshake must be sent");
+            let observed = (
+                migration.lock().is_shard_fenced(shard),
+                fenced_bm.test(shard),
+            );
+
+            gate.store(true, Ordering::Relaxed);
+            let _ = run.join().unwrap();
+            stop.store(true, Ordering::Relaxed);
+            let _ = target.join();
+            observed
+        };
+
+        assert_eq!(
+            observe(MigrationRunOrigin::Handoff),
+            (true, true),
+            "a topology-plan handoff must still fence the source for its \
+             delta window — the target is about to become the authority",
+        );
+        assert_eq!(
+            observe(MigrationRunOrigin::Resync),
+            (false, false),
+            "a repair toward an already-committed holder must keep serving \
+             writes: no ownership moves, and the dual-write window carries \
+             every admitted write to the repair target",
+        );
+    }
+
+    /// A migration target that answers STATUS_OK to everything EXCEPT the
+    /// verification `OP_MIGRATION_COMPLETE`, on which it blocks until `gate`
+    /// is raised. Lets a test observe source-side state that only exists
+    /// between the Phase-2 fence point and the completion's resolution.
+    #[allow(clippy::type_complexity)]
+    fn spawn_gated_target(
+        gate: Arc<std::sync::atomic::AtomicBool>,
+    ) -> (
+        SocketAddr,
+        std::sync::mpsc::Receiver<(u16, u16)>,
+        Arc<std::sync::atomic::AtomicBool>,
+        std::thread::JoinHandle<()>,
+    ) {
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_thread = stop.clone();
+        let (op_tx, op_rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            listener.set_nonblocking(true).unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            while !stop_thread.load(Ordering::Relaxed) && std::time::Instant::now() < deadline {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(pair) => pair,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(_) => continue,
+                };
+                stream.set_nonblocking(false).unwrap();
+                // Short: the gate wait below is NOT a read, so this only
+                // bounds how long a finished run's idle connection keeps the
+                // accept loop from noticing `stop`.
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                loop {
+                    let mut header = [0u8; 4];
+                    if stream.read_exact(&mut header).is_err() {
+                        break;
+                    }
+                    let payload_len = u32::from_le_bytes(header) as usize;
+                    let mut rest = vec![0u8; payload_len];
+                    if stream.read_exact(&mut rest).is_err() {
+                        break;
+                    }
+                    let mut frame_bytes = header.to_vec();
+                    frame_bytes.extend_from_slice(&rest);
+                    let Ok((request, _)) = RequestFrame::decode(&frame_bytes) else {
+                        break;
+                    };
+                    let _ = op_tx.send((request.op_code, request.flags));
+                    if request.op_code == OP_MIGRATION_COMPLETE {
+                        while !gate.load(Ordering::Relaxed)
+                            && std::time::Instant::now() < deadline
+                        {
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                    }
+                    let response = ResponseFrame {
+                        request_id: request.request_id,
+                        status: STATUS_OK,
+                        payload: Vec::new(),
+                    };
+                    if stream.write_all(&response.encode()).is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+        (addr, op_rx, stop, handle)
     }
 
     /// W10 DEFECT 1 — `prepare_resync_backfill` must never double-register:

@@ -1648,12 +1648,46 @@ impl MigrationManager {
 
     /// Transition a migration to the Fenced state and record the fence sequence.
     pub fn mark_fenced(&mut self, task: &MigrationTask, fence_sequence: u64) {
+        self.mark_fenced_with_origin(task, fence_sequence, true);
+    }
+
+    /// W11 FIX 3(b) — [`Self::mark_fenced`] with the CLIENT WRITE FENCE made
+    /// optional.
+    ///
+    /// The delta-phase transition itself (state, `fence_sequence`, phase
+    /// gauges) is identical for every migration origin: `fence_sequence` is
+    /// just a redo position, and the delta replay of
+    /// `[snapshot_sequence, fence_sequence)` is driven off it either way.
+    ///
+    /// `raise_write_fence == false` is the Phase-H RESYNC backfill: a repair
+    /// toward a node the committed table already names as a holder. No
+    /// ownership transition happens, so the source stays the authority
+    /// throughout and must keep serving writes; the writes it admits past
+    /// `fence_sequence` reach the repair target through the Phase E
+    /// dual-write window (opened by [`Self::start_outbound_resync`] BEFORE
+    /// any data moved) and the target's ordinary replica fan-out, instead of
+    /// through this batch's delta. Fencing them instead was a pure
+    /// availability loss (armed-04: 128/4096 shards per node write-fenced
+    /// continuously, 5/200 spends rejected).
+    ///
+    /// The task still enters `Fenced` state, so an unfenced repair on a shard
+    /// that ALSO has a live handoff keeps that handoff's fence up until the
+    /// repair resolves (`has_other_fenced_task`) — bounded by the run, and
+    /// the fail-safe direction.
+    pub fn mark_fenced_with_origin(
+        &mut self,
+        task: &MigrationTask,
+        fence_sequence: u64,
+        raise_write_fence: bool,
+    ) {
         let prev_state = self.find_task_mut(task).map(|p| p.state.clone());
         if let Some(p) = self.find_task_mut(task) {
             p.state = MigrationState::Fenced;
             p.fence_sequence = fence_sequence;
         }
-        self.fence_shard(task.shard);
+        if raise_write_fence {
+            self.fence_shard(task.shard);
+        }
         if let Some(m) = migration_metrics() {
             if let Some(prev) = prev_state {
                 dec_phase_gauge(m, &prev);
