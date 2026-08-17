@@ -5689,20 +5689,27 @@ impl ClusterCoordinator {
                         });
                     }
                     if resend_tasks.is_empty() && diverged == 0 {
-                        // Say so. This used to `continue` silently while the
-                        // handler had already replied STATUS_OK, so the
-                        // requester saw "transfer request accepted" and waited
-                        // forever for shards this node was never going to send.
-                        // The requester now prunes such inbounds itself, but the
-                        // condition must still be visible — an accepted request
-                        // that moves nothing is the single most misleading
-                        // signal in this subsystem.
+                        // W11 FIX 4(a) — reaching here now means the
+                        // IDEMPOTENCY filter above emptied the list: every
+                        // requested shard already has a live tracked migration
+                        // toward the requester. That is NOT a refusal — the
+                        // requester must keep waiting on the worker in flight
+                        // — so the handler correctly replied STATUS_OK.
+                        //
+                        // The genuine "neither a target holder nor the
+                        // intended master" verdict is answered SYNCHRONOUSLY
+                        // and NEGATIVELY by the dispatch handler
+                        // (`transfer_request_match_counts` →
+                        // ERR_MIGRATION_NO_TASKS), so the requester retires the
+                        // entry instead of re-asking every 10 s forever. It
+                        // cannot be answered here: this runs long after the
+                        // reply went out.
                         tracing::info!(
                             requester = req.requester.0,
                             epoch = req.epoch,
                             shards = req.shards.len(),
-                            "cluster: shard transfer request matched no tasks — requester is \
-                             neither a target holder nor the intended master for these shards",
+                            "cluster: shard transfer request matched no NEW tasks — a tracked \
+                             migration is already in flight for every requested shard",
                         );
                         continue;
                     }
@@ -5898,6 +5905,10 @@ impl ClusterCoordinator {
                             }
                             let addrs = node_addrs.read().clone();
                             let secret = cluster_secret_event.clone();
+                            // W11 FIX 4(a) — needed to act on a REFUSAL.
+                            let refusal_mig = migration.clone();
+                            let refusal_st = shard_table.clone();
+                            let refusal_eng = engine.clone();
                             tracing::info!(
                                 sources = by_source.len(),
                                 epoch = committed_term,
@@ -5918,17 +5929,76 @@ impl ClusterCoordinator {
                                         self_id,
                                         &shards,
                                     );
-                                    match send_topology_frame(
+                                    match send_topology_frame_response(
                                         addr,
                                         OP_MIGRATION_TRANSFER_REQUEST,
                                         &payload,
                                         secret.as_deref().map(Vec::as_slice),
                                     ) {
-                                        Ok(_) => tracing::info!(
+                                        Ok(resp) if resp.status == STATUS_OK => tracing::info!(
                                             source = source.0,
                                             shards = shards.len(),
                                             epoch = committed_term,
                                             "cluster: shard transfer request accepted",
+                                        ),
+                                        Ok(resp)
+                                            if transfer_request_was_refused(&resp.payload) =>
+                                        {
+                                            // W11 FIX 4(a) — the source says
+                                            // it will NEVER send these: we are
+                                            // neither a target holder nor its
+                                            // intended master at the epoch we
+                                            // both activated. Retire the
+                                            // entries rather than re-asking
+                                            // every 10 s forever.
+                                            //
+                                            // Judged by the SAME fail-closed
+                                            // predicate the periodic prune
+                                            // uses: an entry whose records are
+                                            // still local is KEPT and stays
+                                            // fenced (dropping it would expose
+                                            // orphans to local reads — the
+                                            // scenario-17 three-holder bug);
+                                            // orphan cleanup reclaims those
+                                            // and the prune then drops it.
+                                            let dropped = {
+                                                // LOCK ORDER (W8): table
+                                                // before migration.
+                                                let table = refusal_st.read();
+                                                let mut mgr = refusal_mig.lock();
+                                                mgr.drop_refused_inbound(&shards, source, |s| {
+                                                    inbound_entry_must_be_kept(
+                                                        &table,
+                                                        self_id,
+                                                        s,
+                                                        refusal_eng.shard_record_count(s),
+                                                    )
+                                                })
+                                            };
+                                            if dropped > 0 && let Some(m) =
+                                                crate::metrics::migration_metrics()
+                                            {
+                                                m.migration_dangling_inbound_dropped
+                                                    .inc_by(dropped as u64);
+                                            }
+                                            tracing::warn!(
+                                                source = source.0,
+                                                shards = shards.len(),
+                                                dropped,
+                                                kept = shards.len().saturating_sub(dropped),
+                                                epoch = committed_term,
+                                                "cluster: shard transfer request REFUSED — the \
+                                                 source has no tasks for us; dangling inbound \
+                                                 entries dropped (entries whose records are \
+                                                 still local stay fenced for orphan cleanup)",
+                                            );
+                                        }
+                                        Ok(resp) => tracing::warn!(
+                                            source = source.0,
+                                            shards = shards.len(),
+                                            epoch = committed_term,
+                                            status = resp.status,
+                                            "cluster: shard transfer request rejected",
                                         ),
                                         Err(e) => tracing::warn!(
                                             source = source.0,
@@ -13526,6 +13596,13 @@ fn run_orphan_cleanup(
     // evidence permanently, the guard (correctly, fail-closed) never passes;
     // the gauge makes that census gap visible instead of silent.
     let mut retained_no_evidence = 0u32;
+    // W11 FIX 4(b) — the skips ABOVE the #28 evidence check were silent
+    // `continue`s, so a node sitting on stale copies reported
+    // `orphan_cleanup_retained_no_evidence = 0` and looked healthy while
+    // nothing was being reclaimed at all (default-17: 619 stale copies, gauge
+    // reading zero). A census gap must be visible whichever gate caused it.
+    let mut skipped_unsettled = 0u32;
+    let mut skipped_pending_inbound = 0u32;
     {
         let table = shard_table.read();
         let mgr = migration.lock();
@@ -13543,6 +13620,7 @@ fn run_orphan_cleanup(
             .collect();
         for shard in 0..NUM_SHARDS as u16 {
             if unsettled.contains(&shard) {
+                skipped_unsettled = skipped_unsettled.saturating_add(1);
                 debug_shard_log(shard, "orphan_cleanup SKIP (unresolved task for shard)");
                 continue;
             }
@@ -13560,6 +13638,7 @@ fn run_orphan_cleanup(
             // (`MigrationManager::inbound_migration_work_count`) locally TRUE
             // instead of resting on a non-local invariant.
             if mgr.has_pending_inbound(shard) {
+                skipped_pending_inbound = skipped_pending_inbound.saturating_add(1);
                 debug_shard_log(shard, "orphan_cleanup SKIP (pending inbound / heal fence)");
                 continue;
             }
@@ -13609,6 +13688,10 @@ fn run_orphan_cleanup(
     if let Some(m) = crate::metrics::migration_metrics() {
         m.orphan_cleanup_retained_no_evidence
             .store(retained_no_evidence, Ordering::Relaxed);
+        // W11 FIX 4(b) — same contract as the gauge above (published every
+        // pass, including zero, so a cleared skip leaves the gauge).
+        m.orphan_cleanup_skipped_pending_inbound
+            .store(skipped_pending_inbound, Ordering::Relaxed);
     }
     if retained_no_evidence > 0 {
         tracing::warn!(
@@ -13616,6 +13699,20 @@ fn run_orphan_cleanup(
             "cluster: orphan cleanup RETAINED non-owned shard(s) without \
              committed-handoff evidence (fail-closed, #28) — census gap is \
              gauged as teraslab_orphan_cleanup_retained_no_evidence",
+        );
+    }
+    // W11 FIX 4(b) — the two gates ABOVE the #28 check used to `continue`
+    // silently, so a pass that never reached a single evidence decision
+    // published `retained_no_evidence = 0` and read as healthy while
+    // reclaiming nothing (default-17: 619 stale copies behind a zero gauge).
+    if skipped_pending_inbound > 0 || skipped_unsettled > 0 {
+        tracing::info!(
+            pending_inbound = skipped_pending_inbound,
+            unsettled_task = skipped_unsettled,
+            "cluster: orphan cleanup SKIPPED shard(s) before the #28 evidence \
+             check — a zero retained-no-evidence census does NOT mean there \
+             was nothing to reclaim (gauged as \
+             teraslab_orphan_cleanup_skipped_pending_inbound)",
         );
     }
 
@@ -13716,6 +13813,13 @@ fn cleanup_orphaned_shard_if_settled(
             p.shard == shard && p.state == crate::cluster::migration::MigrationState::Failed
         });
         if shard_still_active || shard_failed {
+            // W11 FIX 4(b) — never silent: this return short-circuits the #28
+            // evidence decision, so a run that only ever takes this path
+            // reclaims nothing while every reclaim gauge reads clean.
+            if let Some(m) = crate::metrics::migration_metrics() {
+                m.orphan_cleanup_shard_skipped.inc();
+            }
+            debug_shard_log(shard, "per-shard orphan_cleanup SKIP (unresolved task)");
             return;
         }
         // W10 composition review P2-2 — never reclaim a shard with a pending
@@ -13723,6 +13827,14 @@ fn cleanup_orphaned_shard_if_settled(
         // fail-closed fence). See the matching guard in `run_orphan_cleanup`
         // for why the ownership test below does not already cover heal fences.
         if mgr.has_pending_inbound(shard) {
+            // W11 FIX 4(b) — see the sibling above.
+            if let Some(m) = crate::metrics::migration_metrics() {
+                m.orphan_cleanup_shard_skipped.inc();
+            }
+            debug_shard_log(
+                shard,
+                "per-shard orphan_cleanup SKIP (pending inbound / heal fence)",
+            );
             return;
         }
         // Data-loss guard (task #28): only reclaim with positive evidence the
@@ -17404,6 +17516,52 @@ fn encode_transfer_request_payload(epoch: u64, requester: NodeId, shards: &[u16]
 ///   activation, which rebuilds the handoff and re-pushes.
 /// - Shards where the requester is neither a current target holder nor
 ///   the intended master are ignored (stale or malicious request).
+/// W11 FIX 4(a) — does an `OP_MIGRATION_TRANSFER_REQUEST` error payload carry
+/// the source's TERMINAL "I have no tasks for you" refusal?
+///
+/// The wire shape is the standard `[code:2][msg_len:2][msg]` error envelope.
+/// A payload too short to carry a code is NOT treated as a refusal
+/// (fail-safe: keep the entry and keep asking) — only an explicit
+/// [`ERR_MIGRATION_NO_TASKS`] retires anything, so a truncated frame, a
+/// different rejection (stale epoch, target-not-ready) or a transport error
+/// all leave the requester's state exactly as it was.
+///
+/// Exposed as [`transfer_request_rejection_is_no_tasks`] so the dispatch-side
+/// test can drive the REAL rejection envelope through this REAL detector,
+/// pinning producer and consumer together.
+fn transfer_request_was_refused(payload: &[u8]) -> bool {
+    payload.len() >= 2
+        && u16::from_le_bytes([payload[0], payload[1]]) == ERR_MIGRATION_NO_TASKS
+}
+
+/// Test-visible alias of [`transfer_request_was_refused`] — see its doc.
+pub(crate) fn transfer_request_rejection_is_no_tasks(payload: &[u8]) -> bool {
+    transfer_request_was_refused(payload)
+}
+
+/// W11 FIX 4(a) — [`split_transfer_request_tasks`]'s verdict as counts, for
+/// the `OP_MIGRATION_TRANSFER_REQUEST` dispatch handler.
+///
+/// The handler must answer NEGATIVELY, synchronously, when a request matches
+/// no outbound work at all — otherwise it replies `STATUS_OK` and the
+/// requester re-asks every 10 s forever for shards this node will never send.
+/// The verdict is derived from the same table and the same rules the event
+/// loop applies, so the two cannot disagree: this is a thin projection of the
+/// real splitter, not a second implementation.
+///
+/// Returns `(matched_tasks, diverged)`. `(0, 0)` — and only `(0, 0)` — means
+/// "the requester is neither a target holder nor the intended master for any
+/// requested shard", the refusal condition.
+pub(crate) fn transfer_request_match_counts(
+    table: &ShardTable,
+    self_id: NodeId,
+    requester: NodeId,
+    shards: &[u16],
+) -> (usize, u32) {
+    let (tasks, diverged) = split_transfer_request_tasks(table, self_id, requester, shards);
+    (tasks.len(), diverged)
+}
+
 fn split_transfer_request_tasks(
     table: &ShardTable,
     self_id: NodeId,

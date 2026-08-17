@@ -2251,6 +2251,45 @@ pub(crate) fn handle_request(
                     &format!("transfer-request epoch {epoch} behind local version {local_version}"),
                 );
             }
+            // W11 FIX 4(a) — answer the "matched no tasks" verdict HERE,
+            // negatively, instead of queuing a request whose only outcome is
+            // a log line on this node.
+            //
+            // The verdict is a pure function of the shard table both sides
+            // have just been proven to share (the epoch checks above), so it
+            // is decidable synchronously and cannot change without a new
+            // topology term. Deliberately computed BEFORE the event loop's
+            // idempotency filter: that filter drops shards with a LIVE
+            // tracked migration, which is precisely a case the requester must
+            // keep waiting on — only "neither a target holder nor the
+            // intended master" is a refusal.
+            let matched_nothing = {
+                let shard_table = cluster.shard_table();
+                let table = shard_table.read();
+                let (tasks, diverged) =
+                    crate::cluster::coordinator::transfer_request_match_counts(
+                        &table,
+                        cluster.self_id(),
+                        NodeId(requester_id),
+                        &shards,
+                    );
+                tasks == 0 && diverged == 0
+            };
+            if matched_nothing {
+                if let Some(m) = crate::metrics::migration_metrics() {
+                    m.migration_transfer_request_refused.inc();
+                }
+                return error_response(
+                    request.request_id,
+                    ERR_MIGRATION_NO_TASKS,
+                    &format!(
+                        "transfer-request at epoch {epoch}: requester {requester_id} is \
+                         neither a target holder nor the intended master for any of the \
+                         {} requested shard(s)",
+                        shards.len(),
+                    ),
+                );
+            }
             let queued = cluster.signal_shard_transfer_request(
                 crate::cluster::coordinator::ShardTransferRequest {
                     epoch,
@@ -30491,6 +30530,11 @@ mod tests {
     /// event loop; a requester ahead of this node gets
     /// `ERR_MIGRATION_TARGET_NOT_READY` (retryable); a stale requester
     /// gets `ERR_STALE_EPOCH`.
+    ///
+    /// W11 FIX 4(a) — the queued case now requires shards the requester
+    /// really is a target holder of; the "holder of nothing" case is a
+    /// NEGATIVE reply and is covered by
+    /// `migration_transfer_request_refuses_a_requester_that_holds_nothing`.
     #[test]
     fn migration_transfer_request_validates_epoch_and_queues() {
         let h = DispatchTestHarness::new();
@@ -30500,6 +30544,15 @@ mod tests {
             crate::cluster::shards::NodeId(3),
         ];
         let table = crate::cluster::shards::ShardTable::compute_with_epoch(&members, 2, 7, 1);
+        let held: Vec<u16> = (0..crate::cluster::shards::NUM_SHARDS as u16)
+            .filter(|&s| {
+                let a = table.target_assignment(s);
+                a.master == crate::cluster::shards::NodeId(3)
+                    || a.replicas.contains(&crate::cluster::shards::NodeId(3))
+            })
+            .take(2)
+            .collect();
+        assert_eq!(held.len(), 2, "node 3 must hold at least two shards");
         let mut cluster = crate::cluster::coordinator::new_test_running_cluster(
             crate::cluster::shards::NodeId(1),
             table,
@@ -30547,27 +30600,116 @@ mod tests {
         };
 
         // Requester ahead of this node (epoch 8 > local 7): retryable.
-        let resp = send(&cluster, encode(8, &[10, 11]));
+        let resp = send(&cluster, encode(8, &held));
         assert_eq!(resp.status, STATUS_ERROR);
         let (code, _) = decode_error_payload(&resp.payload).unwrap();
         assert_eq!(code, ERR_MIGRATION_TARGET_NOT_READY);
 
         // Requester behind this node (epoch 6 < local 7): stale.
-        let resp = send(&cluster, encode(6, &[10, 11]));
+        let resp = send(&cluster, encode(6, &held));
         assert_eq!(resp.status, STATUS_ERROR);
         let (code, _) = decode_error_payload(&resp.payload).unwrap();
         assert_eq!(code, ERR_STALE_EPOCH);
 
         // Matching epoch: accepted and queued verbatim.
-        let resp = send(&cluster, encode(7, &[10, 11]));
+        let resp = send(&cluster, encode(7, &held));
         assert_eq!(resp.status, STATUS_OK);
         let queued = rx.try_recv().expect("request must be queued");
         assert_eq!(queued.epoch, 7);
         assert_eq!(queued.requester, crate::cluster::shards::NodeId(3));
-        assert_eq!(queued.shards, vec![10, 11]);
+        assert_eq!(queued.shards, held);
 
         // Nothing else queued by the two rejected frames.
         assert!(rx.try_recv().is_err());
+    }
+
+    /// W11 FIX 4(a) (RED→GREEN) — a transfer request at the correct epoch
+    /// that matches NO outbound work must be answered NEGATIVELY, in the
+    /// handler, so the requester can retire the entry.
+    ///
+    /// Pre-fix the handler replied STATUS_OK unconditionally (the verdict was
+    /// reached asynchronously in the coordinator event loop, long after the
+    /// reply was on the wire), so the requester logged "shard transfer
+    /// request accepted" and re-asked every 10 s forever for shards this node
+    /// was never going to send — default-17's dangling inbound entries. The
+    /// verdict is decidable here: both sides have activated the same table.
+    #[test]
+    fn migration_transfer_request_refuses_a_requester_that_holds_nothing() {
+        let h = DispatchTestHarness::new();
+        let members = vec![
+            crate::cluster::shards::NodeId(1),
+            crate::cluster::shards::NodeId(2),
+            crate::cluster::shards::NodeId(3),
+        ];
+        let table = crate::cluster::shards::ShardTable::compute_with_epoch(&members, 2, 7, 1);
+        // Shards node 3 is neither a target holder of nor the intended master
+        // for — exactly the "will never be sent" set.
+        let unheld: Vec<u16> = (0..crate::cluster::shards::NUM_SHARDS as u16)
+            .filter(|&s| {
+                let a = table.target_assignment(s);
+                a.master != crate::cluster::shards::NodeId(3)
+                    && !a.replicas.contains(&crate::cluster::shards::NodeId(3))
+                    && table.intended_master(s) != crate::cluster::shards::NodeId(3)
+            })
+            .take(3)
+            .collect();
+        assert_eq!(unheld.len(), 3, "RF=2 over 3 members leaves node 3 out of some shards");
+
+        let mut cluster = crate::cluster::coordinator::new_test_running_cluster(
+            crate::cluster::shards::NodeId(1),
+            table,
+            &[(
+                crate::cluster::shards::NodeId(1),
+                "127.0.0.1:4731".parse().unwrap(),
+            )],
+            &members,
+            &[],
+            &[],
+            &[],
+            3,
+        );
+        let rx = cluster.test_take_transfer_request_rx();
+
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&7u64.to_le_bytes());
+        payload.extend_from_slice(&3u64.to_le_bytes());
+        payload.extend_from_slice(&(unheld.len() as u32).to_le_bytes());
+        for &s in &unheld {
+            payload.extend_from_slice(&s.to_le_bytes());
+        }
+        let req = RequestFrame {
+            request_id: 0,
+            op_code: OP_MIGRATION_TRANSFER_REQUEST,
+            flags: 0,
+            payload: payload.into(),
+        };
+        let mut conn_state = crate::server::ConnectionState::new();
+        let resp = handle_request(
+            &req,
+            &h.engine,
+            8192,
+            Some(&cluster),
+            None,
+            &mut conn_state,
+            None,
+        );
+
+        assert_eq!(resp.status, STATUS_ERROR);
+        let (code, msg) = decode_error_payload(&resp.payload).unwrap();
+        assert_eq!(
+            code, ERR_MIGRATION_NO_TASKS,
+            "an unmatchable request must be refused, not accepted: {msg}",
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "a refused request must not be queued for the event loop",
+        );
+        // Producer/consumer pinned together: the requester's refusal detector
+        // must read THIS envelope, not a hand-written one.
+        assert!(
+            crate::cluster::coordinator::transfer_request_rejection_is_no_tasks(&resp.payload),
+            "the requester-side detector must recognise the real envelope",
+        );
     }
 
     #[test]

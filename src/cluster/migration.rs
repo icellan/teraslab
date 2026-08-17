@@ -2823,6 +2823,52 @@ impl MigrationManager {
         removed
     }
 
+    /// W11 FIX 4(a) — drop pending inbound entries for `shards` that `source`
+    /// has TERMINALLY REFUSED (`ERR_MIGRATION_NO_TASKS`: the requester is
+    /// neither a target holder nor its intended master at the epoch both
+    /// sides activated).
+    ///
+    /// Scoped exactly to the refusal: only entries naming THAT source, only
+    /// the listed shards, only uncompleted ones. Every other inbound entry —
+    /// including one for the same shard from a different source — is
+    /// untouched, so a refusal from a stale peer cannot cancel a live
+    /// transfer.
+    ///
+    /// `must_be_kept` is the SAME fail-closed predicate the periodic
+    /// not-held prune applies (`inbound_entry_must_be_kept`): an entry whose
+    /// shard still has local records is KEPT and stays fenced, because
+    /// dropping the fence would expose those orphans to local reads (the
+    /// scenario-17 three-holder bug). Orphan cleanup reclaims the records and
+    /// the ordinary prune then drops the entry. The refusal therefore buys
+    /// promptness for the safe case and changes nothing about the unsafe one.
+    ///
+    /// Returns how many entries were removed.
+    pub fn drop_refused_inbound(
+        &mut self,
+        shards: &[u16],
+        source: NodeId,
+        must_be_kept: impl Fn(u16) -> bool,
+    ) -> usize {
+        let refused: std::collections::HashSet<u16> = shards.iter().copied().collect();
+        let before = self.inbound_migrations.len();
+        self.inbound_migrations.retain(|m| {
+            m.completed
+                || m.from_node != source
+                || !refused.contains(&m.shard)
+                || must_be_kept(m.shard)
+        });
+        let removed = before - self.inbound_migrations.len();
+        if removed > 0 {
+            self.inbound_bitmap.clear_all();
+            for m in &self.inbound_migrations {
+                if !m.completed {
+                    self.inbound_bitmap.set(m.shard);
+                }
+            }
+        }
+        removed
+    }
+
     /// Serialize active outbound migration state to bytes.
     ///
     /// Format:
@@ -5303,6 +5349,63 @@ mod tests {
         assert!(mgr.has_pending_inbound(10));
         assert!(mgr.has_pending_inbound(20));
         assert_eq!(mgr.inbound_count(), 2);
+    }
+
+    /// W11 FIX 4(a) (RED→GREEN) — a source's terminal
+    /// `ERR_MIGRATION_NO_TASKS` refusal retires the dangling inbound entries
+    /// it names, and NOTHING else.
+    ///
+    /// Scoping matters: a refusal from one source must not cancel a live
+    /// transfer for the same shard from another, and an entry whose records
+    /// are still local must be KEPT fenced — dropping it would expose those
+    /// orphans to local reads (the scenario-17 three-holder bug), which is
+    /// why the drop reuses the periodic prune's fail-closed predicate rather
+    /// than trusting the refusal blindly.
+    #[test]
+    fn refused_transfer_request_drops_only_its_own_dangling_inbounds() {
+        let refuser = NodeId(3);
+        let other = NodeId(4);
+
+        let mut mgr = MigrationManager::new();
+        assert!(mgr.register_inbound_source(10, refuser)); // refused, no records
+        assert!(mgr.register_inbound_source(11, refuser)); // refused, HAS records
+        assert!(mgr.register_inbound_source(12, refuser)); // not in the request
+        assert!(mgr.register_inbound_source(10, other)); // same shard, live peer
+
+        // Shard 11 still holds local records → fail-closed keep.
+        let dropped = mgr.drop_refused_inbound(&[10, 11], refuser, |shard| shard == 11);
+
+        assert_eq!(dropped, 1, "only the record-free refused entry is retired");
+        assert!(
+            !mgr.pending_inbound_entries().contains(&(10, refuser)),
+            "the dangling entry the source will never satisfy must go",
+        );
+        assert!(
+            mgr.pending_inbound_entries().contains(&(11, refuser)),
+            "an entry whose records are still local stays fenced fail-closed \
+             until orphan cleanup reclaims them",
+        );
+        assert!(
+            mgr.pending_inbound_entries().contains(&(12, refuser)),
+            "a shard the refusal did not name is untouched",
+        );
+        assert!(
+            mgr.pending_inbound_entries().contains(&(10, other)),
+            "a refusal from one source must never cancel another source's \
+             live transfer for the same shard",
+        );
+        // Shard 10 still has the other source's entry, so it stays fenced;
+        // the bitmap must agree with the entries it shadows.
+        assert!(mgr.has_pending_inbound(10));
+        assert!(mgr.has_pending_inbound(11));
+        assert!(mgr.has_pending_inbound(12));
+
+        // Once the last entry for a shard goes, the fence bit goes with it.
+        assert_eq!(mgr.drop_refused_inbound(&[10], other, |_| false), 1);
+        assert!(
+            !mgr.has_pending_inbound(10),
+            "the inbound bitmap must be rebuilt from the surviving entries",
+        );
     }
 
     /// W11 FIX 1 (RED→GREEN) — an inbound entry for a shard this node is NOT
