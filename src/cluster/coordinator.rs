@@ -7675,13 +7675,14 @@ fn duplicate_completion_upgrade_applicable(
 
 /// W9 FIX 2 — interval between retry exchanges for a det-degraded
 /// activation, as a function of how many retries have already FIRED for
-/// this degrade. Doubles from 2 s to the 30 s cap (the
-/// [`park_reheal_backoff`] doubling-to-cap shape at the exchange scale):
-/// the common rescue is a peer applying the commit within a few seconds,
-/// while a genuinely partitioned peer must not be probed every 2 s
-/// forever.
+/// this degrade. Doubles from 2 s to the 5-minute cap (the
+/// [`park_reheal_backoff`] doubling-to-cap model): the common rescue is a
+/// peer applying the commit within a few seconds, while a
+/// permanently-partitioned peer must not be probed every 30 s forever —
+/// after ~8 fruitless rounds the cadence settles at the same 5-minute
+/// ceiling the park re-heal uses.
 ///
-/// The 2 s floor equals the exchange's total deadline, which makes the
+/// The 2 s floor equals [`EXCHANGE_PHASE_TIMEOUT`], which makes the
 /// retry single-flight BY CONSTRUCTION: an exchange thread always sends
 /// its (possibly partial) result within its deadline, so the previous
 /// retry's exchange has completed before the next one can fire — no
@@ -7690,8 +7691,8 @@ fn duplicate_completion_upgrade_applicable(
 /// exchanges for the same term).
 fn degraded_upgrade_retry_backoff(fired_rounds: u32) -> Duration {
     const START: Duration = Duration::from_secs(2);
-    const CAP: Duration = Duration::from_secs(30);
-    CAP.min(START.saturating_mul(1u32 << fired_rounds.min(4)))
+    const CAP: Duration = Duration::from_secs(300);
+    CAP.min(START.saturating_mul(1u32 << fired_rounds.min(8)))
 }
 
 /// W9 FIX 2 — should the event loop re-fire the exchange phase for a
@@ -7784,6 +7785,15 @@ fn det_plan_launch_due(held_for: Duration) -> bool {
 /// event-loop thread doing this admissibility check, so nothing can start
 /// streaming concurrently. They are therefore safe to supersede; any other
 /// active migration still locks the upgrade out.
+///
+/// KNOWN EXCEPTION (W9 P2-4, pre-existing): the Phase-H resync backfill
+/// deliberately does NOT `start_outbound`-track its tasks, so its workers
+/// are invisible to `active_count()` — to BOTH the strict and the relaxed
+/// form of this gate, exactly as they were before the det-degrade work.
+/// A resync stream racing an upgrade is therefore not excluded here; the
+/// exposure is unchanged by this helper and tracked as a residual, not
+/// papered over by registering resync tasks (which would change Phase-H's
+/// failure semantics).
 fn no_live_migration_workers_for_upgrade(
     active_count: usize,
     det_plan_launch_held_for_term: bool,
@@ -7837,7 +7847,12 @@ fn cancel_deferred_plan_launch(
         {
             let mut mgr = migration.lock();
             for task in &pending.tasks {
-                mgr.mark_failed(task);
+                // Exact (4-tuple) resolution, matching
+                // `active_migrations_all_held`'s key: `mark_failed`'s
+                // (shard, from, to) lookup could fail the wrong twin when
+                // a master and a replica task share endpoints, leaving
+                // the named one active — and preservable — workerless.
+                mgr.mark_failed_exact(task);
             }
         }
         tracing::info!(
@@ -33027,21 +33042,25 @@ mod tests {
     }
 
     /// W9 FIX 2 — the degraded-upgrade retry interval doubles from 2 s to
-    /// the 30 s cap (the `park_reheal_backoff` shape at the exchange scale).
+    /// the 5-minute cap (the `park_reheal_backoff` doubling-to-cap model:
+    /// a permanently-partitioned peer must not be probed every 30 s
+    /// forever, while the early rounds stay prompt).
     #[test]
     fn degraded_upgrade_retry_backoff_doubles_from_start_to_cap() {
         assert_eq!(degraded_upgrade_retry_backoff(0), Duration::from_secs(2));
         assert_eq!(degraded_upgrade_retry_backoff(1), Duration::from_secs(4));
         assert_eq!(degraded_upgrade_retry_backoff(2), Duration::from_secs(8));
         assert_eq!(degraded_upgrade_retry_backoff(3), Duration::from_secs(16));
+        assert_eq!(degraded_upgrade_retry_backoff(4), Duration::from_secs(32));
+        assert_eq!(degraded_upgrade_retry_backoff(7), Duration::from_secs(256));
         assert_eq!(
-            degraded_upgrade_retry_backoff(4),
-            Duration::from_secs(30),
-            "the fifth round hits the 30 s cap",
+            degraded_upgrade_retry_backoff(8),
+            Duration::from_secs(300),
+            "the doubling tops out at the 5-minute cap",
         );
         assert_eq!(
             degraded_upgrade_retry_backoff(u32::MAX),
-            Duration::from_secs(30),
+            Duration::from_secs(300),
             "the cap must hold without overflow",
         );
     }
