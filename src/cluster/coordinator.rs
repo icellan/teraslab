@@ -7224,6 +7224,94 @@ fn split_already_serving_migration_tasks(
     (active, skipped)
 }
 
+/// W10 (armed-11, CI d3437e4) — verify each completion-only "already
+/// serving" candidate before its handshake is allowed to COMMIT mastership
+/// on the target.
+///
+/// The completion-only skip rests on the invariant "a ServingNew master
+/// retains its data". The wave-9 event-driven orphan cleanup broke it: a
+/// rejoining node's boot-time cleanup deleted its pre-kill copies ~2 s
+/// before epoch 3 handed those shards back via this path with nothing
+/// streamed — the target committed mastership over ZERO records and served
+/// the shard empty (armed-11's transient blob unavailability).
+///
+/// Verification, per candidate (the split routed it here because the
+/// batch's key SNAPSHOT held nothing for the shard):
+/// - Source LIVE record count == 0: nothing could be streamed anyway, and a
+///   genuinely empty shard must keep committing completion-only (fresh
+///   clusters hand off thousands of empty shards through this path), so the
+///   candidate is confirmed without a probe.
+/// - Source LIVE record count > 0 (the snapshot was stale or scoped past
+///   this shard): completion-only is safe ONLY if the target provably
+///   retains the data. Reuse the verify-only superset probe
+///   ([`confirm_target_holds_superset`] — the manifest machinery the
+///   completion handshake already carries): a confirmed superset keeps the
+///   cheap completion-only path (no pointless full re-stream on the routine
+///   FIX-B / re-drive handshake resends); anything else — target holds
+///   nothing, rejects, or is unreachable — DEMOTES the task to the normal
+///   streaming path with its live keys, whose count+manifest completion
+///   re-verifies end-to-end. An unreadable-footer manifest failure also
+///   demotes (issue-#46 posture: never commit an unverified non-empty
+///   shard; the streaming path's own error handling owns the outcome).
+///
+/// Returns `(confirmed_completion_only, demoted)` where each demoted entry
+/// carries the live keys to stream.
+fn verify_already_serving_skips(
+    engine: &Arc<Engine>,
+    target_addr: SocketAddr,
+    candidates: Vec<MigrationTask>,
+    topology_epoch: u64,
+    auth_secret: Option<&[u8]>,
+) -> (Vec<MigrationTask>, Vec<(MigrationTask, Vec<TxKey>)>) {
+    let mut confirmed = Vec::with_capacity(candidates.len());
+    let mut demoted = Vec::new();
+    for task in candidates {
+        if engine.shard_record_count(task.shard) == 0 {
+            confirmed.push(task);
+            continue;
+        }
+        let keys = engine.keys_for_shard(task.shard);
+        let target_holds = match collect_manifest_entries(engine, task.shard, &keys) {
+            Ok(entries) if !entries.is_empty() => confirm_target_holds_superset(
+                target_addr,
+                task.shard,
+                task.from_node,
+                topology_epoch,
+                &entries,
+                auth_secret,
+            ),
+            // Every live key resolved stale mid-collection: nothing real
+            // to move — same disposition as the empty case.
+            Ok(_) => {
+                confirmed.push(task);
+                continue;
+            }
+            Err(err) => {
+                tracing::warn!(
+                    shard = task.shard,
+                    err = %err,
+                    "cluster: already-serving verification could not collect the \
+                     shard manifest — demoting to the streaming path (issue #46)",
+                );
+                false
+            }
+        };
+        if target_holds {
+            confirmed.push(task);
+        } else {
+            tracing::warn!(
+                shard = task.shard,
+                records = keys.len(),
+                %target_addr,
+                "cluster: already-serving completion REFUSED — the target does not \
+                 provably hold this shard's records; streaming instead (armed-11)",
+            );
+            demoted.push((task, keys));
+        }
+    }
+    (confirmed, demoted)
+}
+
 fn should_trigger_topology_reactivation(
     startup_reactivation_due: bool,
     normal_reactivation_due: bool,
@@ -10028,19 +10116,6 @@ fn run_migration_batch(
     // in place after this capture.
     let all_batch_tasks: Vec<(MigrationTask, u64)> = migration.lock().capture_task_attempts(&tasks);
 
-    // Pre-group keys by shard ONCE. Without this, each shard does an
-    // O(N) scan of all keys, making total cost O(shards × keys).
-    // With pre-grouping, total cost is O(keys) for the grouping +
-    // O(shard_keys) per shard for the actual migration.
-    let mut keys_by_shard: std::collections::HashMap<u16, Vec<&TxKey>> =
-        std::collections::HashMap::new();
-    for key in all_keys {
-        let shard = ShardTable::shard_for_key(key);
-        keys_by_shard.entry(shard).or_default().push(key);
-    }
-
-    // Separate empty shards from shards with data using the pre-grouped
-    // map (O(1) per shard instead of O(all_keys) per shard).
     // Pre-filter: skip master shards already in ServingNew (already committed
     // by a previous topology cycle or by the begin_handoff_with callback).
     // Replica-only migrations intentionally enter ServingNew immediately
@@ -10048,11 +10123,39 @@ fn run_migration_batch(
     // data to maintain RF when the source snapshot contains records.
     // Send OP_MIGRATION_COMPLETE to the target so it clears its inbound
     // state and unblocks writes for these shards.
-    let data_shards: std::collections::HashSet<u16> = keys_by_shard.keys().copied().collect();
-    let (tasks, skipped_tasks) = {
+    let data_shards: std::collections::HashSet<u16> =
+        all_keys.iter().map(ShardTable::shard_for_key).collect();
+    let (tasks, skip_candidates) = {
         let table = shard_table.read();
         split_already_serving_migration_tasks(tasks, &table, &data_shards)
     };
+    // W10 (armed-11) — a completion-only skip commits mastership on the
+    // target, so it must first be VERIFIED: a candidate whose shard holds
+    // LIVE source records (the snapshot was stale) may only stay
+    // completion-only if the target provably retains those records;
+    // otherwise it is demoted to the streaming path with its live keys.
+    let (skipped_tasks, demoted) =
+        verify_already_serving_skips(&engine, addr, skip_candidates, topology_epoch, auth_secret);
+    // Owned storage for the demoted shards' live keys; must outlive
+    // `keys_by_shard`, which borrows from it.
+    let demoted_keys: Vec<TxKey> = demoted
+        .iter()
+        .flat_map(|(_, keys)| keys.iter().copied())
+        .collect();
+    let mut tasks = tasks;
+    tasks.extend(demoted.into_iter().map(|(task, _)| task));
+
+    // Pre-group keys by shard ONCE. Without this, each shard does an
+    // O(N) scan of all keys, making total cost O(shards × keys).
+    // With pre-grouping, total cost is O(keys) for the grouping +
+    // O(shard_keys) per shard for the actual migration.
+    let mut keys_by_shard: std::collections::HashMap<u16, Vec<&TxKey>> =
+        std::collections::HashMap::new();
+    for key in all_keys.iter().chain(demoted_keys.iter()) {
+        let shard = ShardTable::shard_for_key(key);
+        keys_by_shard.entry(shard).or_default().push(key);
+    }
+
     if !skipped_tasks.is_empty() {
         tracing::info!(
             shards = skipped_tasks.len(),
@@ -23959,6 +24062,242 @@ mod tests {
             1,
             "the pre-existing tracked entry must remain the only registration"
         );
+    }
+
+    /// W10 DEFECT 2 (armed-11, CI d3437e4) — the completion-only "already
+    /// serving" handshake must NOT commit mastership on a target that does
+    /// not hold the shard's records while this source does. Setup mirrors
+    /// armed-11's shape: the shard is ServingNew on a settled table, the
+    /// batch's key SNAPSHOT holds nothing for it (stale/scoped enumeration),
+    /// but the source engine holds a LIVE record — and the target (its
+    /// copies just orphan-cleaned) rejects the superset presence probe.
+    /// Pre-fix the batch sent a bare `OP_MIGRATION_BATCH_COMPLETE`, the
+    /// target committed mastership over zero records, and nothing was ever
+    /// streamed; post-fix the task is demoted to the streaming path.
+    #[test]
+    fn already_serving_handshake_streams_when_target_lost_its_copies() {
+        let members = vec![NodeId(1), NodeId(2)];
+        // Settled table: no handoff in progress, so every shard reports
+        // ServingNew — the armed-11 re-drive shape.
+        let table = ShardTable::compute_with_epoch(&members, 2, 3, 1);
+        let shard = (0..NUM_SHARDS as u16)
+            .find(|&s| {
+                table.target_assignment(s).master == NodeId(2)
+                    && table.target_assignment(s).replicas.contains(&NodeId(1))
+            })
+            .expect("node 2 must master a shard node 1 replicates");
+        assert_eq!(table.shard_handoff_state(shard), ShardHandoff::ServingNew);
+        let epoch = table.version;
+        let shard_table = Arc::new(ShardTableLock::new(table));
+
+        let engine = Arc::new(test_engine());
+        let key = tx_key_for_shard(shard, 3);
+        create_test_record(&engine, key);
+
+        let task = MigrationTask {
+            shard,
+            from_node: NodeId(1),
+            to_node: NodeId(2),
+            is_master: true,
+        };
+        let migration = Arc::new(Mutex::new(MigrationManager::new()));
+        let populated: std::collections::HashSet<u16> = [shard].into_iter().collect();
+        migration
+            .lock()
+            .start_outbound(std::slice::from_ref(&task), NodeId(1), &populated);
+        let fenced_bm = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+        let migrating_bm = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+        let inbound_bm = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+
+        // The target's copies were just orphan-cleaned: it rejects the
+        // superset presence probe.
+        let (addr, op_rx, stop, target) = spawn_ack_all_target(true);
+        // Empty key snapshot for the shard — the stale enumeration that
+        // routes the task onto the completion-only path today.
+        let (completed, failed) = run_migration_batch(
+            vec![task],
+            Some(addr),
+            &[],
+            engine,
+            &migration,
+            &shard_table,
+            &None,
+            epoch,
+            1,
+            100,
+            fenced_bm,
+            migrating_bm,
+            inbound_bm,
+            NodeId(1),
+            None,
+            None,
+        );
+        assert_eq!((completed, failed), (1, 0));
+        let seen: Vec<(u16, u16)> = op_rx.try_iter().collect();
+        assert!(
+            seen.iter().any(|(op, flags)| *op == OP_MIGRATION_COMPLETE
+                && *flags & FLAG_MIGRATION_VERIFY_ONLY != 0
+                && *flags & FLAG_MIGRATION_SUPERSET_OK != 0),
+            "the source must probe the target's presence before an \
+             already-serving commit (saw: {seen:?})"
+        );
+        assert!(
+            seen.iter()
+                .any(|(op, _)| *op == crate::protocol::opcodes::OP_REPLICA_BATCH),
+            "the shard must NOT commit without data: a target that fails the \
+             presence probe must be STREAMED the source's records, not handed \
+             a bare completion (saw: {seen:?})"
+        );
+        stop.store(true, Ordering::Relaxed);
+        target.join().unwrap();
+    }
+
+    /// W10 DEFECT 2 — the verified fast path: when the target CONFIRMS it
+    /// holds a superset of the source's records for an already-serving
+    /// shard, the completion-only handshake proceeds and nothing is
+    /// re-streamed (routine FIX-B / re-drive handshake resends must not
+    /// degrade into full shard re-streams).
+    #[test]
+    fn already_serving_handshake_commits_without_restream_when_target_confirms() {
+        let members = vec![NodeId(1), NodeId(2)];
+        let table = ShardTable::compute_with_epoch(&members, 2, 3, 1);
+        let shard = (0..NUM_SHARDS as u16)
+            .find(|&s| {
+                table.target_assignment(s).master == NodeId(2)
+                    && table.target_assignment(s).replicas.contains(&NodeId(1))
+            })
+            .expect("node 2 must master a shard node 1 replicates");
+        let epoch = table.version;
+        let shard_table = Arc::new(ShardTableLock::new(table));
+
+        let engine = Arc::new(test_engine());
+        let key = tx_key_for_shard(shard, 4);
+        create_test_record(&engine, key);
+
+        let task = MigrationTask {
+            shard,
+            from_node: NodeId(1),
+            to_node: NodeId(2),
+            is_master: true,
+        };
+        let migration = Arc::new(Mutex::new(MigrationManager::new()));
+        let populated: std::collections::HashSet<u16> = [shard].into_iter().collect();
+        migration
+            .lock()
+            .start_outbound(std::slice::from_ref(&task), NodeId(1), &populated);
+        let fenced_bm = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+        let migrating_bm = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+        let inbound_bm = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+
+        let (addr, op_rx, stop, target) = spawn_ack_all_target(false);
+        let (completed, failed) = run_migration_batch(
+            vec![task],
+            Some(addr),
+            &[],
+            engine,
+            &migration,
+            &shard_table,
+            &None,
+            epoch,
+            1,
+            100,
+            fenced_bm,
+            migrating_bm,
+            inbound_bm,
+            NodeId(1),
+            None,
+            None,
+        );
+        assert_eq!((completed, failed), (1, 0));
+        let seen: Vec<(u16, u16)> = op_rx.try_iter().collect();
+        assert!(
+            seen.iter().any(|(op, flags)| *op == OP_MIGRATION_COMPLETE
+                && *flags & FLAG_MIGRATION_SUPERSET_OK != 0),
+            "the presence probe must run (saw: {seen:?})"
+        );
+        assert!(
+            !seen
+                .iter()
+                .any(|(op, _)| *op == crate::protocol::opcodes::OP_REPLICA_BATCH),
+            "a confirmed target must not be re-streamed (saw: {seen:?})"
+        );
+        assert!(
+            seen.iter()
+                .any(|(op, _)| *op == OP_MIGRATION_BATCH_COMPLETE),
+            "the completion-only handshake must still be delivered (saw: {seen:?})"
+        );
+        stop.store(true, Ordering::Relaxed);
+        target.join().unwrap();
+    }
+
+    /// W10 DEFECT 2 — a genuinely empty shard (zero LIVE source records)
+    /// keeps the historical completion-only behavior WITHOUT any network
+    /// probe: fresh clusters hand off thousands of empty shards this way
+    /// and must not pay a per-shard round-trip nor stall on it.
+    #[test]
+    fn already_serving_empty_shard_commits_completion_only_without_probe() {
+        let members = vec![NodeId(1), NodeId(2)];
+        let table = ShardTable::compute_with_epoch(&members, 2, 3, 1);
+        let shard = (0..NUM_SHARDS as u16)
+            .find(|&s| {
+                table.target_assignment(s).master == NodeId(2)
+                    && table.target_assignment(s).replicas.contains(&NodeId(1))
+            })
+            .expect("node 2 must master a shard node 1 replicates");
+        let epoch = table.version;
+        let shard_table = Arc::new(ShardTableLock::new(table));
+        let engine = Arc::new(test_engine());
+
+        let task = MigrationTask {
+            shard,
+            from_node: NodeId(1),
+            to_node: NodeId(2),
+            is_master: true,
+        };
+        let migration = Arc::new(Mutex::new(MigrationManager::new()));
+        migration.lock().start_outbound(
+            std::slice::from_ref(&task),
+            NodeId(1),
+            &std::collections::HashSet::new(),
+        );
+        let fenced_bm = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+        let migrating_bm = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+        let inbound_bm = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+
+        let (addr, op_rx, stop, target) = spawn_ack_all_target(true);
+        let (completed, failed) = run_migration_batch(
+            vec![task],
+            Some(addr),
+            &[],
+            engine,
+            &migration,
+            &shard_table,
+            &None,
+            epoch,
+            1,
+            100,
+            fenced_bm,
+            migrating_bm,
+            inbound_bm,
+            NodeId(1),
+            None,
+            None,
+        );
+        assert_eq!((completed, failed), (1, 0));
+        let seen: Vec<(u16, u16)> = op_rx.try_iter().collect();
+        assert!(
+            !seen.iter().any(|(op, flags)| *op == OP_MIGRATION_COMPLETE
+                && *flags & FLAG_MIGRATION_SUPERSET_OK != 0),
+            "an empty source shard must not probe (saw: {seen:?})"
+        );
+        assert!(
+            seen.iter()
+                .any(|(op, _)| *op == OP_MIGRATION_BATCH_COMPLETE),
+            "the empty shard's completion-only handshake must be delivered \
+             (saw: {seen:?})"
+        );
+        stop.store(true, Ordering::Relaxed);
+        target.join().unwrap();
     }
 
     /// W10 DEFECT 3 (armed-11) — the event-driven orphan-cleanup pass is
