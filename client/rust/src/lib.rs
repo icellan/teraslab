@@ -3685,6 +3685,7 @@ mod tests {
             replication_factor,
             committed_master_election_enabled: false,
             under_replication_sweep_enabled: false,
+            replica_abort_forced_resync_enabled: true,
             migration_vetoed_reduction_enabled: false,
             probe_interval: Duration::from_millis(100),
             suspicion_timeout: Duration::from_secs(2),
