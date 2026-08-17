@@ -9017,6 +9017,49 @@ fn run_topology_proposer(
     );
 }
 
+/// W11 FIX 2 — what one peer's `OP_TOPOLOGY_PROPOSE` round-trip told us
+/// about that peer's reachability, as opposed to its vote.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProposeOutcome {
+    /// The peer answered with a decodable vote.
+    Voted,
+    /// The peer answered, but the response was not a decodable vote
+    /// (malformed, or a rejection envelope). It is REACHABLE.
+    Answered,
+    /// The TCP CONNECT to the peer failed: it is unreachable right now.
+    ///
+    /// Classified at the single site that produces the error string —
+    /// [`send_topology_frame_response_with_read_timeout`] maps only
+    /// `TcpStream::connect_timeout` failures to the `connect: ` prefix; a
+    /// timed-out or malformed frame READ produces a different message and is
+    /// therefore `Answered`, not `Unreachable`.
+    Unreachable,
+}
+
+/// W11 FIX 2 — the peers a commit broadcast should actually dial.
+///
+/// A peer whose propose could not even CONNECT milliseconds ago will not
+/// connect for the commit either; dialling it only buys another
+/// `TOPOLOGY_FRAME_CONNECT_TIMEOUT` (500 ms) plus, in the old inline
+/// retry loop, two more. In CI @ 3a38dc2 scenario 07 that node's container
+/// had already been removed, and re-dialling it is what serialized the
+/// proposer's own commit-apply behind 1.75 s of dead-peer TCP.
+///
+/// Everything else stays on the list. A peer that ANSWERED — even with a
+/// rejection or a malformed frame — is reachable and still needs the commit;
+/// dropping it would turn a vote-level disagreement into a missed commit.
+/// Skipping is a pure LIVENESS optimization: an unreachable peer learns the
+/// term from gossip's `committed_term` piggyback and the `TopologyStale`
+/// catch-up when it returns, exactly as it would have after the broadcast
+/// failed against it.
+fn commit_broadcast_targets(outcomes: &[(SocketAddr, ProposeOutcome)]) -> Vec<SocketAddr> {
+    outcomes
+        .iter()
+        .filter(|(_, outcome)| *outcome != ProposeOutcome::Unreachable)
+        .map(|(addr, _)| *addr)
+        .collect()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn try_run_topology_proposal(
     proposal: &crate::cluster::topology::TopologyTerm,
@@ -9048,38 +9091,62 @@ fn try_run_topology_proposal(
     // Send proposals to ALL peers in parallel. Each thread handles one
     // peer's TCP round-trip independently. This reduces topology change
     // latency from O(peers × timeout) to O(timeout).
-    let votes: Vec<Option<crate::cluster::topology::TopologyVote>> = std::thread::scope(|scope| {
+    //
+    // W11 FIX 2 — each round-trip also reports the peer's REACHABILITY
+    // ([`ProposeOutcome`]), classified where the error is produced rather
+    // than re-derived later, so the commit broadcast can skip a peer it just
+    // failed to connect to.
+    type ProposeResult = (
+        ProposeOutcome,
+        Option<crate::cluster::topology::TopologyVote>,
+    );
+    let results: Vec<ProposeResult> = std::thread::scope(|scope| {
         let handles: Vec<_> = peers.iter().map(|(peer_id, peer_addr)| {
             let payload = &propose_payload;
             let pid = *peer_id;
             let paddr = *peer_addr;
-            scope.spawn(move || -> Option<crate::cluster::topology::TopologyVote> {
+            scope.spawn(move || -> ProposeResult {
                 match send_topology_frame(paddr, OP_TOPOLOGY_PROPOSE, payload, auth_secret) {
                     Ok(response_payload) => {
                         match crate::cluster::topology::TopologyVote::deserialize(&response_payload) {
-                            Some(v) => Some(v),
+                            Some(v) => (ProposeOutcome::Voted, Some(v)),
                             None => {
                                 tracing::warn!(?pid, %paddr, "cluster: topology propose — malformed vote");
-                                None
+                                (ProposeOutcome::Answered, None)
                             }
                         }
                     }
                     Err(e) => {
-                        tracing::warn!(?pid, %paddr, err = %e, "cluster: topology propose failed");
-                        None
+                        // Only a failed TCP connect proves unreachability; a
+                        // read timeout or a garbled frame means the peer
+                        // answered the dial and must still receive the commit.
+                        let outcome = if e.starts_with("connect: ") {
+                            ProposeOutcome::Unreachable
+                        } else {
+                            ProposeOutcome::Answered
+                        };
+                        tracing::warn!(?pid, %paddr, err = %e, ?outcome, "cluster: topology propose failed");
+                        (outcome, None)
                     }
                 }
             })
         }).collect();
         handles
             .into_iter()
-            .map(|h| h.join().unwrap_or(None))
+            // A panicked propose thread proves nothing about reachability:
+            // fail OPEN (`Answered`) so the peer still receives the commit.
+            .map(|h| h.join().unwrap_or((ProposeOutcome::Answered, None)))
             .collect()
     });
+    let broadcast_outcomes: Vec<(SocketAddr, ProposeOutcome)> = peers
+        .iter()
+        .zip(results.iter())
+        .map(|((_, addr), (outcome, _))| (*addr, *outcome))
+        .collect();
 
     // Feed all collected votes to the topology authority.
     let mut commit_result = None;
-    for vote in votes.into_iter().flatten() {
+    for vote in results.into_iter().filter_map(|(_, vote)| vote) {
         if let Some(commit) = topology_authority.handle_vote(&vote) {
             commit_result = Some(commit);
             break; // Quorum reached
@@ -9098,66 +9165,55 @@ fn try_run_topology_proposal(
         }
     };
 
-    tracing::info!(
-        term = commit.term,
-        "cluster: quorum reached — broadcasting commit"
-    );
+    tracing::info!(term = commit.term, "cluster: quorum reached — committing");
 
-    // Broadcast OP_TOPOLOGY_COMMIT to all peers in parallel with retry.
-    let commit_payload = commit.serialize();
-    let failed_addrs: Vec<SocketAddr> = std::thread::scope(|scope| {
-        let handles: Vec<_> = peers.iter().map(|(_, addr)| {
-            let payload = &commit_payload;
-            let a = *addr;
-            scope.spawn(move || -> Option<SocketAddr> {
-                if let Err(e) = send_topology_frame(a, OP_TOPOLOGY_COMMIT, payload, auth_secret) {
-                    tracing::warn!(addr = %a, err = %e, "cluster: topology commit broadcast failed");
-                    Some(a)
-                } else {
-                    None
-                }
-            })
-        }).collect();
-        handles
-            .into_iter()
-            .filter_map(|h| h.join().unwrap_or(None))
-            .collect()
-    });
-
-    // Retry failed broadcasts sequentially (transient failures).
-    let mut still_failed = failed_addrs;
-    for (retry, delay_ms) in [(1u32, 50u64), (2, 200)] {
-        if still_failed.is_empty() {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(delay_ms));
-        still_failed.retain(|addr| {
-            if let Err(e) =
-                send_topology_frame(*addr, OP_TOPOLOGY_COMMIT, &commit_payload, auth_secret)
-            {
-                tracing::warn!(retry, %addr, err = %e, "cluster: topology commit retry failed");
-                true
-            } else {
-                false
-            }
-        });
-    }
-    if !still_failed.is_empty() {
-        tracing::warn!(
-            unreachable = still_failed.len(),
-            "cluster: topology commit: nodes unreachable after retries",
-        );
-    }
-
-    // G9 — apply the commit locally only AFTER its committed term is durable.
-    // The proposer already broadcast the commit to peers; if its own persist
-    // fails it must NOT begin serving/activating under the new term (a crash
-    // would revert it to T-1 while peers hold T). Fail-closed: stay on the
-    // prior term and let a later TopologyStale catch-up re-drive activation.
+    // ── W11 FIX 2 (P1): APPLY LOCALLY FIRST, THEN DISSEMINATE ───────────
+    //
+    // This block used to run AFTER the peer broadcast and its two sequential
+    // retries. CI @ 3a38dc2 scenario 07 measured the cost: the broadcast (and
+    // both retries) blocked on a node whose container had already been
+    // removed, so for 1.75 s the proposer's own `local_cluster_key` was still
+    // the PREVIOUS term's and it answered STATUS_ERROR to every
+    // `OP_PARTITION_VERSION_REPORT` query
+    // (`teraslab_exchange_peer_failure_status_total` = 8 on n2 and n3). The
+    // post-commit exchange fires ~100 ms after the commit, so it collected 2
+    // of 4 views, both survivors det-degraded, and 1024 shards landed on a
+    // dead node.
+    //
+    // # Why the old order was NOT a safety requirement (verified in-code)
+    //
+    //  1. **The decision is already made.** `handle_vote` returned a
+    //     `TopologyCommit` only once a quorum of voters ACCEPTED, and each of
+    //     those voters persisted its `voted_term` before replying
+    //     (`handle_propose`'s persist-before-reply contract). The broadcast
+    //     disseminates a decided term; it is not part of deciding it.
+    //  2. **The broadcast fed nothing back into the local decision.** Its
+    //     only output was `still_failed`, consumed by a `warn!` and nothing
+    //     else — the old code applied the commit locally whether the
+    //     broadcast reached zero peers or all of them.
+    //  3. **Persist-before-apply is preserved, because it lives INSIDE
+    //     `handle_commit_durable`** (gate → persist → apply, all under the
+    //     `commit_apply` lock). Moving the call earlier relative to the
+    //     broadcast cannot reorder anything within it; G9's fail-closed
+    //     `PersistFailed` branch is untouched.
+    //  4. **Neither order is a durability barrier for the peers.** Under the
+    //     OLD order a proposer whose persist failed had already pushed the
+    //     commit to peers and stayed on T-1 itself; under the NEW order a
+    //     proposer that dies right after applying leaves peers to learn T
+    //     from the gossip `committed_term` piggyback and the `TopologyStale`
+    //     catch-up (`OP_GET_COMMITTED_TOPOLOGY`) — the same mechanism that
+    //     already had to cover a broadcast that failed against every peer.
+    //     A quorum of voters holds the term durably in both orders.
+    //
+    // So broadcast-then-apply was a LIVENESS choice (peers learn a touch
+    // sooner) paid for with a serving-authority stall on the one node that
+    // must be authoritative first. Applied-first is strictly better: the
+    // proposer is the node whose cluster key every peer's exchange query is
+    // about to test.
     let peak = peak_size.load(Ordering::Relaxed) as u64;
     let inc = swim_incarnation.load(Ordering::Relaxed);
     let path = topology_state_path.as_deref();
-    match topology_authority.handle_commit_durable(&commit, peak, inc, |state| {
+    let applied = match topology_authority.handle_commit_durable(&commit, peak, inc, |state| {
         persist_topology_state_durable(path, state)
     }) {
         crate::cluster::topology::DurableCommitOutcome::Applied(_) => {
@@ -9166,6 +9222,12 @@ fn try_run_topology_proposal(
             true
         }
         crate::cluster::topology::DurableCommitOutcome::PersistFailed => {
+            // G9 — fail closed: this node must NOT begin serving/activating
+            // under a term it could not persist (a crash would revert it to
+            // T-1 while peers hold T). The commit is still BROADCAST below:
+            // it is quorum-decided and the other members must learn it
+            // regardless of this node's local persist failure (the old order
+            // had already broadcast it by this point, so this is unchanged).
             tracing::error!(
                 term = commit.term,
                 "cluster: proposer NOT activating committed term — durable persist \
@@ -9178,7 +9240,92 @@ fn try_run_topology_proposal(
             // advanced past this term). No local activation needed.
             true
         }
+    };
+
+    // Disseminate OP_TOPOLOGY_COMMIT off the proposer thread. `run_topology_-
+    // proposer` may re-enter this function up to five times, so a broadcast
+    // that blocks for seconds against a dead peer would otherwise delay the
+    // NEXT proposal attempt as well.
+    spawn_commit_broadcast(
+        commit.serialize(),
+        commit_broadcast_targets(&broadcast_outcomes),
+        commit.term,
+        auth_secret.map(|s| s.to_vec()),
+    );
+
+    applied
+}
+
+/// W11 FIX 2 — disseminate a decided `TopologyCommit` to `targets` on a
+/// detached thread: one parallel fan-out followed by two sequential retries
+/// of whatever failed.
+///
+/// Detached because dissemination is pure liveness (see the safety argument
+/// at the call site): the term is already quorum-decided and locally applied,
+/// and every peer that misses the broadcast still converges through the
+/// gossip `committed_term` piggyback and the `TopologyStale` catch-up. Costs
+/// one thread plus one per target per commit — the same fan-out as before,
+/// just no longer on the proposer's critical path. Topology commits are rare
+/// (one per term), so the spawn is not a hot-path allocation.
+///
+/// The payload and secret are owned copies so the thread can outlive the
+/// proposal attempt that produced them.
+fn spawn_commit_broadcast(
+    commit_payload: Vec<u8>,
+    targets: Vec<SocketAddr>,
+    term: u64,
+    auth_secret: Option<Vec<u8>>,
+) {
+    if targets.is_empty() {
+        return;
     }
+    std::thread::spawn(move || {
+        let secret = auth_secret.as_deref();
+        let failed: Vec<SocketAddr> = std::thread::scope(|scope| {
+            let handles: Vec<_> = targets.iter().map(|addr| {
+                let payload = &commit_payload;
+                let a = *addr;
+                scope.spawn(move || -> Option<SocketAddr> {
+                    if let Err(e) = send_topology_frame(a, OP_TOPOLOGY_COMMIT, payload, secret) {
+                        tracing::warn!(term, addr = %a, err = %e, "cluster: topology commit broadcast failed");
+                        Some(a)
+                    } else {
+                        None
+                    }
+                })
+            }).collect();
+            handles
+                .into_iter()
+                .filter_map(|h| h.join().unwrap_or(None))
+                .collect()
+        });
+
+        // Retry failed broadcasts sequentially (transient failures).
+        let mut still_failed = failed;
+        for (retry, delay_ms) in [(1u32, 50u64), (2, 200)] {
+            if still_failed.is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(delay_ms));
+            still_failed.retain(|addr| {
+                if let Err(e) =
+                    send_topology_frame(*addr, OP_TOPOLOGY_COMMIT, &commit_payload, secret)
+                {
+                    tracing::warn!(term, retry, %addr, err = %e, "cluster: topology commit retry failed");
+                    true
+                } else {
+                    false
+                }
+            });
+        }
+        if !still_failed.is_empty() {
+            tracing::warn!(
+                term,
+                unreachable = still_failed.len(),
+                "cluster: topology commit: nodes unreachable after retries",
+            );
+        }
+    });
 }
 
 /// G8 stage 3 — react to a commit this node just durably applied, in case it
@@ -32588,6 +32735,158 @@ mod tests {
             vec![NodeId(1), NodeId(2), NodeId(3)],
             "pre-commit bootstrap keeps the address-book source",
         );
+    }
+
+    /// W11 FIX 2 (P1) — a peer whose PROPOSE round-trip failed at TCP
+    /// CONNECT is unreachable right now; re-dialling it for the commit
+    /// broadcast only buys another `connect_timeout`. Peers that answered
+    /// (with a vote or with anything else) stay on the broadcast list — a
+    /// rejection is not unreachability, and that node still needs the commit.
+    #[test]
+    fn commit_broadcast_skips_only_the_peers_whose_propose_could_not_connect() {
+        let a1: SocketAddr = "127.0.0.1:7101".parse().unwrap();
+        let a2: SocketAddr = "127.0.0.1:7102".parse().unwrap();
+        let a3: SocketAddr = "127.0.0.1:7103".parse().unwrap();
+        let outcomes = vec![
+            (a1, ProposeOutcome::Voted),
+            (a2, ProposeOutcome::Unreachable),
+            (a3, ProposeOutcome::Answered),
+        ];
+
+        assert_eq!(
+            commit_broadcast_targets(&outcomes),
+            vec![a1, a3],
+            "the unreachable peer is dropped; the voter and the non-voting \
+             responder both still get the commit",
+        );
+    }
+
+    /// W11 FIX 2 (P1) — the commit-apply must not be serialized behind
+    /// dead-peer TCP.
+    ///
+    /// CI @ 3a38dc2 scenario 07 (~coordinator.rs:9021-9096): the proposer
+    /// broadcast the commit and ran TWO sequential retries against a node
+    /// whose container had been removed BEFORE calling
+    /// `handle_commit_durable`. For 1.75 s node1's `local_cluster_key` was
+    /// still the previous term's, so it answered STATUS_ERROR to every
+    /// exchange query (`teraslab_exchange_peer_failure_status_total` = 8 on
+    /// n2 and n3); the exchange collected 2 of 4 views and both survivors
+    /// det-degraded onto a table that put 1024 shards on the dead node.
+    ///
+    /// Here the peer votes YES and then accepts the commit connection
+    /// without ever answering it — the dead-peer TCP shape. The local
+    /// committed term must advance anyway, promptly.
+    #[test]
+    fn topology_commit_applies_locally_before_a_blocked_broadcast() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let peer_addr = listener.local_addr().unwrap();
+
+        let read_frame =
+            |stream: &mut std::net::TcpStream| -> crate::protocol::frame::RequestFrame {
+                let mut header = [0u8; 4];
+                stream.read_exact(&mut header).unwrap();
+                let len = u32::from_le_bytes(header) as usize;
+                let mut body = vec![0u8; len];
+                stream.read_exact(&mut body).unwrap();
+                let mut bytes = header.to_vec();
+                bytes.extend_from_slice(&body);
+                crate::protocol::frame::RequestFrame::decode(&bytes)
+                    .unwrap()
+                    .0
+            };
+
+        let peer = std::thread::spawn(move || {
+            // 1. The proposal: answer with an accepting vote so quorum forms.
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_frame(&mut stream);
+            assert_eq!(request.op_code, OP_TOPOLOGY_PROPOSE);
+            let term =
+                crate::cluster::topology::TopologyTerm::deserialize(&request.payload).unwrap();
+            let vote = crate::cluster::topology::TopologyVote {
+                term: term.term,
+                digest: term.digest,
+                voter: NodeId(2),
+                accepted: true,
+                voter_current_term: 0,
+                voter_placement_support: crate::cluster::shards::MAX_SUPPORTED_PLACEMENT_VERSION,
+            };
+            stream
+                .write_all(
+                    &crate::protocol::frame::ResponseFrame {
+                        request_id: request.request_id,
+                        status: crate::protocol::opcodes::STATUS_OK,
+                        payload: vote.serialize().into(),
+                    }
+                    .encode(),
+                )
+                .unwrap();
+            drop(stream);
+
+            // 2. The commit broadcast: accept, read, and NEVER answer —
+            //    the connection a removed container leaves behind.
+            let (mut blocked, _) = listener.accept().unwrap();
+            let _ = read_frame(&mut blocked);
+            std::thread::sleep(Duration::from_secs(3));
+            // Listener dropped here so the off-thread retries fail fast
+            // instead of outliving the test.
+        });
+
+        let auth = Arc::new(crate::cluster::topology::TopologyAuthority::new(
+            NodeId(1),
+            Duration::from_secs(1),
+            1,
+        ));
+        auth.set_committed_voter_ever_seen(&[NodeId(1), NodeId(2)]);
+        let proposal = auth
+            .on_membership_changed(&[NodeId(1), NodeId(2)])
+            .expect("node 1 is the lowest-id proposer for {1,2}");
+        let proposal_term = proposal.term;
+
+        let addrs = Arc::new(RwLock::new(std::collections::HashMap::from([
+            (NodeId(1), "127.0.0.1:7999".parse::<SocketAddr>().unwrap()),
+            (NodeId(2), peer_addr),
+        ])));
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        let started = std::time::Instant::now();
+        assert!(
+            try_run_topology_proposal(
+                &proposal,
+                &auth,
+                &addrs,
+                NodeId(1),
+                &tx,
+                &None,
+                &Arc::new(std::sync::atomic::AtomicUsize::new(2)),
+                &Arc::new(std::sync::atomic::AtomicU64::new(1)),
+                None,
+            ),
+            "quorum was reached and the local persist (path None) succeeded",
+        );
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            auth.committed_term(),
+            proposal_term,
+            "the proposer must have applied its own committed term",
+        );
+        assert!(
+            elapsed < Duration::from_millis(1500),
+            "the commit-apply must not sit behind the broadcast's read timeout \
+             (2 s) or its two retries (+2.25 s): took {elapsed:?}",
+        );
+        let (members, term) = rx
+            .recv_timeout(Duration::from_millis(500))
+            .expect("the event loop must be signalled to activate");
+        assert_eq!(term, proposal_term, "signalled the committed term");
+        assert_eq!(
+            members,
+            vec![NodeId(1), NodeId(2)],
+            "signalled the committed members",
+        );
+
+        peer.join().unwrap();
     }
 
     /// Scenario 09 (quiesce revert) — node2 quiesced itself out at term 5,
