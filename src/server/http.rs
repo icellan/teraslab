@@ -717,6 +717,9 @@ async fn handle_metrics(
     // W10 P1-1 — recency-cache scan observability (appended here rather
     // than threaded through `render_metrics_text`'s positional signature).
     append_recency_metrics(&mut out, state.engine.recency_scan_stats());
+    // W10 composition review P2-3 — tombstone population (weak entries are
+    // now repair-bounded, not retention-bounded, so they must be watched).
+    append_tombstone_metrics(&mut out, state.engine.tombstone_population());
 
     let mut resp_headers = HeaderMap::new();
     resp_headers.insert(
@@ -1508,6 +1511,31 @@ pub(crate) fn render_metrics_text(
             mm.orphan_cleanup_retained_no_evidence
                 .load(Ordering::Relaxed) as u64,
         );
+        // W10 composition review P1 — the reverse-heal live-recency confirm
+        // runs synchronously on the coordinator event loop and pays one
+        // filtered index walk per round, so its rate, admitted volume,
+        // capped-out backlog and last duration are all operator-visible.
+        prom_counter(
+            &mut out,
+            "teraslab_reheal_live_confirm_rounds_total",
+            mm.reheal_live_confirm_rounds.get(),
+        );
+        prom_counter(
+            &mut out,
+            "teraslab_reheal_live_confirm_shards_total",
+            mm.reheal_live_confirm_shards.get(),
+        );
+        prom_counter(
+            &mut out,
+            "teraslab_reheal_live_confirm_deferred_total",
+            mm.reheal_live_confirm_deferred.get(),
+        );
+        prom_gauge(
+            &mut out,
+            "teraslab_reheal_live_confirm_last_duration_ms",
+            mm.reheal_live_confirm_last_duration_ms
+                .load(Ordering::Relaxed) as u64,
+        );
     }
     if let Some(sw) = swim_metrics() {
         prom_counter(
@@ -1792,6 +1820,32 @@ pub(crate) fn append_recency_metrics(
         "teraslab_recency_unknown_shards",
         stats.unknown_shards_last_report,
     );
+}
+
+/// W10 composition review P2-3 — append the deletion-tombstone population
+/// gauges, or nothing at all when tombstones are disabled (`None`), so an
+/// absent series reads as "subsystem off" rather than "zero tombstones".
+///
+/// - `teraslab_tombstone_entries` — live tombstones of every cause;
+/// - `teraslab_tombstone_weak_entries` — the WEAK-cause subset
+///   (`PruneReplace` / `CompensatedCreate`).
+///
+/// The weak gauge is the one that needs watching. Weak tombstones are EXEMPT
+/// from retention GC (their role is proving that a key missing from a
+/// migration manifest is this node's own prune/rollback damage rather than
+/// deletion-intent, and that claim has no block-height horizon), so their
+/// population is bounded by REPAIRS landing, not by
+/// `tombstone_retention_blocks`. A weak count that keeps climbing means
+/// pruned keys are not being repaired: each costs one in-RAM entry plus one
+/// durable-file record, and each keeps vetoing at-or-behind images for its
+/// key until the repair (or the `OP_MIGRATION_WEAK_VETO_ARBITRATE`
+/// handshake) clears it.
+pub(crate) fn append_tombstone_metrics(out: &mut String, population: Option<(u64, u64)>) {
+    let Some((total, weak)) = population else {
+        return;
+    };
+    prom_gauge(out, "teraslab_tombstone_entries", total);
+    prom_gauge(out, "teraslab_tombstone_weak_entries", weak);
 }
 
 /// Emit a `LatencyHistogram` as a Prometheus histogram.
@@ -5421,6 +5475,10 @@ mod tests {
             "teraslab_migration_prune_skipped_cutoff_gate_total",
             "teraslab_topology_proposal_revalidation_emptied_total",
             "teraslab_orphan_cleanup_retained_no_evidence",
+            "teraslab_reheal_live_confirm_rounds_total",
+            "teraslab_reheal_live_confirm_shards_total",
+            "teraslab_reheal_live_confirm_deferred_total",
+            "teraslab_reheal_live_confirm_last_duration_ms",
             "teraslab_swim_probes_sent_total",
             "teraslab_swim_probe_timeouts_total",
             "teraslab_swim_indirect_probes_total",
@@ -7004,6 +7062,52 @@ mod tests {
         assert!(
             !never.contains("teraslab_recency_scan_last_age_seconds"),
             "never-scanned must omit the age gauge; output:\n{never}"
+        );
+    }
+
+    /// W10 composition review P2-3 (RED→GREEN) — the tombstone population
+    /// gauges must actually be EXPORTED.
+    ///
+    /// `TombstoneLog::gc` now exempts WEAK causes from retention, converting a
+    /// block-height-bounded population into one bounded only by repairs
+    /// landing. That residual was documented as "observable through
+    /// `TombstoneLog::len`" — but `len()` had no exporter at all, so nothing
+    /// could see it. Both series must render, and tombstones-disabled must
+    /// emit NOTHING (an absent series reads as "subsystem off"; a zero would
+    /// read as "no tombstones", which is a different claim).
+    #[test]
+    fn metrics_appends_tombstone_population_gauges() {
+        let mut text = String::new();
+        append_tombstone_metrics(&mut text, Some((41, 7)));
+        for expected in [
+            "# TYPE teraslab_tombstone_entries gauge",
+            "teraslab_tombstone_entries 41",
+            "# TYPE teraslab_tombstone_weak_entries gauge",
+            "teraslab_tombstone_weak_entries 7",
+        ] {
+            assert!(
+                text.lines().any(|l| l == expected),
+                "missing metrics line {expected:?}; output:\n{text}"
+            );
+        }
+
+        // A live-but-empty log still reports zeros (the drained steady state
+        // must be distinguishable from the subsystem being off).
+        let mut empty = String::new();
+        append_tombstone_metrics(&mut empty, Some((0, 0)));
+        assert!(
+            empty
+                .lines()
+                .any(|l| l == "teraslab_tombstone_weak_entries 0"),
+            "an enabled, empty log must emit an explicit zero; output:\n{empty}"
+        );
+
+        // Disabled: no series at all.
+        let mut off = String::new();
+        append_tombstone_metrics(&mut off, None);
+        assert!(
+            off.is_empty(),
+            "tombstones disabled must emit NO series, not zeros; output:\n{off}"
         );
     }
 }

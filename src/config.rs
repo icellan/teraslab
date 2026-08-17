@@ -1576,6 +1576,24 @@ pub struct ServerConfig {
     /// disabling is a complete local rollback of the mechanism. Turning it
     /// OFF restores the pre-W10 disposition: the stranded shard rolls back to
     /// the source and stays under-replicated until operator action.
+    ///
+    /// # BEHAVIOUR CHANGE in the OFF mode (W10 composition review P2-4)
+    ///
+    /// OFF is no longer self-healing on a timer. Previously the target's weak
+    /// tombstone eventually expired on the `tombstone_retention_blocks`
+    /// retention clock, which unblocked an at-or-behind same-generation
+    /// re-push all by itself — so an operator who left this flag off would
+    /// still see the shard converge after the retention horizon, slowly.
+    /// `TombstoneLog::gc` now EXEMPTS weak causes from retention (their
+    /// manifest-omission claim has no block-height horizon; expiring it let a
+    /// delayed repair turn the source's omission into deletion-intent and the
+    /// #29 prune deleted the last live copy — the armed-05 chain). With this
+    /// flag OFF the arbitration drain is disarmed too, so the ONLY remaining
+    /// drains are a live re-create of the key (Invariant TS-1) and the boot
+    /// `reconcile_against_live`: a stranded shard now stays under-replicated
+    /// until one of those or operator action, indefinitely. That is a stalled
+    /// repair, never a deleted last copy — but it no longer resolves itself.
+    /// Watch `teraslab_tombstone_weak_entries`.
     pub migration_weak_veto_arbitration_enabled: bool,
 
     /// SWIM probe interval in milliseconds.

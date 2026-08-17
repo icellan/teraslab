@@ -1463,6 +1463,28 @@ pub struct MigrationMetrics {
     /// pass (event-driven or batch-completion); a pass that reclaims (or
     /// finds no retained shard) resets it to the new census.
     pub orphan_cleanup_retained_no_evidence: AtomicU32,
+    /// W10 composition review P1 — completed LIVE-RECENCY CONFIRM rounds
+    /// (`confirm_self_behind_with_live_recency`). Each round costs one
+    /// filtered primary-index walk plus the device reads for the shards it
+    /// admitted, and runs synchronously on the coordinator event loop, so the
+    /// rate is the operator's handle on how much event-loop time the
+    /// reverse-heal direction gate is consuming.
+    pub reheal_live_confirm_rounds: PaddedCounter,
+    /// W10 composition review P1 — shards ADMITTED to a live-recency confirm
+    /// (i.e. actually scanned and given a fresh verdict), summed over rounds.
+    pub reheal_live_confirm_shards: PaddedCounter,
+    /// W10 composition review P1 — shards a confirm round DEFERRED because
+    /// the per-round shard/key cap was already spent. Deferred shards are
+    /// neither fenced nor backed off, so they are simply re-evaluated next
+    /// round; a persistently high value means the divergent set is draining
+    /// at cap speed and each round is paying a full index walk.
+    pub reheal_live_confirm_deferred: PaddedCounter,
+    /// W10 composition review P1 — gauge: wall-clock duration of the most
+    /// recent live-recency confirm round, in ms. This is event-loop time the
+    /// coordinator spent NOT handling SWIM events, topology commits, or
+    /// migration completions; compare against the watchdog's 10 s stall
+    /// threshold.
+    pub reheal_live_confirm_last_duration_ms: AtomicU32,
 }
 
 /// Number of {direction, role} buckets for migration byte counters.
@@ -1535,6 +1557,10 @@ impl MigrationMetrics {
             migration_prune_skipped_cutoff_gate: PaddedCounter::new(),
             topology_proposal_revalidation_emptied: PaddedCounter::new(),
             orphan_cleanup_retained_no_evidence: AtomicU32::new(0),
+            reheal_live_confirm_rounds: PaddedCounter::new(),
+            reheal_live_confirm_shards: PaddedCounter::new(),
+            reheal_live_confirm_deferred: PaddedCounter::new(),
+            reheal_live_confirm_last_duration_ms: AtomicU32::new(0),
         }
     }
 

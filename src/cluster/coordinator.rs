@@ -942,6 +942,71 @@ fn revalidate_settled_members(
     }
 }
 
+/// W10 composition review P2-1 — must the topology debounce be RE-ARMED
+/// because propose-time re-validation collapsed the proposal into a no-op?
+///
+/// # The composition defect
+///
+/// [`TopologyDebounce::take_due`] CONSUMES the burst before the proposer
+/// re-validates it ([`revalidate_settled_members`]). When re-validation drops
+/// a member and the survivors EQUAL the committed set,
+/// [`crate::cluster::topology::TopologyAuthority::on_membership_changed`]
+/// takes its identical-membership skip and returns `None`: nothing is
+/// proposed, and the debounce that would have retried is already gone. The
+/// dropped member cannot rescue itself — only the lowest-id member may
+/// propose — so recovery depends entirely on some LATER SWIM alive-SET edge
+/// re-arming the debounce. The observed burst
+/// `{1,2}→{1,2,3}→{1,2}→{1,2,3}` records `departed=[3]`; if SWIM has 3
+/// SUSPECT at the propose instant, 3 is dropped, the proposal collapses, and
+/// a subsequent Suspect→Alive refutation changes NO alive set — so no
+/// `MembershipChanged` fires, no `observe` runs, and node 3 is permanently
+/// left out of the cluster.
+///
+/// # The re-arm condition (all three must hold)
+///
+/// 1. Re-validation actually REMOVED members — an unchanged set was already
+///    handled normally and needs no retry.
+/// 2. The surviving set equals `committed` — only then does
+///    `on_membership_changed` skip, wasting the consumed debounce. A survivor
+///    set that still differs is proposed on this pass and needs no retry.
+/// 3. Some removed member is currently `Suspect`. This is the ONLY removal
+///    reason that can resolve WITHOUT an alive-set edge (SWIM refutes the
+///    suspicion in place), i.e. the only case with no other wake-up. A `Dead`
+///    removal ends with a SWIM reap that DOES change the alive set (and fires
+///    a fresh burst), and a member with no SWIM record at all has nothing to
+///    wait for — re-arming for either would spin a no-op burst every window
+///    forever.
+///
+/// Set comparison is order-independent (sorted copies), so it cannot be
+/// defeated by a differently-ordered committed vector.
+fn revalidation_collapse_needs_rearm(
+    settled: &[NodeId],
+    revalidated: &[NodeId],
+    committed: &[NodeId],
+    state_of: impl Fn(&NodeId) -> Option<crate::cluster::membership::NodeState>,
+) -> bool {
+    use crate::cluster::membership::NodeState;
+    let removed: Vec<NodeId> = settled
+        .iter()
+        .copied()
+        .filter(|m| !revalidated.contains(m))
+        .collect();
+    if removed.is_empty() {
+        return false;
+    }
+    let sorted = |v: &[NodeId]| {
+        let mut out = v.to_vec();
+        out.sort_unstable();
+        out
+    };
+    if sorted(revalidated) != sorted(committed) {
+        return false;
+    }
+    removed
+        .iter()
+        .any(|m| state_of(m) == Some(NodeState::Suspect))
+}
+
 fn snapshot_under_replication_inputs(
     swim_membership: &Arc<Mutex<crate::cluster::membership::Membership>>,
     shard_table: &Arc<ShardTableLock<ShardTable>>,
@@ -3168,6 +3233,13 @@ impl ClusterCoordinator {
         let reheal_backoff = Arc::new(Mutex::new(std::collections::HashMap::<u16, u64>::new()));
         let reheal_backoff_for_cluster = reheal_backoff.clone();
         let reheal_backoff_event = reheal_backoff;
+        // W10 review P2-B — rotation cursor for the live-recency confirm's
+        // per-round admission window. Shared with the struct for the same
+        // reason as `reheal_backoff`: `run_online_reheal` drives the same
+        // path in tests. See `reheal_confirm_admission`.
+        let reheal_confirm_cursor = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let reheal_confirm_cursor_for_cluster = reheal_confirm_cursor.clone();
+        let reheal_confirm_cursor_event = reheal_confirm_cursor;
         let (topology_commit_tx, topology_commit_rx) = std::sync::mpsc::channel();
         let topology_commit_tx_event = topology_commit_tx.clone();
         // Phase H — resync request channel. The catchup loop in
@@ -3814,7 +3886,7 @@ impl ClusterCoordinator {
                     // suspicion is transient, and excluding it from a grow
                     // proposal would churn terms.
                     let settled_members = revalidate_settled_members(
-                        settled.members,
+                        settled.members.clone(),
                         &settled.departed_during_burst,
                         |node| {
                             swim_membership_event
@@ -3824,6 +3896,33 @@ impl ClusterCoordinator {
                         },
                         self_id,
                     );
+                    // W10 composition review P2-1 — a re-validation that
+                    // collapses the proposal back onto the committed set
+                    // consumed the debounce for NOTHING; put the burst back
+                    // (departures preserved) so the next window re-validates
+                    // against fresher SWIM state instead of losing the join
+                    // forever. See `revalidation_collapse_needs_rearm`.
+                    if revalidation_collapse_needs_rearm(
+                        &settled.members,
+                        &settled_members,
+                        &topo_authority_event.committed_members(),
+                        |node| {
+                            swim_membership_event
+                                .lock()
+                                .member_info(node)
+                                .map(|info| info.state)
+                        },
+                    ) {
+                        tracing::warn!(
+                            settled = ?settled.members.iter().map(|n| n.0).collect::<Vec<_>>(),
+                            proposed = ?settled_members.iter().map(|n| n.0).collect::<Vec<_>>(),
+                            "cluster: propose-time re-validation collapsed the settled \
+                             set onto the committed set (a SUSPECT member was dropped) \
+                             — RE-ARMING the topology debounce so the join is retried \
+                             once SWIM resolves the suspicion (W10 P2-1)",
+                        );
+                        topology_debounce.rearm(settled, std::time::Instant::now());
+                    }
                     let settled_event = ClusterEvent::MembershipChanged(settled_members);
                     Self::handle_event(
                         &settled_event,
@@ -5136,7 +5235,13 @@ impl ClusterCoordinator {
                         // settled.
                         let cleanup_admissible = {
                             let table_version = shard_table.read().version;
-                            let pending_inbound = migration.lock().inbound_count();
+                            // W10 composition review P1-3b/P2-4 — count only
+                            // genuine in-flight MIGRATION work: a reverse-heal
+                            // fence (especially a #74 park, which holds
+                            // forever by design) is alert-and-hold state, not
+                            // inbound work, and gating on it disabled this
+                            // pass for the life of the process.
+                            let pending_inbound = migration.lock().inbound_migration_work_count();
                             event_orphan_cleanup_admissible(table_version, term, pending_inbound)
                         };
                         if cleanup_admissible
@@ -5293,6 +5398,8 @@ impl ClusterCoordinator {
                                 &inbound_state_path_event,
                                 &reheal_backoff_event,
                                 &partition_view,
+                                Some(&engine),
+                                &reheal_confirm_cursor_event,
                             );
                         if queued > 0 {
                             tracing::warn!(
@@ -5782,6 +5889,7 @@ impl ClusterCoordinator {
             startup_reactivation_needed,
             stale_suspect_shards: Arc::new(RwLock::new(std::collections::BTreeSet::new())),
             reheal_backoff: reheal_backoff_for_cluster,
+            reheal_confirm_cursor: reheal_confirm_cursor_for_cluster,
             #[cfg(any(test, feature = "fault-injection"))]
             drop_commit_signals: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
@@ -9627,7 +9735,7 @@ pub fn is_self_behind_any_replica_coarse(
 
 /// A stale-mastered-shard classification produced by
 /// [`classify_stale_mastered_shards`] for the Phase-3b online re-heal.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct RehealCandidate {
     /// The mastered shard that diverges (digest mismatch) from a live replica.
     pub shard: u16,
@@ -9638,7 +9746,16 @@ pub(crate) struct RehealCandidate {
     /// DIRECTION: coarsely BEHIND a live replica
     /// ([`is_self_behind_any_replica_coarse`]) — the fence + pull gate. `false`
     /// for an ahead/equal master (never fenced).
+    ///
+    /// W10 composition review P1-3a — this verdict is computed from the
+    /// CACHED self recency the partition view carries; it is a PRE-FILTER.
+    /// Before fencing, [`trigger_online_reheal`] re-checks it against self's
+    /// LIVE recency ([`confirm_self_behind_with_live_recency`]).
     pub self_behind: bool,
+    /// The live replicas' reported recencies for the shard — carried so the
+    /// live-recency confirm can re-run the direction gate without re-deriving
+    /// them from a shard table that may have moved on.
+    pub replica_recencies: Vec<ShardRecency>,
 }
 
 /// Order-independent change-detector signature over this node's recency and its
@@ -9725,9 +9842,351 @@ pub(crate) fn classify_stale_mastered_shards(
             shard,
             signature: shard_view_signature(self_recency, &replica_recencies),
             self_behind: is_self_behind_any_replica_coarse(self_recency, &replica_recencies),
+            replica_recencies,
         });
     }
     out
+}
+
+/// W10 composition review P1 — maximum shards ONE live-recency confirm round
+/// admits. A coarse ceiling (1/64 of the 4096-shard ring) that bounds the
+/// per-round work even when every admitted shard is tiny; the real bound on
+/// device I/O is [`REHEAL_LIVE_CONFIRM_MAX_KEYS_PER_ROUND`].
+const REHEAL_LIVE_CONFIRM_MAX_SHARDS_PER_ROUND: usize = 64;
+
+/// W10 composition review P1 — maximum live records ONE live-recency confirm
+/// round admits, summed over its shards from the engine's O(1) per-shard
+/// counters BEFORE any I/O is issued.
+///
+/// Each admitted key costs ~2 device reads (the txid resolve inside
+/// [`Engine::keys_by_shard_filtered`] plus the footer read in
+/// `Engine::recency_for_keys`), so a round that stays inside this budget is
+/// ≤ ~40 000 reads — a few seconds at a conservative 100 µs/read, well inside
+/// the 15-30 s exchange-completion / reactivation cooldown that paces rounds,
+/// and never inside the ~2 s exchange window itself.
+///
+/// # THE BUDGET ONLY BINDS ON A SMALL STORE (W10 review P2-A)
+///
+/// Read the paragraph above as a CEILING that a large store never reaches,
+/// not as a description of steady state. The cluster shard is 12 bits of the
+/// key hash and is near-uniform, so mean shard population is
+/// `records / 4096`: this budget binds only below roughly
+/// `20 000 × 4096 ≈ 80 M` records. At the 2 B-record design point ONE shard
+/// holds ~488 k records — about 24× the whole round budget — so the
+/// always-progress rule below fires EVERY round and the per-round bound
+/// DEGENERATES TO EXACTLY ONE SHARD, costing ~1 M device reads (~98 s at
+/// 100 µs) on the coordinator event loop.
+///
+/// That is a deliberate, documented floor, not a sizing that can be tuned
+/// away: lowering the budget cannot go below one shard, and raising it only
+/// admits more. What actually closes it is SHARD-LOCAL ENUMERATION — an index
+/// path that reads one cluster shard's keys without walking (and paying
+/// device reads for) a whole filter pass. That is tracked as follow-up work;
+/// until it lands, this cap bounds the FAN-OUT (how many shards a round can
+/// touch), not the absolute cost of the smallest possible round.
+///
+/// A shard whose OWN record count exceeds the budget is still admitted when
+/// it is first in the round's rotation: the alternative is a permanently
+/// unconfirmable shard, i.e. a silently disarmed online re-heal. See
+/// [`reheal_confirm_admission`] for why the rotation, not the ordering, is
+/// what keeps that from monopolising every round.
+const REHEAL_LIVE_CONFIRM_MAX_KEYS_PER_ROUND: u64 = 20_000;
+
+/// W10 composition review P1-3a — RE-CHECK a fence verdict against SELF's
+/// LIVE recency, resolved directly from the engine instead of from the
+/// cached partition-version snapshot.
+///
+/// # The composition defect this closes
+///
+/// Wave 10 replaced the report's per-poll-instant recency scan with a CACHED
+/// per-shard `(digest, max_generation)` snapshot
+/// ([`crate::ops::recency`]). Both sides of
+/// [`is_self_behind_any_replica_coarse`] are now cache-served, and the skew
+/// between the two snapshots is no longer the ~2 s exchange window — it is
+/// the difference between two nodes' last COMPLETED whole-store scans,
+/// unbounded in store size AND systematically directional: a node's own
+/// exchange kicks its refresh and then immediately serves the snapshot from
+/// BEFORE that kick, while a peer's cache is additionally kicked by every
+/// other node's `OP_PARTITION_VERSION_REPORT` query, so peers' snapshots run
+/// systematically fresher. (The 500 ms exchange re-query cadence is NOT part
+/// of this: a peer thread returns on its first successful parse, so a healthy
+/// peer is asked once and also serves a pre-kick snapshot. The gap is the
+/// unbounded scan interval, not the re-query.) Under a spend-heavy UTXO
+/// workload — where generations advance but the record COUNT does not, so the
+/// honest live-count leg never fires — that reads as "a replica is ahead of
+/// me" and `trigger_online_reheal` FENCES the master's own shard
+/// (`heal_pending` → `Transitioning`, keyspace client-invisible) for a no-op
+/// baseline pull. `reverse_heal_online` is ON by default for RF>1, so this
+/// re-creates the scenario-07 read-outage shape the wave was fixing.
+///
+/// # Why the SELF side is resolved rather than age-compared
+///
+/// The alternative — carry each snapshot's age on the wire and refuse a
+/// verdict when self's snapshot is older — is not fit for purpose: the bias
+/// is systematic, so under a strict age comparison the verdict is suppressed
+/// in the GENUINE divergence case too (self's snapshot is older there as
+/// well) and the online re-heal silently stops working; adding a tolerance
+/// large enough to avoid that also re-admits the false verdicts, because ANY
+/// positive skew produces one. Resolving self's side instead removes the
+/// self-side staleness by construction.
+///
+/// # Cost containment (W10 composition review P1)
+///
+/// The confirm considers ONLY the shards otherwise about to be FENCED (post
+/// single-flight, post backoff, `self_behind == true`) — the destructive set
+/// — and it is skipped entirely when the recency cache is not stale. That is
+/// not sufficient on its own: on a spend-heavy workload EVERY actively
+/// written mastered shard reads behind after each refresh (order 1/3 of the
+/// ring at 4096 shards / RF 2 / 3 nodes), the backoff does not damp the
+/// FREQUENCY (the source-view signature includes self's cached fingerprint,
+/// so every refresh moves it and the whole set re-enters), and this runs
+/// SYNCHRONOUSLY in the coordinator's exchange-drain phase, where the loop is
+/// not handling SWIM events, topology commits, migration completions or
+/// transfer-request draining (the watchdog's stall threshold is 10 s and it
+/// only logs).
+///
+/// So each round admits a capped, ROTATING WINDOW over the shard-ascending
+/// candidate set ([`reheal_confirm_admission`]), bounded by both
+/// [`REHEAL_LIVE_CONFIRM_MAX_SHARDS_PER_ROUND`] and
+/// [`REHEAL_LIVE_CONFIRM_MAX_KEYS_PER_ROUND`], budgeted from the engine's
+/// O(1) per-shard record counters BEFORE any I/O is issued so the cap bounds
+/// the txid-resolve reads too. The remainder is DEFERRED: not confirmed, not
+/// refuted, and (crucially) not backed off, so it is simply re-evaluated on
+/// the next round. Deferring is never a safety change — an unconfirmed shard
+/// is never fenced. The window's start rotates across rounds (W10 review
+/// P2-B) so a shard that consumes a whole round's budget — and, being
+/// permanently source-refused, never leaves the candidate set — cannot
+/// monopolise every round and stall the confirm entirely; see
+/// [`reheal_confirm_admission`] for that composition and its pin.
+///
+/// RESIDUAL (not closed by the cap): [`Engine::keys_by_shard_filtered`] walks
+/// the ENTIRE primary index and only FILTERS by shard, so every confirm round
+/// still pays one full in-RAM index walk (taking each index shard's read
+/// lock) regardless of how few shards it admits. The cap bounds the FAN-OUT
+/// and the device I/O, not the walk — and past ~80 M records the per-round
+/// bound degenerates to one shard anyway (see
+/// [`REHEAL_LIVE_CONFIRM_MAX_KEYS_PER_ROUND`]). Shard-local index enumeration
+/// is what actually closes this; it is tracked as follow-up work. Meanwhile
+/// the walk is the same one the background recency refresher already performs
+/// on its own ≥ 5 s pacing, and here it is paid at most once per re-heal
+/// round, with `teraslab_reheal_live_confirm_last_duration_ms` making the
+/// event-loop cost measurable.
+///
+/// # Fail-safe returns
+///
+/// * `total_skipped > 0` from the enumeration (an unreadable footer / a raced
+///   deletion, issue #46) means self's fresh fingerprint may itself omit a
+///   record: NOTHING is confirmed and nothing is refuted, so every candidate
+///   is simply re-evaluated next round.
+/// * A shard whose live count is non-zero but whose scan folded NO readable
+///   record is the fabricated-emptiness shape — no evidence, so it is neither
+///   confirmed nor refuted (deferred, not backed off).
+///
+/// # Error directions
+///
+/// * REPLICA side: a stale replica snapshot can only under-report the
+///   generation it scanned, which makes the replica look LESS ahead — it
+///   defers a heal rather than fabricating a fence. Fail-safe.
+/// * SELF side (NIT 2): the fold mixes the live O(1) `count` with a digest
+///   folded from keys enumerated slightly earlier, and a key DELETED
+///   mid-confirm is skipped by `recency_for_keys` (`Err(_) => continue`)
+///   WITHOUT contributing to `total_skipped`. So self's fresh digest can
+///   still differ from a perfectly-simultaneous scan. That is the same class
+///   as the documented coarse over-flag — it can only make self look
+///   different or slightly behind, i.e. it can re-admit a fence the fresh
+///   evidence would otherwise refute, never suppress a genuine one. The
+///   authoritative per-record confirm still arbitrates every key.
+///
+/// Returns `(confirmed, refuted, deferred)`: shards still genuinely behind a
+/// live replica against FRESH self evidence, shards the fresh evidence clears
+/// (safe to record in the not-behind backoff cache), and the count the cap
+/// left for a later round.
+/// W10 composition review P2-1 — keep only the shards `self_id` masters in
+/// `table` RIGHT NOW.
+///
+/// The reverse-heal fence classification happens under an earlier read guard
+/// than the fence itself, and the shard-table VERSION is not a witness that
+/// the table is unchanged between them:
+/// [`ShardTable::rollback_shard`](crate::cluster::shards::ShardTable::rollback_shard)
+/// restores `assignments[shard]` from `prev_assignments` IN PLACE without
+/// bumping `version`, and background workers call it on the live installed
+/// table — so a same-version, different-table state demonstrably exists.
+/// Today every rollback call site is source-side (mastership moves TOWARD
+/// self) and `commit_shard` does not touch assignments, so the flip that would
+/// hurt cannot occur; but that is a non-local invariant spread over three call
+/// sites that nothing enforces, and the failure mode it guards is fencing +
+/// baseline-pulling a shard this node does not own.
+///
+/// This filter is version-INDEPENDENT: it re-reads the assignment under the
+/// same guard that selects heal sources, so the guarantee is local no matter
+/// what mutated the table in between.
+fn retain_self_mastered_shards(table: &ShardTable, self_id: NodeId, shards: &[u16]) -> Vec<u16> {
+    shards
+        .iter()
+        .copied()
+        .filter(|&shard| table.target_assignment(shard).master == self_id)
+        .collect()
+}
+
+/// W10 composition review P1/P2-B — which slice of `counts` (shard, live
+/// record count), ASCENDING BY SHARD, one live-recency confirm round admits.
+///
+/// Returns `(start_index, admitted)`: a WRAPPING run of `admitted` entries
+/// beginning at `start_index`, bounded by `max_shards` AND `max_keys`. The
+/// first entry of the run is admitted unconditionally so a single shard bigger
+/// than the whole key budget is never permanently unconfirmable (that would be
+/// a silently disabled online re-heal). Counts come from the engine's O(1)
+/// per-shard counters and are consulted BEFORE any I/O, so the budget bounds
+/// the txid-resolve reads inside [`Engine::keys_by_shard_filtered`] as well as
+/// the footer reads after it.
+///
+/// # Why the start ROTATES (W10 review P2-B)
+///
+/// Admitting a fixed lowest-id-first prefix composes two otherwise-benign
+/// residuals into a FULL STALL of the online re-heal on the node:
+///
+/// 1. a CONFIRMED shard whose heal-source selection is permanently REFUSED
+///    (#74: no quorum-current candidate) is never fenced and never backed off,
+///    so it re-enters the candidate set every single round;
+/// 2. once mean shard population exceeds
+///    [`REHEAL_LIVE_CONFIRM_MAX_KEYS_PER_ROUND`] — i.e. at any realistic store
+///    size, see that constant's doc — the always-progress rule means the FIRST
+///    admitted shard consumes the entire round on its own.
+///
+/// Compose them and one stuck low-id shard is re-admitted alone, forever: the
+/// confirm never reaches any other shard, so every other divergent shard stays
+/// permanently unconfirmed and therefore permanently unfenced. The direction
+/// is benign (no fence = keep serving) and the precondition already pages the
+/// operator via `teraslab_heal_source_refused_no_quorum_total`, but the stall
+/// is otherwise invisible — two climbing counters and nothing else.
+///
+/// Rotating the start (`next = (start + admitted) mod len`, carried across
+/// rounds by the caller) means a shard that consumes a whole round is stepped
+/// PAST on the next one. Admission stays fully deterministic given
+/// `(counts, start)`, so a round is still reproducible and the function stays
+/// pure; only the cursor is state.
+///
+/// `start` is taken modulo `counts.len()`, so a cursor carried over from a
+/// larger candidate set is always in range.
+fn reheal_confirm_admission(
+    counts: &[(u16, u64)],
+    start: usize,
+    max_shards: usize,
+    max_keys: u64,
+) -> (usize, usize) {
+    debug_assert!(
+        counts.windows(2).all(|w| w[0].0 <= w[1].0),
+        "admission budgeting requires shard-ascending input for determinism",
+    );
+    if counts.is_empty() {
+        return (0, 0);
+    }
+    let start = start % counts.len();
+    let mut admitted = 0usize;
+    let mut keys: u64 = 0;
+    while admitted < counts.len() {
+        if admitted >= max_shards {
+            break;
+        }
+        let (_, count) = counts[(start + admitted) % counts.len()];
+        if admitted > 0 && keys.saturating_add(count) > max_keys {
+            break;
+        }
+        keys = keys.saturating_add(count);
+        admitted += 1;
+    }
+    (start, admitted)
+}
+
+fn confirm_self_behind_with_live_recency(
+    engine: &Engine,
+    candidates: &[(u16, Vec<ShardRecency>)],
+    cursor: &std::sync::atomic::AtomicUsize,
+) -> (Vec<u16>, Vec<u16>, usize) {
+    let mut ordered: Vec<&(u16, Vec<ShardRecency>)> = candidates.iter().collect();
+    ordered.sort_unstable_by_key(|(shard, _)| *shard);
+    let counts: Vec<(u16, u64)> = ordered
+        .iter()
+        .map(|(shard, _)| (*shard, engine.shard_record_count(*shard)))
+        .collect();
+    let (start, admit) = reheal_confirm_admission(
+        &counts,
+        cursor.load(Ordering::Relaxed),
+        REHEAL_LIVE_CONFIRM_MAX_SHARDS_PER_ROUND,
+        REHEAL_LIVE_CONFIRM_MAX_KEYS_PER_ROUND,
+    );
+    // P2-B — advance the rotation so a shard that consumed a whole round is
+    // stepped PAST next round; `reheal_confirm_admission` re-normalises the
+    // stored value against whatever the next round's candidate count is.
+    if !ordered.is_empty() {
+        cursor.store((start + admit) % ordered.len(), Ordering::Relaxed);
+    }
+    let admitted: Vec<&(u16, Vec<ShardRecency>)> = (0..admit)
+        .map(|i| ordered[(start + i) % ordered.len()])
+        .collect();
+    let deferred = candidates.len() - admitted.len();
+
+    let shards: std::collections::HashSet<u16> = admitted.iter().map(|(s, _)| *s).collect();
+    let started = std::time::Instant::now();
+    let (keys_by_shard, total_skipped) = engine.keys_by_shard_filtered(&shards);
+    let mut confirmed = Vec::new();
+    let mut refuted = Vec::new();
+    // NIT 1 — an incomplete enumeration defers EVERY candidate, not just the
+    // over-cap remainder, and folds none of them; the metrics must say so.
+    let mut scanned_shards = shards.len() as u64;
+    let mut deferred = deferred;
+    if total_skipped > 0 {
+        tracing::warn!(
+            skipped = total_skipped,
+            shards = shards.len(),
+            candidates = candidates.len(),
+            "reverse-heal Phase 3b: live-recency confirm read an INCOMPLETE \
+             key enumeration — deferring EVERY fence verdict this round \
+             (re-evaluated on the next partition view)",
+        );
+        scanned_shards = 0;
+        deferred = candidates.len();
+    } else {
+        for (shard, replica_recencies) in admitted {
+            let keys: &[TxKey] = keys_by_shard.get(shard).map_or(&[], |k| k.as_slice());
+            let (scan_count, digest, max_generation) = engine.recency_for_keys(keys);
+            let live_count = engine.shard_record_count(*shard);
+            if scan_count == 0 && live_count > 0 {
+                // Records exist but none folded — the fingerprint is fabricated
+                // emptiness, not evidence. Defer without a backoff entry.
+                tracing::warn!(
+                    shard,
+                    live_count,
+                    "reverse-heal Phase 3b: live-recency confirm folded NO readable \
+                     record for a populated shard — deferring the fence verdict",
+                );
+                continue;
+            }
+            let fresh = ShardRecency {
+                count: live_count,
+                digest,
+                max_generation,
+                recency_unknown: false,
+            };
+            if is_shard_stale_vs_replicas(fresh, replica_recencies)
+                && is_self_behind_any_replica_coarse(fresh, replica_recencies)
+            {
+                confirmed.push(*shard);
+            } else {
+                refuted.push(*shard);
+            }
+        }
+    }
+    if let Some(m) = crate::metrics::migration_metrics() {
+        m.reheal_live_confirm_rounds.inc();
+        m.reheal_live_confirm_shards.inc_by(scanned_shards);
+        m.reheal_live_confirm_deferred.inc_by(deferred as u64);
+        m.reheal_live_confirm_last_duration_ms.store(
+            u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX),
+            Ordering::Relaxed,
+        );
+    }
+    (confirmed, refuted, deferred)
 }
 
 // ---------------------------------------------------------------------------
@@ -10458,6 +10917,17 @@ fn resource_parked_heal_fences(
     started
 }
 
+/// `engine` is the live store this node serves. It is `Option` ONLY because
+/// the unit-test `RunningCluster` fixture carries no engine (see the field
+/// doc on `RunningCluster::engine`); production always supplies one. With no
+/// engine there is no recency CACHE either, so there is no cached-vs-live
+/// distinction to correct and the cached classification stands.
+///
+/// `confirm_cursor` is the live-recency confirm's rotation state (W10 review
+/// P2-B) — one `usize` carried across rounds by the event loop so no single
+/// budget-consuming shard can monopolise every round. See
+/// [`reheal_confirm_admission`].
+#[allow(clippy::too_many_arguments)]
 fn trigger_online_reheal(
     self_id: NodeId,
     shard_table: &Arc<ShardTableLock<ShardTable>>,
@@ -10466,6 +10936,8 @@ fn trigger_online_reheal(
     inbound_state_path: &Option<std::path::PathBuf>,
     reheal_backoff: &Arc<Mutex<std::collections::HashMap<u16, u64>>>,
     partition_view: &std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>>,
+    engine: Option<&Arc<Engine>>,
+    confirm_cursor: &Arc<std::sync::atomic::AtomicUsize>,
 ) -> usize {
     if partition_view.is_empty() {
         return 0;
@@ -10499,49 +10971,128 @@ fn trigger_online_reheal(
     // to the authoritative per-record manifest exchange the boot heal runs (or the
     // next real generation/count change that trips the coarse gate). This trades a
     // rare deferred-completeness gap for the hard invariant that an ahead/equal
-    // master is never fenced online. Detect + classify + select under a single
-    // shard-table read so all three see one consistent table.
-    let sources = {
+    // master is never fenced online.
+    //
+    // W10 composition review P1-3a — the classification is a PRE-FILTER over
+    // CACHED recency on both sides; the fence verdict is re-checked against
+    // self's LIVE recency below. The classify pass and the confirm are
+    // deliberately NOT under one shard-table read: the confirm scans the
+    // engine, and holding the table's read lock across it would stall the
+    // activation writer — under parking_lot's writer preference that blocks
+    // every new reader, `is_master` on the client path included, which is the
+    // very read outage this fix exists to prevent. Consistency is preserved by
+    // pinning the table VERSION instead: if it moves between classify and
+    // select, the round is abandoned and the next partition view re-runs it.
+    let (candidates, table_version) = {
         let table = shard_table.read();
-        let candidates = classify_stale_mastered_shards(self_id, &table, partition_view);
-        // Apply SINGLE-FLIGHT, DIRECTION, and BACKOFF to pick the shards to fence.
-        let mut to_fence: Vec<u16> = Vec::new();
-        {
-            let mut backoff = reheal_backoff.lock();
-            for c in &candidates {
-                // SINGLE-FLIGHT: a shard already inbound-fenced (heal in flight,
-                // fail-closed fence, or forward migration) is skipped so a
-                // being-healed shard never thrashes. `register_heal_source` keys on
-                // `(shard, from_node)`; gating on the per-shard fence here makes the
-                // dedup robust to a source that changes between detector passes.
-                if inbound_atomic.test(c.shard) {
-                    continue;
-                }
-                // BACKOFF: if we already evaluated this exact source view for the
-                // shard and did NOT fence it (an ahead/equal master), skip
-                // re-evaluating until the source view changes — no re-check, no
-                // re-fence on every topology commit.
-                if backoff.get(&c.shard) == Some(&c.signature) {
-                    continue;
-                }
-                if c.self_behind {
-                    // Genuine heal candidate: clear any stale not-behind cache
-                    // entry so a completed/re-diverged heal is never suppressed,
-                    // then fence + pull.
-                    backoff.remove(&c.shard);
-                    to_fence.push(c.shard);
-                } else {
-                    // Ahead/equal master — NEVER fence. Record the source-view
-                    // signature so repeated commits with an unchanged view do not
-                    // re-check (and certainly do not re-fence) this shard.
-                    backoff.insert(c.shard, c.signature);
-                }
+        (
+            classify_stale_mastered_shards(self_id, &table, partition_view),
+            table.version,
+        )
+    };
+    // Apply SINGLE-FLIGHT, DIRECTION, and BACKOFF to pick the fence candidates.
+    let mut to_confirm: Vec<(u16, Vec<ShardRecency>)> = Vec::new();
+    let mut signature_of: std::collections::HashMap<u16, u64> = std::collections::HashMap::new();
+    {
+        let mut backoff = reheal_backoff.lock();
+        for c in candidates {
+            // SINGLE-FLIGHT: a shard already inbound-fenced (heal in flight,
+            // fail-closed fence, or forward migration) is skipped so a
+            // being-healed shard never thrashes. `register_heal_source` keys on
+            // `(shard, from_node)`; gating on the per-shard fence here makes the
+            // dedup robust to a source that changes between detector passes.
+            if inbound_atomic.test(c.shard) {
+                continue;
+            }
+            // BACKOFF: if we already evaluated this exact source view for the
+            // shard and did NOT fence it (an ahead/equal master), skip
+            // re-evaluating until the source view changes — no re-check, no
+            // re-fence on every topology commit. This also keeps the live
+            // confirm below off an unchanged view.
+            if backoff.get(&c.shard) == Some(&c.signature) {
+                continue;
+            }
+            if c.self_behind {
+                // Candidate heal: clear any stale not-behind cache entry so a
+                // completed/re-diverged heal is never suppressed, then confirm.
+                backoff.remove(&c.shard);
+                signature_of.insert(c.shard, c.signature);
+                to_confirm.push((c.shard, c.replica_recencies));
+            } else {
+                // Ahead/equal master — NEVER fence. Record the source-view
+                // signature so repeated commits with an unchanged view do not
+                // re-check (and certainly do not re-fence) this shard.
+                backoff.insert(c.shard, c.signature);
             }
         }
-        if to_fence.is_empty() {
+    }
+    if to_confirm.is_empty() {
+        return started;
+    }
+    // W10 composition review P1-3a — CONFIRM against self's LIVE recency
+    // before fencing anything. A shard the fresh evidence REFUTES is recorded
+    // in the not-behind backoff cache under the same source-view signature the
+    // pre-filter used, so an unchanged view neither re-fences nor re-scans.
+    let to_fence: Vec<u16> = match engine {
+        Some(engine) if engine.recency_cache_is_stale() => {
+            let (confirmed, refuted, deferred) =
+                confirm_self_behind_with_live_recency(engine, &to_confirm, confirm_cursor);
+            if !refuted.is_empty() {
+                let mut backoff = reheal_backoff.lock();
+                for shard in &refuted {
+                    if let Some(sig) = signature_of.get(shard) {
+                        backoff.insert(*shard, *sig);
+                    }
+                }
+            }
+            if !refuted.is_empty() || deferred > 0 {
+                tracing::info!(
+                    refuted = refuted.len(),
+                    confirmed = confirmed.len(),
+                    deferred,
+                    candidates = to_confirm.len(),
+                    "reverse-heal Phase 3b: live-recency confirm ran against \
+                     the CACHED partition-version snapshot's fence candidates \
+                     (refuted = not fenced; deferred = over the per-round cap, \
+                     re-evaluated next round) (W10 P1-3a)",
+                );
+            }
+            confirmed
+        }
+        // Cache is current (or no engine attached — the unit-test fixture):
+        // the served self recency IS self's live recency, nothing to correct.
+        _ => to_confirm.iter().map(|(shard, _)| *shard).collect(),
+    };
+    if to_fence.is_empty() {
+        return started;
+    }
+    let sources = {
+        let table = shard_table.read();
+        // W10 composition review P2-1 — the version check below is a CHEAP
+        // EARLY-OUT, NOT a witness that the table is unchanged; ownership is
+        // re-checked per shard by `retain_self_mastered_shards`, whose doc
+        // carries the full analysis of why the version cannot serve as one.
+        if table.version != table_version {
+            tracing::info!(
+                classified_at = table_version,
+                now = table.version,
+                "reverse-heal Phase 3b: shard table advanced during the \
+                 live-recency confirm — abandoning this round's fences",
+            );
             return started;
         }
-        select_reverse_heal_sources_for(self_id, &table, &to_fence, partition_view)
+        let owned = retain_self_mastered_shards(&table, self_id, &to_fence);
+        if owned.len() != to_fence.len() {
+            tracing::info!(
+                dropped = to_fence.len() - owned.len(),
+                "reverse-heal Phase 3b: dropping fence candidate(s) this node \
+                 no longer masters at select time (W10 P2-1)",
+            );
+        }
+        if owned.is_empty() {
+            return started;
+        }
+        select_reverse_heal_sources_for(self_id, &table, &owned, partition_view)
     };
     if sources.is_empty() {
         // A newly-stale shard whose selection REFUSED is NOT fenced: an
@@ -12678,6 +13229,14 @@ const EVENT_ORPHAN_CLEANUP_MIN_INTERVAL: Duration = Duration::from_secs(60);
 /// - `pending_inbound == 0` — its plan's inbound work has settled, so
 ///   nothing this node is still receiving can be misjudged around the pass.
 ///
+/// W10 composition review P1-3b/P2-4 — `pending_inbound` is
+/// [`MigrationManager::inbound_migration_work_count`], NOT `inbound_count`:
+/// reverse-heal fences are EXCLUDED. They are alert-and-hold state rather
+/// than in-flight migration work, and a #74 parked no-source fence holds
+/// forever BY DESIGN — counting it turned a transient fence into a permanent
+/// disable of this pass (the armed-17 disk-reclaim regression). See that
+/// method's doc for the full safety argument.
+///
 /// Refusal is fail-safe: it defers reclaim, never data. The
 /// batch-completion-site invocations of `run_orphan_cleanup` /
 /// `cleanup_orphaned_shard_if_settled` are deliberately NOT gated — they
@@ -12773,6 +13332,23 @@ fn run_orphan_cleanup(
         for shard in 0..NUM_SHARDS as u16 {
             if unsettled.contains(&shard) {
                 debug_shard_log(shard, "orphan_cleanup SKIP (unresolved task for shard)");
+                continue;
+            }
+            // W10 composition review P2-2 — a shard with ANY pending inbound
+            // entry (a forward transfer, a reverse-heal pull, or a #74 parked
+            // fail-closed fence) is not judged here. The ownership test below
+            // is NOT sufficient to exclude heal fences: the boot G3 path
+            // fences shards derived from lost create keys with no ownership
+            // filter, and a persisted heal fence can be restored after a
+            // topology change moved the shard away (#74 F1) — so a non-owned,
+            // heal-fenced shard could be reclaimed while its own pull was
+            // still queued. #28 keeps that churn rather than loss, but the
+            // churn is pointless; skipping is free and makes the admissibility
+            // gate's "heal fences are not orphan candidates" argument
+            // (`MigrationManager::inbound_migration_work_count`) locally TRUE
+            // instead of resting on a non-local invariant.
+            if mgr.has_pending_inbound(shard) {
+                debug_shard_log(shard, "orphan_cleanup SKIP (pending inbound / heal fence)");
                 continue;
             }
             let assignment = table.effective_assignment(shard);
@@ -12928,6 +13504,13 @@ fn cleanup_orphaned_shard_if_settled(
             p.shard == shard && p.state == crate::cluster::migration::MigrationState::Failed
         });
         if shard_still_active || shard_failed {
+            return;
+        }
+        // W10 composition review P2-2 — never reclaim a shard with a pending
+        // inbound entry (forward transfer, reverse-heal pull, or a #74 parked
+        // fail-closed fence). See the matching guard in `run_orphan_cleanup`
+        // for why the ownership test below does not already cover heal fences.
+        if mgr.has_pending_inbound(shard) {
             return;
         }
         // Data-loss guard (task #28): only reclaim with positive evidence the
@@ -17337,6 +17920,13 @@ pub struct RunningCluster {
     /// never suppressed; a signature change (the source moved) forces a fresh
     /// evaluation. Empty in the boot path — this gates only the runtime path.
     reheal_backoff: Arc<Mutex<std::collections::HashMap<u16, u64>>>,
+    /// W10 review P2-B — the live-recency confirm's per-round admission
+    /// rotation cursor, shared with the event loop. One `usize`: the index
+    /// (into the shard-ascending candidate list) the NEXT confirm round starts
+    /// from, so a shard that consumes a whole round's budget is stepped past
+    /// on the following round instead of monopolising every round forever.
+    /// See [`reheal_confirm_admission`].
+    reheal_confirm_cursor: Arc<std::sync::atomic::AtomicUsize>,
     /// Test-only: when set, [`RunningCluster::signal_topology_committed`]
     /// drops the signal instead of queuing it. Models the production race
     /// where a node's authority commits a new term (via the dispatch
@@ -18268,6 +18858,8 @@ impl RunningCluster {
             &self.inbound_state_path,
             &self.reheal_backoff,
             partition_view,
+            self.engine.as_ref(),
+            &self.reheal_confirm_cursor,
         )
     }
 
@@ -19970,6 +20562,7 @@ pub(crate) fn new_test_running_cluster(
         startup_reactivation_needed: Arc::new(AtomicBool::new(false)),
         stale_suspect_shards: Arc::new(RwLock::new(std::collections::BTreeSet::new())),
         reheal_backoff: Arc::new(Mutex::new(std::collections::HashMap::new())),
+        reheal_confirm_cursor: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         #[cfg(any(test, feature = "fault-injection"))]
         drop_commit_signals: Arc::new(AtomicBool::new(false)),
         #[cfg(test)]
@@ -23910,6 +24503,190 @@ mod tests {
         assert_eq!(engine.shard_record_count(shard), 1);
     }
 
+    /// W10 composition review P2-2 (RED→GREEN) — orphan cleanup must SKIP a
+    /// shard with a pending inbound entry, heal fences included.
+    ///
+    /// The admissibility gate's argument for excluding heal fences from the
+    /// pending-inbound count is that a heal-fenced shard is never an orphan
+    /// candidate. Ownership alone does NOT deliver that: the boot G3 path
+    /// fences shards derived from lost create keys with no ownership filter,
+    /// and a persisted heal fence can be restored after a topology change
+    /// moved the shard away (#74 F1). Without a per-shard fence check the
+    /// cleanup pass reclaimed such a shard while its own reverse-pull was
+    /// still queued — churn (the #28 guard keeps it from being loss), and
+    /// pointless churn at that. Both cleanup entry points must skip it.
+    #[test]
+    fn orphan_cleanup_skips_a_heal_fenced_shard_it_does_not_own() {
+        let old_table =
+            ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2), NodeId(3)], 2, 20, 1);
+        let new_table = ShardTable::compute_with_epoch(&[NodeId(2), NodeId(3)], 2, 21, 1);
+        let unowned = |s: u16| {
+            let old = old_table.target_assignment(s);
+            let new = new_table.target_assignment(s);
+            (old.master == NodeId(1) || old.replicas.contains(&NodeId(1)))
+                && new.master != NodeId(1)
+                && !new.replicas.contains(&NodeId(1))
+        };
+        let mut shards = (0..NUM_SHARDS as u16).filter(|&s| unowned(s));
+        let fenced = shards.next().expect("a shard node1 no longer owns");
+        let unfenced = shards.next().expect("a second such shard");
+
+        let engine = Arc::new(test_engine());
+        create_test_record(&engine, tx_key_for_shard(fenced, 80));
+        create_test_record(&engine, tx_key_for_shard(unfenced, 81));
+        assert_eq!(engine.shard_record_count(fenced), 1);
+        assert_eq!(engine.shard_record_count(unfenced), 1);
+
+        let shard_table = Arc::new(ShardTableLock::new(new_table.clone()));
+        let migration = Arc::new(Mutex::new(MigrationManager::new()));
+        {
+            let mgr = &mut migration.lock();
+            // Both shards have the #28 evidence that would otherwise authorize
+            // reclaim, so the FENCE is the only difference between them.
+            mgr.record_committed_handoff(fenced, new_table.version);
+            mgr.record_committed_handoff(unfenced, new_table.version);
+            // A #74 parked no-source heal fence on a shard this node no longer
+            // owns — the restored-fence / boot-G3 shape.
+            mgr.mark_heal_fence_active(fenced);
+        }
+
+        run_orphan_cleanup(
+            NodeId(1),
+            &engine,
+            &shard_table,
+            &migration,
+            new_table.version,
+        );
+        assert_eq!(
+            engine.shard_record_count(fenced),
+            1,
+            "the sweep must NOT reclaim a shard whose reverse-pull is still \
+             fenced/queued (W10 P2-2)",
+        );
+        assert_eq!(
+            engine.shard_record_count(unfenced),
+            0,
+            "…while an unfenced, non-owned, #28-evidenced shard is still \
+             reclaimed — the guard is per-shard, not a global bail",
+        );
+
+        // The per-shard entry point carries the same guard.
+        create_test_record(&engine, tx_key_for_shard(unfenced, 82));
+        cleanup_orphaned_shard_if_settled(
+            NodeId(1),
+            &engine,
+            &shard_table,
+            &migration,
+            fenced,
+            new_table.version,
+        );
+        assert_eq!(
+            engine.shard_record_count(fenced),
+            1,
+            "cleanup_orphaned_shard_if_settled must skip the heal-fenced shard too",
+        );
+        cleanup_orphaned_shard_if_settled(
+            NodeId(1),
+            &engine,
+            &shard_table,
+            &migration,
+            unfenced,
+            new_table.version,
+        );
+        assert_eq!(
+            engine.shard_record_count(unfenced),
+            0,
+            "…and still reclaims the unfenced one",
+        );
+    }
+
+    /// W10 composition review P2-6 (RED→GREEN) — the armed-05 chain past the
+    /// retention horizon, at the CONSUMER the migration completion builder
+    /// actually calls (`Engine::weak_tombstone_keys_for_shard`).
+    ///
+    /// The source pruned key K locally (#29 prune damage → a WEAK
+    /// `PruneReplace` tombstone), so every manifest it ships omits K; the
+    /// declaration is what stops the target's prune from reading that omission
+    /// as deletion-intent and deleting its LAST LIVE COPY. Pre-fix the weak
+    /// tombstone expired on the block-height retention clock, so a repair
+    /// slower than `tombstone_retention_blocks` silently withdrew the
+    /// declaration while the omission persisted. A genuine client delete must
+    /// still expire on schedule.
+    #[test]
+    fn weak_tombstone_declaration_survives_the_retention_horizon() {
+        use crate::ops::remaining::DeleteRequest;
+        let engine = Arc::new(test_engine());
+        // A DELIBERATELY short retention so the horizon is reachable in-test;
+        // production sizes this at the reorg/finality horizon.
+        engine.set_tombstone_log(crate::ops::tombstone::TombstoneLog::new(
+            std::path::PathBuf::from("/nonexistent/w10-p2-6.tombstones"),
+            engine.index_seed(),
+            engine.index_shard_count(),
+            10,
+        ));
+
+        let pruned = tx_key_for_shard(64, 70);
+        let client_deleted = tx_key_for_shard(64, 71);
+        let shard = ShardTable::shard_for_key(&pruned);
+        assert_eq!(
+            ShardTable::shard_for_key(&client_deleted),
+            shard,
+            "fixture: both keys must live in the same cluster shard",
+        );
+        create_test_record(&engine, pruned);
+        create_test_record(&engine, client_deleted);
+        engine.observe_block_height(100);
+
+        // Our OWN reconcile damage (the #29 completion prune) …
+        engine
+            .delete_prune_replace(&DeleteRequest {
+                tx_key: pruned,
+                due_guard: None,
+            })
+            .expect("prune-replace delete must succeed");
+        // … versus a real, authoritative client delete.
+        engine
+            .delete(&DeleteRequest {
+                tx_key: client_deleted,
+                due_guard: None,
+            })
+            .expect("client delete must succeed");
+        assert_eq!(
+            engine.weak_tombstone_keys_for_shard(shard),
+            vec![pruned],
+            "precondition: only the prune damage is a weak omission claim",
+        );
+
+        // Repair is delayed far past the retention horizon, and a checkpoint
+        // GC runs.
+        engine.observe_block_height(100_000);
+        assert_eq!(
+            engine.gc_tombstones(),
+            1,
+            "the authoritative client delete still expires on schedule",
+        );
+        assert!(
+            engine.tombstone_lookup(&client_deleted).is_none(),
+            "the expired client delete really is gone",
+        );
+        assert_eq!(
+            engine.weak_tombstone_keys_for_shard(shard),
+            vec![pruned],
+            "the source must KEEP declaring the omission it can no longer \
+             otherwise justify — withdrawing it turns 'my own prune damage' \
+             into 'deletion-intent' and the target's #29 prune deletes its \
+             last live copy (armed-05, past the horizon)",
+        );
+
+        // The declaration drains when the repair actually lands (Invariant
+        // TS-1: the key comes back LIVE).
+        create_test_record(&engine, pruned);
+        assert!(
+            engine.weak_tombstone_keys_for_shard(shard).is_empty(),
+            "a repaired key leaves no lingering claim",
+        );
+    }
+
     /// Broad-sweep mirror of
     /// [`per_shard_orphan_cleanup_reclaims_without_authority_tombstone_and_repair_lands`]:
     /// `run_orphan_cleanup` produced the same `ClientDelete` authority
@@ -26454,6 +27231,81 @@ mod tests {
             assert!(event_orphan_cleanup_fire(&mut last_fired, now));
         }
         assert!(last_fired.is_some());
+    }
+
+    /// W10 composition review P1-3b/P2-4 (RED→GREEN) — a reverse-heal fence
+    /// must NOT disable the event-driven orphan cleanup. `inbound_count`
+    /// counts every uncompleted inbound entry, heal fences included, and the
+    /// admissibility gate demands zero — so ONE #74 parked no-source fence
+    /// (which alert-and-hold DESIGNS to hold forever) disabled the pass for
+    /// the life of the process and brought back the armed-17 disk-reclaim
+    /// regression. Genuine in-flight forward inbound work must still gate.
+    /// Driven through the REAL `MigrationManager` and the REAL gate.
+    #[test]
+    fn parked_heal_fence_does_not_disable_event_orphan_cleanup() {
+        let mut mgr = MigrationManager::new();
+
+        // #74: a no-source heal fence, parked on the NodeId(0) sentinel —
+        // fenced fail-closed until an operator intervenes.
+        assert!(mgr.mark_heal_fence_active(11));
+        assert_eq!(
+            mgr.parked_no_source_heal_shards(),
+            vec![11],
+            "precondition: the fence really is a #74 park",
+        );
+        assert_eq!(
+            mgr.inbound_count(),
+            1,
+            "the park IS an uncompleted inbound entry (the old gate input)",
+        );
+        assert_eq!(
+            mgr.inbound_migration_work_count(),
+            0,
+            "...but it is alert-and-hold state, not in-flight migration work",
+        );
+        assert!(
+            event_orphan_cleanup_admissible(7, 7, mgr.inbound_migration_work_count()),
+            "a node holding a parked heal fence must STILL run the event \
+             cleanup pass (pre-fix: never again, for the life of the process)",
+        );
+
+        // A concrete-source heal (a baseline reverse-pull in flight) is the
+        // same class of state — the transient-fence trickle that also kept
+        // the gate permanently shut.
+        assert!(mgr.register_heal_source(12, NodeId(2)));
+        assert_eq!(mgr.inbound_count(), 2);
+        assert_eq!(mgr.inbound_migration_work_count(), 0);
+        assert!(event_orphan_cleanup_admissible(
+            7,
+            7,
+            mgr.inbound_migration_work_count()
+        ));
+
+        // Genuine plan-driven inbound work STILL gates the pass...
+        assert!(mgr.mark_inbound_active(13));
+        assert_eq!(
+            mgr.inbound_migration_work_count(),
+            1,
+            "a forward inbound transfer is real migration work",
+        );
+        assert!(
+            !event_orphan_cleanup_admissible(7, 7, mgr.inbound_migration_work_count()),
+            "the pass must still defer while this node is receiving plan work",
+        );
+
+        // ...and stops gating the moment it completes, with the heal fences
+        // still up.
+        mgr.mark_inbound_complete_from_source(13, NodeId(0));
+        assert_eq!(mgr.inbound_migration_work_count(), 0);
+        assert!(
+            mgr.inbound_count() >= 2,
+            "the heal fences are untouched — only the WORK counter moved",
+        );
+        assert!(event_orphan_cleanup_admissible(
+            7,
+            7,
+            mgr.inbound_migration_work_count()
+        ));
     }
 
     /// W8 (defect 1) — the all-EMPTY batch path returns before the main
@@ -30353,6 +31205,183 @@ mod tests {
         assert_eq!(out, settled);
     }
 
+    /// W10 composition review P2-1 (RED→GREEN) — the permanently-dropped
+    /// join. Drives the REAL chain — `TopologyDebounce` burst →
+    /// `take_due` → `revalidate_settled_members` →
+    /// `revalidation_collapse_needs_rearm` → `TopologyDebounce::rearm` — over
+    /// the observed shape: the burst `{1,2}→{1,2,3}→{1,2}→{1,2,3}` records
+    /// node 3 as departed, SWIM has 3 SUSPECT at the propose instant, so 3 is
+    /// dropped and the survivors `{1,2}` EQUAL the committed set. Pre-fix the
+    /// consumed debounce was simply gone: `on_membership_changed` skips on the
+    /// identical set, only the lowest-id member may propose, and a
+    /// Suspect→Alive refutation changes no alive SET so nothing ever re-armed
+    /// — node 3 never rejoined. The burst must be put BACK, still carrying the
+    /// departure, and must propose `{1,2,3}` on the retry once SWIM proves 3
+    /// Alive.
+    #[test]
+    fn revalidation_collapse_rearms_the_debounce_until_suspicion_resolves() {
+        use crate::cluster::membership::NodeState;
+        use crate::cluster::topology::TopologyDebounce;
+        let window = Duration::from_millis(500);
+        let mut deb = TopologyDebounce::from_window(window);
+        let t0 = std::time::Instant::now();
+        let committed = vec![NodeId(1), NodeId(2)];
+
+        // The observed burst: 3 joins, drops out, rejoins — all inside one
+        // debounce window, so the settled target is {1,2,3} with 3 flagged
+        // departed-during-burst.
+        deb.observe(&[NodeId(1), NodeId(2)], t0);
+        deb.observe(
+            &[NodeId(1), NodeId(2), NodeId(3)],
+            t0 + Duration::from_millis(50),
+        );
+        deb.observe(&[NodeId(1), NodeId(2)], t0 + Duration::from_millis(100));
+        deb.observe(
+            &[NodeId(1), NodeId(2), NodeId(3)],
+            t0 + Duration::from_millis(150),
+        );
+        let settled = deb
+            .take_due(t0 + Duration::from_millis(700))
+            .expect("the burst settles and fires");
+        assert_eq!(settled.members, vec![NodeId(1), NodeId(2), NodeId(3)]);
+        assert_eq!(settled.departed_during_burst, vec![NodeId(3)]);
+
+        // Propose instant: SWIM still only SUSPECTS 3 → re-validation drops it
+        // and the survivors equal the committed set (a guaranteed no-op
+        // proposal).
+        let suspect = |n: &NodeId| match n.0 {
+            2 => Some(NodeState::Alive),
+            3 => Some(NodeState::Suspect),
+            _ => None,
+        };
+        let revalidated = revalidate_settled_members(
+            settled.members.clone(),
+            &settled.departed_during_burst,
+            suspect,
+            NodeId(1),
+        );
+        assert_eq!(revalidated, committed, "the proposal collapsed to a no-op");
+        assert!(
+            revalidation_collapse_needs_rearm(&settled.members, &revalidated, &committed, suspect),
+            "a collapse caused by a SUSPECT drop must re-arm — nothing else \
+             will ever wake this join up",
+        );
+        assert!(
+            deb.rearm(settled, t0 + Duration::from_millis(700)),
+            "the consumed burst is re-installed (nothing newer was pending)",
+        );
+
+        // Retry #1 — still Suspect: it fires again (the periodic safety net)
+        // and STILL carries the departure, so the still-unproven member cannot
+        // ride the retry into a committed term.
+        let retry = deb
+            .take_due(t0 + Duration::from_millis(1400))
+            .expect("the re-armed burst becomes due again one window later");
+        assert_eq!(retry.members, vec![NodeId(1), NodeId(2), NodeId(3)]);
+        assert_eq!(
+            retry.departed_during_burst,
+            vec![NodeId(3)],
+            "the re-arm preserves the departure — the retry re-validates too",
+        );
+        assert_eq!(
+            revalidate_settled_members(
+                retry.members.clone(),
+                &retry.departed_during_burst,
+                suspect,
+                NodeId(1),
+            ),
+            committed,
+            "while 3 stays SUSPECT the retry keeps collapsing (data-safe)",
+        );
+
+        // Retry #2 — SWIM has since refuted the suspicion IN PLACE (no
+        // alive-SET change, hence no MembershipChanged, hence no fresh
+        // observe): the re-armed burst is what finally proposes {1,2,3}.
+        let alive = |n: &NodeId| match n.0 {
+            2 | 3 => Some(NodeState::Alive),
+            _ => None,
+        };
+        assert!(deb.rearm(retry, t0 + Duration::from_millis(1400)));
+        let healed = deb
+            .take_due(t0 + Duration::from_millis(2100))
+            .expect("still armed");
+        let proposal = revalidate_settled_members(
+            healed.members.clone(),
+            &healed.departed_during_burst,
+            alive,
+            NodeId(1),
+        );
+        assert_eq!(
+            proposal,
+            vec![NodeId(1), NodeId(2), NodeId(3)],
+            "once SWIM proves the member Alive the re-armed burst proposes the join",
+        );
+        assert!(
+            !revalidation_collapse_needs_rearm(&healed.members, &proposal, &committed, alive),
+            "a proposal that differs from the committed set needs no re-arm",
+        );
+    }
+
+    /// W10 composition review P2-1 — the re-arm is BOUNDED: only a SUSPECT
+    /// removal (the one SWIM can refute without an alive-set edge) re-arms. A
+    /// DEAD removal ends in a SWIM reap that changes the alive set and fires a
+    /// fresh burst anyway, and a survivor set that still DIFFERS from the
+    /// committed set is proposed on this very pass — re-arming for either
+    /// would spin a no-op burst every window forever.
+    #[test]
+    fn revalidation_collapse_rearm_is_bounded_to_refutable_suspicion() {
+        use crate::cluster::membership::NodeState;
+        let settled = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let committed = vec![NodeId(1), NodeId(2)];
+        let dead = |n: &NodeId| match n.0 {
+            2 => Some(NodeState::Alive),
+            3 => Some(NodeState::Dead),
+            _ => None,
+        };
+        assert!(
+            !revalidation_collapse_needs_rearm(&settled, &committed, &committed, dead),
+            "a DEAD removal must not re-arm — the reap changes the alive set",
+        );
+        let unknown = |n: &NodeId| match n.0 {
+            2 => Some(NodeState::Alive),
+            _ => None,
+        };
+        assert!(
+            !revalidation_collapse_needs_rearm(&settled, &committed, &committed, unknown),
+            "a removal of a member with no SWIM record has nothing to wait for",
+        );
+        let suspect = |n: &NodeId| match n.0 {
+            2 => Some(NodeState::Alive),
+            3 => Some(NodeState::Suspect),
+            _ => None,
+        };
+        assert!(
+            !revalidation_collapse_needs_rearm(&settled, &settled, &committed, suspect),
+            "no removal happened — the proposal proceeds normally",
+        );
+        assert!(
+            !revalidation_collapse_needs_rearm(
+                &settled,
+                &[NodeId(1), NodeId(2), NodeId(4)],
+                &committed,
+                suspect,
+            ),
+            "survivors that still differ from the committed set are proposed \
+             on this pass — no retry needed",
+        );
+        // Order-independence: a differently-ordered committed vector must not
+        // defeat the equality check.
+        assert!(
+            revalidation_collapse_needs_rearm(
+                &settled,
+                &committed,
+                &[NodeId(2), NodeId(1)],
+                suspect
+            ),
+            "the committed-set comparison is order-independent",
+        );
+    }
+
     /// W8 review P1-3 — the reduction-round backstop: a target that names a
     /// NEW vetoed key on every completion retry (instead of the full set at
     /// once) is cut off after `VETOED_REDUCTION_ROUNDS_MAX` rounds rather
@@ -33999,6 +35028,491 @@ mod tests {
                 .pending_inbound_entries()
                 .is_empty(),
             "no baseline pull may be queued from an UNKNOWN self report",
+        );
+    }
+
+    /// W10 composition review P1-3a (RED→GREEN) — the CACHED-recency
+    /// self-fence, and the read outage it re-creates.
+    ///
+    /// Wave 10 replaced the partition-version report's per-poll-instant scan
+    /// with a cached per-shard `(digest, max_generation)` snapshot, so BOTH
+    /// sides of the destructive direction gate are now cache-served. The skew
+    /// between them is no longer the ~2 s exchange window but the difference
+    /// between two nodes' last COMPLETED whole-store scans — unbounded in
+    /// store size and systematically directional (a node's own exchange serves
+    /// the snapshot from BEFORE the refresh it kicks, while peers' snapshots
+    /// are kicked by every peer's report query too). On a spend-heavy UTXO
+    /// workload generations advance while the record COUNT does not, so the
+    /// honest count leg never fires and the master reads its own STALE
+    /// max_generation as "a replica is ahead of me" — fencing its own mastered
+    /// shard (`heal_pending` → `Transitioning`, CLIENT-INVISIBLE) for a no-op
+    /// baseline pull, with `reverse_heal_online` ON by default at RF>1.
+    ///
+    /// Driven through the REAL report builder over a REAL engine whose cache
+    /// is stale exactly the way the refresh pacing makes it stale.
+    #[test]
+    fn online_reheal_does_not_fence_on_a_stale_self_recency_cache() {
+        let (mut cluster, shard, replica) = three_node_cluster_mastering_with_replica();
+        let k = key_for_shard(shard);
+        assert!(
+            matches!(cluster.is_master(&k), MasterQueryResult::Yes),
+            "precondition: the node masters + serves the shard",
+        );
+
+        // A completed whole-store scan fingerprints the shard at its
+        // pre-churn generations.
+        let engine = Arc::new(test_engine());
+        let spent = tx_key_for_shard(shard, 1);
+        create_test_record(&engine, spent);
+        create_test_record(&engine, tx_key_for_shard(shard, 2));
+        engine.refresh_shard_recency_cache();
+        assert!(!engine.recency_cache_is_stale());
+        let (_, _, cached_max) = engine.shard_recency_cached(shard);
+
+        // Spend churn: a generation advances, the record COUNT does not (so
+        // the honest count leg can never fire), and the next scan has not run
+        // — the RECENCY_REFRESH_MIN_INTERVAL floor guarantees this window.
+        engine
+            .spend(&crate::ops::spend::SpendRequest {
+                tx_key: spent,
+                offset: 0,
+                utxo_hash: [0x44u8; 32],
+                spending_data: [0xAB; 36],
+                ignore_conflicting: false,
+                ignore_locked: false,
+                current_block_height: 1000,
+                block_height_retention: 100,
+            })
+            .expect("spend must apply");
+        assert!(engine.recency_cache_is_stale());
+        let (live_count, _, live_max) = engine.shard_recency(shard);
+        assert!(
+            live_max > cached_max,
+            "fixture: the spend must advance the shard's live max_generation \
+             past the cached snapshot ({live_max} vs {cached_max})",
+        );
+
+        // The REAL production report builder serves the STALE fingerprint.
+        cluster.test_set_engine(engine.clone());
+        let self_entries = build_self_partition_version_entries(
+            NodeId(1),
+            &engine,
+            &cluster.shard_table(),
+            cluster.inbound_bitmap(),
+        );
+        let self_entry = self_entries
+            .iter()
+            .find(|e| e.shard == shard)
+            .expect("the mastered shard must be reported")
+            .clone();
+        assert_eq!(
+            self_entry.max_generation, cached_max,
+            "the report serves the CACHED (stale) generation, not the live one",
+        );
+        assert_eq!(
+            self_entry.flags & PARTITION_FLAG_RECENCY_UNKNOWN,
+            0,
+            "the entry is KNOWN — a scan HAS evidenced the shard; this is \
+             ordinary staleness, not the P0-1 fabricated-emptiness shape",
+        );
+
+        // A replica whose own scan is CURRENT: same record count (no count
+        // divergence), the post-spend generation, a differing digest.
+        let replica_entry = PartitionVersionEntry {
+            shard,
+            flags: 0,
+            replica_count: 1,
+            last_applied_seq: live_count,
+            manifest_digest: 0xBBBB,
+            max_generation: live_max,
+        };
+        // The trap, pinned: on the CACHED inputs the coarse direction gate
+        // says "self is behind" — this is exactly what used to fence.
+        assert!(
+            is_self_behind_any_replica_coarse(
+                ShardRecency::from_entry(&self_entry),
+                &[ShardRecency::from_entry(&replica_entry)],
+            ),
+            "pin: the cached inputs really do read as self-behind",
+        );
+
+        let mut view: std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>> =
+            std::collections::HashMap::new();
+        view.insert(NodeId(1), self_entries);
+        view.insert(replica, vec![replica_entry]);
+
+        assert_eq!(
+            cluster.run_online_reheal(&view),
+            0,
+            "a master whose LIVE recency is at-or-ahead of the replica must \
+             NOT fence itself on its own stale cache (W10 P1-3a)",
+        );
+        assert!(
+            matches!(cluster.is_master(&k), MasterQueryResult::Yes),
+            "the master keeps SERVING — no heal_pending fence, no read outage",
+        );
+        assert!(
+            cluster
+                .migration
+                .lock()
+                .pending_inbound_entries()
+                .is_empty(),
+            "and no no-op baseline pull is queued",
+        );
+
+        // The refuted shard is recorded in the not-behind backoff cache, so an
+        // unchanged source view re-runs neither the classification nor the
+        // live-recency scan.
+        assert!(
+            cluster.reheal_backoff.lock().contains_key(&shard),
+            "a refuted fence verdict must be backed off on its source-view \
+             signature, not re-scanned every round",
+        );
+        assert_eq!(cluster.run_online_reheal(&view), 0);
+    }
+
+    /// W10 composition review P1 (RED→GREEN) — the live-recency confirm must
+    /// be CAPPED per round.
+    ///
+    /// Uncapped, its worst case IS the target scenario: on a spend-heavy
+    /// workload every actively-written mastered shard reads behind after each
+    /// refresh (order 1/3 of the ring), the backoff does not damp the
+    /// frequency (the source-view signature carries self's cached fingerprint,
+    /// so every refresh moves it and the whole set re-enters), and the confirm
+    /// runs SYNCHRONOUSLY in the coordinator's exchange-drain phase — where a
+    /// multi-second stall stops SWIM handling, topology commits, migration
+    /// completions and transfer-request draining (watchdog threshold 10 s, and
+    /// it only logs). Each round must therefore admit a bounded window and
+    /// DEFER the rest un-backed-off, which is never a safety change because an
+    /// unconfirmed shard is never fenced.
+    #[test]
+    fn reheal_confirm_admission_is_capped_deterministic_and_always_progresses() {
+        // SHARD cap: a bounded window, never the whole set.
+        let many: Vec<(u16, u64)> = (0..300u16).map(|s| (s, 1)).collect();
+        assert_eq!(
+            reheal_confirm_admission(&many, 0, 64, 20_000),
+            (0, 64),
+            "the shard cap bounds a round even when every shard is tiny",
+        );
+        // KEY cap: bounds the device fan-out independently of shard count.
+        let heavy: Vec<(u16, u64)> = (0..64u16).map(|s| (s, 8_000)).collect();
+        assert_eq!(
+            reheal_confirm_admission(&heavy, 0, 64, 20_000),
+            (0, 2),
+            "the key budget stops the round at 16k keys — a third shard would \
+             put the round's device reads over budget",
+        );
+        // ALWAYS PROGRESS: a single shard bigger than the whole budget is
+        // still admitted, alone. Refusing it would make it permanently
+        // unconfirmable — a silently disarmed online re-heal.
+        let giant = [(7u16, 10_000_000u64), (8, 1), (9, 1)];
+        assert_eq!(
+            reheal_confirm_admission(&giant, 0, 64, 20_000),
+            (0, 1),
+            "an over-budget shard at the window start is admitted alone, \
+             never skipped",
+        );
+        // DETERMINISM: same (counts, start), same window — a round is
+        // reproducible; only the cursor is state.
+        assert_eq!(
+            reheal_confirm_admission(&many, 5, 64, 20_000),
+            reheal_confirm_admission(&many, 5, 64, 20_000),
+        );
+        // Degenerate inputs stay sane.
+        assert_eq!(reheal_confirm_admission(&[], 0, 64, 20_000), (0, 0));
+        assert_eq!(reheal_confirm_admission(&many, 0, 0, 20_000), (0, 0));
+        // An out-of-range cursor (carried over from a larger candidate set)
+        // normalises instead of panicking or skipping the round.
+        assert_eq!(reheal_confirm_admission(&giant, 4_000, 64, 20_000).0, 1);
+        // The window WRAPS, so a late start still admits a full budget.
+        let three = [(1u16, 1u64), (2, 1), (3, 1)];
+        assert_eq!(
+            reheal_confirm_admission(&three, 2, 64, 20_000),
+            (2, 3),
+            "a window starting near the end wraps around the candidate list",
+        );
+        // The shipped constants are the ones the production path uses.
+        assert_eq!(
+            reheal_confirm_admission(
+                &many,
+                0,
+                REHEAL_LIVE_CONFIRM_MAX_SHARDS_PER_ROUND,
+                REHEAL_LIVE_CONFIRM_MAX_KEYS_PER_ROUND,
+            ),
+            (0, REHEAL_LIVE_CONFIRM_MAX_SHARDS_PER_ROUND),
+        );
+    }
+
+    /// W10 composition review P2-B (RED→GREEN) — the FULL STALL the two
+    /// accepted residuals compose into, and the rotation that breaks it.
+    ///
+    /// Compose: (1) a CONFIRMED shard whose heal-source selection is
+    /// permanently REFUSED gets neither a fence nor a backoff entry, so it
+    /// re-enters the candidate set every round; (2) past ~80 M records the
+    /// always-progress rule means the first admitted shard consumes the whole
+    /// round on its own. With a fixed lowest-id-first window, that one stuck
+    /// low-id shard is re-admitted alone FOREVER and the confirm never reaches
+    /// any other shard — online re-heal fully stalled on the node, visible
+    /// only as two climbing counters.
+    ///
+    /// The pin: across successive rounds, a permanently over-budget low-id
+    /// shard must NOT prevent every higher id from being admitted.
+    #[test]
+    fn reheal_confirm_rotation_prevents_a_stuck_shard_from_monopolising_rounds() {
+        // Shard 1 alone exceeds the whole key budget (the 2 B-record shape);
+        // shards 2..=4 are tiny. Shard 1 is also permanently source-refused in
+        // the scenario, so it never leaves the candidate set.
+        let counts = [(1u16, 10_000_000u64), (2, 1), (3, 1), (4, 1)];
+        let mut cursor = 0usize;
+        let mut admitted_shards: Vec<Vec<u16>> = Vec::new();
+        for _ in 0..4 {
+            let (start, admitted) = reheal_confirm_admission(&counts, cursor, 64, 20_000);
+            admitted_shards.push(
+                (0..admitted)
+                    .map(|i| counts[(start + i) % counts.len()].0)
+                    .collect(),
+            );
+            cursor = (start + admitted) % counts.len();
+        }
+        assert_eq!(
+            admitted_shards[0],
+            vec![1],
+            "round 1: the over-budget shard consumes the round alone",
+        );
+        assert_eq!(
+            admitted_shards[1],
+            vec![2, 3, 4],
+            "round 2: the rotation STEPS PAST it — pre-fix this round \
+             re-admitted shard 1 alone and shards 2-4 were never reached \
+             (the P2-B stall)",
+        );
+        assert_eq!(
+            admitted_shards[2],
+            vec![1],
+            "round 3: the cursor wraps back to the stuck shard",
+        );
+        assert_eq!(
+            admitted_shards[3],
+            vec![2, 3, 4],
+            "round 4: and past it again"
+        );
+
+        // The property that matters, stated directly: every candidate is
+        // admitted at least once within a bounded number of rounds.
+        let reached: std::collections::HashSet<u16> =
+            admitted_shards.iter().flatten().copied().collect();
+        assert_eq!(
+            reached,
+            counts.iter().map(|(s, _)| *s).collect(),
+            "every candidate is reached despite a permanently budget-hogging \
+             low-id shard",
+        );
+    }
+
+    /// W10 composition review P1 (RED→GREEN) — the cap end-to-end through the
+    /// REAL confirm over a REAL engine: more candidate shards than the shard
+    /// cap must leave a DEFERRED remainder that is neither confirmed nor
+    /// refuted (hence never backed off, hence re-offered next round) — and the
+    /// SECOND round must cover the shards the first one deferred (P2-B).
+    #[test]
+    fn live_recency_confirm_defers_candidates_past_the_per_round_cap() {
+        let engine = test_engine();
+        let over_cap = REHEAL_LIVE_CONFIRM_MAX_SHARDS_PER_ROUND + 6;
+        // One record per shard so the SHARD cap binds, not the key budget.
+        let mut candidates: Vec<(u16, Vec<ShardRecency>)> = Vec::new();
+        for shard in 0..over_cap as u16 {
+            let key = tx_key_for_shard(shard, 1);
+            create_test_record(&engine, key);
+            let shard = ShardTable::shard_for_key(&key);
+            // A replica that is ahead on both axes, so every candidate would
+            // otherwise be CONFIRMED — isolating the cap as the only reason
+            // any shard is left out.
+            candidates.push((
+                shard,
+                vec![ShardRecency {
+                    count: 99,
+                    digest: 0xBBBB,
+                    max_generation: 9_999,
+                    recency_unknown: false,
+                }],
+            ));
+        }
+        candidates.sort_unstable_by_key(|(s, _)| *s);
+        candidates.dedup_by_key(|(s, _)| *s);
+        assert!(
+            candidates.len() > REHEAL_LIVE_CONFIRM_MAX_SHARDS_PER_ROUND,
+            "fixture: the candidate set must exceed the cap ({})",
+            candidates.len(),
+        );
+
+        let cursor = std::sync::atomic::AtomicUsize::new(0);
+        let (confirmed, refuted, deferred) =
+            confirm_self_behind_with_live_recency(&engine, &candidates, &cursor);
+        assert_eq!(
+            confirmed.len(),
+            REHEAL_LIVE_CONFIRM_MAX_SHARDS_PER_ROUND,
+            "exactly the capped window is scanned and confirmed",
+        );
+        assert!(refuted.is_empty(), "every admitted shard really is behind");
+        assert_eq!(
+            deferred,
+            candidates.len() - REHEAL_LIVE_CONFIRM_MAX_SHARDS_PER_ROUND,
+            "the remainder is DEFERRED, not silently confirmed",
+        );
+        assert_eq!(
+            confirmed.len() + refuted.len() + deferred,
+            candidates.len(),
+            "every candidate is accounted for exactly once",
+        );
+        // Round 1 admits the window at the cursor (lowest ids at cursor 0).
+        let mut expected: Vec<u16> = candidates.iter().map(|(s, _)| *s).collect();
+        expected.truncate(REHEAL_LIVE_CONFIRM_MAX_SHARDS_PER_ROUND);
+        let mut got = confirmed.clone();
+        got.sort_unstable();
+        assert_eq!(got, expected);
+
+        // P2-B — round 2 starts where round 1 stopped, so the 6 shards round 1
+        // deferred are the first ones it reaches.
+        let (confirmed2, _, _) =
+            confirm_self_behind_with_live_recency(&engine, &candidates, &cursor);
+        let round1: std::collections::HashSet<u16> = confirmed.into_iter().collect();
+        let deferred_ids: Vec<u16> = candidates
+            .iter()
+            .map(|(s, _)| *s)
+            .filter(|s| !round1.contains(s))
+            .collect();
+        assert!(
+            deferred_ids.iter().all(|s| confirmed2.contains(s)),
+            "every shard round 1 deferred must be covered by round 2 \
+             (rotation, not a fixed prefix)",
+        );
+    }
+
+    /// W10 composition review P2-1 (RED→GREEN) — the shard-table VERSION is
+    /// NOT a witness that the table is unchanged, so the fence set must be
+    /// re-filtered on CURRENT ownership.
+    ///
+    /// `ShardTable::rollback_shard` restores `assignments[shard]` from
+    /// `prev_assignments` IN PLACE and does not bump `version`; background
+    /// workers call it on the live installed table. This pins that a
+    /// same-version table can stop naming this node as master — the version
+    /// check sails straight through it — and that the ownership filter catches
+    /// exactly that case. Without the filter the round would fence and
+    /// baseline-pull a shard this node does not own.
+    #[test]
+    fn fence_set_is_refiltered_on_current_ownership_not_the_table_version() {
+        let self_id = NodeId(1);
+        let old_members = vec![NodeId(1), NodeId(2)];
+        let new_members = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let old_table = ShardTable::compute_with_epoch(&old_members, 2, 7, 1);
+        let new_table = ShardTable::compute_with_epoch(&new_members, 2, 8, 1);
+        // A shard whose mastership MOVES TO self in the new table: mid-handoff
+        // `target_assignment` names self, and a rollback restores the old
+        // master — i.e. mastership moves AWAY from self at an unchanged
+        // version.
+        let shard = (0..NUM_SHARDS as u16)
+            .find(|&s| {
+                old_table.target_assignment(s).master != self_id
+                    && new_table.target_assignment(s).master == self_id
+            })
+            .expect("some shard's mastership moves to node 1");
+
+        let mut table = old_table.clone();
+        table.begin_handoff_with(&new_table, |_| true);
+        let version_at_classify = table.version;
+        assert_eq!(
+            table.target_assignment(shard).master,
+            self_id,
+            "precondition: mid-handoff the table names self as target master, \
+             so classification admits the shard",
+        );
+        assert_eq!(
+            retain_self_mastered_shards(&table, self_id, &[shard]),
+            vec![shard],
+            "while self really is the target master the filter keeps it",
+        );
+
+        // The in-place, version-silent mutation.
+        table.rollback_shard(shard);
+        assert_eq!(
+            table.version, version_at_classify,
+            "rollback_shard does NOT bump the version — a same-version, \
+             DIFFERENT table demonstrably exists, so the version pin cannot \
+             witness ownership",
+        );
+        assert_ne!(
+            table.target_assignment(shard).master,
+            self_id,
+            "…and this node is no longer the shard's master",
+        );
+        assert!(
+            retain_self_mastered_shards(&table, self_id, &[shard]).is_empty(),
+            "the version-independent ownership filter drops a shard this node \
+             no longer masters — fencing + baseline-pulling it would be \
+             unfounded (W10 P2-1)",
+        );
+    }
+
+    /// W10 composition review P1-3a — the confirm must not DISARM the online
+    /// re-heal: a master that is GENUINELY behind (its live recency really is
+    /// behind the replica's) is still fenced and still pulls.
+    #[test]
+    fn online_reheal_still_fences_a_genuinely_behind_master() {
+        let (mut cluster, shard, replica) = three_node_cluster_mastering_with_replica();
+        let k = key_for_shard(shard);
+
+        let engine = Arc::new(test_engine());
+        create_test_record(&engine, tx_key_for_shard(shard, 1));
+        engine.refresh_shard_recency_cache();
+        // Churn AFTER the scan so the cache is stale and the confirm runs.
+        create_test_record(&engine, tx_key_for_shard(shard, 2));
+        assert!(engine.recency_cache_is_stale());
+        let (live_count, _, live_max) = engine.shard_recency(shard);
+        cluster.test_set_engine(engine.clone());
+
+        let self_entries = build_self_partition_version_entries(
+            NodeId(1),
+            &engine,
+            &cluster.shard_table(),
+            cluster.inbound_bitmap(),
+        );
+        // The replica is ahead of self's LIVE recency on BOTH axes — writes
+        // this node genuinely never applied.
+        let mut view: std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>> =
+            std::collections::HashMap::new();
+        view.insert(NodeId(1), self_entries);
+        view.insert(
+            replica,
+            vec![PartitionVersionEntry {
+                shard,
+                flags: 0,
+                replica_count: 1,
+                last_applied_seq: live_count + 5,
+                manifest_digest: 0xBBBB,
+                max_generation: live_max.wrapping_add(9),
+            }],
+        );
+
+        assert_eq!(
+            cluster.run_online_reheal(&view),
+            1,
+            "a genuinely-behind master is still fenced + queued for a pull",
+        );
+        assert!(
+            matches!(
+                cluster.is_master(&k),
+                MasterQueryResult::Transitioning { .. }
+            ),
+            "no-serve-before-heal still holds for a real divergence",
+        );
+        assert!(
+            cluster
+                .migration
+                .lock()
+                .pending_inbound_entries()
+                .iter()
+                .any(|(s, from)| *s == shard && *from == replica),
+            "the concrete-source reverse-pull is still queued",
         );
     }
 

@@ -3918,6 +3918,63 @@ impl TopologyDebounce {
         }
     }
 
+    /// W10 composition review P2-1 — put a consumed burst BACK, so a
+    /// proposal that propose-time re-validation collapsed into a no-op is
+    /// retried instead of being dropped on the floor.
+    ///
+    /// # The bug this exists for
+    ///
+    /// [`Self::take_due`] CONSUMES the burst; the caller then re-validates
+    /// the settled set against current SWIM state
+    /// (`revalidate_settled_members`). When that re-validation REMOVES a
+    /// member and what is left equals the already-committed set,
+    /// [`TopologyAuthority::on_membership_changed`] returns `None` (the
+    /// identical-membership skip) — nothing is proposed AND the debounce is
+    /// already gone. Because only the lowest-id member may propose, the
+    /// dropped member cannot propose itself back in; and because SWIM emits
+    /// `MembershipChanged` on alive-SET changes, a Suspect→Alive refutation
+    /// that leaves the set unchanged never re-arms the debounce. The join is
+    /// then permanently lost with no periodic safety net
+    /// ({1,2}→{1,2,3}→{1,2}→{1,2,3} with node 3 Suspect at the propose
+    /// instant — the observed shape).
+    ///
+    /// # Semantics
+    ///
+    /// * With NOTHING pending, `settled` is installed as a fresh burst whose
+    ///   trailing-edge timer restarts at `now`, so it becomes due again one
+    ///   `window` later — the periodic retry. Returns `true`.
+    /// * With a burst ALREADY pending (a newer observation landed since the
+    ///   `take_due`), the newer target WINS — it is strictly more current
+    ///   than the set being put back. Only `departed_during_burst` is merged
+    ///   into it, so the re-validation gate the departure exists for is not
+    ///   lost by the merge. Returns `false`.
+    ///
+    /// Re-arming preserves `departed_during_burst`: the retry must go through
+    /// the SAME propose-time re-validation, or a departed-and-still-Suspect
+    /// member would ride the retry into a committed term — the exact
+    /// scenario-07 read-outage shape the re-validation exists to prevent.
+    pub fn rearm(&mut self, settled: SettledMembership, now: Instant) -> bool {
+        match self.pending.as_mut() {
+            Some(p) => {
+                for m in settled.departed_during_burst {
+                    if !p.departed.contains(&m) {
+                        p.departed.push(m);
+                    }
+                }
+                false
+            }
+            None => {
+                self.pending = Some(DebouncePending {
+                    members: settled.members,
+                    first_observed: now,
+                    last_changed: now,
+                    departed: settled.departed_during_burst,
+                });
+                true
+            }
+        }
+    }
+
     /// Whether anything is currently pending (used by the event loop to
     /// decide whether the per-tick due-check needs to run at all).
     pub fn has_pending(&self) -> bool {
@@ -6064,6 +6121,71 @@ mod tests {
             deb.take_due(t0 + Duration::from_millis(1600))
                 .map(|s| s.members),
             Some(members(&[1, 2, 3])),
+        );
+    }
+
+    /// W10 composition review P2-1 — `rearm` puts a CONSUMED burst back so a
+    /// proposal that propose-time re-validation collapsed into a no-op is
+    /// retried one window later, and it NEVER clobbers a newer pending burst
+    /// (it only merges the departure flags the re-validation gate needs).
+    #[test]
+    fn rearm_reinstalls_a_consumed_burst_without_clobbering_a_newer_one() {
+        let window = Duration::from_millis(500);
+        let mut deb = TopologyDebounce::from_window(window);
+        let t0 = Instant::now();
+
+        deb.observe(&members(&[1, 2, 3]), t0);
+        let settled = deb
+            .take_due(t0 + Duration::from_millis(600))
+            .expect("the burst fires");
+        assert!(!deb.has_pending(), "take_due CONSUMED the burst");
+
+        // Nothing pending → the burst is reinstalled and becomes due again a
+        // full window later (not immediately: the timer restarts at `now`).
+        assert!(deb.rearm(
+            SettledMembership {
+                members: settled.members.clone(),
+                departed_during_burst: members(&[3]),
+            },
+            t0 + Duration::from_millis(600),
+        ));
+        assert_eq!(
+            deb.take_due(t0 + Duration::from_millis(900)),
+            None,
+            "the re-armed burst is NOT due before a full window elapses",
+        );
+        let again = deb
+            .take_due(t0 + Duration::from_millis(1200))
+            .expect("re-armed burst becomes due one window after the re-arm");
+        assert_eq!(again.members, members(&[1, 2, 3]));
+        assert_eq!(
+            again.departed_during_burst,
+            members(&[3]),
+            "the departure survives the re-arm so the retry re-validates too",
+        );
+
+        // A NEWER observation is strictly more current than the set being put
+        // back: it wins, and only the departure flags merge into it.
+        deb.observe(&members(&[1, 2]), t0 + Duration::from_millis(1300));
+        assert!(!deb.rearm(
+            SettledMembership {
+                members: members(&[1, 2, 3, 4]),
+                departed_during_burst: members(&[3, 4]),
+            },
+            t0 + Duration::from_millis(1300),
+        ));
+        let newer = deb
+            .take_due(t0 + Duration::from_millis(1900))
+            .expect("the newer burst fires");
+        assert_eq!(
+            newer.members,
+            members(&[1, 2]),
+            "the re-arm must never overwrite a newer observed target",
+        );
+        assert_eq!(
+            newer.departed_during_burst,
+            members(&[3, 4]),
+            "the re-armed departures merge into the newer burst (dedup'd)",
         );
     }
 

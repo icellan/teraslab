@@ -2176,6 +2176,55 @@ impl MigrationManager {
             .count()
     }
 
+    /// W10 composition review P1-3b / P2-4 — uncompleted inbound entries that
+    /// are genuine IN-FLIGHT MIGRATION WORK: [`Self::inbound_count`] minus
+    /// every `heal_pending` reverse-heal fence.
+    ///
+    /// # Why the distinction exists
+    ///
+    /// [`Self::inbound_count`] counts EVERY uncompleted inbound entry, and the
+    /// event-driven orphan-cleanup admissibility gate
+    /// (`event_orphan_cleanup_admissible`) requires it to be ZERO. A
+    /// reverse-heal fence is an inbound entry too, so a single heal fence
+    /// disables that gate for as long as it is up — and #74 DESIGNS a parked
+    /// no-source heal fence (`heal_pending` + the `NodeId(0)` sentinel) to
+    /// hold FOREVER under alert-and-hold. One such park therefore disabled the
+    /// event-driven orphan cleanup for the life of the process, bringing back
+    /// the armed-17 disk-reclaim regression (a third RF=2 copy retained
+    /// forever once the cluster settles and no batch-completion site fires
+    /// again).
+    ///
+    /// # Why excluding heal fences is safe
+    ///
+    /// The gate's purpose is that "nothing this node is still RECEIVING as
+    /// part of its topology plan can be misjudged around the pass". A
+    /// `heal_pending` entry is not plan-driven inbound work:
+    ///
+    /// * the cleanup pass SKIPS any shard with a pending inbound entry
+    ///   outright — `run_orphan_cleanup` and
+    ///   `cleanup_orphaned_shard_if_settled` both gate on
+    ///   [`Self::has_pending_inbound`] (W10 composition review P2-2), so a
+    ///   heal-fenced shard is never an orphan candidate whether or not this
+    ///   node masters it. Ownership alone would NOT be enough: the boot G3
+    ///   path fences shards derived from lost create keys with no ownership
+    ///   filter, and a persisted heal fence can be restored after a topology
+    ///   change moved the shard away (#74 F1);
+    /// * independently of that, the pass still refuses to delete without
+    ///   positive committed-handoff evidence (#28) — the per-shard data-loss
+    ///   guard is unchanged by this counter;
+    /// * a park is ALERT-AND-HOLD state, not progress: waiting on it is
+    ///   waiting on an operator, which is exactly the unbounded wait that
+    ///   turned a transient A-side fence into a permanent B-side stall.
+    ///
+    /// Genuine forward inbound work (a plan-driven transfer, with or without a
+    /// concrete source) still gates the pass exactly as before.
+    pub fn inbound_migration_work_count(&self) -> usize {
+        self.inbound_migrations
+            .iter()
+            .filter(|m| !m.completed && !m.heal_pending)
+            .count()
+    }
+
     /// Snapshot the currently pending inbound migrations.
     pub fn pending_inbound_entries(&self) -> Vec<(u16, NodeId)> {
         self.inbound_migrations
