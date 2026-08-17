@@ -41992,6 +41992,9 @@ mod tests {
     /// concurrency), so the phase is one probe round-trip deep, not N.
     #[test]
     fn already_serving_verification_is_probe_bounded_and_parallel() {
+        // Bulk task registration perturbs the process-global migration
+        // gauges; serialize against the tests that assert on them.
+        let _metrics_guard = crate::metrics::migration_metrics_test_lock();
         const CANDIDATES: u16 = 64;
         const BUDGET: usize = 8;
         const CONCURRENCY: usize = 4;
@@ -42087,6 +42090,9 @@ mod tests {
     /// this batch.
     #[test]
     fn deferred_already_serving_candidates_are_parked_for_the_redrive() {
+        // Bulk task registration perturbs the process-global migration
+        // gauges; serialize against the tests that assert on them.
+        let _metrics_guard = crate::metrics::migration_metrics_test_lock();
         let members = vec![NodeId(1), NodeId(2)];
         let table = ShardTable::compute_with_epoch(&members, 2, 3, 1);
         let engine = Arc::new(test_engine());

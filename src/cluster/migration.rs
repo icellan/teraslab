@@ -6347,6 +6347,9 @@ mod tests {
         use std::sync::OnceLock;
         use std::sync::atomic::Ordering;
 
+        // The gauge is process-global; hold the shared lock so a neighbour's
+        // bulk registration cannot land between this test's two reads.
+        let _metrics_guard = crate::metrics::migration_metrics_test_lock();
         static TEST_METRICS: OnceLock<MigrationMetrics> = OnceLock::new();
         let m_ref: &'static MigrationMetrics = TEST_METRICS.get_or_init(MigrationMetrics::new);
         init_migration_metrics(m_ref);

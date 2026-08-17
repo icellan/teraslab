@@ -1874,6 +1874,23 @@ pub fn migration_metrics() -> Option<&'static MigrationMetrics> {
     MIGRATION_METRICS.get().copied()
 }
 
+/// Serializes tests that ASSERT on the process-wide migration gauges against
+/// tests that PERTURB them in bulk.
+///
+/// `MIGRATION_METRICS` is a process-global installed once per test binary, so
+/// `migration_active` is shared by every test in the binary. A test that reads
+/// the gauge, performs an operation, and reads it again cannot make any claim
+/// about the delta while a neighbour registers tasks concurrently — wave-10's
+/// bulk registration tests (hundreds of `start_outbound` calls in one test)
+/// turned that latent raciness into a routine failure. Any test on either side
+/// of that contract takes this lock for its critical section; the guard is
+/// deliberately poison-tolerant so one failing test does not cascade.
+#[cfg(test)]
+pub fn migration_metrics_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// Install the process-wide SWIM metrics reference.
 pub fn init_swim_metrics(m: &'static SwimMetrics) {
     let _ = SWIM_METRICS.set(m);
