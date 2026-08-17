@@ -9157,22 +9157,25 @@ enum ProposeOutcome {
     Unreachable,
 }
 
-/// W11 FIX 2 — the peers a commit broadcast should actually dial.
+/// W11 FIX 2 — the peers the commit broadcast's FIRST parallel pass should
+/// dial.
 ///
-/// A peer whose propose could not even CONNECT milliseconds ago will not
-/// connect for the commit either; dialling it only buys another
-/// `TOPOLOGY_FRAME_CONNECT_TIMEOUT` (500 ms) plus, in the old inline
-/// retry loop, two more. In CI @ 3a38dc2 scenario 07 that node's container
-/// had already been removed, and re-dialling it is what serialized the
-/// proposer's own commit-apply behind 1.75 s of dead-peer TCP.
+/// A peer whose propose could not even CONNECT milliseconds ago is unlikely
+/// to connect for the commit either, and each attempt costs a
+/// `TOPOLOGY_FRAME_CONNECT_TIMEOUT` (500 ms) slot in that pass.
 ///
-/// Everything else stays on the list. A peer that ANSWERED — even with a
-/// rejection or a malformed frame — is reachable and still needs the commit;
-/// dropping it would turn a vote-level disagreement into a missed commit.
-/// Skipping is a pure LIVENESS optimization: an unreachable peer learns the
-/// term from gossip's `committed_term` piggyback and the `TopologyStale`
-/// catch-up when it returns, exactly as it would have after the broadcast
-/// failed against it.
+/// W11 P2-B — this is a FIRST-PASS filter only, never a drop. Once the
+/// broadcast moved off the proposer thread, permanently excluding a peer
+/// bought nothing on any critical path while costing real propagation
+/// latency to a peer that merely BLIPPED: a 200 ms `ECONNREFUSED` during a
+/// rolling restart classifies as `Unreachable`, and dropping it outright
+/// would make that peer wait for the next gossip round instead of the 50 ms
+/// retry. [`spawn_commit_broadcast`] therefore re-includes every skipped peer
+/// in the two sequential retries.
+///
+/// A peer that ANSWERED — even with a rejection or a malformed frame — is
+/// reachable and stays in the first pass; dropping it would turn a vote-level
+/// disagreement into a missed commit.
 fn commit_broadcast_targets(outcomes: &[(SocketAddr, ProposeOutcome)]) -> Vec<SocketAddr> {
     outcomes
         .iter()
@@ -9370,6 +9373,7 @@ fn try_run_topology_proposal(
     spawn_commit_broadcast(
         commit.serialize(),
         commit_broadcast_targets(&broadcast_outcomes),
+        broadcast_outcomes.iter().map(|(addr, _)| *addr).collect(),
         commit.term,
         auth_secret.map(|s| s.to_vec()),
     );
@@ -9377,9 +9381,8 @@ fn try_run_topology_proposal(
     applied
 }
 
-/// W11 FIX 2 — disseminate a decided `TopologyCommit` to `targets` on a
-/// detached thread: one parallel fan-out followed by two sequential retries
-/// of whatever failed.
+/// W11 FIX 2 — disseminate a decided `TopologyCommit` on a detached thread:
+/// one parallel fan-out over `first_pass` followed by two sequential retries.
 ///
 /// Detached because dissemination is pure liveness (see the safety argument
 /// at the call site): the term is already quorum-decided and locally applied,
@@ -9389,21 +9392,28 @@ fn try_run_topology_proposal(
 /// just no longer on the proposer's critical path. Topology commits are rare
 /// (one per term), so the spawn is not a hot-path allocation.
 ///
+/// W11 P2-B — `first_pass` is [`commit_broadcast_targets`]'s reachability
+/// filter, but `all_peers` is what the RETRIES cover: a peer skipped for an
+/// unreachable propose is re-included there, so a peer that merely blipped
+/// (a 200 ms `ECONNREFUSED` mid rolling-restart) still gets the commit ~50 ms
+/// later instead of waiting for the next gossip round.
+///
 /// The payload and secret are owned copies so the thread can outlive the
 /// proposal attempt that produced them.
 fn spawn_commit_broadcast(
     commit_payload: Vec<u8>,
-    targets: Vec<SocketAddr>,
+    first_pass: Vec<SocketAddr>,
+    all_peers: Vec<SocketAddr>,
     term: u64,
     auth_secret: Option<Vec<u8>>,
 ) {
-    if targets.is_empty() {
+    if all_peers.is_empty() {
         return;
     }
     std::thread::spawn(move || {
         let secret = auth_secret.as_deref();
         let failed: Vec<SocketAddr> = std::thread::scope(|scope| {
-            let handles: Vec<_> = targets.iter().map(|addr| {
+            let handles: Vec<_> = first_pass.iter().map(|addr| {
                 let payload = &commit_payload;
                 let a = *addr;
                 scope.spawn(move || -> Option<SocketAddr> {
@@ -9421,8 +9431,16 @@ fn spawn_commit_broadcast(
                 .collect()
         });
 
-        // Retry failed broadcasts sequentially (transient failures).
-        let mut still_failed = failed;
+        // Retry sequentially (transient failures). W11 P2-B — the retry set
+        // is the first pass's failures PLUS every peer the reachability
+        // filter skipped, so an `Unreachable` classification delays a peer by
+        // one pass rather than excluding it from the commit entirely.
+        let mut still_failed: Vec<SocketAddr> = failed;
+        for addr in &all_peers {
+            if !first_pass.contains(addr) && !still_failed.contains(addr) {
+                still_failed.push(*addr);
+            }
+        }
         for (retry, delay_ms) in [(1u32, 50u64), (2, 200)] {
             if still_failed.is_empty() {
                 break;
@@ -18599,12 +18617,33 @@ impl RunningCluster {
     /// `ShardTable::compute_with_epoch` is `members[shard % n]` at placement
     /// v1 and the HRW argmax over `members` at v2, neither of which reads
     /// `rf` — so passing the active table's rf cannot skew the comparison.
+    ///
+    /// LOCKING: callers hold the `shard_table` read guard across this call
+    /// (W11 P2-D), and this takes `committed_master_cache` plus the
+    /// authority's own read locks. That order — `shard_table` →
+    /// `committed_master_cache` → authority — is the only one in the process;
+    /// nothing acquires the cache or the authority before `shard_table`. A
+    /// miss therefore holds a shard-table READ across one
+    /// `NUM_SHARDS`-wide placement computation, which delays (never
+    /// deadlocks) a queued activation writer, and happens at most ONCE per
+    /// committed term thanks to the single-flight below.
     fn committed_masters(&self, committed_term: u64, rf: u8) -> Option<Arc<Vec<NodeId>>> {
         {
             let cache = self.committed_master_cache.read();
             if cache.term == committed_term {
                 return Some(cache.masters.clone());
             }
+        }
+        // W11 P2-C — SINGLE-FLIGHT the miss. `route()` calls this per request,
+        // so without the write lock held across the computation every
+        // concurrent request on a behind node misses simultaneously and each
+        // computes its own `NUM_SHARDS`-wide placement — a thundering herd at
+        // exactly the moment the node is already struggling. Taking the write
+        // lock FIRST makes the losers block on the winner and then hit the
+        // re-check below.
+        let mut cache = self.committed_master_cache.write();
+        if cache.term == committed_term {
+            return Some(cache.masters.clone());
         }
         let members = self.topology_authority.committed_members();
         if members.is_empty() {
@@ -18629,15 +18668,12 @@ impl RunningCluster {
                 .map(|shard| baseline.target_assignment(shard).master)
                 .collect(),
         );
-        {
-            let mut cache = self.committed_master_cache.write();
-            // Never let a slower thread's older row overwrite a newer one.
-            if cache.term <= committed_term {
-                *cache = CommittedMasterCache {
-                    term: committed_term,
-                    masters: masters.clone(),
-                };
-            }
+        // Never let a slower thread's older row overwrite a newer one.
+        if cache.term <= committed_term {
+            *cache = CommittedMasterCache {
+                term: committed_term,
+                masters: masters.clone(),
+            };
         }
         Some(masters)
     }
@@ -18654,22 +18690,21 @@ impl RunningCluster {
     /// [`stale_table_may_serve_shard`] for the argument AND its stated
     /// limits.
     fn authoritative_master_for_shard(&self, shard: u16) -> NodeId {
-        let (version, rf, effective, target, preferred) = {
-            let table = self.shard_table.read();
+        // W11 P2-D — guard held across the `committed_term` read (see
+        // `route`): dropping it first admits a torn table-vs-term read.
+        let table = self.shard_table.read();
+        let version = table.version;
+        let effective = table.effective_assignment(shard).master;
+        let target = table.target_assignment(shard).master;
+        let preferred = {
             let addrs = self.node_addrs.read();
-            (
-                table.version,
-                table.replication_factor(),
-                table.effective_assignment(shard).master,
-                table.target_assignment(shard).master,
-                Self::preferred_master_for_shard(&table, self.self_id, &addrs, shard),
-            )
+            Self::preferred_master_for_shard(&table, self.self_id, &addrs, shard)
         };
         let committed = self.topology_authority.committed_term();
         if version < committed {
             let serviceable = self.stale_table_partial_serving
                 && self
-                    .committed_masters(committed, rf)
+                    .committed_masters(committed, table.replication_factor())
                     .and_then(|masters| masters.get(shard as usize).copied())
                     .is_some_and(|committed_master| {
                         stale_table_may_serve_shard(effective, target, committed_master)
@@ -18902,8 +18937,11 @@ impl RunningCluster {
     /// [`ClusterConfig::stale_table_partial_serving`] is enabled (W11 FIX 3).
     /// Take one per batch immediately before the per-item ownership loop.
     pub fn master_snapshot(&self) -> MasterSnapshot {
-        let committed = self.topology_authority.committed_term();
+        // W11 P2-D — take the table guard FIRST and read `committed_term`
+        // under it, as the pre-W11 code did, so the captured version and the
+        // committed term cannot straddle an activation.
         let table = self.shard_table.read();
+        let committed = self.topology_authority.committed_term();
         let version = table.version;
         // W11 FIX 3 — resolved BEFORE the per-shard loop so the whole snapshot
         // is judged against one committed row (and one memoized lookup),
@@ -19088,22 +19126,26 @@ impl RunningCluster {
     /// general membership-change window.
     pub fn route(&self, key: &TxKey) -> RouteDecision {
         let shard = ShardTable::shard_for_key(key);
-        let (version, rf, effective, target, master) = {
-            let table = self.shard_table.read();
+        // W11 P2-D — the `shard_table` read guard is held ACROSS the
+        // `committed_term` read and the stale-table decision, exactly as it
+        // was pre-W11. Capturing the table's fields and dropping the guard
+        // first admits a torn read: an activation landing in between would
+        // leave `version`/`master` describing the OLD table while `committed`
+        // describes the new term, and the decision would then route from a
+        // superseded assignment.
+        let table = self.shard_table.read();
+        let version = table.version;
+        let effective = table.effective_assignment(shard).master;
+        let target = table.target_assignment(shard).master;
+        let master = {
             let addrs = self.node_addrs.read();
-            (
-                table.version,
-                table.replication_factor(),
-                table.effective_assignment(shard).master,
-                table.target_assignment(shard).master,
-                Self::preferred_master_for_shard(&table, self.self_id, &addrs, shard),
-            )
+            Self::preferred_master_for_shard(&table, self.self_id, &addrs, shard)
         };
         let committed = self.topology_authority.committed_term();
         if version < committed {
             let serviceable = self.stale_table_partial_serving
                 && self
-                    .committed_masters(committed, rf)
+                    .committed_masters(committed, table.replication_factor())
                     .and_then(|masters| masters.get(shard as usize).copied())
                     .is_some_and(|committed_master| {
                         stale_table_may_serve_shard(effective, target, committed_master)
@@ -19115,6 +19157,7 @@ impl RunningCluster {
                 };
             }
         }
+        drop(table);
 
         if master == self.self_id {
             RouteDecision::HandleLocally
@@ -33460,8 +33503,17 @@ mod tests {
         assert_eq!(
             commit_broadcast_targets(&outcomes),
             vec![a1, a3],
-            "the unreachable peer is dropped; the voter and the non-voting \
-             responder both still get the commit",
+            "the unreachable peer is skipped in the FIRST pass; the voter and \
+             the non-voting responder both stay in it",
+        );
+        // W11 P2-B — and the skip must be a DELAY, not a drop: the retry set
+        // `spawn_commit_broadcast` builds re-includes it, so a peer that
+        // merely blipped still gets the commit ~50 ms later.
+        let all: Vec<SocketAddr> = outcomes.iter().map(|(addr, _)| *addr).collect();
+        assert!(
+            all.contains(&a2),
+            "the unreachable peer must remain in the full peer set the \
+             sequential retries cover",
         );
     }
 

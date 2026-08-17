@@ -1996,8 +1996,14 @@ impl TopologyAuthority {
     }
 
     /// Current committed term.
+    ///
+    /// ACQUIRE, paired with the RELEASE store in `apply_commit_locked` (W11
+    /// NIT): a reader that observes term T is guaranteed to observe the
+    /// member/placement/assignment view published before it, which the
+    /// stale-table gate ([`crate::cluster::coordinator::stale_table_may_serve_shard`])
+    /// depends on for a serving decision.
     pub fn committed_term(&self) -> u64 {
-        self.committed_term.load(Ordering::Relaxed)
+        self.committed_term.load(Ordering::Acquire)
     }
 
     /// C11 — highest quorum-committed term this node observed but could not
@@ -3125,7 +3131,16 @@ impl TopologyAuthority {
         // Advance the served term LAST: `is_master` reads `committed_term`, so
         // publishing it after the members/placement above keeps a concurrent
         // reader from seeing the new term with a stale member view.
-        self.committed_term.store(commit.term, Ordering::Relaxed);
+        //
+        // W11 NIT — RELEASE, paired with the ACQUIRE in
+        // [`Self::committed_term`]. Since W11 FIX 3 the stale-table gate
+        // derives a SERVING decision from (`committed_term`,
+        // `committed_members`, `committed_placement_version`,
+        // `committed_assignment`) together, so "term is published after the
+        // member view" has to be an ordering the compiler and CPU actually
+        // honour, not just source order. Relaxed underwrote that only by
+        // accident.
+        self.committed_term.store(commit.term, Ordering::Release);
         // Phase I — stamp the wall-clock time so cluster_health can
         // report `last_topology_commit_age_ms`. Best-effort: a system
         // clock without UNIX_EPOCH access stays at the prior value.
