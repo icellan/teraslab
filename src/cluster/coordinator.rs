@@ -10364,7 +10364,19 @@ fn run_migration_batch(
                     &migrating_bm,
                     task,
                     topology_epoch,
-                    FailedTaskTableAction::Rollback,
+                    // W10 (reviewer P2): W3 FIX C table disposition per task,
+                    // matching the other fail sites — only a MASTER handoff
+                    // rolls the table back to self; a replica-side task
+                    // (including every skip-demoted already-serving
+                    // candidate the empty-list demotion routes here) leaves
+                    // it untouched, since `rollback_shard` is shard-scoped
+                    // and would revert an unrelated in-flight master handoff
+                    // of the same shard.
+                    if task.is_master {
+                        FailedTaskTableAction::Rollback
+                    } else {
+                        FailedTaskTableAction::None
+                    },
                 ) {
                     failed.fetch_add(1, Ordering::Relaxed);
                 }
@@ -24548,6 +24560,147 @@ mod tests {
         );
         stop.store(true, Ordering::Relaxed);
         target.join().unwrap();
+    }
+
+    /// W10 final micro-round (reviewer P2) — the empty-recheck failure
+    /// (`empty_recheck_incomplete`) must apply the same per-task W3-FIX-C
+    /// table disposition as the other three fail sites: only a MASTER
+    /// handoff rolls the table back; a replica-side task leaves it
+    /// untouched. The empty-list demotion routes strictly more traffic
+    /// (all skip-demoted already-serving candidates, replicas included)
+    /// into this block, where a blanket Rollback would revert a
+    /// concurrent mid-Copying master handoff of the same shard.
+    #[test]
+    fn empty_recheck_fail_keeps_table_for_replica_tasks() {
+        use crate::index::TxIndexEntry;
+        use crate::record::{METADATA_SIZE, TxMetadata, UtxoSlot};
+
+        let old_members = vec![NodeId(1), NodeId(2)];
+        let new_members = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let old_table = ShardTable::compute_with_epoch(&old_members, 2, 1, 1);
+        let new_table = ShardTable::compute_with_epoch(&new_members, 2, 2, 1);
+        let shard = (0..NUM_SHARDS as u16)
+            .find(|&s| {
+                old_table.target_assignment(s).master == NodeId(1)
+                    && new_table.target_assignment(s).master == NodeId(3)
+            })
+            .expect("a shard whose master moves 1 -> 3");
+
+        // The shard is mid-Copying under a live master handoff 1 -> 3.
+        let mut handoff = old_table.clone();
+        handoff.begin_handoff_with(&new_table, |s| s == shard);
+        assert_eq!(handoff.shard_handoff_state(shard), ShardHandoff::Copying);
+        let epoch = handoff.version;
+        let shard_table = Arc::new(ShardTableLock::new(handoff));
+
+        // One record in the shard whose footer is unreadable, so the
+        // empty-path fenced recheck reports skipped > 0
+        // (`empty_recheck_incomplete`) — the issue-#46 corrupt-header
+        // fixture.
+        let dev: Arc<dyn crate::device::BlockDevice> =
+            Arc::new(crate::device::MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let mut alloc = crate::allocator::SlotAllocator::new(dev.clone()).unwrap();
+        let mut index = crate::index::Index::new(100).unwrap();
+        let key = tx_key_for_shard(shard, 5);
+        let utxo_count = 1u32;
+        let offset = alloc
+            .allocate(TxMetadata::record_size_for(utxo_count))
+            .unwrap();
+        let mut meta = TxMetadata::new(utxo_count);
+        meta.tx_id = key.txid;
+        let slots: Vec<UtxoSlot> = (0..utxo_count)
+            .map(|_| UtxoSlot::new_unspent([0u8; 32]))
+            .collect();
+        crate::io::write_full_record(&*dev, offset, &meta, &slots).unwrap();
+        index
+            .register(
+                key,
+                TxIndexEntry {
+                    device_id: 0,
+                    record_offset: offset,
+                    mined_slot: crate::index::mined_index::NO_MINED_SLOT,
+                },
+            )
+            .unwrap();
+        let engine = Arc::new(Engine::new(
+            dev,
+            index,
+            alloc,
+            crate::locks::StripedLocks::new(64),
+            crate::index::DahIndex::new(),
+        ));
+        let ptr = engine.device_ptr_for(0);
+        assert!(!ptr.is_null());
+        // SAFETY: same bounds argument as the issue-#46 fixture — `offset`
+        // is an allocator-issued in-bounds record offset and METADATA_SIZE
+        // stays within the record.
+        unsafe {
+            std::ptr::write_bytes(ptr.add(offset as usize), 0xFF, METADATA_SIZE);
+        }
+        assert!(engine.read_metadata(&key).is_err());
+        assert_eq!(engine.shard_record_count(shard), 1);
+
+        // A REPLICA-side task for the same shard toward a DIFFERENT target
+        // than the live handoff — the skip-demoted already-serving shape.
+        let task = MigrationTask {
+            shard,
+            from_node: NodeId(1),
+            to_node: NodeId(2),
+            is_master: false,
+        };
+        let migration = Arc::new(Mutex::new(MigrationManager::new()));
+        migration.lock().start_outbound(
+            std::slice::from_ref(&task),
+            NodeId(1),
+            &std::collections::HashSet::new(),
+        );
+        let fenced_bm = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+        let migrating_bm = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+        let inbound_bm = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+        // Nothing streams before the recheck refuses, so no live target is
+        // needed.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let dead_addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let (completed, failed) = run_migration_batch(
+            vec![task],
+            Some(dead_addr),
+            &[],
+            engine,
+            &migration,
+            &shard_table,
+            &None,
+            epoch,
+            1,
+            100,
+            fenced_bm,
+            migrating_bm,
+            inbound_bm,
+            NodeId(1),
+            None,
+            None,
+        );
+        assert_eq!((completed, failed), (0, 1));
+        {
+            let table = shard_table.read();
+            assert_eq!(
+                table.shard_handoff_state(shard),
+                ShardHandoff::Copying,
+                "a failed REPLICA-side empty recheck must leave the in-flight \
+                 master handoff untouched (W3 FIX C)"
+            );
+            assert_eq!(
+                table.target_assignment(shard).master,
+                NodeId(3),
+                "the mid-Copying handoff's target assignment must survive"
+            );
+        }
+        assert_eq!(
+            migration.lock().failed_count(),
+            1,
+            "the replica task must still park Failed in the retry queue"
+        );
     }
 
     /// W10 re-review P1-1 (+ residual) — the already-serving verification
