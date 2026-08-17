@@ -33536,6 +33536,86 @@ mod tests {
         );
     }
 
+    /// Shared body for the three non-DEAD states. Asserts that a member the
+    /// newer term dropped is NOT folded back into the repair, and that the
+    /// node stalls rather than proposing it back in.
+    fn assert_no_resurrection_for_dropped_member_state(
+        state: Option<crate::cluster::membership::NodeState>,
+        what: &str,
+    ) {
+        let auth = authority_that_missed_a_drain_step(UNSET_ID);
+        auth.set_committed_voter_ever_seen(&[NodeId(1), NodeId(2), NodeId(3), NodeId(4)]);
+        let term7 = commit_over(UNSET_ID, 7, &[NodeId(1), NodeId(3), NodeId(4)]);
+        assert_eq!(auth.handle_commit(&term7), None, "refused as non-monotonic");
+
+        // Node 2 is the dropped member; everyone else is plainly Alive.
+        let state_of = move |n: &NodeId| {
+            if n.0 == 2 {
+                state
+            } else {
+                Some(crate::cluster::membership::NodeState::Alive)
+            }
+        };
+
+        let repair = auth.monotonic_repair_for_refused_commit(&term7, state_of);
+        assert!(
+            repair.is_none(),
+            "{what}: only POSITIVE PROOF OF DEATH may license folding a \
+             dropped member back in — got {repair:?}",
+        );
+
+        let addrs = four_node_addr_book();
+        let proposal =
+            catch_up_fallback_proposal(&auth, &addrs, 7, NodeId(1), state_of, repair.as_deref());
+        assert!(
+            proposal.is_none(),
+            "{what}: the node must stall rather than propose the dropped \
+             member back in",
+        );
+        assert_eq!(auth.committed_term(), 5, "{what}: stalled, as intended");
+        assert_eq!(
+            auth.committed_members(),
+            vec![NodeId(1), NodeId(2), NodeId(3)],
+            "{what}: nothing was committed that re-adds the dropped node",
+        );
+    }
+
+    /// W11 P1-D follow-up — SUSPECT is not death.
+    ///
+    /// `NodeState` is `{Alive, Suspect, Dead}`, so an `== Alive` exclusion let
+    /// `Suspect` fall through to the union: absence of an ACK read as LICENCE
+    /// to re-add a member the cluster deliberately dropped. That is the
+    /// opposite polarity from every other liveness test in this module
+    /// (`revalidate_settled_members`: "death is definitive… a member that
+    /// never departed and is not Dead is RETAINED even when Suspect —
+    /// suspicion is transient").
+    ///
+    /// It is reachable, not theoretical: a quiescing node is alive and serving
+    /// two-phase handoffs, and needs to miss ONE probe
+    /// (`swim_probe_interval_ms` 200) to be Suspect for the whole
+    /// `swim_suspicion_timeout_ms` (5000) window. The catch-up is re-armed per
+    /// GOSSIP MESSAGE, not edge-triggered, so a single observation landing
+    /// inside that 5 s window would have folded the draining node back in and
+    /// proposed it — peers see a pure ADD, `drops_a_live_member` is false,
+    /// they accept, and nothing reverses it.
+    #[test]
+    fn unset_cluster_id_never_resurrects_a_suspect_member() {
+        assert_no_resurrection_for_dropped_member_state(
+            Some(crate::cluster::membership::NodeState::Suspect),
+            "SUSPECT (one missed probe on a draining node)",
+        );
+    }
+
+    /// W11 P1-D follow-up — NO SWIM RECORD is not death either.
+    ///
+    /// `state_of` returns `None` when SWIM has never had an entry for the
+    /// node. Treating that as "gone" would make a cold or freshly-restarted
+    /// SWIM view a resurrection channel; fail closed instead.
+    #[test]
+    fn unset_cluster_id_never_resurrects_a_member_with_no_swim_record() {
+        assert_no_resurrection_for_dropped_member_state(None, "NO SWIM RECORD");
+    }
+
     /// The same alive-drained shape under a CONFIGURED `cluster_id` converges
     /// instead of stalling — via direct adoption, which cannot resurrect
     /// anything because it proposes nothing. This is why (B) is the primary

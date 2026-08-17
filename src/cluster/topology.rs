@@ -2214,11 +2214,42 @@ impl TopologyAuthority {
     /// `cluster_id` is the direct evidence, which is why the existing code
     /// already lets a `cluster_id` match skip the ever-seen half.
     ///
+    /// # Proposal gate vs adoption gate
+    ///
+    /// Monotonicity as a PROPOSAL gate prevents creating the fact; as an
+    /// ADOPTION gate it refuses to learn a fact that already happened, and
+    /// refusing to learn it does not undo it.
+    ///
     /// So when a commit carries a quorum voter proof AND its `cluster_id`
     /// matches ours EXACTLY and ours is CONFIGURED (non-UNSET), the proxy has
-    /// nothing left to add: the commit is proven to come from a majority of
-    /// our own cluster, and it is the CURRENT membership by definition. Adopt
-    /// it directly.
+    /// nothing left to add. The claim that licenses adoption is deliberately
+    /// NARROW — it is NOT "this commit was ratified by a majority":
+    ///
+    ///  * the commit's member set is the RESPONDER'S OWN committed
+    ///    membership, whose lineage passed the peak-derived quorum floor
+    ///    ([`Self::activation_quorum_needed`] plus Gate B below), so under a
+    ///    partition at most one side ever advances and the other's committed
+    ///    set is a strict PREFIX of it, never a divergent lineage. Adopting is
+    ///    therefore LEARNING, not merging;
+    ///  * the strictly-higher-term gate (`commit.term <= committed` is
+    ///    rejected before this runs) forbids adopting a stale prefix, so the
+    ///    only direction of travel is forward.
+    ///
+    /// The stronger "ratified by a majority" reading would be FALSE, and the
+    /// counter-example is the very endpoint the catch-up fetches from:
+    /// [`crate::cluster::coordinator::RunningCluster::encode_committed_topology`]
+    /// (the `OP_GET_COMMITTED_TOPOLOGY` handler) FABRICATES a commit when it
+    /// no longer holds the winning bytes for its own term — proposer defaulted
+    /// to `members[0]`, voters defaulted to `committed_voters` or the member
+    /// set, digest recomputed over its own fields. Its own doc says a
+    /// receiver's "digest check, quorum proof and proposer rule are all
+    /// vacuous against it". That object carries a matching `cluster_id` and
+    /// satisfies `has_quorum_voter_proof()` without ever having been ratified.
+    /// It is still SAFE to adopt for the reasons above, and
+    /// [`TopologyCommit::has_quorum_voter_proof`] never distinguished
+    /// ratified from self-reported anyway — it is documented as "a purely
+    /// STRUCTURAL check on a plaintext, self-declared `voters` field", whose
+    /// integrity rests on the inter-node frame HMAC.
     ///
     /// # What this replaces, and why the alternative was worse
     ///
@@ -2255,6 +2286,18 @@ impl TopologyAuthority {
     ///
     /// A commit with an UNSET id on either side, or a mismatched one, falls
     /// through to the unchanged [`Self::membership_change_is_safe`].
+    ///
+    /// # Containment
+    ///
+    /// This function has exactly ONE caller
+    /// ([`Self::commit_passes_gates_inner`]). Every site that MINTS or ATTESTS
+    /// a member set still calls the bare [`Self::membership_change_is_safe`] —
+    /// [`Self::on_membership_changed`], [`Self::handle_propose`],
+    /// [`Self::retry_proposal`], [`Self::propose_shrink`], and
+    /// [`Self::check_timeout`] — so a conforming node can never MANUFACTURE a
+    /// non-monotonic member set, only LEARN one that a quorum already
+    /// committed. Keep it that way: widening this relaxation to any of those
+    /// five turns "refuse to unlearn" into "licence to create".
     fn commit_membership_is_acceptable(&self, commit: &TopologyCommit) -> bool {
         let my_id = self.cluster_id();
         if !my_id.is_unset() && commit.cluster_id == my_id && commit.has_quorum_voter_proof() {
@@ -2308,7 +2351,9 @@ impl TopologyAuthority {
     /// nodes too. STALENESS was.)
     ///
     /// So only members our committed set names, the commit dropped, and SWIM
-    /// does NOT currently report ALIVE are folded back in:
+    /// POSITIVELY PROVES DEAD are folded back in. The test is `== Dead`, never
+    /// `!= Alive`: absence of an ACK is not evidence of death, and reading it
+    /// as such would be the same resurrection channel by a slower route.
     ///
     ///  * a DEAD dropped member is the compressed two-step this exists for —
     ///    the union restores monotonicity, and step 2
@@ -2322,7 +2367,16 @@ impl TopologyAuthority {
     ///    never drained"), and nothing reverses it: the strict-subset drop
     ///    needs it dead, and the debounce path proposes the SWIM-alive set
     ///    that still contains it. Excluding it leaves the union non-monotonic,
-    ///    so this returns `None` and the commit stays refused.
+    ///    so this returns `None` and the commit stays refused;
+    ///  * a SUSPECT dropped member is the SAME node one missed probe later —
+    ///    a draining node needs to miss a single 200 ms probe to read Suspect
+    ///    for the whole 5 s suspicion window, and the catch-up is re-armed per
+    ///    GOSSIP MESSAGE rather than edge-triggered, so an observation landing
+    ///    in that window is entirely ordinary. Suspicion is transient
+    ///    everywhere else in this codebase; it is not death here either;
+    ///  * a dropped member with NO SWIM RECORD (`None`) is a cold or
+    ///    freshly-restarted SWIM view, which says nothing about the node.
+    ///    Fail closed.
     ///
     /// That refusal is a STALL, and it is the correct trade: a stall is
     /// observable (`topology_catch_up_reproposal_skipped` plus the
@@ -2363,16 +2417,27 @@ impl TopologyAuthority {
             if commit.members.contains(node) {
                 continue;
             }
-            if state_of(node) == Some(crate::cluster::membership::NodeState::Alive) {
+            // POSITIVE PROOF OF DEATH, not absence of proof of life. `Suspect`
+            // and `None` (no SWIM record) are NOT evidence a member is gone —
+            // treating them as such reads a missed ACK as licence to re-add a
+            // node the cluster deliberately dropped, and inverts the polarity
+            // every other liveness test in this codebase uses (see
+            // `crate::cluster::coordinator::revalidate_settled_members`: death
+            // is definitive, suspicion is transient).
+            let state = state_of(node);
+            if state != Some(crate::cluster::membership::NodeState::Dead) {
                 tracing::warn!(
                     node = node.0,
                     term = commit.term,
+                    ?state,
                     "topology: NOT folding a committed member back into the \
-                     catch-up repair — the newer term dropped it and SWIM still \
-                     reports it ALIVE, which is a graceful drain in progress. \
-                     Re-adding it would undo the drain (W11 P1-D); the commit \
-                     stays refused until the drain completes or a configured \
-                     cluster_id enables direct adoption.",
+                     catch-up repair — the newer term dropped it and SWIM does \
+                     not prove it DEAD. Alive is a graceful drain in progress; \
+                     Suspect is one missed probe on such a node; no record at \
+                     all is a cold SWIM view. Re-adding it would undo the drain \
+                     (W11 P1-D); the commit stays refused until the member is \
+                     definitively reaped or a configured cluster_id enables \
+                     direct adoption.",
                 );
                 continue;
             }
@@ -6176,11 +6241,13 @@ mod tests {
         // not a merge. Refusing it instead stalled such a node FOREVER, since
         // the catch-up's fetch loop gets the identical commit from every peer.
         //
-        // CONTAINMENT: only the COMMIT-ADOPTION path is relaxed. A conforming
-        // node still refuses to PROPOSE (`on_membership_changed`) or to VOTE
-        // FOR (`handle_propose`) a non-monotonic member set, so this shape can
-        // never be manufactured — only adopted once some quorum already
-        // committed it.
+        // CONTAINMENT: only the COMMIT-ADOPTION path is relaxed —
+        // `commit_membership_is_acceptable` has exactly ONE caller
+        // (`commit_passes_gates_inner`). All FIVE mint/attest sites still call
+        // the bare `membership_change_is_safe`: `on_membership_changed`,
+        // `handle_propose`, `retry_proposal`, `propose_shrink`, and
+        // `check_timeout`. So a conforming node can never MANUFACTURE this
+        // shape — only adopt it once some quorum already committed it.
         assert_eq!(
             auth.handle_commit(&merged_commit),
             Some(7),
